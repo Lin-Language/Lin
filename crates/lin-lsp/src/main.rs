@@ -3235,6 +3235,14 @@ impl WorkspaceIndex {
     ///
     /// Returns `None` when the rename is unsound/unsupported (stdlib symbol), so the
     /// handler can decline rather than produce a partial or wrong edit.
+    ///
+    /// SOUNDNESS (the whole point of this function vs. `occurrences`): rename edits are derived from
+    /// IDENTIFIER TOKENS (`identifier_token_spans`), NOT a raw text scan. That excludes matches inside
+    /// comments and string literals, which a text scan would wrongly rewrite. For the SHADOWING case
+    /// — an importing file that locally re-binds the same name (`val foo`, a param `foo`, a
+    /// destructuring `{ foo }`, etc.) — a flat token scan still cannot tell the import's uses from
+    /// the shadow's uses, so we refuse to touch the body: only the import-clause token is renamed and
+    /// the body uses are left to the user. Partial-but-sound beats complete-but-wrong.
     fn rename_edits(
         &self,
         owner_module: &str,
@@ -3247,10 +3255,18 @@ impl WorkspaceIndex {
 
         let mut out: Vec<(String, lin_common::Span)> = Vec::new();
 
-        // Owner file: decl + every use of the export name.
+        // Owner file: decl + every use of the export name — identifier tokens only (no
+        // comment/string over-match). The owner file can locally shadow its own export inside a
+        // nested scope; if it does, fall back to renaming only the export's declaration site.
         if let Some(owner) = self.files.get(owner_module) {
-            for span in whole_word_spans(&owner.source, export_name) {
-                out.push((owner_module.to_string(), span));
+            if file_rebinds_name_excluding_decl(&owner.source, export_name) {
+                if let Some(span) = decl_span(self, owner_module, export_name) {
+                    out.push((owner_module.to_string(), span));
+                }
+            } else {
+                for span in identifier_token_spans(&owner.source, export_name) {
+                    out.push((owner_module.to_string(), span));
+                }
             }
         }
 
@@ -3269,9 +3285,25 @@ impl WorkspaceIndex {
                     continue;
                 }
                 if imp.local_name == imp.export_name {
-                    // No alias: rename the clause token + every body use.
-                    for span in whole_word_spans(&file.source, &imp.local_name) {
-                        out.push((mod_id.clone(), span));
+                    // No alias. If this file locally re-binds the name (a shadowing `val`/`var`/param/
+                    // destructuring), we cannot soundly distinguish import uses from shadow uses with
+                    // a flat token scan — rename ONLY the import-clause token and leave body uses
+                    // alone. Otherwise rename the clause token + every identifier-token body use.
+                    if file_rebinds_name(&file.source, &imp.local_name) {
+                        if let Some(off) = find_name_in_import(
+                            &file.source,
+                            imp.stmt_span.start as usize,
+                            &imp.local_name,
+                        ) {
+                            out.push((
+                                mod_id.clone(),
+                                lin_common::Span::new(0, off as u32, (off + imp.local_name.len()) as u32),
+                            ));
+                        }
+                    } else {
+                        for span in identifier_token_spans(&file.source, &imp.local_name) {
+                            out.push((mod_id.clone(), span));
+                        }
                     }
                 } else {
                     // Aliased: rename ONLY the export-side token inside the import
@@ -3528,6 +3560,183 @@ fn whole_word_spans(source: &str, name: &str) -> Vec<lin_common::Span> {
         start = abs + 1;
     }
     out
+}
+
+/// Every IDENTIFIER-token occurrence of `name` in `source`, as byte spans — the SOUND occurrence
+/// primitive for rename. Unlike `whole_word_spans` (a raw `source.find` text scan), this lexes the
+/// file and keeps only `TokenKind::Ident` spans, so matches inside COMMENTS and STRING LITERALS are
+/// excluded (the lexer emits those as `Comment`/`StringLit`, never `Ident`). Identifiers inside
+/// `${...}` string interpolations ARE real uses and are collected by recursing into the
+/// interpolation's sub-token-stream (ADR-004). It does NOT do scope resolution, so a same-named
+/// local that shadows the symbol is still matched — callers that need shadow-safety must guard with
+/// `file_rebinds_name` first.
+fn identifier_token_spans(source: &str, name: &str) -> Vec<lin_common::Span> {
+    let mut out = Vec::new();
+    if name.is_empty() {
+        return out;
+    }
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    collect_ident_spans_in_tokens(&tokens, name, &mut out);
+    out.sort_by_key(|s| (s.start, s.end));
+    out.dedup();
+    out
+}
+
+/// Recurse a token stream pushing every `Ident(name)` span, descending into `InterpString` expr
+/// parts so identifiers used inside `${...}` interpolations count as real uses.
+fn collect_ident_spans_in_tokens(tokens: &[lin_lex::Token], name: &str, out: &mut Vec<lin_common::Span>) {
+    use lin_lex::{InterpPart, TokenKind};
+    for tok in tokens {
+        match &tok.kind {
+            TokenKind::Ident(n) if n == name => out.push(tok.span),
+            TokenKind::InterpString(parts) => {
+                for part in parts {
+                    if let InterpPart::Expr(sub) = part {
+                        collect_ident_spans_in_tokens(sub, name, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// True when the file's AST introduces a LOCAL binding named `name` anywhere (a `val`/`var`, a
+/// function parameter, or a destructuring/match pattern element) — i.e. a binding that could SHADOW
+/// an imported symbol of the same name. When this holds, a flat identifier-token scan cannot tell an
+/// import use from a shadow use, so rename must NOT rewrite body uses (it would corrupt the shadow).
+/// Conservative: the top-level `import` binding itself is excluded (it's the symbol we're renaming,
+/// not a shadow), but any other introduction of `name` returns true.
+fn file_rebinds_name(source: &str, name: &str) -> bool {
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let module = parser.parse_module();
+    module.statements.iter().any(|s| stmt_binds_name(s, name, true))
+}
+
+/// Like `file_rebinds_name`, but for the OWNER file: the symbol's own top-level `export val|var`
+/// declaration is NOT a shadow (it's the declaration we're renaming). Returns true only when a
+/// NESTED scope (function body, block, match arm) re-binds the name — in which case the owner file's
+/// body uses can't be soundly distinguished from the shadow, so the caller renames only the decl
+/// site.
+fn file_rebinds_name_excluding_decl(source: &str, name: &str) -> bool {
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let module = parser.parse_module();
+    module.statements.iter().any(|s| match s {
+        // The export's own top-level binding is the declaration, not a shadow — but a nested
+        // re-binding inside its initializer expression still counts.
+        Stmt::Val { pattern, value, .. } if pattern_binds_name(pattern, name) => {
+            expr_binds_name(value, name)
+        }
+        Stmt::Var { name: vn, value, .. } if vn == name => expr_binds_name(value, name),
+        other => stmt_binds_name(other, name, true),
+    })
+}
+
+/// Whether `stmt` (recursively, into expressions) introduces a binding named `name`. When
+/// `top_level` is true the statement is a module-level statement and a top-level `import` of `name`
+/// is NOT counted as a shadow (it's the import we're tracking); a top-level `val`/`var` of `name`
+/// IS a shadow (re-binding the imported name at module scope).
+fn stmt_binds_name(stmt: &Stmt, name: &str, top_level: bool) -> bool {
+    match stmt {
+        Stmt::Val { pattern, value, .. } => {
+            pattern_binds_name(pattern, name) || expr_binds_name(value, name)
+        }
+        Stmt::Var { name: vn, value, .. } => vn == name || expr_binds_name(value, name),
+        Stmt::Replace { name: rn, value, .. } => rn == name || expr_binds_name(value, name),
+        Stmt::Expr(e) => expr_binds_name(e, name),
+        // A top-level import of `name` is the binding we're renaming, not a shadow.
+        Stmt::Import { .. } if top_level => false,
+        _ => false,
+    }
+}
+
+/// Whether a binding pattern (incl. destructuring) introduces `name`.
+fn pattern_binds_name(pattern: &lin_parse::ast::Pattern, name: &str) -> bool {
+    use lin_parse::ast::Pattern as P;
+    match pattern {
+        P::Ident(n, _) => n == name,
+        P::Object(fields, rest, _) => {
+            rest.as_deref() == Some(name)
+                || fields.iter().any(|f| pattern_binds_name(&f.pattern, name))
+        }
+        P::Array(items, rest, _) => {
+            rest.as_deref() == Some(name) || items.iter().any(|p| pattern_binds_name(p, name))
+        }
+        _ => false,
+    }
+}
+
+/// Whether an expression introduces a binding named `name` in some nested scope: a function
+/// parameter, or a `val`/`var`/match-pattern inside a block/branch. Use-sites are irrelevant here —
+/// we only look for binding INTRODUCTIONS that would shadow the import.
+fn expr_binds_name(expr: &lin_parse::ast::Expr, name: &str) -> bool {
+    use lin_parse::ast::Expr as E;
+    match expr {
+        E::Function { params, body, .. } => {
+            params.iter().any(|p| pattern_binds_name(&p.pattern, name)
+                || p.default.as_ref().map(|d| expr_binds_name(d, name)).unwrap_or(false))
+                || expr_binds_name(body, name)
+        }
+        E::Block(stmts, tail, _) => {
+            stmts.iter().any(|s| stmt_binds_name(s, name, false)) || expr_binds_name(tail, name)
+        }
+        E::If { condition, then_branch, else_branch, .. } => {
+            expr_binds_name(condition, name)
+                || expr_binds_name(then_branch, name)
+                || expr_binds_name(else_branch, name)
+        }
+        E::Match { scrutinee, arms, .. } => {
+            use lin_parse::ast::MatchPattern;
+            expr_binds_name(scrutinee, name)
+                || arms.iter().any(|a| {
+                    let pat_binds = match &a.pattern {
+                        MatchPattern::Is(p) | MatchPattern::Has(p) => pattern_binds_name(p, name),
+                        MatchPattern::Else => false,
+                    };
+                    pat_binds
+                        || a.guard.as_ref().map(|g| expr_binds_name(g, name)).unwrap_or(false)
+                        || expr_binds_name(&a.body, name)
+                })
+        }
+        E::Call { func, args, .. } => {
+            expr_binds_name(func, name) || args.iter().any(|a| expr_binds_name(a, name))
+        }
+        E::DotCall { receiver, args, .. } => {
+            expr_binds_name(receiver, name)
+                || args.as_ref().map(|a| a.iter().any(|x| expr_binds_name(x, name))).unwrap_or(false)
+        }
+        E::BinaryOp { left, right, .. } => {
+            expr_binds_name(left, name) || expr_binds_name(right, name)
+        }
+        E::UnaryOp { operand, .. } => expr_binds_name(operand, name),
+        E::Assign { value, .. } => expr_binds_name(value, name),
+        E::IndexAssign { value, .. } => expr_binds_name(value, name),
+        E::Index { object, key, .. } => {
+            expr_binds_name(object, name) || expr_binds_name(key, name)
+        }
+        E::Array(items, _) => items.iter().any(|i| expr_binds_name(i, name)),
+        E::Object(fields, _) => fields.iter().any(|f| {
+            use lin_parse::ast::ObjectField;
+            match f {
+                ObjectField::Pair(k, v) => expr_binds_name(k, name) || expr_binds_name(v, name),
+                ObjectField::Spread(e) => expr_binds_name(e, name),
+            }
+        }),
+        E::Is { expr, pattern, .. } | E::Has { expr, pattern, .. } => {
+            expr_binds_name(expr, name) || pattern_binds_name(pattern, name)
+        }
+        E::StringInterp(parts, _) => parts.iter().any(|p| {
+            use lin_parse::ast::StringPart;
+            matches!(p, StringPart::Expr(e) if expr_binds_name(e, name))
+        }),
+        E::TupleArgs(items, _) => items.iter().any(|i| expr_binds_name(i, name)),
+        _ => false,
+    }
 }
 
 /// Canonical id for a user file path: the canonicalised absolute path as a string
@@ -4263,6 +4472,86 @@ mod tests {
         assert_eq!(&b[span.start as usize..span.end as usize], "foo");
         // It must sit inside the import statement (line 0), not the body.
         assert!((span.start as usize) < b.find('\n').unwrap());
+    }
+
+    /// SOUND cross-file rename: an importing file that has BOTH `import { foo }` AND a shadowing
+    /// local `val foo` (plus a comment and a string literal mentioning `foo`) must NOT have its
+    /// shadow uses, comment, or string rewritten. Only the import-clause `foo` is renamed.
+    #[test]
+    fn cross_file_rename_does_not_rewrite_shadow_comment_or_string() {
+        let a = "export val foo = 1\n";
+        // b.lin imports `foo`, but a nested function locally re-binds `foo`. The body use of the
+        // local `foo`, the `// foo` comment, and the `"foo"` string must all be left alone.
+        let b = "import { foo } from \"a\"\n\
+                 // foo is mentioned here\n\
+                 val g = (foo: Int32) => foo + foo\n\
+                 val s = \"foo bar\"\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+
+        let edits = index.rename_edits(&a_id, "foo").expect("user export renameable");
+        let a_edits: Vec<_> = edits.iter().filter(|(m, _)| m == &a_id).collect();
+        let b_edits: Vec<_> = edits.iter().filter(|(m, _)| m == &b_id).collect();
+
+        // a.lin: the single declaration site renames (a.lin doesn't shadow its own export).
+        assert_eq!(a_edits.len(), 1, "owner decl renamed once: {:?}", edits);
+        // b.lin: ONLY the import-clause token renames — the shadow `foo` param + its 2 body uses,
+        // the comment, and the string are all excluded.
+        assert_eq!(b_edits.len(), 1, "shadowed importer renames only the import token: {:?}", b_edits);
+        let (_, span) = b_edits[0];
+        assert_eq!(&b[span.start as usize..span.end as usize], "foo");
+        // The renamed token must sit on the import line (line 0), never in the body/comment/string.
+        assert!((span.start as usize) < b.find('\n').unwrap(), "edit must be in the import clause");
+    }
+
+    /// SOUND cross-file rename, non-shadow case: when the importer does NOT re-bind the name, body
+    /// uses ARE renamed — but matches inside a comment or string literal are STILL excluded (token
+    /// scan, not text scan). This is the regression guard for the comment/string over-match.
+    #[test]
+    fn cross_file_rename_excludes_comment_and_string_when_unshadowed() {
+        let a = "export val foo = 1\n";
+        // No local `foo` binding here — body uses rename, but the comment and string don't.
+        let b = "import { foo } from \"a\"\n\
+                 // call foo twice\n\
+                 val s = \"foo literal\"\n\
+                 val x = foo + foo\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let b_id = id_of("/ws/b.lin");
+        let a_id = id_of("/ws/a.lin");
+
+        let edits = index.rename_edits(&a_id, "foo").expect("renameable");
+        let b_edits: Vec<_> = edits.iter().filter(|(m, _)| m == &b_id).collect();
+        // Import clause `foo` + the two real body uses = 3. The comment's `foo` and the string's
+        // `foo` are NOT edited.
+        assert_eq!(b_edits.len(), 3, "import token + 2 body uses, no comment/string: {:?}", b_edits);
+        for (_, span) in &b_edits {
+            let text = &b[span.start as usize..span.end as usize];
+            assert_eq!(text, "foo");
+            // No edit may fall inside the comment line or the string-literal line.
+            let comment_line_start = b.find("// call").unwrap();
+            let comment_line_end = b[comment_line_start..].find('\n').unwrap() + comment_line_start;
+            assert!(
+                !((span.start as usize) >= comment_line_start && (span.start as usize) < comment_line_end),
+                "comment occurrence must not be renamed"
+            );
+            let str_start = b.find("\"foo literal\"").unwrap();
+            assert!(
+                (span.start as usize) < str_start || (span.start as usize) >= str_start + "\"foo literal\"".len(),
+                "string-literal occurrence must not be renamed"
+            );
+        }
+    }
+
+    /// `file_rebinds_name` detects shadowing introductions (val/var/param/destructuring) but not a
+    /// top-level import of the same name (that's the symbol we track, not a shadow).
+    #[test]
+    fn file_rebinds_name_detects_shadows_only() {
+        assert!(file_rebinds_name("val foo = 1\n", "foo"), "top-level val shadows");
+        assert!(file_rebinds_name("val g = (foo: Int32) => foo\n", "foo"), "param shadows");
+        assert!(file_rebinds_name("val { foo } = bar\n", "foo"), "destructure shadows");
+        assert!(!file_rebinds_name("import { foo } from \"a\"\nval x = foo\n", "foo"), "import is not a shadow");
+        assert!(!file_rebinds_name("val x = foo + foo\n", "foo"), "mere uses are not a shadow");
     }
 
     /// Workspace-symbol fuzzy filter aggregates top-level exports across files and
