@@ -1179,6 +1179,14 @@ impl Checker {
                 if let Some(decl) = self.env.lookup_type(n) {
                     if decl.params.is_empty() {
                         let body = decl.body.clone();
+                        // Guard against a self-referential body. A named record type's stored body
+                        // can be the opaque self-reference `Named(n)` itself (the cycle sentinel a
+                        // recursive type resolves to, and — pre-existing — for some record shapes
+                        // whose declared body never got re-expanded). Unfolding that and retrying
+                        // would loop forever (stack overflow). Defer to ordinary inference instead.
+                        if matches!(&body, Type::Named(b) if b == n) {
+                            return Ok(None);
+                        }
                         return self.check_object_against(fields, &body, span);
                     }
                 }

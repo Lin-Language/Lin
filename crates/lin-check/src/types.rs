@@ -217,6 +217,10 @@ impl Type {
             // to be packable — the field holds a pointer to a separately-allocated array, retained
             // on construct / released on drop by the descriptor walk.
             || matches!(self, Type::Array(_) | Type::FixedArray(_))
+            // Stage 3b step 4 (2026-06-08): a `{ String: T }` index-signature map field packs as an
+            // owned `*LinMap` pointer slot (KIND_MAP), exactly like a String/Array slot — retained on
+            // construct, released on drop, deep-copied on transfer by the descriptor walk.
+            || matches!(self, Type::Map(_))
             // Stage 3b step 3 (2026-06-08): a NESTED SEALED-RECORD field packs as an owned pointer
             // slot (KIND_SEALED); the descriptor walk recurses into the nested record's own fields.
             || (matches!(self, Type::Object { sealed: true, .. }) && self.sealed_record_all_fields_packable())

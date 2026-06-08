@@ -38,6 +38,45 @@ unsafe fn clone_string(s: *const LinString) -> *mut LinString {
     fresh
 }
 
+/// Deep-copy a `LinMap` (`{ String: T }` index-signature container) for cross-thread transfer.
+/// Share-nothing: allocate a fresh map and re-insert a DEEP CLONE of every live key/value pair, so
+/// the worker owns a private, disjoint graph. Keys are cloned strings; each value's heap payload is
+/// recursively transferred via `transfer_payload` (scalars copy verbatim; strings/arrays/objects/
+/// nested maps deep-copy). The fresh map has refcount 1; `lin_map_set` takes its own +1 on each
+/// inserted key + value payload, so we DROP our construction references afterwards (release the
+/// cloned key; release the cloned value payload via a temporary box) to leave exactly the map's own
+/// +1 per entry. Frozen/immortal maps are shared read-only (zero-copy), mirroring clone_array.
+unsafe fn clone_map(src: *const crate::map::LinMap) -> *mut crate::map::LinMap {
+    if src.is_null() {
+        return std::ptr::null_mut();
+    }
+    if (*src).refcount >= IMMORTAL_RC {
+        return src as *mut crate::map::LinMap;
+    }
+    let dst = crate::map::lin_map_alloc((*src).len);
+    let cap = (*src).cap as usize;
+    if cap > 0 && !(*src).slots.is_null() {
+        for i in 0..cap {
+            let slot = (*src).slots.add(i);
+            if (*slot).key.is_null() {
+                continue;
+            }
+            // Deep-clone the key (a fresh +1 LinString) and the value payload (verbatim for scalars,
+            // a private deep copy for heap payloads).
+            let key = clone_string((*slot).key);
+            let src_v = &(*slot).value;
+            let cloned_payload = transfer_payload(src_v.tag, src_v.payload);
+            let v = TaggedVal { tag: src_v.tag, _pad: [0; 7], payload: cloned_payload };
+            // lin_map_set retains the key (first insert) and retains the value payload; both are now
+            // owned by the map. Drop our construction references so each entry ends at the map's +1.
+            crate::map::lin_map_set(dst, key, &v);
+            crate::string::lin_string_release(key);
+            crate::object::release_tagged_payload_pub(&v);
+        }
+    }
+    dst
+}
+
 /// Deep-copy a sealed record (sealed-records Stages 1–2). Share-nothing: allocate a fresh struct of
 /// the same byte `size` (read from offset 4) carrying the same field descriptor (offset 8), copy the
 /// field bytes verbatim (this gets every SCALAR field right in one move), then — for each HEAP field
@@ -80,6 +119,7 @@ unsafe fn clone_sealed(src: *const u8) -> *mut u8 {
                 crate::sealed::KIND_STRING => clone_string(payload as *const LinString) as *mut u8,
                 crate::sealed::KIND_ARRAY => clone_array(payload as *const LinArray) as *mut u8,
                 crate::sealed::KIND_SEALED => clone_sealed(payload as *const u8),
+                crate::sealed::KIND_MAP => clone_map(payload as *const crate::map::LinMap) as *mut u8,
                 _ => payload,
             };
             *slot = cloned;
@@ -137,6 +177,7 @@ unsafe fn clone_sealed_array(src: *const LinArray) -> *mut LinArray {
                     crate::sealed::KIND_STRING => clone_string(p as *const LinString) as *mut u8,
                     crate::sealed::KIND_ARRAY => clone_array(p as *const LinArray) as *mut u8,
                     crate::sealed::KIND_SEALED => clone_sealed(p),
+                    crate::sealed::KIND_MAP => clone_map(p as *const crate::map::LinMap) as *mut u8,
                     _ => p,
                 };
                 *slot = cloned;
@@ -218,11 +259,12 @@ unsafe fn clone_object(src: *const LinObject) -> *mut LinObject {
 /// Transfer one tagged payload (the 8-byte field) by kind: scalars copy verbatim; heap
 /// pointers are deep-copied.
 unsafe fn transfer_payload(tag: u8, payload: u64) -> u64 {
-    use crate::tagged::TAG_SHARED;
+    use crate::tagged::{TAG_SHARED, TAG_MAP};
     match tag {
         TAG_STR => clone_string(payload as *const LinString) as u64,
         TAG_ARRAY => clone_array(payload as *const LinArray) as u64,
         TAG_OBJECT => clone_object(payload as *const LinObject) as u64,
+        TAG_MAP => clone_map(payload as *const crate::map::LinMap) as u64,
         TAG_SHARED => {
             // Nesting/boundary rule (ADR-028 §2.3.1): a Shared box embedded in a transferred
             // value is NOT deep-copied through — bump its atomic refcount and SHARE the box.
@@ -417,6 +459,60 @@ pub unsafe fn env_is_transferable(env_ptr: *const u8, desc: *const u8) -> bool {
 mod tests {
     use super::*;
     use crate::tagged::{alloc_tagged, TAG_INT32};
+
+    // ADR-063 KIND_MAP: `clone_map` deep-copies a `LinMap` share-nothing for cross-thread transfer.
+    // Asserts: (1) the clone is a DISTINCT map with the same key/value content, (2) a STRING value is
+    // a PRIVATE copy (distinct pointer, share-nothing), (3) RC is balanced — dropping the source does
+    // NOT free the clone's string, and dropping the clone frees only its own. A by-pointer share
+    // would be a cross-thread UAF (caught under ASan). Also exercises a SCALAR value (verbatim copy).
+    #[test]
+    fn clone_map_is_private_and_rc_balanced() {
+        use crate::map::{lin_map_alloc, lin_map_set, lin_map_get, lin_map_length, lin_map_release};
+        use crate::string::{lin_string_from_bytes, lin_string_release, lin_string_eq, LinString};
+        use crate::tagged::{TaggedVal, TAG_STR, TAG_INT64};
+        unsafe {
+            let src = lin_map_alloc(4);
+            // key "name" -> string "hello" (a fresh, non-interned +1)
+            let kname = lin_string_from_bytes(b"name".as_ptr(), 4);
+            let sval = lin_string_from_bytes(b"hello".as_ptr(), 5);
+            assert_eq!((*sval).refcount, 1);
+            let tv_s = TaggedVal { tag: TAG_STR, _pad: [0; 7], payload: sval as u64 };
+            lin_map_set(src, kname, &tv_s); // map retains the string -> rc 2
+            assert_eq!((*sval).refcount, 2);
+            // key "n" -> Int64 42 (scalar, no inner heap)
+            let kn = lin_string_from_bytes(b"n".as_ptr(), 1);
+            let tv_n = TaggedVal { tag: TAG_INT64, _pad: [0; 7], payload: 42 };
+            lin_map_set(src, kn, &tv_n);
+            // Drop our local +1 on the string and keys (map keeps its own refs).
+            lin_string_release(sval); // rc -> 1, owned only by the source map
+            assert_eq!((*sval).refcount, 1);
+
+            // Deep-copy for transfer.
+            let dst = clone_map(src);
+            assert!(!dst.is_null() && dst != src);
+            assert_eq!(lin_map_length(dst), 2);
+            // The cloned string must be a PRIVATE copy: distinct pointer, same bytes, its own rc 1.
+            let got = lin_map_get(dst, kname);
+            assert!(!got.is_null());
+            assert_eq!((*got).tag, TAG_STR);
+            let ds = (*got).payload as *const LinString;
+            assert_ne!(ds, sval as *const LinString, "value string must be a private copy");
+            assert!(lin_string_eq(ds, sval));
+            assert_eq!((*ds).refcount, 1, "clone owns the sole +1 of its string");
+            // The scalar value copies verbatim.
+            let gotn = lin_map_get(dst, kn);
+            assert_eq!((*gotn).tag, TAG_INT64);
+            assert_eq!((*gotn).payload, 42);
+
+            // Drop the SOURCE: frees src's string. The clone's string is independent.
+            lin_map_release(src);
+            assert_eq!((*ds).refcount, 1, "source drop must not touch the clone's string");
+            // Drop the clone: frees its private string exactly once (ASan verifies no leak/UAF).
+            lin_map_release(dst);
+            lin_string_release(kname);
+            lin_string_release(kn);
+        }
+    }
 
     #[test]
     fn transfer_scalar_box_is_independent() {
