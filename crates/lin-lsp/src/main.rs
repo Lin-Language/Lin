@@ -2619,9 +2619,12 @@ fn find_enclosing_call_in_expr(
             let open = span.start as usize;
             if source.as_bytes().get(open) == Some(&b'(') {
                 // `.get` so a stale span start can't panic; `(` is ASCII so `open` is a char boundary.
+                // Use the SOURCE matcher (not `matching_paren`, which treats `<>` as brackets) — in
+                // real source `<`/`>` are comparison operators and `=>` is a lambda arrow, so an
+                // argument like `f(1 > 0, 2)` must not unbalance the paren scan.
                 let close = source
                     .get(open..)
-                    .and_then(matching_paren)
+                    .and_then(matching_paren_in_source)
                     .map(|c| open + c);
                 let paren_after = open + 1;
                 // Inside the parens: after `(` and at/before the `)` (or to EOF when unclosed,
@@ -2695,12 +2698,55 @@ fn function_param_types(sig: &str) -> Option<Vec<String>> {
 }
 
 /// Index of the `)` that closes the `(` at byte 0 of `s` (depth-balanced over `()[]{}<>`).
+///
+/// Scans a RENDERED TYPE string, where `<>` legitimately delimit generic arguments (`Foo<Bar>`). The
+/// one ambiguity is the function arrow `=>`: its `>` is NOT a closing angle bracket, so a function
+/// type like `(Int32) => Int32` would otherwise have its depth driven negative by the arrow. We skip
+/// the `>` of a `=>` (a `>` immediately preceded by `=`) so function-typed parameters split correctly.
 fn matching_paren(s: &str) -> Option<usize> {
     let mut depth = 0i32;
+    let mut prev = '\0';
     for (i, c) in s.char_indices() {
         match c {
             '(' | '[' | '{' | '<' => depth += 1,
+            // `=>` arrow: the `>` is part of the arrow, not a closing angle bracket.
+            '>' if prev == '=' => {}
             ')' | ']' | '}' | '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        prev = c;
+    }
+    None
+}
+
+/// Index of the `)` that closes the `(` at byte 0 of `s`, scanning over USER SOURCE. Depth is
+/// balanced over `()[]{}` only (NOT `<>`, which are comparison operators in source) and string
+/// literals are skipped (honouring `\"` escapes) so a `)` inside a string can't close the call.
+/// This is the source-text counterpart of `matching_paren` (which scans rendered type strings).
+fn matching_paren_in_source(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if in_str {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
                 depth -= 1;
                 if depth == 0 {
                     return Some(i);
@@ -2712,14 +2758,19 @@ fn matching_paren(s: &str) -> Option<usize> {
     None
 }
 
-/// Split `s` on top-level commas (commas at bracket depth 0), trimming each piece.
+/// Split a RENDERED TYPE string `s` on top-level commas (commas at bracket depth 0), trimming each
+/// piece. Depth balances `()[]{}<>`; the `>` of a function arrow `=>` is skipped (it is part of the
+/// arrow, not a closing angle bracket) so a function-typed parameter like `(Int32) => Int32` is kept
+/// as a single piece rather than split at its arrow.
 fn split_top_level(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
+    let mut prev = '\0';
     for (i, c) in s.char_indices() {
         match c {
             '(' | '[' | '{' | '<' => depth += 1,
+            '>' if prev == '=' => {}
             ')' | ']' | '}' | '>' => depth -= 1,
             ',' if depth == 0 => {
                 out.push(s[start..i].trim().to_string());
@@ -2727,20 +2778,43 @@ fn split_top_level(s: &str) -> Vec<String> {
             }
             _ => {}
         }
+        prev = c;
     }
     out.push(s[start..].trim().to_string());
     out
 }
 
-/// Count top-level commas (depth 0) in `s`. Used to pick the active parameter from the text between
-/// a call's `(` and the cursor.
+/// Count top-level commas (bracket-depth 0) in USER SOURCE argument text. Used to pick the active
+/// parameter from the text between a call's `(` and the cursor.
+///
+/// Unlike `split_top_level`/`matching_paren` (which scan RENDERED TYPE strings, where `<>` legitimately
+/// delimit generic arguments), this runs over real source where `<`/`>` are the comparison operators
+/// and `=>` is the lambda arrow — so it must NOT treat them as bracket depth. Doing so previously
+/// skewed the comma count for argument text like `f(x > 0, y)` or `f(x => x, y)`, mis-bolding the
+/// active parameter. Depth is tracked using only `()`, `[]`, `{}`. Commas inside string literals
+/// (`"..."`, honouring `\"` escapes) are skipped; `${...}` interpolation spans inside a string are
+/// likewise ignored along with the rest of the string body.
 fn top_level_commas(s: &str) -> u32 {
     let mut depth = 0i32;
     let mut count = 0u32;
-    for c in s.chars() {
+    let mut in_str = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_str {
+            match c {
+                // Skip the escaped character (e.g. `\"` does not close the string).
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
         match c {
-            '(' | '[' | '{' | '<' => depth += 1,
-            ')' | ']' | '}' | '>' => depth -= 1,
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
             ',' if depth == 0 => count += 1,
             _ => {}
         }
@@ -4196,6 +4270,52 @@ mod tests {
         // Commas nested inside brackets don't advance the active parameter.
         assert_eq!(top_level_commas("[1, 2], 3"), 1);
         assert_eq!(top_level_commas("f(a, b), "), 1);
+        // `<`/`>` are comparison operators in source, NOT bracket depth: `x > b` is one arg, then
+        // the cursor after the comma is in the SECOND argument.
+        assert_eq!(top_level_commas("a > b, c"), 1);
+        assert_eq!(top_level_commas("a < b, c"), 1);
+        // `=>` (lambda arrow) must not be read as `>` opening/closing a bracket.
+        assert_eq!(top_level_commas("x => x, y"), 1);
+        // Commas inside a string literal are NOT argument separators (respecting `\"` escapes).
+        assert_eq!(top_level_commas("\"a,b\", c"), 1);
+        assert_eq!(top_level_commas("\"a,b,c\""), 0);
+        assert_eq!(top_level_commas("\"a\\\",b\", c"), 1);
+    }
+
+    /// End to end: with a comparison in the first argument (`f(x > 0, y)`) and the cursor in the
+    /// SECOND argument, the active parameter is index 1 — not skewed by the `>` operator.
+    #[test]
+    fn signature_help_active_param_unskewed_by_comparison() {
+        let src = "val f = (a: Boolean, b: Int32) => b\nval r = f(1 > 0, 2)\n";
+        let analysis = analyse(src, None);
+        let call_open = src.rfind('(').unwrap();
+        let cursor = call_open + src[call_open..].find('2').unwrap();
+        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        assert_eq!(help.signatures[0].active_parameter, Some(1), "comparison must not skew active param");
+    }
+
+    /// A lambda argument (`f(x => x, y)`) must not skew the active parameter via its `=>` arrow:
+    /// cursor in the second arg is index 1.
+    #[test]
+    fn signature_help_active_param_unskewed_by_lambda() {
+        let src = "val f = (g: (Int32) => Int32, b: Int32) => b\nval r = f(x => x, 9)\n";
+        let analysis = analyse(src, None);
+        let call_open = src.rfind('(').unwrap();
+        let cursor = call_open + src[call_open..].find('9').unwrap();
+        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        assert_eq!(help.signatures[0].active_parameter, Some(1), "lambda arrow must not skew active param");
+    }
+
+    /// A comma inside a string-literal argument (`f("a,b", c)`) is not an argument separator: cursor
+    /// in the second arg is index 1, not 2.
+    #[test]
+    fn signature_help_active_param_ignores_string_comma() {
+        let src = "val f = (s: String, n: Int32) => n\nval r = f(\"a,b\", 7)\n";
+        let analysis = analyse(src, None);
+        let call_open = src.rfind('(').unwrap();
+        let cursor = call_open + src[call_open..].find('7').unwrap();
+        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        assert_eq!(help.signatures[0].active_parameter, Some(1), "string comma must not advance active param");
     }
 
     #[test]
@@ -5055,3 +5175,4 @@ mod tests {
         assert_eq!(position_to_offset(src, Position { line: 0, character: 10 }), second);
     }
 }
+
