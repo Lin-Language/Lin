@@ -192,19 +192,42 @@ impl LanguageServer for Backend {
         let analysis = analyse(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
-        let def_span = match tightest_span(&analysis.span_type_map, offset)
-            .and_then(|(_, _, ds)| *ds)
-        {
-            Some(s) => s,
-            None => return Ok(None),
-        };
+        // Same-file first: a local/parameter use carries a `def_span` pointing at its binding in
+        // THIS file. That's the most precise target, so prefer it.
+        if let Some(def_span) = tightest_span(&analysis.span_type_map, offset).and_then(|(_, _, ds)| *ds) {
+            let start = offset_to_position(&source, def_span.start as usize);
+            let end = offset_to_position(&source, def_span.end as usize);
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: Range { start, end },
+            })));
+        }
 
-        let start = offset_to_position(&source, def_span.start as usize);
-        let end = offset_to_position(&source, def_span.end as usize);
-        Ok(Some(GotoDefinitionResponse::Scalar(Location {
-            uri: uri.clone(),
-            range: Range { start, end },
-        })))
+        // Cross-file fallback: an IMPORTED name has no intra-file `def_span` (imported bindings are
+        // `env.define`d without one — see the cross-file index note). Resolve the symbol under the
+        // cursor to its owner module via the SAME path references/rename use, then jump to the owner
+        // file's export declaration span. stdlib owners have no on-disk URI (`module_id_to_uri`
+        // returns `None`), so goto into stdlib yields nothing — acceptable.
+        if let Ok(path) = uri.to_file_path() {
+            let module_id = canonical_id(&path);
+            let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
+            if let Some((owner, name)) = index.resolve_symbol(&module_id, offset) {
+                if let (Some(decl), Some(owner_uri), Some(owner_file)) = (
+                    decl_span(&index, &owner, &name),
+                    module_id_to_uri(&owner),
+                    index.files.get(&owner),
+                ) {
+                    // Convert the decl span using the OWNER file's source (offsets index into it),
+                    // not the current file's.
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: owner_uri,
+                        range: span_to_range(&owner_file.source, decl),
+                    })));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -4582,6 +4605,54 @@ mod tests {
             .resolve_symbol(&b_id, use_off)
             .expect("should resolve the imported symbol from its use");
         assert_eq!((owner2, name2), (owner, name));
+    }
+
+    /// Cross-file goto-definition: B imports `foo` from A; a goto-def on the USE of `foo` in B must
+    /// resolve to A's `foo` DECLARATION span (in A's source). This mirrors the handler's cross-file
+    /// fallback (`resolve_symbol` → `decl_span` → owner file URI/source).
+    #[test]
+    fn cross_file_goto_definition_jumps_to_owner_decl() {
+        let a = "export val foo = 1\n";
+        let b = "import { foo } from \"a\"\nval x = foo + 1\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+
+        // Cursor on the USE of `foo` in b.lin's body.
+        let use_off = b.rfind("foo").unwrap();
+        let (owner, name) = index
+            .resolve_symbol(&b_id, use_off)
+            .expect("imported use must resolve to its owner");
+        assert_eq!(owner, a_id, "owner of `foo` is a.lin");
+        assert_eq!(name, "foo");
+
+        // The decl span points into A's source at A's `foo` declaration.
+        let decl = decl_span(&index, &owner, &name).expect("owner declares foo");
+        let owner_file = index.files.get(&owner).unwrap();
+        assert_eq!(
+            &owner_file.source[decl.start as usize..decl.end as usize],
+            "foo",
+            "decl span must cover `foo` in a.lin"
+        );
+        // And the target URI is A's file (not B's, and never a stdlib id).
+        assert_eq!(module_id_to_uri(&owner), module_id_to_uri(&a_id));
+        assert!(module_id_to_uri(&owner).is_some(), "owner has an on-disk URI");
+    }
+
+    /// Goto-def on an imported name owned by STDLIB yields no navigable target (stdlib has no
+    /// on-disk URI) — the handler returns nothing, which is acceptable.
+    #[test]
+    fn cross_file_goto_definition_skips_stdlib_owner() {
+        let b = "import { print } from \"std/io\"\nval x = print\n";
+        let index = index_from(&[("/ws/b.lin", b)]);
+        let b_id = id_of("/ws/b.lin");
+        let use_off = b.rfind("print").unwrap();
+        let (owner, _name) = index
+            .resolve_symbol(&b_id, use_off)
+            .expect("imported stdlib use resolves to std/io");
+        assert!(owner.starts_with("std/"), "owner is a stdlib module: {}", owner);
+        // No on-disk URI for stdlib → handler emits no Location.
+        assert!(module_id_to_uri(&owner).is_none(), "stdlib owner must have no file URI");
     }
 
     /// Dependency computation for the on-edit re-check: when A changes, the set of
