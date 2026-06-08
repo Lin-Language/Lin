@@ -16,7 +16,7 @@
 // `while`, so the byte scans are written as tail-recursive helpers over a byte index.
 //
 // Structural URL parsing (scheme/host/path/fragment) is out of scope — see std/url.
-import { fromCodePoints, byteAt, fromUtf8, toString } from "std/string"
+import { fromCodePoints, byteAt, fromUtf8, toString, lengthBytes } from "std/string"
 import { length, push } from "std/array"
 import { keys } from "std/object"
 import { for } from "std/iter"
@@ -249,16 +249,8 @@ val isUnreserved = (byte: Int32): Boolean =>
   val isMark = byte == 45 || byte == 46 || byte == 95 || byte == 126
   isAlpha || isDigit || isMark
 
-// Number of bytes in the (ASCII-or-UTF-8) string, by scanning byteAt to the -1 sentinel.
-// O(n); byteAt is O(1) so the whole scan is linear.
-val byteLen = (s: String): Int32 =>
-  byteLenFrom(s, 0)
-
-val byteLenFrom = (s: String, i: Int32): Int32 =>
-  if byteAt(s, i) == -1 then
-    i
-  else
-    byteLenFrom(s, i + 1)
+// Byte length comes from std/string.lengthBytes (O(1) — the runtime stores it), replacing an
+// earlier O(n) byteAt-to-sentinel scan.
 
 // UTF-8-encode a string to its raw byte buffer — the inverse of `std/string.fromUtf8`. Pure Lin
 // (scans the codepoint-aware string's bytes via `byteAt`). The String→UInt8[] companion to the
@@ -419,7 +411,7 @@ val hexEncGo = (bytes: UInt8[], n: Int32, i: Int32, out: Int32[]): Int32[] =>
 // @param s  the hex string to decode.
 // @returns the decoded bytes, or an Error on odd length or any non-hex character.
 export val hexDecode = (s: String): UInt8[] | Error =>
-  val n = byteLen(s)
+  val n = lengthBytes(s)
   if n % 2 != 0 then
     mkError("hex: odd-length input")
   else
@@ -482,7 +474,7 @@ export val urlDecode = (s: String): String | Error =>
 // escape (a `%` not followed by two hex digits).
 val percentDecodeBytes = (s: String): UInt8[] | Error =>
   val out: UInt8[] = []
-  pctDecGo(s, byteLen(s), 0, out)
+  pctDecGo(s, lengthBytes(s), 0, out)
 
 val pctDecGo = (s: String, n: Int32, i: Int32, out: UInt8[]): UInt8[] | Error =>
   if i >= n then
@@ -513,7 +505,7 @@ val pctDecGo = (s: String, n: Int32, i: Int32, out: UInt8[]): UInt8[] | Error =>
 // maps to a space (form semantics). Always succeeds.
 val queryDecode = (s: String): String =>
   val out: UInt8[] = []
-  val bytes = queryDecGo(s, byteLen(s), 0, out)
+  val bytes = queryDecGo(s, lengthBytes(s), 0, out)
   // Lenient: if the decoded bytes are not valid UTF-8, fall back to the original text.
   val decoded = fromUtf8(bytes)
   if decoded is Error then
@@ -564,7 +556,7 @@ val byteSliceGo = (s: String, i: Int32, end: Int32, out: Int32[]): Int32[] =>
 // @returns the parsed multimap; each key maps to its list of values in input order.
 export val parseQuery = (s: String): { String: String[] } =>
   val result: { String: String[] } = {}
-  val n = byteLen(s)
+  val n = lengthBytes(s)
   val start = if byteAt(s, 0) == 63 then 1 else 0
   parseQueryGo(s, n, start, start, -1, result)
 
