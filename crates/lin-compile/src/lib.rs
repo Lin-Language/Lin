@@ -1342,8 +1342,22 @@ This is likely a compiler bug — please report it at https://github.com/linusno
         }
     }
 
-    // Anything else: a generic, clean failure with no linker jargon in the top line.
-    "could not build your program: a required external library could not be found".to_string()
+    // Anything else: we could not attribute the failure to a specific cause. Emit a clean,
+    // jargon-free top line WITHOUT asserting a cause we don't actually know (e.g. claiming a
+    // missing library when the real problem is something else), and keep the raw diagnostic on a
+    // quiet `details:` line so a bug report still carries the underlying linker output.
+    let mut msg = String::from(
+        "could not build your program: the final build step failed for an unrecognised reason",
+    );
+    let detail = raw.trim();
+    if !detail.is_empty() {
+        // Collapse to the first few non-empty lines so the details stay scannable.
+        let snippet: Vec<&str> = detail.lines().filter(|l| !l.trim().is_empty()).take(4).collect();
+        if !snippet.is_empty() {
+            msg.push_str(&format!("\n(details: {})", snippet.join(" | ")));
+        }
+    }
+    msg
 }
 
 fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: bool, debug: bool) -> Result<(), CompileError> {
