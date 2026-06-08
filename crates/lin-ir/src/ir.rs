@@ -457,6 +457,16 @@ pub enum Instruction {
     /// double-freeing when the callback returned (an alias of) that box — whose separate full
     /// release already reclaimed it. Maps to `lin_tagged_free_box_if_distinct`. Null/cached-safe.
     FreeBoxShellIfDistinct { val: Temp, other: Temp },
+    /// FULLY release a `TaggedVal*` element box (inner heap payload + shell), but ONLY when `val` is
+    /// a distinct pointer from `other`. The full-release counterpart of `FreeBoxShellIfDistinct`,
+    /// used by `for`/`while` to reclaim the per-iteration element box that `lin_array_get_tagged`
+    /// returned as a fresh +1 WITH the inner heap payload RETAINED. A side-effecting `for`/`while`
+    /// body never MOVES that inner anywhere, so it must be fully reclaimed — freeing only the shell
+    /// (the old `FreeBoxShellIfDistinct`) leaked the retained inner of every heap-bearing element.
+    /// The `if distinct` guard avoids a double-free when the callback returned (an alias of) the box,
+    /// whose separate full release already reclaimed it. Maps to `lin_tagged_release_if_distinct`.
+    /// Null/cached-box safe. A flat-scalar element box has no inner, so this degrades to a shell free.
+    ReleaseIfDistinct { val: Temp, other: Temp },
     /// result = val is type_tag? (returns bool)
     IsType { dst: Temp, val: Temp, ty: Type },
     /// UNBOXED SUM TYPE (unboxed-sumtype Stage 1): `result = (val's inline tag == the tag of the
