@@ -37,7 +37,8 @@
   "scripts": {
     "vscode:prepublish": "npm run compile -- --production",
     "compile": "node esbuild.js",
-    "watch": "node esbuild.js --watch"
+    "watch": "node esbuild.js --watch",
+    "test": "node test/discovery.test.js"
   },
   "contributes": {
     "configurationDefaults": {
