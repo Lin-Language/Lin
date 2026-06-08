@@ -101,16 +101,14 @@ unsafe fn make_str_raw(s: &str) -> *mut u8 {
 // One-shot digests (raw 32/64/20/16-byte buffers)
 // ---------------------------------------------------------------------------
 
+// The lowercase-hex digest variants (sha256Hex/…/hmacSha256Hex/digestHex) and the hex/UTF-8 codecs
+// (toHex/fromHex/toBytes) live in std/crypto as pure Lin composed over std/encoding's hexEncode /
+// hexDecode / utf8Bytes — they are NOT runtime intrinsics, to avoid duplicating that plumbing here.
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_crypto_sha256(data: *const u8) -> *mut u8 {
     let d = Sha256::digest(read_byte_buf(data));
     make_byte_buf(&d)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn lin_crypto_sha256_hex(data: *const u8) -> *mut u8 {
-    let d = Sha256::digest(read_byte_buf(data));
-    make_str_raw(&hex::encode(d))
 }
 
 #[no_mangle]
@@ -120,33 +118,15 @@ pub unsafe extern "C" fn lin_crypto_sha512(data: *const u8) -> *mut u8 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_crypto_sha512_hex(data: *const u8) -> *mut u8 {
-    let d = Sha512::digest(read_byte_buf(data));
-    make_str_raw(&hex::encode(d))
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn lin_crypto_sha1(data: *const u8) -> *mut u8 {
     let d = Sha1::digest(read_byte_buf(data));
     make_byte_buf(&d)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_crypto_sha1_hex(data: *const u8) -> *mut u8 {
-    let d = Sha1::digest(read_byte_buf(data));
-    make_str_raw(&hex::encode(d))
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn lin_crypto_md5(data: *const u8) -> *mut u8 {
     let d = Md5::digest(read_byte_buf(data));
     make_byte_buf(&d)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn lin_crypto_md5_hex(data: *const u8) -> *mut u8 {
-    let d = Md5::digest(read_byte_buf(data));
-    make_str_raw(&hex::encode(d))
 }
 
 // ---------------------------------------------------------------------------
@@ -159,14 +139,6 @@ pub unsafe extern "C" fn lin_crypto_hmac_sha256(key: *const u8, msg: *const u8) 
         .expect("HMAC accepts any key length");
     mac.update(&read_byte_buf(msg));
     make_byte_buf(&mac.finalize().into_bytes())
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn lin_crypto_hmac_sha256_hex(key: *const u8, msg: *const u8) -> *mut u8 {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&read_byte_buf(key))
-        .expect("HMAC accepts any key length");
-    mac.update(&read_byte_buf(msg));
-    make_str_raw(&hex::encode(mac.finalize().into_bytes()))
 }
 
 // ---------------------------------------------------------------------------
@@ -214,39 +186,7 @@ pub unsafe extern "C" fn lin_crypto_ct_eq(a: *const u8, b: *const u8) -> *mut u8
     lin_box_bool(eq as u8)
 }
 
-// ---------------------------------------------------------------------------
-// Codecs
-// ---------------------------------------------------------------------------
-
-#[no_mangle]
-pub unsafe extern "C" fn lin_crypto_to_bytes(s: *const u8) -> *mut u8 {
-    match resolve_lin_str(s) {
-        Some(text) => make_byte_buf(text.as_bytes()),
-        None => make_byte_buf(&[]),
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn lin_crypto_to_hex(data: *const u8) -> *mut u8 {
-    make_str_raw(&hex::encode(read_byte_buf(data)))
-}
-
-/// fromHex: decode a hex string to a `UInt8[]`, or the canonical error object on odd length /
-/// non-hex characters.
-#[no_mangle]
-pub unsafe extern "C" fn lin_crypto_from_hex(s: *const u8) -> *mut u8 {
-    let text = match resolve_lin_str(s) {
-        Some(t) => t,
-        None => return make_error_tagged("invalid hex string"),
-    };
-    if text.len() % 2 != 0 {
-        return make_error_tagged("odd-length hex");
-    }
-    match hex::decode(&text) {
-        Ok(bytes) => make_byte_buf(&bytes),
-        Err(_) => make_error_tagged("invalid hex"),
-    }
-}
+// (hex/UTF-8 codecs — toHex/fromHex/toBytes — are pure Lin in std/crypto over std/encoding.)
 
 // ---------------------------------------------------------------------------
 // Incremental Hasher (opaque Int64 handle backed by a global registry)
@@ -333,13 +273,4 @@ pub unsafe extern "C" fn lin_crypto_hasher_digest(handle: i64) -> *mut u8 {
         None => make_byte_buf(&[]),
     }
 }
-
-/// digestHex(handle) -> String. As `digest` but hex-encoded.
-#[no_mangle]
-pub unsafe extern "C" fn lin_crypto_hasher_digest_hex(handle: i64) -> *mut u8 {
-    let state = registry().lock().unwrap().remove(&handle);
-    match state {
-        Some(s) => make_str_raw(&hex::encode(s.finalize())),
-        None => make_str_raw(""),
-    }
-}
+// (digestHex is pure Lin in std/crypto: hexEncode(digest(h)).)
