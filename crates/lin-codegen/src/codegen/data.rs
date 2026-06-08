@@ -1129,6 +1129,61 @@ impl<'ctx> Codegen<'ctx> {
         if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
     }
 
+    /// `rec["field"] = value` over a PACKED SEALED RECORD: a constant-offset packed-struct store, the
+    /// write counterpart of `sealed_field_get`. The object operand is a sealed-struct pointer (proven
+    /// by the repr pass / verifier). For a SCALAR field this is a direct store (coercing a narrower/
+    /// wider source to the field's width); for a HEAP field (String / Array / nested sealed) the old
+    /// pointer is released and the new one retained, so the struct keeps exactly one +1 reference and
+    /// the source value stays owned by its caller (released at scope exit) — the same retain semantics
+    /// as a boxed `lin_object_set`.
+    pub(crate) fn compile_ir_field_set(
+        &mut self,
+        obj: BasicValueEnum<'ctx>,
+        field: &str,
+        value: BasicValueEnum<'ctx>,
+        obj_ty: &Type,
+        val_ty: &Type,
+        obj_repr: &lin_ir::repr::Repr,
+    ) {
+        // The fields come from the repr (the proven packed layout); fall back to the static type's
+        // sealed fields if the repr did not carry them (should not happen — verifier asserts packed).
+        let fields = obj_repr
+            .packed_struct_fields()
+            .cloned()
+            .or_else(|| Self::sealed_scalar_fields(obj_ty).cloned());
+        let Some(fields) = fields else { return; };
+        if !obj.is_pointer_value() || !fields.contains_key(field) {
+            return;
+        }
+        let (offset, _total) = Self::sealed_field_layout(&fields, field);
+        let i64_ty = self.context.i64_type();
+        let base = obj.into_pointer_value();
+        let fld_ty = fields.get(field).cloned().unwrap_or(Type::Null);
+        let p = unsafe {
+            self.builder.gep(self.context.i8_type(), base, &[i64_ty.const_int(offset, false)], "sealed_set_fld_p")
+        };
+        let is_heap = Self::sealed_field_kind(&fld_ty).is_some();
+        // Coerce a representation-mismatched source into the field's layout (a narrower/wider scalar,
+        // or an unsealed `{...}` / Json projected into a nested sealed field). A repr-changing coerce
+        // yields a FRESH +1 we then own (and must NOT additionally retain below).
+        let repr_change = Self::sealed_repr_differs(val_ty, &fld_ty);
+        let stored = if repr_change { self.compile_ir_coerce(value, val_ty, &fld_ty) } else { value };
+        if is_heap {
+            // Release the OLD heap pointer the slot held (balanced against its construction/prior-set
+            // +1), then store and take a fresh +1 for the struct. A repr-changing coerce already
+            // produced an owned +1, so only retain when the source was stored verbatim (borrowed).
+            let old = self.builder.load(self.context.ptr_type(AddressSpace::default()), p, "sealed_set_old");
+            self.emit_release(old, &fld_ty);
+            self.builder.store(p, stored);
+            if !repr_change && stored.is_pointer_value() {
+                self.builder.call(self.rt.rc_retain, &[stored.into_pointer_value().into()], "sealed_set_retain");
+            }
+        } else {
+            // Scalar field: a plain store (coerced to the field width above). No RC.
+            self.builder.store(p, stored);
+        }
+    }
+
     /// FUSED `arr[idx].field` over a SEALED-RECORD ARRAY (Stage 3): a single constant-offset scalar
     /// load directly from the contiguous, header-less element — no per-element struct
     /// materialization. The element payload begins at `data + idx*stride`; the field lives at the

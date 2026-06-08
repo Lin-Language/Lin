@@ -6894,6 +6894,61 @@ print(toString(g(5)["v"]))
     assert_eq!(output, vec!["1", "0"]);
 }
 
+// Regression: a LITERAL-KEY field WRITE into a PACKED SEALED RECORD (`rec["f"] = …`). Before the
+// FieldSet fix, codegen routed every sealed-record `obj_ty` (Named alias or inline `{...}`) write
+// through `lin_object_set`, which reads a packed sealed struct's bytes as a LinObject header and
+// crashed (`index_cap` underflow in `index_probe`). The fix lowers a literal-key write of a present
+// field into a constant-offset packed-struct store. This is the exact shape `std/random`'s `Rng`
+// handle relies on (a mutable `{ state: UInt64, inc: UInt64 }` advanced in place through a helper).
+#[test]
+fn test_sealed_record_field_write_through_helper() {
+    // Mutate a field of a NAMED sealed record through a function-arg reference (the mutation must be
+    // visible at the call site — a sealed record is a mutable reference like an array).
+    let scalar = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Counter = { "state": Int32, "inc": Int32 }
+val advance = (c: Counter): Null =>
+  c["state"] = c["state"] + c["inc"]
+  null
+val c: Counter = { "state": 0, "inc": 7 }
+advance(c)
+advance(c)
+print(toString(c["state"]))
+"#);
+    assert_eq!(scalar, vec!["14"]);
+
+    // The wide-scalar case the PCG core uses: a two-field UInt64 sealed record, advanced in place.
+    // (UInt64 + named-alias + 2 fields was the precise trigger; an inline `{...}` happened to box.)
+    let u64 = run(r#"import { print } from "std/io"
+import { toUInt64 } from "std/number"
+type Rng = { "state": UInt64, "inc": UInt64 }
+val advance = (rng: Rng): Null =>
+  rng["state"] = rng["state"] * toUInt64(6364136223846793005) + rng["inc"]
+  null
+val rng: Rng = { "state": toUInt64(0), "inc": toUInt64(1442695040888963407) }
+advance(rng)
+advance(rng)
+print("${rng["state"]}")
+"#);
+    // state0=0; s1 = 0*MUL + INC = INC; s2 = INC*MUL + INC (wrapping u64).
+    // INC=1442695040888963407, MUL=6364136223846793005.
+    // s2 = (1442695040888963407 * 6364136223846793005 + 1442695040888963407) mod 2^64.
+    assert_eq!(u64, vec!["1876011003808476466"]);
+
+    // A HEAP field (String) write into a sealed record: the old pointer is released and the new one
+    // retained (one net +1 in the struct), so no leak / UAF and the value round-trips.
+    let heapf = run(r#"import { print } from "std/io"
+type Box = { "tag": Int32, "name": String }
+val rename = (b: Box, n: String): Null =>
+  b["name"] = n
+  null
+val b: Box = { "tag": 1, "name": "old" }
+rename(b, "new")
+print(b["name"])
+"#);
+    assert_eq!(heapf, vec!["new"]);
+}
+
 // Variants of the mutual-recursion-record-return fix: a multi-field sealed record, a boxed record
 // (a `Json` field forces the boxed `LinObject` repr), a `String` return, and a scalar return
 // (the non-record case that always worked — a regression guard). All must round-trip correctly.
