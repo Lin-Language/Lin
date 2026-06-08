@@ -16513,3 +16513,187 @@ main()
     // sum over i in [0,300) of (i + 1) = (299*300/2) + 300 = 44850 + 300 = 45150
     assert_eq!(out, vec!["45150"]);
 }
+
+// ---------------------------------------------------------------------------
+// Capturing-closure inline (perf/capturing-closure-inline): a LITERAL lambda at a
+// `.for`/combinator call site that CAPTURES an outer binding is spliced inline (no boxed
+// per-element closure call). The captured slot resolves through the enclosing builder's
+// cell/global/local binding, so captured-`var` mutation hits the same shared cell/global
+// (ADR-012). These tests guard the correctness surfaces: var-cell accumulation, an inlined
+// body that EMITS ITS OWN BLOCKS (the spike's CFG-latch hang), a captured top-level global var,
+// and the unchanged fallback paths (Stream `.for` / a non-literal closure value).
+
+// Array `.for` with a LOCAL captured `var` accumulator: the body `total = total + x` writes the
+// captured heap cell each iteration; the inlined `CellSet` hits the same cell. Sum 1..=5 = 15.
+#[test]
+fn test_capturing_for_array_var_cell_accumulation() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/iter"
+
+val main = () =>
+  var total: Int32 = 0
+  [1, 2, 3, 4, 5].for(x => total = total + x)
+  print(toString(total))
+main()
+"#);
+    assert_eq!(output, vec!["15"]);
+}
+
+// MANDATORY CFG case (the spike hang): an inlined `.for` body that EMITS ITS OWN BASIC BLOCKS via
+// an inner combinator (`.filter` produces keep/skip/join blocks). After inlining, the loop latch is
+// NOT the provisional body block but the inner construct's exit; the back-edge + header phi must be
+// patched latch-relative or the CFG is malformed → infinite loop. Sum of (count of evens in
+// [1..=n]) over n in {1,2,3,4} = 0+1+1+2 = 4.
+#[test]
+fn test_capturing_for_block_emitting_body_inner_filter() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for, filter, length } from "std/iter"
+
+val main = () =>
+  var acc: Int32 = 0
+  [1, 2, 3, 4].for(n =>
+    val evens = [1, 2, 3, 4].filter(x => x <= n).filter(x => x % 2 == 0)
+    acc = acc + evens.length()
+  )
+  print(toString(acc))
+main()
+"#);
+    assert_eq!(output, vec!["4"]);
+}
+
+// MANDATORY CFG case (block-emitting body): an inlined `.for` body containing a `match` (multiple
+// arms → multiple blocks). Same latch-relative wiring requirement as the inner-filter case.
+#[test]
+fn test_capturing_for_block_emitting_body_match() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/iter"
+
+val main = () =>
+  var acc: Int32 = 0
+  [1, 2, 3, 4, 5].for(x =>
+    val d = match x % 2
+      is 0 => 10
+      else => 1
+    acc = acc + d
+  )
+  print(toString(acc))
+main()
+"#);
+    // x in {1,2,3,4,5}: parity {1,0,1,0,1} → {1,10,1,10,1} → sum 23
+    assert_eq!(output, vec!["23"]);
+}
+
+// Captured TOP-LEVEL `var` (a module GLOBAL, not a heap cell): the inlined body's write becomes a
+// `GlobalValSet` to the same global slot. Sum 1..=4 = 10.
+#[test]
+fn test_capturing_for_top_level_global_var() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/iter"
+
+var counter: Int32 = 0
+[1, 2, 3, 4].for(x => counter = counter + x)
+print(toString(counter))
+"#);
+    assert_eq!(output, vec!["10"]);
+}
+
+// Fused `range(a,b).for(f)` with a captured var accumulator (the spike's original path). Sum
+// 0..100 = 4950.
+#[test]
+fn test_capturing_range_for_var_accumulation() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+val main = () =>
+  var total: Int64 = 0i64
+  range(0, 100).for(i => total = total + 1i64)
+  print(toString(total))
+main()
+"#);
+    assert_eq!(output, vec!["100"]);
+}
+
+// `range().for` with a block-emitting (inner `if`) capturing body: latch-relative wiring for the
+// hand-written range loop. Count of i in [0,10) with i%3==0 → {0,3,6,9} = 4.
+#[test]
+fn test_capturing_range_for_block_emitting_body() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+val main = () =>
+  var n: Int32 = 0
+  range(0, 10).for(i =>
+    val hit = if i % 3 == 0 then 1 else 0
+    n = n + hit
+  )
+  print(toString(n))
+main()
+"#);
+    assert_eq!(output, vec!["4"]);
+}
+
+// Capturing `.map` and `.reduce`: a captured `offset`/`base` is read inside the inlined body.
+#[test]
+fn test_capturing_map_and_reduce() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, reduce, for } from "std/iter"
+
+val main = () =>
+  val offset = 100
+  val shifted = [1, 2, 3].map(x => x + offset)
+  shifted.for(x => print(toString(x)))
+  val base = 1000
+  val total = [1, 2, 3].reduce(0, (acc, x) => acc + x + base)
+  print(toString(total))
+main()
+"#);
+    assert_eq!(output, vec!["101", "102", "103", "3006"]);
+}
+
+// A NON-LITERAL closure (a lambda bound to a `val` then passed by name) must take the UNCHANGED
+// boxed path — it is not a literal at the call site, so the inliner bails. Correct sum 15.
+#[test]
+fn test_non_literal_closure_for_unchanged_path() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/iter"
+
+val main = () =>
+  var total: Int32 = 0
+  val adder = (x: Int32) => total = total + x
+  [1, 2, 3, 4, 5].for(adder)
+  print(toString(total))
+main()
+"#);
+    assert_eq!(output, vec!["15"]);
+}
+
+// A Stream `.for` with a capturing body must NOT be eagerly inlined (ADR-051: a Stream is driven
+// lazily by the runtime). The body closure escapes into the StreamFor runtime call unchanged.
+#[test]
+fn test_capturing_stream_for_unchanged_path() {
+    let inp = std::env::temp_dir().join(format!("lin_ctest_capstream_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    fs::write(&inp, "a\nb\nc\nd\n").unwrap();
+    let inp_s = inp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ readStream, lines }} from "std/stream"
+import {{ for }} from "std/iter"
+
+val main = () =>
+  var seen: Int32 = 0
+  readStream("{inp_s}").lines().for(l => seen = seen + 1)
+  print(toString(seen))
+main()
+"#));
+    let _ = fs::remove_file(&inp);
+    assert_eq!(output, vec!["4"]);
+}

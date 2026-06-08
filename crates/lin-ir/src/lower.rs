@@ -4808,6 +4808,74 @@ fn inlinable_lambda(expr: &TypedExpr) -> Option<(&[TypedParam], &TypedExpr)> {
     }
 }
 
+/// A literal lambda at a combinator call site that is inlinable EVEN IF it captures. Returns its
+/// params + body. The captured outer slots are NOT rebound by the inliner — when the body is spliced
+/// into the enclosing function, its `LocalGet`/`CellGet`/`CellSet`/`GlobalValGet`/`GlobalValSet` on a
+/// captured slot resolve THROUGH the enclosing builder's `slots`/`cell_slots`/`global_var_slots` to
+/// the very binding the closure captured by reference. This preserves ADR-012 shared-`var`-cell
+/// semantics AUTOMATICALLY: a captured local `var` is a `MakeCell` heap cell in the enclosing builder
+/// (`cell_slots`), and a captured top-level `var` is a module global (`global_var_slots`); an inlined
+/// `CellSet`/`GlobalValSet` hits the same cell/global the boxed closure would have.
+///
+/// GUARD (productionizing the spike, which "trusted it blindly"): every capture's `outer_slot` must be
+/// provably resolvable in the enclosing builder, with a representation that matches the binding there;
+/// otherwise bail to the boxed closure path (a sound fallback). A capture is resolvable when its slot
+/// is a module global (`global_var_slots`), a heap cell (`cell_slots`), or a plain local value temp
+/// (`slots`). A mutable capture MUST resolve to a cell or global (its writes go through one); if it is
+/// only a plain local temp here (no cell), inlining a `CellSet` would have no cell to hit — bail. A
+/// representation mismatch between `cap.ty` and the binding's stored type would mean the inlined body
+/// reads/writes the wrong physical shape — bail.
+fn inlinable_capturing_lambda<'a>(
+    expr: &'a TypedExpr,
+    builder: &FuncBuilder,
+    ctx: &LowerCtx,
+) -> Option<(&'a [TypedParam], &'a TypedExpr)> {
+    let TypedExpr::Function { params, body, captures, .. } = expr else { return None };
+    // Capture-less lambdas are handled by the existing `inlinable_lambda` fast path; this predicate
+    // is only consulted as the relaxed fallback, but accepting the empty case too is harmless.
+    for cap in captures {
+        if !capture_resolvable(cap, builder, ctx) {
+            return None;
+        }
+    }
+    Some((params, body))
+}
+
+/// Is a single capture's `outer_slot` resolvable in the enclosing builder with a matching
+/// representation? See `inlinable_capturing_lambda` for the rationale.
+fn capture_resolvable(cap: &Capture, builder: &FuncBuilder, ctx: &LowerCtx) -> bool {
+    let slot = cap.outer_slot;
+    // Module-level `var` (global). A captured `var` write becomes a `GlobalValSet` to this slot.
+    if ctx.global_var_slots.contains(&slot) {
+        // The binding's stored representation (from global_val_slots, else the capture's own ty).
+        let gty = ctx.global_val_slots.get(&slot).unwrap_or(&cap.ty);
+        return !type_repr_differs(&cap.ty, gty);
+    }
+    // Mutably-captured `var` materialized as a heap cell in the enclosing builder.
+    if let Some(cell_ty) = builder.cell_slots.get(&slot) {
+        // A cell read/write goes through this cell; require a matching representation. The inner cell
+        // type promotes a Null cell to Json (see the closure-env path), so treat a union cell as a
+        // match for a Null/union capture.
+        if is_union_ty(cell_ty) {
+            return true;
+        }
+        return !type_repr_differs(&cap.ty, cell_ty);
+    }
+    // A mutable capture with NO cell/global binding here cannot be inlined: its `CellSet` would have
+    // no cell to hit. (A mutable capture is ALWAYS backed by a cell or global in a correct program; a
+    // missing one means an analysis gap — bail to the sound boxed path.)
+    if cap.is_mutable {
+        return false;
+    }
+    // Immutable capture: the value lives directly in a plain local slot temp. Require it to be present
+    // and to share the capture's representation.
+    if let Some(&t) = builder.slots.get(&slot) {
+        let stored = builder.temp_types.get(&t).unwrap_or(&cap.ty);
+        return !type_repr_differs(&cap.ty, stored);
+    }
+    false
+}
+
 /// Inline a capture-less lambda's body into the current block: bind each param slot to the
 /// corresponding argument temp (coerced to the param's declared representation), then lower the body
 /// inline. Returns the body's result temp (typed as the body's lowered type). Used by the combinator
@@ -5431,6 +5499,38 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
     // mistyped as flat). See `combinator_read_elem_ty` (ADR-044).
     let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let iterable = lower_expr(&args[0], builder, ctx);
+
+    // INLINE FAST PATH (capturing-closure inline): a literal side-effecting lambda — capturing OR not —
+    // is spliced into the loop body, its param bound to the element, with no closure alloc and no
+    // per-element box ABI / indirect call. Captured slots resolve through the enclosing builder's
+    // bindings (ADR-012 cell/global semantics preserved); the back-edge is patched latch-relative by
+    // `emit_index_loop` even when the inlined body emits its own blocks (inner combinator / match / if).
+    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+        let lam_params = lam_params.to_vec();
+        let lam_body = lam_body.clone();
+        let elem_ty = read_elem_ty.clone();
+        emit_index_loop(iterable, &iterable_ty, &read_elem_ty, builder, ctx, |i, elem, b, c| {
+            // Optional 0-based SOURCE index; narrowed Int64→Int32. `inline_lambda_body` binds by the
+            // lambda's OWN param count, so a 1-param `x => …` simply ignores this surplus arg.
+            let idx = narrow_loop_index(i, b);
+            let (res, res_ty) =
+                inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], b, c);
+            // `for` discards the body result; release it if it owns a heap value (no-op for a scalar).
+            b.emit(Instruction::Release { val: res, ty: res_ty });
+            // ELEMENT-BOX RC: a union/Json source read (`lin_array_get_tagged`) allocated a fresh +1
+            // element box (shell + a retained inner). A side-effecting `for` body NEVER moves the
+            // element into a result (no `push`/`set` of `elem` itself — those are `map`/`filter`/the
+            // body's own owned values), so the element box is genuinely dropped: FULLY release it
+            // (shell + inner) exactly as the filter-SKIP path does, else every element's inner leaks.
+            // No-op for a flat-scalar read (no box was allocated).
+            free_combinator_elem_box_full(elem, &elem_ty, b);
+            // A PACKED sealed-array source materialized a fresh +1 element struct; the body read a copy
+            // out of it (side effect), so release it or it leaks per iteration.
+            free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
+        });
+        return builder.const_temp(Const::Null);
+    }
+
     let body = lower_callback_in_safe_ctx(&args[1], builder, ctx);
     let elem_ty = read_elem_ty.clone();
     // The callback closure uses the uniform BOXED ABI: it ALWAYS returns a freshly-allocated,
@@ -5490,9 +5590,22 @@ fn lower_range_for(
     let start = coerce_to_slot_type(start_raw, &start_e.ty(), &Type::Int32, builder);
     let end = coerce_to_slot_type(end_raw, &end_e.ty(), &Type::Int32, builder);
 
-    let body = lower_callback_in_safe_ctx(callback, builder, ctx);
     let elem_ty = Type::Int32;
     let boxed = Type::TypeVar(u32::MAX);
+
+    // INLINE FAST PATH (capturing-closure inline): a literal lambda callback — capturing OR not — is
+    // spliced into the loop body. Its element param binds to the UNBOXED i32 counter; captured slots
+    // resolve through the enclosing builder's slots/cell_slots/global_var_slots (the SAME bindings the
+    // closure would have captured), so a captured `var` mutation hits the same shared global/cell —
+    // ADR-012 intact. No closure alloc, no per-element box, no indirect call, no return-box release.
+    let inline_lam = inlinable_capturing_lambda(callback, builder, ctx);
+    // Lower the (boxed) callback closure ONLY when we are NOT inlining — otherwise the closure value
+    // is unused.
+    let body = if inline_lam.is_none() {
+        Some(lower_callback_in_safe_ctx(callback, builder, ctx))
+    } else {
+        None
+    };
 
     let preheader = builder.current_block;
     let header = builder.alloc_block("range_for_header");
@@ -5517,24 +5630,44 @@ fn lower_range_for(
     builder.terminate(Terminator::CondJump { cond, then_block: body_block, else_block: exit });
 
     builder.switch_to(body_block);
-    // The callback receives `i` (Int32) as BOTH the element and the optional 0-based source index
-    // (for a range, element == index). `call_body_closure_with_elem_boxes` boxes `i` per the ABI and
-    // truncates the surplus index arg when the callback declares only `(item)`.
-    let (ret, elem_boxes) = call_body_closure_with_elem_boxes(
-        body, &[(i, elem_ty.clone()), (i, Type::Int32)], param_tys, &boxed, builder,
-    );
-    // Release the callback-RETURN box, then reclaim each element box SHELL if distinct — identical
-    // to the generic `for` path (see `lower_for` for the full rationale).
-    builder.emit(Instruction::Release { val: ret, ty: boxed.clone() });
-    for ebox in &elem_boxes {
-        builder.emit(Instruction::FreeBoxShellIfDistinct { val: *ebox, other: ret });
+    if let Some((lam_params, lam_body)) = inline_lam {
+        let lam_params = lam_params.to_vec();
+        let lam_body = lam_body.clone();
+        // Bind the element param (and optional index param) to the unboxed i32 counter, lower the body
+        // inline, then discard its (owned) result. Captured slots are NOT rebound — they resolve to the
+        // enclosing function's live bindings. `inline_lambda_body` binds by the lambda's OWN param count
+        // (a 1-param `i => …` ignores the surplus index arg).
+        let (res, res_ty) = inline_lambda_body(
+            &lam_params, &lam_body, &[(i, elem_ty.clone()), (i, Type::Int32)], builder, ctx,
+        );
+        // `for` discards the body result; release it if it's an owned heap value (no-op for a scalar).
+        builder.emit(Instruction::Release { val: res, ty: res_ty });
+    } else {
+        let body = body.expect("non-inline range-for lowers the callback closure");
+        // The callback receives `i` (Int32) as BOTH the element and the optional 0-based source index
+        // (for a range, element == index). `call_body_closure_with_elem_boxes` boxes `i` per the ABI and
+        // truncates the surplus index arg when the callback declares only `(item)`.
+        let (ret, elem_boxes) = call_body_closure_with_elem_boxes(
+            body, &[(i, elem_ty.clone()), (i, Type::Int32)], param_tys, &boxed, builder,
+        );
+        // Release the callback-RETURN box, then reclaim each element box SHELL if distinct — identical
+        // to the generic `for` path (see `lower_for` for the full rationale).
+        builder.emit(Instruction::Release { val: ret, ty: boxed.clone() });
+        for ebox in &elem_boxes {
+            builder.emit(Instruction::FreeBoxShellIfDistinct { val: *ebox, other: ret });
+        }
     }
+    // The inlined body may have switched basic blocks (an inner combinator / match / multi-branch if):
+    // the increment + back-edge must originate from the CURRENT block (the true loop latch), and the
+    // header phi's back-edge predecessor patched to it so SSA dominance holds (the spike's hang bug).
+    let latch = builder.current_block;
     let one = builder.const_temp(Const::Int(1, Type::Int32));
     builder.emit(Instruction::Binary {
         dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
         operand_ty: Type::Int32, ty: Type::Int32,
     });
     builder.terminate(Terminator::Jump(header));
+    builder.patch_phi_incoming(header, i, body_block, latch);
 
     builder.switch_to(exit);
     builder.const_temp(Const::Null)
@@ -5691,10 +5824,12 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
 
     let iterable = lower_expr(&args[0], builder, ctx);
 
-    // INLINE FAST PATH (ADR-044): a capture-less literal lambda is spliced directly into the loop —
-    // its param bound to the element temp, its body lowered inline — with no closure alloc and no
-    // per-element box/unbox/indirect call.
-    if let Some((lam_params, lam_body)) = inlinable_lambda(&args[1]) {
+    // INLINE FAST PATH (ADR-044 + capturing-closure inline): a literal lambda — capturing OR not — is
+    // spliced directly into the loop, its param bound to the element temp and its body lowered inline,
+    // with no closure alloc and no per-element box/unbox/indirect call. Captured slots resolve through
+    // the enclosing builder's bindings (see `inlinable_capturing_lambda`); the CFG back-edge is patched
+    // latch-relative by `emit_index_loop` even when the inlined body emits its own blocks.
+    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
@@ -5744,9 +5879,12 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
 
     let iterable = lower_expr(&args[0], builder, ctx);
 
-    // INLINE FAST PATH (ADR-044): a capture-less literal predicate lambda is spliced into the loop;
-    // its body's Bool result drives the keep/skip split directly — no closure, no boxed call.
-    if let Some((lam_params, lam_body)) = inlinable_lambda(&args[1]) {
+    // INLINE FAST PATH (ADR-044 + capturing-closure inline): a literal predicate lambda — capturing
+    // OR not — is spliced into the loop; its body's Bool result drives the keep/skip split directly —
+    // no closure, no boxed call. Captured slots resolve through the enclosing builder's bindings; the
+    // keep/skip blocks the body and the predicate join emit are patched latch-relative by
+    // `emit_index_loop`.
+    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
@@ -5830,7 +5968,7 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     // accumulator representation): a union/Json/heap accumulator keeps the boxed Json-phi path below
     // (its phi must carry a uniform boxed ptr, and the inline machinery here assumes a value phi).
     if is_inline_scalar(result_type) {
-        if let Some((lam_params, lam_body)) = inlinable_lambda(&args[2]) {
+        if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[2], builder, ctx) {
             let lam_params = lam_params.to_vec();
             let lam_body = lam_body.clone();
             let acc_ty = result_type.clone();
