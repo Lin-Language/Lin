@@ -124,6 +124,52 @@ fn combinator_unsound_over_sealed(name: &str) -> bool {
         | "slice" | "chunk" | "zip")
 }
 
+/// Generic stdlib functions that MUTATE their receiver (arg0) IN PLACE through the runtime array it
+/// points at — `push` (`lin_push` → `lin_array_push_tagged` / `lin_push_dyn`) and `set`
+/// (`arr[idx] = item` → `lin_array_set`). For these the receiver value is the ACTUAL array the
+/// caller observes afterwards; the mutation must hit THAT array, not a fresh copy. This matters when
+/// the receiver is a container-stored array read (`obj[k]` / `m[k]`): its runtime representation is a
+/// BOXED tagged array, but a packed-sealed (`push$Obj_…`) specialization would coerce/MATERIALIZE the
+/// receiver to a fresh detached packed buffer (`sealed_array_project_from` →`lin_sealed_array_alloc`),
+/// so the push lands in the copy and is silently lost (the stored array stays empty). See
+/// `receiver_mutator_over_boxed_indexed_array`. Projection-only combinators (`map`/`filter`/…) build
+/// a NEW result and never write through arg0, so they are NOT listed.
+fn is_receiver_inplace_mutator(name: &str) -> bool {
+    matches!(name, "push" | "set")
+}
+
+/// A non-packed (boxed/Json/union) array representation: the runtime value is a tagged `Object[]`/
+/// dynamic array, NOT a contiguous packed-sealed buffer. Used to detect when an in-place-mutator
+/// receiver would be MATERIALIZED (detached) by a packed-sealed specialization — `obj[k]` reads a
+/// `Json`/union value whose stored array must be mutated through the boxed path instead.
+fn is_packed_sealed_array(ty: &Type) -> bool {
+    match ty {
+        Type::Array(elem) => matches!(elem.as_ref(),
+            Type::Object { fields, sealed: true }
+                if !fields.is_empty() && fields.values().all(field_packed_scalar)),
+        _ => false,
+    }
+}
+
+/// True when this call is a RECEIVER-mutating in-place op (`push`/`set`) whose receiver (arg0) is a
+/// CONTAINER INDEX READ (`obj[k]` / `m[k]`) that yields a BOXED tagged array (its type is NOT itself a
+/// packed-sealed array). Coercing such a receiver into a packed-sealed param would MATERIALIZE a fresh
+/// detached buffer and lose the mutation (the silent data-loss bug). When this fires, every packable-
+/// sealed binding is rebound to the Json wildcard so the call specializes at the boxed `$Json`
+/// representation (`lin_push_dyn` / `lin_array_set` mutating the REAL stored array) — the same path
+/// that already makes the direct-`Json`-receiver case correct.
+fn receiver_mutator_over_boxed_indexed_array(name: &str, args: &[TypedExpr]) -> bool {
+    if !is_receiver_inplace_mutator(name) {
+        return false;
+    }
+    match args.first() {
+        // The receiver must be a container index read. A plain local/param binding (`var arr: Pt[]`)
+        // routes its own packed array correctly and MUST keep the packed fast path.
+        Some(TypedExpr::Index { result_type, .. }) => !is_packed_sealed_array(result_type),
+        _ => false,
+    }
+}
+
 /// A top-level generic function discovered in the module (or in an import).
 struct GenericFn {
     name: String,
@@ -1463,6 +1509,27 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                                 if item_is_json && bound_concrete {
                                     subs.insert(*id, Type::TypeVar(u32::MAX));
                                 }
+                            }
+                        }
+                    }
+
+                    // IN-PLACE RECEIVER MUTATOR over a CONTAINER-STORED array (silent data-loss
+                    // fix): `push(obj[k], rec)` / `set(m[k], i, rec)` where `rec`'s record type is
+                    // PACKABLE pins `T` to the packed-sealed element via the `item` arg, which would
+                    // select the `push$Obj_…`/packed specialization. But the receiver `obj[k]` reads a
+                    // BOXED tagged array out of the container, so the packed specialization's arg-coercion
+                    // MATERIALIZES a fresh detached packed buffer (`sealed_array_project_from`), the push
+                    // mutates the copy, and the array still stored in the container is never written back
+                    // (`length(obj[k])` re-reads the empty original). REBIND every packable-sealed binding
+                    // to the Json wildcard so the call specializes at the boxed `$Json` representation
+                    // (`lin_push_dyn` / `lin_array_set`), mutating the REAL stored array — the SAME path
+                    // that already makes the direct-`Json`-receiver `push(arr, rec)` case correct. Only
+                    // fires for an in-place-mutator receiver that is a container index read yielding a
+                    // boxed array; a typed `Pt[]` local/param keeps its packed fast path untouched.
+                    if receiver_mutator_over_boxed_indexed_array(&g_name(state, gslot), args) {
+                        for v in subs.values_mut() {
+                            if mentions_sealed(v) {
+                                *v = Type::TypeVar(u32::MAX);
                             }
                         }
                     }
