@@ -67,7 +67,10 @@ impl LanguageServer for Backend {
                 completion_provider: Some(CompletionOptions {
                     // `"` and `/` additionally trigger import-path completion inside a `from "…"`.
                     trigger_characters: Some(vec![".".into(), " ".into(), "\"".into(), "/".into()]),
-                    resolve_provider: Some(false),
+                    // Docs are filled lazily in `completion_resolve` for the selected item only (the
+                    // offered set can be large — every imported stdlib symbol — and extracting a doc
+                    // re-lexes the owner module source, so eager resolution would be a hot-path cost).
+                    resolve_provider: Some(true),
                     ..Default::default()
                 }),
                 document_formatting_provider: Some(OneOf::Left(true)),
@@ -169,10 +172,32 @@ impl LanguageServer for Backend {
         let analysis = analyse(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
-        Ok(tightest_span(&analysis.span_type_map, offset).map(|(_, ty_str, _)| Hover {
+        let Some((_, ty_str, def_span)) = tightest_span(&analysis.span_type_map, offset).cloned()
+        else {
+            return Ok(None);
+        };
+
+        // Resolve a doc comment for the hovered symbol, if it has one. Two sources, in order:
+        //   1. a LOCAL binding in this file — its `def_span` points at the declaration's name in
+        //      THIS source, so extract its leading doc block directly;
+        //   2. an IMPORTED symbol (or this file's own export) — resolve it through the cross-file
+        //      index to the owner module's source + decl span (the same path goto-def uses).
+        let doc = hover_doc(&source, uri, def_span, offset);
+
+        // Signature on top (```lin fence), docs below (Markdown) — rust-analyzer/TS style.
+        let mut value = format!("```lin\n{}\n```", ty_str);
+        if let Some(doc) = doc {
+            let rendered = render_doc_markdown(&doc);
+            if !rendered.is_empty() {
+                value.push_str("\n\n---\n\n");
+                value.push_str(&rendered);
+            }
+        }
+
+        Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
-                value: format!("```lin\n{}\n```", ty_str),
+                value,
             }),
             range: None,
         }))
@@ -283,6 +308,9 @@ impl LanguageServer for Backend {
                                 label: name.to_string(),
                                 kind: Some(kind),
                                 detail: Some(ty_str.clone()),
+                                // Stash a resolve key so `completion_resolve` can fill the doc
+                                // (lazily, for the selected item only) from this file's own decl.
+                                data: completion_resolve_data(uri, name),
                                 ..Default::default()
                             });
                         }
@@ -359,13 +387,58 @@ impl LanguageServer for Backend {
                 label: imp.name.clone(),
                 kind: Some(kind),
                 detail: imp.ty.clone(),
+                // Fallback documentation (the source module) shown until — and if — `completion_resolve`
+                // upgrades it to the symbol's rendered doc comment. The resolve key is the importing
+                // file + the local name, so the resolver walks the SAME cross-file path as hover.
                 documentation: Some(Documentation::String(format!("from {}", imp.module))),
+                data: completion_resolve_data(uri, &imp.name),
                 ..Default::default()
             });
         }
         items.dedup_by(|a, b| a.label == b.label && a.detail == b.detail);
 
         Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    /// Lazily fill a completion item's `documentation` with the symbol's rendered doc comment, for
+    /// the SELECTED item only (advertised via `resolve_provider: true`). The item carries a
+    /// `{ uri, name }` key in `data` (set by the `completion` handler); we re-resolve the doc from
+    /// that file's current buffer (local decl first, then the cross-file index) — the same path hover
+    /// uses — and replace the placeholder "from <module>" string with rich Markdown when found. When
+    /// there's no doc (or no resolvable key), the item is returned unchanged.
+    async fn completion_resolve(&self, mut item: CompletionItem) -> Result<CompletionItem> {
+        let Some((uri, name)) = parse_completion_resolve_data(item.data.as_ref()) else {
+            return Ok(item);
+        };
+        let Some(source) = self.docs.read().unwrap_or_else(|e| e.into_inner()).get(&uri).cloned()
+        else {
+            return Ok(item);
+        };
+        let base_dir = file_dir(&uri);
+        let analysis = analyse(&source, base_dir.as_deref());
+
+        // Local declaration in this file first; then imports / own exports via the index.
+        let mut doc = local_decl_name_span(&analysis.module, &name)
+            .and_then(|span| extract_doc(&source, span))
+            .filter(|d| !d.is_empty());
+        if doc.is_none() {
+            if let Ok(path) = uri.to_file_path() {
+                let module_id = canonical_id(&path);
+                let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
+                doc = resolve_doc_via_index(&index, &module_id, &name).filter(|d| !d.is_empty());
+            }
+        }
+
+        if let Some(doc) = doc {
+            let rendered = render_doc_markdown(&doc);
+            if !rendered.is_empty() {
+                item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: rendered,
+                }));
+            }
+        }
+        Ok(item)
     }
 
     async fn formatting(
@@ -621,7 +694,23 @@ impl LanguageServer for Backend {
         let analysis = analyse(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
-        Ok(signature_help(&source, &analysis, offset))
+        // Resolve a callee's doc comment by NAME: a local declaration in this file first (its leading
+        // block lives in `source`), then the cross-file index (imports + own exports).
+        let module_id = uri.to_file_path().ok().map(|p| canonical_id(&p));
+        let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let resolve = |name: &str| -> Option<DocComment> {
+            if let Some(span) = local_decl_name_span(&analysis.module, name) {
+                if let Some(doc) = extract_doc(&source, span) {
+                    if !doc.is_empty() {
+                        return Some(doc);
+                    }
+                }
+            }
+            let mid = module_id.as_deref()?;
+            resolve_doc_via_index(&index, mid, name).filter(|d| !d.is_empty())
+        };
+
+        Ok(signature_help(&source, &analysis, offset, resolve))
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
@@ -2852,12 +2941,89 @@ fn resolve_doc_via_index(index: &WorkspaceIndex, module_id: &str, word: &str) ->
     extract_doc(&owner_file.source, decl)
 }
 
+/// The name-span of a top-level `val`/`var`/`type` declaration named `name` in this module's surface
+/// AST (the local-symbol counterpart of `decl_span`, which only covers cross-file EXPORTS). Used to
+/// extract the doc block of a callee that is a local, non-exported declaration in the current file.
+fn local_decl_name_span(module: &lin_parse::ast::Module, name: &str) -> Option<lin_common::Span> {
+    for stmt in &module.statements {
+        match stmt {
+            Stmt::Val { pattern, .. } => {
+                if let Some((n, span)) = pattern_ident(pattern) {
+                    if n == name {
+                        return Some(span);
+                    }
+                }
+            }
+            Stmt::Var { name: vn, name_span, .. } if vn == name => return Some(*name_span),
+            Stmt::TypeDecl { name: tn, span, .. } if tn == name => return Some(*span),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Resolve the doc comment to surface in hover for the symbol at `offset` in the file `uri`.
+/// Prefers a LOCAL binding's leading doc block (the cursor's `def_span` points into THIS file's
+/// source), then falls back to the cross-file index for an imported symbol or this file's own
+/// export. Returns `None` when no doc block is found (the hover then shows just the type).
+fn hover_doc(
+    source: &str,
+    uri: &Url,
+    def_span: Option<lin_common::Span>,
+    offset: usize,
+) -> Option<DocComment> {
+    // 1. Local binding: its def_span is the declaration's name span in this very file.
+    if let Some(ds) = def_span {
+        if let Some(doc) = extract_doc(source, ds) {
+            if !doc.is_empty() {
+                return Some(doc);
+            }
+        }
+    }
+    // 2. Imported symbol / own export: resolve via the cross-file index.
+    let path = uri.to_file_path().ok()?;
+    let module_id = canonical_id(&path);
+    let word = word_at(source, offset);
+    if word.is_empty() {
+        return None;
+    }
+    let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
+    resolve_doc_via_index(&index, &module_id, word).filter(|d| !d.is_empty())
+}
+
+/// Build the `CompletionItem.data` payload that lets `completion_resolve` lazily fetch a doc for an
+/// item: the originating file URI + the (local) symbol name. Kept as a tiny JSON object so it
+/// round-trips losslessly through the client back to the resolve handler.
+fn completion_resolve_data(uri: &Url, name: &str) -> Option<serde_json::Value> {
+    Some(serde_json::json!({ "uri": uri.to_string(), "name": name }))
+}
+
+/// Parse the `{ uri, name }` key stashed by `completion_resolve_data` back into `(Url, name)`.
+/// Returns `None` for an absent/malformed payload (the item then resolves to itself unchanged).
+fn parse_completion_resolve_data(data: Option<&serde_json::Value>) -> Option<(Url, String)> {
+    let data = data?;
+    let uri = data.get("uri")?.as_str()?;
+    let name = data.get("name")?.as_str()?;
+    let uri = Url::parse(uri).ok()?;
+    Some((uri, name.to_string()))
+}
+
 // ── signature help ─────────────────────────────────────────────────────────────
 
 /// Build signature help when `offset` sits inside a `f(…)` call's argument list. Returns `None`
 /// when the cursor is not inside a resolvable call (e.g. dot-calls, or callees whose function type
 /// can't be looked up) — per the no-guessing rule.
-fn signature_help(source: &str, analysis: &Analysis, offset: usize) -> Option<SignatureHelp> {
+///
+/// `resolve_doc` is invoked with the callee's bare name and returns its parsed `DocComment` (if the
+/// callee is a documented import / own export); the handler supplies the index-backed resolver while
+/// unit tests can pass a closure directly. The function's description becomes the signature
+/// documentation and each `@param`'s description is attached to the matching parameter.
+fn signature_help(
+    source: &str,
+    analysis: &Analysis,
+    offset: usize,
+    resolve_doc: impl Fn(&str) -> Option<DocComment>,
+) -> Option<SignatureHelp> {
     // Find the innermost plain `Call` whose argument region (between `(` and the closing `)`)
     // contains the cursor, plus the byte offset just after its opening `(`.
     let (callee_span, paren_after) = find_enclosing_call(&analysis.module.statements, source, offset)?;
@@ -2885,6 +3051,10 @@ fn signature_help(source: &str, analysis: &Analysis, offset: usize) -> Option<Si
     let names = callee_param_names(&analysis.module, callee_name)
         .filter(|n| n.len() == param_types.len());
 
+    // The callee's doc comment, if any — its description annotates the signature and its `@param`
+    // entries annotate the matching parameters (matched by name).
+    let doc = resolve_doc(callee_name).filter(|d| !d.is_empty());
+
     // Render one ParameterInformation per parameter as `name: Type` when names are known, else the
     // bare type. The overall signature label is rebuilt to match (so the client highlights the
     // right slice of the label string for the active parameter).
@@ -2901,18 +3071,56 @@ fn signature_help(source: &str, analysis: &Analysis, offset: usize) -> Option<Si
     let return_tail = ty_str.find("=>").map(|i| &ty_str[i..]).unwrap_or("");
     let label = format!("({}) {}", rendered.join(", "), return_tail).trim_end().to_string();
 
+    // Attach each param's `@param` description (matched by NAME) as its documentation. Params with
+    // no name recovered, or no matching `@param` entry, get no doc (left empty per the brief).
     let parameters: Vec<ParameterInformation> = rendered
         .iter()
-        .map(|p| ParameterInformation {
-            label: ParameterLabel::Simple(p.clone()),
-            documentation: None,
+        .enumerate()
+        .map(|(i, p)| {
+            let param_doc = names
+                .as_ref()
+                .and_then(|n| n.get(i))
+                .and_then(|name| doc.as_ref().and_then(|d| d.param_doc(name)))
+                .filter(|d| !d.trim().is_empty())
+                .map(|d| {
+                    Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: d.trim().to_string(),
+                    })
+                });
+            ParameterInformation {
+                label: ParameterLabel::Simple(p.clone()),
+                documentation: param_doc,
+            }
         })
         .collect();
+
+    // The function's description (prose + Returns) annotates the whole signature.
+    let signature_doc = doc.as_ref().and_then(|d| {
+        let desc = d.description_text();
+        let mut parts: Vec<String> = Vec::new();
+        if !desc.trim().is_empty() {
+            parts.push(desc);
+        }
+        if let Some(ret) = &d.returns {
+            if !ret.trim().is_empty() {
+                parts.push(format!("**Returns** {}", ret.trim()));
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: parts.join("\n\n"),
+            }))
+        }
+    });
 
     Some(SignatureHelp {
         signatures: vec![SignatureInformation {
             label,
-            documentation: None,
+            documentation: signature_doc,
             parameters: Some(parameters),
             active_parameter: Some(active),
         }],
@@ -4737,7 +4945,7 @@ mod tests {
         let analysis = analyse(src, None);
         let call_open = src.rfind('(').unwrap();
         let cursor = call_open + src[call_open..].find('2').unwrap();
-        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        let help = signature_help(src, &analysis, cursor, |_| None).expect("expected signature help");
         assert_eq!(help.signatures[0].active_parameter, Some(1), "comparison must not skew active param");
     }
 
@@ -4749,7 +4957,7 @@ mod tests {
         let analysis = analyse(src, None);
         let call_open = src.rfind('(').unwrap();
         let cursor = call_open + src[call_open..].find('9').unwrap();
-        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        let help = signature_help(src, &analysis, cursor, |_| None).expect("expected signature help");
         assert_eq!(help.signatures[0].active_parameter, Some(1), "lambda arrow must not skew active param");
     }
 
@@ -4761,7 +4969,7 @@ mod tests {
         let analysis = analyse(src, None);
         let call_open = src.rfind('(').unwrap();
         let cursor = call_open + src[call_open..].find('7').unwrap();
-        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        let help = signature_help(src, &analysis, cursor, |_| None).expect("expected signature help");
         assert_eq!(help.signatures[0].active_parameter, Some(1), "string comma must not advance active param");
     }
 
@@ -4786,7 +4994,7 @@ mod tests {
         // Cursor right before the `2`.
         let call_open = src.rfind('(').unwrap();
         let cursor = call_open + src[call_open..].find("2").unwrap();
-        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        let help = signature_help(src, &analysis, cursor, |_| None).expect("expected signature help");
         assert_eq!(help.signatures.len(), 1);
         let sig = &help.signatures[0];
         assert!(sig.label.contains("=>"), "label should be a function type: {}", sig.label);
@@ -4801,7 +5009,7 @@ mod tests {
         let src = "val add = (a: Int32, b: Int32) => a + b\nval r = add(1, 2)\n";
         let analysis = analyse(src, None);
         // Offset 0 (`v` of `val`) is not inside any call.
-        assert!(signature_help(src, &analysis, 0).is_none());
+        assert!(signature_help(src, &analysis, 0, |_| None).is_none());
     }
 
     // ── Tier-2: code actions ────────────────────────────────────────────────────
@@ -5598,7 +5806,7 @@ mod tests {
         let analysis = analyse(src, None);
         let call_open = src.rfind('(').unwrap();
         let cursor = call_open + 1;
-        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        let help = signature_help(src, &analysis, cursor, |_| None).expect("expected signature help");
         let sig = &help.signatures[0];
         let params = sig.parameters.as_ref().unwrap();
         // Labels carry the parameter names.
@@ -5664,7 +5872,7 @@ mod tests {
         // produce some result (Some or None) without panicking.
         let analysis = analyse(src, None);
         let cursor = emoji + 1; // mid-surrogate / mid-utf8 byte offset
-        let _ = signature_help(src, &analysis, cursor);
+        let _ = signature_help(src, &analysis, cursor, |_| None);
 
         // Completion at a multibyte offset must not panic either.
         let _ = analyse(src, None);
