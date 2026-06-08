@@ -13979,6 +13979,47 @@ print("${b["items"][0]} ${b["items"][2]}")
     assert_eq!(out, vec!["1 3", "10 30"]);
 }
 
+// Regression (record-with-RECORD-ARRAY-field construction leak): a sealed record `T` whose field
+// is itself an array OF sealed records (`type Leg = {d}; type T = {legs: Leg[], a}`) — the RAPTOR
+// `Trip { stopTimes: StopTime[] }` shape. Building such a value into a `T[]` (push/index-set/map/
+// drop) routes the element through the sealed→boxed materializer (`sealed_materialize_to_object` /
+// `sealed_array_elem_materializer`), where `box_value` of the `legs` field MATERIALISES a FRESH +1
+// tagged `Object[]` (via `sealed_array_to_tagged`) — not a borrowed pointer. The materializer used
+// to free only the box SHELL (`lin_tagged_free_box`) for any non-Object heap field, leaking the
+// whole fresh `legs` array (header + every `Leg` element) at ~176 B/element on every operation
+// (ASan-confirmed linear; sealed harness `record_array` push_read/index_set/array_drop/map_field).
+// Fixed by `tagged_release`-ing the field when `box_value_yields_fresh_owned` (sealed Object OR
+// sealed-record array). The matching retain is object_set_fresh's, so the count stays balanced — an
+// over-release here would corrupt/crash the read-back. cargo test can't see the leak; this guards
+// the result is correct (no double-free) across a loop; the ASan harness guards the leak itself.
+#[test]
+fn test_sealed_record_array_field_build_push_drop_in_loop() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+import { map } from "std/iter"
+
+type Leg = { "d": Int32 }
+type T = { "legs": Leg[], "a": Int32 }
+
+val once = (i: Int32): Int32 =>
+  var ts: T[] = []
+  push(ts, { "legs": [{ "d": i }], "a": i })
+  push(ts, { "legs": [{ "d": i + 1 }, { "d": i + 2 }], "a": i + 10 })
+  val ds: Int32[] = map(ts, (x) => x["a"])
+  ds[0] + ds[1] + length(ts[1]["legs"])
+
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc
+  else loop(i + 1, n, acc + once(i))
+
+print(toString(loop(0, 1000, 0)))
+"#);
+    // per i: ds[0]=i, ds[1]=i+10, legs(ts[1])=2  => 2*i + 12
+    // sum over i in 0..1000 = 2*sum(0..999) + 12*1000 = 999000 + 12000 = 1011000
+    assert_eq!(out, vec!["1011000"]);
+}
+
 #[test]
 fn test_sealed_nested_record_field() {
     // A nested sealed record field: `type Line = { a: Pt, b: Pt }` where Pt is sealed. Releasing the
