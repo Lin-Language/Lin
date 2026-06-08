@@ -47,7 +47,7 @@ A **Get Started with Lin** walkthrough (Help → Welcome) guides you through ins
 
 Lin supports source-level debugging of compiled programs (breakpoints and stepping in your `.lin` files) via DWARF line tables emitted by `lin build --debug`.
 
-Debugging delegates to **[CodeLLDB](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb)** (`vadimcn.vscode-lldb`), which is declared as an extension dependency and installed automatically alongside this extension.
+Debugging delegates to **[CodeLLDB](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb)** (`vadimcn.vscode-lldb`). It is **not** a hard dependency of this extension — the rest of the extension (syntax highlighting, diagnostics, tasks, tests) works without it. CodeLLDB is only needed for the debugger: the first time you press **F5** on a `.lin` file, if CodeLLDB isn't installed the extension prompts you to install it (with a one-click button) and then aborts that launch cleanly. Install it and press F5 again.
 
 To debug: open a `.lin` file, set a breakpoint in the gutter, and press **F5**. With no `launch.json` the extension auto-supplies a "Debug Lin file" configuration; it builds the active file with `lin build --debug` and launches it under CodeLLDB. To customise, add a configuration of `"type": "lin"` to `launch.json`:
 
@@ -82,7 +82,7 @@ When stopped at a breakpoint, the **Variables** and **Watch** panels show *logic
 
 A C linker (`cc`) must be on your `$PATH` to link compiled programs — on macOS this comes with the Xcode Command Line Tools; on Linux install `gcc` or `clang`. No LLVM installation is required; it is bundled inside `lin`.
 
-For debugging, the **CodeLLDB** extension (`vadimcn.vscode-lldb`) is required; it is installed automatically as a dependency of this extension.
+For debugging, the **CodeLLDB** extension (`vadimcn.vscode-lldb`) is required. It is not installed automatically — the extension prompts you to install it the first time you start a debug session (press F5) if it isn't already present.
 
 ## Learn more
 

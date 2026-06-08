@@ -5,11 +5,11 @@ const path = require("path");
 const os = require("os");
 const cp = require("child_process");
 const {
-  workspace, window, commands, Range, Uri,
+  workspace, window, commands, Range, Uri, env,
   tests, TestRunRequest, TestRunProfileKind, TestMessage, Position,
   FileCoverage, StatementCoverage, CancellationTokenSource,
   tasks, Task, ShellExecution, ShellQuoting, TaskScope,
-  debug,
+  debug, extensions,
 } = require("vscode");
 const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
 
@@ -754,6 +754,43 @@ function formattersScriptPath(context) {
   return path.join(context.extensionPath, "formatters", "lin_formatters.py");
 }
 
+// CodeLLDB is a SOFT dependency: the core extension activates without it (syntax,
+// LSP, tasks, tests all work). Only the debugger needs it, so we check at debug-
+// resolve time rather than declaring it in `extensionDependencies` (which would
+// force-install it for everyone and block activation when it's unavailable).
+const CODELLDB_EXT_ID = "vadimcn.vscode-lldb";
+const CODELLDB_MARKETPLACE_URL =
+  "https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb";
+
+// Maximum time to wait for `lin build --debug` to finish before aborting the launch.
+// Guards against onDidEndTaskProcess never firing (task merged/resolved oddly, or a
+// provider error), which would otherwise hang F5 forever.
+const BUILD_TIMEOUT_MS = 60000;
+
+// Verify CodeLLDB is installed before launching a Lin debug session. If absent, show an
+// actionable message (with a button to open the marketplace) and return false so the caller
+// can abort gracefully — never throw, so a missing debugger can't crash the extension.
+async function ensureCodeLldbInstalled() {
+  if (extensions.getExtension(CODELLDB_EXT_ID)) return true;
+  const open = "Install CodeLLDB";
+  const choice = await window.showErrorMessage(
+    "Lin debug: the CodeLLDB extension (vadimcn.vscode-lldb) is required for debugging " +
+    "but isn't installed. Install it, then press F5 again.",
+    open
+  );
+  if (choice === open) {
+    // Prefer opening the extension directly in the Extensions view; fall back to the
+    // marketplace URL if the command isn't available.
+    try {
+      await commands.executeCommand("workbench.extensions.installExtension", CODELLDB_EXT_ID);
+      window.showInformationMessage("Lin debug: CodeLLDB installed. Press F5 again to debug.");
+    } catch (_) {
+      try { await env.openExternal(Uri.parse(CODELLDB_MARKETPLACE_URL)); } catch (_) { /* best effort */ }
+    }
+  }
+  return false;
+}
+
 // Phase 2 (data formatters): the returned CodeLLDB config carries `initCommands` that import
 // the bundled lldb pretty-printer script. On import the script self-registers `type summary`/
 // `type synthetic` providers (via __lldb_init_module) that decode Lin's boxed runtime values,
@@ -777,6 +814,12 @@ function makeDebugConfigProvider(linBin, context) {
     // Resolve after VS Code has substituted ${...} variables. We build here (async) and
     // return the CodeLLDB config; returning undefined aborts the session.
     async resolveDebugConfigurationWithSubstitutedVariables(folder, config) {
+      // CodeLLDB is a soft dependency — verify it's present before doing any work, and
+      // abort gracefully (return undefined) if it isn't.
+      if (!(await ensureCodeLldbInstalled())) {
+        return undefined;
+      }
+
       // Bare F5 with no config: fill from the active editor.
       const editor = window.activeTextEditor;
       let source = config.source;
@@ -806,26 +849,50 @@ function makeDebugConfigProvider(linBin, context) {
         exec,
         "$lin"
       );
-      const ok = await new Promise((resolve) => {
-        let disposed = false;
-        const end = tasks.onDidEndTaskProcess((e) => {
-          if (e.execution.task === buildTask || e.execution.task.name === buildTask.name) {
-            if (!disposed) {
-              disposed = true;
-              end.dispose();
-              resolve(e.exitCode === 0);
+      // Await the build. We resolve with a result string so the caller can give a precise
+      // message: "ok" (exit 0), "failed" (non-zero exit / launch error), or "timeout".
+      // Matching is by EXECUTION IDENTITY (the TaskExecution returned by executeTask), never
+      // by name, so a same-named task or a racing launch can't resolve us by mistake.
+      const buildResult = await new Promise((resolve) => {
+        let settled = false;
+        let timer;
+        let endSub;
+        const cleanup = () => {
+          if (endSub) endSub.dispose();
+          if (timer) clearTimeout(timer);
+        };
+        const settle = (result) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(result);
+        };
+
+        // executeTask resolves to the TaskExecution for THIS launch; we key the end-event
+        // match off it so only our build's completion settles the promise.
+        const execPromise = tasks.executeTask(buildTask);
+
+        endSub = tasks.onDidEndTaskProcess((e) => {
+          execPromise.then((exec) => {
+            if (e.execution === exec) {
+              settle(e.exitCode === 0 ? "ok" : "failed");
             }
-          }
+          }, () => { /* execPromise rejection handled below */ });
         });
-        tasks.executeTask(buildTask).then(undefined, () => {
-          if (!disposed) {
-            disposed = true;
-            end.dispose();
-            resolve(false);
-          }
-        });
+
+        execPromise.then(undefined, () => settle("failed"));
+
+        timer = setTimeout(() => settle("timeout"), BUILD_TIMEOUT_MS);
       });
-      if (!ok) {
+
+      if (buildResult === "timeout") {
+        window.showErrorMessage(
+          `Lin debug: \`lin build --debug\` did not finish within ${Math.round(BUILD_TIMEOUT_MS / 1000)}s; ` +
+          "aborting the debug session. See the terminal for build progress."
+        );
+        return undefined;
+      }
+      if (buildResult !== "ok") {
         window.showErrorMessage("Lin debug: `lin build --debug` failed; see the terminal/Problems panel.");
         return undefined;
       }
