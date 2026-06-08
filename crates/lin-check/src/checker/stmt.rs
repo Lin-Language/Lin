@@ -8,6 +8,58 @@ use crate::typed_ir::*;
 use crate::types::Type;
 
 impl Checker {
+    /// Build the diagnostic for `import { name } from "path"` where `path` is a resolved module
+    /// that does not export `name`. Prefers a cross-module suggestion (another module that DOES
+    /// export `name`), falling back to a within-module did-you-mean for a likely typo.
+    fn unknown_import_diagnostic(&self, path: &str, name: &str, span: Span) -> Diagnostic {
+        let mut help_lines: Vec<String> = Vec::new();
+
+        // CROSS-MODULE: which OTHER modules export this exact name?
+        // Source 1: the stdlib export index (covers stdlib modules not necessarily imported here).
+        // Source 2: the live import_types map (covers any resolved module, stdlib or local).
+        let mut other_modules: Vec<String> = Vec::new();
+        if let Some(mods) = self.stdlib_export_index.get(name) {
+            for m in mods {
+                if m != path {
+                    other_modules.push(m.clone());
+                }
+            }
+        }
+        for (p, n) in self.import_types.keys() {
+            if n == name && p != path && !other_modules.contains(p) {
+                other_modules.push(p.clone());
+            }
+        }
+        other_modules.sort();
+        other_modules.dedup();
+        for m in &other_modules {
+            help_lines.push(format!("`{}` is exported by \"{}\"", name, m));
+        }
+
+        // WITHIN-MODULE: only if no cross-module match — suggest a near-miss export of `path`.
+        if help_lines.is_empty() {
+            let candidates: Vec<&str> = self
+                .import_types
+                .keys()
+                .filter(|(p, _)| p == path)
+                .map(|(_, n)| n.as_str())
+                .collect();
+            if let Some(s) = lin_common::closest_match(name, candidates.into_iter(), 3) {
+                help_lines.push(format!("did you mean `{}`?", s));
+            }
+        }
+
+        let diag = Diagnostic::error(
+            span,
+            format!("module \"{}\" has no export `{}`", path, name),
+        );
+        if help_lines.is_empty() {
+            diag
+        } else {
+            diag.with_help(help_lines.join("\n"))
+        }
+    }
+
     pub(crate) fn check_stmt(&mut self, stmt: &Stmt) -> Result<TypedStmt, Diagnostic> {
         match stmt {
             Stmt::Val {
@@ -270,9 +322,40 @@ impl Checker {
                 span,
             } => {
                 let mut import_slots = Vec::new();
+                // Is this module KNOWN to the checker? It is iff at least one export key carries
+                // its path. (Some isolated/standalone checking modes seed NO signatures at all; in
+                // that case we keep the fresh-TypeVar fallback and must NOT error — there's simply
+                // no information to validate against.)
+                let module_known = self.import_types.keys().any(|(p, _)| p == path);
                 for binding in bindings {
                     let local_name = binding.alias.as_ref().unwrap_or(&binding.name);
                     // Use pre-resolved type if available, else fall back to TypeVar.
+                    let has_export = self
+                        .import_types
+                        .contains_key(&(path.clone(), binding.name.clone()));
+                    if module_known && !has_export {
+                        // The module exists and was resolved, but does not export this name.
+                        // Reject it here (a clean type-check error) instead of letting it slip
+                        // through to a fresh TypeVar and fail later at link time with a mangled
+                        // `undefined reference to <module>_<name>__val`.
+                        let diag = self.unknown_import_diagnostic(path, &binding.name, *span);
+                        self.diagnostics.push(diag);
+                        // Still bind the local name (to a fresh TypeVar) so downstream uses don't
+                        // panic on an undefined identifier; the pushed error already fails the
+                        // module's overall type-check.
+                        let ty = self.env.fresh_type_var();
+                        let slot = self.env.define(local_name.clone(), ty.clone(), false);
+                        self.import_origins.insert(
+                            local_name.clone(),
+                            (path.clone(), binding.name.clone()),
+                        );
+                        import_slots.push(ImportSlot {
+                            name: binding.name.clone(),
+                            slot,
+                            ty,
+                        });
+                        continue;
+                    }
                     let ty = self.import_types
                         .get(&(path.clone(), binding.name.clone()))
                         .cloned()
