@@ -5552,15 +5552,17 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
         // element box — e.g. `x => x`, or `acc = f(acc, x)` where `f` yields its element — in which
         // case `ret` IS the element box and this single release already reclaimed it.
         b.emit(Instruction::Release { val: ret, ty: boxed.clone() });
-        // Reclaim the per-iteration element BOX SHELL — but ONLY when it is DISTINCT from `ret`
-        // (the release above already reclaimed it otherwise; a second free would double-free).
-        // `lin_tagged_free_box_if_distinct` frees only the 16-byte shell (cached- and
-        // non-pointer-safe), never the inner payload — so it is safe for both flat (scalar, no
-        // inner: full reclaim — the ~36 B/iter leak) and tagged (heap inner stays owned by the
-        // source array / wherever the body moved it) element boxes. for/while-only reclaim;
-        // map/filter/reduce use the plain `call_body_closure` and never reach this path.
+        // FULLY reclaim the per-iteration element box (inner heap payload + shell) — but ONLY when it
+        // is DISTINCT from `ret` (the release above already reclaimed it otherwise; a second release
+        // would double-free). `lin_array_get_tagged` returns the element box as a fresh +1 WITH its
+        // inner heap payload RETAINED; a side-effecting `for` body never MOVES that inner anywhere, so
+        // it must be fully released, else every heap-bearing element's inner leaks (the String-packed
+        // sealed `for` leak AND the pre-existing genuine `Json[]`-of-objects `for` leak). For a
+        // flat-scalar element box there is no inner, so this degrades to a shell free (the old ~36 B/iter
+        // reclaim). Cached-box and non-pointer safe. for/while-only reclaim; map/filter/reduce use the
+        // plain `call_body_closure` (move-into-result) and never reach this path.
         for ebox in &elem_boxes {
-            b.emit(Instruction::FreeBoxShellIfDistinct { val: *ebox, other: ret });
+            b.emit(Instruction::ReleaseIfDistinct { val: *ebox, other: ret });
         }
         // A PACKED sealed-array source materialized a fresh +1 element struct each iteration; `for`
         // discards it (a side-effecting body never moves the struct out), so release it or it leaks.
@@ -5719,11 +5721,14 @@ fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx
     // narrowed Int64→Int32; truncated away when the callback declares only `(item)`.
     let idx = narrow_loop_index(i, builder);
     let (keep, elem_boxes) = call_body_closure_with_elem_boxes(body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &param_tys, &Type::Bool, builder);
-    // Reclaim the per-iteration element BOX SHELL (same mechanism + safety as `lower_for`):
-    // `FreeBoxShell` frees only the 16-byte shell, never the inner. The predicate's `Bool` return
-    // is an unboxed scalar, so it can NEVER alias the element box — no de-aliasing needed here.
+    // FULLY reclaim the per-iteration element box (inner + shell), same mechanism + safety as
+    // `lower_for`: `lin_array_get_tagged` returned a fresh +1 with its inner heap payload retained,
+    // and the predicate body never moves that inner anywhere, so it must be fully released or every
+    // heap-bearing element's inner leaks. The predicate's `Bool` return (`keep`) is an unboxed scalar,
+    // so it can NEVER alias the element box — codegen treats the non-pointer `other` as null and the
+    // release is unconditional. For a flat-scalar element box this degrades to a shell free.
     for ebox in &elem_boxes {
-        builder.emit(Instruction::FreeBoxShell { val: *ebox });
+        builder.emit(Instruction::ReleaseIfDistinct { val: *ebox, other: keep });
     }
     // A PACKED sealed-array source materialized a fresh +1 element struct; `while` discards it
     // (the predicate body never moves the struct out), so release it or it leaks per iteration.
@@ -6095,6 +6100,14 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     builder.emit(Instruction::Call {
         dst: acc_next, callee: CallTarget::Indirect(f), args: call_args, ret_ty: json.clone(),
     });
+    // FULLY reclaim the per-iteration element box (inner + shell): `lin_array_get_tagged` returned it
+    // as a fresh +1 with its inner heap payload retained, and the reducer BORROWS it (its return
+    // `acc_next` is its own freshly-owned +1), so the element box is dropped each iteration — release
+    // it or every heap-bearing element's inner leaks (the boxed-reduce analogue of the `for` leak). The
+    // `if distinct` guard covers a reducer that returns the element verbatim (`(acc, x) => x`), where
+    // `acc_next` would alias the element box and the phi/exit release already owns it. A flat-scalar
+    // element box has no inner, so this degrades to a shell free.
+    builder.emit(Instruction::ReleaseIfDistinct { val: elem, other: acc_next });
     let one = builder.const_temp(Const::Int(1, Type::Int64));
     builder.emit(Instruction::Binary {
         dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
