@@ -85,7 +85,7 @@ This document specifies the standard library for the Lin language. All modules a
 **std/iter**
 
 Combinators dispatch on the receiver type: **eager** (`U[]`) over an array or iterator, **lazy**
-(`Stream<U>`) over a stream; terminals over a stream gain an `| Error` arm (ADR-051). The signatures
+(`Stream<U>`) over a stream; terminals over a stream gain an `| Error` arm. The signatures
 below show the array/iterator (eager) form; the per-function reference notes the stream form.
 
 | Function | Signature | Summary |
@@ -108,7 +108,7 @@ below show the array/iterator (eager) form; the per-function reference notes the
 | [`some`](#some-iter) | `<T>(T[], (T) -> Boolean) -> Boolean` | True if any element matches |
 | [`take`](#take-iter) | `<T>(T[], Int32) -> T[]` | First n elements |
 | [`takeWhile`](#takeWhile-iter) | `<T>(T[], (T) -> Boolean) -> T[]` | Elements until predicate fails |
-| [`while`](#while-iter) | `(Json[], (Json) -> Boolean) -> Null` | Iterate, stopping when callback returns false |
+| [`while`](#while-iter) | `<T>(T[] \| Iterator \| Stream, (T) -> Boolean) -> Null` | Iterate, stopping when callback returns false |
 
 **std/array**
 
@@ -120,7 +120,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | --- | --- | --- |
 | [`append`](#append) | `<T>(T[], T) -> T[]` | Non-mutating single-element append |
 | [`arrayAllocate`](#arrayAllocate) | `(Int32) -> Json[]` | Allocate an array of n nulls |
-| [`arrayAllocateFilled`](#arrayAllocateFilled) | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
+| [`arrayAllocateFilled`](#arrayAllocateFilled) | `<T>(Int32, T) -> T[]` | Allocate an array of n copies of a fill value |
 | [`at`](#at-array) | `<T, D>(T[], Int32, D = null) -> T \| D` | Element at index, or the default (`null` if omitted) when out of bounds; negative indices count from end |
 | [`chunk`](#chunk) | `<T>(T[], Int32) -> T[][]` | Split into n-sized sub-arrays |
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
@@ -371,7 +371,7 @@ Generic over the event payload type `T`. Exported types: `Listener<T> = (T) -> N
 
 Stream-specific sources, adapters, sinks, and terminals. The unified combinators
 (`map`/`filter`/`take`/`drop`/`reduce`/`for`/…) are **not** exported here — they come from
-[`std/iter`](#stditer) and dispatch to the lazy stream backend on a stream receiver (ADR-051).
+[`std/iter`](#stditer) and dispatch to the lazy stream backend on a stream receiver.
 
 | Function | Signature | Summary |
 | --- | --- | --- |
@@ -381,7 +381,7 @@ Stream-specific sources, adapters, sinks, and terminals. The unified combinators
 | [`chunks`](#chunks) | `(Stream<UInt8[]>, Int32) -> Stream<UInt8[]>` | Re-chunk a byte stream to fixed-size windows |
 | [`readText`](#readText) | `(Stream<UInt8[]>) -> String \| Error` | Drain a byte stream to one String |
 | [`collect`](#collect) | `(Stream<UInt8[]>) -> UInt8[] \| Error` | Drain a byte stream to one byte buffer |
-| [`writeStream`](#writeStream) | `<T>(Stream<T>, String) -> Stream<T>` | Build a RAW sink: write each item's bytes verbatim, no separator |
+| [`writeStream`](#writeStream) | `<T>(Stream<T>, String) -> Stream<T>` | Build a raw sink: write each item's bytes verbatim, no separator |
 | [`writeLines`](#writeLines) | `<T>(Stream<T>, String) -> Stream<T>` | Build a line-oriented sink: write each item followed by a newline |
 | [`drain`](#drain) | `<T>(Stream<T>) -> Null \| Error` | Run a pipeline on the calling thread |
 | [`promise`](#promise-stream) | `<T>(Stream<T>) -> Json` | Move a pipeline to a worker thread; `Promise<Null \| Error>` |
@@ -866,7 +866,7 @@ array, an `Iterator`, or a `Stream` — and **dispatches on the receiver's stati
 argument, in dot-application terms): the same name is **eager** over an array/iterator (returning a
 materialised `U[]`) and **lazy** over a stream (returning a `Stream<U>` adapter that reads nothing until
 a terminal drives it). Terminals over a stream gain an `| Error` arm, because a stream read can fail
-mid-traversal (ADR-051; stream semantics in spec §27.9). Eager combinators are non-mutating and return
+mid-traversal. Eager combinators are non-mutating and return
 new values.
 
 Import:
@@ -906,7 +906,7 @@ match total
 
 ### Optional index parameter
 
-Every combinator callback OPTIONALLY receives a **0-based `Int32` SOURCE index** as a trailing
+Every combinator callback optionally receives a **0-based `Int32` source index** as a trailing
 parameter — the JS `forEach((item, idx) => …)` model. A 1-arg callback stays valid and unchanged
 (this is opt-in by arity, fully backward-compatible). It applies to `for`/`map`/`filter`/`reduce`/
 `while` and the derived `find`/`some`/`every`/`flatMap`/`takeWhile`/`dropWhile` (and
@@ -942,7 +942,7 @@ val map: <T, U>(src: T[] | Iterator | Stream<T>, f: (T[, i: Int32]) -> U) -> U[]
 Applies `f` to each element in order. `f` optionally receives the 0-based source index as a second
 parameter (`(x, i) => …`); a 1-arg `f` is unchanged. **Array/Iterator** → eager `U[]`. **Stream** → lazy `Stream<U>`
 (a transform adapter; `f` runs once per item as the item is pulled). For a monomorphic scalar array with
-a capture-less literal lambda, the body is inlined into a flat loop with no per-element boxing (ADR-044).
+a capture-less literal lambda, the body is inlined into a flat loop with no per-element boxing.
 
 ```txt
 [1, 2, 3].map(x => x * 2)                 // [2, 4, 6]
@@ -979,7 +979,7 @@ Folds left-to-right from `init`. `f` receives the accumulator first and the curr
 optionally receives the 0-based source index as a **third** parameter (`(acc, x, i) => …`).
 **Array/Iterator** → eager `U`. **Stream** → **terminal** returning `U | Error` (it drives the stream to
 completion on the calling thread; a read fault surfaces as `Error`). For a monomorphic scalar
-accumulator with a capture-less literal reducer, the accumulator is carried unboxed (ADR-044).
+accumulator with a capture-less literal reducer, the accumulator is carried unboxed.
 
 ```txt
 [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)   // 10
@@ -999,7 +999,7 @@ val for: (src: Json[] | Iterator | Stream, f: (Json[, i: Int32]) -> Json) -> Nul
 Iterates over each element, calling `f` (its return value is discarded). `f` optionally receives the
 0-based source index as a second parameter (`(item, i) => …`); array/iterator only. **Array/Iterator** → `Null`.
 **Stream** → **terminal** returning `Null | Error`: EOF ends the loop normally (`Null`), and a read
-`Error` mid-traversal becomes the result (spec §27.9.4). Lin has no `for…in`; iteration is always
+`Error` mid-traversal becomes the result. Lin has no `for…in`; iteration is always
 `.for(fn)`.
 
 ```txt
@@ -1279,7 +1279,7 @@ import { push, slice, sort, sum } from "std/array"
 val append: <T>(arr: T[], item: T) -> T[]
 ```
 
-Returns a new array with `item` added at the end. Does not modify `arr`. For in-place mutation, use `push`. Generic over the element type `T`, so the element type is enforced: `append(intArr, "s")` is a compile error. The result preserves the input's element representation: appending to a flat scalar array (e.g. `UInt8[]`, `Int32[]`) yields a flat array of the same type (a numeric LITERAL item adopts the array's element width, so `b.append(3)` on a `UInt8[]` stays `UInt8[]`), so byte-level consumers still read packed bytes; a `Json[]` stays tagged.
+Returns a new array with `item` added at the end. Does not modify `arr`. For in-place mutation, use `push`. Generic over the element type `T`, so the element type is enforced: `append(intArr, "s")` is a compile error. The result preserves the input's element representation: appending to a flat scalar array (e.g. `UInt8[]`, `Int32[]`) yields a flat array of the same type (a numeric literal item adopts the array's element width, so `b.append(3)` on a `UInt8[]` stays `UInt8[]`), so byte-level consumers still read packed bytes; a `Json[]` stays tagged.
 
 ```txt
 append([1, 2], 3)    // [1, 2, 3]
@@ -1308,7 +1308,7 @@ set(buf, 0, "a")
 ### arrayAllocateFilled
 
 ```txt
-val arrayAllocateFilled: (n: Int32, fill: Json) -> Json[]
+val arrayAllocateFilled: <T>(n: Int32, fill: T) -> T[]
 ```
 
 Returns a new array of length `n` with every element set to `fill`. When `fill` is a heap value (array, object, or string), the elements share the same value (each slot reads it back equal); replace a slot wholesale with [`set`](#set-array) to give it a distinct value.
@@ -1389,7 +1389,7 @@ compact([1, 2, 3])               // [1, 2, 3]
 val countBy: <T>(arr: T[], f: (T) -> String) -> { String: Int32 }
 ```
 
-Returns a typed map (`{ String: Int32 }`, ADR-055) from each distinct key (produced by `f`) to the number of elements that produced that key.
+Returns a typed map (`{ String: Int32 }`) from each distinct key (produced by `f`) to the number of elements that produced that key.
 
 ```txt
 ["apple", "banana", "avocado", "blueberry"].countBy(s => s.at(0))
@@ -1407,7 +1407,7 @@ Returns a typed map (`{ String: Int32 }`, ADR-055) from each distinct key (produ
 val groupBy: <T>(arr: T[], f: (T) -> String) -> { String: T[] }
 ```
 
-Returns a typed map (`{ String: T[] }`, ADR-055) where each key is a value returned by `f`, and the corresponding value is an array of all elements that produced that key. Within each group, elements keep their encounter order. The map's keys are in **hash order** (the typed-map backing is hashed, not insertion-ordered).
+Returns a typed map (`{ String: T[] }`) where each key is a value returned by `f`, and the corresponding value is an array of all elements that produced that key. Within each group, elements keep their encounter order. The map's keys are in **hash order** (the typed-map backing is hashed, not insertion-ordered).
 
 ```txt
 ["one", "two", "three", "four"].groupBy(s => toString(length(s)))
@@ -1568,7 +1568,7 @@ product([])              // 1
 val push: <T>(arr: T[], item: T) -> Null
 ```
 
-Appends `item` to `arr` in place. This is one of the few mutating operations in Lin — it modifies the array that was passed in. Generic over the element type `T`, so the element type is enforced: `push(intArr, "s")` is a compile error (ADR-059). An empty accumulator literal must be annotated so `T` is pinned: an evidence-free `[]` cannot infer its element type (ADR-058) — `val xs: Int32[] = []`, not `val xs = []`.
+Appends `item` to `arr` in place. This is one of the few mutating operations in Lin — it modifies the array that was passed in. Generic over the element type `T`, so the element type is enforced: `push(intArr, "s")` is a compile error. An empty accumulator literal must be annotated so `T` is pinned: an evidence-free `[]` cannot infer its element type — `val xs: Int32[] = []`, not `val xs = []`.
 
 ```txt
 val xs: Int32[] = []
@@ -1842,7 +1842,7 @@ val toInt64:  (v: UInt64) -> Int64
 val toUInt64: (v: UInt64) -> UInt64
 ```
 
-Explicit integer narrowing (spec §21). Implicit narrowing — assigning a wider numeric to a narrower one — is a compile-time error; these casts perform it explicitly, truncating to the target width with two's-complement (`as`-cast) semantics. The input is taken as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value masked down to a byte/word — widens into the parameter without range loss; a bare integer literal in range is accepted directly. They are the byte-extraction mechanism used by `std/bytes`, but are generally useful wherever explicit width control is needed.
+Explicit integer narrowing. Implicit narrowing — assigning a wider numeric to a narrower one — is a compile-time error; these casts perform it explicitly, truncating to the target width with two's-complement (`as`-cast) semantics. The input is taken as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value masked down to a byte/word — widens into the parameter without range loss; a bare integer literal in range is accepted directly. They are the byte-extraction mechanism used by `std/bytes`, but are generally useful wherever explicit width control is needed.
 
 ```txt
 toUInt8(0x1234)              // 0x34  (52)
@@ -1885,7 +1885,7 @@ tryParseInt32("bad")   // null
 
 ## std/bytes
 
-Slicing and endian (de)serialization on `UInt8[]` byte buffers (spec §27.1–§27.3). The endian helpers are written in Lin on top of the bitwise operators (§27.2) and the `std/number` narrowing casts (extracting a byte from a wider integer needs an explicit narrowing cast). The four float bit-reinterpret functions are runtime intrinsics, since a float's bit pattern cannot be obtained by shift-and-mask.
+Slicing and endian (de)serialization on `UInt8[]` byte buffers. The endian helpers are written in Lin on top of the bitwise operators and the `std/number` narrowing casts (extracting a byte from a wider integer needs an explicit narrowing cast). The four float bit-reinterpret functions are runtime intrinsics, since a float's bit pattern cannot be obtained by shift-and-mask.
 
 | Function | Signature | Description |
 | --- | --- | --- |
@@ -2388,17 +2388,16 @@ import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, 
 ```
 
 > **Typed maps (`{ String: T }`).** Two groups of `std/object` ops relate to the typed
-> index-signature map (the dictionary type, ADR-055, backed by a hashed O(1) container — see
-> Specification §5.1.1):
+> index-signature map (the dictionary type, backed by a hashed O(1) container):
 >
 > - **Tag-aware introspection** — `keys`, `values`, `entries`, `length`, and `isEmpty` keep a `Json`
->   parameter and work on BOTH a plain `Json`/`{}` record AND a typed map (the runtime dispatches on
+>   parameter and work on both a plain `Json`/`{}` record and a typed map (the runtime dispatches on
 >   the value's tag). This is deliberate: they are the way to introspect *any* object, and a genuine
 >   `Json` value must be able to flow in. Over a typed map their results are in **hash order**, not
 >   insertion order; over a plain `{}` record they preserve insertion order.
 > - **Typed map producers** — `merge`, `pick`, `omit`, `mapValues` are generic over `{ String: T }`
 >   and *return* a typed map, so the element type flows through statically. They accept a typed map
->   (not a plain `Json` record — there is no implicit `Json -> { String: T }` coercion, §5.1.1; pass
+>   (not a plain `Json` record — there is no implicit `Json -> { String: T }` coercion; pass
 >   a value annotated `{ String: T }`).
 >
 > A typed map also supports the built-in `m[k]` (yields `T | Null`) and `m[k] = v` directly. For a
@@ -2451,7 +2450,7 @@ Defaulted read over a typed `{ String: T }` map: returns the value at `key`, or 
 - a same-typed default collapses the union: over a `{ String: Int32 }` map, `get(m, k, 0)` is `Int32 | Int32 = Int32`, a bare scalar usable in arithmetic;
 - a differently-typed default keeps both arms: `get(m, k, "n/a")` is `Int32 | String`.
 
-`m` must be a typed map (not a plain `Json` record — there is no implicit `Json -> { String: T }` coercion, §5.1.1).
+`m` must be a typed map (not a plain `Json` record — there is no implicit `Json -> { String: T }` coercion).
 
 ```txt
 val counts: { String: Int32 } = { "a": 7 }
@@ -2613,12 +2612,12 @@ object — it stops at the first error and does not collect all of them. The `Er
 `path` is a JSONPath-ish location of the mismatch, e.g. `$.address.city` or `$[2]`. Detect a
 decode failure with `is Error` or, equivalently, the discriminant `result["type"] == "error"`.
 `is Error` is special-cased to check the `"type": "error"` discriminant (not just the object
-tag), so it distinguishes a decode failure from a successfully-decoded value (see ADR-031).
+tag), so it distinguishes a decode failure from a successfully-decoded value.
 
 ```txt
-// Idiomatic: match on `T | Error`. The `is Error` arm MUST come first — a structural object
+// Idiomatic: match on `T | Error`. The `is Error` arm must come first — a structural object
 // type like `Person` is matched by a bare object tag check, so a later `is Person` arm would
-// also catch the Error object (union first-match-wins, ADR-031).
+// also catch the Error object (union first-match-wins).
 val describe = (r: Person | Error): Null =>
   match r
     is Error => print("decode failed at ${r["path"]}: ${r["message"]}")
@@ -2640,7 +2639,7 @@ else
 - **Arrays** (`T[]`): every element is validated against `T`. **Fixed arrays** (`[A, B]`): the
   length must match exactly and each position is validated.
 - **Unions**: the **first** structurally-matching variant wins. Prefer a discriminant field for
-  overlapping object variants (ADR-031).
+  overlapping object variants.
 - **Numbers** (target-driven): an **integer** target requires an integral, in-range number
   (`3.14` → error; out-of-range → error); a **float** target accepts any number; a
   `Json`/unconstrained target accepts any number as-is.
@@ -2650,7 +2649,7 @@ Array, fixed-array, and union targets must be named via a `type` alias (the rece
 bare type name): `type IntArr = Int32[]; IntArr.fromJson([1, 2, 3])`.
 
 A `Json` value cannot be assigned to a concrete structured object without decoding — `fromJson`
-(or `is`/`has` narrowing) is the sound conversion (ADR-045).
+(or `is`/`has` narrowing) is the sound conversion.
 
 ### toJsonString
 
@@ -2677,7 +2676,7 @@ This is the primitive the test runner uses to build machine-readable records for
 val toJson: (value: Json) -> String
 ```
 
-Recursively serializes ANY Lin value to a strict, valid JSON string:
+Recursively serializes any Lin value to a strict, valid JSON string:
 
 - strings are escaped and quoted (same escaping as `toJsonString`);
 - object **keys** are escaped and quoted too;
@@ -2715,7 +2714,7 @@ import { hash } from "std/hash"
 val hash: (x: Json) -> String
 ```
 
-Returns a canonical, type-tagged string key for any JSON value. The key is stable and matches Lin's structural equality (spec §9): equal values produce equal keys, objects hash independently of key order, and arrays hash order-sensitively. Values of different types never collide — the key carries a type tag, so `hash(42)` (`"i:42"`) differs from `hash("42")` (`"s:42"`). Use it to deduplicate or index values by structural identity (e.g. as object keys in a manual set/map).
+Returns a canonical, type-tagged string key for any JSON value. The key is stable and matches Lin's structural equality: equal values produce equal keys, objects hash independently of key order, and arrays hash order-sensitively. Values of different types never collide — the key carries a type tag, so `hash(42)` (`"i:42"`) differs from `hash("42")` (`"s:42"`). Use it to deduplicate or index values by structural identity (e.g. as object keys in a manual set/map).
 
 ```txt
 hash(null)        // "N"
@@ -3161,7 +3160,7 @@ match readFile("config.txt")
 val readFileBytes: (path: String) -> UInt8[] | Error
 ```
 
-Reads the file at `path` as a packed `UInt8[]` byte buffer (§27.1) — one byte per element. Returns an `Error` if the file cannot be read.
+Reads the file at `path` as a packed `UInt8[]` byte buffer — one byte per element. Returns an `Error` if the file cannot be read.
 
 ```txt
 val bytes = readFileBytes("image.png")
@@ -3243,7 +3242,7 @@ Writes `content` to the file at `path`, replacing existing contents.
 val writeFileBytes: (path: String, bytes: UInt8[]) -> Null | Error
 ```
 
-Writes a `UInt8[]` byte buffer (§27.1) to the file at `path`. Returns `Null` on success, `Error` on failure.
+Writes a `UInt8[]` byte buffer to the file at `path`. Returns `Null` on success, `Error` on failure.
 
 ---
 
@@ -3677,7 +3676,7 @@ match body
 
 ## std/net
 
-Low-level UDP and TCP sockets — the byte-stream layer beneath `std/http`, for non-HTTP protocols and custom framing. Every socket is an opaque integer fd handle (spec §27.4): there are no open-socket objects in user code, just the raw OS fd as an `Int32`. Every fallible call returns the `T | Error` result shape; a non-blocking read with no data available yet returns `Null` (so a poll loop reads naturally). IPv4 only; `bind`/`listen` bind to `0.0.0.0`.
+Low-level UDP and TCP sockets — the byte-stream layer beneath `std/http`, for non-HTTP protocols and custom framing. Every socket is an opaque integer fd handle: there are no open-socket objects in user code, just the raw OS fd as an `Int32`. Every fallible call returns the `T | Error` result shape; a non-blocking read with no data available yet returns `Null` (so a poll loop reads naturally). IPv4 only; `bind`/`listen` bind to `0.0.0.0`.
 
 `recv`/`recvFrom`/`tcpRecv` fill a **caller-owned** `UInt8[]` and return the number of bytes read; the buffer is never transferred across the boundary. The buffer's length bounds the read — pre-size it to the maximum datagram/chunk you want to accept (e.g. `[0,0,...]` of N elements).
 
@@ -3750,7 +3749,7 @@ tcpClose(listener)
 
 ## std/ffi
 
-Raw-memory and C-string helpers for **richer FFI** — calling C libraries that traffic in pointers and out-param structs, beyond the scalar-only `import foreign` surface (spec §26.3). This is a **prototype keystone**: it lets pure Lin marshal `String` arguments into NUL-terminated C strings, allocate scratch/out-param buffers, and read/write fixed-layout structs returned through a C `void*`.
+Raw-memory and C-string helpers for **richer FFI** — calling C libraries that traffic in pointers and out-param structs, beyond the scalar-only `import foreign` surface. This is a **prototype keystone**: it lets pure Lin marshal `String` arguments into NUL-terminated C strings, allocate scratch/out-param buffers, and read/write fixed-layout structs returned through a C `void*`.
 
 These are inherently unsafe primitives — they do raw memory access with no bounds checking. They are the trusted boundary between Lin's managed values and arbitrary C memory; the caller is responsible for offsets being in-bounds and for the lifetime of any pointer handed to a C API.
 
@@ -3811,7 +3810,7 @@ Run and manage external processes. Two styles share one module:
 - **Batch** — `exec`/`shell` run a command to completion and collect its full stdout/stderr into an `ExecResult`. `cwd`/`chdir` query/change the working directory.
 - **Streaming** — `spawn` starts a child and returns an opaque `ProcessHandle`; `readStdout` reads its piped stdout incrementally; `kill` signals it; `wait` blocks for the exit code.
 
-Every fallible call returns the `T | Error` result shape (spec §27.6).
+Every fallible call returns the `T | Error` result shape.
 
 ### Types
 
@@ -3868,13 +3867,13 @@ print("exited ${code}")
 
 ## std/stream
 
-Lazy, fallible streams over OS resources — files, sockets, subprocess stdout, and stdin (spec §27.9). A `Stream<T>` is an opaque runtime value built as a **lazy pull graph**: a source node (`readStream`), zero or more adapters (`lines`/`linesMax`/`chunks`, plus the `std/iter` combinators `map`/`filter`/`take`/… which dispatch lazily on a stream receiver), and a terminal operation that drives the graph one item at a time with bounded memory. Errors are threaded **in-band** — the first read error poisons the upstream and short-circuits to the terminal op, so error handling lives only at the terminal, not at every adapter.
+Lazy, fallible streams over OS resources — files, sockets, subprocess stdout, and stdin. A `Stream<T>` is an opaque runtime value built as a **lazy pull graph**: a source node (`readStream`), zero or more adapters (`lines`/`linesMax`/`chunks`, plus the `std/iter` combinators `map`/`filter`/`take`/… which dispatch lazily on a stream receiver), and a terminal operation that drives the graph one item at a time with bounded memory. Errors are threaded **in-band** — the first read error poisons the upstream and short-circuits to the terminal op, so error handling lives only at the terminal, not at every adapter.
 
-**A stream can only be read once.** Reading consumes it, so each stream flows through a single pipeline — once you've called a combinator or terminal on it, using that stream again is a compile-time error. To make a second pass over the same data, open a fresh stream. You don't have to consume a stream (opening one and never reading it is fine — it cleans up after itself), and a stream lives in a local `val`, a function parameter, or a return value — not in an object field, array, or `var`. (The single-use rule is what lets `.promise()` safely hand the whole pipeline to a worker thread; design rationale in ADR-049.)
+**A stream can only be read once.** Reading consumes it, so each stream flows through a single pipeline — once you've called a combinator or terminal on it, using that stream again is a compile-time error. To make a second pass over the same data, open a fresh stream. You don't have to consume a stream (opening one and never reading it is fine — it cleans up after itself), and a stream lives in a local `val`, a function parameter, or a return value — not in an object field, array, or `var`. (The single-use rule is what lets `.promise()` safely hand the whole pipeline to a worker thread.)
 
 The combinators (`map`/`filter`/`take`/`drop`/`reduce`/`for`/…) are **not** part of `std/stream` — they
 come from [`std/iter`](#stditer) and dispatch to the lazy stream backend automatically when the receiver
-is a `Stream` (ADR-051). A stream pipeline imports its **sources and sinks** from `std/stream` and its
+is a `Stream`. A stream pipeline imports its **sources and sinks** from `std/stream` and its
 **combinators** from `std/iter`:
 
 ```txt
@@ -3889,7 +3888,7 @@ readStream("in.csv")
   .drain()
 ```
 
-Byte sources also come from other modules — `tcpStream` (`std/net`), `stdoutStream` (`std/process`), and `stdinStream` (`std/io`) all return `Stream<UInt8[]>` (spec §27.9.2) and feed the same adapters and terminals documented here.
+Byte sources also come from other modules — `tcpStream` (`std/net`), `stdoutStream` (`std/process`), and `stdinStream` (`std/io`) all return `Stream<UInt8[]>` and feed the same adapters and terminals documented here.
 
 > The optional 0-based callback **index parameter** (`(item, i) => …`) on the `std/iter` combinators is **array/iterator-only**: over a `Stream`, the lazy combinators (`map`/`filter`/`for`/…) keep their 1-arg callbacks (a stream is pull-driven with no materialised source position).
 
@@ -3907,7 +3906,7 @@ Stream<T>   // opaque; covariant in T; not JSON, not subscriptable
 val readStream: (path: String) -> Stream<UInt8[]>
 ```
 
-Opens the file at `path` as a lazy byte stream. No bytes are read until a terminal operation drives the stream. A failure to open, or a read failure during traversal, surfaces in-band as an `Error` at the terminal op (the source-kind ending rule of spec §27.9.4).
+Opens the file at `path` as a lazy byte stream. No bytes are read until a terminal operation drives the stream. A failure to open, or a read failure during traversal, surfaces in-band as an `Error` at the terminal op.
 
 ```txt
 val text = readStream("notes.txt").readText()
@@ -4050,9 +4049,9 @@ match outcome
 val promise: <T>(Stream<T>) -> Json    // Promise<Null | Error>
 ```
 
-Terminal. Runs the whole pipeline on a **background thread** and returns a promise immediately, so your program can do other work while the stream is processed. `await` the promise for the result — `Null` on success, or an `Error` if anything went wrong while processing (a crash mid-stream is caught at the thread boundary and handed back as an `Error` rather than aborting the program; spec §24.2.2). Use `.drain()` when you simply want to run the pipeline and wait. (Design rationale — how the pipeline is safely handed to the worker — is in ADR-049.)
+Terminal. Runs the whole pipeline on a **background thread** and returns a promise immediately, so your program can do other work while the stream is processed. `await` the promise for the result — `Null` on success, or an `Error` if anything went wrong while processing (a crash mid-stream is caught at the thread boundary and handed back as an `Error` rather than aborting the program). Use `.drain()` when you simply want to run the pipeline and wait.
 
-The promise type is conceptually `Promise<Null | Error>`; like all promise handles it is erased to `Json` in annotations (spec §24.1). `await` reattaches the `Null | Error` union, so the `Error` case must be handled (ADR-045).
+The promise type is conceptually `Promise<Null | Error>`; like all promise handles it is erased to `Json` in annotations. `await` reattaches the `Null | Error` union, so the `Error` case must be handled.
 
 ```txt
 val p = readStream("big.log")
@@ -4138,23 +4137,25 @@ Compresses a byte stream as a **raw DEFLATE** bitstream (no gzip header/CRC).
 
 ## std/archive
 
-Tar splitting over a byte stream (`Stream<UInt8[]>`). A **tar** archive is a flat sequence of
+Tar splitting over a byte stream (`Stream<UInt8[]>`). A tar archive is a flat sequence of
 512-byte-aligned (header + body) records; these surfaces turn a byte stream into archive entries
-**without buffering the whole archive** — the parent stream is pulled one chunk at a time. A
-`.tar.gz` is just `gunzip()` (`std/compress`) composed with the tar splitter. **Only the tar format
-is supported** (zip is not).
+without buffering the whole archive — the parent stream is pulled one chunk at a time. A
+`.tar.gz` is just `gunzip()` (`std/compress`) composed with the tar splitter. Only the tar format
+is supported (zip is not).
 
-All three surfaces **consume** the parent stream (it is moved in); the source binding may not be used
+All three surfaces consume the parent stream (it is moved in); the source binding may not be used
 again after the call — the affine stream check rejects a reuse (re-open the source for a second pass).
 
-Each entry's **`meta`** object is pure JSON:
+Two record types describe the entries:
 
 ```txt
-{ name: String, size: Int64, typeflag: String, isDir: Boolean }
+TarHeader = { name: String, size: Int64, typeflag: String, isDir: Boolean }
+TarFile   = { name: String, data: UInt8[], size: Int64, typeflag: String, isDir: Boolean }
 ```
 
-where `typeflag` is the tar type byte as a one-character string (`"0"` = regular file, `"5"` =
-directory) and `isDir` is `true` iff `typeflag == "5"`.
+`manifest` yields `TarHeader` values, `files` yields `TarFile` values, and `untar` passes a
+`TarHeader` as the callback's `meta`. In each, `typeflag` is the tar type byte as a one-character
+string (`"0"` = regular file, `"5"` = directory) and `isDir` is `true` iff `typeflag == "5"`.
 
 ```txt
 import { readStream, drain, writeStream } from "std/stream"
@@ -4174,50 +4175,50 @@ readStream("data.tar.gz").gunzip().untar((meta, data) =>
 ### untar
 
 ```txt
-val untar: (Stream<UInt8[]>, body: (Json, Stream<UInt8[]>) -> Json) -> Null | Error
+val untar: (Stream<UInt8[]>, body: (TarHeader, Stream<UInt8[]>) -> Json) -> Null | Error
 ```
 
-The **terminal** driver: drives the whole archive on the calling thread, calling `body(meta, data)`
-once per entry, where `data` is a `Stream<UInt8[]>` **sub-stream** over that entry's body. The body's
-return value is ignored. Returns `Null` on a clean archive, or an `Error` if a read fault or a body
-fault occurs. This is the **constant-memory primitive** — an arbitrarily large member flows through
-its `data` sub-stream without ever being fully buffered.
+The terminal driver: drives the whole archive on the calling thread, calling `body(meta, data)`
+once per entry, where `meta` is a `TarHeader` and `data` is a `Stream<UInt8[]>` sub-stream over that
+entry's body. The body's return value is ignored. Returns `Null` on a clean archive, or an `Error` if
+a read fault or a body fault occurs. This is the constant-memory primitive — an arbitrarily large
+member flows through its `data` sub-stream without ever being fully buffered.
 
-Whether the body **drains** `data` or **ignores** it, the driver always skips to the next entry
+Whether the body drains `data` or ignores it, the driver always skips to the next entry
 correctly (an undrained body is skipped automatically).
 
-> **Sync-only sub-stream.** Inside the body, `data` is valid **only during the body's synchronous
-> execution** — the driver is paused while the body runs and resumes (advancing to the next entry)
-> the moment the body returns. `data` must therefore be consumed (drained / read) **inside the
-> callback**; it shares a cursor with the paused driver. Handing it to a worker via `.promise()`
-> would race that cursor and is **unsupported**. The ADR-049 stream placement restriction bounds
+> **Sync-only sub-stream.** Inside the body, `data` is valid only during the body's synchronous
+> execution — the driver is paused while the body runs and resumes (advancing to the next entry)
+> the moment the body returns. `data` must therefore be consumed (drained / read) inside the
+> callback; it shares a cursor with the paused driver. Handing it to a worker via `.promise()`
+> would race that cursor and is unsupported. The stream placement restriction bounds
 > `data`'s lifetime to the callback (it cannot be stored in a field, `var`, or array); a dedicated
 > compile-time check specifically for `.promise()` on a sub-stream is a known gap.
 
 ### manifest
 
 ```txt
-val manifest: (Stream<UInt8[]>) -> Stream<Object>
+val manifest: (Stream<UInt8[]>) -> Stream<TarHeader>
 ```
 
-An **adapter** yielding each entry's `meta` object, with its body **skipped** (a meta-only listing).
+An adapter yielding each entry's `TarHeader`, with its body skipped (a meta-only listing).
 Composes with `std/iter` (`filter`/`map`/`for`) like any other `Stream`. No sub-streams are minted.
 
 ### files
 
 ```txt
-val files: (Stream<UInt8[]>) -> Stream<Object>
+val files: (Stream<UInt8[]>) -> Stream<TarFile>
 ```
 
-An **adapter** yielding `{ name, data, size, typeflag, isDir }` per entry, where `data` is the
-entry's **full body buffered** into a `UInt8[]`. A convenience for normal-sized files; composes with
-`std/iter`. Because each body is buffered in memory, prefer `untar` for arbitrarily large entries.
+An adapter yielding a `TarFile` per entry, where `data` is the entry's full body buffered into a
+`UInt8[]`. A convenience for normal-sized files; composes with `std/iter`. Because each body is
+buffered in memory, prefer `untar` for arbitrarily large entries.
 
 ---
 
 ## std/tty
 
-Raw terminal mode and non-blocking key input on stdin (spec §27.7).
+Raw terminal mode and non-blocking key input on stdin.
 
 ```txt
 rawMode:  (on: Boolean)  => Null | Error    // enable/disable terminal raw mode
@@ -4311,7 +4312,7 @@ val [users, posts] = await([
 ])
 ```
 
-`await` auto-flattens nested promises (§24.2.3): if the thunk itself returns a `Promise`, `await`
+`await` auto-flattens nested promises: if the thunk itself returns a `Promise`, `await`
 resolves through every layer (`await(async(() => async(() => 42)))` is `42`).
 
 If the thunk faults (array out of bounds, division by zero, …), the fault is caught at the thread
@@ -4324,7 +4325,7 @@ match await(p)
   else     => use(result)
 ```
 
-The static check from §24.2.2 *is* enforced: because `await` returns `T | Error`, assigning the
+The static check *is* enforced: because `await` returns `T | Error`, assigning the
 result to a binding that does not handle the `Error` case is a compile-time error.
 
 ```txt
@@ -4333,7 +4334,7 @@ val r: Int32 = await(p)   // type error: Int32 | Error is not assignable to Int3
 
 You must handle the `Error` (e.g. with the `match` above) before using the value as a plain `T`.
 
-> Limitation (ADR-045): there is no nominal `Promise<T>` type — a promise handle is erased to
+> Limitation: there is no nominal `Promise<T>` type — a promise handle is erased to
 > `Json` — so this enforces "you must handle the `Error` after awaiting" but does **not** catch
 > "you forgot to `await`" (using a promise as if it were the value). Error injection happens at
 > `await` (where the value materialises), not at `async`, because the other async primitives
@@ -4463,7 +4464,7 @@ val set:      <T>(Shared<T>, T) -> Null
 val withLock: <T, R>(Shared<T>, (T) -> R) -> R
 ```
 
-`Shared<T>` is opt-in **shared mutable state** for many threads (ADR-028 §2.3.1): an
+`Shared<T>` is opt-in **shared mutable state** for many threads: an
 atomic-refcounted box wrapping a reader-writer lock over a private copy of the value.
 
 - `shared(v)` creates a `Shared<T>` boxing a deep copy of `v` (must be transferable).
@@ -4488,7 +4489,7 @@ gap (last-writer-wins); use `withLock` when the update must be atomic.
 
 > `Shared<T>` is **accessor-only**: `shared`/`get`/`set`/`withLock` are the only operations.
 > Passing a `Shared` value to anything else (e.g. `push(s, 7)`, indexing) is a compile-time type
-> error — the box never auto-unwraps to its inner type or to `Json` (ADR-029). The inner value
+> error — the box never auto-unwraps to its inner type or to `Json`. The inner value
 > is reachable only via `get`/`withLock`, which copy it out. (This check is enforced by
 > `lin build`/`lin run`, which resolve imports; a bare `lin check` does not resolve imports and
 > so won't show it.)
@@ -4505,7 +4506,7 @@ gap (last-writer-wins); use `withLock` when the update must be atomic.
 val frozen: <T>(T) -> T
 ```
 
-`frozen(v)` deep-freezes a transferable graph into shared **read-only** state (ADR-030 §2.3.2):
+`frozen(v)` deep-freezes a transferable graph into shared **read-only** state:
 every heap node is sealed immortal+immutable, so many threads can read it concurrently with
 **zero copies, no lock, and no atomics**. The value keeps its plain type, so readers use it
 transparently:
@@ -4520,7 +4521,7 @@ val routes = parallel(
 > **Immortal ⇒ never freed.** Use `frozen` for load-once, program-lifetime reference data (a
 > timetable, routing table, config). A `frozen()` value created and discarded in a loop leaks.
 > The compile-time read-only coercion / mutation-inference (rejecting a frozen value passed to a
-> mutating parameter) is deferred (ADR-030): mutating a frozen value is currently a silent no-op
+> mutating parameter) is deferred: mutating a frozen value is currently a silent no-op
 > rather than a compile error. Concurrent reads are fully safe.
 
 ---
@@ -4551,7 +4552,7 @@ envelope, no string-tagged `{ type, data }`. Each emitter/bus is parameterised b
 `T`, so `emit`/`send` accept a `T` and listeners receive a `T`. For several event shapes through
 one channel, make `T` a tagged union and `match` on it.
 
-- **Layer 1 — `emitter` (async, worker-backed).** A long-lived worker (`std/async`, §24.6) owns the
+- **Layer 1 — `emitter` (async, worker-backed).** A long-lived worker (`std/async`) owns the
   subscriber state `S` and folds each delivered `T` into it with a reducer `(T, S) => S` running on
   the worker thread. Use it when a producer on one thread feeds a subscriber on another — e.g.
   stream a file and `send` processed records to an indexer worker.
@@ -4559,7 +4560,7 @@ one channel, make `T` a tagged union and `match` on it.
   thread, for decoupled pub/sub within one thread.
 
 Design notes (learning from Node's `EventEmitter`): no magic `"error"` event that aborts the
-process when unhandled — an async reducer fault is isolated at the worker boundary (§24.6.5); you
+process when unhandled — an async reducer fault is isolated at the worker boundary; you
 **unsubscribe by handle**, not by fragile closure identity; each event is **one typed payload**, not
 positional varargs; listener counts are queryable.
 
@@ -4568,13 +4569,13 @@ propagate its parameter back to a generic consumer. So **annotate the bus bindin
 `val b: Bus<Int32> = bus(firstListener)` — and every other call resolves `T` from that binding or a
 value argument. The async layer takes a representative `sample: T` argument on `emitter`/`drain`
 purely to pin `T` (a worker handler cannot otherwise recover it); the worker handle itself is the
-one opaque value (a `Worker`, erased to `Json` per §24.1 — that is the runtime handle, never your
+one opaque value (a `Worker`, erased to `Json` — that is the runtime handle, never your
 payload).
 
 The module exports the types `Listener<T>` (`= (T) => Null`), `Bus<T>`, and `Sub`.
 
 The reducer (Layer 1) runs on the worker thread, one event at a time, so its state is thread-confined
-(it may hold a captured `var`, §24.6.4). `send` is fire-and-forget — a fast producer can outrun a slow
+(it may hold a captured `var`). `send` is fire-and-forget — a fast producer can outrun a slow
 reducer and grow the queue; use `request` to pace, or rely on the final `drain`. `request`/`drain`
 return `S | Error` (the worker boundary injects `Error` on a reducer fault); annotate the binding to
 recover `S`. For the synchronous bus (Layer 2), `bus(first)` is seeded with its first listener so its
@@ -5114,7 +5115,7 @@ replace readFile = (path: String): Json => "mock contents of ${path}"
 
 For worked examples see `examples/processes/` (mocking `std/process.exec`) and
 `examples/web-server/` (mocking `std/fs` read/write in the `/route` solver, and
-`std/template.render` in the handlers); ADR-046 has the design.
+`std/template.render` in the handlers).
 
 ---
 
@@ -5132,14 +5133,14 @@ mis-parsing newer shapes.
 Each line is one of four record shapes:
 
 ```jsonc
-// Always the FIRST line — the NDJSON schema version
+// Always the first line — the NDJSON schema version
 { "event": "meta", "schema": 2 }
 
 // One per test (from the suite's results)
 { "event": "test", "file": "<path>", "name": "<test name>", "status": "pass", "durationMs": <int> }
 { "event": "test", "file": "<path>", "name": "<test name>", "status": "fail", "message": "<joined failure messages>", "expected"?: <any JSON>, "actual"?: <any JSON>, "durationMs": <int> }
 
-// OPTIONAL: the user's own `print(...)` output for a file, emitted before that file's
+// Optional: the user's own `print(...)` output for a file, emitted before that file's
 // `file` record. Absent when the file produced no non-runner stdout. (Added in schema 2.)
 { "event": "output", "file": "<path>", "text": "<joined stdout lines>" }
 
@@ -5150,10 +5151,10 @@ Each line is one of four record shapes:
 - `status` on a `test` record is `pass` or `fail`; the `message` (failures only) is the
   test's failure messages joined with `\n` (so a `toBe` mismatch carries its
   `expected: …\nactual: …` text). All strings are properly JSON-escaped.
-- `expected` / `actual` are OPTIONAL structured fields on a `fail` `test` record, carrying the
+- `expected` / `actual` are optional structured fields on a `fail` `test` record, carrying the
   raw compared values as arbitrary JSON (any shape — strings, numbers, objects, arrays). They are
   emitted by equality-style matchers (`toBe`, `toBeNull`, `toFailWith`) and let consumers render a
-  structured diff without parsing the human `message`. They are present only when EXACTLY ONE of
+  structured diff without parsing the human `message`. They are present only when exactly one of
   the test's failing assertions carries a pair; with multiple failing assertions, or matchers
   without a meaningful pair (`toSatisfy`, `toSucceed`, `toFail`), they are omitted and the
   `message` conveys everything. Values are serialized with `toJson` (the recursive serializer).

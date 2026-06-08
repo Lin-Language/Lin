@@ -1,21 +1,13 @@
-// std/encoding — byte/text transport codecs: Base64 (standard + URL-safe), hex,
+// std/encoding — byte/text transport codecs: Base64 (standard and URL-safe), hex,
 // URL/percent encoding, and query-string parse/build.
 //
-// These sit on the seam between `UInt8[]` byte buffers (std/bytes, §35.1) and `String`
-// text. Following the std/bytes precedent the codecs are pure Lin over the bitwise
-// operators (§35.2) and the std/number narrowing casts (§26); the one capability that
-// cannot be expressed in Lin — validated UTF-8 bytes → String — is borrowed from
-// std/string.fromUtf8 (a shared runtime primitive, not a codec-specific intrinsic).
+// These sit on the seam between `UInt8[]` byte buffers (std/bytes) and `String` text.
 //
-// Encoding never fails. Decoding is fallible: malformed Base64/hex/percent input returns
-// the standard Error shape `{ "type": "error", "message": String }`, matched with
-// `is Error` (the Error arm comes first in a match). The Base64 and hex alphabets and
-// output are pure ASCII, so output strings are assembled with `fromCodePoints` (sound
-// because codepoint == byte for ASCII); decoding scans input bytes with the O(1) `byteAt`
-// primitive (NOT codePointAt-in-a-loop, which would be O(n²)). Lin has no imperative
-// `while`, so the byte scans are written as tail-recursive helpers over a byte index.
+// Encoding never fails. Decoding is fallible: malformed Base64, hex, or percent input returns
+// the standard Error shape `{ "type": "error", "message": String }`, matched with `is Error`.
+// The Base64 and hex alphabets and output are pure ASCII.
 //
-// Structural URL parsing (scheme/host/path/fragment) is out of scope — see std/url.
+// Structural URL parsing (scheme, host, path, fragment) is out of scope — see std/url.
 import { fromCodePoints, byteAt, fromUtf8, toString, lengthBytes } from "std/string"
 import { length, push } from "std/array"
 import { keys } from "std/object"
@@ -252,9 +244,8 @@ val isUnreserved = (byte: Int32): Boolean =>
 // Byte length comes from std/string.lengthBytes (O(1) — the runtime stores it), replacing an
 // earlier O(n) byteAt-to-sentinel scan.
 
-// UTF-8-encode a string to its raw byte buffer — the inverse of `std/string.fromUtf8`. Pure Lin
-// (scans the codepoint-aware string's bytes via `byteAt`). The String→UInt8[] companion to the
-// byte/text codecs here; other modules (e.g. std/crypto) hash/encode bytes, so this is the bridge.
+// UTF-8-encode a string to its byte buffer — the inverse of `std/string.fromUtf8`. This is the
+// String to UInt8[] companion to the byte/text codecs here.
 // @param s  the text to encode.
 // @returns the UTF-8 bytes of `s`.
 export val utf8Bytes = (s: String): UInt8[] =>
@@ -292,7 +283,7 @@ val byteOr0 = (bytes: UInt8[], i: Int32, n: Int32): Int32 =>
 export val base64Encode = (bytes: UInt8[]): String =>
   b64EncodeWith(bytes, b64Std, true)
 
-// Encode bytes as URL-safe Base64 (RFC 4648 §5, `-`/`_` alphabet) WITHOUT padding. Never fails.
+// Encode bytes as URL-safe Base64 (RFC 4648 §5, `-`/`_` alphabet) without padding. Never fails.
 // @param bytes  the bytes to encode.
 // @returns the URL-safe Base64 string.
 export val base64UrlEncode = (bytes: UInt8[]): String =>
@@ -406,8 +397,8 @@ val hexEncGo = (bytes: UInt8[], n: Int32, i: Int32, out: Int32[]): Int32[] =>
     push(out, hexLower[byte & 15])
     hexEncGo(bytes, n, i + 1, out)
 
-// Decode a hex string back to bytes. Accepts upper- and lower-case; does NOT skip whitespace or
-// accept a `0x` prefix.
+// Decode a hex string back to bytes. Accepts upper- and lower-case; it does not skip whitespace
+// or accept a `0x` prefix.
 // @param s  the hex string to decode.
 // @returns the decoded bytes, or an Error on odd length or any non-hex character.
 export val hexDecode = (s: String): UInt8[] | Error =>
@@ -431,9 +422,9 @@ val hexDecGo = (s: String, n: Int32, i: Int32, out: UInt8[]): UInt8[] | Error =>
       hexDecGo(s, n, i + 2, out)
 
 // --- url / percent ---------------------------------------------------------
-// Percent-encode `s` as a URI COMPONENT (RFC 3986): the strict, maximal-escaping component
+// Percent-encode `s` as a URI component (RFC 3986): the strict, maximal-escaping component
 // encoder, safe for both path segments and query values. Every UTF-8 byte is escaped to %XX
-// (upper-case hex) except the unreserved set; space becomes %20 (NOT +).
+// (upper-case hex) except the unreserved set; space becomes %20, not `+`.
 // @param s  the text to encode.
 // @returns the percent-encoded string.
 export val urlEncode = (s: String): String =>
@@ -597,8 +588,8 @@ val addPair = (result: { String: String[] }, k: String, v: String): Null =>
     push(cur, v)
 
 // Serialize a multimap back to a query string: each key paired with each value (`k=v1&k=v2`), keys
-// and values percent-encoded with the component rules PLUS the form convention of encoding space as
-// `+`. Inverse of parseQuery (up to key/iteration order). No leading `?` is emitted.
+// and values percent-encoded with the component rules plus the form convention of encoding space as
+// `+`. This is the inverse of parseQuery (up to key/iteration order). No leading `?` is emitted.
 // @param params  the multimap of keys to value lists.
 // @returns the query string, or "" for an empty map.
 export val buildQuery = (params: { String: String[] }): String =>
@@ -639,7 +630,7 @@ export val base64EncodeString = (s: String): String =>
 
 // Standard Base64 decode, then UTF-8 decode the bytes back to a String.
 // @param s  the Base64 string to decode.
-// @returns the decoded text, or an Error on malformed Base64 OR invalid UTF-8.
+// @returns the decoded text, or an Error on malformed Base64 or invalid UTF-8.
 export val base64DecodeString = (s: String): String | Error =>
   val bytes = base64Decode(s)
   if bytes is Error then
@@ -649,12 +640,12 @@ export val base64DecodeString = (s: String): String | Error =>
 
 // --- structural hash -------------------------------------------------------
 // Compute a stable, canonical, type-tagged structural hash key for any value. The key matches
-// Lin's structural equality (spec §14): equal values hash equal, objects hash independently of
-// key order, and arrays hash order-sensitively. The type tag means values of different types
-// never collide — `hash(42)` is `"i:42"` while `hash("42")` is `"s:42"`. Use it to deduplicate
-// values or index them by structural identity (e.g. as object keys in a hand-rolled set/map, or
-// to bucket structurally-equal records with std/array's `countBy`). Generic over the input type —
-// it walks the runtime value, so T can be anything. (Folded in from the former std/hash module.)
+// Lin's structural equality: equal values hash equal, objects hash independently of key order,
+// and arrays hash order-sensitively. The type tag means values of different types never collide —
+// `hash(42)` is `"i:42"` while `hash("42")` is `"s:42"`. Use it to deduplicate values or index
+// them by structural identity (for example, as object keys in a hand-rolled set or map, or to
+// bucket structurally-equal records with std/array's `countBy`). It is generic over the input
+// type and walks the runtime value, so `T` can be anything.
 // @param x  the value to hash.
 // @returns the structural hash key as a String.
 // @example hash(null)     // "N"

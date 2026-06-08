@@ -1,4 +1,4 @@
-// std/template — Jinja-style template rendering, backed by the minijinja engine (ADR-048).
+// std/template — Jinja-style template rendering, backed by the minijinja engine.
 //
 // `renderWith` renders an in-memory template string; `render` loads a `.jinja` file from disk
 // (and supports `{% extends %}`/`{% include %}` layouts, resolved from the file's directory).
@@ -17,7 +17,7 @@ import foreign "lin-runtime"
   val lin_template_render: (String, {  }) => Json
   val lin_template_render_path: (String, {  }) => Json
 
-// Render an in-memory Jinja-style template string (minijinja-backed, ADR-048).
+// Render an in-memory Jinja-style template string (minijinja-backed).
 // @param template  the template source. Because it is in-memory, `{% extends %}`/`{% include %}`
 //   cannot resolve (no directory to load from) — use `render` for layout/inheritance.
 // @param data      the variables to render against; undefined variables render as `""`.
@@ -27,7 +27,7 @@ import foreign "lin-runtime"
 export val renderWith = (template: String, data: {  }): Json =>
   lin_template_render(template, data)
 
-// Read a template from `path` and render it, with full layout support (ADR-048): the template may
+// Read a template from `path` and render it, with full layout support: the template may
 // `{% extends "base.jinja" %}` and fill `{% block %}`s, or pull in partials via
 // `{% include "_nav.jinja" %}` — referenced files are loaded by name from the same directory as
 // `path`.

@@ -1,7 +1,7 @@
 // std/string — string manipulation functions.
 //
 // All operations are codepoint-aware: indices and lengths count Unicode codepoints, not bytes. The
-// one exception is `byteAt`, a low-level O(1) raw-UTF-8 byte accessor for fast byte/ASCII scanning.
+// one exception is `byteAt`, a low-level O(1) UTF-8 byte accessor for fast byte/ASCII scanning.
 //
 // import { trim, toUpper, toLower, split, join, replace, replaceAll, contains, startsWith, endsWith, substring, indexOf, length } from "std/string"
 import { for } from "std/iter"
@@ -200,7 +200,7 @@ export val at = (s: String, index: Int32): String =>
 export val charCode = (s: String, index: Int32): Int32 =>
   lin_string_char_code(s, index)
 
-// Get the raw UTF-8 byte at byte-index `index` in O(1). Use this for fast byte/ASCII
+// Get the UTF-8 byte at byte-index `index` in O(1). Use this for fast byte/ASCII
 // scanning: a loop over `0..length(s)` with `byteAt` is O(n), whereas the same loop with
 // `charCode` (code-point indexed) is O(n²). For ASCII text the two agree.
 // @param s      the source string.
@@ -211,7 +211,7 @@ export val charCode = (s: String, index: Int32): Int32 =>
 export val byteAt = (s: String, index: Int32): Int32 =>
   lin_string_byte_at(s, index)
 
-// The number of raw UTF-8 BYTES in `s`, in O(1) (the runtime stores it). This is the byte-view
+// The number of UTF-8 bytes in `s`, in O(1) (the runtime stores it). This is the byte-view
 // companion to `byteAt`: a `0..lengthBytes(s)` loop with `byteAt` is the canonical O(n) byte scan.
 // Contrast `length`, which counts Unicode codepoints. For ASCII the two agree; for multi-byte text
 // `lengthBytes` is larger.
@@ -284,8 +284,8 @@ export val padEnd = (s: String, width: Int32, pad: String = " "): String =>
     val padded = lin_string_repeat(pad, (needed / padLen) + 1)
     "${s}${_substring(padded, 0, needed)}"
 
-// Decode a `UInt8[]` of UTF-8 bytes into a validated `String`. The inverse of `byteAt`: where
-// `byteAt` walks a `String`'s raw UTF-8 bytes, `fromUtf8` reassembles a byte buffer back into a
+// Decode a `UInt8[]` of UTF-8 bytes into a validated `String`. This is the inverse of `byteAt`:
+// where `byteAt` walks a `String`'s UTF-8 bytes, `fromUtf8` reassembles a byte buffer back into a
 // `String`. Unlike `fromCodePoints` (which treats each Int as a code point and would mojibake
 // multi-byte sequences), this validates and decodes genuine UTF-8 — use it for bytes that came
 // from a file, socket, or a base64/percent decode.

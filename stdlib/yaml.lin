@@ -2,7 +2,7 @@
 //
 // YAML maps onto the same data model as JSON, so a parsed document is an ordinary `Json` value
 // (object, array, string, number, boolean, or null). Because YAML decodes to plain `Json`, it
-// composes directly with std/json's `fromJson` and with std/jq filters — a "yq" query is just
+// composes directly with std/json's `fromJson` and with std/jq filters — a "yq" query is just a
 // `parse` followed by `jq`. Fallible functions return the canonical `Error` value
 // `{ "type": "error", "message": String }`, detectable with `is Error`.
 //

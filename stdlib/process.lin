@@ -98,11 +98,11 @@ export val kill = (handle: ProcessHandle): Json =>
 export val wait = (handle: ProcessHandle): Json =>
   lin_process_wait(handle)
 
-// Wrap a spawned child's piped stdout as a lazy byte Stream (streams brief §4). Reading pulls from
+// Wrap a spawned child's piped stdout as a lazy byte stream. Reading pulls from
 // the pipe until EOF.
 // @param handle  the spawned process's handle.
 // @returns a `Stream<UInt8[]>` over the child's stdout.
-export val stdoutStream = (handle: ProcessHandle): Stream =>
+export val stdoutStream = (handle: ProcessHandle): Stream<UInt8[]> =>
   lin_process_stdout_stream(handle)
 
 // ===== OS / system introspection (folded in from the former std/os module) =====

@@ -1,11 +1,10 @@
 // std/fs — filesystem read, write, and directory operations.
 //
 // All operations are synchronous and blocking. Fallible calls return their value or an Error shape
-// (`{ "type": "error", "message": ... }`) that you narrow with `is Error`; the predicates exists /
-// isFile / isDir / isSymlink are total and return a plain Boolean. The `opts` Json argument on
-// ls / mkdir / rm / writeJson selects a variant (`{ "recursive": true }`, `{ "parents": true }`,
-// `{ "compact": true }`). For incremental reads, openRead returns a lazy byte Stream that
-// std/stream builds its adapters on.
+// (`{ "type": "error", "message": ... }`) that you narrow with `is Error`; the predicates exists,
+// isFile, isDir, and isSymlink are total and return a plain Boolean. The `opts` Json argument on
+// ls, mkdir, rm, and writeJson selects a variant via keys such as `{ recursive }`, `{ parents }`,
+// or `{ compact }`. For incremental reads, openRead returns a lazy byte stream.
 //
 // import { readFile, writeFile, readJson, ls, mkdir, exists, isFile, isDir } from "std/fs"
 import foreign "lin-runtime"
@@ -79,7 +78,7 @@ export val readJson = (path: String): Json =>
 // Serialise `value` to JSON and write it to `path`, truncating any existing file.
 // @param path  the file to write.
 // @param value  the Json value to serialise.
-// @param opts  optional; pass `{ "compact": true }` for minified output (default is pretty-printed).
+// @param opts  accepts `{ compact }`; when true, output is minified rather than pretty-printed.
 // @returns Null on success, or an Error if the write fails.
 // @example writeJson("config.json", { "version": 2 }, { "compact": true })
 export val writeJson = (path: String, value: Json, opts: Json): Json =>
@@ -110,8 +109,8 @@ export val isDir = (path: String): Boolean =>
 
 // Read filesystem metadata for `path`, following symlinks by default (reports the target).
 // @param path  the path to stat.
-// @param opts  optional; `{ "follow": false }` reports the final symlink itself (equivalent to
-//   `lstat`). One-argument calls keep following.
+// @param opts  accepts `{ follow }`, default true; `{ follow: false }` reports the final symlink
+//   itself rather than following it (equivalent to `lstat`).
 // @returns a Json metadata object, or an Error if the path cannot be read. The object carries
 //   `size` (bytes), `modified`/`created` (Unix ms), `isFile`, `isDir`, and `mode` (Unix perm bits).
 // @example stat("main.lin")["size"]   // file size in bytes
@@ -125,7 +124,7 @@ export val stat = (path: String, opts: Json = null): Json =>
 
 // List the entries of a directory.
 // @param path  the directory to list.
-// @param opts  optional; `{ "recursive": true }` walks the whole tree (default lists one level).
+// @param opts  accepts `{ recursive }`; when true, walks the whole tree instead of one level.
 // @returns an array of entry paths, or an Error if `path` cannot be read.
 // @example ls("src", {})                       // one level
 // @example ls("src", { "recursive": true })    // whole tree, relative paths
@@ -139,7 +138,7 @@ export val ls = (path: String, opts: Json): Json =>
 
 // Create the directory `path`.
 // @param path  the directory to create.
-// @param opts  optional; `{ "parents": true }` creates missing parent directories too (and
+// @param opts  accepts `{ parents }`; when true, creates missing parent directories too (and
 //   succeeds if the directory already exists).
 // @returns Null on success, or an Error (e.g. a missing parent without `parents`).
 // @example mkdir("output", {})
@@ -154,7 +153,7 @@ export val mkdir = (path: String, opts: Json): Json =>
 
 // Remove the file or directory at `path`.
 // @param path  the path to remove.
-// @param opts  optional; `{ "recursive": true }` removes a directory and its contents (a
+// @param opts  accepts `{ recursive }`; when true, removes a directory and its contents (a
 //   non-recursive call on a non-empty directory is an Error).
 // @returns Null on success, or an Error.
 // @example rm("temp.txt", {})
@@ -201,7 +200,6 @@ export val writeFileBytes = (path: String, bytes: UInt8[]): Json =>
 export val writeLines = (path: String, lines: String[]): Json =>
   lin_fs_write_lines(path, lines)
 
-// --- std/fs extras (fs-extras proposal): glob, temp files/dirs, chmod, symlinks, touch, realpath.
 // Expand a shell-glob pattern (`**`/`*`/`?`/`[…]`) to the matching paths, sorted.
 // @param pattern  the glob pattern.
 // @returns a sorted String[] of matches (an empty array when nothing matches — not a fault), or
@@ -209,9 +207,9 @@ export val writeLines = (path: String, lines: String[]): Json =>
 export val glob = (pattern: String): String[] | Error =>
   lin_fs_glob(pattern)
 
-// Create a unique, empty 0600 temp file and return its absolute path. Performs NO cleanup (delete
+// Create a unique, empty 0600 temp file and return its absolute path. Performs no cleanup (delete
 // it with `rm`); prefer withTempFile unless the file must outlive a single lexical scope.
-// @param opts  optional; may carry `{ "prefix": "...", "suffix": ".ext" }` for the generated name.
+// @param opts  accepts `{ prefix, suffix }` to shape the generated name (e.g. a `.ext` suffix).
 // @returns the new file's absolute path, or an Error if it cannot be created.
 export val tempFile = (opts: Json): String | Error =>
   if opts == null then
@@ -221,9 +219,9 @@ export val tempFile = (opts: Json): String | Error =>
     val suffix = if opts["suffix"] == null then "" else opts["suffix"]
     lin_fs_temp_file(prefix, suffix)
 
-// Create a unique temp directory and return its absolute path. Performs NO cleanup (delete it with
+// Create a unique temp directory and return its absolute path. Performs no cleanup (delete it with
 // `rm(dir, { "recursive": true })`); prefer withTempDir for scoped use. Distinct from
-// `std/process.tempDir`, which reports the system temp LOCATION and creates nothing.
+// `std/process.tempDir`, which reports the system temp location and creates nothing.
 // @returns the new directory's absolute path, or an Error if it cannot be created.
 export val tempDir = (): String | Error =>
   lin_fs_temp_dir()
@@ -270,7 +268,7 @@ export val chmod = (path: String, mode: Int32): Null | Error =>
 export val symlink = (target: String, linkPath: String): Null | Error =>
   lin_fs_symlink(target, linkPath)
 
-// Read the target string stored in a symbolic link (verbatim, NOT resolved — use realpath for that).
+// Read the target string stored in a symbolic link (verbatim, not resolved — use realpath for that).
 // @param path  the symlink to read.
 // @returns the stored target String, or an Error if `path` is not a symlink or does not exist.
 export val readlink = (path: String): String | Error =>
@@ -283,7 +281,7 @@ export val readlink = (path: String): String | Error =>
 export val isSymlink = (path: String): Boolean =>
   lin_fs_is_symlink(path)
 
-// Read filesystem metadata for `path` WITHOUT following a final symlink (reports the link itself,
+// Read filesystem metadata for `path` without following a final symlink (reports the link itself,
 // with `isSymlink: true`). Exactly `stat(p, { "follow": false })`.
 // @param path  the path to stat.
 // @returns a Json metadata object, or an Error if the path cannot be read.
@@ -304,8 +302,8 @@ export val touch = (path: String): Null | Error =>
 export val realpath = (path: String): String | Error =>
   lin_fs_realpath(path)
 
-// Open a file as a lazy byte Stream for incremental reading. The low-level pull surface that
-// std/stream builds its lazy adapters on (Stage 4); use readChunk / closeStream to drive it.
+// Open a file as a lazy byte stream for incremental reading. The low-level pull surface that
+// std/stream builds its lazy adapters on; use readChunk and closeStream to drive it.
 // @param path  the file to open.
 // @returns a `Stream<UInt8[]>`, or an Error if the file cannot be opened.
 export val openRead = (path: String) =>
