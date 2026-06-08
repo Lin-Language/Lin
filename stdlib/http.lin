@@ -4,7 +4,7 @@
 // shape (`{ "type": "error", ... }`) that you narrow with `is Error`. On the server side, write a
 // handler `(HttpRequest) -> HttpResponse` and pass it to `serve`; build responses with json / text
 // / redirect / badRequest / notFound, route with matchPath, and read request bodies with parseBody.
-// The handler is the FIRST argument to serve, so the dot-call form `handler.serve(port)` reads
+// The handler is the first argument to serve, so the dot-call form `handler.serve(port)` reads
 // naturally. The URL layer (Url / parse / build / join / withQuery / withPath, folded in from the
 // former std/url) splits a string into RFC 3986 components verbatim — no percent-decoding.
 //
@@ -140,17 +140,17 @@ export val serve = (handler: Json, port: Int32): Null =>
   lin_serve(handler, port)
 
 // ===== URL parsing/building (folded in from the former std/url module) =====
-// A parsed URL, split into its RFC 3986 components (each emitted/stored verbatim, NOT decoded):
+// A parsed URL, split into its RFC 3986 components (each emitted/stored verbatim, not decoded):
 //   scheme    "https"; lowercased; "" if the input was relative
 //   userinfo  raw "user:pass" between "//" and "@", undecoded; Null if absent
 //   host      "example.com", "[::1]"; "" if no authority
-//   port      443; Null if absent (scheme defaults are NOT filled in)
+//   port      443; Null if absent (scheme defaults are not filled in)
 //   path      "/a/b"; raw, percent-encoding preserved
-//   query     raw, WITHOUT the leading "?"; Null if absent
-//   fragment  raw, WITHOUT the leading "#"; Null if absent
+//   query     raw, without the leading "?"; Null if absent
+//   fragment  raw, without the leading "#"; Null if absent
 export type Url = { "scheme": String, "userinfo": String | Null, "host": String, "port": Int32 | Null, "path": String, "query": String | Null, "fragment": String | Null }
 
-// Parse `s` as an RFC 3986 URI (or relative reference). Components are split, NOT decoded.
+// Parse `s` as an RFC 3986 URI (or relative reference). Components are split, not decoded.
 // @param s  the URL string.
 // @returns the parsed `Url`, or an `Error` if `s` violates the generic URI syntax.
 export val parse = (s: String): Url | Error =>

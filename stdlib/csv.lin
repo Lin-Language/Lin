@@ -1,25 +1,10 @@
 // std/csv — RFC 4180 CSV reader and writer.
 //
-// A CSV document is a sequence of records, each a sequence of String fields. std/csv never
-// coerces field values — every field is a String (CSV has no types). Quoted fields, embedded
-// delimiters/newlines, and the `""` quote-escape are all handled per RFC 4180. The eager API
-// (`parse`/`parseWithHeader`/`stringify`/`stringifyRecords`) is a PURE-LIN state machine; the
-// streaming API (`rows`/`recordRows`) is a quote-aware row assembler over a byte Stream.
-//
-// SCANNING: the structural delimiters (`,` `"` `\r` `\n` and a single-codepoint custom delimiter)
-// are ASCII, and an ASCII byte (< 0x80) never collides with a UTF-8 continuation byte. So the
-// parser scans RAW BYTES with the O(1) `byteAt` and slices fields by byte offset via `substring`
-// (each slice then decodes as valid UTF-8 as a whole). `std/string.lengthBytes` is the BYTE length
-// (also O(1)), so the scan bound and the slice offsets live in the same byte-index space — the
-// parser is O(n), not the O(n²) trap a `codePointAt`-driven scan would be (see std/string.byteAt).
-//
-// TCO-BUG WORKAROUND: a tail-recursive function that returns an owned array PARAM on one terminal
-// branch and an OBJECT on another corrupts its output (the TCO owned-param release bug, being fixed
-// separately). To sidestep it, the recursive record scanner ALWAYS returns ONE consistent object
-// shape — a cursor `{ "fields": String[], "pos": Int32, "ok": Boolean }` — and signals a malformed
-// field through the `ok` flag (a separate channel), never returning a bare array on one branch and
-// an Error object on another. The canonical `Error` value is built only in the NON-recursive outer
-// `parse` wrapper.
+// A CSV document is a sequence of records, each a sequence of String fields. Field values are
+// never coerced — every field is a String, since CSV has no types. Quoted fields, embedded
+// delimiters and newlines, and the `""` quote-escape are all handled per RFC 4180. The eager API
+// (`parse`/`parseWithHeader`/`stringify`/`stringifyRecords`) reads a whole document at once; the
+// streaming API (`rows`/`recordRows`) is a quote-aware row assembler over a byte stream.
 import { push, length } from "std/array"
 import { for, range, map, while } from "std/iter"
 import { keys } from "std/object"
@@ -80,7 +65,7 @@ val trimAsciiWs = (s: String): String =>
   substring(s, start, end)
 
 // ── the field scanner ────────────────────────────────────────────────────────
-// Parse ONE field starting at byte `pos`. Returns a cursor object (ALWAYS this one shape):
+// Parse one field starting at byte `pos`. Returns a cursor object (always this one shape):
 //   { "value": String, "pos": Int32, "ok": Boolean }
 // `pos` on return points at the delimiter / CR / LF / EOF that terminates the field. `ok` is false
 // only for a malformed field (a stray `"` in an unquoted field, or EOF inside a quoted field).
@@ -226,12 +211,12 @@ val scanRows = (rows: Json[], s: String, n: Int32, pos: Int32, delim: Int32, tri
       scanRows(rows, s, n, rec["pos"], delim, trim)
 
 // Parse a CSV document into positional records (a list of rows, each a list of String fields).
-// Quoted fields, embedded delimiters/newlines, and the `""` quote-escape are handled per RFC 4180;
-// fields are never coerced (every field is a String).
+// Quoted fields, embedded delimiters and newlines, and the `""` quote-escape are handled per
+// RFC 4180; fields are never coerced, so every field is a String.
 // @param s     the CSV text.
-// @param opts  optional `{ "delimiter": String, "trim": Boolean }`; delimiter defaults to `,` and
-//              must be a single character that is not `"`, CR, or LF; trim strips leading/trailing
-//              ASCII spaces/tabs from unquoted fields.
+// @param opts  accepts `{ delimiter, trim }`. `delimiter` defaults to `,` and must be a single
+//              character that is not `"`, CR, or LF; `trim`, when true, strips leading and trailing
+//              ASCII spaces and tabs from unquoted fields.
 // @returns the parsed rows, or an Error on an invalid delimiter option or malformed input (an
 //          unterminated quoted field or a stray quote).
 // @example parse("a,b\n1,2")  // [["a", "b"], ["1", "2"]]
@@ -349,10 +334,10 @@ val renderRow = (row: Json, delim: Int32, sep: String): String =>
   val cells: String[] = row.map(field => renderField(field, delim))
   join(cells, sep)
 
-// Serialize positional rows to a CSV document. Each field is quoted iff it contains the delimiter,
-// a `"`, a CR, or an LF (embedded `"` doubled); rows are LF-terminated.
+// Serialize positional rows to a CSV document. A field is quoted only when it contains the
+// delimiter, a `"`, a CR, or an LF (embedded `"` is doubled); rows are LF-terminated.
 // @param rows  the rows to render (each a list of String fields).
-// @param opts  optional `{ "delimiter": String }`; delimiter defaults to `,`.
+// @param opts  accepts `{ delimiter }`; the delimiter defaults to `,`.
 // @returns the CSV text, or "" for no rows.
 export val stringify = (rows: String[][], opts: Json = {  }): String =>
   val delim = optDelimByte(opts)
@@ -409,10 +394,9 @@ val appendRecordRows = (records: Json, header: String[], rows: Json[], i: Int32,
 // Serialize keyed records to a CSV document with a header row. The header is the union of all keys
 // across all records; a record missing a column emits an empty field.
 // @param records  the records to render.
-// @param opts     optional `{ "delimiter": String }`; delimiter defaults to `,`.
-// @returns the CSV text (header line first), or "" for no records. NOTE: column order follows the
-//          runtime map's key-iteration order (deterministic, but not necessarily first-seen — see
-//          the collectKeys note below).
+// @param opts     accepts `{ delimiter }`; the delimiter defaults to `,`.
+// @returns the CSV text (header line first), or "" for no records. Column order follows the
+//          record map's key-iteration order — deterministic, but not necessarily first-seen.
 export val stringifyRecords = (records: { String: String }[], opts: Json = {  }): String =>
   val total = length(records)
   if total == 0 then
@@ -429,35 +413,30 @@ export val stringifyRecords = (records: { String: String }[], opts: Json = {  })
     stringify(rows, opts)
 
 // ── streaming adapters ────────────────────────────────────────────────────────
-// A quote-aware row assembler CANNOT be a stateless `.lines().map(...)`: a single quoted field may
-// contain a newline and span several physical lines, so a line-stream is not row-aligned. It is a
-// genuine stream node with carry-over state (the partial-record byte buffer and the in-quote flag)
-// — the same family as `lines`/`chunks` — so it lives in the runtime (`lin_stream_csv_rows`), which
-// reframes a `Stream<UInt8[]>` into a `Stream<String[]>`. An unterminated quote at EOF surfaces
-// in-band as an Error at the terminal; the in-flight buffer is capped (64 MiB) like `linesMax`.
+// The streaming row assembler is quote-aware: a single quoted field may contain a newline and span
+// several physical lines, so it carries over a partial-record buffer and an in-quote flag between
+// chunks rather than splitting on line boundaries. An unterminated quote at end of input surfaces
+// as an Error at the terminal; the in-flight buffer is capped at 64 MiB.
 import foreign "lin-runtime"
   val lin_stream_csv_rows: (Stream, Int32) => Stream
 
 // Lazily parse a byte stream into a stream of CSV rows (`String[]` per row), quote-aware so a
-// quoted field may span newlines without splitting the row. Bounded memory; a malformed (e.g.
-// unterminated-quote) input surfaces as an `Error` at the terminal.
+// quoted field may span newlines without splitting the row. Memory is bounded; a malformed input
+// (such as an unterminated quote) surfaces as an `Error` at the terminal.
 // @param src  the source byte stream (e.g. from `readStream`).
-// @param opts  optional `{ delimiter, trim }` (delimiter defaults to ",").
-// @returns a `Stream` of `String[]` rows.
-export val rows = (src: Stream, opts: Json = {  }): Stream =>
-  // The streaming FSM is a runtime adapter (a Stream node with carry-over state can't be built in
-  // pure Lin), mirroring the eager scanner's RFC 4180 rules.
+// @param opts  accepts `{ delimiter, trim }`; the delimiter defaults to ",".
+// @returns a `Stream<String[]>` of rows.
+export val rows = (src: Stream<UInt8[]>, opts: Json = {  }): Stream<String[]> =>
   lin_stream_csv_rows(src, optDelimByte(opts))
 
 import foreign "lin-runtime"
   val lin_stream_csv_records: (Stream, Int32) => Stream
 
 // Lazily parse a byte stream into a stream of keyed records, using the first row as the header.
-// Each subsequent row becomes a `{ String: String }` keyed by the header columns.
+// Each subsequent row becomes a record keyed by the header columns. The header is consumed on the
+// first pull and held for the life of the pipeline.
 // @param src  the source byte stream.
-// @param opts  optional `{ delimiter, trim }` (delimiter defaults to ",").
-// @returns a `Stream` of `{ String: String }` records.
-export val recordRows = (src: Stream, opts: Json = {  }): Stream =>
-  // Runtime adapter: the header is consumed on the first pull and held for the pipeline's life
-  // (peeling it lazily in pure Lin would need a stateful Stream node).
+// @param opts  accepts `{ delimiter, trim }`; the delimiter defaults to ",".
+// @returns a `Stream` yielding `{ String: String }` records.
+export val recordRows = (src: Stream<UInt8[]>, opts: Json = {  }): Stream =>
   lin_stream_csv_records(src, optDelimByte(opts))

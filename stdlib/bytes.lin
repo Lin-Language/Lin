@@ -12,11 +12,6 @@
 // returns a freshly allocated `UInt8[]`; each `*From*` reads at a byte offset into an existing
 // buffer. The endianness suffix controls byte order: `Be` writes the most-significant byte
 // first, `Le` the least-significant byte first.
-//
-// Maintainer note: built on §35.1 (UInt8[] packed byte buffers), §35.2 (bitwise operators),
-// the explicit narrowing casts from std/number (§26), and the float bit-reinterpret intrinsics
-// declared below (a float's bit pattern cannot be obtained by shift-and-mask, so those four are
-// runtime intrinsics).
 import { slice as arraySlice } from "std/array"
 import { toUInt8, toUInt16, toUInt32, toUInt64 } from "std/number"
 
@@ -175,10 +170,10 @@ export val u64ToLe = (v: UInt64): UInt8[] =>
   out
 
 // --- float bit reinterpret -------------------------------------------------
-// `f32ToBits`/`f64ToBits` expose the raw IEEE-754 bit pattern of a float (and the `*FromBits`
+// `f32ToBits` and `f64ToBits` expose the IEEE-754 bit pattern of a float (with the `*FromBits`
 // inverses) without going through a byte buffer — the only way to inspect those bits, since a
 // float's bit pattern cannot be obtained by shift-and-mask.
-// Reinterpret the bit pattern of a Float32 as a UInt32 (IEEE-754 raw bits).
+// Reinterpret the bit pattern of a Float32 as a UInt32 (IEEE-754 bits).
 // @param f  the float.
 // @returns the 32-bit pattern of `f`.
 export val f32ToBits = (f: Float32): UInt32 =>
@@ -190,7 +185,7 @@ export val f32ToBits = (f: Float32): UInt32 =>
 export val f32FromBits = (u: UInt32): Float32 =>
   lin_f32_from_bits(u)
 
-// Reinterpret the bit pattern of a Float64 as a UInt64 (IEEE-754 raw bits).
+// Reinterpret the bit pattern of a Float64 as a UInt64 (IEEE-754 bits).
 // @param f  the double.
 // @returns the 64-bit pattern of `f`.
 // @example f64ToBits(1.0)                  // 0x3FF0000000000000

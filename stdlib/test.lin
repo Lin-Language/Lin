@@ -2,7 +2,7 @@
 //
 //   import { suite, test, run, expect } from "std/test"
 //
-// A test body RETURNS an array of assertions (`Assertion[]`) — even a single assertion is written
+// A test body returns an array of assertions (`Assertion[]`) — even a single assertion is written
 // `[ expect(...).toBe(...) ]`. The array requirement is type-enforced, which is what guarantees
 // every assertion is actually evaluated. Build tests with `test(name, () => [...])`, group them
 // with `suite(name, tests)`, then run them: `run` prints a summary and `exit(1)`s if any test
@@ -17,8 +17,8 @@
 // eagerly as the suite array is built); statements after `report(suite)` are "afterAll";
 // `withFixture(setup, teardown, name, body)` is per-test "beforeEach/afterEach" with dependency
 // injection — compose it via partial application, e.g. `val withDb = withFixture(openDb, closeDb,)`.
-// Mocking is the test-only `replace <name> = <expr>` statement (see std-level docs / the Testing
-// tutorial), permitted only in a `*.test.lin`.
+// Mocking is the test-only `replace <name> = <expr>` statement (see the Testing tutorial),
+// permitted only in a `*.test.lin`.
 import { print } from "std/io"
 import { toString, join, split } from "std/string"
 import { length } from "std/array"
@@ -181,7 +181,7 @@ val _isSelected = (name: String): Boolean =>
 // @param body  a thunk returning an `Assertion[]` (use the `[ expect(...).toBe(...), ... ]` form,
 //   even for a single assertion); every assertion is evaluated and the test fails if any fails.
 // @returns a result record. When `--filter-test` (via LIN_TEST_ONLY) did not select this test, the
-//   body is NOT evaluated (no side effects, no fixture setup/teardown) and a `{ "type": "skip" }`
+//   body is not evaluated (no side effects, no fixture setup/teardown) and a `{ "type": "skip" }`
 //   sentinel is produced, which `report` counts as neither pass nor fail.
 export val test = (name: String, body: () => Json[]): Json =>
   if _isSelected(name) then
@@ -191,13 +191,13 @@ export val test = (name: String, body: () => Json[]): Json =>
   else
     { "type": "skip", "name": name }
 
-// Run a test with per-test setup/teardown and dependency injection (ADR-046): build a fixture,
-// inject it into the body, and tear it down — all within a single `test`. The functional
-// alternative to keyword beforeEach/afterEach; compose via partial application into a per-fixture
-// helper, e.g. `val withDb = withFixture(openDb, closeDb,)`, then `withDb("name", db => [ ... ])`.
+// Run a test with per-test setup/teardown and dependency injection: build a fixture, inject it into
+// the body, and tear it down — all within a single `test`. The functional alternative to keyword
+// beforeEach/afterEach; compose via partial application into a per-fixture helper, e.g.
+// `val withDb = withFixture(openDb, closeDb,)`, then `withDb("name", db => [ ... ])`.
 // @param setup     builds the fixture value.
 // @param teardown  releases the fixture; always runs, even when the body's assertions fail (because
-//   assertion failures are VALUES, not exceptions).
+//   assertion failures are values, not exceptions).
 // @param name      the test name.
 // @param body      receives the fixture and returns an `Assertion[]`.
 // @returns the test result record (same as `test`).
@@ -248,7 +248,7 @@ val _reportJsonResult = (r: Json): Null =>
         "##LINTEST## {\"event\":\"test\",\"name\":${toJsonString(r["name"])},\"status\":\"fail\",\"message\":${toJsonString(joined)},\"ms\":${toString(r["ms"])}}"
       )
 
-// Print a suite's results and return the failure count. Unlike `run`, does NOT call `exit`, so
+// Print a suite's results and return the failure count. Unlike `run`, does not call `exit`, so
 // statements after it run regardless of outcome — the building block for guaranteed afterAll
 // teardown: `val failures = report(s); cleanup(); if failures > 0 then exit(1)`.
 // @param s  the suite from `suite`.
