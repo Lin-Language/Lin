@@ -13909,6 +13909,41 @@ print(if people[0]["gone"] == null then "elem-absent" else "elem-present")
 }
 
 #[test]
+fn test_boxed_record_array_fused_field_read() {
+    // BoxedArrayFieldGet fusion (perf/token-alloc): `arr[i].field` / `arr[i]["field"]` over a BOXED
+    // `Object[]` whose element is a sealed record WITH HEAP FIELDS (a `Token` = two Strings) — the
+    // calc/interp tokenizer shape. Such an array is NOT a packed sealed-scalar array (the gate rejects
+    // heap-field elements), so it stays a boxed `Object[]`. The lowerer fuses the index+field read to a
+    // single borrowed `lin_array_get` + `lin_object_get` instead of MATERIALIZING the whole element
+    // into a fresh sealed struct (alloc + read every field + per-field retain + reload + release) per
+    // access. This asserts the fused read is behaviorally correct: every field reads back its true
+    // value through both `["field"]` and the helper-typed path, push grows the array, length is right,
+    // and an out-of-bounds guard still returns the sentinel. (RC soundness — no UAF/leak — is verified
+    // separately under ASan; this is the behavioral gate.)
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+type Token = { "kind": String, "text": String }
+val build = (): Token[] =>
+  var t: Token[] = []
+  push(t, { "kind": "num", "text": "42" })
+  push(t, { "kind": "op", "text": "+" })
+  push(t, { "kind": "num", "text": "7" })
+  t
+val kindAt = (toks: Token[], pos: Int32): String =>
+  if pos >= length(toks) then "eof" else toks[pos]["kind"]
+val toks = build()
+print("${length(toks)}")
+print("${kindAt(toks, 0)} ${toks[0]["text"]}")
+print("${kindAt(toks, 1)} ${toks[1]["text"]}")
+print("${kindAt(toks, 2)} ${toks[2]["text"]}")
+print(kindAt(toks, 9))
+"#);
+    assert_eq!(out, vec!["3", "num 42", "op +", "num 7", "eof"]);
+}
+
+#[test]
 fn test_sealed_boundary_projection_drops_extras_source_untouched() {
     // (b) A wider Json/anonymous literal with an EXTRA field passed to a sealed-scalar param: the
     // param sees only its own fields (extras dropped in the projecting copy), and the ORIGINAL

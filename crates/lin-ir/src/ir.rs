@@ -385,6 +385,17 @@ pub enum Instruction {
     /// loads the scalar directly. `arr_ty` is the `Array(elem)` type (so codegen recovers the
     /// element fields/stride); `result_ty` is the field's type. Sound only for SCALAR fields (no RC).
     SealedArrayFieldGet { dst: Temp, array: Temp, index: Temp, field: String, arr_ty: Type, result_ty: Type },
+    /// result = (BOXED `Object[]` array)[index][field] — a single field read of one element of a
+    /// BOXED array whose element is a sealed/typed record stored as a heap `LinObject` (the boxed
+    /// `Token[]` representation: a record with heap fields, NOT a packed sealed-scalar array).
+    /// Codegen reads the BORROWED element box via `lin_array_get` (no fresh box, no per-element
+    /// sealed materialization), unboxes to the raw `LinObject`, does the single `lin_object_get` for
+    /// `field`, then unboxes/coerces to `result_ty`. The lowerer registers `dst` owned (a `Retain`
+    /// follows for an RC `result_ty`), matching the materialize-then-read path it replaces. Avoids
+    /// the alloc + 2-field read + 2 retains + reload + release the generic `arr[i]` sealed projection
+    /// pays per access in a hot parser loop. `arr_ty` is the `Array(elem)` type; `result_ty` is the
+    /// field's type.
+    BoxedArrayFieldGet { dst: Temp, array: Temp, index: Temp, field: String, arr_ty: Type, result_ty: Type },
     /// result = env[index]  — load a captured value from a closure's environment struct
     /// (raw pointer load at byte offset 8 + index*8), NOT a Lin object field access.
     EnvCapture { dst: Temp, env: Temp, index: u32, ty: Type },
