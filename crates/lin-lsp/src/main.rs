@@ -2604,6 +2604,254 @@ fn quoted_path_range(source: &str, stmt_span: lin_common::Span, path: &str) -> O
     })
 }
 
+// ── doc comments (JSDoc-like `//` blocks) ──────────────────────────────────────
+//
+// The stdlib (and user code) documents declarations with a contiguous block of own-line `//`
+// comments directly above an `export val`/`export type` (or any `val`/`var`/`type`). Tags follow a
+// JSDoc-like convention:
+//   - bare prose lines           → free-form description (joined into a paragraph);
+//   - `@param <name>  <desc>`    → one parameter entry (ordered);
+//   - `@returns <desc>`          → the return description;
+//   - `@example <code>`          → an example snippet (rendered in a ```lin fence);
+//   - `// ── Title ──` banners    → decorative section headers; NOT part of a decl's doc, so they
+//                                    terminate a leading block (a banner is never a doc line).
+//
+// This is the SINGLE extract + render path used by hover, completion, and signature help. The raw
+// extraction (`extract_doc`) mirrors the formatter's leading-comment attachment rule (own-line
+// comments immediately preceding the decl, no blank-line gap) and gen-stdlib's "stop at the first
+// blank/code/banner line" behaviour; the parse + render (`DocComment` / `render_doc_markdown`)
+// mirror gen-stdlib's `renderDocLine` markdown conventions so editor hovers match the docs site.
+
+/// A parsed JSDoc-like doc comment, separated into its constituent pieces. Any piece may be empty:
+/// a block with no `@`-tags is just `description`; a block with no prose has an empty `description`.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct DocComment {
+    /// Free-form leading prose lines (in order), each already stripped of its `//` prefix.
+    description: Vec<String>,
+    /// `@param <name> <desc>` entries, in source order.
+    params: Vec<(String, String)>,
+    /// `@returns <desc>` (the LAST one wins if repeated; rare).
+    returns: Option<String>,
+    /// `@example <code>` snippets, in source order.
+    examples: Vec<String>,
+}
+
+impl DocComment {
+    /// True when nothing was captured — used by callers to fall back to non-doc behaviour.
+    fn is_empty(&self) -> bool {
+        self.description.iter().all(|l| l.trim().is_empty())
+            && self.params.is_empty()
+            && self.returns.is_none()
+            && self.examples.is_empty()
+    }
+
+    /// The `@param` description for `name`, if any (used by signature help).
+    fn param_doc(&self, name: &str) -> Option<&str> {
+        self.params.iter().find(|(n, _)| n == name).map(|(_, d)| d.as_str())
+    }
+
+    /// The description joined into a single paragraph string (blank lines separate paragraphs).
+    fn description_text(&self) -> String {
+        let mut paras: Vec<String> = Vec::new();
+        let mut cur: Vec<&str> = Vec::new();
+        for line in &self.description {
+            if line.trim().is_empty() {
+                if !cur.is_empty() {
+                    paras.push(cur.join(" "));
+                    cur.clear();
+                }
+            } else {
+                cur.push(line.trim());
+            }
+        }
+        if !cur.is_empty() {
+            paras.push(cur.join(" "));
+        }
+        paras.join("\n\n")
+    }
+}
+
+/// Strip the leading `//` (and at most one following space) from a captured comment's `text`.
+/// `lin_lex::Comment.text` retains the `//` prefix (right-trimmed), so e.g. `"// foo"` → `"foo"`,
+/// `"//foo"` → `"foo"`, `"//"` → `""`.
+fn strip_comment_prefix(text: &str) -> &str {
+    let t = text.trim_start();
+    let rest = t.strip_prefix("//").unwrap_or(t);
+    rest.strip_prefix(' ').unwrap_or(rest)
+}
+
+/// True when a (already-`//`-stripped) doc line is a decorative section banner, e.g.
+/// `── Arithmetic ──` or `--- shared tables ---`. Mirrors gen-stdlib's `isBanner`. Banners are not
+/// a declaration's documentation, so they terminate a leading block.
+fn is_doc_banner(text: &str) -> bool {
+    let t = text.trim();
+    t.contains('─') || t.starts_with("---") || t.starts_with("==")
+}
+
+/// Extract the contiguous leading block of own-line `//` comments immediately preceding the
+/// declaration whose NAME span is `decl_name_span`, lexing `source` for comments. The block is the
+/// run of own-line comment lines that end on the line just above the decl (no blank-line gap, no
+/// intervening code) — the formatter's leading-comment rule. A decorative `── … ──` banner line
+/// terminates the block from above (it documents a section, not this decl). Returns `None` when no
+/// leading comment block exists.
+fn extract_doc(source: &str, decl_name_span: lin_common::Span) -> Option<DocComment> {
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let _ = lexer.tokenize();
+    let comments: Vec<lin_lex::Comment> =
+        lexer.comments().iter().filter(|c| c.own_line).cloned().collect();
+    if comments.is_empty() {
+        return None;
+    }
+
+    // The decl's source line (0-based). The leading block must end on the line directly above it.
+    let decl_line = offset_to_position(source, decl_name_span.start as usize).line;
+
+    // Pair each own-line comment with its source line, in source order.
+    let mut commented_lines: Vec<(u32, &str)> = comments
+        .iter()
+        .map(|c| {
+            let line = offset_to_position(source, c.span.start as usize).line;
+            (line, c.text.as_str())
+        })
+        .collect();
+    commented_lines.sort_by_key(|(l, _)| *l);
+
+    // Walk UP from `decl_line - 1`: collect comment lines that are contiguous (each exactly one line
+    // above the previous), stopping at the first gap (blank line or code). A banner line also stops
+    // the block (and is not included).
+    let mut block: Vec<&str> = Vec::new();
+    let mut expected = decl_line.checked_sub(1)?;
+    loop {
+        // The comment that sits exactly on `expected`, if any.
+        let Some((_, text)) = commented_lines.iter().rev().find(|(l, _)| *l == expected) else {
+            break; // gap (blank/code): the contiguous run ends here.
+        };
+        let stripped = strip_comment_prefix(text);
+        if is_doc_banner(stripped) {
+            break; // a section banner above is not this decl's documentation.
+        }
+        block.push(text);
+        if expected == 0 {
+            break;
+        }
+        expected -= 1;
+    }
+    if block.is_empty() {
+        return None;
+    }
+    // We collected bottom-up; reverse to source order.
+    block.reverse();
+    let stripped: Vec<String> = block.iter().map(|t| strip_comment_prefix(t).to_string()).collect();
+    Some(parse_doc_block(&stripped))
+}
+
+/// Parse a block of (already-`//`-stripped) doc lines into a `DocComment`. `@param`/`@returns`/
+/// `@example` tags are recognised at the START of a line; everything else is description prose.
+/// Robust to missing pieces and to a compact mid-line `@returns` on a prose/param line (mirrors
+/// gen-stdlib's split behaviour).
+fn parse_doc_block(lines: &[String]) -> DocComment {
+    let mut doc = DocComment::default();
+    for raw in lines {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("@param") {
+            let rest = rest.trim_start();
+            // Name runs up to the first whitespace; the remainder is the description.
+            let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let name = rest[..name_end].trim().to_string();
+            let mut desc = rest[name_end..].trim().to_string();
+            // Compact style: a `@param` line may carry a trailing `@returns ...` — split it out.
+            if let Some(cut) = desc.find("@returns") {
+                let after = desc[cut..].trim_start_matches("@returns").trim().to_string();
+                desc = desc[..cut].trim().to_string();
+                if !after.is_empty() {
+                    doc.returns = Some(after);
+                }
+            }
+            if !name.is_empty() {
+                doc.params.push((name, desc));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("@returns") {
+            doc.returns = Some(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("@example") {
+            doc.examples.push(rest.trim().to_string());
+        } else if let Some(cut) = trimmed.find("@returns ") {
+            // A compact one-liner like "Sum of a and b. @returns a + b." — split prose from tag.
+            let prose = trimmed[..cut].trim();
+            let ret = trimmed[cut..].trim_start_matches("@returns").trim();
+            if !prose.is_empty() {
+                doc.description.push(prose.to_string());
+            }
+            if !ret.is_empty() {
+                doc.returns = Some(ret.to_string());
+            }
+        } else {
+            doc.description.push(line.to_string());
+        }
+    }
+    doc
+}
+
+/// Render a `DocComment` to LSP Markdown, matching the docs-site (`gen-stdlib`) conventions:
+///   - description prose as paragraphs;
+///   - a **Parameters** bullet list (`` - `name` — desc ``);
+///   - a **Returns** line;
+///   - each `@example` as a fenced ```lin code block.
+/// Sections are separated by blank lines; absent sections are omitted. Returns an empty string when
+/// the doc is empty (callers treat that as "no doc").
+fn render_doc_markdown(doc: &DocComment) -> String {
+    if doc.is_empty() {
+        return String::new();
+    }
+    let mut sections: Vec<String> = Vec::new();
+
+    let desc = doc.description_text();
+    if !desc.trim().is_empty() {
+        sections.push(desc);
+    }
+
+    if !doc.params.is_empty() {
+        let mut block = String::from("**Parameters**\n");
+        for (name, d) in &doc.params {
+            if d.trim().is_empty() {
+                block.push_str(&format!("- `{}`\n", name));
+            } else {
+                block.push_str(&format!("- `{}` — {}\n", name, d.trim()));
+            }
+        }
+        sections.push(block.trim_end().to_string());
+    }
+
+    if let Some(ret) = &doc.returns {
+        if !ret.trim().is_empty() {
+            sections.push(format!("**Returns** {}", ret.trim()));
+        }
+    }
+
+    for ex in &doc.examples {
+        if !ex.trim().is_empty() {
+            sections.push(format!("**Example**\n```lin\n{}\n```", ex.trim()));
+        }
+    }
+
+    sections.join("\n\n")
+}
+
+/// Resolve the doc comment for the symbol named `word` as seen from the file `module_id`, using the
+/// cross-file index: the symbol is resolved to its owner module + export name (the same path
+/// goto-definition/references use), then the owner's source + declaration name-span yield the
+/// leading doc block. Returns `None` for symbols with no resolvable owner/decl or no doc block.
+///
+/// Covers IMPORTED symbols (owner is another module, incl. stdlib) AND a file's OWN exports (owner
+/// is this file). Local non-exported bindings are not in the index — those are handled separately by
+/// the hover/completion handlers, which already hold the current file's source + decl span.
+fn resolve_doc_via_index(index: &WorkspaceIndex, module_id: &str, word: &str) -> Option<DocComment> {
+    let (owner, export) = index.resolve_symbol_by_name(module_id, word)?;
+    let owner_file = index.files.get(&owner)?;
+    let decl = decl_span(index, &owner, &export)?;
+    extract_doc(&owner_file.source, decl)
+}
+
 // ── signature help ─────────────────────────────────────────────────────────────
 
 /// Build signature help when `offset` sits inside a `f(…)` call's argument list. Returns `None`
@@ -3391,6 +3639,22 @@ impl WorkspaceIndex {
         // 2. The cursor is on an imported binding (or a use of it): owner is the
         //    source module + the original export name.
         if let Some(imp) = file.imports.iter().find(|i| i.local_name == word) {
+            return Some((imp.module_id.clone(), imp.export_name.clone()));
+        }
+        None
+    }
+
+    /// Resolve a bare symbol `name` as seen from the file `module_id` to its owner module +
+    /// export name, WITHOUT a cursor offset. Mirrors `resolve_symbol`'s logic (own export first,
+    /// then an imported binding) but keys off a name the caller already has (completion item /
+    /// signature-help callee). Returns `None` when the file isn't indexed or the name is neither a
+    /// local export nor an imported binding.
+    fn resolve_symbol_by_name(&self, module_id: &str, name: &str) -> Option<(String, String)> {
+        let file = self.files.get(module_id)?;
+        if file.exports.iter().any(|(n, _)| n == name) {
+            return Some((module_id.to_string(), name.to_string()));
+        }
+        if let Some(imp) = file.imports.iter().find(|i| i.local_name == name) {
             return Some((imp.module_id.clone(), imp.export_name.clone()));
         }
         None
