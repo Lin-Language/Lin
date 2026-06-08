@@ -144,6 +144,51 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.box_function, &[val.into()], "boxfn")
                     .try_as_basic_value().unwrap_basic()
             }
+            // UNBOXED SUM TYPE (unboxed-sumtype Stage 3): a Stage-eligible sum type's value is
+            // physically a `*SumNode`, NOT a `LinObject`. `box_value` is the GENERICALLY-DYNAMIC
+            // boxing entry (toString / `==` / match-discriminator `object_get` / spread / closure
+            // arg / a `sum|Null` param) — those consumers read the boxed value as a LinObject, so the
+            // node MUST be MATERIALIZED to a real boxed `LinObject` here (boxing the raw `*SumNode` as
+            // TAG_OBJECT was a latent type-confusion bug: the consumer's `object_get`/release walked a
+            // SumNode header as a LinObject → garbage discriminant / crash). The keep-packed
+            // container-store boundary (Map value slot) does NOT route through `box_value`; it emits
+            // `BoxKeepPacked` (TAG_SUMNODE) directly so only the genuinely-dynamic consumers pay the
+            // materialize. Handle BEFORE the generic Union arm (a sum type IS a `Type::Union`).
+            Type::Union(_) if Self::is_sum_type(val_ty) && val.is_pointer_value() => {
+                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let obj = self.sumnode_materialize_to_object(val, val_ty, llvm_fn);
+                self.builder.call(self.rt.box_object, &[obj.into()], "boxsumobj")
+                    .try_as_basic_value().unwrap_basic()
+            }
+            // A `sum | Null` value (e.g. a `{ String: Expr }` map read): physically EITHER a `*SumNode`
+            // or a null pointer. Materialize the node to a boxed LinObject when non-null, else box
+            // Null. Without this the generic Union arm (below) returned the raw `*SumNode` verbatim
+            // (a non-`all_objects` union), so a downstream `object_get`/match read it as a LinObject →
+            // garbage discriminant ("non-exhaustive match"). Runtime-branch on null.
+            Type::Union(_) if Self::sum_member_of_nullable_union(val_ty).is_some() && val.is_pointer_value() => {
+                let sum_ty = Self::sum_member_of_nullable_union(val_ty).unwrap();
+                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let p = val.into_pointer_value();
+                let pi = self.builder.ptr_to_int(p, self.context.i64_type(), "sumnull_p2i");
+                let is_null = self.builder.int_compare(inkwell::IntPredicate::EQ, pi, self.context.i64_type().const_zero(), "sumnull_isnull");
+                let null_bb = self.context.append_basic_block(llvm_fn, "sum_box_null");
+                let node_bb = self.context.append_basic_block(llvm_fn, "sum_box_node");
+                let merge_bb = self.context.append_basic_block(llvm_fn, "sum_box_merge");
+                self.builder.conditional_branch(is_null, null_bb, node_bb);
+                self.builder.position_at_end(null_bb);
+                let null_box = self.builder.call(self.rt.box_null, &[], "sumnull_box").try_as_basic_value().unwrap_basic();
+                let null_pred = self.builder.get_insert_block().unwrap();
+                self.builder.unconditional_branch(merge_bb);
+                self.builder.position_at_end(node_bb);
+                let obj = self.sumnode_materialize_to_object(val, &sum_ty, llvm_fn);
+                let node_box = self.builder.call(self.rt.box_object, &[obj.into()], "sumnode_box").try_as_basic_value().unwrap_basic();
+                let node_pred = self.builder.get_insert_block().unwrap();
+                self.builder.unconditional_branch(merge_bb);
+                self.builder.position_at_end(merge_bb);
+                let phi = self.builder.phi(self.context.ptr_type(AddressSpace::default()), "sum_box_phi");
+                phi.add_incoming(&[(&null_box, null_pred), (&node_box, node_pred)]);
+                phi.as_basic_value()
+            }
             // Union type — if value is a pointer, box as object (most common case).
             // If it's already a tagged pointer, return as-is.
             Type::Union(variants) => {
@@ -362,6 +407,23 @@ impl<'ctx> Codegen<'ctx> {
         raw
     }
 
+    /// KEEP-PACKED box of an unboxed sum value (`*SumNode`) into a record/object FIELD slot
+    /// (keep-packed-through-record-fields). Wraps the still-packed node by-pointer in a 16-byte
+    /// `TaggedVal(TAG_SUMNODE)` — O(1), no `lin_summat` materialize. The DISTINCT tag is what makes
+    /// this sound: the slot's release routes to `lin_sumnode_release_self` (the node's own size), not
+    /// `lin_object_release`. Borrows the inner (shell is +1); the slot's owning reference comes from
+    /// the IR `transfer_into_container`. The read-back twin is `compile_ir_unbox_keep_sumnode`, which
+    /// tag-checks before unwrapping — so a slot that was instead MATERIALIZED (TAG_OBJECT, the
+    /// fallback / cross-thread / boundary path) reads back correctly too (runtime-tag dispatch removes
+    /// the store/read static asymmetry entirely).
+    pub(crate) fn compile_ir_box_keep_sumnode(&mut self, val: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        if !val.is_pointer_value() {
+            return val;
+        }
+        self.builder.call(self.rt.box_sumnode, &[val.into()], "kp_boxsum")
+            .try_as_basic_value().unwrap_basic()
+    }
+
     pub(crate) fn compile_ir_box(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> BasicValueEnum<'ctx> {
         // Heap-box (see compile_ir_coerce) so the boxed value can safely escape.
         self.box_value(val, ty)
@@ -418,6 +480,33 @@ impl<'ctx> Codegen<'ctx> {
             // making nested-map mutation a no-op).
             Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Function { .. } | Type::Map(_) => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr.into()], "ir_uptr").try_as_basic_value().unwrap_basic()
+            }
+            // KEEP-PACKED-THROUGH-RECORD-FIELDS read into UNION/Json position: a `sum | Null` result
+            // (the safe-access `cur["node"] : Expr | Null` shape) stays a BOXED union value. If the slot
+            // holds a keep-packed `TAG_SUMNODE`, MATERIALIZE it to a real TAG_OBJECT box so the dynamic
+            // consumers (toString/eq/json, or a later `is`-narrowing match's `object_get`) see a real
+            // object — NOT a SumNode pointer they cannot interpret. A non-keep-packed box / null passes
+            // through. (A subsequent narrow into a sum PARAM re-projects the materialized box → correct.)
+            // This keeps the keep-packed STORE win while making EVERY read boundary correct + sound.
+            Type::Union(_) if Self::sum_member_of_nullable_union(ty).is_some() => {
+                let sum_ty = Self::sum_member_of_nullable_union(ty).unwrap();
+                self.sumnode_box_readback_to_object_box(tagged, &sum_ty)
+            }
+            // UNBOXED SUM TYPE (unboxed-sumtype Stage 3): unboxing a boxed Json/object into a sum-typed
+            // target is a PROJECTION back into a fresh `*SumNode` — the consumer (a SumNode param / a
+            // `match` over the packed scrutinee / a recursive eval) requires the packed repr the type
+            // implies, NOT the boxed LinObject. Without this arm the sum union fell to `_ => tagged`,
+            // returning the boxed value where a SumNode was expected → garbage tag read. Reads the
+            // discriminant + scalar/recursive-child fields from the boxed object (recursing for
+            // children). This is the read-back twin of the `box_value` sum-materialize boundary above.
+            _ if Self::is_sum_type(ty) => {
+                // KEEP-PACKED-THROUGH-RECORD-FIELDS read-back: `sumnode_project_from_boxed` tag-dispatches
+                // on the boxed value — a keep-packed `TAG_SUMNODE` (cursor zero-copy store) is unwrapped
+                // to the still-packed `*SumNode` (+retain, zero copy); a materialized `TAG_OBJECT` is
+                // projected into a fresh node. Sound with NO static store/read agreement. (`ty` is a
+                // union here, so the tag probe is on a genuine box.)
+                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                self.sumnode_project_from_boxed(tagged, ty, ty, llvm_fn)
             }
             Type::Null => ptr_ty.const_null().into(),
             _ => tagged, // pass through for union/unknown
