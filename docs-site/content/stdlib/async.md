@@ -18,13 +18,6 @@ detectable); WORKERS, being single-threaded, may close over `var`.
 give opt-in shared MUTABLE state safe across threads; `frozen` deep-freezes a value into
 lock-free read-only state any thread can share without copying.
 
-`async` runs thunk `f` concurrently and returns an opaque `Promise<T>` handle; resolve it with
-`await` (the value materialises only at the await site, where any fault is injected as an
-`Error`). Example:
-
-  val p = async(() => expensiveComputation())   // ... do other work ...
-  match await(p) is Error => print("failed") else => print("${await(p)}")
-
 ## Reference
 
 #### `async`
@@ -33,6 +26,12 @@ lock-free read-only state any thread can share without copying.
 val async = (f: Json): Json
 ```
 
+`async` runs thunk `f` concurrently and returns an opaque `Promise<T>` handle; resolve it with
+`await` (the value materialises only at the await site, where any fault is injected as an
+`Error`). Example:
+
+  val p = async(() => expensiveComputation())   // ... do other work ...
+  match await(p) is Error => print("failed") else => print("${await(p)}")
 
 #### `await`
 

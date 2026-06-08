@@ -7630,6 +7630,28 @@ fn fmt(source: &str) -> String {
     lin_parse::Formatter::with_comments(source, comments).format_module(&module)
 }
 
+#[test]
+fn test_fmt_preserves_blank_line_between_leading_comments() {
+    // A blank line the author leaves BETWEEN two leading comment lines is preserved (one blank;
+    // runs collapse to one) — so a module-header comment block stays visually separated from the
+    // doc comment of the first declaration, instead of being glued into one block. This is what
+    // lets the docs generator tell the page intro apart from the first function's doc.
+    let src = "// module header line 1\n// module header line 2\n\n// doc for foo\nval foo = (n: Int32): Int32 =>\n  n + 1\n";
+    let out = fmt(src);
+    assert_eq!(out, src, "blank line between leading comments must be preserved");
+    // Idempotent.
+    assert_eq!(fmt(&out), out, "formatter not idempotent");
+
+    // A run of 2+ blank lines between comments collapses to exactly one.
+    let runs = "// a\n\n\n\n// b\nval x = (): Int32 =>\n  1\n";
+    let collapsed = "// a\n\n// b\nval x = (): Int32 =>\n  1\n";
+    assert_eq!(fmt(runs), collapsed, "blank-line run must collapse to one");
+
+    // No blank between comments stays no blank (the common doc-comment-on-its-decl case).
+    let glued = "// header\n// doc\nval y = (): Int32 =>\n  2\n";
+    assert_eq!(fmt(glued), glued, "adjacent comments must stay adjacent");
+}
+
 // ── Formatter must never change program meaning ───────────────────────────────
 // The formatter rebuilds source from the AST, which discards parentheses and the
 // generic `<T>` list. If it doesn't re-emit them correctly the formatted code can

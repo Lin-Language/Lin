@@ -149,16 +149,33 @@ fn in_arg_position() -> bool {
 }
 
 /// Leading comments for `anchor_start`, rendered as `"{ind}{text}\n"` lines (joined), or empty.
+/// A blank line the author left BETWEEN two consecutive leading comments is preserved as exactly
+/// one blank line (runs of blanks collapse to one) — the same single-blank policy Rule 2 applies
+/// between statements. This lets a module-header comment block stay visually separated from the
+/// doc comment of the first declaration below it, instead of being glued into one block.
 fn take_leading(anchor_start: u32, ind: &str) -> String {
     CTX.with(|c| {
         let c = c.borrow();
         match c.leading.get(&anchor_start) {
             Some(cs) if !cs.is_empty() => {
                 let mut out = String::new();
+                let mut prev_line: Option<usize> = None;
                 for cm in cs {
+                    let line = LINE_STARTS.with(|ls_c| {
+                        let ls = ls_c.borrow();
+                        if ls.is_empty() { 0 } else { line_of(&ls, cm.span.start as usize) }
+                    });
+                    // A source gap of >1 line between this comment and the previous one means the
+                    // author left a blank line there; reproduce a single blank line.
+                    if let Some(p) = prev_line {
+                        if line > p + 1 {
+                            out.push('\n');
+                        }
+                    }
                     out.push_str(ind);
                     out.push_str(&cm.text);
                     out.push('\n');
+                    prev_line = Some(line);
                 }
                 out
             }

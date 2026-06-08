@@ -127,21 +127,21 @@ val genModule = (modName: String, source: String): String =>
   push(out, "# std/${modName}")
   push(out, "")
 
-  // 1. Module header comment block: the contiguous comment/blank lines at the very top, ending at
-  // the first real code line (import/export). The convention (enforced by a blank line after the
-  // header in every module) is that this whole block is the page intro; `headerEnd` is the first
-  // code line, so the body walk in step 2 starts there and never re-reads the header as a doc block.
+  // 1. Module header comment block: the comment lines at the very top, ending at the FIRST blank
+  // line or the first real code line (whichever comes first). Module headers use bare `//` for
+  // internal paragraph breaks (never a true empty line), so a blank line marks the end of the
+  // header — and separates it from the doc comment of the first declaration, which then belongs to
+  // that declaration (handled by the body walk in step 2), not the page intro.
   var inHeader = true
   var headerEnd = 0
   var idx = 0
   lines.for(line =>
     if inHeader then
-      if isComment(line) then
-        // renderDocLine so that when a first-export doc folds into the header (modules whose top
-        // comment block runs straight into an export), its @param/@returns render rather than leak.
+      if isBlank(line) then
+        inHeader = false
+        headerEnd = idx
+      else if isComment(line) then
         push(out, renderDocLine(stripComment(line)))
-      else if isBlank(line) then
-        push(out, "")
       else
         inHeader = false
         headerEnd = idx

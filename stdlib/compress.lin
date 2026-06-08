@@ -12,6 +12,7 @@
 //   import { readStream, writeStream, drain } from "std/stream"
 //   import { gunzip } from "std/compress"
 //   readStream("data.gz").gunzip().writeStream("data.txt").drain()
+
 // Adapter: decompress a gzip-framed byte stream. LAZY.
 // @param s  the upstream gzip-framed byte stream.
 // @returns a `Stream<UInt8[]>` of decompressed chunks; a decode fault surfaces in-band as `Error`.
