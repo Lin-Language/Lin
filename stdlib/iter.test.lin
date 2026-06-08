@@ -2,7 +2,7 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
 import { push, length } from "std/array"
 import { writeFile } from "std/fs"
-import { readStream, lines, for as sfor } from "std/stream"
+import { readStream, lines } from "std/stream"
 import { sliding, pairwise, zipWith, intersperse, dedup, count, repeat, cycle, take, map, for } from "std/iter"
 
 // Empty-literal sources need an annotation to pin the element type (ADR-058): an unannotated `[]`

@@ -43,6 +43,17 @@ pub enum CompileError {
     /// A circular import was detected while resolving the module graph. Carries the
     /// cycle as a human-readable path chain (e.g. `a -> b -> a`).
     ImportCycle(String),
+    /// An `import` referred to a module file that does not exist. Carries the import path as
+    /// written, the absolute path we tried to read, an optional did-you-mean suggestion, and
+    /// whether the import looked like a stdlib (`std/...`) import.
+    ModuleNotFound {
+        import_path: String,
+        tried: PathBuf,
+        suggestion: Option<String>,
+        std_like: bool,
+    },
+    /// The entry source file passed on the command line does not exist.
+    SourceFileNotFound(PathBuf),
 }
 
 impl std::fmt::Display for CompileError {
@@ -56,9 +67,36 @@ impl std::fmt::Display for CompileError {
                 Ok(())
             }
             CompileError::Codegen(msg) => write!(f, "codegen error: {}", msg),
-            CompileError::Link(msg) => write!(f, "link error: {}", msg),
+            CompileError::Link(msg) => write!(f, "build error: {}", msg),
             CompileError::ImportCycle(chain) => {
                 write!(f, "circular import detected: {}", chain)
+            }
+            CompileError::ModuleNotFound {
+                import_path,
+                tried,
+                suggestion,
+                std_like,
+            } => {
+                write!(
+                    f,
+                    "module not found: could not resolve import \"{}\"\n  tried to read: {}",
+                    import_path,
+                    tried.display()
+                )?;
+                if *std_like {
+                    write!(
+                        f,
+                        "\n  note: \"{}\" is not a built-in stdlib module",
+                        import_path
+                    )?;
+                }
+                if let Some(s) = suggestion {
+                    write!(f, "\n  help: did you mean \"{}\"?", s)?;
+                }
+                Ok(())
+            }
+            CompileError::SourceFileNotFound(path) => {
+                write!(f, "source file not found: {}", path.display())
             }
         }
     }
@@ -89,7 +127,13 @@ struct CheckedFrontEnd {
 /// how imports are resolved or how the module cache is consulted.
 fn check_front_end(source_path: &Path) -> Result<CheckedFrontEnd, CompileError> {
     // 1. Read source
-    let source = std::fs::read_to_string(source_path)?;
+    let source = std::fs::read_to_string(source_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            CompileError::SourceFileNotFound(source_path.to_path_buf())
+        } else {
+            CompileError::Io(e)
+        }
+    })?;
     let module_name = source_path
         .file_stem()
         .unwrap_or_default()
@@ -323,7 +367,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         let lib_path = Path::new(lib);
         if !lib_path.exists() {
             return Err(CompileError::Link(format!(
-                "Foreign library '{}' not found; cannot link",
+                "could not build your program: a required external library could not be found (missing library: {})",
                 lib
             )));
         }
@@ -525,7 +569,10 @@ fn check_module_with_imports(
     }
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
+    checker.stdlib_export_index = build_stdlib_export_index();
     checker.import_type_decls = import_type_decls;
+    // Every import here is a fully-resolved `TypedModule`, so unknown-export validation is safe.
+    checker.fully_resolved_import_paths = imported_modules.keys().cloned().collect();
     // The trusted stdlib forwards Json handles into concrete intrinsic/foreign params by
     // design, so it checks Json->concrete leniently (ADR-045). User code does not.
     checker.lenient_json = lenient_json;
@@ -576,7 +623,12 @@ fn check_module_with_seeded_imports(
     }
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
+    checker.stdlib_export_index = build_stdlib_export_index();
     checker.import_type_decls = import_type_decls;
+    // Only the acyclic deps (`imported_modules`) are fully resolved. The seeded SCC peers carry
+    // VALUE exports only, so they are deliberately NOT marked fully-resolved — a type import across
+    // the cycle must fall back to a TypeVar, not be rejected as "no export".
+    checker.fully_resolved_import_paths = imported_modules.keys().cloned().collect();
     checker.lenient_json = lenient_json;
     // `lin_*` intrinsics are accessible only to trusted stdlib modules; the LIN_ALLOW_INTRINSICS
     // env var is a test-only escape hatch for the compiler's own intrinsic-exercising fixtures.
@@ -592,46 +644,106 @@ fn check_module_with_seeded_imports(
     Ok((typed, warnings))
 }
 
-/// Embedded stdlib source files (mirrors interpreter's include_str! approach).
+/// Embedded stdlib source files (mirrors interpreter's include_str! approach), as an enumerable
+/// `(module-name, source)` table. The `include_str!` paths must stay literal, so this is the single
+/// source of truth both for `stdlib_source` lookups and for did-you-mean candidate enumeration.
+const STDLIB_MODULES: &[(&str, &str)] = &[
+    ("std/io",       include_str!("../../../stdlib/io.lin")),
+    ("std/json",     include_str!("../../../stdlib/json.lin")),
+    ("std/string",   include_str!("../../../stdlib/string.lin")),
+    ("std/number",   include_str!("../../../stdlib/number.lin")),
+    ("std/array",    include_str!("../../../stdlib/array.lin")),
+    ("std/iter",     include_str!("../../../stdlib/iter.lin")),
+    ("std/fs",       include_str!("../../../stdlib/fs.lin")),
+    ("std/ffi",      include_str!("../../../stdlib/ffi.lin")),
+    ("std/http",     include_str!("../../../stdlib/http.lin")),
+    ("std/object",   include_str!("../../../stdlib/object.lin")),
+    ("std/template", include_str!("../../../stdlib/template.lin")),
+    ("std/async",    include_str!("../../../stdlib/async.lin")),
+    ("std/env",      include_str!("../../../stdlib/env.lin")),
+    ("std/test",     include_str!("../../../stdlib/test.lin")),
+    ("std/time",     include_str!("../../../stdlib/time.lin")),
+    ("std/path",     include_str!("../../../stdlib/path.lin")),
+    ("std/math",     include_str!("../../../stdlib/math.lin")),
+    ("std/bytes",    include_str!("../../../stdlib/bytes.lin")),
+    ("std/regex",    include_str!("../../../stdlib/regex.lin")),
+    ("std/crypto",   include_str!("../../../stdlib/crypto.lin")),
+    ("std/csv",      include_str!("../../../stdlib/csv.lin")),
+    ("std/encoding", include_str!("../../../stdlib/encoding.lin")),
+    ("std/random",   include_str!("../../../stdlib/random.lin")),
+    ("std/bignum",   include_str!("../../../stdlib/bignum.lin")),
+    ("std/decimal",  include_str!("../../../stdlib/decimal.lin")),
+    ("std/net",      include_str!("../../../stdlib/net.lin")),
+    ("std/process",  include_str!("../../../stdlib/process.lin")),
+    ("std/tty",      include_str!("../../../stdlib/tty.lin")),
+    ("std/signal",   include_str!("../../../stdlib/signal.lin")),
+    ("std/yaml",     include_str!("../../../stdlib/yaml.lin")),
+    ("std/jq",       include_str!("../../../stdlib/jq.lin")),
+    ("std/stream",   include_str!("../../../stdlib/stream.lin")),
+    ("std/compress", include_str!("../../../stdlib/compress.lin")),
+    ("std/archive",  include_str!("../../../stdlib/archive.lin")),
+    ("std/event",    include_str!("../../../stdlib/event.lin")),
+];
+
+/// Embedded stdlib source for `path`, if `path` names a built-in module.
 fn stdlib_source(path: &str) -> Option<&'static str> {
-    match path {
-        "std/io"     => Some(include_str!("../../../stdlib/io.lin")),
-        "std/json"   => Some(include_str!("../../../stdlib/json.lin")),
-        "std/string" => Some(include_str!("../../../stdlib/string.lin")),
-        "std/number" => Some(include_str!("../../../stdlib/number.lin")),
-        "std/array"  => Some(include_str!("../../../stdlib/array.lin")),
-        "std/iter"   => Some(include_str!("../../../stdlib/iter.lin")),
-        "std/fs"     => Some(include_str!("../../../stdlib/fs.lin")),
-        "std/ffi"    => Some(include_str!("../../../stdlib/ffi.lin")),
-        "std/http"   => Some(include_str!("../../../stdlib/http.lin")),
-        "std/object"   => Some(include_str!("../../../stdlib/object.lin")),
-        "std/template" => Some(include_str!("../../../stdlib/template.lin")),
-        "std/async"    => Some(include_str!("../../../stdlib/async.lin")),
-        "std/env"      => Some(include_str!("../../../stdlib/env.lin")),
-        "std/test"     => Some(include_str!("../../../stdlib/test.lin")),
-        "std/time"     => Some(include_str!("../../../stdlib/time.lin")),
-        "std/path"     => Some(include_str!("../../../stdlib/path.lin")),
-        "std/math"     => Some(include_str!("../../../stdlib/math.lin")),
-        "std/bytes"    => Some(include_str!("../../../stdlib/bytes.lin")),
-        "std/regex"       => Some(include_str!("../../../stdlib/regex.lin")),
-        "std/crypto"      => Some(include_str!("../../../stdlib/crypto.lin")),
-        "std/csv"         => Some(include_str!("../../../stdlib/csv.lin")),
-        "std/encoding"    => Some(include_str!("../../../stdlib/encoding.lin")),
-        "std/random"      => Some(include_str!("../../../stdlib/random.lin")),
-        "std/bignum"      => Some(include_str!("../../../stdlib/bignum.lin")),
-        "std/decimal"     => Some(include_str!("../../../stdlib/decimal.lin")),
-        "std/net"      => Some(include_str!("../../../stdlib/net.lin")),
-        "std/process"  => Some(include_str!("../../../stdlib/process.lin")),
-        "std/tty"      => Some(include_str!("../../../stdlib/tty.lin")),
-        "std/signal"   => Some(include_str!("../../../stdlib/signal.lin")),
-        "std/yaml"     => Some(include_str!("../../../stdlib/yaml.lin")),
-        "std/jq"       => Some(include_str!("../../../stdlib/jq.lin")),
-        "std/stream"   => Some(include_str!("../../../stdlib/stream.lin")),
-        "std/compress" => Some(include_str!("../../../stdlib/compress.lin")),
-        "std/archive"  => Some(include_str!("../../../stdlib/archive.lin")),
-        "std/event"    => Some(include_str!("../../../stdlib/event.lin")),
-        _ => None,
+    STDLIB_MODULES
+        .iter()
+        .find(|(name, _)| *name == path)
+        .map(|(_, src)| *src)
+}
+
+/// Build an `export-name -> [module paths]` index across the embedded stdlib, so the checker can
+/// suggest the RIGHT module when an `import { x } from "m"` names an `x` that some OTHER stdlib
+/// module exports (e.g. `gunzip` lives in `std/compress`, not `std/stream`).
+///
+/// A simple per-line textual scan: stdlib is canonically formatted, so every export is a line of
+/// the form `export val NAME = ...` or `export type NAME ...` (modulo leading whitespace). We take
+/// the identifier immediately after `export val `/`export type `.
+fn build_stdlib_export_index() -> HashMap<String, Vec<String>> {
+    fn ident_after<'a>(rest: &'a str) -> Option<&'a str> {
+        let rest = rest.trim_start();
+        let end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if end == 0 {
+            None
+        } else {
+            Some(&rest[..end])
+        }
     }
+
+    let mut index: HashMap<String, Vec<String>> = HashMap::new();
+    for (module_name, source) in STDLIB_MODULES.iter() {
+        let module_name: &str = module_name;
+        for line in source.lines() {
+            let line = line.trim_start();
+            let ident = if let Some(rest) = line.strip_prefix("export val ") {
+                ident_after(rest)
+            } else if let Some(rest) = line.strip_prefix("export type ") {
+                ident_after(rest)
+            } else {
+                None
+            };
+            if let Some(ident) = ident {
+                let entry = index.entry(ident.to_string()).or_default();
+                if !entry.iter().any(|m| m.as_str() == module_name) {
+                    entry.push(module_name.to_string());
+                }
+            }
+        }
+    }
+    index
+}
+
+/// Closest stdlib module name to `import_path` within `max_dist`, for did-you-mean diagnostics.
+fn closest_stdlib_module(import_path: &str, max_dist: usize) -> Option<String> {
+    lin_common::closest_match(
+        import_path,
+        STDLIB_MODULES.iter().map(|(name, _)| *name),
+        max_dist,
+    )
+    .map(|s| s.to_string())
 }
 
 /// A module's stable identity for cycle detection. Stdlib paths (`std/...`) are already
@@ -707,7 +819,26 @@ fn build_import_graph(
                 (ast, src.to_string(), base_dir.to_path_buf(), None, true)
             } else {
                 let file_path = base_dir.join(format!("{}.lin", path));
-                let src = std::fs::read_to_string(&file_path)?;
+                let src = std::fs::read_to_string(&file_path).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        let std_like = path.starts_with("std/");
+                        // `std/std/stream` -> `std/stream` is edit distance 4; allow a little
+                        // headroom (6) without letting nonsense matches through.
+                        let suggestion = if std_like {
+                            closest_stdlib_module(path, 6)
+                        } else {
+                            None
+                        };
+                        CompileError::ModuleNotFound {
+                            import_path: path.clone(),
+                            tried: file_path.clone(),
+                            suggestion,
+                            std_like,
+                        }
+                    } else {
+                        CompileError::Io(e)
+                    }
+                })?;
                 let ast = parse_source(&src).map_err(CompileError::TypeCheck)?;
                 let imported_base = file_path.parent().unwrap_or(base_dir).to_path_buf();
                 let abs = file_path.canonicalize().unwrap_or(file_path);
@@ -1144,6 +1275,91 @@ fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
     Some(rel)
 }
 
+/// Turn raw link-step diagnostics into a clean, jargon-free, user-facing message. The raw text
+/// (from `cc`/`ld`/`collect2`) is full of paths and mangled symbols an end user can't act on, so
+/// we classify the failure and emit something actionable. We never surface `ld`/`linker`/`collect2`
+/// or `exited with status` wording in the top line.
+fn classify_link_failure(raw: &str) -> String {
+    // An undefined reference to an INTERNAL/mangled symbol (stdlib/runtime/compiler-generated)
+    // means a component the compiler should have provided is missing — a compiler/stdlib bug, not
+    // a user mistake. With the checker's "module has no export" error (Fix 1) this is now
+    // unreachable from a user import typo, but keep the safety net.
+    if raw.contains("undefined reference to") {
+        // Pull the first referenced symbol for bug-reportability, if we can.
+        let symbol = raw
+            .split("undefined reference to")
+            .nth(1)
+            .and_then(|rest| {
+                let rest = rest.trim_start();
+                // Symbols are usually quoted (`ld` uses backticks/quotes); fall back to the first token.
+                let trimmed = rest.trim_start_matches(['`', '\'', '"']);
+                let end = trimmed
+                    .find(['`', '\'', '"', '\n'])
+                    .unwrap_or(trimmed.len());
+                let sym = trimmed[..end].trim();
+                if sym.is_empty() { None } else { Some(sym.to_string()) }
+            });
+        let internal = symbol.as_deref().map(|s| {
+            s.contains("std_") || s.contains("lin_") || s.ends_with("__val") || s.ends_with("__fn")
+        });
+        if internal.unwrap_or(true) {
+            let mut msg = String::from(
+                "could not finish building your program: an internal component was missing. \
+This is likely a compiler bug — please report it at https://github.com/linusnorton/Lin/issues",
+            );
+            if let Some(sym) = symbol {
+                msg.push_str(&format!("\n(details: undefined symbol `{}`)", sym));
+            }
+            return msg;
+        }
+    }
+
+    // A missing external/foreign library — name it if we can extract it cheaply.
+    let missing_lib = raw
+        .split("cannot find -l")
+        .nth(1)
+        .map(|rest| {
+            let end = rest
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(rest.len());
+            rest[..end].to_string()
+        })
+        .or_else(|| {
+            raw.split("library not found for -l").nth(1).map(|rest| {
+                let end = rest
+                    .find(|c: char| c.is_whitespace())
+                    .unwrap_or(rest.len());
+                rest[..end].to_string()
+            })
+        });
+    if let Some(lib) = missing_lib {
+        if !lib.is_empty() {
+            return format!(
+                "could not build your program: a required external library could not be found \
+(missing library: {})",
+                lib
+            );
+        }
+    }
+
+    // Anything else: we could not attribute the failure to a specific cause. Emit a clean,
+    // jargon-free top line WITHOUT asserting a cause we don't actually know (e.g. claiming a
+    // missing library when the real problem is something else), and keep the raw diagnostic on a
+    // quiet `details:` line so a bug report still carries the underlying linker output.
+    let mut msg = String::from(
+        "could not build your program: the final build step failed for an unrecognised reason",
+    );
+    let detail = raw.trim();
+    if !detail.is_empty() {
+        // Collapse to the first few non-empty lines so the details stay scannable.
+        let snippet: Vec<&str> = detail.lines().filter(|l| !l.trim().is_empty()).take(4).collect();
+        if !snippet.is_empty() {
+            msg.push_str(&format!("\n(details: {})", snippet.join(" | ")));
+        }
+    }
+    msg
+}
+
 fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: bool, debug: bool) -> Result<(), CompileError> {
     // Find the lin-runtime static library.
     let runtime_lib = find_runtime_lib();
@@ -1274,24 +1490,22 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
     let dead_strip = if cfg!(target_os = "macos") { "-Wl,-dead_strip" } else { "-Wl,--gc-sections" };
     cmd.arg(dead_strip);
 
-    // Capture stderr so a link failure surfaces the real linker diagnostic (e.g. "cannot find
-    // libclang_rt.profile...") instead of a bare exit status. A successful link normally writes
-    // nothing, so capturing doesn't change observable behaviour on success.
-    let output = cmd.output().map_err(|e| CompileError::Link(e.to_string()))?;
+    // Capture stderr/stdout so a build-step failure can be CLASSIFIED into a clean, jargon-free,
+    // user-facing message by `classify_link_failure` (no `ld`/`collect2`/`linker` wording leaks to
+    // the user). A successful link normally writes nothing, so capturing doesn't change observable
+    // behaviour on success.
+    let output = cmd.output().map_err(|e| {
+        CompileError::Link(format!(
+            "could not build your program: the build toolchain could not be run ({})",
+            e
+        ))
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut msg = format!("linker exited with status {}", output.status);
-        if !stderr.trim().is_empty() {
-            msg.push_str("\n");
-            msg.push_str(stderr.trim_end());
-        }
-        if !stdout.trim().is_empty() {
-            msg.push_str("\n");
-            msg.push_str(stdout.trim_end());
-        }
-        return Err(CompileError::Link(msg));
+        let combined = format!("{}\n{}", stderr, stdout);
+        return Err(CompileError::Link(classify_link_failure(&combined)));
     }
 
     // macOS-only, best-effort: rewrite the executable's load commands for each vendored dylib to

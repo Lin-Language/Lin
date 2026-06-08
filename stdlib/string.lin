@@ -3,7 +3,7 @@
 // All operations are codepoint-aware: indices and lengths count Unicode codepoints, not bytes. The
 // one exception is `byteAt`, a low-level O(1) UTF-8 byte accessor for fast byte/ASCII scanning.
 //
-// import { trim, toUpper, toLower, split, join, replace, replaceAll, contains, startsWith, endsWith, substring, indexOf, length } from "std/string"
+// import { trim, toUpper, toLower, split, join, replace, replaceAll, contains, startsWith, endsWith, substring, indexOf } from "std/string"
 import { for } from "std/iter"
 
 import foreign "lin-runtime"
