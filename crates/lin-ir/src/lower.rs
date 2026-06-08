@@ -1379,12 +1379,12 @@ fn is_sealed_scalar_array(ty: &Type) -> bool {
     }
 }
 
-/// Element-field eligibility — the lower.rs mirror of `Codegen::sealed_array_elem_field_packable`.
-/// SCALARS ONLY (Stage 3a) — MUST mirror `Codegen::sealed_array_elem_field_packable` /
-/// `monomorphize::field_packed_scalar` EXACTLY. Heap-field element arrays stay boxed pending the
-/// whole-program record-representation-consistency work (see the codegen gate note).
+/// Element-field eligibility — delegates to the SINGLE source of truth
+/// `Type::is_sealed_array_field_packable` (ADR-063 gate consolidation). The codegen gate
+/// (`Codegen::sealed_array_elem_field_packable`), `monomorphize::field_packed_scalar`, and
+/// `repr::sealed_array_elem_field_packable` all defer to the same predicate, so they cannot drift.
 fn is_sealed_array_elem_field_packable(ty: &Type) -> bool {
-    ty.is_flat_scalar() || matches!(ty, Type::Bool)
+    ty.is_sealed_array_field_packable()
 }
 
 /// True when `param_ty` is an array whose element is a BOXED runtime representation — a generic
@@ -5193,6 +5193,9 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
         for ebox in &elem_boxes {
             b.emit(Instruction::FreeBoxShellIfDistinct { val: *ebox, other: ret });
         }
+        // A PACKED sealed-array source materialized a fresh +1 element struct each iteration; `for`
+        // discards it (a side-effecting body never moves the struct out), so release it or it leaks.
+        free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
     });
     builder.const_temp(Const::Null)
 }
@@ -5249,6 +5252,9 @@ fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx
     for ebox in &elem_boxes {
         builder.emit(Instruction::FreeBoxShell { val: *ebox });
     }
+    // A PACKED sealed-array source materialized a fresh +1 element struct; `while` discards it
+    // (the predicate body never moves the struct out), so release it or it leaks per iteration.
+    free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, builder);
     builder.terminate(Terminator::CondJump { cond: keep, then_block: cont_block, else_block: exit });
 
     builder.switch_to(cont_block);
@@ -5299,6 +5305,35 @@ fn free_combinator_elem_box_full(elem: Temp, elem_ty: &Type, builder: &mut FuncB
     }
 }
 
+/// Reclaim a combinator per-element value when the element TYPE is a SEALED scalar record
+/// (`is_sealed_scalar_repr`): the `Index` op materializes a FRESH +1 sealed struct each iteration,
+/// from EITHER source representation —
+///   - a PACKED sealed-scalar array → `Codegen::sealed_array_materialize_elem` (header + payload
+///     copied; for heap-field records — Stage 3b strings — also takes its OWN +1 on each heap field
+///     via `retain_sealed_payload_fields`); OR
+///   - a BOXED `Object[]` (a `[]`+push array of records that isn't packable, e.g. one with a
+///     String/Array/nested-record field) → `lin_array_get` + `unbox_tagged_val_to_type` →
+///     `sealed_project_from`, which projects the boxed `LinObject` into a fresh +1 sealed struct
+///     (likewise retaining its heap fields).
+/// Either way the element is a fully-owned, fully independent value that nothing else aliases. The
+/// combinator body CONSUMES it (reads a scalar field for `map`/`reduce`, a predicate for `filter`, a
+/// side effect for `for`/`while`) but never moves the STRUCT itself into the result:
+///   - a scalar/flat output array copies the read scalar by value (no aliasing);
+///   - a boxed `Object[]` output `Coerce`s the struct to a FRESH boxed `LinObject`
+///     (`sealed_materialize_to_object`) — again a copy, leaving this struct distinct;
+///   - a sealed-scalar output array copies the packed bytes by value.
+/// So the materialized struct is always genuinely DROPPED and must be released, else it leaks one
+/// fresh sealed struct per element, per combinator call (the `map(ts, x => x["a"])` per-element leak,
+/// ASan-confirmed across all sealed field shapes; mirrors `lower_for`'s per-iteration box reclaim).
+/// `Release` on a sealed `Object` routes to `lin_sealed_release` (rc-- + heap-field walk on zero), so
+/// the struct's own field references are reclaimed and the (separately owned) source/result
+/// references are untouched — never a double-free. No-op unless the element is a sealed scalar repr.
+fn free_combinator_sealed_elem(elem: Temp, _iterable_ty: &Type, elem_ty: &Type, builder: &mut FuncBuilder) {
+    if is_sealed_scalar_repr(elem_ty) {
+        builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
+    }
+}
+
 /// `map(iterable, f)` → new array of `f(elem)` for each element.
 fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
@@ -5332,6 +5367,9 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
             // `mapped` is the lambda's freshly-owned result (+1) — MOVE it into the result array.
             push_output(out, flat, &out_elem_ty, mapped, &mapped_ty, false, b);
             free_combinator_elem_box(elem, &elem_ty, b);
+            // A PACKED sealed-array source materialized a fresh +1 element struct; the body read a
+            // copy out of it (scalar field / re-boxed object), so release it or it leaks per element.
+            free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
         });
         return out;
     }
@@ -5345,6 +5383,7 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
         // `mapped` is the callback's freshly-owned result (+1) — MOVE it into the result array.
         push_output(out, flat, &out_elem_ty, mapped, &cb_ret, false, b);
         free_combinator_elem_box(elem, &elem_ty, b);
+        free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
     });
     out
 }
@@ -5504,6 +5543,11 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
                 &[(acc, acc_ty.clone()), (elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx,
             );
             let acc_next = coerce_arg_to_param_repr(acc_next_raw, &acc_next_ty, &acc_ty, builder);
+            // A PACKED sealed-array source materialized a fresh +1 element struct; the reducer read a
+            // copy out of it into the scalar accumulator, so release it or it leaks per iteration.
+            // (Only the inline-scalar-accumulator path reaches here; a heap/union acc keeps the boxed
+            // Json-phi path below, which reads the element via the union box, not a sealed struct.)
+            free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, builder);
             let one = builder.const_temp(Const::Int(1, Type::Int64));
             builder.emit(Instruction::Binary {
                 dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
