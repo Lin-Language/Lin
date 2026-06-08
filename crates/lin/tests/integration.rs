@@ -7143,6 +7143,47 @@ print(toString(f(5)))
     assert_eq!(scalar, vec!["1"]);
 }
 
+// Reading a PACKED sealed-record array through a `Json` view, then unboxing a scalar field out of
+// the dynamic index read, used to leak ~104 B/call (a LINEAR per-call leak, exit 0, no UAF):
+//   (1) `val j: Json = ps` materialized a fresh tagged `Object[]` view of the packed `P[]` but the
+//       binding-coercion ALSO `unregister_owned`'d the source sealed array (assuming the box took
+//       its +1), orphaning the packed array's header + element buffer (~88 B/call).
+//   (2) the function-body return path KEPT the raw pre-coercion box (`raw_ret`) unconditionally,
+//       which is correct only for a concrete→union SHELL-box (the box wraps `raw_ret`); for the
+//       REVERSE unbox (`Json` body returned as `Int32`: `j[0]["x"]`) the scalar result does NOT own
+//       the box, so keeping it orphaned the fresh +1 TaggedVal (~16 B/call) — a generic dynamic
+//       field/index-read leak, not sealed-specific.
+// The leak itself is gated by the ASan harness; this test guards the CORRECTNESS of both shapes (a
+// wrong RC release would corrupt the result or crash).
+#[test]
+fn test_json_view_packed_array_read_round_trip() {
+    // Sealed packed P[] read through a Json view, scalar field unboxed out (fix #1 + #2).
+    let sealed_view = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type P = { "x": Int32, "y": Int32 }
+val once = (i: Int32): Int32 =>
+  val ps: P[] = [{ "x": i, "y": 2 }, { "x": 3, "y": 4 }]
+  val j: Json = ps
+  j[0]["x"]
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, acc + once(i))
+print(toString(loop(0, 10, 0)))
+"#);
+    assert_eq!(sealed_view, vec!["45"]);
+
+    // Pure-Json object field unboxed to a scalar return (fix #2 in isolation, no sealed array).
+    let pure_json = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val once = (i: Int32): Int32 =>
+  val j: Json = { "x": i, "y": 2 }
+  j["x"]
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, acc + once(i))
+print(toString(loop(0, 10, 0)))
+"#);
+    assert_eq!(pure_json, vec!["45"]);
+}
+
 // Self-recursion returning a record must still work (it TCO's; this guards against the fix
 // perturbing the single-function path).
 #[test]
