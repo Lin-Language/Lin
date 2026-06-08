@@ -3645,6 +3645,39 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         TypedExpr::IndexSet { object, key, value, obj_ty, .. } => {
             let key_ty = key.ty();
             let val_ty = value.ty();
+            // SEALED-RECORD FIELD WRITE (the write counterpart of the FieldGet fast path above):
+            // `rec["field"] = value` over a sealed-scalar record with a compile-time string key that
+            // names a STATICALLY PRESENT field → a constant-offset packed-struct store (codegen
+            // `FieldSet`), NOT the dynamic `lin_object_set` path. A sealed record is a packed heap
+            // struct with no runtime key table, so `lin_object_set` reads its packed bytes as a
+            // LinObject header and crashes (the index-cap underflow). For a SCALAR field this is a
+            // direct store; for a HEAP field codegen releases the old pointer and retains the new, so
+            // the source value stays owned (released at scope exit) — exactly the object-set retain
+            // semantics, so we do NOT transfer/consume the value. An absent field is statically Null
+            // (§6.1); we fall through to the generic path which the codegen handles (object branch),
+            // but a sealed record can never carry an extra field, so this is effectively a no-op
+            // write — still safer to route present fields here and leave the rest to the fallback.
+            if is_sealed_scalar_repr(obj_ty) {
+                if let TypedExpr::StringLit(name, _, _) = key.as_ref() {
+                    let present = matches!(obj_ty,
+                        Type::Object { fields, .. } if fields.contains_key(name));
+                    if present {
+                        // Lower object then value (the value may reference the object's fields, e.g.
+                        // `rng["state"] = rng["state"] + rng["inc"]`; reading first is correct).
+                        let obj_temp = lower_expr(object, builder, ctx);
+                        let val_temp = lower_expr(value, builder, ctx);
+                        builder.emit(Instruction::FieldSet {
+                            object: obj_temp,
+                            field: name.clone(),
+                            value: val_temp,
+                            obj_ty: obj_ty.clone(),
+                            val_ty,
+                        });
+                        // FieldSet evaluates to Null.
+                        return builder.const_temp(Const::Null);
+                    }
+                }
+            }
             // Borrow the container (a bare `LocalGet` of a concrete-RC array/object): a store
             // writes THROUGH the container without needing to own it, so skip the retain/release
             // the owning load would emit. The KEY and VALUE are lowered FIRST so the borrowed base
