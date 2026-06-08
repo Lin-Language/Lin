@@ -67,13 +67,20 @@ impl Parser {
     pub(crate) fn parse_type_primary(&mut self) -> TypeExpr {
         let base = match self.peek_kind() {
             TokenKind::LParen => {
-                // Function type: (T1, T2) => U
+                // Either a function type `(T1, T2) => U` OR a parenthesized (grouped) type
+                // `(T)` — the latter is needed so a union/intersection can take a postfix `[]`
+                // array suffix, e.g. `(String | Null)[]`. We can't tell which until after the
+                // `)`: a single parenthesized type followed by `=>` is a function with one param;
+                // the same type NOT followed by `=>` is a grouped type. So parse the comma-list,
+                // consume `)`, then branch on whether `=>` follows.
                 self.advance();
                 let mut params = Vec::new();
+                let mut saw_comma = false;
                 while !self.check(TokenKind::RParen) && !self.is_at_end() {
                     let loop_start = self.pos;
                     params.push(self.parse_type_expr());
                     if self.check(TokenKind::Comma) {
+                        saw_comma = true;
                         self.advance();
                     }
                     if self.ensure_progress(loop_start) {
@@ -81,9 +88,19 @@ impl Parser {
                     }
                 }
                 self.expect(TokenKind::RParen);
-                self.expect(TokenKind::Arrow);
-                let ret = self.parse_type_primary();
-                TypeExpr::Function(params, Box::new(ret), Span::dummy())
+                // A `=>` makes it a function type. A single grouped type with no `=>` is just
+                // that type (and may take a postfix `[]` below). A comma-list / zero-arg with no
+                // `=>` is malformed as a grouped type, so still expect the arrow (preserving the
+                // original error) and treat it as a function type.
+                if self.check(TokenKind::Arrow) || saw_comma || params.len() != 1 {
+                    self.expect(TokenKind::Arrow);
+                    let ret = self.parse_type_primary();
+                    TypeExpr::Function(params, Box::new(ret), Span::dummy())
+                } else {
+                    // `(T)` — grouped type. Unwrap to the inner type so the postfix `[]` loop
+                    // (and `&`/`|` continuations handled by callers) apply to it directly.
+                    params.into_iter().next().unwrap()
+                }
             }
             TokenKind::LBrace => {
                 // Object type

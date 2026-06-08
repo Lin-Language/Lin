@@ -1119,7 +1119,19 @@ fn fmt_type(ty: &TypeExpr) -> String {
             let ps: Vec<String> = params.iter().map(fmt_type).collect();
             format!("{}<{}>", name, ps.join(", "))
         }
-        TypeExpr::Array(inner, _) => format!("{}[]", fmt_type(inner)),
+        TypeExpr::Array(inner, _) => {
+            // The postfix `[]` binds tighter than `|`/`&`/`=>`, so an inner union/intersection/
+            // function type MUST be parenthesized to round-trip: `Array(Union(String, Null))` is
+            // `(String | Null)[]`, not `String | Null[]` (which would parse as `String | (Null[])`).
+            let inner_str = fmt_type(inner);
+            match inner.as_ref() {
+                TypeExpr::Union(..)
+                | TypeExpr::TaggedUnion(..)
+                | TypeExpr::Intersection(..)
+                | TypeExpr::Function(..) => format!("({})[]", inner_str),
+                _ => format!("{}[]", inner_str),
+            }
+        }
         TypeExpr::FixedArray(types, _) => {
             let ts: Vec<String> = types.iter().map(fmt_type).collect();
             format!("[{}]", ts.join(", "))
@@ -2528,5 +2540,24 @@ mod tests {
         let out = format("val g = (x): Int => x\n");
         assert!(out.contains("(x): Int =>"), "expected parenthesised param, got {out:?}");
         assert!(parses_clean(&out), "output did not re-parse: {out:?}");
+    }
+
+    /// A union/intersection/function inside an array type MUST keep its parentheses, or the
+    /// postfix `[]` (which binds tighter) would re-parse to a different type. `(String | Null)[]`
+    /// must NOT be rewritten to the meaning-changing `String | Null[]`.
+    #[test]
+    fn grouped_type_array_keeps_parens() {
+        let cases = [
+            "type G = (String | Null)[]\n",
+            "type R = { \"groups\": (String | Null)[] }\n",
+            "val f = (xs: (Int32 | String)[]): Int32 => 0\n",
+        ];
+        for src in cases {
+            let out = format(src);
+            assert!(out.contains(")[]"), "expected parenthesised array element, got {out:?}");
+            assert!(parses_clean(&out), "formatter output did not re-parse: {out:?}");
+            let out2 = format(&out);
+            assert_eq!(out, out2, "formatter not idempotent for {src:?}");
+        }
     }
 }
