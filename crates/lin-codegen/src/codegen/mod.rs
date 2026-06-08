@@ -1739,12 +1739,13 @@ impl<'ctx> Codegen<'ctx> {
                                 let fields = fields.clone();
                                 let stride = Self::sealed_array_stride(&fields);
                                 let desc = self.sealed_descriptor(&fields); // NULL for scalar-only
+                                let named_desc = self.sealed_named_descriptor(&fields); // ADR-063 (i)
                                 let has_heap = fields.values().any(|t| Self::sealed_field_kind(t).is_some());
                                 let alloc_fn = self.get_or_declare_fn(
                                     "lin_sealed_array_alloc",
-                                    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+                                    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into(), ptr_ty.into()], false));
                                 let arr_v = self.builder.call(alloc_fn,
-                                    &[cap.into(), i64_ty.const_int(stride, false).into(), desc.into()],
+                                    &[cap.into(), i64_ty.const_int(stride, false).into(), desc.into(), named_desc.into()],
                                     "ir_sarr").try_as_basic_value().unwrap_basic();
                                 // Construct: each element struct `ev` is a BORROWED standalone struct
                                 // (owned by its own temp, released at this scope's exit). A heap-field

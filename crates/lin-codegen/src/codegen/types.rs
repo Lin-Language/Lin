@@ -203,6 +203,37 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) const KIND_ARRAY: u32 = 2;
     pub(crate) const KIND_SEALED: u32 = 3;
 
+    /// NAMED full-field descriptor kind codes (ADR-063 Stage 3b mechanism (i)). Unlike the heap-only
+    /// `KIND_*`, these cover SCALARS too, since the named descriptor lists EVERY field for the boxed
+    /// materialize-on-read path. MUST stay in lockstep with `lin_runtime::sealed::NKIND_*`. The boxing
+    /// each code implies matches `type_tag` / `box_value` exactly (so a materialized field reads back
+    /// identically to a directly-boxed value).
+    pub(crate) const NKIND_INT32: u32 = 1; // Int8/Int16/Int32
+    pub(crate) const NKIND_INT64: u32 = 2; // Int64, UInt8/UInt16/UInt32 (zero-extended positive)
+    pub(crate) const NKIND_UINT64: u32 = 3; // UInt64
+    pub(crate) const NKIND_FLOAT64: u32 = 4; // Float32/Float64
+    pub(crate) const NKIND_BOOL: u32 = 5; // Bool
+    pub(crate) const NKIND_STRING: u32 = 6; // String/StrLit
+    pub(crate) const NKIND_ARRAY: u32 = 7; // Array/FixedArray
+    pub(crate) const NKIND_SEALED: u32 = 8; // nested sealed record
+
+    /// The NAMED-descriptor kind for `ty` (a sealed-record field). Covers every permissible sealed
+    /// field — scalar OR heap. Returns `None` only for a type that is not a valid sealed field (which
+    /// `sealed_fields` already rules out upstream). Mirrors `type_tag`'s boxing choices.
+    pub(crate) fn sealed_named_field_kind(ty: &Type) -> Option<u32> {
+        match ty {
+            Type::Bool => Some(Self::NKIND_BOOL),
+            Type::Int8 | Type::Int16 | Type::Int32 => Some(Self::NKIND_INT32),
+            Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::Int64 => Some(Self::NKIND_INT64),
+            Type::UInt64 => Some(Self::NKIND_UINT64),
+            Type::Float32 | Type::Float64 => Some(Self::NKIND_FLOAT64),
+            Type::Str | Type::StrLit(_) => Some(Self::NKIND_STRING),
+            Type::Array(_) | Type::FixedArray(_) => Some(Self::NKIND_ARRAY),
+            Type::Object { .. } if Self::sealed_fields(ty).is_some() => Some(Self::NKIND_SEALED),
+            _ => None,
+        }
+    }
+
     /// True when `ty` is a permissible field of a sealed record: a scalar OR an eligible heap field.
     pub(crate) fn is_sealed_field(ty: &Type) -> bool {
         Self::is_sealed_scalar_field(ty) || Self::sealed_field_kind(ty).is_some()
