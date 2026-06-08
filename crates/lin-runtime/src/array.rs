@@ -2,14 +2,16 @@ use std::alloc::{alloc, alloc_zeroed, dealloc, realloc, Layout};
 
 /// Heap-allocated growable array.
 /// Layout: refcount (u32) | elem_tag (u8) | _pad3 ([u8;3]) | len (u64) | cap (u64) | data (*mut LinArrayElem)
-///         | elem_stride (u64) | elem_desc (*const u8)
+///         | elem_stride (u64) | elem_desc (*const u8) | elem_named_desc (*const u8)
 /// elem_tag == 0xFF → tagged elements (LinArrayElem 16-byte layout).
 /// elem_tag == TAG_INT32/INT64/FLOAT32/FLOAT64 → flat scalar elements (raw T-sized layout).
 /// elem_tag == 0xFE (SEALED_ARRAY_TAG) → inline contiguous HEADER-LESS sealed-record payloads of
-///   `elem_stride` bytes each, with `elem_desc` the field descriptor (sealed-records Stage 3). For
-///   ALL other tags `elem_stride`/`elem_desc` are 0/NULL and unused.
+///   `elem_stride` bytes each, with `elem_desc` the heap-only field descriptor (sealed-records Stage
+///   3) and `elem_named_desc` the NAMED full-field descriptor (ADR-063 Stage 3b mechanism (i),
+///   read only by the boxed materialize-on-read path). For ALL other tags
+///   `elem_stride`/`elem_desc`/`elem_named_desc` are 0/NULL and unused (never read).
 ///
-/// The two trailing fields are appended AFTER `data` (offset 32+) so they never disturb the fixed
+/// The trailing fields are appended AFTER `data` (offset 32+) so they never disturb the fixed
 /// offsets the codegen and flat/tagged runtime paths read (refcount@0, elem_tag@4, len@8, cap@16,
 /// data@24). All allocations use `size_of::<LinArray>()`, so growing the struct is transparent to
 /// the existing families.
@@ -23,9 +25,14 @@ pub struct LinArray {
     pub data: *mut LinArrayElem,
     /// Byte stride of one element (sealed-record arrays only; 0 otherwise).
     pub elem_stride: u64,
-    /// Field descriptor for sealed-record elements (`lin_runtime::sealed` layout), or NULL when the
-    /// record is scalar-only / the array is not a sealed-record array.
+    /// Heap-only field descriptor for sealed-record elements (`lin_runtime::sealed` layout), or NULL
+    /// when the record is scalar-only / the array is not a sealed-record array. Drives per-element
+    /// heap-field RC (retain/release walks).
     pub elem_desc: *const u8,
+    /// NAMED full-field descriptor (`lin_runtime::sealed` NamedDesc layout): EVERY field with its
+    /// name + offset + kind, used ONLY by `lin_array_get_tagged`'s 0xFE materialize-on-read branch
+    /// (ADR-063 mechanism (i)). NULL when the array is not a sealed-record array.
+    pub elem_named_desc: *const u8,
 }
 
 /// `elem_tag` sentinel for an array of inline contiguous sealed-record payloads (Stage 3). Distinct
@@ -218,7 +225,7 @@ unsafe fn sealed_array_data_layout(stride: u64, cap: u64) -> Layout {
 /// Allocate an empty (len 0) sealed-record array with the given per-element `stride` and field
 /// `desc` (NULL for a scalar-only record). `initial_cap` is the element capacity.
 #[no_mangle]
-pub unsafe extern "C" fn lin_sealed_array_alloc(initial_cap: u64, stride: u64, desc: *const u8) -> *mut LinArray {
+pub unsafe extern "C" fn lin_sealed_array_alloc(initial_cap: u64, stride: u64, desc: *const u8, named_desc: *const u8) -> *mut LinArray {
     let cap = initial_cap.max(4);
     let ptr = alloc(array_layout()) as *mut LinArray;
     (*ptr).refcount = 1;
@@ -229,6 +236,7 @@ pub unsafe extern "C" fn lin_sealed_array_alloc(initial_cap: u64, stride: u64, d
     (*ptr).data = alloc(sealed_array_data_layout(stride, cap)) as *mut LinArrayElem;
     (*ptr).elem_stride = stride;
     (*ptr).elem_desc = desc;
+    (*ptr).elem_named_desc = named_desc;
     ptr
 }
 
@@ -746,6 +754,19 @@ pub unsafe extern "C-unwind" fn lin_array_get_tagged(arr: *const LinArray, idx: 
             (*tv).tag = TAG_UINT64;
             (*tv)._pad = [0; 7];
             (*tv).payload = v;
+        }
+        SEALED_ARRAY_TAG => {
+            // ADR-063 Stage 3b mechanism (i): a 0xFE element is a packed HEADER-LESS sealed-record
+            // payload of `elem_stride` bytes — NOT a TaggedVal. The default arm below would misread
+            // its first 16 bytes as a `{tag, payload}` box (a scalar misread; a heap-field deref
+            // crash). Instead MATERIALIZE a fresh keyed `LinObject` view from the packed element via
+            // the NAMED full-field descriptor, box it TAG_OBJECT, and return it as the caller's owned
+            // +1 (matching the get_tagged contract: the caller frees it). Heap fields are RETAINED
+            // into the materialized object; the packed buffer keeps its own reference. We allocated
+            // `tv` above as a scratch box; free it and return the materializer's box instead.
+            dealloc(tv as *mut u8, tv_layout);
+            let payload = ((*arr).data as *const u8).add((idx as u64 * (*arr).elem_stride) as usize);
+            return crate::sealed::materialize_sealed_elem_boxed(payload, (*arr).elem_named_desc);
         }
         _ => {
             // Tagged array: elem is already a LinArrayElem (16 bytes) = TaggedVal layout.
