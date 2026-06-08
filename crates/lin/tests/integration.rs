@@ -9593,6 +9593,33 @@ print(toString(p[0]))
     assert_eq!(out, vec!["30", "5"]);
 }
 
+// SILENT DATA-LOSS regression: `push(obj[k], rec)` into an array stored inside a Json
+// object/map field, where `rec`'s record type is packable. The packable element pinned the
+// generic `push`'s `T` to a packed-sealed element, selecting the `push$Obj_…` specialization
+// whose arg coercion MATERIALIZED a fresh detached packed buffer (`lin_sealed_array_alloc`) from
+// the boxed array the container holds — the push mutated the copy, the stored array stayed empty,
+// and `length(obj[k])` re-read it as 0 (silent drop). The fix routes an in-place-mutator receiver
+// that is a container index-read through the boxed `$Json` path (`lin_push_dyn`), mutating the
+// REAL stored array. Asserts both the corrected length AND element read-back through the field.
+#[test]
+fn test_push_into_json_object_field_array_reads_back() {
+    let out = run(r#"import { print } from "std/io"
+import { length, push } from "std/array"
+type Pt = { "x": Int32, "y": Int32 }
+val mk = (x: Int32, y: Int32): Pt => { "x": x, "y": y }
+val main = (): Null =>
+  var obj: Json = {}
+  obj["k"] = []
+  push(obj["k"], mk(3, 4))
+  push(obj["k"], mk(5, 6))
+  print("${length(obj["k"])}")
+  print("${obj["k"][0]["x"]}")
+  print("${obj["k"][1]["y"]}")
+main()
+"#);
+    assert_eq!(out, vec!["2", "3", "6"]);
+}
+
 // A generic `push` of a CONCRETE-OBJECT element into a record-typed array (`Field[]`) reads back
 // correctly. The element is materialized into a boxed LinObject for the tagged array (gap #2: a
 // sealed-projected struct must NOT be stored raw under TAG_OBJECT — it crashed at object.rs:195 /
