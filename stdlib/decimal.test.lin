@@ -1,0 +1,71 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { decimal, fromInt, add, sub, mul, div, round, cmp, eq, toString, scale, RoundHalfEven, RoundHalfUp, RoundDown } from "std/decimal"
+
+// std/decimal: exact base-10 fixed-point over an opaque handle. Money math with no Float64
+// rounding error: sum line items exactly, apply VAT, round once at the end.
+val s = suite("std/decimal", [
+  test("construct and stringify (scale preserved)", () =>
+    val a = decimal("3.14")
+    val b = decimal("10.00")
+    [
+      expect(a is Error).toBe(false),
+      expect(toString(a)).toBe("3.14"),
+      expect(toString(b)).toBe("10.00")
+    ]
+  ),
+
+  test("parse rejects garbage", () => [
+    expect(decimal("not a number") is Error).toBe(true)
+  ]),
+
+  test("exact addition has no float drift (0.1 + 0.2 == 0.3)", () =>
+    val r = add(decimal("0.1"), decimal("0.2"))
+    [
+      expect(toString(r)).toBe("0.3")
+    ]
+  ),
+
+  test("sub / mul", () => [
+    expect(toString(sub(decimal("10.00"), decimal("3.33")))).toBe("6.67"),
+    expect(toString(mul(decimal("1.5"), decimal("4")))).toBe("6.0")
+  ]),
+
+  test("div with explicit scale + rounding mode", () =>
+    // 10 / 3 to 4 dp, half-even -> 3.3333
+    val q = div(decimal("10"), decimal("3"), 4, RoundHalfEven)
+    [
+      expect(q is Error).toBe(false),
+      expect(toString(q)).toBe("3.3333")
+    ]
+  ),
+
+  test("rounding modes differ on the half", () => [
+    // 2.5 -> half-even rounds to even (2), half-up rounds away (3), down truncates (2)
+    expect(toString(round(decimal("2.5"), 0, RoundHalfEven))).toBe("2"),
+    expect(toString(round(decimal("2.5"), 0, RoundHalfUp))).toBe("3"),
+    expect(toString(round(decimal("2.9"), 0, RoundDown))).toBe("2")
+  ]),
+
+  test("invoice: sum line items, apply 20% VAT, round to 2dp (exact)", () =>
+    // Three line items, summed exactly, +20% VAT, rounded once with banker's rounding.
+    val net = add(add(decimal("19.99"), decimal("5.50")), decimal("100.00"))
+    val gross = mul(net, decimal("1.20"))
+    val due = round(gross, 2, RoundHalfEven)
+    [
+      expect(toString(net)).toBe("125.49"),
+      expect(toString(due)).toBe("150.59")
+    ]
+  ),
+
+  test("cmp / eq", () => [
+    expect(cmp(decimal("1.10"), decimal("1.20"))).toBe(-1),
+    expect(eq(decimal("1.50"), decimal("1.50"))).toBe(true),
+    expect(eq(decimal("1.5"), decimal("1.50"))).toBe(true)
+  ]),
+
+  test("fromInt widens an integer", () => [
+    expect(toString(fromInt(42))).toBe("42")
+  ])
+])
+
+run(s)

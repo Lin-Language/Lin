@@ -1,0 +1,78 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { bigInt, parseBigInt, add, sub, mul, pow, modPow, cmp, eq, toString, toInt64, sign } from "std/bignum"
+import { range, reduce } from "std/iter"
+
+// std/bignum: arbitrary-precision integers over an opaque refcounted handle. Arithmetic is
+// exposed as named functions (no operator overloading); dot-application keeps it readable.
+val s = suite("std/bignum", [
+  test("construct and stringify", () => [
+    expect(bigInt(42).toString()).toBe("42"),
+    expect(bigInt(0).toString()).toBe("0"),
+    expect(bigInt(-7).toString()).toBe("-7")
+  ]),
+
+  test("parse round-trips through toString", () =>
+    val n = parseBigInt("123456789012345678901234567890")
+    [
+      expect(n is Error).toBe(false),
+      expect(toString(n)).toBe("123456789012345678901234567890")
+    ]
+  ),
+
+  test("parse rejects garbage with an Error", () => [
+    expect(parseBigInt("not a number") is Error).toBe(true)
+  ]),
+
+  test("add / sub / mul beyond Int64 range", () =>
+    // 2^70, well past Int64, computed as exact bignum arithmetic.
+    val big = pow(bigInt(2), 70)
+    [
+      expect(big is Error).toBe(false),
+      expect(toString(big)).toBe("1180591620717411303424"),
+      expect(add(bigInt(2), bigInt(3)).toString()).toBe("5"),
+      expect(sub(bigInt(10), bigInt(25)).toString()).toBe("-15"),
+      expect(mul(bigInt(1000000), bigInt(1000000)).toString()).toBe("1000000000000")
+    ]
+  ),
+
+  test("exact factorial(25) (overflows Int64)", () =>
+    // 25! = 15511210043330985984000000, accumulated as a bignum fold over 1..=25.
+    val fact = range(1, 26).reduce(bigInt(1), (acc, i) => mul(acc, bigInt(i)))
+    [
+      expect(toString(fact)).toBe("15511210043330985984000000")
+    ]
+  ),
+
+  test("modPow for crypto-sized exponentiation", () =>
+    // 4^13 mod 497 == 445
+    val r = modPow(bigInt(4), bigInt(13), bigInt(497))
+    [
+      expect(r is Error).toBe(false),
+      expect(toString(r)).toBe("445")
+    ]
+  ),
+
+  test("cmp / eq ordering", () => [
+    expect(cmp(bigInt(3), bigInt(5))).toBe(-1),
+    expect(cmp(bigInt(5), bigInt(3))).toBe(1),
+    expect(cmp(bigInt(4), bigInt(4))).toBe(0),
+    expect(eq(bigInt(7), bigInt(7))).toBe(true)
+  ]),
+
+  test("sign", () => [
+    expect(sign(bigInt(9))).toBe(1),
+    expect(sign(bigInt(0))).toBe(0),
+    expect(sign(bigInt(-9))).toBe(-1)
+  ]),
+
+  test("toInt64 in range, Error out of range", () =>
+    val ok = toInt64(bigInt(123))
+    val over = toInt64(pow(bigInt(2), 100))
+    [
+      expect(ok).toBe(123),
+      expect(over is Error).toBe(true)
+    ]
+  )
+])
+
+run(s)

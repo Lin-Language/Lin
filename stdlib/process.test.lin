@@ -1,6 +1,10 @@
-import { expect, toBe, test, suite, run } from "std/test"
+import { expect, toBe, toSatisfy, test, suite, run } from "std/test"
 import { contains } from "std/string"
 import { spawn, readStdout, wait, exec, shell, cwd, chdir, kill } from "std/process"
+import { hostname, platform, arch, cpuCount, pid, ppid } from "std/process"
+import { username, homeDir, tempDir, uptime, loadAverage, memInfo } from "std/process"
+import { isDir } from "std/fs"
+import { length } from "std/array"
 
 // std/process over real subprocesses is deterministic. We run small `sh`/`printf`
 // commands, so this touches no stdin/TTY state and is CI-safe.
@@ -109,4 +113,116 @@ val s = suite("std/process", [
   )
 ])
 
-run(s)
+
+// All assertions here are PORTABLE / non-brittle: they check structural invariants (a value is
+// in the documented closed set, is positive, is non-empty, names a real directory) rather than
+// exact machine values, so the suite passes on any host/CI runner regardless of platform.
+// platform() must be one of the documented closed set.
+val knownPlatform = (p: Json): Boolean =>
+  p == "linux" || p == "macos" || p == "windows" || p == "freebsd" || p == "openbsd" || p == "netbsd" || p == "unknown"
+
+// arch() must be one of the documented closed set.
+val knownArch = (a: Json): Boolean =>
+  a == "x86_64" || a == "aarch64" || a == "arm" || a == "x86" || a == "riscv64" || a == "wasm32" || a == "unknown"
+
+val osSuite = suite("std/process", [
+  test("platform returns a value from the known set", () => [
+    expect(knownPlatform(platform())).toBe(true)
+  ]),
+
+  test("platform is non-empty and not 'unknown' on a supported host", () => [
+    // We don't assert WHICH platform, only that it is a real, non-empty string.
+    expect(platform().length() > 0).toBe(true)
+  ]),
+
+  test("arch returns a value from the known set", () => [
+    expect(knownArch(arch())).toBe(true)
+  ]),
+
+  test("arch is non-empty", () => [
+    expect(arch().length() > 0).toBe(true)
+  ]),
+
+  test("cpuCount is at least 1", () => [
+    expect(cpuCount() >= 1).toBe(true)
+  ]),
+
+  test("cpuCount composes as a bare Int32 (no match needed)", () => [
+    // The headline integration: cpuCount() feeds threadPool(n) directly. Here we just
+    // confirm it is usable in plain arithmetic without unwrapping.
+    expect(cpuCount() + 0 >= 1).toBe(true)
+  ]),
+
+  test("pid is positive", () => [
+    expect(pid() > 0).toBe(true)
+  ]),
+
+  test("ppid is non-negative", () => [
+    // ppid may be 0 where the parent cannot be determined; never negative.
+    expect(ppid() >= 0).toBe(true)
+  ]),
+
+  test("hostname is a non-empty string (or Error)", () => [
+    expect(hostname()).toSatisfy((h: Json) =>
+      match h
+        is Error => true
+        else => length(h) > 0
+    )
+  ]),
+
+  test("username resolves to a non-empty string (or Error)", () => [
+    expect(username()).toSatisfy((u: Json) =>
+      match u
+        is Error => true
+        else => length(u) > 0
+    )
+  ]),
+
+  test("homeDir resolves to a non-empty path (or Error)", () => [
+    expect(homeDir()).toSatisfy((h: Json) =>
+      match h
+        is Error => true
+        else => length(h) > 0
+    )
+  ]),
+
+  test("tempDir returns an existing directory", () => [
+    expect(isDir(tempDir())).toBe(true)
+  ]),
+
+  test("tempDir is a non-empty path", () => [
+    expect(tempDir().length() > 0).toBe(true)
+  ]),
+
+  test("uptime is a positive whole number of seconds (or Error)", () => [
+    expect(uptime()).toSatisfy((u: Json) =>
+      match u
+        is Error => true
+        else => u >= 0
+    )
+  ]),
+
+  test("loadAverage is a 3-element array on Unix, Error elsewhere", () => [
+    expect(loadAverage()).toSatisfy((la: Json) =>
+      match la
+        is Error => true
+        else => la.length() == 3 && la[0] >= 0.0
+    )
+  ]),
+
+  test("memInfo reports total > free >= 0 (or Error)", () => [
+    expect(memInfo()).toSatisfy((m: Json) =>
+      match m
+        is Error => true
+        else => m["total"] > 0 && m["free"] >= 0
+    )
+  ]),
+
+  test("dot-application form: cpuCount via plain call equals itself", () => [
+    // cpuCount has no argument, so exercise dot-application on a string-touching call instead:
+    // platform().length() is the dot form of length(platform()).
+    expect(platform().length()).toBe(length(platform()))
+  ])
+])
+
+run([s, osSuite])

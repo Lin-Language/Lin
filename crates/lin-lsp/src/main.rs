@@ -1094,6 +1094,13 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/math"     => Some(include_str!("../../../stdlib/math.lin")),
         "std/env"      => Some(include_str!("../../../stdlib/env.lin")),
         "std/bytes"    => Some(include_str!("../../../stdlib/bytes.lin")),
+        "std/regex"       => Some(include_str!("../../../stdlib/regex.lin")),
+        "std/crypto"      => Some(include_str!("../../../stdlib/crypto.lin")),
+        "std/csv"         => Some(include_str!("../../../stdlib/csv.lin")),
+        "std/encoding"    => Some(include_str!("../../../stdlib/encoding.lin")),
+        "std/random"      => Some(include_str!("../../../stdlib/random.lin")),
+        "std/bignum"      => Some(include_str!("../../../stdlib/bignum.lin")),
+        "std/decimal"     => Some(include_str!("../../../stdlib/decimal.lin")),
         "std/net"      => Some(include_str!("../../../stdlib/net.lin")),
         "std/process"  => Some(include_str!("../../../stdlib/process.lin")),
         "std/tty"      => Some(include_str!("../../../stdlib/tty.lin")),
@@ -4012,7 +4019,7 @@ const STDLIB_MODULE_IDS: &[&str] = &[
     "std/io", "std/json", "std/string", "std/number", "std/array", "std/iter",
     "std/object", "std/fs", "std/ffi", "std/http", "std/template", "std/async",
     "std/test", "std/time", "std/path", "std/math", "std/env",
-    "std/bytes", "std/net", "std/process", "std/tty", "std/signal", "std/yaml",
+    "std/bytes", "std/regex", "std/crypto", "std/csv", "std/encoding", "std/random", "std/bignum", "std/decimal", "std/net", "std/process", "std/tty", "std/signal", "std/yaml",
     "std/jq", "std/stream", "std/compress", "std/archive", "std/event",
 ];
 

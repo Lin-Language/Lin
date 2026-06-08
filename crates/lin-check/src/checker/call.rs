@@ -265,7 +265,8 @@ impl Checker {
             // typed as a Stream so a following `.take`/`.reduce`/… also sees a definite-stream
             // receiver and dispatches lazily.
             "map" | "filter" | "take" | "drop" | "flatMap" | "takeWhile" | "dropWhile"
-            | "flatten" | "concat" => {
+            | "flatten" | "concat" | "sliding" | "pairwise" | "intersperse" | "dedup"
+            | "zipWith" => {
                 let elem = match &array_ret {
                     Type::Array(inner) => (**inner).clone(),
                     Type::Stream(inner) => (**inner).clone(),
@@ -1464,6 +1465,7 @@ fn is_std_iter_stream_combinator(export_name: &str) -> bool {
         export_name,
         "map" | "filter" | "take" | "drop" | "flatMap" | "takeWhile" | "dropWhile"
             | "flatten" | "concat" | "reduce" | "find" | "some" | "every" | "while" | "for"
+            | "sliding" | "pairwise" | "intersperse" | "dedup" | "zipWith"
     )
 }
 
