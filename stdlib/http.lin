@@ -6,18 +6,34 @@ import foreign "lin-runtime"
   val lin_parse_json: (String) => Json
   val lin_server_path_match: (String, String) => Json
 
+// An incoming HTTP request passed to a `serve` handler: method, path, raw query string,
+// header map, and the raw request body.
 export type HttpRequest = { "method": String, "path": String, "query": String, "headers": { String: String }, "body": String }
 
+// An HTTP response: numeric status, header map, and body string. Built by `json`/`text`/
+// `redirect`/`badRequest`/`notFound` or constructed directly.
 export type HttpResponse = { "status": Int32, "headers": { String: String }, "body": String }
 
+// Options for `fetchWith`: HTTP method, request headers, and body.
 export type HttpOptions = { "method": String, "headers": { String: String }, "body": String }
 
+// GET `url`.
+// @param url  the URL to fetch.
+// @returns the response object, or an `Error` (`{ "type":"error", ... }`) if the request fails.
 export val fetch = (url: String): Json =>
   lin_http_fetch(url)
 
+// Issue a request to `url` with a custom method/headers/body.
+// @param url  the URL to request.
+// @param options  an `HttpOptions`-shaped record (method, headers, body).
+// @returns the response object, or an `Error` if the request fails.
 export val fetchWith = (url: String, options: Json): Json =>
   lin_http_fetch_with(url, options)
 
+// GET `url` and parse the response body as JSON.
+// @param url  the URL to fetch.
+// @returns the parsed JSON value, or an `Error` if the request fails (the error is passed through
+//          unparsed).
 export val fetchJson = (url: String): Json =>
   val response = lin_http_fetch(url)
   if response["type"] == "error" then
@@ -25,6 +41,10 @@ export val fetchJson = (url: String): Json =>
   else
     lin_parse_json(response["body"])
 
+// POST `body` to `url` as `application/json`.
+// @param url  the target URL.
+// @param body  any JSON-serialisable value; sent as the JSON request body.
+// @returns the response object, or an `Error` if the request fails.
 export val postJson = (url: String, body: Json): Json =>
   lin_http_fetch_with(url, {
     "method": "POST",
@@ -32,6 +52,10 @@ export val postJson = (url: String, body: Json): Json =>
     "body": lin_to_string(body)
   })
 
+// Build an `application/json` response with the given status and a JSON-serialised body.
+// @param status  the HTTP status code.
+// @param data  any JSON-serialisable value; becomes the response body.
+// @returns the `HttpResponse`.
 export val json = (status: Int32, data: Json): HttpResponse =>
   {
     "status": status,
@@ -39,6 +63,10 @@ export val json = (status: Int32, data: Json): HttpResponse =>
     "body": lin_to_string(data)
   }
 
+// Build a `text/plain; charset=utf-8` response with the given status and body.
+// @param status  the HTTP status code.
+// @param body  the plain-text body.
+// @returns the `HttpResponse`.
 export val text = (status: Int32, body: String): HttpResponse =>
   {
     "status": status,
@@ -46,6 +74,9 @@ export val text = (status: Int32, body: String): HttpResponse =>
     "body": body
   }
 
+// Build a 302 redirect response to `location`.
+// @param location  the URL to redirect to (sent in the `Location` header).
+// @returns the `HttpResponse`.
 export val redirect = (location: String): HttpResponse =>
   {
     "status": 302,
@@ -53,12 +84,16 @@ export val redirect = (location: String): HttpResponse =>
     "body": ""
   }
 
+// A ready-made 404 Not Found response.
 export val notFound: HttpResponse = {
   "status": 404,
   "headers": {},
   "body": "Not Found"
 }
 
+// Build a 400 Bad Request response carrying `message` as the body.
+// @param message  the error text to return as the body.
+// @returns the `HttpResponse`.
 export val badRequest = (message: String): HttpResponse =>
   {
     "status": 400,
@@ -66,27 +101,40 @@ export val badRequest = (message: String): HttpResponse =>
     "body": message
   }
 
+// Parse a request's body as JSON.
+// @param req  the `HttpRequest` (its `body` field is parsed).
+// @returns the parsed JSON value, or an `Error` if the body is not valid JSON.
 export val parseBody = (req: Json): Json =>
   lin_parse_json(req["body"])
 
+// Match a request path against a route pattern (e.g. `/users/:id`), extracting path params.
+// @param path  the concrete request path.
+// @param pattern  the route pattern with `:name` capture segments.
+// @returns a map of captured params if the path matches, or a non-match result otherwise.
 export val matchPath = (path: String, pattern: String): Json =>
   lin_server_path_match(pattern, path)
 
+// Start a blocking HTTP server on `port`, dispatching each request to `handler`.
+// @param handler  a function `(HttpRequest) -> HttpResponse`.
+// @param port  the TCP port to listen on.
+// @returns never returns under normal operation (runs the accept loop).
 export val serve = (handler: Json, port: Int32): Null =>
   lin_serve(handler, port)
 
 // ===== URL parsing/building (folded in from the former std/url module) =====
+// A parsed URL, split into its RFC 3986 components (each emitted/stored verbatim, NOT decoded):
+//   scheme    "https"; lowercased; "" if the input was relative
+//   userinfo  raw "user:pass" between "//" and "@", undecoded; Null if absent
+//   host      "example.com", "[::1]"; "" if no authority
+//   port      443; Null if absent (scheme defaults are NOT filled in)
+//   path      "/a/b"; raw, percent-encoding preserved
+//   query     raw, WITHOUT the leading "?"; Null if absent
+//   fragment  raw, WITHOUT the leading "#"; Null if absent
 export type Url = { "scheme": String, "userinfo": String | Null, "host": String, "port": Int32 | Null, "path": String, "query": String | Null, "fragment": String | Null }
-// "https"; lowercased; "" if the input was relative
-// raw "user:pass" between "//" and "@", undecoded
-// "example.com", "[::1]"; "" if no authority
-// 443; Null if absent (scheme defaults are NOT filled in)
-// "/a/b"; raw, percent-encoding preserved
-// raw, WITHOUT the leading "?"; Null if absent
-// raw, WITHOUT the leading "#"; Null if absent
-// Parse `s` as an RFC 3986 URI (or relative reference). Returns an Error
-// ({ "type":"error", "message":... }, matched `is Error`) if `s` violates the generic syntax.
-// Components are split, NOT decoded.
+
+// Parse `s` as an RFC 3986 URI (or relative reference). Components are split, NOT decoded.
+// @param s  the URL string.
+// @returns the parsed `Url`, or an `Error` if `s` violates the generic URI syntax.
 export val parse = (s: String): Url | Error =>
   val raw = lin_url_parse(s)
   if raw["type"] == "error" then

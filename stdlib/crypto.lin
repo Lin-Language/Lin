@@ -39,46 +39,65 @@ import foreign "lin-runtime"
 export type Hasher = Int64
 
 // --- SHA-256 ---------------------------------------------------------------
-// 32 raw bytes. Hashing never fails. Use sha256Hex for a printable id, the raw form when the
-// digest feeds back into more bytes.
+// Hash bytes with SHA-256. Hashing never fails. Use sha256Hex for a printable id; prefer the raw
+// form when the digest feeds back into more bytes.
+// @param data  the bytes to hash.
+// @returns the 32-byte raw digest.
 export val sha256 = (data: UInt8[]): UInt8[] =>
   lin_crypto_sha256(data)
 
 // SHA-256 as a 64-char lowercase hex string (content-addressed ids, HTTP ETags).
+// @param data  the bytes to hash.
+// @returns the digest as lowercase hex.
 export val sha256Hex = (data: UInt8[]): String =>
   lin_crypto_sha256_hex(data)
 
 // --- SHA-512 ---------------------------------------------------------------
-// 64 raw bytes. Faster than SHA-256 on 64-bit hardware.
+// Hash bytes with SHA-512 (faster than SHA-256 on 64-bit hardware).
+// @param data  the bytes to hash.
+// @returns the 64-byte raw digest.
 export val sha512 = (data: UInt8[]): UInt8[] =>
   lin_crypto_sha512(data)
 
 // SHA-512 as a 128-char lowercase hex string.
+// @param data  the bytes to hash.
+// @returns the digest as lowercase hex.
 export val sha512Hex = (data: UInt8[]): String =>
   lin_crypto_sha512_hex(data)
 
 // --- SHA-1 (LEGACY / INSECURE) ---------------------------------------------
-// 20 raw bytes. Broken (practical collisions) — interop ONLY (e.g. Git object ids).
+// Hash bytes with SHA-1. Broken (practical collisions) — interop ONLY (e.g. Git object ids).
+// @param data  the bytes to hash.
+// @returns the 20-byte raw digest.
 export val sha1 = (data: UInt8[]): UInt8[] =>
   lin_crypto_sha1(data)
 
-// SHA-1 as a 40-char lowercase hex string. See sha1.
+// SHA-1 as a 40-char lowercase hex string. Legacy interop only; see sha1.
+// @param data  the bytes to hash.
+// @returns the digest as lowercase hex.
 export val sha1Hex = (data: UInt8[]): String =>
   lin_crypto_sha1_hex(data)
 
 // --- MD5 (LEGACY / INSECURE) -----------------------------------------------
-// 16 raw bytes. Thoroughly broken — legacy interop only (old checksums, some S3 ETags).
+// Hash bytes with MD5. Thoroughly broken — legacy interop only (old checksums, some S3 ETags).
+// @param data  the bytes to hash.
+// @returns the 16-byte raw digest.
 export val md5 = (data: UInt8[]): UInt8[] =>
   lin_crypto_md5(data)
 
-// MD5 as a 32-char lowercase hex string. See md5.
+// MD5 as a 32-char lowercase hex string. Legacy interop only; see md5.
+// @param data  the bytes to hash.
+// @returns the digest as lowercase hex.
 export val md5Hex = (data: UInt8[]): String =>
   lin_crypto_md5_hex(data)
 
 // --- hashString ------------------------------------------------------------
-// UTF-8 hash a string by named algorithm ("sha256" | "sha512" | "sha1" | "md5",
-// case-insensitive), returning lowercase hex. An unknown name falls back to sha256. Prefer the
-// dedicated shaNNNHex functions when the algorithm is fixed; use this for the dynamic case.
+// UTF-8 hash a string by named algorithm, returning lowercase hex. Prefer the dedicated shaNNNHex
+// functions when the algorithm is fixed; use this for the dynamic case.
+// @param s          the text to UTF-8 encode and hash.
+// @param algorithm  "sha256" | "sha512" | "sha1" | "md5" (case-insensitive); an unknown name
+//                   falls back to sha256.
+// @returns the digest as lowercase hex.
 export val hashString = (s: String, algorithm: String): String =>
   val bytes = lin_crypto_to_bytes(s)
   val algo = algorithm.toLower()
@@ -92,66 +111,91 @@ export val hashString = (s: String, algorithm: String): String =>
     lin_crypto_sha256_hex(bytes)
 
 // --- HMAC-SHA-256 ----------------------------------------------------------
-// 32 raw tag bytes authenticating `message` under secret `key` (webhook signatures, signed
-// cookies, API signing). Verify with constantTimeEqual, never `==`.
+// Compute an HMAC-SHA-256 message authentication tag (webhook signatures, signed cookies, API
+// signing). Verify a received tag with constantTimeEqual, never `==`.
+// @param key      the shared secret key bytes.
+// @param message  the bytes to authenticate.
+// @returns the 32-byte raw tag.
 export val hmacSha256 = (key: UInt8[], message: UInt8[]): UInt8[] =>
   lin_crypto_hmac_sha256(key, message)
 
 // HMAC-SHA-256 tag as a 64-char lowercase hex string (the form most webhook providers send).
+// @param key      the shared secret key bytes.
+// @param message  the bytes to authenticate.
+// @returns the tag as lowercase hex.
 export val hmacSha256Hex = (key: UInt8[], message: UInt8[]): String =>
   lin_crypto_hmac_sha256_hex(key, message)
 
 // --- CSPRNG ----------------------------------------------------------------
-// n bytes from the OS CSPRNG (getrandom/urandom). For tokens, salts, nonces, key material. NOT
-// std/math `random`. n must be >= 0; randomBytes(0) returns an empty buffer.
+// Generate cryptographically-secure random bytes from the OS CSPRNG (getrandom/urandom). For
+// tokens, salts, nonces, key material. NOT std/math `random`.
+// @param n  the number of bytes; must be >= 0 (0 returns an empty buffer).
+// @returns a fresh buffer of `n` random bytes.
 export val randomBytes = (n: Int32): UInt8[] =>
   lin_crypto_random_bytes(n)
 
 // --- UUID ------------------------------------------------------------------
-// Random (version 4) UUID as canonical lowercase 8-4-4-4-12. 122 random bits from the CSPRNG.
+// Generate a random (version 4) UUID — 122 random bits from the CSPRNG.
+// @returns the UUID as canonical lowercase 8-4-4-4-12.
 export val uuidV4 = (): String =>
   lin_crypto_uuid_v4()
 
-// Time-ordered (version 7) UUID: leading 48 bits are the Unix-ms timestamp, remainder CSPRNG.
-// v7 values sort chronologically — better than v4 as database primary keys.
+// Generate a time-ordered (version 7) UUID: leading 48 bits are the Unix-ms timestamp, remainder
+// CSPRNG. v7 values sort chronologically — better than v4 as database primary keys.
+// @returns the UUID as canonical lowercase 8-4-4-4-12.
 export val uuidV7 = (): String =>
   lin_crypto_uuid_v7()
 
 // --- constant-time compare -------------------------------------------------
-// Timing-safe byte-buffer equality: time depends only on length, never on where they differ.
-// Use for HMAC tags / secret-dependent bytes. Returns false immediately for differing lengths.
+// Compare two byte buffers in constant time: the runtime depends only on length, never on where
+// they differ. Use for HMAC tags / secret-dependent bytes.
+// @param a  the first buffer.
+// @param b  the second buffer.
+// @returns true if equal; false immediately for differing lengths.
 export val constantTimeEqual = (a: UInt8[], b: UInt8[]): Boolean =>
   lin_crypto_ct_eq(a, b)
 
 // --- codecs ----------------------------------------------------------------
 // UTF-8-encode a string to its byte buffer (the bridge from codepoint String to UInt8[]).
+// @param s  the text to encode.
+// @returns the UTF-8 bytes.
 export val toBytes = (s: String): UInt8[] =>
   lin_crypto_to_bytes(s)
 
 // Lowercase-hex encode a byte buffer (two chars/byte, no separators). Never fails.
+// @param data  the bytes to encode.
+// @returns the lowercase hex string.
 export val toHex = (data: UInt8[]): String =>
   lin_crypto_to_hex(data)
 
-// Decode a hex string to bytes (upper/lowercase accepted). Returns an Error for odd length or a
-// non-hex character — the only fallible function here.
+// Decode a hex string to bytes (upper/lowercase accepted) — the only fallible codec here.
+// @param s  the hex string to decode.
+// @returns the decoded bytes, or an Error for odd length or a non-hex character.
 export val fromHex = (s: String): Json =>
   lin_crypto_from_hex(s)
 
 // --- streaming Hasher ------------------------------------------------------
-// Create an incremental hasher for `algorithm` ("sha256" | "sha512" | "sha1" | "md5",
-// case-insensitive). Returns an Error for an unknown algorithm — construction is the validation
-// point, so update/digest themselves never fail.
+// Create an incremental hasher. Construction is the validation point, so update/digest never fail.
+// @param algorithm  "sha256" | "sha512" | "sha1" | "md5" (case-insensitive).
+// @returns a Hasher handle, or an Error for an unknown algorithm.
 export val newHasher = (algorithm: String): Json =>
   lin_crypto_hasher_new(algorithm)
 
-// Feed bytes into a running digest, returning the same handle for chaining.
+// Feed bytes into a running digest.
+// @param h     the hasher handle.
+// @param data  the bytes to absorb.
+// @returns the same handle, for chaining.
 export val update = (h: Hasher, data: UInt8[]): Hasher =>
   lin_crypto_hasher_update(h, data)
 
 // Finalise a hasher to its raw digest bytes (length per algorithm). Leaves the handle spent.
+// @param h  the hasher handle.
+// @returns the raw digest bytes.
 export val digest = (h: Hasher): UInt8[] =>
   lin_crypto_hasher_digest(h)
 
 // Finalise a hasher to a lowercase hex string. Leaves the handle spent.
+// @param h  the hasher handle.
+// @returns the digest as lowercase hex.
 export val digestHex = (h: Hasher): String =>
   lin_crypto_hasher_digest_hex(h)

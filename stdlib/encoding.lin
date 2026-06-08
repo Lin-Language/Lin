@@ -286,14 +286,20 @@ val byteOr0 = (bytes: UInt8[], i: Int32, n: Int32): Int32 =>
     0
 
 // --- base64 ----------------------------------------------------------------
-// Shared encoder for both alphabets. `pad` controls trailing '=' (standard pads,
-// URL-safe does not). Groups input bytes 3-at-a-time, emitting 4 sextet codepoints.
+// Encode bytes as standard Base64 (RFC 4648 §4, `+`/`/` alphabet) with `=` padding. Never fails.
+// @param bytes  the bytes to encode.
+// @returns the Base64 string.
 export val base64Encode = (bytes: UInt8[]): String =>
   b64EncodeWith(bytes, b64Std, true)
 
+// Encode bytes as URL-safe Base64 (RFC 4648 §5, `-`/`_` alphabet) WITHOUT padding. Never fails.
+// @param bytes  the bytes to encode.
+// @returns the URL-safe Base64 string.
 export val base64UrlEncode = (bytes: UInt8[]): String =>
   b64EncodeWith(bytes, b64Url, false)
 
+// Shared encoder for both alphabets. `pad` controls trailing '=' (standard pads, URL-safe does
+// not). Groups input bytes 3-at-a-time, emitting 4 sextet codepoints.
 val b64EncodeWith = (bytes: UInt8[], alpha: Int32[], pad: Boolean): String =>
   val out: Int32[] = []
   fromCodePoints(b64EncGo(bytes, length(bytes), 0, alpha, pad, out))
@@ -321,13 +327,17 @@ val b64EncGo = (bytes: UInt8[], n: Int32, i: Int32, alpha: Int32[], pad: Boolean
       push(out, PAD)
     b64EncGo(bytes, n, i + 3, alpha, pad, out)
 
-// Decode standard Base64 back to bytes. ASCII whitespace is ignored. Returns an Error on
-// a non-alphabet character, malformed padding, or an impossible length (≡ 1 mod 4).
+// Decode standard Base64 back to bytes. ASCII whitespace is ignored.
+// @param s  the Base64 string to decode.
+// @returns the decoded bytes, or an Error on a non-alphabet character, malformed padding, or an
+//          impossible length (≡ 1 mod 4).
 export val base64Decode = (s: String): UInt8[] | Error =>
   b64DecodeWith(s, false)
 
-// Decode URL-safe Base64. Trailing `=` padding is tolerated but optional. Standard-alphabet
-// characters (`+`/`/`) are rejected — use base64Decode for those.
+// Decode URL-safe Base64 back to bytes. Trailing `=` padding is tolerated but optional;
+// standard-alphabet characters (`+`/`/`) are rejected — use base64Decode for those.
+// @param s  the URL-safe Base64 string to decode.
+// @returns the decoded bytes, or an Error on a non-alphabet character or malformed padding.
 export val base64UrlDecode = (s: String): UInt8[] | Error =>
   b64DecodeWith(s, true)
 
@@ -380,8 +390,9 @@ val b64DecGo = (s: String, i: Int32, urlSafe: Boolean, acc: Int32, bits: Int32, 
         b64DecGo(s, i + 1, urlSafe, acc2, bits + 1, sawPad, out)
 
 // --- hex -------------------------------------------------------------------
-// Lower-case hex, two chars per byte, most-significant nibble first. Length is exactly
-// 2 * length(bytes). Never fails.
+// Encode bytes as lower-case hex, two chars per byte, most-significant nibble first. Never fails.
+// @param bytes  the bytes to encode.
+// @returns the hex string (length exactly 2 * length(bytes)).
 export val hexEncode = (bytes: UInt8[]): String =>
   val out: Int32[] = []
   fromCodePoints(hexEncGo(bytes, length(bytes), 0, out))
@@ -395,8 +406,10 @@ val hexEncGo = (bytes: UInt8[], n: Int32, i: Int32, out: Int32[]): Int32[] =>
     push(out, hexLower[byte & 15])
     hexEncGo(bytes, n, i + 1, out)
 
-// Decode a hex string back to bytes. Accepts upper- and lower-case. Returns an Error on
-// odd length or any non-hex character. Does NOT skip whitespace or accept a `0x` prefix.
+// Decode a hex string back to bytes. Accepts upper- and lower-case; does NOT skip whitespace or
+// accept a `0x` prefix.
+// @param s  the hex string to decode.
+// @returns the decoded bytes, or an Error on odd length or any non-hex character.
 export val hexDecode = (s: String): UInt8[] | Error =>
   val n = byteLen(s)
   if n % 2 != 0 then
@@ -418,9 +431,11 @@ val hexDecGo = (s: String, n: Int32, i: Int32, out: UInt8[]): UInt8[] | Error =>
       hexDecGo(s, n, i + 2, out)
 
 // --- url / percent ---------------------------------------------------------
-// Percent-encode `s` as a URI COMPONENT (RFC 3986). Every UTF-8 byte is escaped to %XX
-// (upper-case hex) except the unreserved set. Space becomes %20 (NOT +). The strict,
-// maximal-escaping component encoder, safe for both path segments and query values.
+// Percent-encode `s` as a URI COMPONENT (RFC 3986): the strict, maximal-escaping component
+// encoder, safe for both path segments and query values. Every UTF-8 byte is escaped to %XX
+// (upper-case hex) except the unreserved set; space becomes %20 (NOT +).
+// @param s  the text to encode.
+// @returns the percent-encoded string.
 export val urlEncode = (s: String): String =>
   val out: Int32[] = []
   fromCodePoints(pctEncGo(s, 0, false, out))
@@ -442,17 +457,15 @@ val pctEncGo = (s: String, i: Int32, plusSpace: Boolean, out: Int32[]): Int32[] 
       push(out, hexUpper[byte & 15])
     pctEncGo(s, i + 1, plusSpace, out)
 
-// Decode percent-escapes back to a String. `%XX` triples become their byte value, a
-// literal `+` decodes to a space (form symmetry), and the resulting bytes are UTF-8
-// decoded. Returns an Error on a `%` not followed by two hex digits, or invalid UTF-8.
-// NOTE on the `if bytes is Error` shape: the checker narrows the FALSE branch of an
-// `is Error` test (subtracting Error to give `UInt8[]`) but does NOT narrow the TRUE
-// branch to `Error` for a non-Json union scrutinee — passing `bytes` through there yields
-// the un-narrowed `UInt8[] | Error`, a type error. So the error is reconstructed from its
-// message field (a fresh `Error`), which is well-typed.
+// Decode percent-escapes back to a String. `%XX` triples become their byte value, a literal `+`
+// decodes to a space (form symmetry), and the resulting bytes are UTF-8 decoded.
+// @param s  the percent-encoded string.
+// @returns the decoded text, or an Error on a `%` not followed by two hex digits, or invalid UTF-8.
 export val urlDecode = (s: String): String | Error =>
   val bytes = percentDecodeBytes(s)
   if bytes is Error then
+    // The checker narrows the FALSE branch of `is Error` (giving `UInt8[]`) but not the TRUE
+    // branch to `Error` for a non-Json union scrutinee, so reconstruct a fresh Error here.
     mkError(toString(bytes["message"]))
   else
     fromUtf8(bytes)
@@ -535,10 +548,12 @@ val byteSliceGo = (s: String, i: Int32, end: Int32, out: Int32[]): Int32[] =>
     push(out, byteAt(s, i))
     byteSliceGo(s, i + 1, end, out)
 
-// Parse a query string into a multimap key -> list of values. Pairs split on `&`; each
-// pair splits on the first `=`. Keys/values are percent-decoded with `+`->space (form
-// semantics), leniently (malformed escapes are kept literal). A bare key (`flag`) maps to
-// a single `""` value. A leading `?` is tolerated and stripped.
+// Parse a query string into a multimap of key -> list of values. Pairs split on `&`; each pair
+// splits on the first `=`. Keys/values are percent-decoded with `+`->space (form semantics),
+// leniently (malformed escapes are kept literal). A bare key (`flag`) maps to a single `""` value.
+// A leading `?` is tolerated and stripped. Always succeeds.
+// @param s  the query string (with or without a leading `?`).
+// @returns the parsed multimap; each key maps to its list of values in input order.
 export val parseQuery = (s: String): { String: String[] } =>
   val result: { String: String[] } = {}
   val n = byteLen(s)
@@ -581,10 +596,11 @@ val addPair = (result: { String: String[] }, k: String, v: String): Null =>
   else
     push(cur, v)
 
-// Serialize a multimap back to a query string: each key paired with each value
-// (`k=v1&k=v2`), keys and values percent-encoded with the component rules PLUS the form
-// convention of encoding space as `+`. Inverse of parseQuery (up to key/iteration order).
-// Returns "" for an empty map. No leading `?` is emitted.
+// Serialize a multimap back to a query string: each key paired with each value (`k=v1&k=v2`), keys
+// and values percent-encoded with the component rules PLUS the form convention of encoding space as
+// `+`. Inverse of parseQuery (up to key/iteration order). No leading `?` is emitted.
+// @param params  the multimap of keys to value lists.
+// @returns the query string, or "" for an empty map.
 export val buildQuery = (params: { String: String[] }): String =>
   val parts: String[] = []
   keys(params).for(k =>
@@ -615,12 +631,15 @@ val joinAmp = (parts: String[], n: Int32, i: Int32, acc: String): String =>
     joinAmp(parts, n, i + 1, "${acc}&${parts[i]}")
 
 // --- string convenience wrappers ------------------------------------------
-// UTF-8 encode `s` to bytes, then standard Base64. Use for text payloads.
+// UTF-8 encode `s` to bytes, then standard Base64. Use for text payloads. Never fails.
+// @param s  the text to encode.
+// @returns the Base64 string.
 export val base64EncodeString = (s: String): String =>
   base64Encode(strBytes(s))
 
-// Standard Base64 decode, then UTF-8 decode the bytes back to a String. Surfaces an Error
-// on malformed Base64 OR invalid UTF-8.
+// Standard Base64 decode, then UTF-8 decode the bytes back to a String.
+// @param s  the Base64 string to decode.
+// @returns the decoded text, or an Error on malformed Base64 OR invalid UTF-8.
 export val base64DecodeString = (s: String): String | Error =>
   val bytes = base64Decode(s)
   if bytes is Error then
@@ -629,9 +648,11 @@ export val base64DecodeString = (s: String): String | Error =>
     fromUtf8(bytes)
 
 // --- structural hash -------------------------------------------------------
-// Stable structural hash key for any value: equal values produce equal keys (objects are
-// order-independent, arrays element-wise, type-tagged so 42 and "42" differ). Generic over
-// the input type — it walks the runtime value, so T can be anything. (Folded in from the
-// former std/hash module.)
+// Compute a stable structural hash key for any value: equal values produce equal keys (objects are
+// order-independent, arrays element-wise, type-tagged so 42 and "42" differ). Generic over the
+// input type — it walks the runtime value, so T can be anything. (Folded in from the former
+// std/hash module.)
+// @param x  the value to hash.
+// @returns the structural hash key as a String.
 export val hash = <T>(x: T): String =>
   lin_value_key(x)

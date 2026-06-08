@@ -35,45 +35,67 @@ import foreign "lin-runtime"
   val lin_regex_find_all: (Json, String) => Json
   val lin_regex_replace: (Json, String, String, Boolean) => String
   val lin_regex_split: (Json, String) => Json
-// compile returns either a boxed Int64 handle or an Error object => declared Json.
-// The handle is passed back into the other intrinsics as a boxed Json value (Regex = Json);
-// the Rust side reads the leaked-engine pointer out of the boxed Int64 payload.
-// find / find_all return freshly-built Match objects => declared Json, re-annotated.
-// replace returns a bare LinString (the `=> String` foreign ABI contract).
-// Compile `pattern` into a reusable Regex handle. Returns an Error value (detect with
-// `is Error`) if the pattern is not valid RE2 syntax — an unbalanced group, an unterminated
-// class, or an unsupported backreference / lookaround construct.
+// compile returns either a boxed Int64 handle or an Error object => declared Json. The handle is
+// passed back into the other intrinsics as a boxed Json value (Regex = Json); the Rust side reads
+// the leaked-engine pointer out of the boxed Int64 payload. find / find_all return freshly-built
+// Match objects => declared Json, re-annotated. replace returns a bare LinString.
+// Compile a pattern into a reusable Regex handle. The only fault case in the module.
+// @param pattern  the RE2 source pattern.
+// @returns the compiled Regex, or an Error (detect with `is Error`) if the pattern is not valid
+//          RE2 syntax — an unbalanced group, an unterminated class, or an unsupported
+//          backreference / lookaround construct.
 export val compile = (pattern: String): Regex | Error =>
   lin_regex_compile(pattern)
 
-// True if `re` matches anywhere within `s`. Cheapest operation; allocates no Match.
+// Test whether `re` matches anywhere within `s`. Cheapest operation; allocates no Match.
+// @param re  the compiled pattern.
+// @param s   the subject string.
+// @returns true if there is a match anywhere in `s`.
 export val isMatch = (re: Regex, s: String): Boolean =>
   lin_regex_is_match(re, s)
 
-// Leftmost match of `re` in `s`, or Null if there is no match.
+// Find the leftmost match of `re` in `s`.
+// @param re  the compiled pattern.
+// @param s   the subject string.
+// @returns the leftmost Match, or Null if there is no match.
 export val find = (re: Regex, s: String): Match | Null =>
   lin_regex_find(re, s)
 
-// Every non-overlapping match of `re` in `s`, left to right. Empty array if none.
+// Find every non-overlapping match of `re` in `s`, left to right.
+// @param re  the compiled pattern.
+// @param s   the subject string.
+// @returns the matches in order, or an empty array if none.
 export val findAll = (re: Regex, s: String): Match[] =>
   lin_regex_find_all(re, s)
 
-// Replace the FIRST match of `re` in `s` with `replacement` ($1 / ${name} / $$ substitution).
-// If there is no match, `s` is returned unchanged.
+// Replace the FIRST match of `re` in `s`.
+// @param re           the compiled pattern.
+// @param s            the subject string.
+// @param replacement  the replacement template ($1 / ${name} / $$ substitution).
+// @returns `s` with the first match replaced, or `s` unchanged if there is no match.
 export val replace = (re: Regex, s: String, replacement: String): String =>
   lin_regex_replace(re, s, replacement, false)
 
-// Replace EVERY non-overlapping match of `re` in `s` with `replacement`.
+// Replace EVERY non-overlapping match of `re` in `s`.
+// @param re           the compiled pattern.
+// @param s            the subject string.
+// @param replacement  the replacement template ($1 / ${name} / $$ substitution).
+// @returns `s` with all matches replaced.
 export val replaceAll = (re: Regex, s: String, replacement: String): String =>
   lin_regex_replace(re, s, replacement, true)
 
-// Split `s` around each non-overlapping match of `re`. If the pattern never matches, the
-// result is the single-element array `[s]`.
+// Split `s` around each non-overlapping match of `re`.
+// @param re  the compiled pattern.
+// @param s   the subject string.
+// @returns the pieces between matches; the single-element array `[s]` if the pattern never matches.
 export val split = (re: Regex, s: String): String[] =>
   lin_regex_split(re, s)
 
-// Convenience: compile `pattern` then test it against `s` in one call, propagating the
-// compile Error. Prefer `compile` + `isMatch` when matching the same pattern many times.
+// Compile `pattern` then test it against `s` in one call. Prefer `compile` + `isMatch` when
+// matching the same pattern many times.
+// @param pattern  the RE2 source pattern.
+// @param s        the subject string.
+// @returns true if `pattern` matches `s`, or the compile Error if `pattern` is invalid.
 export val matches = (pattern: String, s: String): Boolean | Error =>
   val re = compile(pattern)
   if re is Error then

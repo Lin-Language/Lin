@@ -12916,6 +12916,57 @@ print(x)
 }
 
 #[test]
+fn test_foreign_decl_scalar_union_return_is_callable() {
+    // Regression: a function TYPE with a union return (`(A) => B | C`) parsed the return with
+    // single-leaf precedence, so `(Json) => Int64 | Error` became `((Json) => Int64) | Error` —
+    // a non-callable union. The foreign val was then typed as that union and any call failed with
+    // "Cannot call non-function type (?T) => Int64 | { ... }". `=>` is the lowest-precedence type
+    // operator, so the return must bind the whole union. This blocked `std/bignum`/`std/decimal`
+    // whose `lin_*_to_int64` intrinsics are declared `(BigInt) => Int64 | Error`.
+    //
+    // Trigger confirmed: ANY function-type union return, scalar arm (`Int64 | Error`,
+    // `Int64 | Null`, `Float64 | Error`) or otherwise, in a `foreign` decl OR a normal `type`
+    // alias / function annotation. Foreign scalar-union was simply the only place it surfaced,
+    // since other stdlib intrinsics return `Json` (no union) and wrap to `T | Error` in Lin.
+    let (ok, output) = check_source(
+        r#"import foreign "lin-runtime"
+  val lin_demo_to_int: (Json) => Int64 | Error
+
+export val toIntDemo = (x: Json): Int64 | Error => lin_demo_to_int(x)
+
+val r = toIntDemo(5)
+val out = match (r)
+  is Error => 0
+  else => r + 1
+"#,
+    );
+    assert!(
+        ok,
+        "expected a foreign decl with a scalar-union return `(Json) => Int64 | Error` to type-check \
+         and be callable (result narrowing under `is Error`), got:\n{}",
+        output
+    );
+
+    // Other union-return shapes must also check (scalar | Null, float | Error, multi-arm, and a
+    // non-foreign `type` alias — same parse site).
+    for src in [
+        "import foreign \"lin-runtime\"\n  val f: (Json) => Int64 | Null\nexport val g = (x: Json): Int64 | Null => f(x)\n",
+        "import foreign \"lin-runtime\"\n  val f: (Json) => Float64 | Error\nexport val g = (x: Json): Float64 | Error => f(x)\n",
+        "import foreign \"lin-runtime\"\n  val f: (Json) => Int64 | Null | Error\nexport val g = (x: Json): Int64 | Null | Error => f(x)\n",
+        "type Fn = (Json) => Int64 | Error\nexport val g = (f: Fn, x: Json): Int64 | Error => f(x)\n",
+    ] {
+        let (ok, output) = check_source(src);
+        assert!(ok, "expected union-return decl to type-check:\n{}\n---\n{}", src, output);
+    }
+
+    // Regression guard: a plain (non-union) scalar foreign return must still check.
+    let (ok, output) = check_source(
+        "import foreign \"lin-runtime\"\n  val f: (Json) => Int64\nexport val g = (x: Json): Int64 => f(x)\n",
+    );
+    assert!(ok, "plain scalar foreign return regressed:\n{}", output);
+}
+
+#[test]
 fn test_check_and_build_agree_on_import_dependent_case() {
     // The bad program: both `check` and `build` must reject it.
     let bad = r#"import { trim } from "std/string"

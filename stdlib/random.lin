@@ -48,16 +48,17 @@ export type Rng = { "state": UInt64, "inc": UInt64 }
 // A single draw of a `UInt64`: the value plus the advanced generator to thread onward.
 type Step = { "value": UInt64, "rng": Rng }
 
-// A draw of an `Int32` paired with the advanced generator.
+// The result of an `Int32` draw: the drawn `value` plus the advanced generator to thread onward.
 export type IntDraw = { "value": Int32, "rng": Rng }
 
-// A draw of a `Float64` (in `[0, 1)`) paired with the advanced generator.
+// The result of a `Float64` draw (in `[0, 1)`) plus the advanced generator to thread onward.
 export type FloatDraw = { "value": Float64, "rng": Rng }
 
-// A draw of a `Boolean` paired with the advanced generator.
+// The result of a `Boolean` draw plus the advanced generator to thread onward.
 export type BoolDraw = { "value": Boolean, "rng": Rng }
 
-// A draw of some `T` paired with the advanced generator (for the generic `choice`/`shuffle`/`sample`).
+// The result of a generic draw of some `T` plus the advanced generator to thread onward (used by
+// `choice`/`shuffle`/`sample`).
 export type Draw<T> = { "value": T, "rng": Rng }
 
 // ── PCG / SplitMix64 internals ─────────────────────────────────────────────────────────────────
@@ -96,57 +97,72 @@ val step = (r: Rng): Step =>
 
 // ── Constructors ───────────────────────────────────────────────────────────────────────────────
 // Build a generator from a numeric seed. Deterministic: the same `n` always yields the same
-// sequence. The seed is run through SplitMix64 twice (once for the initial state, once for the
-// stream-selecting increment) so even `seed(0)` / `seed(1)` are well-distributed, then the PCG
-// init dance (state←0, inc←(seq<<1)|1, step, +=initstate, step) brings the generator to a usable
-// state. Accepts an `Int32` for ergonomic `seed(42)`; widened to the full `UInt64` seed space.
+// sequence (even low-entropy seeds like `0`/`1` are well-distributed).
+// @param n  the seed; an `Int32` is accepted ergonomically and widened to the `UInt64` seed space.
+// @returns a fresh `Rng` to thread into the first draw.
 export val seed = (n: UInt64): Rng =>
+  // SplitMix64 the seed twice: once for the initial state, once for the stream-selecting increment.
   val m1 = splitmix64(n)
   val m2 = splitmix64(m1["acc"])
   val initstate = m1["out"]
   val initseq = m2["out"]
   val inc = (initseq << 1u64) | 1u64
-  // PCG standard seeding.
+  // PCG standard seeding: state←0, step, += initstate, step again to a usable state.
   val s1 = step({ "state": 0u64, "inc": inc })
   val s2 = step({ "state": s1["rng"]["state"] + initstate, "inc": inc })
   s2["rng"]
 
 // Build a generator seeded from operating-system entropy. NON-reproducible by design (each call
-// produces an independent stream). Use this for "I just want different numbers each run"; use
-// `seed(n)` when you need to replay a run. The single OS intrinsic is the only impurity here.
+// produces an independent stream). Use this for "different numbers each run"; use `seed(n)` to
+// replay a run.
+// @returns a fresh OS-seeded `Rng`.
 export val fromEntropy = (): Rng =>
   seed(lin_random_entropy())
 
 // ── Explicit-handle draws ───────────────────────────────────────────────────────────────────────
-// Next raw 32-bit value as an `Int32` (may be negative — it is the full 32-bit pattern
-// reinterpreted). Prefer `randInt`/`float` for bounded draws. Threads the generator.
+// Draw the next raw 32-bit value. Prefer `randInt`/`float` for bounded draws.
+// @param r  the generator state.
+// @returns an `IntDraw`; `value` is the full 32-bit pattern reinterpreted (may be negative), and
+//          `rng` is the advanced generator to thread onward.
 export val nextInt = (r: Rng): IntDraw =>
   val s = step(r)
   { "value": toI32(s["value"]), "rng": s["rng"] }
 
-// A uniform `Float64` in `[0, 1)`. Uses the top 32 output bits divided by 2^32, so it has 32 bits
-// of resolution (sufficient for sampling/jitter; not a full-mantissa double). Threads the generator.
+// Draw a uniform `Float64` in `[0, 1)`. Has 32 bits of resolution (sufficient for sampling/jitter;
+// not a full-mantissa double).
+// @param r  the generator state.
+// @returns a `FloatDraw` with `value` in `[0, 1)` and the advanced `rng`.
 export val float = (r: Rng): FloatDraw =>
+  // Top 32 output bits divided by 2^32.
   val s = step(r)
   { "value": u32ToFloat(s["value"]), "rng": s["rng"] }
 
-// A uniform integer in the HALF-OPEN range `[lo, hi)` (like `range(lo, hi)`). When `hi <= lo` the
-// range is empty and `lo` is returned unchanged (no draw is wasted there, but the generator is
-// still advanced for predictability). Modulo reduction — for the small ranges typical of dice,
-// indices and sampling the modulo bias is negligible; this is not a uniform-crypto primitive.
+// Draw a uniform integer in the HALF-OPEN range `[lo, hi)` (like `range(lo, hi)`). Uses modulo
+// reduction — negligible bias for the small ranges typical of dice/indices/sampling, but not a
+// uniform-crypto primitive.
+// @param r   the generator state.
+// @param lo  the inclusive lower bound.
+// @param hi  the exclusive upper bound.
+// @returns an `IntDraw`; when `hi <= lo` the range is empty and `value` is `lo` (the generator is
+//          still advanced for predictability).
 export val randInt = (r: Rng, lo: Int32, hi: Int32): IntDraw =>
   val s = step(r)
   val span = hi - lo
   val v = if span <= 0 then lo else lo + toI32(s["value"] % toU64(span))
   { "value": v, "rng": s["rng"] }
 
-// A uniform `Boolean` (a coin flip). Threads the generator.
+// Draw a uniform `Boolean` (a coin flip).
+// @param r  the generator state.
+// @returns a `BoolDraw` with the flip and the advanced `rng`.
 export val boolean = (r: Rng): BoolDraw =>
   val s = step(r)
   { "value": (s["value"] & 1u64) == 1u64, "rng": s["rng"] }
 
-// Choose one element of `xs` uniformly. On an empty array there is nothing to choose, so the value
-// is `Null` (and the generator is returned UNADVANCED — no draw is consumed). Threads the generator.
+// Choose one element of `xs` uniformly.
+// @param r   the generator state.
+// @param xs  the array to choose from.
+// @returns a `Draw` whose `value` is the chosen element, or `Null` when `xs` is empty (in which
+//          case `rng` is returned UNADVANCED — no draw is consumed).
 export val choice = <T>(r: Rng, xs: T[]): Draw<T | Null> =>
   val n = length(xs)
   if n <= 0 then
@@ -155,21 +171,30 @@ export val choice = <T>(r: Rng, xs: T[]): Draw<T | Null> =>
     val d = randInt(r, 0, n)
     { "value": xs[d["value"]], "rng": d["rng"] }
 
-// A new array with the elements of `xs` in a uniformly-random order (Fisher–Yates). NON-mutating:
-// `xs` is left untouched and a fresh array is returned. Threads the generator.
+// Produce a uniformly-random reordering of `xs` (Fisher–Yates). NON-mutating: `xs` is left
+// untouched.
+// @param r   the generator state.
+// @param xs  the source array.
+// @returns a `Draw` whose `value` is a fresh shuffled array, plus the advanced `rng`.
 export val shuffle = <T>(r: Rng, xs: T[]): Draw<T[]> =>
   val out = copyOf(xs)
   val rng = shuffleInto(r, out)
   { "value": out, "rng": rng }
 
-// Shuffle `xs` IN PLACE (Fisher–Yates), mutating the given array, and return the advanced
-// generator. Use when you own `xs` and want to avoid the copy `shuffle` makes.
+// Shuffle `xs` IN PLACE (Fisher–Yates), mutating the given array. Use when you own `xs` and want to
+// avoid the copy `shuffle` makes.
+// @param r   the generator state.
+// @param xs  the array to shuffle in place.
+// @returns the advanced generator.
 export val shuffleInPlace = <T>(r: Rng, xs: T[]): Rng =>
   shuffleInto(r, xs)
 
-// `k` elements drawn from `xs` WITHOUT replacement (each source element appears at most once), in
-// random order. If `k >= length(xs)` the result is a full shuffle; if `k <= 0` it is empty.
-// Implemented as a partial Fisher–Yates over a copy, so it is non-mutating. Threads the generator.
+// Draw `k` elements from `xs` WITHOUT replacement (each source element appears at most once), in
+// random order. NON-mutating (partial Fisher–Yates over a copy).
+// @param r   the generator state.
+// @param xs  the source array.
+// @param k   how many to draw; `k >= length(xs)` yields a full shuffle, `k <= 0` yields empty.
+// @returns a `Draw` whose `value` is the sampled array, plus the advanced `rng`.
 export val sample = <T>(r: Rng, xs: T[], k: Int32): Draw<T[]> =>
   val pool = copyOf(xs)
   val n = length(pool)
@@ -194,46 +219,55 @@ export val sample = <T>(r: Rng, xs: T[], k: Int32): Draw<T[]> =>
 // stream comes from `reseed(n)`; for concurrent or fully-reproducible work use the handle API above.
 var g: Rng = fromEntropy()
 
-// Reseed the global generator deterministically. After `reseed(n)`, the global draws replay the
-// same sequence on every run (the script-level analogue of `seed(n)`).
+// Reseed the global generator deterministically — the script-level analogue of `seed(n)`. After
+// `reseed(n)` the global draws replay the same sequence on every run.
+// @param n  the seed.
+// @returns null.
 export val reseed = (n: UInt64): Null =>
   g = seed(n)
   null
 
-// Next raw `Int32` from the global generator.
+// Draw the next raw `Int32` from the global generator.
+// @returns the next raw 32-bit value (may be negative).
 export val next = (): Int32 =>
   val d = nextInt(g)
   g = d["rng"]
   d["value"]
 
-// A uniform integer in `[lo, hi)` from the global generator.
+// Draw a uniform integer in `[lo, hi)` from the global generator.
+// @param lo  the inclusive lower bound.
+// @param hi  the exclusive upper bound.
+// @returns the drawn integer (`lo` when `hi <= lo`).
 export val int = (lo: Int32, hi: Int32): Int32 =>
   val d = randInt(g, lo, hi)
   g = d["rng"]
   d["value"]
 
-// A uniform `Float64` in `[0, 1)` from the global generator.
+// Draw a uniform `Float64` in `[0, 1)` from the global generator.
+// @returns the drawn float in `[0, 1)`.
 export val real = (): Float64 =>
   val d = float(g)
   g = d["rng"]
   d["value"]
 
-// A coin flip from the global generator.
+// Draw a coin flip from the global generator.
+// @returns a uniform `Boolean`.
 export val flip = (): Boolean =>
   val d = boolean(g)
   g = d["rng"]
   d["value"]
 
-// Choose one element of `xs` (or `Null` when empty) from the global generator.
+// Choose one element of `xs` from the global generator. The fully-generic, type-safe equivalent is
+// the explicit-handle `choice`; prefer it when you need precise element typing.
+// @param xs  the array to choose from (typed `Json` — see note below).
+// @returns the chosen element, or `Null` when `xs` is empty.
 //
-// ⚠ The two GLOBAL collection helpers (`pick`, `shuffled`) operate on `Json` arrays rather than a
-// generic `T[]`. This is a deliberate workaround, not a design choice: an EXPORTED, GENERIC global
-// wrapper that reads the module-level `Rng` and threads it through another function miscompiles in
-// this compiler — the packed `Rng` record is passed across the monomorphized cross-module call as a
-// misaligned pointer and the program crashes (misaligned-deref `0x…2`). See the BUG note at the
-// foot of `random.test.lin` for a minimal repro. The fully-generic, type-safe equivalents are the
-// EXPLICIT-HANDLE `choice`/`shuffle` (which take an `Rng` argument and are unaffected) — prefer
-// those when you need precise element typing; reach for `pick`/`shuffled` for quick scripting.
+// ⚠ The two GLOBAL collection helpers (`pick`, `shuffled`) take `Json` arrays rather than a generic
+// `T[]` as a deliberate workaround: an EXPORTED, GENERIC global wrapper that reads the module-level
+// `Rng` and threads it through another function miscompiles — the packed `Rng` record crosses the
+// monomorphized cross-module call as a misaligned pointer and the program crashes (misaligned-deref
+// `0x…2`). See the BUG note at the foot of `random.test.lin`. The explicit-handle
+// `choice`/`shuffle` take an `Rng` argument and are unaffected.
 export val pick = (xs: Json): Json =>
   val n = length(xs)
   if n <= 0 then
@@ -244,8 +278,9 @@ export val pick = (xs: Json): Json =>
     g = d["rng"]
     xs[d["value"]]
 
-// A randomly-ordered copy of `xs` from the global generator (non-mutating). `Json` for the same
-// reason as `pick` above.
+// Produce a randomly-ordered copy of `xs` from the global generator (NON-mutating).
+// @param xs  the source array (typed `Json` for the same reason as `pick` above).
+// @returns a fresh shuffled array.
 export val shuffled = (xs: Json): Json =>
   val out = slice(xs, 0, length(xs))
   val n = length(out)

@@ -1,5 +1,7 @@
 import foreign "lin-runtime"
   val lin_signal_wait: (Int32) => Int32
 
-// Block until the given signal is delivered to this thread; returns the signal number.
+// Block until the given signal is delivered to this thread.
+// @param sig  the signal number to wait for.
+// @returns the signal number that was delivered.
 export val waitSignal = (sig: Int32): Int32 => lin_signal_wait(sig)

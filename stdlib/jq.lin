@@ -3,9 +3,19 @@ import { length } from "std/array"
 import foreign "lin-runtime"
   val lin_jq_query: (Json, String) => Json
 
+// Run a jq filter over a Json value and collect all results.
+// @param input   the Json value to query.
+// @param filter  the jq filter expression.
+// @returns a `Json[]` of the filter's outputs, or an `Error` object if the filter is invalid or
+//   fails to evaluate.
 export val jq = (input: Json, filter: String): Json =>
   lin_jq_query(input, filter)
 
+// Run a jq filter and return only its first result.
+// @param input   the Json value to query.
+// @param filter  the jq filter expression.
+// @returns the first output value, `null` if the filter produced none, or the `Error` object if the
+//   query failed.
 export val jqFirst = (input: Json, filter: String): Json =>
   val result = lin_jq_query(input, filter)
   if result["type"] == "error" then

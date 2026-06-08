@@ -480,7 +480,6 @@ val s = suite("std/object", [
   )
 ])
 
-
 // A fallible function in the `T | Error` convention.
 val parsePort = (s: String): Int32 | Error =>
   if s == "" then error("empty port") else 8080

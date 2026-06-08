@@ -5,32 +5,49 @@ import foreign "lin-runtime"
   val lin_io_print_err: (String) => Null
   val lin_io_args: () => String[]
 
+// Read one line from standard input (without the trailing newline).
+// @returns the line as a `String`, or `null` at end of input.
 export val readLine = (): Json =>
   lin_io_read_line()
 
+// Read all of standard input to end of stream.
+// @returns the entire input as a single `String`.
 export val readAll = (): String =>
   lin_io_read_all()
 
+// Read all of standard input as lines.
+// @returns an array of the input lines (newlines stripped).
 export val lines = (): String[] =>
   lin_io_lines()
 
+// Print a value to standard output, followed by a newline.
+// @param x  the value to print (stringified).
 export val print = (x: Json): Null =>
   lin_print(x)
 
+// Print a value to standard error, followed by a newline.
+// @param x  the value to print (stringified).
 export val printErr = (x: Json): Null =>
   lin_io_print_err(lin_to_string(x))
 
+// The process command-line arguments.
+// @returns an array of the argument strings.
 export val args = (): String[] =>
   lin_io_args()
 
+// Print a prompt and read one line of input.
+// @param message  the prompt to print before reading.
+// @returns the line read, or `null` at end of input.
 export val prompt = (message: String): Json =>
   print(message)
   readLine()
 
+// Terminate the process with the given exit code.
+// @param code  the process exit status (0 = success).
 export val exit = (code: Int32): Null =>
   lin_exit(code)
 
-// stdinStream(): wrap the process's standard input as a lazy byte Stream<UInt8[]> (streams
-// brief §4). Reading pulls from stdin until EOF; pair with `lines`/`map`/… from std/stream.
+// Wrap the process's standard input as a lazy byte `Stream<UInt8[]>` (streams brief §4).
+// @returns a `Stream` that pulls from stdin until EOF; pair with `lines`/`map`/… from std/stream.
 export val stdinStream = (): Stream =>
   lin_io_stdin_stream()

@@ -14,8 +14,8 @@
 // Fallible functions return `Decimal | Error`, matched with `is Error`.
 //
 // NOTE: cross-worker transfer of a Decimal is NOT supported in v1 (raw-pointer handle).
-
 export type Decimal = Json
+// A rounding strategy, one of the `Round*` constants below. Passed to `div`/`round`/`setScale`.
 export type RoundingMode = Int32
 
 import foreign "lin-runtime"
@@ -42,57 +42,95 @@ import foreign "lin-runtime"
 // ── Rounding modes (opaque enumerated constants) ────────────────────────────────
 // 0.5 → away from zero (schoolbook); 0.5 → nearest even (banker's, the money default);
 // toward -inf; toward +inf; toward zero (truncate).
-
+// Round 0.5 away from zero (schoolbook rounding).
 export val RoundHalfUp: RoundingMode = 0
+// Round 0.5 to the nearest even digit (banker's rounding — the money default).
 export val RoundHalfEven: RoundingMode = 1
+// Round toward negative infinity.
 export val RoundFloor: RoundingMode = 2
+// Round toward positive infinity.
 export val RoundCeil: RoundingMode = 3
+// Round toward zero (truncate).
 export val RoundDown: RoundingMode = 4
 
 // ── Construction ──────────────────────────────────────────────────────────────
-
-// PREFERRED, exact: parse a base-10 numeral, preserving the written scale (`"1.50"` → scale 2).
+// Parse a base-10 numeral into an exact `Decimal`, preserving the written scale (`"1.50"` → scale 2).
+// The PREFERRED constructor — exact, with no float intermediary.
+// @param s  the decimal numeral.
+// @returns the `Decimal`, or an `Error` if `s` is not a valid number.
 export val decimal = (s: String): Decimal | Error => lin_decimal_parse(s)
 
+// Build a `Decimal` from an integer (exact, scale 0).
+// @param n  the Int64 value.
+// @returns the `Decimal`.
 export val fromInt = (n: Int64): Decimal => lin_decimal_from_int64(n)
 
-// LOSSY — a Float64 already carries binary rounding error. NEVER use for money.
+// Build a `Decimal` from a Float64. LOSSY — a Float64 already carries binary rounding error;
+// NEVER use this for money (use `decimal` on a string instead).
+// @param f  the float value.
+// @returns the `Decimal` nearest to `f`.
 export val fromFloat = (f: Float64): Decimal => lin_decimal_from_float64(f)
 
+// The `Decimal` constant 0.
 export val zero: Decimal = lin_decimal_zero()
+// The `Decimal` constant 1.
 export val one: Decimal = lin_decimal_one()
 
 // ── Arithmetic ────────────────────────────────────────────────────────────────
-
+// Exact sum. @returns `a + b`.
 export val add = (a: Decimal, b: Decimal): Decimal => lin_decimal_add(a, b)
+// Exact difference. @returns `a - b`.
 export val sub = (a: Decimal, b: Decimal): Decimal => lin_decimal_sub(a, b)
+// Exact product. @returns `a * b`.
 export val mul = (a: Decimal, b: Decimal): Decimal => lin_decimal_mul(a, b)
-// The ONLY rounding arithmetic — requires a target scale + mode.
+// Divide `a` by `b`, rounding to `scale` decimal places with `mode`. The ONLY rounding
+// arithmetic — division has no exact result in general, so a target scale + mode are required.
+// @param scale  number of decimal places in the result.
+// @param mode  one of the `Round*` constants.
+// @returns `a / b` rounded, or an `Error` if `b` is zero.
 export val div = (a: Decimal, b: Decimal, scale: Int32, mode: RoundingMode): Decimal | Error =>
   lin_decimal_div(a, b, scale, mode)
+// Raise `a` to a non-negative integer power (exact). @returns `a ** e`.
 export val pow = (a: Decimal, e: Int32): Decimal => lin_decimal_pow(a, e)
+// Negation. @returns `-a`.
 export val neg = (a: Decimal): Decimal => lin_decimal_neg(a)
+// Absolute value. @returns `|a|`.
 export val abs = (a: Decimal): Decimal => lin_decimal_abs(a)
 
 // ── Comparison (by numeric VALUE, ignoring scale) ───────────────────────────────
-
+// Three-way compare by numeric value (so `1.5` and `1.50` are equal).
+// @returns -1 if `a < b`, 0 if equal, 1 if `a > b`.
 export val cmp = (a: Decimal, b: Decimal): Int32 => lin_decimal_cmp(a, b)
+// @returns true if `a == b` by value (scale-insensitive).
 export val eq = (a: Decimal, b: Decimal): Boolean => lin_decimal_cmp(a, b) == 0
+// @returns true if `a < b`.
 export val lt = (a: Decimal, b: Decimal): Boolean => lin_decimal_cmp(a, b) < 0
+// @returns true if `a <= b`.
 export val lte = (a: Decimal, b: Decimal): Boolean => lin_decimal_cmp(a, b) <= 0
+// @returns true if `a > b`.
 export val gt = (a: Decimal, b: Decimal): Boolean => lin_decimal_cmp(a, b) > 0
+// @returns true if `a >= b`.
 export val gte = (a: Decimal, b: Decimal): Boolean => lin_decimal_cmp(a, b) >= 0
 
 // ── Rounding and scale ──────────────────────────────────────────────────────────
-
+// Round `d` to `scale` decimal places using `mode`.
+// @param scale  target number of decimal places.
+// @param mode  one of the `Round*` constants.
+// @returns the rounded `Decimal`.
 export val round = (d: Decimal, scale: Int32, mode: RoundingMode): Decimal =>
   lin_decimal_round(d, scale, mode)
+// Set `d`'s scale to exactly `scale` places (rounding with `mode` if reducing, padding if growing).
+// @returns the rescaled `Decimal`.
 export val setScale = (d: Decimal, scale: Int32, mode: RoundingMode): Decimal =>
   lin_decimal_set_scale(d, scale, mode)
+// @returns the number of decimal places currently stored in `d`.
 export val scale = (d: Decimal): Int32 => lin_decimal_scale(d)
 
 // ── Conversion ────────────────────────────────────────────────────────────────
-
+// Render as a string, preserving scale (`"1.50"` stays `"1.50"`). @returns the decimal string.
 export val toString = (d: Decimal): String => lin_decimal_to_string(d)
+// Narrow to an integer, dropping any fractional part.
+// @returns the `Int64` value, or an `Error` if the integer part does not fit in 64 bits.
 export val toInt64 = (d: Decimal): Int64 | Error => lin_decimal_to_int64(d)
+// Convert to a double (may lose precision). @returns the `Float64` value.
 export val toFloat64 = (d: Decimal): Float64 => lin_decimal_to_float64(d)
