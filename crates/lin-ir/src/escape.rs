@@ -289,6 +289,11 @@ fn classify_instr(
         Instruction::SealedArrayFieldGet { array, index, .. } => {
             let _ = (array, index);
         }
+        Instruction::BoxedArrayFieldGet { array, index, .. } => {
+            // The array is read (a borrowed element box, single field load); neither the array nor
+            // the index escapes — the result is a fresh/owned scalar-or-heap field copy.
+            let _ = (array, index);
+        }
         // `object.field = value` stores `value` into the record's heap slot (it now outlives the
         // local), so the VALUE escapes. The `object` is only written through — not aliased out —
         // but a record that is mutated in place must stay heap-resident, so mark it escaping too

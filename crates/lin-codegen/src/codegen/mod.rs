@@ -1916,6 +1916,12 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result);
                             }
                         }
+                        Instruction::BoxedArrayFieldGet { dst, array, index, field, arr_ty, result_ty } => {
+                            if let (Some(&arr_v), Some(&idx_v)) = (temp_map.get(array), temp_map.get(index)) {
+                                let result = self.compile_ir_boxed_array_field_get(arr_v, idx_v, field, arr_ty, result_ty);
+                                temp_map.insert(*dst, result);
+                            }
+                        }
                         Instruction::ObjectRest { dst, src, src_ty, exclude } => {
                             if let Some(&src_v) = temp_map.get(src) {
                                 // Unbox a boxed Json object to the raw LinObject*.
