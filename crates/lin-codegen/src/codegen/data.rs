@@ -1045,6 +1045,87 @@ impl<'ctx> Codegen<'ctx> {
         global.as_pointer_value()
     }
 
+    /// Emit (and cache) the static NAMED full-field descriptor global for a sealed record (ADR-063
+    /// Stage 3b mechanism (i)) and return a pointer to it. UNLIKE `sealed_descriptor` (heap-only,
+    /// nameless), this lists EVERY field — scalar and heap — with its NAME, struct-relative byte
+    /// offset and `NKIND_*` code, so the runtime boxed reader (`lin_array_get_tagged`'s 0xFE branch)
+    /// can materialize a keyed `LinObject` on demand. Format (PACKED, little-endian, byte-addressed —
+    /// must match `lin_runtime::sealed::read_named_field`):
+    /// ```text
+    /// NamedDesc  = [ u32 field_count | NamedField * field_count ]
+    /// NamedField = [ u32 offset | u32 nkind | u64 nested_named_desc_ptr | u16 name_len | name_bytes ]
+    /// ```
+    /// `nested_named_desc_ptr` is the nested record's NamedDesc (only for `NKIND_SEALED`; NULL else),
+    /// making materialize recurse. Cached by the field (name, offset, kind) sequence so identical
+    /// record types share one descriptor. Never NULL — a sealed array always carries a named desc.
+    pub(crate) fn sealed_named_descriptor(&mut self, fields: &indexmap::IndexMap<String, Type>) -> inkwell::values::PointerValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i8_ty = self.context.i8_type();
+        let i16_ty = self.context.i16_type();
+        let i32_ty = self.context.i32_type();
+        // Cache key: the per-field (name, offset, nkind) sequence.
+        let key: String = format!(
+            "__sealednameddesc_{}",
+            fields.iter().map(|(k, fty)| {
+                let (off, _) = Self::sealed_field_layout(fields, k);
+                let nk = Self::sealed_named_field_kind(fty).unwrap_or(0);
+                format!("{}@{}#{}", k, off, nk)
+            }).collect::<Vec<_>>().join("__")
+        );
+        if let Some(g) = self.module.get_global(&key) {
+            return g.as_pointer_value();
+        }
+        // Resolve nested named-desc pointers BEFORE adding this global (recursion). A directly
+        // self-recursive record survives resolution as `Type::Named` (never an inlined sealed
+        // `Object`), so `sealed_named_field_kind` returns None/Sealed only for an inlined sealed
+        // field — the recursion terminates exactly as `sealed_fields` does.
+        let mut nested_ptrs: Vec<inkwell::values::PointerValue<'ctx>> = Vec::with_capacity(fields.len());
+        for fty in fields.values() {
+            if Self::sealed_named_field_kind(fty) == Some(Self::NKIND_SEALED) {
+                if let Some(nf) = Self::sealed_fields(fty) {
+                    let nf = nf.clone();
+                    nested_ptrs.push(self.sealed_named_descriptor(&nf));
+                    continue;
+                }
+            }
+            nested_ptrs.push(ptr_ty.const_null());
+        }
+        // Assemble the packed struct field-by-field so byte offsets are exact (no struct padding).
+        let mut members: Vec<inkwell::values::BasicValueEnum<'ctx>> = Vec::new();
+        let mut member_tys: Vec<inkwell::types::BasicTypeEnum<'ctx>> = Vec::new();
+        // field_count (u32)
+        members.push(i32_ty.const_int(fields.len() as u64, false).into());
+        member_tys.push(i32_ty.into());
+        for ((k, fty), nested) in fields.iter().zip(nested_ptrs.iter()) {
+            let (off, _) = Self::sealed_field_layout(fields, k);
+            let nkind = Self::sealed_named_field_kind(fty).unwrap_or(0);
+            // u32 offset
+            members.push(i32_ty.const_int(off, false).into());
+            member_tys.push(i32_ty.into());
+            // u32 nkind
+            members.push(i32_ty.const_int(nkind as u64, false).into());
+            member_tys.push(i32_ty.into());
+            // u64 nested_named_desc_ptr (a real pointer global, or NULL)
+            members.push((*nested).into());
+            member_tys.push(ptr_ty.into());
+            // u16 name_len
+            members.push(i16_ty.const_int(k.len() as u64, false).into());
+            member_tys.push(i16_ty.into());
+            // name bytes as an [N x i8] array
+            let bytes: Vec<inkwell::values::IntValue<'ctx>> =
+                k.bytes().map(|b| i8_ty.const_int(b as u64, false)).collect();
+            let name_arr = i8_ty.const_array(&bytes);
+            member_tys.push(name_arr.get_type().into());
+            members.push(name_arr.into());
+        }
+        let desc_ty = self.context.struct_type(&member_tys, true); // PACKED
+        let desc_val = self.context.const_struct(&members, true);
+        let global = self.module.add_global(desc_ty, None, &key);
+        global.set_initializer(&desc_val);
+        global.set_constant(true);
+        global.as_pointer_value()
+    }
+
     /// Emit (and cache) the static `SumDesc` global for a sum type and return a pointer to it (NULL
     /// pointer constant when NO variant has a heap/recursive field — a Stage-1 scalar-only sum type,
     /// whose drop is a pure refcount decrement + free). The descriptor is the variant-indexed
@@ -1495,13 +1576,14 @@ impl<'ctx> Codegen<'ctx> {
         };
         let stride = Self::sealed_array_stride(&fields);
         let desc = self.sealed_descriptor(&fields);
+        let named_desc = self.sealed_named_descriptor(&fields);
         // len = lin_array_length(src_raw)
         let len_fn = self.get_or_declare_fn("lin_array_length", i64_ty.fn_type(&[ptr_ty.into()], false));
         let len = self.builder.call(len_fn, &[src_raw.into()], "sarrp_len").try_as_basic_value().unwrap_basic().into_int_value();
-        // out = lin_sealed_array_alloc(len, stride, desc)
+        // out = lin_sealed_array_alloc(len, stride, desc, named_desc)
         let alloc_fn = self.get_or_declare_fn("lin_sealed_array_alloc",
-            ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into()], false));
-        let out = self.builder.call(alloc_fn, &[len.into(), i64_ty.const_int(stride, false).into(), desc.into()], "sarrp_out")
+            ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into(), ptr_ty.into()], false));
+        let out = self.builder.call(alloc_fn, &[len.into(), i64_ty.const_int(stride, false).into(), desc.into(), named_desc.into()], "sarrp_out")
             .try_as_basic_value().unwrap_basic();
         let push_fn = self.get_or_declare_fn("lin_sealed_array_push_struct_retaining",
             self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
