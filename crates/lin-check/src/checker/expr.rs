@@ -186,8 +186,13 @@ impl Checker {
             }
         }
 
-        // Propagate the expected type into the final expression of a block.
-        if let (Expr::Block(stmts, final_expr, span, _), true) = (expr, type_mentions_strlit(expected)) {
+        // Propagate the expected type into the final expression of a block — both for `StrLit`
+        // singleton refinement (ADR-034) and for a non-default scalar width, so a block whose tail
+        // is a bare numeric literal (`(): Int64 => …; 28`) re-types it to the declared width
+        // instead of inferring the `Int32`/`Float64` default (codegen IR-width mismatch otherwise).
+        if let (Expr::Block(stmts, final_expr, span, _), true) =
+            (expr, type_mentions_strlit(expected) || expected_pushes_scalar_width(expected))
+        {
             self.env.push_scope();
             let mut typed_stmts = Vec::new();
             for stmt in stmts {
@@ -1409,8 +1414,28 @@ impl Checker {
 pub(crate) fn expected_pushes_into_branches(ty: &Type) -> bool {
     match ty {
         Type::Object { .. } | Type::Named(_) | Type::Union(_) => true,
-        _ => type_mentions_strlit(ty),
+        _ => expected_pushes_scalar_width(ty) || type_mentions_strlit(ty),
     }
+}
+
+/// True for a concrete scalar type whose *width* must be pushed into branch / block-tail
+/// positions so a suffixless numeric literal there adopts it instead of the default
+/// (`Int32` / `Float64`). Covers every non-default sized integer and `Float32`. Without this,
+/// `(): Int64 => if c then 28 else 31` infers the literals as `Int32` and codegen emits an `i32`
+/// value into an `i64`-returning function (invalid IR / "ret i32 ... i64"). `Int32` / `Float64`
+/// are the literal defaults, so pushing them buys nothing and is omitted (keeps the old path).
+pub(crate) fn expected_pushes_scalar_width(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Int8
+            | Type::Int16
+            | Type::Int64
+            | Type::UInt8
+            | Type::UInt16
+            | Type::UInt32
+            | Type::UInt64
+            | Type::Float32
+    )
 }
 
 /// True if `ty` is the dynamic/top `Json` type (`TypeVar(u32::MAX)`). A value of this type is
