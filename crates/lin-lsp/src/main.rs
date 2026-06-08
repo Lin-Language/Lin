@@ -1093,7 +1093,6 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/path"     => Some(include_str!("../../../stdlib/path.lin")),
         "std/math"     => Some(include_str!("../../../stdlib/math.lin")),
         "std/env"      => Some(include_str!("../../../stdlib/env.lin")),
-        "std/hash"     => Some(include_str!("../../../stdlib/hash.lin")),
         "std/bytes"    => Some(include_str!("../../../stdlib/bytes.lin")),
         "std/net"      => Some(include_str!("../../../stdlib/net.lin")),
         "std/process"  => Some(include_str!("../../../stdlib/process.lin")),
@@ -4012,7 +4011,7 @@ fn seed_stdlib_index(index: &mut WorkspaceIndex) {
 const STDLIB_MODULE_IDS: &[&str] = &[
     "std/io", "std/json", "std/string", "std/number", "std/array", "std/iter",
     "std/object", "std/fs", "std/ffi", "std/http", "std/template", "std/async",
-    "std/test", "std/time", "std/path", "std/math", "std/env", "std/hash",
+    "std/test", "std/time", "std/path", "std/math", "std/env",
     "std/bytes", "std/net", "std/process", "std/tty", "std/signal", "std/yaml",
     "std/jq", "std/stream", "std/compress", "std/archive", "std/event",
 ];

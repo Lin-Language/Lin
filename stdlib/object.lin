@@ -97,3 +97,74 @@ export val get = <T, D>(m: { String: T }, key: String, default: D = null): T | D
 
 export val isEmpty = (x: Json): Boolean =>
   length(x) == 0
+
+// ===== Result/Option ergonomics (folded in from the former std/result module) =====
+// std/result — ergonomics for the two fallible-value conventions: `T | Error` and `T | Null`.
+//
+// Lin has NO `Result`/`Option` wrapper ADT. A fallible call returns `T | Error` (the canonical
+// `Error` is `{ "type":"error","message":String }`, discriminated with `is Error`, ADR-031) and an
+// absence-y call returns `T | Null`. The success value IS the value — no unwrap ceremony on the
+// happy path. This module adds small, total, side-effect-free helpers over those conventions
+// WITHOUT introducing a wrapper type.
+//
+// SCOPE (see docs/proposals/stdlib/result-ergonomics.md). Only the helpers that are expressible in
+// Lin's argument-driven, monomorphized generics ship here:
+//   - `isOk` / `isError` / `isNull`        — Json -> Boolean predicates (no type variable to solve)
+//   - `unwrapOr`                           — DEFAULT-DRIVEN collapse: `T` is solved from `default`,
+//                                            exactly the mechanism behind `array.at`/`object.get`
+//   - `error`                              — the canonical-Error constructor
+// The map/chain/bridge family (`mapOk`/`mapError`/`andThen`/`orElse`/`okOr`/`toNull`) is BLOCKED:
+// it needs a union-arm-subtraction inference rule the checker does not have (it cannot bind `T` to
+// "the non-`Error` arm of a `T | Error` argument"). Those are intentionally NOT exported. See the
+// proposal's "Generics & checker constraints" section.
+// The canonical Error constructor. `error("boom")` builds `{ "type":"error","message":"boom" }`,
+// the exact value `is Error` discriminates on (ADR-031). Useful for fabricating an Error to feed a
+// default arm, a test, or a hand-rolled fallible function.
+export val error = (message: String): Error =>
+  { "type": "error", "message": message }
+
+// `true` iff `x` is the canonical Error (`x["type"] == "error"`). This is the `is Error` discriminant
+// exposed as a plain value-returning predicate. Takes `Json` (the permissive supertype any union
+// flows into) so it can be used in `if`/`&&` positions and combinator callbacks (e.g. `xs.filter`).
+//
+// CAVEAT (no narrowing). Because it returns a bare `Boolean`, it does NOT narrow the union the way
+// `if x is Error` does — after `if isError(x)` the compiler still sees `x : T | Error`. For
+// narrowing (to unlock the success arm's fields) you must use the built-in `is Error` test. These
+// predicates are for filtering/counting/branching, not for flow-narrowing.
+export val isError = (x: Json): Boolean =>
+  match x
+    is Error => true
+    else => false
+
+// `true` unless `x` is the canonical Error — the negation of `isError`. Note an `x` that is `Null`
+// is "ok" here (it is not an Error); use `isNull` to test absence.
+export val isOk = (x: Json): Boolean =>
+  match x
+    is Error => false
+    else => true
+
+// `true` iff `x` is the `Null` value (the absence arm of a `T | Null`).
+export val isNull = (x: Json): Boolean =>
+  match x
+    is Null => true
+    else => false
+
+// Collapse the failure arm with a default. Returns the success value if `x` is not an
+// `Error`/`Null`, otherwise returns `default`. The result is a bare `T | D`, usable with no further
+// guard — the union-error analogue of `array.at`/`object.get`'s `default`, generalized to ANY
+// `T | Error` / `T | Null` value.
+//
+//   val port: Int32  = parsePort(input).unwrapOr(8080)    // T | Error -> T
+//   val name: String = config["name"].unwrapOr("anon")    // T | Null  -> T
+//
+// DEFAULT-DRIVEN inference: `T`/`D` are solved from the arguments — `default` pins `D`, and the
+// concrete first argument pins `T` — NOT by subtracting the `Error`/`Null` arm of `x` (that
+// arm-subtraction rule does not exist; see proposal). It handles BOTH conventions because both the
+// `Error` and `Null` arms fall through the `is Error`/`is Null` checks to `default`. `x` is typed
+// `Json` so any union flows in; the static success type is recovered via the `D` default the caller
+// supplies (mirroring `at`/`get`, where the returned static type is `T | D`).
+export val unwrapOr = <D>(x: Json, default: D): Json | D =>
+  match x
+    is Error => default
+    is Null => default
+    else => x
