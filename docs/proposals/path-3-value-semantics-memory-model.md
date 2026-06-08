@@ -121,23 +121,31 @@ is the qualitative difference between Lin's model and Go's. Three sub-options on
 from most-targeted to most-extreme:
 
 ### 3a — Value / copy semantics (the Go-struct model) — the primary proposal
-A record type gets **value semantics**: assignment/argument-passing copies the bytes; the value lives
+**No new syntax — the seal/hash distinction the compiler needs already exists at the surface.**
+`type Person = { "age": UInt8 }` (fixed string-literal keys) is a **sealed, fixed-shape record**;
+`type MyHash = { String: UInt8 }` (an index signature) is a **hashmap**. They are already distinct
+types the checker tells apart — so value semantics attaches to the record kind the syntax *already*
+identifies. There is no `struct` keyword, no annotation, no userland addition: a sealed record type is
+the value type, an index-signature/`Json`/unsealed object is the dynamic, heap-backed kind.
+
+A sealed record gets **value semantics**: assignment/argument-passing copies the bytes; the value lives
 **inline** in its container (a `Token[]` is `Token` structs back-to-back; `{a: Token}` stores `Token`
 inline). **No heap allocation per record, no refcount, no `LinObject`.** Heap fields *inside* a value
 record (String/Array) still need ownership on copy/drop (copy = retain inners or copy-on-write; drop =
-release inners) — the descriptor-walk machinery we have, run on copy instead of construct. Large/shared
-records can still be `&T`/boxed where identity or cheap sharing matters.
+release inners) — the descriptor-walk machinery we have, run on copy instead of construct.
 
 - **Fixes:** reads (inline → const-offset), the boundary (a value array is contiguous; `length`/iterate
   are like a scalar array today, no boxing), **and construction RC (uniquely)** — a small record costs
   zero heap alloc + zero refcount.
-- **The catch — it is a language-semantics change, not a representation tweak.** Today records are
-  *reference* values (mutation through one binding is visible through aliases; identity; closures capture
-  the reference, ADR-012's `var`-capture-by-reference). Value semantics changes all of that: assignment
-  copies, mutation is local, aliasing disappears. On *existing* records this is **breaking**. The safe
-  form is **additive**: introduce value semantics **only on a new `struct` kind** (this is exactly where
-  Path 3 meets Path 4 — see relationship) so nothing existing breaks and the value model is opt-in by
-  using `struct`. Also needs a by-reference path (`&T`) and possibly copy-on-write for heap fields.
+- **The one thing to settle — value vs reference is a *behavioral* (not syntactic) decision.** Today
+  sealed records are *reference* values (mutation through one binding is visible through aliases;
+  identity; closures capture the reference, ADR-012's `var`-capture-by-reference). Value semantics
+  changes that: assignment copies, mutation is local, aliasing disappears. This is settled **without new
+  surface** — by deciding the semantics of the *existing* sealed-record type — and the safest build-out
+  reaches it **compiler-internally and inferred** (S1–S5 below): the escape/borrow analysis copies or
+  borrows under the hood with **no observable semantics change** until/unless a deliberate decision is
+  made to expose value-mutation semantics. (`var`-mutated records, and records whose identity/aliasing
+  is observed, stay reference/heap by the same escape analysis — so existing programs are unaffected.)
 
 ### 3b — Arena / region allocation — the targeted, semantics-preserving sub-option
 Much construction cost is per-object alloc + per-field RC for graphs with a **bounded, common lifetime**:
@@ -155,21 +163,16 @@ free the whole region at once).
   semantics — transparent to program meaning. Risk is escape-analysis soundness (a missed escape → UAF
   on region drop) and, for the explicit form, a (small) surface addition.
 
-### 3c — Static ownership / borrow checking (Rust) — recorded as the far endpoint, not recommended
-The logical end of "no GC, no RC": a borrow checker proves lifetimes statically, removing runtime RC
-entirely; records are stack/inline values with no refcounting at all. **Fixes everything** (reads,
-boundary, construction) at the **maximal** performance ceiling. But it **redefines the language**:
-lifetimes, borrows, moves, `&`/`&mut` — the dominant source of Rust's learning curve, directly opposed to
-Lin's small/ergonomic/JSON-friendly identity. Enormous implementation + design cost, and it throws away
-Lin's RC machinery rather than building on it. **Out of scope** unless Lin's identity is being
-reconsidered wholesale; documented only to bound the axis: RC (today) → value (3a) → arena (3b) →
-ownership (3c).
+*(A static ownership / borrow-checker model — Rust's — is the logical far endpoint of "no GC, no RC",
+but it is a wholesale userland language redefinition (lifetimes, `&`/`&mut`, moves) opposed to Lin's
+small/JSON-friendly identity, and is **excluded**. The axis this path lives on is: RC (today) → inferred
+value/borrow (3a, compiler-internal) → arena (3b). The borrow analysis 3a uses is *inferred and
+invisible* — it is emphatically not a user-facing borrow checker.)*
 
 ## What this path fixes
 
 - **3a (value semantics):** reads + boundary + **construction RC** — all three.
 - **3b (arenas):** **construction RC** only (composes with another path for reads/boundary).
-- **3c (ownership):** all three, maximally — but out of scope (language-redefining).
 
 ## Rationale / why pursue this path
 
@@ -184,25 +187,27 @@ ownership (3c).
 
 ## Cons / risks
 
-- **3a changes language semantics (reference → value)** — breaking on existing records; only safe as an
-  additive feature on a new `struct` kind (couples to Path 4). It is a **spec change** (assignment,
-  argument passing, mutation, identity, closure capture, `&T`, copy-on-write) with a migration story, not
-  an implementation tweak. Copy cost replaces alloc/RC cost — needs `&T` and possibly CoW.
+- **3a is a behavioral change to the sealed-record kind (reference → value) — but NO new surface.** The
+  sealed-vs-hash distinction is already syntactic (`{ "k": T }` vs `{ String: T }`), so no keyword is
+  added. The risk is in the *semantics* (assignment copies, mutation is local, aliasing/identity change)
+  and in getting the escape/borrow analysis sound — which is why the build-out is **inferred and
+  staged** (S1–S5), keeping observable behavior unchanged (records whose mutation/identity/aliasing is
+  observed stay reference/heap) until any deliberate exposure of value-mutation is decided. Copy cost
+  replaces alloc/RC cost — needs an internal by-reference path and possibly CoW for heap fields.
 - **3b** is orthogonal — it does nothing for reads alone, so it only pays off *composed* with a path that
-  makes reads cheap (1/2) or with packing. Escape-analysis soundness is a UAF risk; explicit `region` is
-  a (small) surface change.
-- **3c** is language-redefining and out of scope.
+  makes reads cheap (1/2) or with packing. Escape-analysis soundness is a UAF risk; explicit `region`
+  (if pursued) is a small surface addition — the *inferred* region form has none.
 - Heap fields inside value/arena records still need RC discipline on copy/drop — Path 3 removes the
   *shell* RC, not the inner-pointer RC (unless the whole graph is in a region).
 
 ## Relationship to the other paths
 
-- **3a meets Path 4 (distinct `struct` kind):** value semantics is only *safe* as an additive feature on
-  a new `struct` kind. So "3a done right" = Path 4 (the kind) + Path 3a (its semantics). They are two
-  facets of the same coherent end-state.
+- **3a applies to the existing sealed-record type — no new kind needed.** The syntax already separates
+  sealed records (`{ "k": T }`) from hashmaps (`{ String: T }`); 3a gives the sealed kind value
+  semantics, inferred and staged, with no userland addition.
 - **3b composes with everything:** arenas fix construction; Path 1/2 fix reads; together they cover all
-  three costs without 3a's semantic change. The lowest-total-risk "fix all three costs" combination is
-  plausibly **Path 1 (in-place ABI) + Path 3b (arenas)**.
+  three costs. The lowest-total-risk "fix all three costs" combination is plausibly **Path 1 (in-place
+  ABI) + Path 3b (arenas)**.
 - **3a/3b need a reads-cheap mechanism too:** value records still get read — 3a's inline values are
   const-offset by construction; 3b's region records need Path 1/2 unless also packed.
 - **Orthogonal to Path 2** (which leaves records refcounted heap objects and makes their *reads* fast):
@@ -210,12 +215,13 @@ ownership (3c).
 
 ## Implementation plan for 3a (the read-only-arg-borrow build-out)
 
-3a does not have to land as a big-bang language change. The H8 spike is the first stage of a staged,
+3a does not have to land as a big-bang language change. The H8 spike was the first stage of a staged,
 each-step-ASan-gated build that reaches value semantics incrementally on the existing static-RC runtime
-— **inferring** the borrow (no user-facing borrow checker, no spec change) until/unless a `struct` kind
-(Path 4) makes it explicit. The escape pass + RC-suppression + sealed packed layout + the `Repr` lattice
-and its `verify`/`oracle_check` gates already exist; the new work is the interprocedural summary and a
-by-borrow ABI.
+— **inferring** the borrow (no user-facing borrow checker, no new syntax, no spec change — it applies to
+the sealed-record type the syntax already identifies). The escape pass + RC-suppression + sealed packed
+layout + the `Repr` lattice and its `verify`/`oracle_check` gates already exist; the new work is the
+interprocedural summary and a by-borrow ABI — **with the construction-side codegen the H8 prototype got
+wrong (it returns garbage; see the H8 correction) as the actual unsolved core of S1.**
 
 | stage | scope | risk | gate |
 |---|---|---|---|
@@ -261,10 +267,12 @@ lower-risk, ship-incrementally half (no ownership-model change); the borrow is t
 
 ## Acceptance gates
 
-For 3a: each stage above is independently ASan-gated and benchmark-measured; a *full spec* of value vs
-reference semantics + migration story is required only if 3a is exposed as a **user-facing** value kind
-(Path 4) — the inferred-borrow build-out (S1–S3) is a compiler-internal change with no spec impact. For
-3b: escape-analysis soundness — ASan must prove no UAF on region drop for the inferred variant. Plus the
+For 3a: each stage above is independently ASan-gated and benchmark-measured; the inferred-borrow
+build-out (S1–S5) is a **compiler-internal change with no surface/spec impact** — it applies to the
+existing sealed-record type, adds no syntax, and keeps observable behavior unchanged (the only decision
+that would touch the spec is a *future, optional* one to expose value-mutation semantics, which is not
+required for the performance win). For 3b: escape-analysis soundness — ASan must prove no UAF on region
+drop for the inferred variant. Plus the
 shared gates: full `cargo test`; harness + IR-mechanism assertion; RAPTOR digest byte-identical;
 ASan-clean; cross-language benchmark non-regression (esp. the build-heavy phases — RAPTOR LOAD/PREP,
 interp tokenize — where this path should show its win). **And — the lesson of H4 — a perf gate, not only
@@ -275,7 +283,9 @@ still regressed interp 2.8×).**
 
 The only path that attacks construction RC — the third cost, untouched by the read/dispatch paths and a
 large remainder per the spike. **3a (value semantics)** is the deepest "be like Go" answer and fixes all
-three costs, but is a language-semantics change only safe additively on a new `struct` kind (so it
-couples to Path 4). **3b (arenas)** is the low-risk, semantics-preserving way to claw back construction
-cost, orthogonal and composable with any reads-cheap path. **3c (ownership)** is the out-of-scope far
-endpoint. Best pursued *composed* — most likely Path 1+3b, or Path 4+3a — rather than alone.
+three costs; it applies to the **existing sealed-record type** (`{ "k": T }`, already distinct from the
+`{ String: T }` hashmap) with **no new syntax** — the change is the *behavior* of that type
+(reference → value), reached compiler-internally and inferred, not a userland feature. **3b (arenas)** is
+the low-risk, semantics-preserving way to claw back construction cost, orthogonal and composable with any
+reads-cheap path. Best pursued *composed* — most likely **Path 1 (in-place ABI) + Path 3a/3b** — rather
+than alone.

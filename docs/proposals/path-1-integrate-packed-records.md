@@ -3,7 +3,7 @@
 **Status:** Open proposal, one of five independent paths. Self-contained.
 **Direction in one line:** keep one record construct; make the packed/sealed representation we already
 built actually pay off by making the stdlib *operations* (`length`/`map`/`for`/index) work on packed
-data without re-boxing, and decide how packing is chosen (gate, default, or annotation).
+data without re-boxing, and pack fixed-key record types by default (no userland change — the grammar already says struct vs map).
 
 ---
 
@@ -186,23 +186,34 @@ Two mechanisms, not exclusive:
   `mangle_type` collisions, `get<T,D>` failure). A pragmatic system does **both**: monomorphize hot
   statically-typed sites (b), keep a repr-dispatched boxed instance (a) as the shared fallback.
 
-### Step 3 (the default sub-choice) — how is packing *chosen*?
-Once the ABI makes packing never-slower, the gate stops being a perf heuristic. Three sub-variants:
-- **Boxed-default + soundness gate (conservative):** keep boxed default, widen the gate to all
-  layout-eligible heap-field shapes (it's now a soundness predicate "can this pack", not "is it a win").
-  Lowest blast radius; a value is fast only where it provably packed.
-- **Packed-by-default (the "Option B" inversion):** a fully-known closed sealed shape packs by default;
-  boxed is the fallback for genuine dynamism (`Json`, undiscriminated unions, structurally-subtyped
-  params, FFI, transfer). Makes field reads fast **unconditionally** — but highest blast radius
-  (structural/width subtyping and `Json` round-trips must all route through the boxed fallback; this is
-  exactly the packed/boxed-mismatch bug class §H4/H5 produced). Only safe *after* Step 1 proves out and
-  the oracle/verifier + boxed-boundary set are hardened.
-- **Annotation (the "Option C" knob — disfavored):** a `packed` modifier opts a type in. Disfavored: it
-  asks the programmer to annotate what the type already encodes, adds permanent surface area, and still
-  needs Step 1 underneath. If a surface distinction is wanted at all, Path 4 (a distinct `struct` kind)
-  is the better-considered place to spend it. (A pure *usage-inferred* gate — count read vs construct
-  sites — is **rejected**: read-count ≠ read-frequency, the shape-ratio proxy had a measured 3.6× blind
-  spot, and it optimizes the wrong decision since cost #2 is the boundary, not read frequency.)
+### Step 3 (the default) — pack fixed-key record types by default. NO userland change.
+**Key realization: the surface grammar ALREADY distinguishes a struct from a map — the compiler does not
+have to infer or annotate anything.**
+- `type Person = { "age": UInt8, "name": String }` — **fixed keys** → a sealed struct → pack it.
+- `type Counts = { String: UInt8 }` — **index signature** → a hashmap → boxed `LinMap`, dynamic.
+- `Json` and inferred/anonymous-shape values → boxed, dynamic.
+
+So packing a fixed-key record type **by default** is not a heuristic (rejected: §H7's usage/shape-ratio
+gate had a 3.6× blind spot) and not a new keyword (rejected: a `packed` annotation asks the programmer to
+re-state what `type Person = {fixed keys}` already declares — pure ceremony). It is simply **honoring the
+declaration the programmer already wrote.** A fixed-key `type` is the struct; it gets the struct
+representation. This absorbs the entire value of a distinct-`struct`-kind idea **with zero surface
+change**, because Lin's grammar already carries the distinction.
+
+The gate (`is_sealed_array_field_packable`) therefore stops being a perf heuristic and becomes a pure
+**soundness predicate**: "can this fixed-key shape be laid out packed?" — yes unless it reaches a genuine
+dynamic boundary (`Json` slot, undiscriminated union, structurally-subtyped param that reinterprets the
+layout, FFI, cross-thread transfer), where it materializes to boxed.
+
+**The one real risk this still carries (not a userland change — an implementation-soundness obligation):**
+structural/width subtyping. `{a,b,c} <: {a}` means a value can be read through a narrower type than it was
+built with; a packed struct has a fixed declaration-order layout, so the gate must refuse to pack (or
+must box at) any site where width/structural subtyping can reinterpret the value, and `Json` round-trips
+must route through the boxed fallback. This is exactly the packed/boxed-mismatch class §H4/H5 produced, so
+it is only safe *after* Step 1's in-place ABI proves out and the repr oracle/verifier + the boxed-boundary
+set are hardened. But note: it is a *correctness* problem in the compiler, **not** a question the
+programmer is asked to answer — the programmer already answered it by writing fixed keys vs an index
+signature.
 
 ### The orphaned axis — inlining / fusion (orthogonal to everything above; partly shipped)
 Distinct from representation entirely, and **composable with every path**, is the lever of making Lin's
@@ -242,29 +253,28 @@ representation is the only axis.)
 
 ## Cons / risks
 
-- **Doesn't fully answer the framing unless you take the packed-by-default sub-variant** — and that
-  sub-variant (Step 3 inversion) is the highest-risk move, living in the exact packed/boxed-mismatch bug
-  class that consumed this session (structural/width subtyping, `Json` round-trips). The conservative
-  sub-variant leaves field-read speed conditional on whether a value packed.
+- **The structural-subtyping soundness obligation (Step 3)** is the highest-risk part — packing a
+  fixed-key type by default is sound only where width/structural subtyping cannot reinterpret the layout
+  and where `Json` round-trips route through the boxed fallback. This is the exact packed/boxed-mismatch
+  bug class §H4/H5 produced. It is a *compiler-correctness* obligation, **not** a userland change (the
+  programmer already declared struct-vs-map by writing fixed keys vs an index signature) — but it is real
+  and must be hardened (repr oracle/verifier coverage) before packed-by-default is safe.
 - **Touches every eager combinator's lowering** (Step 1) — multi-week; the monomorphization mechanism (b)
   adds compile-time/bloat costs and extends machinery that has bitten us.
-- **Construction RC untouched** — needs composition with Path 3 for build-heavy workloads.
+- **Construction RC untouched** — needs composition with Path 3's inferred arenas for build-heavy
+  workloads.
 - **The boxed boundary is the risk surface.** Every genuine dynamic boundary (`Json` slot,
   undiscriminated union, FFI, transfer, `toString`/serialize) must still materialize; a missed site is a
   UAF/mis-read. The repr oracle/verifier is the structural guard and must cover every new in-place
-  lowering — and must be *hardened* before any packed-by-default inversion.
+  lowering — and must be *hardened* before packed-by-default.
 
 ## Relationship to the other paths
 
-- **Path 4 (distinct `struct` kind)** needs this path's Step 1 (the in-place ABI / monomorphization) to
-  make `struct` arrays' operations cheap — Path 4 is the *type*, this path's Step 1 is the *operations*.
-  The packed-by-default sub-variant here is the "no surface change" alternative to Path 4's "explicit new
-  kind" — both deliver fast-by-construction reads, this one by inverting a default (riskier), Path 4 by
-  adding a kind (additive).
 - **Path 2 (inline caches)** is the opposite philosophy — make the *dynamic* representation fast so no
   packed type is needed. Mutually exclusive in spirit (though a mature system could have both layers).
-- **Path 3 (value semantics / arenas)** is orthogonal and composable — it fixes cost #3 (construction)
-  which this path leaves untouched.
+- **Path 3 (inferred arenas)** is orthogonal and composable — it fixes cost #3 (construction) which this
+  path leaves untouched. Path 1 (in-place reads/ops) + Path 3 (cheap construction) covers all three costs
+  with **no userland change**.
 
 ## Acceptance gates (apply to every step)
 
@@ -277,9 +287,10 @@ scaling leak — the boxed-boundary contract is the risk); **cross-language benc
 
 ## Verdict
 
-The lowest-disruption continuation: it makes the work already done pay off by fixing the one cost that
-was never addressed, reuses all existing machinery, and its first step (the in-place ABI) is the
-decision-free core of several paths. It does not, by itself, fully answer "a struct field read is cheap,
-full stop" (only the risky packed-by-default sub-variant does) and does not touch construction RC. Best
-if the goal is to ship the win without a language change and the appetite for the eventual default-
-inversion risk is there.
+The lowest-disruption continuation, and **entirely within the compiler — no userland change.** It makes
+the work already done pay off by fixing the one cost that was never addressed (the in-place ABI), reuses
+all existing machinery, and packs fixed-key record types by default simply by honoring the struct-vs-map
+distinction the grammar already carries (`{"age":UInt8}` = struct; `{String:UInt8}` = map). It fully
+answers "a struct field read is cheap, full stop" *once Step 1 + packed-by-default land* (the latter
+gated on the structural-subtyping soundness hardening). It does not touch construction RC — compose with
+Path 3's inferred arenas for that. Best if the goal is the win with zero language-surface change.
