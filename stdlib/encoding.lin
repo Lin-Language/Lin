@@ -260,7 +260,15 @@ val byteLenFrom = (s: String, i: Int32): Int32 =>
   else
     byteLenFrom(s, i + 1)
 
-// Collect the raw UTF-8 bytes of `s` into a UInt8[] (the inverse of fromUtf8), via byteAt.
+// UTF-8-encode a string to its raw byte buffer — the inverse of `std/string.fromUtf8`. Pure Lin
+// (scans the codepoint-aware string's bytes via `byteAt`). The String→UInt8[] companion to the
+// byte/text codecs here; other modules (e.g. std/crypto) hash/encode bytes, so this is the bridge.
+// @param s  the text to encode.
+// @returns the UTF-8 bytes of `s`.
+export val utf8Bytes = (s: String): UInt8[] =>
+  strBytes(s)
+
+// Internal: collect the raw UTF-8 bytes of `s` into a UInt8[] via byteAt.
 val strBytes = (s: String): UInt8[] =>
   val out: UInt8[] = []
   strBytesGo(s, 0, out)
