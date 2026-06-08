@@ -197,43 +197,27 @@ impl Type {
     /// SINGLE definition. Any disagreement between the lowerer's ownership/Coerce insertion and
     /// codegen's physical layout would be a UAF / mis-read, which is exactly why this is centralised.
     ///
-    /// CURRENTLY: scalars + Bool (Stage 3a) + String (Stage 3b step 1, shipped 2026-06-08). The
-    /// String widening was gated on four blockers, all now fixed: the push-into-Json-object-field
-    /// data loss (which caused a RAPTOR `legs=4` correctness regression), the dynamic-read
-    /// materialize-on-read leak, the `sealed_construct` width-subtyping extra-field panic, and the
-    /// boxed `for`/`while`/`reduce` per-element box-inner leak. Verified clean: full `cargo test`,
-    /// RAPTOR digest byte-identical (`dep=29400 arr=40680 legs=3 count=1`), the sealed harness
-    /// (String cells PASS + improved vs the boxed baseline), and ASan (String-pack `for` loop leak
-    /// constant, no UAF). NOT YET packable: scalar-array / nested-record / record-array fields — the
-    /// next Stage-3b widening steps, each landed only after the harness + RAPTOR + full ASan clear
-    /// that shape (the descriptor-driven RC primitives handle every heap-field kind uniformly; the
-    /// staging is purely widening this predicate).
+    /// CURRENTLY: scalars + Bool ONLY (Stage 3a).
+    ///
+    /// HEAP-FIELD PACKING (String/Array/Map/nested-record — Stage 3b steps 1-4) was implemented,
+    /// shipped, and then NARROWED BACK OUT on 2026-06-08 because it is a NET LOSS in practice today:
+    ///   - It REGRESSED `benchmarks/compare/interp` ~3x (Token = {kind:String, text:String}: packing
+    ///     `Token[]` materializes a fresh boxed `LinObject` on every hot field read through the
+    ///     generic `for`/combinator path — alloc + per-field retain — where a boxed `Object[]` is a
+    ///     borrowed pointer load, strictly cheaper).
+    ///   - It CRASHED `examples/raspberry-controller/tlv.test.lin` (a soundness bug in the packed
+    ///     scalar-Array-field `{tag:Int32, bytes:Int32[]}[]` path).
+    ///   - It delivers ZERO benefit to its intended consumer (RAPTOR) TODAY: `tripsByRoute` is still
+    ///     `{String: Json[]}` and `bench.lin` packs zero sealed arrays.
+    /// ROOT CAUSE (the strategic finding): packing only WINS when the value is read by const-offset
+    /// through a TYPED PARAM (`(t: T) => t["f"]` → getelementptr+load). On the generic/boxed read
+    /// path (`for`/`map`/union/Json index) mechanism (i) materializes the whole element per read —
+    /// strictly worse than a boxed borrowed-pointer read. So heap-field packing must NOT re-land
+    /// until reads through the typed iteration path are CHEAP (borrowed const-offset, no materialize)
+    /// — the "spike B" / cheap-typed-reads work. The KIND_MAP/descriptor/transfer runtime plumbing is
+    /// kept intact (dormant) for that re-land; only this gate predicate is narrowed.
     pub fn is_sealed_array_field_packable(&self) -> bool {
-        self.is_flat_scalar()
-            || matches!(self, Type::Bool)
-            || self.is_string_ish()
-            // Stage 3b step 2 (2026-06-08): a scalar/heap ARRAY field packs as an owned `*LinArray`
-            // pointer slot (KIND_ARRAY), exactly like a String slot. The element type does not need
-            // to be packable — the field holds a pointer to a separately-allocated array, retained
-            // on construct / released on drop by the descriptor walk.
-            || matches!(self, Type::Array(_) | Type::FixedArray(_))
-            // Stage 3b step 4 (2026-06-08): a `{ String: T }` index-signature map field packs as an
-            // owned `*LinMap` pointer slot (KIND_MAP), exactly like a String/Array slot — retained on
-            // construct, released on drop, deep-copied on transfer by the descriptor walk.
-            || matches!(self, Type::Map(_))
-            // Stage 3b step 3 (2026-06-08): a NESTED SEALED-RECORD field packs as an owned pointer
-            // slot (KIND_SEALED); the descriptor walk recurses into the nested record's own fields.
-            || (matches!(self, Type::Object { sealed: true, .. }) && self.sealed_record_all_fields_packable())
-    }
-
-    /// Helper: a sealed `Type::Object` whose every field is itself packable (for the nested-record
-    /// gate). Non-empty + all fields pass `is_sealed_array_field_packable`.
-    fn sealed_record_all_fields_packable(&self) -> bool {
-        match self {
-            Type::Object { fields, sealed: true } =>
-                !fields.is_empty() && fields.values().all(|f| f.is_sealed_array_field_packable()),
-            _ => false,
-        }
+        self.is_flat_scalar() || matches!(self, Type::Bool)
     }
 
     /// Returns true for the dynamic "any" JSON type (TypeVar(u32::MAX)).
