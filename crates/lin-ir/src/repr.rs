@@ -789,6 +789,23 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                         }
                     }
                 }
+                // ASSUME: FieldSet — object is written as a packed struct iff sealed_scalar_fields
+                // (mirrors FieldGet, both directions).
+                Instruction::FieldSet { object, obj_ty, .. } => {
+                    let r = &repr[object.0 as usize];
+                    match sealed_fields(obj_ty) {
+                        Some(f) => {
+                            if !is_packed_struct(r, f) {
+                                report(&mut bad, "FieldSet(object packed)", *object, "Packed(struct)", r);
+                            }
+                        }
+                        None => {
+                            if r.packed_struct_fields().is_some() {
+                                report(&mut bad, "FieldSet(object NOT predicate-packed)", *object, "non-Packed-struct", r);
+                            }
+                        }
+                    }
+                }
                 // ASSUME: SealedArrayFieldGet — array is read as a packed sealed array (both directions).
                 Instruction::SealedArrayFieldGet { array, arr_ty, .. } => {
                     let r = &repr[array.0 as usize];
@@ -913,6 +930,19 @@ pub fn verify(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                         if !is_packed_struct(&repr[object.0 as usize], f) {
                             bad.push(format!(
                                 "{fname}: FieldGet requires Packed(struct) of t{}, has {:?}",
+                                object.0, repr[object.0 as usize]
+                            ));
+                        }
+                    }
+                }
+                // FieldSet has the SAME object-repr obligation as FieldGet: the literal-key sealed
+                // field write is only emitted for a sealed-scalar record, so the object operand must
+                // carry the matching Packed(struct) repr.
+                Instruction::FieldSet { object, obj_ty, .. } => {
+                    if let Some(f) = sealed_fields(obj_ty) {
+                        if !is_packed_struct(&repr[object.0 as usize], f) {
+                            bad.push(format!(
+                                "{fname}: FieldSet requires Packed(struct) of t{}, has {:?}",
                                 object.0, repr[object.0 as usize]
                             ));
                         }

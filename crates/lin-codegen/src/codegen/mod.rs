@@ -1762,6 +1762,12 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result);
                             }
                         }
+                        Instruction::FieldSet { object, field, value, obj_ty, val_ty } => {
+                            if let (Some(&obj_v), Some(&val_v)) = (temp_map.get(object), temp_map.get(value)) {
+                                let obj_repr = func.repr_of(*object);
+                                self.compile_ir_field_set(obj_v, field, val_v, obj_ty, val_ty, &obj_repr);
+                            }
+                        }
                         Instruction::SealedArrayFieldGet { dst, array, index, field, arr_ty, result_ty } => {
                             if let (Some(&arr_v), Some(&idx_v)) = (temp_map.get(array), temp_map.get(index)) {
                                 let arr_repr = func.repr_of(*array);
