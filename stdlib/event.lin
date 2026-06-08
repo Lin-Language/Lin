@@ -49,13 +49,15 @@ export type Listener<T> = (T) => Null
 // MODULE-INTERNAL: callers only ever pass and receive a `T`.
 type Msg<T> = { "kind": String, "value": T }
 
-// emitter(reduce, initial, sample) — spawn a subscriber worker that owns state `S` (seeded
-// `initial`) and folds each delivered `T` into it. `reduce: (T, S) => S` runs ON THE WORKER
-// THREAD, sequentially, one event at a time, so the state is thread-confined and needs no locks
-// (§24.6.4). `sample: T` is a representative payload value: it pins `T` for the internal envelope
-// (a generic `worker` handler cannot otherwise recover `T`) and is never delivered to `reduce`.
-// `T`/`S` are inferred from `reduce`/`initial`/`sample`. Returns an opaque emitter handle (a
-// Worker; `Json` per §24.1 — the ONLY `Json`, and it is the runtime handle, never a payload).
+// Spawn a subscriber worker that owns state `S` and folds each delivered `T` into it. `reduce` runs
+// ON THE WORKER THREAD, sequentially, one event at a time, so the state is thread-confined and needs
+// no locks (§24.6.4).
+// @param reduce   `(T, S) => S`, applied per event on the worker thread.
+// @param initial  the seed state `S`.
+// @param sample   a representative payload value that pins `T` for the internal envelope (a generic
+//   `worker` handler cannot otherwise recover `T`); never delivered to `reduce`.
+// @returns an opaque emitter handle (a Worker; `Json` per §24.1 — the runtime handle, never a
+//   payload). `T`/`S` are inferred from `reduce`/`initial`/`sample`.
 export val emitter = <T, S>(reduce: (T, S) => S, initial: S, sample: T): Json =>
   var state = initial
   worker(
@@ -69,26 +71,33 @@ export val emitter = <T, S>(reduce: (T, S) => S, initial: S, sample: T): Json =>
     (): Null => null
   )
 
-// send(e, value) — FIRE-AND-FORGET: enqueue `value: T` and return immediately. No backpressure; a
-// fast producer can outpace a slow reducer and grow the queue. `T` is inferred from `value`.
+// FIRE-AND-FORGET: enqueue `value` and return immediately. No backpressure; a fast producer can
+// outpace a slow reducer and grow the queue.
+// @param e      an emitter handle from `emitter`.
+// @param value  the payload `T` to deliver (pins `T`).
 export val send = <T>(e: Json, value: T): Null =>
   message(e, { "kind": "event", "value": value })
 
-// request(e, value) — SYNCHRONOUS: enqueue `value: T` and BLOCK until the reducer has folded it,
-// returning the resulting state `S`. Gives natural backpressure. The result is `S | Error` (the
-// worker boundary injects `Error` on a reducer fault, §24.6.5); annotate/handle accordingly.
+// SYNCHRONOUS: enqueue `value` and BLOCK until the reducer has folded it. Gives natural backpressure.
+// @param e      an emitter handle from `emitter`.
+// @param value  the payload `T` to deliver.
+// @returns the resulting state `S`, or an `Error` injected at the worker boundary on a reducer
+//   fault (§24.6.5); annotate/handle the union accordingly.
 export val request = <T, S>(e: Json, value: T): S | Error =>
   workerRequest(e, { "kind": "event", "value": value })
 
-// drain(e, sample) — flush: BLOCK until the queue is fully processed and return the accumulated
-// state `S`. Because the worker processes messages sequentially, the drain is served only after
-// every prior `send`, so the returned `S` reflects them all. `sample: T` pins the envelope type
-// (the drain message's `value` is ignored). Annotate the result (`val s: Sum | Error = drain(e, 0)`).
+// Flush: BLOCK until the queue is fully processed and return the accumulated state. Because the
+// worker processes messages sequentially, the drain is served only after every prior `send`, so the
+// returned state reflects them all.
+// @param e       an emitter handle from `emitter`.
+// @param sample  a representative `T` that pins the envelope type (its `value` is ignored).
+// @returns the accumulated state `S`, or an `Error` (§24.6.5); annotate the result, e.g.
+//   `val s: Sum | Error = drain(e, 0)`.
 export val drain = <T, S>(e: Json, sample: T): S | Error =>
   workerRequest(e, { "kind": "drain", "value": sample })
 
-// stop(e) — shut the emitter's worker down (drain in-flight, run the no-op onClose, join). After
-// `stop`, sending to the emitter is an error (§24.6.5).
+// Shut the emitter's worker down (drain in-flight, run the no-op onClose, join).
+// @param e  the emitter handle to stop. After `stop`, sending to the emitter is an error (§24.6.5).
 export val stop = (e: Json): Null =>
   close(e)
 
@@ -102,18 +111,22 @@ export type Bus<T> = { "entries": Entry<T>[], "nextId": Int32 }
 // A subscription handle returned by `on`/`once`, consumed by `off`.
 export type Sub = { "id": Int32 }
 
-// bus(first) — a fresh bus seeded with its first listener (which pins `T`). Annotate the binding —
-// `val b: Bus<Int32> = bus(h)` — so later bus-only calls (`emit`/`off`/`listenerCount`) resolve
-// `T`. The seed listener avoids the zero-argument-inference gap (a generic `bus()` could not infer
-// `T`); to start empty, write the literal directly: `val b: Bus<Int32> = { "entries": [], "nextId": 0 }`.
+// Create a fresh bus seeded with its first listener.
+// @param first  the seed `Listener<T>`, which pins `T` (avoids the zero-argument-inference gap).
+// @returns a `Bus<T>`. Annotate the binding — `val b: Bus<Int32> = bus(h)` — so later bus-only
+//   calls (`emit`/`off`/`listenerCount`) resolve `T`. To start empty, write the literal directly:
+//   `val b: Bus<Int32> = { "entries": [], "nextId": 0 }`.
 export val bus = <T>(first: Listener<T>): Bus<T> =>
   {
     "entries": [{ "id": 0, "handler": first, "once": false }],
     "nextId": 1
   }
 
-// on(b, handler) — register `handler` for the bus's payload type. Returns a subscription handle to
-// pass to `off`. (Returning a handle, not requiring closure-identity comparison, makes `off` reliable.)
+// Register `handler` on the bus for its payload type.
+// @param b        the bus.
+// @param handler  the `Listener<T>` to add.
+// @returns a `Sub` subscription handle to pass to `off` (a handle, not closure identity, makes
+//   `off` reliable).
 export val on = <T>(b: Bus<T>, handler: Listener<T>): Sub =>
   val id = b["nextId"]
   b["nextId"] = id + 1
@@ -124,7 +137,10 @@ export val on = <T>(b: Bus<T>, handler: Listener<T>): Sub =>
   })
   { "id": id }
 
-// once(b, handler) — like `on`, but the listener is removed automatically after its first firing.
+// Register `handler` like `on`, but auto-remove it after its first firing.
+// @param b        the bus.
+// @param handler  the one-shot `Listener<T>`.
+// @returns a `Sub` subscription handle (usable with `off` before the first firing).
 export val once = <T>(b: Bus<T>, handler: Listener<T>): Sub =>
   val id = b["nextId"]
   b["nextId"] = id + 1
@@ -135,15 +151,20 @@ export val once = <T>(b: Bus<T>, handler: Listener<T>): Sub =>
   })
   { "id": id }
 
-// off(b, sub) — remove the listener identified by `sub`. Returns `true` if one was removed.
+// Remove the listener identified by `sub`.
+// @param b    the bus.
+// @param sub  the subscription handle returned by `on`/`once`.
+// @returns `true` if a listener was removed, `false` if none matched.
 export val off = <T>(b: Bus<T>, sub: Sub): Boolean =>
   val before = length(b["entries"])
   b["entries"] = keepOthers(b["entries"], sub["id"])
   length(b["entries"]) < before
 
-// emit(b, value) — SYNCHRONOUSLY invoke every listener with `value: T`, in registration order.
-// `once` listeners are removed after firing. Returns the number of listeners invoked (0 if none —
-// no Node-style crash-on-unhandled-error).
+// SYNCHRONOUSLY invoke every listener with `value`, in registration order; `once` listeners are
+// removed after firing.
+// @param b      the bus.
+// @param value  the payload `T` to dispatch.
+// @returns the number of listeners invoked (0 if none — no Node-style crash-on-unhandled-error).
 export val emit = <T>(b: Bus<T>, value: T): Int32 =>
   // Snapshot before firing so a listener that subscribes/unsubscribes during dispatch does not
   // perturb THIS emission (an added listener fires on the NEXT emit; a removed one still completes
@@ -157,7 +178,9 @@ export val emit = <T>(b: Bus<T>, value: T): Int32 =>
   b["entries"] = dropOnce(b["entries"])
   fired
 
-// listenerCount(b) — how many listeners are currently registered.
+// Count the listeners currently registered on the bus.
+// @param b  the bus.
+// @returns the number of registered listeners.
 export val listenerCount = <T>(b: Bus<T>): Int32 =>
   length(b["entries"])
 

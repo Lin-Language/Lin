@@ -12,7 +12,6 @@
 //
 // NOTE: cross-worker transfer of a BigInt is NOT supported in v1 (the handle is a raw pointer that
 // cannot be shared across a thread boundary); bignum math is main-thread.
-
 export type BigInt = Json
 
 import foreign "lin-runtime"
@@ -36,40 +35,69 @@ import foreign "lin-runtime"
   val lin_bignum_to_float64: (BigInt) => Float64
 
 // ── Construction ──────────────────────────────────────────────────────────────
-
+// Build a `BigInt` from a machine integer.
+// @param n  the Int64 value to widen.
+// @returns the `BigInt`.
 export val bigInt = (n: Int64): BigInt => lin_bignum_from_int64(n)
 
+// Parse a base-10 integer string of any length into a `BigInt`.
+// @param s  the decimal string (optional leading `-`).
+// @returns the `BigInt`, or an `Error` if `s` is not a valid integer.
 export val parseBigInt = (s: String): BigInt | Error => lin_bignum_parse(s)
 
+// The `BigInt` constant 0.
 export val zero: BigInt = lin_bignum_zero()
+// The `BigInt` constant 1.
 export val one: BigInt = lin_bignum_one()
 
 // ── Arithmetic ────────────────────────────────────────────────────────────────
-
+// Sum of `a` and `b`. @returns `a + b`.
 export val add = (a: BigInt, b: BigInt): BigInt => lin_bignum_add(a, b)
+// Difference of `a` and `b`. @returns `a - b`.
 export val sub = (a: BigInt, b: BigInt): BigInt => lin_bignum_sub(a, b)
+// Product of `a` and `b`. @returns `a * b`.
 export val mul = (a: BigInt, b: BigInt): BigInt => lin_bignum_mul(a, b)
+// Truncating integer quotient of `a` and `b`.
+// @returns `a / b`, or an `Error` if `b` is zero.
 export val div = (a: BigInt, b: BigInt): BigInt | Error => lin_bignum_div(a, b)
+// Remainder of `a` divided by `b` (sign follows the dividend).
+// @returns `a % b`, or an `Error` if `b` is zero.
 export val mod = (a: BigInt, b: BigInt): BigInt | Error => lin_bignum_mod(a, b)
+// Raise `a` to a non-negative integer power.
+// @param e  the exponent.
+// @returns `a ** e`, or an `Error` if `e` is negative.
 export val pow = (a: BigInt, e: Int64): BigInt | Error => lin_bignum_pow(a, e)
+// Modular exponentiation `base ** exp mod modulus` (single fused op for crypto-sized values).
+// @returns the result, or an `Error` if `modulus` is zero or `exp` is negative.
 export val modPow = (base: BigInt, exp: BigInt, modulus: BigInt): BigInt | Error =>
   lin_bignum_modpow(base, exp, modulus)
+// Negation. @returns `-a`.
 export val neg = (a: BigInt): BigInt => lin_bignum_neg(a)
+// Absolute value. @returns `|a|`.
 export val abs = (a: BigInt): BigInt => lin_bignum_abs(a)
 
 // ── Comparison ────────────────────────────────────────────────────────────────
-// `cmp` is the primitive; the predicates are pure-Lin conveniences over it.
-
+// Three-way compare. @returns -1 if `a < b`, 0 if equal, 1 if `a > b`. The comparison primitive
+// the predicates below are built on.
 export val cmp = (a: BigInt, b: BigInt): Int32 => lin_bignum_cmp(a, b)
+// @returns true if `a == b`.
 export val eq = (a: BigInt, b: BigInt): Boolean => lin_bignum_cmp(a, b) == 0
+// @returns true if `a < b`.
 export val lt = (a: BigInt, b: BigInt): Boolean => lin_bignum_cmp(a, b) < 0
+// @returns true if `a <= b`.
 export val lte = (a: BigInt, b: BigInt): Boolean => lin_bignum_cmp(a, b) <= 0
+// @returns true if `a > b`.
 export val gt = (a: BigInt, b: BigInt): Boolean => lin_bignum_cmp(a, b) > 0
+// @returns true if `a >= b`.
 export val gte = (a: BigInt, b: BigInt): Boolean => lin_bignum_cmp(a, b) >= 0
 
 // ── Conversion ────────────────────────────────────────────────────────────────
-
+// Render as a base-10 string (the inverse of `parseBigInt`). @returns the decimal string.
 export val toString = (a: BigInt): String => lin_bignum_to_string(a)
+// Narrow to a machine integer.
+// @returns the `Int64` value, or an `Error` if `a` does not fit in 64 bits.
 export val toInt64 = (a: BigInt): Int64 | Error => lin_bignum_to_int64(a)
+// Convert to a double (may lose precision for large magnitudes). @returns the `Float64` value.
 export val toFloat64 = (a: BigInt): Float64 => lin_bignum_to_float64(a)
+// @returns the sign of `a`: -1, 0, or 1.
 export val sign = (a: BigInt): Int32 => lin_bignum_sign(a)

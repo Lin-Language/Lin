@@ -14,59 +14,104 @@ import foreign "lin-runtime"
   val lin_to_int64: (UInt64) => Int64
   val lin_to_uint64: (UInt64) => UInt64
 
+// Parse `s` as a base-10 Int32.
+// @param s  the string to parse.
+// @returns the parsed integer.
 export val parseInt32 = (s: String): Int32 =>
   lin_parse_int32(s)
 
+// Parse `s` as a Float64.
+// @param s  the string to parse.
+// @returns the parsed floating-point value.
 export val parseFloat64 = (s: String): Float64 =>
   lin_parse_float64(s)
 
+// Convert a Float64 to an Int32 by truncation toward zero.
+// @param v  the float to convert.
+// @returns the truncated Int32.
 export val toInt32 = (v: Float64): Int32 =>
   lin_to_int32(v)
 
+// Widen an Int32 to a Float64.
+// @param v  the integer to convert.
+// @returns the equivalent Float64.
 export val toFloat64 = (v: Int32): Float64 =>
   lin_to_float64(v)
 
+// Narrow a Float64 to a Float32.
+// @param v  the double to convert.
+// @returns the value rounded to Float32 precision.
 export val toFloat32 = (v: Float64): Float32 =>
   lin_to_float32(v)
 
-// Explicit narrowing integer casts (spec §26). Each truncates the input to the
-// target width using two's-complement / `as`-cast semantics. The input is taken
-// as UInt64 (the widest unsigned) so any narrower unsigned integer — or a value
-// masked down to a byte/word — widens into it at the call site without range
-// loss; truncation to the target width is then well defined.
+// Explicit narrowing integer casts (spec §26). Each truncates the input to the target width
+// using two's-complement / `as`-cast semantics. The input is taken as UInt64 (the widest
+// unsigned) so any narrower unsigned integer — or a value masked down to a byte/word — widens
+// into it at the call site without range loss; truncation to the target width is then well
+// defined.
+// Truncate `v` to a UInt8.
+// @param v  the value to narrow (taken as UInt64).
+// @returns the low 8 bits of `v` as a UInt8.
 export val toUInt8 = (v: UInt64): UInt8 =>
   lin_to_uint8(v)
 
+// Truncate `v` to an Int8.
+// @param v  the value to narrow (taken as UInt64).
+// @returns the low 8 bits of `v` as a signed Int8.
 export val toInt8 = (v: UInt64): Int8 =>
   lin_to_int8(v)
 
+// Truncate `v` to a UInt16.
+// @param v  the value to narrow (taken as UInt64).
+// @returns the low 16 bits of `v` as a UInt16.
 export val toUInt16 = (v: UInt64): UInt16 =>
   lin_to_uint16(v)
 
+// Truncate `v` to an Int16.
+// @param v  the value to narrow (taken as UInt64).
+// @returns the low 16 bits of `v` as a signed Int16.
 export val toInt16 = (v: UInt64): Int16 =>
   lin_to_int16(v)
 
+// Truncate `v` to a UInt32.
+// @param v  the value to narrow (taken as UInt64).
+// @returns the low 32 bits of `v` as a UInt32.
 export val toUInt32 = (v: UInt64): UInt32 =>
   lin_to_uint32(v)
 
+// Reinterpret `v` as a signed Int64.
+// @param v  the value to convert (taken as UInt64).
+// @returns the same bit pattern as a signed Int64.
 export val toInt64 = (v: UInt64): Int64 =>
   lin_to_int64(v)
 
+// Identity cast keeping `v` as a UInt64.
+// @param v  the value.
+// @returns `v` as a UInt64.
 export val toUInt64 = (v: UInt64): UInt64 =>
   lin_to_uint64(v)
 
+// Test whether `s` is a valid base-10 Int32.
+// @param s  the string to test.
+// @returns `true` if `s` parses as an Int32, otherwise `false`.
 export val isInt32 = (s: String): Boolean =>
   lin_is_int32(s)
 
+// Test whether `s` is a valid Float64.
+// @param s  the string to test.
+// @returns `true` if `s` parses as a Float64, otherwise `false`.
 export val isFloat64 = (s: String): Boolean =>
   lin_is_float64(s)
 
-// Parse `s` to an Int32, or `null` if it is not a valid integer (the `if … then`
-// with no `else` yields `Int32 | Null`). The narrower type lets callers narrow with
-// a plain `== null` / `is Int32` test instead of an untyped `Json` read.
+// Parse `s` to an Int32, narrowing to `null` on failure so callers can test with a plain
+// `== null` / `is Int32` instead of an untyped `Json` read.
+// @param s  the string to parse.
+// @returns the parsed Int32, or `null` if `s` is not a valid integer.
 export val tryParseInt32 = (s: String): Int32 | Null =>
   if lin_is_int32(s) then lin_parse_int32(s)
 
-// Parse `s` to a Float64, or `null` if it is not a valid float.
+// Parse `s` to a Float64, narrowing to `null` on failure.
+// @param s  the string to parse.
+// @returns the parsed Float64, or `null` if `s` is not a valid float.
 export val tryParseFloat64 = (s: String): Float64 | Null =>
   if lin_is_float64(s) then lin_parse_float64(s)

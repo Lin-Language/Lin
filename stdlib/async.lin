@@ -1,75 +1,120 @@
-// async returns an opaque Promise<T> handle, modelled as Json: the value only materialises at
-// the await site, so wrapping it in `T | Error` here would mis-type the live promise handle
-// (codegen would try to box the promise pointer as a `T`). The Error injection happens in
-// `await`, where the value is actually produced. See ADR-045.
+// Run thunk `f` concurrently and return a promise for its result.
+// @param f  a zero-argument thunk `() => T` to run asynchronously.
+// @returns an opaque `Promise<T>` handle; resolve it with `await`. The value materialises only at
+//   the await site, where any fault is injected as an `Error`.
 export val async = (f: Json): Json =>
+  // Typed `Json`, not `Promise<T | Error>`: wrapping the live handle in `T | Error` here would
+  // mis-type the promise pointer (codegen would box it as a `T`). Error injection is at `await`
+  // (ADR-045).
   lin_async(f)
 
-// await resolves a promise to its value, wrapping it in `T | Error` (spec §32.2.2). A faulted
-// thunk surfaces as an Error here, so the result is a union; assigning it to a bare binding
-// that does not handle the Error case is a compile-time error (the existing union-assignment
-// check, the same one `fromJson` relies on). Handle it with `match … is Error => … else => …`.
+// Resolve a promise to its value (spec §32.2.2).
+// @param p  the `Promise<T>` handle to await.
+// @returns the resolved value, or an `Error` if the thunk faulted. The `T | Error` union must be
+//   handled (e.g. `match … is Error => … else => …`); assigning it to a bare binding that ignores
+//   the Error arm is a compile-time error.
 export val await = <T>(p: T): T | Error =>
   lin_await(p)
 
-// parallel keeps the Json signature: the element type `(() => T)[]` is not expressible in the
-// surface type grammar (no parenthesised function type before `[]`), and `lin_parallel`
-// deliberately returns a tagged `Json[]` to keep codegen from picking a flat-scalar array
-// representation. See ADR-045.
+// Run a list of thunks concurrently and collect their results in order.
+// @param tasks  an array of zero-argument thunks (`(() => T)[]`, passed as `Json`).
+// @returns a `Json[]` of the results, one per task, in input order.
 export val parallel = (tasks: Json): Json[] =>
+  // Stays `Json`: the `(() => T)[]` element type is not expressible in the surface grammar, and
+  // the intrinsic deliberately returns a tagged `Json[]` to avoid a flat-scalar array repr
+  // (ADR-045).
   lin_parallel(tasks)
 
-// race/timeout/retry/poolAsync all return a Promise handle (lin_race/_timeout/_retry/
-// _pool_async return `*mut LinPromise` in the runtime), NOT a resolved value, so they keep the
-// opaque Json typing — exactly like `async`. The `T | Error` Error injection happens once, at
-// `await`, where the value is actually produced. Typing these as `T | Error` would mis-type the
-// live promise pointer and crash codegen (it would box the promise as a scalar). See ADR-045.
+// Return a promise that resolves to the first of `promises` to settle.
+// @param promises  an array of `Promise` handles (passed as `Json`).
+// @returns an opaque `Promise` handle for the first settled result; resolve with `await`.
 export val race = (promises: Json): Json =>
+  // race/timeout/retry/poolAsync all return a live promise handle, not a resolved value, so they
+  // keep the opaque `Json` typing like `async`; Error injection happens once, at `await` (ADR-045).
   lin_race(promises)
 
+// Return a promise that fails with a timeout `Error` if `p` does not settle within `ms`.
+// @param p   the promise handle to bound.
+// @param ms  the timeout in milliseconds.
+// @returns an opaque `Promise` handle; awaiting it yields `p`'s value or a timeout `Error`.
 export val timeout = (p: Json, ms: Int32): Json =>
   lin_timeout(p, ms)
 
+// Retry a faulting thunk up to `times` attempts.
+// @param f      a zero-argument thunk `() => T` (passed as `Json`).
+// @param times  the maximum number of attempts.
+// @returns an opaque `Promise` handle; awaiting it yields the first success, or the last `Error`.
 export val retry = (f: Json, times: Int32): Json =>
   lin_retry(f, times)
 
+// Create a fixed-size pool of worker threads.
+// @param size  the number of worker threads in the pool.
+// @returns an opaque pool handle for `poolAsync`.
 export val threadPool = (size: Int32): Json =>
   lin_thread_pool(size)
 
+// Submit thunk `f` to a thread pool for execution.
+// @param pool  a pool handle from `threadPool`.
+// @param f     a zero-argument thunk `() => T` (passed as `Json`).
+// @returns an opaque `Promise` handle for the result; resolve with `await`.
 export val poolAsync = (pool: Json, f: Json): Json =>
   lin_pool_async(pool, f)
 
+// Spawn a long-lived worker thread that owns thread-confined state.
+// @param handler  the per-message handler run on the worker thread.
+// @param onClose  a cleanup callback run when the worker shuts down.
+// @returns an opaque worker handle for `request`/`message`/`close`.
 export val worker = (handler: Json, onClose: Json): Json =>
   lin_worker(handler, onClose)
 
+// Send `msg` to a worker and BLOCK until it replies (synchronous; gives backpressure).
+// @param w    a worker handle from `worker`.
+// @param msg  the message payload.
+// @returns the worker's reply (or an `Error` injected at the worker boundary on a handler fault).
 export val request = (w: Json, msg: Json): Json =>
   lin_request(w, msg)
 
+// Send `msg` to a worker FIRE-AND-FORGET (enqueue and return immediately; no reply).
+// @param w    a worker handle from `worker`.
+// @param msg  the message payload.
 export val message = (w: Json, msg: Json): Null =>
   lin_message(w, msg)
 
+// Shut a worker down (drain in-flight work, run its `onClose`, join the thread).
+// @param w  the worker handle to close.
 export val close = (w: Json): Null =>
   lin_close(w)
 
-// Shared<T> — opt-in shared mutable state (ADR-028 §2.3.1). `shared` boxes a private copy;
-// `get` snapshots out, `set` copies in, `withLock` mutates in place under the write lock.
-// Shared<T> accessors. Typed against the opaque `Shared` box so `Shared<T>` is preserved to
-// the caller and the accessor-only guard holds: a non-accessor op on a `Shared` value (push,
-// indexing, …) is a compile-time type error (ADR-029). `shared(v)` produces a `Shared`; the
-// other three only accept a `Shared` first argument.
+// Box a value into opt-in shared MUTABLE state (ADR-028 §2.3.1).
+// @param v  the value to share; a private copy is boxed.
+// @returns a `Shared` handle. Only the accessors below operate on it — any other op (push,
+//   indexing, …) on a `Shared` value is a compile-time type error (ADR-029).
 export val shared = (v: Json): Shared =>
+  // Typed against the opaque `Shared` box so `Shared<T>` is preserved to the caller and the
+  // accessor-only guard holds.
   lin_shared(v)
 
+// Snapshot the current value out of a `Shared` cell under the lock.
+// @param s  the `Shared` handle.
+// @returns a copy of the shared value.
 export val get = (s: Shared): Json =>
   lin_shared_get(s)
 
+// Copy a new value into a `Shared` cell under the write lock.
+// @param s  the `Shared` handle.
+// @param v  the new value to store.
 export val set = (s: Shared, v: Json): Null =>
   lin_shared_set(s, v)
 
+// Mutate a `Shared` cell in place under the write lock.
+// @param s  the `Shared` handle.
+// @param f  a function that mutates the held value while the lock is held.
+// @returns whatever `f` returned.
 export val withLock = (s: Shared, f: Function): Json =>
   lin_shared_with_lock(s, f)
 
-// Frozen<T> — opt-in shared READ-ONLY state (ADR-028 §2.3.2). Deep-freezes a transferable
-// graph into an immortal, immutable, lock-free-readable value; readers use the plain type.
+// Deep-freeze a transferable graph into opt-in shared READ-ONLY state (ADR-028 §2.3.2).
+// @param v  the value graph to freeze.
+// @returns an immortal, immutable, lock-free-readable value (readers use the plain type).
 export val frozen = (v: Json): Json =>
   lin_freeze(v)

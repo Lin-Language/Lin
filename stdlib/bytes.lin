@@ -14,38 +14,72 @@ import foreign "lin-runtime"
   val lin_f64_from_bits: (UInt64) => Float64
 
 // --- slice -----------------------------------------------------------------
-// Sub-buffer copy. Re-exported from std/array; slicing a UInt8[] yields a
-// UInt8[]. `start`/`end` clamp to [0, length]; `end` is exclusive.
+// Copy the sub-buffer of `buf` from `start` (inclusive) to `end` (exclusive). Slicing a
+// `UInt8[]` yields a `UInt8[]`.
+// @param buf    the source byte buffer.
+// @param start  the start index; clamped to [0, length].
+// @param end    the end index (exclusive); clamped to [0, length].
+// @returns a new `UInt8[]` containing the bytes in the range.
 export val slice = (buf: UInt8[], start: Int32, end: Int32): UInt8[] =>
   arraySlice(buf, start, end)
 
 // --- big-endian reads ------------------------------------------------------
+// Read a big-endian UInt16 from `b` at byte offset `off`.
+// @param b    the byte buffer.
+// @param off  the offset of the first (most-significant) byte.
+// @returns the 16-bit value read from `b[off..off+2]`.
 export val u16FromBe = (b: UInt8[], off: Int32): UInt16 =>
   toUInt16((toUInt16(b[off]) << 8) | toUInt16(b[off + 1]))
 
+// Read a big-endian UInt32 from `b` at byte offset `off`.
+// @param b    the byte buffer.
+// @param off  the offset of the first (most-significant) byte.
+// @returns the 32-bit value read from `b[off..off+4]`.
 export val u32FromBe = (b: UInt8[], off: Int32): UInt32 =>
   (toUInt32(b[off]) << 24) | (toUInt32(b[off + 1]) << 16) | (toUInt32(b[off + 2]) << 8) | toUInt32(b[off + 3])
 
+// Read a big-endian UInt64 from `b` at byte offset `off`.
+// @param b    the byte buffer.
+// @param off  the offset of the first (most-significant) byte.
+// @returns the 64-bit value read from `b[off..off+8]`.
 export val u64FromBe = (b: UInt8[], off: Int32): UInt64 =>
   (toUInt64(b[off]) << 56) | (toUInt64(b[off + 1]) << 48) | (toUInt64(b[off + 2]) << 40) | (toUInt64(b[off + 3]) << 32) | (toUInt64(b[off + 4]) << 24) | (toUInt64(b[off + 5]) << 16) | (toUInt64(b[off + 6]) << 8) | toUInt64(b[off + 7])
 
 // --- little-endian reads ---------------------------------------------------
+// Read a little-endian UInt16 from `b` at byte offset `off`.
+// @param b    the byte buffer.
+// @param off  the offset of the first (least-significant) byte.
+// @returns the 16-bit value read from `b[off..off+2]`.
 export val u16FromLe = (b: UInt8[], off: Int32): UInt16 =>
   toUInt16((toUInt16(b[off + 1]) << 8) | toUInt16(b[off]))
 
+// Read a little-endian UInt32 from `b` at byte offset `off`.
+// @param b    the byte buffer.
+// @param off  the offset of the first (least-significant) byte.
+// @returns the 32-bit value read from `b[off..off+4]`.
 export val u32FromLe = (b: UInt8[], off: Int32): UInt32 =>
   (toUInt32(b[off + 3]) << 24) | (toUInt32(b[off + 2]) << 16) | (toUInt32(b[off + 1]) << 8) | toUInt32(b[off])
 
+// Read a little-endian UInt64 from `b` at byte offset `off`.
+// @param b    the byte buffer.
+// @param off  the offset of the first (least-significant) byte.
+// @returns the 64-bit value read from `b[off..off+8]`.
 export val u64FromLe = (b: UInt8[], off: Int32): UInt64 =>
   (toUInt64(b[off + 7]) << 56) | (toUInt64(b[off + 6]) << 48) | (toUInt64(b[off + 5]) << 40) | (toUInt64(b[off + 4]) << 32) | (toUInt64(b[off + 3]) << 24) | (toUInt64(b[off + 2]) << 16) | (toUInt64(b[off + 1]) << 8) | toUInt64(b[off])
 
 // --- big-endian writes -----------------------------------------------------
+// Serialize a UInt16 to its 2-byte big-endian representation.
+// @param v  the value to encode.
+// @returns a 2-byte `UInt8[]`, most-significant byte first.
 export val u16ToBe = (v: UInt16): UInt8[] =>
   val b0: UInt8 = toUInt8((v >> 8) & 0xFF)
   val b1: UInt8 = toUInt8(v & 0xFF)
   val out: UInt8[] = [b0, b1]
   out
 
+// Serialize a UInt32 to its 4-byte big-endian representation.
+// @param v  the value to encode.
+// @returns a 4-byte `UInt8[]`, most-significant byte first.
 export val u32ToBe = (v: UInt32): UInt8[] =>
   val b0: UInt8 = toUInt8((v >> 24) & 0xFF)
   val b1: UInt8 = toUInt8((v >> 16) & 0xFF)
@@ -54,6 +88,9 @@ export val u32ToBe = (v: UInt32): UInt8[] =>
   val out: UInt8[] = [b0, b1, b2, b3]
   out
 
+// Serialize a UInt64 to its 8-byte big-endian representation.
+// @param v  the value to encode.
+// @returns an 8-byte `UInt8[]`, most-significant byte first.
 export val u64ToBe = (v: UInt64): UInt8[] =>
   val b0: UInt8 = toUInt8((v >> 56) & 0xFF)
   val b1: UInt8 = toUInt8((v >> 48) & 0xFF)
@@ -76,12 +113,18 @@ export val u64ToBe = (v: UInt64): UInt8[] =>
   out
 
 // --- little-endian writes --------------------------------------------------
+// Serialize a UInt16 to its 2-byte little-endian representation.
+// @param v  the value to encode.
+// @returns a 2-byte `UInt8[]`, least-significant byte first.
 export val u16ToLe = (v: UInt16): UInt8[] =>
   val b0: UInt8 = toUInt8(v & 0xFF)
   val b1: UInt8 = toUInt8((v >> 8) & 0xFF)
   val out: UInt8[] = [b0, b1]
   out
 
+// Serialize a UInt32 to its 4-byte little-endian representation.
+// @param v  the value to encode.
+// @returns a 4-byte `UInt8[]`, least-significant byte first.
 export val u32ToLe = (v: UInt32): UInt8[] =>
   val b0: UInt8 = toUInt8(v & 0xFF)
   val b1: UInt8 = toUInt8((v >> 8) & 0xFF)
@@ -90,6 +133,9 @@ export val u32ToLe = (v: UInt32): UInt8[] =>
   val out: UInt8[] = [b0, b1, b2, b3]
   out
 
+// Serialize a UInt64 to its 8-byte little-endian representation.
+// @param v  the value to encode.
+// @returns an 8-byte `UInt8[]`, least-significant byte first.
 export val u64ToLe = (v: UInt64): UInt8[] =>
   val b0: UInt8 = toUInt8(v & 0xFF)
   val b1: UInt8 = toUInt8((v >> 8) & 0xFF)
@@ -112,40 +158,80 @@ export val u64ToLe = (v: UInt64): UInt8[] =>
   out
 
 // --- float bit reinterpret -------------------------------------------------
+// Reinterpret the bit pattern of a Float32 as a UInt32 (IEEE-754 raw bits).
+// @param f  the float.
+// @returns the 32-bit pattern of `f`.
 export val f32ToBits = (f: Float32): UInt32 =>
   lin_f32_to_bits(f)
 
+// Reinterpret a UInt32 bit pattern as a Float32 (IEEE-754).
+// @param u  the 32-bit pattern.
+// @returns the Float32 with those bits.
 export val f32FromBits = (u: UInt32): Float32 =>
   lin_f32_from_bits(u)
 
+// Reinterpret the bit pattern of a Float64 as a UInt64 (IEEE-754 raw bits).
+// @param f  the double.
+// @returns the 64-bit pattern of `f`.
 export val f64ToBits = (f: Float64): UInt64 =>
   lin_f64_to_bits(f)
 
+// Reinterpret a UInt64 bit pattern as a Float64 (IEEE-754).
+// @param u  the 64-bit pattern.
+// @returns the Float64 with those bits.
 export val f64FromBits = (u: UInt64): Float64 =>
   lin_f64_from_bits(u)
 
 // --- float (de)serialization (big-endian) ----------------------------------
+// Serialize a Float32 to its 4-byte big-endian IEEE-754 representation.
+// @param f  the value to encode.
+// @returns a 4-byte `UInt8[]`, most-significant byte first.
 export val f32ToBe = (f: Float32): UInt8[] =>
   u32ToBe(f32ToBits(f))
 
+// Read a big-endian IEEE-754 Float32 from `b` at byte offset `off`.
+// @param b    the byte buffer.
+// @param off  the offset of the first byte.
+// @returns the decoded Float32 from `b[off..off+4]`.
 export val f32FromBe = (b: UInt8[], off: Int32): Float32 =>
   f32FromBits(u32FromBe(b, off))
 
+// Serialize a Float64 to its 8-byte big-endian IEEE-754 representation.
+// @param f  the value to encode.
+// @returns an 8-byte `UInt8[]`, most-significant byte first.
 export val f64ToBe = (f: Float64): UInt8[] =>
   u64ToBe(f64ToBits(f))
 
+// Read a big-endian IEEE-754 Float64 from `b` at byte offset `off`.
+// @param b    the byte buffer.
+// @param off  the offset of the first byte.
+// @returns the decoded Float64 from `b[off..off+8]`.
 export val f64FromBe = (b: UInt8[], off: Int32): Float64 =>
   f64FromBits(u64FromBe(b, off))
 
 // --- float (de)serialization (little-endian) --------------------------------
+// Serialize a Float32 to its 4-byte little-endian IEEE-754 representation.
+// @param f  the value to encode.
+// @returns a 4-byte `UInt8[]`, least-significant byte first.
 export val f32ToLe = (f: Float32): UInt8[] =>
   u32ToLe(f32ToBits(f))
 
+// Read a little-endian IEEE-754 Float32 from `b` at byte offset `off`.
+// @param b    the byte buffer.
+// @param off  the offset of the first byte.
+// @returns the decoded Float32 from `b[off..off+4]`.
 export val f32FromLe = (b: UInt8[], off: Int32): Float32 =>
   f32FromBits(u32FromLe(b, off))
 
+// Serialize a Float64 to its 8-byte little-endian IEEE-754 representation.
+// @param f  the value to encode.
+// @returns an 8-byte `UInt8[]`, least-significant byte first.
 export val f64ToLe = (f: Float64): UInt8[] =>
   u64ToLe(f64ToBits(f))
 
+// Read a little-endian IEEE-754 Float64 from `b` at byte offset `off`.
+// @param b    the byte buffer.
+// @param off  the offset of the first byte.
+// @returns the decoded Float64 from `b[off..off+8]`.
 export val f64FromLe = (b: UInt8[], off: Int32): Float64 =>
   f64FromBits(u64FromLe(b, off))

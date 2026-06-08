@@ -28,13 +28,18 @@ export type ExecResult = { "status": Int32, "stdout": String, "stderr": String }
 export type ProcessHandle = Int64
 
 // --- Batch: run to completion, collect all output ---
-// Run `command` with `args`, wait for it to exit, and return its status code and
-// captured stdout/stderr as an ExecResult. Returns an Error if it cannot be launched.
+// Run `command` with `args` and wait for it to exit, capturing its output.
+// @param command  the program to run (looked up on PATH; not passed through a shell).
+// @param args  the argument vector (each element is a separate argument, no shell splitting).
+// @returns an ExecResult with the exit status and captured stdout/stderr, or an Error if the
+//   process cannot be launched.
 export val exec = (command: String, args: String[]): Json =>
   lin_process_exec(command, args)
 
-// Run `command` through the system shell (`/bin/sh -c`). Prefer `exec` to avoid
-// shell injection. Returns an ExecResult, or an Error.
+// Run `command` through the system shell (`/bin/sh -c`). Prefer `exec` to avoid shell injection.
+// @param command  the shell command line.
+// @returns an ExecResult with the exit status and captured stdout/stderr, or an Error if it
+//   cannot be launched.
 export val shell = (command: String): Json =>
   lin_process_shell(command)
 
@@ -42,32 +47,45 @@ export val shell = (command: String): Json =>
 export val cwd = (): String =>
   lin_process_cwd()
 
-// Change the current working directory to `path`. Returns Null on success, or an Error.
+// Change the current working directory.
+// @param path  the directory to switch to.
+// @returns Null on success, or an Error (e.g. if `path` does not exist or is not a directory).
 export val chdir = (path: String): Json =>
   lin_process_chdir(path)
 
 // --- Streaming: spawn and read incrementally ---
-// Start `command` with `args` without waiting. stdout is piped (read it with
-// readStdout); stderr is inherited. Returns an opaque ProcessHandle, or an Error.
+// Start `command` with `args` without waiting for it to finish. stdout is piped (read it with
+// readStdout); stderr is inherited.
+// @param command  the program to run (looked up on PATH).
+// @param args  the argument vector.
+// @returns an opaque ProcessHandle, or an Error if the process cannot be launched.
 export val spawn = (command: String, args: String[]): Json =>
   lin_process_spawn(command, args)
 
-// Read up to buf.length bytes from the process's stdout into buf.
-// Returns the number of bytes read (0 = EOF), or an Error.
+// Read the next chunk of the process's stdout into a caller-provided buffer.
+// @param handle  the spawned process's handle.
+// @param buf  the buffer to fill; up to `buf.length` bytes are read.
+// @returns the number of bytes read (0 = EOF), or an Error.
 export val readStdout = (handle: ProcessHandle, buf: UInt8[]): Json =>
   lin_process_read_stdout(handle, buf)
 
-// Send SIGTERM to the process. Returns Null on success, or an Error.
+// Send SIGTERM to a spawned process.
+// @param handle  the process to signal.
+// @returns Null on success, or an Error.
 export val kill = (handle: ProcessHandle): Json =>
   lin_process_kill(handle)
 
-// Wait for the process to exit and return its exit code, or an Error. (stdout that
-// was streamed via readStdout is not re-collected here — use `exec` for batch output.)
+// Wait for a spawned process to exit. stdout that was streamed via readStdout is not re-collected
+// here — use `exec` for batch output.
+// @param handle  the process to wait on.
+// @returns the process's exit code, or an Error.
 export val wait = (handle: ProcessHandle): Json =>
   lin_process_wait(handle)
 
-// stdoutStream(handle): wrap a spawned child's piped stdout as a lazy byte Stream<UInt8[]>
-// (streams brief §4). Reading pulls from the pipe until EOF.
+// Wrap a spawned child's piped stdout as a lazy byte Stream (streams brief §4). Reading pulls from
+// the pipe until EOF.
+// @param handle  the spawned process's handle.
+// @returns a `Stream<UInt8[]>` over the child's stdout.
 export val stdoutStream = (handle: ProcessHandle): Stream =>
   lin_process_stdout_stream(handle)
 
@@ -76,70 +94,78 @@ export val stdoutStream = (handle: ProcessHandle): Stream =>
 // and its exact meaning varies across platforms (a rough capacity gauge, not exact accounting).
 export type MemInfo = { "total": Int64, "free": Int64 }
 
-// The network hostname of the machine (the short name, e.g. "build-box-3", not an FQDN).
-// Returns an Error on the rare platform where the name cannot be read.
+// The network hostname of the machine.
+// @returns the short name (e.g. "build-box-3", not an FQDN), or an Error on the rare platform
+//   where the name cannot be read.
 export val hostname = (): String | Error =>
   lin_os_hostname()
 
-// The operating-system family, as a lowercase string from a stable closed set:
-// "linux" | "macos" | "windows" | "freebsd" | "openbsd" | "netbsd" | "unknown".
-// Fixed at compile time (the build target) — total, never fails.
+// The operating-system family. Fixed at compile time (the build target) — total, never fails.
+// @returns a lowercase string from a stable closed set: "linux" | "macos" | "windows" |
+//   "freebsd" | "openbsd" | "netbsd" | "unknown".
 export val platform = (): String =>
   lin_os_platform()
 
-// The CPU architecture the binary targets, as a lowercase string from a closed set:
-// "x86_64" | "aarch64" | "arm" | "x86" | "riscv64" | "wasm32" | "unknown". Total.
+// The CPU architecture the binary targets. Total.
+// @returns a lowercase string from a closed set: "x86_64" | "aarch64" | "arm" | "x86" |
+//   "riscv64" | "wasm32" | "unknown".
 export val arch = (): String =>
   lin_os_arch()
 
-// The number of logical CPUs available to the process (cores x SMT, honouring CPU-affinity
-// / cgroup limits where exposed). Always >= 1. Returns a bare Int32 (not Int32 | Error) so it
-// drops straight into `threadPool(cpuCount())` without a match.
+// The number of logical CPUs available to the process (cores x SMT, honouring CPU-affinity /
+// cgroup limits where exposed). Returns a bare Int32 (not Int32 | Error) so it drops straight
+// into `threadPool(cpuCount())` without a match.
+// @returns the CPU count, always >= 1.
 export val cpuCount = (): Int32 =>
   lin_os_cpu_count()
 
-// The OS process id of the current process. Total. (Distinct from a std/process ProcessHandle,
-// which is an opaque id for a child the runtime spawned, not an OS pid.)
+// The OS process id of the current process. Total. Distinct from a ProcessHandle, which is an
+// opaque id for a child the runtime spawned, not an OS pid.
+// @returns the current process's pid.
 export val pid = (): Int32 =>
   lin_os_pid()
 
-// The OS process id of the parent process. On Unix this is getppid(); where the parent pid
-// cannot be determined the runtime returns 0 (rather than an Error) so callers can treat
-// "no parent" uniformly.
+// The OS process id of the parent process (Unix: getppid()).
+// @returns the parent pid, or 0 where it cannot be determined (rather than an Error), so callers
+//   can treat "no parent" uniformly.
 export val ppid = (): Int32 =>
   lin_os_ppid()
 
-// The login name of the user the process runs as ("alice", not a display name). Resolved from
-// the OS (Unix: the effective uid's passwd entry, with $USER / $LOGNAME as a fallback).
-// Returns an Error if no user can be resolved.
+// The login name of the user the process runs as ("alice", not a display name). Resolved from the
+// OS (Unix: the effective uid's passwd entry, with $USER / $LOGNAME as a fallback).
+// @returns the user name, or an Error if no user can be resolved.
 export val username = (): String | Error =>
   lin_os_username()
 
-// The current user's home directory as an absolute path (Unix: $HOME, falling back to the
-// passwd entry). Returns an Error when no home directory is defined for the process. For reading
-// $HOME directly use std/env getEnv; homeDir adds the OS-level fallback when the variable is unset.
+// The current user's home directory as an absolute path (Unix: $HOME, falling back to the passwd
+// entry). For reading $HOME directly use std/env getEnv; homeDir adds the OS-level fallback when
+// the variable is unset.
+// @returns the home directory path, or an Error when no home directory is defined for the process.
 export val homeDir = (): String | Error =>
   lin_os_home_dir()
 
-// The directory the OS designates for temporary files, as an absolute path (Unix: $TMPDIR if
-// set, else /tmp). Always returns *a* path (falls back rather than failing) — total.
+// The directory the OS designates for temporary files (Unix: $TMPDIR if set, else /tmp). Always
+// returns *a* path (falls back rather than failing) — total.
+// @returns the system temp directory as an absolute path.
 export val tempDir = (): String =>
   lin_os_temp_dir()
 
-// How long the *system* has been running, in whole seconds since boot. Returns an Error on a
-// platform where boot time is not queryable. This is system uptime (since boot), not process
-// uptime — wall-clock time for the current program belongs to std/time.
+// How long the *system* has been running since boot (not process uptime — wall-clock time for the
+// current program belongs to std/time).
+// @returns whole seconds since boot, or an Error on a platform where boot time is not queryable.
 export val uptime = (): Int64 | Error =>
   lin_os_uptime()
 
-// The system load average over the last 1, 5, and 15 minutes (a 3-element array). Unix-only:
-// on Windows there is no load-average concept and this returns an Error. Treat the Error as
-// "not available on this platform", not a transient failure.
+// The system load average over the last 1, 5, and 15 minutes. Unix-only.
+// @returns a 3-element Float64[] of load averages, or an Error on platforms without a
+//   load-average concept (e.g. Windows) — treat the Error as "not available", not a transient
+//   failure.
 export val loadAverage = (): Float64[] | Error =>
   lin_os_load_average()
 
-// A snapshot of physical memory, in bytes: `total` (installed RAM) and `free` (memory the OS
-// reports as available). Returns an Error if the platform's memory facility cannot be read.
-// Note: `free` semantics vary across operating systems — a rough capacity gauge, not exact.
+// A snapshot of physical memory, in bytes.
+// @returns a MemInfo with `total` (installed RAM) and `free` (memory the OS reports as
+//   available), or an Error if the platform's memory facility cannot be read. Note: `free`
+//   semantics vary across operating systems — a rough capacity gauge, not exact.
 export val memInfo = (): MemInfo | Error =>
   lin_os_mem_info()

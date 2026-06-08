@@ -14,47 +14,97 @@ import foreign "lin-runtime"
   val lin_tcp_close: (Int32) => Json
 
 // --- UDP ---
+// Bind a UDP socket to `port` on all interfaces.
+// @param port  the local port to bind (0 to let the OS choose).
+// @returns the socket file descriptor, or an `Error` if the bind failed.
 export val udpBind = (port: Int32): Json =>
   lin_udp_bind(port)
 
+// Receive a UDP datagram into `buf` (sender address discarded).
+// @param fd   the socket descriptor from `udpBind`.
+// @param buf  the byte buffer to fill.
+// @returns the number of bytes received, or an `Error` on failure.
 export val udpRecv = (fd: Int32, buf: UInt8[]): Json =>
   lin_udp_recv(fd, buf)
 
+// Receive a UDP datagram into `buf`, keeping the sender's address.
+// @param fd   the socket descriptor from `udpBind`.
+// @param buf  the byte buffer to fill.
+// @returns `{ bytes, addr, port }` for the datagram, or an `Error` on failure.
 export val udpRecvFrom = (fd: Int32, buf: UInt8[]): Json =>
   lin_udp_recv_from(fd, buf)
 
+// Send the bytes in `buf` as a UDP datagram to `addr:port`.
+// @param fd    the socket descriptor from `udpBind`.
+// @param addr  the destination host/IP.
+// @param port  the destination port.
+// @param buf   the bytes to send.
+// @returns the number of bytes sent, or an `Error` on failure.
 export val udpSendTo = (fd: Int32, addr: String, port: Int32, buf: UInt8[]): Json =>
   lin_udp_send_to(fd, addr, port, buf)
 
+// Set or clear non-blocking mode on a UDP socket.
+// @param fd  the socket descriptor.
+// @param on  `true` for non-blocking, `false` for blocking.
+// @returns `Null` on success, or an `Error` on failure.
 export val udpSetNonblocking = (fd: Int32, on: Boolean): Json =>
   if on then lin_udp_set_nonblocking(fd, 1) else lin_udp_set_nonblocking(fd, 0)
 
+// Close a UDP socket.
+// @param fd  the socket descriptor to close.
+// @returns `Null` on success, or an `Error` on failure.
 export val udpClose = (fd: Int32): Json =>
   lin_udp_close(fd)
 
 // --- TCP ---
+// Listen for TCP connections on `port` on all interfaces.
+// @param port  the local port to listen on.
+// @returns the listening socket descriptor, or an `Error` if the listen failed.
 export val tcpListen = (port: Int32): Json =>
   lin_tcp_listen(port)
 
+// Accept the next pending connection on a listening socket (blocks until one arrives).
+// @param fd  the listening socket descriptor from `tcpListen`.
+// @returns the connected client socket descriptor, or an `Error` on failure.
 export val tcpAccept = (fd: Int32): Json =>
   lin_tcp_accept(fd)
 
+// Open a TCP connection to `host:port`.
+// @param host  the destination host/IP.
+// @param port  the destination port.
+// @returns the connected socket descriptor, or an `Error` if the connect failed.
 export val tcpConnect = (host: String, port: Int32): Json =>
   lin_tcp_connect(host, port)
 
+// Receive bytes from a connected TCP socket into `buf`.
+// @param fd   the connected socket descriptor.
+// @param buf  the byte buffer to fill.
+// @returns the number of bytes received (0 at EOF), or an `Error` on failure.
 export val tcpRecv = (fd: Int32, buf: UInt8[]): Json =>
   lin_tcp_recv(fd, buf)
 
+// Send the bytes in `buf` over a connected TCP socket.
+// @param fd   the connected socket descriptor.
+// @param buf  the bytes to send.
+// @returns the number of bytes sent, or an `Error` on failure.
 export val tcpSend = (fd: Int32, buf: UInt8[]): Json =>
   lin_tcp_send(fd, buf)
 
+// Set or clear non-blocking mode on a TCP socket.
+// @param fd  the socket descriptor.
+// @param on  `true` for non-blocking, `false` for blocking.
+// @returns `Null` on success, or an `Error` on failure.
 export val tcpSetNonblocking = (fd: Int32, on: Boolean): Json =>
   if on then lin_tcp_set_nonblocking(fd, 1) else lin_tcp_set_nonblocking(fd, 0)
 
+// Close a TCP socket.
+// @param fd  the socket descriptor to close.
+// @returns `Null` on success, or an `Error` on failure.
 export val tcpClose = (fd: Int32): Json =>
   lin_tcp_close(fd)
 
-// tcpStream(fd): wrap a connected TCP socket as a lazy byte Stream<UInt8[]> (streams brief §4).
-// Reading the stream pulls from the socket until EOF; closing the stream closes the socket.
+// Wrap a connected TCP socket as a lazy byte `Stream<UInt8[]>` (streams brief §4).
+// @param fd  the connected socket descriptor.
+// @returns a `Stream` that pulls from the socket until EOF; closing the stream closes the socket.
 export val tcpStream = (fd: Int32): Stream =>
   lin_net_tcp_stream(fd)

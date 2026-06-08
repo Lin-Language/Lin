@@ -4,14 +4,26 @@ import foreign "lin-runtime"
   val lin_yaml_stringify: (Json) => String
   val lin_yaml_stringify_all: (Json) => String
 
+// Parse a single YAML document into a Json value.
+// @param src  the YAML source text.
+// @returns the parsed value, or an `Error` if `src` is not valid YAML.
 export val parse = (src: String): Json =>
   lin_yaml_parse(src)
 
+// Parse a multi-document YAML stream (`---`-separated) into an array of values.
+// @param src  the YAML source text.
+// @returns a `Json[]` of the parsed documents, or an `Error` if `src` is not valid YAML.
 export val parseAll = (src: String): Json =>
   lin_yaml_parse_all(src)
 
+// Serialize a Json value to a single YAML document.
+// @param value  the value to serialize.
+// @returns the YAML text.
 export val stringify = (value: Json): String =>
   lin_yaml_stringify(value)
 
+// Serialize an array of values to a multi-document (`---`-separated) YAML stream.
+// @param values  the values to serialize, one document each.
+// @returns the multi-document YAML text.
 export val stringifyAll = (values: Json[]): String =>
   lin_yaml_stringify_all(values)

@@ -135,7 +135,6 @@ val s = suite("std/http", [
   ])
 ])
 
-
 // Helper: build directly from a parse result, narrowing the Url | Error union. On the Error arm
 // we return a sentinel so a failed round-trip is visibly wrong rather than silently skipped.
 val roundTrip = (s: String): String =>

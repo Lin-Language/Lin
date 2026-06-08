@@ -94,7 +94,14 @@ impl Parser {
                 // original error) and treat it as a function type.
                 if self.check(TokenKind::Arrow) || saw_comma || params.len() != 1 {
                     self.expect(TokenKind::Arrow);
-                    let ret = self.parse_type_primary();
+                    // The return parses with FULL type-expression precedence so a `|`/`&`
+                    // continuation binds to the RETURN, e.g. `(Json) => Int64 | Error` is
+                    // `(Json) => (Int64 | Error)` (a callable returning a union), not the
+                    // non-callable `((Json) => Int64) | Error` that `parse_type_primary`
+                    // (single-leaf) produced. The grouped-type path below is unaffected: it
+                    // only fires when NO `=>` follows, so `(Int32 | Null)[]` still parses as a
+                    // grouped union with an array suffix.
+                    let ret = self.parse_type_expr();
                     TypeExpr::Function(params, Box::new(ret), Span::dummy())
                 } else {
                     // `(T)` — grouped type. Unwrap to the inner type so the postfix `[]` loop
