@@ -163,8 +163,8 @@ export val isEmpty = (x: Json): Boolean =>
 // happy path. This module adds small, total, side-effect-free helpers over those conventions
 // WITHOUT introducing a wrapper type.
 //
-// SCOPE (see docs/proposals/stdlib/result-ergonomics.md). Only the helpers that are expressible in
-// Lin's argument-driven, monomorphized generics ship here:
+// SCOPE: only the helpers that are expressible in Lin's argument-driven, monomorphized generics
+// ship here:
 //   - `isOk` / `isError` / `isNull`        — Json -> Boolean predicates (no type variable to solve)
 //   - `unwrapOr`                           — DEFAULT-DRIVEN collapse: `T` is solved from `default`,
 //                                            exactly the mechanism behind `array.at`/`object.get`
