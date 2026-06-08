@@ -1506,17 +1506,18 @@ impl<'ctx> Codegen<'ctx> {
             let key_str = self.compile_string_lit(k).into_pointer_value();
             self.builder.call(self.rt.object_set_fresh, &[new_obj.into(), key_str.into(), boxed.into()], "");
             if boxed.is_pointer_value() {
-                if is_heap {
-                    // A nested SEALED field's box_value produced a FRESH boxed LinObject (+1 inner)
-                    // that object_set_fresh retained (+2); full tagged_release drops it back to the
-                    // object's +1 and frees the shell. A String/Array field's box wraps a BORROWED
-                    // element inner that object_set_fresh retained — free only the shell, leaving the
-                    // borrowed element inner untouched (the array still owns it).
-                    if matches!(fty, Type::Object { .. }) {
-                        self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
-                    } else {
-                        self.builder.call(free_box_shell, &[boxed.into()], "");
-                    }
+                if is_heap && Self::box_value_yields_fresh_owned(fty) {
+                    // box_value produced a FRESH +1 value (a nested SEALED record materialized to a
+                    // boxed LinObject, OR a sealed-record ARRAY materialized to a fresh tagged
+                    // `Object[]`). object_set_fresh retained it (+2); full tagged_release drops the
+                    // construction +1 back to the object's owned +1 AND frees the shell. (Mirror of
+                    // `sealed_materialize_to_object`; `free_box_shell` would leak the whole inner.)
+                    self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                } else if is_heap {
+                    // A plain String / plain Array field's box wraps a BORROWED element inner that
+                    // object_set_fresh retained — free only the shell, leaving the borrowed element
+                    // inner untouched (the array still owns it).
+                    self.builder.call(free_box_shell, &[boxed.into()], "");
                 } else {
                     // Scalar field: reclaim the cache-safe box shell (no inner heap).
                     self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
@@ -1755,17 +1756,21 @@ impl<'ctx> Codegen<'ctx> {
             let key_str = self.compile_string_lit(k).into_pointer_value();
             self.builder.call(self.rt.object_set_fresh, &[new_obj.into(), key_str.into(), boxed.into()], "");
             if boxed.is_pointer_value() {
-                if is_heap {
-                    // A nested SEALED field's box_value produced a FRESH boxed LinObject (+1 inner)
-                    // that object_set_fresh retained (+2 on the materialized inner); full
-                    // tagged_release drops it back to +1 owned by the object, and frees the shell.
-                    // A String/Array field's box wraps a BORROWED inner that object_set_fresh
-                    // retained — free only the shell so the borrowed inner is not dropped.
-                    if matches!(fld_ty, Type::Object { .. }) {
-                        self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
-                    } else {
-                        self.builder.call(free_box_shell, &[boxed.into()], "");
-                    }
+                if is_heap && Self::box_value_yields_fresh_owned(&fld_ty) {
+                    // box_value produced a FRESH +1 value (a nested SEALED record materialized to a
+                    // boxed LinObject, OR a sealed-record ARRAY materialized to a fresh tagged
+                    // `Object[]` via `sealed_array_to_tagged`). object_set_fresh retained it (+2 on
+                    // the fresh inner); full tagged_release drops the construction +1 back to the
+                    // object's owned +1 AND frees the box shell. Using `free_box_shell` here would
+                    // leak the entire materialized inner (its header + nested elements) — the
+                    // record-with-record-array-field leak (the RAPTOR `Trip { stopTimes: StopTime[] }`
+                    // shape) every build/push/index-set/map dropped ~176 B/element.
+                    self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                } else if is_heap {
+                    // A plain String / plain (non-sealed-elem) Array field's box wraps a BORROWED
+                    // inner pointer (the struct still owns its original +1) that object_set_fresh
+                    // retained — free ONLY the shell so the borrowed inner is not dropped.
+                    self.builder.call(free_box_shell, &[boxed.into()], "");
                 } else {
                     // Scalar: no inner heap — full release reclaims the (cache-safe) box shell.
                     self.builder.call(self.rt.tagged_release, &[boxed.into()], "");

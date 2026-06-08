@@ -291,6 +291,32 @@ impl<'ctx> Codegen<'ctx> {
         Self::sealed_struct_size(fields) - Self::SEALED_HEADER
     }
 
+    /// Does `box_value(v, ty)` produce a FRESH +1-owned heap value (which the boxing caller must
+    /// later `tagged_release` to reclaim), as opposed to wrapping a BORROWED inner pointer in a box
+    /// shell (which the caller frees with `lin_tagged_free_box`, leaving the borrowed inner alone)?
+    ///
+    /// `box_value` MATERIALIZES — i.e. allocates a fresh +1 — for exactly two sealed-field cases:
+    ///   - a nested SEALED record (`Type::Object` with sealed fields) → fresh boxed `LinObject`
+    ///     (`sealed_materialize_to_object`); and
+    ///   - a sealed-record ARRAY (`T[]` with sealed elements) → fresh tagged `Object[]`
+    ///     (`sealed_array_to_tagged`).
+    /// For every other heap field (plain String, plain/flat Array, Map) `box_value` boxes the
+    /// borrowed pointer with no retain.
+    ///
+    /// This is the single source of truth for the sealed→Json materializers' post-`object_set_fresh`
+    /// cleanup (`sealed_materialize_to_object` / `sealed_array_elem_materializer`): a fresh-owned
+    /// inner needs a full `tagged_release`; a borrowed inner needs only the box shell freed. Getting
+    /// this wrong leaks the whole materialized inner (record-with-record-array-field, the RAPTOR
+    /// `Trip { stopTimes: StopTime[] }` shape).
+    pub(crate) fn box_value_yields_fresh_owned(ty: &Type) -> bool {
+        // Nested sealed record: materialized to a fresh boxed object.
+        if matches!(ty, Type::Object { .. }) && Self::sealed_fields(ty).is_some() {
+            return true;
+        }
+        // Sealed-record array: materialized to a fresh tagged Object[].
+        Self::sealed_array_elem(ty).is_some()
+    }
+
     /// THE sealed-record-ARRAY gate (sealed-records Stage 3). Returns `Some(fields)` iff `ty` is an
     /// `Array(elem)` (or `FixedArray`) whose element is an ALL-SCALAR sealed record — the high-value,
     /// lowest-RC-risk case (no per-element heap fields, so array drop is a single free). FAIL SAFE:
@@ -352,7 +378,10 @@ impl<'ctx> Codegen<'ctx> {
     /// the three mirrors, AND landing one of those two whole-program mechanisms, then re-run corpus +
     /// ASan (the `repr::verify` debug_assert is the structural guard that the swap is consistent).
     pub(crate) fn sealed_array_elem_field_packable(ty: &Type) -> bool {
-        Self::is_sealed_scalar_field(ty)
+        // Delegates to the SINGLE source of truth (ADR-063 gate consolidation). Stage 3b widens the
+        // gate by editing `Type::is_sealed_array_field_packable` alone; this and the three lin-ir
+        // mirrors all defer to it, so they cannot drift.
+        ty.is_sealed_array_field_packable()
     }
 
     // ── Unboxed tagged sum type (`SumNode`) — unboxed-sumtype Stage 1 ─────────────────────────────

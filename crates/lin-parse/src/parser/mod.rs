@@ -387,3 +387,60 @@ mod hang_regression_tests {
         assert!(!diags.is_empty(), "expected a diagnostic for `has {{ 1 }} =>`");
     }
 }
+
+#[cfg(test)]
+mod grouped_type_tests {
+    use super::*;
+    use lin_lex::Lexer;
+
+    fn parse(source: &str) -> (Vec<Diagnostic>, crate::ast::Module) {
+        let mut lexer = Lexer::new(source, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let module = parser.parse_module();
+        (parser.diagnostics, module)
+    }
+
+    /// `(T | U)[]` — a parenthesized union with a postfix `[]` array suffix. The pre-fix parser
+    /// treated `( ... )` in type position as a function-param list and demanded `=>`, so this
+    /// failed with "expected Arrow, got LBracket". It must now parse as `Array(Union(..))`.
+    #[test]
+    fn parenthesized_union_array_parses() {
+        let (diags, _m) = parse("type G = (String | Null)[]\n");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// A grouped type with a postfix `[]` inside a record field type — the std/regex `Match`
+    /// shape that motivated the fix.
+    #[test]
+    fn grouped_union_array_in_record_field_parses() {
+        let src = "type Match = { \"groups\": (String | Null)[] }\n";
+        let (diags, _m) = parse(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// A grouped type as a function parameter type: `(xs: (String | Null)[]) => Int32`.
+    #[test]
+    fn grouped_union_array_as_param_parses() {
+        let (diags, _m) = parse("val f = (xs: (String | Null)[]): Int32 => 0\n");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// A plain parenthesized single type `(T)` parses as that type (grouping).
+    #[test]
+    fn grouped_single_type_parses() {
+        let (diags, _m) = parse("type G = (Int32)\n");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// Regression guard: ordinary function types must STILL parse (the branch we touched).
+    #[test]
+    fn function_types_still_parse() {
+        let (d1, _) = parse("type F = (Int32, String) => Boolean\n");
+        assert!(d1.is_empty(), "fn type with 2 params: {d1:?}");
+        let (d2, _) = parse("type F = (Int32) => Boolean\n");
+        assert!(d2.is_empty(), "fn type with 1 param: {d2:?}");
+        let (d3, _) = parse("type F = () => Boolean\n");
+        assert!(d3.is_empty(), "zero-arg fn type: {d3:?}");
+    }
+}

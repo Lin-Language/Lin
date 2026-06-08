@@ -364,11 +364,11 @@ pub fn sumnode_variant_by_disc(ty: &Type, disc: &str) -> Option<IndexMap<String,
     None
 }
 
-/// Mirror of `Codegen::sealed_array_elem_field_packable` (types.rs): SCALARS ONLY (Stage 3a). Heap
-/// fields stay boxed pending the whole-program record-representation-consistency work — see the gate
-/// note in `Codegen::sealed_array_elem_field_packable`.
+/// Delegates to the SINGLE source of truth `Type::is_sealed_array_field_packable` (ADR-063 gate
+/// consolidation), in lockstep with `Codegen::sealed_array_elem_field_packable`, lower.rs
+/// `is_sealed_array_elem_field_packable`, and `monomorphize::field_packed_scalar`.
 fn sealed_array_elem_field_packable(ty: &Type) -> bool {
-    is_sealed_scalar_field(ty)
+    ty.is_sealed_array_field_packable()
 }
 
 /// Mirror of `Codegen::sealed_array_elem` (types.rs:287): `Some(elem_fields)` iff `ty` is

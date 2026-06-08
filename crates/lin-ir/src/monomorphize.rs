@@ -67,13 +67,13 @@ fn mentions_generic_tv(ty: &Type) -> bool {
     }
 }
 
-/// A field type permitted in a PACKED sealed record element (Stage 3a scalar). MUST mirror
-/// `Codegen::sealed_array_elem_field_packable` / lower.rs `is_sealed_array_elem_field_packable`
-/// EXACTLY — a combinator over a packed sealed element must take the boxed-fallback detour, else the
-/// native specialization reads packed bytes through boxed machinery. Heap-field element arrays stay
-/// boxed (see the codegen gate note), so they flow through the generic combinator's boxed body.
+/// A field type permitted in a PACKED sealed record element — delegates to the SINGLE source of
+/// truth `Type::is_sealed_array_field_packable` (ADR-063 gate consolidation), in lockstep with
+/// `Codegen::sealed_array_elem_field_packable`, lower.rs `is_sealed_array_elem_field_packable`, and
+/// `repr::sealed_array_elem_field_packable`. A combinator over a packed sealed element must take the
+/// boxed-fallback detour, else the native specialization reads packed bytes through boxed machinery.
 fn field_packed_scalar(ty: &Type) -> bool {
-    ty.is_flat_scalar() || matches!(ty, Type::Bool)
+    ty.is_sealed_array_field_packable()
 }
 
 /// True if `ty` is (or contains, transitively) a PACKED SEALED record/array — the representation

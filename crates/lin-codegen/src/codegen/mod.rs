@@ -2056,13 +2056,60 @@ impl<'ctx> Codegen<'ctx> {
                 // Emit terminator
                 match &block.terminator {
                     Terminator::Return(Some(t)) => {
-                        if let Some(&v) = temp_map.get(t) {
+                        let ret_val = temp_map.get(t).copied();
+                        // TCO LOOP-EXIT release (Leak B fix): when this function is a TCO loop,
+                        // each owned param slot may hold a value the loop PRODUCED on a prior
+                        // back-edge (tracked by `tco_owns[i]`). The back-edge machinery releases
+                        // INTERMEDIATE owned values when they are overwritten, but the FINAL value
+                        // left in the slot when the loop returns was never released — it leaks once
+                        // per outer call (e.g. the `cur: T|Null` threaded through `scanRouteAt`).
+                        // Release it here, gated on the runtime owns-flag and (defensively) on the
+                        // slot not aliasing the returned value (a function that returns its own
+                        // owned param would otherwise double-free). Done BEFORE the `ret`.
+                        let ret_ptr = ret_val.and_then(|v| if v.is_pointer_value() { Some(v.into_pointer_value()) } else { None });
+                        // ALL pointer-typed entry params (the borrowed caller-owned values). A TCO
+                        // loop may PERMUTE borrowed array params between slots (the merge-sort
+                        // ping-pong), so an exit slot must be guarded against EVERY entry, not just
+                        // its own — see emit_tco_release_final.
+                        let tco_entry_ptrs: Vec<inkwell::values::PointerValue<'ctx>> = (0..func.params.len())
+                            .filter_map(|i| llvm_fn.get_nth_param(i as u32))
+                            .filter_map(|p| if p.is_pointer_value() { Some(p.into_pointer_value()) } else { None })
+                            .collect();
+                        for (i, (_t, ty)) in func.params.iter().enumerate() {
+                            if let Some(Some(owns)) = tco_owns.get(i) {
+                                if let Some(slot) = param_allocs.get(i) {
+                                    let llvm_ty = self.llvm_type(ty);
+                                    let slot_val = self.builder.load(llvm_ty, *slot, "tco_fslot");
+                                    if slot_val.is_pointer_value() {
+                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), &tco_entry_ptrs, ret_ptr, ty);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(v) = ret_val {
                             self.builder.r#return(Some(&v));
                         } else {
                             self.builder.r#return(None);
                         }
                     }
                     Terminator::Return(None) => {
+                        // TCO LOOP-EXIT release (Leak B fix): see Return(Some) above. No return
+                        // value, so no return-alias guard needed.
+                        let tco_entry_ptrs: Vec<inkwell::values::PointerValue<'ctx>> = (0..func.params.len())
+                            .filter_map(|i| llvm_fn.get_nth_param(i as u32))
+                            .filter_map(|p| if p.is_pointer_value() { Some(p.into_pointer_value()) } else { None })
+                            .collect();
+                        for (i, (_t, ty)) in func.params.iter().enumerate() {
+                            if let Some(Some(owns)) = tco_owns.get(i) {
+                                if let Some(slot) = param_allocs.get(i) {
+                                    let llvm_ty = self.llvm_type(ty);
+                                    let slot_val = self.builder.load(llvm_ty, *slot, "tco_fslot");
+                                    if slot_val.is_pointer_value() {
+                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), &tco_entry_ptrs, None, ty);
+                                    }
+                                }
+                            }
+                        }
                         self.builder.r#return(None);
                     }
                     Terminator::Jump(target) => {
