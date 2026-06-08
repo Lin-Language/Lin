@@ -10,7 +10,12 @@
 // stays self-contained.
 import foreign "lin-runtime"
   val lin_array_concat_dyn: (Json, Json) => Json
-
+  val lin_stream_count: (Int32, Int32) => Stream
+  val lin_stream_repeat: (Json, Int32) => Stream
+  val lin_stream_cycle: (Json) => Stream
+// Infinite-source stream constructors (count/repeat/cycle). They return an opaque Stream<T>
+// pull-source; `value`/`arr` pass a concrete scalar/array that codegen boxes to Json for the
+// `Json`-typed foreign param (verified to round-trip). They MUST be bounded downstream.
 // Private intrinsic wrappers (see header): NOT exported. Identical to std/array's `length`/`push`.
 val length = (x: Json): Int32 =>
   lin_length(x)
@@ -162,14 +167,17 @@ export val flatMap = (arr: Json, f: (Json, Int32) => Json): Json =>
   )
   result
 
+// `take(src, n)` — the first `n` items. Driven by `lin_while` (NOT `arr.for`) so it
+// STOPS pulling the source after `n` items: this makes `take` safe over an INFINITE
+// iterator (`count`/infinite-`repeat`/`cycle`), which `arr.for` / `length(arr)` would
+// drive forever. The predicate returns `i < n`, short-circuiting the pull.
 export val take = <T>(arr: T[] | Iterator | Stream, n: Int32): T[] =>
-  val end = if n < length(arr) then n else length(arr)
-  val result = lin_array_allocate(end)
+  val result: T[] = []
   var i = 0
-  arr.for(item =>
-    if i < end then
-      result[i] = item
-      i = i + 1
+  lin_while(arr, item =>
+    if i < n then push(result, item)
+    i = i + 1
+    i < n
   )
   result
 
@@ -209,3 +217,119 @@ export val dropWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolea
 // `flatten` collapses one level of nesting: an array of `T[]` becomes `T[]`.
 export val flatten = <T>(arr: T[][]): T[] =>
   arr.flatMap(x => x)
+
+// ----------------------------------------------------------------------------
+// Enrichment combinators (iter-combinators proposal). Each that has a lazy
+// stream form follows the SAME receiver-dispatch shape as map/filter above: the
+// iterable param is the `T[] | Iterator | Stream` union (a Stream is accepted;
+// its opaque type does NOT flow into a bare Json param), the array-shaped RETURN
+// annotation is what `streamish_combinator_ret` reads to re-wrap a stream
+// receiver as the next Stream node, and the IR's `stream_combinator_intrinsic_name`
+// redirects a definite-stream arg0 to the lazy `lin_stream_*` backend instead of
+// running the eager array body. The eager bodies reuse the existing `for`/`push`/
+// `length` primitives (no new intrinsics), exactly like take/drop/takeWhile.
+// ----------------------------------------------------------------------------
+// `sliding(src, size)` — overlapping fixed-width windows advancing by one. Window k is
+// `src[k .. k+size]`. A source shorter than `size` yields NO windows (`[]`); `size < 1`
+// is treated as 1. Eager → `T[][]`; over a Stream → lazy `Stream<T[]>` (a bounded ring
+// buffer of the last `size` items, emitting a window per pulled item once full).
+export val sliding = <T>(src: T[] | Iterator | Stream, size: Int32): T[][] =>
+  val w = if size < 1 then 1 else size
+  val result: T[][] = []
+  // Buffer the items as we pull them, emitting a window each time the trailing
+  // `w` items are available. Reuses the eager `for` driver + `push` primitives.
+  val buf: T[] = []
+  src.for(item =>
+    push(buf, item)
+    if length(buf) >= w then
+      // Build the window from the trailing `w` slots of `buf`.
+      val window: T[] = []
+      rangeFill(window, buf, length(buf) - w, w)
+      push(result, window)
+  )
+  result
+
+// Private helper (std/iter self-contained): append `buf[base .. base+count]` into `window`.
+val rangeFill = (window: Json, buf: Json, base: Int32, count: Int32): Null =>
+  lin_range(0, count).for(i => push(window, buf[base + i]))
+
+// `pairwise(src)` — adjacent overlapping pairs `[[src[0],src[1]], [src[1],src[2]], …]`.
+// A source of fewer than 2 elements yields `[]`. This is `sliding(src, 2)` re-typed to the
+// tuple `[T, T][]`; per the proposal it is built INLINE (not delegated to a generic wrapper,
+// which hit a generic-wrapper-result map mismatch). Eager → `[T, T][]`; over a Stream → lazy
+// `Stream<[T, T]>`.
+export val pairwise = <T>(src: T[] | Iterator | Stream): [T, T][] =>
+  val result: [T, T][] = []
+  var prev: T | Null = null
+  var have = false
+  src.for(item =>
+    if have then push(result, [prev, item])
+    prev = item
+    have = true
+  )
+  result
+
+// `zipWith(a, b, f)` — zip two sources element-wise and apply `f` in one pass (the fused form
+// of `zip(a, b).map(([x, y]) => f(x, y))`). Length is the shorter of the two. Eager → `C[]`;
+// when `a` is a Stream (and `b` stays a materialised `B[]`) → lazy `Stream<C>` that pulls `a`
+// lazily and indexes into the in-memory `b`, ending when either side is exhausted.
+export val zipWith = <A, B, C>(a: A[] | Stream, b: B[], f: (A, B) => C): C[] =>
+  val result: C[] = []
+  var i = 0
+  a.for(item =>
+    if i < length(b) then push(result, f(item, b[i]))
+    i = i + 1
+  )
+  result
+
+// `intersperse(src, sep)` — insert `sep` between every pair of adjacent elements (not before
+// the first, not after the last). A source of 0 or 1 element is returned unchanged. Eager →
+// `T[]` (length `2*n - 1` for `n >= 1`); over a Stream → lazy `Stream<T>`.
+export val intersperse = <T>(src: T[] | Iterator | Stream, sep: T): T[] =>
+  val result: T[] = []
+  var first = true
+  src.for(item =>
+    if !first then push(result, sep)
+    push(result, item)
+    first = false
+  )
+  result
+
+// `dedup(src)` — collapse CONSECUTIVE runs of equal elements to a single element, using deep
+// structural equality (`==`). Distinct from `std/array.unique` (which is global). Eager → `T[]`;
+// over a Stream → lazy `Stream<T>` (hold the last-emitted value; emit only when the next differs).
+export val dedup = <T>(src: T[] | Iterator | Stream): T[] =>
+  val result: T[] = []
+  var prev: T | Null = null
+  var have = false
+  src.for(item =>
+    if !have || prev != item then push(result, item)
+    prev = item
+    have = true
+  )
+  result
+
+// ----------------------------------------------------------------------------
+// Infinite stream constructors. These build a LAZY `Stream<T>` pull-source (the same backend that
+// powers file/socket streams) — NOT an eager `lin_iter` array (which would materialise an infinite
+// source and never return). They MUST be bounded downstream by a short-circuiting STREAM combinator
+// (`take`/`takeWhile`/`find`/`some`) before any exhaustive terminal (`for`/`reduce`/`collect`) — the
+// same non-termination footgun as a hand-written `while true` loop. Because they return a Stream,
+// the chained `.map`/`.take`/… dispatch to the lazy `lin_stream_*` backend (receiver-dispatch); to
+// MATERIALISE a bounded result, drive the bounded stream with a terminal, e.g.
+// `count(0).take(5).reduce([], (acc, x) => acc.push(x); acc)` or `.for(...)`.
+// ----------------------------------------------------------------------------
+// `count(start, step=1)` — an INFINITE counting stream: start, start+step, start+2*step, … .
+export val count = (start: Int32, step: Int32 = 1): Stream =>
+  lin_stream_count(start, step)
+
+// `repeat(value, n=-1)` — yields `value` either `n` times, or (when `n < 0`, the default)
+// infinitely. `value` (a concrete `T`) is boxed to Json for the `lin_stream_repeat` foreign param.
+export val repeat = <T>(value: T, n: Int32 = -1): Stream =>
+  lin_stream_repeat(value, n)
+
+// `cycle(src)` — repeat the elements of a finite, materialised `src` endlessly. An empty `src`
+// yields an EMPTY stream (not an infinite loop over nothing). Takes an ARRAY by design: cycling
+// requires re-reading the source, which a single-use stream/general iterator cannot provide.
+export val cycle = <T>(src: T[]): Stream =>
+  lin_stream_cycle(src)

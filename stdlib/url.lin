@@ -1,0 +1,99 @@
+// std/url — structured RFC 3986 URL parsing and building.
+//
+// The partner to std/http: turns a URL string into a typed `Url` record, round-trips it back
+// with `build`, and resolves relative references with `join` (RFC 3986 §5). It is
+// NON-NORMALISING and NON-DECODING: every parsed component is the raw substring as it appeared,
+// so `build(parse(s)) == s` for any well-formed `s`. Percent-encoding and the `key=value`
+// query grammar deliberately live in std/encoding (urlEncode/urlDecode/parseQuery/buildQuery) —
+// std/url never duplicates that logic; the modules compose at the call site.
+import foreign "lin-runtime"
+  val lin_url_parse: (String) => Json
+  val lin_url_join: (String, String) => String
+
+export type Url = { "scheme": String, "userinfo": String | Null, "host": String, "port": Int32 | Null, "path": String, "query": String | Null, "fragment": String | Null }
+// "https"; lowercased; "" if the input was relative
+// raw "user:pass" between "//" and "@", undecoded
+// "example.com", "[::1]"; "" if no authority
+// 443; Null if absent (scheme defaults are NOT filled in)
+// "/a/b"; raw, percent-encoding preserved
+// raw, WITHOUT the leading "?"; Null if absent
+// raw, WITHOUT the leading "#"; Null if absent
+// Parse `s` as an RFC 3986 URI (or relative reference). Returns an Error
+// ({ "type":"error", "message":... }, matched `is Error`) if `s` violates the generic syntax.
+// Components are split, NOT decoded.
+export val parse = (s: String): Url | Error =>
+  val raw = lin_url_parse(s)
+  if raw["type"] == "error" then
+    raw
+  else
+    {
+      "scheme": raw["scheme"],
+      "userinfo": raw["userinfo"],
+      "host": raw["host"],
+      "port": raw["port"],
+      "path": raw["path"],
+      "query": raw["query"],
+      "fragment": raw["fragment"]
+    }
+
+// Serialise a `Url` back to a string — the inverse of `parse`. Components are emitted verbatim
+// (already-encoded); separators are inserted only for the components that are present.
+export val build = (u: Url): String =>
+  val scheme = u["scheme"]
+  val schemePart = if scheme == "" then "" else "${scheme}:"
+
+  val host = u["host"]
+  val userinfo = u["userinfo"]
+  val port = u["port"]
+  // The authority block is emitted whenever the host is non-empty or userinfo/port is set.
+  val hasAuthority = host != "" || userinfo != null || port != null
+  val userPart = if userinfo == null then "" else "${userinfo}@"
+  val portPart = if port == null then "" else ":${port}"
+  val authorityPart = if hasAuthority then "//${userPart}${host}${portPart}" else ""
+
+  val path = u["path"]
+
+  val query = u["query"]
+  val queryPart = if query == null then "" else "?${query}"
+
+  val fragment = u["fragment"]
+  val fragmentPart = if fragment == null then "" else "#${fragment}"
+
+  "${schemePart}${authorityPart}${path}${queryPart}${fragmentPart}"
+
+// Resolve `ref` against `base` using RFC 3986 §5 reference resolution and return the resulting
+// absolute URL string. Returns Error if `base` is not absolute or either side fails to parse.
+// Dot-call form reads "resolve this link against where I am": `base.join(href)`.
+export val join = (base: String, ref: String): String | Error =>
+  val result = lin_url_join(base, ref)
+  if result == "" then
+    {
+      "type": "error",
+      "message": "cannot resolve '${ref}' against base '${base}'"
+    }
+  else
+    result
+
+// Return a copy of `u` with `query` replaced (raw query string, no leading "?").
+export val withQuery = (u: Url, query: String): Url =>
+  {
+    "scheme": u["scheme"],
+    "userinfo": u["userinfo"],
+    "host": u["host"],
+    "port": u["port"],
+    "path": u["path"],
+    "query": query,
+    "fragment": u["fragment"]
+  }
+
+// Return a copy of `u` with `path` replaced (path should already be percent-encoded).
+export val withPath = (u: Url, path: String): Url =>
+  {
+    "scheme": u["scheme"],
+    "userinfo": u["userinfo"],
+    "host": u["host"],
+    "port": u["port"],
+    "path": path,
+    "query": u["query"],
+    "fragment": u["fragment"]
+  }

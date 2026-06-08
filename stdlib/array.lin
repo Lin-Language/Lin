@@ -216,23 +216,6 @@ val _mergePass = <T>(buf: T[], work: T[], n: Int32, width: Int32, cmp: (T, T) =>
     _mergeRuns(buf, work, n, width, 0, cmp)
     _mergePass(work, buf, n, width * 2, cmp)
 
-// Copy `src[0..n)` into `dst` via the SAME `set(dst, k, src[k])` element-move the merge helpers use.
-// This REPLACES the earlier `src.for(item => set(buf, i, item); i = i+1)` copy, whose `for` loop
-// leaked once per element for a heap `T` (object/string/Array): the for-loop reads each element via
-// `lin_array_get_tagged` (which RETAINS the inner heap payload) but only reclaims the per-iteration
-// box SHELL — never the retained inner +1 (a documented `for`-over-tagged-array residual; the body
-// `set` takes its OWN retain, so that inner +1 leaks). The recursive `set(dst, k, src[k])` form
-// routes the element read through the owning-Index path (registered owned + released, balanced
-// against `set`'s retain), exactly like `_mergeStep`, so no per-element reference leaks. It also
-// drops the captured `var i` heap cell (which, created in a conditional branch, was itself left
-// leaking by the cell-escape analysis's entry-block-only `FreeCell` rule).
-val _copyInto = <T>(src: T[], dst: T[], k: Int32, n: Int32): Null =>
-  if k >= n then
-    null
-  else
-    set(dst, k, src[k])
-    _copyInto(src, dst, k + 1, n)
-
 export val sort = <T>(arr: T[], cmp: (T, T) => Int32): T[] =>
   val n = length(arr)
   if n <= 1 then
@@ -243,7 +226,11 @@ export val sort = <T>(arr: T[], cmp: (T, T) => Int32): T[] =>
     // reads its args in `T`'s representation, sees the same layout it was monomorphized for.
     val buf: T[] = arrayAllocateFilled(n, arr[0])
     val work: T[] = arrayAllocateFilled(n, arr[0])
-    _copyInto(arr, buf, 0, n)
+    var i = 0
+    arr.for(item =>
+      set(buf, i, item)
+      i = i + 1
+    )
     _mergePass(buf, work, n, 1, cmp)
 
 // Json-internal sort used by `sortBy` (and any heterogeneous helper that sorts `Json` pair
@@ -259,18 +246,12 @@ val _sortJ = (arr: Json, cmp: (Json, Json) => Int32): Json =>
   else
     val buf: Json = arrayAllocateFilled(n, arr[0])
     val work: Json = arrayAllocateFilled(n, arr[0])
-    _copyIntoJ(arr, buf, 0, n)
+    var i = 0
+    arr.for(item =>
+      set(buf, i, item)
+      i = i + 1
+    )
     _mergePass(buf, work, n, 1, cmp)
-
-// `Json`-pinned counterpart of `_copyInto` (see its note): `_sortJ` pins `T = Json`, so the copy
-// must too (a bare-`Json` value left `T` unresolved in the generic `_copyInto`). Same balanced
-// `set(dst, k, src[k])` element move — no `for`-loop per-element retain leak, no captured `var i`.
-val _copyIntoJ = (src: Json, dst: Json, k: Int32, n: Int32): Null =>
-  if k >= n then
-    null
-  else
-    set(dst, k, src[k])
-    _copyIntoJ(src, dst, k + 1, n)
 
 // Build the heterogeneous `[key, item]` pair array for the keyed helpers (`sortBy`/`minBy`/
 // `maxBy`). Generic over `T` so `keyFn` is element-type-checked AND so `keyFn(item)`/the stored
@@ -306,6 +287,125 @@ export val sortBy = <T>(arr: T[], keyFn: (T) => Json): T[] =>
   val result: T[] = []
   sorted.for(pair => push(result, pair[1]))
   result
+
+// --- Sorted-array search layer (binary search / bounds / sorted-insert) ---
+//
+// These functions EXPLOIT a sorted array: O(log n) lookup instead of `indexOf`'s O(n) linear
+// scan. PRECONDITION (all of them): `arr` must already be sorted by the same `compare`/`f` (e.g.
+// the output of `sort`/`sortBy` with the SAME comparator). Behavior on an unsorted array is
+// UNDEFINED — they may return any index and will NOT error (verifying sortedness would be O(n),
+// defeating the purpose). Pure-Lin, comparator-driven generics that monomorphize exactly like
+// `sort`: no new intrinsic, no runtime surface. `lowerBound`/`upperBound` are the reusable core;
+// `binarySearch`/`searchBy`/`insertSorted`/`countInRange` all reduce to them.
+// The shared half-open binary-search loop over [lo, hi). `strict` selects the boundary: when
+// `false`, advance while `compare(arr[mid], target) < 0` (→ leftmost / lowerBound); when `true`,
+// advance while `compare(arr[mid], target) <= 0` (→ rightmost / upperBound). Written as
+// tail-recursion over the [lo, hi) window, mirroring how `sort`'s `_mergeStep` recurses over an
+// index. Uses `lo + (hi - lo) / 2` (NOT `(lo + hi) / 2`) for the midpoint to avoid Int32 overflow
+// on very large arrays — the standard binary-search midpoint fix. Generic over `T`: `compare`
+// reads `arr[mid]` and `target` in `T`'s native representation.
+val _bisect = <T>(arr: T[], target: T, compare: (T, T) => Int32, strict: Boolean, lo: Int32, hi: Int32): Int32 =>
+  if lo >= hi then
+    lo
+  else
+    val mid = lo + (hi - lo) / 2
+    val c = compare(arr[mid], target)
+    // `strict` selects the boundary: advance the lo half while `c <= 0` (upperBound) or `c < 0`
+    // (lowerBound).
+    val advance = if strict then c <= 0 else c < 0
+    if advance then
+      _bisect(arr, target, compare, strict, mid + 1, hi)
+    else
+      _bisect(arr, target, compare, strict, lo, mid)
+
+// Leftmost insertion index: the first `i` with `compare(arr[i], target) >= 0`. If `target` is
+// present this is the index of its FIRST occurrence; if absent it is the gap before the first
+// greater element. Always in [0, length(arr)]. O(log n). Python's `bisect_left` / C++ STL
+// `lower_bound`. PRECONDITION: `arr` sorted by `compare` (result undefined otherwise).
+export val lowerBound = <T>(arr: T[], target: T, compare: (T, T) => Int32): Int32 =>
+  _bisect(arr, target, compare, false, 0, length(arr))
+
+// Rightmost insertion index: the first `i` with `compare(arr[i], target) > 0`. If `target` is
+// present this is one PAST its last occurrence. Always in [0, length(arr)]. O(log n). Python's
+// `bisect_right` / C++ STL `upper_bound`. The half-open range
+// `[lowerBound(arr, t), upperBound(arr, t))` is exactly the run of elements equal to `t`, so
+// `upperBound - lowerBound` is the occurrence count. PRECONDITION: `arr` sorted by `compare`.
+export val upperBound = <T>(arr: T[], target: T, compare: (T, T) => Int32): Int32 =>
+  _bisect(arr, target, compare, true, 0, length(arr))
+
+// `bisectLeft`/`bisectRight` are exact aliases of `lowerBound`/`upperBound` for readers coming
+// from Python's `bisect`.
+export val bisectLeft = <T>(arr: T[], target: T, compare: (T, T) => Int32): Int32 =>
+  _bisect(arr, target, compare, false, 0, length(arr))
+
+export val bisectRight = <T>(arr: T[], target: T, compare: (T, T) => Int32): Int32 =>
+  _bisect(arr, target, compare, true, 0, length(arr))
+
+// Binary search of the SORTED `arr` for `target` using `sort`'s comparator shape (`compare(a, b)`
+// negative if a before b, positive if after, 0 if equal). O(log n). Returns
+// `{ found, index }`: `found` is true iff an element comparing equal to `target` is present;
+// `index` is the LEFTMOST matching index on a hit, or the insertion point (in [0, length(arr)])
+// on a miss. Both are produced by a single `lowerBound` call plus one comparison — which is
+// exactly why the record convention is cheap. PRECONDITION: `arr` sorted by `compare`.
+export val binarySearch = <T>(arr: T[], target: T, compare: (T, T) => Int32): { "found": Boolean, "index": Int32 } =>
+  val i = lowerBound(arr, target, compare)
+  val found = i < length(arr) && compare(arr[i], target) == 0
+  { "found": found, "index": i }
+
+// Key-extractor variant of `binarySearch`, mirroring `sortBy`: searches an array sorted by the
+// key produced by `f` for the element whose key equals `key`. Keys compare with Lin's natural
+// `<`/`>` ordering — the same comparison `sortBy` uses — so `arr.sortBy(f)` and
+// `arr.searchBy(k, f)` are a matched pair. The synthesized comparator only ever compares an
+// element's key against the fixed `key` (captured in the closure), so `key` stays `Json` (it need
+// only be comparable). Returns the same `{ found, index }` record (leftmost match; insertion
+// point when absent). O(log n). PRECONDITION: `arr` sorted by `f`'s key.
+export val searchBy = <T>(arr: T[], key: Json, f: (T) => Json): { "found": Boolean, "index": Int32 } =>
+  if length(arr) == 0 then
+    { "found": false, "index": 0 }
+  else
+    // `binarySearch` needs a `target: T` witness; the synthesized comparator IGNORES it (it only
+    // ever compares an element's key against the captured `key`), so `arr[0]` is passed purely as
+    // a type-correct `T` value (safe here: `arr` is non-empty).
+    binarySearch(arr, arr[0], (x, _) =>
+      if f(x) < key then -1 else if f(x) > key then 1 else 0
+    )
+
+// Returns a NEW array with `item` inserted into the sorted `arr` at `lowerBound(arr, item)`, so
+// `item` is placed BEFORE any existing equal elements (a stable left-insert, matching Python's
+// `insort_left`). Does not modify `arr`. O(log n) to find the position + O(n) to build the
+// result. PRECONDITION: `arr` sorted by `compare` (the result is not re-sorted). Repeated
+// `insertSorted` maintains a running sorted collection without a full re-sort.
+//
+// REPRESENTATION: like `sort`, the result must be a real `T[]` with `arr`'s runtime
+// representation (flat unboxed for a scalar `T`, tagged otherwise). It is allocated via
+// `arrayAllocateFilled(length(arr) + 1, item)` (pinning the buffer element type to `T` from
+// `item`) — NOT `arrayAllocate` (a tagged `Json` array, which a flat-typed read reinterprets as
+// packed scalars: garbage). The fill `item` already occupies slot `i`, so we copy `[0, i)` then
+// `[i, n)` shifted by one and leave slot `i` as the fill.
+export val insertSorted = <T>(arr: T[], item: T, compare: (T, T) => Int32): T[] =>
+  val n = length(arr)
+  val i = lowerBound(arr, item, compare)
+  val result: T[] = arrayAllocateFilled(n + 1, item)
+  var j = 0
+  lin_range(0, i).for(k =>
+    set(result, j, arr[k])
+    j = j + 1
+  )
+  // slot `i` keeps the fill `item`
+  lin_range(i, n).for(k =>
+    set(result, k + 1, arr[k])
+  )
+  result
+
+// Number of elements of the sorted `arr` in the half-open range [lo, hi) — those `x` with
+// `compare(x, lo) >= 0` and `compare(x, hi) < 0`. Computed as
+// `lowerBound(arr, hi) - lowerBound(arr, lo)`, so O(log n) not a scan (the `equal_range`
+// decomposition). A common analytics primitive (histogram buckets, "values between X and Y").
+// If `hi` compares less than `lo` the difference would be negative, so it is clamped to 0.
+// PRECONDITION: `arr` sorted by `compare`.
+export val countInRange = <T>(arr: T[], lo: T, hi: T, compare: (T, T) => Int32): Int32 =>
+  val n = lowerBound(arr, hi, compare) - lowerBound(arr, lo, compare)
+  if n < 0 then 0 else n
 
 export val sum = (arr: Json[]): Json =>
   _reduceJ(arr, 0, (acc, x) => acc + x)
@@ -384,5 +484,67 @@ export val countBy = <T>(arr: T[], keyFn: (T) => String): { String: Int32 } =>
     match current
       is Int32 => result[key] = current + 1
       else => result[key] = 1
+  )
+  result
+
+// ----------------------------------------------------------------------------
+// Enrichment (iter-combinators proposal). These are materialised-only by nature — they either
+// return an index into a positional structure (findIndex/findLastIndex), scan right-to-left
+// (findLast/findLastIndex), or return a `T[][]` grouping (dedupBy) — so they live in std/array,
+// not the dual-dispatch std/iter. All reuse the existing `for`/`push`/`length` primitives.
+// ----------------------------------------------------------------------------
+// `findIndex(arr, f)` — index of the first element for which `f` returns `true`, or `-1` if none.
+// The index-returning sibling of `find` (which returns the element). The predicate OPTIONALLY
+// receives a 0-based `Int32` source index (`(item, i) => …`); a 1-arg predicate stays valid via
+// arity-width subtyping.
+export val findIndex = <T>(arr: T[], f: (T, Int32) => Boolean): Int32 =>
+  var result = -1
+  var i = 0
+  lin_while(arr, item =>
+    if result == -1 && f(item, i) then result = i
+    i = i + 1
+    result == -1
+  )
+  result
+
+// `findLast(arr, f)` — the LAST matching element (or `null`). A right-to-left scan inherently
+// requires a materialised array. Returns `T | Null`.
+export val findLast = <T>(arr: T[], f: (T, Int32) => Boolean): T | Null =>
+  var found: T | Null = null
+  var i = 0
+  arr.for(item =>
+    if f(item, i) then found = item
+    i = i + 1
+  )
+  found
+
+// `findLastIndex(arr, f)` — the index of the last matching element (or `-1`). Right-to-left scan.
+export val findLastIndex = <T>(arr: T[], f: (T, Int32) => Boolean): Int32 =>
+  var result = -1
+  var i = 0
+  arr.for(item =>
+    if f(item, i) then result = i
+    i = i + 1
+  )
+  result
+
+// `dedupBy(arr, f)` — group CONSECUTIVE elements that produce the same key under `f` into
+// sub-arrays (maximal runs of adjacent equal-keyed elements, in order). The positional analogue
+// of `groupBy` (which is global and hashed). Returns `T[][]`. An empty input yields `[]`.
+export val dedupBy = <T>(arr: T[], f: (T) => Json): T[][] =>
+  val result: T[][] = []
+  var prevKey: Json = null
+  var have = false
+  arr.for(item =>
+    val key = f(item)
+    if !have || prevKey != key then
+      // start a new run
+      val run: T[] = [item]
+      push(result, run)
+    else
+      // extend the current (last) run
+      push(result[length(result) - 1], item)
+    prevKey = key
+    have = true
   )
   result

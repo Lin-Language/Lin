@@ -1078,6 +1078,325 @@ impl StreamSource for ConcatSource {
 }
 
 // -------------------------------------------------------------------------
+// Enrichment lazy adapter + infinite-source nodes (iter-combinators proposal). Each mirrors the
+// MapSource/FilterSource RC discipline: pull the upstream item, transform/decide, release a pulled
+// item once consumed, return an independently-owned box, propagate `Err` straight through, and
+// close the upstream in `close()`. The infinite sources (count/repeat/cycle) own NO upstream — they
+// generate values forever and MUST be bounded downstream by `take`/`takeWhile`/`find`/`some`.
+// -------------------------------------------------------------------------
+
+/// Build a freshly-owned boxed TAGGED array (`TaggedVal*(TAG_ARRAY)`) holding clones of `items`,
+/// in order. Each element is `lin_tagged_clone`'d so the array owns its own +1 (the ring buffer /
+/// caller keeps its own references). Used to materialise a `sliding`/`pairwise` window.
+unsafe fn window_array_from(items: &[*mut u8]) -> *mut u8 {
+    use crate::tagged::{alloc_tagged, TAG_ARRAY};
+    let arr = crate::array::lin_array_alloc(items.len().max(1) as u64);
+    for &it in items {
+        let cloned = crate::object::lin_tagged_clone(it);
+        crate::array::lin_array_push_tagged(arr as *mut crate::array::LinArray, cloned);
+    }
+    alloc_tagged(TAG_ARRAY, arr as u64)
+}
+
+/// `sliding(s, size)`: overlapping fixed-width windows advancing by one. Keeps a bounded ring
+/// buffer (`buf`) of the last `size` PULLED items; once full, emits a window per subsequently
+/// pulled item. A source shorter than `size` yields no windows. The held items are released on
+/// close (or as they age out of the window).
+struct SlidingSource {
+    up: Upstream,
+    size: usize,
+    /// Owned references to the last (up to) `size` pulled items, oldest first.
+    buf: Vec<*mut u8>,
+}
+unsafe impl Send for SlidingSource {}
+impl StreamSource for SlidingSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        loop {
+            match self.up.pull() {
+                TaggedOutcome::Eof => return TaggedOutcome::Eof,
+                TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
+                TaggedOutcome::Item(item) => {
+                    // Append the new item (we own it); drop the oldest if over capacity.
+                    self.buf.push(item);
+                    if self.buf.len() > self.size {
+                        let old = self.buf.remove(0);
+                        crate::tagged::lin_tagged_release(old);
+                    }
+                    if self.buf.len() == self.size {
+                        return TaggedOutcome::Item(window_array_from(&self.buf));
+                    }
+                    // Not enough items yet: pull again.
+                }
+            }
+        }
+    }
+    fn close(&mut self) {
+        unsafe {
+            for &it in &self.buf {
+                crate::tagged::lin_tagged_release(it);
+            }
+            self.buf.clear();
+            self.up.close();
+        }
+    }
+}
+
+/// `pairwise(s)`: adjacent overlapping pairs as 2-element arrays. Holds the single previous item;
+/// emits `[prev, item]` once a second item arrives, then slides. Equivalent to `sliding(s, 2)` with
+/// a fixed 2-tuple shape (built inline, not delegated).
+struct PairwiseSource {
+    up: Upstream,
+    /// One owned reference to the previous pulled item, or None before the first pull.
+    prev: Option<*mut u8>,
+}
+unsafe impl Send for PairwiseSource {}
+impl StreamSource for PairwiseSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        loop {
+            match self.up.pull() {
+                TaggedOutcome::Eof => return TaggedOutcome::Eof,
+                TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
+                TaggedOutcome::Item(item) => {
+                    match self.prev.take() {
+                        None => {
+                            // First item: stash and pull again.
+                            self.prev = Some(item);
+                        }
+                        Some(prev) => {
+                            let pair = window_array_from(&[prev, item]);
+                            // The new item becomes the next pair's left; release the old left.
+                            crate::tagged::lin_tagged_release(prev);
+                            self.prev = Some(item);
+                            return TaggedOutcome::Item(pair);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fn close(&mut self) {
+        unsafe {
+            if let Some(p) = self.prev.take() {
+                crate::tagged::lin_tagged_release(p);
+            }
+            self.up.close();
+        }
+    }
+}
+
+/// `intersperse(s, sep)`: insert `sep` between adjacent items (not before the first, not after the
+/// last). Holds one owned reference to `sep` (cloned per emission); a one-bit `emitted_first` latch
+/// plus a `pending` item buffer alternate item / separator without an extra upstream pull.
+struct IntersperseSource {
+    up: Upstream,
+    /// One owned reference to the separator value (cloned for each emitted copy).
+    sep: *mut u8,
+    /// Have we emitted at least one item yet?
+    emitted_first: bool,
+    /// A pulled item waiting to be emitted AFTER a separator (set when we owe a separator first).
+    pending: Option<*mut u8>,
+}
+unsafe impl Send for IntersperseSource {}
+impl StreamSource for IntersperseSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        // If we owe an item that follows a just-emitted separator, emit it now.
+        if let Some(item) = self.pending.take() {
+            return TaggedOutcome::Item(item);
+        }
+        match self.up.pull() {
+            TaggedOutcome::Eof => TaggedOutcome::Eof,
+            TaggedOutcome::Err(m) => TaggedOutcome::Err(m),
+            TaggedOutcome::Item(item) => {
+                if !self.emitted_first {
+                    self.emitted_first = true;
+                    TaggedOutcome::Item(item)
+                } else {
+                    // Emit the separator now; stash the item to emit on the next pull.
+                    self.pending = Some(item);
+                    TaggedOutcome::Item(crate::object::lin_tagged_clone(self.sep))
+                }
+            }
+        }
+    }
+    fn close(&mut self) {
+        unsafe {
+            if let Some(p) = self.pending.take() {
+                crate::tagged::lin_tagged_release(p);
+            }
+            if !self.sep.is_null() {
+                crate::tagged::lin_tagged_release(self.sep);
+                self.sep = std::ptr::null_mut();
+            }
+            self.up.close();
+        }
+    }
+}
+
+/// `dedup(s)`: collapse CONSECUTIVE runs of equal items (deep structural equality, `lin_tagged_eq`)
+/// to a single item. Holds one owned reference to the last EMITTED value for the compare.
+struct DedupSource {
+    up: Upstream,
+    /// One owned reference to the last emitted value, or None before the first emit.
+    last: Option<*mut u8>,
+}
+unsafe impl Send for DedupSource {}
+impl StreamSource for DedupSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        loop {
+            match self.up.pull() {
+                TaggedOutcome::Eof => return TaggedOutcome::Eof,
+                TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
+                TaggedOutcome::Item(item) => {
+                    let dup = match self.last {
+                        Some(prev) => crate::tagged::lin_tagged_eq(prev as *const u8, item as *const u8) != 0,
+                        None => false,
+                    };
+                    if dup {
+                        // Same as the last emitted value: drop and pull the next.
+                        crate::tagged::lin_tagged_release(item);
+                        continue;
+                    }
+                    // New value: it becomes the last-emitted (we keep our own clone), then emit it.
+                    if let Some(old) = self.last.take() {
+                        crate::tagged::lin_tagged_release(old);
+                    }
+                    self.last = Some(crate::object::lin_tagged_clone(item));
+                    return TaggedOutcome::Item(item);
+                }
+            }
+        }
+    }
+    fn close(&mut self) {
+        unsafe {
+            if let Some(p) = self.last.take() {
+                crate::tagged::lin_tagged_release(p);
+            }
+            self.up.close();
+        }
+    }
+}
+
+/// `zipWith(a, b, f)` (stream arm): pull `a` lazily, index into the captured in-memory boxed array
+/// `b`, and emit `f(item, b[i])`. Ends when `a` ends or `b` is exhausted. Holds one owned reference
+/// to the boxed `b` array and a retained `f`.
+struct ZipWithSource {
+    up: Upstream,
+    /// One owned reference to the boxed `B[]` (TAG_ARRAY) we index into.
+    b: *mut u8,
+    b_len: i64,
+    f: LinFn,
+    idx: i64,
+}
+unsafe impl Send for ZipWithSource {}
+impl StreamSource for ZipWithSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        if self.idx >= self.b_len {
+            return TaggedOutcome::Eof;
+        }
+        match self.up.pull() {
+            TaggedOutcome::Eof => TaggedOutcome::Eof,
+            TaggedOutcome::Err(m) => TaggedOutcome::Err(m),
+            TaggedOutcome::Item(item) => {
+                let i = self.idx;
+                self.idx += 1;
+                // b[i] as a freshly-owned box (lin_array_get_tagged retains the inner).
+                let barr = crate::tagged::lin_unbox_ptr(self.b) as *const crate::array::LinArray;
+                let belem = crate::array::lin_array_get_tagged(barr, i) as *mut u8;
+                let out = self.f.call2_caught(item, belem, i);
+                crate::tagged::lin_tagged_release(item);
+                crate::tagged::lin_tagged_release(belem);
+                match out {
+                    Ok(v) => TaggedOutcome::Item(v),
+                    Err(m) => TaggedOutcome::Err(m),
+                }
+            }
+        }
+    }
+    fn close(&mut self) {
+        unsafe {
+            if !self.b.is_null() {
+                crate::tagged::lin_tagged_release(self.b);
+                self.b = std::ptr::null_mut();
+            }
+            self.up.close();
+        }
+    }
+}
+
+/// `count(start, step)`: an INFINITE counting source: start, start+step, … . Owns no upstream.
+struct CountSource {
+    next: i64,
+    step: i64,
+}
+unsafe impl Send for CountSource {}
+impl StreamSource for CountSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        let v = self.next;
+        self.next = self.next.wrapping_add(self.step);
+        TaggedOutcome::Item(crate::tagged::lin_box_int32(v as i32))
+    }
+    fn close(&mut self) {}
+}
+
+/// `repeat(value, n)`: yield `value` `n` times, or infinitely when `n < 0`. Owns one reference to
+/// the boxed `value` (cloned per emission).
+struct RepeatSource {
+    value: *mut u8,
+    /// Remaining count, or -1 for infinite.
+    remaining: i64,
+    infinite: bool,
+}
+unsafe impl Send for RepeatSource {}
+impl StreamSource for RepeatSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        if !self.infinite {
+            if self.remaining <= 0 {
+                return TaggedOutcome::Eof;
+            }
+            self.remaining -= 1;
+        }
+        TaggedOutcome::Item(crate::object::lin_tagged_clone(self.value))
+    }
+    fn close(&mut self) {
+        unsafe {
+            if !self.value.is_null() {
+                crate::tagged::lin_tagged_release(self.value);
+                self.value = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+/// `cycle(arr)`: repeat the elements of a finite boxed array `arr` endlessly. An empty `arr` yields
+/// EOF immediately (no infinite loop over nothing). Owns one reference to the boxed array.
+struct CycleSource {
+    arr: *mut u8,
+    len: i64,
+    idx: i64,
+}
+unsafe impl Send for CycleSource {}
+impl StreamSource for CycleSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        if self.len <= 0 {
+            return TaggedOutcome::Eof;
+        }
+        let i = self.idx % self.len;
+        self.idx = (self.idx + 1) % self.len;
+        let a = crate::tagged::lin_unbox_ptr(self.arr) as *const crate::array::LinArray;
+        let elem = crate::array::lin_array_get_tagged(a, i) as *mut u8;
+        TaggedOutcome::Item(elem)
+    }
+    fn close(&mut self) {
+        unsafe {
+            if !self.arr.is_null() {
+                crate::tagged::lin_tagged_release(self.arr);
+                self.arr = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
 // Streaming compression byte-adapters (std/compress). gzip/gunzip use the gzip container;
 // deflate/inflate use the raw DEFLATE bitstream. Each wraps a `Stream<UInt8[]>` and runs its bytes
 // through the low-level streaming flate2 `Compress`/`Decompress` engine INCREMENTALLY: each
@@ -1455,6 +1774,82 @@ pub unsafe extern "C" fn lin_stream_concat(a: *const u8, b: *const u8) -> *mut u
     let ua = own_upstream(a);
     let ub = own_upstream(b);
     StreamBox::new_boxed(Box::new(ConcatSource { a: ua, b: ub, on_b: false }))
+}
+
+/// `sliding(s, size)` → a new `Stream<T[]>` of overlapping width-`size` windows. `size < 1` → 1.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_sliding(s: *const u8, size: i64) -> *mut u8 {
+    let up = own_upstream(s);
+    let w = if size < 1 { 1usize } else { size as usize };
+    StreamBox::new_boxed(Box::new(SlidingSource { up, size: w, buf: Vec::with_capacity(w) }))
+}
+
+/// `pairwise(s)` → a new `Stream<[T, T]>` of adjacent overlapping pairs.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_pairwise(s: *const u8) -> *mut u8 {
+    let up = own_upstream(s);
+    StreamBox::new_boxed(Box::new(PairwiseSource { up, prev: None }))
+}
+
+/// `intersperse(s, sep)` → a new `Stream<T>` inserting `sep` between adjacent items. `sep` arrives
+/// boxed (TaggedVal*); we take one owned reference (cloned per emitted copy).
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_intersperse(s: *const u8, sep: *mut u8) -> *mut u8 {
+    let up = own_upstream(s);
+    let sep_owned = crate::object::lin_tagged_clone(sep as *const u8);
+    StreamBox::new_boxed(Box::new(IntersperseSource { up, sep: sep_owned, emitted_first: false, pending: None }))
+}
+
+/// `dedup(s)` → a new `Stream<T>` collapsing consecutive equal items.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_dedup(s: *const u8) -> *mut u8 {
+    let up = own_upstream(s);
+    StreamBox::new_boxed(Box::new(DedupSource { up, last: None }))
+}
+
+/// `zipWith(a, b, f)` (stream arm) → a new `Stream<C>` of `f(a_item, b[i])`. `a` is the upstream
+/// stream; `b` is a boxed in-memory `B[]` (one owned reference taken); `f` a retained closure.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_zip_with(s: *const u8, b: *mut u8, f: *mut u8) -> *mut u8 {
+    let up = own_upstream(s);
+    let b_owned = crate::object::lin_tagged_clone(b as *const u8);
+    let b_len = if b_owned.is_null() {
+        0
+    } else {
+        let barr = crate::tagged::lin_unbox_ptr(b_owned) as *const crate::array::LinArray;
+        if barr.is_null() { 0 } else { crate::array::lin_array_length(barr) }
+    };
+    let closure = retain_closure(as_closure(f));
+    StreamBox::new_boxed(Box::new(ZipWithSource { up, b: b_owned, b_len, f: LinFn::from_owned(closure), idx: 0 }))
+}
+
+/// `count(start, step)` → an INFINITE counting `Stream<Int32>`. Must be bounded downstream.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_count(start: i64, step: i64) -> *mut u8 {
+    StreamBox::new_boxed(Box::new(CountSource { next: start, step }))
+}
+
+/// `repeat(value, n)` → a `Stream<T>` yielding `value` `n` times, or infinitely when `n < 0`.
+/// `value` arrives boxed; one owned reference is taken (cloned per emitted copy).
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_repeat(value: *mut u8, n: i64) -> *mut u8 {
+    let value_owned = crate::object::lin_tagged_clone(value as *const u8);
+    let infinite = n < 0;
+    StreamBox::new_boxed(Box::new(RepeatSource { value: value_owned, remaining: n, infinite }))
+}
+
+/// `cycle(arr)` → a `Stream<T>` repeating the elements of the finite boxed array `arr` endlessly.
+/// An empty `arr` yields an empty stream. One owned reference to `arr` is taken.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_cycle(arr: *mut u8) -> *mut u8 {
+    let arr_owned = crate::object::lin_tagged_clone(arr as *const u8);
+    let len = if arr_owned.is_null() {
+        0
+    } else {
+        let a = crate::tagged::lin_unbox_ptr(arr_owned) as *const crate::array::LinArray;
+        if a.is_null() { 0 } else { crate::array::lin_array_length(a) }
+    };
+    StreamBox::new_boxed(Box::new(CycleSource { arr: arr_owned, len, idx: 0 }))
 }
 
 /// `gunzip(s)` → a `Stream<UInt8[]>` that decompresses a gzip-framed byte stream incrementally.
@@ -2361,6 +2756,384 @@ pub unsafe extern "C" fn lin_stream_files(s: *const u8) -> *mut u8 {
         buf: Vec::new(),
         upstream_done: false,
     }))
+}
+
+// =====================================================================================
+// `std/csv` — quote-aware CSV row assembler over a `Stream<UInt8[]>` (csv proposal).
+//
+// A naive `readStream(...).lines().map(parseLine)` is WRONG for CSV: a single quoted field may
+// contain a `\n` and span several physical lines, so a line-stream is not row-aligned. `rows`/
+// `recordRows` therefore run a small stateful FSM over the BYTE stream directly — it tracks whether
+// the scanner is currently INSIDE a quoted field and only completes a record on a record-
+// terminating newline seen OUTSIDE quotes; a newline inside quotes is buffered as field content.
+// This keeps memory bounded to a single in-flight record. An unterminated quote at EOF surfaces as
+// an in-band Error; the in-flight buffer is capped (à la `linesMax`) so adversarial input fails
+// rather than OOMing.
+//
+// The byte FSM mirrors `stdlib/csv.lin`'s eager scanner RFC 4180 rules EXACTLY (quoted fields,
+// embedded delimiter/newline/quote, `""` escape, CRLF or LF terminators). It is a small, separate
+// Rust implementation because a Stream node with carry-over state cannot be expressed in pure Lin
+// (the eager parser stays pure Lin). The two share no code but share the same five-state spec.
+
+/// Cap on the in-flight record buffer before failing in-band (default 64 MiB, à la `MAX_LINE_BYTES`).
+const MAX_CSV_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
+/// The stateful byte-level CSV row assembler. Fed bytes (in chunks), it emits complete records as
+/// `Vec<Vec<u8>>` (fields are raw UTF-8 byte vectors). State carries across chunk boundaries.
+struct CsvAssembler {
+    delim: u8,
+    /// The field currently being built.
+    field: Vec<u8>,
+    /// Fields accumulated so far for the in-flight record.
+    record: Vec<Vec<u8>>,
+    /// True while the scanner is INSIDE a quoted field (a newline here is field content).
+    in_quotes: bool,
+    /// True just after a closing quote of a quoted field — a following `"` is an escaped quote;
+    /// any other byte (delimiter / newline / EOF) terminates the field.
+    after_quote: bool,
+    /// True if the current field began with a `"` (a quoted field).
+    field_quoted: bool,
+    /// True if anything (any field/byte) has been seen for the current record — distinguishes a
+    /// genuine empty final record (drop a spurious trailing newline) from a one-empty-field row.
+    record_started: bool,
+    /// True if the byte just consumed was a CR that ended a record: a single following LF (CRLF) is
+    /// then ignored rather than starting a spurious empty record.
+    skip_next_lf: bool,
+    /// Total bytes buffered in the in-flight record for the cap check.
+    buffered: usize,
+    /// Latched malformed-input flag (stray quote in an unquoted field). Surfaced at the next emit.
+    malformed: bool,
+}
+
+impl CsvAssembler {
+    fn new(delim: u8) -> CsvAssembler {
+        let d = if delim == 0 { b',' } else { delim };
+        CsvAssembler {
+            delim: d,
+            field: Vec::new(),
+            record: Vec::new(),
+            in_quotes: false,
+            after_quote: false,
+            field_quoted: false,
+            record_started: false,
+            skip_next_lf: false,
+            buffered: 0,
+            malformed: false,
+        }
+    }
+
+    /// Finish the current field, pushing it onto the in-flight record.
+    fn end_field(&mut self) {
+        self.record.push(std::mem::take(&mut self.field));
+        self.field_quoted = false;
+        self.after_quote = false;
+    }
+
+    /// Finish the current record, returning its fields. Resets per-record state.
+    fn end_record(&mut self) -> Vec<Vec<u8>> {
+        self.end_field();
+        self.record_started = false;
+        self.buffered = 0;
+        std::mem::take(&mut self.record)
+    }
+
+    /// Feed one byte. Returns `Some(record)` when a record completes (newline outside quotes).
+    /// Sets `self.malformed` on a stray quote in an unquoted field.
+    fn push_byte(&mut self, b: u8) -> Option<Vec<Vec<u8>>> {
+        // CRLF: a LF immediately after a record-ending CR is swallowed (not a new empty record).
+        if self.skip_next_lf {
+            self.skip_next_lf = false;
+            if b == b'\n' {
+                return None;
+            }
+        }
+        if self.in_quotes {
+            self.record_started = true;
+            if b == b'"' {
+                // Closing quote OR first of an escaped pair: defer the decision to after_quote.
+                self.in_quotes = false;
+                self.after_quote = true;
+            } else {
+                self.field.push(b);
+                self.buffered += 1;
+            }
+            return None;
+        }
+        if self.after_quote {
+            // We just saw a `"` that closed a quoted run.
+            self.after_quote = false;
+            if b == b'"' {
+                // Escaped quote: emit a literal `"` and re-enter the quoted field.
+                self.field.push(b'"');
+                self.buffered += 1;
+                self.in_quotes = true;
+                return None;
+            }
+            // Otherwise the quoted field is closed; fall through to handle `b` structurally.
+        }
+        if b == b'"' {
+            self.record_started = true;
+            if self.field.is_empty() && !self.field_quoted {
+                // Opening quote of a quoted field.
+                self.field_quoted = true;
+                self.in_quotes = true;
+            } else {
+                // A `"` in the middle of an unquoted field is a stray-quote error (RFC 4180).
+                self.malformed = true;
+            }
+            return None;
+        }
+        if b == self.delim {
+            self.record_started = true;
+            self.end_field();
+            return None;
+        }
+        if b == b'\n' {
+            self.record_started = true;
+            return Some(self.end_record());
+        }
+        if b == b'\r' {
+            self.record_started = true;
+            self.skip_next_lf = true;
+            return Some(self.end_record());
+        }
+        // Ordinary field byte.
+        self.record_started = true;
+        self.field.push(b);
+        self.buffered += 1;
+        None
+    }
+
+    /// At EOF, flush a final unterminated record (if any bytes were started). Returns the last
+    /// record, or None if the buffer is clean (a spurious trailing newline left nothing). The
+    /// caller must check `in_quotes` FIRST — an EOF inside quotes is the unterminated-quote Error.
+    fn finish(&mut self) -> Option<Vec<Vec<u8>>> {
+        if self.after_quote {
+            // A closed quoted field with nothing after it: a valid final field.
+            self.after_quote = false;
+        }
+        if self.record_started || !self.field.is_empty() || !self.record.is_empty() {
+            Some(self.end_record())
+        } else {
+            None
+        }
+    }
+}
+
+/// Build a boxed `String[]` (TAG_ARRAY of TAG_STR) from a record's byte-vector fields. Each field
+/// becomes a fresh LinString that the array owns (push_tagged copies the stack TaggedVal inline and
+/// takes ownership of the inner value — the io.rs/fs.rs idiom, no box shell to free).
+unsafe fn record_to_string_array(fields: &[Vec<u8>]) -> *mut u8 {
+    use crate::array::{lin_array_alloc, lin_array_push_tagged};
+    use crate::string::lin_string_from_bytes;
+    use crate::tagged::{alloc_tagged, TAG_ARRAY, TAG_STR};
+    let arr = lin_array_alloc(fields.len().max(1) as u64);
+    for f in fields {
+        let s = lin_string_from_bytes(f.as_ptr(), f.len() as u32);
+        let mut tv: TaggedVal = std::mem::zeroed();
+        tv.tag = TAG_STR;
+        tv.payload = s as u64;
+        lin_array_push_tagged(arr, &tv as *const TaggedVal as *const u8);
+    }
+    alloc_tagged(TAG_ARRAY, arr as u64)
+}
+
+/// Build a boxed `{ String: String }` record (TAG_OBJECT) from a header + a data row, last-wins on
+/// duplicate header names, lenient on ragged rows (short row -> omit trailing keys; surplus fields
+/// dropped). Used by `recordRows`.
+unsafe fn record_to_object(header: &[Vec<u8>], row: &[Vec<u8>]) -> *mut u8 {
+    use crate::object::{lin_object_alloc, lin_object_set};
+    use crate::string::lin_string_release;
+    use crate::tagged::{alloc_tagged, TAG_OBJECT, TAG_STR};
+    let obj = lin_object_alloc(header.len().max(1) as u32);
+    for (i, key_bytes) in header.iter().enumerate() {
+        if i >= row.len() {
+            break; // short row: omit the trailing keys
+        }
+        let k = crate::fs::make_string(&String::from_utf8_lossy(key_bytes));
+        let v = crate::fs::make_string(&String::from_utf8_lossy(&row[i]));
+        let mut tv: TaggedVal = std::mem::zeroed();
+        tv.tag = TAG_STR;
+        tv.payload = v as u64;
+        lin_object_set(obj, k, &tv); // last-wins: a repeated key overwrites
+        lin_string_release(k);
+        lin_string_release(v);
+    }
+    alloc_tagged(TAG_OBJECT, obj as u64)
+}
+
+/// `rows(s)`: a `Stream<String[]>` over a byte stream, quote-aware (see CsvAssembler). Buffers only
+/// the in-flight record; emits one row at a time. Unterminated quote at EOF -> in-band Error.
+struct CsvRowsSource {
+    up: Upstream,
+    asm: CsvAssembler,
+    /// Completed rows decoded from the current buffer, awaiting emission (one per pull).
+    queue: std::collections::VecDeque<Vec<Vec<u8>>>,
+    upstream_done: bool,
+    /// True once the final EOF flush has run.
+    flushed: bool,
+}
+
+impl CsvRowsSource {
+    /// Feed a chunk's bytes through the assembler, enqueueing every completed record. Returns an
+    /// Err message on a stray-quote fault or a buffer-cap overflow.
+    fn feed(&mut self, chunk: &[u8]) -> Result<(), String> {
+        for &b in chunk {
+            if let Some(rec) = self.asm.push_byte(b) {
+                self.queue.push_back(rec);
+            }
+            if self.asm.malformed {
+                return Err("csv: malformed input (stray quote in an unquoted field)".to_string());
+            }
+            if self.asm.buffered > MAX_CSV_RECORD_BYTES {
+                return Err(format!(
+                    "csv: a single record exceeded {} bytes without a terminator — refusing to buffer unbounded input",
+                    MAX_CSV_RECORD_BYTES
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl StreamSource for CsvRowsSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        loop {
+            if let Some(rec) = self.queue.pop_front() {
+                return TaggedOutcome::Item(record_to_string_array(&rec));
+            }
+            if self.upstream_done {
+                if self.flushed {
+                    return TaggedOutcome::Eof;
+                }
+                self.flushed = true;
+                // EOF inside a quoted field (or a dangling `""` open) is the unterminated-quote Error.
+                if self.asm.in_quotes {
+                    return TaggedOutcome::Err(
+                        "csv: unterminated quoted field at end of input".to_string(),
+                    );
+                }
+                if let Some(rec) = self.asm.finish() {
+                    return TaggedOutcome::Item(record_to_string_array(&rec));
+                }
+                return TaggedOutcome::Eof;
+            }
+            match self.up.pull() {
+                TaggedOutcome::Eof => self.upstream_done = true,
+                TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
+                TaggedOutcome::Item(item) => {
+                    let mut bytes: Vec<u8> = Vec::new();
+                    append_u8_array_to(&mut bytes, item);
+                    crate::tagged::lin_tagged_release(item);
+                    if let Err(m) = self.feed(&bytes) {
+                        return TaggedOutcome::Err(m);
+                    }
+                }
+            }
+        }
+    }
+    fn close(&mut self) {
+        unsafe { self.up.close(); }
+    }
+}
+
+/// `recordRows(s)`: like `rows`, but consumes the first record as the header and yields one
+/// `{ String: String }` per subsequent data row (last-wins dup headers, lenient ragged rows).
+struct CsvRecordsSource {
+    inner: CsvRowsSource,
+    header: Option<Vec<Vec<u8>>>,
+    /// True once the header has been pulled (it may legitimately be absent for an empty stream).
+    header_done: bool,
+}
+
+impl CsvRecordsSource {
+    /// Pull one raw record from the inner rows source, threading EOF/Err.
+    unsafe fn pull_record(&mut self) -> Result<Option<Vec<Vec<u8>>>, String> {
+        match self.inner.read_tagged() {
+            TaggedOutcome::Eof => Ok(None),
+            TaggedOutcome::Err(m) => Err(m),
+            TaggedOutcome::Item(item) => {
+                // Decode the just-built String[] box back into byte-vector fields, then release it.
+                let rec = string_array_to_fields(item);
+                crate::tagged::lin_tagged_release(item);
+                Ok(Some(rec))
+            }
+        }
+    }
+}
+
+impl StreamSource for CsvRecordsSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        if !self.header_done {
+            self.header_done = true;
+            match self.pull_record() {
+                Err(m) => return TaggedOutcome::Err(m),
+                Ok(None) => return TaggedOutcome::Eof, // empty stream: no header, no rows
+                Ok(Some(h)) => self.header = Some(h),
+            }
+        }
+        let header = match &self.header {
+            Some(h) => h.clone(),
+            None => return TaggedOutcome::Eof,
+        };
+        match self.pull_record() {
+            Err(m) => TaggedOutcome::Err(m),
+            Ok(None) => TaggedOutcome::Eof,
+            Ok(Some(row)) => TaggedOutcome::Item(record_to_object(&header, &row)),
+        }
+    }
+    fn close(&mut self) {
+        self.inner.close();
+    }
+}
+
+/// Decode a boxed `String[]` (TAG_ARRAY of TAG_STR) back into byte-vector fields.
+unsafe fn string_array_to_fields(item: *mut u8) -> Vec<Vec<u8>> {
+    use crate::tagged::{lin_get_tag, lin_unbox_ptr, TAG_ARRAY, TAG_STR};
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    if lin_get_tag(item) != TAG_ARRAY {
+        return out;
+    }
+    let arr = lin_unbox_ptr(item) as *const crate::array::LinArray;
+    let n = crate::array::lin_array_length(arr);
+    for i in 0..n {
+        let elem = crate::array::lin_array_get_tagged(arr, i);
+        if !elem.is_null() && (*elem).tag == TAG_STR {
+            let s = (*elem).payload as *const crate::string::LinString;
+            let bytes = std::slice::from_raw_parts((*s).data.as_ptr(), (*s).len as usize);
+            out.push(bytes.to_vec());
+        } else {
+            out.push(Vec::new());
+        }
+    }
+    out
+}
+
+/// `rows(s, delim)` → a `Stream<String[]>` of parsed CSV rows over the byte stream `s`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_csv_rows(s: *const u8, delim: i32) -> *mut u8 {
+    let up = own_upstream(s);
+    StreamBox::new_boxed(Box::new(CsvRowsSource {
+        up,
+        asm: CsvAssembler::new(delim as u8),
+        queue: std::collections::VecDeque::new(),
+        upstream_done: false,
+        flushed: false,
+    }))
+}
+
+/// `recordRows(s, delim)` → a `Stream<{ String: String }>` keyed by the first (header) record.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_csv_records(s: *const u8, delim: i32) -> *mut u8 {
+    let up = own_upstream(s);
+    let inner = CsvRowsSource {
+        up,
+        asm: CsvAssembler::new(delim as u8),
+        queue: std::collections::VecDeque::new(),
+        upstream_done: false,
+        flushed: false,
+    };
+    StreamBox::new_boxed(Box::new(CsvRecordsSource { inner, header: None, header_done: false }))
 }
 
 #[cfg(test)]

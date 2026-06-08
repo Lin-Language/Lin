@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { indexOf, reverse, push, length, partition, zip, unique, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, arrayAllocate, arrayAllocateFilled, set, at, slice } from "std/array"
+import { indexOf, reverse, push, length, partition, zip, unique, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, arrayAllocate, arrayAllocateFilled, set, at, slice, binarySearch, lowerBound, upperBound, bisectLeft, bisectRight, searchBy, insertSorted, countInRange, findIndex, findLast, findLastIndex, dedupBy } from "std/array"
 import { map, filter, reduce, find, some, every, flatMap, concat, range, rangeStep, for, take, drop, takeWhile, dropWhile, flatten, iterOf } from "std/iter"
 
 val s = suite("std/array", [
@@ -1182,7 +1182,369 @@ val s = suite("std/array", [
     [
       expect(firstChunkHead).toBe(1)
     ]
-  )
+  ),
+
+  // --- Sorted-array search layer (binarySearch / lowerBound / upperBound / searchBy /
+  //     insertSorted / countInRange). PRECONDITION for all: arr is sorted by the comparator. ---
+  test("binarySearch finds a present element (check found AND index)", () =>
+    val r = [1, 3, 5, 7, 9].binarySearch(5, (a, b) => a - b)
+    [
+      expect(r["found"]).toBe(true),
+      expect(r["index"]).toBe(2)
+    ]
+  ),
+
+  test("binarySearch reports the insertion point on a miss (found false)", () =>
+    val r = [1, 3, 5, 7, 9].binarySearch(6, (a, b) => a - b)
+    [
+      expect(r["found"]).toBe(false),
+      expect(r["index"]).toBe(3)
+    ]
+  ),
+
+  test("binarySearch insertion point past the end", () =>
+    val r = [1, 3, 5, 7, 9].binarySearch(10, (a, b) => a - b)
+    [
+      expect(r["found"]).toBe(false),
+      expect(r["index"]).toBe(5)
+    ]
+  ),
+
+  test("binarySearch insertion point before the start", () =>
+    val r = [1, 3, 5].binarySearch(0, (a, b) => a - b)
+    [
+      expect(r["found"]).toBe(false),
+      expect(r["index"]).toBe(0)
+    ]
+  ),
+
+  test("binarySearch returns the LEFTMOST match among duplicates", () =>
+    val r = [2, 2, 2].binarySearch(2, (a, b) => a - b)
+    [
+      expect(r["found"]).toBe(true),
+      expect(r["index"]).toBe(0)
+    ]
+  ),
+
+  test("binarySearch on an empty array reports insertion point 0", () =>
+    val empty: Int32[] = []
+    val r = empty.binarySearch(5, (a, b) => a - b)
+    [
+      expect(r["found"]).toBe(false),
+      expect(r["index"]).toBe(0)
+    ]
+  ),
+
+  test("binarySearch on a single-element array (hit and miss)", () =>
+    val hit = [7].binarySearch(7, (a, b) => a - b)
+    val low = [7].binarySearch(3, (a, b) => a - b)
+    val high = [7].binarySearch(9, (a, b) => a - b)
+    [
+      expect(hit["found"]).toBe(true),
+      expect(hit["index"]).toBe(0),
+      expect(low["found"]).toBe(false),
+      expect(low["index"]).toBe(0),
+      expect(high["found"]).toBe(false),
+      expect(high["index"]).toBe(1)
+    ]
+  ),
+
+  test("binarySearch dot form and f(x, ...) form agree", () =>
+    val dot = [10, 20, 30].binarySearch(20, (a, b) => a - b)
+    val plain = binarySearch([10, 20, 30], 20, (a, b) => a - b)
+    [
+      expect(dot["index"]).toBe(1),
+      expect(plain["index"]).toBe(1),
+      expect(dot["found"]).toBe(true),
+      expect(plain["found"]).toBe(true)
+    ]
+  ),
+
+  // --- lowerBound / upperBound on arrays WITH DUPLICATES (the whole point) ---
+  test("lowerBound is the first occurrence among duplicates", () =>
+    [
+      expect([1, 2, 2, 2, 3].lowerBound(2, (a, b) => a - b)).toBe(1),
+      expect([1, 2, 2, 2, 3].lowerBound(3, (a, b) => a - b)).toBe(4),
+      expect([1, 3, 5].lowerBound(4, (a, b) => a - b)).toBe(2),
+      expect([1, 3, 5].lowerBound(0, (a, b) => a - b)).toBe(0),
+      expect([1, 3, 5].lowerBound(9, (a, b) => a - b)).toBe(3)
+    ]
+  ),
+
+  test("upperBound is one past the last occurrence among duplicates", () =>
+    [
+      expect([1, 2, 2, 2, 3].upperBound(2, (a, b) => a - b)).toBe(4),
+      expect([1, 2, 2, 2, 3].upperBound(0, (a, b) => a - b)).toBe(0),
+      expect([1, 3, 5].upperBound(3, (a, b) => a - b)).toBe(2),
+      expect([1, 3, 5].upperBound(9, (a, b) => a - b)).toBe(3)
+    ]
+  ),
+
+  test("bisectLeft / bisectRight are aliases of lowerBound / upperBound", () =>
+    [
+      expect([1, 2, 2, 2, 3].bisectLeft(2, (a, b) => a - b)).toBe(1),
+      expect([1, 2, 2, 2, 3].bisectRight(2, (a, b) => a - b)).toBe(4)
+    ]
+  ),
+
+  test("lowerBound / upperBound on an empty array both return 0", () =>
+    val empty: Int32[] = []
+    [
+      expect(empty.lowerBound(5, (a, b) => a - b)).toBe(0),
+      expect(empty.upperBound(5, (a, b) => a - b)).toBe(0)
+    ]
+  ),
+
+  // --- upperBound - lowerBound = occurrence count; countInRange = lowerBound(hi) - lowerBound(lo) ---
+  test("upperBound - lowerBound equals the occurrence count", () =>
+    val xs = [
+      1,
+      2,
+      2,
+      2,
+      3
+    ]
+    [
+      expect(xs.upperBound(2, (a, b) => a - b) - xs.lowerBound(2, (a, b) => a - b)).toBe(3),
+      expect(xs.upperBound(1, (a, b) => a - b) - xs.lowerBound(1, (a, b) => a - b)).toBe(1),
+      expect(xs.upperBound(9, (a, b) => a - b) - xs.lowerBound(9, (a, b) => a - b)).toBe(0)
+    ]
+  ),
+
+  test("countInRange counts elements in the half-open range [lo, hi)", () =>
+    [
+      expect([1, 2, 3, 4, 5, 6, 7].countInRange(3, 6, (a, b) => a - b)).toBe(3),
+      expect([1, 2, 3, 4, 5].countInRange(0, 100, (a, b) => a - b)).toBe(5),
+      expect([1, 2, 3, 4, 5].countInRange(3, 3, (a, b) => a - b)).toBe(0)
+    ]
+  ),
+
+  test("countInRange clamps to 0 when hi < lo", () =>
+    [
+      expect([1, 2, 3, 4, 5].countInRange(4, 2, (a, b) => a - b)).toBe(0)
+    ]
+  ),
+
+  test("countInRange agrees with upperBound - lowerBound on a closed point", () =>
+    val xs = [
+      1,
+      2,
+      2,
+      2,
+      3,
+      5,
+      5
+    ]
+    // [2, 3) is exactly the run of 2s
+    [
+      expect(xs.countInRange(2, 3, (a, b) => a - b)).toBe(3),
+      expect(xs.countInRange(5, 6, (a, b) => a - b)).toBe(2)
+    ]
+  ),
+
+  // --- insertSorted: keeps order AND preserves element representation (the flat-array trap) ---
+  test("insertSorted keeps order on a flat Int32[] and the result stays flat/correct", () =>
+    // Result is declared Int32[] — a flat (unboxed) array. If insertSorted built a tagged Json
+    // array instead, the flat-typed reads below would reinterpret 16-byte slots as packed scalars
+    // (garbage). toString over the flat array verifies the representation AND the order.
+    val r: Int32[] = [1, 3, 5, 7].insertSorted(4, (a, b) => a - b)
+    val head: Int32 = r[0]
+    val ins: Int32 = r[2]
+    [
+      expect(r.toString()).toBe("[1, 3, 4, 5, 7]"),
+      expect(head).toBe(1),
+      expect(ins).toBe(4),
+      expect(r.length()).toBe(5)
+    ]
+  ),
+
+  test("insertSorted at the front, end, and into an empty array", () =>
+    val front: Int32[] = [1, 3, 5].insertSorted(0, (a, b) => a - b)
+    val back: Int32[] = [1, 3, 5].insertSorted(9, (a, b) => a - b)
+    val empty: Int32[] = [].insertSorted(1, (a, b) => a - b)
+    [
+      expect(front.toString()).toBe("[0, 1, 3, 5]"),
+      expect(back.toString()).toBe("[1, 3, 5, 9]"),
+      expect(empty.toString()).toBe("[1]")
+    ]
+  ),
+
+  test("insertSorted is a stable left-insert (item goes before equal elements)", () =>
+    val r: Int32[] = [1, 2, 2, 3].insertSorted(2, (a, b) => a - b)
+    [
+      expect(r.toString()).toBe("[1, 2, 2, 2, 3]"),
+      expect(r.length()).toBe(5)
+    ]
+  ),
+
+  test("insertSorted does not mutate the source array", () =>
+    val src = [1, 3, 5]
+    val r: Int32[] = src.insertSorted(4, (a, b) => a - b)
+    [
+      expect(src.toString()).toBe("[1, 3, 5]"),
+      expect(r.toString()).toBe("[1, 3, 4, 5]")
+    ]
+  ),
+
+  test("repeated insertSorted maintains a running sorted Int32[] collection", () =>
+    var acc: Int32[] = []
+    [5, 2, 8, 1, 2].for(x => acc = acc.insertSorted(x, (a, b) => a - b))
+    [
+      expect(acc.toString()).toBe("[1, 2, 2, 5, 8]")
+    ]
+  ),
+
+  test("insertSorted preserves a tagged String[] representation", () =>
+    val r: String[] = ["apple", "cherry"].insertSorted("banana", (a, b) => if a < b then -1 else if a > b then 1 else 0)
+    val mid: String = r[1]
+    [
+      expect(r.toString()).toBe("[\"apple\", \"banana\", \"cherry\"]"),
+      expect(mid).toBe("banana")
+    ]
+  ),
+
+  // --- searchBy: key-extractor variant, paired with sortBy, on a record array ---
+  test("searchBy finds a record by its numeric key (paired with sortBy)", () =>
+    val people = [
+      { "name": "Alice", "age": 25 },
+      { "name": "Bob", "age": 30 },
+      { "name": "Carol", "age": 40 }
+    ]
+    val r = people.searchBy(30, p => p["age"])
+    [
+      expect(r["found"]).toBe(true),
+      expect(r["index"]).toBe(1)
+    ]
+  ),
+
+  test("searchBy reports the insertion point when the key is absent", () =>
+    val people = [
+      { "name": "Alice", "age": 25 },
+      { "name": "Bob", "age": 30 },
+      { "name": "Carol", "age": 40 }
+    ]
+    val r = people.searchBy(35, p => p["age"])
+    [
+      expect(r["found"]).toBe(false),
+      expect(r["index"]).toBe(2)
+    ]
+  ),
+
+  test("searchBy with a sortBy round-trip on an unsorted record array", () =>
+    val people = sortBy(
+      [
+        { "name": "Carol", "age": 40 },
+        { "name": "Alice", "age": 25 },
+        { "name": "Bob", "age": 30 }
+      ],
+      p => p["age"]
+    )
+    val r = people.searchBy(40, p => p["age"])
+    [
+      expect(r["found"]).toBe(true),
+      expect(r["index"]).toBe(2)
+    ]
+  ),
+
+  test("searchBy with a string key", () =>
+    val words = ["apple", "banana", "cherry"]
+    val hit = words.searchBy("cherry", s => s)
+    // "blueberry" sorts after "banana" (b,l > b,a) and before "cherry" → insertion point 2
+    val miss = words.searchBy("blueberry", s => s)
+    [
+      expect(hit["found"]).toBe(true),
+      expect(hit["index"]).toBe(2),
+      expect(miss["found"]).toBe(false),
+      expect(miss["index"]).toBe(2)
+    ]
+  ),
+
+  test("searchBy on an empty array reports not found at 0", () =>
+    val empty: Int32[] = []
+    val r = empty.searchBy(5, x => x)
+    [
+      expect(r["found"]).toBe(false),
+      expect(r["index"]).toBe(0)
+    ]
+  ),
+
+  // ---- findIndex / findLast / findLastIndex / dedupBy (iter-combinators enrichment) ----
+  test("findIndex returns the first matching index", () => [
+    expect([10, 20, 30].findIndex(x => x > 15)).toBe(1)
+  ]),
+
+  test("findIndex returns -1 when none match", () => [
+    expect([1, 2, 3].findIndex(x => x > 9)).toBe(-1)
+  ]),
+
+  test("findIndex on empty array is -1", () =>
+    val empty: Int32[] = []
+    [
+      expect(empty.findIndex(x => x > 0)).toBe(-1)
+    ]
+  ),
+
+  test("findIndex with the optional index callback param", () => [
+    expect([5, 6, 7, 8].findIndex((x, i) => i == 2)).toBe(2)
+  ]),
+
+  test("findLast returns the last matching element", () => [
+    expect([1, 2, 3, 4].findLast(x => x % 2 == 0)).toBe(4)
+  ]),
+
+  test("findLast returns null when none match", () =>
+    val r = [1, 3, 5].findLast(x => x % 2 == 0)
+    [
+      expect(r == null).toBe(true)
+    ]
+  ),
+
+  test("findLast on empty array is null", () =>
+    val empty: Int32[] = []
+    val r = empty.findLast(x => x > 0)
+    [
+      expect(r == null).toBe(true)
+    ]
+  ),
+
+  test("findLastIndex returns the last matching index", () => [
+    expect([1, 2, 3, 4].findLastIndex(x => x % 2 == 0)).toBe(3)
+  ]),
+
+  test("findLastIndex returns -1 when none match", () => [
+    expect([1, 3, 5].findLastIndex(x => x % 2 == 0)).toBe(-1)
+  ]),
+
+  test("findLastIndex on empty array is -1", () =>
+    val empty: Int32[] = []
+    [
+      expect(empty.findLastIndex(x => x > 0)).toBe(-1)
+    ]
+  ),
+
+  // findLastIndex(f(x,i)) — prefix form too
+  test("findLastIndex prefix form", () => [
+    expect(findLastIndex([2, 4, 6, 7], x => x % 2 == 0)).toBe(2)
+  ]),
+
+  test("dedupBy groups consecutive equal-keyed runs", () => [
+    expect([1, 1, 2, 2, 2, 1].dedupBy(x => x).toString()).toBe("[[1, 1], [2, 2, 2], [1]]")
+  ]),
+
+  test("dedupBy on empty array yields []", () =>
+    val empty: Int32[] = []
+    [
+      expect(empty.dedupBy(x => x).toString()).toBe("[]")
+    ]
+  ),
+
+  test("dedupBy on a single element", () => [
+    expect([7].dedupBy(x => x).toString()).toBe("[[7]]")
+  ]),
+
+  test("dedupBy keys by a derived value", () => [
+    expect([1, 3, 2, 5].dedupBy(x => x % 2).toString()).toBe("[[1, 3], [2], [5]]")
+  ])
 ])
 
 run(s)
