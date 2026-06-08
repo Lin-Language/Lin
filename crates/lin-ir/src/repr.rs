@@ -621,6 +621,12 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
                 set(seeds, *dst, Repr::FlatScalar(s));
             }
         }
+        // A single field read of a BOXED `Object[]` element: the result repr is whatever its static
+        // `result_ty` implies (scalar field → FlatScalar; a String/Array field → Boxed(Opaque); a
+        // nested sealed record → PackedStruct). Seed it from the type exactly like any FieldGet.
+        Instruction::BoxedArrayFieldGet { dst, result_ty, .. } => {
+            set(seeds, *dst, type_seed(result_ty));
+        }
         // Scalar arithmetic / comparison / constants → FlatScalar.
         Instruction::Const { dst, val } => {
             let s = match val {
@@ -834,6 +840,15 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                                 report(&mut bad, "SealedArrayFieldGet(array NOT predicate-packed)", *array, "non-Packed-array", r);
                             }
                         }
+                    }
+                }
+                // ASSUME: BoxedArrayFieldGet — the array is the BOXED `Object[]` representation, so it
+                // must NOT carry a packed sealed-array repr (the lowerer only emits this when the
+                // element record is boxed, i.e. `sealed_array_elem` returns None).
+                Instruction::BoxedArrayFieldGet { array, .. } => {
+                    let r = &repr[array.0 as usize];
+                    if r.packed_sealed_array_layout().is_some() {
+                        report(&mut bad, "BoxedArrayFieldGet(array NOT predicate-packed)", *array, "non-Packed-array", r);
                     }
                 }
                 // ASSUME: Index — object read as packed sealed array (whole-element materialize).

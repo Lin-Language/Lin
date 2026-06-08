@@ -2218,6 +2218,85 @@ fn try_lower_sealed_array_field(
     Some(dst)
 }
 
+/// FUSED `arr[i].field` / `arr[i]["field"]` over a BOXED `Object[]` whose element is a sealed/typed
+/// record stored as a heap `LinObject` (the boxed `Token[]` representation: a record with heap
+/// fields, which the packed-sealed-array gate REJECTS, so the array stays a boxed `Object[]`). When
+/// `object` is `Index{ array, key }` with `array` such an array and `field` is a declared field of
+/// the element record, emit a single `BoxedArrayFieldGet` (borrowed element box + one `lin_object_get`)
+/// instead of the generic `arr[i]` path that MATERIALIZES the whole element into a fresh sealed
+/// struct (alloc + read every field + per-field retain + reload + release) just to read one field.
+/// Returns `Some(dst)` on the fast path, `None` to fall through to the generic path.
+///
+/// Sound: `lin_array_get` returns a BORROWED interior `*TaggedVal` (no fresh box, no release owed),
+/// and `dst` is registered owned with a `Retain` for an RC `result_ty` — identical ownership to the
+/// materialize-then-read path it replaces, so the boxed element's lifetime is unchanged. Only fires
+/// for the SEALED-element case (so the element is a real `LinObject`, never a packed buffer): the
+/// `is_sealed_scalar_array` guard EXCLUDES packed sealed-scalar arrays (handled by the
+/// `SealedArrayFieldGet` fusion), and the element must be a sealed record (`is_sealed_scalar_repr`).
+fn try_lower_boxed_array_field(
+    object: &TypedExpr,
+    field: &str,
+    result_ty: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    let TypedExpr::Index { object: array, key, .. } = object else { return None };
+    let arr_ty = array.ty();
+    // Must be an array of a SEALED record (the boxed `Object[]` shape) that is NOT a packed
+    // sealed-scalar array (which the `SealedArrayFieldGet` fusion already handles).
+    let elem = match &arr_ty {
+        Type::Array(e) => e.as_ref(),
+        _ => return None,
+    };
+    if !is_sealed_scalar_repr(elem) {
+        return None;
+    }
+    if is_sealed_scalar_array(&arr_ty) {
+        return None;
+    }
+    // The field must actually be a declared field of the element record (else the generic path's
+    // safe-access → Null handling applies; keep that conservative behavior).
+    let field_present = matches!(elem, Type::Object { fields, .. } if fields.contains_key(field));
+    if !field_present {
+        return None;
+    }
+    // Lower the index, then the (borrowed where possible) array base last — mirror the Index
+    // borrow-ordering rule (a key that reassigns the array global can't dangle a borrowed base).
+    let (array_temp, index_temp) = if lower_container_base_borrowed_check(array, ctx) {
+        let index_temp = lower_expr(key, builder, ctx);
+        let array_temp = lower_container_base_borrowed(array, builder, ctx)
+            .unwrap_or_else(|| lower_expr(array, builder, ctx));
+        (array_temp, index_temp)
+    } else {
+        let array_temp = lower_expr(array, builder, ctx);
+        let index_temp = lower_expr(key, builder, ctx);
+        (array_temp, index_temp)
+    };
+    let dst = builder.alloc_temp(result_ty.clone());
+    builder.emit(Instruction::BoxedArrayFieldGet {
+        dst,
+        array: array_temp,
+        index: index_temp,
+        field: field.to_string(),
+        arr_ty,
+        result_ty: result_ty.clone(),
+    });
+    // The borrowed field read becomes an owned value (snapshot semantics), exactly like the generic
+    // FieldGet/Index path: a union/Json field is relocated into a fresh owned box; a concrete heap
+    // field is retained; a scalar needs nothing.
+    if is_union_ty(result_ty) {
+        let owned = builder.alloc_temp(result_ty.clone());
+        builder.emit(Instruction::CloneBox { dst: owned, src: dst, ty: result_ty.clone() });
+        builder.register_owned(owned, result_ty.clone());
+        return Some(owned);
+    }
+    if is_rc_type(result_ty) {
+        builder.emit(Instruction::Retain { val: dst, ty: result_ty.clone() });
+        builder.register_owned(dst, result_ty.clone());
+    }
+    Some(dst)
+}
+
 /// Lower `value` into a slot of declared type `slot_ty`, producing a temp in the slot's
 /// representation. Uses the sealed-literal direct-construction fast path when applicable
 /// (`try_lower_sealed_literal`), otherwise `lower_expr` + `coerce_to_slot_type`.
@@ -3404,6 +3483,11 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 if let Some(t) = try_lower_sealed_array_field(object, name, result_type, builder, ctx) {
                     return t;
                 }
+                // FUSED `arr[i]["field"]` over a BOXED `Object[]` of a sealed record (the `Token[]`
+                // shape): one borrowed `lin_object_get` instead of materializing the whole element.
+                if let Some(t) = try_lower_boxed_array_field(object, name, result_type, builder, ctx) {
+                    return t;
+                }
             }
             // Sealed scalar record + a compile-time-known string key `x["f"]` → constant-offset
             // FieldGet (same as `x.f`). Routes to the unboxed load path rather than the dynamic
@@ -3605,6 +3689,11 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // load directly from the contiguous element, skipping the per-element struct
             // materialization the generic Index path would do.
             if let Some(t) = try_lower_sealed_array_field(object, field, result_type, builder, ctx) {
+                return t;
+            }
+            // FUSED `arr[i].field` over a BOXED `Object[]` of a sealed record (the `Token[]` shape):
+            // one borrowed `lin_object_get` instead of materializing the whole element.
+            if let Some(t) = try_lower_boxed_array_field(object, field, result_type, builder, ctx) {
                 return t;
             }
             let obj_ty = object.ty();
