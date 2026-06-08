@@ -2003,6 +2003,54 @@ run()
 }
 
 #[test]
+fn test_scalar_error_union_narrows_and_phi() {
+    // A union of a SCALAR with Error (`Int64 | Error`):
+    //   (a) NARROWING under `is Error` must refine the binding to the bare scalar in the
+    //       else/non-error branch, so it can flow into an `Int64`-parameter use.
+    //   (b) The if/match merge that consumes the narrowed scalar alongside an int LITERAL must
+    //       not MISCOMPILE its PHI. The literal `0`/`-1` defaults to Int32 while the merge result
+    //       is Int64; without a width coercion at the merge the emitted PHI mixed an i32 and an
+    //       i64 incoming and LLVM rejected the module ("PHI node operands are not the same type as
+    //       the result"). The fix coerces the narrower-int branch to the merge's result width.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val mk = (n: Int64): Int64 | Error => if n < 0 then { "type": "error", "message": "neg" } else n
+val use = (n: Int64): Int64 => n + 100
+val r1 = mk(5)
+val out1 = if r1 is Error then 0 else use(r1)
+print(toString(out1))
+val r2 = mk(0 - 3)
+val out2: Int64 = match r2
+  is Error => 0 - 1
+  else => use(r2)
+print(toString(out2))
+// bare narrowed scalar as the else-arm, merged with an int literal then used in arithmetic
+val r3 = mk(7)
+val out3 = if r3 is Error then 0 else r3
+print(toString(out3))
+"#);
+    assert_eq!(output, vec!["105", "-1", "7"]);
+}
+
+#[test]
+fn test_scalar_error_union_error_branch_not_narrowed() {
+    // The COMPLEMENT of the narrowing: in the `then` (Error) branch of `is Error` the binding is
+    // NOT refined to the scalar — it stays `Int64 | Error` — so passing it where an `Int64` is
+    // expected is a type error. Guards against the narrowing leaking into the wrong branch.
+    let err = run_expect_err(r#"import { print } from "std/io"
+val mk = (n: Int64): Int64 | Error => if n < 0 then { "type": "error", "message": "neg" } else n
+val use = (n: Int64): Int64 => n
+val r = mk(5)
+val out = if r is Error then use(r) else 0
+print(toString(out))
+"#);
+    assert!(
+        err.contains("expected Int64") || err.contains("Argument 1 has type"),
+        "expected a narrowing type error in the Error branch, got:\n{err}"
+    );
+}
+
+#[test]
 fn test_float32_widens_to_float64() {
     // A Float32 must widen to Float64 (fpext) across every numeric context, per spec §21
     // (widening is always to a type that represents both). Codegen's Coerce had no
