@@ -132,8 +132,18 @@ unsafe fn clone_object(src: *const LinObject) -> *mut LinObject {
     for i in 0..len as usize {
         let se = (*src).entries.add(i);
         let key = clone_string((*se).key);
-        let mut v: TaggedVal = TaggedVal { tag: (*se).value.tag, _pad: [0; 7], payload: 0 };
-        v.payload = transfer_payload((*se).value.tag, (*se).value.payload);
+        let v: TaggedVal = if (*se).value.tag == crate::tagged::TAG_SUMNODE {
+            // KEEP-PACKED-THROUGH-RECORD-FIELDS thread-transfer (share-nothing): a kept-packed
+            // `*SumNode` field MUST NOT cross the thread boundary by pointer (the origin frees it →
+            // cross-thread UAF). MATERIALIZE it to a real `LinObject` (a deep, self-contained copy)
+            // and transfer THAT as a TAG_OBJECT field. The worker then sees an ordinary object.
+            let obj = crate::sumnode::lin_sumnode_materialize((*se).value.payload as *mut u8);
+            TaggedVal { tag: crate::tagged::TAG_OBJECT, _pad: [0; 7], payload: obj as u64 }
+        } else {
+            let mut v = TaggedVal { tag: (*se).value.tag, _pad: [0; 7], payload: 0 };
+            v.payload = transfer_payload((*se).value.tag, (*se).value.payload);
+            v
+        };
         crate::object::object_push_owned(dst, key, v);
     }
     dst

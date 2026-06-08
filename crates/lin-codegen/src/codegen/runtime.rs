@@ -39,6 +39,7 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub box_str: FunctionValue<'ctx>,
     pub box_object: FunctionValue<'ctx>,
     pub box_array: FunctionValue<'ctx>,
+    pub box_sumnode: FunctionValue<'ctx>,
     pub box_function: FunctionValue<'ctx>,
     pub get_tag: FunctionValue<'ctx>,
     pub unbox_int32: FunctionValue<'ctx>,
@@ -177,6 +178,7 @@ impl<'ctx> RuntimeFns<'ctx> {
         let box_str = module.add_function("lin_box_str", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_object = module.add_function("lin_box_object", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_array = module.add_function("lin_box_array", ptr_type.fn_type(&[ptr_type.into()], false), None);
+        let box_sumnode = module.add_function("lin_box_sumnode", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_function = module.add_function("lin_box_function", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let get_tag = module.add_function("lin_get_tag", i8_type.fn_type(&[ptr_type.into()], false), None);
         let unbox_int32 = module.add_function("lin_unbox_int32", i32_type.fn_type(&[ptr_type.into()], false), None);
@@ -238,6 +240,7 @@ impl<'ctx> RuntimeFns<'ctx> {
             box_str,
             box_object,
             box_array,
+            box_sumnode,
             box_function,
             get_tag,
             unbox_int32,

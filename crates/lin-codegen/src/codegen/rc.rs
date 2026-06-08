@@ -23,6 +23,7 @@ impl<'ctx> Codegen<'ctx> {
         old: PointerValue<'ctx>,
         new_ptrs: &[PointerValue<'ctx>],
         ty: &Type,
+        repr: &Repr,
     ) {
         let i64_ty = self.context.i64_type();
         let bool_ty = self.context.bool_type();
@@ -40,7 +41,12 @@ impl<'ctx> Codegen<'ctx> {
         let cont_bb = self.context.append_basic_block(llvm_fn, "tco_relcont");
         self.builder.conditional_branch(differs, rel_bb, cont_bb);
         self.builder.position_at_end(rel_bb);
-        self.emit_release(old.into(), ty);
+        // Release by PHYSICAL representation, not static type: an unboxed sum-node param slot holds a
+        // raw `*SumNode` (Repr::Packed(SumNode)) even though its static type is a `Union` — releasing
+        // it via the type-dispatched `lin_tagged_release` (the Union arm) would mis-interpret the raw
+        // node as a boxed TaggedVal and corrupt the heap. `emit_release_repr` routes a Packed(SumNode)
+        // to `lin_sumnode_release`, and defers to the type-based release for every non-Packed repr.
+        self.emit_release_repr(old.into(), ty, repr);
         self.builder.unconditional_branch(cont_bb);
         self.builder.position_at_end(cont_bb);
     }
@@ -71,6 +77,7 @@ impl<'ctx> Codegen<'ctx> {
         entry_ptrs: &[PointerValue<'ctx>],
         ret_ptr: Option<PointerValue<'ctx>>,
         ty: &Type,
+        repr: &Repr,
     ) {
         let i64_ty = self.context.i64_type();
         let bool_ty = self.context.bool_type();
@@ -95,7 +102,13 @@ impl<'ctx> Codegen<'ctx> {
         let cont_bb = self.context.append_basic_block(llvm_fn, "tco_frelcont");
         self.builder.conditional_branch(cond, rel_bb, cont_bb);
         self.builder.position_at_end(rel_bb);
-        self.emit_release(slot_val.into(), ty);
+        // Release by PHYSICAL representation, not static type (mirrors `emit_tco_release_old`): an
+        // unboxed sum-node param slot holds a raw `*SumNode` (Repr::Packed(SumNode)) even though its
+        // static type is a `Union` — the interp parser's `parseExprLoop`/`parseTermLoop` accumulators
+        // carry `Ast` nodes through TCO. Routing through the static-type `emit_release` would free the
+        // node as a boxed TaggedVal and corrupt the heap (the `lin_tagged_clone` UAF). `emit_release_repr`
+        // routes a Packed(SumNode) to `lin_sumnode_release` and defers to the type-based release otherwise.
+        self.emit_release_repr(slot_val.into(), ty, repr);
         self.builder.unconditional_branch(cont_bb);
         self.builder.position_at_end(cont_bb);
     }
