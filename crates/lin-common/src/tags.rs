@@ -43,3 +43,14 @@ pub const TAG_MAP: u8 = 20;
 /// to `lin_sumnode_*` and its display/equality/serialization/transfer to a MATERIALIZE-on-demand
 /// boundary. A `TAG_OBJECT` here would type-confuse `lin_object_release` (offset-4 size read as len).
 pub const TAG_SUMNODE: u8 = 21;
+/// Arbitrary-precision integer (`std/bignum`, `crate::bignum`). An opaque, immutable, refcounted
+/// heap handle wrapping a `num_bigint::BigInt`, in the `TAG_STREAM`/`TAG_SHARED` opaque-handle
+/// family. The payload is a `*const BigNumBox`; its RC dispatches through the tag-aware
+/// retain/release (the `TAG_BIGNUM` arm calls `lin_bignum_retain_box`/`lin_bignum_release_box`,
+/// the final drop freeing the boxed Rust value). The Lin surface aliases `BigInt = Json`, so the
+/// handle flows through the universal boxed-TaggedVal* representation like any opaque value.
+pub const TAG_BIGNUM: u8 = 22;
+/// Exact base-10 fixed-point decimal (`std/decimal`, `crate::decimal`). Same opaque-handle shape
+/// as `TAG_BIGNUM`: a `*const DecimalBox` wrapping a `rust_decimal::Decimal`, refcounted via the
+/// `TAG_DECIMAL` arm of the tag-aware retain/release.
+pub const TAG_DECIMAL: u8 = 23;

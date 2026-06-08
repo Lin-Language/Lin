@@ -878,6 +878,87 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn("lin_stream_reduce", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into(), init.into(), func.into()], "ir_stream_reduce").try_as_basic_value().unwrap_basic()
             }
+            // sliding(stream, size): (stream, i64) → Stream<T[]>. Mirrors drop/take's int handling.
+            Intrinsic::StreamSliding => {
+                let i64_ty = self.context.i64_type();
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let n = args.get(1).copied().unwrap_or_else(|| i64_ty.const_zero().into());
+                let n_i64 = if n.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(n.into_int_value(), i64_ty, "ir_stream_sliding_n")
+                } else { i64_ty.const_zero() };
+                let fnv = self.get_or_declare_fn("lin_stream_sliding", ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), n_i64.into()], "ir_stream_sliding").try_as_basic_value().unwrap_basic()
+            }
+            // pairwise(stream)/dedup(stream): (stream) → Stream. Single-stream-arg, modelled on flatten.
+            Intrinsic::StreamPairwise | Intrinsic::StreamDedup => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let name = match intrinsic {
+                    Intrinsic::StreamPairwise => "lin_stream_pairwise",
+                    _ => "lin_stream_dedup",
+                };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into()], "ir_stream_pairwise_dedup").try_as_basic_value().unwrap_basic()
+            }
+            // intersperse(stream, sep): (stream, boxed value) → Stream. The separator is a VALUE
+            // (not a closure): box a concrete/scalar `sep`; pass an already-boxed union/Json through.
+            Intrinsic::StreamIntersperse => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let sep = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let sep_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let sep = if Self::is_union_type(&sep_ty) { sep } else { self.box_value(sep, &sep_ty) };
+                let fnv = self.get_or_declare_fn("lin_stream_intersperse", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), sep.into()], "ir_stream_intersperse").try_as_basic_value().unwrap_basic()
+            }
+            // zipWith(stream, b, f): (stream, boxed b array, closure) → Stream. `b` is a value (box a
+            // concrete array; pass a boxed Json through); the closure may arrive boxed — unbox it.
+            Intrinsic::StreamZipWith => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let b = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let b_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let b = if Self::is_union_type(&b_ty) { b } else { self.box_value(b, &b_ty) };
+                let func = args.get(2).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func_ty = arg_tys.get(2).cloned().unwrap_or(Type::Null);
+                let func = if Self::is_union_type(&func_ty) && func.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[func.into()], "ir_zipwith_cls").try_as_basic_value().unwrap_basic()
+                } else { func };
+                let fnv = self.get_or_declare_fn("lin_stream_zip_with", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), b.into(), func.into()], "ir_stream_zip_with").try_as_basic_value().unwrap_basic()
+            }
+            // count(start, step): (i64, i64) → infinite Stream<Int32>. No upstream, no value boxing.
+            Intrinsic::StreamCount => {
+                let i64_ty = self.context.i64_type();
+                let start = args.first().copied().unwrap_or_else(|| i64_ty.const_zero().into());
+                let step = args.get(1).copied().unwrap_or_else(|| i64_ty.const_int(1, false).into());
+                let start_i64 = if start.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(start.into_int_value(), i64_ty, "ir_count_start")
+                } else { i64_ty.const_zero() };
+                let step_i64 = if step.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(step.into_int_value(), i64_ty, "ir_count_step")
+                } else { i64_ty.const_int(1, false) };
+                let fnv = self.get_or_declare_fn("lin_stream_count", ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false));
+                self.builder.call(fnv, &[start_i64.into(), step_i64.into()], "ir_stream_count").try_as_basic_value().unwrap_basic()
+            }
+            // repeat(value, n): (boxed value, i64) → Stream<T>. Box a concrete/scalar `value`.
+            Intrinsic::StreamRepeat => {
+                let i64_ty = self.context.i64_type();
+                let value = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let value_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
+                let value = if Self::is_union_type(&value_ty) { value } else { self.box_value(value, &value_ty) };
+                let n = args.get(1).copied().unwrap_or_else(|| i64_ty.const_int((-1i64) as u64, true).into());
+                let n_i64 = if n.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(n.into_int_value(), i64_ty, "ir_repeat_n")
+                } else { i64_ty.const_int((-1i64) as u64, true) };
+                let fnv = self.get_or_declare_fn("lin_stream_repeat", ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+                self.builder.call(fnv, &[value.into(), n_i64.into()], "ir_stream_repeat").try_as_basic_value().unwrap_basic()
+            }
+            // cycle(arr): (boxed array) → Stream<T>. Box a concrete array; pass a boxed Json through.
+            Intrinsic::StreamCycle => {
+                let arr = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let arr_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
+                let arr = if Self::is_union_type(&arr_ty) { arr } else { self.box_value(arr, &arr_ty) };
+                let fnv = self.get_or_declare_fn("lin_stream_cycle", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[arr.into()], "ir_stream_cycle").try_as_basic_value().unwrap_basic()
+            }
             // lin_object_set(obj, key, val) => Null. Unbox obj→LinObject*, key→LinString*,
             // box val→TaggedVal*, then call the runtime. Mirrors the AST handler.
             Intrinsic::ObjectSetDyn => {

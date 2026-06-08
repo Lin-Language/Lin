@@ -145,6 +145,18 @@ pub enum Intrinsic {
     StreamFlatMap,
     StreamFlatten,
     StreamConcat,
+    // Enrichment lazy adapters + infinite sources (iter-combinators proposal). sliding carries an
+    // Int width; pairwise/dedup take only the stream; intersperse carries a boxed separator value;
+    // zipWith carries a boxed `b` array + a closure. count/repeat/cycle are SOURCES (no upstream):
+    // count takes two i64s, repeat a boxed value + i64 count, cycle a boxed array.
+    StreamSliding,
+    StreamPairwise,
+    StreamIntersperse,
+    StreamDedup,
+    StreamZipWith,
+    StreamCount,
+    StreamRepeat,
+    StreamCycle,
     // Streaming compression byte-adapters (std/compress): each takes ONE Stream<UInt8[]> and
     // returns a new Stream<UInt8[]> that (de)compresses bytes incrementally. gunzip/gzip use the
     // gzip container; inflate/deflate use raw DEFLATE.

@@ -263,6 +263,8 @@ unsafe fn release_tagged_payload(tv: &TaggedVal) {
         TAG_FUNCTION => crate::memory::lin_closure_release(payload as *mut u8),
         TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
         TAG_STREAM => crate::stream::lin_stream_release_box(payload as *const u8),
+        TAG_BIGNUM => crate::bignum::lin_bignum_release_box(payload as *const u8),
+        TAG_DECIMAL => crate::decimal::lin_decimal_release_box(payload as *const u8),
         _ => {}
     }
 }
@@ -319,6 +321,15 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
         TAG_STREAM => {
             // Refcount on the Stream box; the matching release runs the auto-close finalizer.
             crate::stream::lin_stream_retain_box(payload as *const u8);
+        }
+        // Opaque bignum/decimal handles: bump the box's atomic refcount (mirror of the
+        // TAG_BIGNUM/TAG_DECIMAL release arms). Without this a handle stored into an object/array
+        // slot would be freed while the container still held it (UAF).
+        TAG_BIGNUM => {
+            crate::bignum::lin_bignum_retain_box(payload as *const u8);
+        }
+        TAG_DECIMAL => {
+            crate::decimal::lin_decimal_retain_box(payload as *const u8);
         }
         _ => {} // scalars: no heap payload
     }

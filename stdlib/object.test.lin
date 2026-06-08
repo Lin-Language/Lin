@@ -3,6 +3,8 @@ import { toString } from "std/string"
 import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmpty, get } from "std/object"
 import { length } from "std/array"
 import { range, for } from "std/iter"
+import { error, isOk, isError, isNull, unwrapOr } from "std/object"
+import { filter } from "std/iter"
 
 val s = suite("std/object", [
   test("keys returns object keys", () =>
@@ -478,4 +480,122 @@ val s = suite("std/object", [
   )
 ])
 
-run(s)
+
+// A fallible function in the `T | Error` convention.
+val parsePort = (s: String): Int32 | Error =>
+  if s == "" then error("empty port") else 8080
+
+// An absence-y function in the `T | Null` convention.
+val cfgGet = (k: String): String | Null =>
+  if k == "name" then "alice" else null
+
+val resultSuite = suite("std/object", [
+  // ── error constructor ──────────────────────────────────────────────────────
+  test("error builds the canonical Error value", () =>
+    val e = error("boom")
+    [
+      expect(e is Error).toBe(true),
+      expect(e["type"]).toBe("error"),
+      expect(e["message"]).toBe("boom")
+    ]
+  ),
+
+  // ── isError ─────────────────────────────────────────────────────────────────
+  test("isError is true for an Error", () => [
+    expect(isError(error("x"))).toBe(true)
+  ]),
+
+  test("isError is false for a plain success value", () => [
+    expect(isError(8080)).toBe(false),
+    expect(isError("hello")).toBe(false)
+  ]),
+
+  test("isError is false for Null", () => [
+    expect(isError(null)).toBe(false)
+  ]),
+
+  // A decoded object that merely HAS a "type" field is NOT an Error (ADR-031):
+  // `is Error` requires type == "error".
+  test("isError is false for a non-error object with a type field", () => [
+    expect(isError({ "type": "user", "name": "alice" })).toBe(false)
+  ]),
+
+  test("isError dot-application form", () => [
+    expect(error("x").isError()).toBe(true)
+  ]),
+
+  // ── isOk ──────────────────────────────────────────────────────────────────
+  test("isOk is the negation of isError", () => [
+    expect(isOk(8080)).toBe(true),
+    expect(isOk("hi")).toBe(true),
+    expect(isOk(error("x"))).toBe(false)
+  ]),
+
+  // Null is "not an Error", so isOk(null) is true; use isNull to test absence.
+  test("isOk is true for Null (Null is not an Error)", () => [
+    expect(isOk(null)).toBe(true)
+  ]),
+
+  // ── isNull ───────────────────────────────────────────────────────────────
+  test("isNull is true only for the Null value", () => [
+    expect(isNull(null)).toBe(true),
+    expect(isNull(0)).toBe(false),
+    expect(isNull("")).toBe(false),
+    expect(isNull(error("x"))).toBe(false)
+  ]),
+
+  // ── unwrapOr over T | Error ──────────────────────────────────────────────
+  test("unwrapOr passes the success value through (T | Error)", () =>
+    val a: Int32 = unwrapOr(parsePort("80"), 1234)
+    [expect(a).toBe(8080)]
+  ),
+
+  test("unwrapOr returns default on Error (T | Error)", () =>
+    val b: Int32 = unwrapOr(parsePort(""), 1234)
+    [expect(b).toBe(1234)]
+  ),
+
+  test("unwrapOr dot-application form (T | Error)", () =>
+    val b: Int32 = parsePort("").unwrapOr(1234)
+    [expect(b).toBe(1234)]
+  ),
+
+  // ── unwrapOr over T | Null ────────────────────────────────────────────────
+  test("unwrapOr passes the present value through (T | Null)", () =>
+    val c: String = unwrapOr(cfgGet("name"), "anon")
+    [expect(c).toBe("alice")]
+  ),
+
+  test("unwrapOr returns default on Null (T | Null)", () =>
+    val d: String = unwrapOr(cfgGet("missing"), "anon")
+    [expect(d).toBe("anon")]
+  ),
+
+  test("unwrapOr dot-application form (T | Null)", () =>
+    val d: String = cfgGet("missing").unwrapOr("anon")
+    [expect(d).toBe("anon")]
+  ),
+
+  // ── predicate use in a filter callback ────────────────────────────────────
+  test("isOk filters successes out of a mixed Json array", () =>
+    val xs: Json = [
+      parsePort("80"),
+      parsePort(""),
+      parsePort("443")
+    ]
+    val oks = xs.filter(isOk)
+    [expect(oks.length()).toBe(2)]
+  ),
+
+  test("isError filters failures out of a mixed Json array", () =>
+    val xs: Json = [
+      parsePort("80"),
+      parsePort(""),
+      parsePort("443")
+    ]
+    val errs = xs.filter(isError)
+    [expect(errs.length()).toBe(1)]
+  )
+])
+
+run([s, resultSuite])
