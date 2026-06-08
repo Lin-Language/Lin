@@ -1,3 +1,20 @@
+// std/net — low-level UDP and TCP sockets, the byte-stream layer beneath std/http for
+// non-HTTP protocols and custom framing.
+//
+// Every socket is an opaque integer file descriptor (`Int32`) — there are no socket objects
+// in user code. Data is read and written through caller-owned `UInt8[]` buffers; construct
+// one with a type-annotated array literal, e.g. `val buf: UInt8[] = [0, 0, 0, 0]`. IPv4 only;
+// `udpBind`/`tcpListen` bind to `0.0.0.0` (all interfaces).
+//
+// Every fallible call returns the `T | Error` result shape (an `Error` is an object with
+// `"type": "error"`). A non-blocking read with no data available yet returns `Null`, so a poll
+// loop reads naturally:
+//
+//   import { tcpListen, tcpAccept, tcpRecv, tcpSend, tcpClose } from "std/net"
+//   import { udpBind, udpRecv, udpRecvFrom, udpSendTo, udpClose } from "std/net"
+//
+// For a higher-level lazy byte stream over a connection, see `tcpStream` (feeds std/stream
+// adapters).
 import foreign "lin-runtime"
   val lin_udp_bind: (Int32) => Json
   val lin_udp_recv: (Int32, UInt8[]) => Json
@@ -23,7 +40,9 @@ export val udpBind = (port: Int32): Json =>
 // Receive a UDP datagram into `buf` (sender address discarded).
 // @param fd   the socket descriptor from `udpBind`.
 // @param buf  the byte buffer to fill.
-// @returns the number of bytes received, or an `Error` on failure.
+// @returns the number of bytes received, or an `Error` on failure. After
+//   `udpSetNonblocking(fd, true)`, a receive with no data pending returns `Null` instead of
+//   blocking, so a poll loop can `match` on `Null` for "nothing yet".
 export val udpRecv = (fd: Int32, buf: UInt8[]): Json =>
   lin_udp_recv(fd, buf)
 
@@ -31,6 +50,10 @@ export val udpRecv = (fd: Int32, buf: UInt8[]): Json =>
 // @param fd   the socket descriptor from `udpBind`.
 // @param buf  the byte buffer to fill.
 // @returns `{ bytes, addr, port }` for the datagram, or an `Error` on failure.
+// @example val sock = udpBind(39303)
+// @example udpSendTo(sock, "127.0.0.1", 39303, [72, 105, 33])   // 3 bytes sent ("Hi!")
+// @example val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+// @example val res = udpRecvFrom(sock, buf)   // res["len"] == 3, res["addr"] == "127.0.0.1"
 export val udpRecvFrom = (fd: Int32, buf: UInt8[]): Json =>
   lin_udp_recv_from(fd, buf)
 
@@ -66,6 +89,11 @@ export val tcpListen = (port: Int32): Json =>
 // Accept the next pending connection on a listening socket (blocks until one arrives).
 // @param fd  the listening socket descriptor from `tcpListen`.
 // @returns the connected client socket descriptor, or an `Error` on failure.
+// @example val listener = tcpListen(8080)
+// @example val client = tcpAccept(listener)   // blocks until a connection arrives
+// @example val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+// @example val n = tcpRecv(client, buf)
+// @example tcpSend(client, slice(buf, 0, n))  // echo it back (slice from std/array)
 export val tcpAccept = (fd: Int32): Json =>
   lin_tcp_accept(fd)
 
@@ -73,6 +101,11 @@ export val tcpAccept = (fd: Int32): Json =>
 // @param host  the destination host/IP.
 // @param port  the destination port.
 // @returns the connected socket descriptor, or an `Error` if the connect failed.
+// @example val fd = tcpConnect("127.0.0.1", 8080)
+// @example tcpSend(fd, [104, 105])        // "hi"
+// @example val buf: UInt8[] = [0, 0, 0, 0]
+// @example val n = tcpRecv(fd, buf)       // bytes read; 0 = peer closed
+// @example tcpClose(fd)
 export val tcpConnect = (host: String, port: Int32): Json =>
   lin_tcp_connect(host, port)
 

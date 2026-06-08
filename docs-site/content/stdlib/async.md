@@ -1,152 +1,220 @@
 # std/async
 
-Concurrency primitives: async/await, workers, thread pools.
+std/async — concurrency primitives: async/await, workers, thread pools, and shared state.
+
+  import { async, await, parallel, race, timeout, retry } from "std/async"
+  import { worker, message, request, close } from "std/async"
+  import { threadPool, poolAsync } from "std/async"
+  import { shared, get, set, withLock, frozen } from "std/async"
+
+`async(thunk)` runs a zero-arg thunk on a background thread and returns a `Promise`; `await(p)`
+blocks for the result as `T | Error` (a fault in the thunk surfaces as the `Error` arm, which
+you MUST handle — assigning straight to the bare value type is a compile-time error, spec
+§32.2.2 / ADR-045). An async thunk may not capture `var` bindings (compile-time error where
+detectable); WORKERS, being single-threaded, may close over `var`.
+
+`worker(handler, onClose)` spawns a long-lived background thread for request/reply messaging;
+`threadPool(n)` bounds concurrency to `n` in-flight thunks. `shared`/`get`/`set`/`withLock`
+give opt-in shared MUTABLE state safe across threads; `frozen` deep-freezes a value into
+lock-free read-only state any thread can share without copying.
+
+`async` runs thunk `f` concurrently and returns an opaque `Promise<T>` handle; resolve it with
+`await` (the value materialises only at the await site, where any fault is injected as an
+`Error`). Example:
+
+  val p = async(() => expensiveComputation())   // ... do other work ...
+  match await(p) is Error => print("failed") else => print("${await(p)}")
+
+## Reference
+
+#### `async`
 
 ```lin
-import { async, await, parallel, race, timeout, retry } from "std/async"
-import { worker, message, request, close } from "std/async"
-import { threadPool, poolAsync } from "std/async"
-import { shared, get, set, withLock, frozen } from "std/async"
+val async = (f: Json): Json
 ```
 
-## Function reference
 
-| Function | Signature | Description |
-| --- | --- | --- |
-| `async` | `(() -> T) -> Promise` | Run thunk on background thread |
-| `await` | `(Promise) -> T \| Error` | Block until promise resolves; result must handle `Error` |
-| `close` | `(Worker) -> Null` | Shut down worker |
-| `frozen` | `(T) -> T` | Deep-freeze a value into lock-free shared read-only state |
-| `get` | `(Shared) -> T` | Read a snapshot copy out of a `Shared` |
-| `message` | `(Worker, Msg) -> Null` | Fire-and-forget message to worker |
-| `parallel` | `((() -> T)[]) -> T[]` | Run array of thunks concurrently |
-| `poolAsync` | `(ThreadPool, () -> T) -> Promise` | Enqueue a thunk on a thread pool |
-| `race` | `(Promise[]) -> T` | First promise to complete wins |
-| `request` | `(Worker, Msg) -> Reply` | Synchronous request/reply to worker |
-| `retry` | `(() -> T, Int32) -> T` | Retry thunk up to n times |
-| `set` | `(Shared, T) -> Null` | Replace a `Shared`'s value |
-| `shared` | `(T) -> Shared` | Create opt-in shared mutable state |
-| `threadPool` | `(Int32) -> ThreadPool` | Create thread pool |
-| `timeout` | `(Promise, Int32) -> T` | Add timeout to a promise |
-| `withLock` | `(Shared, (T) -> R) -> R` | Atomic read-modify-write on a `Shared` |
-| `worker` | `((Msg) -> Reply, () -> Null) -> Worker` | Create background worker |
-
----
-
-### `async` / `await`
+#### `await`
 
 ```lin
-val p = async(() => expensiveComputation())
-// ... do other work ...
-val result = await(p)   // T | Error
-match result
-  is Error => print("failed")
-  else     => print("${result}")
+val await = <T>(p: T): T | Error
 ```
 
-`await` returns `T | Error` — a fault inside the thunk surfaces as an `Error` here. You must handle the `Error` case; assigning straight to the bare value type (`val n: Int32 = await(p)`) is a compile-time error (spec §32.2.2, ADR-045).
+Resolve a promise to its value (spec §32.2.2).
+- **`p`** — the `Promise<T>` handle to await.
+- **Returns** the resolved value, or an `Error` if the thunk faulted. The `T | Error` union must be
+  handled (e.g. `match … is Error => … else => …`); assigning it to a bare binding that ignores
+  the Error arm is a compile-time error.
 
-The thunk may not capture `var` bindings (compile-time error where detectable).
-
----
-
-### `parallel`
+#### `parallel`
 
 ```lin
-val [a, b, c] = parallel([
-  () => fetchUsers(),
-  () => fetchPosts(),
-  () => fetchComments()
-])
+val parallel = (tasks: Json): Json[]
 ```
 
----
+Run a list of thunks concurrently and collect their results in order.
+- **`tasks`** — an array of zero-argument thunks (`(() => T)[]`, passed as `Json`).
+- **Returns** a `Json[]` of the results, one per task, in input order.
+- **Example:** val [a, b, c] = parallel([() => fetchUsers(), () => fetchPosts(), () => fetchComments()])
 
-### `race`
+#### `race`
 
 ```lin
-val fastest = await(race([
-  async(() => fetchFrom("mirror-a")),
-  async(() => fetchFrom("mirror-b"))
-]))
+val race = (promises: Json): Json
 ```
 
----
+Return a promise that resolves to the first of `promises` to settle.
+- **`promises`** — an array of `Promise` handles (passed as `Json`).
+- **Returns** an opaque `Promise` handle for the first settled result; resolve with `await`.
+- **Example:** val fastest = await(race([async(() => fetchFrom("a")), async(() => fetchFrom("b"))]))
 
-### `timeout`
+#### `timeout`
 
 ```lin
-val result = await(timeout(longOp, 5000))
-match result
-  is Null  => print("timed out")
-  is Error => print("failed")
-  else     => print("ok: ${result}")
+val timeout = (p: Json, ms: Int32): Json
 ```
 
----
+Return a promise that fails with a timeout `Error` if `p` does not settle within `ms`.
+- **`p`** — the promise handle to bound.
+- **`ms`** — the timeout in milliseconds.
+- **Returns** an opaque `Promise` handle; awaiting it yields `p`'s value or a timeout `Error`.
+- **Example:** match await(timeout(longOp, 5000)) is Null => print("timed out") is Error => print("failed") else => print("ok")
 
-### `retry`
+#### `retry`
 
 ```lin
-val data = await(retry(() => unstableFetch(), 3))
+val retry = (f: Json, times: Int32): Json
 ```
 
----
+Retry a faulting thunk up to `times` attempts.
+- **`f`** — a zero-argument thunk `() => T` (passed as `Json`).
+- **`times`** — the maximum number of attempts.
+- **Returns** an opaque `Promise` handle; awaiting it yields the first success, or the last `Error`.
+- **Example:** val data = await(retry(() => unstableFetch(), 3))
 
-### `worker`
+#### `threadPool`
 
 ```lin
-val w = worker(
-  (msg: String) => "echo: ${msg}",
-  () => null
-)
-
-val reply = request(w, "hello")   // "echo: hello"
-message(w, "fire-and-forget")
-close(w)
+val threadPool = (size: Int32): Json
 ```
 
-Workers may close over `var` bindings (single-threaded, no races).
+Create a fixed-size pool of worker threads.
+- **`size`** — the number of worker threads in the pool.
+- **Returns** an opaque pool handle for `poolAsync`.
 
----
-
-### `threadPool` / `poolAsync`
-
-A thread pool bounds concurrency: at most `n` thunks run at once, and excess work queues until a worker frees up. Enqueue work with `poolAsync(pool, thunk)`, designed for the dot-call form `pool.poolAsync(thunk)`.
+#### `poolAsync`
 
 ```lin
-val pool = threadPool(8)
-val p = pool.poolAsync(() => heavyWork())
-val result = await(p)
-
-// Multiple tasks:
-val results = parallel([
-  () => pool.poolAsync(() => work(1)),
-  () => pool.poolAsync(() => work(2)),
-  () => pool.poolAsync(() => work(3))
-])
+val poolAsync = (pool: Json, f: Json): Json
 ```
 
----
+Submit thunk `f` to a thread pool for execution. A pool bounds concurrency: at most `n` thunks
+run at once, and excess work queues until a worker frees up. Designed for the dot-call form
+`pool.poolAsync(thunk)`.
+- **`pool`** — a pool handle from `threadPool`.
+- **`f`** — a zero-argument thunk `() => T` (passed as `Json`).
+- **Returns** an opaque `Promise` handle for the result; resolve with `await`.
+- **Example:** val pool = threadPool(8)
+- **Example:** val result = await(pool.poolAsync(() => heavyWork()))
 
-### `shared` / `get` / `set` / `withLock`
-
-`shared` wraps a value in opt-in shared mutable state safe to read and update across threads. `get` reads a snapshot, `set` replaces it, and `withLock` runs an atomic read-modify-write.
+#### `worker`
 
 ```lin
-val counter = shared(0)
-
-counter.withLock(n => n + 1)   // atomic increment
-val current = get(counter)     // snapshot copy
-set(counter, 100)              // replace
+val worker = (handler: Json, onClose: Json): Json
 ```
 
----
+Spawn a long-lived worker thread that owns thread-confined state.
+- **`handler`** — the per-message handler run on the worker thread.
+- **`onClose`** — a cleanup callback run when the worker shuts down.
+- **Returns** an opaque worker handle for `request`/`message`/`close`. Workers may close over `var`
+  bindings (single-threaded, no races).
+- **Example:** val w = worker((msg: String) => "echo: ${msg}", () => null)
+- **Example:** val reply = request(w, "hello")   // "echo: hello"
+- **Example:** message(w, "fire-and-forget")
+- **Example:** close(w)
 
-### `frozen`
-
-`frozen` deep-freezes a value into lock-free read-only state that any thread can share without copying.
+#### `request`
 
 ```lin
-val config = frozen({ "retries": 3, "timeout": 5000 })
+val request = (w: Json, msg: Json): Json
 ```
+
+Send `msg` to a worker and BLOCK until it replies (synchronous; gives backpressure).
+- **`w`** — a worker handle from `worker`.
+- **`msg`** — the message payload.
+- **Returns** the worker's reply (or an `Error` injected at the worker boundary on a handler fault).
+
+#### `message`
+
+```lin
+val message = (w: Json, msg: Json): Null
+```
+
+Send `msg` to a worker FIRE-AND-FORGET (enqueue and return immediately; no reply).
+- **`w`** — a worker handle from `worker`.
+- **`msg`** — the message payload.
+
+#### `close`
+
+```lin
+val close = (w: Json): Null
+```
+
+Shut a worker down (drain in-flight work, run its `onClose`, join the thread).
+- **`w`** — the worker handle to close.
+
+#### `shared`
+
+```lin
+val shared = (v: Json): Shared
+```
+
+Box a value into opt-in shared MUTABLE state (ADR-028 §2.3.1).
+- **`v`** — the value to share; a private copy is boxed.
+- **Returns** a `Shared` handle. Only the accessors below operate on it — any other op (push,
+  indexing, …) on a `Shared` value is a compile-time type error (ADR-029).
+
+#### `get`
+
+```lin
+val get = (s: Shared): Json
+```
+
+Snapshot the current value out of a `Shared` cell under the lock.
+- **`s`** — the `Shared` handle.
+- **Returns** a copy of the shared value.
+
+#### `set`
+
+```lin
+val set = (s: Shared, v: Json): Null
+```
+
+Copy a new value into a `Shared` cell under the write lock.
+- **`s`** — the `Shared` handle.
+- **`v`** — the new value to store.
+
+#### `withLock`
+
+```lin
+val withLock = (s: Shared, f: Function): Json
+```
+
+Mutate a `Shared` cell in place under the write lock.
+- **`s`** — the `Shared` handle.
+- **`f`** — a function that mutates the held value while the lock is held.
+- **Returns** whatever `f` returned.
+- **Example:** val counter = shared(0)
+- **Example:** counter.withLock(n => n + 1)   // atomic increment
+- **Example:** val current = get(counter)     // snapshot copy; set(counter, 100) replaces it
+
+#### `frozen`
+
+```lin
+val frozen = (v: Json): Json
+```
+
+Deep-freeze a transferable graph into opt-in shared READ-ONLY state (ADR-028 §2.3.2).
+- **`v`** — the value graph to freeze.
+- **Returns** an immortal, immutable, lock-free-readable value (readers use the plain type).
+- **Example:** val config = frozen({ "retries": 3, "timeout": 5000 })

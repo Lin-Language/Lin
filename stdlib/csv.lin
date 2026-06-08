@@ -226,6 +226,7 @@ val scanRows = (rows: Json[], s: String, n: Int32, pos: Int32, delim: Int32, tri
 //              ASCII spaces/tabs from unquoted fields.
 // @returns the parsed rows, or an Error on an invalid delimiter option or malformed input (an
 //          unterminated quoted field or a stray quote).
+// @example parse("a,b\n1,2")  // [["a", "b"], ["1", "2"]]
 export val parse = (s: String, opts: Json = {  }): String[][] | Error =>
   if optDelimInvalid(opts) then
     {

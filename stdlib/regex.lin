@@ -51,6 +51,7 @@ export val compile = (pattern: String): Regex | Error =>
 // @param re  the compiled pattern.
 // @param s   the subject string.
 // @returns true if there is a match anywhere in `s`.
+// @example matches("\\d+", "abc123")  // true
 export val isMatch = (re: Regex, s: String): Boolean =>
   lin_regex_is_match(re, s)
 

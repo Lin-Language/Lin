@@ -58,6 +58,7 @@ export val RoundDown: RoundingMode = 4
 // The PREFERRED constructor — exact, with no float intermediary.
 // @param s  the decimal numeral.
 // @returns the `Decimal`, or an `Error` if `s` is not a valid number.
+// @example decimal("0.1").add(decimal("0.2")).toString()  // "0.3" (exact, no binary error)
 export val decimal = (s: String): Decimal | Error => lin_decimal_parse(s)
 
 // Build a `Decimal` from an integer (exact, scale 0).

@@ -1,0 +1,234 @@
+// gen-stdlib — generate docs-site/content/stdlib/<mod>.md from the doc comments in stdlib/<mod>.lin.
+//
+// Single source of truth: the `//` comments in the stdlib modules themselves. The leading comment
+// block at the top of a module (before the first `import`/`export`) becomes the page intro; each
+// exported `val`/`type` and its preceding `//` doc lines becomes a reference entry. Section banner
+// comments (`// ── Title ──`) become `##` subsection headers. Run from the repo root before main.lin.
+import { print } from "std/io"
+import { readFile, writeFile, ls, mkdir, rm, exists } from "std/fs"
+import { split, startsWith, endsWith, trim, trimStart, substring, contains, indexOf, replaceAll, join } from "std/string"
+import { push, length } from "std/array"
+import { for, filter, map, range } from "std/iter"
+
+val stdlibDir = "stdlib"
+val outDir = "docs-site/content/stdlib"
+
+// True if a value is the stdlib Error shape.
+val isErr = (v: Json): Boolean =>
+  v != null && v["type"] == "error"
+
+// Strip the leading "// " (or "//") from a comment line, returning the bare text.
+val stripComment = (line: String): String =>
+  val t = trimStart(line)
+  // t starts with "//"
+  val rest = substring(t, 2, length(t))
+  if startsWith(rest, " ") then substring(rest, 1, length(rest)) else rest
+
+// Is this (trimmed) line a `//` comment?
+val isComment = (line: String): Boolean =>
+  startsWith(trimStart(line), "//")
+
+// Is this (trimmed) line blank?
+val isBlank = (line: String): Boolean =>
+  trim(line) == ""
+
+// A decorative section banner, e.g. "── Arithmetic ──────" or "--- shared tables ---". Detected by
+// the box-drawing rule character or a run of dashes around a title.
+val isBanner = (text: String): Boolean =>
+  contains(text, "──") || startsWith(trim(text), "---") || startsWith(trim(text), "==")
+
+// Pull the title out of a banner line, dropping the dash/box runs and surrounding space.
+val bannerTitle = (text: String): String =>
+  val noBox = replaceAll(text, "─", "")
+  val noDash = replaceAll(noBox, "-", "")
+  val noEq = replaceAll(noDash, "=", "")
+  trim(noEq)
+
+// Is this (trimmed) line the start of an exported declaration?
+val isExport = (line: String): Boolean =>
+  val t = trimStart(line)
+  startsWith(t, "export val ") || startsWith(t, "export type ")
+
+// Extract the exported NAME from an `export val NAME ...` / `export type NAME ...` line.
+val exportName = (line: String): String =>
+  val t = trimStart(line)
+  val afterKw = if startsWith(t, "export val ") then
+    substring(t, 11, length(t))
+  else
+    substring(t, 12, length(t))
+  // Name runs until the first space, ':', '=', '(' or '<'.
+  nameUntilDelim(afterKw, 0)
+
+val nameUntilDelim = (s: String, i: Int32): String =>
+  if i >= length(s) then
+    s
+  else
+    val c = substring(s, i, i + 1)
+    if c == " " || c == ":" || c == "=" || c == "(" || c == "<" then
+      substring(s, 0, i)
+    else
+      nameUntilDelim(s, i + 1)
+
+// Build the display signature from an export line. Functions: everything before "=>". Consts:
+// everything before " = ". Types: the whole declaration. The leading "export " is stripped.
+val signature = (line: String): String =>
+  val t = trim(line)
+  val noExport = substring(t, 7, length(t)) // drop "export "
+  if startsWith(noExport, "type ") then
+    noExport
+  else if contains(noExport, "=>") then
+    trim(substring(noExport, 0, indexOf(noExport, "=>")))
+  else if contains(noExport, " = ") then
+    trim(substring(noExport, 0, indexOf(noExport, " = ")))
+  else
+    noExport
+
+// Render one doc-comment line as markdown: @param/@returns become list items, the rest is prose.
+val renderDocLine = (text: String): String =>
+  if startsWith(text, "@param ") then
+    val rest = trim(substring(text, 7, length(text)))
+    val pname = nameUntilDelim(rest, 0)
+    val pdescRaw = trim(substring(rest, length(pname), length(rest)))
+    // A param line may carry a trailing "@returns ..." (compact style); split it onto its own item.
+    if contains(pdescRaw, "@returns ") then
+      val cut = indexOf(pdescRaw, "@returns ")
+      val pd = trim(substring(pdescRaw, 0, cut))
+      val ret = trim(substring(pdescRaw, cut + 9, length(pdescRaw)))
+      "- **`${pname}`** — ${pd}\n- **Returns** ${ret}"
+    else
+      "- **`${pname}`** — ${pdescRaw}"
+  else if startsWith(text, "@returns ") then
+    "- **Returns** ${trim(substring(text, 9, length(text)))}"
+  else if startsWith(text, "@returns") then
+    "- **Returns** ${trim(substring(text, 8, length(text)))}"
+  else if startsWith(text, "@example") then
+    "- **Example:** ${trim(substring(text, 8, length(text)))}"
+  else if contains(text, "@returns ") then
+    // A compact one-liner like "Sum of a and b. @returns a + b." — split the prose from the
+    // mid-line @returns so the tag renders as its own Returns item instead of leaking verbatim.
+    val cut = indexOf(text, "@returns ")
+    val prose = trim(substring(text, 0, cut))
+    val ret = trim(substring(text, cut + 9, length(text)))
+    "${prose}\n- **Returns** ${ret}"
+  else
+    text
+
+// Render a buffered doc-comment block (array of bare text lines) into markdown lines, appending to
+// `out`. Plain prose lines are joined into a paragraph; @-tag lines render as their own list items.
+val renderDoc = (docLines: String[], out: String[]): Null =>
+  docLines.for(dl =>
+    push(out, renderDocLine(dl))
+  )
+
+// Generate the markdown for one module from its source.
+val genModule = (modName: String, source: String): String =>
+  val lines = split(source, "\n")
+  val out: String[] = []
+  push(out, "# std/${modName}")
+  push(out, "")
+
+  // 1. Module header comment block: the contiguous comment/blank lines at the very top, ending at
+  // the first real code line (import/export). The convention (enforced by a blank line after the
+  // header in every module) is that this whole block is the page intro; `headerEnd` is the first
+  // code line, so the body walk in step 2 starts there and never re-reads the header as a doc block.
+  var inHeader = true
+  var headerEnd = 0
+  var idx = 0
+  lines.for(line =>
+    if inHeader then
+      if isComment(line) then
+        // renderDocLine so that when a first-export doc folds into the header (modules whose top
+        // comment block runs straight into an export), its @param/@returns render rather than leak.
+        push(out, renderDocLine(stripComment(line)))
+      else if isBlank(line) then
+        push(out, "")
+      else
+        inHeader = false
+        headerEnd = idx
+    idx = idx + 1
+  )
+  push(out, "")
+  push(out, "## Reference")
+  push(out, "")
+
+  // 2. Walk the body (after the header), buffering doc comments and flushing them at each export.
+  // A section banner is held in `pendingSection` and only emitted when the NEXT export fires — so a
+  // banner over a purely-private region (e.g. "--- shared tables ---" above internal `val`s) is
+  // never shown in the public reference.
+  var pending: String[] = []
+  var pendingSection = ""
+  var bidx = 0
+  lines.for(line =>
+    if bidx < headerEnd then
+      bidx = bidx + 1
+    else if isComment(line) then
+      val text = stripComment(line)
+      if isBanner(text) then
+        val title = bannerTitle(text)
+        if title != "" then pendingSection = title
+        pending = []
+      else
+        push(pending, text)
+    else if isExport(line) then
+      // Emit a held section header lazily, now that we know a public export follows it.
+      if pendingSection != "" then
+        push(out, "### ${pendingSection}")
+        push(out, "")
+        pendingSection = ""
+      val nm = exportName(line)
+      val sig = signature(line)
+      push(out, "#### `${nm}`")
+      push(out, "")
+      push(out, "```lin")
+      push(out, sig)
+      push(out, "```")
+      push(out, "")
+      renderDoc(pending, out)
+      push(out, "")
+      pending = []
+    else if isBlank(line) then
+      // Blank line breaks a pending doc block from a non-doc'd export below it.
+      pending = []
+    else
+      // Any other code line (a private `val`, a continuation) clears pending docs.
+      pending = []
+  )
+
+  join(out, "\n")
+
+// List the stdlib modules (.lin, excluding .test.lin).
+val entriesJson = ls(stdlibDir, {})
+val entries = if isErr(entriesJson) then [] else entriesJson
+val modules = entries.filter(f => endsWith(f, ".lin") && !contains(f, ".test."))
+
+print("Generating stdlib docs from comments: ${length(modules)} modules...")
+mkdir(outDir, { "parents": true })
+
+modules.for(fname =>
+  val modName = substring(fname, 0, length(fname) - 4) // drop ".lin"
+  val srcJson = readFile("${stdlibDir}/${fname}")
+  if isErr(srcJson) then
+    print("  ERROR reading ${fname}")
+  else
+    val md = genModule(modName, srcJson)
+    val outPath = "${outDir}/${modName}.md"
+    val w = writeFile(outPath, md)
+    if isErr(w) then
+      print("  ERROR writing ${outPath}")
+    else
+      print("  ${outPath}")
+)
+
+// Remove orphaned pages: any content/stdlib/<x>.md whose stdlib/<x>.lin no longer exists (e.g. a
+// module that was consolidated away). Keeps the generated docs in lockstep with the source tree.
+val pagesJson = ls(outDir, {})
+val pages = if isErr(pagesJson) then [] else pagesJson
+pages.for(page =>
+  if endsWith(page, ".md") then
+    val base = substring(page, 0, length(page) - 3)
+    if !exists("${stdlibDir}/${base}.lin") then
+      rm("${outDir}/${page}", {})
+      print("  removed orphan ${outDir}/${page}")
+)
+
+print("Done.")

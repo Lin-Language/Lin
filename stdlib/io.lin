@@ -1,3 +1,10 @@
+// std/io — standard input, standard output, and process control.
+//
+// Functions for reading from stdin, writing to stdout/stderr, accessing the command-line
+// arguments, and exiting the process. `print` stringifies any value (strings unquoted, everything
+// else as JSON); the read functions return `String | Null` so EOF narrows with a plain `== null`.
+//
+//   import { print, readLine, args, exit } from "std/io"
 import foreign "lin-runtime"
   val lin_io_read_line: () => Json
   val lin_io_read_all: () => String
@@ -22,6 +29,9 @@ export val lines = (): String[] =>
 
 // Print a value to standard output, followed by a newline.
 // @param x  the value to print (stringified).
+// @example print("hello")     // hello
+// @example print([1, 2, 3])   // [1, 2, 3]
+// @example print({ "a": 1 })  // {"a":1}
 export val print = (x: Json): Null =>
   lin_print(x)
 

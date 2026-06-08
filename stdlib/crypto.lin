@@ -98,6 +98,7 @@ export val md5Hex = (data: UInt8[]): String =>
 // @param algorithm  "sha256" | "sha512" | "sha1" | "md5" (case-insensitive); an unknown name
 //                   falls back to sha256.
 // @returns the digest as lowercase hex.
+// @example hashString("abc", "sha256")  // "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 export val hashString = (s: String, algorithm: String): String =>
   val bytes = lin_crypto_to_bytes(s)
   val algo = algorithm.toLower()

@@ -58,6 +58,10 @@ type Msg<T> = { "kind": String, "value": T }
 //   `worker` handler cannot otherwise recover `T`); never delivered to `reduce`.
 // @returns an opaque emitter handle (a Worker; `Json` per §24.1 — the runtime handle, never a
 //   payload). `T`/`S` are inferred from `reduce`/`initial`/`sample`.
+// @example val sink = emitter((x: Int32, sum: Int32) => sum + x, 0, 0)   // T = S = Int32
+// @example send(sink, 10)   // send(sink, 5); fire-and-forget
+// @example val total: Int32 | Error = drain(sink, 0)   // 15 (once the Error arm is handled)
+// @example stop(sink)
 export val emitter = <T, S>(reduce: (T, S) => S, initial: S, sample: T): Json =>
   var state = initial
   worker(
@@ -165,6 +169,10 @@ export val off = <T>(b: Bus<T>, sub: Sub): Boolean =>
 // @param b      the bus.
 // @param value  the payload `T` to dispatch.
 // @returns the number of listeners invoked (0 if none — no Node-style crash-on-unhandled-error).
+// @example val b: Bus<Int32> = bus(d => print("tick ${d}"))
+// @example val sub = on(b, d => print("also ${d}"))   // once(b, ...) fires at most once
+// @example emit(b, 1)   // all listeners fire; returns the count
+// @example off(b, sub)  // unsubscribe by handle; emit(b, 2) now fires one fewer
 export val emit = <T>(b: Bus<T>, value: T): Int32 =>
   // Snapshot before firing so a listener that subscribes/unsubscribes during dispatch does not
   // perturb THIS emission (an added listener fires on the NEXT emit; a removed one still completes

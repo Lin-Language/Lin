@@ -35,5 +35,6 @@ export val toJsonString = (s: String): String =>
 // @param value  the value to serialize; arrays and objects recurse arbitrarily deep.
 // @returns the JSON text. Strings (and object keys) are escaped+quoted; numbers/bools/null become
 //   JSON literals (non-finite floats become `null`, matching JSON.stringify).
+// @example toJson({ "a": 1, "b": [true, null] })  // {"a":1,"b":[true,null]}
 export val toJson = (value: Json): String =>
   lin_to_json(value)

@@ -1,20 +1,43 @@
-// std/stream — opaque, lazy, effectful byte/value streams (streams brief, ADR-047).
+// std/stream — lazy, fallible streams over OS resources (files, sockets, subprocess stdout,
+// stdin). Streams brief, ADR-047.
 //
-// A `Stream<T>` is a lazy pull-source that owns an OS resource. Building a pipeline
-// (readStream → lines → map → filter → writeStream) allocates lazy adapter nodes but reads
-// NOTHING; a terminal driver (`.drain()`, `collect`, `readText`) pulls the graph to completion.
-// IN-BAND error threading: the first read/transform Error short-circuits straight to the
-// terminal op, so the chain stays fluent (no `is Error` between steps).
+// A `Stream<T>` is an opaque runtime value built as a lazy PULL GRAPH: a SOURCE node
+// (`readStream`), zero or more ADAPTERS (`lines`/`linesMax`/`chunks`, plus the std/iter
+// combinators map/filter/take/… which dispatch lazily on a stream receiver), and a TERMINAL op
+// that drives the graph one item at a time with bounded memory. Building a pipeline allocates
+// the lazy nodes but reads NOTHING; the terminal driver pulls it to completion.
 //
-// Stream is opaque: `compat.rs` forbids every non-stream operation on a `Stream` value, so the
-// only thing you can do with one is call these adapters/terminals. Transform closures operate on
-// boxed `Json` items (a chunk is `UInt8[]`, a line is `String` — both JSON-compatible), so map/
-// filter take `(Json) => Json` / `(Json) => Boolean`.
-// Open a file as a lazy byte stream.
-// @param path  the file path to open.
-// @returns a `Stream<UInt8[]>`, or an `Error` if the file cannot be opened. (Return type is
-//   inferred from the intrinsic — the opaque Stream type cannot drive a clean re-export
-//   annotation here.)
+//   import { readStream, writeLines, drain } from "std/stream"
+//   import { map, filter, take, for } from "std/iter"
+//
+//   readStream("in.csv").lines().map(transform).filter(notEmpty).writeLines("out.csv").drain()
+//
+// Errors are threaded IN-BAND: the first read error poisons the upstream and short-circuits to
+// the terminal op, so error handling lives only at the terminal, not at every adapter.
+//
+// The generic combinators (map/filter/take/drop/reduce/for/…) are NOT part of std/stream — they
+// come from std/iter and dispatch to the lazy stream backend automatically when the receiver is
+// a `Stream`. A pipeline imports its SOURCES and SINKS from std/stream and its COMBINATORS from
+// std/iter. (The optional callback index parameter documented in std/iter is for array/iterator
+// receivers only — lazy stream combinators keep 1-arg callbacks.) Byte sources also come from
+// other modules: `tcpStream` (std/net), `stdoutStream` (std/process), and `stdinStream` (std/io)
+// all return `Stream<UInt8[]>` and feed the same adapters and terminals.
+//
+// A STREAM CAN ONLY BE READ ONCE. A stream is consumed as you read it, so each one flows through
+// a single pipeline; once you've called a combinator or terminal on a stream, reaching for it
+// again is a compile-time error. To make a second pass, open a fresh stream. You don't have to
+// consume a stream — opening one and never reading it is fine; it cleans up after itself. Keep a
+// stream in a local `val` (or pass/return it from a function); it can't be stashed in objects,
+// arrays, or `var`s.
+//
+// Maintainer note: Stream is opaque — `compat.rs` forbids every non-stream operation on a
+// `Stream` value. Transform closures operate on boxed `Json` items (a chunk is `UInt8[]`, a line
+// is `String` — both JSON-compatible), so map/filter take `(Json) => Json` / `(Json) => Boolean`.
+//
+// `readStream(path)` opens a file as a lazy byte stream (`Stream<UInt8[]>`, or an `Error` if the
+// file cannot be opened); no bytes are read until a terminal op drives it. Example:
+//
+//   readStream("notes.txt").readText()   // file contents as String | Error
 export val readStream = (path: String) =>
   lin_fs_open(path)
 
@@ -23,6 +46,7 @@ export val readStream = (path: String) =>
 // @returns a `Stream<String>`. A single line is capped at 64 MiB, so a newline-less input fails
 //   in-band with an `Error` rather than buffering the whole stream; use `linesMax` to change the
 //   cap.
+// @example readStream("access.log").lines().for(line => print(line))   // `for` from std/iter
 export val lines = (s: Stream): Stream =>
   lin_stream_lines(s, 0)
 
@@ -37,6 +61,7 @@ export val linesMax = (s: Stream, maxBytes: Int32): Stream =>
 // @param s  the upstream byte stream.
 // @param n  the target chunk size in bytes (the final chunk may be shorter).
 // @returns a `Stream<UInt8[]>`.
+// @example readStream("frames.bin").chunks(188).for(frame => process(frame))
 export val chunks = (s: Stream, n: Int32): Stream =>
   lin_stream_chunks(s, n)
 
@@ -56,6 +81,7 @@ export val chunks = (s: Stream, n: Int32): Stream =>
 // @param s     the upstream stream to write.
 // @param path  the destination file path.
 // @returns a sink `Stream` node; nothing is written until a terminal driver runs it.
+// @example readStream("data.txt").gzip().writeStream("data.gz").drain()   // raw bytes, valid .gz
 export val writeStream = (s: Stream, path: String): Stream =>
   lin_stream_write(s, path)
 
@@ -64,6 +90,7 @@ export val writeStream = (s: Stream, path: String): Stream =>
 // @param s     the upstream stream to write.
 // @param path  the destination file path.
 // @returns a sink `Stream` node; nothing is written until a terminal driver runs it.
+// @example readStream("in.csv").lines().map(transform).writeLines("out.csv").drain()
 export val writeLines = (s: Stream, path: String): Stream =>
   lin_stream_write_lines(s, path)
 
@@ -77,6 +104,7 @@ export val drain = (s: Stream): Json =>
 // Terminal: pull all bytes into a single buffer.
 // @param s  the byte pipeline to drive.
 // @returns a `UInt8[]` of all bytes, or an `Error` if a read/transform faulted.
+// @example readStream("data.bin").collect()   // UInt8[] | Error
 export val collect = (s: Stream): Json =>
   lin_stream_collect(s)
 
@@ -100,6 +128,9 @@ export val close = (s: Stream): Null =>
 // it to EOF. Run several with `parallel([...])`.
 // @param s  the pipeline to drive off-thread.
 // @returns a `Promise<Null | Error>`; awaiting it yields `Null` on success, or an `Error` if a
-//   read/transform faulted (caught at the async boundary, ADR-045 / §32.2.2).
+//   read/transform faulted (caught at the async boundary, ADR-045 / §32.2.2). `await` reattaches
+//   the `Null | Error` union, so the `Error` case must be handled (see std/async).
+// @example val p = readStream("big.log").lines().filter(isError).writeLines("errors.log").promise()
+// @example match await(p) is Error => print("failed") else => print("done")
 export val promise = (s: Stream): Json =>
   lin_stream_promise(s)

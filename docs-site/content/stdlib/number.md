@@ -1,140 +1,187 @@
 # std/number
 
-Numeric parsing and conversion functions.
+std/number — numeric parsing, conversion, and fixed-width casts.
 
-```lin
+Two parsing styles: the bare `parseInt32`/`parseFloat64` raise a runtime error on bad input, while
+`tryParseInt32`/`tryParseFloat64` narrow to `null` instead so callers can test with a plain
+`== null` / `is Int32`. Guard untrusted input with `isInt32`/`isFloat64`, or just use the
+try-variants. `toInt32`/`toFloat64`/`toFloat32` convert between the numeric types (truncating or
+widening). The fixed-width casts (toUInt8/toInt8/…/toUInt64) take a UInt64 and truncate/reinterpret
+to the target width — the building blocks for the bit-level packing in std/bytes.
+
 import { parseInt32, parseFloat64, toInt32, toFloat64, isInt32, isFloat64 } from "std/number"
-```
 
-## Function reference
+## Reference
 
-| Function | Signature | Description |
-| --- | --- | --- |
-| `isFloat64` | `(String) -> Boolean` | True if string parses as Float64 |
-| `isInt32` | `(String) -> Boolean` | True if string parses as Int32 |
-| `parseFloat64` | `(String) -> Float64` | Parse decimal string to Float64 |
-| `parseInt32` | `(String) -> Int32` | Parse decimal string to Int32 |
-| `toFloat32` | `(Float64) -> Float32` | Narrow Float64 to Float32 |
-| `toFloat64` | `(Int32) -> Float64` | Widen Int32 to Float64 |
-| `toInt8` | `(UInt64) -> Int8` | Truncate to an 8-bit signed byte |
-| `toInt16` | `(UInt64) -> Int16` | Truncate to a 16-bit signed int |
-| `toInt32` | `(Float64) -> Int32` | Truncate Float64 to Int32 |
-| `toInt64` | `(UInt64) -> Int64` | Reinterpret to a 64-bit signed int |
-| `toUInt8` | `(UInt64) -> UInt8` | Truncate to an 8-bit unsigned byte |
-| `toUInt16` | `(UInt64) -> UInt16` | Truncate to a 16-bit unsigned int |
-| `toUInt32` | `(UInt64) -> UInt32` | Truncate to a 32-bit unsigned int |
-| `toUInt64` | `(UInt64) -> UInt64` | Identity / reinterpret to 64-bit unsigned int |
-| `tryParseFloat64` | `(String) -> Float64 \| Null` | Parse Float64 safely |
-| `tryParseInt32` | `(String) -> Int32 \| Null` | Parse Int32 safely |
-
----
-
-### `parseInt32`
+#### `parseInt32`
 
 ```lin
-val parseInt32: (s: String) -> Int32
+val parseInt32 = (s: String): Int32
 ```
 
-Parses `s` as a base-10 integer. Runtime error if unparseable or overflows `Int32`. Use `tryParseInt32` for safe parsing.
+Parse `s` as a base-10 Int32.
+- **`s`** — the string to parse.
+- **Returns** the parsed integer. Runtime error if unparseable or out of Int32 range — use
+  `tryParseInt32` for safe parsing.
+- **Example:** parseInt32("42")   // 42
+
+#### `parseFloat64`
 
 ```lin
-parseInt32("42")    // 42
-parseInt32("-7")    // -7
+val parseFloat64 = (s: String): Float64
 ```
 
----
+Parse `s` as a Float64.
+- **`s`** — the string to parse.
+- **Returns** the parsed floating-point value.
+- **Example:** parseFloat64("1e10")   // 10000000000.0
 
-### `tryParseInt32`
+#### `toInt32`
 
 ```lin
-val tryParseInt32: (s: String) -> Int32 | Null
+val toInt32 = (v: Float64): Int32
 ```
 
-Returns `Null` if `s` is not a valid `Int32`, instead of a runtime error.
+Convert a Float64 to an Int32 by truncation toward zero.
+- **`v`** — the float to convert.
+- **Returns** the truncated Int32. Runtime error if `v` cannot be represented as an Int32.
+- **Example:** toInt32(3.9)   // 3
+
+#### `toFloat64`
 
 ```lin
-tryParseInt32("42")    // 42
-tryParseInt32("bad")   // null
-tryParseInt32("3.14")  // null
+val toFloat64 = (v: Int32): Float64
 ```
 
----
+Widen an Int32 to a Float64.
+- **`v`** — the integer to convert.
+- **Returns** the equivalent Float64 (always exact).
+- **Example:** toFloat64(42)   // 42.0
 
-### `parseFloat64`
+#### `toFloat32`
 
 ```lin
-val parseFloat64: (s: String) -> Float64
+val toFloat32 = (v: Float64): Float32
 ```
+
+Narrow a Float64 to a Float32.
+- **`v`** — the double to convert.
+- **Returns** the value rounded to Float32 precision.
+
+#### `toUInt8`
 
 ```lin
-parseFloat64("3.14")   // 3.14
-parseFloat64("1e10")   // 10000000000.0
+val toUInt8 = (v: UInt64): UInt8
 ```
 
----
+Explicit narrowing integer casts (spec §26). Each truncates the input to the target width
+using two's-complement / `as`-cast semantics. The input is taken as UInt64 (the widest
+unsigned) so any narrower unsigned integer — or a value masked down to a byte/word — widens
+into it at the call site without range loss; truncation to the target width is then well
+defined.
+Truncate `v` to a UInt8.
+- **`v`** — the value to narrow (taken as UInt64).
+- **Returns** the low 8 bits of `v` as a UInt8.
+- **Example:** toUInt8(0x1FF)   // 255  (low 8 bits)
 
-### `tryParseFloat64`
+#### `toInt8`
 
 ```lin
-val tryParseFloat64: (s: String) -> Float64 | Null
+val toInt8 = (v: UInt64): Int8
 ```
+
+Truncate `v` to an Int8.
+- **`v`** — the value to narrow (taken as UInt64).
+- **Returns** the low 8 bits of `v` as a signed Int8.
+
+#### `toUInt16`
 
 ```lin
-tryParseFloat64("3.14")   // 3.14
-tryParseFloat64("bad")    // null
+val toUInt16 = (v: UInt64): UInt16
 ```
 
----
+Truncate `v` to a UInt16.
+- **`v`** — the value to narrow (taken as UInt64).
+- **Returns** the low 16 bits of `v` as a UInt16.
 
-### `toInt32`
+#### `toInt16`
 
 ```lin
-val toInt32: (v: Float64) -> Int32
+val toInt16 = (v: UInt64): Int16
 ```
 
-Truncates toward zero. Runtime error if value cannot be represented as `Int32`.
+Truncate `v` to an Int16.
+- **`v`** — the value to narrow (taken as UInt64).
+- **Returns** the low 16 bits of `v` as a signed Int16.
+
+#### `toUInt32`
 
 ```lin
-toInt32(3.9)    // 3
-toInt32(-2.1)   // -2
+val toUInt32 = (v: UInt64): UInt32
 ```
 
----
+Truncate `v` to a UInt32.
+- **`v`** — the value to narrow (taken as UInt64).
+- **Returns** the low 32 bits of `v` as a UInt32.
 
-### `toFloat64`
+#### `toInt64`
 
 ```lin
-val toFloat64: (v: Int32) -> Float64
+val toInt64 = (v: UInt64): Int64
 ```
 
-Widens `Int32` to `Float64`. Always exact.
+Reinterpret `v` as a signed Int64.
+- **`v`** — the value to convert (taken as UInt64).
+- **Returns** the same bit pattern as a signed Int64.
+
+#### `toUInt64`
 
 ```lin
-toFloat64(42)   // 42.0
+val toUInt64 = (v: UInt64): UInt64
 ```
 
----
+Identity cast keeping `v` as a UInt64.
+- **`v`** — the value.
+- **Returns** `v` as a UInt64.
 
-### `isInt32` / `isFloat64`
-
-Use these to guard untrusted input before calling the non-safe parse functions:
+#### `isInt32`
 
 ```lin
-val safe = (s: String): Int32 | Null =>
-  if isInt32(s) then parseInt32(s)
-  else null
+val isInt32 = (s: String): Boolean
 ```
 
-Or prefer `tryParseInt32` / `tryParseFloat64` directly.
+Test whether `s` is a valid base-10 Int32.
+- **`s`** — the string to test.
+- **Returns** `true` if `s` parses as an Int32, otherwise `false`.
 
----
-
-### Narrowing casts
-
-The fixed-width casts (`toUInt8`, `toInt8`, `toUInt16`, `toInt16`, `toUInt32`, `toInt64`, `toUInt64`) all take a `UInt64` and truncate/reinterpret it to the target width. They are the building blocks for the bit-level packing in `std/bytes`.
+#### `isFloat64`
 
 ```lin
-toUInt8(0x1FF)    // 255   (low 8 bits)
-toUInt16(0x1FFFF) // 65535 (low 16 bits)
-toFloat32(3.14159265358979)   // 3.1415927  (Float32 precision)
+val isFloat64 = (s: String): Boolean
 ```
+
+Test whether `s` is a valid Float64.
+- **`s`** — the string to test.
+- **Returns** `true` if `s` parses as a Float64, otherwise `false`.
+
+#### `tryParseInt32`
+
+```lin
+val tryParseInt32 = (s: String): Int32 | Null
+```
+
+Parse `s` to an Int32, narrowing to `null` on failure so callers can test with a plain
+`== null` / `is Int32` instead of an untyped `Json` read.
+- **`s`** — the string to parse.
+- **Returns** the parsed Int32, or `null` if `s` is not a valid integer.
+- **Example:** tryParseInt32("bad")   // null
+
+#### `tryParseFloat64`
+
+```lin
+val tryParseFloat64 = (s: String): Float64 | Null
+```
+
+Parse `s` to a Float64, narrowing to `null` on failure.
+- **`s`** — the string to parse.
+- **Returns** the parsed Float64, or `null` if `s` is not a valid float.

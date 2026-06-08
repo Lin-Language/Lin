@@ -648,11 +648,20 @@ export val base64DecodeString = (s: String): String | Error =>
     fromUtf8(bytes)
 
 // --- structural hash -------------------------------------------------------
-// Compute a stable structural hash key for any value: equal values produce equal keys (objects are
-// order-independent, arrays element-wise, type-tagged so 42 and "42" differ). Generic over the
-// input type — it walks the runtime value, so T can be anything. (Folded in from the former
-// std/hash module.)
+// Compute a stable, canonical, type-tagged structural hash key for any value. The key matches
+// Lin's structural equality (spec §14): equal values hash equal, objects hash independently of
+// key order, and arrays hash order-sensitively. The type tag means values of different types
+// never collide — `hash(42)` is `"i:42"` while `hash("42")` is `"s:42"`. Use it to deduplicate
+// values or index them by structural identity (e.g. as object keys in a hand-rolled set/map, or
+// to bucket structurally-equal records with std/array's `countBy`). Generic over the input type —
+// it walks the runtime value, so T can be anything. (Folded in from the former std/hash module.)
 // @param x  the value to hash.
 // @returns the structural hash key as a String.
+// @example hash(null)     // "N"
+// @example hash(42)       // "i:42"
+// @example hash("hello")  // "s:hello"
+// @example hash([1, 2, 3]) == hash([1, 2, 3])   // true (order-sensitive: [1,2] != [2,1])
+// @example hash({ "x": 1, "y": 2 }) == hash({ "y": 2, "x": 1 })   // true (order-independent)
+// @example hash(42) == hash("42")   // false (type-tagged: never collides across types)
 export val hash = <T>(x: T): String =>
   lin_value_key(x)

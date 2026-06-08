@@ -1,3 +1,9 @@
+// std/string — string manipulation functions.
+//
+// All operations are codepoint-aware: indices and lengths count Unicode codepoints, not bytes. The
+// one exception is `byteAt`, a low-level O(1) raw-UTF-8 byte accessor for fast byte/ASCII scanning.
+//
+// import { trim, toUpper, toLower, split, join, replace, replaceAll, contains, startsWith, endsWith, substring, indexOf, length } from "std/string"
 import { for } from "std/iter"
 
 import foreign "lin-runtime"
@@ -28,6 +34,7 @@ import foreign "lin-runtime"
 // Remove whitespace from both ends of `s`.
 // @param s  the string to trim.
 // @returns `s` with leading and trailing whitespace removed.
+// @example trim("  hello  ")   // "hello"
 export val trim = (s: String): String =>
   lin_string_trim(s)
 
@@ -46,12 +53,14 @@ export val trimEnd = (s: String): String =>
 // Convert `s` to upper case.
 // @param s  the string to convert.
 // @returns the upper-cased string.
+// @example toUpper("hello")   // "HELLO"
 export val toUpper = (s: String): String =>
   lin_string_to_upper(s)
 
 // Convert `s` to lower case.
 // @param s  the string to convert.
 // @returns the lower-cased string.
+// @example toLower("HELLO")   // "hello"
 export val toLower = (s: String): String =>
   lin_string_to_lower(s)
 
@@ -60,6 +69,9 @@ export val toLower = (s: String): String =>
 // @param start  the start index (inclusive).
 // @param end    the end index (exclusive); defaults to the length of `s`.
 // @returns the substring between `start` and `end`.
+// @example substring("hello", 1, 3)    // "el"
+// @example substring("hello", 2)       // "llo"   (omitted end defaults to length)
+// @example substring("hello", 0, -1)   // "hell"  (strip last char)
 export val substring = (s: String, start: Int32, end: Int32 = _length(s)): String =>
   lin_string_slice(s, start, end)
 
@@ -74,6 +86,8 @@ val _substring = (s: String, start: Int32, end: Int32): String =>
 // @param needle     the substring to find.
 // @param fromIndex  the index to start searching from (default 0).
 // @returns the index of the first match at or after `fromIndex`, or -1 if not found.
+// @example indexOf("hello world", "o")   // 4
+// @example indexOf("abcabc", "bc", 2)    // 4   (search at or after fromIndex)
 export val indexOf = (s: String, needle: String, fromIndex: Int32 = 0): Int32 =>
   lin_string_index_of_from(s, needle, fromIndex)
 
@@ -82,6 +96,8 @@ export val indexOf = (s: String, needle: String, fromIndex: Int32 = 0): Int32 =>
 // @param needle     the substring to find.
 // @param fromIndex  the index to start searching back from (default the length of `s`).
 // @returns the index of the last match at or before `fromIndex`, or -1 if not found.
+// @example lastIndexOf("hello world", "o")  // 7
+// @example lastIndexOf("abcabc", "bc", 2)   // 1   (search at or before fromIndex)
 export val lastIndexOf = (s: String, needle: String, fromIndex: Int32 = _length(s)): Int32 =>
   lin_string_last_index_of_from(s, needle, fromIndex)
 
@@ -95,6 +111,7 @@ export val isBlank = (s: String): Boolean =>
 // @param s       the string to search.
 // @param needle  the substring to look for.
 // @returns `true` if `needle` occurs in `s`, otherwise `false`.
+// @example contains("hello world", "world")   // true
 export val contains = (s: String, needle: String): Boolean =>
   lin_string_index_of(s, needle) != -1
 
@@ -102,6 +119,7 @@ export val contains = (s: String, needle: String): Boolean =>
 // @param s       the string to test.
 // @param prefix  the prefix to check for.
 // @returns `true` if `s` starts with `prefix`, otherwise `false`.
+// @example startsWith("hello", "hel")   // true
 export val startsWith = (s: String, prefix: String): Boolean =>
   lin_string_starts_with(s, prefix)
 
@@ -109,6 +127,7 @@ export val startsWith = (s: String, prefix: String): Boolean =>
 // @param s       the string to test.
 // @param suffix  the suffix to check for.
 // @returns `true` if `s` ends with `suffix`, otherwise `false`.
+// @example endsWith("hello", "llo")   // true
 export val endsWith = (s: String, suffix: String): Boolean =>
   lin_string_ends_with(s, suffix)
 
@@ -116,6 +135,7 @@ export val endsWith = (s: String, suffix: String): Boolean =>
 // @param s          the string to split.
 // @param delimiter  the separator to split on.
 // @returns the array of pieces between delimiters.
+// @example split("a,b,c", ",")   // ["a", "b", "c"]
 export val split = (s: String, delimiter: String): String[] =>
   lin_string_split(s, delimiter)
 
@@ -123,6 +143,7 @@ export val split = (s: String, delimiter: String): String[] =>
 // @param arr        the strings to join.
 // @param separator  the text placed between elements.
 // @returns the joined string.
+// @example join(["a", "b", "c"], ",")   // "a,b,c"
 export val join = (arr: String[], separator: String): String =>
   lin_string_join_arr(arr, separator)
 
@@ -131,6 +152,7 @@ export val join = (arr: String[], separator: String): String =>
 // @param pattern      the substring to replace.
 // @param replacement  the text to substitute in.
 // @returns `s` with the first match of `pattern` replaced, or `s` unchanged if `pattern` is absent.
+// @example replace("hello world", "world", "Lin")   // "hello Lin"
 export val replace = (s: String, pattern: String, replacement: String): String =>
   val idx = lin_string_index_of(s, pattern)
   if idx == -1 then
@@ -145,6 +167,7 @@ export val replace = (s: String, pattern: String, replacement: String): String =
 // @param pattern      the substring to replace.
 // @param replacement  the text to substitute in.
 // @returns `s` with all matches of `pattern` replaced.
+// @example replaceAll("aabbcc", "b", "x")   // "aaxxcc"
 export val replaceAll = (s: String, pattern: String, replacement: String): String =>
   lin_string_replace_all(s, pattern, replacement)
 
@@ -152,6 +175,7 @@ export val replaceAll = (s: String, pattern: String, replacement: String): Strin
 // @param s      the string to repeat.
 // @param count  the number of copies to concatenate.
 // @returns the concatenation of `count` copies of `s`.
+// @example repeat("-", 5)   // "-----"
 export val repeat = (s: String, count: Int32): String =>
   lin_string_repeat(s, count)
 
@@ -159,14 +183,20 @@ export val repeat = (s: String, count: Int32): String =>
 // @param s      the source string.
 // @param index  the character index; negative counts from the end.
 // @returns the single-character string at the (resolved) index.
+// @example at("hello", 0)    // "h"
+// @example at("hello", -1)   // "o"
 export val at = (s: String, index: Int32): String =>
   val i = if index < 0 then _length(s) + index else index
   lin_string_char_at(s, i)
 
-// Get the Unicode code point at character index `index`.
+// Get the numeric Unicode code point at character index `index` (alias of `codePointAt`). A negative
+// index counts from the end codepoint-wise (`-1` is the last codepoint); an out-of-range index returns
+// -1. Codepoint-indexed and therefore O(n) per call — for fast byte/ASCII scanning use `byteAt`.
 // @param s      the source string.
-// @param index  the character (code-point) index.
-// @returns the code point value at `index`.
+// @param index  the character (code-point) index; negative counts from the end.
+// @returns the code point value at `index`, or -1 if out of range.
+// @example charCode("café", 3)   // 233   (é)
+// @example charCode("hi", -1)    // 105   (i, counting from the end)
 export val charCode = (s: String, index: Int32): Int32 =>
   lin_string_char_code(s, index)
 
@@ -176,12 +206,15 @@ export val charCode = (s: String, index: Int32): Int32 =>
 // @param s      the source string.
 // @param index  the byte index.
 // @returns the byte value at `index`, or -1 if out of range.
+// @example byteAt("ABC", 0)   // 65
+// @example byteAt("AB", 5)    // -1
 export val byteAt = (s: String, index: Int32): Int32 =>
   lin_string_byte_at(s, index)
 
 // Build a single-character string from a Unicode code point.
 // @param code  the code point value.
 // @returns the one-character string for `code`.
+// @example fromCharCode(65)   // "A"
 export val fromCharCode = (code: Int32): String =>
   lin_string_from_char_code(code)
 
@@ -195,6 +228,7 @@ export val lines = (s: String): String[] =>
 // @param s      the source string.
 // @param index  the character (code-point) index.
 // @returns the code point value at `index`.
+// @example codePointAt("A", 0)   // 65
 export val codePointAt = (s: String, index: Int32): Int32 =>
   lin_string_char_code(s, index)
 
@@ -211,6 +245,8 @@ export val fromCodePoints = (codes: Int32[]): String =>
 // @param width  the minimum target width.
 // @param pad    the padding string repeated on the left (default a single space).
 // @returns `s` padded on the left, or `s` unchanged if it is already at least `width` wide.
+// @example padStart("42", 5, "0")   // "00042"
+// @example padStart("5", 3)         // "  5"    (pad defaults to a space)
 export val padStart = (s: String, width: Int32, pad: String = " "): String =>
   val len = _length(s)
   if len >= width then
@@ -226,6 +262,7 @@ export val padStart = (s: String, width: Int32, pad: String = " "): String =>
 // @param width  the minimum target width.
 // @param pad    the padding string repeated on the right (default a single space).
 // @returns `s` padded on the right, or `s` unchanged if it is already at least `width` wide.
+// @example padEnd("hi", 5, ".")   // "hi..."
 export val padEnd = (s: String, width: Int32, pad: String = " "): String =>
   val len = _length(s)
   if len >= width then
@@ -249,5 +286,8 @@ export val fromUtf8 = (bytes: UInt8[]): String | Error =>
 // Render any JSON value as its string representation.
 // @param x  the value to stringify.
 // @returns the string form of `x`.
+// @example toString(42)        // "42"
+// @example toString(true)      // "true"
+// @example toString([1, 2])    // "[1, 2]"
 export val toString = (x: Json): String =>
   lin_to_string(x)

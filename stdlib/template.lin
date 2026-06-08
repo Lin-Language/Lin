@@ -1,3 +1,18 @@
+// std/template — Jinja-style template rendering, backed by the minijinja engine (ADR-048).
+//
+// `renderWith` renders an in-memory template string; `render` loads a `.jinja` file from disk
+// (and supports `{% extends %}`/`{% include %}` layouts, resolved from the file's directory).
+// The data record `{}` is the render context. Both return `String | Error` — a syntax/render
+// failure is the canonical `Error` value `{ "type": "error", "message": ... }`, matched with
+// `is Error`.
+//
+//   import { render, renderWith } from "std/template"
+//
+// Template syntax: substitutions `{{ name }}` / `{{ stats.score }}` (dot-paths into the data
+// record); loops `{% for x in xs %}...{% endfor %}`; conditionals `{% if c %}...{% else %}...{% endif %}`;
+// the standard minijinja filters (`{{ name | upper }}`). Undefined/missing variables render as the
+// empty string (not null, not an error). Only the file-based `render` can resolve layouts —
+// `renderWith` has no source directory, so it cannot follow `{% extends %}`/`{% include %}`.
 import foreign "lin-runtime"
   val lin_template_render: (String, {  }) => Json
   val lin_template_render_path: (String, {  }) => Json
@@ -8,6 +23,7 @@ import foreign "lin-runtime"
 // @param data      the variables to render against; undefined variables render as `""`.
 // @returns the rendered `String`, or an `Error` object `{ type, message }` on a syntax/render
 //   error.
+// @example renderWith("<h1>{{ t }}</h1>", { "t": "Hi" })  // "<h1>Hi</h1>"
 export val renderWith = (template: String, data: {  }): Json =>
   lin_template_render(template, data)
 
