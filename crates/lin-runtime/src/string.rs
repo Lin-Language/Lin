@@ -882,6 +882,13 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
         let s = lin_object_to_string(obj as *const crate::object::LinObject);
         crate::object::lin_object_release(obj as *mut crate::object::LinObject);
         s
+    } else if tag == crate::tagged::TAG_BIGNUM {
+        // Opaque BigInt handle: render its exact base-10 form (so accidental interpolation shows
+        // the value rather than `[object]`; the canonical entry point is still std/bignum.toString).
+        crate::bignum::bignum_render(payload as *const u8)
+    } else if tag == crate::tagged::TAG_DECIMAL {
+        // Opaque Decimal handle: render its exact, scale-preserving base-10 form.
+        crate::decimal::decimal_render(payload as *const u8)
     } else {
         lin_string_from_bytes(b"[object]".as_ptr(), 8)
     }
@@ -1015,6 +1022,65 @@ unsafe fn push_json_object(out: &mut String, obj: *const crate::object::LinObjec
         push_json_value(out, &(*entry).value as *const TaggedVal);
     }
     out.push('}');
+}
+
+/// Decode a `UInt8[]` of UTF-8 bytes into a validated `String`. The inverse of `byteAt`:
+/// `byteAt` turns a `String` into bytes one at a time; this turns the byte buffer back into a
+/// `String`, validating that the bytes are well-formed UTF-8. Returns a boxed `TaggedVal*`:
+///   * success → `TAG_STR` box wrapping a fresh +1 `LinString`
+///   * invalid UTF-8 → `TAG_OBJECT` box wrapping the standard `{type:"error",message}` shape
+/// This is why the foreign declaration is `=> Json` (a boxed tagged value, re-annotated to
+/// `String | Error` in the `std/string.fromUtf8` wrapper): a bare `=> UInt8[]`/`=> String`
+/// foreign return cannot carry the Error arm. `arr` may be a raw `LinArray*` or a
+/// `TaggedVal*(Array)`; flat `UInt8`/`Int8` buffers are read straight from the data buffer,
+/// other element shapes fall back to per-element boxing + truncation (mirrors
+/// `lin_fs_write_file_bytes`). The returned box is independently owned by the caller (release
+/// with `lin_tagged_release`).
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_from_utf8(arr: *const u8) -> *mut u8 {
+    use crate::array::{lin_array_get_tagged, lin_array_length, LinArray};
+    use crate::fs::make_error_tagged;
+    use crate::tagged::{alloc_tagged, TaggedVal, TAG_ARRAY, TAG_UINT8, TAG_INT8};
+    if arr.is_null() {
+        return make_error_tagged("fromUtf8: null byte array");
+    }
+    // arr may be a TaggedVal*(Array) or a raw LinArray* (see resolve patterns in fs.rs).
+    let head = (arr as *const u64).read_unaligned();
+    let lin_arr = if head == TAG_ARRAY as u64 {
+        (*(arr as *const TaggedVal)).payload as *const LinArray
+    } else {
+        arr as *const LinArray
+    };
+    if lin_arr.is_null() {
+        return make_error_tagged("fromUtf8: null byte array");
+    }
+    let len = lin_array_length(lin_arr) as usize;
+    let mut bytes: Vec<u8> = Vec::with_capacity(len);
+    let elem_tag = (*lin_arr).elem_tag;
+    if elem_tag == TAG_UINT8 || elem_tag == TAG_INT8 {
+        // Flat 1-byte buffer: copy the raw bytes directly.
+        let data = (*lin_arr).data as *const u8;
+        for i in 0..len {
+            bytes.push(*data.add(i));
+        }
+    } else {
+        // Tagged / wider-element arrays: box each element and truncate to a byte.
+        for i in 0..len as i64 {
+            let tv_ptr = lin_array_get_tagged(lin_arr, i);
+            let v = if tv_ptr.is_null() {
+                0u8
+            } else {
+                let payload = (*tv_ptr).payload;
+                std::alloc::dealloc(tv_ptr as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+                payload as u8
+            };
+            bytes.push(v);
+        }
+    }
+    match std::str::from_utf8(&bytes) {
+        Ok(s) => alloc_tagged(TAG_STR, lin_string_from_bytes(s.as_ptr(), s.len() as u32) as u64),
+        Err(_) => make_error_tagged("fromUtf8: invalid UTF-8 byte sequence"),
+    }
 }
 
 /// Serialize ANY Lin value (passed as a boxed TaggedVal*) to a strict, valid JSON string.

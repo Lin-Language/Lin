@@ -1,151 +1,48 @@
 # std/template
 
-Jinja-style template rendering, backed by the [minijinja](https://crates.io/crates/minijinja) engine.
+std/template — Jinja-style template rendering, backed by the minijinja engine (ADR-048).
+
+`renderWith` renders an in-memory template string; `render` loads a `.jinja` file from disk
+(and supports `{% extends %}`/`{% include %}` layouts, resolved from the file's directory).
+The data record `{}` is the render context. Both return `String | Error` — a syntax/render
+failure is the canonical `Error` value `{ "type": "error", "message": ... }`, matched with
+`is Error`.
+
+  import { render, renderWith } from "std/template"
+
+Template syntax: substitutions `{{ name }}` / `{{ stats.score }}` (dot-paths into the data
+record); loops `{% for x in xs %}...{% endfor %}`; conditionals `{% if c %}...{% else %}...{% endif %}`;
+the standard minijinja filters (`{{ name | upper }}`). Undefined/missing variables render as the
+empty string (not null, not an error). Only the file-based `render` can resolve layouts —
+`renderWith` has no source directory, so it cannot follow `{% extends %}`/`{% include %}`.
+
+## Reference
+
+#### `renderWith`
 
 ```lin
-import { render, renderWith } from "std/template"
+val renderWith = (template: String, data: {  }): Json
 ```
 
-## Function reference
+Render an in-memory Jinja-style template string (minijinja-backed, ADR-048).
+- **`template`** — the template source. Because it is in-memory, `{% extends %}`/`{% include %}`
+  cannot resolve (no directory to load from) — use `render` for layout/inheritance.
+- **`data`** — the variables to render against; undefined variables render as `""`.
+- **Returns** the rendered `String`, or an `Error` object `{ type, message }` on a syntax/render
+  error.
+- **Example:** renderWith("<h1>{{ t }}</h1>", { "t": "Hi" })  // "<h1>Hi</h1>"
 
-| Function | Signature | Description |
-| --- | --- | --- |
-| `render` | `(String, {}) -> String \| Error` | Load a `.jinja` file and render with data |
-| `renderWith` | `(String, {}) -> String \| Error` | Render a template string directly |
-
-## Template syntax
-
-Templates use Jinja syntax. The data record `{}` is the render context.
-
-- **Substitutions** — `{{ name }}`, `{{ stats.score }}` (dot-separated paths into the data record).
-- **Loops** — `{% for item in items %}...{% endfor %}`.
-- **Conditionals** — `{% if cond %}...{% else %}...{% endif %}`.
-- **Filters** — the standard minijinja builtin filters, e.g. `{{ name | upper }}`.
-- **Layouts** — `{% extends "base.jinja" %}` + `{% block %}`, and partials via `{% include "footer.jinja" %}` (file-based `render` only — see [Layouts](#layouts)).
-
-```
-Hello, {{ name }}!
-You have {{ stats.messages }} unread messages.
-{% for tag in tags %}#{{ tag }} {% endfor %}
-```
-
-**Undefined / missing variables render as the empty string** (not `null`, not an error). A **template syntax error or render failure** is returned as an `Error` value (`{ "type": "error", "message": ... }`), discriminated with `is Error`.
-
----
-
-### `renderWith`
+#### `render`
 
 ```lin
-val html = renderWith(
-  "<h1>{{ title }}</h1><p>{{ body }}</p>",
-  { "title": "Hello", "body": "World" }
-)
-// "<h1>Hello</h1><p>World</p>"
+val render = (path: String, data: {  }): Json
 ```
 
-Loops and conditionals work too:
-
-```lin
-renderWith(
-  "{% for n in nums %}{{ n }}{% if not loop.last %}, {% endif %}{% endfor %}",
-  { "nums": [1, 2, 3] }
-)
-// "1, 2, 3"
-```
-
-A missing variable renders as the empty string; a malformed template returns an `Error`.
-
----
-
-### `render`
-
-```lin
-val result = render("templates/email.jinja", {
-  "name": "Alice",
-  "subject": "Welcome"
-})
-match result
-  is Error => print("template error: ${result["message"]}")
-  else => sendEmail(result)
-```
-
-`render` reads the template file from disk, then renders it against the data record. It returns an `Error` if the file cannot be read or the template fails to render.
-
----
-
-### Template files (`.jinja`)
-
-Create a `greeting.jinja` file:
-
-```
-Hello, {{ name }}!
-Your score is {{ stats.score }}.
-{% if stats.score > 40 %}Great work!{% endif %}
-```
-
-Load and render it:
-
-```lin
-import { render } from "std/template"
-import { print } from "std/io"
-
-val result = render("greeting.jinja", {
-  "name": "Bob",
-  "stats": { "score": 42 }
-})
-
-match result
-  is Error => print("error: ${result["message"]}")
-  else => print(result)
-```
-
-Output:
-
-```
-Hello, Bob!
-Your score is 42.
-Great work!
-```
-
----
-
-## Layouts
-
-`render` (the file-based entry point) supports template **inheritance**, so pages share a
-single layout instead of duplicating their chrome. Referenced templates are loaded by name
-from the same directory as the file passed to `render`.
-
-A base layout declares the skeleton with fillable blocks:
-
-```
-<!-- templates/base.jinja -->
-<!DOCTYPE html>
-<html>
-<head><title>{{ title }}</title></head>
-<body{% block body_attrs %}{% endblock %}>
-  {% block main %}{% endblock %}
-  {% include "footer.jinja" %}
-</body>
-</html>
-```
-
-A page extends it and fills in the blocks (an unfilled block keeps the base's default):
-
-```
-<!-- templates/page.jinja -->
-{% extends "base.jinja" %}
-
-{% block main %}
-  <article>{{ content }}</article>
-{% endblock %}
-```
-
-```lin
-render("templates/page.jinja", { "title": "Docs", "content": "<p>Hi</p>" })
-```
-
-`base.jinja` and `footer.jinja` are resolved from `templates/` automatically. This is how the
-docs site itself is built — see `docs-site/templates/`.
-
-> `renderWith` takes an in-memory string with no source directory, so it **cannot** resolve
-> `{% extends %}` / `{% include %}`. Use `render` (file-based) for layouts.
+Read a template from `path` and render it, with full layout support (ADR-048): the template may
+`{% extends "base.jinja" %}` and fill `{% block %}`s, or pull in partials via
+`{% include "_nav.jinja" %}` — referenced files are loaded by name from the same directory as
+`path`.
+- **`path`** — the template file path.
+- **`data`** — the variables to render against.
+- **Returns** the rendered `String`, or an `Error` object `{ type, message }` on a missing file or a
+  syntax/render error (discriminated via `is Error`).

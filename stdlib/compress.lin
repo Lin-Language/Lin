@@ -12,18 +12,27 @@
 //   import { readStream, writeStream, drain } from "std/stream"
 //   import { gunzip } from "std/compress"
 //   readStream("data.gz").gunzip().writeStream("data.txt").drain()
-// Decompress a gzip-framed byte stream → a stream of decompressed `UInt8[]` chunks.
+
+// Adapter: decompress a gzip-framed byte stream. LAZY.
+// @param s  the upstream gzip-framed byte stream.
+// @returns a `Stream<UInt8[]>` of decompressed chunks; a decode fault surfaces in-band as `Error`.
 export val gunzip = (s: Stream): Stream =>
   lin_stream_gunzip(s)
 
-// Compress a byte stream into the gzip container format.
+// Adapter: compress a byte stream into the gzip container format (header + CRC32 + ISIZE). LAZY.
+// @param s  the upstream byte stream.
+// @returns a `Stream<UInt8[]>` of gzip-framed chunks.
 export val gzip = (s: Stream): Stream =>
   lin_stream_gzip(s)
 
-// Decompress a raw DEFLATE byte stream (no gzip header/CRC).
+// Adapter: decompress a raw DEFLATE byte stream (no gzip header/CRC). LAZY.
+// @param s  the upstream raw-DEFLATE byte stream.
+// @returns a `Stream<UInt8[]>` of decompressed chunks; a decode fault surfaces in-band as `Error`.
 export val inflate = (s: Stream): Stream =>
   lin_stream_inflate(s)
 
-// Compress a byte stream as a raw DEFLATE bitstream (no gzip header/CRC).
+// Adapter: compress a byte stream as a raw DEFLATE bitstream (no gzip header/CRC). LAZY.
+// @param s  the upstream byte stream.
+// @returns a `Stream<UInt8[]>` of raw-DEFLATE chunks.
 export val deflate = (s: Stream): Stream =>
   lin_stream_deflate(s)

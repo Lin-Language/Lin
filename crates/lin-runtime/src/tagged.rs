@@ -34,6 +34,7 @@ pub use lin_common::tags::{
     TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT32, TAG_FLOAT64, TAG_STR, TAG_OBJECT,
     TAG_ARRAY, TAG_FUNCTION, TAG_UINT8, TAG_INT8, TAG_UINT16, TAG_INT16, TAG_UINT64, TAG_UINT32,
     TAG_PROMISE, TAG_HANDLE, TAG_SHARED, TAG_STREAM, TAG_MAP, TAG_SUMNODE,
+    TAG_BIGNUM, TAG_DECIMAL,
 };
 
 #[repr(C)]
@@ -600,6 +601,10 @@ pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
         TAG_SUMNODE => crate::sumnode::lin_sumnode_release_self(payload as *mut u8),
         TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
         TAG_STREAM => crate::stream::lin_stream_release_box(payload as *const u8),
+        // Opaque arbitrary-precision/decimal handles (std/bignum, std/decimal): refcounted Rust
+        // boxes whose final drop frees the wrapped num value. Mirror of the TAG_STREAM arm.
+        TAG_BIGNUM => crate::bignum::lin_bignum_release_box(payload as *const u8),
+        TAG_DECIMAL => crate::decimal::lin_decimal_release_box(payload as *const u8),
         _ => {} // Scalars (null, bool, int, float) have no heap payload.
     }
     // Cached scalar boxes (small ints, bools) are immutable statics — never free them.

@@ -1,3 +1,18 @@
+// std/object — object introspection and transformation, plus Result/Option ergonomics.
+//
+// import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, isEmpty } from "std/object"
+//
+// `keys`/`values`/`entries` are tag-aware — they work on both a plain `{}`/`Json` record and a typed
+// index-signature map `{ String: T }` (ADR-055). `merge`/`pick`/`omit`/`mapValues` are generic over
+// `{ String: T }` and return a typed map; pass them a value annotated `{ String: T }` (there is no
+// implicit `Json -> { String: T }` coercion). Over a typed map, key order is hash order, not insertion
+// order. `get` is the idiomatic defaulted read (`m[k] ?? default`) — a bare `m[k]` already yields
+// `T | Null`, so the helper folds in a fallback whose type `D` is independent of the value type `T`.
+//
+// This module also carries the Result/Option ergonomics folded in from the former std/result
+// (error/isOk/isError/isNull/unwrapOr) — see the section lower in the file. Lin has NO
+// `Result`/`Option` wrapper ADT: a fallible call returns `T | Error`, an absence-y call returns
+// `T | Null`, and the success value IS the value with no unwrap ceremony on the happy path.
 import foreign "lin-runtime"
   val lin_keys_any: (Json) => String[]
   val lin_values_any: (Json) => Json[]
@@ -9,39 +24,56 @@ import { for, some } from "std/iter"
 // `keys`/`values`/`entries` are deliberately typed `Json`, NOT `<T>(obj: { String: T })`. They are
 // tag-aware at runtime (the `lin_*_any` bridges dispatch on the boxed value's tag, ADR-055), so the
 // SAME function serves both a plain `Json`/`{}` record (TAG_OBJECT → insertion order) and a typed
-// index-signature map `{ String: T }` (TAG_MAP → hash order): a typed map flows in via the SOUND
-// `{ String: T } → Json` widening direction (a map read back through these tag-aware bridges is
-// safe). Re-typing the *parameter* to `{ String: T }` would NOT work and is not desired:
-//   - it would reject the dominant use — introspecting an arbitrary `Json`/`{}` record (e.g.
-//     `keys(parsedConfig)`), since `Json → { String: T }` is correctly rejected (§5.1.1; enforced
-//     in `compat.rs` — there is no implicit object→map coercion in either user or stdlib code), and
-//   - no caller wants a typed `T[]`/`[String,T][]` back: `values`/`entries` are used for dynamic
-//     introspection, where `Json[]` is the honest result.
-// So these stay `Json` + tag-aware by design, not as a workaround.
+// index-signature map `{ String: T }` (TAG_MAP → hash order). Re-typing the parameter to
+// `{ String: T }` would reject the dominant use — introspecting an arbitrary `Json`/`{}` record (e.g.
+// `keys(parsedConfig)`), since `Json → { String: T }` is correctly rejected (§5.1.1) — and no caller
+// wants a typed `T[]`/`[String,T][]` back, since these are used for dynamic introspection.
+//
+// Return the keys of an object or map.
+// @param obj  any `Json`/`{}` record or `{ String: T }` map.
+// @returns a `String[]` of the keys (insertion order for a record, hash order for a map).
+// @example keys({ "a": 1, "b": 2 })   // ["a", "b"]
 export val keys = (obj: Json): String[] =>
   lin_keys_any(obj)
 
+// Return the values of an object or map.
+// @param obj  any `Json`/`{}` record or `{ String: T }` map.
+// @returns a `Json[]` of the values, in key order.
+// @example values({ "a": 1, "b": 2 })   // [1, 2]
 export val values = (obj: Json): Json[] =>
   lin_values_any(obj)
 
+// Return the key/value pairs of an object or map.
+// @param obj  any `Json`/`{}` record or `{ String: T }` map.
+// @returns a `Json[]` of `[key, value]` pairs, in key order.
+// @example entries({ "a": 1, "b": 2 })   // [["a", 1], ["b", 2]]
 export val entries = (obj: Json): Json[] =>
   lin_entries_any(obj)
 
-// NOTE: kept `Json` (not `<T>(pairs: [String, T][]): { String: T }`). The monomorphizer cannot
-// bind a type parameter that appears NESTED inside a tuple-in-array parameter shape — `<T>(pairs:
-// [String, T][])` fails inference at every call site (even with the result annotated), because the
-// inference engine does not decompose `[String, T][]` to recover `T`. That is a compiler/inference
-// gap, not laxity here; re-type this once nested-tuple inference lands. See ADR-055 follow-up.
+// Build an object from a list of `[key, value]` pairs (the inverse of `entries`). Later pairs with
+// the same key overwrite earlier ones.
+// @param pairs  an array of `[String, value]` pairs (typed `Json`).
+// @returns a `Json` object mapping each key to its value.
+// @example fromEntries([["a", 1], ["b", 2]])   // { "a": 1, "b": 2 }
+// @example entries(obj).map(([k, v]) => [k, v * 2]).fromEntries()   // double every value
 export val fromEntries = (pairs: Json): Json =>
+  // Kept `Json` (not `<T>(pairs: [String, T][]): { String: T }`): the monomorphizer cannot recover a
+  // type parameter NESTED inside a tuple-in-array shape, so `<T>` would fail inference at every call
+  // site. Re-type once nested-tuple inference lands (ADR-055 follow-up).
   var result: {  } = {}
   pairs.for(pair =>
     result[pair[0]] = pair[1]
   )
   result
 
-// Right-biased merge: keys in `b` win over keys in `a`. Built imperatively because a `{ ...a, ...b }`
-// spread literal infers a fixed record `{ }`, not the index-signature map type.
+// Merge two maps into a new one. Right-biased: keys present in `b` win over those in `a`.
+// @param a  the base map.
+// @param b  the overriding map; its entries take precedence on key collisions.
+// @returns a new `{ String: T }` with the entries of both.
+// @example a.merge(b)   // { "a": 1, "b": 99, "c": 3 }   (right-side values win on conflict)
 export val merge = <T>(a: { String: T }, b: { String: T }): { String: T } =>
+  // Built imperatively because a `{ ...a, ...b }` spread literal infers a fixed record `{ }`, not the
+  // index-signature map type.
   var result: { String: T } = {}
   lin_keys_any(a).for(k =>
     result[k] = a[k]
@@ -51,6 +83,11 @@ export val merge = <T>(a: { String: T }, b: { String: T }): { String: T } =>
   )
   result
 
+// Build a new map containing only the named keys that are present in `obj`.
+// @param obj  the source map.
+// @param ks   the keys to keep; keys absent from `obj` are skipped.
+// @returns a new `{ String: T }` with just the selected present entries.
+// @example m.pick(["a", "c"])   // { "a": 1, "c": 3 }
 export val pick = <T>(obj: { String: T }, ks: String[]): { String: T } =>
   var result: { String: T } = {}
   ks.for(k =>
@@ -58,6 +95,11 @@ export val pick = <T>(obj: { String: T }, ks: String[]): { String: T } =>
   )
   result
 
+// Build a new map with the named keys removed.
+// @param obj  the source map.
+// @param ks   the keys to drop.
+// @returns a new `{ String: T }` with every entry of `obj` except those keyed in `ks`.
+// @example m.omit(["b"])   // { "a": 1, "c": 3 }
 export val omit = <T>(obj: { String: T }, ks: String[]): { String: T } =>
   val skip: { String: Boolean } = {}
   ks.for(k => skip[k] = true)
@@ -68,6 +110,11 @@ export val omit = <T>(obj: { String: T }, ks: String[]): { String: T } =>
   )
   result
 
+// Transform every value of a map, keeping the keys unchanged.
+// @param obj  the source map (value type `V`).
+// @param f    `(value) => W` applied to each value.
+// @returns a new `{ String: W }` with the same keys and mapped values.
+// @example m.mapValues(v => v * 10)   // { "a": 10, "b": 20 } : { String: Int32 }
 export val mapValues = <V, W>(obj: { String: V }, f: (V) => W): { String: W } =>
   val ks = lin_keys_any(obj)
   var result: { String: W } = {}
@@ -76,24 +123,100 @@ export val mapValues = <V, W>(obj: { String: V }, f: (V) => W): { String: W } =>
   )
   result
 
-// Defaulted read with an independent default-type param `D`: the value at `key`, or `default`
-// when the key is absent. `m[key]` is `T | Null` (§5.1.1); this helper folds in a fallback whose
-// type `D` is SEPARATE from the value type `T`, so the result is `T | D` and the default never
-// pollutes `T`. With no default supplied, `D` defaults to `Null` (the `default: D = null`
-// parameter), giving the plain `T | Null` you would get from a bare `m[key]`:
-//   - `m.get(k)`       => `T | Null`
-//   - `m.get(k, 0)`    => `T | Int32` (= `T` when `T = Int32`: the "definitely present" form)
+// Read the value at `key`, with a fallback when the key is absent. The default's type `D` is
+// separate from the value type `T`, so the result is `T | D` and the default never pollutes `T`.
+//   - `m.get(k)`        => `T | Null`
+//   - `m.get(k, 0)`     => `T | Int32` (= `T` when `T = Int32`: the "definitely present" form)
 //   - `m.get(k, "n/a")` => `T | String`
-// Written with the `is Null => default; else => m[key]` arm order (NOT `is T => …; else =>
-// default`): a positive `is T` arm on a monomorphized type parameter does not select the
-// present-value branch today, whereas the `is Null` + `else` form narrows correctly. The `else`
-// arm returns the present (non-null) value.
+// @param m        the map to read from.
+// @param key      the key to look up.
+// @param default  value returned when `key` is absent; defaults to `null`, pinning `D`.
+// @returns the value at `key`, or `default` (typed `T | D`) when the key is absent.
+// @example counts.get("a", 0)        // 7
+// @example counts.get("missing", 0)  // 0
+// @example counts.get("z", "n/a")    // "n/a"   (independent default type -> Int32 | String)
 export val get = <T, D>(m: { String: T }, key: String, default: D = null): T | D =>
+  // `is Null => default; else => m[key]` arm order (NOT `is T => …; else => default`): a positive
+  // `is T` arm on a monomorphized type parameter does not select the present-value branch today,
+  // whereas the `is Null` + `else` form narrows correctly.
   match m[key]
     is Null =>
       default
     else =>
       m[key]
 
+// Test whether an object, map, array, or string is empty.
+// @param x  any object, map, array, or string.
+// @returns `true` iff `x` has zero entries/elements/characters.
+// @example isEmpty({})        // true
+// @example isEmpty([])        // true
+// @example isEmpty({ "a": 1 })   // false
 export val isEmpty = (x: Json): Boolean =>
   length(x) == 0
+
+// ===== Result/Option ergonomics (folded in from the former std/result module) =====
+// std/result — ergonomics for the two fallible-value conventions: `T | Error` and `T | Null`.
+//
+// Lin has NO `Result`/`Option` wrapper ADT. A fallible call returns `T | Error` (the canonical
+// `Error` is `{ "type":"error","message":String }`, discriminated with `is Error`, ADR-031) and an
+// absence-y call returns `T | Null`. The success value IS the value — no unwrap ceremony on the
+// happy path. This module adds small, total, side-effect-free helpers over those conventions
+// WITHOUT introducing a wrapper type.
+//
+// SCOPE (see docs/proposals/stdlib/result-ergonomics.md). Only the helpers that are expressible in
+// Lin's argument-driven, monomorphized generics ship here:
+//   - `isOk` / `isError` / `isNull`        — Json -> Boolean predicates (no type variable to solve)
+//   - `unwrapOr`                           — DEFAULT-DRIVEN collapse: `T` is solved from `default`,
+//                                            exactly the mechanism behind `array.at`/`object.get`
+//   - `error`                              — the canonical-Error constructor
+// The map/chain/bridge family (`mapOk`/`mapError`/`andThen`/`orElse`/`okOr`/`toNull`) is BLOCKED:
+// it needs a union-arm-subtraction inference rule the checker does not have (it cannot bind `T` to
+// "the non-`Error` arm of a `T | Error` argument"). Those are intentionally NOT exported. See the
+// proposal's "Generics & checker constraints" section.
+// Construct the canonical Error value. Useful for fabricating an Error to feed a default arm, a
+// test, or a hand-rolled fallible function.
+// @param message  the human-readable error message.
+// @returns the `Error` `{ "type": "error", "message": message }`, the exact value `is Error` discriminates on (ADR-031).
+export val error = (message: String): Error =>
+  { "type": "error", "message": message }
+
+// Test whether `x` is the canonical Error — the `is Error` discriminant as a plain predicate, usable
+// in `if`/`&&` positions and combinator callbacks (e.g. `xs.filter`).
+// NOTE: this does NOT narrow the union — after `if isError(x)` the compiler still sees `x : T | Error`.
+// Use the built-in `is Error` test to unlock the success arm's fields; this is for filtering/counting/branching.
+// @param x  any value (typed `Json`, the supertype any union flows into).
+// @returns `true` iff `x` is the canonical Error.
+export val isError = (x: Json): Boolean =>
+  match x
+    is Error => true
+    else => false
+
+// Test whether `x` is NOT the canonical Error — the negation of `isError`. A `Null` `x` is "ok"
+// here (it is not an Error); use `isNull` to test absence.
+// @param x  any value (typed `Json`).
+// @returns `true` unless `x` is the canonical Error.
+export val isOk = (x: Json): Boolean =>
+  match x
+    is Error => false
+    else => true
+
+// Test whether `x` is the `Null` value (the absence arm of a `T | Null`).
+// @param x  any value (typed `Json`).
+// @returns `true` iff `x` is `null`.
+export val isNull = (x: Json): Boolean =>
+  match x
+    is Null => true
+    else => false
+
+// Collapse the failure arm of a fallible value with a default. Handles BOTH conventions: the
+// success value is returned when `x` is neither an `Error` nor `Null`, otherwise `default`.
+// @example val port: Int32 = parsePort(input).unwrapOr(8080)    // T | Error -> T
+// @example val name: String = config["name"].unwrapOr("anon")   // T | Null  -> T
+// @param x        any value (typed `Json`, so any `T | Error` / `T | Null` union flows in).
+// @param default  the fallback returned for the `Error`/`Null` arms; pins `D`.
+// @returns the success value, or `default`, typed `Json | D` (the static success type is recovered via `D`, as in `at`/`get`).
+export val unwrapOr = <D>(x: Json, default: D): Json | D =>
+  match x
+    is Error => default
+    is Null => default
+    else => x

@@ -19,20 +19,26 @@
 // worker via `.promise()`, stored in a field/var/array, or otherwise outlive the callback. The
 // ADR-049 stream placement restriction enforces the lifetime bound; a `.promise()` on `data` would
 // race the shared cursor and is UNSUPPORTED (a dedicated compile-time check for that is a known gap).
-// untar(s, body) — drive the whole archive on the calling thread, calling `body(meta, data)` per
-// entry. `meta` is `{ name, size, typeflag, isDir }`; `data` is a `Stream<UInt8[]>` sub-stream over
-// the entry's body (sync-only, see the module caveat). The body's return is ignored. Constant
-// memory. Returns `Null | Error` (an entry-body fault or a read error surfaces as the Error).
+
+// Drive the whole tar archive on the calling thread in constant memory, calling `body` per entry.
+// @param s     the upstream byte stream (moved in — may not be reused after the call).
+// @param body  `body(meta, data)`, called per entry; `meta` is `{ name, size, typeflag, isDir }`
+//   and `data` is a `Stream<UInt8[]>` sub-stream over the entry's body (sync-only, see the module
+//   caveat). Its return is ignored.
+// @returns `Null` on success, or an `Error` if an entry body faulted or a read failed.
 export val untar = (s: Stream, body: (Json, Stream) => Json): Json =>
   lin_stream_untar(s, body)
 
-// manifest(s) — a `Stream<Object>` of each entry's `meta` object, with bodies SKIPPED (meta-only
-// listing). Composes with std/iter (filter/map/for) like any other Stream.
+// Stream each entry's metadata, skipping bodies (a meta-only listing).
+// @param s  the upstream byte stream (moved in).
+// @returns a `Stream<Object>` of each entry's `meta` object; composes with std/iter.
 export val manifest = (s: Stream): Stream =>
   lin_stream_manifest(s)
 
-// files(s) — a `Stream<Object>` of `{ name, data, size, typeflag, isDir }` where `data` is the
-// entry's full body buffered into a `UInt8[]`. Convenience for normal-sized files; composes with
-// std/iter. (Buffers each body in memory — prefer `untar` for arbitrarily large entries.)
+// Stream each entry with its full body buffered into memory (convenience for normal-sized files;
+// prefer `untar` for arbitrarily large entries).
+// @param s  the upstream byte stream (moved in).
+// @returns a `Stream<Object>` of `{ name, data, size, typeflag, isDir }` where `data` is the entry
+//   body as a `UInt8[]`; composes with std/iter.
 export val files = (s: Stream): Stream =>
   lin_stream_files(s)

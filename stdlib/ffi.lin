@@ -34,31 +34,37 @@ import foreign "lin-runtime"
   val lin_ffi_poke_f64: (Ptr, Int64, Float64) => Null
   val lin_ffi_poke_ptr: (Ptr, Int64, Ptr) => Null
 
-// Allocate a NUL-terminated C-string copy of `s`; returns a Ptr. The buffer is NOT freed for you —
-// pair with `free` (or prefer `withCstr` below) unless the C API takes ownership of the pointer.
+// Allocate a NUL-terminated C-string copy of `s`.
+// @param s  the string to copy into C memory.
+// @returns a `Ptr` to the buffer. NOT freed for you — pair with `free` (or prefer `withCstr`)
+//   unless the C API takes ownership of the pointer.
 export val cstr = (s: String): Ptr => lin_ffi_cstr(s)
 
-// Scoped C-string: allocate a NUL-terminated copy of `s`, run `body` with the pointer, free the
-// buffer, and return whatever `body` returned. This is the recommended, leak-free idiom for the
-// common "C copies the string during the call" case:
-//
+// Run `body` with a scoped, auto-freed C-string copy of `s`. The recommended, leak-free idiom for
+// the common "C copies the string during the call" case, e.g.
 //   withCstr(title, (p) => SDL_CreateWindow(p, 320, 240, 0))
-//
-// CAVEAT: Lin has no try/finally. The free runs only after `body` returns normally; a faulting
-// callback would leak the buffer. That is an accepted limitation for this prototype.
+// @param s     the string to copy into C memory for the duration of `body`.
+// @param body  callback receiving the `Ptr` to the C string.
+// @returns whatever `body` returned. The buffer is freed after `body` returns.
+//   CAVEAT: Lin has no try/finally, so a faulting callback leaks the buffer (accepted for this
+//   prototype).
 export val withCstr = <T>(s: String, body: (Ptr) => T): T =>
   val p = cstr(s)
   val result = body(p)
   free(p)
   result
 
-// Allocate `n` bytes of raw scratch memory; release with `free`.
+// Allocate `n` bytes of raw scratch memory.
+// @param n  the byte count to allocate.
+// @returns a `Ptr` to the buffer; release with `free`.
 export val alloc = (n: Int64): Ptr => lin_ffi_alloc(n)
 
-// Free a buffer from `alloc` (or `cstr`).
+// Free a buffer previously returned by `alloc` or `cstr`.
+// @param p  the pointer to free.
 export val free = (p: Ptr): Null => lin_ffi_free(p)
 
-// Read primitives at byte offset `off` from pointer `p`.
+// Read a primitive at byte offset `off` from pointer `p`. One reader per width/type; each returns
+// the value loaded at `p + off`.
 export val peekU8 = (p: Ptr, off: Int64): UInt8 => lin_ffi_peek_u8(p, off)
 export val peekU16 = (p: Ptr, off: Int64): UInt16 => lin_ffi_peek_u16(p, off)
 export val peekU32 = (p: Ptr, off: Int64): UInt32 => lin_ffi_peek_u32(p, off)
@@ -69,7 +75,8 @@ export val peekF32 = (p: Ptr, off: Int64): Float32 => lin_ffi_peek_f32(p, off)
 export val peekF64 = (p: Ptr, off: Int64): Float64 => lin_ffi_peek_f64(p, off)
 export val peekPtr = (p: Ptr, off: Int64): Ptr => lin_ffi_peek_ptr(p, off)
 
-// Write primitives at byte offset `off` to pointer `p`.
+// Write a primitive `v` at byte offset `off` to pointer `p`. One writer per width/type; each stores
+// `v` at `p + off`.
 export val pokeU8 = (p: Ptr, off: Int64, v: UInt8): Null => lin_ffi_poke_u8(p, off, v)
 export val pokeU16 = (p: Ptr, off: Int64, v: UInt16): Null => lin_ffi_poke_u16(p, off, v)
 export val pokeU32 = (p: Ptr, off: Int64, v: UInt32): Null => lin_ffi_poke_u32(p, off, v)

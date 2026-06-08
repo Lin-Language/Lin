@@ -1,125 +1,235 @@
 # std/http
 
-HTTP client and server. All client functions are synchronous and blocking.
+std/http — HTTP client and server, plus URL parsing/building.
 
-```lin
+All client functions are synchronous and blocking. Requests return an HttpResponse or an Error
+shape (`{ "type": "error", ... }`) that you narrow with `is Error`. On the server side, write a
+handler `(HttpRequest) -> HttpResponse` and pass it to `serve`; build responses with json / text
+/ redirect / badRequest / notFound, route with matchPath, and read request bodies with parseBody.
+The handler is the FIRST argument to serve, so the dot-call form `handler.serve(port)` reads
+naturally. The URL layer (Url / parse / build / join / withQuery / withPath, folded in from the
+former std/url) splits a string into RFC 3986 components verbatim — no percent-decoding.
+
 import { fetch, fetchJson, fetchWith, postJson } from "std/http"
 import { serve, json, text, redirect, notFound, badRequest, matchPath, parseBody } from "std/http"
-```
 
-## Types
+## Reference
 
-```lin
-type HttpRequest = {
-  "method":  String,
-  "path":    String,
-  "query":   String,
-  "headers": { String: String },
-  "body":    String
-}
-
-type HttpResponse = {
-  "status":  Int32,
-  "headers": { String: String },
-  "body":    String
-}
-
-type HttpOptions = {
-  "method":  String,
-  "headers": { String: String },
-  "body":    String
-}
-```
-
-## Client functions
-
-| Function | Signature | Description |
-| --- | --- | --- |
-| `fetch` | `(String) -> HttpResponse \| Error` | GET a URL |
-| `fetchJson` | `(String) -> Json \| Error` | GET a URL and parse body as JSON |
-| `fetchWith` | `(String, HttpOptions) -> HttpResponse \| Error` | Request with custom options |
-| `postJson` | `(String, Json) -> HttpResponse \| Error` | POST a JSON body |
-
-### `fetch`
+#### `HttpRequest`
 
 ```lin
-val result = fetch("https://example.com/ping")
-match result
-  is Error => print("network error: ${result["message"]}")
-  else => print(result["status"])
+type HttpRequest = { "method": String, "path": String, "query": String, "headers": { String: String }, "body": String }
 ```
 
-### `fetchJson`
+An incoming HTTP request passed to a `serve` handler: method, path, raw query string,
+header map, and the raw request body.
+
+#### `HttpResponse`
 
 ```lin
-val users = fetchJson("https://api.example.com/users")
-match users
-  is Error => print("failed: ${users["message"]}")
-  else => users.for(u => print(u["name"]))
+type HttpResponse = { "status": Int32, "headers": { String: String }, "body": String }
 ```
 
-### `fetchWith`
+An HTTP response: numeric status, header map, and body string. Built by `json`/`text`/
+`redirect`/`badRequest`/`notFound` or constructed directly.
+
+#### `HttpOptions`
 
 ```lin
-val resp = fetchWith("https://api.example.com/items", {
-  "method": "DELETE",
-  "headers": { "Authorization": "Bearer ${token}" },
-  "body": ""
-})
+type HttpOptions = { "method": String, "headers": { String: String }, "body": String }
 ```
 
-### `postJson`
+Options for `fetchWith`: HTTP method, request headers, and body.
+
+#### `fetch`
 
 ```lin
-postJson("https://api.example.com/users", { "name": "Alice" })
+val fetch = (url: String): Json
 ```
 
-## Server functions
+GET `url`.
+- **`url`** — the URL to fetch.
+- **Returns** the response object, or an `Error` (`{ "type":"error", ... }`) if the request fails.
+- **Example:** val result = fetch("https://example.com/ping")   // then result["status"]
 
-| Function | Signature | Description |
-| --- | --- | --- |
-| `serve` | `((HttpRequest) -> HttpResponse, Int32) -> Null` | Start HTTP server (sequential) |
-| `json` | `(Int32, Json) -> HttpResponse` | Build JSON response |
-| `text` | `(Int32, String) -> HttpResponse` | Build plain-text response |
-| `redirect` | `(String) -> HttpResponse` | Build 302 redirect |
-| `notFound` | `HttpResponse` | Pre-built 404 response (value, not function) |
-| `badRequest` | `(String) -> HttpResponse` | Build 400 response |
-| `matchPath` | `(String, String) -> { ...String } \| Null` | Match URL path against pattern |
-| `parseBody` | `(HttpRequest) -> Json \| Error` | Parse request body as JSON |
-
-### `serve`
-
-The handler is the **first** argument, so the dot-call form `handler.serve(port)` reads naturally:
+#### `fetchWith`
 
 ```lin
-val handler = req =>
-  match req["path"]
-    is "/ping" => text(200, "pong")
-    else       => notFound
-
-handler.serve(3000)
+val fetchWith = (url: String, options: Json): Json
 ```
 
-### `matchPath`
+Issue a request to `url` with a custom method/headers/body.
+- **`url`** — the URL to request.
+- **`options`** — an `HttpOptions`-shaped record (method, headers, body).
+- **Returns** the response object, or an `Error` if the request fails.
+- **Example:** fetchWith("https://api.example.com/items", { "method": "DELETE", "headers": {}, "body": "" })
 
-`matchPath(path, pattern)` returns an object of captured `:name` params, or `Null` if the path does not match.
+#### `fetchJson`
 
 ```lin
-val params = matchPath("/users/42", "/users/:id")
-// { "id": "42" }
-
-// Chain off request:
-val params = req["path"].matchPath("/users/:id/posts")
+val fetchJson = (url: String): Json
 ```
 
-### `parseBody`
+GET `url` and parse the response body as JSON.
+- **`url`** — the URL to fetch.
+- **Returns** the parsed JSON value, or an `Error` if the request fails (the error is passed through
+         unparsed).
+- **Example:** val users = fetchJson("https://api.example.com/users")   // then users.for(u => ...)
+
+#### `postJson`
 
 ```lin
-val handler = req =>
-  val body = parseBody(req)
-  match body
-    is Error => badRequest(body["message"])
-    else => json(200, { "received": body })
-
-handler.serve(3000)
+val postJson = (url: String, body: Json): Json
 ```
+
+POST `body` to `url` as `application/json`.
+- **`url`** — the target URL.
+- **`body`** — any JSON-serialisable value; sent as the JSON request body.
+- **Returns** the response object, or an `Error` if the request fails.
+- **Example:** postJson("https://api.example.com/users", { "name": "Alice" })
+
+#### `json`
+
+```lin
+val json = (status: Int32, data: Json): HttpResponse
+```
+
+Build an `application/json` response with the given status and a JSON-serialised body.
+- **`status`** — the HTTP status code.
+- **`data`** — any JSON-serialisable value; becomes the response body.
+- **Returns** the `HttpResponse`.
+
+#### `text`
+
+```lin
+val text = (status: Int32, body: String): HttpResponse
+```
+
+Build a `text/plain; charset=utf-8` response with the given status and body.
+- **`status`** — the HTTP status code.
+- **`body`** — the plain-text body.
+- **Returns** the `HttpResponse`.
+
+#### `redirect`
+
+```lin
+val redirect = (location: String): HttpResponse
+```
+
+Build a 302 redirect response to `location`.
+- **`location`** — the URL to redirect to (sent in the `Location` header).
+- **Returns** the `HttpResponse`.
+
+#### `notFound`
+
+```lin
+val notFound: HttpResponse
+```
+
+A ready-made 404 Not Found response.
+
+#### `badRequest`
+
+```lin
+val badRequest = (message: String): HttpResponse
+```
+
+Build a 400 Bad Request response carrying `message` as the body.
+- **`message`** — the error text to return as the body.
+- **Returns** the `HttpResponse`.
+
+#### `parseBody`
+
+```lin
+val parseBody = (req: Json): Json
+```
+
+Parse a request's body as JSON.
+- **`req`** — the `HttpRequest` (its `body` field is parsed).
+- **Returns** the parsed JSON value, or an `Error` if the body is not valid JSON.
+
+#### `matchPath`
+
+```lin
+val matchPath = (path: String, pattern: String): Json
+```
+
+Match a request path against a route pattern (e.g. `/users/:id`), extracting path params.
+- **`path`** — the concrete request path.
+- **`pattern`** — the route pattern with `:name` capture segments.
+- **Returns** a map of captured params if the path matches, or a non-match result otherwise.
+- **Example:** matchPath("/users/42", "/users/:id")   // { "id": "42" }
+
+#### `serve`
+
+```lin
+val serve = (handler: Json, port: Int32): Null
+```
+
+Start a blocking HTTP server on `port`, dispatching each request to `handler`.
+- **`handler`** — a function `(HttpRequest) -> HttpResponse`.
+- **`port`** — the TCP port to listen on.
+- **Returns** never returns under normal operation (runs the accept loop).
+- **Example:** handler.serve(3000)   // handler = req => match req["path"] is "/ping" => text(200, "pong") else => notFound
+
+### URL parsing/building (folded in from the former std/url module)
+
+#### `Url`
+
+```lin
+type Url = { "scheme": String, "userinfo": String | Null, "host": String, "port": Int32 | Null, "path": String, "query": String | Null, "fragment": String | Null }
+```
+
+A parsed URL, split into its RFC 3986 components (each emitted/stored verbatim, NOT decoded):
+  scheme    "https"; lowercased; "" if the input was relative
+  userinfo  raw "user:pass" between "//" and "@", undecoded; Null if absent
+  host      "example.com", "[::1]"; "" if no authority
+  port      443; Null if absent (scheme defaults are NOT filled in)
+  path      "/a/b"; raw, percent-encoding preserved
+  query     raw, WITHOUT the leading "?"; Null if absent
+  fragment  raw, WITHOUT the leading "#"; Null if absent
+
+#### `parse`
+
+```lin
+val parse = (s: String): Url | Error
+```
+
+Parse `s` as an RFC 3986 URI (or relative reference). Components are split, NOT decoded.
+- **`s`** — the URL string.
+- **Returns** the parsed `Url`, or an `Error` if `s` violates the generic URI syntax.
+
+#### `build`
+
+```lin
+val build = (u: Url): String
+```
+
+Serialise a `Url` back to a string — the inverse of `parse`. Components are emitted verbatim
+(already-encoded); separators are inserted only for the components that are present.
+
+#### `join`
+
+```lin
+val join = (base: String, ref: String): String | Error
+```
+
+Resolve `ref` against `base` using RFC 3986 §5 reference resolution and return the resulting
+absolute URL string. Returns Error if `base` is not absolute or either side fails to parse.
+Dot-call form reads "resolve this link against where I am": `base.join(href)`.
+
+#### `withQuery`
+
+```lin
+val withQuery = (u: Url, query: String): Url
+```
+
+Return a copy of `u` with `query` replaced (raw query string, no leading "?").
+
+#### `withPath`
+
+```lin
+val withPath = (u: Url, path: String): Url
+```
+
+Return a copy of `u` with `path` replaced (path should already be percent-encoded).

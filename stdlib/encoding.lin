@@ -1,0 +1,667 @@
+// std/encoding — byte/text transport codecs: Base64 (standard + URL-safe), hex,
+// URL/percent encoding, and query-string parse/build.
+//
+// These sit on the seam between `UInt8[]` byte buffers (std/bytes, §35.1) and `String`
+// text. Following the std/bytes precedent the codecs are pure Lin over the bitwise
+// operators (§35.2) and the std/number narrowing casts (§26); the one capability that
+// cannot be expressed in Lin — validated UTF-8 bytes → String — is borrowed from
+// std/string.fromUtf8 (a shared runtime primitive, not a codec-specific intrinsic).
+//
+// Encoding never fails. Decoding is fallible: malformed Base64/hex/percent input returns
+// the standard Error shape `{ "type": "error", "message": String }`, matched with
+// `is Error` (the Error arm comes first in a match). The Base64 and hex alphabets and
+// output are pure ASCII, so output strings are assembled with `fromCodePoints` (sound
+// because codepoint == byte for ASCII); decoding scans input bytes with the O(1) `byteAt`
+// primitive (NOT codePointAt-in-a-loop, which would be O(n²)). Lin has no imperative
+// `while`, so the byte scans are written as tail-recursive helpers over a byte index.
+//
+// Structural URL parsing (scheme/host/path/fragment) is out of scope — see std/url.
+import { fromCodePoints, byteAt, fromUtf8, toString } from "std/string"
+import { length, push } from "std/array"
+import { keys } from "std/object"
+import { for } from "std/iter"
+
+// --- shared tables ---------------------------------------------------------
+// Standard Base64 alphabet (RFC 4648 §4): A-Z a-z 0-9 + /
+val b64Std: Int32[] = [
+  65,
+  66,
+  67,
+  68,
+  69,
+  70,
+  71,
+  72,
+  73,
+  74,
+  75,
+  76,
+  77,
+  78,
+  79,
+  80,
+  81,
+  82,
+  83,
+  84,
+  85,
+  86,
+  87,
+  88,
+  89,
+  90,
+  97,
+  98,
+  99,
+  100,
+  101,
+  102,
+  103,
+  104,
+  105,
+  106,
+  107,
+  108,
+  109,
+  110,
+  111,
+  112,
+  113,
+  114,
+  115,
+  116,
+  117,
+  118,
+  119,
+  120,
+  121,
+  122,
+  48,
+  49,
+  50,
+  51,
+  52,
+  53,
+  54,
+  55,
+  56,
+  57,
+  43,
+  47
+]
+
+// URL-safe Base64 alphabet (RFC 4648 §5): same as standard but + -> -, / -> _
+val b64Url: Int32[] = [
+  65,
+  66,
+  67,
+  68,
+  69,
+  70,
+  71,
+  72,
+  73,
+  74,
+  75,
+  76,
+  77,
+  78,
+  79,
+  80,
+  81,
+  82,
+  83,
+  84,
+  85,
+  86,
+  87,
+  88,
+  89,
+  90,
+  97,
+  98,
+  99,
+  100,
+  101,
+  102,
+  103,
+  104,
+  105,
+  106,
+  107,
+  108,
+  109,
+  110,
+  111,
+  112,
+  113,
+  114,
+  115,
+  116,
+  117,
+  118,
+  119,
+  120,
+  121,
+  122,
+  48,
+  49,
+  50,
+  51,
+  52,
+  53,
+  54,
+  55,
+  56,
+  57,
+  45,
+  95
+]
+
+// Lower-case hex digit codepoints, indexed by nibble value 0..15.
+val hexLower: Int32[] = [
+  48,
+  49,
+  50,
+  51,
+  52,
+  53,
+  54,
+  55,
+  56,
+  57,
+  97,
+  98,
+  99,
+  100,
+  101,
+  102
+]
+// Upper-case hex digit codepoints (for percent-encoding, RFC 3986 prefers upper-case).
+val hexUpper: Int32[] = [
+  48,
+  49,
+  50,
+  51,
+  52,
+  53,
+  54,
+  55,
+  56,
+  57,
+  65,
+  66,
+  67,
+  68,
+  69,
+  70
+]
+
+val PAD: Int32 = 61 // '='
+
+// Map a single ASCII byte value to its Base64 sextet (0..63), or -1 if not in the
+// alphabet. `urlSafe` swaps + (43) / (47) for - (45) _ (95).
+val b64Sextet = (byte: Int32, urlSafe: Boolean): Int32 =>
+  if byte >= 65 && byte <= 90 then
+    byte - 65 // A-Z -> 0..25
+  else if byte >= 97 && byte <= 122 then
+    byte - 71 // a-z -> 26..51
+  else if byte >= 48 && byte <= 57 then
+    byte + 4 // 0-9 -> 52..61
+  else if !urlSafe && byte == 43 then
+    62 // '+'
+  else if !urlSafe && byte == 47 then
+    63 // '/'
+  else if urlSafe && byte == 45 then
+    62 // '-'
+  else if urlSafe && byte == 95 then
+    63 // '_'
+  else
+    -1
+
+// True for ASCII whitespace (space, tab, CR, LF) — ignored by base64Decode.
+val isWs = (byte: Int32): Boolean =>
+  byte == 32 || byte == 9 || byte == 13 || byte == 10
+
+// Map an ASCII hex digit byte to its 0..15 value, or -1 if not a hex digit.
+val hexVal = (byte: Int32): Int32 =>
+  if byte >= 48 && byte <= 57 then
+    byte - 48 // 0-9
+  else if byte >= 97 && byte <= 102 then
+    byte - 87 // a-f
+  else if byte >= 65 && byte <= 70 then
+    byte - 55 // A-F
+  else
+    -1
+
+val mkError = (msg: String): Error =>
+  {
+    "type": "error",
+    "message": msg
+  }
+
+// True for an RFC 3986 unreserved byte: A-Z a-z 0-9 - . _ ~ (emitted literally).
+// (Broken into named sub-conditions: a multiline `||` chain whose continuation lines start
+// with `(` is mis-parsed as a function application — `(expr)\n (expr)` reads as a call.)
+val isUnreserved = (byte: Int32): Boolean =>
+  val isAlpha = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+  val isDigit = byte >= 48 && byte <= 57
+  val isMark = byte == 45 || byte == 46 || byte == 95 || byte == 126
+  isAlpha || isDigit || isMark
+
+// Number of bytes in the (ASCII-or-UTF-8) string, by scanning byteAt to the -1 sentinel.
+// O(n); byteAt is O(1) so the whole scan is linear.
+val byteLen = (s: String): Int32 =>
+  byteLenFrom(s, 0)
+
+val byteLenFrom = (s: String, i: Int32): Int32 =>
+  if byteAt(s, i) == -1 then
+    i
+  else
+    byteLenFrom(s, i + 1)
+
+// Collect the raw UTF-8 bytes of `s` into a UInt8[] (the inverse of fromUtf8), via byteAt.
+val strBytes = (s: String): UInt8[] =>
+  val out: UInt8[] = []
+  strBytesGo(s, 0, out)
+
+val strBytesGo = (s: String, i: Int32, out: UInt8[]): UInt8[] =>
+  val byte = byteAt(s, i)
+  if byte == -1 then
+    out
+  else
+    push(out, byte)
+    strBytesGo(s, i + 1, out)
+
+// Read byte `i` of a `UInt8[]` widened to Int32, or 0 if `i >= n`. NOTE: the flat read
+// `bytes[i]` is bound to its own `Int32` local before the function returns it — writing the
+// conditional read inline (`if i < n then bytes[i] else 0`) miscompiles, because codegen
+// keeps the indexed value at its i8 flat width inside the branch and the resulting PHI/shift
+// then mixes i8 with i32. Routing it through an explicit Int32 binding forces the widen.
+val byteOr0 = (bytes: UInt8[], i: Int32, n: Int32): Int32 =>
+  if i < n then
+    val b: Int32 = bytes[i]
+    b
+  else
+    0
+
+// --- base64 ----------------------------------------------------------------
+// Encode bytes as standard Base64 (RFC 4648 §4, `+`/`/` alphabet) with `=` padding. Never fails.
+// @param bytes  the bytes to encode.
+// @returns the Base64 string.
+export val base64Encode = (bytes: UInt8[]): String =>
+  b64EncodeWith(bytes, b64Std, true)
+
+// Encode bytes as URL-safe Base64 (RFC 4648 §5, `-`/`_` alphabet) WITHOUT padding. Never fails.
+// @param bytes  the bytes to encode.
+// @returns the URL-safe Base64 string.
+export val base64UrlEncode = (bytes: UInt8[]): String =>
+  b64EncodeWith(bytes, b64Url, false)
+
+// Shared encoder for both alphabets. `pad` controls trailing '=' (standard pads, URL-safe does
+// not). Groups input bytes 3-at-a-time, emitting 4 sextet codepoints.
+val b64EncodeWith = (bytes: UInt8[], alpha: Int32[], pad: Boolean): String =>
+  val out: Int32[] = []
+  fromCodePoints(b64EncGo(bytes, length(bytes), 0, alpha, pad, out))
+
+val b64EncGo = (bytes: UInt8[], n: Int32, i: Int32, alpha: Int32[], pad: Boolean, out: Int32[]): Int32[] =>
+  if i >= n then
+    out
+  else
+    val b0: Int32 = bytes[i]
+    val have1 = i + 1 < n
+    val have2 = i + 2 < n
+    val b1: Int32 = byteOr0(bytes, i + 1, n)
+    val b2: Int32 = byteOr0(bytes, i + 2, n)
+    // 24-bit big-endian group.
+    val triple = (b0 << 16) | (b1 << 8) | b2
+    push(out, alpha[(triple >> 18) & 63])
+    push(out, alpha[(triple >> 12) & 63])
+    if have1 then
+      push(out, alpha[(triple >> 6) & 63])
+    else if pad then
+      push(out, PAD)
+    if have2 then
+      push(out, alpha[triple & 63])
+    else if pad then
+      push(out, PAD)
+    b64EncGo(bytes, n, i + 3, alpha, pad, out)
+
+// Decode standard Base64 back to bytes. ASCII whitespace is ignored.
+// @param s  the Base64 string to decode.
+// @returns the decoded bytes, or an Error on a non-alphabet character, malformed padding, or an
+//          impossible length (≡ 1 mod 4).
+export val base64Decode = (s: String): UInt8[] | Error =>
+  b64DecodeWith(s, false)
+
+// Decode URL-safe Base64 back to bytes. Trailing `=` padding is tolerated but optional;
+// standard-alphabet characters (`+`/`/`) are rejected — use base64Decode for those.
+// @param s  the URL-safe Base64 string to decode.
+// @returns the decoded bytes, or an Error on a non-alphabet character or malformed padding.
+export val base64UrlDecode = (s: String): UInt8[] | Error =>
+  b64DecodeWith(s, true)
+
+val b64DecodeWith = (s: String, urlSafe: Boolean): UInt8[] | Error =>
+  val out: UInt8[] = []
+  // acc accumulates sextets; bits = how many sextets (0..3); sawPad latches '='.
+  b64DecGo(s, 0, urlSafe, 0, 0, false, out)
+
+val b64DecGo = (s: String, i: Int32, urlSafe: Boolean, acc: Int32, bits: Int32, sawPad: Boolean, out: UInt8[]): UInt8[] | Error =>
+  val c = byteAt(s, i)
+  if c == -1 then
+    if bits == 1 then
+      // End of input: flush the trailing partial group.
+      mkError("base64: invalid length")
+    else if bits == 2 then
+      push(out, (acc >> 4) & 255)
+      out
+    else if bits == 3 then
+      push(out, (acc >> 10) & 255)
+      push(out, (acc >> 2) & 255)
+      out
+    else
+      out
+  else if isWs(c) then
+    b64DecGo(s, i + 1, urlSafe, acc, bits, sawPad, out)
+  else if c == PAD then
+    // Padding is only valid when it completes a PARTIAL final group (2 or 3 sextets
+    // accumulated). A `=` at a group boundary (bits == 0) — e.g. a complete group
+    // followed by a stray `=` as in "SGkx=" — is malformed. Once padding starts we just
+    // consume any further `=`; non-pad data after padding is caught below.
+    if !sawPad && bits != 2 && bits != 3 then
+      mkError("base64: invalid padding")
+    else
+      b64DecGo(s, i + 1, urlSafe, acc, bits, true, out)
+  else if sawPad then
+    mkError("base64: data after padding")
+  else
+    val sx = b64Sextet(c, urlSafe)
+    if sx == -1 then
+      mkError("base64: invalid character")
+    else
+      val acc2 = (acc << 6) | sx
+      if bits == 3 then
+        // Completed a 24-bit group -> 3 bytes; reset accumulator.
+        push(out, (acc2 >> 16) & 255)
+        push(out, (acc2 >> 8) & 255)
+        push(out, acc2 & 255)
+        b64DecGo(s, i + 1, urlSafe, 0, 0, sawPad, out)
+      else
+        b64DecGo(s, i + 1, urlSafe, acc2, bits + 1, sawPad, out)
+
+// --- hex -------------------------------------------------------------------
+// Encode bytes as lower-case hex, two chars per byte, most-significant nibble first. Never fails.
+// @param bytes  the bytes to encode.
+// @returns the hex string (length exactly 2 * length(bytes)).
+export val hexEncode = (bytes: UInt8[]): String =>
+  val out: Int32[] = []
+  fromCodePoints(hexEncGo(bytes, length(bytes), 0, out))
+
+val hexEncGo = (bytes: UInt8[], n: Int32, i: Int32, out: Int32[]): Int32[] =>
+  if i >= n then
+    out
+  else
+    val byte: Int32 = bytes[i]
+    push(out, hexLower[(byte >> 4) & 15])
+    push(out, hexLower[byte & 15])
+    hexEncGo(bytes, n, i + 1, out)
+
+// Decode a hex string back to bytes. Accepts upper- and lower-case; does NOT skip whitespace or
+// accept a `0x` prefix.
+// @param s  the hex string to decode.
+// @returns the decoded bytes, or an Error on odd length or any non-hex character.
+export val hexDecode = (s: String): UInt8[] | Error =>
+  val n = byteLen(s)
+  if n % 2 != 0 then
+    mkError("hex: odd-length input")
+  else
+    val out: UInt8[] = []
+    hexDecGo(s, n, 0, out)
+
+val hexDecGo = (s: String, n: Int32, i: Int32, out: UInt8[]): UInt8[] | Error =>
+  if i >= n then
+    out
+  else
+    val hi = hexVal(byteAt(s, i))
+    val lo = hexVal(byteAt(s, i + 1))
+    if hi == -1 || lo == -1 then
+      mkError("hex: invalid character")
+    else
+      push(out, (hi << 4) | lo)
+      hexDecGo(s, n, i + 2, out)
+
+// --- url / percent ---------------------------------------------------------
+// Percent-encode `s` as a URI COMPONENT (RFC 3986): the strict, maximal-escaping component
+// encoder, safe for both path segments and query values. Every UTF-8 byte is escaped to %XX
+// (upper-case hex) except the unreserved set; space becomes %20 (NOT +).
+// @param s  the text to encode.
+// @returns the percent-encoded string.
+export val urlEncode = (s: String): String =>
+  val out: Int32[] = []
+  fromCodePoints(pctEncGo(s, 0, false, out))
+
+// Shared percent-encoder. `plusSpace` selects the form convention (space -> '+') used by
+// buildQuery; urlEncode keeps space as %20.
+val pctEncGo = (s: String, i: Int32, plusSpace: Boolean, out: Int32[]): Int32[] =>
+  val byte = byteAt(s, i)
+  if byte == -1 then
+    out
+  else
+    if byte == 32 && plusSpace then
+      push(out, 43) // '+'
+    else if isUnreserved(byte) then
+      push(out, byte)
+    else
+      push(out, 37) // '%'
+      push(out, hexUpper[(byte >> 4) & 15])
+      push(out, hexUpper[byte & 15])
+    pctEncGo(s, i + 1, plusSpace, out)
+
+// Decode percent-escapes back to a String. `%XX` triples become their byte value, a literal `+`
+// decodes to a space (form symmetry), and the resulting bytes are UTF-8 decoded.
+// @param s  the percent-encoded string.
+// @returns the decoded text, or an Error on a `%` not followed by two hex digits, or invalid UTF-8.
+export val urlDecode = (s: String): String | Error =>
+  val bytes = percentDecodeBytes(s)
+  if bytes is Error then
+    // The checker narrows the FALSE branch of `is Error` (giving `UInt8[]`) but not the TRUE
+    // branch to `Error` for a non-Json union scrutinee, so reconstruct a fresh Error here.
+    mkError(toString(bytes["message"]))
+  else
+    fromUtf8(bytes)
+
+// Strict percent-decode to the raw decoded `UInt8[]`. `+` -> space. Error on a malformed
+// escape (a `%` not followed by two hex digits).
+val percentDecodeBytes = (s: String): UInt8[] | Error =>
+  val out: UInt8[] = []
+  pctDecGo(s, byteLen(s), 0, out)
+
+val pctDecGo = (s: String, n: Int32, i: Int32, out: UInt8[]): UInt8[] | Error =>
+  if i >= n then
+    out
+  else
+    val c = byteAt(s, i)
+    if c == 37 then
+      if i + 2 >= n then
+        mkError("url: truncated percent-escape")
+      else
+        val hi = hexVal(byteAt(s, i + 1))
+        val lo = hexVal(byteAt(s, i + 2))
+        if hi == -1 || lo == -1 then
+          mkError("url: invalid percent-escape")
+        else
+          push(out, (hi << 4) | lo)
+          pctDecGo(s, n, i + 3, out)
+    else if c == 43 then
+      push(out, 32)
+      pctDecGo(s, n, i + 1, out)
+    else
+      push(out, c)
+      pctDecGo(s, n, i + 1, out)
+
+// --- query string ----------------------------------------------------------
+// Lenient percent-decode for query keys/values: a malformed escape is left as its literal
+// bytes rather than failing (a server should not 500 on attacker/legacy query input). `+`
+// maps to a space (form semantics). Always succeeds.
+val queryDecode = (s: String): String =>
+  val out: UInt8[] = []
+  val bytes = queryDecGo(s, byteLen(s), 0, out)
+  // Lenient: if the decoded bytes are not valid UTF-8, fall back to the original text.
+  val decoded = fromUtf8(bytes)
+  if decoded is Error then
+    s
+  else
+    decoded
+
+val queryDecGo = (s: String, n: Int32, i: Int32, out: UInt8[]): UInt8[] =>
+  if i >= n then
+    out
+  else
+    val c = byteAt(s, i)
+    if c == 37 && i + 2 < n then
+      val hi = hexVal(byteAt(s, i + 1))
+      val lo = hexVal(byteAt(s, i + 2))
+      if hi != -1 && lo != -1 then
+        push(out, (hi << 4) | lo)
+        queryDecGo(s, n, i + 3, out)
+      else
+        push(out, c)
+        queryDecGo(s, n, i + 1, out)
+    else if c == 43 then
+      push(out, 32)
+      queryDecGo(s, n, i + 1, out)
+    else
+      push(out, c)
+      queryDecGo(s, n, i + 1, out)
+
+// Byte-range substring [start, end) as a String. Emits each byte as a codepoint; the slice
+// boundaries are always at ASCII `&`/`=`/start, so this is sound for re-feeding to
+// queryDecode (which re-validates the UTF-8 of any escaped multibyte content).
+val byteSlice = (s: String, start: Int32, end: Int32): String =>
+  val out: Int32[] = []
+  fromCodePoints(byteSliceGo(s, start, end, out))
+
+val byteSliceGo = (s: String, i: Int32, end: Int32, out: Int32[]): Int32[] =>
+  if i >= end then
+    out
+  else
+    push(out, byteAt(s, i))
+    byteSliceGo(s, i + 1, end, out)
+
+// Parse a query string into a multimap of key -> list of values. Pairs split on `&`; each pair
+// splits on the first `=`. Keys/values are percent-decoded with `+`->space (form semantics),
+// leniently (malformed escapes are kept literal). A bare key (`flag`) maps to a single `""` value.
+// A leading `?` is tolerated and stripped. Always succeeds.
+// @param s  the query string (with or without a leading `?`).
+// @returns the parsed multimap; each key maps to its list of values in input order.
+export val parseQuery = (s: String): { String: String[] } =>
+  val result: { String: String[] } = {}
+  val n = byteLen(s)
+  val start = if byteAt(s, 0) == 63 then 1 else 0
+  parseQueryGo(s, n, start, start, -1, result)
+
+// Scan byte by byte; `keyStart` is the start of the current pair, `eqAt` the index of its
+// first '=' (-1 if none seen yet). At each '&' (or end of input) the pair [keyStart, i) is
+// emitted into `result`. Returns `result`.
+val parseQueryGo = (s: String, n: Int32, i: Int32, keyStart: Int32, eqAt: Int32, result: { String: String[] }): { String: String[] } =>
+  if i > n then
+    result
+  else
+    // Treat one-past-the-end as a final '&' so the last pair is flushed.
+    val c = if i < n then byteAt(s, i) else 38
+    if c == 38 then
+      if i > keyStart then
+        val rawKey = if eqAt == -1 then
+          byteSlice(s, keyStart, i)
+        else
+          byteSlice(s, keyStart, eqAt)
+        val rawVal = if eqAt == -1 then "" else byteSlice(s, eqAt + 1, i)
+        val k = queryDecode(rawKey)
+        val v = queryDecode(rawVal)
+        addPair(result, k, v)
+      parseQueryGo(s, n, i + 1, i + 1, -1, result)
+    else if c == 61 && eqAt == -1 then
+      parseQueryGo(s, n, i + 1, keyStart, i, result)
+    else
+      parseQueryGo(s, n, i + 1, keyStart, eqAt, result)
+
+// Append value `v` to the list at key `k`, creating a fresh one-element list on first use.
+// `result[k]` is read into a local so the `== null` guard narrows the else branch to a
+// non-null `String[]` (indexing twice would re-widen to `String[] | Null`).
+val addPair = (result: { String: String[] }, k: String, v: String): Null =>
+  val cur = result[k]
+  if cur == null then
+    val fresh: String[] = [v]
+    result[k] = fresh
+  else
+    push(cur, v)
+
+// Serialize a multimap back to a query string: each key paired with each value (`k=v1&k=v2`), keys
+// and values percent-encoded with the component rules PLUS the form convention of encoding space as
+// `+`. Inverse of parseQuery (up to key/iteration order). No leading `?` is emitted.
+// @param params  the multimap of keys to value lists.
+// @returns the query string, or "" for an empty map.
+export val buildQuery = (params: { String: String[] }): String =>
+  val parts: String[] = []
+  keys(params).for(k =>
+    val ek = formEncode(k)
+    // `k` came from keys(params) so the value is always present; guard anyway since the
+    // index type is `String[] | Null` (the `!= null` check narrows `vals` to `String[]`).
+    val vals = params[k]
+    if vals != null then
+      vals.for(v =>
+        push(parts, "${ek}=${formEncode(v)}")
+      )
+  )
+  joinAmp(parts, length(parts), 0, "")
+
+// Percent-encode for x-www-form-urlencoded: like urlEncode but space -> '+'.
+val formEncode = (s: String): String =>
+  val out: Int32[] = []
+  fromCodePoints(pctEncGo(s, 0, true, out))
+
+// Join already-built `k=v` ASCII parts with `&` (a local join so the module needs no exact
+// dependency on std/string.join's signature).
+val joinAmp = (parts: String[], n: Int32, i: Int32, acc: String): String =>
+  if i >= n then
+    acc
+  else if i == 0 then
+    joinAmp(parts, n, 1, parts[0])
+  else
+    joinAmp(parts, n, i + 1, "${acc}&${parts[i]}")
+
+// --- string convenience wrappers ------------------------------------------
+// UTF-8 encode `s` to bytes, then standard Base64. Use for text payloads. Never fails.
+// @param s  the text to encode.
+// @returns the Base64 string.
+export val base64EncodeString = (s: String): String =>
+  base64Encode(strBytes(s))
+
+// Standard Base64 decode, then UTF-8 decode the bytes back to a String.
+// @param s  the Base64 string to decode.
+// @returns the decoded text, or an Error on malformed Base64 OR invalid UTF-8.
+export val base64DecodeString = (s: String): String | Error =>
+  val bytes = base64Decode(s)
+  if bytes is Error then
+    mkError(toString(bytes["message"]))
+  else
+    fromUtf8(bytes)
+
+// --- structural hash -------------------------------------------------------
+// Compute a stable, canonical, type-tagged structural hash key for any value. The key matches
+// Lin's structural equality (spec §14): equal values hash equal, objects hash independently of
+// key order, and arrays hash order-sensitively. The type tag means values of different types
+// never collide — `hash(42)` is `"i:42"` while `hash("42")` is `"s:42"`. Use it to deduplicate
+// values or index them by structural identity (e.g. as object keys in a hand-rolled set/map, or
+// to bucket structurally-equal records with std/array's `countBy`). Generic over the input type —
+// it walks the runtime value, so T can be anything. (Folded in from the former std/hash module.)
+// @param x  the value to hash.
+// @returns the structural hash key as a String.
+// @example hash(null)     // "N"
+// @example hash(42)       // "i:42"
+// @example hash("hello")  // "s:hello"
+// @example hash([1, 2, 3]) == hash([1, 2, 3])   // true (order-sensitive: [1,2] != [2,1])
+// @example hash({ "x": 1, "y": 2 }) == hash({ "y": 2, "x": 1 })   // true (order-independent)
+// @example hash(42) == hash("42")   // false (type-tagged: never collides across types)
+export val hash = <T>(x: T): String =>
+  lin_value_key(x)
