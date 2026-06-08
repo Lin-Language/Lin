@@ -1,6 +1,6 @@
 # Path 1 — Finish the packed-record approach: integrate packing with the operations
 
-**Status:** Open proposal, one of five independent paths. Self-contained.
+**Status:** Open proposal, one of three independent paths. Self-contained.
 **Direction in one line:** keep one record construct; make the packed/sealed representation we already
 built actually pay off by making the stdlib *operations* (`length`/`map`/`for`/index) work on packed
 data without re-boxing, and pack fixed-key record types by default (no userland change — the grammar already says struct vs map).
@@ -140,22 +140,17 @@ the String/Array/Map/nested extension is the spike on `spike/cheap-typed-reads`,
 the actual unsolved core — making `length`/iteration/the combinators operate on a packed array **in
 place** instead of materializing it (cost #2, which nothing on master addresses).
 
-### Step 0 (the cheapest large win, do FIRST and MEASURE) — type RAPTOR's trips
-Before the multi-week in-place ABI, the single highest value-to-risk move is to **type RAPTOR's trips
-end-to-end and measure** (§H5b). It is *not* a new feature — it is three bug-fixes + a `.lin` retype:
-- fix the two H5 crash/RC blockers (packed `Trip[]` vs the monomorphized `sort` comparator reading
-  packed elements as boxed; the `Trip|Null` tail-recursive scan-param UAF/repr-demotion);
-- fix `get<T,D>` monomorphization for `T = record-array` (the link error);
-- then type `tripsByRoute: {String: Trip[]}` + the hot-path params as `Trip`/`StopTime`.
-The hot-read micro projects **~110 s → ~30 s (~3.5×)**, digest byte-identical, no language change — and
-the packed const-offset read it relies on **is already shipped**. **But this is exactly where H5
-(>5× regression) and H5b (~3.5× win) must be reconciled empirically:** the win materialises iff RAPTOR's
-hot path is dominated by the now-cheap field *reads* rather than by `length`/`for`/combinator calls that
-still materialize (cost #2). So Step 0 is: do the bug-fixes + retype, **measure**, and branch — if it
-wins, this is the cheapest large RAPTOR win available and needs none of Step 1; if the combinators
-dominate and it still regresses, that is the concrete proof that **Step 1 (the in-place ABI) is the
-prerequisite**, and Step 0 becomes "after Step 1." Either way the measurement is decisive and cheap to
-get. (The `get<T,D>` fix is also literally a down-payment on Step 2b's monomorphization.)
+### Step 0 — see [Path 0 (Prerequisites)](path-0-prerequisites.md), do it FIRST
+The cheapest large RAPTOR win — type the trips off `Json` + fix `get<T,D>` monomorphization + the
+`Trip|Null` tail-param UAF, then **measure** — has been hoisted into its own
+[Path 0](path-0-prerequisites.md) because it is **path-independent**: those fixes and the de-`Json`-ing
+are needed under Path 2 just as much as Path 1, so they are not part of *this* path's strategy. Path 0's
+measurement is also what decides whether this path's Step 1 (the in-place ABI) is even required: if
+RAPTOR's hot path is read-dominated, typing alone wins (~110 s → ~30 s) and Step 1 isn't needed for
+RAPTOR; if the `length`/`for`/combinator calls still dominate (they materialize the packed array — cost
+#2), that is the concrete proof Step 1 is the prerequisite. **One sub-fix IS this path's, not Path 0's:**
+the `sort$Object` comparator reading packed `Trip[]` elements as boxed — it only bites once the trips are
+*packed* (this path's representation), so it lives here, not in Path 0.
 
 ### Step 1 (mandatory if Step 0 shows combinators dominate; the core) — an in-place packed-array ABI
 Make `length`/index/`for`/`map`/`filter`/`reduce`/`sort`/`push`/`set` operate on a `0xFE` packed array
