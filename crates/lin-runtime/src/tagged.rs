@@ -562,6 +562,23 @@ pub unsafe extern "C" fn lin_tagged_free_box_if_distinct(p: *mut u8, other: *mut
     lin_tagged_free_box(p);
 }
 
+/// FULLY release a `TaggedVal*` box (inner heap payload + shell), but ONLY when `p` is a DISTINCT
+/// pointer from `other`. The full-release counterpart of `lin_tagged_free_box_if_distinct`: used by
+/// `for`/`while` to reclaim a per-iteration element box that `lin_array_get_tagged` returned as a
+/// fresh +1 (with the inner heap payload RETAINED), while avoiding a double-free when the callback
+/// returned (an alias of) that very box — in which case the loop's separate full release of the
+/// return box already reclaimed it. Releasing only the shell here (the old behaviour) leaked the
+/// retained inner heap value of every heap-bearing element (Object/String/Array) — the
+/// String-packed-sealed `for` leak AND the pre-existing genuine `Json[]`-of-objects `for` leak.
+/// Null/cached-box safe (via `lin_tagged_release`).
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_release_if_distinct(p: *mut u8, other: *mut u8) {
+    if p == other {
+        return;
+    }
+    lin_tagged_release(p);
+}
+
 /// Release a TaggedVal*: release the pointed-to heap value (if pointer type), then free the box.
 /// Safe to call with null (treated as null — no-op).
 #[no_mangle]
@@ -627,6 +644,65 @@ mod cache_tests {
             assert_eq!(lin_unbox_int32(p), v);
             assert!(!is_cached_box(p), "out-of-range int should be heap-allocated");
             lin_tagged_release(p); // frees the heap box
+        }
+    }
+
+    // Regression: the combinator element-reclaim leak (ADR-063 Stage 3b read path). `for`/`while`/
+    // `reduce` over a heap-bearing tagged array read each element via `lin_array_get_tagged`, which
+    // returns a fresh box WITH its inner heap payload RETAINED (+1). The old reclaim freed only the
+    // box SHELL (`lin_tagged_free_box_if_distinct`), leaking the retained inner of every heap element
+    // — the String-packed-sealed `for` leak AND the pre-existing genuine `Json[]`-of-objects leak.
+    // `lin_tagged_release_if_distinct` is the full-release fix: it releases inner + shell, but only
+    // when the box is DISTINCT from the loop's discarded callback-return box (else that box's own
+    // release already reclaimed it — guarding the double-free).
+    #[test]
+    fn release_if_distinct_reclaims_inner_when_distinct() {
+        unsafe {
+            // A heap String with rc bumped to 2 so we can observe the inner decrement without freeing.
+            let s = crate::string::lin_string_from_bytes(b"hello".as_ptr(), 5);
+            assert_eq!((*s).refcount, 1);
+            crate::memory::lin_rc_retain(s as *mut u32); // rc = 2
+            assert_eq!((*s).refcount, 2);
+            // Box it TAG_STR (the box does not retain — it owns the existing +1).
+            let elem = lin_box_str(s as *mut u8);
+            // Some OTHER distinct pointer (a separate box) standing in for the callback-return box.
+            let other = lin_box_int32(SMALL_INT_MAX as i32); // out-of-range → fresh heap box
+            assert_ne!(elem, other);
+            // Full release of the DISTINCT element box: frees the shell AND releases the inner String
+            // (rc 2 → 1). A shell-only free would have left rc at 2 (the leak).
+            lin_tagged_release_if_distinct(elem, other);
+            assert_eq!((*s).refcount, 1, "inner String must be released (was the shell-only leak)");
+            // Clean up the standins.
+            lin_tagged_release(other);
+            crate::string::lin_string_release(s); // rc 1 → 0, frees
+        }
+    }
+
+    #[test]
+    fn release_if_distinct_is_noop_when_aliased() {
+        unsafe {
+            // When the element box ALIASES the (already-released) return box, releasing it again would
+            // double-free. The guard makes it a no-op.
+            let s = crate::string::lin_string_from_bytes(b"world".as_ptr(), 5);
+            let elem = lin_box_str(s as *mut u8);
+            // p == other → no-op: neither the shell nor the inner are touched.
+            lin_tagged_release_if_distinct(elem, elem);
+            assert_eq!((*s).refcount, 1, "aliased release must be a no-op (no double-free)");
+            // Now reclaim for real.
+            lin_tagged_release(elem); // releases inner (rc 1 → 0) + shell
+        }
+    }
+
+    #[test]
+    fn release_if_distinct_scalar_box_degrades_to_shell_free() {
+        unsafe {
+            // A flat-scalar element box has no heap inner, so a full release just frees the shell.
+            // Use an out-of-range int so the box is a fresh heap allocation (not a cached static).
+            let elem = lin_box_int64(SMALL_INT_MAX);
+            let other = lin_box_int64(SMALL_INT_MAX + 1);
+            assert!(!is_cached_box(elem) && !is_cached_box(other));
+            lin_tagged_release_if_distinct(elem, other); // frees elem's shell (no inner)
+            lin_tagged_release(other);
         }
     }
 

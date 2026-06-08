@@ -75,11 +75,13 @@ named `ScanResults` record through `raptor.lin`/`query.lin`):
 Arrival times are **Int64** (the MAX sentinel `9007199254740991` needs it). `previousArrival`/
 `bestArrival` read the typed slot (so `m[k]` is `Int64 | Null`) but **widen to `Json`** so the
 arithmetic/comparison consumers in `raptor.lin`'s inner scan loop keep their existing `!= null`
-guards + Json numeric ops unchanged. `getFoundStations` (`query.lin`) must keep `bestArrivals`
-typed `{ String: Int64 }` (NOT widened to `Json`): a `Json m[k]` index uses the object path and
-misreads the `TAG_MAP` rep — a typed-map value passed to a `Json` param round-trips fine, but
-indexing it as `Json` does not tag-dispatch `TAG_MAP` (a cross-rep boundary gap; it null-deref'd
-in `lin_unbox_int32` until the param was re-typed).
+guards + Json numeric ops unchanged. `getFoundStations` (`query.lin`) keeps `bestArrivals` typed
+`{ String: Int64 }` for fidelity. (HISTORICAL: indexing a typed map *after widening it to a `Json`
+param* once misread the `TAG_MAP` rep and null-deref'd in `lin_unbox_int32` — a codegen cross-rep
+boundary gap, NOT a type-system issue. That gap is FIXED: the index path now tag-dispatches
+`TAG_MAP` → `lin_map_get` (`codegen/data.rs`, commit 0819c17), so a `Json m[k]` over a real map is
+now sound. The typed-map accessor itself always behaved correctly: `m[k]` on `{ String: T }` is
+`T | Null`, consumed with the normal `== null` guard.)
 
 **Measured payoff: NEUTRAL within heavy noise.** Unlike the PREP/`RaptorIndex` win (~5.6×,
 because those indexes were ~16k-key routeId maps scanned per-trip over 240k trips), the

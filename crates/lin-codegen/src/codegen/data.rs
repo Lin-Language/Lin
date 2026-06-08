@@ -1872,8 +1872,12 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.store(desc_p, self.context.ptr_type(AddressSpace::default()).const_null());
 
         // Fields: all scalars, stored inline by offset. No coerce (scalar field type == value type
-        // under this gate), no retain.
+        // under this gate), no retain. Skip any width-subtyping EXTRA field not in the declared
+        // sealed shape (see `sealed_construct`).
         for (name, val, _val_ty, _already_owned) in field_vals {
+            if !fields.contains_key(name) {
+                continue;
+            }
             let (offset, _) = Self::sealed_field_layout(fields, name);
             let p = unsafe {
                 self.builder.gep(i8_ty, obj, &[i64_ty.const_int(offset, false)], "sealed_stk_set_p")
@@ -1894,6 +1898,14 @@ impl<'ctx> Codegen<'ctx> {
         let obj = self.builder.call(self.rt.sealed_alloc, &[i64_ty.const_int(total, false).into(), desc.into()], "sealed_obj")
             .try_as_basic_value().unwrap_basic().into_pointer_value();
         for (name, val, val_ty, already_owned) in field_vals {
+            // A literal may carry EXTRA fields beyond the declared sealed shape (width subtyping:
+            // `val p: Pt = { x, y, extra }` is well-typed; extras are dropped on assignment). The
+            // packed sealed layout has slots ONLY for the declared fields, so skip any field_vals
+            // entry not in `fields` — otherwise `sealed_field_layout` asserts "field not in record".
+            // (The value is still lowered by the caller; here we simply don't store it.)
+            if !fields.contains_key(name) {
+                continue;
+            }
             let (offset, _) = Self::sealed_field_layout(fields, name);
             let fld_ty = fields.get(name).cloned().unwrap_or(Type::Null);
             // Convert the supplied value to the field's stored representation if needed. NOTE:

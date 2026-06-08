@@ -249,6 +249,7 @@ pub fn instr_use_def(instr: &Instruction) -> (Vec<Temp>, Vec<Temp>) {
         Instruction::CloneBox { dst, src, .. } => (vec![*src], vec![*dst]),
         Instruction::FreeBoxShell { val } => (vec![*val], vec![]),
         Instruction::FreeBoxShellIfDistinct { val, other } => (vec![*val, *other], vec![]),
+        Instruction::ReleaseIfDistinct { val, other } => (vec![*val, *other], vec![]),
         Instruction::IsType { dst, val, .. } => (vec![*val], vec![*dst]),
         Instruction::SumTagEq { dst, val, .. } => (vec![*val], vec![*dst]),
         Instruction::HasPattern { dst, val, .. } => (vec![*val], vec![*dst]),
