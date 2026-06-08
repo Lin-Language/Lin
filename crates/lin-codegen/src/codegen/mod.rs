@@ -1056,6 +1056,26 @@ impl<'ctx> Codegen<'ctx> {
                                 }
                             }
                         }
+                        Instruction::ReleaseIfDistinct { val, other } => {
+                            if let Some(&v) = temp_map.get(val) {
+                                if v.is_pointer_value() {
+                                    // `other` is the loop's discarded callback-return box. When it is
+                                    // also a pointer the element box MAY alias it (a body returning the
+                                    // element verbatim), so guard the full release. When `other` is a
+                                    // scalar/Null (a Bool predicate, a void-ish body) it can never alias,
+                                    // so release unconditionally.
+                                    let o = match temp_map.get(other) {
+                                        Some(&o) if o.is_pointer_value() => o,
+                                        _ => ptr_ty.const_null().into(),
+                                    };
+                                    let rel_fn = self.get_or_declare_fn(
+                                        "lin_tagged_release_if_distinct",
+                                        self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+                                    );
+                                    self.builder.call(rel_fn, &[v.into(), o.into()], "");
+                                }
+                            }
+                        }
                         Instruction::Call { dst, callee, args, ret_ty } => {
                             let arg_vals: Vec<BasicMetadataValueEnum> = args
                                 .iter()
