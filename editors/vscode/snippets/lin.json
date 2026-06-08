@@ -41,8 +41,8 @@
   },
   "match expression": {
     "prefix": "match",
-    "body": "match ${1:expr}\n  has ${2:{ \"type\": \"success\", value \\}} => ${3:value}\n  else => ${4:fallback}",
-    "description": "Pattern match with has-arms and an else fallback"
+    "body": "match ${1:expr}\n  has { \"type\": \"${2:success}\", ${3:value} } => ${4:$3}\n  else => ${5:fallback}",
+    "description": "Pattern match with a record-shape has-arm and an else fallback"
   },
   "match on type": {
     "prefix": "matchis",
