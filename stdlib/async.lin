@@ -15,7 +15,7 @@
 // `threadPool(n)` bounds concurrency to `n` in-flight thunks. `shared`/`get`/`set`/`withLock`
 // give opt-in shared MUTABLE state safe across threads; `frozen` deep-freezes a value into
 // lock-free read-only state any thread can share without copying.
-//
+
 // `async` runs thunk `f` concurrently and returns an opaque `Promise<T>` handle; resolve it with
 // `await` (the value materialises only at the await site, where any fault is injected as an
 // `Error`). Example:

@@ -14,9 +14,6 @@ Build a pipeline with std/stream + std/iter as usual, e.g.
   import { readStream, writeStream, drain } from "std/stream"
   import { gunzip } from "std/compress"
   readStream("data.gz").gunzip().writeStream("data.txt").drain()
-Adapter: decompress a gzip-framed byte stream. LAZY.
-- **`s`** — the upstream gzip-framed byte stream.
-- **Returns** a `Stream<UInt8[]>` of decompressed chunks; a decode fault surfaces in-band as `Error`.
 
 ## Reference
 
@@ -26,6 +23,9 @@ Adapter: decompress a gzip-framed byte stream. LAZY.
 val gunzip = (s: Stream): Stream
 ```
 
+Adapter: decompress a gzip-framed byte stream. LAZY.
+- **`s`** — the upstream gzip-framed byte stream.
+- **Returns** a `Stream<UInt8[]>` of decompressed chunks; a decode fault surfaces in-band as `Error`.
 
 #### `gzip`
 

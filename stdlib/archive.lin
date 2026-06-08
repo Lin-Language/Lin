@@ -19,6 +19,7 @@
 // worker via `.promise()`, stored in a field/var/array, or otherwise outlive the callback. The
 // ADR-049 stream placement restriction enforces the lifetime bound; a `.promise()` on `data` would
 // race the shared cursor and is UNSUPPORTED (a dedicated compile-time check for that is a known gap).
+
 // Drive the whole tar archive on the calling thread in constant memory, calling `body` per entry.
 // @param s     the upstream byte stream (moved in — may not be reused after the call).
 // @param body  `body(meta, data)`, called per entry; `meta` is `{ name, size, typeflag, isDir }`

@@ -21,12 +21,6 @@ paused while the body runs and resumes (skipping to the next entry) the moment t
 worker via `.promise()`, stored in a field/var/array, or otherwise outlive the callback. The
 ADR-049 stream placement restriction enforces the lifetime bound; a `.promise()` on `data` would
 race the shared cursor and is UNSUPPORTED (a dedicated compile-time check for that is a known gap).
-Drive the whole tar archive on the calling thread in constant memory, calling `body` per entry.
-- **`s`** — the upstream byte stream (moved in — may not be reused after the call).
-- **`body`** — `body(meta, data)`, called per entry; `meta` is `{ name, size, typeflag, isDir }`
-  and `data` is a `Stream<UInt8[]>` sub-stream over the entry's body (sync-only, see the module
-  caveat). Its return is ignored.
-- **Returns** `Null` on success, or an `Error` if an entry body faulted or a read failed.
 
 ## Reference
 
@@ -36,6 +30,12 @@ Drive the whole tar archive on the calling thread in constant memory, calling `b
 val untar = (s: Stream, body: (Json, Stream)
 ```
 
+Drive the whole tar archive on the calling thread in constant memory, calling `body` per entry.
+- **`s`** — the upstream byte stream (moved in — may not be reused after the call).
+- **`body`** — `body(meta, data)`, called per entry; `meta` is `{ name, size, typeflag, isDir }`
+  and `data` is a `Stream<UInt8[]>` sub-stream over the entry's body (sync-only, see the module
+  caveat). Its return is ignored.
+- **Returns** `Null` on success, or an `Error` if an entry body faulted or a read failed.
 
 #### `manifest`
 
