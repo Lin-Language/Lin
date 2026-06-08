@@ -26,7 +26,7 @@ import foreign "lin-runtime"
   val lin_string_slice: (String, Int32, Int32) => String
 
 import { push, length } from "std/array"
-import { for, range, map } from "std/iter"
+import { for, range, map, while } from "std/iter"
 import { keys } from "std/object"
 import { join } from "std/string"
 
@@ -64,13 +64,23 @@ val trimAsciiWs = (s: String): String =>
   val n = lin_string_length(s)
   var start = 0
   var end = n
-  range(0, n).for(i =>
+  // `while` stops at the first non-space (short-circuits; a `range(...).for` would scan the whole
+  // field even after the trim boundary).
+  range(0, n).while(_ =>
     val b = lin_string_byte_at(s, start)
-    if (b == 32 || b == 9) && start < end then start = start + 1
+    if (b == 32 || b == 9) && start < end then
+      start = start + 1
+      true
+    else
+      false
   )
-  range(0, n).for(i =>
+  range(0, n).while(_ =>
     val b = lin_string_byte_at(s, end - 1)
-    if (b == 32 || b == 9) && end > start then end = end - 1
+    if (b == 32 || b == 9) && end > start then
+      end = end - 1
+      true
+    else
+      false
   )
   lin_string_slice(s, start, end)
 
@@ -87,34 +97,36 @@ val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean)
     var i = start + 1
     var segStart = start + 1
     val parts: String[] = []
-    var done = false
     var ok = false
     var endPos = n
-    // Bounded walk: at most n iterations (each advances i by >= 1).
-    range(0, n).for(_ =>
-      if !done then
-        val b = lin_string_byte_at(s, i)
-        if b == -1 then
-          // EOF inside a quoted field -> unterminated quote.
-          done = true
-          ok = false
-          endPos = n
-        else if b == QUOTE then
-          val next = lin_string_byte_at(s, i + 1)
-          if next == QUOTE then
-            // Escaped quote: emit the span up to and including this quote's position, skip the pair.
-            push(parts, lin_string_slice(s, segStart, i + 1))
-            i = i + 2
-            segStart = i
-          else
-            // Closing quote: emit the final span, terminate.
-            push(parts, lin_string_slice(s, segStart, i))
-            i = i + 1
-            done = true
-            ok = true
-            endPos = i
+    // Bounded walk via `while` (which SHORT-CIRCUITS — `range(...).for` would run the full bound
+    // even after the field ends, making the parser O(n²)). The callback returns true to continue,
+    // false to stop. Each step advances `i` by >= 1, so it terminates in O(field length).
+    range(0, n).while(_ =>
+      val b = lin_string_byte_at(s, i)
+      if b == -1 then
+        // EOF inside a quoted field -> unterminated quote.
+        ok = false
+        endPos = n
+        false
+      else if b == QUOTE then
+        val next = lin_string_byte_at(s, i + 1)
+        if next == QUOTE then
+          // Escaped quote: emit the span up to and including this quote's position, skip the pair.
+          push(parts, lin_string_slice(s, segStart, i + 1))
+          i = i + 2
+          segStart = i
+          true
         else
+          // Closing quote: emit the final span, terminate.
+          push(parts, lin_string_slice(s, segStart, i))
           i = i + 1
+          ok = true
+          endPos = i
+          false
+      else
+        i = i + 1
+        true
     )
     {
       "value": join(parts, ""),
@@ -123,19 +135,19 @@ val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean)
     }
   else
     // Unquoted field: scan to delimiter / CR / LF / EOF. A `"` mid-field is a stray-quote error.
+    // `while` short-circuits (a `range(...).for` would run the full bound — O(n²)).
     var i = start
     var ok = true
-    var done = false
-    range(0, n + 1).for(_ =>
-      if !done then
-        val b = lin_string_byte_at(s, i)
-        if b == -1 || b == delim || b == CR || b == LF then
-          done = true
-        else if b == QUOTE then
-          done = true
-          ok = false
-        else
-          i = i + 1
+    range(0, n + 1).while(_ =>
+      val b = lin_string_byte_at(s, i)
+      if b == -1 || b == delim || b == CR || b == LF then
+        false
+      else if b == QUOTE then
+        ok = false
+        false
+      else
+        i = i + 1
+        true
     )
     val raw = lin_string_slice(s, start, i)
     {
@@ -153,30 +165,31 @@ val scanRecord = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean
   val fields: String[] = []
   var pos = start
   var ok = true
-  var done = false
-  range(0, n + 1).for(_ =>
-    if !done then
-      val cur = scanField(s, n, pos, delim, trim)
-      if cur["ok"] != true then
-        ok = false
-        done = true
+  // `while` short-circuits at the record terminator (a `range(...).for` would run the full bound —
+  // making the whole parse O(n²)). One field is scanned per iteration; bounded by n+1 fields.
+  range(0, n + 1).while(_ =>
+    val cur = scanField(s, n, pos, delim, trim)
+    if cur["ok"] != true then
+      ok = false
+      false
+    else
+      push(fields, cur["value"])
+      pos = cur["pos"]
+      val b = lin_string_byte_at(s, pos)
+      if b == delim then
+        pos = pos + 1 // another field follows
+        true
+      else if b == CR then
+        // CR or CRLF terminates the record.
+        val nb = lin_string_byte_at(s, pos + 1)
+        pos = if nb == LF then pos + 2 else pos + 1
+        false
+      else if b == LF then
+        pos = pos + 1
+        false
       else
-        push(fields, cur["value"])
-        pos = cur["pos"]
-        val b = lin_string_byte_at(s, pos)
-        if b == delim then
-          pos = pos + 1 // another field follows
-        else if b == CR then
-          // CR or CRLF terminates the record.
-          val nb = lin_string_byte_at(s, pos + 1)
-          pos = if nb == LF then pos + 2 else pos + 1
-          done = true
-        else if b == LF then
-          pos = pos + 1
-          done = true
-        else
-          // EOF terminates the final record.
-          done = true
+        // EOF terminates the final record.
+        false
   )
   {
     "fields": fields,
