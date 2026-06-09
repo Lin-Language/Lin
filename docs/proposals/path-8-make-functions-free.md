@@ -26,6 +26,29 @@ in-place `for`, ~3.2× — won by *removing per-element calls*, not by touching 
 This path explains **why** the calls are so expensive (the current ABI, read from the codegen below) and
 lays out the **full menu** of how to make them free — of which Path 6's IR-inlining is the middle tier.
 
+> ## ⚠️ Reconciliation with the RAPTOR profile — "reads are already const-offset" is true ONLY for SEALED records
+> The RAPTOR cost-attribution profile (`investigate/raptor-typed-profile`, measured by env-gated hot-call
+> counters; `perf`/`valgrind` unavailable) found the query-phase bottleneck is **field reads after all** —
+> but specifically reads of **`Json`-typed** records: **756 M `lin_object_get`, of which 631 M (83%) are
+> LINEAR SCANS** over small (<16-key) objects, plus **~3.5 B value-box ops** (TAGGED_RELEASE 1.37 B /
+> CLONE 1.12 B / ALLOC 1.02 B). This is **not** a contradiction of the interp ceiling test — it is the
+> resolution of both: a field read is a const-offset `FieldGet` **only when the value's static type is a
+> sealed record**; a **`Json`-typed** value's read is *always* `lin_object_get` (verified in codegen:
+> boxed objects have no const-offset path; runtime objects with <16 keys *always* linear-scan, no hash
+> index — verified in `lin-runtime/src/object.rs`). **interp's records are typed/sealed → its reads are
+> already cheap → its residual cost is the calls (ceiling test). RAPTOR's hot records are `Json` → its
+> reads are 631 M linear scans → its bottleneck is the boxed-`Json` representation.** Two different
+> programs, two different dominant costs, both measured — and the lever differs accordingly (RAPTOR needs
+> de-`Json`-ing to sealed *with* the consuming ops able to read packed; interp needs the calls inlined).
+> **The crucial RAPTOR finding (and the trap):** *partial* typing is a **measured ~13% REGRESSION** —
+> typing a value read back from a still-`Json` source *materializes a fresh sealed struct per access*
+> (SEALED_ALLOC 468→65 M, RC_RETAIN 778 M→2.09 B) on top of the unchanged `lin_object_get`. So RAPTOR's
+> fix is **all-or-nothing end-to-end** packed records (loader → `createRaptor` → map store → read), not
+> incremental typing — and it is blocked today by (1) packed records with a heap-array field
+> (`stopTimes: StopTime[]`) still boxing the inner array, and (2) the loader needing a real `Json→Trip[]`
+> decode. That is a **representation** effort (Path 1 / Path 5 territory), *distinct from this path's
+> call-cost lever* — RAPTOR and interp need different primary fixes. See `benchmarks/compare/raptor/lin/NOTES.md`.
+
 ## The architectural finding — what's actually happening (read from `crates/lin-codegen`)
 
 Three facts about how Lin compiles today explain the entire call cost:
