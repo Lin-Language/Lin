@@ -88,6 +88,8 @@ whether you need Path 1's expensive ABI at all and whether Path 1 or Path 2 is t
 
 ## IMPLEMENTATION FINDINGS (2026-06-09, branch `path1-packed-records`, NOT merged)
 
+> **Work reference:** branch **`path1-packed-records`** (durable handle — `git log path1-packed-records`; worktree `.claude/worktrees/path1-packed` is ephemeral). The Path-0 deliverable is commit **`04bec701`** (the `Trip|Null` tail-recursive UAF fix — merge-worthy on its own). Full commit chain + the Path-1 work that builds on it is in path-1's IMPLEMENTATION FINDINGS section.
+
 Worked through Path 0 in full. Outcome: **the two bug fixes are real and one landed sound; the decisive RAPTOR measurement was taken and it settles the H5-vs-H5b contradiction empirically.**
 
 ### Fix 1 — `get<T,D>` monomorphization for record-array `T`: NOT a bug on current master

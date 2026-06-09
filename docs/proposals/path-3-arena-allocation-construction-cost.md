@@ -217,6 +217,8 @@ that covers all three costs.** Best pursued *in parallel* with a reads path, not
 
 ## IMPLEMENTATION FINDINGS (2026-06-09)
 
+> **Work reference:** no Path-3 code was written (see below) — but it composes with branch **`path1-packed-records`** (durable handle — `git log path1-packed-records`; worktree `.claude/worktrees/path1-packed` is ephemeral), which landed Path 1's in-place ABI (the read/iteration half) that Path 3's arenas (the construction half) would sit alongside.
+
 Path 3 was in scope alongside Path 0/1 but was **not implemented** — the foundation was verified and the full inferred-arena deferred as out-of-scope-for-this-pass, with two concrete findings.
 
 ### The escape-analysis foundation is live and effective (the thing Path 3 would generalize)
