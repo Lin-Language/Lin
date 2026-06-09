@@ -296,6 +296,14 @@ impl LanguageServer for Backend {
         // types only in type-annotation position). Dot context is its own path (handled below).
         let ctx = classify_completion_context(&analysis.module, &source, offset);
 
+        // Binding-NAME position (`val ▮` / `var ▮`): the user is typing a fresh name — there is
+        // nothing to complete. Return an empty list (not `None`, so the client doesn't fall back to
+        // its own word list), gating off EVERY source below (bindings/keywords/types/imports). A dot
+        // context can't co-occur with this (a `val name` line has no receiver), so this is safe.
+        if ctx == CompletionContext::BindingName {
+            return Ok(Some(CompletionResponse::Array(Vec::new())));
+        }
+
         // In dot context only show applicable stdlib functions — no keywords/types/bindings.
         if !in_dot_context {
             // 1. In-scope bindings — offered in Expression / StatementStart, NOT in a type position.
@@ -1623,6 +1631,11 @@ enum CompletionContext {
     ImportStmt,
     StatementStart,
     Expression,
+    /// The cursor sits right after a `val`/`var` keyword in the binding-NAME position
+    /// (`val ▮` / `var ▮`, possibly mid-typing the name), before any `:` or `=` on the line.
+    /// The user is about to TYPE A NEW NAME, so there is nothing to complete — every completion
+    /// source is gated off and the handler returns an empty list (like `in_string_or_comment`).
+    BindingName,
 }
 
 /// The keyword set offered in a given completion context. Pure (no I/O) so the gating policy is
@@ -1646,6 +1659,8 @@ fn keywords_for_context(ctx: CompletionContext) -> &'static [&'static str] {
         ],
         CompletionContext::ImportStmt => &["from", "as"],
         CompletionContext::TypeAnnotation => &[],
+        // Binding-NAME position (`val ▮`): the user is typing a fresh name — offer nothing.
+        CompletionContext::BindingName => &[],
     }
 }
 
@@ -1682,6 +1697,13 @@ fn classify_completion_context(
     }
 
     // 3. Backward char scan to disambiguate the cases the AST can't yet see.
+    // Binding-NAME position (`val ▮` / `var ▮`, no `:`/`=` yet) FIRST: the user is typing a fresh
+    // name, so nothing is offered. This must precede the statement-start/expression fallbacks (a
+    // bare `val` line trims non-empty, so `backward_scan_is_statement_start` wouldn't catch it and
+    // it would otherwise fall through to `Expression` and dump in-scope bindings).
+    if backward_scan_is_binding_name_position(source, offset) {
+        return CompletionContext::BindingName;
+    }
     if backward_scan_is_type_position(source, offset) {
         return CompletionContext::TypeAnnotation;
     }
@@ -1804,6 +1826,35 @@ fn backward_scan_is_statement_start(source: &str, offset: usize) -> bool {
         break;
     }
     true
+}
+
+/// Backward scan: is the cursor in the binding-NAME position of a `val`/`var` declaration — i.e.
+/// the user has typed `val `/`var ` (plus optional indentation) and is now TYPING THE NAME, before
+/// any `:` (type annotation) or `=` (RHS)? In that position there is nothing to complete (the name
+/// is brand new), so the classifier returns `BindingName` and the handler offers an empty list.
+///
+/// True when the text from the current line's start up to the cursor matches
+/// `^\s*(val|var)\s+[A-Za-z0-9_]*$` — only the keyword + whitespace + the partial name. The trailing
+/// `\s+` requires at least one space after the keyword, so a still-being-typed keyword like `va▮`
+/// (which has no following space) is NOT caught (that stays a StatementStart). Once a `:` or `=`
+/// appears the regex no longer matches, so `val x: ▮` (TypeAnnotation) and `val x = ▮` (Expression)
+/// are unaffected. `offset` is a CHAR offset (the canonical Lin span space), converted to a byte
+/// index for the line slice exactly like the sibling backward scans.
+fn backward_scan_is_binding_name_position(source: &str, offset: usize) -> bool {
+    let byte_off = char_offset_to_byte(source, offset);
+    let line_start = source[..byte_off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &source[line_start..byte_off];
+    // Strip leading indentation; the keyword must be the first token on the line.
+    let body = line.trim_start();
+    // Match `val`/`var` followed by at least one space, then only name chars to the cursor.
+    let rest = match body.strip_prefix("val ").or_else(|| body.strip_prefix("var ")) {
+        Some(r) => r,
+        None => return false,
+    };
+    // After the keyword+space: only further whitespace + an optional partial identifier, nothing
+    // else (no `:`, no `=`, no `(` etc. — any of those means we're past the name position).
+    let name = rest.trim_start();
+    name.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 // ── in-scope binding collection (scope-aware completion) ──────────────────────
@@ -5516,6 +5567,33 @@ mod tests {
         assert_eq!(classify_at("type Id = ▮\n"), CompletionContext::TypeAnnotation);
         // An object-LITERAL `key:` is NOT a type position (it's a value).
         assert_eq!(classify_at("val o = { k: ▮ }\n"), CompletionContext::Expression);
+    }
+
+    /// FIX 1: the binding-NAME position (`val ▮` / `var ▮`, before any `:`/`=`) offers NOTHING.
+    /// Boundaries: once a `:` appears it's a TypeAnnotation; once a `=` appears the RHS is an
+    /// Expression. The bare-name position (mid-block, indented, name partially typed) is suppressed.
+    #[test]
+    fn classify_binding_name_position_offers_nothing() {
+        // Cursor right after `val ` (top level), no name yet.
+        assert_eq!(classify_at("val ▮\n"), CompletionContext::BindingName);
+        // `var` too.
+        assert_eq!(classify_at("var ▮\n"), CompletionContext::BindingName);
+        // Mid-typing the name is still the name position.
+        assert_eq!(classify_at("val fo▮\n"), CompletionContext::BindingName);
+        // The report's exact shape: indented, inside a lambda body passed to `.for(...)`.
+        assert_eq!(
+            classify_at("val nums = [1, 2, 3]\nnums.for(item =>\n  print(item)\n  val ▮\n)\n"),
+            CompletionContext::BindingName
+        );
+        // BOUNDARY: a `:` makes it a TYPE position again (types, not nothing).
+        assert_eq!(classify_at("val x:▮\n"), CompletionContext::TypeAnnotation);
+        assert_eq!(classify_at("val x: ▮\n"), CompletionContext::TypeAnnotation);
+        // BOUNDARY: a `=` makes the RHS an EXPRESSION.
+        assert_eq!(classify_at("val x =▮\n"), CompletionContext::Expression);
+        assert_eq!(classify_at("val x = ▮\n"), CompletionContext::Expression);
+        // A still-being-typed `va`/`var` keyword (no following space) stays StatementStart, not
+        // BindingName — there's no binding yet, the user may be typing `val`/`var`/`var`.
+        assert_eq!(classify_at("va▮\n"), CompletionContext::StatementStart);
     }
 
     #[test]
