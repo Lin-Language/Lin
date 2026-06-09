@@ -532,6 +532,29 @@ impl LanguageServer for Backend {
             ));
         }
 
+        // 6. UNIMPORTED USERLAND exports (cross-file). Like the stdlib path above, but sourced from
+        // the WorkspaceIndex's user files (NOT this file, NOT stdlib). Offered in BOTH dot context
+        // (gated by the shared first-param gate against the receiver) and identifier position (gated
+        // by the typed prefix). Deduped against everything already offered + this file's existing
+        // imports. The import edit + doc are attached lazily in `completion_resolve` from the
+        // `{ module, name }` stash, where `module` is the importing-file-relative specifier.
+        if ctx != CompletionContext::TypeAnnotation {
+            let already: HashSet<String> = items.iter().map(|i| i.label.clone()).collect();
+            let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
+            items.extend(userland_completion_items(
+                &index,
+                uri,
+                base_dir.as_deref(),
+                receiver_category.as_deref().unwrap_or("any"),
+                receiver_precise.as_deref(),
+                in_dot_context,
+                prefix,
+                &already,
+                snippet_support,
+                next_char_is_paren,
+            ));
+        }
+
         items.dedup_by(|a, b| a.label == b.label && a.detail == b.detail);
 
         Ok(Some(CompletionResponse::Array(items)))
@@ -554,17 +577,21 @@ impl LanguageServer for Backend {
         let base_dir = file_dir(&uri);
         let analysis = analyse(&source, base_dir.as_deref());
 
-        // Unimported stdlib candidate (FIX B): the item carries an owner `module`. Attach the
-        // import edit (computed by the SAME `auto_import_edit` the auto-import code action uses, so
-        // they produce identical edits — merge into an existing import from the module, else a new
-        // line) and resolve the doc from the OWNER module rather than this file.
+        // Unimported candidate (stdlib FIX B or userland PART 2): the item carries the import
+        // `module` specifier. Attach the import edit (computed by the SAME `auto_import_edit` the
+        // auto-import code action uses, so they produce identical edits — merge into an existing
+        // import from the module, else a new line). The doc is resolved from the OWNER module: for a
+        // userland candidate the specifier is NOT an index key, so a separate `owner` (canonical id)
+        // is stashed and preferred; for stdlib the specifier IS the index key (no `owner`).
         let candidate_module = parse_completion_resolve_module(item.data.as_ref());
+        let candidate_owner = parse_completion_resolve_owner(item.data.as_ref());
         let doc = if let Some(module) = candidate_module.as_deref() {
             if let Some(edit) = auto_import_edit(&source, &name, module) {
                 item.additional_text_edits = Some(vec![edit]);
             }
             let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
-            resolve_doc_via_index(&index, module, &name).filter(|d| !d.is_empty())
+            let doc_module = candidate_owner.as_deref().unwrap_or(module);
+            resolve_doc_via_index(&index, doc_module, &name).filter(|d| !d.is_empty())
         } else {
             // Local declaration in this file first; then imports / own exports via the index.
             let mut doc = local_decl_name_span(&analysis.module, &name)
@@ -2482,6 +2509,159 @@ fn stdlib_dot_completion_items<'a>(
     out
 }
 
+/// One USERLAND (cross-file) export offered as an unimported completion candidate: a function or
+/// value `export`ed by another workspace file. `owner_id` is the OWNER file's canonical module id
+/// (used for doc resolution via the index); `specifier` is the importing-file-relative path string
+/// for the generated `import { name } from "specifier"` (derived the same way cross-file goto
+/// resolves modules); `ty` is the cleaned rendered type-string when the owner type-checked, else
+/// `None` (the name is still offered — just with weaker gating/detail).
+#[derive(Clone)]
+struct UserlandCandidate {
+    name: String,
+    owner_id: String,
+    specifier: String,
+    ty: Option<String>,
+}
+
+/// Collect the unimported userland export candidates visible from the file `uri`: every export of
+/// every OTHER indexed user file, minus this file's own exports and anything it already imports. Each
+/// candidate carries the owner's canonical id (doc resolution) + the importing-file-relative import
+/// specifier. The owner's export TYPES are recovered by re-analysing the owner's indexed source (the
+/// same path the stdlib candidate builder uses), so the precise dot-gate + detail have a real type.
+fn collect_userland_candidates(
+    index: &WorkspaceIndex,
+    uri: &Url,
+    base_dir: Option<&Path>,
+) -> Vec<UserlandCandidate> {
+    // This file's canonical id (so we never offer its OWN exports as an import-from-elsewhere) and
+    // the set of names it already imports (so an already-imported symbol isn't offered).
+    let self_id = uri.to_file_path().ok().map(|p| canonical_id(&p));
+    let already_imported: HashSet<String> = self_id
+        .as_deref()
+        .and_then(|id| index.files.get(id))
+        .map(|f| f.imports.iter().map(|i| i.local_name.clone()).collect())
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for (mod_id, file) in &index.files {
+        // Skip stdlib (handled by the stdlib candidate path) and this very file.
+        if file.is_stdlib || Some(mod_id.as_str()) == self_id.as_deref() {
+            continue;
+        }
+        if file.exports.is_empty() {
+            continue;
+        }
+        // The importing-file-relative import specifier for this owner module (e.g. `./helpers`,
+        // `../util/math`). `None` when a relative path can't be formed (non-absolute ids); skip then.
+        let Some(specifier) = import_path_for(mod_id, base_dir) else {
+            continue;
+        };
+        // Recover the owner's export name→type map by re-analysing its source. Cheap-ish and only
+        // done for files that actually export something; degrades to no-type when checking fails.
+        let owner_dir = Path::new(mod_id).parent().map(|p| p.to_path_buf());
+        let export_types: HashMap<String, String> = {
+            let owner_analysis = analyse(&file.source, owner_dir.as_deref());
+            owner_analysis
+                .typed
+                .as_ref()
+                .map(|t| {
+                    extract_exports(t)
+                        .into_iter()
+                        .map(|(n, ty)| (n, clean_type_string(&ty.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for (name, _span) in &file.exports {
+            if already_imported.contains(name) {
+                continue;
+            }
+            out.push(UserlandCandidate {
+                name: name.clone(),
+                owner_id: mod_id.clone(),
+                specifier: specifier.clone(),
+                ty: export_types.get(name).cloned(),
+            });
+        }
+    }
+    out
+}
+
+/// Build the unimported-userland completion items. Mirrors `stdlib_dot_completion_items` but over
+/// cross-file user exports, and serves BOTH positions per the user's choice:
+///   - DOT context (`in_dot`): offer function-shaped exports whose first parameter accepts the
+///     receiver (the shared `dot_first_param_gate`); the receiver fills the first slot, so smart
+///     parens use the dot arity (arity − 1).
+///   - IDENTIFIER position (non-dot): offer functions AND values matching the typed `prefix`; smart
+///     parens (for functions) use the full arity.
+///
+/// In both positions a candidate is dropped when its name is already offered (`already`, seeded with
+/// in-scope bindings + imported symbols + earlier candidates) — thorough dedupe. The import edit +
+/// doc are attached lazily in `completion_resolve` from the `{ module, owner, name }` stash.
+#[allow(clippy::too_many_arguments)]
+fn userland_completion_items(
+    index: &WorkspaceIndex,
+    uri: &Url,
+    base_dir: Option<&Path>,
+    receiver_cat: &str,
+    receiver_precise: Option<&str>,
+    in_dot: bool,
+    prefix: &str,
+    already: &HashSet<String>,
+    snippet_support: bool,
+    next_char_is_paren: bool,
+) -> Vec<CompletionItem> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for cand in collect_userland_candidates(index, uri, base_dir) {
+        if !cand.name.starts_with(prefix) || already.contains(&cand.name) {
+            continue;
+        }
+        // Dedupe across owner modules: the same export name offered by two files appears once (the
+        // import code action / resolve still picks a concrete owner per item — first wins here).
+        if !seen.insert(cand.name.clone()) {
+            continue;
+        }
+        let is_function = cand.ty.as_deref().map(|t| t.contains("=>")).unwrap_or(false);
+        if in_dot {
+            // Dot context offers only function-shaped exports (a bare value isn't a dot-method), and
+            // only when its first param accepts the receiver.
+            if !is_function {
+                continue;
+            }
+            let first_param = cand.ty.as_deref().and_then(first_param_type);
+            if !dot_first_param_gate(receiver_cat, receiver_precise, first_param.as_deref()) {
+                continue;
+            }
+        }
+        let kind = if is_function {
+            CompletionItemKind::FUNCTION
+        } else {
+            CompletionItemKind::VALUE
+        };
+        let detail = cand
+            .ty
+            .as_deref()
+            .map(|t| format!("{}  (from {})", t, cand.specifier))
+            .or_else(|| Some(format!("(from {})", cand.specifier)));
+        let mut item = CompletionItem {
+            label: cand.name.clone(),
+            kind: Some(kind),
+            detail,
+            documentation: Some(Documentation::String(format!("from {}", cand.specifier))),
+            data: completion_resolve_data_import(uri, &cand.name, &cand.specifier, &cand.owner_id),
+            ..Default::default()
+        };
+        // Smart parens for functions: dot context fills the first param from the receiver (arity − 1);
+        // identifier position uses the full arity.
+        if let Some(sig) = cand.ty.as_deref() {
+            apply_function_parens(&mut item, sig, in_dot, snippet_support, next_char_is_paren);
+        }
+        out.push(item);
+    }
+    out
+}
+
 /// Type-check a single stdlib module (resolving its own imports first) and return its genuinely
 /// `export`ed `val`s as `(name, Type)`. The export flag is read from the PARSED AST (the typed
 /// module drops it), so private helpers like `_bisect` — declared `val`, not `export val` — are NOT
@@ -4148,6 +4328,26 @@ fn completion_resolve_data(uri: &Url, name: &str) -> Option<serde_json::Value> {
 /// the owner module rather than this file.
 fn completion_resolve_data_stdlib(uri: &Url, name: &str, module: &str) -> Option<serde_json::Value> {
     Some(serde_json::json!({ "uri": uri.to_string(), "name": name, "module": module }))
+}
+
+/// `data` payload for an UNIMPORTED USERLAND export candidate (PART 2): like the stdlib variant but
+/// carries BOTH the import `module` (the importing-file-relative specifier, used by `auto_import_edit`
+/// to write `from "<specifier>"`) AND the `owner` canonical module id (used to resolve the doc via the
+/// index, where the specifier is NOT a key). For stdlib the specifier IS the index key, so no `owner`
+/// is stashed and `completion_resolve` falls back to `module` for the doc.
+fn completion_resolve_data_import(uri: &Url, name: &str, specifier: &str, owner_id: &str) -> Option<serde_json::Value> {
+    Some(serde_json::json!({
+        "uri": uri.to_string(),
+        "name": name,
+        "module": specifier,
+        "owner": owner_id,
+    }))
+}
+
+/// Read the `owner` canonical module id from a userland-candidate `data` payload (set by
+/// `completion_resolve_data_import`). `None` for stdlib candidates / ordinary items.
+fn parse_completion_resolve_owner(data: Option<&serde_json::Value>) -> Option<String> {
+    data?.get("owner")?.as_str().map(|s| s.to_string())
 }
 
 /// Parse the `{ uri, name }` key stashed by `completion_resolve_data` back into `(Url, name)`.
@@ -6347,6 +6547,232 @@ val _helper = 3
         let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", None, "", &already, &fixb_uri(), false, false);
         assert!(item_named(&items, "push").is_some(), "exported `push` should still be offered");
         assert!(item_named(&items, "_bisect").is_none(), "private `_bisect` must not be offered");
+    }
+
+    // ── PART 1: precise first-param type-match gate ──────────────────────────────
+
+    /// `first_param_type` extracts the FULL first-parameter type-string (delimiter-depth aware), so a
+    /// first param whose own type contains commas/parens/`|` (`T[] | Iterator | Stream`, `(T) => U`)
+    /// survives. Returns `None` for a non-function / zero-param signature.
+    #[test]
+    fn first_param_type_extracts_full_first_param() {
+        assert_eq!(first_param_type("(String, String) => Boolean").as_deref(), Some("String"));
+        assert_eq!(first_param_type("(Int32) => Float64").as_deref(), Some("Int32"));
+        // First param is itself a union with nested generics — kept whole.
+        assert_eq!(
+            first_param_type("(T[] | Iterator<T> | Stream<T>, (T, Int32) => U) => U[]").as_deref(),
+            Some("T[] | Iterator<T> | Stream<T>"),
+        );
+        // First param is a function type — its inner `)` must not terminate the param early.
+        assert_eq!(first_param_type("((T) => U, T[]) => U[]").as_deref(), Some("(T) => U"));
+        assert_eq!(first_param_type("() => String"), None);
+        assert_eq!(first_param_type("String"), None);
+    }
+
+    /// `is_generic_type_var` recognises the rendered generic-var forms (`T`..`Z`, `T1`) and rejects
+    /// concrete types.
+    #[test]
+    fn is_generic_type_var_recognises_rendered_vars() {
+        for v in ["T", "U", "V", "Z", "T1", "T42"] {
+            assert!(is_generic_type_var(v), "`{v}` should be a generic var");
+        }
+        for c in ["String", "Int8", "Json", "Point", "Iterator", "t"] {
+            assert!(!is_generic_type_var(c), "`{c}` should NOT be a generic var");
+        }
+    }
+
+    /// `split_top_level_union` splits only at TOP-LEVEL `|` and returns `None` for a non-union.
+    #[test]
+    fn split_top_level_union_splits_only_top_level() {
+        assert_eq!(split_top_level_union("Int32"), None);
+        assert_eq!(
+            split_top_level_union("T[] | Iterator<T> | Stream<T>"),
+            Some(vec!["T[]".to_string(), "Iterator<T>".to_string(), "Stream<T>".to_string()]),
+        );
+        // A `|` nested inside `<…>` is NOT a top-level split point.
+        assert_eq!(split_top_level_union("Array<Int32 | String>"), None);
+    }
+
+    /// The crux of the user's rule. A `String` receiver:
+    ///   - ACCEPTS a `String` / `Json` / generic first param;
+    ///   - REJECTS an `Int8` (numeric) first param.
+    /// A number receiver accepts numeric / `Json`. An array receiver accepts `T[]`,
+    /// `T[] | Iterator | Stream` (the `map`/`for` first param), and a bare generic.
+    #[test]
+    fn first_param_accepts_matches_receiver_to_first_param() {
+        // String receiver.
+        assert!(first_param_accepts("String", "String"));
+        assert!(first_param_accepts("String", "Json"));
+        assert!(first_param_accepts("String", "T"));
+        assert!(!first_param_accepts("String", "Int8"), "String must NOT fit a numeric first param");
+        assert!(!first_param_accepts("String", "Int32"));
+
+        // Number receiver.
+        assert!(first_param_accepts("Int32", "Float64"));
+        assert!(first_param_accepts("Int32", "Json"));
+        assert!(!first_param_accepts("Int32", "String"));
+
+        // Array receiver: concrete array, receiver-polymorphic union, bare generic, Iterator/Stream.
+        assert!(first_param_accepts("Point[]", "T[]"));
+        assert!(first_param_accepts("Int32[]", "T[] | Iterator<T> | Stream<T>"));
+        assert!(first_param_accepts("Int32[]", "T"));
+        assert!(first_param_accepts("Int32[]", "Iterator<Int32>"));
+        assert!(!first_param_accepts("Int32[]", "String"));
+
+        // A Json / generic RECEIVER can't be proven a mismatch → accepts anything.
+        assert!(first_param_accepts("Json", "Int8"));
+        assert!(first_param_accepts("T", "String"));
+    }
+
+    /// `dot_first_param_gate`: with a PRECISE receiver type it uses `first_param_accepts`; with NONE
+    /// it falls back to coarse category matching (so a non-type-checking receiver still gets looser
+    /// suggestions). The fallback keeps the `map`/`for` polymorphic case (generic/Json/array-union).
+    #[test]
+    fn dot_first_param_gate_precise_then_category_fallback() {
+        // Precise: a numeric first param is gated OUT on a String receiver.
+        assert!(!dot_first_param_gate("string", Some("String"), Some("Int8")));
+        assert!(dot_first_param_gate("string", Some("String"), Some("String")));
+        // Precise array receiver keeps the polymorphic combinator union.
+        assert!(dot_first_param_gate("array", Some("Int32[]"), Some("T[] | Iterator | Stream")));
+        // Fallback (no precise type): array receiver keeps an array first param, drops a numeric one.
+        assert!(dot_first_param_gate("array", None, Some("T[]")));
+        assert!(!dot_first_param_gate("array", None, Some("Int32")));
+        // Fallback: a generic/Json first param ("any" category) applies to any receiver.
+        assert!(dot_first_param_gate("string", None, Some("Json")));
+        assert!(dot_first_param_gate("array", None, Some("T")));
+    }
+
+    /// Regression guard: a precise `String` receiver does NOT offer a numeric-first-param method but
+    /// DOES offer a String-first-param one and a `Json`-first-param one — exercised through the real
+    /// `stdlib_dot_completion_items` gate. And on an array receiver, the receiver-polymorphic `map`/
+    /// `for` combinators STAY offered (the over-tightening risk the task calls out).
+    #[test]
+    fn stdlib_dot_precise_gate_string_rejects_numeric_keeps_string_and_json() {
+        let cands = vec![
+            cand("upper", "std/string", "(String) => String"),
+            cand("toJson", "std/json", "(Json) => String"),
+            cand("addOne", "std/number", "(Int8) => Int8"),
+        ];
+        let already = HashSet::new();
+        // Precise String receiver.
+        let items = stdlib_dot_completion_items(
+            cands.iter(), "string", Some("String"), "", &already, &fixb_uri(), false, false,
+        );
+        assert!(item_named(&items, "upper").is_some(), "String-first-param method must be offered");
+        assert!(item_named(&items, "toJson").is_some(), "Json-first-param method must be offered");
+        assert!(
+            item_named(&items, "addOne").is_none(),
+            "numeric-first-param method must be gated out for a String receiver",
+        );
+    }
+
+    /// `map`/`for` STAY offered on an array receiver under the PRECISE gate (their first param is a
+    /// receiver-polymorphic union / generic marker). This is the over-tightening regression risk.
+    #[test]
+    fn stdlib_dot_precise_gate_keeps_map_for_on_array() {
+        let already = HashSet::new();
+        let items = stdlib_dot_completion_items(
+            STDLIB_DOT_CANDIDATES.iter(), "array", Some("Int32[]"), "", &already, &fixb_uri(), false, false,
+        );
+        for name in ["map", "filter", "for"] {
+            assert!(
+                item_named(&items, name).is_some(),
+                "`{name}` must STILL be offered on an array receiver under the precise gate",
+            );
+        }
+        // A number-first-param combinator (`range`) is still gated out.
+        assert!(item_named(&items, "range").is_none(), "`range` stays gated out on an array receiver");
+    }
+
+    // ── PART 2: unimported userland exports ──────────────────────────────────────
+
+    /// Build the userland completion items from an in-memory index, importing FILE uri + base dir.
+    fn userland_items(
+        index: &WorkspaceIndex,
+        uri: &Url,
+        base_dir: Option<&Path>,
+        receiver_cat: &str,
+        receiver_precise: Option<&str>,
+        in_dot: bool,
+        prefix: &str,
+    ) -> Vec<CompletionItem> {
+        let already = HashSet::new();
+        userland_completion_items(
+            index, uri, base_dir, receiver_cat, receiver_precise, in_dot, prefix, &already, false, false,
+        )
+    }
+
+    /// A userland export from another indexed file is offered in DOT context on a matching receiver,
+    /// resolves to an `additional_text_edits` importing it from the correct relative path, and is NOT
+    /// offered when already imported. The current file's OWN exports are never offered.
+    #[test]
+    fn userland_dot_completion_offers_and_imports_export() {
+        // helpers.lin exports `double : (Int32) => Int32` (numeric first param).
+        let helpers = "export val double = (n: Int32) => n * 2\n";
+        // main.lin (the importing file) has its own export `mine` — must NOT be self-offered.
+        let main = "export val mine = 1\n";
+        let helpers_path = "/proj/helpers.lin";
+        let main_path = "/proj/main.lin";
+        let index = index_from(&[(helpers_path, helpers), (main_path, main)]);
+        let main_uri = Url::from_file_path(main_path).unwrap();
+        let base = Path::new("/proj");
+
+        // On a NUMBER receiver `double` (first param Int32) is offered.
+        let on_number = userland_items(&index, &main_uri, Some(base), "number", Some("Int32"), true, "");
+        let it = item_named(&on_number, "double").expect("`double` should be offered on a number receiver");
+        assert_eq!(it.kind, Some(CompletionItemKind::FUNCTION));
+        // The owner + relative specifier are stashed; resolve attaches the import edit.
+        assert_eq!(parse_completion_resolve_module(it.data.as_ref()).as_deref(), Some("helpers"));
+        assert_eq!(
+            parse_completion_resolve_owner(it.data.as_ref()).as_deref(),
+            Some(id_of(helpers_path).as_str()),
+        );
+        // The import edit (what completion_resolve attaches) targets the relative specifier.
+        let edit = auto_import_edit(main, "double", "helpers").expect("expected an import edit");
+        assert!(
+            edit.new_text.contains("import { double } from \"helpers\""),
+            "expected a relative userland import, got {:?}", edit.new_text,
+        );
+
+        // The current file's OWN export `mine` is NOT offered as an import-from-elsewhere.
+        let everything = userland_items(&index, &main_uri, Some(base), "any", None, false, "");
+        assert!(item_named(&everything, "mine").is_none(), "own export must not be offered");
+
+        // On a STRING receiver, `double` (numeric first param) is gated OUT.
+        let on_string = userland_items(&index, &main_uri, Some(base), "string", Some("String"), true, "");
+        assert!(item_named(&on_string, "double").is_none(), "numeric-first-param export gated out on String");
+
+        // Already-imported: once main imports `double`, it's not offered again.
+        let main_with_import = "import { double } from \"helpers\"\nval x = 1\n";
+        let index2 = index_from(&[(helpers_path, helpers), (main_path, main_with_import)]);
+        let after = userland_items(&index2, &main_uri, Some(base), "number", Some("Int32"), true, "");
+        assert!(item_named(&after, "double").is_none(), "already-imported `double` must not be re-offered");
+    }
+
+    /// A userland export is offered in IDENTIFIER position by typed prefix (functions AND values),
+    /// carrying the relative-import resolve payload.
+    #[test]
+    fn userland_identifier_completion_offers_by_prefix() {
+        let helpers = "\
+export val makeThing = (n: Int32) => n
+export val thingCount = 7
+";
+        let helpers_path = "/proj/helpers.lin";
+        let main_path = "/proj/main.lin";
+        let index = index_from(&[(helpers_path, helpers), (main_path, "val x = 1\n")]);
+        let main_uri = Url::from_file_path(main_path).unwrap();
+        let base = Path::new("/proj");
+
+        // Prefix "thing" in identifier position matches the VALUE `thingCount` but not `makeThing`.
+        let by_prefix = userland_items(&index, &main_uri, Some(base), "any", None, false, "thing");
+        let tc = item_named(&by_prefix, "thingCount").expect("`thingCount` should match prefix `thing`");
+        assert_eq!(tc.kind, Some(CompletionItemKind::VALUE));
+        assert_eq!(parse_completion_resolve_module(tc.data.as_ref()).as_deref(), Some("helpers"));
+        assert!(item_named(&by_prefix, "makeThing").is_none(), "`makeThing` does not match prefix `thing`");
+
+        // Prefix "make" matches the FUNCTION `makeThing`.
+        let by_make = userland_items(&index, &main_uri, Some(base), "any", None, false, "make");
+        assert!(item_named(&by_make, "makeThing").is_some(), "`makeThing` should match prefix `make`");
     }
 
     /// Cyclic import graph (A imports B, B imports A) must terminate, not
