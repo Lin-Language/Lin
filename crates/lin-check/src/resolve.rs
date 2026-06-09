@@ -163,6 +163,9 @@ fn resolve_named_cycle(
         // `val =` RHS. Opacity is unchanged: `compat.rs` still forbids any non-stream op on a
         // `Stream`, so naming it buys a user nothing but the type itself.
         "Stream" => Ok(Type::Stream(Box::new(json_type()))),
+        // Promise without a type argument: Promise<Json>. The opaque async-result handle; the only
+        // operation is `await` (which yields `T | Error`). Same opacity as Shared/Stream.
+        "Promise" => Ok(Type::Promise(Box::new(json_type()))),
         _ => {
             // Cycle detected: return Named(name) as an opaque reference instead of expanding.
             if visiting.contains(name) {
@@ -233,6 +236,7 @@ fn expand_named_body(
         }),
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(expand_named_body(inner, env, visiting)?))),
         Type::Stream(inner) => Ok(Type::Stream(Box::new(expand_named_body(inner, env, visiting)?))),
+        Type::Promise(inner) => Ok(Type::Promise(Box::new(expand_named_body(inner, env, visiting)?))),
         Type::Map(v) => Ok(Type::Map(Box::new(expand_named_body(v, env, visiting)?))),
         other => Ok(other.clone()),
     }
@@ -262,6 +266,12 @@ fn resolve_generic(
                 return Err("Stream takes exactly 1 type argument".to_string());
             }
             Ok(Type::Stream(Box::new(args[0].clone())))
+        }
+        "Promise" => {
+            if args.len() != 1 {
+                return Err("Promise takes exactly 1 type argument".to_string());
+            }
+            Ok(Type::Promise(Box::new(args[0].clone())))
         }
         _ => {
             if let Some(decl) = env.lookup_type(name) {
@@ -332,6 +342,7 @@ fn substitute(
         }),
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(substitute(inner, params, args, env, visiting)?))),
         Type::Stream(inner) => Ok(Type::Stream(Box::new(substitute(inner, params, args, env, visiting)?))),
+        Type::Promise(inner) => Ok(Type::Promise(Box::new(substitute(inner, params, args, env, visiting)?))),
         Type::Map(v) => Ok(Type::Map(Box::new(substitute(v, params, args, env, visiting)?))),
         _ => Ok(ty.clone()),
     }

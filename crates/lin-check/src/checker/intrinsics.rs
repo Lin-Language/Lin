@@ -169,34 +169,45 @@ impl Checker {
         );
 
         // Concurrency intrinsics (spec §24)
-        // async: (() => T) => Promise<T>  (TypeVar-based, overloaded: also accepts T[])
-        let promise_t = Type::TypeVar(9100);
+        // async: (() => T) => Promise<T>. The thunk's return type `T` (9100) is wrapped in the
+        // opaque `Promise<T>` handle that `await` later resolves. (Also accepts an array of thunks
+        // — the legacy overload — returning a Promise over that representation.)
+        let async_t = Type::TypeVar(9100);
         self.define_intrinsic("lin_async", Type::func(vec![Type::Union(vec![
-                Type::func(vec![], promise_t.clone()),
-                Type::Array(Box::new(Type::func(vec![], promise_t.clone()))),
-            ])], Type::TypeVar(9100)));
-        // await: accepts a promise or array of promises
-        self.define_intrinsic("lin_await", Type::func(vec![Type::TypeVar(9101)], Type::TypeVar(9101)));
+                Type::func(vec![], async_t.clone()),
+                Type::Array(Box::new(Type::func(vec![], async_t.clone()))),
+            ])], Type::Promise(Box::new(async_t.clone()))));
+        // await: <T>(Promise<T>) => T | Error. Resolves the handle to its payload, or the fault
+        // arm (ADR-070). The result type is the `T | Error` UNION — not bare `T` — so the value
+        // stays tagged at runtime: a faulted await returns an Error object, and unboxing the result
+        // as a raw `T` (e.g. i32) would corrupt it. 9101 links the Promise<T> payload to the result.
+        self.define_intrinsic("lin_await", Type::func(
+            vec![Type::Promise(Box::new(Type::TypeVar(9101)))],
+            Type::Union(vec![Type::TypeVar(9101), crate::resolve::error_type()])));
         // parallel: variadic — always returns a tagged array (TypeVar(u32::MAX) = Json/any).
         // Using u32::MAX prevents zonking from resolving the element type to a flat scalar,
         // which would cause codegen to use a flat array representation for a tagged array.
         self.define_intrinsic("lin_parallel", Type::func(vec![Type::Array(Box::new(Type::func(vec![], Type::TypeVar(9102))))], Type::Array(Box::new(Type::TypeVar(u32::MAX)))));
-        // race: Promise[] => Promise
-        self.define_intrinsic("lin_race", Type::func(vec![Type::Array(Box::new(Type::TypeVar(9103)))], Type::TypeVar(9103)));
-        // timeout: (Promise, Int32) => Promise
-        self.define_intrinsic("lin_timeout", Type::func(vec![Type::TypeVar(9104), Type::Int32], Type::TypeVar(9104)));
-        // retry: (() => T, Int32) => Promise<T>
+        // race: (Promise<T>[]) => Promise<T> — resolves with the first promise to settle.
+        self.define_intrinsic("lin_race", Type::func(
+            vec![Type::Array(Box::new(Type::Promise(Box::new(Type::TypeVar(9103)))))],
+            Type::Promise(Box::new(Type::TypeVar(9103)))));
+        // timeout: (Promise<T>, Int32) => Promise<T> — same handle, fails if the deadline passes.
+        self.define_intrinsic("lin_timeout", Type::func(
+            vec![Type::Promise(Box::new(Type::TypeVar(9104))), Type::Int32],
+            Type::Promise(Box::new(Type::TypeVar(9104)))));
+        // retry: (() => T, Int32) => Promise<T> — re-runs the thunk up to N times.
         self.define_intrinsic("lin_retry", Type::func(vec![
                 Type::func(vec![], Type::TypeVar(9105)),
                 Type::Int32,
-            ], Type::TypeVar(9105)));
+            ], Type::Promise(Box::new(Type::TypeVar(9105)))));
         // threadPool: (Int32) => ThreadPool
         self.define_intrinsic("lin_thread_pool", Type::func(vec![Type::Int32], Type::TypeVar(9106)));
         // poolAsync: (ThreadPool, () => T) => Promise<T>  — enqueue a thunk on a bounded pool.
         self.define_intrinsic("lin_pool_async", Type::func(vec![
                 Type::TypeVar(9120),
                 Type::func(vec![], Type::TypeVar(9121)),
-            ], Type::TypeVar(9121)));
+            ], Type::Promise(Box::new(Type::TypeVar(9121)))));
         // Shared<T> accessors (ADR-028 §2.3.1). The opaque Shared<T> type is modelled with a
         // The opaque `Shared<T>` type (ADR-029): the four accessors below are the ONLY operations.
         // `Shared<T>` is invariant and never auto-unwraps to `T`/`Json`, so any other op on it
@@ -362,10 +373,10 @@ impl Checker {
         self.define_intrinsic("lin_io_stdin_stream", Type::func(vec![], byte_stream()));
 
         // promise(s): (Stream) => Promise<Null | Error> (Stage 8). The promise handle round-trips
-        // as a Json/TypeVar value (TAG_PROMISE), like every other promise; `await` then yields the
-        // `Null | Error` result. Typed `Json` result so it flows through await/parallel uniformly.
+        // as a Promise<Null> handle (TAG_PROMISE), like every other promise; `await` then yields the
+        // `Null | Error` result — Null on success, Error if a read/transform faulted upstream.
         self.define_intrinsic("lin_stream_promise",
-            Type::func(vec![any_stream()], Type::TypeVar(u32::MAX)));
+            Type::func(vec![any_stream()], Type::Promise(Box::new(Type::Null))));
 
         // serve: ((Request) => Response, Int32) => Null  (spec §25.5). Handler-first so
         // `router.serve(port)` desugars to `serve(router, port)`. Blocks forever; typed Null.

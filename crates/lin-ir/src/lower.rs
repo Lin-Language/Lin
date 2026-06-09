@@ -1922,9 +1922,10 @@ pub fn mangle_module_key(path: &str) -> String {
 /// `lin_tagged_retain`/`lin_tagged_release`, whose TAG_SHARED arm does the atomic box rc.
 /// `Stream<T>` is likewise a boxed `TaggedVal*(TAG_STREAM)` whose RC dispatches through the
 /// tag-aware path (the TAG_STREAM arm decrements the stream box's refcount, closing the fd at
-/// zero) — so it is owning too.
+/// zero) — so it is owning too. `Promise<T>` is a boxed `TaggedVal*(TAG_PROMISE)` on the same
+/// tag-aware RC path, so it belongs here too.
 fn is_union_ty(ty: &Type) -> bool {
-    matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_))
+    matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_))
 }
 
 /// True if `ty` IS a `Stream` or a `Union` containing one. A streamish capture crosses a thread

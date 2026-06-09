@@ -421,12 +421,16 @@ impl<'ctx> Codegen<'ctx> {
                     ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(par_fn, &[arr_unboxed.into()], "ir_parallel").try_as_basic_value().unwrap_basic()
             }
-            // race(promises): unbox the array, hand to lin_race → first-to-complete promise.
+            // race(promises): hand the promise array to lin_race → first-to-complete promise.
+            // Unbox only when the arg arrives boxed (a `Json`/union-typed `TaggedVal*` wrapping the
+            // `LinArray*`); a concrete `Promise<T>[]` param is already a bare `LinArray*` — unboxing
+            // that would read garbage (the array header is not a tagged box).
             Intrinsic::Race => {
                 let promises = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
-                let arr_unboxed = if promises.is_pointer_value() {
+                let promises_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
+                let arr_unboxed = if Self::is_union_type(&promises_ty) && promises.is_pointer_value() {
                     self.builder.call(self.rt.unbox_ptr, &[promises.into()], "ir_race_arr").try_as_basic_value().unwrap_basic()
-                } else { ptr_ty.const_null().into() };
+                } else { promises };
                 let race_fn = self.get_or_declare_fn("lin_race",
                     ptr_ty.fn_type(&[ptr_ty.into()], false));
                 let raw = self.builder.call(race_fn, &[arr_unboxed.into()], "ir_race").try_as_basic_value().unwrap_basic();
@@ -1416,6 +1420,8 @@ impl<'a> DescEncoder<'a> {
             // `Stream<T>` is opaque and never a `fromJson` target (not JSON-shaped, not
             // spellable in annotations); included only for match exhaustiveness — accept-any.
             | Type::Stream(_)
+            // `Promise<T>` is likewise opaque and never a `fromJson` target — accept-any.
+            | Type::Promise(_)
             // A typed index-signature map `{ String: T }` (ADR-055) is NOT a v1 `fromJson` decode
             // target — the decoder produces a `LinObject`, not a `LinMap`, so decoding INTO a map
             // would yield the wrong representation. Treated as accept-any here only for
