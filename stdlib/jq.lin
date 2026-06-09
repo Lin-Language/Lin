@@ -24,7 +24,7 @@ import foreign "lin-runtime"
 //   fails to evaluate.
 // @example jq({ "users": [{ "name": "Ada" }] }, ".users[] | .name")  // ["Ada"]
 // @example jq({ "xs": [1, 2, 3] }, ".xs | add")                      // [6]
-export val jq = (input: Json, filter: String): Json =>
+export val jq = (input: Json, filter: String): Json | Error =>
   lin_jq_query(input, filter)
 
 // Run a jq filter and return only its first result.
@@ -33,7 +33,7 @@ export val jq = (input: Json, filter: String): Json =>
 // @returns the first output value, `null` if the filter produced none, or the `Error` object if the
 //   query failed.
 // @example jqFirst({ "users": [{ "name": "Ada" }] }, ".users[0].name")  // "Ada"
-export val jqFirst = (input: Json, filter: String): Json =>
+export val jqFirst = (input: Json, filter: String): Json | Error =>
   val result = lin_jq_query(input, filter)
   if result["type"] == "error" then
     result

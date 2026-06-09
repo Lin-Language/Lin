@@ -49,7 +49,7 @@ export val fetchWith = (url: String, options: Json): HttpResponse | Error =>
 // @returns the parsed JSON value, or an `Error` if the request fails (the error is passed through
 //          unparsed).
 // @example val users = fetchJson("https://api.example.com/users")   // then users.for(u => ...)
-export val fetchJson = (url: String): Json =>
+export val fetchJson = (url: String): Json | Error =>
   val response = lin_http_fetch(url)
   if response["type"] == "error" then
     response
@@ -120,7 +120,7 @@ export val badRequest = (message: String): HttpResponse =>
 // Parse a request's body as JSON.
 // @param req  the `HttpRequest` (its `body` field is parsed).
 // @returns the parsed JSON value, or an `Error` if the body is not valid JSON.
-export val parseBody = (req: Json): Json =>
+export val parseBody = (req: Json): Json | Error =>
   lin_parse_json(req["body"])
 
 // Match a request path against a route pattern (e.g. `/users/:id`), extracting path params.

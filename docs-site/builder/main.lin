@@ -130,7 +130,7 @@ val processFile = (filePath: String, navEntries: Json): Null =>
       "base": basePath,
       "hero": hero
     })
-    if isError(rendered) then
+    if rendered is Error then
       print("Error rendering ${templatePath}: ${errorMsg(rendered)}")
     else
       val outDir = dirName(outputPath)
