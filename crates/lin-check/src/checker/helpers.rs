@@ -108,6 +108,7 @@ pub(crate) fn collect_type_subs(pattern: &Type, actual: &Type, subs: &mut std::c
         }
         (Type::Shared(pt), Type::Shared(at)) => collect_type_subs(pt, at, subs),
         (Type::Stream(pt), Type::Stream(at)) => collect_type_subs(pt, at, subs),
+        (Type::Promise(pt), Type::Promise(at)) => collect_type_subs(pt, at, subs),
         (Type::Union(pts), actual) => {
             for pt in pts { collect_type_subs(pt, actual, subs); }
         }
@@ -127,6 +128,7 @@ pub(crate) fn apply_type_subs(ty: &Type, subs: &std::collections::HashMap<u32, T
         Type::Iterator(t) => Type::Iterator(Box::new(apply_type_subs(t, subs))),
         Type::Shared(t) => Type::Shared(Box::new(apply_type_subs(t, subs))),
         Type::Stream(t) => Type::Stream(Box::new(apply_type_subs(t, subs))),
+        Type::Promise(t) => Type::Promise(Box::new(apply_type_subs(t, subs))),
         Type::Map(t) => Type::Map(Box::new(apply_type_subs(t, subs))),
         // Substituting a union's members can DUPLICATE or collapse it: `<T, D>(…): T | D` with
         // `T = D` (e.g. `at(ints, i, 0)` over `Int32[]`, both members `Int32`) naively becomes the
