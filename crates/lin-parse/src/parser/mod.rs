@@ -198,6 +198,27 @@ impl Parser {
         }
     }
 
+    /// True if the current token can begin a `val`/`var` binding target (a name or a
+    /// destructuring pattern). Used to detect a missing binding name *before* the
+    /// generic pattern parser eats the `:`/`=` that should anchor recovery.
+    pub(crate) fn is_binding_target_start(&self) -> bool {
+        matches!(
+            self.peek_kind(),
+            TokenKind::Ident(_) | TokenKind::LBrace | TokenKind::LBracket
+        )
+    }
+
+    /// Emit the clear, shared "missing name" diagnostic for a `val`/`var` declaration
+    /// whose binding name is absent (e.g. `val: T = ...`). `kind` is `"val"` or `"var"`.
+    pub(crate) fn missing_binding_name(&mut self, kind: &str, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::error(span, format!("missing name for this `{}` binding", kind))
+                .with_help(format!(
+                    "a `{kind}` declaration needs a name: `{kind} name: Type = value`"
+                )),
+        );
+    }
+
 
     pub(crate) fn expect_keyword(&mut self, kind: TokenKind) {
         self.expect(kind);
@@ -480,5 +501,100 @@ mod grouped_type_tests {
         assert!(d2.is_empty(), "fn type with 1 param: {d2:?}");
         let (d3, _) = parse("type F = () => Boolean\n");
         assert!(d3.is_empty(), "zero-arg fn type: {d3:?}");
+    }
+}
+
+#[cfg(test)]
+mod missing_binding_name_tests {
+    use super::*;
+    use lin_lex::Lexer;
+
+    fn diagnostics_for(source: &str) -> Vec<Diagnostic> {
+        let mut lexer = Lexer::new(source, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let _module = parser.parse_module();
+        parser.diagnostics
+    }
+
+    /// A `val` with no name (`val: T = ...`) must report the missing NAME — not the
+    /// misleading downstream "expected Eq, got Ident(..)" the stream-desync used to produce.
+    /// And it must be a SINGLE diagnostic (the `: T = value` tail still parses).
+    #[test]
+    fn val_missing_name_reports_clear_error_no_cascade() {
+        let diags = diagnostics_for("val: UInt8 = [1,2,3]\n");
+        assert_eq!(diags.len(), 1, "expected exactly one diagnostic, got: {diags:?}");
+        assert_eq!(diags[0].message, "missing name for this `val` binding");
+        assert!(
+            !diags[0].message.contains("expected Eq"),
+            "must not surface the old misleading message: {:?}",
+            diags[0].message
+        );
+        assert_eq!(
+            diags[0].help.as_deref(),
+            Some("a `val` declaration needs a name: `val name: Type = value`")
+        );
+    }
+
+    /// `export val: T = ...` hits the same path and must get the same clear message.
+    #[test]
+    fn export_val_missing_name_reports_clear_error() {
+        let diags = diagnostics_for("export val: UInt8 = [1,2,3]\n");
+        assert_eq!(diags.len(), 1, "expected exactly one diagnostic, got: {diags:?}");
+        assert_eq!(diags[0].message, "missing name for this `val` binding");
+    }
+
+    /// A `var` with no name must get the same clear, name-focused message (previously it
+    /// gave the slightly-better-but-still-confusing "expected identifier, got Colon").
+    #[test]
+    fn var_missing_name_reports_clear_error_no_cascade() {
+        let diags = diagnostics_for("var: UInt8 = 1\n");
+        assert_eq!(diags.len(), 1, "expected exactly one diagnostic, got: {diags:?}");
+        assert_eq!(diags[0].message, "missing name for this `var` binding");
+        assert_eq!(
+            diags[0].help.as_deref(),
+            Some("a `var` declaration needs a name: `var name: Type = value`")
+        );
+    }
+
+    #[test]
+    fn export_var_missing_name_reports_clear_error() {
+        let diags = diagnostics_for("export var: UInt8 = 1\n");
+        assert_eq!(diags.len(), 1, "expected exactly one diagnostic, got: {diags:?}");
+        assert_eq!(diags[0].message, "missing name for this `var` binding");
+    }
+
+    /// A `val`/`var` missing both name AND type (`val = expr`) is also a missing name.
+    #[test]
+    fn val_missing_name_with_eq_immediately() {
+        let diags = diagnostics_for("val = 1\n");
+        assert_eq!(diags.len(), 1, "expected exactly one diagnostic, got: {diags:?}");
+        assert_eq!(diags[0].message, "missing name for this `val` binding");
+    }
+
+    /// Regression: the valid happy path must still parse with ZERO diagnostics.
+    #[test]
+    fn valid_val_var_still_parse() {
+        assert!(
+            diagnostics_for("val nums: UInt8 = [1,2,3]\n").is_empty(),
+            "valid `val` must not error"
+        );
+        assert!(
+            diagnostics_for("export val nums: UInt8 = [1,2,3]\n").is_empty(),
+            "valid `export val` must not error"
+        );
+        assert!(
+            diagnostics_for("var n: UInt8 = 1\n").is_empty(),
+            "valid `var` must not error"
+        );
+        assert!(
+            diagnostics_for("export var n: UInt8 = 1\n").is_empty(),
+            "valid `export var` must not error"
+        );
+        // Destructuring binding targets must still work.
+        assert!(
+            diagnostics_for("val { a, b } = obj\n").is_empty(),
+            "valid object-destructuring `val` must not error"
+        );
     }
 }
