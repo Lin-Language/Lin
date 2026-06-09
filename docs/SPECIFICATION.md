@@ -636,10 +636,19 @@ boxed (`LinObject`/`TaggedVal`) form is a flow-sensitive fact decided by the
 representation-inference pass (ADR-062), not by the type alone — the same `T` is
 packed when freshly constructed and boxed-wrapping-the-packed-buffer when read back
 from a map/object slot. This is transparent to programs: it affects only speed.
-Currently sealed records with **all-scalar** fields (and arrays of them, `T[]`) are
-laid out packed/contiguous; records with heap fields (String/Array/nested-record)
-remain boxed pending a language feature that forbids field omission. Either way the
-observable semantics in this section are identical.
+A sealed record is laid out packed/contiguous when **every** field is itself
+packable: a scalar (numeric or `Boolean`, stored inline at its natural offset) or
+an eligible heap field — `String`, an array, a `{ String: T }` map, or a nested
+sealed record — each stored as an 8-byte owned pointer slot with a per-field
+retain/release. So a record with `String`/array/map fields is still packed: field
+access remains a constant-offset load (not an association-list lookup), and the only
+overhead over an all-scalar record is the owned-pointer refcounting. A record is
+kept boxed (fail-safe) only when some field is not packable — a `Json`/union field,
+a `Function`/`Iterator`/other opaque value, or an unsealed object. (Arrays *of*
+heap-field records — `Person[]` where `Person` has a `String` field — are a separate
+representation question and currently stay boxed; that is about the array element
+layout, not the record itself.) Either way the observable semantics in this section
+are identical.
 
 The two are reconciled by a **non-mutating projection** at the boundary: when a
 wider value (one with extra fields, or a `Json` value) flows into a slot of named

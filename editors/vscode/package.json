@@ -42,6 +42,21 @@
     "test": "node test/discovery.test.js"
   },
   "contributes": {
+    "configuration": {
+      "title": "Lin",
+      "properties": {
+        "lin.inlayHints.variableTypes": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show inferred type hints on `val`/`var` bindings that have no explicit type annotation. (The built-in `#editor.inlayHints.enabled#` master toggle still applies.)"
+        },
+        "lin.inlayHints.parameterTypes": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show inferred type hints on function/lambda parameters that have no explicit type annotation. (The built-in `#editor.inlayHints.enabled#` master toggle still applies.)"
+        }
+      }
+    },
     "configurationDefaults": {
       "[lin]": {
         "editor.defaultFormatter": "LinusN.lin-lang",

@@ -275,6 +275,13 @@ impl Checker {
             };
 
             let slot = self.env.define_at(name.clone(), ty.clone(), false, name_span);
+            // Record a definition-site type entry for this parameter (LSP inlay hints). The `ty`
+            // may still be an unsolved TypeVar here; it is zonked to its final solution when
+            // appended to `span_type_map` at the end of `check_module`. Done for every parameter
+            // with a name span (annotated or not) — the LSP decides which to hint. Metadata-only.
+            if let Some(ns) = name_span {
+                self.param_def_span_types.push((ns, ty.clone()));
+            }
             typed_params.push(TypedParam {
                 slot,
                 name,
@@ -524,9 +531,9 @@ impl Checker {
                 self.env.fresh_type_var()
             };
 
-            let name = match &param.pattern {
-                Pattern::Ident(name, _) => name.clone(),
-                _ => format!("__param_{}", i),
+            let (name, name_span) = match &param.pattern {
+                Pattern::Ident(name, span) => (name.clone(), Some(*span)),
+                _ => (format!("__param_{}", i), None),
             };
 
             // Type-check the default before defining this param's slot (earlier params
@@ -552,6 +559,13 @@ impl Checker {
             };
 
             let slot = self.env.define(name.clone(), ty.clone(), false);
+            // Record a definition-site type entry for this parameter (LSP inlay hints). Here `ty`
+            // is usually already the resolved hint from the call context (e.g. a `for` callback's
+            // element type); any residual TypeVar is zonked when appended to `span_type_map` at
+            // the end of `check_module`. Metadata-only. See `infer_function` for the rationale.
+            if let Some(ns) = name_span {
+                self.param_def_span_types.push((ns, ty.clone()));
+            }
             typed_params.push(TypedParam { slot, name, ty: ty.clone(), default: typed_default });
 
             if let Pattern::Object(fields, obj_rest, _) = &param.pattern {
