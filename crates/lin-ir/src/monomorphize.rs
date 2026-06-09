@@ -259,6 +259,15 @@ fn erase_nonconcrete_typevars(ty: &Type) -> Type {
     match ty {
         // Leftover/unsolved inference var (below the quantified-generic range): erase to Json.
         Type::TypeVar(id) if *id < GENERIC_TV_BASE => Type::TypeVar(u32::MAX),
+        // A `Never` binding is a DEGENERATE empty-collection element pin (`[]` literal flowing into
+        // a generic param fixes `T = Never`), carrying no usable runtime representation — just like
+        // an unbound inference var. A native specialization keyed on `Never` (e.g. `push$Never`)
+        // emits a malformed call (an `i8`/`ptr` element slot that mismatches the boxed value the
+        // empty array actually stores). Erase it to the `Json` wildcard so the call monomorphizes at
+        // the DYNAMIC `$Json` representation (`lin_push_dyn` / tagged buffer) — the same path a bare
+        // `Json` element takes. Surfaced by generic `shared([])`: the empty payload binds the
+        // `Shared<T>` element to `Never`, then a later `push` inside `withLock` specializes on it.
+        Type::Never => Type::TypeVar(u32::MAX),
         // Json wildcard, or a quantified generic param: leave as-is.
         Type::TypeVar(_) => ty.clone(),
         Type::Array(t) => Type::Array(Box::new(erase_nonconcrete_typevars(t))),

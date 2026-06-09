@@ -274,7 +274,7 @@ impl Type {
     pub fn contains_type_var(&self) -> bool {
         match self {
             Type::TypeVar(_) => true,
-            Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) => inner.contains_type_var(),
+            Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) | Type::Shared(inner) => inner.contains_type_var(),
             Type::FixedArray(elems) => elems.iter().any(|t| t.contains_type_var()),
             Type::Union(variants) => variants.iter().any(|t| t.contains_type_var()),
             Type::Object { fields, .. } => fields.values().any(|t| t.contains_type_var()),

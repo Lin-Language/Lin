@@ -112,32 +112,33 @@ export val close = (w: Json): Null =>
 
 // Box a value into opt-in shared mutable state.
 // @param v  the value to share; a private copy is boxed.
-// @returns a `Shared` handle. Only the accessors below operate on it; any other operation (push,
-//   indexing, and so on) on a `Shared` value is a compile-time type error. A `Shared` box does not
-//   auto-unwrap to its inner value — read it with `get` or `withLock`.
-export val shared = (v: Json): Shared =>
+// @returns a `Shared<T>` handle that remembers its payload type `T`. Only the accessors below
+//   operate on it; any other operation (push, indexing, and so on) on a `Shared` value is a
+//   compile-time type error. A `Shared` box does not auto-unwrap to its inner value — read it
+//   with `get` or `withLock`.
+export val shared = <T>(v: T): Shared<T> =>
   lin_shared(v)
 
 // Snapshot the current value out of a `Shared` cell under the lock.
-// @param s  the `Shared` handle.
-// @returns a copy of the shared value.
-export val get = (s: Shared): Json =>
+// @param s  the `Shared<T>` handle.
+// @returns a copy of the shared value, typed as `T`.
+export val get = <T>(s: Shared<T>): T =>
   lin_shared_get(s)
 
 // Copy a new value into a `Shared` cell under the write lock.
-// @param s  the `Shared` handle.
-// @param v  the new value to store.
-export val set = (s: Shared, v: Json): Null =>
+// @param s  the `Shared<T>` handle.
+// @param v  the new value to store; must match the payload type `T`.
+export val set = <T>(s: Shared<T>, v: T): Null =>
   lin_shared_set(s, v)
 
 // Mutate a `Shared` cell in place under the write lock.
-// @param s  the `Shared` handle.
-// @param f  a function that mutates the held value while the lock is held.
-// @returns whatever `f` returned.
+// @param s  the `Shared<T>` handle.
+// @param f  a function that receives the held value `T` while the lock is held and returns `R`.
+// @returns whatever `f` returned (`R`).
 // @example val counter = shared(0)
 // @example counter.withLock(n => n + 1)   // atomic increment
 // @example val current = get(counter)     // snapshot copy; set(counter, 100) replaces it
-export val withLock = (s: Shared, f: Function): Json =>
+export val withLock = <T, R>(s: Shared<T>, f: (T) => R): R =>
   lin_shared_with_lock(s, f)
 
 // Deep-freeze a transferable graph into opt-in shared read-only state.
@@ -145,5 +146,5 @@ export val withLock = (s: Shared, f: Function): Json =>
 // @returns an immutable, lock-free-readable value that any thread can share without copying.
 //   A frozen value is read-only; readers use the plain type.
 // @example val config = frozen({ "retries": 3, "timeout": 5000 })
-export val frozen = (v: Json): Json =>
+export val frozen = <T>(v: T): T =>
   lin_freeze(v)

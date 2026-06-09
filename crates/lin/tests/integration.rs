@@ -6018,6 +6018,63 @@ print(toString(length(snap)))
 }
 
 #[test]
+fn test_shared_payload_type_preserved() {
+    // Shared<T> is a properly-typed generic handle: `get` yields the concrete payload `T`, so a
+    // Shared<Int32> snapshot is directly usable as an Int32 (no widening to Json). This exercises
+    // the box/unbox path for a scalar payload — get(si) must unbox to a real i32 for arithmetic.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get, set, withLock } from "std/async"
+
+val si = shared(5)
+val n: Int32 = get(si)
+set(si, 10)
+val n2: Int32 = get(si)
+val sum: Int32 = n + n2
+print(toString(sum))
+val r: Int32 = withLock(si, x => x * 2)
+print(toString(r))
+"#);
+    assert_eq!(output, vec!["15", "20"]);
+}
+
+#[test]
+fn test_shared_string_and_record_payload() {
+    // Non-scalar payloads round-trip too: Shared<String> get yields a usable String, and
+    // Shared<{record}> get yields a record whose typed field access compiles to a const-slot load.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get } from "std/async"
+
+val ss = shared("hello")
+val str: String = get(ss)
+print(str)
+
+type Point = { "x": Int32, "y": Int32 }
+val sp = shared({ "x": 1, "y": 2 })
+val p = get(sp)
+val px: Int32 = p["x"]
+print(toString(px))
+"#);
+    assert_eq!(output, vec!["hello", "1"]);
+}
+
+#[test]
+fn test_shared_not_assignable_to_inner_value() {
+    // The "forgot to get()" catch: a Shared<Int32> handle must NOT be assignable to a bare Int32.
+    // The opaque box keeps its payload type but never auto-unwraps — you must read it via get().
+    let err = run_expect_err(r#"import { shared } from "std/async"
+
+val s = shared(5)
+val n: Int32 = s
+"#);
+    assert!(
+        err.contains("Int32") && err.contains("Shared<Int32>"),
+        "expected a Shared<Int32>-vs-Int32 mismatch, got:\n{err}"
+    );
+}
+
+#[test]
 fn test_async_real_parallelism() {
     // Two thunks that each sleep 150ms run on real OS threads should overlap (~150ms wall), not
     // run sequentially (~300ms). Rather than assert against a fixed absolute bound (brittle on
