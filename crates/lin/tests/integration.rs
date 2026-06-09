@@ -11329,6 +11329,40 @@ val r = greet(j)
 }
 
 #[test]
+fn test_keys_rejects_scalar_argument() {
+    // `keys`/`values`/`entries` take `{ String: Json } | {}`, so a scalar argument is a
+    // compile error (closing the old `keys(obj: Json)` hole where `keys(1)` type-checked).
+    let err = run_expect_err(r#"import { keys } from "std/object"
+import { print } from "std/io"
+val r = keys(1)
+print("${r}")
+"#);
+    assert!(
+        err.contains("Int32") || err.contains("String") || err.to_lowercase().contains("expected"),
+        "expected a type error rejecting a scalar to keys, got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_keys_values_entries_accept_record_map_json() {
+    // The `{ String: Json } | {}` parameter still accepts all three valid object shapes: a record
+    // literal, a typed index-signature map, and a `Json` value carrying an object.
+    let out = run(r#"import { keys, values, entries } from "std/object"
+import { length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val rec = { "a": 1, "b": 2 }
+print(toString(length(keys(rec))))
+val m: { String: Int32 } = { "x": 10, "y": 20 }
+print(toString(length(values(m))))
+val j: Json = { "p": 1 }
+print(toString(length(entries(j))))
+"#);
+    assert_eq!(out, vec!["2", "2", "1"]);
+}
+
+#[test]
 fn test_concrete_to_json_still_ok() {
     // Concrete value -> Json (covariant sink) still compiles.
     let out = run(r#"import { print } from "std/io"
