@@ -294,6 +294,15 @@ Path 3's inferred arenas for that. Best if the goal is the win with zero languag
 
 ## IMPLEMENTATION FINDINGS (2026-06-09, branch `path1-packed-records`, NOT merged)
 
+> **Work reference (the code is all here):** branch **`path1-packed-records`** (tip `39f8329c`), checked out at worktree `.claude/worktrees/path1-packed`. The worktree is ephemeral; the **branch is the durable handle** — `git log path1-packed-records`. Commit chain from master base `29d39237`:
+> - `04bec701` fix(ir): Trip|Null tail-recursive self-tail-call UAF (Path 0)
+> - `568756b0` fix(ir): per-iteration index/element box leak in non-inline for loops
+> - `470ea0ad` perf(ir): **Path-1 Step 1+2** — in-place packed-array `for`/`length`, no materialize
+> - `4de04817` perf(ir): **Path-1 Step 1+2** — in-place packed `map`/`reduce` field reads
+> - `39f8329c` perf(ir): **Path-1 Step 3** — in-place String field read capability; gate stays scalar+Bool (oracle blocker)
+>
+> Mergeable subset (the 4.5× win, scalar scope): `470ea0ad` + `4de04817` on top of the two fixes.
+
 **Steps 1+2 (the in-place packed-array op ABI — "the unsolved core") are SOLVED and measured-winning. Step 3 (pack heap-field records by default) hit the predicted repr-oracle wall and is built-but-dormant.** All numbers below independently re-verified, not just agent-reported.
 
 ### Steps 1+2 — DONE (commits `470ea0ad`, `4de04817`)
