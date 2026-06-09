@@ -59,24 +59,28 @@ export val makeStringResults = (): Json =>
 
 export val add = (sr: Json, kConnections: { String: { String: Conn } }): Null =>
   val results = sr["results"]
-  keys(kConnections).for(destination =>
-    sortedRoundKeys(kConnections[destination]).for(k =>
-      val path = getPath(kConnections, k, destination)
-      if length(path) >= 1 then
-        val origin = path[0]
-        val tail = slice(path, 1, length(path))
-        val journeyKey = if origin > destination then
-          "${destination}${origin}"
-        else
-          "${origin}${destination}"
-        val pathString = if origin > destination then
-          join(reverse(tail), ",")
-        else
-          join(tail, ",")
-        if results[journeyKey] == null then results[journeyKey] = {  }
-        results[journeyKey][pathString] = true
+  kConnections
+    .keys()
+    .for(destination =>
+      val destMap = kConnections[destination]
+      if destMap != null then
+        sortedRoundKeys(destMap).for(k =>
+          val path = getPath(kConnections, k, destination)
+          if length(path) >= 1 then
+            val origin = path[0]
+            val tail = slice(path, 1, length(path))
+            val journeyKey = if origin > destination then
+              "${destination}${origin}"
+            else
+              "${origin}${destination}"
+            val pathString = if origin > destination then
+              join(reverse(tail), ",")
+            else
+              join(tail, ",")
+            if results[journeyKey] == null then results[journeyKey] = {  }
+            results[journeyKey][pathString] = true
+        )
     )
-  )
 
 export val finalize = (sr: Json): Json =>
   sr["results"]
