@@ -1,9 +1,12 @@
 # Path 5 — Records are values, not refcounted heap objects (the memory-model fix the read paths could not reach)
 
-**Status:** Open proposal, written *after* Paths 0–4 and after re-reading the spec against the runtime.
-**No userland language change** (the one observable corner — in-place aliased mutation of a sealed
-record — already crashes today, so closing it is a zero-regression honesty fix, see §"The mutation
-question").
+**Status:** ⚠️ **PREMISE FALSIFIED — see "RESULTS 2026-06-09" at the bottom before reading.** The body
+below claims records are *already* value-semantic and so this is "no userland language change." That is
+**WRONG**: records are observably-mutable reference types (`val b = a; a["k"]=v` → `b` sees it, verified),
+so value records ARE a breaking change. The *cost diagnosis* is sound and confirmed by the RAPTOR profile,
+but the non-breaking framing is not — **the live, non-breaking form of "make records cheap" is
+[Path 1](path-1-integrate-packed-records.md) (packed-by-default, a representation change), not this path's
+value semantics.** Read the body for the cost argument; read the RESULTS section for what's actually true.
 
 **Direction in one line:** stop representing fixed-key records as refcounted heap `LinObject`s and
 start representing them as **inline values** (registers / stack / contiguous array slots, no header, no
@@ -263,3 +266,63 @@ a **single, semantics-preserving** change, with an ABI every systems language al
 (H3 descriptors, ADR-062 repr pass, `project_sumtype_build`, the inlining lever) already built. Stage 1
 is the cheap, falsifiable first move. **This is the fundamental redesign the benchmarks have been asking
 for.**
+
+---
+
+## RESULTS 2026-06-09 — the central premise is FALSIFIED (records are observably-mutable references), but the diagnosis it pointed at is CORRECT
+
+**Verdict: this path's thesis — "Lin's records are *already* value-semantic, so making fixed-key records
+inline values is semantics-preserving / no userland change" — is FALSE. Verified directly, not
+self-reported.**
+
+### The falsifying test (run on master, byte-checked)
+```txt
+type Counter = { "state": Int32, "inc": Int32 }
+val a: Counter = { "state": 0, "inc": 7 }
+val b = a
+a["state"] = 99
+print(toString(b["state"]))   // → 99
+```
+`b` sees `a`'s mutation. Records are **genuine mutable reference types with observable aliasing** — through
+plain `val b = a` (the simplest case), and through function-argument passing (the existing, *passing* test
+`test_sealed_record_field_write_through_helper`, integration.rs:7275, whose comment states outright: *"a
+sealed record is a mutable reference like an array — the mutation must be visible at the call site"*).
+
+### Where the proposal's argument went wrong
+- **Structural equality (§9) does not imply value semantics.** §9 means a *copy* is indistinguishable from
+  a *reference under reads*; it does **not** mean *mutation* is unobservable — and aliased mutation plainly
+  is. The proposal conflated "no identity equality" with "no observable identity." They are different.
+- **§5.9.1's "copy at the boundary" is only *projection*** (width-narrowing a wider value into a *smaller*
+  named type). A same-type `val b = a` does **not** copy. So the spec does not already mandate value copies
+  for the aliasing case the model needs.
+- **"BUG 1 — `r["k"]=v` already crashes" is STALE.** Verified: in-place packed-sealed-record field write
+  works today and is tested. The "zero-regression" justification for making index-assign a compile error
+  rested on a bug that is already fixed; doing so would BREAK `test_sealed_record_field_write_through_helper`.
+
+### Consequence: value records ARE a breaking semantic change
+Making records value types changes mutation/aliasing/identity — exactly what Path 3 said when it placed
+value semantics out of scope, and exactly the constraint this path claimed to dodge. **It cannot be done
+"semantics-preserving."** The user's literal ask ("Go's approach, everything inline on stack") *is* value
+semantics, so the breaking change may be *acceptable* — but it is a **language-direction decision**, not a
+free implementation swap, and must be made explicitly (and would need a migration: the `makeCounter`
+in-place idiom, the helper-mutation test, any `obj[k]=v`-through-alias code). See
+[[project_records_are_reference_types]].
+
+### What survives — the diagnosis, redirected
+The proposal's *cost* analysis was right; only the "non-breaking" claim was wrong. The
+[RAPTOR profile](path-8-make-functions-free.md) then confirmed the value-records *target* is real for the
+`Json`-read-bound case: **631 M of 756 M `lin_object_get` are linear scans + ~3.5 B box ops** — the boxed
+representation IS RAPTOR's bottleneck. And **partial typing REGRESSES ~13%** (materializes a fresh sealed
+struct per access on top of the still-boxed source), which is the measured proof of this path's own warning
+that the win is *end-to-end or nothing*. So the representation lever is correct; the open question is the
+**non-breaking** way to get it — which is **Path 1's packed-by-default (a representation change, not a
+semantic one)**, not this path's value semantics. **Path 1, not Path 5, is the live form of "make records
+cheap."** This path stays on file as the considered-and-rejected value-semantics option: rejected not
+because it wouldn't be fast, but because it is breaking and Path 1 reaches most of the same layout benefit
+without changing what a program means.
+
+### If pursued anyway (the only sound framing)
+Opt-in, additive value types (a distinct `struct`-like declaration / explicit value-record marker) for
+hot leaf data only, leaving today's reference records unchanged — the non-breaking subset. That is recorded
+as "Layer 2a" in [Path 7](path-7-tracing-gc-foundation.md). It is additive, not the wholesale default-flip
+this path originally proposed.

@@ -350,3 +350,14 @@ remaining target is the *record* values (`Trip`/`StopTime`) the query phase iter
 does not help. See path-0's RETROSPECTIVE 2026-06-09 — the two were conflated under one "de-`Json`-ing"
 heading, which is part of why the dictionary win went uncredited to any path and the profiling pointed
 five agents at the harder record/packing half.
+
+### → Continued in [Path 9](path-9-end-to-end-packed-records.md) (2026-06-09): the RAPTOR end-to-end thread + the prereq stack
+The [RAPTOR profile](path-8-make-functions-free.md) confirmed this path's record-packing target is exactly
+RAPTOR's bottleneck (**631 M of 756 M `lin_object_get` are linear scans** over `Json` records + ~3.5 B box
+ops), and that *partial* typing **regresses ~13%** (per-access materialization) — so the win is
+**all-or-nothing end-to-end**. [Path 9](path-9-end-to-end-packed-records.md) is this path carried to that
+conclusion: Steps 1+2 (merge — the in-place ABI, ~4.5×, the gating first move, currently only on
+`path1-packed-records`/`worktree-agent-aa197d6e`, NOT master) → Step 3 (the repr-oracle reconciliation that
+has blocked heap-field packing twice) → the `stopTimes: StopTime[]` nested-packed-array gap → the loader
+`Json→Trip[]` decode (machinery exists: `lin_from_json`, ADR-031). The measured trap and prereq dependency
+order live in Path 9; the per-operation mechanism lives here.

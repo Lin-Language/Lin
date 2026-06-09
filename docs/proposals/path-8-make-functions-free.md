@@ -1,11 +1,15 @@
 # Path 8 — Make functions free: demolish the call/closure/dispatch abstraction before *and* with LLVM
 
-**Status:** Open proposal. The architectural framing + concrete current-ABI findings behind the
-call/dispatch lever. **Complements [Path 6 (eliminate-call-dispatch-cost)](path-6-eliminate-call-dispatch-cost.md)**,
-which proposes the IR-level inlining/fusion/monomorphization mechanisms (Tiers 2–3 here). This path adds
-the missing **Tier 1** (the LLVM never gets to *see* the helpers — they're a linked `.a`, not bitcode)
-and **Tier 4** (the loop forms), and the unifying model that makes the whole thing add up. **No userland
-language change.**
+**Status:** Open proposal, **now spike-tested and reconciled with the full cost map (see the dated
+sections at the bottom — read them first).** The architectural framing + concrete current-ABI findings
+behind the call/dispatch lever. **Complements [Path 6 (eliminate-call-dispatch-cost)](path-6-eliminate-call-dispatch-cost.md)**
+(the IR-level inlining/fusion/monomorphization mechanisms = Tiers 2–3 here) and **hands off the
+representation half to [Path 9 (end-to-end packed records)](path-9-end-to-end-packed-records.md)**. This
+path adds **Tier 1** (the LLVM never gets to *see* the helpers — a linked `.a`, not bitcode) + **Tier 4**
+(loop forms) + the compounding model. **No userland language change.** **Key measured updates since first
+draft:** Tier-1-alone buys <2% (sequencing reversed — Tier 2 leads); and the cost is **two bottlenecks in
+two programs** (interp = calls → this path; RAPTOR = `Json`-record reads → Path 9) — see "THE COMPLETED
+COST MAP".
 
 **Direction in one line:** Lin is a functional language where *everything is a function* — `for`, every
 combinator, every loop — and it is slow because those abstractions are still **standing as runtime
@@ -232,8 +236,11 @@ function. The fix is to demolish the abstraction in two compounding places: **le
 **demolish it yourself at the IR level** (Tiers 2–4: inline/fuse combinator+closure calls, devirtualize +
 monomorphize the dispatch, flatten the loop forms — Path 6's mechanisms, proven once at ~3.2×). This is
 exactly how Rust/Zig/Go reach C speed: the functional design is not the enemy; *leaving the abstraction
-standing at runtime* is. Zero userland change. Start with Tier 1 (in-flight spike), then generalize Tier 2,
-then go deep on Tier 3 — sequenced by what the profile says dominates.
+standing at runtime* is. Zero userland change. **Lead with Tier 2** (combinator/closure inlining — kills
+the indirect call that blocks everything), then Tier 3 (devirtualize/monomorphize the consuming helper),
+then **Tier 1 LAST** as the finishing pass (the spike proved it buys <2% until the consumer boundary
+falls). For interp and call-bound code this is *the* lever; for `Json`-read-bound code (RAPTOR) see the
+two-bottleneck map below.
 
 ---
 
@@ -255,3 +262,44 @@ demolish the helpers that remain. This is why path-0's per-call-site-**class** p
 Tier-1 spike — it tells you how much of the opaque-call cost is a type annotation away vs genuinely needs
 the bitcode/inlining work. See **path-0 RETROSPECTIVE 2026-06-09** for the full root-cause of why this win
 was invisible to the aggregate-`lin_object_get` profile that originally framed Paths 0–7.
+
+---
+
+### 🗺️ THE COMPLETED COST MAP 2026-06-09 — two bottlenecks, two programs, two levers (all measured)
+The investigations are now reconciled into one picture. **There is no single bottleneck — there are two,
+in different programs, needing different primary fixes.** Both are measured, not assumed.
+
+| | **interp** | **RAPTOR (query phase)** |
+|---|---|---|
+| Hot records are… | typed / sealed | **`Json`** |
+| So a field read is… | const-offset `FieldGet` (cheap) | **`lin_object_get` — 631 M of 756 M are LINEAR SCANS** (<16-key objects, no index) |
+| Dominant cost | **the non-inlined calls** (H12 ceiling: deleting ALL alloc+RC = *no* speedup) | **the boxed-`Json` representation** (~3.5 B box ops: RELEASE 1.37 B / CLONE 1.12 B / ALLOC 1.02 B) |
+| Primary fix | **this path** (Tier 2/3: inline the calls) | **end-to-end packed records** (Path 1 packed-by-default / Path 5's target) |
+| Map lookups (`{String:T}`) | n/a | 269 M, **O(1), NOT the problem** (dead lever) |
+
+**Why it's not a contradiction:** a const-offset read exists *only* for statically-sealed records; a
+`Json` value's read is *always* `lin_object_get` (verified in codegen + `object.rs` HASH_INDEX_THRESHOLD=16).
+interp's records are sealed → reads cheap → residual cost is the calls. RAPTOR's records are `Json` →
+631 M linear scans → cost is the representation. **Measured trap:** *partial* RAPTOR typing **REGRESSES
+~13%** — reading a `Json`-built value back as a typed record *materializes a fresh sealed struct per
+access* (SEALED_ALLOC 65 M, RC_RETAIN 778 M→2.09 B) on top of the unchanged scan. So RAPTOR's repr fix is
+**all-or-nothing end-to-end**, not incremental. See [[project_raptor_json_read_bottleneck]] and
+`benchmarks/compare/raptor/lin/NOTES.md`.
+
+**Dead levers, now measured-negative (stop proposing):** map-lookup cost (O(1)); RC/alloc in isolation
+(interp ceiling test, [Path 7](path-7-tracing-gc-foundation.md) demoted); internal linkage (already one
+module); Tier-1 bitcode *alone* (<2%, consumer stays opaque — [[project_bitcode_runtime_spike]]);
+incremental RAPTOR typing (regresses 13%).
+
+**Live levers, each targeting a *measured* dominant cost:**
+1. **This path's Tier 2** (combinator/closure inlining) → interp + all call-bound functional code. Lower
+   risk, proven mechanism (Stage 1 ~3.2×), ships incrementally. **The recommended first implementation.**
+2. **Path 1 packed-by-default + the heap-field-array + loader-decode gaps** → RAPTOR + all `Json`-read-bound
+   code. The *only* thing the profile shows will help it; the non-breaking form of Path 5. Bigger, riskier
+   (the repr-oracle reconciliation Path 1 Step 3 names). **Scoped as its own continuation — see
+   [Path 9](path-9-end-to-end-packed-records.md).**
+3. **Secondary RAPTOR frontier:** 203 M string allocs from round-key `"${k}"` interpolation (string
+   interning / avoid per-access key construction). Separate, smaller.
+
+These two primary levers (1 and 2) **do not compete — they fix different programs** and can proceed in
+parallel. This path owns lever 1; Path 9 owns lever 2.
