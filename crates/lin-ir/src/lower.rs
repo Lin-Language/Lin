@@ -5546,15 +5546,26 @@ fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp,
             builder.emit(Instruction::CallIntrinsic {
                 dst: push_dst, intrinsic: Intrinsic::Push, args: vec![out, boxed], ret_ty: Type::Null,
             });
-            // `Push` (`lin_array_push_tagged`) MOVES the box's inner into the result slot without
-            // retaining. When `box_to_json` made a FRESH box for a concrete `val` (val_ty not a
-            // union), its 16-byte shell is now orphaned — the inner lives on in the array. Reclaim
-            // the shell (the inner is NOT touched — that pointer belongs to the array). Skipped when
-            // `boxed == val` (val was already a union; that box is owned/freed elsewhere — e.g. the
-            // map elem box freed by `free_combinator_elem_box`). Without this a concrete-producing
-            // `map(src, x => {…})` leaked the per-element push box shell (~16 B/elem).
+            // RECLAIM the fresh per-element box when `box_to_json` allocated one for a CONCRETE `val`
+            // (`boxed != val`; skipped when `val` was already a union — that box is owned/freed
+            // elsewhere, e.g. the map elem box reclaimed by `free_combinator_elem_box`).
+            //
+            // The reclaim DEPTH must match what codegen's `Intrinsic::Push` does with the inner:
+            //   - the MOVE push (`lin_array_push_tagged`) raw-copies the box's inner into the result
+            //     slot WITHOUT retaining — the inner now lives on in the array, so only the orphaned
+            //     16-byte shell is reclaimed (`FreeBoxShell`);
+            //   - the RETAINING push (`lin_push_dyn`) BUMPS the inner's refcount so the result array
+            //     owns its OWN reference — the fresh box still holds `val`'s original +1, which must be
+            //     FULLY released (inner decrement + shell) or every element's inner heap value leaks
+            //     (the ~88 B/elem `map(src, x => {…})`-into-`Object[]`/`Rec[]` leak).
+            // A freshly-boxed concrete `val` is a Json/union value pushed into an `Array`, which is
+            // exactly codegen's retaining-push condition (`union_elem_into_concrete`, and for a
+            // union/Named result-element type also `arr_elem_dynamic`). So `boxed != val` in this
+            // tagged-store branch ALWAYS takes the retaining `lin_push_dyn` → the fresh box still owns
+            // `val`'s original +1 after the push and must be FULLY released (inner + shell), NOT just
+            // the orphaned shell. `Release` on a Json temp lowers to `lin_tagged_release`.
             if boxed != val {
-                builder.emit(Instruction::FreeBoxShell { val: boxed });
+                builder.emit(Instruction::Release { val: boxed, ty: Type::TypeVar(u32::MAX) });
             }
         }
     }
@@ -6149,6 +6160,12 @@ fn apply_fuse_stages(
 ) -> Option<(Temp, Type)> {
     let src_elem = elem;
     let src_elem_ty = elem_ty.clone();
+    // OWNERSHIP of the per-iteration SOURCE materialize (`src_elem`): once an upstream map CONSUMES
+    // it (producing a fresh value that does not alias it), the map FREES it here and the source no
+    // longer owns it. A later stage that also tried to free `src_elem` would double-free (the
+    // `map.filter.reduce` UAF in `lin_sealed_release`). Track liveness so each `src_elem` reclaim
+    // happens exactly once.
+    let mut src_alive = true;
     for stage in stages {
         match stage {
             FuseStage::Filter { params, body } => {
@@ -6165,8 +6182,13 @@ fn apply_fuse_stages(
                 let drop_block = builder.alloc_block("fuse_drop");
                 builder.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
                 builder.switch_to(drop_block);
-                free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
-                free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                // Reclaim the dropped element: the SOURCE materialize (only if an upstream map has
+                // not already consumed it), plus the CURRENT carried value when it is a distinct
+                // upstream-map output (a fresh value the map produced and the source no longer owns).
+                if src_alive {
+                    free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
+                    free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                }
                 if elem != src_elem {
                     builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
                 }
@@ -6186,8 +6208,11 @@ fn apply_fuse_stages(
                     if elem != src_elem {
                         builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
                     } else {
+                        // The map consumed the SOURCE materialize → reclaim it here, exactly once,
+                        // and mark it dead so no downstream stage frees it again.
                         free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
                         free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                        src_alive = false;
                     }
                 }
                 elem = mapped;
@@ -7092,6 +7117,9 @@ fn apply_fuse_stages_reduce(
 ) -> Option<(Temp, Type)> {
     let src_elem = elem;
     let src_elem_ty = elem_ty.clone();
+    // See `apply_fuse_stages`: track whether the per-iteration SOURCE materialize is still owned, so
+    // a map that consumed it followed by a filter drop does not double-free it (`lin_sealed_release`).
+    let mut src_alive = true;
     for stage in stages {
         match stage {
             FuseStage::Filter { params, body } => {
@@ -7108,8 +7136,10 @@ fn apply_fuse_stages_reduce(
                 let drop_block = builder.alloc_block("freduce_drop");
                 builder.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
                 builder.switch_to(drop_block);
-                free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
-                free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                if src_alive {
+                    free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
+                    free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                }
                 if elem != src_elem {
                     builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
                 }
@@ -7130,6 +7160,7 @@ fn apply_fuse_stages_reduce(
                     } else {
                         free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
                         free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                        src_alive = false;
                     }
                 }
                 elem = mapped;
