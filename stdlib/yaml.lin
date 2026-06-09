@@ -21,14 +21,14 @@ import foreign "lin-runtime"
 // Parse a single YAML document into a Json value.
 // @param src  the YAML source text.
 // @returns the parsed value, or an `Error` if `src` is not valid YAML.
-export val parse = (src: String): Json =>
+export val parse = (src: String): Json | Error =>
   lin_yaml_parse(src)
 
 // Parse a multi-document YAML stream (`---`-separated) into an array of values.
 // @param src  the YAML source text.
 // @returns a `Json[]` of the parsed documents, or an `Error` if `src` is not valid YAML.
 // @example parseAll("a: 1\n---\nb: 2\n").length()  // 2
-export val parseAll = (src: String): Json =>
+export val parseAll = (src: String): Json | Error =>
   lin_yaml_parse_all(src)
 
 // Serialize a Json value to a single YAML document.
