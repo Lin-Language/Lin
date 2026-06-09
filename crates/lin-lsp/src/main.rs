@@ -291,41 +291,95 @@ impl LanguageServer for Backend {
 
         let mut items: Vec<CompletionItem> = Vec::new();
 
+        // Classify the cursor's position so each completion source is offered only where it makes
+        // sense (the user's report: bindings in expression position, no `import`/`from`/`as` there,
+        // types only in type-annotation position). Dot context is its own path (handled below).
+        let ctx = classify_completion_context(&analysis.module, &source, offset);
+
         // In dot context only show applicable stdlib functions — no keywords/types/bindings.
         if !in_dot_context {
-            // 1. Bindings visible at the cursor (from span_type_map def_spans).
-            for (_, ty_str, def_span) in &analysis.span_type_map {
-                if let Some(ds) = def_span {
-                    // `.get` (not raw index) so a stale/multi-byte-misaligned def_span can't panic.
-                    let name = source.get(ds.start as usize..ds.end as usize).unwrap_or("");
-                    if !name.is_empty() && name.starts_with(|c: char| c.is_alphabetic() || c == '_') {
-                        if name.starts_with(prefix) {
-                            let kind = if ty_str.contains("=>") {
-                                CompletionItemKind::FUNCTION
-                            } else {
-                                CompletionItemKind::VARIABLE
-                            };
-                            items.push(CompletionItem {
-                                label: name.to_string(),
-                                kind: Some(kind),
-                                detail: Some(clean_type_string(ty_str)),
-                                // Stash a resolve key so `completion_resolve` can fill the doc
-                                // (lazily, for the selected item only) from this file's own decl.
-                                data: completion_resolve_data(uri, name),
-                                ..Default::default()
-                            });
+            // 1. In-scope bindings — offered in Expression / StatementStart, NOT in a type position.
+            //    Two sources, deduped by name: (a) referenced bindings with an inferred type from
+            //    `span_type_map`, and (b) ALL binders structurally in lexical scope at the cursor
+            //    (so a defined-but-unreferenced lambda param like `item` is offered — the report's
+            //    core fix). (a) is preferred for its richer inferred type detail.
+            if matches!(ctx, CompletionContext::Expression | CompletionContext::StatementStart) {
+                let mut seen: HashSet<String> = HashSet::new();
+                // (a) referenced bindings (rich inferred type).
+                for (_, ty_str, def_span) in &analysis.span_type_map {
+                    if let Some(ds) = def_span {
+                        // `.get` (not raw index) so a stale/multi-byte-misaligned def_span can't panic.
+                        let name = source.get(ds.start as usize..ds.end as usize).unwrap_or("");
+                        if name.is_empty() || !name.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+                            continue;
                         }
+                        if !name.starts_with(prefix) || !seen.insert(name.to_string()) {
+                            continue;
+                        }
+                        let kind = if ty_str.contains("=>") {
+                            CompletionItemKind::FUNCTION
+                        } else {
+                            CompletionItemKind::VARIABLE
+                        };
+                        items.push(CompletionItem {
+                            label: name.to_string(),
+                            kind: Some(kind),
+                            detail: Some(clean_type_string(ty_str)),
+                            // Stash a resolve key so `completion_resolve` can fill the doc
+                            // (lazily, for the selected item only) from this file's own decl.
+                            data: completion_resolve_data(uri, name),
+                            ..Default::default()
+                        });
                     }
                 }
+                // (b) structural scope binders (covers unreferenced names absent from span_type_map).
+                for b in collect_scope_bindings(&analysis.module, offset) {
+                    if b.name.is_empty() || !b.name.starts_with(prefix) || !seen.insert(b.name.clone()) {
+                        continue;
+                    }
+                    // Prefer the inferred type recorded for this binder's def_span (if it WAS used
+                    // somewhere); else fall back to its AST annotation; else offer with no detail.
+                    let detail = b
+                        .def_span
+                        .and_then(|ds| {
+                            analysis
+                                .span_type_map
+                                .iter()
+                                .find(|(_, _, d)| *d == Some(ds))
+                                .map(|(_, ty, _)| clean_type_string(ty))
+                        })
+                        .or(b.annotated_ty.clone());
+                    let kind = if b.is_function {
+                        CompletionItemKind::FUNCTION
+                    } else {
+                        CompletionItemKind::VARIABLE
+                    };
+                    items.push(CompletionItem {
+                        label: b.name.clone(),
+                        kind: Some(kind),
+                        detail,
+                        data: completion_resolve_data(uri, &b.name),
+                        ..Default::default()
+                    });
+                }
             }
-            items.dedup_by(|a, b| a.label == b.label);
 
-            // 2. Keywords.
-            let keywords = [
-                "val", "var", "type", "export", "import", "from", "as",
-                "if", "then", "else", "match", "is", "has", "when",
-                "true", "false", "null",
-            ];
+            // 2. Keywords, gated by context (the report: NO `import`/`from`/`as`/`export` in an
+            //    expression). Declaration keywords only at a statement start; `from`/`as` only inside
+            //    an import clause; `if`/`match`/`is`/`has`/`when` + literals are expression-level.
+            let keywords: &[&str] = match ctx {
+                CompletionContext::StatementStart => &[
+                    "val", "var", "type", "export", "import",
+                    "if", "then", "else", "match", "is", "has", "when",
+                    "true", "false", "null",
+                ],
+                CompletionContext::Expression => &[
+                    "if", "then", "else", "match", "is", "has", "when",
+                    "true", "false", "null",
+                ],
+                CompletionContext::ImportStmt => &["from", "as"],
+                CompletionContext::TypeAnnotation => &[],
+            };
             for kw in keywords {
                 if kw.starts_with(prefix) {
                     items.push(CompletionItem {
@@ -336,21 +390,35 @@ impl LanguageServer for Backend {
                 }
             }
 
-            // 3. Built-in types.
-            let builtin_types = [
-                "String", "Boolean", "Null", "Number", "Json", "Error",
-                "Int8", "Int16", "Int32", "Int64",
-                "UInt8", "UInt16", "UInt32", "UInt64",
-                "Float32", "Float64",
-                "Iterator", "Iterable", "Function",
-            ];
-            for ty in builtin_types {
-                if ty.starts_with(prefix) {
-                    items.push(CompletionItem {
-                        label: ty.to_string(),
-                        kind: Some(CompletionItemKind::CLASS),
-                        ..Default::default()
-                    });
+            // 3. Types — built-ins + user-defined `type` names + in-scope generic params. Offered
+            //    ONLY in a type-annotation position (`val x: ▮`, param/return types, `type T = ▮`).
+            if ctx == CompletionContext::TypeAnnotation {
+                let builtin_types = [
+                    "String", "Boolean", "Null", "Number", "Json", "Error",
+                    "Int8", "Int16", "Int32", "Int64",
+                    "UInt8", "UInt16", "UInt32", "UInt64",
+                    "Float32", "Float64",
+                    "Iterator", "Iterable", "Function",
+                ];
+                let mut seen_types: HashSet<String> = HashSet::new();
+                for ty in builtin_types {
+                    if ty.starts_with(prefix) && seen_types.insert(ty.to_string()) {
+                        items.push(CompletionItem {
+                            label: ty.to_string(),
+                            kind: Some(CompletionItemKind::CLASS),
+                            ..Default::default()
+                        });
+                    }
+                }
+                // User-defined type names + generic type params in scope.
+                for ty in collect_type_names(&analysis.module, offset) {
+                    if ty.starts_with(prefix) && seen_types.insert(ty.clone()) {
+                        items.push(CompletionItem {
+                            label: ty.clone(),
+                            kind: Some(CompletionItemKind::CLASS),
+                            ..Default::default()
+                        });
+                    }
                 }
             }
         }
@@ -358,13 +426,18 @@ impl LanguageServer for Backend {
         // 4. Imported symbols — derived from THIS file's `import` statements (never a hardcoded
         // list). In dot context, filter to functions whose first parameter matches the receiver
         // category; otherwise offer every imported name. Keywords/types/bindings are suppressed in
-        // dot context (handled above).
+        // dot context (handled above). Imported VALUES are not offered in a TypeAnnotation position
+        // (a type is expected there, not a value), but the dot-context path is unconditional.
         let filter_cat = if in_dot_context {
             Some(receiver_category.as_deref().unwrap_or("any"))
         } else {
             None
         };
+        let suppress_imports_for_type = !in_dot_context && ctx == CompletionContext::TypeAnnotation;
         for imp in &analysis.imported_names {
+            if suppress_imports_for_type {
+                break;
+            }
             if !imp.name.starts_with(prefix) {
                 continue;
             }
@@ -1669,17 +1742,58 @@ fn backward_scan_is_import_clause(source: &str, offset: usize) -> bool {
 }
 
 /// Backward scan: is the cursor at the START of a statement? True when only whitespace precedes the
-/// cursor on its line (the user is at the first token of a new line) AND that line isn't a
-/// continuation of a dotted chain (a leading `.` means dot-completion / expression). Declaration
-/// keywords (`val`/`var`/`type`/`import`/`export`) are offered here.
+/// cursor on its line (the user is at the first token of a new line) AND the line isn't a
+/// CONTINUATION of the previous line's expression. Declaration keywords (`val`/`var`/`type`/`import`/
+/// `export`) are offered here. A previous line ending in a continuation token (`=`, `=>`, a binary
+/// operator, an open delimiter, `,`, `|`, `&`, etc.) means the cursor continues that expression, so
+/// we do NOT treat it as a statement start (avoids offering `import` inside a wrapped `val` RHS).
 fn backward_scan_is_statement_start(source: &str, offset: usize) -> bool {
     let byte_off = char_offset_to_byte(source, offset);
     let line_start = source[..byte_off].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let line = &source[line_start..byte_off];
     // The text before the cursor on this line, minus any partial identifier being typed.
     let before_word = line.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
-    // Statement start: everything before the typed word is whitespace (indentation only).
-    before_word.trim().is_empty()
+    // Statement start requires nothing but indentation before the typed word.
+    if !before_word.trim().is_empty() {
+        return false;
+    }
+    // Look at the nearest preceding non-empty line. If it ends in a continuation token, the cursor
+    // is a wrapped expression, not a fresh statement.
+    let mut prev = &source[..line_start];
+    loop {
+        let pstart = prev.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let pline = prev[pstart..].trim_end();
+        if pline.trim().is_empty() {
+            if pstart == 0 {
+                break;
+            }
+            prev = &source[..pstart - 1];
+            continue;
+        }
+        // Strip a trailing `//` comment so the real last token is examined.
+        let code = pline.split("//").next().unwrap_or(pline).trim_end();
+        let cont = code.ends_with('=')
+            || code.ends_with("=>")
+            || code.ends_with('(')
+            || code.ends_with('[')
+            || code.ends_with('{')
+            || code.ends_with(',')
+            || code.ends_with('|')
+            || code.ends_with('&')
+            || code.ends_with('+')
+            || code.ends_with('-')
+            || code.ends_with('*')
+            || code.ends_with('/')
+            || code.ends_with('<')
+            || code.ends_with('>')
+            || code.ends_with("&&")
+            || code.ends_with("||");
+        if cont {
+            return false;
+        }
+        break;
+    }
+    true
 }
 
 // ── in-scope binding collection (scope-aware completion) ──────────────────────
