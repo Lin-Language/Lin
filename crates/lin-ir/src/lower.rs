@@ -6339,6 +6339,22 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+        // PATH-1 in-place packed iteration: `map(ts, x => x["a"])` over a packed sealed-scalar array
+        // reads the mapped field by const-offset, NO per-element materialize. Gated to bodies that
+        // use the element ONLY for scalar field reads (`x => x["a"]`, `(x,i) => x["a"]+i`); a
+        // whole-value map (`x => x`, `x => {…x…}`) needs the materialized struct and falls through.
+        if is_sealed_scalar_array(&iterable_ty)
+            && lam_params.first().map(|p| elem_used_only_for_scalar_fields(p.slot, &lam_body)).unwrap_or(false)
+        {
+            let static_elem = iter_elem_type(&iterable_ty);
+            emit_packed_index_loop(iterable, &iterable_ty, builder, ctx, |i, array, b, c| {
+                let idx = narrow_loop_index(i, b);
+                let (mapped, mapped_ty) = inline_lambda_body_packed_view(
+                    &lam_params, &lam_body, array, i, &static_elem, idx, b, c);
+                push_output(out, flat, &out_elem_ty, mapped, &mapped_ty, false, b);
+            });
+            return out;
+        }
         emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |i, elem, b, c| {
             // Optional 0-based SOURCE index; narrowed Int64→Int32. `inline_lambda_body` binds by the
             // lambda's OWN param count, so a 1-param `x => …` simply ignores this surplus arg.
@@ -6512,26 +6528,48 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
             builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
 
             builder.switch_to(body);
-            let elem = builder.alloc_temp(elem_ty.clone());
-            builder.emit(Instruction::Index {
-                dst: elem, object: iterable, key: i,
-                obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
-            });
-            // acc_next = <lambda body>(acc, elem, i), inlined. The reducer params are (acc, elem)
-            // plus the OPTIONAL 0-based SOURCE index `i` (narrowed Int64→Int32). A 2-param
-            // `(acc, x) => …` reducer ignores the surplus index arg (`inline_lambda_body` binds by
-            // the lambda's own param count).
+            // PATH-1 in-place packed iteration: a reducer `(acc, x) => acc + x["a"]` over a packed
+            // sealed-scalar array whose body uses the ELEMENT param (index 1) ONLY for scalar field
+            // reads → bind that param to a borrowed (array, index) view (const-offset reads, no
+            // materialize). The accumulator param (index 0) carries the unboxed scalar phi as before.
+            let elem_param_only_fields = lam_params.get(1)
+                .map(|p| elem_used_only_for_scalar_fields(p.slot, &lam_body)).unwrap_or(false);
             let idx = narrow_loop_index(i, builder);
-            let (acc_next_raw, acc_next_ty) = inline_lambda_body(
-                &lam_params, &lam_body,
-                &[(acc, acc_ty.clone()), (elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx,
-            );
+            let (acc_next_raw, acc_next_ty) = if is_sealed_scalar_array(&iterable_ty) && elem_param_only_fields {
+                let static_elem = iter_elem_type(&iterable_ty);
+                builder.push_scope();
+                if let Some(p) = lam_params.first() { builder.slots.insert(p.slot, acc); }
+                if let Some(p) = lam_params.get(1) {
+                    ctx.packed_elem_slots.insert(p.slot, (iterable, i, static_elem.clone()));
+                }
+                if let Some(p) = lam_params.get(2) {
+                    let b = coerce_arg_to_param_repr(idx, &Type::Int32, &p.ty, builder);
+                    builder.slots.insert(p.slot, b);
+                }
+                let raw = lower_expr(&lam_body, builder, ctx);
+                let bty = builder.temp_types.get(&raw).cloned().unwrap_or_else(|| lam_body.ty());
+                builder.pop_scope_releasing_keep(&[raw]);
+                if let Some(p) = lam_params.get(1) { ctx.packed_elem_slots.remove(&p.slot); }
+                (raw, bty)
+            } else {
+                let elem = builder.alloc_temp(elem_ty.clone());
+                builder.emit(Instruction::Index {
+                    dst: elem, object: iterable, key: i,
+                    obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+                });
+                // acc_next = <lambda body>(acc, elem, i), inlined. The reducer params are (acc, elem)
+                // plus the OPTIONAL 0-based SOURCE index `i` (narrowed Int64→Int32). A 2-param
+                // `(acc, x) => …` reducer ignores the surplus index arg.
+                let r = inline_lambda_body(
+                    &lam_params, &lam_body,
+                    &[(acc, acc_ty.clone()), (elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx,
+                );
+                // A PACKED sealed-array source materialized a fresh +1 element struct; the reducer read
+                // a copy out of it into the scalar accumulator, so release it or it leaks per iteration.
+                free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, builder);
+                r
+            };
             let acc_next = coerce_arg_to_param_repr(acc_next_raw, &acc_next_ty, &acc_ty, builder);
-            // A PACKED sealed-array source materialized a fresh +1 element struct; the reducer read a
-            // copy out of it into the scalar accumulator, so release it or it leaks per iteration.
-            // (Only the inline-scalar-accumulator path reaches here; a heap/union acc keeps the boxed
-            // Json-phi path below, which reads the element via the union box, not a sealed struct.)
-            free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, builder);
             let one = builder.const_temp(Const::Int(1, Type::Int64));
             builder.emit(Instruction::Binary {
                 dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
