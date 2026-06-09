@@ -4939,22 +4939,57 @@ fn inline_lambda_body(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> (Temp, Type) {
+    let (raw, body_ty, _boxes) = inline_lambda_body_tracking_elem_boxes(params, body, arg_temps, builder, ctx);
+    (raw, body_ty)
+}
+
+/// As `inline_lambda_body`, but ALSO returns the SCALAR→union element boxes freshly created by
+/// `coerce_arg_to_param_repr` when binding the params. Objective C: when a scalar element (e.g. the
+/// `range(0,N).for(n => …)` i32 counter) is bound to a Json/union param, the bind emits a `Coerce`
+/// that codegen lowers to `lin_box_int32`/etc — a FRESH +1 TaggedVal SHELL for any value outside the
+/// small-int cache. That shell is otherwise never reclaimed (the param bind is deliberately not
+/// registered owned, since the temp belongs to the loop), so a body that uses `n` dynamically leaked
+/// ~16 B/iter (the documented inline-for element-box leak). The caller frees each returned box's
+/// SHELL after the iteration (mirroring the NON-inline `elem_boxes` + `FreeBoxShellIfDistinct` path).
+/// Only SCALAR→union coercions are tracked: the payload is a scalar (no inner heap) so freeing the
+/// 16-byte shell is sound, and a cached small-int box is skipped by the runtime free (no double-free).
+fn inline_lambda_body_tracking_elem_boxes(
+    params: &[TypedParam],
+    body: &TypedExpr,
+    arg_temps: &[(Temp, Type)],
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> (Temp, Type, Vec<Temp>) {
     builder.push_scope();
+    let mut elem_boxes: Vec<Temp> = Vec::new();
     for (i, param) in params.iter().enumerate() {
         if let Some((t, arg_ty)) = arg_temps.get(i) {
             // Coerce the argument to the param's declared representation (e.g. unbox a Json
             // element into a concrete scalar param, or box a scalar into a Json param). For the
             // common monomorphic-scalar case the representations already match and this is a no-op.
             let bound = coerce_arg_to_param_repr(*t, arg_ty, &param.ty, builder);
+            // A SCALAR→union bind allocated a fresh box shell (`bound != *t`, arg is a flat scalar,
+            // param is a union). Track it so the caller reclaims the shell after the body. Excludes
+            // the no-op case (`bound == *t`, same repr) and heap-element coercions (handled elsewhere).
+            if bound != *t
+                && (arg_ty.is_flat_scalar() || matches!(arg_ty, Type::Bool))
+                && is_union_ty(&param.ty)
+            {
+                elem_boxes.push(bound);
+            }
             builder.slots.insert(param.slot, bound);
         }
     }
     let raw = lower_expr(body, builder, ctx);
     let body_ty = builder.temp_types.get(&raw).cloned().unwrap_or_else(|| body.ty());
-    // Release this body scope's own locals, KEEPING the result temp. The bound param temps were
+    // Release this body scope's own locals, KEEPING the result temp AND the tracked element boxes
+    // (the caller frees their shells explicitly after the iteration). The bound param temps were
     // never registered owned here (they belong to the loop), so they are not double-released.
-    builder.pop_scope_releasing_keep(&[raw]);
-    (raw, body_ty)
+    let mut keep: Vec<Temp> = Vec::with_capacity(1 + elem_boxes.len());
+    keep.push(raw);
+    keep.extend_from_slice(&elem_boxes);
+    builder.pop_scope_releasing_keep(&keep);
+    (raw, body_ty, elem_boxes)
 }
 
 /// Coerce `arg` (typed `arg_ty`) to the representation of `param_ty`: box a concrete value into a
@@ -5707,11 +5742,16 @@ fn lower_range_for(
         // inline, then discard its (owned) result. Captured slots are NOT rebound — they resolve to the
         // enclosing function's live bindings. `inline_lambda_body` binds by the lambda's OWN param count
         // (a 1-param `i => …` ignores the surplus index arg).
-        let (res, res_ty) = inline_lambda_body(
+        let (res, res_ty, elem_boxes) = inline_lambda_body_tracking_elem_boxes(
             &lam_params, &lam_body, &[(i, elem_ty.clone()), (i, Type::Int32)], builder, ctx,
         );
         // `for` discards the body result; release it if it's an owned heap value (no-op for a scalar).
         builder.emit(Instruction::Release { val: res, ty: res_ty });
+        // Objective C: reclaim each per-iteration scalar→union element box SHELL (distinct from the
+        // result, which we just released). `FreeBoxShellIfDistinct` is shell-only + cached-box-safe.
+        for ebox in &elem_boxes {
+            builder.emit(Instruction::FreeBoxShellIfDistinct { val: *ebox, other: res });
+        }
     } else {
         let body = body.expect("non-inline range-for lowers the callback closure");
         // The callback receives `i` (Int32) as BOTH the element and the optional 0-based source index
