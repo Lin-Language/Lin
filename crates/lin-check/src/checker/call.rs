@@ -197,7 +197,7 @@ impl Checker {
                     }
                 }
             }
-            Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) => self.collect_named_defs(inner, seen, out),
+            Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) | Type::Shared(inner) => self.collect_named_defs(inner, seen, out),
             Type::FixedArray(elems) => {
                 for e in elems {
                     self.collect_named_defs(e, seen, out);
