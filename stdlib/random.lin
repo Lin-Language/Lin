@@ -252,15 +252,11 @@ export val flip = (): Boolean =>
   g = d["rng"]
   d["value"]
 
-// Choose one element of `xs` from the global generator. The fully-generic, type-safe equivalent is
-// the explicit-handle `choice`; prefer it when you need precise element typing.
-// @param xs  the array to choose from (typed `Json` — see note below).
-// @returns the chosen element, or `Null` when `xs` is empty.
-//
-// The two global collection helpers (`pick`, `shuffled`) take `Json` arrays rather than a generic
-// `T[]`. For precise element typing, use the explicit-handle `choice`/`shuffle`, which take an
-// `Rng` argument.
-export val pick = (xs: Json): Json =>
+// Choose one element of `xs` from the global generator.
+// @param xs  the array to choose from.
+// @returns the chosen element (typed `T | Null`), or `Null` when `xs` is empty.
+// @example pick([10, 20, 30])   // e.g. 20
+export val pick = <T>(xs: T[]): T | Null =>
   val n = length(xs)
   if n <= 0 then
     null
@@ -271,9 +267,10 @@ export val pick = (xs: Json): Json =>
     xs[d["value"]]
 
 // Produce a randomly-ordered copy of `xs` from the global generator (non-mutating).
-// @param xs  the source array (typed `Json` for the same reason as `pick` above).
-// @returns a fresh shuffled array.
-export val shuffled = (xs: Json): Json =>
+// @param xs  the source array.
+// @returns a fresh `T[]` with the same elements in random order.
+// @example shuffled([1, 2, 3, 4])   // e.g. [3, 1, 4, 2]
+export val shuffled = <T>(xs: T[]): T[] =>
   val out = slice(xs, 0, length(xs))
   val n = length(out)
   var r = g
