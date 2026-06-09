@@ -213,15 +213,44 @@ unsafe fn index_probe(obj: *const LinObject, key: *const LinString) -> u32 {
 /// index fields (which are not observable through the assoc-list API), so we take `*mut`.
 /// Returns true if the index is now usable (so the caller should probe), false to fall back to
 /// the linear scan (small object, or a zero-length table edge case).
+///
+/// THREAD-SAFETY (frozen objects): a `frozen(v)` graph has `refcount >= IMMORTAL_RC` and is
+/// designed for lock-free concurrent reads across threads (ADR-043). The lazy build MUTATES the
+/// object's index fields (`rebuild_index` allocs + writes `index`/`index_cap`/`index_dirty`), so
+/// two threads calling a lookup (`get`/`has`/`eq`) on the SAME frozen object would race — torn
+/// index pointer, double-alloc leak, probing a half-built table. We therefore NEVER build (mutate)
+/// a frozen object here: a frozen object is only probed if its index was already built CLEANLY at
+/// freeze time (`freeze_object` calls `build_index_for_freeze` single-threaded; the immortal guard
+/// then ensures it is never rebuilt or freed). A frozen object with no/dirty index falls back to
+/// the (read-only, race-free) linear scan. Non-frozen objects keep the lazy build as before.
 #[inline]
 unsafe fn ensure_index(obj: *mut LinObject) -> bool {
     if (*obj).len < HASH_INDEX_THRESHOLD {
         return false;
     }
-    if (*obj).index.is_null() || (*obj).index_dirty != 0 {
-        rebuild_index(obj);
+    let clean = !(*obj).index.is_null() && (*obj).index_dirty == 0;
+    if clean {
+        return true;
     }
+    // Index is null or dirty: a build would MUTATE the object. Refuse on a frozen (immortal)
+    // object — concurrent readers must never trigger a write. Caller falls back to linear scan.
+    if (*obj).refcount >= crate::string::IMMORTAL_RC {
+        return false;
+    }
+    rebuild_index(obj);
     !(*obj).index.is_null()
+}
+
+/// Build the hash index for a LARGE object AT FREEZE TIME (single-threaded). After this, all
+/// threads can probe the immutable, clean index lock-free; the immortal-RC guard in `ensure_index`
+/// guarantees it is never rebuilt or freed. Below the threshold, do nothing (the linear scan is
+/// used and is itself read-only/race-free). Called from `frozen::freeze_object`. The caller has
+/// already (or is about to) set `refcount = IMMORTAL_RC`; this only writes the index cache fields.
+pub(crate) unsafe fn build_index_for_freeze(obj: *mut LinObject) {
+    if obj.is_null() || (*obj).len < HASH_INDEX_THRESHOLD {
+        return;
+    }
+    rebuild_index(obj);
 }
 
 #[no_mangle]
@@ -812,6 +841,27 @@ pub unsafe extern "C" fn lin_object_eq(a: *const LinObject, b: *const LinObject)
     let a_len = (*a).len;
     let b_len = (*b).len;
     if a_len != b_len { return 0; }
+    // Large objects (>= HASH_INDEX_THRESHOLD): use B's O(1) hash side-index for the inner lookup
+    // instead of a per-key linear scan, turning O(n*m) into O(n) average. Equality stays
+    // order-independent — the index finds the key regardless of its slot. `ensure_index` builds
+    // the index lazily for non-frozen B; for a frozen B it only USES an index that was built at
+    // freeze time (it never mutates a frozen object — see its thread-safety note), otherwise it
+    // returns false here and we fall through to the read-only linear scan. Small objects fall
+    // through too (faster for tiny N, no hashing/alloc). This branch reads B's index but never
+    // writes A, so an A == B compare where A is frozen is unaffected.
+    if ensure_index(b as *mut LinObject) {
+        for i in 0..a_len {
+            let ae = (*a).entries.add(i as usize);
+            let a_key = (*ae).key;
+            let slot = index_probe(b, a_key);
+            if slot == u32::MAX { return 0; }
+            let be = (*b).entries.add(slot as usize);
+            let av = &(*ae).value as *const TaggedVal;
+            let bv = &(*be).value as *const TaggedVal;
+            if !tagged_val_eq(av, bv) { return 0; }
+        }
+        return 1;
+    }
     // For each entry in a, find matching entry in b with equal value.
     for i in 0..a_len {
         let ae = (*a).entries.add(i as usize);
@@ -1221,6 +1271,132 @@ mod tests {
             crate::tagged::lin_tagged_free_box(map_box);
             crate::string::lin_string_release(even);
             crate::string::lin_string_release(odd);
+        }
+    }
+
+    // Build an object with `n` integer-valued keys "k0".."k{n-1}" in the given slot order.
+    // Caller owns the returned object (rc 1) and is responsible for releasing it.
+    unsafe fn build_int_object(order: &[usize]) -> *mut LinObject {
+        let obj = lin_object_alloc(order.len() as u32);
+        for &i in order {
+            let k = mk_string(&format!("k{i}"));
+            let v = alloc_tagged(TAG_INT32, i as u64) as *const TaggedVal;
+            // lin_object_set_fresh retains key + value; we drop our own refs after.
+            lin_object_set_fresh(obj, k, v);
+            crate::string::lin_string_release(k);
+            crate::tagged::lin_tagged_release(v as *mut u8);
+        }
+        obj
+    }
+
+    // The indexed eq fast path (large objects) must agree with structural equality on every
+    // dimension: order-independence, value-diff detection, key-rename detection, symmetry — and
+    // it must also stay correct for SMALL objects (which take the linear-scan path). 24 keys >
+    // HASH_INDEX_THRESHOLD (16) so `b` gets a hash index; the reversed-order `a` proves the
+    // comparison is order-independent through the index probe.
+    #[test]
+    fn object_eq_indexed_is_order_independent_and_exact() {
+        unsafe {
+            let n = 24usize;
+            let fwd: Vec<usize> = (0..n).collect();
+            let rev: Vec<usize> = (0..n).rev().collect();
+
+            // Equal, but built in opposite slot orders → must compare equal both ways.
+            let a = build_int_object(&fwd);
+            let b = build_int_object(&rev);
+            assert_eq!(lin_object_eq(a, b), 1, "reversed-order large objects compare equal");
+            assert_eq!(lin_object_eq(b, a), 1, "symmetric");
+
+            // Value-diff: change one value in b → unequal both directions.
+            let kd = mk_string("k7");
+            let v999 = alloc_tagged(TAG_INT32, 999u64) as *const TaggedVal;
+            lin_object_set(b, kd, v999); // overwrite existing key (dup-check path)
+            crate::string::lin_string_release(kd);
+            crate::tagged::lin_tagged_release(v999 as *mut u8);
+            assert_eq!(lin_object_eq(a, b), 0, "value difference detected");
+            assert_eq!(lin_object_eq(b, a), 0, "value difference symmetric");
+            lin_object_release(b);
+
+            // Key-rename: same count, same values, but one key renamed → unequal (the index probe
+            // for the missing key must miss). Build c = fwd then rename "k0" to "kX" by rebuilding.
+            let mut c_order = fwd.clone();
+            c_order.remove(0); // drop k0
+            let c = build_int_object(&c_order);
+            // add a renamed key "kX" carrying value 0 (so counts/values match a but a key differs).
+            let kx = mk_string("kX");
+            let v0 = alloc_tagged(TAG_INT32, 0u64) as *const TaggedVal;
+            lin_object_set(c, kx, v0);
+            crate::string::lin_string_release(kx);
+            crate::tagged::lin_tagged_release(v0 as *mut u8);
+            assert_eq!((*c).len, n as u32, "same key count");
+            assert_eq!(lin_object_eq(a, c), 0, "key rename detected");
+            assert_eq!(lin_object_eq(c, a), 0, "key rename symmetric");
+            lin_object_release(c);
+            lin_object_release(a);
+
+            // SMALL objects (< threshold) take the linear-scan path; verify it still works.
+            let sfwd: Vec<usize> = (0..4).collect();
+            let srev: Vec<usize> = (0..4).rev().collect();
+            let sa = build_int_object(&sfwd);
+            let sb = build_int_object(&srev);
+            assert_eq!(lin_object_eq(sa, sb), 1, "small reversed-order equal");
+            let ksd = mk_string("k1");
+            let sv = alloc_tagged(TAG_INT32, 42u64) as *const TaggedVal;
+            lin_object_set(sb, ksd, sv);
+            crate::string::lin_string_release(ksd);
+            crate::tagged::lin_tagged_release(sv as *mut u8);
+            assert_eq!(lin_object_eq(sa, sb), 0, "small value difference detected");
+            lin_object_release(sa);
+            lin_object_release(sb);
+        }
+    }
+
+    // THREAD-SAFETY (mandatory): N threads each compare against the SAME frozen >= 16-key object
+    // via `lin_object_eq` in a loop. With the freeze-time index build + the immortal guard in
+    // `ensure_index`, no thread ever mutates the frozen object's index fields, so there is no data
+    // race (no torn pointer, no double-alloc leak, no half-built table probe). Without the fix the
+    // first lookup on the frozen object would lazily `rebuild_index` it concurrently → UB. Modeled
+    // on `frozen::frozen_array_read_concurrently_is_race_free`. Run under TSan to prove race-free.
+    #[test]
+    fn frozen_object_eq_concurrently_is_race_free() {
+        unsafe {
+            let n = 32usize;
+            let order: Vec<usize> = (0..n).collect();
+            // The shared frozen reference object `b`.
+            let b = build_int_object(&order);
+            let b_box = alloc_tagged(TAG_OBJECT, b as u64);
+            crate::frozen::lin_freeze(b_box);
+            assert!((*b).refcount >= crate::string::IMMORTAL_RC, "b is frozen");
+            // Freeze must have built the index single-threaded so all threads probe it lock-free.
+            assert!(!(*b).index.is_null(), "freeze built the hash index for the large object");
+
+            let b_addr = b as usize;
+            let mut handles = Vec::new();
+            for t in 0..8 {
+                handles.push(std::thread::spawn(move || unsafe {
+                    let bp = b_addr as *const LinObject;
+                    // Each thread builds its OWN equal probe object (reversed order to force the
+                    // index path to do real work) and compares it against the shared frozen b.
+                    let rev: Vec<usize> = (0..n).rev().collect();
+                    for _ in 0..200 {
+                        let a = build_int_object(&rev);
+                        assert_eq!(lin_object_eq(a, bp), 1, "thread {t}: equal compare");
+                        // A fast-reject case too (differing key count).
+                        let short: Vec<usize> = (0..n - 1).collect();
+                        let a2 = build_int_object(&short);
+                        assert_eq!(lin_object_eq(a2, bp), 0, "thread {t}: reject compare");
+                        lin_object_release(a);
+                        lin_object_release(a2);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            // The frozen object survives unchanged (never freed, index never torn).
+            assert!((*b).refcount >= crate::string::IMMORTAL_RC);
+            assert!(!(*b).index.is_null());
+            crate::tagged::lin_tagged_free_box(b_box);
         }
     }
 }
