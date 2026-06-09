@@ -7265,6 +7265,40 @@ print(toString(g(5)["v"]))
     assert_eq!(output, vec!["1", "0"]);
 }
 
+// Regression: a combinator result whose lambda returns an UNSEALED object literal (so the runtime
+// value is a BOXED `Object[]`) bound to an explicit PACKED sealed-scalar-array annotation (`Pt[]`),
+// then read through a representation-dispatched op. The annotation made downstream index/`.for`/
+// field-read emit PACKED const-offset reads, but the bound value was a boxed array → the boxed
+// element pointers were mis-read as inline packed struct bytes → garbage (printed `7 7`, a value no
+// field holds). Fix: `lower::type_repr_differs` now detects the packed-sealed-array-vs-boxed-array
+// representation disagreement at the binding boundary and emits a `Coerce`, which codegen's
+// `sealed_array_project_from` materializes into a genuine packed buffer (matching the annotation).
+#[test]
+fn test_combinator_boxed_result_bound_to_packed_sealed_array() {
+    // map → for/index/field. The lambda returns an UNSEALED literal, so map's runtime result is a
+    // boxed Object[]; binding to `Pt[]` must materialize a packed buffer that reads back correctly.
+    let mapped = run(r#"import { print } from "std/io"
+import { map, filter, for } from "std/iter"
+import { toString } from "std/string"
+type Pt = { "x": Int32, "y": Int32 }
+val pts: Pt[] = [{ "x": 1, "y": 2 }, { "x": 3, "y": 4 }, { "x": 5, "y": 6 }]
+val shifted: Pt[] = pts.map(p => { "x": p["x"] + 10, "y": p["y"] })
+shifted.for(p => print(toString(p["x"])))
+print(toString(shifted[0]["x"]))
+print(toString(shifted[1]["x"]))
+print(toString(shifted[2]["y"]))
+val kept: Pt[] = pts.filter(p => p["x"] > 2)
+kept.for(p => print(toString(p["x"])))
+print(toString(kept[0]["y"]))
+"#);
+    // shifted x's via for: 11,13,15 ; shifted[0].x=11, shifted[1].x=13, shifted[2].y=6.
+    // filter x>2 keeps {3,4},{5,6}: x's via for 3,5 ; kept[0].y=4.
+    assert_eq!(
+        mapped,
+        vec!["11", "13", "15", "11", "13", "6", "3", "5", "4"]
+    );
+}
+
 // Regression: a LITERAL-KEY field WRITE into a PACKED SEALED RECORD (`rec["f"] = …`). Before the
 // FieldSet fix, codegen routed every sealed-record `obj_ty` (Named alias or inline `{...}`) write
 // through `lin_object_set`, which reads a packed sealed struct's bytes as a LinObject header and

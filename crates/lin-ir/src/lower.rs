@@ -2504,9 +2504,24 @@ fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty: &Type, bui
     // independently owned and must each be released at scope exit — so DON'T `unregister_owned(t)`
     // (that orphaned the packed source array, leaking its header + element buffer per binding).
     let sealed_array_materialized = made_fresh_box && is_sealed_scalar_array(value_ty);
+    // A BOXED-element array (a combinator result `pts.map(...)` whose lambda returns an unsealed
+    // object literal, runtime repr = `Object[]` of boxed `LinObject`s) bound to a packed
+    // sealed-scalar-array slot (`Pt[]`). `type_repr_differs`'s new sealed-array arm emits a `Coerce`
+    // whose codegen `sealed_array_project_from` PROJECTS the boxed array into a FRESH +1-owned packed
+    // 0xFE buffer (rebuild branch — the source is genuinely boxed, never keep-packed here because a
+    // keep-packed source would be a bare Json/union caught by the union arm, not an
+    // `Array(boxed-element)`). Like the flat-array widen, the source array (`t`) is NOT consumed and
+    // keeps its own +1 (released by its own scope); register the fresh packed result so the binding's
+    // scope releases it. Mirrors the explicit-`TypedExpr::Coerce` sealed-array arm (lower_expr ~3337).
+    let sealed_array_reprojected =
+        param_elem_is_boxed_repr(value_ty) && is_sealed_scalar_array(slot_ty);
     let coerced = coerce_to_slot_type(t, value_ty, slot_ty, builder);
-    if sealed_array_materialized {
-        // Box owns the fresh materialized array; `t` keeps its own +1 (released by its own scope).
+    if sealed_array_reprojected || sealed_array_materialized {
+        // Both directions produce a FRESH +1-owned array that does NOT consume the source: the
+        // reproject builds a new packed buffer, the materialize a new tagged `Object[]` view (which
+        // a union slot then boxes). The source (`t`) keeps its own +1 (released by its own scope), so
+        // register only the fresh result for scope-exit release — DON'T `unregister_owned(t)` (that
+        // would orphan the source array, leaking its header + element buffer per binding).
         if coerced != t {
             builder.register_owned(coerced, slot_ty.clone());
         }
@@ -5184,6 +5199,27 @@ fn type_repr_differs(from: &Type, to: &Type) -> bool {
     // to a narrower one): their physical layouts differ, so re-project. `Type` PartialEq compares
     // the field maps, so `from != to` here means a different shape.
     if is_sealed_scalar_repr(from) && is_sealed_scalar_repr(to) && from != to {
+        return true;
+    }
+    // The sealed-record ARRAY boundary (sealed-records Stage 3). A packed sealed-scalar array
+    // (`Pt[]`, elem_tag 0xFE contiguous unboxed buffer) and a BOXED array of the same shape (an
+    // `Object[]` of boxed `LinObject`s — e.g. a combinator result `pts.map(p => { ... })` whose
+    // lambda returns an UNSEALED object literal) are physically DIFFERENT representations, even
+    // though their `Type`s compare equal (PartialEq ignores `sealed`). Without a `Coerce` here, a
+    // boxed `Object[]` bound to a `Pt[]`-annotated slot is read by downstream packed-dispatched ops
+    // (index / `.for` / field read) as a contiguous struct buffer → garbage (the `7 7` mis-read).
+    // Codegen's `compile_ir_coerce` already PROJECTS a boxed array into a fresh packed buffer
+    // (`sealed_array_project_from`) / MATERIALIZES a packed array to a tagged `Object[]`
+    // (`sealed_array_to_tagged`) for exactly this Coerce — this arm just makes the lowerer emit it.
+    // Gate: exactly one side is a packed sealed-scalar array AND the other is a BOXED-element array
+    // (unsealed Object / Json / union / TypeVar / Map element). Mirrors `param_elem_is_boxed_repr`
+    // (the function-ARGUMENT boundary's trigger) so a `Named`-element array (a self-recursive alias
+    // the callee reads as the SAME packed struct) and same-shape packed↔packed arrays pass through
+    // unchanged — and matches codegen's `sealed_array_elem(_).is_some()` XOR gate EXACTLY.
+    if is_sealed_scalar_array(from) && param_elem_is_boxed_repr(to) {
+        return true;
+    }
+    if param_elem_is_boxed_repr(from) && is_sealed_scalar_array(to) {
         return true;
     }
     false
