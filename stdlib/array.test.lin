@@ -165,6 +165,22 @@ val s = suite("std/array", [
     ]
   ),
 
+  test("flatMap scalar result reads back correctly (flat repr)", () =>
+    val nums: Int32[] = [1, 2, 3].flatMap(x => [x, x * 10])
+    [
+      expect(nums[0]).toBe(1),
+      expect(nums[1]).toBe(10),
+      expect(nums[0] + nums[1]).toBe(11)
+    ]
+  ),
+
+  test("flatMap preserves heap (String) elements", () =>
+    val result = ["a", "b"].flatMap((x, i) => [x, "${i}"])
+    [
+      expect(result.toString()).toBe("[\"a\", \"0\", \"b\", \"1\"]")
+    ]
+  ),
+
   test("indexOf returns index of found element", () =>
     val result = [10, 20, 30].indexOf(20)
     [
