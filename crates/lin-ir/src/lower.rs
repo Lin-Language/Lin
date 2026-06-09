@@ -2313,7 +2313,13 @@ fn try_lower_packed_elem_field(
         _ => None,
     };
     let concrete_field_ty = concrete_field_ty?;
-    if !(concrete_field_ty.is_flat_scalar() || matches!(concrete_field_ty, Type::Bool)) {
+    // SCALAR/Bool: a pure const-offset load, no RC. STRING: a const-offset `load ptr` yielding a
+    // BORROWED interior String pointer (the array still owns it) — sound iff the result is RETAINED
+    // when it escapes the read (snapshot semantics), handled below. Other heap shapes (Array, nested
+    // record, Map) are NOT handled in-place here — fall back to materialize.
+    let scalar = concrete_field_ty.is_flat_scalar() || matches!(concrete_field_ty, Type::Bool);
+    let string_field = concrete_field_ty.is_string_ish();
+    if !(scalar || string_field) {
         return None;
     }
     // Read the field at its CONCRETE scalar type (the const-offset load yields an unboxed scalar).
@@ -2335,9 +2341,18 @@ fn try_lower_packed_elem_field(
         arr_ty,
         result_ty: concrete_field_ty.clone(),
     });
+    // A STRING field read is a BORROWED interior pointer (the packed buffer owns it). Snapshot
+    // semantics: the reader must own its own reference, so retain it (and register owned so the body
+    // scope releases it). This mirrors the generic FieldGet's `is_rc_type` retain. A scalar needs no
+    // RC. The subsequent coerce-to-Json (if any) boxes the (now-owned) String into a TaggedVal*.
+    if string_field {
+        builder.emit(Instruction::Retain { val: raw, ty: concrete_field_ty.clone() });
+        builder.register_owned(raw, concrete_field_ty.clone());
+    }
     let coerced = coerce_to_slot_type(raw, &concrete_field_ty, result_ty, builder);
     if coerced != raw && is_union_ty(result_ty) {
-        // A freshly boxed scalar: own it so scope exit reclaims the box.
+        // A freshly boxed scalar (or boxed String): own it so scope exit reclaims the box. (For a
+        // String the box wraps the already-owned String inner; releasing the box releases the inner.)
         builder.register_owned(coerced, result_ty.clone());
     }
     Some(coerced)
