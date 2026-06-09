@@ -4939,7 +4939,20 @@ fn inline_lambda_body(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> (Temp, Type) {
-    let (raw, body_ty, _boxes) = inline_lambda_body_tracking_elem_boxes(params, body, arg_temps, builder, ctx);
+    let (raw, body_ty, boxes) = inline_lambda_body_tracking_elem_boxes(params, body, arg_temps, builder, ctx);
+    // Objective C (uniform): reclaim each per-iteration SCALAR→union param-bind box SHELL, distinct
+    // from the body result (which the caller owns/consumes). This covers EVERY inline combinator
+    // (`for`/`map`/`filter`/`reduce`/`while`/…) where a flat-scalar element is bound to a Json/union
+    // lambda param — the bind boxes the scalar (`lin_box_int32`) and the shell was never reclaimed,
+    // leaking ~16 B/iter for any value outside the small-int cache. `FreeBoxShellIfDistinct` is
+    // shell-only (the payload is a scalar — no inner heap) and cached-box-safe (a cached small-int box
+    // is skipped at runtime), and the `IfDistinct(result)` guard prevents freeing a box the body
+    // returned AS its result (which the caller still owns). The range-for caller frees these itself
+    // (it needs the raw boxes for its own latch placement), so it uses the `_tracking_` variant
+    // directly; all other callers get the reclaim here.
+    for ebox in &boxes {
+        builder.emit(Instruction::FreeBoxShellIfDistinct { val: *ebox, other: raw });
+    }
     (raw, body_ty)
 }
 
