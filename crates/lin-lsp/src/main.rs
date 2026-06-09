@@ -310,6 +310,18 @@ impl LanguageServer for Backend {
         let (in_dot_context, receiver_category, receiver_precise) =
             dot_receiver_category(&source, offset, &analysis.span_type_map);
 
+        // TUPLE-ARGS receiver (`(a, b).f`): Lin spreads the N elements over the candidate's leading N
+        // params (`f(a, b, ...)`, spec §1310). `receiver_elems` is `Some` only when EVERY element
+        // type is recoverable (else we degrade to the single-receiver gate). `dot_receiver_arity` is
+        // how many leading params the receiver fills: N for a typed tuple, else 1 for an ordinary
+        // single receiver (used for the smart-paren args-to-fill = arity − arity_filled rule).
+        let receiver_elems: Option<Vec<String>> = if in_dot_context {
+            dot_receiver_elem_types(&source, offset, &analysis.module, &analysis.span_type_map)
+        } else {
+            None
+        };
+        let dot_receiver_arity = receiver_elems.as_ref().map(|e| e.len()).unwrap_or(1);
+
         // Smart-parens inputs: does the client support snippet inserts, and is the char immediately
         // after the cursor already a `(` (the user is editing an existing call — don't double the
         // parens)? `next_char_is_paren` checks the very next source char at the cursor offset.
@@ -367,7 +379,7 @@ impl LanguageServer for Backend {
                         };
                         // Plain (non-dot) call: a function-typed binding inserts `name()` with the
                         // cursor placed by its full arity.
-                        apply_function_parens(&mut ci, ty_str, false, snippet_support, next_char_is_paren);
+                        apply_function_parens(&mut ci, ty_str, 0, snippet_support, next_char_is_paren);
                         items.push(ci);
                     }
                 }
@@ -403,7 +415,7 @@ impl LanguageServer for Backend {
                     // Plain (non-dot) call. Only function-typed binders get parens — drive arity off
                     // the binder's type-string (its inferred/annotated detail).
                     if let Some(sig) = detail.as_deref() {
-                        apply_function_parens(&mut ci, sig, false, snippet_support, next_char_is_paren);
+                        apply_function_parens(&mut ci, sig, 0, snippet_support, next_char_is_paren);
                     }
                     items.push(ci);
                 }
@@ -479,12 +491,23 @@ impl LanguageServer for Backend {
             // (`map`/`filter`/`for`, first param `T[] | Iterator | Stream` / generic) stay offered on
             // every receiver — the whole point of `xs.map(...)`.
             if let Some(cat) = filter_cat {
-                let first_param = imp
-                    .ty
-                    .as_deref()
-                    .map(clean_type_string)
-                    .and_then(|s| first_param_type(&s));
-                if !dot_first_param_gate(cat, receiver_precise.as_deref(), first_param.as_deref()) {
+                // SHARED gate over the candidate's full cleaned signature: a tuple receiver matches
+                // its N elements against the leading N params (`dot_candidate_gate`); a single
+                // receiver falls back to the first-param check. A value (no signature) is kept under
+                // the single path (can't prove inapplicable) but dropped under a tuple receiver.
+                let cleaned = imp.ty.as_deref().map(clean_type_string);
+                let applies = match cleaned.as_deref() {
+                    Some(sig) => dot_candidate_gate(
+                        cat,
+                        receiver_precise.as_deref(),
+                        receiver_elems.as_deref(),
+                        sig,
+                    ),
+                    // No type info: a tuple receiver has nothing to match against → drop; a single
+                    // receiver keeps it (mirrors the prior `first_param = None` keep behaviour).
+                    None => receiver_elems.is_none(),
+                };
+                if !applies {
                     continue;
                 }
             }
@@ -506,7 +529,10 @@ impl LanguageServer for Backend {
             // Smart-parens for an imported FUNCTION. Dot context uses the receiver-fills-first-param
             // arity rule (arity − 1); plain expression position uses the full arity.
             if let Some(sig) = imp.ty.as_deref() {
-                apply_function_parens(&mut ci, sig, in_dot_context, snippet_support, next_char_is_paren);
+                // Dot context: the receiver fills `dot_receiver_arity` leading params (N for a tuple,
+                // 1 for a single receiver); plain expression position fills none (arity 0).
+                let receiver_arity = if in_dot_context { dot_receiver_arity } else { 0 };
+                apply_function_parens(&mut ci, sig, receiver_arity, snippet_support, next_char_is_paren);
             }
             items.push(ci);
         }
@@ -524,6 +550,7 @@ impl LanguageServer for Backend {
                 STDLIB_DOT_CANDIDATES.iter(),
                 receiver_category.as_deref().unwrap_or("any"),
                 receiver_precise.as_deref(),
+                receiver_elems.as_deref(),
                 prefix,
                 &already,
                 uri,
@@ -547,6 +574,7 @@ impl LanguageServer for Backend {
                 base_dir.as_deref(),
                 receiver_category.as_deref().unwrap_or("any"),
                 receiver_precise.as_deref(),
+                receiver_elems.as_deref(),
                 in_dot_context,
                 prefix,
                 &already,
@@ -1689,6 +1717,100 @@ fn type_to_category(ty: &str) -> &'static str {
     }
 }
 
+
+/// When the dot-completion receiver is a parenthesised comma list (`(a, b).f`), Lin dot-application
+/// spreads ALL its elements as the leading arguments: `(a, b).f(c)` desugars to `f(a, b, c)` (spec
+/// §1310; checker `call.rs` spreads a `TupleArgs` receiver with >1 element). So for matching against
+/// a candidate's parameters we must consider the N element types, not a single receiver type.
+///
+/// Returns `Some([t0, t1, ...])` (CLEANED element type-strings, in order) only when:
+///   - the cursor sits in a dot context whose receiver is `Expr::TupleArgs(elems, _)` with
+///     `elems.len() > 1`, AND
+///   - EVERY element's type is recoverable (a literal's intrinsic type, or an inferred type from
+///     `span_type_map`).
+///
+/// Returns `None` otherwise — including the single-receiver case (`(x).f`, which parses to plain `x`,
+/// NOT a tuple) and the degraded case where some element didn't type-check. The caller then falls
+/// back to the existing single-receiver gate, so a partially-typed tuple never wrongly filters
+/// everything out (graceful degradation).
+fn dot_receiver_elem_types(
+    source: &str,
+    offset: usize,
+    module: &lin_parse::ast::Module,
+    span_type_map: &[(lin_common::Span, String, Option<lin_common::Span>)],
+) -> Option<Vec<String>> {
+    use lin_parse::ast::Expr as E;
+
+    // Locate the `.` byte the cursor is completing against — mirrors `dot_receiver_category`'s
+    // dot-offset computation so the two stay in lock-step.
+    let prefix_len = word_before(source, offset).len();
+    let dot_offset = offset.checked_sub(prefix_len + 1)?;
+    let dot_byte = char_offset_to_byte(source, dot_offset);
+    if source.as_bytes().get(dot_byte) != Some(&b'.') {
+        return None;
+    }
+
+    // Find the `DotCall` whose method-dot is at `dot_byte` and whose receiver is a multi-element
+    // tuple. The parser produces a complete `DotCall` even while the method is still empty
+    // (`(a, b).` -> `DotCall { receiver: TupleArgs(..), method: "" }`); its `span` is the `.` token.
+    let mut elem_tys: Option<Vec<String>> = None;
+    for stmt in &module.statements {
+        walk_exprs_in_stmt(stmt, &mut |e| {
+            if elem_tys.is_some() {
+                return;
+            }
+            if let E::DotCall { receiver, span, .. } = e {
+                if span.start as usize != dot_byte {
+                    return;
+                }
+                if let E::TupleArgs(elems, _) = receiver.as_ref() {
+                    if elems.len() > 1 {
+                        // Recover EVERY element's type; bail (-> None, graceful fallback) on the
+                        // first one we can't resolve so we never filter on a partial picture.
+                        let mut tys = Vec::with_capacity(elems.len());
+                        for el in elems {
+                            match tuple_element_type(el, span_type_map) {
+                                Some(t) => tys.push(t),
+                                None => return,
+                            }
+                        }
+                        elem_tys = Some(tys);
+                    }
+                }
+            }
+        });
+        if elem_tys.is_some() {
+            break;
+        }
+    }
+    elem_tys
+}
+
+/// The CLEANED type-string of a single tuple-receiver element. Literals carry their type
+/// intrinsically (they are NOT recorded in `span_type_map`); any other expression (identifier, call,
+/// field access, ...) is looked up by its opening-token span in `span_type_map`. `None` when neither
+/// source yields a type (e.g. an element that didn't type-check) — the caller degrades gracefully.
+fn tuple_element_type(
+    el: &lin_parse::ast::Expr,
+    span_type_map: &[(lin_common::Span, String, Option<lin_common::Span>)],
+) -> Option<String> {
+    use lin_parse::ast::Expr as E;
+    // Literals: the checker doesn't record a span_type_map entry for them, but their type is fixed.
+    // Numeric literals default to the checker's default numeric types (Int32 / Float64) — exactly
+    // what an unannotated `0` / `1.0` infers as, which is what the gate needs to match a param.
+    match el {
+        E::StringLit(..) | E::StringInterp(..) => return Some("String".to_string()),
+        E::IntLit(..) => return Some("Int32".to_string()),
+        E::FloatLit(..) => return Some("Float64".to_string()),
+        E::BoolLit(..) => return Some("Boolean".to_string()),
+        E::NullLit(..) => return Some("Null".to_string()),
+        _ => {}
+    }
+    // Non-literal: use the inferred type recorded at the element's opening-token span.
+    let sp = el.span();
+    tightest_span(span_type_map, sp.start as usize).map(|(_, t, _)| clean_type_string(t))
+}
+
 // ── completion helpers ────────────────────────────────────────────────────────
 
 /// Decide whether an imported function should appear in `xs.` dot-completion, given the receiver's
@@ -1856,6 +1978,24 @@ fn first_param_accepts(receiver_ty: &str, first_param_ty: &str) -> bool {
     recv_cat == param_cat
 }
 
+/// Generalises `first_param_accepts` to a TUPLE-ARGS receiver of arity N. A `(a, b).f` dot-call
+/// spreads its N elements over the function's FIRST N parameters (`f(a, b, ...)`), so the function
+/// must (a) have at LEAST N parameters and (b) accept each receiver element type in the
+/// corresponding leading slot. Position `i` reuses `first_param_accepts(elem_ty[i], param_ty[i])`,
+/// so a single-element receiver (N == 1) is exactly the old single-param check.
+///
+/// `receiver_elem_tys` — the cleaned receiver element type-strings (in order).
+/// `fn_param_tys` — the candidate's cleaned parameter type-strings (from `function_param_types`).
+fn leading_params_accept(receiver_elem_tys: &[String], fn_param_tys: &[String]) -> bool {
+    if fn_param_tys.len() < receiver_elem_tys.len() {
+        return false;
+    }
+    receiver_elem_tys
+        .iter()
+        .zip(fn_param_tys.iter())
+        .all(|(recv, param)| first_param_accepts(recv, param))
+}
+
 /// True when `ty` renders as a bare generic type variable: a single upper-case letter (`T`..`Z`,
 /// the `generic_name` scheme) or `T`+digits (`T1`, `T2`, …). Used by `first_param_accepts` to treat
 /// a receiver-polymorphic first param as accepting any receiver.
@@ -1923,6 +2063,35 @@ fn dot_first_param_gate(
         // TYPE, so its category comes straight from `type_to_category` (a union like
         // `T[] | Iterator | Stream` classifies as "array" via its `[]`, matching the old behaviour).
         (None, p) => dot_item_applies(receiver_cat, p.map(type_to_category)),
+    }
+}
+
+/// The unified dot-completion gate over a candidate's CLEANED full signature (`sig`, e.g.
+/// `(String, Int32, Int32) => String`), wrapping `dot_first_param_gate` with TUPLE-ARGS receiver
+/// support.
+///
+/// When the receiver is a multi-element tuple (`receiver_elems = Some([t0, t1, ...])`), the elements
+/// spread over the candidate's LEADING N parameters, so the candidate must have at least N params
+/// and accept each element in its slot (`leading_params_accept`). A candidate with no parsable
+/// function signature (a bare value) can't receive a spread → rejected.
+///
+/// Otherwise (single receiver / no recoverable tuple types) it falls back to the original
+/// single-first-param gate (`dot_first_param_gate`), preserving N == 1 behaviour exactly.
+fn dot_candidate_gate(
+    receiver_cat: &str,
+    receiver_precise: Option<&str>,
+    receiver_elems: Option<&[String]>,
+    sig: &str,
+) -> bool {
+    match receiver_elems {
+        Some(elems) => match function_param_types(sig) {
+            // Tuple receiver: the N elements fill the first N params (`leading_params_accept`).
+            Some(params) => leading_params_accept(elems, &params),
+            // No function signature → a value can't absorb a spread receiver. Reject.
+            None => false,
+        },
+        // Single receiver: original first-param gate (unchanged N == 1 path).
+        None => dot_first_param_gate(receiver_cat, receiver_precise, first_param_type(sig).as_deref()),
     }
 }
 
@@ -2458,7 +2627,8 @@ fn build_stdlib_dot_candidates() -> Vec<StdlibCandidate> {
 ///   - its name is NOT already offered (`already`, which the caller seeds with imported symbols +
 ///     local bindings) — so an already-imported `map` isn't listed twice;
 ///   - it is function-shaped (`=>` in the signature) — a bare value isn't a dot-method;
-///   - the SHARED `dot_first_param_gate` accepts it: when `receiver_precise` is known, the receiver
+///   - the SHARED `dot_candidate_gate` accepts it: a tuple receiver matches its N elements against
+///     the leading N params; otherwise, when `receiver_precise` is known, the receiver
 ///     type must be assignable to the candidate's first parameter (`first_param_accepts`); otherwise
 ///     a coarse `receiver_cat` category match — so a `.` doesn't dump the whole stdlib (e.g. a
 ///     `string`-first-param method is dropped on an array) while receiver-polymorphic combinators
@@ -2471,6 +2641,7 @@ fn stdlib_dot_completion_items<'a>(
     candidates: impl Iterator<Item = &'a StdlibCandidate>,
     receiver_cat: &str,
     receiver_precise: Option<&str>,
+    receiver_elems: Option<&[String]>,
     prefix: &str,
     already: &HashSet<String>,
     uri: &Url,
@@ -2485,11 +2656,12 @@ fn stdlib_dot_completion_items<'a>(
         if !cand.ty.contains("=>") {
             continue;
         }
-        // Clean the raw signature so the extracted first-param type renders the same way the receiver
-        // type does (`?T<id>` → generic letters / `Json`), keeping the precise gate apples-to-apples.
+        // Clean the raw signature so the matched param types render the same way the receiver type
+        // does (`?T<id>` → generic letters / `Json`), keeping the precise gate apples-to-apples. The
+        // SHARED `dot_candidate_gate` matches a tuple receiver's N elements against the leading N
+        // params, or falls back to the single first-param check for an ordinary receiver.
         let cleaned = clean_type_string(&cand.ty);
-        let first_param = first_param_type(&cleaned);
-        if !dot_first_param_gate(receiver_cat, receiver_precise, first_param.as_deref()) {
+        if !dot_candidate_gate(receiver_cat, receiver_precise, receiver_elems, &cleaned) {
             continue;
         }
         let mut item = CompletionItem {
@@ -2500,10 +2672,12 @@ fn stdlib_dot_completion_items<'a>(
             data: completion_resolve_data_stdlib(uri, &cand.name, &cand.module),
             ..Default::default()
         };
-        // These are stdlib combinators reached via a dot receiver, so the receiver fills the first
-        // parameter (`xs.map(f)` == `map(xs, f)`): args-to-fill = arity − 1. The auto-import edit is
-        // attached lazily in `completion_resolve` — `insert_text` here is an independent field.
-        apply_function_parens(&mut item, &cand.ty, true, snippet_support, next_char_is_paren);
+        // These are stdlib combinators reached via a dot receiver, so the receiver fills its leading
+        // params (`xs.map(f)` == `map(xs, f)` fills 1; `(a, b).f(c)` == `f(a, b, c)` fills 2):
+        // args-to-fill = arity − receiver_arity. The auto-import edit is attached lazily in
+        // `completion_resolve` — `insert_text` here is an independent field.
+        let receiver_arity = receiver_elems.map(|e| e.len()).unwrap_or(1);
+        apply_function_parens(&mut item, &cand.ty, receiver_arity, snippet_support, next_char_is_paren);
         out.push(item);
     }
     out
@@ -2589,9 +2763,9 @@ fn collect_userland_candidates(
 
 /// Build the unimported-userland completion items. Mirrors `stdlib_dot_completion_items` but over
 /// cross-file user exports, and serves BOTH positions per the user's choice:
-///   - DOT context (`in_dot`): offer function-shaped exports whose first parameter accepts the
-///     receiver (the shared `dot_first_param_gate`); the receiver fills the first slot, so smart
-///     parens use the dot arity (arity − 1).
+///   - DOT context (`in_dot`): offer function-shaped exports whose leading params accept the
+///     receiver (the shared `dot_candidate_gate`: N tuple elements → N leading params, else the
+///     single first-param check); the receiver fills those slots, so smart parens use arity − N.
 ///   - IDENTIFIER position (non-dot): offer functions AND values matching the typed `prefix`; smart
 ///     parens (for functions) use the full arity.
 ///
@@ -2605,6 +2779,7 @@ fn userland_completion_items(
     base_dir: Option<&Path>,
     receiver_cat: &str,
     receiver_precise: Option<&str>,
+    receiver_elems: Option<&[String]>,
     in_dot: bool,
     prefix: &str,
     already: &HashSet<String>,
@@ -2629,8 +2804,11 @@ fn userland_completion_items(
             if !is_function {
                 continue;
             }
-            let first_param = cand.ty.as_deref().and_then(first_param_type);
-            if !dot_first_param_gate(receiver_cat, receiver_precise, first_param.as_deref()) {
+            // SHARED gate over the cleaned full signature: a tuple receiver matches its N elements
+            // against the leading N params (`dot_candidate_gate`); a single receiver uses the
+            // first-param check.
+            let cleaned = cand.ty.as_deref().map(clean_type_string).unwrap_or_default();
+            if !dot_candidate_gate(receiver_cat, receiver_precise, receiver_elems, &cleaned) {
                 continue;
             }
         }
@@ -2652,10 +2830,11 @@ fn userland_completion_items(
             data: completion_resolve_data_import(uri, &cand.name, &cand.specifier, &cand.owner_id),
             ..Default::default()
         };
-        // Smart parens for functions: dot context fills the first param from the receiver (arity − 1);
-        // identifier position uses the full arity.
+        // Smart parens for functions: dot context fills the receiver's leading params (N for a tuple
+        // else 1); identifier position fills none (arity 0).
         if let Some(sig) = cand.ty.as_deref() {
-            apply_function_parens(&mut item, sig, in_dot, snippet_support, next_char_is_paren);
+            let receiver_arity = if in_dot { receiver_elems.map(|e| e.len()).unwrap_or(1) } else { 0 };
+            apply_function_parens(&mut item, sig, receiver_arity, snippet_support, next_char_is_paren);
         }
         out.push(item);
     }
@@ -4658,14 +4837,15 @@ fn function_arity(sig: &str) -> Option<usize> {
 
 /// How many call arguments the user still has to fill in once a FUNCTION completion is accepted,
 /// derived from the function's type-string `sig`:
-///   - dot-completion (`receiver.method`): the receiver fills the first parameter (Lin dot-application
-///     is `recv.f()` == `f(recv)`), so args-to-fill = arity − 1.
-///   - plain call (`f` at expression position): args-to-fill = arity.
+///   - plain call (`f` at expression position): `receiver_arity = 0` -> args-to-fill = arity.
+///   - single-receiver dot (`recv.f()` == `f(recv)`): `receiver_arity = 1` -> args-to-fill = arity - 1.
+///   - tuple-args dot (`(a, b).f()` == `f(a, b, ...)`, spec §1310): `receiver_arity = N` -> args-to-fill
+///     = arity - N (when the tuple fills ALL params, args-to-fill is 0 -> cursor after the parens).
 /// `None` when arity can't be determined (not a function type / unparsable) — callers then default to
 /// the safe cursor-inside form.
-fn args_to_fill(sig: &str, is_dot: bool) -> Option<usize> {
+fn args_to_fill(sig: &str, receiver_arity: usize) -> Option<usize> {
     let arity = function_arity(sig)?;
-    Some(if is_dot { arity.saturating_sub(1) } else { arity })
+    Some(arity.saturating_sub(receiver_arity))
 }
 
 /// Pure decision for what text a FUNCTION completion inserts and in which format.
@@ -4709,7 +4889,7 @@ fn function_insert_text(
 fn apply_function_parens(
     item: &mut CompletionItem,
     sig: &str,
-    is_dot: bool,
+    receiver_arity: usize,
     snippet_support: bool,
     next_char_is_paren: bool,
 ) {
@@ -4717,8 +4897,12 @@ fn apply_function_parens(
     if !sig.contains("=>") {
         return;
     }
-    let (text, is_snippet) =
-        function_insert_text(&item.label, args_to_fill(sig, is_dot), snippet_support, next_char_is_paren);
+    let (text, is_snippet) = function_insert_text(
+        &item.label,
+        args_to_fill(sig, receiver_arity),
+        snippet_support,
+        next_char_is_paren,
+    );
     // Plain bare-name insert == the label: leave `insert_text`/format unset so nothing changes.
     if text == item.label {
         return;
@@ -6016,6 +6200,7 @@ async fn main() {
 mod tests {
     use super::*;
 
+
     fn parse(src: &str) -> lin_parse::ast::Module {
         let mut lexer = lin_lex::Lexer::new(src, 0);
         let tokens = lexer.tokenize();
@@ -6376,7 +6561,7 @@ mod tests {
         )];
         let already = HashSet::new();
         let items =
-            stdlib_dot_completion_items(cands.iter(), "array", None, "", &already, &fixb_uri(), true, false);
+            stdlib_dot_completion_items(cands.iter(), "array", None, None, "", &already, &fixb_uri(), true, false);
         let map = item_named(&items, "map").expect("`map` must be offered on an array receiver");
         // Smart-parens snippet, cursor between the parens (one arg still to fill).
         assert_eq!(map.insert_text.as_deref(), Some("map($0)"));
@@ -6423,7 +6608,7 @@ mod tests {
         let cands = vec![cand("map", "std/iter", "(?T9002[], (?T9002, Int32) => ?T9003) => ?T9003[]")];
         let mut already = HashSet::new();
         already.insert("map".to_string());
-        let items = stdlib_dot_completion_items(cands.iter(), "array", None, "", &already, &fixb_uri(), false, false);
+        let items = stdlib_dot_completion_items(cands.iter(), "array", None, None, "", &already, &fixb_uri(), false, false);
         assert!(item_named(&items, "map").is_none(), "an already-offered `map` must not be re-offered");
     }
 
@@ -6438,11 +6623,11 @@ mod tests {
         ];
         let already = HashSet::new();
         // Array receiver: `range` (number first param) is gated OUT; `map` (array) is kept.
-        let on_array = stdlib_dot_completion_items(cands.iter(), "array", None, "", &already, &fixb_uri(), false, false);
+        let on_array = stdlib_dot_completion_items(cands.iter(), "array", None, None, "", &already, &fixb_uri(), false, false);
         assert!(item_named(&on_array, "range").is_none(), "`range` must be gated out on an array receiver");
         assert!(item_named(&on_array, "map").is_some(), "`map` should be offered on an array receiver");
         // String receiver: `map` (array first param) is gated OUT.
-        let on_string = stdlib_dot_completion_items(cands.iter(), "string", None, "", &already, &fixb_uri(), false, false);
+        let on_string = stdlib_dot_completion_items(cands.iter(), "string", None, None, "", &already, &fixb_uri(), false, false);
         assert!(item_named(&on_string, "map").is_none(), "`map` (array first param) must be gated out on a string receiver");
     }
 
@@ -6456,7 +6641,7 @@ mod tests {
             "(?T4294967295, (?T4294967295, Int32) => ?T4294967295) => Null",
         )];
         let already = HashSet::new();
-        let items = stdlib_dot_completion_items(cands.iter(), "array", None, "", &already, &fixb_uri(), false, false);
+        let items = stdlib_dot_completion_items(cands.iter(), "array", None, None, "", &already, &fixb_uri(), false, false);
         let for_item = item_named(&items, "for").expect("`for` must be offered on an array receiver");
         assert_eq!(parse_completion_resolve_module(for_item.data.as_ref()).as_deref(), Some("std/iter"));
     }
@@ -6467,7 +6652,7 @@ mod tests {
     #[test]
     fn stdlib_dot_real_candidates_offer_iter_combinators_on_array() {
         let already = HashSet::new();
-        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", None, "", &already, &fixb_uri(), false, false);
+        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", None, None, "", &already, &fixb_uri(), false, false);
         for name in ["map", "filter", "for"] {
             let it = item_named(&items, name)
                 .unwrap_or_else(|| panic!("`{name}` should be offered on an array receiver from the real stdlib"));
@@ -6480,7 +6665,7 @@ mod tests {
         // `range` (number first param) is gated out even from the real set.
         assert!(item_named(&items, "range").is_none(), "`range` must be gated out on an array receiver");
         // Prefix filter: only `map` survives a "ma" prefix.
-        let only_ma = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", None, "ma", &already, &fixb_uri(), false, false);
+        let only_ma = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", None, None, "ma", &already, &fixb_uri(), false, false);
         assert!(item_named(&only_ma, "map").is_some());
         assert!(item_named(&only_ma, "filter").is_none(), "prefix `ma` must exclude `filter`");
     }
@@ -6544,7 +6729,7 @@ val _helper = 3
         );
         // Genuinely-exported array ops ARE still offered on an array receiver.
         let already = HashSet::new();
-        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", None, "", &already, &fixb_uri(), false, false);
+        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", None, None, "", &already, &fixb_uri(), false, false);
         assert!(item_named(&items, "push").is_some(), "exported `push` should still be offered");
         assert!(item_named(&items, "_bisect").is_none(), "private `_bisect` must not be offered");
     }
@@ -6642,6 +6827,136 @@ val _helper = 3
         assert!(dot_first_param_gate("array", None, Some("T")));
     }
 
+    /// `leading_params_accept` generalises the single first-param check to a TUPLE receiver of arity
+    /// N: the fn must have >= N params and accept each element in its leading slot. N == 1 collapses
+    /// to the single-param case.
+    #[test]
+    fn leading_params_accept_matches_n_leading_params() {
+        let recv2 = vec!["String".to_string(), "Int32".to_string()];
+        // substring(s: String, start: Int32, end: Int32) — both leading params match → accepted.
+        let substring = vec!["String".to_string(), "Int32".to_string(), "Int32".to_string()];
+        assert!(leading_params_accept(&recv2, &substring));
+        // Fewer params than the receiver arity → rejected (a 1-param fn can't take a 2-tuple spread).
+        assert!(!leading_params_accept(&recv2, &["String".to_string()]));
+        // Element 2 mismatches param 2 ([String, String] vs [String, Int32, ...]) → rejected.
+        let recv_mismatch = vec!["String".to_string(), "String".to_string()];
+        assert!(!leading_params_accept(&recv_mismatch, &substring));
+        // Tuple fills ALL params exactly (arity == N) → accepted.
+        assert!(leading_params_accept(&recv2, &["String".to_string(), "Int32".to_string()]));
+        // N == 1 behaves like the single first-param check.
+        assert!(leading_params_accept(&["String".to_string()], &["String".to_string(), "Int32".to_string()]));
+        assert!(!leading_params_accept(&["String".to_string()], &["Int8".to_string()]));
+    }
+
+    /// `dot_candidate_gate`: a tuple receiver matches its N elements against the leading N params of
+    /// the candidate's full signature; a single receiver (receiver_elems = None) falls back to the
+    /// first-param gate (identical to the old behaviour).
+    #[test]
+    fn dot_candidate_gate_tuple_vs_single() {
+        let elems = vec!["String".to_string(), "Int32".to_string()];
+        // Tuple [String, Int32] fits substring's first two params.
+        assert!(dot_candidate_gate("any", None, Some(&elems), "(String, Int32, Int32) => String"));
+        // A 1-param fn can't receive a 2-tuple spread.
+        assert!(!dot_candidate_gate("any", None, Some(&elems), "(String) => String"));
+        // 2nd element mismatches 2nd param.
+        assert!(!dot_candidate_gate("any", None, Some(&elems), "(String, String, Int32) => String"));
+        // A bare value (no signature) can't absorb a spread.
+        assert!(!dot_candidate_gate("any", None, Some(&elems), "String"));
+        // Single receiver (None) → first-param gate: precise String fits a String first param, not Int8.
+        assert!(dot_candidate_gate("string", Some("String"), None, "(String, Int32) => String"));
+        assert!(!dot_candidate_gate("string", Some("String"), None, "(Int8) => Int8"));
+    }
+
+    /// Smart-paren args-to-fill for a tuple receiver: args-to-fill = arity − N. `substring` (3 params)
+    /// with a 2-tuple receiver leaves ONE arg → cursor inside; a tuple that fills ALL params leaves 0
+    /// → cursor after. N == 1 (single receiver) is unchanged (arity − 1).
+    #[test]
+    fn args_to_fill_tuple_receiver_arity() {
+        // substring/3, tuple fills 2 → 1 arg to fill (cursor inside).
+        assert_eq!(args_to_fill("(String, Int32, Int32) => String", 2), Some(1));
+        // tuple fills ALL params → 0 to fill (cursor after).
+        assert_eq!(args_to_fill("(String, Int32) => String", 2), Some(0));
+        // N == 1 single receiver unchanged.
+        assert_eq!(args_to_fill("(String, Int32, Int32) => String", 1), Some(2));
+        // Over-arity (tuple bigger than params) saturates at 0.
+        assert_eq!(args_to_fill("(String) => String", 2), Some(0));
+    }
+
+    /// `dot_receiver_elem_types` detects a typed multi-element tuple receiver at the dot site and
+    /// returns its element types in order. Identifier elements resolve via `span_type_map`.
+    #[test]
+    fn dot_receiver_elem_types_detects_typed_tuple() {
+        // Literal elements carry their type intrinsically (the canonical `("str", 0).substring(1)`
+        // case from the task) — recoverable even though an incomplete `.` won't fully type-check.
+        let src = "val r = (\"str\", 0).\n";
+        let map = span_map(src);
+        let module = parse(src);
+        // Cursor right after the `.` (no method typed yet).
+        let needle = "(\"str\", 0).";
+        let offset = offset_after(src, 0, needle) + needle.len();
+        let tys = dot_receiver_elem_types(src, offset, &module, &map);
+        assert_eq!(tys, Some(vec!["String".to_string(), "Int32".to_string()]));
+    }
+
+    /// `dot_receiver_elem_types` returns None for a SINGLE receiver `(x).` — the parser flattens it to
+    /// plain `x` (no TupleArgs), so the caller keeps the single-receiver gate (graceful, N == 1).
+    #[test]
+    fn dot_receiver_elem_types_single_receiver_is_none() {
+        let src = "val a = \"str\"\nval r = (a).\n";
+        let map = span_map(src);
+        let module = parse(src);
+        let offset = offset_after(src, 0, "(a).") + "(a).".len();
+        assert_eq!(dot_receiver_elem_types(src, offset, &module, &map), None);
+    }
+
+    /// Graceful fallback: a tuple element that didn't type-check (an unbound name) makes the element
+    /// types unrecoverable → None, so the caller does NOT wrongly filter every candidate out.
+    #[test]
+    fn dot_receiver_elem_types_unresolved_element_is_none() {
+        // `nope` is unbound → no span_type_map entry → element type unrecoverable.
+        let src = "val r = (nope, 0).\n";
+        let map = span_map(src);
+        let module = parse(src);
+        let offset = offset_after(src, 0, "(nope, 0).") + "(nope, 0).".len();
+        assert_eq!(dot_receiver_elem_types(src, offset, &module, &map), None);
+    }
+
+    /// End-to-ish: with a `[String, Int32]` tuple receiver, `stdlib_dot_completion_items` offers a
+    /// `substring`-shaped method (first two params `String, Int32`) — with cursor placed for the ONE
+    /// remaining arg — but NOT a method whose 2nd param is incompatible, NOR a 1-param method.
+    #[test]
+    fn stdlib_dot_tuple_receiver_matches_leading_params() {
+        let elems = vec!["String".to_string(), "Int32".to_string()];
+        let cands = vec![
+            cand("substring", "std/string", "(String, Int32, Int32) => String"),
+            cand("bad2nd", "std/x", "(String, String, Int32) => String"),
+            cand("oneParam", "std/x", "(String) => String"),
+        ];
+        let already = HashSet::new();
+        let items = stdlib_dot_completion_items(
+            cands.iter(), "any", None, Some(&elems), "", &already, &fixb_uri(), true, false,
+        );
+        let sub = item_named(&items, "substring").expect("substring must be offered (leading params match)");
+        // 3 params, tuple fills 2 → ONE arg left → cursor BETWEEN the parens.
+        assert_eq!(sub.insert_text.as_deref(), Some("substring($0)"));
+        assert!(item_named(&items, "bad2nd").is_none(), "2nd-param mismatch must be gated out");
+        assert!(item_named(&items, "oneParam").is_none(), "a 1-param fn can't take a 2-tuple spread");
+    }
+
+    /// Tuple receiver that fills ALL of a candidate's params → cursor placed AFTER the parens
+    /// (nothing left to fill).
+    #[test]
+    fn stdlib_dot_tuple_receiver_fills_all_params_cursor_after() {
+        let elems = vec!["String".to_string(), "Int32".to_string()];
+        let cands = vec![cand("startsAt", "std/x", "(String, Int32) => Boolean")];
+        let already = HashSet::new();
+        let items = stdlib_dot_completion_items(
+            cands.iter(), "any", None, Some(&elems), "", &already, &fixb_uri(), true, false,
+        );
+        let it = item_named(&items, "startsAt").expect("startsAt must be offered");
+        assert_eq!(it.insert_text.as_deref(), Some("startsAt()$0"));
+    }
+
     /// Regression guard: a precise `String` receiver does NOT offer a numeric-first-param method but
     /// DOES offer a String-first-param one and a `Json`-first-param one — exercised through the real
     /// `stdlib_dot_completion_items` gate. And on an array receiver, the receiver-polymorphic `map`/
@@ -6656,7 +6971,7 @@ val _helper = 3
         let already = HashSet::new();
         // Precise String receiver.
         let items = stdlib_dot_completion_items(
-            cands.iter(), "string", Some("String"), "", &already, &fixb_uri(), false, false,
+            cands.iter(), "string", Some("String"), None, "", &already, &fixb_uri(), false, false,
         );
         assert!(item_named(&items, "upper").is_some(), "String-first-param method must be offered");
         assert!(item_named(&items, "toJson").is_some(), "Json-first-param method must be offered");
@@ -6672,7 +6987,7 @@ val _helper = 3
     fn stdlib_dot_precise_gate_keeps_map_for_on_array() {
         let already = HashSet::new();
         let items = stdlib_dot_completion_items(
-            STDLIB_DOT_CANDIDATES.iter(), "array", Some("Int32[]"), "", &already, &fixb_uri(), false, false,
+            STDLIB_DOT_CANDIDATES.iter(), "array", Some("Int32[]"), None, "", &already, &fixb_uri(), false, false,
         );
         for name in ["map", "filter", "for"] {
             assert!(
@@ -6698,7 +7013,7 @@ val _helper = 3
     ) -> Vec<CompletionItem> {
         let already = HashSet::new();
         userland_completion_items(
-            index, uri, base_dir, receiver_cat, receiver_precise, in_dot, prefix, &already, false, false,
+            index, uri, base_dir, receiver_cat, receiver_precise, None, in_dot, prefix, &already, false, false,
         )
     }
 
@@ -7199,16 +7514,16 @@ export val thingCount = 7
     #[test]
     fn args_to_fill_dot_vs_plain() {
         // `map` (2 params) dot-called → 1 arg to fill; plain → 2.
-        assert_eq!(args_to_fill("(T[], (T, Int32) => U) => U[]", true), Some(1));
-        assert_eq!(args_to_fill("(T[], (T, Int32) => U) => U[]", false), Some(2));
+        assert_eq!(args_to_fill("(T[], (T, Int32) => U) => U[]", 1), Some(1));
+        assert_eq!(args_to_fill("(T[], (T, Int32) => U) => U[]", 0), Some(2));
         // `toString` (1 param) dot-called → 0 args to fill (cursor after); plain → 1.
-        assert_eq!(args_to_fill("(Json) => String", true), Some(0));
-        assert_eq!(args_to_fill("(Json) => String", false), Some(1));
+        assert_eq!(args_to_fill("(Json) => String", 1), Some(0));
+        assert_eq!(args_to_fill("(Json) => String", 0), Some(1));
         // Zero-arg fn: dot saturates at 0 (can't go negative).
-        assert_eq!(args_to_fill("() => Int32", true), Some(0));
-        assert_eq!(args_to_fill("() => Int32", false), Some(0));
+        assert_eq!(args_to_fill("() => Int32", 1), Some(0));
+        assert_eq!(args_to_fill("() => Int32", 0), Some(0));
         // Unknown arity.
-        assert_eq!(args_to_fill("Int32", true), None);
+        assert_eq!(args_to_fill("Int32", 1), None);
     }
 
     /// The pure insert-text decision: snippet form, cursor placement, double-paren suppression,
@@ -7254,7 +7569,7 @@ export val thingCount = 7
     #[test]
     fn apply_function_parens_skips_non_functions() {
         let mut item = CompletionItem { label: "count".to_string(), ..Default::default() };
-        apply_function_parens(&mut item, "Int32", false, true, false);
+        apply_function_parens(&mut item, "Int32", 0, true, false);
         assert!(item.insert_text.is_none(), "a non-function must not get parens");
         assert!(item.insert_text_format.is_none());
     }
@@ -7264,7 +7579,7 @@ export val thingCount = 7
     #[test]
     fn apply_function_parens_dot_one_param_cursor_after() {
         let mut item = CompletionItem { label: "toString".to_string(), ..Default::default() };
-        apply_function_parens(&mut item, "(Json) => String", true, true, false);
+        apply_function_parens(&mut item, "(Json) => String", 1, true, false);
         assert_eq!(item.insert_text.as_deref(), Some("toString()$0"));
         assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
     }
@@ -7274,7 +7589,7 @@ export val thingCount = 7
     #[test]
     fn apply_function_parens_dot_two_param_cursor_inside() {
         let mut item = CompletionItem { label: "map".to_string(), ..Default::default() };
-        apply_function_parens(&mut item, "(T[], (T, Int32) => U) => U[]", true, true, false);
+        apply_function_parens(&mut item, "(T[], (T, Int32) => U) => U[]", 1, true, false);
         assert_eq!(item.insert_text.as_deref(), Some("map($0)"));
         assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
     }
@@ -7284,7 +7599,7 @@ export val thingCount = 7
     #[test]
     fn apply_function_parens_suppressed_before_existing_paren() {
         let mut item = CompletionItem { label: "toString".to_string(), ..Default::default() };
-        apply_function_parens(&mut item, "(Json) => String", true, true, true);
+        apply_function_parens(&mut item, "(Json) => String", 1, true, true);
         assert!(item.insert_text.is_none(), "must not double the parens before an existing `(`");
         assert!(item.insert_text_format.is_none());
     }
