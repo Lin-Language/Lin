@@ -75,6 +75,9 @@ impl Checker {
                         Type::Array(Box::new(Type::TypeVar(9010))),
                         Type::Iterator(Box::new(Type::TypeVar(9010))),
                         Type::Stream(Box::new(Type::TypeVar(9010))),
+                        // A `Null` receiver is a no-op (the loop bound is tag-checked to 0), so the
+                        // `for` wrapper accepts `T[] | … | Null` (a nullable map lookup `adj[k].for`).
+                        Type::Null,
                     ]),
                     // The callback OPTIONALLY receives a 0-based `Int32` SOURCE index as a trailing
                     // parameter (`(item, i) => …`). A 1-arg callback stays valid via arity-width

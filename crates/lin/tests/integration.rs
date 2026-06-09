@@ -11363,6 +11363,45 @@ val r = greet(j)
 }
 
 #[test]
+fn test_for_callback_element_is_typed() {
+    // `for` is `<T>(T[] | … , (T, Int32) => Json)`: the callback element is typed `T`, so passing
+    // a `String` element to an `Int32`-requiring function is a compile error (closing the old
+    // `for(iterable: Json, f: (Json, …))` hole where the callback param was untyped `Json`).
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { for } from "std/iter"
+val needsInt = (n: Int32): Int32 => n + 1
+["a", "b"].for(x => print("${needsInt(x)}"))
+"#);
+    assert!(
+        err.contains("String") && err.contains("Int32"),
+        "expected a String-vs-Int32 type error from the for callback, got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_for_over_iterator_and_nullable_and_empty_branches() {
+    // Regressions the generic `for` exposed and fixed: (1) `for` over an opaque `Iterator`
+    // (element TypeVar defaults to Json); (2) `for` over a `T[] | Null` map lookup (Null is a
+    // no-op receiver); (3) `if`/`match` whose `else`/`is Null` branch is an empty `[]` no longer
+    // mis-infers the result as `Never[]` — the non-empty branch's element type dominates.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { iter, for } from "std/iter"
+val it = iter(() => 0, i => i < 3, i => i + 1, i => i * 10)
+it.for(x => print(toString(x)))
+val pick = (m: { String: Int32[] }, k: String): Null =>
+  val xs = match m[k]
+    is Null => []
+    else => m[k]
+  xs.for(v => print(toString(v)))
+pick({ "a": [7, 8] }, "a")
+pick({ "a": [7, 8] }, "missing")
+"#);
+    assert_eq!(out, vec!["0", "10", "20", "7", "8"]);
+}
+
+#[test]
 fn test_keys_rejects_scalar_argument() {
     // `keys`/`values`/`entries` take `{ String: Json } | {}`, so a scalar argument is a
     // compile error (closing the old `keys(obj: Json)` hole where `keys(1)` type-checked).
