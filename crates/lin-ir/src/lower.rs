@@ -588,6 +588,15 @@ struct LowerCtx {
     /// scope exit. When this is 0, any captured cell is conservatively marked escaping (left
     /// leaking). See `FreeCell` and the captured-cell escape analysis.
     safe_callback_depth: u32,
+    /// PATH-1 in-place packed iteration: lambda param slots that are bound to a BORROWED packed
+    /// sealed-array element view rather than a materialized struct. slot → (array_temp, index_temp,
+    /// sealed element type). A `param["field"]` read on such a slot lowers to a const-offset
+    /// `SealedArrayFieldGet` straight off the packed buffer (no per-element materialize, no boxed
+    /// `lin_object_get`); any OTHER use of the param (passing it as a whole value, storing it)
+    /// materializes the element on demand via `materialize_packed_elem_view`. Populated only inside
+    /// the inline combinator fast paths over a `is_sealed_scalar_array` receiver, and cleared when
+    /// the inlined body's scope exits.
+    packed_elem_slots: HashMap<usize, (Temp, Temp, Type)>,
     /// When lowering an IMPORTED module that has top-level mutable `var`s, this holds the
     /// once-guarded var-init function symbol (`{module_key}__var_init`). Set just before a
     /// TOP-LEVEL EXPORTED function body (or `__val` wrapper) is lowered, so the body emits a
@@ -643,6 +652,7 @@ impl LowerCtx {
             default_descriptors: HashMap::new(),
             safe_combinator_slots: HashMap::new(),
             safe_callback_depth: 0,
+            packed_elem_slots: HashMap::new(),
             import_var_init_prologue: None,
         }
     }
@@ -2273,6 +2283,66 @@ fn try_lower_sealed_array_field(
     Some(dst)
 }
 
+/// PATH-1 in-place packed iteration: a `param["field"]` / `param.field` read where `param` is a
+/// lambda element param bound to a BORROWED packed-array element VIEW (`ctx.packed_elem_slots`).
+/// Emits a single const-offset `SealedArrayFieldGet` straight off the recorded `(array, index)` —
+/// the SAME instruction the shipped `arr[i]["field"]` fusion uses — instead of the generic path that
+/// would materialize a per-element struct then read it (or, worse, re-box it to a `LinObject` and do
+/// a dynamic `lin_object_get` because the param's declared type is `Json`). Returns `Some(dst)` on
+/// the fast path, `None` (no view, or a non-scalar field) to fall back.
+///
+/// Sound: the field is a scalar (the in-place iteration is gated to `is_sealed_scalar_array`, all
+/// fields scalar/Bool — see `try_lower_packed_elem_field`'s scalar check below), so the read is a
+/// pure const-offset load with no RC and no escaping interior pointer — identical to the receiver
+/// `arr[i]["field"]` fusion. The recorded `array`/`index` temps are the loop's own (the array base
+/// is live for the whole loop; the index is the loop counter), so no dangling.
+fn try_lower_packed_elem_field(
+    object: &TypedExpr,
+    field: &str,
+    result_ty: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    let TypedExpr::LocalGet { slot, .. } = object else { return None };
+    let (array, index, elem_ty) = ctx.packed_elem_slots.get(slot)?.clone();
+    // Only a SCALAR field is a sound const-offset read here (no RC, no interior-pointer escape).
+    // The in-place gate is `is_sealed_scalar_array` (all fields scalar/Bool), so this always holds
+    // for a declared field — but a non-declared key (safe-access → Null) must fall back.
+    let concrete_field_ty = match &elem_ty {
+        Type::Object { fields, .. } => fields.get(field).cloned(),
+        _ => None,
+    };
+    let concrete_field_ty = concrete_field_ty?;
+    if !(concrete_field_ty.is_flat_scalar() || matches!(concrete_field_ty, Type::Bool)) {
+        return None;
+    }
+    // Read the field at its CONCRETE scalar type (the const-offset load yields an unboxed scalar).
+    // `result_ty` is the static type of `p["field"]`, which — because the element param `p` is
+    // declared `Json` on the callback ABI — is typically `Json`/`TypeVar` (NOT the concrete scalar).
+    // Allocating `dst` at `result_ty` while the instruction stores a raw i32 would mistype the temp
+    // (codegen then mis-handles the value). So read at the concrete type, then COERCE to `result_ty`
+    // (boxing the scalar into a `TaggedVal*` when `result_ty` is Json) and register that fresh box
+    // owned so the body scope releases it — without this the per-iteration operand box leaks (the
+    // tagged-arith op only READS its operand box, never frees it). When `result_ty` already equals
+    // the concrete type (a typed-element callback, post-monomorphization), the coerce is a no-op.
+    let arr_ty = Type::Array(Box::new(elem_ty));
+    let raw = builder.alloc_temp(concrete_field_ty.clone());
+    builder.emit(Instruction::SealedArrayFieldGet {
+        dst: raw,
+        array,
+        index,
+        field: field.to_string(),
+        arr_ty,
+        result_ty: concrete_field_ty.clone(),
+    });
+    let coerced = coerce_to_slot_type(raw, &concrete_field_ty, result_ty, builder);
+    if coerced != raw && is_union_ty(result_ty) {
+        // A freshly boxed scalar: own it so scope exit reclaims the box.
+        builder.register_owned(coerced, result_ty.clone());
+    }
+    Some(coerced)
+}
+
 /// FUSED `arr[i].field` / `arr[i]["field"]` over a BOXED `Object[]` whose element is a sealed/typed
 /// record stored as a heap `LinObject` (the boxed `Token[]` representation: a record with heap
 /// fields, which the packed-sealed-array gate REJECTS, so the array stays a boxed `Object[]`). When
@@ -2922,6 +2992,24 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
         }
 
         TypedExpr::LocalGet { slot, ty, .. } => {
+            // PATH-1: a packed-array element VIEW slot read as a WHOLE value (not a `p["field"]`
+            // const-offset read, which `try_lower_packed_elem_field` already intercepts upstream).
+            // Materialize a fresh +1 sealed struct from the recorded `(array, index)` — the same
+            // value the generic `Index` path would have produced — and own it for scope-exit release.
+            // This is the fallback for any non-field use of the param (passing it whole, storing it).
+            if let Some((array, index, elem_ty)) = ctx.packed_elem_slots.get(slot).cloned() {
+                let dst = builder.alloc_temp(elem_ty.clone());
+                builder.emit(Instruction::Index {
+                    dst,
+                    object: array,
+                    key: index,
+                    obj_ty: Type::Array(Box::new(elem_ty.clone())),
+                    key_ty: Type::Int64,
+                    result_ty: elem_ty.clone(),
+                });
+                builder.register_owned(dst, elem_ty.clone());
+                return dst;
+            }
             // Top-level mutable `var` (module global): ALWAYS load via GlobalValGet, never a
             // cached local temp — a preceding closure call may have mutated the global. (A
             // top-level immutable `val` can use the local-temp fast path below.)
@@ -3592,6 +3680,10 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
             // FUSED `arr[i]["field"]` over a sealed-record array (Stage 3): same constant-offset
             // scalar load as `arr[i].field`. `object` is an Index of the array; `key` is a literal.
             if let TypedExpr::StringLit(name, _, _) = key.as_ref() {
+                // PATH-1: `p["field"]` where `p` is a borrowed packed-element view → const-offset load.
+                if let Some(t) = try_lower_packed_elem_field(object, name, result_type, builder, ctx) {
+                    return t;
+                }
                 if let Some(t) = try_lower_sealed_array_field(object, name, result_type, builder, ctx) {
                     return t;
                 }
@@ -3797,6 +3889,10 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
         }
 
         TypedExpr::FieldGet { object, field, result_type, .. } => {
+            // PATH-1: `p.field` where `p` is a borrowed packed-element view → const-offset load.
+            if let Some(t) = try_lower_packed_elem_field(object, field, result_type, builder, ctx) {
+                return t;
+            }
             // FUSED `arr[i].field` over a sealed-record array (Stage 3): a constant-offset scalar
             // load directly from the contiguous element, skipping the per-element struct
             // materialization the generic Index path would do.
@@ -4163,6 +4259,14 @@ fn lower_call(
             // proven std/stream wrapper path exactly.
             if let Some(stream_intr) = stream_combinator_intrinsic_name(&sym, args) {
                 return lower_intrinsic_call(stream_intr, args, result_type, builder, ctx);
+            }
+            // PATH-1 in-place packed-array op: a combinator over a PACKED sealed-scalar array
+            // receiver is lowered via the matching intrinsic (`lin_for`/`lin_length`) at the
+            // receiver's CONCRETE type — skipping the `Json`-param whole-array `sealed_array_to_tagged`
+            // materialize and the boxed `std_*` dispatch (cost #2). See
+            // `packed_array_combinator_intrinsic_name`.
+            if let Some(intr) = packed_array_combinator_intrinsic_name(&sym, args) {
+                return lower_intrinsic_call(intr, args, result_type, builder, ctx);
             }
             // FUSED `range(a, b).for(f)` across the module boundary: in the IMPORTING module `for`
             // and `range` are calls to the compiled `std_iter_for` / `std_iter_range` symbols, so the
@@ -4687,6 +4791,36 @@ fn stream_combinator_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'s
     })
 }
 
+/// PATH-1 in-place packed-array op dispatch (mechanism (a), representation-dispatched lowering).
+///
+/// When a `std/iter` or `std/array` combinator is called with a PACKED sealed-scalar array receiver
+/// (`arg0` is `is_sealed_scalar_array`), the receiver would otherwise be coerced to the `Json`
+/// parameter — materializing the WHOLE packed buffer into a boxed `Object[]` via
+/// `lin_sealed_array_to_tagged` (cost #2, the dominant cost) — and then dispatched through the
+/// compiled `std_*` symbol that reads each element through the dynamic ABI. Redirecting to the
+/// matching INTRINSIC lowering (`lin_for`/`lin_length`/...) makes the op see the receiver at its
+/// CONCRETE `Pt[]` type, so `lower_for` etc. emit an in-place index loop over the `0xFE` buffer and
+/// `length` loads the u64 size at offset 8 — no whole-array materialize, no `std_*` boxed call.
+///
+/// Keyed on the exact import symbol so a user function with the same name is never affected (mirrors
+/// `stream_combinator_intrinsic_name`). Only the ops whose intrinsic lowering ALREADY handles a
+/// packed/concrete `Array(elem)` receiver in place are redirected. `map`/`filter`/`reduce` already
+/// reach their inline `lower_*` path (they are generic `<T>`, not `Json`), so they are left alone —
+/// the redirect targets the `Json`-typed ops (`for`, `length`) that force the whole-array box.
+fn packed_array_combinator_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'static str> {
+    // The receiver must be a PACKED sealed-scalar array; only then is the redirect a win (and sound:
+    // the intrinsic lowering reads the packed buffer directly via the same `is_sealed_scalar_array`
+    // gate the codegen `Index`/`Length` paths honour).
+    if !args.first().map(|a| is_sealed_scalar_array(&a.ty())).unwrap_or(false) {
+        return None;
+    }
+    match sym {
+        "std_iter_for" => Some("lin_for"),
+        "std_array_length" | "std_iter_length" => Some("lin_length"),
+        _ => None,
+    }
+}
+
 fn safe_combinator_callback_index(name: &str) -> Option<usize> {
     match name {
         "for" | "while" | "map" | "filter" | "find" | "some" | "every" => Some(1),
@@ -5033,6 +5167,129 @@ fn inline_lambda_body_tracking_elem_boxes(
     keep.extend_from_slice(&elem_boxes);
     builder.pop_scope_releasing_keep(&keep);
     (raw, body_ty, elem_boxes)
+}
+
+/// PATH-1 in-place packed iteration eligibility: true iff EVERY use of the element param `slot` in
+/// `body` is as the immediate `object` of a field read (`param.field` or `param["literalKey"]`).
+///
+/// The in-place packed-element VIEW only services const-offset SCALAR field reads. Any OTHER use of
+/// the element (passing it whole to a call, storing it, indexing with a non-literal key, comparing
+/// it, returning it, spreading it) needs the materialized struct — and materializing-on-demand a
+/// `Json`-typed element to feed e.g. `push(out, p)` round-trips through a pre-existing
+/// push-Json-into-packed-array bug AND would defeat the no-materialize goal anyway. So when the body
+/// uses the element as anything but a scalar-field read, this returns false and the caller falls back
+/// to the generic materialize path (identical to today's boxed behaviour — no regression). Bare-key
+/// reads (`p[i]`) and whole-value uses are conservatively rejected.
+fn elem_used_only_for_scalar_fields(slot: usize, body: &TypedExpr) -> bool {
+    // `ok`: this position is NOT a bare element use (it is a field-read object, handled by the caller).
+    // Returns false the moment a bare/whole-value use of `slot` is found.
+    fn walk(slot: usize, e: &TypedExpr) -> bool {
+        match e {
+            // A field read whose object is exactly the element param is FINE — and we must NOT
+            // descend into the object as a bare use. (A field read on a NESTED expression that
+            // merely CONTAINS the param elsewhere is handled by descending into that subexpr.)
+            TypedExpr::FieldGet { object, .. } => {
+                if matches!(object.as_ref(), TypedExpr::LocalGet { slot: s, .. } if *s == slot) {
+                    return true;
+                }
+                walk(slot, object)
+            }
+            TypedExpr::Index { object, key, .. } => {
+                let obj_is_elem = matches!(object.as_ref(), TypedExpr::LocalGet { slot: s, .. } if *s == slot);
+                let key_is_lit = matches!(key.as_ref(), TypedExpr::StringLit(..));
+                if obj_is_elem {
+                    // `param["literal"]` ok; `param[dynamicKey]` is a whole-value-ish use → reject.
+                    return key_is_lit && walk(slot, key);
+                }
+                walk(slot, object) && walk(slot, key)
+            }
+            // A bare element-param reference anywhere else is a whole-value use → reject.
+            TypedExpr::LocalGet { slot: s, .. } => *s != slot,
+            // Structural recursion over every other node.
+            TypedExpr::LocalSet { value, .. } => walk(slot, value),
+            TypedExpr::BinaryOp { left, right, .. } => walk(slot, left) && walk(slot, right),
+            TypedExpr::UnaryOp { operand, .. } => walk(slot, operand),
+            TypedExpr::Coerce { expr, .. } => walk(slot, expr),
+            TypedExpr::Call { func, args, .. } => walk(slot, func) && args.iter().all(|a| walk(slot, a)),
+            TypedExpr::If { cond, then_br, else_br, .. } =>
+                walk(slot, cond) && walk(slot, then_br) && walk(slot, else_br),
+            TypedExpr::FromJson { value, .. } => walk(slot, value),
+            TypedExpr::Match { scrutinee, arms, .. } =>
+                walk(slot, scrutinee) && arms.iter().all(|a| walk(slot, &a.body)),
+            TypedExpr::Block { stmts, expr, .. } =>
+                stmts.iter().all(|s| stmt_ok(slot, s)) && walk(slot, expr),
+            // A nested function literal that captures the element would need the whole value — its
+            // captures reference outer slots, so conservatively reject if the param slot is named.
+            TypedExpr::Function { body, .. } => walk(slot, body),
+            TypedExpr::MakeObject { fields, spreads, .. } =>
+                fields.iter().all(|(_, v)| walk(slot, v)) && spreads.iter().all(|s| walk(slot, s)),
+            TypedExpr::MakeArray { elements, .. } => elements.iter().all(|x| walk(slot, x)),
+            TypedExpr::IndexSet { object, key, value, .. } =>
+                walk(slot, object) && walk(slot, key) && walk(slot, value),
+            TypedExpr::StringInterp { parts, .. } => parts.iter().all(|p| interp_part_ok(slot, p)),
+            TypedExpr::Is { expr, .. } => walk(slot, expr),
+            TypedExpr::Has { expr, .. } => walk(slot, expr),
+            TypedExpr::IntLit(..) | TypedExpr::FloatLit(..) | TypedExpr::StringLit(..)
+            | TypedExpr::BoolLit(..) | TypedExpr::NullLit(..) => true,
+        }
+    }
+    fn stmt_ok(slot: usize, s: &TypedStmt) -> bool {
+        match s {
+            TypedStmt::Expr(e) => walk(slot, e),
+            TypedStmt::Val { value, .. } => walk(slot, value),
+            TypedStmt::Var { value, .. } => walk(slot, value),
+            TypedStmt::Destructure { value, .. } => walk(slot, value),
+            TypedStmt::ArrayDestructure { value, .. } => walk(slot, value),
+            // No element-param use is possible in an import/foreign-import statement.
+            TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. } => true,
+        }
+    }
+    fn interp_part_ok(slot: usize, p: &TypedStringPart) -> bool {
+        match p {
+            TypedStringPart::Expr(e) => walk(slot, e),
+            TypedStringPart::Literal(_) => true,
+        }
+    }
+    walk(slot, body)
+}
+
+/// PATH-1 in-place packed iteration: inline a lambda body whose ELEMENT param (index 0) is bound to
+/// a BORROWED packed-array element VIEW — the recorded `(array, index)` — instead of a materialized
+/// struct. `param["field"]` reads inside the body lower to const-offset `SealedArrayFieldGet`
+/// (`try_lower_packed_elem_field`); any whole-value use materializes on demand (`LocalGet` fallback).
+/// The optional index param (index 1, the 0-based source index) binds to `idx` as normal.
+///
+/// The element struct is NEVER materialized when the body only does field reads — eliminating the
+/// per-element `lin_sealed_alloc`+memcpy AND the `Json`-param re-box+`lin_object_get`. The view is
+/// removed when this body returns (its lifetime is exactly this one inlined body), so a later
+/// combinator in the same function cannot mis-resolve the slot.
+fn inline_lambda_body_packed_view(
+    params: &[TypedParam],
+    body: &TypedExpr,
+    array: Temp,
+    index: Temp,
+    elem_ty: &Type,
+    idx: Temp,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> (Temp, Type) {
+    builder.push_scope();
+    let elem_slot = params.first().map(|p| p.slot);
+    if let Some(slot) = elem_slot {
+        ctx.packed_elem_slots.insert(slot, (array, index, elem_ty.clone()));
+    }
+    // Optional index param: bind exactly as the generic inline path does.
+    if let Some(p) = params.get(1) {
+        let bound = coerce_arg_to_param_repr(idx, &Type::Int32, &p.ty, builder);
+        builder.slots.insert(p.slot, bound);
+    }
+    let raw = lower_expr(body, builder, ctx);
+    let body_ty = builder.temp_types.get(&raw).cloned().unwrap_or_else(|| body.ty());
+    builder.pop_scope_releasing_keep(&[raw]);
+    if let Some(slot) = elem_slot {
+        ctx.packed_elem_slots.remove(&slot);
+    }
+    (raw, body_ty)
 }
 
 /// Coerce `arg` (typed `arg_ty`) to the representation of `param_ty`: box a concrete value into a
@@ -5608,6 +5865,57 @@ fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
     builder.switch_to(exit);
 }
 
+/// PATH-1 in-place packed iteration loop: like `emit_index_loop`, but does NOT emit a materializing
+/// `Index` for the element — instead it passes the loop counter `i` (Int64) to `body_fn` along with
+/// the (already-lowered) `iterable` temp, so the body can register a packed-element VIEW and read
+/// fields by const-offset. `body_fn(i, array, builder, ctx)`. The header-phi back-edge is patched
+/// latch-relative exactly as `emit_index_loop` does, so an inlined body that emits its own blocks
+/// (inner match/if/combinator) is wired correctly.
+fn emit_packed_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
+    iterable: Temp,
+    iterable_ty: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    body_fn: F,
+) {
+    let len = emit_iterable_len(iterable, iterable_ty, builder);
+    let zero = builder.const_temp(Const::Int(0, Type::Int64));
+
+    let preheader = builder.current_block;
+    let header = builder.alloc_block("for_header");
+    let body = builder.alloc_block("for_body");
+    let exit = builder.alloc_block("for_exit");
+
+    let i = builder.alloc_temp(Type::Int64);
+    let i_next = builder.alloc_temp(Type::Int64);
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(header);
+    builder.emit(Instruction::Phi {
+        dst: i, ty: Type::Int64,
+        incomings: vec![(zero, preheader), (i_next, body)],
+    });
+    let cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary {
+        dst: cond, op: BinOp::Lt, lhs: i, rhs: len,
+        operand_ty: Type::Int64, ty: Type::Bool,
+    });
+    builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+
+    builder.switch_to(body);
+    body_fn(i, iterable, builder, ctx);
+    let back_block = builder.current_block;
+    let one = builder.const_temp(Const::Int(1, Type::Int64));
+    builder.emit(Instruction::Binary {
+        dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
+        operand_ty: Type::Int64, ty: Type::Int64,
+    });
+    builder.terminate(Terminator::Jump(header));
+    builder.patch_phi_incoming(header, i, body, back_block);
+
+    builder.switch_to(exit);
+}
+
 /// `for(iterable, body)` → index loop calling `body(elem)` for side effects; returns Null.
 fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
@@ -5655,6 +5963,25 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let elem_ty = read_elem_ty.clone();
+        // PATH-1 in-place packed iteration: a packed sealed-scalar array source iterates over the
+        // contiguous buffer with NO per-element materialize — the element param is bound to a
+        // borrowed `(array, index)` view, and its `p["field"]` reads lower to const-offset loads
+        // (`try_lower_packed_elem_field`). Gated to bodies that use the element ONLY for scalar
+        // field reads (`elem_used_only_for_scalar_fields`): a whole-value use (passing `p` to a
+        // call, storing it, comparing it) falls through to the generic materialize path below —
+        // identical to today's boxed behaviour, so no correctness regression.
+        if is_sealed_scalar_array(&iterable_ty)
+            && lam_params.first().map(|p| elem_used_only_for_scalar_fields(p.slot, &lam_body)).unwrap_or(false)
+        {
+            let static_elem = iter_elem_type(&iterable_ty);
+            emit_packed_index_loop(iterable, &iterable_ty, builder, ctx, |i, array, b, c| {
+                let idx = narrow_loop_index(i, b);
+                let (res, res_ty) = inline_lambda_body_packed_view(
+                    &lam_params, &lam_body, array, i, &static_elem, idx, b, c);
+                b.emit(Instruction::Release { val: res, ty: res_ty });
+            });
+            return builder.const_temp(Const::Null);
+        }
         emit_index_loop(iterable, &iterable_ty, &read_elem_ty, builder, ctx, |i, elem, b, c| {
             // Optional 0-based SOURCE index; narrowed Int64→Int32. `inline_lambda_body` binds by the
             // lambda's OWN param count, so a 1-param `x => …` simply ignores this surplus arg.
