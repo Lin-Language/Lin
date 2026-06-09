@@ -161,8 +161,8 @@ export val toHex = (data: UInt8[]): String =>
 
 // Decode a hex string to bytes (upper/lowercase accepted) — the only fallible codec here.
 // @param s  the hex string to decode.
-// @returns the decoded bytes, or an Error for odd length or a non-hex character.
-export val fromHex = (s: String): Json =>
+// @returns the decoded bytes (`UInt8[]`), or an Error for odd length or a non-hex character.
+export val fromHex = (s: String): UInt8[] | Error =>
   hexDecode(s)
 
 // --- streaming Hasher ------------------------------------------------------
