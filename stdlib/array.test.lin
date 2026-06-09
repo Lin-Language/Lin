@@ -1585,7 +1585,109 @@ val s = suite("std/array", [
 
   test("dedupBy keys by a derived value", () => [
     expect([1, 3, 2, 5].dedupBy(x => x % 2).toString()).toBe("[[1, 3], [2], [5]]")
-  ])
+  ]),
+
+  // --- Generic key-type (K) representation tests: keyFn keys of distinct runtime
+  // representations (flat-scalar Int32, Float64, String) must compare/sort/group correctly.
+  // These exercise the <T, K> signatures of sortBy / searchBy / dedupBy. ---
+
+  // sortBy where the element type T (record) differs from the key type K (Int32 scalar): the
+  // flat-scalar key must round-trip through the boxed Json pair and sort numerically (not lexically).
+  test("sortBy record elements by a flat Int32 key sorts numerically", () =>
+    val people = [
+      { "name": "Bob", "age": 30 },
+      { "name": "Eve", "age": 9 },
+      { "name": "Al", "age": 100 },
+      { "name": "Cara", "age": 25 }
+    ]
+    val sorted = people.sortBy(p => p["age"])
+    [
+      // 9, 25, 30, 100 — numeric, NOT lexical "100" < "25" < "30" < "9"
+      expect(sorted[0]["age"]).toBe(9),
+      expect(sorted[1]["age"]).toBe(25),
+      expect(sorted[2]["age"]).toBe(30),
+      expect(sorted[3]["age"]).toBe(100),
+      expect(sorted[0]["name"]).toBe("Eve"),
+      expect(sorted[3]["name"]).toBe("Al")
+    ]
+  ),
+
+  // sortBy with a Float64 scalar key.
+  test("sortBy by a Float64 key sorts numerically", () =>
+    val result = [3.5, 1.25, 2.0, 0.5].sortBy(x => x)
+    [
+      expect(result.toString()).toBe("[0.5, 1.25, 2.0, 3.5]")
+    ]
+  ),
+
+  // sortBy with a String key.
+  test("sortBy by a String key sorts lexically", () =>
+    val result = ["pear", "apple", "fig", "banana"].sortBy(w => w)
+    [
+      expect(result.toString()).toBe("[\"apple\", \"banana\", \"fig\", \"pear\"]")
+    ]
+  ),
+
+  // searchBy with a Float64 scalar key: a hit and a miss must report correct found/index.
+  test("searchBy with a Float64 key finds and misses correctly", () =>
+    val xs = [0.5, 1.25, 2.0, 3.5]
+    val hit = xs.searchBy(2.0, x => x)
+    val miss = xs.searchBy(1.5, x => x)
+    [
+      expect(hit["found"]).toBe(true),
+      expect(hit["index"]).toBe(2),
+      expect(miss["found"]).toBe(false),
+      // 1.5 sorts between 1.25 (idx 1) and 2.0 (idx 2) → insertion point 2
+      expect(miss["index"]).toBe(2)
+    ]
+  ),
+
+  // searchBy on a record array keyed by a flat Int32 field: hit and miss.
+  test("searchBy record array by a flat Int32 key, hit and miss", () =>
+    val people = [
+      { "name": "Eve", "age": 9 },
+      { "name": "Cara", "age": 25 },
+      { "name": "Bob", "age": 30 },
+      { "name": "Al", "age": 100 }
+    ]
+    val hit = people.searchBy(30, p => p["age"])
+    val miss = people.searchBy(50, p => p["age"])
+    [
+      expect(hit["found"]).toBe(true),
+      expect(hit["index"]).toBe(2),
+      expect(miss["found"]).toBe(false),
+      expect(miss["index"]).toBe(3)
+    ]
+  ),
+
+  // dedupBy with a String key (consecutive runs by string equality).
+  test("dedupBy groups consecutive runs by a String key", () => [
+    expect(["a", "a", "b", "a", "a"].dedupBy(s => s).toString()).toBe("[[\"a\", \"a\"], [\"b\"], [\"a\", \"a\"]]")
+  ]),
+
+  // dedupBy with a Float64 key.
+  test("dedupBy groups consecutive runs by a Float64 key", () => [
+    expect([1.5, 1.5, 2.5, 1.5].dedupBy(x => x).toString()).toBe("[[1.5, 1.5], [2.5], [1.5]]")
+  ]),
+
+  // dedupBy where element T (record) differs from key K (String field).
+  test("dedupBy record elements by a String key field", () =>
+    val rows = [
+      { "g": "x", "n": 1 },
+      { "g": "x", "n": 2 },
+      { "g": "y", "n": 3 },
+      { "g": "x", "n": 4 }
+    ]
+    val runs = rows.dedupBy(r => r["g"])
+    [
+      expect(length(runs)).toBe(3),
+      expect(length(runs[0])).toBe(2),
+      expect(length(runs[1])).toBe(1),
+      expect(length(runs[2])).toBe(1),
+      expect(runs[0][1]["n"]).toBe(2),
+      expect(runs[2][0]["n"]).toBe(4)
+    ]
+  )
 ])
 
 run(s)
