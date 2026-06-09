@@ -227,7 +227,7 @@ val genModule = (modName: String, source: String): String =>
 
 // List the stdlib modules (.lin, excluding .test.lin).
 val entriesJson = ls(stdlibDir, {})
-val entries = if isErr(entriesJson) then [] else entriesJson
+val entries = if entriesJson is Error then [] else entriesJson
 val modules = entries.filter(f => endsWith(f, ".lin") && !contains(f, ".test."))
 
 print("Generating stdlib docs from comments: ${length(modules)} modules...")
@@ -236,7 +236,7 @@ mkdir(outDir, { "parents": true })
 modules.for(fname =>
   val modName = substring(fname, 0, length(fname) - 4) // drop ".lin"
   val srcJson = readFile("${stdlibDir}/${fname}")
-  if isErr(srcJson) then
+  if srcJson is Error then
     print("  ERROR reading ${fname}")
   else
     val md = genModule(modName, srcJson)
@@ -251,7 +251,7 @@ modules.for(fname =>
 // Remove orphaned pages: any content/stdlib/<x>.md whose stdlib/<x>.lin no longer exists (e.g. a
 // module that was consolidated away). Keeps the generated docs in lockstep with the source tree.
 val pagesJson = ls(outDir, {})
-val pages = if isErr(pagesJson) then [] else pagesJson
+val pages = if pagesJson is Error then [] else pagesJson
 pages.for(page =>
   if endsWith(page, ".md") then
     val base = substring(page, 0, length(page) - 3)

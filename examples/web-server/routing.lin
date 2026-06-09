@@ -133,8 +133,8 @@ export val dijkstra = (adj: { String: Neighbor[] }, source: String, allNodes: St
 export val solve = (graphPath: String, from: String, to: String): SolveResult =>
   val graphData = readJson(graphPath)
   match graphData
-    has { "type": "error", message } =>
-      { "type": "error", "message": message }
+    is Error =>
+      { "type": "error", "message": graphData["message"] }
     else =>
       val adj = buildAdj(graphData["edges"])
       val result = dijkstra(adj, from, graphData["nodes"])

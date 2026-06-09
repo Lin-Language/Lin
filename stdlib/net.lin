@@ -30,11 +30,17 @@ import foreign "lin-runtime"
   val lin_tcp_set_nonblocking: (Int32, Int32) => Json
   val lin_tcp_close: (Int32) => Json
 
+// A received UDP datagram's metadata: byte count plus the sender's address and port.
+export type Datagram = { "len": Int32, "addr": String, "port": Int32 }
+
+// An accepted TCP connection: the new client socket's descriptor and the peer's address/port.
+export type TcpPeer = { "fd": Int32, "addr": String, "port": Int32 }
+
 // --- UDP ---
 // Bind a UDP socket to `port` on all interfaces.
 // @param port  the local port to bind (0 to let the OS choose).
 // @returns the socket file descriptor, or an `Error` if the bind failed.
-export val udpBind = (port: Int32): Json =>
+export val udpBind = (port: Int32): Int32 | Error =>
   lin_udp_bind(port)
 
 // Receive a UDP datagram into `buf` (sender address discarded).
@@ -43,18 +49,19 @@ export val udpBind = (port: Int32): Json =>
 // @returns the number of bytes received, or an `Error` on failure. After
 //   `udpSetNonblocking(fd, true)`, a receive with no data pending returns `Null` instead of
 //   blocking, so a poll loop can `match` on `Null` for "nothing yet".
-export val udpRecv = (fd: Int32, buf: UInt8[]): Json =>
+export val udpRecv = (fd: Int32, buf: UInt8[]): Int32 | Null | Error =>
   lin_udp_recv(fd, buf)
 
 // Receive a UDP datagram into `buf`, keeping the sender's address.
 // @param fd   the socket descriptor from `udpBind`.
 // @param buf  the byte buffer to fill.
-// @returns `{ bytes, addr, port }` for the datagram, or an `Error` on failure.
+// @returns a `Datagram` (`{ len, addr, port }`) for the received packet, `Null` if non-blocking
+//   and nothing is pending, or an `Error` on failure.
 // @example val sock = udpBind(39303)
 // @example udpSendTo(sock, "127.0.0.1", 39303, [72, 105, 33])   // 3 bytes sent ("Hi!")
 // @example val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
 // @example val res = udpRecvFrom(sock, buf)   // res["len"] == 3, res["addr"] == "127.0.0.1"
-export val udpRecvFrom = (fd: Int32, buf: UInt8[]): Json =>
+export val udpRecvFrom = (fd: Int32, buf: UInt8[]): Datagram | Null | Error =>
   lin_udp_recv_from(fd, buf)
 
 // Send the bytes in `buf` as a UDP datagram to `addr:port`.
@@ -63,38 +70,40 @@ export val udpRecvFrom = (fd: Int32, buf: UInt8[]): Json =>
 // @param port  the destination port.
 // @param buf   the bytes to send.
 // @returns the number of bytes sent, or an `Error` on failure.
-export val udpSendTo = (fd: Int32, addr: String, port: Int32, buf: UInt8[]): Json =>
+export val udpSendTo = (fd: Int32, addr: String, port: Int32, buf: UInt8[]): Int32 | Error =>
   lin_udp_send_to(fd, addr, port, buf)
 
 // Set or clear non-blocking mode on a UDP socket.
 // @param fd  the socket descriptor.
 // @param on  `true` for non-blocking, `false` for blocking.
 // @returns `Null` on success, or an `Error` on failure.
-export val udpSetNonblocking = (fd: Int32, on: Boolean): Json =>
+export val udpSetNonblocking = (fd: Int32, on: Boolean): Null | Error =>
   if on then lin_udp_set_nonblocking(fd, 1) else lin_udp_set_nonblocking(fd, 0)
 
 // Close a UDP socket.
 // @param fd  the socket descriptor to close.
-// @returns `Null` on success, or an `Error` on failure.
-export val udpClose = (fd: Int32): Json =>
+// @returns `Null` (always succeeds).
+export val udpClose = (fd: Int32): Null =>
   lin_udp_close(fd)
 
 // --- TCP ---
 // Listen for TCP connections on `port` on all interfaces.
 // @param port  the local port to listen on.
 // @returns the listening socket descriptor, or an `Error` if the listen failed.
-export val tcpListen = (port: Int32): Json =>
+export val tcpListen = (port: Int32): Int32 | Error =>
   lin_tcp_listen(port)
 
-// Accept the next pending connection on a listening socket (blocks until one arrives).
+// Accept the next pending connection on a listening socket (blocks until one arrives, unless the
+// listener is non-blocking).
 // @param fd  the listening socket descriptor from `tcpListen`.
-// @returns the connected client socket descriptor, or an `Error` on failure.
+// @returns a `TcpPeer` (`{ fd, addr, port }`) for the accepted connection, `Null` if non-blocking
+//   and none is pending, or an `Error` on failure.
 // @example val listener = tcpListen(8080)
 // @example val client = tcpAccept(listener)   // blocks until a connection arrives
 // @example val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
 // @example val n = tcpRecv(client, buf)
 // @example tcpSend(client, slice(buf, 0, n))  // echo it back (slice from std/array)
-export val tcpAccept = (fd: Int32): Json =>
+export val tcpAccept = (fd: Int32): TcpPeer | Null | Error =>
   lin_tcp_accept(fd)
 
 // Open a TCP connection to `host:port`.
@@ -106,34 +115,35 @@ export val tcpAccept = (fd: Int32): Json =>
 // @example val buf: UInt8[] = [0, 0, 0, 0]
 // @example val n = tcpRecv(fd, buf)       // bytes read; 0 = peer closed
 // @example tcpClose(fd)
-export val tcpConnect = (host: String, port: Int32): Json =>
+export val tcpConnect = (host: String, port: Int32): Int32 | Error =>
   lin_tcp_connect(host, port)
 
 // Receive bytes from a connected TCP socket into `buf`.
 // @param fd   the connected socket descriptor.
 // @param buf  the byte buffer to fill.
-// @returns the number of bytes received (0 at EOF), or an `Error` on failure.
-export val tcpRecv = (fd: Int32, buf: UInt8[]): Json =>
+// @returns the number of bytes received (0 at EOF), `Null` if non-blocking and nothing is pending,
+//   or an `Error` on failure.
+export val tcpRecv = (fd: Int32, buf: UInt8[]): Int32 | Null | Error =>
   lin_tcp_recv(fd, buf)
 
 // Send the bytes in `buf` over a connected TCP socket.
 // @param fd   the connected socket descriptor.
 // @param buf  the bytes to send.
 // @returns the number of bytes sent, or an `Error` on failure.
-export val tcpSend = (fd: Int32, buf: UInt8[]): Json =>
+export val tcpSend = (fd: Int32, buf: UInt8[]): Int32 | Error =>
   lin_tcp_send(fd, buf)
 
 // Set or clear non-blocking mode on a TCP socket.
 // @param fd  the socket descriptor.
 // @param on  `true` for non-blocking, `false` for blocking.
 // @returns `Null` on success, or an `Error` on failure.
-export val tcpSetNonblocking = (fd: Int32, on: Boolean): Json =>
+export val tcpSetNonblocking = (fd: Int32, on: Boolean): Null | Error =>
   if on then lin_tcp_set_nonblocking(fd, 1) else lin_tcp_set_nonblocking(fd, 0)
 
 // Close a TCP socket.
 // @param fd  the socket descriptor to close.
-// @returns `Null` on success, or an `Error` on failure.
-export val tcpClose = (fd: Int32): Json =>
+// @returns `Null` (always succeeds).
+export val tcpClose = (fd: Int32): Null =>
   lin_tcp_close(fd)
 
 // Wrap a connected TCP socket as a lazy byte stream.
