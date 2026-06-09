@@ -57,7 +57,22 @@ impl Checker {
         // Binary operands are never in tail position.
         let prev_tail = std::mem::replace(&mut self.in_tail_position, false);
         let typed_left = self.infer_expr(left)?;
-        let typed_right = self.infer_expr(right)?;
+        // Flow-narrowing across `&&` (short-circuit): the RIGHT operand of `a && b` is only
+        // evaluated when `a` is truthy, so a null/type test in `a` narrows the tested binding for
+        // `b` — exactly as it does in an `if` then-branch. `x != null && x.f()` must type-check
+        // (`x` is non-Null on the right of `&&`). Apply the test's "then" narrowing in a scope
+        // around the right operand, mirroring `infer_if`. (`||` does NOT narrow its right operand
+        // this way — there `a` was falsy — so this is `And`-only.)
+        let typed_right = if matches!(op, BinOp::And) {
+            let narrowing = self.null_test_narrowing(left);
+            self.env.push_scope();
+            self.apply_null_narrowing(&narrowing, true);
+            let r = self.infer_expr(right);
+            self.env.pop_scope();
+            r?
+        } else {
+            self.infer_expr(right)?
+        };
         self.in_tail_position = prev_tail;
 
         // Spec §21: a suffixless integer literal takes its context type. When one operand of

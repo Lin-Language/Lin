@@ -376,6 +376,12 @@ impl fmt::Display for Type {
                 write!(f, "]")
             }
             Type::Object { fields, .. } => {
+                if fields.is_empty() {
+                    // An empty object type (e.g. the `{}` arm of an index-map param union
+                    // `{ String: T } | {}`) renders as `{}`, not `{  }` — the latter reads as a
+                    // stray double space in a diagnostic.
+                    return write!(f, "{{}}");
+                }
                 write!(f, "{{ ")?;
                 for (i, (k, v)) in fields.iter().enumerate() {
                     if i > 0 {
@@ -413,6 +419,11 @@ impl fmt::Display for Type {
             Type::Iterator(inner) => write!(f, "Iterator<{}>", inner),
             Type::Shared(inner) => write!(f, "Shared<{}>", inner),
             Type::Stream(inner) => write!(f, "Stream<{}>", inner),
+            // `TypeVar(u32::MAX)` is the dynamic `Json` marker — render it as `Json`, not a raw id.
+            // Other ids are unresolved generic/inference variables; they render as `?T<id>` so the
+            // LSP's `clean_type_string` can assign distinct positional names (`T`/`U`/…) while
+            // deduping repeats of the same var.
+            Type::TypeVar(id) if *id == u32::MAX => write!(f, "Json"),
             Type::TypeVar(id) => write!(f, "?T{}", id),
             Type::Never => write!(f, "Never"),
             Type::Named(name) => write!(f, "{}", name),
