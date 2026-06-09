@@ -3072,14 +3072,20 @@ impl StreamSource for CsvRecordsSource {
                 Ok(Some(h)) => self.header = Some(h),
             }
         }
-        let header = match &self.header {
-            Some(h) => h.clone(),
-            None => return TaggedOutcome::Eof,
-        };
+        // No header (e.g. an empty stream that ended before yielding one) => Eof.
+        if self.header.is_none() {
+            return TaggedOutcome::Eof;
+        }
+        // Pull the row FIRST (needs &mut self), THEN borrow self.header (needs &self) for
+        // record_to_object. The two borrows no longer overlap, so the per-row header clone
+        // that previously only existed to bridge them is gone.
         match self.pull_record() {
             Err(m) => TaggedOutcome::Err(m),
             Ok(None) => TaggedOutcome::Eof,
-            Ok(Some(row)) => TaggedOutcome::Item(record_to_object(&header, &row)),
+            Ok(Some(row)) => {
+                let header = self.header.as_deref().unwrap();
+                TaggedOutcome::Item(record_to_object(header, &row))
+            }
         }
     }
     fn close(&mut self) {
