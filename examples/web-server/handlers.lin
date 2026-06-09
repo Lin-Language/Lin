@@ -19,7 +19,7 @@ export val getIndex = (req: Request, config: Config): Response =>
   }
   val html = render("examples/web-server/views/index.jinja", data)
   match html
-    has { "type": "error", message } => badRequest("template error: ${message}")
+    is Error => badRequest("template error: ${html["message"]}")
     else => text(200, html)
 
 // GET /api/status — a JSON health/status payload including the service name.

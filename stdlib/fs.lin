@@ -329,7 +329,7 @@ export val openRead = (path: String) =>
 // Pull the next chunk of bytes from a stream.
 // @param s  the stream to read from.
 // @returns a `UInt8[]` chunk, Null at end-of-stream, or an Error on a read failure.
-export val readChunk = (s: Stream): Json =>
+export val readChunk = (s: Stream): UInt8[] | Null | Error =>
   lin_stream_read(s)
 
 // Close a stream, releasing its underlying resource. Idempotent (safe to call more than once).

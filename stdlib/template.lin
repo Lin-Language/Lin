@@ -24,7 +24,7 @@ import foreign "lin-runtime"
 // @returns the rendered `String`, or an `Error` object `{ type, message }` on a syntax/render
 //   error.
 // @example renderWith("<h1>{{ t }}</h1>", { "t": "Hi" })  // "<h1>Hi</h1>"
-export val renderWith = (template: String, data: {  }): Json =>
+export val renderWith = (template: String, data: {  }): String | Error =>
   lin_template_render(template, data)
 
 // Read a template from `path` and render it, with full layout support: the template may
@@ -35,5 +35,5 @@ export val renderWith = (template: String, data: {  }): Json =>
 // @param data  the variables to render against.
 // @returns the rendered `String`, or an `Error` object `{ type, message }` on a missing file or a
 //   syntax/render error (discriminated via `is Error`).
-export val render = (path: String, data: {  }): Json =>
+export val render = (path: String, data: {  }): String | Error =>
   lin_template_render_path(path, data)
