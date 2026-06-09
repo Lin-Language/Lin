@@ -3,31 +3,82 @@
 std/fs — filesystem read, write, and directory operations.
 
 All operations are synchronous and blocking. Fallible calls return their value or an Error shape
-(`{ "type": "error", "message": ... }`) that you narrow with `is Error`; the predicates exists /
-isFile / isDir / isSymlink are total and return a plain Boolean. The `opts` Json argument on
-ls / mkdir / rm / writeJson selects a variant (`{ "recursive": true }`, `{ "parents": true }`,
-`{ "compact": true }`). For incremental reads, openRead returns a lazy byte Stream that
-std/stream builds its adapters on.
+(`{ "type": "error", "message": ... }`) that you narrow with `is Error`; the predicates exists,
+isFile, isDir, and isSymlink are total and return a plain Boolean. The `opts` Json argument on
+ls, mkdir, rm, and writeJson selects a variant via keys such as `{ recursive }`, `{ parents }`,
+or `{ compact }`. For incremental reads, openRead returns a lazy byte stream.
 
+```lin
 import { readFile, writeFile, readJson, ls, mkdir, exists, isFile, isDir } from "std/fs"
+```
 
 ## Reference
+
+#### `StatOpts`
+
+```lin
+type StatOpts = { "follow": Boolean | Null }
+```
+
+Option records for the filesystem operations. Every field is optional — an omitted key reads as
+`Null` (the same as not passing it), so `{}` and a partial literal like `{ "recursive": true }`
+are both accepted. Pass `null` (or, for `stat`, omit the argument) to take all defaults.
+
+#### `LsOpts`
+
+```lin
+type LsOpts = { "recursive": Boolean | Null }
+```
+
+
+#### `MkdirOpts`
+
+```lin
+type MkdirOpts = { "parents": Boolean | Null }
+```
+
+
+#### `RmOpts`
+
+```lin
+type RmOpts = { "recursive": Boolean | Null }
+```
+
+
+#### `WriteJsonOpts`
+
+```lin
+type WriteJsonOpts = { "compact": Boolean | Null }
+```
+
+
+#### `TempFileOpts`
+
+```lin
+type TempFileOpts = { "prefix": String | Null, "suffix": String | Null }
+```
+
 
 #### `readFile`
 
 ```lin
-val readFile = (path: String): Json
+val readFile = (path: String): String | Error
 ```
 
 Read the entire contents of a file as a UTF-8 string.
 - **`path`** — the file to read.
 - **Returns** the file contents as a String, or an Error if it cannot be read.
-- **Example:** val content = readFile("config.txt")   // String, or Error on failure
+
+**Example:**
+
+```lin
+val content = readFile("config.txt")   // String, or Error on failure
+```
 
 #### `writeFile`
 
 ```lin
-val writeFile = (path: String, content: String): Json
+val writeFile = (path: String, content: String): Null | Error
 ```
 
 Write `content` to `path`, truncating any existing file (creates it if absent).
@@ -38,7 +89,7 @@ Write `content` to `path`, truncating any existing file (creates it if absent).
 #### `appendFile`
 
 ```lin
-val appendFile = (path: String, content: String): Json
+val appendFile = (path: String, content: String): Null | Error
 ```
 
 Append `content` to the end of `path` (creates it if absent).
@@ -49,7 +100,7 @@ Append `content` to the end of `path` (creates it if absent).
 #### `readLines`
 
 ```lin
-val readLines = (path: String): Json
+val readLines = (path: String): String[] | Error
 ```
 
 Read a file and split it into an array of lines (line terminators removed).
@@ -59,26 +110,36 @@ Read a file and split it into an array of lines (line terminators removed).
 #### `readJson`
 
 ```lin
-val readJson = (path: String): Json
+val readJson = (path: String): Json | Error
 ```
 
 Read a file and parse its contents as JSON.
 - **`path`** — the file to read.
 - **Returns** the parsed Json value, or an Error if the file cannot be read or is not valid JSON.
-- **Example:** val data = readJson("config.json")   // then data["version"], or Error on failure
+
+**Example:**
+
+```lin
+val data = readJson("config.json")   // then data["version"], or Error on failure
+```
 
 #### `writeJson`
 
 ```lin
-val writeJson = (path: String, value: Json, opts: Json): Json
+val writeJson = (path: String, value: Json, opts: WriteJsonOpts | Null): Null | Error
 ```
 
 Serialise `value` to JSON and write it to `path`, truncating any existing file.
 - **`path`** — the file to write.
 - **`value`** — the Json value to serialise.
-- **`opts`** — optional; pass `{ "compact": true }` for minified output (default is pretty-printed).
+- **`opts`** — accepts `{ compact }`; when true, output is minified rather than pretty-printed.
 - **Returns** Null on success, or an Error if the write fails.
-- **Example:** writeJson("config.json", { "version": 2 }, { "compact": true })
+
+**Example:**
+
+```lin
+writeJson("config.json", { "version": 2 }, { "compact": true })
+```
 
 #### `exists`
 
@@ -110,65 +171,108 @@ Test whether `path` exists and is a directory (follows symlinks).
 - **`path`** — the path to test.
 - **Returns** true if it is a directory, false otherwise. Total — never fails.
 
+#### `FileStat`
+
+```lin
+type FileStat = { "size": Int64, "modified": Int64, "created": Int64, "isFile": Boolean, "isDir": Boolean, "isSymlink": Boolean, "mode": Int32 }
+```
+
+Filesystem metadata for a path: byte size, modified/created times (Unix ms), the file-kind
+flags, and the Unix permission bits in `mode` (0 on non-Unix). Every field is always present.
+
 #### `stat`
 
 ```lin
-val stat = (path: String, opts: Json = null): Json
+val stat = (path: String, opts: StatOpts | Null = null): FileStat | Error
 ```
 
 Read filesystem metadata for `path`, following symlinks by default (reports the target).
 - **`path`** — the path to stat.
-- **`opts`** — optional; `{ "follow": false }` reports the final symlink itself (equivalent to
-  `lstat`). One-argument calls keep following.
-- **Returns** a Json metadata object, or an Error if the path cannot be read. The object carries
-  `size` (bytes), `modified`/`created` (Unix ms), `isFile`, `isDir`, and `mode` (Unix perm bits).
-- **Example:** stat("main.lin")["size"]   // file size in bytes
+- **`opts`** — accepts `{ follow }`, default true; `{ follow: false }` reports the final symlink
+  itself rather than following it (equivalent to `lstat`).
+- **Returns** a `FileStat`, or an Error if the path cannot be read.
+
+**Example:**
+
+```lin
+stat("main.lin")["size"]   // file size in bytes
+```
 
 #### `ls`
 
 ```lin
-val ls = (path: String, opts: Json): Json
+val ls = (path: String, opts: LsOpts | Null): String[] | Error
 ```
 
 List the entries of a directory.
 - **`path`** — the directory to list.
-- **`opts`** — optional; `{ "recursive": true }` walks the whole tree (default lists one level).
+- **`opts`** — accepts `{ recursive }`; when true, walks the whole tree instead of one level.
 - **Returns** an array of entry paths, or an Error if `path` cannot be read.
-- **Example:** ls("src", {})                       // one level
-- **Example:** ls("src", { "recursive": true })    // whole tree, relative paths
+
+**Example:**
+
+```lin
+ls("src", {})                       // one level
+```
+
+**Example:**
+
+```lin
+ls("src", { "recursive": true })    // whole tree, relative paths
+```
 
 #### `mkdir`
 
 ```lin
-val mkdir = (path: String, opts: Json): Json
+val mkdir = (path: String, opts: MkdirOpts | Null): Null | Error
 ```
 
 Create the directory `path`.
 - **`path`** — the directory to create.
-- **`opts`** — optional; `{ "parents": true }` creates missing parent directories too (and
+- **`opts`** — accepts `{ parents }`; when true, creates missing parent directories too (and
   succeeds if the directory already exists).
 - **Returns** Null on success, or an Error (e.g. a missing parent without `parents`).
-- **Example:** mkdir("output", {})
-- **Example:** mkdir("output/reports/2024", { "parents": true })
+
+**Example:**
+
+```lin
+mkdir("output", {})
+```
+
+**Example:**
+
+```lin
+mkdir("output/reports/2024", { "parents": true })
+```
 
 #### `rm`
 
 ```lin
-val rm = (path: String, opts: Json): Json
+val rm = (path: String, opts: RmOpts | Null): Null | Error
 ```
 
 Remove the file or directory at `path`.
 - **`path`** — the path to remove.
-- **`opts`** — optional; `{ "recursive": true }` removes a directory and its contents (a
+- **`opts`** — accepts `{ recursive }`; when true, removes a directory and its contents (a
   non-recursive call on a non-empty directory is an Error).
 - **Returns** Null on success, or an Error.
-- **Example:** rm("temp.txt", {})
-- **Example:** rm("build/", { "recursive": true })
+
+**Example:**
+
+```lin
+rm("temp.txt", {})
+```
+
+**Example:**
+
+```lin
+rm("build/", { "recursive": true })
+```
 
 #### `cp`
 
 ```lin
-val cp = (src: String, dst: String): Json
+val cp = (src: String, dst: String): Null | Error
 ```
 
 Copy a file from `src` to `dst`, overwriting `dst` if it exists.
@@ -179,7 +283,7 @@ Copy a file from `src` to `dst`, overwriting `dst` if it exists.
 #### `mv`
 
 ```lin
-val mv = (src: String, dst: String): Json
+val mv = (src: String, dst: String): Null | Error
 ```
 
 Move (rename) a file or directory from `src` to `dst`.
@@ -190,7 +294,7 @@ Move (rename) a file or directory from `src` to `dst`.
 #### `readFileBytes`
 
 ```lin
-val readFileBytes = (path: String): Json
+val readFileBytes = (path: String): UInt8[] | Error
 ```
 
 Read the entire contents of a file as raw bytes.
@@ -200,7 +304,7 @@ Read the entire contents of a file as raw bytes.
 #### `writeFileBytes`
 
 ```lin
-val writeFileBytes = (path: String, bytes: UInt8[]): Json
+val writeFileBytes = (path: String, bytes: UInt8[]): Null | Error
 ```
 
 Write raw bytes to `path`, truncating any existing file (creates it if absent).
@@ -211,15 +315,13 @@ Write raw bytes to `path`, truncating any existing file (creates it if absent).
 #### `writeLines`
 
 ```lin
-val writeLines = (path: String, lines: String[]): Json
+val writeLines = (path: String, lines: String[]): Null | Error
 ```
 
 Write an array of lines to `path` (each followed by a newline), truncating any existing file.
 - **`path`** — the file to write.
 - **`lines`** — the lines to write, without terminators.
 - **Returns** Null on success, or an Error if the write fails.
-
-### std/fs extras (fsextras proposal): glob, temp files/dirs, chmod, symlinks, touch, realpath.
 
 #### `glob`
 
@@ -235,12 +337,12 @@ Expand a shell-glob pattern (`**`/`*`/`?`/`[…]`) to the matching paths, sorted
 #### `tempFile`
 
 ```lin
-val tempFile = (opts: Json): String | Error
+val tempFile = (opts: TempFileOpts | Null): String | Error
 ```
 
-Create a unique, empty 0600 temp file and return its absolute path. Performs NO cleanup (delete
+Create a unique, empty 0600 temp file and return its absolute path. Performs no cleanup (delete
 it with `rm`); prefer withTempFile unless the file must outlive a single lexical scope.
-- **`opts`** — optional; may carry `{ "prefix": "...", "suffix": ".ext" }` for the generated name.
+- **`opts`** — accepts `{ prefix, suffix }` to shape the generated name (e.g. a `.ext` suffix).
 - **Returns** the new file's absolute path, or an Error if it cannot be created.
 
 #### `tempDir`
@@ -249,15 +351,15 @@ it with `rm`); prefer withTempFile unless the file must outlive a single lexical
 val tempDir = (): String | Error
 ```
 
-Create a unique temp directory and return its absolute path. Performs NO cleanup (delete it with
+Create a unique temp directory and return its absolute path. Performs no cleanup (delete it with
 `rm(dir, { "recursive": true })`); prefer withTempDir for scoped use. Distinct from
-`std/process.tempDir`, which reports the system temp LOCATION and creates nothing.
+`std/process.tempDir`, which reports the system temp location and creates nothing.
 - **Returns** the new directory's absolute path, or an Error if it cannot be created.
 
 #### `withTempFile`
 
 ```lin
-val withTempFile = <R>(fn: (String)
+val withTempFile = <R>(fn: (String) => R): R | Error
 ```
 
 Create a fresh temp file, run `fn` with its path, then delete the file. Mirrors the
@@ -269,7 +371,7 @@ withLock/withFixture scoped-resource idiom.
 #### `withTempDir`
 
 ```lin
-val withTempDir = <R>(fn: (String)
+val withTempDir = <R>(fn: (String) => R): R | Error
 ```
 
 Create a fresh temp directory, run `fn` with its path, then recursively delete the whole tree.
@@ -306,7 +408,7 @@ Create a symbolic link at `linkPath` pointing at `target`. Argument order matche
 val readlink = (path: String): String | Error
 ```
 
-Read the target string stored in a symbolic link (verbatim, NOT resolved — use realpath for that).
+Read the target string stored in a symbolic link (verbatim, not resolved — use realpath for that).
 - **`path`** — the symlink to read.
 - **Returns** the stored target String, or an Error if `path` is not a symlink or does not exist.
 
@@ -324,13 +426,13 @@ Test whether `path` is itself a symbolic link (does not follow it).
 #### `lstat`
 
 ```lin
-val lstat = (path: String): Json
+val lstat = (path: String): FileStat | Error
 ```
 
-Read filesystem metadata for `path` WITHOUT following a final symlink (reports the link itself,
+Read filesystem metadata for `path` without following a final symlink (reports the link itself,
 with `isSymlink: true`). Exactly `stat(p, { "follow": false })`.
 - **`path`** — the path to stat.
-- **Returns** a Json metadata object, or an Error if the path cannot be read.
+- **Returns** a `FileStat`, or an Error if the path cannot be read.
 
 #### `touch`
 
@@ -360,15 +462,15 @@ counterpart to the pure-string `std/path.resolve`.
 val openRead = (path: String)
 ```
 
-Open a file as a lazy byte Stream for incremental reading. The low-level pull surface that
-std/stream builds its lazy adapters on (Stage 4); use readChunk / closeStream to drive it.
+Open a file as a lazy byte stream for incremental reading. The low-level pull surface that
+std/stream builds its lazy adapters on; use readChunk and closeStream to drive it.
 - **`path`** — the file to open.
 - **Returns** a `Stream<UInt8[]>`, or an Error if the file cannot be opened.
 
 #### `readChunk`
 
 ```lin
-val readChunk = (s: Stream): Json
+val readChunk = (s: Stream): UInt8[] | Null | Error
 ```
 
 Pull the next chunk of bytes from a stream.

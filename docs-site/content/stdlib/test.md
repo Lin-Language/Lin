@@ -2,9 +2,11 @@
 
 std/test — a lightweight test framework. Tests are plain Lin values — no magic, no macros.
 
-  import { suite, test, run, expect } from "std/test"
+```lin
+import { suite, test, run, expect } from "std/test"
+```
 
-A test body RETURNS an array of assertions (`Assertion[]`) — even a single assertion is written
+A test body returns an array of assertions (`Assertion[]`) — even a single assertion is written
 `[ expect(...).toBe(...) ]`. The array requirement is type-enforced, which is what guarantees
 every assertion is actually evaluated. Build tests with `test(name, () => [...])`, group them
 with `suite(name, tests)`, then run them: `run` prints a summary and `exit(1)`s if any test
@@ -19,8 +21,8 @@ Lifecycle without keywords: a module-scope `val` above the suite is "beforeAll" 
 eagerly as the suite array is built); statements after `report(suite)` are "afterAll";
 `withFixture(setup, teardown, name, body)` is per-test "beforeEach/afterEach" with dependency
 injection — compose it via partial application, e.g. `val withDb = withFixture(openDb, closeDb,)`.
-Mocking is the test-only `replace <name> = <expr>` statement (see std-level docs / the Testing
-tutorial), permitted only in a `*.test.lin`.
+Mocking is the test-only `replace <name> = <expr>` statement (see the Testing tutorial),
+permitted only in a `*.test.lin`.
 
 ## Reference
 
@@ -45,8 +47,18 @@ Assert the asserter's value equals `expected` (structural `==`).
 - **`asserter`** — the asserter from `expect`.
 - **`expected`** — the value it should equal.
 - **Returns** a passing assertion, or a failing one carrying the expected/actual pair.
-- **Example:** expect(1 + 2).toBe(3)
-- **Example:** expect("hi".toUpper()).toBe("HI")
+
+**Example:**
+
+```lin
+expect(1 + 2).toBe(3)
+```
+
+**Example:**
+
+```lin
+expect("hi".toUpper()).toBe("HI")
+```
 
 #### `toBeNull`
 
@@ -104,7 +116,7 @@ Assert the asserter's value is a failure result whose `error` equals `message`.
 #### `test`
 
 ```lin
-val test = (name: String, body: ()
+val test = (name: String, body: () => Json[]): Json
 ```
 
 Define a test: eagerly run its body and store the result alongside the name.
@@ -112,22 +124,22 @@ Define a test: eagerly run its body and store the result alongside the name.
 - **`body`** — a thunk returning an `Assertion[]` (use the `[ expect(...).toBe(...), ... ]` form,
   even for a single assertion); every assertion is evaluated and the test fails if any fails.
 - **Returns** a result record. When `--filter-test` (via LIN_TEST_ONLY) did not select this test, the
-  body is NOT evaluated (no side effects, no fixture setup/teardown) and a `{ "type": "skip" }`
+  body is not evaluated (no side effects, no fixture setup/teardown) and a `{ "type": "skip" }`
   sentinel is produced, which `report` counts as neither pass nor fail.
 
 #### `withFixture`
 
 ```lin
-val withFixture = (setup: ()
+val withFixture = (setup: () => Json, teardown: (Json) => Null, name: String, body: (Json) => Json[]): Json
 ```
 
-Run a test with per-test setup/teardown and dependency injection (ADR-046): build a fixture,
-inject it into the body, and tear it down — all within a single `test`. The functional
-alternative to keyword beforeEach/afterEach; compose via partial application into a per-fixture
-helper, e.g. `val withDb = withFixture(openDb, closeDb,)`, then `withDb("name", db => [ ... ])`.
+Run a test with per-test setup/teardown and dependency injection: build a fixture, inject it into
+the body, and tear it down — all within a single `test`. The functional alternative to keyword
+beforeEach/afterEach; compose via partial application into a per-fixture helper, e.g.
+`val withDb = withFixture(openDb, closeDb,)`, then `withDb("name", db => [ ... ])`.
 - **`setup`** — builds the fixture value.
 - **`teardown`** — releases the fixture; always runs, even when the body's assertions fail (because
-  assertion failures are VALUES, not exceptions).
+  assertion failures are values, not exceptions).
 - **`name`** — the test name.
 - **`body`** — receives the fixture and returns an `Assertion[]`.
 - **Returns** the test result record (same as `test`).
@@ -149,7 +161,7 @@ Group test results into a named suite for `report`/`run`.
 val report = (s: Json): Int32
 ```
 
-Print a suite's results and return the failure count. Unlike `run`, does NOT call `exit`, so
+Print a suite's results and return the failure count. Unlike `run`, does not call `exit`, so
 statements after it run regardless of outcome — the building block for guaranteed afterAll
 teardown: `val failures = report(s); cleanup(); if failures > 0 then exit(1)`.
 - **`s`** — the suite from `suite`.

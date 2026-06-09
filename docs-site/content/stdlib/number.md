@@ -9,7 +9,9 @@ try-variants. `toInt32`/`toFloat64`/`toFloat32` convert between the numeric type
 widening). The fixed-width casts (toUInt8/toInt8/…/toUInt64) take a UInt64 and truncate/reinterpret
 to the target width — the building blocks for the bit-level packing in std/bytes.
 
+```lin
 import { parseInt32, parseFloat64, toInt32, toFloat64, isInt32, isFloat64 } from "std/number"
+```
 
 ## Reference
 
@@ -23,7 +25,12 @@ Parse `s` as a base-10 Int32.
 - **`s`** — the string to parse.
 - **Returns** the parsed integer. Runtime error if unparseable or out of Int32 range — use
   `tryParseInt32` for safe parsing.
-- **Example:** parseInt32("42")   // 42
+
+**Example:**
+
+```lin
+parseInt32("42")   // 42
+```
 
 #### `parseFloat64`
 
@@ -34,7 +41,12 @@ val parseFloat64 = (s: String): Float64
 Parse `s` as a Float64.
 - **`s`** — the string to parse.
 - **Returns** the parsed floating-point value.
-- **Example:** parseFloat64("1e10")   // 10000000000.0
+
+**Example:**
+
+```lin
+parseFloat64("1e10")   // 10000000000.0
+```
 
 #### `toInt32`
 
@@ -45,7 +57,12 @@ val toInt32 = (v: Float64): Int32
 Convert a Float64 to an Int32 by truncation toward zero.
 - **`v`** — the float to convert.
 - **Returns** the truncated Int32. Runtime error if `v` cannot be represented as an Int32.
-- **Example:** toInt32(3.9)   // 3
+
+**Example:**
+
+```lin
+toInt32(3.9)   // 3
+```
 
 #### `toFloat64`
 
@@ -56,7 +73,12 @@ val toFloat64 = (v: Int32): Float64
 Widen an Int32 to a Float64.
 - **`v`** — the integer to convert.
 - **Returns** the equivalent Float64 (always exact).
-- **Example:** toFloat64(42)   // 42.0
+
+**Example:**
+
+```lin
+toFloat64(42)   // 42.0
+```
 
 #### `toFloat32`
 
@@ -74,15 +96,19 @@ Narrow a Float64 to a Float32.
 val toUInt8 = (v: UInt64): UInt8
 ```
 
-Explicit narrowing integer casts (spec §26). Each truncates the input to the target width
-using two's-complement / `as`-cast semantics. The input is taken as UInt64 (the widest
-unsigned) so any narrower unsigned integer — or a value masked down to a byte/word — widens
-into it at the call site without range loss; truncation to the target width is then well
-defined.
+Explicit narrowing integer casts. Each truncates its input to the target width using
+two's-complement semantics. The input is taken as a UInt64 (the widest unsigned type) so any
+narrower unsigned integer — or a value masked down to a byte or word — widens into it at the
+call site without losing range; truncation to the target width is then well defined.
 Truncate `v` to a UInt8.
 - **`v`** — the value to narrow (taken as UInt64).
 - **Returns** the low 8 bits of `v` as a UInt8.
-- **Example:** toUInt8(0x1FF)   // 255  (low 8 bits)
+
+**Example:**
+
+```lin
+toUInt8(0x1FF)   // 255  (low 8 bits)
+```
 
 #### `toInt8`
 
@@ -174,7 +200,12 @@ Parse `s` to an Int32, narrowing to `null` on failure so callers can test with a
 `== null` / `is Int32` instead of an untyped `Json` read.
 - **`s`** — the string to parse.
 - **Returns** the parsed Int32, or `null` if `s` is not a valid integer.
-- **Example:** tryParseInt32("bad")   // null
+
+**Example:**
+
+```lin
+tryParseInt32("bad")   // null
+```
 
 #### `tryParseFloat64`
 

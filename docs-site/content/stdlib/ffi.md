@@ -10,9 +10,9 @@ and read/write fixed-layout structs returned through a C `void*`.
 scalar, so a `Ptr` value is never refcounted and can be passed straight back into another
 foreign function.
 
-LIFETIME: prefer `withCstr` — it allocates a C string, runs your callback with it, then frees
-it, so you never leak. Use the bare `cstr`/`free` pair only when the C API RETAINS the pointer
-and you must manage its lifetime explicitly. (`cstr` alone does not free — see ffi.rs.)
+On lifetimes: prefer `withCstr` — it allocates a C string, runs your callback with it, then
+frees it, so you never leak. Use the bare `cstr`/`free` pair only when the C API retains the
+pointer and you must manage its lifetime explicitly (`cstr` alone does not free).
 
 ## Reference
 
@@ -24,23 +24,27 @@ val cstr = (s: String): Ptr
 
 Allocate a NUL-terminated C-string copy of `s`.
 - **`s`** — the string to copy into C memory.
-- **Returns** a `Ptr` to the buffer. NOT freed for you — pair with `free` (or prefer `withCstr`)
-  unless the C API takes ownership of the pointer.
+- **Returns** a `Ptr` to the buffer. This is not freed for you — pair it with `free` (or prefer
+  `withCstr`) unless the C API takes ownership of the pointer.
 
 #### `withCstr`
 
 ```lin
-val withCstr = <T>(s: String, body: (Ptr)
+val withCstr = <T>(s: String, body: (Ptr) => T): T
 ```
 
-Run `body` with a scoped, auto-freed C-string copy of `s`. The recommended, leak-free idiom for
-the common "C copies the string during the call" case, e.g.
-  withCstr(title, (p) => SDL_CreateWindow(p, 320, 240, 0))
+Run `body` with a scoped, auto-freed C-string copy of `s`. This is the recommended, leak-free
+idiom for the common case where C copies the string during the call.
 - **`s`** — the string to copy into C memory for the duration of `body`.
 - **`body`** — callback receiving the `Ptr` to the C string.
-- **Returns** whatever `body` returned. The buffer is freed after `body` returns.
-  CAVEAT: Lin has no try/finally, so a faulting callback leaks the buffer (accepted for this
-  prototype).
+- **Returns** whatever `body` returned. The buffer is freed after `body` returns. Note that Lin has
+  no try/finally, so a faulting callback leaks the buffer (accepted for this prototype).
+
+**Example:**
+
+```lin
+withCstr(title, (p) => SDL_CreateWindow(p, 320, 240, 0))
+```
 
 #### `alloc`
 

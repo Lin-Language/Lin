@@ -1,25 +1,30 @@
 # std/encoding
 
-std/encoding — byte/text transport codecs: Base64 (standard + URL-safe), hex,
+std/encoding — byte/text transport codecs: Base64 (standard and URL-safe), hex,
 URL/percent encoding, and query-string parse/build.
 
-These sit on the seam between `UInt8[]` byte buffers (std/bytes, §35.1) and `String`
-text. Following the std/bytes precedent the codecs are pure Lin over the bitwise
-operators (§35.2) and the std/number narrowing casts (§26); the one capability that
-cannot be expressed in Lin — validated UTF-8 bytes → String — is borrowed from
-std/string.fromUtf8 (a shared runtime primitive, not a codec-specific intrinsic).
+These sit on the seam between `UInt8[]` byte buffers (std/bytes) and `String` text.
 
-Encoding never fails. Decoding is fallible: malformed Base64/hex/percent input returns
-the standard Error shape `{ "type": "error", "message": String }`, matched with
-`is Error` (the Error arm comes first in a match). The Base64 and hex alphabets and
-output are pure ASCII, so output strings are assembled with `fromCodePoints` (sound
-because codepoint == byte for ASCII); decoding scans input bytes with the O(1) `byteAt`
-primitive (NOT codePointAt-in-a-loop, which would be O(n²)). Lin has no imperative
-`while`, so the byte scans are written as tail-recursive helpers over a byte index.
+Encoding never fails. Decoding is fallible: malformed Base64, hex, or percent input returns
+the standard Error shape `{ "type": "error", "message": String }`, matched with `is Error`.
+The Base64 and hex alphabets and output are pure ASCII.
 
-Structural URL parsing (scheme/host/path/fragment) is out of scope — see std/url.
+Structural URL parsing (scheme, host, path, fragment) is out of scope — see std/url.
 
 ## Reference
+
+### shared tables
+
+#### `utf8Bytes`
+
+```lin
+val utf8Bytes = (s: String): UInt8[]
+```
+
+UTF-8-encode a string to its byte buffer — the inverse of `std/string.fromUtf8`. This is the
+String to UInt8[] companion to the byte/text codecs here.
+- **`s`** — the text to encode.
+- **Returns** the UTF-8 bytes of `s`.
 
 ### base64
 
@@ -39,7 +44,7 @@ Encode bytes as standard Base64 (RFC 4648 §4, `+`/`/` alphabet) with `=` paddin
 val base64UrlEncode = (bytes: UInt8[]): String
 ```
 
-Encode bytes as URL-safe Base64 (RFC 4648 §5, `-`/`_` alphabet) WITHOUT padding. Never fails.
+Encode bytes as URL-safe Base64 (RFC 4648 §5, `-`/`_` alphabet) without padding. Never fails.
 - **`bytes`** — the bytes to encode.
 - **Returns** the URL-safe Base64 string.
 
@@ -83,8 +88,8 @@ Encode bytes as lower-case hex, two chars per byte, most-significant nibble firs
 val hexDecode = (s: String): UInt8[] | Error
 ```
 
-Decode a hex string back to bytes. Accepts upper- and lower-case; does NOT skip whitespace or
-accept a `0x` prefix.
+Decode a hex string back to bytes. Accepts upper- and lower-case; it does not skip whitespace
+or accept a `0x` prefix.
 - **`s`** — the hex string to decode.
 - **Returns** the decoded bytes, or an Error on odd length or any non-hex character.
 
@@ -96,9 +101,9 @@ accept a `0x` prefix.
 val urlEncode = (s: String): String
 ```
 
-Percent-encode `s` as a URI COMPONENT (RFC 3986): the strict, maximal-escaping component
+Percent-encode `s` as a URI component (RFC 3986): the strict, maximal-escaping component
 encoder, safe for both path segments and query values. Every UTF-8 byte is escaped to %XX
-(upper-case hex) except the unreserved set; space becomes %20 (NOT +).
+(upper-case hex) except the unreserved set; space becomes %20, not `+`.
 - **`s`** — the text to encode.
 - **Returns** the percent-encoded string.
 
@@ -135,8 +140,8 @@ val buildQuery = (params: { String: String[] }): String
 ```
 
 Serialize a multimap back to a query string: each key paired with each value (`k=v1&k=v2`), keys
-and values percent-encoded with the component rules PLUS the form convention of encoding space as
-`+`. Inverse of parseQuery (up to key/iteration order). No leading `?` is emitted.
+and values percent-encoded with the component rules plus the form convention of encoding space as
+`+`. This is the inverse of parseQuery (up to key/iteration order). No leading `?` is emitted.
 - **`params`** — the multimap of keys to value lists.
 - **Returns** the query string, or "" for an empty map.
 
@@ -160,7 +165,7 @@ val base64DecodeString = (s: String): String | Error
 
 Standard Base64 decode, then UTF-8 decode the bytes back to a String.
 - **`s`** — the Base64 string to decode.
-- **Returns** the decoded text, or an Error on malformed Base64 OR invalid UTF-8.
+- **Returns** the decoded text, or an Error on malformed Base64 or invalid UTF-8.
 
 ### structural hash
 
@@ -171,17 +176,47 @@ val hash = <T>(x: T): String
 ```
 
 Compute a stable, canonical, type-tagged structural hash key for any value. The key matches
-Lin's structural equality (spec §14): equal values hash equal, objects hash independently of
-key order, and arrays hash order-sensitively. The type tag means values of different types
-never collide — `hash(42)` is `"i:42"` while `hash("42")` is `"s:42"`. Use it to deduplicate
-values or index them by structural identity (e.g. as object keys in a hand-rolled set/map, or
-to bucket structurally-equal records with std/array's `countBy`). Generic over the input type —
-it walks the runtime value, so T can be anything. (Folded in from the former std/hash module.)
+Lin's structural equality: equal values hash equal, objects hash independently of key order,
+and arrays hash order-sensitively. The type tag means values of different types never collide —
+`hash(42)` is `"i:42"` while `hash("42")` is `"s:42"`. Use it to deduplicate values or index
+them by structural identity (for example, as object keys in a hand-rolled set or map, or to
+bucket structurally-equal records with std/array's `countBy`). It is generic over the input
+type and walks the runtime value, so `T` can be anything.
 - **`x`** — the value to hash.
 - **Returns** the structural hash key as a String.
-- **Example:** hash(null)     // "N"
-- **Example:** hash(42)       // "i:42"
-- **Example:** hash("hello")  // "s:hello"
-- **Example:** hash([1, 2, 3]) == hash([1, 2, 3])   // true (order-sensitive: [1,2] != [2,1])
-- **Example:** hash({ "x": 1, "y": 2 }) == hash({ "y": 2, "x": 1 })   // true (order-independent)
-- **Example:** hash(42) == hash("42")   // false (type-tagged: never collides across types)
+
+**Example:**
+
+```lin
+hash(null)     // "N"
+```
+
+**Example:**
+
+```lin
+hash(42)       // "i:42"
+```
+
+**Example:**
+
+```lin
+hash("hello")  // "s:hello"
+```
+
+**Example:**
+
+```lin
+hash([1, 2, 3]) == hash([1, 2, 3])   // true (order-sensitive: [1,2] != [2,1])
+```
+
+**Example:**
+
+```lin
+hash({ "x": 1, "y": 2 }) == hash({ "y": 2, "x": 1 })   // true (order-independent)
+```
+
+**Example:**
+
+```lin
+hash(42) == hash("42")   // false (type-tagged: never collides across types)
+```

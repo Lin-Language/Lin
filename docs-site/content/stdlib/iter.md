@@ -12,43 +12,50 @@ terms):
 A handful of combinators are terminals — `reduce`, `for`, `while`, `find`, `some`, `every`. Over
 an array they return their plain result; over a stream they drive the pipeline to completion and
 gain an `| Error` arm, because a stream read can fail mid-traversal. The same chain that runs
-eagerly over an array runs lazily over a stream, just because the receiver is a `Stream`; over a
+eagerly over an array runs lazily over a stream, just because the receiver is a `Stream`. Over a
 stream a combinator consumes its input, so using the same stream value twice is a compile error.
 
-Every combinator callback OPTIONALLY receives a trailing 0-based `Int32` source index (the JS
-`forEach((item, idx) => …)` model); a 1-arg callback stays valid (opt-in by arity). For `reduce`
-the index is the third parameter `(acc, item, i)`. The index is always the source position. The
-key-extractor combinators (sortBy/minBy/maxBy/groupBy/countBy, in std/array) take no index.
+Every combinator callback optionally receives a trailing 0-based `Int32` source index (the JS
+`forEach((item, idx) => …)` model); a 1-arg callback stays valid. For `reduce` the index is the
+third parameter `(acc, item, i)`. The index is always the source position. The key-extractor
+combinators (sortBy/minBy/maxBy/groupBy/countBy, in std/array) take no index.
 
+```lin
 import { map, filter, reduce, take, drop } from "std/iter"
 import { range, rangeStep, iter, iterOf } from "std/iter"
+```
 
 Array-shaped operations (push, slice, sort, sum, …) live in std/array; stream sources and sinks
 (readStream, writeStream, lines, drain, …) live in std/stream. The combinators here are the single
 vocabulary that spans all three.
 
-v1 limitation: lazy dispatch fires at a concrete combinator call with a `Stream` receiver. A
-stream passed through a user-defined generic `Iterable` parameter stays array-shaped (eager)
-inside that function — the safe resolution.
+Lazy dispatch fires at a concrete combinator call with a `Stream` receiver. A stream passed
+through a user-defined generic `Iterable` parameter stays array-shaped (eager) inside that
+function.
 
 ## Reference
 
 #### `for`
 
 ```lin
-val for = (iterable: Json, f: (Json, Int32)
+val for = <T>(iterable: T[] | Iterator | Stream | Null, f: (T, Int32) => Json): Null
 ```
 
 Run `f` over every item of any iterable (the universal iteration driver). For side effects only.
-- **`iterable`** — any Array, Iterator, or Stream.
+- **`iterable`** — an Array, Iterator, or Stream of `T`.
 - **`f`** — callback `(item, index?) => …`; the trailing 0-based `Int32` index is optional.
 - **Returns** `null`.
-- **Example:** [1, 2, 3].for(x => print(x))
+
+**Example:**
+
+```lin
+[1, 2, 3].for(x => print(x))
+```
 
 #### `while`
 
 ```lin
-val while = <T>(arr: T[] | Iterator | Stream, f: (T, Int32)
+val while = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean)
 ```
 
 Pull items while `f` returns `true`, stopping at the first `false` (or at exhaustion). For side
@@ -56,7 +63,12 @@ effects / short-circuiting; the per-item value is not collected.
 - **`arr`** — an Array, Iterator, or Stream.
 - **`f`** — predicate `(item, index?) => Boolean`; iteration continues while it returns `true`.
 - **Returns** `null` for an Array/Iterator; `Null | Error` over a Stream, where a read fault surfaces in-band.
-- **Example:** [1, 2, -3, 4].while(x => x >= 0)   // visits 1, 2, stops at -3
+
+**Example:**
+
+```lin
+[1, 2, -3, 4].while(x => x >= 0)   // visits 1, 2, stops at -3
+```
 
 #### `range`
 
@@ -68,8 +80,18 @@ Build the ascending integer sequence `[start, start+1, …, end-1]` (half-open; 
 - **`start`** — the first value (inclusive).
 - **`end`** — the upper bound (exclusive).
 - **Returns** an `Int32[]` of the range.
-- **Example:** range(0, 5).for(i => print(i))    // 0 1 2 3 4
-- **Example:** range(1, 6).map(i => i * i)        // [1, 4, 9, 16, 25]
+
+**Example:**
+
+```lin
+range(0, 5).for(i => print(i))    // 0 1 2 3 4
+```
+
+**Example:**
+
+```lin
+range(1, 6).map(i => i * i)        // [1, 4, 9, 16, 25]
+```
 
 #### `rangeStep`
 
@@ -82,8 +104,18 @@ Build an integer sequence from `start` toward `end` (exclusive) advancing by `st
 - **`end`** — the bound (exclusive).
 - **`step`** — the increment; positive counts up, negative counts down, `0` yields an empty sequence.
 - **Returns** an iterator over the stepped range.
-- **Example:** rangeStep(0, 10, 2).for(i => print(i))   // 0, 2, 4, 6, 8
-- **Example:** rangeStep(5, 0, -1).map(i => i)           // [5, 4, 3, 2, 1]
+
+**Example:**
+
+```lin
+rangeStep(0, 10, 2).for(i => print(i))   // 0, 2, 4, 6, 8
+```
+
+**Example:**
+
+```lin
+rangeStep(5, 0, -1).map(i => i)           // [5, 4, 3, 2, 1]
+```
 
 #### `iterOf`
 
@@ -94,7 +126,12 @@ val iterOf = (arr: Json)
 Build an opaque Iterator that yields the elements of `arr` in order.
 - **`arr`** — the backing array (its element type is recovered at the consuming combinator, not pinned here).
 - **Returns** an Iterator over `arr`'s elements.
-- **Example:** val it = iterOf([10, 20, 30]); it.for(x => print(x))   // prints 10, 20, 30
+
+**Example:**
+
+```lin
+val it = iterOf([10, 20, 30]); it.for(x => print(x))   // prints 10, 20, 30
+```
 
 #### `iter`
 
@@ -108,7 +145,12 @@ Build a custom Iterator from explicit state-machine closures.
 - **`next`** — `(state) => state'` advancing to the next state.
 - **`value`** — `(state) => item` projecting the current state to its yielded element.
 - **Returns** an Iterator driven by those closures.
-- **Example:** iter(() => 0, s => s < 3, s => s + 1, s => s)   // yields 0, 1, 2
+
+**Example:**
+
+```lin
+iter(() => 0, s => s < 3, s => s + 1, s => s)   // yields 0, 1, 2
+```
 
 #### `concat`
 
@@ -122,38 +164,63 @@ yield a flat array (so byte-level consumers read packed bytes); mixed/tagged ele
 - **`a`** — the first iterable (Array, Iterator, or Stream).
 - **`b`** — the second iterable, appended after `a`.
 - **Returns** the concatenation; flat when both inputs are the same flat type, tagged/`Json[]` otherwise.
-- **Example:** concat([1, 2], [3, 4])   // [1, 2, 3, 4]
+
+**Example:**
+
+```lin
+concat([1, 2], [3, 4])   // [1, 2, 3, 4]
+```
 
 #### `map`
 
 ```lin
-val map = <T, U>(arr: T[] | Iterator | Stream, f: (T, Int32)
+val map = <T, U>(arr: T[] | Iterator | Stream, f: (T, Int32) => U)
 ```
 
 Apply `f` to every item, producing a new collection of the results.
 - **`arr`** — an Array, Iterator, or Stream of `T`.
 - **`f`** — mapping `(item, index?) => U`; the trailing 0-based `Int32` index is optional.
 - **Returns** a `U[]` over an Array/Iterator, or a lazy `Stream<U>` over a Stream receiver.
-- **Example:** [1, 2, 3].map(x => x * 2)            // [2, 4, 6]
-- **Example:** ["a", "b", "c"].map((x, i) => "${i}: ${x}")   // ["0: a", "1: b", "2: c"]
+
+**Example:**
+
+```lin
+[1, 2, 3].map(x => x * 2)            // [2, 4, 6]
+```
+
+**Example:**
+
+```lin
+["a", "b", "c"].map((x, i) => "${i}: ${x}")   // ["0: a", "1: b", "2: c"]
+```
 
 #### `filter`
 
 ```lin
-val filter = <T>(arr: T[] | Iterator | Stream, f: (T, Int32)
+val filter = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean)
 ```
 
 Keep only the items for which `f` returns `true`.
 - **`arr`** — an Array, Iterator, or Stream of `T`.
 - **`f`** — predicate `(item, index?) => Boolean`; the trailing 0-based `Int32` index is optional.
 - **Returns** a `T[]` of the kept items over an Array/Iterator, or a lazy `Stream<T>` over a Stream receiver.
-- **Example:** [1, 2, 3, 4].filter(x => x % 2 == 0)        // [2, 4]
-- **Example:** [10, 20, 30, 40].filter((x, i) => i % 2 == 0)   // [10, 30]  (source indices 0, 2)
+
+**Example:**
+
+```lin
+[1, 2, 3, 4].filter(x => x % 2 == 0)        // [2, 4]
+```
+
+**Example:**
+
+```lin
+[10, 20, 30, 40].filter((x, i) => i % 2 == 0)   // [10, 30]  (source indices 0, 2)
+```
 
 #### `reduce`
 
 ```lin
-val reduce = <T, U>(arr: T[] | Iterator | Stream, init: U, f: (U, T, Int32)
+val reduce = <T, U>(arr: T[] | Iterator | Stream, init: U, f: (U, T, Int32) => U)
 ```
 
 Fold the items left-to-right into a single accumulated value.
@@ -161,64 +228,98 @@ Fold the items left-to-right into a single accumulated value.
 - **`init`** — the initial accumulator; pins the accumulator type `U`.
 - **`f`** — folding step `(acc, item, index?) => acc'`; the trailing 0-based `Int32` index is optional.
 - **Returns** the final accumulator `U` over an Array/Iterator, or `U | Error` over a Stream receiver.
-- **Example:** [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)   // 10
-- **Example:** [1, 1, 1].reduce(0, (acc, x, i) => acc + i)   // 3   (0 + 0 + 1 + 2)
+
+**Example:**
+
+```lin
+[1, 2, 3, 4].reduce(0, (acc, x) => acc + x)   // 10
+```
+
+**Example:**
+
+```lin
+[1, 1, 1].reduce(0, (acc, x, i) => acc + i)   // 3   (0 + 0 + 1 + 2)
+```
 
 #### `find`
 
 ```lin
-val find = <T>(arr: T[] | Iterator | Stream, f: (T, Int32)
+val find = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T | Null
 ```
-
-Tier B derived combinators (find/some/every). Each callback OPTIONALLY receives a trailing 0-based
-`Int32` source index; a 1-arg callback stays valid (the checker pads it to 2 params). Each iterable
-is the `T[] | Iterator | Stream` union (a Stream is accepted; its opaque type does not flow into a
-bare `Json` param). `Iterator`/`Stream` are written without a type argument (the `T[]` arm carries
-element-type inference; the formatter cannot round-trip a parametric `Iterator<T>`).
 
 Find the first item for which `f` returns `true`, short-circuiting the scan.
 - **`arr`** — an Array, Iterator, or Stream of `T`.
 - **`f`** — predicate `(item, index?) => Boolean`.
 - **Returns** the first matching item, or `null` if none match (typed `T | Null`).
-- **Example:** [1, 3, 5, 6].find(x => x % 2 == 0)   // 6
-- **Example:** [1, 3, 5].find(x => x % 2 == 0)      // null
+
+**Example:**
+
+```lin
+[1, 3, 5, 6].find(x => x % 2 == 0)   // 6
+```
+
+**Example:**
+
+```lin
+[1, 3, 5].find(x => x % 2 == 0)      // null
+```
 
 #### `some`
 
 ```lin
-val some = <T>(arr: T[] | Iterator | Stream, f: (T, Int32)
+val some = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): Boolean
 ```
 
 Test whether `f` returns `true` for at least one item, short-circuiting on the first match.
 - **`arr`** — an Array, Iterator, or Stream of `T`.
 - **`f`** — predicate `(item, index?) => Boolean`.
 - **Returns** `true` if any item matches, `false` otherwise (`false` for an empty source).
-- **Example:** [1, 2, 3].some(x => x > 2)    // true
+
+**Example:**
+
+```lin
+[1, 2, 3].some(x => x > 2)    // true
+```
 
 #### `every`
 
 ```lin
-val every = <T>(arr: T[] | Iterator | Stream, f: (T, Int32)
+val every = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): Boolean
 ```
 
 Test whether `f` returns `true` for every item, short-circuiting on the first failure.
 - **`arr`** — an Array, Iterator, or Stream of `T`.
 - **`f`** — predicate `(item, index?) => Boolean`.
 - **Returns** `true` if all items match, `false` otherwise (`true` for an empty source).
-- **Example:** [1, 2, 3].every(x => x > 0)   // true
-- **Example:** [1, 2, 3].every(x => x > 1)   // false
+
+**Example:**
+
+```lin
+[1, 2, 3].every(x => x > 0)   // true
+```
+
+**Example:**
+
+```lin
+[1, 2, 3].every(x => x > 1)   // false
+```
 
 #### `flatMap`
 
 ```lin
-val flatMap = (arr: Json, f: (Json, Int32)
+val flatMap = <T, U>(arr: T[] | Iterator | Stream, f: (T, Int32) => U[]): U[]
 ```
 
-Map each item to an inner iterable and concatenate all the results into one array.
-- **`arr`** — any iterable.
-- **`f`** — `(item, index?) => iterable`; the trailing 0-based `Int32` index is optional.
-- **Returns** the concatenation of every produced inner iterable, in order.
-- **Example:** [1, 2, 3].flatMap(x => [x, x * 2])   // [1, 2, 2, 4, 3, 6]
+Map each item to an inner array and concatenate all the results into one array.
+- **`arr`** — an Array, Iterator, or Stream of `T`.
+- **`f`** — `(item, index?) => U[]`; the trailing 0-based `Int32` index is optional.
+- **Returns** a `U[]` — the concatenation of every produced inner array, in order.
+
+**Example:**
+
+```lin
+[1, 2, 3].flatMap(x => [x, x * 2])   // [1, 2, 2, 4, 3, 6]
+```
 
 #### `take`
 
@@ -226,12 +327,17 @@ Map each item to an inner iterable and concatenate all the results into one arra
 val take = <T>(arr: T[] | Iterator | Stream, n: Int32): T[]
 ```
 
-Take the first `n` items. Safe over an INFINITE source (`count`/infinite-`repeat`/`cycle`): it
+Take the first `n` items. Safe over an infinite source (`count`/infinite-`repeat`/`cycle`): it
 stops pulling after `n` items rather than materialising the whole source.
 - **`arr`** — an Array, Iterator, or Stream of `T`.
 - **`n`** — the maximum number of items to take; fewer if the source is shorter.
 - **Returns** a `T[]` of the first `n` items (a lazy `Stream<T>` over a Stream receiver).
-- **Example:** take([1, 2, 3, 4], 2)   // [1, 2]
+
+**Example:**
+
+```lin
+take([1, 2, 3, 4], 2)   // [1, 2]
+```
 
 #### `drop`
 
@@ -243,31 +349,46 @@ Skip the first `n` items and keep the rest.
 - **`arr`** — an Array, Iterator, or Stream of `T`.
 - **`n`** — the number of leading items to skip; if `n >= length`, the result is empty.
 - **Returns** a `T[]` of the remaining items (a lazy `Stream<T>` over a Stream receiver).
-- **Example:** drop([1, 2, 3, 4], 2)   // [3, 4]
+
+**Example:**
+
+```lin
+drop([1, 2, 3, 4], 2)   // [3, 4]
+```
 
 #### `takeWhile`
 
 ```lin
-val takeWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32)
+val takeWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T[]
 ```
 
 Take leading items while `f` returns `true`, stopping at (and excluding) the first that fails.
 - **`arr`** — an Array, Iterator, or Stream of `T`.
 - **`f`** — predicate `(item, index?) => Boolean`; the trailing 0-based `Int32` index is optional.
 - **Returns** a `T[]` of the leading run that satisfies `f` (a lazy `Stream<T>` over a Stream receiver).
-- **Example:** [1, 2, 3, 4, 1].takeWhile(x => x < 3)   // [1, 2]
+
+**Example:**
+
+```lin
+[1, 2, 3, 4, 1].takeWhile(x => x < 3)   // [1, 2]
+```
 
 #### `dropWhile`
 
 ```lin
-val dropWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32)
+val dropWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T[]
 ```
 
 Skip leading items while `f` returns `true`, then keep everything from the first failure onward.
 - **`arr`** — an Array, Iterator, or Stream of `T`.
 - **`f`** — predicate `(item, index?) => Boolean`; the trailing 0-based `Int32` index is optional.
 - **Returns** a `T[]` starting at the first item that fails `f` (a lazy `Stream<T>` over a Stream receiver).
-- **Example:** [1, 2, 3, 4, 1].dropWhile(x => x < 3)   // [3, 4, 1]
+
+**Example:**
+
+```lin
+[1, 2, 3, 4, 1].dropWhile(x => x < 3)   // [3, 4, 1]
+```
 
 #### `flatten`
 
@@ -278,7 +399,12 @@ val flatten = <T>(arr: T[][]): T[]
 Collapse one level of nesting, concatenating the sub-arrays in order.
 - **`arr`** — an array of arrays (`T[][]`).
 - **Returns** the concatenated `T[]`.
-- **Example:** flatten([[1, 2], [3, 4]])   // [1, 2, 3, 4]
+
+**Example:**
+
+```lin
+flatten([[1, 2], [3, 4]])   // [1, 2, 3, 4]
+```
 
 #### `sliding`
 
@@ -304,7 +430,7 @@ Pair each item with its successor: `[[src[0],src[1]], [src[1],src[2]], …]`.
 #### `zipWith`
 
 ```lin
-val zipWith = <A, B, C>(a: A[] | Stream, b: B[], f: (A, B)
+val zipWith = <A, B, C>(a: A[] | Stream, b: B[], f: (A, B) => C): C[]
 ```
 
 Combine two sources element-wise with `f` in a single pass (the fused `zip(a, b).map(f)`).
@@ -341,7 +467,16 @@ Distinct from `std/array.unique`, which dedups globally.
 val count = (start: Int32, step: Int32 = 1): Stream
 ```
 
-Build an INFINITE counting stream: `start, start+step, start+2*step, …`. Must be bounded downstream.
+Infinite stream constructors. These build a lazy `Stream<T>` pull-source (the same backend that
+powers file/socket streams), rather than an eager array that would try to materialise an infinite
+source and never return. Bound them downstream with a short-circuiting stream combinator
+(`take`/`takeWhile`/`find`/`some`) before any exhaustive terminal (`for`/`reduce`/`collect`);
+otherwise they loop forever, just like a hand-written `while true`. Because they return a Stream,
+the chained `.map`/`.take`/… dispatch to the lazy stream backend. To materialise a bounded result,
+drive the bounded stream with a terminal, e.g.
+`count(0).take(5).reduce([], (acc, x) => acc.push(x); acc)` or `.for(...)`.
+
+Build an infinite counting stream: `start, start+step, start+2*step, …`. Must be bounded downstream.
 - **`start`** — the first value.
 - **`step`** — the increment between successive values (default `1`).
 - **Returns** an infinite `Stream` of counted `Int32` values.
@@ -364,5 +499,5 @@ val cycle = <T>(src: T[]): Stream
 ```
 
 Repeat the elements of a finite, materialised array endlessly. Must be bounded downstream.
-- **`src`** — the source array; takes an ARRAY by design (cycling requires re-reading the source).
-- **Returns** an infinite `Stream` cycling through `src` (an EMPTY stream if `src` is empty, not an infinite loop).
+- **`src`** — the source array; it takes an array because cycling requires re-reading the source.
+- **Returns** an infinite `Stream` cycling through `src` (an empty stream if `src` is empty, not an infinite loop).

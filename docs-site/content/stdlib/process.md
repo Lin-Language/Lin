@@ -10,7 +10,9 @@ injection. Fallible calls return an Error shape you narrow with `is Error`. The 
 former std/os) reports machine and process facts; the compile-time ones (platform / arch) and the
 always-available ones (cpuCount / pid) are total, the rest can return an Error.
 
+```lin
 import { exec, shell, cwd, chdir, spawn, wait, kill } from "std/process"
+```
 
 ## Reference
 
@@ -36,7 +38,7 @@ readStdout / kill / wait.
 #### `exec`
 
 ```lin
-val exec = (command: String, args: String[]): Json
+val exec = (command: String, args: String[]): ExecResult | Error
 ```
 
 Run `command` with `args` and wait for it to exit, capturing its output.
@@ -44,19 +46,29 @@ Run `command` with `args` and wait for it to exit, capturing its output.
 - **`args`** — the argument vector (each element is a separate argument, no shell splitting).
 - **Returns** an ExecResult with the exit status and captured stdout/stderr, or an Error if the
   process cannot be launched.
-- **Example:** val r = exec("git", ["status", "--short"])   // then r["status"], r["stdout"]
+
+**Example:**
+
+```lin
+val r = exec("git", ["status", "--short"])   // then r["status"], r["stdout"]
+```
 
 #### `shell`
 
 ```lin
-val shell = (command: String): Json
+val shell = (command: String): ExecResult | Error
 ```
 
 Run `command` through the system shell (`/bin/sh -c`). Prefer `exec` to avoid shell injection.
 - **`command`** — the shell command line.
 - **Returns** an ExecResult with the exit status and captured stdout/stderr, or an Error if it
   cannot be launched.
-- **Example:** shell("ls -la | wc -l")["stdout"].trim()
+
+**Example:**
+
+```lin
+shell("ls -la | wc -l")["stdout"].trim()
+```
 
 #### `cwd`
 
@@ -65,12 +77,17 @@ val cwd = (): String
 ```
 
 The absolute path of the current working directory.
-- **Example:** cwd()   // "/home/alice/project"
+
+**Example:**
+
+```lin
+cwd()   // "/home/alice/project"
+```
 
 #### `chdir`
 
 ```lin
-val chdir = (path: String): Json
+val chdir = (path: String): Null | Error
 ```
 
 Change the current working directory.
@@ -82,7 +99,7 @@ Change the current working directory.
 #### `spawn`
 
 ```lin
-val spawn = (command: String, args: String[]): Json
+val spawn = (command: String, args: String[]): ProcessHandle | Error
 ```
 
 Start `command` with `args` without waiting for it to finish. stdout is piped (read it with
@@ -94,19 +111,24 @@ readStdout); stderr is inherited.
 #### `readStdout`
 
 ```lin
-val readStdout = (handle: ProcessHandle, buf: UInt8[]): Json
+val readStdout = (handle: ProcessHandle, buf: UInt8[]): Int32 | Error
 ```
 
 Read the next chunk of the process's stdout into a caller-provided buffer.
 - **`handle`** — the spawned process's handle.
 - **`buf`** — the buffer to fill; up to `buf.length` bytes are read.
 - **Returns** the number of bytes read (0 = EOF), or an Error.
-- **Example:** val n = readStdout(h, buf)   // n bytes copied into buf; 0 means end-of-stream
+
+**Example:**
+
+```lin
+val n = readStdout(h, buf)   // n bytes copied into buf; 0 means end-of-stream
+```
 
 #### `kill`
 
 ```lin
-val kill = (handle: ProcessHandle): Json
+val kill = (handle: ProcessHandle): Null | Error
 ```
 
 Send SIGTERM to a spawned process.
@@ -116,22 +138,27 @@ Send SIGTERM to a spawned process.
 #### `wait`
 
 ```lin
-val wait = (handle: ProcessHandle): Json
+val wait = (handle: ProcessHandle): Int32 | Error
 ```
 
 Wait for a spawned process to exit. stdout that was streamed via readStdout is not re-collected
 here — use `exec` for batch output.
 - **`handle`** — the process to wait on.
 - **Returns** the process's exit code, or an Error. After `wait` the handle is no longer valid.
-- **Example:** val proc = spawn("server", ["--port", "8080"])   // ...later... val code = wait(proc)
+
+**Example:**
+
+```lin
+val proc = spawn("server", ["--port", "8080"])   // ...later... val code = wait(proc)
+```
 
 #### `stdoutStream`
 
 ```lin
-val stdoutStream = (handle: ProcessHandle): Stream
+val stdoutStream = (handle: ProcessHandle): Stream<UInt8[]>
 ```
 
-Wrap a spawned child's piped stdout as a lazy byte Stream (streams brief §4). Reading pulls from
+Wrap a spawned child's piped stdout as a lazy byte stream. Reading pulls from
 the pipe until EOF.
 - **`handle`** — the spawned process's handle.
 - **Returns** a `Stream<UInt8[]>` over the child's stdout.

@@ -5,13 +5,17 @@
 // through in constant memory. A decode/encode fault surfaces in-band as the canonical `Error`
 // value at the terminal op (no `is Error` between steps), exactly like every other adapter.
 //
-//   gunzip(s) / gzip(s)     — the gzip container format (header + CRC32 + ISIZE trailer).
-//   inflate(s) / deflate(s) — raw DEFLATE bitstream (no gzip header/CRC).
+// Two framings are supported: `gunzip`/`gzip` handle the gzip container format (header, CRC32 and
+// ISIZE trailer), while `inflate`/`deflate` handle the raw DEFLATE bitstream (no gzip header or
+// CRC). Build a pipeline with std/stream as usual:
 //
-// Build a pipeline with std/stream + std/iter as usual, e.g.
 //   import { readStream, writeStream, drain } from "std/stream"
 //   import { gunzip } from "std/compress"
-//   readStream("data.gz").gunzip().writeStream("data.txt").drain()
+//
+//   val pipeline = readStream("data.gz")
+//     .gunzip()
+//     .writeStream("data.txt")
+//   drain(pipeline)
 
 // Adapter: decompress a gzip-framed byte stream. Lazy.
 // @param s  the upstream gzip-framed byte stream.
