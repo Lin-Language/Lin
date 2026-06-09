@@ -14,7 +14,7 @@ import foreign "lin-runtime"
 
 // Read one line from standard input (without the trailing newline).
 // @returns the line as a `String`, or `null` at end of input.
-export val readLine = (): Json =>
+export val readLine = (): String | Null =>
   lin_io_read_line()
 
 // Read all of standard input to end of stream.
@@ -48,7 +48,7 @@ export val args = (): String[] =>
 // Print a prompt and read one line of input.
 // @param message  the prompt to print before reading.
 // @returns the line read, or `null` at end of input.
-export val prompt = (message: String): Json =>
+export val prompt = (message: String): String | Null =>
   print(message)
   readLine()
 
