@@ -141,7 +141,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`set`](#set-array) | `<T>(T[], Int32, T) -> Null` | Set an element by index in place |
 | [`slice`](#slice) | `<T>(T[], Int32, Int32 = length(arr)) -> T[]` | Sub-buffer copy; preserves element type; `end` optional, negatives count from end |
 | [`sort`](#sort) | `<T>(T[], (T, T) -> Int32) -> T[]` | Return sorted copy using comparator |
-| [`sortBy`](#sortBy) | `<T>(T[], (T) -> Json) -> T[]` | Return sorted copy using key extractor |
+| [`sortBy`](#sortBy) | `<T, K>(T[], (T) -> K) -> T[]` | Return sorted copy using key extractor |
 | [`sum`](#sum) | `(Number[]) -> Number` | Sum all elements |
 | [`unique`](#unique) | `<T>(T[]) -> T[]` | Remove duplicate elements (deep equality) |
 | [`zip`](#zip) | `<A, B>(A[], B[]) -> [A, B][]` | Pair elements by index |
@@ -1665,10 +1665,10 @@ Returns a new array with elements sorted according to `compare`. The comparator 
 ### sortBy
 
 ```txt
-val sortBy: <T>(arr: T[], f: (T) -> Json) -> T[]
+val sortBy: <T, K>(arr: T[], f: (T) -> K) -> T[]
 ```
 
-Returns a new array sorted in ascending order by the key extracted by `f`. Keys are compared using Lin's natural ordering (numbers numerically, strings lexicographically). Does not modify `arr`. Generic over the element type `T`: `f` is checked against the element type, and the result is a `T[]` that preserves the element type. The key value is left as `Json` (it only needs to be comparable).
+Returns a new array sorted in ascending order by the key extracted by `f`. Keys are compared using Lin's natural ordering (numbers numerically, strings lexicographically). Does not modify `arr`. Generic over the element type `T` and the key type `K`: `f` is checked against the element type and its key type `K` is inferred, while the result is a `T[]` that preserves the element type. `K` may be any comparable type (e.g. `Int32`, `Float64`, `String`).
 
 ```txt
 ["banana", "apple", "cherry"].sortBy(s => s)
