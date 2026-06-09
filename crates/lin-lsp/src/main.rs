@@ -23,6 +23,13 @@ struct Backend {
     /// smart-parens completion: snippet inserts (`name($0)`) are only emitted when true, else we fall
     /// back to a plaintext `name()` (never a literal `$0`). Captured once in `initialize`.
     snippet_support: AtomicBool,
+    /// Whether to emit inferred-type inlay hints on `val`/`var` bindings. Mirrors the client
+    /// `lin.inlayHints.variableTypes` setting; defaults true. Captured from `initializationOptions`
+    /// at `initialize` and refreshed by `did_change_configuration` so toggles take effect live.
+    inlay_variable_types: AtomicBool,
+    /// Whether to emit inferred-type inlay hints on unannotated function/lambda parameters. Mirrors
+    /// `lin.inlayHints.parameterTypes`; defaults true. Captured/refreshed alongside the above.
+    inlay_parameter_types: AtomicBool,
 }
 
 #[tower_lsp::async_trait]
@@ -59,6 +66,13 @@ impl LanguageServer for Backend {
             .and_then(|ci| ci.snippet_support)
             .unwrap_or(false);
         self.snippet_support.store(snippet_support, Ordering::Relaxed);
+
+        // Capture the granular inlay-hint toggles from `initializationOptions.inlayHints.*`
+        // (sent by the VSCode client at startup). Absent/malformed options default both to true,
+        // preserving the prior always-on behaviour for clients that don't send them.
+        let (var_hints, param_hints) = parse_inlay_hint_options(params.initialization_options.as_ref());
+        self.inlay_variable_types.store(var_hints, Ordering::Relaxed);
+        self.inlay_parameter_types.store(param_hints, Ordering::Relaxed);
 
         // Build the cross-file index: seed stdlib, then enumerate + index every
         // `*.lin` file under the workspace root. Files are re-indexed on edit, and
@@ -153,6 +167,16 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Live-update the inlay-hint toggles when the user changes `lin.inlayHints.*`. The VSCode
+    /// client pushes the whole `lin` settings tree here (via `synchronize.configurationSection`),
+    /// so we re-parse the same `inlayHints.{variableTypes,parameterTypes}` shape used at startup.
+    /// VSCode re-requests inlay hints on a configuration change, so no explicit refresh is needed.
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        let (var_hints, param_hints) = parse_inlay_hint_settings(&params.settings);
+        self.inlay_variable_types.store(var_hints, Ordering::Relaxed);
+        self.inlay_parameter_types.store(param_hints, Ordering::Relaxed);
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -862,7 +886,9 @@ impl LanguageServer for Backend {
         // Only emit hints whose anchor falls inside the requested range — clients re-request as the
         // viewport scrolls, so honouring the range keeps the response small.
         let range = params.range;
-        let hints: Vec<InlayHint> = inlay_hints(&source, &analysis)
+        let var_hints = self.inlay_variable_types.load(Ordering::Relaxed);
+        let param_hints = self.inlay_parameter_types.load(Ordering::Relaxed);
+        let hints: Vec<InlayHint> = inlay_hints(&source, &analysis, var_hints, param_hints)
             .into_iter()
             .filter(|h| position_in_range(h.position, range))
             .collect();
@@ -5045,18 +5071,70 @@ fn top_level_commas(s: &str) -> u32 {
 ///
 /// Pure over `(source, analysis)` so it's unit-testable. Returns an empty vec when checking failed
 /// (no typed module) — we never guess a type from a broken parse.
-fn inlay_hints(source: &str, analysis: &Analysis) -> Vec<InlayHint> {
+/// Parse the granular inlay-hint toggles out of the client's `initializationOptions`. Expected
+/// shape: `{ "inlayHints": { "variableTypes": bool, "parameterTypes": bool } }`. Returns
+/// `(variable_types, parameter_types)`, each defaulting to `true` when the field is absent or not a
+/// boolean — so a missing/malformed options object leaves both hint kinds enabled (prior behaviour).
+fn parse_inlay_hint_options(opts: Option<&serde_json::Value>) -> (bool, bool) {
+    parse_inlay_hints_object(opts.and_then(|v| v.get("inlayHints")))
+}
+
+/// Parse the inlay-hint toggles out of a `workspace/didChangeConfiguration` `settings` payload.
+/// The VSCode client (via `synchronize.configurationSection: "lin"`) pushes the `lin` settings
+/// subtree, so the toggles live at `inlayHints.{variableTypes,parameterTypes}`. We also tolerate a
+/// wrapping `{ "lin": { "inlayHints": ... } }` (some clients send the full settings root). Same
+/// default-true semantics as `parse_inlay_hint_options`.
+fn parse_inlay_hint_settings(settings: &serde_json::Value) -> (bool, bool) {
+    let inlay = settings
+        .get("inlayHints")
+        .or_else(|| settings.get("lin").and_then(|l| l.get("inlayHints")));
+    parse_inlay_hints_object(inlay)
+}
+
+/// Shared reader for an `inlayHints` object — `(variableTypes, parameterTypes)`, both default true.
+fn parse_inlay_hints_object(inlay: Option<&serde_json::Value>) -> (bool, bool) {
+    let read = |key: &str| {
+        inlay
+            .and_then(|o| o.get(key))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    };
+    (read("variableTypes"), read("parameterTypes"))
+}
+
+/// Build the document's inlay type hints. `variable_types` gates the inferred-type hints on
+/// `val`/`var` bindings; `parameter_types` gates the inferred-type hints on unannotated
+/// function/lambda parameters. With both `false` the result is empty. The two hint kinds anchor at
+/// disjoint spans (binder identifier vs. param identifier), so they never collide.
+fn inlay_hints(
+    source: &str,
+    analysis: &Analysis,
+    variable_types: bool,
+    parameter_types: bool,
+) -> Vec<InlayHint> {
     let Some(typed) = analysis.typed.as_ref() else {
         return Vec::new();
     };
-    // Map every `val`/`var` binding's STATEMENT span to its inferred type. The AST and typed
-    // statements share stmt spans (the checker copies them through), so we join on span.
-    let mut ty_by_stmt: HashMap<(u32, u32), String> = HashMap::new();
-    collect_binding_types(&typed.statements, &mut ty_by_stmt);
 
-    // Walk the AST for unannotated `val`/`var` bindings and pair each with the inferred type.
+    // Each anchor is `(identifier_name_span, inferred_type_string)`; we emit a `: <Type>` hint at
+    // the end of the identifier. Variable and parameter anchors are gathered into one list and
+    // rendered uniformly below.
     let mut anchors: Vec<(lin_common::Span, String)> = Vec::new();
-    collect_unannotated_bindings(&analysis.module.statements, &ty_by_stmt, &mut anchors);
+
+    if variable_types {
+        // Map every `val`/`var` binding's STATEMENT span to its inferred type. The AST and typed
+        // statements share stmt spans (the checker copies them through), so we join on span.
+        let mut ty_by_stmt: HashMap<(u32, u32), String> = HashMap::new();
+        collect_binding_types(&typed.statements, &mut ty_by_stmt);
+        // Walk the AST for unannotated `val`/`var` bindings and pair each with the inferred type.
+        collect_unannotated_bindings(&analysis.module.statements, &ty_by_stmt, &mut anchors);
+    }
+
+    if parameter_types {
+        // Walk the AST for unannotated function/lambda params and resolve each param's inferred
+        // type from its def-site `span_type_map` entry (recorded by the checker at the name span).
+        collect_unannotated_params(&analysis.module.statements, &analysis.span_type_map, &mut anchors);
+    }
 
     let mut hints = Vec::new();
     for (name_span, ty_str) in anchors {
@@ -5077,6 +5155,132 @@ fn inlay_hints(source: &str, analysis: &Analysis) -> Vec<InlayHint> {
         });
     }
     hints
+}
+
+/// Resolve an identifier's inferred type from its def-site `span_type_map` entry. The checker
+/// records a `(span, type, Some(def_span))` self-entry whose `span == def_span == name_span` for
+/// every function/lambda parameter (even unused ones). We look up the entry anchored exactly at the
+/// param's name span. Returns the raw type string (cleaned by the caller).
+fn param_type_at_span(
+    span_type_map: &[(lin_common::Span, String, Option<lin_common::Span>)],
+    name_span: lin_common::Span,
+) -> Option<String> {
+    span_type_map
+        .iter()
+        .find(|(sp, _, def)| {
+            sp.start == name_span.start
+                && sp.end == name_span.end
+                && def.map_or(true, |d| d.start == name_span.start && d.end == name_span.end)
+        })
+        .map(|(_, ty, _)| ty.clone())
+}
+
+/// Walk the surface AST for function/lambda parameters that have NO explicit type annotation and
+/// bind a single identifier (destructuring patterns are skipped — they bind several names with no
+/// single anchor, mirroring the binding logic). For each, resolve the inferred type from the
+/// param's def-site `span_type_map` entry and record `(name_span, type_string)`. Descends into
+/// every expression position that can contain a nested function/lambda.
+fn collect_unannotated_params(
+    stmts: &[Stmt],
+    span_type_map: &[(lin_common::Span, String, Option<lin_common::Span>)],
+    out: &mut Vec<(lin_common::Span, String)>,
+) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Val { value, .. } | Stmt::Var { value, .. } => {
+                collect_unannotated_params_in_expr(value, span_type_map, out);
+            }
+            Stmt::Expr(e) => collect_unannotated_params_in_expr(e, span_type_map, out),
+            _ => {}
+        }
+    }
+}
+
+/// Descend a surface expression collecting unannotated single-identifier params of every
+/// function/lambda literal encountered (including nested ones in bodies, args, branches).
+fn collect_unannotated_params_in_expr(
+    expr: &lin_parse::ast::Expr,
+    span_type_map: &[(lin_common::Span, String, Option<lin_common::Span>)],
+    out: &mut Vec<(lin_common::Span, String)>,
+) {
+    use lin_parse::ast::Expr as E;
+    match expr {
+        E::Function { params, body, .. } => {
+            for p in params {
+                // Only hint params with no explicit annotation and a single-identifier pattern.
+                if p.type_ann.is_none() {
+                    if let Some((_, name_span)) = pattern_ident(&p.pattern) {
+                        if let Some(ty) = param_type_at_span(span_type_map, name_span) {
+                            out.push((name_span, ty));
+                        }
+                    }
+                }
+                // A default value expression can itself contain function literals.
+                if let Some(d) = &p.default {
+                    collect_unannotated_params_in_expr(d, span_type_map, out);
+                }
+            }
+            collect_unannotated_params_in_expr(body, span_type_map, out);
+        }
+        E::Block(stmts, tail, _, _) => {
+            collect_unannotated_params(stmts, span_type_map, out);
+            collect_unannotated_params_in_expr(tail, span_type_map, out);
+        }
+        E::If { condition, then_branch, else_branch, .. } => {
+            collect_unannotated_params_in_expr(condition, span_type_map, out);
+            collect_unannotated_params_in_expr(then_branch, span_type_map, out);
+            collect_unannotated_params_in_expr(else_branch, span_type_map, out);
+        }
+        E::Match { scrutinee, arms, .. } => {
+            collect_unannotated_params_in_expr(scrutinee, span_type_map, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_unannotated_params_in_expr(g, span_type_map, out);
+                }
+                collect_unannotated_params_in_expr(&arm.body, span_type_map, out);
+            }
+        }
+        E::Call { func, args, .. } => {
+            collect_unannotated_params_in_expr(func, span_type_map, out);
+            for a in args {
+                collect_unannotated_params_in_expr(a, span_type_map, out);
+            }
+        }
+        E::DotCall { receiver, args, .. } => {
+            collect_unannotated_params_in_expr(receiver, span_type_map, out);
+            if let Some(args) = args {
+                for a in args {
+                    collect_unannotated_params_in_expr(a, span_type_map, out);
+                }
+            }
+        }
+        E::BinaryOp { left, right, .. } => {
+            collect_unannotated_params_in_expr(left, span_type_map, out);
+            collect_unannotated_params_in_expr(right, span_type_map, out);
+        }
+        E::UnaryOp { operand, .. } => collect_unannotated_params_in_expr(operand, span_type_map, out),
+        E::Assign { value, .. } => collect_unannotated_params_in_expr(value, span_type_map, out),
+        // Lambdas can appear inside array/object literals (e.g. `[x => x]`, `{ f: x => x }`), so
+        // descend into them too — unlike the val/var binding walk, which only needs statements.
+        E::Array(elements, _, _) => {
+            for e in elements {
+                collect_unannotated_params_in_expr(e, span_type_map, out);
+            }
+        }
+        E::Object(fields, _, _) => {
+            for f in fields {
+                match f {
+                    lin_parse::ast::ObjectField::Pair(_, v) => {
+                        collect_unannotated_params_in_expr(v, span_type_map, out)
+                    }
+                    lin_parse::ast::ObjectField::Spread(e) => {
+                        collect_unannotated_params_in_expr(e, span_type_map, out)
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Recursively collect `(stmt_span_tuple -> type_string)` for every `val`/`var` in the typed
@@ -6192,6 +6396,8 @@ async fn main() {
         client,
         docs: RwLock::new(HashMap::new()),
         snippet_support: AtomicBool::new(false),
+        inlay_variable_types: AtomicBool::new(true),
+        inlay_parameter_types: AtomicBool::new(true),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
@@ -7334,7 +7540,7 @@ export val thingCount = 7
     fn inlay_hints_only_for_inferred_bindings() {
         let src = "val a = 1\nval b: Int32 = 2\n";
         let analysis = analyse(src, None);
-        let hints = inlay_hints(src, &analysis);
+        let hints = inlay_hints(src, &analysis, true, true);
         let labels: Vec<String> = hints
             .iter()
             .map(|h| match &h.label {
@@ -7356,7 +7562,7 @@ export val thingCount = 7
     fn inlay_hints_descend_into_function_bodies() {
         let src = "val f = () =>\n  val inner = \"hi\"\n  inner\n";
         let analysis = analyse(src, None);
-        let hints = inlay_hints(src, &analysis);
+        let hints = inlay_hints(src, &analysis, true, true);
         let labels: Vec<String> = hints
             .iter()
             .filter_map(|h| match &h.label {
@@ -7370,6 +7576,169 @@ export val thingCount = 7
             labels
         );
     }
+
+    /// Helper: the string labels of all inlay hints, in order.
+    fn hint_labels(hints: &[InlayHint]) -> Vec<String> {
+        hints
+            .iter()
+            .filter_map(|h| match &h.label {
+                InlayHintLabel::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// FEATURE 1: an unannotated lambda parameter gets an inferred-type hint anchored at the end of
+    /// its name. The for-callback shape `range(0,5).for(i => ...)` resolves the element type.
+    #[test]
+    fn inlay_hints_on_for_callback_parameter() {
+        let src = "import { range, for } from \"std/iter\"\nimport { print } from \"std/io\"\nimport { toString } from \"std/string\"\nrange(0, 5).for(i => print(i.toString()))\n";
+        let analysis = analyse(src, None);
+        let hints = inlay_hints(src, &analysis, true, true);
+        let labels = hint_labels(&hints);
+        // The param `i` gets a `: <Type>` hint (range yields Int32 elements today).
+        let i_off = src.rfind("i =>").unwrap();
+        let i_pos = offset_to_position(src, i_off + 1); // end of identifier `i`
+        let i_hint = hints
+            .iter()
+            .find(|h| h.position.line == i_pos.line && h.position.character == i_pos.character)
+            .unwrap_or_else(|| panic!("expected a param hint at `i`, got {:?}", labels));
+        assert_eq!(i_hint.kind, Some(InlayHintKind::TYPE));
+        assert!(
+            matches!(&i_hint.label, InlayHintLabel::String(s) if s.starts_with(": ")),
+            "param hint should be `: <Type>`, got {:?}",
+            i_hint.label
+        );
+    }
+
+    /// FEATURE 1: an UNUSED unannotated parameter still gets a hint (the checker records a def-site
+    /// type entry even for params never referenced in the body).
+    #[test]
+    fn inlay_hints_on_unused_unannotated_parameter() {
+        // `unused` is an inferred (unannotated) param that is never referenced in its body.
+        let src = "val apply = (g: (Int32) => Int32, n: Int32) => g(n)\nval r = apply(unused => 7, 3)\n";
+        let analysis = analyse(src, None);
+        let hints = inlay_hints(src, &analysis, true, true);
+        let labels = hint_labels(&hints);
+        // `unused` is never referenced in its body (`7`) yet must still get a type hint.
+        let off = src.find("unused").unwrap() + "unused".len();
+        let pos = offset_to_position(src, off);
+        assert!(
+            hints.iter().any(|h| h.position.line == pos.line
+                && h.position.character == pos.character
+                && h.kind == Some(InlayHintKind::TYPE)),
+            "expected a hint on the unused param `unused`, got {:?}",
+            labels
+        );
+    }
+
+    /// FEATURE 1: an ANNOTATED parameter gets NO hint; a DESTRUCTURED parameter gets NO hint.
+    #[test]
+    fn inlay_hints_skip_annotated_and_destructured_params() {
+        // Annotated param `n: Int32` -> no param hint at `n`.
+        let src = "val f = (n: Int32) => n + 1\n";
+        let analysis = analyse(src, None);
+        let hints = inlay_hints(src, &analysis, true, true);
+        let n_off = src.find("(n").unwrap() + 2; // end of `n`
+        let n_pos = offset_to_position(src, n_off);
+        assert!(
+            !hints.iter().any(|h| h.position.line == n_pos.line && h.position.character == n_pos.character),
+            "annotated param should get no hint, got {:?}",
+            hint_labels(&hints)
+        );
+
+        // Destructured param -> no anchor, no hint.
+        let src2 = "val f = ({ a, b }) => a\n";
+        let analysis2 = analyse(src2, None);
+        let hints2 = inlay_hints(src2, &analysis2, true, true);
+        // No hint should land inside the destructuring pattern braces.
+        let brace = src2.find('{').unwrap();
+        let close = src2.find('}').unwrap();
+        let bpos = offset_to_position(src2, brace);
+        let cpos = offset_to_position(src2, close);
+        assert!(
+            !hints2.iter().any(|h| {
+                h.position.line == bpos.line
+                    && h.position.character > bpos.character
+                    && h.position.character < cpos.character + 1
+            }),
+            "destructured params should get no hint, got {:?}",
+            hint_labels(&hints2)
+        );
+    }
+
+    /// FEATURE 2: `parameterTypes=false` suppresses param hints but keeps variable hints; conversely
+    /// `variableTypes=false` suppresses variable hints but keeps param hints; both false -> empty.
+    #[test]
+    fn inlay_hints_gating_flags() {
+        let src = "val f = (n) =>\n  val y = n\n  y\n";
+        let analysis = analyse(src, None);
+
+        let param_off = src.find("(n)").unwrap() + 2;
+        let param_pos = offset_to_position(src, param_off);
+        let var_off = src.find("val y").unwrap() + "val y".len();
+        let var_pos = offset_to_position(src, var_off);
+
+        let has_param = |hs: &[InlayHint]| {
+            hs.iter()
+                .any(|h| h.position.line == param_pos.line && h.position.character == param_pos.character)
+        };
+        let has_var = |hs: &[InlayHint]| {
+            hs.iter()
+                .any(|h| h.position.line == var_pos.line && h.position.character == var_pos.character)
+        };
+
+        // Defaults (both on): both kinds present.
+        let both = inlay_hints(src, &analysis, true, true);
+        assert!(has_param(&both), "param hint expected with both on: {:?}", hint_labels(&both));
+        assert!(has_var(&both), "var hint expected with both on: {:?}", hint_labels(&both));
+
+        // parameterTypes off -> no param hint, var hint stays.
+        let no_param = inlay_hints(src, &analysis, true, false);
+        assert!(!has_param(&no_param), "param hint should be gated off: {:?}", hint_labels(&no_param));
+        assert!(has_var(&no_param), "var hint should survive: {:?}", hint_labels(&no_param));
+
+        // variableTypes off -> no var hint, param hint stays.
+        let no_var = inlay_hints(src, &analysis, false, true);
+        assert!(has_param(&no_var), "param hint should survive: {:?}", hint_labels(&no_var));
+        assert!(!has_var(&no_var), "var hint should be gated off: {:?}", hint_labels(&no_var));
+
+        // Both off -> empty.
+        let none = inlay_hints(src, &analysis, false, false);
+        assert!(none.is_empty(), "both off should yield no hints, got {:?}", hint_labels(&none));
+    }
+
+    /// FEATURE 2: parsing the granular toggles from `initializationOptions` JSON. Absent/malformed
+    /// -> both default true; explicit booleans are honoured; `did_change_configuration` settings
+    /// (both the `lin`-subtree and wrapped shapes) parse identically.
+    #[test]
+    fn parse_inlay_hint_options_defaults_and_explicit() {
+        // Absent options -> both true.
+        assert_eq!(parse_inlay_hint_options(None), (true, true));
+
+        // Empty object -> both true.
+        let empty = serde_json::json!({});
+        assert_eq!(parse_inlay_hint_options(Some(&empty)), (true, true));
+
+        // Explicit booleans honoured.
+        let opts = serde_json::json!({
+            "inlayHints": { "variableTypes": false, "parameterTypes": true }
+        });
+        assert_eq!(parse_inlay_hint_options(Some(&opts)), (false, true));
+
+        // Malformed (non-bool) -> default true for that field.
+        let bad = serde_json::json!({ "inlayHints": { "variableTypes": "nope" } });
+        assert_eq!(parse_inlay_hint_options(Some(&bad)), (true, true));
+
+        // didChangeConfiguration: bare `lin` subtree shape.
+        let subtree = serde_json::json!({ "inlayHints": { "parameterTypes": false } });
+        assert_eq!(parse_inlay_hint_settings(&subtree), (true, false));
+
+        // didChangeConfiguration: wrapped `{ lin: { inlayHints: ... } }` shape.
+        let wrapped = serde_json::json!({ "lin": { "inlayHints": { "variableTypes": false } } });
+        assert_eq!(parse_inlay_hint_settings(&wrapped), (false, true));
+    }
+
 
     // ── Tier-2: semantic tokens ─────────────────────────────────────────────────
 
