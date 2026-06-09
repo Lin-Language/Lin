@@ -2126,6 +2126,24 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
         if is_union_ty(arg_ty) && !is_union_ty(param_ty) {
             builder.record_escape_alias(dst, arg);
         }
+        // WIDEN (concrete heap arg → union param): the Coerce `box_object`/`box_array`/… wraps the
+        // inner WITHOUT bumping its rc — the box `dst` ALIASES `arg`'s inner heap payload. The source
+        // `arg` stays registered owned in scope (its +1 is released at scope exit). For a normal call
+        // that is correct (the box is a transient borrow consumed by the callee; the accepted
+        // per-call shell residual is unchanged). But when this arg flows into a SELF-TAIL-CALL whose
+        // param is the union (`scanRouteAt(…, trip, …)` re-threading a `match x is T => x` narrowed
+        // `Trip` into the `Trip | Null` tail param), the box `dst` becomes the new param-slot value
+        // and must SURVIVE the back-edge — yet `release_owned_for_tail_call` would release `arg`'s +1
+        // (the box is not itself a kept arg unless aliased), freeing the inner while it is still
+        // threaded into the slot AND still owned by a durable container (`tripsByRoute` + a
+        // `kConnections` Conn) → double-free. Record the alias so the keep-set treats `arg` as kept
+        // whenever the box `dst` is a kept tail-call arg (symmetric to the unbox alias above): the
+        // inner survives into the slot, exactly as the source-box does in the unbox direction. No RC
+        // accounting changes for non-tail calls (the alias is only consulted by the tail-call keep
+        // expansion).
+        if !is_union_ty(arg_ty) && is_union_ty(param_ty) && is_rc_type(arg_ty) {
+            builder.record_escape_alias(dst, arg);
+        }
         return dst;
     }
     // Numeric width/kind mismatch between two concrete numeric types.
@@ -7336,6 +7354,18 @@ fn lower_typed_pattern_bindings(
                 builder.emit(Instruction::Coerce {
                     dst: t, src: scrut, from_ty: scrut_ty, to_ty: ty.clone(),
                 });
+                // Unboxing (Coerce) does NOT add a reference — the narrowed concrete value aliases
+                // the scrutinee box's inner payload. For a CONCRETE RC binding (an Object/Array/Map/
+                // String narrowed out of a `T | Null` union, e.g. `match trip is Trip => trip`), the
+                // binding must own its own reference: otherwise passing it on (e.g. storing it into a
+                // container that later releases it) over-decrements the shared payload while the
+                // union's true owner still holds it — a use-after-free. Mirror the global narrowed
+                // read at lower.rs ~2891: retain the inner in place + register owned so it is freed
+                // at scope exit. (`own_for_read` is a no-op for scalars, so the `is n: Int32` case is
+                // unaffected.)
+                let owned = own_for_read(t, ty, builder);
+                builder.slots.insert(*slot, owned);
+                return;
             } else {
                 builder.emit(Instruction::Bind { dst: t, src: scrut, ty: ty.clone() });
             }
