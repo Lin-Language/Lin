@@ -151,6 +151,8 @@ Inline (anonymous) functions work too:
 val doubled = [1, 2, 3].map(x => x * 2)
 ```
 
+Passing a named function directly (`nums.map(double)`) rather than wrapping it in a lambda (`nums.map(x => double(x))`) is the point-free style — see [passing functions directly](/tutorials/06-arrays-and-iteration.html#passing-functions-directly) for when the two are equivalent.
+
 ## Closures
 
 Functions capture their enclosing scope:
