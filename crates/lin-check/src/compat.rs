@@ -105,6 +105,20 @@ pub fn is_compatible_env(
         (Type::Stream(_), _) => false,
         (_, Type::Stream(_)) => false,
 
+        // `Promise<T>` — opaque, covariant, and (like `Shared`/`Stream`) never widens to `Json`,
+        // so a promise can only flow into another `Promise<U>` (compatible inner). The MAX/Json
+        // wildcard is rejected explicitly before the permissive non-MAX-TypeVar arm; a Promise into
+        // a union defers to the union rules (e.g. `Promise<T>` into `Promise<T> | Error`).
+        (Type::Promise(a), Type::Promise(b)) => is_compatible_env(a, b, env, lenient_json, depth),
+        (Type::Promise(_), Type::TypeVar(n)) if *n == u32::MAX => false,
+        (Type::TypeVar(n), Type::Promise(_)) if *n == u32::MAX => false,
+        (Type::Promise(_), Type::TypeVar(_)) | (Type::TypeVar(_), Type::Promise(_)) => true,
+        (Type::Promise(_), Type::Union(_)) | (Type::Union(_), Type::Promise(_)) => {
+            return union_compat(value_type, target_type, env, lenient_json, depth);
+        }
+        (Type::Promise(_), _) => false,
+        (_, Type::Promise(_)) => false,
+
         // Anything is assignable INTO Json (covariant sink): concrete T -> Json. (ADR-045)
         // This INCLUDES a typed index-signature map `{ String: T }` -> Json: a `LinMap` widened to
         // `Json` is only ever read back through the tag-aware `lin_*_any` bridges (keys/values/

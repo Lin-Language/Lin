@@ -5532,6 +5532,41 @@ match await(p)
 }
 
 #[test]
+fn test_promise_type_annotation_roundtrip() {
+    // `Promise<T>` is a first-class opaque type (ADR-045 update): a promise handle can be stored
+    // in an explicitly-annotated `Promise<T>` binding and a `Promise<T>[]` array, then awaited.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await, race } from "std/async"
+import { push } from "std/array"
+import { for } from "std/iter"
+
+val p: Promise<Int32> = async(() => 21 * 2)
+val ps: Promise<Int32>[] = [async(() => 1), async(() => 2)]
+val first = await(race(ps))
+match await(p)
+  is Error => print("error")
+  else => print(toString(await(p)))
+"#);
+    assert_eq!(output, vec!["42"]);
+}
+
+#[test]
+fn test_promise_not_assignable_to_inner_value() {
+    // Because `Promise<T>` is its own type (not erased to Json), "forgot to await" is caught:
+    // a `Promise<Int32>` is not assignable to `Int32`.
+    let err = run_expect_err(r#"import { async } from "std/async"
+
+val p = async(() => 1 + 1)
+val n: Int32 = p
+"#);
+    assert!(
+        err.contains("Promise") && err.contains("Int32"),
+        "expected a Promise-not-assignable-to-Int32 type error, got:\n{err}"
+    );
+}
+
+#[test]
 fn test_async_val_capture() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -5757,12 +5792,12 @@ import { await, threadPool, poolAsync } from "std/async"
 import { push, length } from "std/array"
 import { for, range } from "std/iter"
 
-val unwrap = (r: Json): Int32 =>
+val unwrap = (r: Int32 | Error): Int32 =>
   match r
     is Error => 0
     else => r
 val pool = threadPool(3)
-var promises: Json[] = []
+var promises: Promise<Int32>[] = []
 range(0, 30).for(i => push(promises, pool.poolAsync(() => 1)))
 var total = 0
 promises.for(p => total = total + unwrap(await(p)))

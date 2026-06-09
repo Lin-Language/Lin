@@ -185,6 +185,9 @@ impl<'ctx> Codegen<'ctx> {
             // closes the fd when it hits zero (Stage 2). Owning model (is_union_ty), so scope-exit
             // and global-reassign releases land here.
             Type::Stream(_) => { self.builder.call(self.rt.tagged_release, &[ptr.into()], ""); }
+            // Promise<T> is a boxed TaggedVal*(TAG_PROMISE); its release dispatches the tag-aware
+            // `lin_tagged_release`, whose TAG_PROMISE arm joins/drops the promise box. Owning model.
+            Type::Promise(_) => { self.builder.call(self.rt.tagged_release, &[ptr.into()], ""); }
             _ => {} // scalars: nothing to release
         }
     }

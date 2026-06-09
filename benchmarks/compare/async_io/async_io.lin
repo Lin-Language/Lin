@@ -34,7 +34,7 @@ val recoverInt = (result: Json): Int32 =>
     else => 0
 
 val pool = threadPool(50)
-var promises: Json[] = []
+var promises: Promise<Int32>[] = []
 range(0, 200).for(i => push(promises, pool.poolAsync(() => task(i))))
 
 var sum = 0
