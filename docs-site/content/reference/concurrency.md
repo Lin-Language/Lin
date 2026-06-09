@@ -46,13 +46,9 @@ A fault (runtime error) inside the thunk is caught at the thread boundary and su
 val n: Int32 = await(p)   // compile error: Int32 | Error is not assignable to Int32
 ```
 
-`await` also accepts a `Promise[]` and returns a result array:
+To await several computations at once, use [`parallel`](#parallelthunks) (collect a whole array of results) or `await` each `Promise<T>` handle in turn.
 
-```lin
-val [a, b] = await([asyncA, asyncB])
-```
-
-> The `T | Error` union is attached at `await` rather than at `async` (the promise handle in flight is opaque; only `await` materialises a result that can fault). There is no nominal `Promise<T>` type, so the checker enforces "handle the `Error`" but does not catch "forgot to `await`". See ADR-045.
+> The `T | Error` union is attached at `await` rather than at `async` (the promise handle in flight is opaque; only `await` materialises a result that can fault). `Promise<T>` is a first-class opaque type that does not widen to `Json`, so the checker enforces "handle the `Error`" **and** catches "forgot to `await`" (passing a `Promise<T>` where its resolved value is expected is a type error). See ADR-045.
 
 ## `parallel(thunks)`
 

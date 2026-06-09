@@ -312,17 +312,20 @@ val _sortJ = (arr: Json, cmp: (Json, Json) => Int32): Json =>
 // but a misaligned read for a scalar `T`). Calling `lin_map` from this generic body keeps `arr`
 // at `T[]` and the lambda's `item` at `T`, so `keyFn(item)` is invoked on the `T` ABI; `lin_map`
 // boxes each result `[key, item]` pair into the returned tagged `Json` array itself.
-val _keyedPairs = <T>(arr: T[], keyFn: (T) => Json): Json =>
+val _keyedPairs = <T, K>(arr: T[], keyFn: (T) => K): Json =>
   lin_map(arr, item => [keyFn(item), item])
 
 // Stably sort `arr` by a key extracted from each element, comparing keys with Lin's natural
 // `<`/`>` ordering. Does not mutate `arr`. (Paired with `searchBy`, which searches such an array.)
 // @param arr    the array to sort.
-// @param keyFn  maps an element to its (comparable `Json`) sort key; must accept the element type `T`.
+// @param keyFn  maps an element to its (comparable) sort key `K`; must accept the element type `T`.
 // @returns a new `T[]` sorted ascending by key, ties in original order.
 // @example people.sortBy(p => p["name"])
-export val sortBy = <T>(arr: T[], keyFn: (T) => Json): T[] =>
-  // The key stays `Json` because it only needs to be `<`-comparable, which `Json` is.
+export val sortBy = <T, K>(arr: T[], keyFn: (T) => K): T[] =>
+  // The key `K` is checker-visible but only ever flows into the `[keyFn(item), item]` Json pair
+  // literal built by `_keyedPairs` (which BOXES it into the tagged Json array). The sort comparator
+  // below reads it back as the Json `a[0]`/`b[0]`, so the runtime comparison path is the boxed
+  // `lin_tagged_cmp` regardless of `K`'s monomorphization — no flat-scalar-vs-tagged hazard here.
   val pairs = _keyedPairs(arr, keyFn)
   val sorted = _sortJ(pairs, (a, b) =>
     if a[0] < b[0] then -1 else if a[0] > b[0] then 1 else 0
@@ -412,7 +415,7 @@ export val binarySearch = <T>(arr: T[], target: T, compare: (T, T) => Int32): { 
 // @param key  the comparable key value to find.
 // @param f    the same key extractor `arr` was sorted by.
 // @returns `{ found, index }` as in `binarySearch` (leftmost match; insertion point when absent).
-export val searchBy = <T>(arr: T[], key: Json, f: (T) => Json): { "found": Boolean, "index": Int32 } =>
+export val searchBy = <T, K>(arr: T[], key: K, f: (T) => K): { "found": Boolean, "index": Int32 } =>
   if length(arr) == 0 then
     { "found": false, "index": 0 }
   else
@@ -615,10 +618,15 @@ export val findLastIndex = <T>(arr: T[], f: (T, Int32) => Boolean): Int32 =>
 // Group consecutive elements with the same key into sub-arrays (maximal runs of adjacent
 // equal-keyed elements, in order). The positional analogue of `groupBy` (which is global and hashed).
 // @param arr  the array to scan.
-// @param f    maps each element to its (comparable `Json`) run key.
+// @param f    maps each element to its (comparable) run key `K`.
 // @returns a `T[][]` of the consecutive runs (`[]` for an empty input).
-export val dedupBy = <T>(arr: T[], f: (T) => Json): T[][] =>
+export val dedupBy = <T, K>(arr: T[], f: (T) => K): T[][] =>
   val result: T[][] = []
+  // `prevKey` stays `Json` (not `K`): it must hold a `null` sentinel before the first element, which
+  // a bare `K` cannot. The first comparison is guarded by `have`, so the `null` is never compared.
+  // `prevKey != key` is then a Json-vs-`K` compare; codegen's order-symmetric tagged-equality arm
+  // boxes the concrete `K` operand by its static type before `lin_tagged_eq`, so a flat-scalar `K`
+  // is correctly boxed (no flat-vs-tagged read hazard).
   var prevKey: Json = null
   var have = false
   arr.for(item =>

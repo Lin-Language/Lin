@@ -141,7 +141,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`set`](#set-array) | `<T>(T[], Int32, T) -> Null` | Set an element by index in place |
 | [`slice`](#slice) | `<T>(T[], Int32, Int32 = length(arr)) -> T[]` | Sub-buffer copy; preserves element type; `end` optional, negatives count from end |
 | [`sort`](#sort) | `<T>(T[], (T, T) -> Int32) -> T[]` | Return sorted copy using comparator |
-| [`sortBy`](#sortBy) | `<T>(T[], (T) -> Json) -> T[]` | Return sorted copy using key extractor |
+| [`sortBy`](#sortBy) | `<T, K>(T[], (T) -> K) -> T[]` | Return sorted copy using key extractor |
 | [`sum`](#sum) | `(Number[]) -> Number` | Sum all elements |
 | [`unique`](#unique) | `<T>(T[]) -> T[]` | Remove duplicate elements (deep equality) |
 | [`zip`](#zip) | `<A, B>(A[], B[]) -> [A, B][]` | Pair elements by index |
@@ -309,21 +309,21 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 
 | Function | Signature | Summary |
 | --- | --- | --- |
-| [`async`](#async) | `(() -> T) -> Promise` | Run a thunk asynchronously |
-| [`await`](#await) | `<T>(T) -> T \| Error` | Block until a promise resolves; result must handle `Error` |
+| [`async`](#async) | `<T>(() -> T) -> Promise<T>` | Run a thunk asynchronously |
+| [`await`](#await) | `<T>(Promise<T>) -> T \| Error` | Block until a promise resolves; result must handle `Error` |
 | [`close`](#close) | `(Worker) -> Null` | Shut down a worker |
 | [`frozen`](#frozen) | `<T>(T) -> T` | Deep-freeze a value into lock-free shared read-only state |
 | [`get`](#shared--get--set--withlock) | `<T>(Shared<T>) -> T` | Read a snapshot copy out of a `Shared` |
 | [`message`](#message) | `(Worker, Msg) -> Null` | Send a fire-and-forget message to a worker |
 | [`parallel`](#parallel) | `((() -> T)[]) -> T[]` | Run an array of thunks concurrently, collect results |
-| [`poolAsync`](#poolAsync) | `(ThreadPool, () -> T) -> Promise` | Enqueue a thunk on a thread pool |
-| [`race`](#race) | `(Promise[]) -> T` | Resolve with the first promise to complete |
+| [`poolAsync`](#poolAsync) | `<T>(ThreadPool, () -> T) -> Promise<T>` | Enqueue a thunk on a thread pool |
+| [`race`](#race) | `<T>(Promise<T>[]) -> Promise<T>` | Resolve with the first promise to complete |
 | [`request`](#request) | `(Worker, Msg) -> Reply` | Send a request to a worker and wait for reply |
-| [`retry`](#retry) | `(() -> T, Int32) -> T` | Retry a thunk up to n times on failure |
+| [`retry`](#retry) | `<T>(() -> T, Int32) -> Promise<T>` | Retry a thunk up to n times on failure |
 | [`set`](#shared--get--set--withlock) | `<T>(Shared<T>, T) -> Null` | Replace a `Shared`'s value |
 | [`shared`](#shared--get--set--withlock) | `<T>(T) -> Shared<T>` | Create opt-in shared mutable state |
 | [`threadPool`](#threadPool) | `(Int32) -> ThreadPool` | Create a thread pool with n workers |
-| [`timeout`](#timeout) | `(Promise, Int32) -> T` | Add a millisecond timeout to a promise |
+| [`timeout`](#timeout) | `<T>(Promise<T>, Int32) -> Promise<T>` | Add a millisecond timeout to a promise |
 | [`withLock`](#shared--get--set--withlock) | `<T, R>(Shared<T>, (T) -> R) -> R` | Atomic read-modify-write on a `Shared` |
 | [`worker`](#worker) | `((Msg) -> Reply, () -> Null) -> Worker` | Create a background worker |
 
@@ -384,7 +384,7 @@ Stream-specific sources, adapters, sinks, and terminals. The unified combinators
 | [`writeStream`](#writeStream) | `<T>(Stream<T>, String) -> Stream<T>` | Build a raw sink: write each item's bytes verbatim, no separator |
 | [`writeLines`](#writeLines) | `<T>(Stream<T>, String) -> Stream<T>` | Build a line-oriented sink: write each item followed by a newline |
 | [`drain`](#drain) | `<T>(Stream<T>) -> Null \| Error` | Run a pipeline on the calling thread |
-| [`promise`](#promise-stream) | `<T>(Stream<T>) -> Json` | Move a pipeline to a worker thread; `Promise<Null \| Error>` |
+| [`promise`](#promise-stream) | `<T>(Stream<T>) -> Promise<Null>` | Move a pipeline to a worker thread; `await` yields `Null \| Error` |
 | [`close`](#close-stream) | `(Stream<T>) -> Null` | Release the file/socket now (optional; idempotent) |
 
 **std/compress**
@@ -1665,10 +1665,10 @@ Returns a new array with elements sorted according to `compare`. The comparator 
 ### sortBy
 
 ```txt
-val sortBy: <T>(arr: T[], f: (T) -> Json) -> T[]
+val sortBy: <T, K>(arr: T[], f: (T) -> K) -> T[]
 ```
 
-Returns a new array sorted in ascending order by the key extracted by `f`. Keys are compared using Lin's natural ordering (numbers numerically, strings lexicographically). Does not modify `arr`. Generic over the element type `T`: `f` is checked against the element type, and the result is a `T[]` that preserves the element type. The key value is left as `Json` (it only needs to be comparable).
+Returns a new array sorted in ascending order by the key extracted by `f`. Keys are compared using Lin's natural ordering (numbers numerically, strings lexicographically). Does not modify `arr`. Generic over the element type `T` and the key type `K`: `f` is checked against the element type and its key type `K` is inferred, while the result is a `T[]` that preserves the element type. `K` may be any comparable type (e.g. `Int32`, `Float64`, `String`).
 
 ```txt
 ["banana", "apple", "cherry"].sortBy(s => s)
@@ -4048,12 +4048,12 @@ match outcome
 ### promise (stream) {#promise-stream}
 
 ```txt
-val promise: <T>(Stream<T>) -> Json    // Promise<Null | Error>
+val promise: <T>(Stream<T>) -> Promise<Null>
 ```
 
 Terminal. Runs the whole pipeline on a **background thread** and returns a promise immediately, so your program can do other work while the stream is processed. `await` the promise for the result — `Null` on success, or an `Error` if anything went wrong while processing (a crash mid-stream is caught at the thread boundary and handed back as an `Error` rather than aborting the program). Use `.drain()` when you simply want to run the pipeline and wait.
 
-The promise type is conceptually `Promise<Null | Error>`; like all promise handles it is erased to `Json` in annotations. `await` reattaches the `Null | Error` union, so the `Error` case must be handled.
+The promise has type `Promise<Null>`; `await` yields `Null | Error`, so the `Error` case must be handled.
 
 ```txt
 val p = readStream("big.log")
@@ -4287,10 +4287,10 @@ import { threadPool } from "std/async"
 ### async
 
 ```txt
-val async: (() -> T) -> Promise
+val async: <T>(() -> T) -> Promise<T>
 ```
 
-Runs a zero-argument thunk asynchronously on a background thread. Returns a `Promise` that resolves to the thunk's return value.
+Runs a zero-argument thunk asynchronously on a background thread. Returns a `Promise<T>` that resolves to the thunk's return value `T`.
 
 ```txt
 val p = async(() => fetchJson("https://api.example.com/data"))
@@ -4302,17 +4302,20 @@ val result = await(p)
 ### await
 
 ```txt
-val await: <T>(p: T) -> T | Error
+val await: <T>(p: Promise<T>) -> T | Error
 ```
 
-Blocks the current thread until the promise resolves, then returns its value as `T | Error`. Can also await an array of promises — returns an array of results.
+Blocks the current thread until the promise resolves, then returns its value as `T | Error`.
 
 ```txt
-val [users, posts] = await([
-  async(() => fetchJson("https://db/users")),
-  async(() => fetchJson("https://db/posts"))
-])
+val p = async(() => fetchJson("https://db/users"))
+match await(p)
+  is Error => print("fetch failed")
+  else     => use(p)
 ```
+
+To await several promises at once, use [`parallel`](#parallel) (collect a whole array of
+results) or `await` each handle in turn.
 
 `await` auto-flattens nested promises: if the thunk itself returns a `Promise`, `await`
 resolves through every layer (`await(async(() => async(() => 42)))` is `42`).
@@ -4336,11 +4339,13 @@ val r: Int32 = await(p)   // type error: Int32 | Error is not assignable to Int3
 
 You must handle the `Error` (e.g. with the `match` above) before using the value as a plain `T`.
 
-> Limitation: there is no nominal `Promise<T>` type — a promise handle is erased to
-> `Json` — so this enforces "you must handle the `Error` after awaiting" but does **not** catch
-> "you forgot to `await`" (using a promise as if it were the value). Error injection happens at
-> `await` (where the value materialises), not at `async`, because the other async primitives
-> return live promise handles, not values.
+`Promise<T>` is a first-class opaque handle type: `async` returns `Promise<T>`, `await` takes
+`Promise<T>`, and the type checker tracks the payload `T` through `race`/`timeout`/`retry`/
+`poolAsync`. Because a promise is its own type (not erased to a value), "you forgot to `await`"
+is caught — passing a `Promise<T>` where a `T` is expected is a type error. Like other opaque
+handles (`Shared<T>`, `Stream<T>`), a `Promise<T>` does not widen to `Json`. Error injection
+happens at `await` (where the value materialises), not at `async`, because the other async
+primitives return live promise handles, not values.
 
 ---
 
@@ -4385,10 +4390,10 @@ val results = parallel([
 ### race
 
 ```txt
-val race: (Promise[]) -> T
+val race: <T>(Promise<T>[]) -> Promise<T>
 ```
 
-Resolves with the value of the first promise in the array to complete.
+Returns a promise that resolves with the value of the first promise in the array to complete.
 
 ---
 
@@ -4405,10 +4410,10 @@ Sends `msg` to worker `w` and blocks until the handler returns a reply.
 ### retry
 
 ```txt
-val retry: (() -> T, Int32) -> T
+val retry: <T>(() -> T, Int32) -> Promise<T>
 ```
 
-Runs the thunk up to `n` times, returning the first successful result. If all attempts fail, returns the last error.
+Returns a promise that runs the thunk up to `n` times, resolving with the first successful result. If all attempts fail, the awaited result is the last `Error`.
 
 ---
 
@@ -4433,7 +4438,7 @@ val r = await(p)
 ### poolAsync
 
 ```txt
-val poolAsync: (ThreadPool, () => T) -> Promise<T | Error>
+val poolAsync: <T>(ThreadPool, () => T) -> Promise<T>
 ```
 
 Enqueues `thunk` on `pool` and returns a `Promise` for its result, resolved when a pool worker
@@ -4450,10 +4455,10 @@ not capture `var`). A fault inside the thunk is isolated and surfaces as an `Err
 ### timeout
 
 ```txt
-val timeout: (Promise, Int32) -> T
+val timeout: <T>(Promise<T>, Int32) -> Promise<T>
 ```
 
-Adds a millisecond timeout to `promise`. If the promise does not resolve within `ms` milliseconds, the result is an error.
+Returns a promise that adds a millisecond timeout to `promise`. If `promise` does not resolve within `ms` milliseconds, awaiting the result yields `Null` (timed out); otherwise it passes the original value through.
 
 ---
 

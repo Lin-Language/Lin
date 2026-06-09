@@ -2484,7 +2484,7 @@ fn type_mentions_typevar(ty: &Type) -> bool {
         // The Json wildcard `TypeVar(u32::MAX)` is a concrete dynamic type, NOT a quantified
         // generic param — a function returning/taking Json is a real, callable function.
         Type::TypeVar(id) => *id != u32::MAX,
-        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Map(t) => {
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Promise(t) | Type::Map(t) => {
             type_mentions_typevar(t)
         }
         Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(type_mentions_typevar),

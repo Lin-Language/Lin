@@ -235,6 +235,43 @@ val s = suite("std/async", [
     [
       expect(results.toString()).toBe("[5, 5, 5]")
     ]
+  ),
+
+  test("Shared<Int32> keeps its scalar payload type through get/set/withLock", () =>
+    val si = shared(5)
+    val n: Int32 = get(si)
+    set(si, 10)
+    val n2: Int32 = get(si)
+    val sum: Int32 = n + n2
+    val doubled: Int32 = withLock(si, x => x * 2)
+    [
+      expect(sum).toBe(15),
+      expect(doubled).toBe(20)
+    ]
+  ),
+
+  test("Shared<String> keeps its String payload type", () =>
+    val ss = shared("hello")
+    val str: String = get(ss)
+    set(ss, "world")
+    val str2: String = get(ss)
+    [
+      expect(str).toBe("hello"),
+      expect(str2).toBe("world")
+    ]
+  ),
+
+  test("Shared<record> keeps its record payload type (typed field access)", () =>
+    val sp = shared({ "x": 1, "y": 2 })
+    val p = get(sp)
+    val px: Int32 = p["x"]
+    set(sp, { "x": 7, "y": 8 })
+    val q = get(sp)
+    val qy: Int32 = q["y"]
+    [
+      expect(px).toBe(1),
+      expect(qy).toBe(8)
+    ]
   )
 ])
 
