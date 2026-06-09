@@ -5992,14 +5992,37 @@ fn extract_fuse_chain<'a>(
             break;
         }
         let Some((params, body)) = inlinable_capturing_lambda(&args[1], builder, ctx) else { break };
+        // SCALAR-ONLY GATE (sound subset): fuse only when the value FLOWING THROUGH this stage is a
+        // concrete inline scalar — the element this stage reads and (for a map) produces. This keeps
+        // fusion on the proven flat-scalar pipeline (range/map/filter/reduce of Int/Float) and bails
+        // any SEALED-RECORD / heap-element source to the existing per-stage path. The packed-sealed
+        // element materialize-and-reclaim (`free_combinator_sealed_elem`) is left to the single-
+        // combinator lowering, which the repr pass and runtime already agree on; folding it into a
+        // fused loop risks the per-element sealed-struct double-release (a separate, pre-existing hazard
+        // in packed `map`-field-projection — out of scope for this fusion).
+        let in_ty = iter_elem_type(&args[0].ty());
+        if !is_inline_scalar(&in_ty) {
+            break;
+        }
         let stage = if is_map {
             let (_, ret) = callback_signature(&args[1]);
+            // A map producing a non-scalar (heap/sealed/union) value would carry a boxed value into the
+            // next stage / terminal that the fused RC discipline here doesn't cover — bail.
+            if !is_inline_scalar(&ret) {
+                break;
+            }
             FuseStage::Map { params: params.to_vec(), body: body.clone(), out_elem_ty: ret }
         } else {
             FuseStage::Filter { params: params.to_vec(), body: body.clone() }
         };
         stages.push(stage);
         cur = &args[0];
+    }
+    // After peeling, the BASE source element must also be an inline scalar (a filter-only chain over a
+    // sealed array would otherwise fuse with a packed element source). If not, drop all stages — the
+    // caller falls back to the per-stage path for the whole chain.
+    if !is_inline_scalar(&iter_elem_type(&cur.ty())) {
+        stages.clear();
     }
     stages.reverse();
     (cur, stages)
