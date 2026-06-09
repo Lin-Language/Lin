@@ -365,22 +365,8 @@ impl LanguageServer for Backend {
             }
 
             // 2. Keywords, gated by context (the report: NO `import`/`from`/`as`/`export` in an
-            //    expression). Declaration keywords only at a statement start; `from`/`as` only inside
-            //    an import clause; `if`/`match`/`is`/`has`/`when` + literals are expression-level.
-            let keywords: &[&str] = match ctx {
-                CompletionContext::StatementStart => &[
-                    "val", "var", "type", "export", "import",
-                    "if", "then", "else", "match", "is", "has", "when",
-                    "true", "false", "null",
-                ],
-                CompletionContext::Expression => &[
-                    "if", "then", "else", "match", "is", "has", "when",
-                    "true", "false", "null",
-                ],
-                CompletionContext::ImportStmt => &["from", "as"],
-                CompletionContext::TypeAnnotation => &[],
-            };
-            for kw in keywords {
+            //    expression). Selection delegated to `keywords_for_context` so it's unit-testable.
+            for kw in keywords_for_context(ctx) {
                 if kw.starts_with(prefix) {
                     items.push(CompletionItem {
                         label: kw.to_string(),
@@ -1637,6 +1623,30 @@ enum CompletionContext {
     ImportStmt,
     StatementStart,
     Expression,
+}
+
+/// The keyword set offered in a given completion context. Pure (no I/O) so the gating policy is
+/// unit-testable. The split enforces the report's requirements:
+///   - declaration keywords (`val`/`var`/`type`/`export`/`import`) only at a `StatementStart`;
+///   - `from`/`as` only inside an `ImportStmt` (never in expression position — the user's complaint);
+///   - expression-level keywords (`if`/`then`/`else`/`match`/`is`/`has`/`when`) + value literals
+///     (`true`/`false`/`null`) in `Expression` (and at a `StatementStart`, which can begin with an
+///     expression statement);
+///   - nothing in a `TypeAnnotation` (types are offered there instead, see the handler).
+fn keywords_for_context(ctx: CompletionContext) -> &'static [&'static str] {
+    match ctx {
+        CompletionContext::StatementStart => &[
+            "val", "var", "type", "export", "import",
+            "if", "then", "else", "match", "is", "has", "when",
+            "true", "false", "null",
+        ],
+        CompletionContext::Expression => &[
+            "if", "then", "else", "match", "is", "has", "when",
+            "true", "false", "null",
+        ],
+        CompletionContext::ImportStmt => &["from", "as"],
+        CompletionContext::TypeAnnotation => &[],
+    }
 }
 
 /// Classify the completion cursor position. Combines a structural AST signal (cursor inside a
@@ -5451,6 +5461,170 @@ mod tests {
         // String receiver: BOTH apply (poly always, upper because its first param is string).
         assert!(dot_item_applies("string", poly.ty.as_deref().and_then(first_param_category).as_deref()));
         assert!(dot_item_applies("string", stronly.ty.as_deref().and_then(first_param_category).as_deref()));
+    }
+
+    // ── context-aware completion (scope/position awareness) ──────────────────
+
+    /// Classify the cursor at the `▮` marker in `src` (the marker is stripped before parsing). Char
+    /// offset of the marker is its position in the marker-free source.
+    fn classify_at(src_with_marker: &str) -> CompletionContext {
+        let offset = src_with_marker.find('▮').expect("missing ▮ cursor marker");
+        // The marker is a 3-byte char; the char offset of the cursor equals the char count before it.
+        let char_off = src_with_marker[..offset].chars().count();
+        let src = src_with_marker.replace('▮', "");
+        let module = parse(&src);
+        classify_completion_context(&module, &src, char_off)
+    }
+
+    /// Collect the in-scope binding NAMES at the `▮` marker in `src`.
+    fn scope_names_at(src_with_marker: &str) -> Vec<String> {
+        let offset = src_with_marker.find('▮').expect("missing ▮ cursor marker");
+        let char_off = src_with_marker[..offset].chars().count();
+        let src = src_with_marker.replace('▮', "");
+        let module = parse(&src);
+        collect_scope_bindings(&module, char_off)
+            .into_iter()
+            .map(|b| b.name)
+            .collect()
+    }
+
+    #[test]
+    fn classify_expression_inside_lambda_body_and_val_rhs() {
+        // Inside a lambda body passed to `.for(...)` — expression position.
+        assert_eq!(
+            classify_at("val nums = [1, 2, 3]\nnums.for(item =>\n  print(it▮)\n)\n"),
+            CompletionContext::Expression
+        );
+        // A `val` RHS is an expression position.
+        assert_eq!(
+            classify_at("val x = fo▮\n"),
+            CompletionContext::Expression
+        );
+    }
+
+    #[test]
+    fn classify_type_annotation_positions() {
+        // After `val x: ` (no type text yet) — backward scan fires.
+        assert_eq!(classify_at("val x: ▮\n"), CompletionContext::TypeAnnotation);
+        // Partially-typed annotation — the parsed TypeExpr span brackets the cursor.
+        assert_eq!(classify_at("val x: Int▮\n"), CompletionContext::TypeAnnotation);
+        // A function PARAM annotation `(x: ▮`.
+        assert_eq!(classify_at("val f = (x: ▮) => x\n"), CompletionContext::TypeAnnotation);
+        // A function RETURN type `): ▮`.
+        assert_eq!(classify_at("val f = (x: Int32): ▮ => x\n"), CompletionContext::TypeAnnotation);
+        // A `type T = ▮` declaration RHS.
+        assert_eq!(classify_at("type Id = ▮\n"), CompletionContext::TypeAnnotation);
+        // An object-LITERAL `key:` is NOT a type position (it's a value).
+        assert_eq!(classify_at("val o = { k: ▮ }\n"), CompletionContext::Expression);
+    }
+
+    #[test]
+    fn classify_statement_start_and_import() {
+        // A fresh top-level line is a statement start.
+        assert_eq!(classify_at("val a = 1\n▮\n"), CompletionContext::StatementStart);
+        // Partially-typed declaration keyword at line start.
+        assert_eq!(classify_at("val a = 1\nva▮\n"), CompletionContext::StatementStart);
+        // Inside an import clause (before the `from "…"` string).
+        assert_eq!(classify_at("import { foo▮ } from \"std/io\"\n"), CompletionContext::ImportStmt);
+        // A wrapped `val` RHS continuation is NOT a statement start (prev line ends with `=`).
+        assert_eq!(classify_at("val x =\n  ▮\n"), CompletionContext::Expression);
+    }
+
+    /// THE regression test for the report: the user's exact snippet, cursor after `it`. The in-scope
+    /// set must include the lambda param `item` (even though it's never referenced) AND the outer
+    /// `nums`, and must NOT include an out-of-scope sibling binding.
+    #[test]
+    fn scope_collection_surfaces_unreferenced_lambda_param() {
+        let names = scope_names_at(
+            "val nums = [1, 2, 3]\nval other = 99\nnums.for(item =>\n  print(it▮)\n)\n",
+        );
+        assert!(names.contains(&"item".to_string()), "expected lambda param `item`, got {names:?}");
+        assert!(names.contains(&"nums".to_string()), "expected outer `nums`, got {names:?}");
+        // `other` is a sibling top-level binding — also in scope (module-global), so present.
+        assert!(names.contains(&"other".to_string()), "expected top-level `other`, got {names:?}");
+    }
+
+    #[test]
+    fn scope_collection_respects_lexical_scope_for_lambda_params() {
+        // Cursor is in `f`'s body (after a complete reference); `g`'s param `b` is a sibling scope
+        // that does NOT enclose it.
+        let names = scope_names_at(
+            "val f = (a: Int32) => print(a▮)\nval g = (b: Int32) => b\n",
+        );
+        assert!(names.contains(&"a".to_string()), "expected own param `a`, got {names:?}");
+        assert!(!names.contains(&"b".to_string()), "sibling param `b` leaked: {names:?}");
+    }
+
+    #[test]
+    fn scope_collection_includes_destructured_binders() {
+        let names = scope_names_at("val { x, y } = pt\nprint(▮)\n");
+        assert!(names.contains(&"x".to_string()), "expected destructured `x`, got {names:?}");
+        assert!(names.contains(&"y".to_string()), "expected destructured `y`, got {names:?}");
+    }
+
+    /// Keyword gating: the report's hard requirement — no `import`/`from`/`as`/`export`/`val`/`var`/
+    /// `type` in expression position; declaration keywords + `import` at a statement start; `from`/
+    /// `as` only inside an import clause.
+    #[test]
+    fn keyword_gating_by_context() {
+        let expr = keywords_for_context(CompletionContext::Expression);
+        for banned in ["import", "from", "as", "export", "val", "var", "type"] {
+            assert!(!expr.contains(&banned), "`{banned}` must NOT be offered in expression position");
+        }
+        // Expression-level keywords + literals ARE offered.
+        for kw in ["if", "match", "is", "true", "null"] {
+            assert!(expr.contains(&kw), "`{kw}` expected in expression position");
+        }
+
+        let stmt = keywords_for_context(CompletionContext::StatementStart);
+        assert!(stmt.contains(&"val"), "`val` expected at statement start");
+        assert!(stmt.contains(&"import"), "`import` expected at statement start");
+        assert!(!stmt.contains(&"from"), "`from` must not be at statement start");
+
+        let imp = keywords_for_context(CompletionContext::ImportStmt);
+        assert!(imp.contains(&"from") && imp.contains(&"as"), "from/as expected inside import clause");
+        assert!(!imp.contains(&"val"), "`val` must not be inside import clause");
+
+        // No keywords in a type-annotation position (types are offered there instead).
+        assert!(keywords_for_context(CompletionContext::TypeAnnotation).is_empty());
+    }
+
+    /// Type gating: built-in + user `type` names are offered ONLY in a TypeAnnotation position; user
+    /// type names are collected from the module's `type` decls + in-scope generic params.
+    #[test]
+    fn type_name_collection_and_gating() {
+        // User type decl + a generic param inside the declaring fn are collected at a body cursor.
+        let names = {
+            let src_with_marker = "type Point = { x: Int32 }\nval id = <T>(v: T): T => ▮\n";
+            let offset = src_with_marker.find('▮').unwrap();
+            let char_off = src_with_marker[..offset].chars().count();
+            let src = src_with_marker.replace('▮', "");
+            let module = parse(&src);
+            collect_type_names(&module, char_off)
+        };
+        assert!(names.contains(&"Point".to_string()), "expected user type `Point`, got {names:?}");
+        assert!(names.contains(&"T".to_string()), "expected generic param `T`, got {names:?}");
+
+        // Type keywords/builtins are gated by context: types only in TypeAnnotation; keywords (which
+        // exclude types) carry the value-side. The handler offers builtins only when
+        // ctx == TypeAnnotation — assert the classification drives that:
+        assert_eq!(classify_at("val x: ▮\n"), CompletionContext::TypeAnnotation);
+        assert_eq!(classify_at("val x = ▮\n"), CompletionContext::Expression);
+    }
+
+    /// End-to-end gate documentation: in Expression position the in-scope binder set + the keyword
+    /// set together must surface `item`/`nums` and exclude statement keywords. This composes the two
+    /// pure pieces the async handler wires together.
+    #[test]
+    fn expression_position_offers_bindings_not_statement_keywords() {
+        let src_with_marker = "val nums = [1, 2, 3]\nnums.for(item =>\n  print(it▮)\n)\n";
+        let ctx = classify_at(src_with_marker);
+        assert_eq!(ctx, CompletionContext::Expression);
+        let names = scope_names_at(src_with_marker);
+        assert!(names.contains(&"item".to_string()));
+        assert!(names.contains(&"nums".to_string()));
+        let kws = keywords_for_context(ctx);
+        assert!(!kws.contains(&"import"), "import leaked into expression completion");
     }
 
     /// FIX A: raw solver type-var ids (`?T9004`) render as clean, stable generic names. The same
