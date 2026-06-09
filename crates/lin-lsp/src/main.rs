@@ -7221,21 +7221,28 @@ export val thingCount = 7
         }
     }
 
-    /// LIMITATION: definition sites are not recorded as their own entry in the span map (only
-    /// USE-spans are pushed by the checker). So placing the cursor exactly on a param/let binding
-    /// that has no overlapping use-span yields no occurrences. This test pins that known behaviour
-    /// so a future change that DOES record def-sites updates it deliberately.
+    /// The checker now records a def-site self-entry (`use_span == def_span == name_span`) for
+    /// every function/lambda parameter (for LSP inlay hints — see lin-check's
+    /// `param_def_span_types`). As a deliberate consequence, placing the cursor exactly on a
+    /// param decl now resolves: the def-site entry's `def_span` groups it with all of the param's
+    /// body uses, so occurrences returns the binding plus every read. (Previously only USE-spans
+    /// were recorded, so the bare decl site yielded nothing — that limitation is now lifted.)
     #[test]
-    fn occurrences_at_from_bare_definition_is_empty_known_limitation() {
+    fn occurrences_at_from_param_definition_resolves() {
         let src = "val f = (n: Int32) => n + n + n\n";
         let map = span_map(src);
         let param = src.find('(').unwrap() + 1; // the `n` of the param decl
         let from_def = occurrences_at(&map, offset_after(src, param, "n"));
-        assert!(
-            from_def.is_empty(),
-            "param decl site has no recorded span; expected empty, got {:?}",
+        // 1 binding (param decl) + 3 body uses, deduped.
+        assert_eq!(
+            from_def.len(),
+            4,
+            "param decl site now resolves to binding + 3 uses, got {:?}",
             from_def
         );
+        for s in &from_def {
+            assert_eq!(&src[s.start as usize..s.end as usize], "n", "span {:?} not over `n`", s);
+        }
     }
 
     /// A plain `val x = ...` binding (not a param) is now bound with a real def_span, so its uses

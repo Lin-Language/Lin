@@ -20,7 +20,7 @@ pub fn zonk_module(module: &mut TypedModule, subs: &HashMap<u32, Type>) {
     }
 }
 
-fn zonk_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
+pub(crate) fn zonk_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
     match ty {
         Type::TypeVar(id) => {
             if let Some(concrete) = subs.get(id) {

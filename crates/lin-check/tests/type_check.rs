@@ -463,3 +463,110 @@ fn test_scalar_annotation_on_string_array_no_hint() {
         diags[0].help
     );
 }
+
+// --- Parameter def-site entries in span_type_map (LSP inlay hints) ---------------------------
+//
+// The checker records a definition-site `(name_span, type, Some(name_span))` entry in
+// `span_type_map` for EVERY function/lambda parameter — including unannotated params that are
+// never used — so the language server can show an inlay type hint at the parameter's name span
+// without relying on a USE of the param (only uses are otherwise recorded). These tests assert
+// that contract. They are metadata-only: the success/failure of `check_module` is unchanged.
+
+/// Parse + check, returning the checker so tests can inspect `span_type_map`.
+fn parse_and_check_with_checker(
+    source: &str,
+) -> (Checker, Result<lin_check::TypedModule, Vec<lin_common::Diagnostic>>) {
+    let mut lexer = Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::new(tokens);
+    let module = parser.parse_module();
+    let mut checker = Checker::new();
+    checker.allow_intrinsics = true;
+    let result = checker.check_module(&module);
+    (checker, result)
+}
+
+/// Find the def-site type string recorded for the identifier `name` at byte offset `at` in the
+/// source: an entry whose use-span == def-span and whose span starts at `at`.
+fn param_def_type_at(checker: &Checker, at: u32, name_len: u32) -> Option<String> {
+    checker
+        .span_type_map
+        .iter()
+        .find(|(span, _, def)| {
+            span.start == at
+                && span.end == at + name_len
+                && *def == Some(*span)
+        })
+        .map(|(_, ty, _)| ty.clone())
+}
+
+#[test]
+fn test_unused_annotated_param_recorded_in_span_type_map() {
+    // `x` is annotated `Int32` and NEVER used in the body — `infer_ident` never runs for it, so
+    // only the def-site entry can carry its type.
+    let source = "val f = (x: Int32) => 0";
+    let at = source.find('x').unwrap() as u32;
+    let (checker, result) = parse_and_check_with_checker(source);
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+    assert_eq!(
+        param_def_type_at(&checker, at, 1).as_deref(),
+        Some("Int32"),
+        "param `x` def-site type missing/wrong; span_type_map = {:?}",
+        checker.span_type_map
+    );
+}
+
+#[test]
+fn test_unused_unannotated_param_has_def_site_entry() {
+    // An UNANNOTATED, unused param: its type stays a free var (`?T`-ish). We only assert that a
+    // def-site self-entry EXISTS at the name span (the LSP suppresses unresolved `?T`).
+    let source = "val f = (y) => 0";
+    let at = source.find('y').unwrap() as u32;
+    let (checker, result) = parse_and_check_with_checker(source);
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+    let has_entry = checker
+        .span_type_map
+        .iter()
+        .any(|(span, _, def)| span.start == at && span.end == at + 1 && *def == Some(*span));
+    assert!(has_entry, "no def-site entry for unannotated param `y`: {:?}", checker.span_type_map);
+}
+
+#[test]
+fn test_inferred_param_def_site_resolves_to_concrete_type() {
+    // `n`'s type is INFERRED from the call context: it is added to `1`, forcing it numeric, and
+    // the call `f(5)` pins it to `Int32`. The def-site entry must carry the RESOLVED type (zonked),
+    // not an unsolved `?T`.
+    let source = "val f = (n) => n + 1\nval r = f(5)";
+    let at = source.find("(n)").unwrap() as u32 + 1; // the `n` inside the parens
+    let (checker, result) = parse_and_check_with_checker(source);
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+    let ty = param_def_type_at(&checker, at, 1);
+    assert_eq!(
+        ty.as_deref(),
+        Some("Int32"),
+        "inferred param `n` def-site type should resolve to Int32; span_type_map = {:?}",
+        checker.span_type_map
+    );
+}
+
+#[test]
+fn test_unused_lambda_param_from_for_callback_recorded() {
+    // The classic inlay-hint case: a `for` callback param `i` that is NEVER used. Its type is
+    // supplied by the combinator's callback element type (`Int32`) via `infer_function_with_hints`,
+    // so the def-site entry should resolve to a concrete type rather than `?T` — and exist at all,
+    // unlike a use-driven entry (there is no use).
+    let source = "import { range, for } from \"std/iter\"\nrange(0, 5).for(i => 0)";
+    // The `i` param: locate the `i =>` occurrence.
+    let at = source.find("i =>").unwrap() as u32;
+    let (checker, result) = parse_and_check_with_checker(source);
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+    let has_entry = checker
+        .span_type_map
+        .iter()
+        .any(|(span, _, def)| span.start == at && span.end == at + 1 && *def == Some(*span));
+    assert!(
+        has_entry,
+        "no def-site entry for unused `for`-callback param `i`: {:?}",
+        checker.span_type_map
+    );
+}
