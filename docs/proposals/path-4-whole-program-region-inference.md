@@ -114,13 +114,44 @@ That is exactly why making reads faster (Paths 1/2) barely moved the benchmarks.
   *could* take are *already* stack-allocated by the merged all-scalar mechanism. **The reachable win is
   whole-program / build-phase region inference** — which is this path.
 
-### The central finding (measured, not assumed)
+### ⚠️ CORRECTION 2026-06-09 — H9 conflated two levers; one of them is the biggest shipped RAPTOR win
+H9 ("typing RAPTOR's trips made GROUP/RANGE 2× slower, `lin_object_get` unchanged") is correct for the
+lever it pulled — `Json`-RECORD → packed struct (`Trip`/`StopTime` field reads). But this path
+generalises it to *"making reads fast / de-`Json`-ing barely moved the benchmarks"*, and that
+over-reaches, because **"de-`Json`-ing" is two different levers** and the *other* one is the single
+biggest RAPTOR speedup on master:
+
+- **`Json`-DICTIONARY → typed `{ String: T }` map** (`routeStopIndex`, `bestArrivals`, `kConnections`):
+  changes `m[k]` from `lin_object_get` (tag-check + intern-compare + **box result to `TaggedVal`** +
+  optimiser barrier) to a lean `lin_map_get`. `8859f713` measured **PREP 144 s → 25.7 s (~5.6×)**;
+  `8ee79a8d` + `3c4ed0b8`/`ea1569c2` typed the rest. **All on master, digest byte-identical.** This is
+  exactly an `lin_object_get`-reduction win — the very thing H9 reported as "reads aren't the
+  bottleneck." The reconciliation: H9 counted `lin_object_get` on the *record* reads (which typing to a
+  packed-but-unpackable `Trip` does not remove) and missed that the *dictionary* `lin_object_get`s were
+  separately, cheaply removable by a different type change.
+- H9's own table shows **LOAD −38%** from typing the loader's construction and flags it as "the tell" —
+  but the path then scopes LOAD/PREP out ("one-time setup") and optimises GROUP/RANGE. PREP is where the
+  5.6× landed.
+
+**Implication for this path:** Path 4's *target* (construction/RC of escaping build-once graphs) is a
+real and dominant cost in the GROUP/RANGE query phase — that part stands. But the strategic claim that
+"the read/de-`Json` axis is not where RAPTOR's cost lives" is only true for the *record-packing* arm; the
+*dictionary-typing* arm was never run as an isolated experiment and, where it was run incidentally, won
+~5.6×. **Before committing to whole-program region inference, run a per-call-site-CLASS profile of the
+query phase** (split `lin_object_get` into dict-lookup-on-`Json` vs record-field-read vs small-map,
+attributed to source lines) to see how much remaining query-phase cost is *still* cheap dictionary
+typing vs the genuinely-hard construction/RC this path targets. See path-0's RETROSPECTIVE 2026-06-09 for
+the full root-cause of why the profiling missed this.
+
+### The central finding (measured, not assumed) — *modulo the correction above*
 RAPTOR and interp are slow because they **allocate and refcount large graphs of small records that are
 built once and live for the whole program** — and Lin pays per-object `malloc` + per-field retain + a
 drop-walk for every one of them, plus RC across every call boundary. Reads are already fast (concrete
 records are const-offset); the read paths therefore can't help. The cost is **allocation + lifetime
 management of escaping build-once data** — a memory-model/lifetime problem, addressable in the compiler
-without changing the language.
+without changing the language. *(Caveat: "reads are already fast" holds for packed concrete records and
+for typed maps; it does NOT cover `Json` dictionaries still on the `lin_object_get`+box path — those are
+the cheap dictionary-typing wins above, orthogonal to this path's construction-RC target.)*
 
 ---
 

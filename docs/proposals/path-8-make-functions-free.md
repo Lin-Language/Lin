@@ -185,3 +185,24 @@ monomorphize the dispatch, flatten the loop forms — Path 6's mechanisms, prove
 exactly how Rust/Zig/Go reach C speed: the functional design is not the enemy; *leaving the abstraction
 standing at runtime* is. Zero userland change. Start with Tier 1 (in-flight spike), then generalize Tier 2,
 then go deep on Tier 3 — sequenced by what the profile says dominates.
+
+---
+
+### ✅ Corroborating note 2026-06-09 — the biggest shipped RAPTOR win already validates this thesis (and refines the target list)
+The single largest RAPTOR speedup on master, which no path claimed, is a direct instance of "the cost is
+an opaque non-inlined call": typing the `Json` **dictionaries** (`routeStopIndex`/`bestArrivals`/
+`kConnections`) as `{ String: T }` maps measured **PREP 144 s → 25.7 s (~5.6×)** (`8859f713`, on master).
+Mechanism: `m[k]` on a `Json` object is fact-#1's opaque `lin_object_get` (+ box the result into a
+`TaggedVal`); typing the value routes it to a lean `lin_map_get`. So it **removed a hot opaque helper
+call** — Tier 1's exact target — but *without* Tier 1's bitcode-runtime machinery: a type annotation made
+the compiler stop emitting the call at all.
+
+The refinement for this path's target list: when enumerating the opaque helpers to demolish, separate
+`lin_object_get` calls by the **kind** of value they read — a `Json` **dictionary** (string→value) is
+removable *for free today* by typing it `{ String: T }`; a `Json` **record** read needs Tier 1/2/3 (or
+packing) because there is no cheaper typed form for it. Cheapest-first: type the dictionaries, then
+demolish the helpers that remain. This is why path-0's per-call-site-**class** profile (split
+`lin_object_get` into dict-lookup vs record-read vs small-map, by source line) should run **before** the
+Tier-1 spike — it tells you how much of the opaque-call cost is a type annotation away vs genuinely needs
+the bitcode/inlining work. See **path-0 RETROSPECTIVE 2026-06-09** for the full root-cause of why this win
+was invisible to the aggregate-`lin_object_get` profile that originally framed Paths 0–7.
