@@ -64,7 +64,7 @@ export val cwd = (): String =>
 // Change the current working directory.
 // @param path  the directory to switch to.
 // @returns Null on success, or an Error (e.g. if `path` does not exist or is not a directory).
-export val chdir = (path: String): Json =>
+export val chdir = (path: String): Null | Error =>
   lin_process_chdir(path)
 
 // --- Streaming: spawn and read incrementally ---
@@ -73,7 +73,7 @@ export val chdir = (path: String): Json =>
 // @param command  the program to run (looked up on PATH).
 // @param args  the argument vector.
 // @returns an opaque ProcessHandle, or an Error if the process cannot be launched.
-export val spawn = (command: String, args: String[]): Json =>
+export val spawn = (command: String, args: String[]): ProcessHandle | Error =>
   lin_process_spawn(command, args)
 
 // Read the next chunk of the process's stdout into a caller-provided buffer.
@@ -81,13 +81,13 @@ export val spawn = (command: String, args: String[]): Json =>
 // @param buf  the buffer to fill; up to `buf.length` bytes are read.
 // @returns the number of bytes read (0 = EOF), or an Error.
 // @example val n = readStdout(h, buf)   // n bytes copied into buf; 0 means end-of-stream
-export val readStdout = (handle: ProcessHandle, buf: UInt8[]): Json =>
+export val readStdout = (handle: ProcessHandle, buf: UInt8[]): Int32 | Error =>
   lin_process_read_stdout(handle, buf)
 
 // Send SIGTERM to a spawned process.
 // @param handle  the process to signal.
 // @returns Null on success, or an Error.
-export val kill = (handle: ProcessHandle): Json =>
+export val kill = (handle: ProcessHandle): Null | Error =>
   lin_process_kill(handle)
 
 // Wait for a spawned process to exit. stdout that was streamed via readStdout is not re-collected
@@ -95,7 +95,7 @@ export val kill = (handle: ProcessHandle): Json =>
 // @param handle  the process to wait on.
 // @returns the process's exit code, or an Error. After `wait` the handle is no longer valid.
 // @example val proc = spawn("server", ["--port", "8080"])   // ...later... val code = wait(proc)
-export val wait = (handle: ProcessHandle): Json =>
+export val wait = (handle: ProcessHandle): Int32 | Error =>
   lin_process_wait(handle)
 
 // Wrap a spawned child's piped stdout as a lazy byte stream. Reading pulls from

@@ -11,17 +11,22 @@ val plain = "/tmp/lin_compress_plain.txt"
 val gzPath = "/tmp/lin_compress_out.gz"
 val dfPath = "/tmp/lin_compress_out.deflate"
 
-// `collect` / `readText` return `X | Error`; unwrap the success arm (Error stands in as "err").
-val unwrapStr = (r: Json): String =>
+// `collect` / `readText` return `X | Error`; unwrap the success arm (Error stands in as a sentinel).
+val unwrapStr = (r: String | Error): String =>
   match r
     is Error => "err"
+    else => r
+
+val unwrapBytes = (r: UInt8[] | Error): UInt8[] =>
+  match r
+    is Error => []
     else => r
 
 val s = suite("std/compress", [
   test("gzip then gunzip recovers the input (round-trip via disk)", () =>
     writeFile(plain, "the quick brown fox jumps over the lazy dog")
     // Compress the plaintext stream into the gzip container, write the raw bytes to disk.
-    val compressed = readStream(plain).gzip().collect()
+    val compressed = unwrapBytes(readStream(plain).gzip().collect())
     writeFileBytes(gzPath, compressed)
     // Decompress the on-disk gzip file back through a stream.
     val recovered = readStream(gzPath).gunzip().readText()
@@ -32,7 +37,7 @@ val s = suite("std/compress", [
 
   test("gzip output starts with the gzip magic bytes", () =>
     writeFile(plain, "hello gzip")
-    val compressed = readStream(plain).gzip().collect()
+    val compressed = unwrapBytes(readStream(plain).gzip().collect())
     // gzip magic: 0x1f 0x8b.
     [
       expect(compressed[0]).toBe(31),
@@ -42,7 +47,7 @@ val s = suite("std/compress", [
 
   test("deflate then inflate recovers the input (raw DEFLATE, via disk)", () =>
     writeFile(plain, "round-trip through raw deflate with no gzip header")
-    val compressed = readStream(plain).deflate().collect()
+    val compressed = unwrapBytes(readStream(plain).deflate().collect())
     writeFileBytes(dfPath, compressed)
     val recovered = readStream(dfPath).inflate().readText()
     [
@@ -52,8 +57,8 @@ val s = suite("std/compress", [
 
   test("compressing a repetitive payload shrinks it", () =>
     writeFile(plain, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-    val original = readFile(plain)
-    val compressed = readStream(plain).gzip().collect()
+    val original = unwrapStr(readFile(plain))
+    val compressed = unwrapBytes(readStream(plain).gzip().collect())
     [
       // 64 highly-compressible bytes compress to well under their original size.
       expect(length(compressed) < length(original)).toBe(true)
