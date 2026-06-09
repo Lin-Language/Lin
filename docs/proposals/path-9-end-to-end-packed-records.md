@@ -45,6 +45,15 @@ must be all-or-nothing end-to-end** — there is no incremental typing path that
 
 ## The prerequisite stack (in dependency order — each gates the next)
 
+> **⚠️ STATUS UPDATE 2026-06-09 (see RESULTS section at the bottom):** prereqs 1, 2, AND 3 are now BUILT
+> (unmerged, parallel branches). Step 1+2 (in-place packed-array ABI) MERGED to master (`acf35a83`). Step
+> 3's "real blocker" (the repr-oracle reconciliation) is SOLVED (`d341824d` — it was a stale over-assertion,
+> not a deep conflict) and the producer/consumer seal asymmetry is SOLVED (9C, `253ea5f6`). Heap-field
+> **String** packing now works end-to-end on `perf/path9a-widen-on-9c` (blocker fixed, gates green,
+> linear-scan→const-offset verified). The text below is the ORIGINAL plan; what remains is **9-D** (retype
+> RAPTOR's `Json` trips) + the `stopTimes` nested-array (built on `perf/path9-raptor-payoff`) + pre-existing
+> leak cleanup — NOT the repr-oracle work, which is done.
+
 1. **Path 1 Steps 1+2 — the in-place packed-array ABI — MERGED to master.** *(Currently only on the
    `path1-packed-records` / `worktree-agent-aa197d6e` branches; `is_packed_scalar_struct` /
    `sealed_array_elem_ptr` / the in-place `for`/`length` redirect are NOT yet on master — verified.)*
@@ -147,3 +156,29 @@ representation alternative to Path 5's value semantics, parallel to and non-comp
 call-cost lever (they fix different programs). Pursue it for the `Json`-read-bound workloads; lead the
 overall effort with whichever of {Path 8 Tier 2, Path 1 Step 1} is lower-risk-per-win — both are gating
 first moves for their respective halves.
+
+---
+
+## ✅ RESULTS 2026-06-09 — 9C seal-propagation + 9-A String packing: BLOCKER CLEARED, mechanism VERIFIED (my exploration line; all UNMERGED, parallel)
+
+Three of this path's prerequisites are now built and I verified them myself. Branch lineage (each cut from the prior, off master): `perf/path9b-repr-reconcile` → `perf/path9c-seal-propagation` → `perf/path9a-widen-on-9c`. (Sibling parallel explorations reached overlapping states via different routes: `perf/path9c-face2` (String, different worker-boundary fix), `perf/path9-raptor-payoff` (String + nested record-array + RAPTOR retype) — RECONCILE all three when comparing notes.)
+
+### Prereq 1+2 — cheap borrowed heap-field read + repr-oracle reconciliation (on the `path9b`/`path9c` base)
+- **Cheap read** (`aa7a550d`): a packed heap-field read is a const-offset borrowed `load ptr` + retain-if-escapes, NOT a per-access materialize — the fix for the H6 dead-end.
+- **Repr-oracle reconciliation** (`d341824d`): the multi-day §H4/H5 blocker was a STALE OVER-ASSERTION in repr.rs's `Index` oracle/verify arms (asserted sealed-typed ⇒ Packed, but `compile_ir_index` is repr-adaptive with a sound Boxed path). Fix relaxes the Index forward arm only. NOT a deep union conflict.
+
+### Prereq 3 — 9C symmetric seal-propagation (`perf/path9c-seal-propagation`, commits `253ea5f6`+`a26a2cc9`, checker-only)
+The blocker that crashed every prior heap-field widen was a **checker producer/consumer seal ASYMMETRY**: the consumer reads `trip["stopTimes"]` as sealed/packed (from the `Trip` annotation), but the producer's object literal fell to undirected inference → `Array(Object{sealed:false})` → BOXED. Fix: `expected_field_needs_directing` (expr.rs:1579) now returns true for a sealed record / sealed-record-array, so `check_object_fields` DIRECTS those fields and the producer seals to match the consumer — **gated on `is_sealed_array_field_packable` per field**, so it auto-extends when the gate widens, with no further checker change.
+- **Fixes LIVE silent data corruption (I verified both sides):** a nested all-scalar sealed-record-array read `outer["items"][0]["a"]` printed garbage **`7 0` on master** → correct **`33 44`** with 9C. Producer now emits `sealed_array_alloc`.
+- **Gates I ran:** 696 integration + 72/72 lin + RAPTOR 9/9 + fmt all green; gate stays scalar+Bool (9C is checker-only). **Worth landing for the corruption fix alone, independent of perf.**
+
+### 9-A — gate WIDENED to String + the worker-transfer blocker FIXED (`perf/path9a-widen-on-9c`)
+With 9C in place, widening `is_sealed_array_field_packable` to `Str|StrLit` (types.rs) makes the producer/consumer symmetric for String-field records. The one remaining blocker (a hard `lin test` gate) was **`examples/event-transfers`**: a packed sealed-record array crossing the std/event worker boundary arrives BOXED (elem_tag 0xFF), but `lin_sealed_array_push_struct_retaining` / `lin_sealed_array_to_tagged` assumed a packed 0xFE buffer → `[null]`/misaligned-deref (PRE-EXISTING — scalar records hit it too; String widening merely exposed it).
+- **Fix (commit `c001352c`, runtime `array.rs`):** new `lin_sealed_array_push_struct_retaining_named` — on a 0xFE array delegates to the packed copy; on a BOXED array materializes the struct to a boxed `LinObject` and does a retaining tagged push. `lin_sealed_array_to_tagged` returns a +1 alias on a non-0xFE array instead of striding. Made the runtime primitives **representation-agnostic** at the boxed/packed boundary (most contained — fixes any boxed-vs-packed mismatch, not just std/event). Codegen `Push` passes the named descriptor.
+- **MECHANISM VERIFIED BY ME (load-independent, definitive):** typed String-record read `ts[i]["text"]` — **master = 2 `lin_object_get` (linear scan), 0 packed; branch = 2 packed const-offset reads (`sealed_array_elem_ptr`+`sealed_fld`), linear-scan eliminated.** This is the linear-scan→const-offset conversion the whole path targets. (Agent measured ~5.4× wall-clock on a typed-index read; I could not reproduce the *number* — my microbenches were loop-invariant and LLVM-hoisted to ~0.019s — so I trust the IR mechanism, which is unambiguous.)
+- **Gates I ran:** 696 integration + 72/72 lin test (incl. **event-transfers** — the blocker) + fmt + RAPTOR digest byte-identical; String value-correctness (filter/map/reduce/index over `Tok[]` → correct).
+- **Leak truth (I isolated it — the agent's "constant residual" was imprecise):** the new gate-widen + boxed-push primitive add **NO leak** (read/index path = 10 B constant; the new primitive's ASan regression test is RC-balanced, no UAF). The scaling leaks visible on this branch are **two PRE-EXISTING bugs it inherits**: (1) the Step-8.1 multi-stage-chain leak (scalar chain leaks identically; fixed only on `perf/path8-step1-record-fusion`, not here); (2) the `range().map()`-into-sealed-array BUILD leak (String build ≈ scalar build, byte-identical → pre-existing on master).
+- **Scope:** String only (Array/Map/nested kept boxed). **RAPTOR digest UNCHANGED** because `tripsByRoute` is still `Json`-typed in the `.lin` source — RAPTOR realizes the win only after its trips are retyped to concrete `Trip` (the end-to-end **9-D** thread, explored on `perf/path9-raptor-payoff`: correct + digest-exact but not-yet-a-win, gated on a packed-record drop-walk codegen fix + the boxed `Trip|Null` construction).
+
+### Net (this line)
+Heap-field **String** packing is shippable-quality end-to-end on `perf/path9a-widen-on-9c`: blocker fixed, all hard gates green, the linear-scan→const-offset mechanism verified. The remaining work to the **headline** win is **9-D** (retype RAPTOR's `Json` trips → `Trip`) + cleaning up the two inherited pre-existing leaks (one already fixed on the 8.1 branch). The repr-oracle blocker that stalled this path for weeks is solved; the producer/consumer asymmetry is solved; what's left is plumbing (typed RAPTOR source) and pre-existing leak cleanup, not a new design problem.
