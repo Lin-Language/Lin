@@ -5931,6 +5931,169 @@ fn emit_packed_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)
     builder.switch_to(exit);
 }
 
+// ===========================================================================================
+// COMBINATOR-CHAIN FUSION (path-6, mechanism 6a) — fold map/filter transformer stages into the
+// terminal's single loop: read the element once from the base source, inline each transformer's
+// literal lambda in order (a filter skip jumps to the loop latch; a map rebinds the carried value),
+// and run only the terminal's loop — no intermediate array, no per-stage closure call. ONLY literal
+// map/filter lambdas with capture-resolvable closures fuse (the inliner's existing gate); a Stream
+// receiver stays lazy. Observably identical to the eager per-stage lowering (map/filter are pure,
+// order-preserving, total over the element).
+// ===========================================================================================
+
+/// One inlinable transformer stage of a fused combinator chain.
+enum FuseStage {
+    Map { params: Vec<TypedParam>, body: TypedExpr, out_elem_ty: Type },
+    Filter { params: Vec<TypedParam>, body: TypedExpr },
+}
+
+/// Resolve `expr` to a combinator NAME ("map"/"filter"/"reduce"/"for"/"range"/...) when it is a
+/// direct call to one (via an intrinsic slot or an imported stdlib export); else None.
+fn combinator_callee_name(expr: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> Option<&'static str> {
+    let TypedExpr::Call { func, .. } = expr else { return None };
+    let TypedExpr::LocalGet { slot, .. } = func.as_ref() else { return None };
+    let trailing = if let Some(intr) = builder.intrinsic_slots.get(slot) {
+        intr.strip_prefix("lin_").unwrap_or(intr)
+    } else if let Some((sym, _)) = ctx.import_fn_slots.get(slot) {
+        sym.rsplit('_').next()?
+    } else {
+        return None;
+    };
+    Some(match trailing {
+        "map" => "map",
+        "filter" => "filter",
+        "reduce" => "reduce",
+        "for" => "for",
+        "while" => "while",
+        "range" => "range",
+        _ => return None,
+    })
+}
+
+/// Peel a chain of FUSIBLE map/filter stages off a terminal's receiver `recv`, returning the base
+/// source + the stages in SOURCE ORDER. Stops at the first non-fusible stage (non-literal lambda,
+/// Stream receiver, wrong arity), so the caller falls back to per-stage lowering for the prefix.
+fn extract_fuse_chain<'a>(
+    recv: &'a TypedExpr,
+    builder: &FuncBuilder,
+    ctx: &LowerCtx,
+) -> (&'a TypedExpr, Vec<FuseStage>) {
+    let mut stages: Vec<FuseStage> = Vec::new();
+    let mut cur = recv;
+    loop {
+        let Some(name) = combinator_callee_name(cur, builder, ctx) else { break };
+        let TypedExpr::Call { args, .. } = cur else { break };
+        let is_map = name == "map";
+        let is_filter = name == "filter";
+        if (!is_map && !is_filter) || args.len() != 2 {
+            break;
+        }
+        if matches!(args[0].ty(), Type::Stream(_)) {
+            break;
+        }
+        let Some((params, body)) = inlinable_capturing_lambda(&args[1], builder, ctx) else { break };
+        let stage = if is_map {
+            let (_, ret) = callback_signature(&args[1]);
+            FuseStage::Map { params: params.to_vec(), body: body.clone(), out_elem_ty: ret }
+        } else {
+            FuseStage::Filter { params: params.to_vec(), body: body.clone() }
+        };
+        stages.push(stage);
+        cur = &args[0];
+    }
+    stages.reverse();
+    (cur, stages)
+}
+
+/// Apply fused stages for a side-effecting terminal (a filter skip jumps to `skip_block`). Returns
+/// the carried (value, type) on the keep path. Source-element reclaim: a map consuming the source
+/// frees it; a filter drop frees it; a filter-only chain leaves it as the carried value for the
+/// terminal to reclaim.
+#[allow(clippy::too_many_arguments)]
+fn apply_fuse_stages(
+    stages: &[FuseStage],
+    mut elem: Temp,
+    mut elem_ty: Type,
+    iterable_ty: &Type,
+    idx: Temp,
+    skip_block: BlockId,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<(Temp, Type)> {
+    let src_elem = elem;
+    let src_elem_ty = elem_ty.clone();
+    for stage in stages {
+        match stage {
+            FuseStage::Filter { params, body } => {
+                let (pred_raw, pred_ty) =
+                    inline_lambda_body(params, body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx);
+                let keep = if matches!(pred_ty, Type::Bool) {
+                    pred_raw
+                } else {
+                    let d = builder.alloc_temp(Type::Bool);
+                    builder.emit(Instruction::Coerce { dst: d, src: pred_raw, from_ty: pred_ty, to_ty: Type::Bool });
+                    d
+                };
+                let keep_block = builder.alloc_block("fuse_keep");
+                let drop_block = builder.alloc_block("fuse_drop");
+                builder.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
+                builder.switch_to(drop_block);
+                free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
+                free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                if elem != src_elem {
+                    builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
+                }
+                builder.terminate(Terminator::Jump(skip_block));
+                builder.switch_to(keep_block);
+            }
+            FuseStage::Map { params, body, out_elem_ty } => {
+                let (mapped, mapped_ty) =
+                    inline_lambda_body(params, body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx);
+                if elem != src_elem {
+                    builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
+                } else {
+                    free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
+                    free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                }
+                elem = mapped;
+                elem_ty = if matches!(mapped_ty, Type::TypeVar(_)) { out_elem_ty.clone() } else { mapped_ty };
+            }
+        }
+    }
+    Some((elem, elem_ty))
+}
+
+/// Drive a fused chain over a base SOURCE for a side-effecting terminal (`for`): an index loop whose
+/// body reads the element, applies the stages, then runs `terminal` on the survivor. A filter skip
+/// jumps to a per-iteration `fuse_cont` latch; the terminal path converges there. Reuses
+/// `emit_index_loop` (back-edge patched to the CURRENT block = fuse_cont, the true latch).
+fn emit_fused_loop<T>(
+    iterable: Temp,
+    iterable_ty: &Type,
+    read_elem_ty: &Type,
+    stages: &[FuseStage],
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    mut terminal: T,
+) where
+    T: FnMut(Temp, Type, Temp, Temp, &Type, &mut FuncBuilder, &mut LowerCtx),
+{
+    let read_elem_ty = read_elem_ty.clone();
+    emit_index_loop(iterable, iterable_ty, &read_elem_ty, builder, ctx, |i, elem, b, c| {
+        let cont = b.alloc_block("fuse_cont");
+        let idx = narrow_loop_index(i, b);
+        let src_elem = elem;
+        let src_elem_ty = read_elem_ty.clone();
+        if let Some((val, val_ty)) = apply_fuse_stages(stages, elem, read_elem_ty.clone(), iterable_ty, idx, cont, b, c) {
+            terminal(val, val_ty, idx, src_elem, &src_elem_ty, b, c);
+        }
+        if !b.is_current_block_terminated() {
+            b.terminate(Terminator::Jump(cont));
+        }
+        b.switch_to(cont);
+    });
+}
+
 /// `for(iterable, body)` → index loop calling `body(elem)` for side effects; returns Null.
 fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
@@ -5962,6 +6125,31 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
     // captured-`var` mutation and any callback return value behave exactly as before.
     if let Some((start_e, end_e)) = range_for_bounds(&args[0], builder, ctx) {
         return lower_range_for(start_e, end_e, &args[1], &param_tys, builder, ctx);
+    }
+    // FUSED CHAIN (path-6 6a): base.map/filter chain into the `for` loop (no intermediate array).
+    // Requires an inlinable side-effecting body lambda and at least one fusible stage; bails otherwise.
+    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+        let (base, stages) = extract_fuse_chain(&args[0], builder, ctx);
+        if !stages.is_empty() {
+            let lam_params = lam_params.to_vec();
+            let lam_body = lam_body.clone();
+            let base_ty = base.ty();
+            let read_elem_ty = combinator_read_elem_ty(base, builder, ctx);
+            let iterable = lower_expr(base, builder, ctx);
+            emit_fused_loop(iterable, &base_ty, &read_elem_ty, &stages, builder, ctx,
+                |val, val_ty, idx, src_elem, src_elem_ty, b, c| {
+                    let (res, res_ty) =
+                        inline_lambda_body(&lam_params, &lam_body, &[(val, val_ty.clone()), (idx, Type::Int32)], b, c);
+                    b.emit(Instruction::Release { val: res, ty: res_ty });
+                    if val == src_elem {
+                        free_combinator_elem_box_full(src_elem, src_elem_ty, b);
+                        free_combinator_sealed_elem(src_elem, &base_ty, src_elem_ty, b);
+                    } else {
+                        b.emit(Instruction::Release { val, ty: val_ty });
+                    }
+                });
+            return builder.const_temp(Const::Null);
+        }
     }
     // Read elements at the source's PROVABLE runtime representation: flat-scalar only when the
     // source is a provably-flat producer, else the tagged Json read (sound for a `[]`+push array
@@ -6488,8 +6676,178 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
 /// `reduce(iterable, init, f)` → fold `acc = f(acc, elem)` over the elements.
 /// The reducer `f` takes `(Json, Json)`, so the accumulator and element are carried as
 /// Json (boxed); the final accumulator is coerced back to `result_type`.
+/// Fused base.<map/filter...>.reduce(init, f) over a scalar accumulator (path-6 6a): a single loop
+/// over the BASE source whose body reads the element, applies the transformer `stages` inline (a
+/// filter skip carries the accumulator UNCHANGED to the latch; a map rebinds the carried value), then
+/// folds acc = f(acc, survivor). No intermediate array per stage, no per-stage closure call. The
+/// accumulator is carried UNBOXED through a value phi (gated to a scalar result_type by the caller).
+#[allow(clippy::too_many_arguments)]
+fn lower_fused_reduce(
+    base: &TypedExpr,
+    stages: &[FuseStage],
+    reducer_params: &[TypedParam],
+    reducer_body: &TypedExpr,
+    init_expr: &TypedExpr,
+    init_ty: &Type,
+    result_type: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Temp {
+    let iterable_ty = base.ty();
+    let acc_ty = result_type.clone();
+    let read_elem_ty = combinator_read_elem_ty(base, builder, ctx);
+
+    let iterable = lower_expr(base, builder, ctx);
+    let init_raw = lower_expr(init_expr, builder, ctx);
+    let init = coerce_arg_to_param_repr(init_raw, init_ty, &acc_ty, builder);
+
+    let len = emit_iterable_len(iterable, &iterable_ty, builder);
+    let zero = builder.const_temp(Const::Int(0, Type::Int64));
+
+    let preheader = builder.current_block;
+    let header = builder.alloc_block("freduce_header");
+    let body = builder.alloc_block("freduce_body");
+    let latch = builder.alloc_block("freduce_latch");
+    let exit = builder.alloc_block("freduce_exit");
+
+    let i = builder.alloc_temp(Type::Int64);
+    let i_next = builder.alloc_temp(Type::Int64);
+    let acc = builder.alloc_temp(acc_ty.clone());
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(header);
+    builder.emit(Instruction::Phi {
+        dst: i, ty: Type::Int64, incomings: vec![(zero, preheader), (i_next, latch)],
+    });
+    builder.emit(Instruction::Phi {
+        dst: acc, ty: acc_ty.clone(), incomings: vec![(init, preheader), (acc, latch)],
+    });
+    let cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary {
+        dst: cond, op: BinOp::Lt, lhs: i, rhs: len, operand_ty: Type::Int64, ty: Type::Bool,
+    });
+    builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+
+    builder.switch_to(body);
+    let elem = builder.alloc_temp(read_elem_ty.clone());
+    builder.emit(Instruction::Index {
+        dst: elem, object: iterable, key: i,
+        obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
+    });
+    let idx = narrow_loop_index(i, builder);
+    // Every latch predecessor contributes (acc value, predecessor): a SKIPPED element carries the
+    // unchanged `acc`; a KEPT element carries the folded `acc_next`.
+    let mut acc_incomings: Vec<(Temp, BlockId)> = Vec::new();
+    let survivor = apply_fuse_stages_reduce(
+        stages, elem, read_elem_ty.clone(), &iterable_ty, idx, acc, latch, &mut acc_incomings, builder, ctx,
+    );
+    if let Some((sv, sv_ty)) = survivor {
+        let (acc_next_raw, acc_next_ty) = inline_lambda_body(
+            reducer_params, reducer_body,
+            &[(acc, acc_ty.clone()), (sv, sv_ty.clone()), (idx, Type::Int32)], builder, ctx,
+        );
+        let acc_next = coerce_arg_to_param_repr(acc_next_raw, &acc_next_ty, &acc_ty, builder);
+        if sv == elem {
+            free_combinator_elem_box_full(elem, &read_elem_ty, builder);
+            free_combinator_sealed_elem(elem, &iterable_ty, &read_elem_ty, builder);
+        }
+        let keep_latch_pred = builder.current_block;
+        builder.terminate(Terminator::Jump(latch));
+        acc_incomings.push((acc_next, keep_latch_pred));
+    }
+
+    builder.switch_to(latch);
+    let acc_latch = builder.alloc_temp(acc_ty.clone());
+    builder.emit(Instruction::Phi { dst: acc_latch, ty: acc_ty.clone(), incomings: acc_incomings });
+    let one = builder.const_temp(Const::Int(1, Type::Int64));
+    builder.emit(Instruction::Binary {
+        dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
+    });
+    builder.terminate(Terminator::Jump(header));
+    builder.patch_phi_incoming_value(header, acc, acc, acc_latch, latch);
+
+    builder.switch_to(exit);
+    acc
+}
+
+/// Like `apply_fuse_stages`, but for the FUSED REDUCE loop: a filter skip carries the unchanged
+/// accumulator `acc` to the shared `latch`. Returns the surviving (value, type) on the keep path.
+#[allow(clippy::too_many_arguments)]
+fn apply_fuse_stages_reduce(
+    stages: &[FuseStage],
+    mut elem: Temp,
+    mut elem_ty: Type,
+    iterable_ty: &Type,
+    idx: Temp,
+    acc: Temp,
+    latch: BlockId,
+    acc_incomings: &mut Vec<(Temp, BlockId)>,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<(Temp, Type)> {
+    let src_elem = elem;
+    let src_elem_ty = elem_ty.clone();
+    for stage in stages {
+        match stage {
+            FuseStage::Filter { params, body } => {
+                let (pred_raw, pred_ty) =
+                    inline_lambda_body(params, body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx);
+                let keep = if matches!(pred_ty, Type::Bool) {
+                    pred_raw
+                } else {
+                    let d = builder.alloc_temp(Type::Bool);
+                    builder.emit(Instruction::Coerce { dst: d, src: pred_raw, from_ty: pred_ty, to_ty: Type::Bool });
+                    d
+                };
+                let keep_block = builder.alloc_block("freduce_keep");
+                let drop_block = builder.alloc_block("freduce_drop");
+                builder.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
+                builder.switch_to(drop_block);
+                free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
+                free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                if elem != src_elem {
+                    builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
+                }
+                let drop_pred = builder.current_block;
+                builder.terminate(Terminator::Jump(latch));
+                acc_incomings.push((acc, drop_pred));
+                builder.switch_to(keep_block);
+            }
+            FuseStage::Map { params, body, out_elem_ty } => {
+                let (mapped, mapped_ty) =
+                    inline_lambda_body(params, body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx);
+                if elem != src_elem {
+                    builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
+                } else {
+                    free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
+                    free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                }
+                elem = mapped;
+                elem_ty = if matches!(mapped_ty, Type::TypeVar(_)) { out_elem_ty.clone() } else { mapped_ty };
+            }
+        }
+    }
+    Some((elem, elem_ty))
+}
+
 fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let json = Type::TypeVar(u32::MAX);
+
+    // FUSED CHAIN (path-6 6a): when the reducer's receiver is a map/filter chain of inlinable lambdas
+    // and the accumulator is a concrete scalar, fold the transformer stages INTO the reduce loop.
+    // Only fires with at least one fusible stage; else falls through to the single-combinator paths.
+    if is_inline_scalar(result_type) {
+        if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[2], builder, ctx) {
+            let (base, stages) = extract_fuse_chain(&args[0], builder, ctx);
+            if !stages.is_empty() {
+                let lam_params = lam_params.to_vec();
+                let lam_body = lam_body.clone();
+                let init_ty = args[1].ty();
+                return lower_fused_reduce(base, &stages, &lam_params, &lam_body, &args[1], &init_ty, result_type, builder, ctx);
+            }
+        }
+    }
+
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[2]);
     // Read at the source's PROVABLE representation (ADR-044): a flat scalar for a provably-flat
