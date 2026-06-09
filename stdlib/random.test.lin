@@ -213,6 +213,10 @@ val s = suite("std/random", [
 
   test("global shuffled preserves the multiset", () => [
     expect(globalShuffledIsPermutation()).toBe(true)
+  ]),
+
+  test("global pick/shuffled are generic over String elements", () => [
+    expect(globalPickShuffledStrings()).toBe(true)
   ])
 ])
 
@@ -286,14 +290,30 @@ val globalFlipReproducible = (): Boolean =>
   val b = flip()
   a == b
 
-// `pick`/`shuffled` are the GLOBAL `Json`-array convenience helpers (see the workaround BUG note
-// at the foot of this file), so these bodies compare against `Json` values directly.
+// `pick`/`shuffled` are the GLOBAL generic `<T>(xs: T[])` convenience helpers (over the module's
+// global `Rng`); see the FIXED BUG 2 note at the foot of this file.
 val globalPickBehaviour = (): Boolean =>
   reseed(7u64)
   val empty: Int32[] = []
   val none = pick(empty)
   val some = pick([100, 200])
   none == null && (some == 100 || some == 200)
+
+// Regression for FIXED BUG 2: generic `pick`/`shuffled` over a HEAP (String) element array yield a
+// correctly-typed `String`/`String[]` (the cross-module global-var specialization no longer drops
+// the `Rng` argument). A wrong-typed/corrupted result would fail the membership/multiset checks.
+val globalPickShuffledStrings = (): Boolean =>
+  reseed(7u64)
+  val picked: String | Null = pick(["a", "b", "c"])
+  val out: String[] = shuffled(["x", "y", "z"])
+  val pickOk = picked == "a" || picked == "b" || picked == "c"
+  var allPresent = true
+  ["x", "y", "z"].for(w =>
+    var found = false
+    out.for(o => if o == w then found = true else null)
+    if found == false then allPresent = false
+  )
+  pickOk && length(out) == 3 && allPresent
 
 val globalShuffledIsPermutation = (): Boolean =>
   reseed(7u64)
@@ -329,27 +349,15 @@ run(s)
 //   `lin_object_set` path. WORKAROUND: `Rng` is treated as immutable — every draw builds a FRESH
 //   `Rng` and returns it (the functional PCG style), so no field is ever mutated in place.
 //
-// BUG 2 — an EXPORTED GENERIC function that reads a module-level `var` and threads it through a
-//   call miscompiles across the module boundary.
-//   A `var g: Rng` at module scope, read inside an exported `<T>(xs: T[])` and passed as the first
-//   argument to another function, is either (a) dropped from the emitted call — "Incorrect number
-//   of arguments passed to called function!" at codegen, the packed `Rng` arg vanishing — or
-//   (b) passed as a misaligned pointer (`misaligned pointer dereference: address … 0x…2`,
-//   memory.rs:129) at run time. The NON-generic global wrappers (`next`/`int`/`real`/`flip`) that
-//   read the same `g` are unaffected, and a LOCAL (non-exported / user-file) generic wrapper doing
-//   the identical thing works — it is specifically the exported-generic-in-stdlib + module-var
-//   combination. WORKAROUND: the two GLOBAL collection helpers `pick`/`shuffled` are declared over
-//   `Json` (non-generic) instead of `T[]`. The fully-generic, type-safe equivalents remain the
-//   EXPLICIT-HANDLE `choice`/`shuffle` (they take an `Rng` parameter rather than reading a global,
-//   so neither bug fires).
-//
-// Minimal repro for BUG 2 (compile error), assuming `pick`/`shuffled` were generic:
-//   import { shuffled } from "std/random"
-//   val main = (): Null => print("${shuffled([1, 2, 3])}\n")
-//   main()
-//   ⇒ Build failed: codegen error: Incorrect number of arguments passed to called function!
-//        %call_n = tail call ptr @std_random_shuffle(ptr %0)
-//
+// BUG 2 — FIXED. An EXPORTED GENERIC function that reads a module-level `var` and threads it
+//   through a call used to miscompile across the module boundary: the global read was dropped from
+//   the emitted call ("Incorrect number of arguments passed to called function!"). Root cause: the
+//   monomorphizer NATIVE-specializes a cross-module generic by CLONING its body into the importing
+//   module, but the body's free reference to the origin module's global `var g` cannot be re-homed
+//   (`classify_origin_slot` had no `Var` arm) — so the reference resolved to nothing and the arg
+//   vanished. FIX: `body_refs_origin_global_var` detects this and routes the call to the boxed
+//   (type-erased) fallback, whose body stays in the origin module where the global is in scope.
+//   `pick`/`shuffled` are now the fully-generic `<T>(xs: T[])` they always should have been.
 // BUG 3 — building a record literal whose field reads a LOCAL BINDING leaks a box per call.
 //   (Memory-safe — no UAF/double-free; clean under `detect_leaks=0` — but a steady per-call leak
 //   under `detect_leaks=1`.)
