@@ -92,20 +92,20 @@ export val writeLines = (s: Stream, path: String): Stream =>
 // Terminal: force a sink (or any pipeline) to completion.
 // @param s  the pipeline to drive.
 // @returns `Null` on success, or an `Error` if a read/transform faulted.
-export val drain = (s: Stream): Json =>
+export val drain = (s: Stream): Null | Error =>
   lin_stream_drain(s)
 
 // Terminal: pull all bytes into a single buffer.
 // @param s  the byte pipeline to drive.
 // @returns a `UInt8[]` of all bytes, or an `Error` if a read/transform faulted.
 // @example readStream("data.bin").collect()   // UInt8[] | Error
-export val collect = (s: Stream): Json =>
+export val collect = (s: Stream): UInt8[] | Error =>
   lin_stream_collect(s)
 
 // Terminal: pull all bytes into a single UTF-8 string.
 // @param s  the byte pipeline to drive.
 // @returns a `String` of the decoded bytes, or an `Error` if a read/transform faulted.
-export val readText = (s: Stream): Json =>
+export val readText = (s: Stream): String | Error =>
   lin_stream_read_text(s)
 
 // Release the stream's underlying resource explicitly.

@@ -22,25 +22,31 @@ val s = suite("std/process", [
       0,
       0
     ]
-    val n = readStdout(h, buf)
-    val code = wait(h)
-    [
-      expect(n).toBe(5),
-      expect(buf[0]).toBe(104),
-      expect(buf[1]).toBe(101),
-      expect(buf[2]).toBe(108),
-      expect(buf[3]).toBe(108),
-      expect(buf[4]).toBe(111),
-      expect(code).toBe(0)
-    ]
+    if h is Error then
+      [expect(false).toBe(true)]
+    else
+      val n = readStdout(h, buf)
+      val code = wait(h)
+      [
+        expect(n).toBe(5),
+        expect(buf[0]).toBe(104),
+        expect(buf[1]).toBe(101),
+        expect(buf[2]).toBe(108),
+        expect(buf[3]).toBe(108),
+        expect(buf[4]).toBe(111),
+        expect(code).toBe(0)
+      ]
   ),
 
   test("wait returns the child's exit code", () =>
     val h = spawn("sh", ["-c", "exit 3"])
-    val code = wait(h)
-    [
-      expect(code).toBe(3)
-    ]
+    if h is Error then
+      [expect(false).toBe(true)]
+    else
+      val code = wait(h)
+      [
+        expect(code).toBe(3)
+      ]
   ),
 
   // --- batch: exec / shell / cwd ---
@@ -104,12 +110,15 @@ val s = suite("std/process", [
     // Spawn a long sleeper, kill it (SIGTERM), then reap it. A child killed by a
     // signal reports a -1 exit code via wait().
     val h = spawn("sh", ["-c", "sleep 30"])
-    val k = kill(h)
-    val code = wait(h)
-    [
-      expect(k == null).toBe(true),
-      expect(code).toBe(-1)
-    ]
+    if h is Error then
+      [expect(false).toBe(true)]
+    else
+      val k = kill(h)
+      val code = wait(h)
+      [
+        expect(k == null).toBe(true),
+        expect(code).toBe(-1)
+      ]
   )
 ])
 

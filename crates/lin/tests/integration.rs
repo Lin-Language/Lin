@@ -10443,19 +10443,21 @@ import { print } from "std/io"
 import { toString } from "std/string"
 
 val h = spawn("sh", ["-c", "printf hello"])
-print("spawned: ${toString(h["type"] != "error")}")
+print("spawned: ${toString(!(h is Error))}")
+if h is Error then
+  print("(spawn failed)")
+else
+  val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+  val n = readStdout(h, buf)
+  print("n: ${toString(n)}")
+  print("b0: ${toString(buf[0])}")
+  print("b1: ${toString(buf[1])}")
+  print("b2: ${toString(buf[2])}")
+  print("b3: ${toString(buf[3])}")
+  print("b4: ${toString(buf[4])}")
 
-val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
-val n = readStdout(h, buf)
-print("n: ${toString(n)}")
-print("b0: ${toString(buf[0])}")
-print("b1: ${toString(buf[1])}")
-print("b2: ${toString(buf[2])}")
-print("b3: ${toString(buf[3])}")
-print("b4: ${toString(buf[4])}")
-
-val code = wait(h)
-print("code: ${toString(code)}")
+  val code = wait(h)
+  print("code: ${toString(code)}")
 "#);
     assert_eq!(
         out,
@@ -10482,8 +10484,14 @@ import { readText } from "std/stream"
 import { print } from "std/io"
 
 val h = spawn("sh", ["-c", "printf 'line1\nline2\n'"])
-val text = stdoutStream(h).readText()
-print(text)
+if h is Error then
+  print("(spawn failed)")
+else
+  val text = stdoutStream(h).readText()
+  if text is Error then
+    print("(read failed)")
+  else
+    print(text)
 "#);
     assert_eq!(out, vec!["line1", "line2"]);
 }
@@ -10545,8 +10553,11 @@ import { print } from "std/io"
 import { toString } from "std/string"
 
 val h = spawn("sh", ["-c", "exit 3"])
-val code = wait(h)
-print("code: ${toString(code)}")
+if h is Error then
+  print("(spawn failed)")
+else
+  val code = wait(h)
+  print("code: ${toString(code)}")
 "#);
     assert_eq!(out, vec!["code: 3"]);
 }
