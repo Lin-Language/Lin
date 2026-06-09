@@ -312,6 +312,25 @@ The whole-array materialization on combinator entry — the dominant cost #2 —
 - **IR criterion proven (by me):** `Pt[].for(p => … p["x"] …)` emits **0** `sealed_array_to_tagged` (was 2) and **0** `lin_object_get` for the element — only const-offset `getelementptr`+`load`. Same for `map`/`reduce`.
 - **Measured (by me, low load): 2.84s → 0.63s ≈ 4.5×** on a packed-`Pt[]` iteration microbench, output identical (29970000000). interp **neutral** (0.44s, RESULT 10460000), records **neutral**, RAPTOR digest **byte-identical**, 682 integration tests green, ASan-clean (constant 72 B leak at N=1k and N=100k — no scaling). This is the first time across the whole effort that cost #2 was both eliminated AND shown a wall-clock win — two prior agents stopped short here (one reverted a fixable operand-box leak; this run fixed it via a concrete-type read coerced to the param's `Json` type with the box owned by the body scope).
 
+  **The exact microbench (reproducible from this doc alone):**
+  ```lin
+  import { print } from "std/io"
+  import { toString } from "std/string"
+  import { range, for } from "std/iter"
+  import { push } from "std/array"
+  type Pt = { "x": Int32, "y": Int32 }
+  val main = () =>
+    var ps: Pt[] = []
+    range(0, 1000).for(i => push(ps, { "x": i, "y": i * 2 }))   // build a 1000-elem packed Pt[]
+    var acc = 0i64
+    range(0, 20000).for(_ =>                                    // 20000 passes × 1000 elems = 20M reads
+      ps.for(p => acc = acc + p["x"] + p["y"])                  // the hot in-place packed iteration
+    )
+    print(toString(acc))                                       // 29970000000
+  main()
+  ```
+  Recipe: build the compiler release (`cargo build -p lin --release`) on master vs branch `path1-packed-records`, for EACH `cp target/release/deps/liblin_runtime-*.a target/release/liblin_runtime.a`, then `LIN_EMIT_IR=1 ./target/release/lin build mb.lin -o mb` and time `mb` (median of ≥5, `TIMEFORMAT='%3R'`, **at 1-min load < ~4** — other agents contend). IR check: `grep -c sealed_array_to_tagged mb.ll` → **2 on master, 0 on branch** (the materialize eliminated = the win). Master baseline ≈ **2.84s**, branch ≈ **0.63s**, both print `29970000000`. (The whole-program `lin_object_get` count drops 10→8; the residual 8 are the `range().for()` driver + `push`, not the packed element read — which is pure const-offset.)
+
 ### Step 3 — pack fixed-key records by default: PARTIAL, blocked at the repr oracle (the §H4/H5 seam, now precisely located)
 - **Scalar fixed-key records already pack by default** (verified) and now iterate in place — that IS the win above.
 - **String-field widening is built but DORMANT.** The in-place String field read (borrowed `load ptr` + retain-if-escapes) is implemented and harness-leak-clean for build/push/index/map/for/reduce (commit `39f8329c`). But flipping `Type::is_sealed_array_field_packable` to admit String **trips the repr Stage-2 oracle**: an `Index` on a packed String-field array threaded through a `T|Null` tail-recursive param has the *old type predicate* saying `Packed` while the *dataflow repr analysis* correctly demotes to `Boxed(Opaque)` at the union boundary. This is the §H4/H5 packed/boxed classification divergence — now pinned to a specific contradiction between the type-predicate gate and the repr pass at the union/tail-recursive boundary, rather than vaguely "hard." Gate reverted to scalar+Bool; the capability stays present, dormant.
