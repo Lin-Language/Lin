@@ -829,6 +829,32 @@ fn find_exported_fn(module: &TypedModule, name: &str) -> Option<TypedExpr> {
 
 /// How a free (non-local) slot referenced inside a re-homed cross-module body resolves in the
 /// origin module — used to pick the importer-side construct it should be rewritten into.
+/// If `ty` is a combinator's iterable-union parameter `T[] | Iterator | Stream` (in any order),
+/// return the quantified element TypeVar id of the `T[]` arm. Used to default `T` to the `Json`
+/// wildcard when such a parameter is applied to an OPAQUE `Iterator`/`Stream` argument that carries
+/// no static element type. Only fires for the exact iterable-union shape (an `Array(TypeVar)` arm
+/// alongside `Iterator`/`Stream` arms); a plain `T[]` param is NOT matched (its `T` binds normally
+/// from the array's element type).
+fn iterable_union_elem_tv(ty: &Type) -> Option<u32> {
+    let Type::Union(arms) = ty else { return None };
+    let mut has_iter_or_stream = false;
+    let mut elem_id = None;
+    for arm in arms {
+        match arm {
+            Type::Array(inner) => {
+                if let Type::TypeVar(id) = **inner {
+                    if id >= GENERIC_TV_BASE && id != u32::MAX {
+                        elem_id = Some(id);
+                    }
+                }
+            }
+            Type::Iterator(_) | Type::Stream(_) => has_iter_or_stream = true,
+            _ => {}
+        }
+    }
+    if has_iter_or_stream { elem_id } else { None }
+}
+
 /// True if a cross-module generic's body has a FREE reference to a top-level mutable `var` of its
 /// origin module (e.g. `std/random`'s global `g: Rng` read by `pick`/`shuffled`). Such a global is
 /// genuine shared state living in the origin module; a native specialization clones the body into
@@ -1527,6 +1553,35 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                         collect_subs(&p.ty, &a.ty(), &mut subs);
                     }
                     collect_subs(&ret_type, result_type, &mut subs);
+
+                    // ITERABLE-UNION over a source with NO usable static element type. A combinator
+                    // param of the form `T[] | Iterator | Stream` (the `for`/`while`/`map`/… iterable
+                    // union) applied to an opaque `Iterator`/`Stream`, a dynamic `Json` value, or an
+                    // empty `Never[]` literal carries no concrete element, so its element TypeVar `T`
+                    // is left unbound or bound to a non-concrete/garbage type. Such a source drives the
+                    // combinator through the TAGGED runtime path (`lin_for`/…), the element arriving
+                    // BOXED — so default `T` to the `Json` wildcard. Without this, the call either
+                    // errors "cannot infer" (the only-type-param `for`/`while` over an opaque iterator)
+                    // or binds `T` to a representation that mismatches the boxed element (`for` over
+                    // `if … else []`, a `Json` value backed at runtime by a tagged array → an
+                    // `i8`-vs-`ptr` callback-ABI clash at codegen).
+                    for (p, a) in params.iter().zip(args.iter()) {
+                        if let Some(elem_id) = iterable_union_elem_tv(&p.ty) {
+                            let arg_ty = a.ty();
+                            let arg_no_elem = matches!(arg_ty, Type::Iterator(_) | Type::Stream(_) | Type::TypeVar(_))
+                                || matches!(&arg_ty, Type::Array(e) if matches!(**e, Type::Never));
+                            let unresolved = match subs.get(&elem_id) {
+                                None => true,
+                                // `Never` (an empty `[]` literal element) and any non-concrete
+                                // TypeVar are both "no usable element type" → take the Json default.
+                                Some(Type::Never) => true,
+                                Some(t) => mentions_generic_tv(t),
+                            };
+                            if arg_no_elem && unresolved {
+                                subs.insert(elem_id, Type::TypeVar(u32::MAX));
+                            }
+                        }
+                    }
 
                     // A genuinely-`Json` (wildcard) NON-FIRST argument flowing into a bare-TypeVar
                     // param that an earlier CONTAINER argument pinned to a concrete type

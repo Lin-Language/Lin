@@ -911,7 +911,18 @@ impl Checker {
                     && *a >= GENERIC_TV_BASE && *a != u32::MAX
                     && *b >= GENERIC_TV_BASE && *b != u32::MAX
         );
-        let result_type = if distinct_generic_params {
+        // An EMPTY-array branch (`[]`, typed `Array(Never)` — the bottom array type) must not WIN
+        // the merge over a non-empty-array other branch. `types_compatible` treats `Never[]` as
+        // assignable to/from anything, so the collapse below would otherwise pick `Never[]` as the
+        // result and discard the real branch — e.g. `if cond then jsonValue else []` (a fresh
+        // inference-var `then`) became `Never[]`, after which iterating it lowered the element at a
+        // bogus scalar repr (the `for`-over-`if…else []` codegen ABI clash). The non-empty branch
+        // carries the real element type, so it dominates; two empty arrays keep `Never[]`.
+        let then_empty_arr = matches!(&then_ty, Type::Array(e) if matches!(**e, Type::Never));
+        let else_empty_arr = matches!(&else_ty, Type::Array(e) if matches!(**e, Type::Never));
+        let result_type = if then_empty_arr != else_empty_arr {
+            if then_empty_arr { else_ty } else { then_ty }
+        } else if distinct_generic_params {
             Type::flatten_union(vec![then_ty, else_ty])
         } else if (then_ty == Type::Null) != (else_ty == Type::Null) {
             // Exactly one branch is the literal Null type. Keep both as a union so the
@@ -1083,7 +1094,7 @@ impl Checker {
         } else if arm_types.is_empty() {
             Type::Never
         } else {
-            unify_types(&arm_types)
+            unify_types(&drop_empty_array_arms(&arm_types))
         };
 
         let exhaustiveness_diags =
@@ -1122,7 +1133,7 @@ impl Checker {
             typed_arms.push(typed_arm);
         }
         self.consumed_streams = consumed_union;
-        let result_type = if arm_types.is_empty() { Type::Never } else { unify_types(&arm_types) };
+        let result_type = if arm_types.is_empty() { Type::Never } else { unify_types(&drop_empty_array_arms(&arm_types)) };
 
         // Exhaustiveness check: emit diagnostics but don't fail — warnings stay as warnings,
         // errors are collected alongside other diagnostics and reported together.
@@ -1529,6 +1540,21 @@ pub(crate) fn expected_pushes_scalar_width(ty: &Type) -> bool {
 /// accept-any in checked branch/arm position (see `check_branch_against`).
 pub(crate) fn is_json_dynamic(ty: &Type) -> bool {
     matches!(ty, Type::TypeVar(n) if *n == u32::MAX)
+}
+
+/// Drop empty-array (`Array(Never)`) members from a set of branch/arm types when at least one
+/// NON-empty-array member is present. An `[]` arm (`match x is Null => [] else => xs`, or the `if`
+/// counterpart) is the bottom array type; it carries no element information and must not pollute or
+/// win the merged union — the real arm (`xs: Neighbor[]`) carries the element type. Without this the
+/// union keeps a `Never[]` member, and iterating it (`.for`) lowers the element at a bogus repr.
+/// If EVERY member is an empty array (or there are none), the list is returned unchanged.
+fn drop_empty_array_arms(arm_types: &[Type]) -> Vec<Type> {
+    let is_empty_arr = |t: &Type| matches!(t, Type::Array(e) if matches!(**e, Type::Never));
+    if arm_types.iter().any(|t| !is_empty_arr(t)) && arm_types.iter().any(is_empty_arr) {
+        arm_types.iter().filter(|t| !is_empty_arr(t)).cloned().collect()
+    } else {
+        arm_types.to_vec()
+    }
 }
 
 /// True if `ty` IS a `Stream` or a `Union` that includes a `Stream` variant. The source

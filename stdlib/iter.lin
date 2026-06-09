@@ -46,13 +46,17 @@ val push = (arr: Json, item: Json): Null =>
   lin_push(arr, item)
 
 // Run `f` over every item of any iterable (the universal iteration driver). For side effects only.
-// @param iterable  any Array, Iterator, or Stream.
+// @param iterable  an Array, Iterator, or Stream of `T`.
 // @param f          callback `(item, index?) => …`; the trailing 0-based `Int32` index is optional.
 // @returns `null`.
 // @example [1, 2, 3].for(x => print(x))
-export val for = (iterable: Json, f: (Json, Int32) => Json): Null =>
-  // Stays `Json` rather than generic so it can drive `Json`-typed sources (e.g. a `Json[]` of
-  // promise handles) directly.
+export val for = <T>(iterable: T[] | Iterator | Stream | Null, f: (T, Int32) => Json): Null =>
+  // Generic over the element type `T` (matching `while`/`map`/`filter`): the callback receives the
+  // element typed, so `[1, 2, 3].for(x => …)` type-checks `x` as `Int32`. A `Json[]` source binds
+  // `T = Json` (the wildcard), so dynamic sources still drive directly. The callback RESULT stays
+  // `Json` — `for` is side-effecting and discards it, so the body may return anything. `Null` is
+  // accepted (iterating a missing/`T[] | Null` source is a no-op — the loop bound is tag-checked to
+  // 0 for a non-array), so `adj[k].for(…)` over a nullable map lookup needs no guard.
   lin_for(iterable, f)
 
 // Pull items while `f` returns `true`, stopping at the first `false` (or at exhaustion). For side
