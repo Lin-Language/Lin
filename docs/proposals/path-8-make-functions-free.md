@@ -75,17 +75,37 @@ straight-line code." Neither alone reaches the ceiling; together they do.
 
 ## The 4-tier menu (ranked by leverage × inverse-effort; all zero userland change)
 
-### Tier 1 — Unblock LLVM (cheapest, widest blast radius, never tried)
+### Tier 1 — Unblock LLVM (SPIKED — confirmed it pays off ONLY after Tier 2/3, not alone)
 - **Ship `lin-runtime` as embedded LLVM bitcode**, `llvm-link` it into the module *before* `run_passes`,
   and mark the hot leaf helpers (`lin_box_*`, `lin_unbox_*`, `lin_object_get`, `lin_tagged_arith`,
-  small string/array accessors) `alwaysinline`/`inlinehint`. Effect: LLVM inlines the helpers and
-  **cancels the box/unbox round-trips that today go through memory**, folds tag-known arithmetic, and SROA's
-  the boxed values. This is the single highest value-to-effort action available and it has **never been
-  done** (the runtime has always been a linked `.a`).
-- **Internal linkage for all non-exported user functions** (`set_linkage(Internal)`), so LLVM's inliner
-  is free to inline across them. Near-zero effort.
-- *Risk:* keeping the bitcode in sync with the `.a` (build both from one source), DWARF/debug interplay,
-  and that `alwaysinline` on a too-large helper bloats code — gate on size. ASan-clean + suite green.
+  small string/array accessors) `alwaysinline`/`inlinehint`. Intended effect: LLVM inlines the helpers and
+  **cancels the box/unbox round-trips that today go through memory**, folds tag-known arithmetic, SROA's
+  the boxed values.
+- **Internal linkage for all non-exported user functions** (`set_linkage(Internal)`).
+
+> **⚠️ SPIKE RESULT (`spike/bitcode-runtime`, `bf72f308`, measured — do NOT lead with this tier).** The
+> visibility mechanism **fires exactly as hypothesized** (box/unbox helper calls 91→0, helpers inlined),
+> but the box/unbox round-trips **do NOT cancel**, and the wall-clock win on realistic benchmarks is
+> **under 2%** (interp −0.6%, object_access −1.8% — within noise). The one real win (a synthetic tight box
+> loop, **−16%**) was *call/branch-overhead removal, not cancellation*. **Why no cancellation:** the
+> operation that *consumes* the boxed value — `lin_tagged_arith`, `lin_object_get`, or the **indirect
+> closure call** — is still an opaque boundary, so LLVM cannot prove the box doesn't escape and cannot
+> elide it. *Inlining the producer (`box`) is worthless while the consumer stays opaque.* This is the
+> "tiers compound" claim **confirmed empirically as a negative**: Tier 1 in isolation has little payoff;
+> it only pays after Tier 2 (inline the closure → kill the indirect call) and Tier 3 (inline/devirtualize
+> the consuming helper) put `box` and its consumer in the *same* function where the pair can cancel.
+> Also measured: **internal linkage (B1) bought nothing** — the whole program is already one LLVM module,
+> so external linkage was not actually throttling the inliner in practice.
+> **Feasibility:** LLVM versions match (rustc LLVM 22 / inkwell llvm22), so `parse_bitcode` +
+> `link_in_module` pre-O2 works. BUT the *full Rust-runtime* bc link is **genuinely fragile** — the
+> helpers reference per-build hash-mangled `internal` statics (int/bool caches, panic-location, async/fault
+> vtables) not linkable from the `.a` and not isolable (`llvm-extract` drags in 4600+ globals). A sound
+> productionized version needs the bc **and** the `.a` built from *one* compilation with stable C-ABI
+> exported symbols for those statics — a real build-system change, not a flip. The spike's working route
+> was *hand-authored LLVM IR* for the box/unbox/tag helpers (links cleanly, byte-identical) — fine for a
+> spike, not maintainable (duplicates runtime semantics, drops the small-int cache).
+> **Verdict: Tier 1 is necessary plumbing for the *end* state, but it is NOT a lead move and NOT a cheap
+> win — it is sequenced AFTER Tier 2/3 remove the consuming boundary, and its integration cost is real.**
 
 ### Tier 2 — Demolish the closure/combinator abstraction at the IR level (Path 6's 6a; the headline win)
 - **Generalize the inlined-callback lowering** from `for`/`length` (shipped, Stage 1) to
@@ -123,22 +143,28 @@ straight-line code." Neither alone reaches the ceiling; together they do.
 
 ---
 
-## Sequencing (the order matters because the tiers compound)
+## Sequencing (REVISED after the Tier-1 spike — Tier 2 leads, not Tier 1)
 
-1. **Tier 1 first.** Low risk, and it *multiplies* the value of everything after it — without it, even
-   perfectly-inlined loops still hit opaque helper calls. Cheapest thing with the widest blast radius, and
-   it has never been done. **A prototype is in flight** (`spike/bitcode-runtime`): build the runtime to
-   bitcode, link pre-`O2`, `alwaysinline` the hot helpers, internal-linkage user fns; measure box/unbox
-   cancellation in IR + interp/RAPTOR wall-clock.
-2. **Tier 2** (generalize combinator/closure inlining) — the proven mechanism (Stage 1's ~3.2×), the
-   headline per-element win, now amplified by Tier 1's helper inlining.
-3. **Tier 3** (devirtualize + monomorphize + unboxed convention) — the deep structural fix; highest
-   ceiling, highest risk; incremental and measured.
+The Tier-1 spike falsified the original "Tier 1 first" plan: making the producer helpers visible buys
+nothing while the *consumer* (the indirect closure call, `lin_tagged_arith`, `lin_object_get`) stays
+opaque. The boundary that must fall first is the **consumer**, which is Tier 2/3. Revised order:
+
+1. **Tier 2 LEADS** (generalize combinator/closure inlining) — the proven mechanism (Stage 1's ~3.2×), the
+   headline per-element win. Inlining the closure **removes the indirect call** that was blocking box
+   elision, so it *also* unlocks Tier 1's cancellation as a side effect (producer + consumer land in one
+   function).
+2. **Tier 3** (devirtualize known targets; monomorphize the polymorphic stdlib; unboxed convention) — the
+   deep structural fix that makes the *consuming* helper (`lin_tagged_arith`/`lin_object_get`) direct/typed
+   so the box it consumes can finally fold. Highest ceiling, highest risk; incremental and measured.
+3. **Tier 1 LAST** (bitcode runtime + alwaysinline) — once Tier 2/3 have put producers and consumers in the
+   same function, *then* making the leaf helpers inlinable lets the pairs cancel. Spike-measured to be
+   worthless before that point, and its integration cost is real (the stable-ABI bc/`.a` co-build) — so it
+   is the *finishing* pass, not the opening move.
 4. **Tier 4** woven in where the loop shape is the bottleneck.
 
-The in-flight RAPTOR profile tells us the *mix* — how much of the hot path is opaque-helper calls (favors
-Tier 1) vs per-element closure calls (favors Tier 2) vs polymorphic dispatch (favors Tier 3) vs the
-separate string-allocation frontier Path 6 flags — and therefore which tier leads for *that* workload.
+The in-flight RAPTOR profile tells us the *mix* — how much of the hot path is per-element closure calls
+(favors Tier 2) vs polymorphic dispatch (favors Tier 3) vs the separate string-allocation frontier Path 6
+flags — and therefore where within Tier 2/3 to concentrate for *that* workload.
 
 ## What this fixes / does not fix
 
