@@ -1431,6 +1431,41 @@ print(toString(total))
     assert_eq!(output, vec!["10"]);
 }
 
+// Path-8 Step 8.1 regression: a 3-stage fused chain whose FIRST stage is a `map` consuming the source
+// record, followed by a `filter`, then a terminal. The map frees the per-iteration source materialize;
+// the downstream filter's drop path must NOT free it again (double-free → `lin_sealed_release` UAF on
+// the 24-byte packed element). Covers map.filter.reduce, map.filter (array terminal) and map.filter.for.
+// id 0..5 → dist*2 → keep >4 → {6,8,10} sum 24 / count 3 / for-sum 24.
+#[test]
+fn test_fused_map_first_then_filter_chain() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, reduce, for } from "std/iter"
+import { length } from "std/array"
+
+type Rec = { "id": Int32, "dur": Int32 }
+val recs: Rec[] = [
+  { "id": 0, "dur": 0 },
+  { "id": 1, "dur": 1 },
+  { "id": 2, "dur": 2 },
+  { "id": 3, "dur": 3 },
+  { "id": 4, "dur": 4 },
+  { "id": 5, "dur": 5 }
+]
+// map FIRST, then filter, then reduce
+val total = recs.map(r => r["dur"] * 2).filter(x => x > 4).reduce(0, (a, x) => a + x)
+print(toString(total))
+// map FIRST, then filter -> array terminal
+val kept: Int32[] = recs.map(r => r["dur"] * 2).filter(x => x > 4)
+print(toString(length(kept)))
+// map FIRST, then filter, then for
+var s = 0
+recs.map(r => r["dur"] * 2).filter(x => x > 4).for(x => s = s + x)
+print(toString(s))
+"#);
+    assert_eq!(output, vec!["24", "3", "24"]);
+}
+
 #[test]
 fn test_destructuring() {
     let output = run(r#"import { print } from "std/io"
