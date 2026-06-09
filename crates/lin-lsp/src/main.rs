@@ -10,7 +10,7 @@ use lin_check::typed_ir::{TypedExpr, TypedModule, TypedStmt};
 use lin_check::types::Type;
 use lin_check::Checker;
 use lin_common::Severity;
-use lin_parse::ast::Stmt;
+use lin_parse::ast::{Stmt, TypeExpr};
 
 // ── server ────────────────────────────────────────────────────────────────────
 
@@ -1538,6 +1538,375 @@ fn first_param_category(sig: &str) -> Option<String> {
         }
     }
     Some(type_to_category(first.trim()).to_string())
+}
+
+// ── completion-context classification (scope/position awareness) ──────────────
+
+/// Where the cursor sits, used to gate which completion sources are offered. Classified by
+/// `classify_completion_context` from the parsed AST + a light backward char scan. The variants:
+///
+///   - `TypeAnnotation` — a type is expected: after a `:` governing a `val`/`var`/param/field
+///     binding, after a function `): ` return type, inside a `type Name = …` RHS, or with the
+///     cursor already inside a parsed `TypeExpr`. Offers built-in + user type names; NOT bindings.
+///   - `ImportStmt` — the cursor is inside an `import … from "…"` statement (outside its path
+///     string, which has its own handler). The only place `from`/`as` are offered.
+///   - `StatementStart` — the cursor begins a fresh statement (only whitespace precedes it on the
+///     line, at top level or block level). Offers declaration keywords `val`/`var`/`type`/`import`/
+///     `export` in addition to the expression sources.
+///   - `Expression` — the common fallback: a function/lambda body, a `val`/`var` RHS, a call
+///     argument, etc. Offers in-scope bindings, imported symbols, expression keywords + literals.
+///
+/// Anything the classifier can't confidently place falls back to `Expression` (the safe default —
+/// it offers bindings, which is what the user usually wants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionContext {
+    TypeAnnotation,
+    ImportStmt,
+    StatementStart,
+    Expression,
+}
+
+/// Classify the completion cursor position. Combines a structural AST signal (cursor inside a
+/// parsed `TypeExpr` ⇒ TypeAnnotation; inside an `Import` statement span ⇒ ImportStmt) with a light
+/// BACKWARD char scan over the current line/preceding tokens to catch the fine cases the AST can't
+/// (a `:` just typed before any type text exists ⇒ TypeAnnotation; an empty line at block level ⇒
+/// StatementStart). `offset` is a CHAR offset (the canonical Lin span space). Falls back to
+/// `Expression` whenever no stronger signal applies.
+fn classify_completion_context(
+    module: &lin_parse::ast::Module,
+    source: &str,
+    offset: usize,
+) -> CompletionContext {
+    // 1. Inside an `import … from "…"` statement (outside the path string — that's handled earlier).
+    //    This is the ONLY place `from`/`as` are offered.
+    for stmt in &module.statements {
+        if let Stmt::Import { span, .. } = stmt {
+            if (span.start as usize) <= offset && offset <= (span.end as usize) {
+                return CompletionContext::ImportStmt;
+            }
+        }
+    }
+
+    // 2. Inside a parsed type expression ⇒ TypeAnnotation (covers `val x: Int▮`, union/array/generic
+    //    arg positions where a `TypeExpr` node already exists). Reuses the same type-position span
+    //    collector the semantic-tokens highlighter uses, so it stays in sync with the AST shape.
+    let mut type_spans = Vec::new();
+    collect_type_spans(&module.statements, &mut type_spans);
+    for span in type_spans {
+        if (span.start as usize) <= offset && offset <= (span.end as usize) {
+            return CompletionContext::TypeAnnotation;
+        }
+    }
+
+    // 3. Backward char scan to disambiguate the cases the AST can't yet see.
+    if backward_scan_is_type_position(source, offset) {
+        return CompletionContext::TypeAnnotation;
+    }
+    if backward_scan_is_import_clause(source, offset) {
+        return CompletionContext::ImportStmt;
+    }
+    if backward_scan_is_statement_start(source, offset) {
+        return CompletionContext::StatementStart;
+    }
+
+    CompletionContext::Expression
+}
+
+/// Backward char scan: is the cursor in a TYPE-annotation position? True when, scanning back over
+/// the current line (skipping whitespace), we hit a `:` that governs a binding/param/return type
+/// (e.g. `val x: ▮`, `(x: ▮`, `): ▮`) or a `type Name = ▮` RHS, BEFORE hitting a token that would
+/// end such a context (a newline that starts a fresh statement, `;`, `(` for an arg, etc.). This
+/// fires for the "colon typed, no type text yet" case where no `TypeExpr` node exists. It is
+/// intentionally conservative: a `:` inside a JSON object LITERAL (`{ k: ▮ }`) is NOT a type
+/// position, so an unbalanced `{` before the `:` on the line disqualifies it.
+fn backward_scan_is_type_position(source: &str, offset: usize) -> bool {
+    let byte_off = char_offset_to_byte(source, offset);
+    let line_start = source[..byte_off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &source[line_start..byte_off];
+
+    // Walk back over the partial type identifier the user may be typing, then whitespace.
+    let trimmed = line.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
+    let trimmed = trimmed.trim_end();
+    let last = match trimmed.chars().last() {
+        Some(c) => c,
+        None => return false,
+    };
+
+    // After `:` — but exclude object-literal `key:` and ternary/`?:`-style uses by requiring the
+    // line to look like a binding/param/return. We check for an unbalanced `{` (object literal).
+    if last == ':' {
+        // `::` isn't a Lin token, but guard anyway.
+        let before_colon = &trimmed[..trimmed.len() - 1];
+        // A `{` opened on this line and not closed before the `:` ⇒ object literal field, not a type.
+        let opens = before_colon.matches('{').count();
+        let closes = before_colon.matches('}').count();
+        if opens > closes {
+            return false;
+        }
+        return true;
+    }
+
+    // `type Name = ▮` — the RHS of a type declaration is a type position. Match a line that begins
+    // (after optional `export`) with `type` and has an `=` before the cursor.
+    let line_trim = line.trim_start();
+    let body = line_trim.strip_prefix("export ").unwrap_or(line_trim).trim_start();
+    if body.starts_with("type ") && body.contains('=') {
+        return true;
+    }
+
+    false
+}
+
+/// Backward scan: is the cursor inside an `import` clause (the keyword-bearing part, not the path
+/// string)? True when the current line — after optional `export` — begins with `import`. Used so
+/// `from`/`as` are offered only here.
+fn backward_scan_is_import_clause(source: &str, offset: usize) -> bool {
+    let byte_off = char_offset_to_byte(source, offset);
+    let line_start = source[..byte_off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &source[line_start..byte_off];
+    let body = line.trim_start();
+    body.starts_with("import ") || body == "import" || body.starts_with("import")
+}
+
+/// Backward scan: is the cursor at the START of a statement? True when only whitespace precedes the
+/// cursor on its line (the user is at the first token of a new line) AND that line isn't a
+/// continuation of a dotted chain (a leading `.` means dot-completion / expression). Declaration
+/// keywords (`val`/`var`/`type`/`import`/`export`) are offered here.
+fn backward_scan_is_statement_start(source: &str, offset: usize) -> bool {
+    let byte_off = char_offset_to_byte(source, offset);
+    let line_start = source[..byte_off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &source[line_start..byte_off];
+    // The text before the cursor on this line, minus any partial identifier being typed.
+    let before_word = line.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
+    // Statement start: everything before the typed word is whitespace (indentation only).
+    before_word.trim().is_empty()
+}
+
+// ── in-scope binding collection (scope-aware completion) ──────────────────────
+
+/// One binding visible at the cursor, collected structurally from the AST so that even a
+/// defined-but-never-referenced name (e.g. a lambda param the user hasn't used yet) is offered.
+#[derive(Debug, Clone)]
+struct ScopeBinding {
+    name: String,
+    /// The binder's defining identifier span, used to look its inferred type up in `span_type_map`
+    /// (which keys types by use-site but records the `def_span`) and to dedupe against it.
+    def_span: Option<lin_common::Span>,
+    /// A type annotation rendered from the AST when present (params/`val x: T`), used as a fallback
+    /// detail when the binding was never referenced (so `span_type_map` has no inferred type).
+    annotated_ty: Option<String>,
+    is_function: bool,
+}
+
+/// Collect every binding in lexical scope at `offset`, walking the module and descending ONLY into
+/// the scopes that enclose the cursor. Surfaces: top-level + block `val`/`var` names whose scope
+/// reaches the cursor, parameters of any lambda/function whose body contains the cursor (this is
+/// what surfaces an unreferenced `item`), and destructuring-bound names. Respects lexical scope —
+/// a binding in a sibling scope that doesn't enclose the cursor is NOT collected.
+fn collect_scope_bindings(
+    module: &lin_parse::ast::Module,
+    offset: usize,
+) -> Vec<ScopeBinding> {
+    let mut out = Vec::new();
+    let off = offset as u32;
+    // Top-level statements form the outermost scope: every top-level binding is in scope for the
+    // whole module (Lin top-level `val`/fns are mutually visible — ADR-012 forward-decl), so we
+    // don't gate them on textual order.
+    for stmt in &module.statements {
+        collect_bindings_from_stmt(stmt, off, &mut out);
+    }
+    out
+}
+
+/// Collect binders introduced directly by a statement (the binding it declares), then descend into
+/// its initialiser expression looking for enclosing-lambda params / nested blocks.
+fn collect_bindings_from_stmt(stmt: &Stmt, off: u32, out: &mut Vec<ScopeBinding>) {
+    match stmt {
+        Stmt::Val { pattern, type_ann, value, .. } => {
+            let is_fn = matches!(value, lin_parse::ast::Expr::Function { .. });
+            collect_binders_from_pattern(pattern, type_ann.as_ref(), is_fn, out);
+            collect_bindings_from_expr(value, off, out);
+        }
+        Stmt::Var { name, name_span, type_ann, value, .. } => {
+            out.push(ScopeBinding {
+                name: name.clone(),
+                def_span: Some(*name_span),
+                annotated_ty: type_ann.as_ref().map(render_type_expr),
+                is_function: matches!(value, lin_parse::ast::Expr::Function { .. }),
+            });
+            collect_bindings_from_expr(value, off, out);
+        }
+        Stmt::Replace { value, .. } => collect_bindings_from_expr(value, off, out),
+        Stmt::Expr(e) => collect_bindings_from_expr(e, off, out),
+        _ => {}
+    }
+}
+
+/// Add the names a binding `pattern` introduces (plain ident or destructuring) to `out`. `type_ann`
+/// is the optional annotation on the binding; `is_function` flags a function-valued binding so it
+/// renders with a function icon (params are always `false`).
+fn collect_binders_from_pattern(
+    pattern: &lin_parse::ast::Pattern,
+    type_ann: Option<&TypeExpr>,
+    is_function: bool,
+    out: &mut Vec<ScopeBinding>,
+) {
+    use lin_parse::ast::Pattern as P;
+    match pattern {
+        P::Ident(name, span) => out.push(ScopeBinding {
+            name: name.clone(),
+            def_span: Some(*span),
+            annotated_ty: type_ann.map(render_type_expr),
+            is_function,
+        }),
+        P::Object(fields, rest, _) => {
+            for f in fields {
+                collect_binders_from_subpattern(&f.pattern, out);
+            }
+            if let Some(r) = rest {
+                out.push(ScopeBinding { name: r.clone(), def_span: None, annotated_ty: None, is_function: false });
+            }
+        }
+        P::Array(elems, rest, _) => {
+            for e in elems {
+                collect_binders_from_subpattern(e, out);
+            }
+            if let Some(r) = rest {
+                out.push(ScopeBinding { name: r.clone(), def_span: None, annotated_ty: None, is_function: false });
+            }
+        }
+        P::TypeName(..) | P::Literal(..) | P::Wildcard(..) => {}
+    }
+}
+
+/// Recurse into a destructuring sub-pattern, collecting plain-ident binders (no type annotation
+/// available at this depth).
+fn collect_binders_from_subpattern(pattern: &lin_parse::ast::Pattern, out: &mut Vec<ScopeBinding>) {
+    use lin_parse::ast::Pattern as P;
+    match pattern {
+        P::Ident(name, span) => out.push(ScopeBinding {
+            name: name.clone(),
+            def_span: Some(*span),
+            annotated_ty: None,
+            is_function: false,
+        }),
+        P::Object(fields, rest, _) => {
+            for f in fields {
+                collect_binders_from_subpattern(&f.pattern, out);
+            }
+            if let Some(r) = rest {
+                out.push(ScopeBinding { name: r.clone(), def_span: None, annotated_ty: None, is_function: false });
+            }
+        }
+        P::Array(elems, rest, _) => {
+            for e in elems {
+                collect_binders_from_subpattern(e, out);
+            }
+            if let Some(r) = rest {
+                out.push(ScopeBinding { name: r.clone(), def_span: None, annotated_ty: None, is_function: false });
+            }
+        }
+        P::TypeName(..) | P::Literal(..) | P::Wildcard(..) => {}
+    }
+}
+
+/// Descend into an expression looking for enclosing scopes of `off`: a `Function` whose BODY
+/// contains the cursor contributes its params (the `item` case), a `Block` whose extent contains
+/// the cursor contributes its `val`/`var`s, and a `Match` arm whose body contains the cursor
+/// contributes its pattern bindings. Only scopes that ENCLOSE the cursor are descended (lexical
+/// scoping), so a sibling lambda's params never leak in.
+fn collect_bindings_from_expr(expr: &lin_parse::ast::Expr, off: u32, out: &mut Vec<ScopeBinding>) {
+    use lin_parse::ast::Expr as E;
+    match expr {
+        E::Function { params, body, full_span, .. } => {
+            // Only contribute params + descend when the cursor is within this function's extent.
+            if full_span.start <= off && off <= full_span.end {
+                for p in params {
+                    collect_binders_from_pattern(&p.pattern, p.type_ann.as_ref(), false, out);
+                }
+                collect_bindings_from_expr(body, off, out);
+            }
+        }
+        E::Block(stmts, tail, _, full_span) => {
+            if full_span.start <= off && off <= full_span.end {
+                for s in stmts {
+                    collect_bindings_from_stmt(s, off, out);
+                }
+                collect_bindings_from_expr(tail, off, out);
+            }
+        }
+        E::Match { scrutinee, arms, full_span, .. } => {
+            if full_span.start <= off && off <= full_span.end {
+                collect_bindings_from_expr(scrutinee, off, out);
+                for arm in arms {
+                    let bspan = arm.body.full_span();
+                    if bspan.start <= off && off <= bspan.end {
+                        if let lin_parse::ast::MatchPattern::Is(p) | lin_parse::ast::MatchPattern::Has(p) = &arm.pattern {
+                            collect_binders_from_subpattern(p, out);
+                        }
+                    }
+                    collect_bindings_from_expr(&arm.body, off, out);
+                }
+            }
+        }
+        _ => walk_child_exprs(expr, &mut |child| collect_bindings_from_expr(child, off, out)),
+    }
+}
+
+/// Render a `TypeExpr` to a short display string for completion `detail` when no inferred type is
+/// available. Best-effort and read-only — covers the common shapes; falls back to a generic label.
+fn render_type_expr(ty: &TypeExpr) -> String {
+    use TypeExpr as T;
+    match ty {
+        T::Named(n, _) => n.clone(),
+        T::Generic(n, args, _) => format!("{}<{}>", n, args.iter().map(render_type_expr).collect::<Vec<_>>().join(", ")),
+        T::Array(inner, _) => format!("{}[]", render_type_expr(inner)),
+        T::Union(parts, _) => parts.iter().map(render_type_expr).collect::<Vec<_>>().join(" | "),
+        T::Intersection(parts, _) => parts.iter().map(render_type_expr).collect::<Vec<_>>().join(" & "),
+        T::Function(params, ret, _) => format!(
+            "({}) => {}",
+            params.iter().map(render_type_expr).collect::<Vec<_>>().join(", "),
+            render_type_expr(ret)
+        ),
+        T::StringLit(s, _) => format!("\"{}\"", s),
+        T::Object(..) | T::IndexSig(..) | T::FixedArray(..) | T::TaggedUnion(..) => "{ … }".to_string(),
+    }
+}
+
+// ── user-defined type names (for TypeAnnotation completion) ───────────────────
+
+/// Collect the names of `type` declarations and generic type params in scope at `offset`, offered
+/// alongside the built-in types in a `TypeAnnotation` position. Top-level `type` decls are module-
+/// global; generic `<T>` params are added when the cursor is inside the declaring function.
+fn collect_type_names(module: &lin_parse::ast::Module, offset: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let off = offset as u32;
+    for stmt in &module.statements {
+        match stmt {
+            Stmt::TypeDecl { name, params, .. } => {
+                out.push(name.clone());
+                out.extend(params.iter().cloned());
+            }
+            Stmt::Val { value, .. } | Stmt::Var { value, .. } => {
+                collect_type_params_from_expr(value, off, &mut out);
+            }
+            Stmt::Expr(e) => collect_type_params_from_expr(e, off, &mut out),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Add a function's `<T, …>` generic params when the cursor is within its extent (so they're
+/// offered in its param/return annotations + body type positions).
+fn collect_type_params_from_expr(expr: &lin_parse::ast::Expr, off: u32, out: &mut Vec<String>) {
+    use lin_parse::ast::Expr as E;
+    if let E::Function { type_params, full_span, .. } = expr {
+        if full_span.start <= off && off <= full_span.end {
+            out.extend(type_params.iter().cloned());
+        }
+    }
+    walk_child_exprs(expr, &mut |child| collect_type_params_from_expr(child, off, out));
 }
 
 // ── unimported stdlib dot-completion candidates (FIX B) ───────────────────────
