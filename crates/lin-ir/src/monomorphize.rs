@@ -1863,15 +1863,14 @@ fn native_spec_slot(
 /// `lin_X(params…)` forwarding its parameters 1:1, so a call's existing args are already in the
 /// intrinsic's argument order and need no reordering when we repoint the callee.
 ///
-/// `lin_for` is included so a `.for(body)` call is rewritten to the intrinsic at the call site —
-/// exposing the literal lambda to `lower_for`'s inline loop — INSTEAD of being native-specialized
-/// into a `for$Int32` wrapper that takes the callback as an opaque closure parameter and dispatches
-/// it indirectly per element. (`for`/`while` became generic in commit 9d6d2970, which incidentally
-/// routed them onto that slow specialization path; this restores `for`'s inline dispatch.) `lin_while`
-/// is NOT included yet: `lower_while` has no inline fast path, so routing it here would not inline the
-/// callback — that needs a `lower_while` change first.
+/// `lin_for`/`lin_while` are included so a `.for(body)` / `.while(pred)` call is rewritten to the
+/// intrinsic at the call site — exposing the literal lambda to `lower_for`/`lower_while`'s inline
+/// loop — INSTEAD of being native-specialized into a `for$Int32`/`while$Int32` wrapper that takes
+/// the callback as an opaque closure parameter and dispatches it indirectly per element. (`for`/
+/// `while` became generic in commit 9d6d2970, which incidentally routed them onto that slow
+/// specialization path; this restores their inline dispatch.)
 fn combinator_intrinsic(name: &str) -> bool {
-    matches!(name, "lin_map" | "lin_filter" | "lin_reduce" | "lin_for")
+    matches!(name, "lin_map" | "lin_filter" | "lin_reduce" | "lin_for" | "lin_while")
 }
 
 /// If `arg` is a bare reference to a direct-callable module function (see
