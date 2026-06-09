@@ -1,0 +1,89 @@
+// Benchmark: large-record structural equality (`==` over Json objects).
+//
+// Models change-detection / membership over parsed config-style records: a reference
+// config with many fields is compared against a stream of incoming records, counting how
+// many match. `==` on objects is deep, order-independent structural equality, backed by
+// `lin_object_eq` in the runtime. For records at/above the hash-index threshold (16 keys)
+// the inner key lookup uses the object's O(1) hash side-index instead of a per-key linear
+// scan, turning each compare from O(n*m) into O(n).
+//
+// Each incoming record is built with its fields in REVERSED order relative to the reference,
+// so the comparison genuinely exercises the order-independent path (a slot-by-slot memcmp
+// would be wrong). A controlled fraction of incoming records differ in exactly one field,
+// exercising the fast-reject path too. The RESULT line is deterministic so a regression to
+// wrong output (e.g. order-dependent compare) is caught.
+import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+val n = 400000
+
+// A 24-field reference record (>= the 16-key hash-index threshold). Built once.
+val reference = {
+  "f00": 0,
+  "f01": 1,
+  "f02": 2,
+  "f03": 3,
+  "f04": 4,
+  "f05": 5,
+  "f06": 6,
+  "f07": 7,
+  "f08": 8,
+  "f09": 9,
+  "f10": 10,
+  "f11": 11,
+  "f12": 12,
+  "f13": 13,
+  "f14": 14,
+  "f15": 15,
+  "f16": 16,
+  "f17": 17,
+  "f18": 18,
+  "f19": 19,
+  "f20": 20,
+  "f21": 21,
+  "f22": 22,
+  "f23": 23
+}
+
+// Build an incoming record with the SAME 24 fields, but inserted in REVERSED key order so
+// equality must be order-independent. `f12v` lets the caller perturb exactly one field: when
+// it is not 12, the record must compare UNEQUAL to the reference (fast-reject path).
+val makeIncoming = (f12v: Int32) => {
+  "f23": 23,
+  "f22": 22,
+  "f21": 21,
+  "f20": 20,
+  "f19": 19,
+  "f18": 18,
+  "f17": 17,
+  "f16": 16,
+  "f15": 15,
+  "f14": 14,
+  "f13": 13,
+  "f12": f12v,
+  "f11": 11,
+  "f10": 10,
+  "f09": 9,
+  "f08": 8,
+  "f07": 7,
+  "f06": 6,
+  "f05": 5,
+  "f04": 4,
+  "f03": 3,
+  "f02": 2,
+  "f01": 1,
+  "f00": 0
+}
+
+// Every 5th record differs (f12 = 9999); the rest match (f12 = 12). Count the matches.
+var matches = 0i64
+range(0, n).for(i =>
+  val f12v = if i % 5 == 0 then 9999 else 12
+  val incoming = makeIncoming(f12v)
+  matches = matches + if incoming == reference then 1i64 else 0i64
+)
+
+// Expected matches = records where i % 5 != 0 = n - (n/5).
+// n = 400000, n/5 = 80000 exactly, so matches = 400000 - 80000 = 320000.
+print("RESULT matches=${toString(matches)}")

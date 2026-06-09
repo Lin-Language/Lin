@@ -46,6 +46,13 @@ unsafe fn freeze_object(obj: *mut LinObject) {
         return;
     }
     (*obj).refcount = IMMORTAL_RC;
+    // Build the O(1) hash side-index NOW, while we are still single-threaded. A frozen object is
+    // designed for lock-free concurrent reads (ADR-043), but the index is normally built LAZILY on
+    // first lookup, which would be a data race across threads. By building it at freeze time, every
+    // subsequent `get`/`has`/`eq` on this (large) frozen object probes a clean, immutable index
+    // lock-free, and the immortal-RC guard in `ensure_index` ensures it is never rebuilt or freed.
+    // No-op for small objects (< HASH_INDEX_THRESHOLD), which keep the read-only linear scan.
+    crate::object::build_index_for_freeze(obj);
     let len = (*obj).len as usize;
     for i in 0..len {
         let entry = (*obj).entries.add(i);
