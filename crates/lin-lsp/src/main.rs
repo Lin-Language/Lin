@@ -304,9 +304,11 @@ impl LanguageServer for Backend {
 
         let prefix = word_before(&source, offset);
 
-        // Detect whether cursor is in a dot-completion context and resolve
-        // the receiver's type category (e.g. "array", "string", "object").
-        let (in_dot_context, receiver_category) = dot_receiver_category(&source, offset, &analysis.span_type_map);
+        // Detect whether cursor is in a dot-completion context and resolve the receiver's type
+        // category (e.g. "array", "string", "object") AND, when the receiver type-checked, its
+        // PRECISE cleaned type-string — used by the type-accurate `first_param_accepts` dot gate.
+        let (in_dot_context, receiver_category, receiver_precise) =
+            dot_receiver_category(&source, offset, &analysis.span_type_map);
 
         // Smart-parens inputs: does the client support snippet inserts, and is the char immediately
         // after the cursor already a `(` (the user is editing an existing call — don't double the
@@ -470,15 +472,19 @@ impl LanguageServer for Backend {
             if !imp.name.starts_with(prefix) {
                 continue;
             }
-            // Dot-context filtering: only show items applicable to the receiver type. The decision
-            // is delegated to `dot_item_applies` so it can be unit-tested directly. The key change
-            // from the old logic: a RECEIVER-POLYMORPHIC combinator (first-param category "any",
-            // e.g. `map`/`filter`/`reduce` whose first param renders as generic/`Json`/union) is now
-            // OFFERED on any receiver instead of being dropped — that idiom is the whole point of
-            // `xs.map(...)`.
+            // Dot-context filtering: only show items applicable to the receiver type, via the SHARED
+            // `dot_first_param_gate`. When the receiver's PRECISE type is known, the gate requires it
+            // to be assignable to the candidate's first parameter (`first_param_accepts`); otherwise
+            // it falls back to the coarse receiver category. Receiver-polymorphic combinators
+            // (`map`/`filter`/`for`, first param `T[] | Iterator | Stream` / generic) stay offered on
+            // every receiver — the whole point of `xs.map(...)`.
             if let Some(cat) = filter_cat {
-                let first_param_cat = imp.ty.as_deref().and_then(first_param_category);
-                if !dot_item_applies(cat, first_param_cat.as_deref()) {
+                let first_param = imp
+                    .ty
+                    .as_deref()
+                    .map(clean_type_string)
+                    .and_then(|s| first_param_type(&s));
+                if !dot_first_param_gate(cat, receiver_precise.as_deref(), first_param.as_deref()) {
                     continue;
                 }
             }
@@ -517,6 +523,7 @@ impl LanguageServer for Backend {
             items.extend(stdlib_dot_completion_items(
                 STDLIB_DOT_CANDIDATES.iter(),
                 receiver_category.as_deref().unwrap_or("any"),
+                receiver_precise.as_deref(),
                 prefix,
                 &already,
                 uri,
@@ -1590,33 +1597,37 @@ fn generic_name(n: usize) -> String {
 
 // ── dot-completion helpers ────────────────────────────────────────────────────
 
-/// Returns `(in_dot_context, category)`.
+/// Returns `(in_dot_context, category, precise_type)`.
 /// `in_dot_context` is true when the cursor is immediately after a `.`.
 /// `category` is Some("array"|"string"|"number"|"object") when the receiver type is known,
 /// or None when in dot context but the type couldn't be resolved (show all stdlib items).
+/// `precise_type` is the receiver's CLEANED type-string (e.g. `String`, `Point[]`, `Json`) when
+/// the receiver type-checked — used for the precise `first_param_accepts` gate. It is `None` when
+/// the receiver didn't type-check (the caller then falls back to the coarse `category` gate so we
+/// don't regress — better coarse than nothing).
 fn dot_receiver_category(
     source: &str,
     offset: usize,
     span_type_map: &[(lin_common::Span, String, Option<lin_common::Span>)],
-) -> (bool, Option<String>) {
+) -> (bool, Option<String>, Option<String>) {
     // `offset` and the offsets derived from it here are CHAR offsets. The prefix word is ASCII
     // (`[A-Za-z0-9_]`), so its byte length equals its char count — usable directly in char space.
     let prefix_len = word_before(source, offset).len();
     let dot_offset = match offset.checked_sub(prefix_len + 1) {
         Some(o) => o,
-        None => return (false, None),
+        None => return (false, None, None),
     };
 
     // Index the source BY BYTE to read the `.` char: convert the char offset to a byte index first.
     let dot_byte = char_offset_to_byte(source, dot_offset);
     if source.as_bytes().get(dot_byte) != Some(&b'.') {
-        return (false, None);
+        return (false, None, None);
     }
 
     // Find the type of the expression to the left of the dot.
     let receiver_offset = match dot_offset.checked_sub(1) {
         Some(o) => o,
-        None => return (true, None),
+        None => return (true, None, None),
     };
     let ty_str = tightest_span(span_type_map, receiver_offset)
         .map(|(_, s, _)| s.as_str())
@@ -1624,10 +1635,13 @@ fn dot_receiver_category(
 
     if ty_str.is_empty() {
         // In dot context but type unknown — show all stdlib items.
-        return (true, None);
+        return (true, None, None);
     }
 
-    (true, Some(type_to_category(ty_str).to_string()))
+    // Clean the raw type-string (resolve `?T<id>` solver ids → `Json`/generic letters) so the
+    // precise gate matches on the same rendered form `detail` uses.
+    let precise = clean_type_string(ty_str);
+    (true, Some(type_to_category(ty_str).to_string()), Some(precise))
 }
 
 /// Maps a Lin type string to a broad category used for dot-completion filtering.
@@ -1674,9 +1688,11 @@ fn dot_item_applies(receiver_cat: &str, first_param_cat: Option<&str>) -> bool {
     }
 }
 
-/// Extract the broad category of a function signature's FIRST parameter, used to decide whether
-/// an imported function applies to a dot-receiver of a given category. e.g. `(String, ...) => X`
-/// → "string". Returns `None` when the string isn't a function type or has no parameters.
+/// Extract the broad category of a function signature's FIRST parameter from a full `(…) => R`
+/// signature: e.g. `(String, ...) => X` → "string". Superseded in production by `first_param_type`
+/// + `type_to_category` (the gate now extracts the bare param type and categorises that), but kept
+/// as a test helper that pins `dot_item_applies`' category behaviour against rendered signatures.
+#[cfg(test)]
 fn first_param_category(sig: &str) -> Option<String> {
     // Signatures render as `(P1, P2, ...) => R`. Grab the text inside the leading parens.
     if !sig.starts_with('(') {
@@ -1702,6 +1718,185 @@ fn first_param_category(sig: &str) -> Option<String> {
         }
     }
     Some(type_to_category(first.trim()).to_string())
+}
+
+/// Extract the FULL rendered type-string of a function signature's FIRST parameter (the
+/// type-precise counterpart of `first_param_category`). Unlike that helper — which only needs the
+/// text up to the first `)` because it collapses to a coarse category — this must survive a first
+/// param whose own type contains delimiters (e.g. `(?T[] | Iterator, (T) => U) => …`), so it scans
+/// with delimiter-depth tracking from the *matching* close-paren of the leading `(`. Returns `None`
+/// when `sig` isn't a function type or has no parameters.
+fn first_param_type(sig: &str) -> Option<String> {
+    let sig = sig.trim();
+    if !sig.starts_with('(') {
+        return None;
+    }
+    // Walk from just after the leading `(`, tracking nesting depth so a comma/close-paren inside a
+    // nested `(...)`/`[...]`/`{...}`/`<...>` doesn't terminate the first parameter prematurely. The
+    // function arrow `=>` is the one trap: its `>` is NOT a closing angle bracket, so a first param
+    // that is itself a function type (`(T) => U`) would otherwise be cut at the arrow — skip a `>`
+    // immediately preceded by `=` (mirrors `matching_paren`).
+    let mut depth = 0i32;
+    let mut start: Option<usize> = None;
+    let mut prev = '\0';
+    for (i, c) in sig.char_indices() {
+        match c {
+            '(' | '[' | '{' | '<' => {
+                depth += 1;
+                if depth == 1 && start.is_none() {
+                    // Just past the leading `(` — the first param text begins at the next byte.
+                    start = Some(i + c.len_utf8());
+                }
+            }
+            // `=>` arrow: the `>` is part of the arrow, not a closing angle bracket.
+            '>' if prev == '=' => {}
+            ')' | ']' | '}' | '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    // Matching close of the leading `(` — params end here. (A zero-param `()` yields
+                    // an empty slice → `None` below.)
+                    let s = start?;
+                    let first = sig[s..i].trim();
+                    return if first.is_empty() { None } else { Some(first.to_string()) };
+                }
+            }
+            ',' if depth == 1 => {
+                // Top-level comma → end of the first parameter.
+                let s = start?;
+                return Some(sig[s..i].trim().to_string());
+            }
+            _ => {}
+        }
+        prev = c;
+    }
+    None
+}
+
+/// Whether a dot receiver of (cleaned) type `receiver_ty` is assignable to a function's (cleaned)
+/// FIRST-parameter type `first_param_ty` — the precise gate the user asked for: `receiver.fn` is
+/// offered ONLY when the receiver fits the function's first slot.
+///
+/// This is a pragmatic STRUCTURAL check over the rendered type-strings (the LSP has no direct line
+/// to the checker's `assignable`), and it ACCEPTS when any of:
+///   - the first param is `Json` — the dynamic escape hatch accepts anything;
+///   - the first param is a bare generic type var (`T`..`Z`, `T1`…) or `Iterable` — a
+///     receiver-polymorphic combinator (`map`/`filter`/`reduce`/`for`), which must stay offered on
+///     every receiver;
+///   - the first param is a UNION (`A | B | …`) and the receiver satisfies ANY member — e.g. an
+///     array receiver against `T[] | Iterator | Stream` (the real `map`/`for` first param);
+///   - the receiver and first param are category-compatible: numeric↔numeric, String↔String,
+///     array↔array (incl. a generic-element array `T[]`), object↔object/record. A receiver whose
+///     own type is `Json`/generic (category "any") matches anything (we can't prove a mismatch).
+///
+/// It REJECTS only a provably-incompatible concrete pairing (e.g. a `String` receiver against an
+/// `Int8` first param). The caller falls back to coarse category matching when the precise receiver
+/// type isn't known (the receiver didn't type-check).
+fn first_param_accepts(receiver_ty: &str, first_param_ty: &str) -> bool {
+    let recv = receiver_ty.trim();
+    let param = first_param_ty.trim();
+
+    // `Json` first param accepts anything.
+    if param == "Json" {
+        return true;
+    }
+    // A bare generic type var or the `Iterable` polymorphic marker accepts any receiver.
+    if is_generic_type_var(param) || param == "Iterable" {
+        return true;
+    }
+    // Union first param: accept if the receiver satisfies ANY member (e.g. `T[] | Iterator | Stream`
+    // accepts an array receiver). Split only at top-level `|` so a nested union inside `<…>` is kept
+    // whole.
+    if let Some(members) = split_top_level_union(param) {
+        return members.iter().any(|m| first_param_accepts(recv, m));
+    }
+    // A receiver whose own type is polymorphic (`Json`/generic) can't be proven a mismatch → accept.
+    if recv == "Json" || is_generic_type_var(recv) {
+        return true;
+    }
+
+    // Concrete structural check via the coarse categories. `Iterator`/`Stream` first params accept an
+    // array receiver (the eager-over-array combinator dispatch).
+    let recv_cat = type_to_category(recv);
+    let param_cat = type_to_category(param);
+    if recv_cat == "array" && (param.starts_with("Iterator") || param.starts_with("Stream")) {
+        return true;
+    }
+    // `any` on either side (an unclassifiable type, e.g. a named record / Function) — don't claim a
+    // mismatch we can't prove.
+    if recv_cat == "any" || param_cat == "any" {
+        return true;
+    }
+    recv_cat == param_cat
+}
+
+/// True when `ty` renders as a bare generic type variable: a single upper-case letter (`T`..`Z`,
+/// the `generic_name` scheme) or `T`+digits (`T1`, `T2`, …). Used by `first_param_accepts` to treat
+/// a receiver-polymorphic first param as accepting any receiver.
+fn is_generic_type_var(ty: &str) -> bool {
+    let ty = ty.trim();
+    let mut chars = ty.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    // Single upper-case letter (`T`..`Z`), or `<Letter><digits>` (`T1`).
+    chars.all(|c| c.is_ascii_digit())
+}
+
+/// Split a type-string at TOP-LEVEL `|` (union members), returning `None` when it isn't a union (no
+/// top-level `|`). Delimiter-depth-aware so a `|` nested inside `<…>`/`(…)`/`[…]`/`{…}` is ignored.
+fn split_top_level_union(ty: &str) -> Option<Vec<String>> {
+    let mut depth = 0i32;
+    let mut parts: Vec<String> = Vec::new();
+    let mut last = 0usize;
+    let mut found = false;
+    let mut prev = '\0';
+    for (i, c) in ty.char_indices() {
+        match c {
+            '(' | '[' | '{' | '<' => depth += 1,
+            // `=>` arrow: the `>` is part of the arrow, not a closing angle bracket.
+            '>' if prev == '=' => {}
+            ')' | ']' | '}' | '>' => depth -= 1,
+            '|' if depth == 0 => {
+                parts.push(ty[last..i].trim().to_string());
+                last = i + c.len_utf8();
+                found = true;
+            }
+            _ => {}
+        }
+        prev = c;
+    }
+    if !found {
+        return None;
+    }
+    parts.push(ty[last..].trim().to_string());
+    Some(parts)
+}
+
+/// The SHARED dot-completion gate used uniformly across the stdlib, imported, and userland candidate
+/// paths. When the precise receiver type is known (`receiver_precise`), use the type-accurate
+/// `first_param_accepts`; otherwise fall back to the coarse `dot_item_applies(receiver_cat, …)` so a
+/// receiver that didn't type-check still gets (looser) suggestions instead of none.
+///
+/// `first_param`: the candidate function's cleaned FIRST-PARAMETER type-string (the type itself, e.g.
+/// `String` / `Int32` / `T[] | Iterator | Stream`, NOT the whole `(…) => R` signature), or `None`
+/// when the candidate has no resolvable function signature (e.g. a bare value) — in which case we
+/// can't prove it inapplicable and keep it (matching `dot_item_applies`' `None` behaviour).
+fn dot_first_param_gate(
+    receiver_cat: &str,
+    receiver_precise: Option<&str>,
+    first_param: Option<&str>,
+) -> bool {
+    match (receiver_precise, first_param) {
+        // Precise receiver type known AND the candidate has a first param: type-accurate gate.
+        (Some(recv), Some(p)) => first_param_accepts(recv, p),
+        // Precise receiver known but no first param → keep (can't prove inapplicable).
+        (Some(_), None) => true,
+        // No precise receiver type: coarse category fallback. `first_param` is already the bare param
+        // TYPE, so its category comes straight from `type_to_category` (a union like
+        // `T[] | Iterator | Stream` classifies as "array" via its `[]`, matching the old behaviour).
+        (None, p) => dot_item_applies(receiver_cat, p.map(type_to_category)),
+    }
 }
 
 // ── completion-context classification (scope/position awareness) ──────────────
@@ -2236,8 +2431,11 @@ fn build_stdlib_dot_candidates() -> Vec<StdlibCandidate> {
 ///   - its name is NOT already offered (`already`, which the caller seeds with imported symbols +
 ///     local bindings) — so an already-imported `map` isn't listed twice;
 ///   - it is function-shaped (`=>` in the signature) — a bare value isn't a dot-method;
-///   - `dot_item_applies(receiver_cat, first_param_category)` — gating by receiver category so a
-///     `.` doesn't dump the whole stdlib (e.g. a `string`-first-param method is dropped on an array).
+///   - the SHARED `dot_first_param_gate` accepts it: when `receiver_precise` is known, the receiver
+///     type must be assignable to the candidate's first parameter (`first_param_accepts`); otherwise
+///     a coarse `receiver_cat` category match — so a `.` doesn't dump the whole stdlib (e.g. a
+///     `string`-first-param method is dropped on an array) while receiver-polymorphic combinators
+///     (`map`/`for`, whose first param is `T[] | Iterator | Stream` / generic) stay offered.
 ///
 /// The label is the bare NAME (plain identifier insert, no arg snippet). The `detail` uses the FIX A
 /// clean renderer (no raw `?T` ids). The import edit + doc are attached lazily in `completion_resolve`
@@ -2245,6 +2443,7 @@ fn build_stdlib_dot_candidates() -> Vec<StdlibCandidate> {
 fn stdlib_dot_completion_items<'a>(
     candidates: impl Iterator<Item = &'a StdlibCandidate>,
     receiver_cat: &str,
+    receiver_precise: Option<&str>,
     prefix: &str,
     already: &HashSet<String>,
     uri: &Url,
@@ -2259,8 +2458,11 @@ fn stdlib_dot_completion_items<'a>(
         if !cand.ty.contains("=>") {
             continue;
         }
-        let first_param_cat = first_param_category(&cand.ty);
-        if !dot_item_applies(receiver_cat, first_param_cat.as_deref()) {
+        // Clean the raw signature so the extracted first-param type renders the same way the receiver
+        // type does (`?T<id>` → generic letters / `Json`), keeping the precise gate apples-to-apples.
+        let cleaned = clean_type_string(&cand.ty);
+        let first_param = first_param_type(&cleaned);
+        if !dot_first_param_gate(receiver_cat, receiver_precise, first_param.as_deref()) {
             continue;
         }
         let mut item = CompletionItem {
@@ -5974,7 +6176,7 @@ mod tests {
         )];
         let already = HashSet::new();
         let items =
-            stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri(), true, false);
+            stdlib_dot_completion_items(cands.iter(), "array", None, "", &already, &fixb_uri(), true, false);
         let map = item_named(&items, "map").expect("`map` must be offered on an array receiver");
         // Smart-parens snippet, cursor between the parens (one arg still to fill).
         assert_eq!(map.insert_text.as_deref(), Some("map($0)"));
@@ -6021,7 +6223,7 @@ mod tests {
         let cands = vec![cand("map", "std/iter", "(?T9002[], (?T9002, Int32) => ?T9003) => ?T9003[]")];
         let mut already = HashSet::new();
         already.insert("map".to_string());
-        let items = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri(), false, false);
+        let items = stdlib_dot_completion_items(cands.iter(), "array", None, "", &already, &fixb_uri(), false, false);
         assert!(item_named(&items, "map").is_none(), "an already-offered `map` must not be re-offered");
     }
 
@@ -6036,11 +6238,11 @@ mod tests {
         ];
         let already = HashSet::new();
         // Array receiver: `range` (number first param) is gated OUT; `map` (array) is kept.
-        let on_array = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri(), false, false);
+        let on_array = stdlib_dot_completion_items(cands.iter(), "array", None, "", &already, &fixb_uri(), false, false);
         assert!(item_named(&on_array, "range").is_none(), "`range` must be gated out on an array receiver");
         assert!(item_named(&on_array, "map").is_some(), "`map` should be offered on an array receiver");
         // String receiver: `map` (array first param) is gated OUT.
-        let on_string = stdlib_dot_completion_items(cands.iter(), "string", "", &already, &fixb_uri(), false, false);
+        let on_string = stdlib_dot_completion_items(cands.iter(), "string", None, "", &already, &fixb_uri(), false, false);
         assert!(item_named(&on_string, "map").is_none(), "`map` (array first param) must be gated out on a string receiver");
     }
 
@@ -6054,7 +6256,7 @@ mod tests {
             "(?T4294967295, (?T4294967295, Int32) => ?T4294967295) => Null",
         )];
         let already = HashSet::new();
-        let items = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri(), false, false);
+        let items = stdlib_dot_completion_items(cands.iter(), "array", None, "", &already, &fixb_uri(), false, false);
         let for_item = item_named(&items, "for").expect("`for` must be offered on an array receiver");
         assert_eq!(parse_completion_resolve_module(for_item.data.as_ref()).as_deref(), Some("std/iter"));
     }
@@ -6065,7 +6267,7 @@ mod tests {
     #[test]
     fn stdlib_dot_real_candidates_offer_iter_combinators_on_array() {
         let already = HashSet::new();
-        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "", &already, &fixb_uri(), false, false);
+        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", None, "", &already, &fixb_uri(), false, false);
         for name in ["map", "filter", "for"] {
             let it = item_named(&items, name)
                 .unwrap_or_else(|| panic!("`{name}` should be offered on an array receiver from the real stdlib"));
@@ -6078,7 +6280,7 @@ mod tests {
         // `range` (number first param) is gated out even from the real set.
         assert!(item_named(&items, "range").is_none(), "`range` must be gated out on an array receiver");
         // Prefix filter: only `map` survives a "ma" prefix.
-        let only_ma = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "ma", &already, &fixb_uri(), false, false);
+        let only_ma = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", None, "ma", &already, &fixb_uri(), false, false);
         assert!(item_named(&only_ma, "map").is_some());
         assert!(item_named(&only_ma, "filter").is_none(), "prefix `ma` must exclude `filter`");
     }
@@ -6142,7 +6344,7 @@ val _helper = 3
         );
         // Genuinely-exported array ops ARE still offered on an array receiver.
         let already = HashSet::new();
-        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "", &already, &fixb_uri(), false, false);
+        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", None, "", &already, &fixb_uri(), false, false);
         assert!(item_named(&items, "push").is_some(), "exported `push` should still be offered");
         assert!(item_named(&items, "_bisect").is_none(), "private `_bisect` must not be offered");
     }
