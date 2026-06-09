@@ -72,7 +72,7 @@ export val runWithRetry = (t: Task, times: Int32): Result<TaskResult, String> =>
     else => err("gave up after ${toString(times)} attempt(s)")
 
 // Drain one pooled promise into the accumulator, narrowing its awaited value.
-val drain = (out: TaskResult[], p: Json): Null =>
+val drain = (out: TaskResult[], p: Promise<TaskResult>): Null =>
   val r = await(p)
   match r
     is TaskResult => push(out, r)
@@ -88,7 +88,7 @@ export val runThen = (first: Task, second: Task, ms: Int32): Result<TaskResult, 
 // subprocesses are in flight at once. Returns the results in submission order.
 export val runOnPool = (tasks: Task[], workers: Int32): TaskResult[] =>
   val pool = threadPool(workers)
-  var promises: Json[] = []
+  var promises: Promise<TaskResult>[] = []
   tasks.for(t => push(promises, pool.poolAsync(() => runTask(t))))
   var out: TaskResult[] = []
   promises.for(p => drain(out, p))

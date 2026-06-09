@@ -5532,6 +5532,41 @@ match await(p)
 }
 
 #[test]
+fn test_promise_type_annotation_roundtrip() {
+    // `Promise<T>` is a first-class opaque type (ADR-045 update): a promise handle can be stored
+    // in an explicitly-annotated `Promise<T>` binding and a `Promise<T>[]` array, then awaited.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await, race } from "std/async"
+import { push } from "std/array"
+import { for } from "std/iter"
+
+val p: Promise<Int32> = async(() => 21 * 2)
+val ps: Promise<Int32>[] = [async(() => 1), async(() => 2)]
+val first = await(race(ps))
+match await(p)
+  is Error => print("error")
+  else => print(toString(await(p)))
+"#);
+    assert_eq!(output, vec!["42"]);
+}
+
+#[test]
+fn test_promise_not_assignable_to_inner_value() {
+    // Because `Promise<T>` is its own type (not erased to Json), "forgot to await" is caught:
+    // a `Promise<Int32>` is not assignable to `Int32`.
+    let err = run_expect_err(r#"import { async } from "std/async"
+
+val p = async(() => 1 + 1)
+val n: Int32 = p
+"#);
+    assert!(
+        err.contains("Promise") && err.contains("Int32"),
+        "expected a Promise-not-assignable-to-Int32 type error, got:\n{err}"
+    );
+}
+
+#[test]
 fn test_async_val_capture() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -5757,12 +5792,12 @@ import { await, threadPool, poolAsync } from "std/async"
 import { push, length } from "std/array"
 import { for, range } from "std/iter"
 
-val unwrap = (r: Json): Int32 =>
+val unwrap = (r: Int32 | Error): Int32 =>
   match r
     is Error => 0
     else => r
 val pool = threadPool(3)
-var promises: Json[] = []
+var promises: Promise<Int32>[] = []
 range(0, 30).for(i => push(promises, pool.poolAsync(() => 1)))
 var total = 0
 promises.for(p => total = total + unwrap(await(p)))
@@ -6015,6 +6050,63 @@ push(snap, 4)
 print(toString(length(snap)))
 "#);
     assert_eq!(output, vec!["4"]);
+}
+
+#[test]
+fn test_shared_payload_type_preserved() {
+    // Shared<T> is a properly-typed generic handle: `get` yields the concrete payload `T`, so a
+    // Shared<Int32> snapshot is directly usable as an Int32 (no widening to Json). This exercises
+    // the box/unbox path for a scalar payload — get(si) must unbox to a real i32 for arithmetic.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get, set, withLock } from "std/async"
+
+val si = shared(5)
+val n: Int32 = get(si)
+set(si, 10)
+val n2: Int32 = get(si)
+val sum: Int32 = n + n2
+print(toString(sum))
+val r: Int32 = withLock(si, x => x * 2)
+print(toString(r))
+"#);
+    assert_eq!(output, vec!["15", "20"]);
+}
+
+#[test]
+fn test_shared_string_and_record_payload() {
+    // Non-scalar payloads round-trip too: Shared<String> get yields a usable String, and
+    // Shared<{record}> get yields a record whose typed field access compiles to a const-slot load.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get } from "std/async"
+
+val ss = shared("hello")
+val str: String = get(ss)
+print(str)
+
+type Point = { "x": Int32, "y": Int32 }
+val sp = shared({ "x": 1, "y": 2 })
+val p = get(sp)
+val px: Int32 = p["x"]
+print(toString(px))
+"#);
+    assert_eq!(output, vec!["hello", "1"]);
+}
+
+#[test]
+fn test_shared_not_assignable_to_inner_value() {
+    // The "forgot to get()" catch: a Shared<Int32> handle must NOT be assignable to a bare Int32.
+    // The opaque box keeps its payload type but never auto-unwraps — you must read it via get().
+    let err = run_expect_err(r#"import { shared } from "std/async"
+
+val s = shared(5)
+val n: Int32 = s
+"#);
+    assert!(
+        err.contains("Int32") && err.contains("Shared<Int32>"),
+        "expected a Shared<Int32>-vs-Int32 mismatch, got:\n{err}"
+    );
 }
 
 #[test]

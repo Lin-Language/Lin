@@ -22,7 +22,7 @@
 //
 //   val p = async(() => expensiveComputation())   // ... do other work ...
 //   match await(p) is Error => print("failed") else => print("${await(p)}")
-export val async = (f: Json): Json =>
+export val async = <T>(f: () => T): Promise<T> =>
   lin_async(f)
 
 // Resolve a promise to its value.
@@ -30,7 +30,7 @@ export val async = (f: Json): Json =>
 // @returns the resolved value, or an `Error` if the thunk faulted. The `T | Error` union must be
 //   handled (e.g. `match … is Error => … else => …`); assigning it to a bare binding that ignores
 //   the Error arm is a compile-time error.
-export val await = <T>(p: T): T | Error =>
+export val await = <T>(p: Promise<T>): T | Error =>
   lin_await(p)
 
 // Run a list of thunks concurrently and collect their results in order.
@@ -44,7 +44,7 @@ export val parallel = (tasks: Json): Json[] =>
 // @param promises  an array of `Promise` handles (passed as `Json`).
 // @returns an opaque `Promise` handle for the first settled result; resolve with `await`.
 // @example val fastest = await(race([async(() => fetchFrom("a")), async(() => fetchFrom("b"))]))
-export val race = (promises: Json): Json =>
+export val race = <T>(promises: Promise<T>[]): Promise<T> =>
   lin_race(promises)
 
 // Return a promise that fails with a timeout `Error` if `p` does not settle within `ms`.
@@ -52,7 +52,7 @@ export val race = (promises: Json): Json =>
 // @param ms  the timeout in milliseconds.
 // @returns an opaque `Promise` handle; awaiting it yields `p`'s value or a timeout `Error`.
 // @example match await(timeout(longOp, 5000)) is Null => print("timed out") is Error => print("failed") else => print("ok")
-export val timeout = (p: Json, ms: Int32): Json =>
+export val timeout = <T>(p: Promise<T>, ms: Int32): Promise<T> =>
   lin_timeout(p, ms)
 
 // Retry a faulting thunk up to `times` attempts.
@@ -60,7 +60,7 @@ export val timeout = (p: Json, ms: Int32): Json =>
 // @param times  the maximum number of attempts.
 // @returns an opaque `Promise` handle; awaiting it yields the first success, or the last `Error`.
 // @example val data = await(retry(() => unstableFetch(), 3))
-export val retry = (f: Json, times: Int32): Json =>
+export val retry = <T>(f: () => T, times: Int32): Promise<T> =>
   lin_retry(f, times)
 
 // Create a fixed-size pool of worker threads.
@@ -77,7 +77,7 @@ export val threadPool = (size: Int32): Json =>
 // @returns an opaque `Promise` handle for the result; resolve with `await`.
 // @example val pool = threadPool(8)
 // @example val result = await(pool.poolAsync(() => heavyWork()))
-export val poolAsync = (pool: Json, f: Json): Json =>
+export val poolAsync = <T>(pool: Json, f: () => T): Promise<T> =>
   lin_pool_async(pool, f)
 
 // Spawn a long-lived worker thread that owns thread-confined state.
@@ -112,32 +112,33 @@ export val close = (w: Json): Null =>
 
 // Box a value into opt-in shared mutable state.
 // @param v  the value to share; a private copy is boxed.
-// @returns a `Shared` handle. Only the accessors below operate on it; any other operation (push,
-//   indexing, and so on) on a `Shared` value is a compile-time type error. A `Shared` box does not
-//   auto-unwrap to its inner value — read it with `get` or `withLock`.
-export val shared = (v: Json): Shared =>
+// @returns a `Shared<T>` handle that remembers its payload type `T`. Only the accessors below
+//   operate on it; any other operation (push, indexing, and so on) on a `Shared` value is a
+//   compile-time type error. A `Shared` box does not auto-unwrap to its inner value — read it
+//   with `get` or `withLock`.
+export val shared = <T>(v: T): Shared<T> =>
   lin_shared(v)
 
 // Snapshot the current value out of a `Shared` cell under the lock.
-// @param s  the `Shared` handle.
-// @returns a copy of the shared value.
-export val get = (s: Shared): Json =>
+// @param s  the `Shared<T>` handle.
+// @returns a copy of the shared value, typed as `T`.
+export val get = <T>(s: Shared<T>): T =>
   lin_shared_get(s)
 
 // Copy a new value into a `Shared` cell under the write lock.
-// @param s  the `Shared` handle.
-// @param v  the new value to store.
-export val set = (s: Shared, v: Json): Null =>
+// @param s  the `Shared<T>` handle.
+// @param v  the new value to store; must match the payload type `T`.
+export val set = <T>(s: Shared<T>, v: T): Null =>
   lin_shared_set(s, v)
 
 // Mutate a `Shared` cell in place under the write lock.
-// @param s  the `Shared` handle.
-// @param f  a function that mutates the held value while the lock is held.
-// @returns whatever `f` returned.
+// @param s  the `Shared<T>` handle.
+// @param f  a function that receives the held value `T` while the lock is held and returns `R`.
+// @returns whatever `f` returned (`R`).
 // @example val counter = shared(0)
 // @example counter.withLock(n => n + 1)   // atomic increment
 // @example val current = get(counter)     // snapshot copy; set(counter, 100) replaces it
-export val withLock = (s: Shared, f: Function): Json =>
+export val withLock = <T, R>(s: Shared<T>, f: (T) => R): R =>
   lin_shared_with_lock(s, f)
 
 // Deep-freeze a transferable graph into opt-in shared read-only state.
@@ -145,5 +146,5 @@ export val withLock = (s: Shared, f: Function): Json =>
 // @returns an immutable, lock-free-readable value that any thread can share without copying.
 //   A frozen value is read-only; readers use the plain type.
 // @example val config = frozen({ "retries": 3, "timeout": 5000 })
-export val frozen = (v: Json): Json =>
+export val frozen = <T>(v: T): T =>
   lin_freeze(v)

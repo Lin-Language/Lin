@@ -35,6 +35,7 @@ pub(crate) fn zonk_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
         Type::Iterator(inner) => Type::Iterator(Box::new(zonk_type(inner, subs))),
         Type::Shared(inner) => Type::Shared(Box::new(zonk_type(inner, subs))),
         Type::Stream(inner) => Type::Stream(Box::new(zonk_type(inner, subs))),
+        Type::Promise(inner) => Type::Promise(Box::new(zonk_type(inner, subs))),
         Type::Union(ts) => Type::flatten_union(ts.iter().map(|t| zonk_type(t, subs)).collect()),
         Type::Function { params, ret, required } => Type::Function {
             params: params.iter().map(|p| zonk_type(p, subs)).collect(),
