@@ -4283,6 +4283,14 @@ fn lower_call(
             if let Some(intr) = packed_array_combinator_intrinsic_name(&sym, args) {
                 return lower_intrinsic_call(intr, args, result_type, builder, ctx);
             }
+            // SPIKE 6b: redirect a concrete-typed `std/array` length/push to its intrinsic so the
+            // receiver is NOT boxed into the `Json` dynamic ABI on entry to the `std_array_*`
+            // wrapper (see `array_op_intrinsic_name`). Fail-safe: a union/Json/TypeVar receiver
+            // keeps the Named-call path below unchanged. (Disjoint from the packed redirect above:
+            // that matches sealed-scalar arrays, this matches Array/FixedArray/Iterator/Str.)
+            if let Some(arr_intr) = array_op_intrinsic_name(&sym, args) {
+                return lower_intrinsic_call(arr_intr, args, result_type, builder, ctx);
+            }
             // FUSED `range(a, b).for(f)` across the module boundary: in the IMPORTING module `for`
             // and `range` are calls to the compiled `std_iter_for` / `std_iter_range` symbols, so the
             // intrinsic-level fusion in `lower_for` never sees them. When `std_iter_for`'s receiver is
@@ -4832,6 +4840,45 @@ fn packed_array_combinator_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Opti
     match sym {
         "std_iter_for" => Some("lin_for"),
         "std_array_length" | "std_iter_length" => Some("lin_length"),
+        _ => None,
+    }
+}
+
+/// SPIKE (6b monomorphic/specialized dispatch): redirect a concrete-typed `std/array` op
+/// (`length`, `push`) to its intrinsic lowering so the receiver is NOT boxed into the `Json`
+/// dynamic ABI on entry to the compiled `std_array_*` wrapper. The intrinsic codegen dispatches
+/// on the receiver's STATIC type (`Array`→`lin_array_length`/`tagged_array_push`,
+/// `Str`→`lin_string_length`, …) and falls back to the dynamic `lin_*_dyn` path only for a
+/// genuinely-`Json`/union/TypeVar receiver — which is ALREADY a boxed `TaggedVal` at runtime, so
+/// passing it raw is correct. The win: a concrete `Trip[]`/`Token[]` receiver skips the per-call
+/// `lin_box_array` + `lin_tagged_free_box` shell churn AND the intrinsic takes the direct typed
+/// path instead of `lin_length_dyn`.
+///
+/// Fail-safe: only fires for a receiver whose static type the intrinsic handles WITHOUT the
+/// dynamic fallback (concrete array / string / object / map). A `Json`/union/TypeVar receiver
+/// keeps the Named-call path (no behaviour change). `push` additionally requires a concrete
+/// `Array` receiver (the intrinsic's element-coercion is keyed on the array's element type).
+fn array_op_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'static str> {
+    let export = sym.strip_prefix("std_array_")?;
+    let recv_ty = args.first().map(|a| a.ty())?;
+    // Concrete (statically-resolved) receiver whose `lin_length` intrinsic branch emits a FAITHFUL
+    // direct op with no box. Arrays/iterators/strings only: `lin_array_length`/`lin_string_length`
+    // read a real length field. `Object`/`Named`/`Map` are DELIBERATELY excluded — a packed sealed
+    // record is NOT a runtime `LinObject`, so the intrinsic's `lin_object_length` would read a
+    // struct byte as the count (`length(rec)` → 32 instead of the key count). Those keep the
+    // dynamic Named-call wrapper, which boxes/materializes correctly. (This is the documented
+    // "specialization machinery has bitten before" hazard — fail safe to the dynamic ABI.)
+    let recv_is_concrete_lengthable = matches!(
+        &recv_ty,
+        Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_)
+            | Type::Str | Type::StrLit(_)
+    );
+    match export {
+        // `length(x)` — non-generic `(x: Json)` wrapper; the concrete receiver is otherwise boxed.
+        "length" if recv_is_concrete_lengthable => Some("lin_length"),
+        // `push(arr, item)` — generic `<T>(arr: T[], item: T)`; redirect only for a concrete array
+        // receiver (the Push intrinsic dispatches the element store on the array's element type).
+        "push" if matches!(&recv_ty, Type::Array(_)) => Some("lin_push"),
         _ => None,
     }
 }
