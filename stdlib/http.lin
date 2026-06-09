@@ -31,17 +31,17 @@ export type HttpOptions = { "method": String, "headers": { String: String }, "bo
 
 // GET `url`.
 // @param url  the URL to fetch.
-// @returns the response object, or an `Error` (`{ "type":"error", ... }`) if the request fails.
+// @returns an `HttpResponse`, or an `Error` (`{ "type":"error", ... }`) if the request fails.
 // @example val result = fetch("https://example.com/ping")   // then result["status"]
-export val fetch = (url: String): Json =>
+export val fetch = (url: String): HttpResponse | Error =>
   lin_http_fetch(url)
 
 // Issue a request to `url` with a custom method/headers/body.
 // @param url  the URL to request.
 // @param options  an `HttpOptions`-shaped record (method, headers, body).
-// @returns the response object, or an `Error` if the request fails.
+// @returns an `HttpResponse`, or an `Error` if the request fails.
 // @example fetchWith("https://api.example.com/items", { "method": "DELETE", "headers": {}, "body": "" })
-export val fetchWith = (url: String, options: Json): Json =>
+export val fetchWith = (url: String, options: Json): HttpResponse | Error =>
   lin_http_fetch_with(url, options)
 
 // GET `url` and parse the response body as JSON.
@@ -59,9 +59,9 @@ export val fetchJson = (url: String): Json =>
 // POST `body` to `url` as `application/json`.
 // @param url  the target URL.
 // @param body  any JSON-serialisable value; sent as the JSON request body.
-// @returns the response object, or an `Error` if the request fails.
+// @returns an `HttpResponse`, or an `Error` if the request fails.
 // @example postJson("https://api.example.com/users", { "name": "Alice" })
-export val postJson = (url: String, body: Json): Json =>
+export val postJson = (url: String, body: Json): HttpResponse | Error =>
   lin_http_fetch_with(url, {
     "method": "POST",
     "headers": { "Content-Type": "application/json" },
