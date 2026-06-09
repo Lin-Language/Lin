@@ -1,8 +1,10 @@
 # Path 6 — Eliminate the non-inlined call / dispatch cost (inlining, fusion, monomorphic dispatch)
 
-**Status:** Open proposal, written *after* Paths 0–5 and after the **ceiling measurement** (the
-`LIN_NO_RC`/arena spike) falsified the construction-RC premise. Self-contained. **No userland language
-change.**
+**Status:** ✅ **6a (chain fusion) + 6b (length/push dispatch) MERGED to master `acf35a83` (2026-06-09)**,
+together with the in-place packed-combinator base (the convergent "cheap typed iteration" lever). **6c is
+the only mechanism not yet attempted** — see "6c — next step" below. Originally written after Paths 0–5
+and after the **ceiling measurement** (the `LIN_NO_RC`/arena spike) falsified the construction-RC premise.
+Self-contained. **No userland language change.**
 
 **Direction in one line:** the measured dominant cost in interp — and a large share in RAPTOR — is the
 **non-inlined runtime call and its internal work** (the per-element boxed closure call, the polymorphic
@@ -245,3 +247,15 @@ Typing RAPTOR loses *only because* typed-array iteration materializes per elemen
 
 ### Methodological lesson (cost real time — fooled TWO agents)
 RAPTOR absolute timings swing ~4× run-to-run on this 128-core box from memory-bandwidth contention. ONLY a tight interleaved same-window A/B with the **compiler held constant** (compare typed-`.lin` vs Json-`.lin` on the SAME binary) is trustworthy. Two agents reported "typing wins RAPTOR" off cross-window comparisons; both were artifacts; both were ~2× regressions when measured properly.
+
+---
+
+## ✅ MERGED 2026-06-09 (master `acf35a83`) — 6a + 6b + the in-place base shipped
+The two complementary verified wins landed together (branch `perf/integrate-inplace-fusion`; RAPTOR full-typing regression EXCLUDED, benchmark `.lin` unchanged):
+- **6a combinator-chain fusion** — `map().filter().reduce()` → one loop, no intermediate arrays / per-stage closure call. Cross-lang **pipeline 75ms→27ms (2.8×)** — Lin now beats Rust/Go on that workload; ~3.4× on tight chains.
+- **In-place packed combinators** (from `path1-packed-records`, the other 0/1/3 agent — COMPLEMENTARY to 6a, not redundant): single-combinator `reduce`/`map`/`for`/`length` over a packed sealed-record array read elements by const-offset pointer with NO per-element materialize (~34–55× on a lone packed reduce). This **IS the "convergent next lever" the section below anticipated** — it was already built on that branch and is now merged, so the "extend in-place to reduce/map" follow-on is DONE. + Step-3 String-field-read capability (gate stays scalar+Bool) + the `Trip|Null` tail-call UAF fix + a per-iteration box-leak fix.
+- **6b length/push dispatch** — concrete-receiver `length()`/`push()` → direct intrinsic, skipping the Json box (~1.35–1.8×).
+- Verified: 1026 workspace / 687 integration tests; ASan `detect_leaks=0` AND `=1`-scaling clean on all packed/fused shapes; cross-lang correctness gate all 7 workloads; RAPTOR digest byte-identical; regression sweep shows pipeline −64%, all else flat. The two combinator paths coexist (disjoint by shape: single packed op → in-place; chain → fused).
+
+## 6c — next step (the only un-attempted mechanism)
+With 6a/6b/in-place merged, the remaining path-6 lever is **6c — inline the leaf helpers LLVM is currently blind to** (`lin_object_get` on a concrete stable-shape site, cancelling `lin_box_*`/`lin_unbox_*` pairs, `lin_tagged_arith` with statically-known operand tags). Make them inlinable (LLVM `internal`/`alwaysinline` on the runtime bitcode, or emit the body at monomorphic call sites) so LLVM can cancel box/unbox pairs and fold arithmetic. Lowest-charted (the prior whole-program-LTO investigation found no win precisely *because* the codegen-level inlining wasn't there — 6c is the targeted version). Measure-first: it may help the interp class (call-bound) where 6a's fusion doesn't fire (interp is recursion-bound). ASan-gated as always.
