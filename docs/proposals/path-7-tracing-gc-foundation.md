@@ -1,12 +1,20 @@
 # Path 7 — The memory model is the bottleneck: a tracing GC foundation (+ opt-in value types on top)
 
-**Status:** Open proposal — **DEMOTED, and partially falsified for interp by a measurement this proposal
-was originally unaware of (see the ⚠️ caveat below).** Read [Path 6
-(eliminate-call-dispatch-cost)](path-6-eliminate-call-dispatch-cost.md) FIRST — its ceiling test is the
-evidence that bounds this one. This path is **gated on the in-flight RAPTOR cost-attribution profile**
-(`investigate/raptor-typed-profile`) and is justified **only if** that profile shows RAPTOR is
-allocation/RC-bound in a way interp is measured *not* to be. If the profile shows call/dispatch cost
-dominates (as it does for interp), **Path 6, not this path, is the direction.**
+**Status:** ❌ **CLOSED-NEGATIVE (2026-06-09) — RETIRED. Do not build this.** The decisive
+allocation-bound measurement was run (`investigate/path7-alloc-bound`) and **no workload or phase is
+allocation-bound**: turning the *entire* allocator + RC subsystem into a no-op (`LIN_NO_RC` — the ceiling a
+perfect bump-allocator + tracing collector cannot exceed) recovers **~0% wall-clock** on interp (0.394→0.394,
+reproducing H12), RAPTOR every phase (LOAD/PREP/GROUP/RANGE all ~1.0× under matched load), and even a
+deliberately allocation-heavy synthetic (~4%). **The trap it sprang and survived:** RAPTOR has *textbook
+GC-bait retention* — 32.9 GB allocated over 1.8 B allocations, never >1.3 GB live, retention **0.039**, 96%
+dying young — and removing alloc+RC *still* does nothing, because the cost is the **work done per
+allocation** (631 M linear-scan `lin_object_get` `Json` reads + non-inlined calls), not the allocation or
+reclamation. A GC makes `ptr += size` cheap and batches `free`; neither is the bottleneck. **The real
+levers are [Path 9](path-9-end-to-end-packed-records.md) (packed records → kills the read cost at source)
+and [Path 8](path-8-make-functions-free.md) (devirtualize/inline → kills the call cost); a GC touches
+neither.** Revisit ONLY if the RC-driven UAF bug class becomes a recurring *production* problem (a
+correctness argument, not a perf one). The measured table is in `investigate/path7-alloc-bound`. The body
+below is preserved as the considered-and-measured-negative case.
 
 > ## ⚠️ The falsifying measurement (the GC ceiling test — Path 6's, verified)
 > A throwaway build with `lin_rc_retain`/`release`/`free` **and** all `lin_*_alloc` turned into no-ops
