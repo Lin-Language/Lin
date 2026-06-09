@@ -121,10 +121,10 @@ export val close = (s: Stream): Null =>
 // stream is moved onto the worker, which owns the whole pipeline and drives it to EOF. Run several
 // with `parallel([...])`.
 // @param s  the pipeline to drive off-thread.
-// @returns a `Promise<Null | Error>`; awaiting it yields `Null` on success, or an `Error` if a
+// @returns a `Promise<Null>`; awaiting it yields `Null` on success, or an `Error` if a
 //   read/transform faulted (caught at the async boundary). `await` reattaches the `Null | Error`
 //   union, so the `Error` case must be handled (see std/async).
 // @example val p = readStream("big.log").lines().filter(isError).writeLines("errors.log").promise()
 // @example match await(p) is Error => print("failed") else => print("done")
-export val promise = (s: Stream): Json =>
+export val promise = (s: Stream): Promise<Null> =>
   lin_stream_promise(s)

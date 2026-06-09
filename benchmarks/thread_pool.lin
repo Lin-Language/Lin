@@ -13,7 +13,7 @@ val pool = threadPool(8)
 
 // Submit many trivial tasks, collecting their promises (the thunk `() => 1`
 // captures nothing — submitted, queued, and run by a pool worker).
-var promises: Json[] = []
+var promises: Promise<Int32>[] = []
 range(0, 20000).for(i => push(promises, pool.poolAsync(() => 1)))
 
 // Drain: await every promise and sum the results. `await` returns `T | Error`

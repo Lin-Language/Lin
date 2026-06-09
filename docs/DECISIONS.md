@@ -908,7 +908,22 @@ calls. Capturing lambdas and stored-fn callbacks keep the (correct, boxed) closu
 
 **Also absorbs the earlier direct-index-accessor genericization (Phase 6).** A first, conservative pass had already genericized only the **direct-index accessors** — `at: <T>(arr: T[], index: Int32): T`, `set: <T>(arr: T[], idx: Int32, item: T): Null`, `indexOf: <T>(arr: T[], target: T): Int32` — because they read/write a single element through the already-element-type-aware bracket-index path (`arr[i]` / `arr[i] = item`) without allocating or routing the element through an opaque `for`/closure callback, so flat and tagged inputs both stay representation-consistent (no perf delta, pure type-safety). Every *allocating/builder/dyn-fn/numeric/iterator* combinator was deliberately left `Json` at that point precisely because of the boxed-closure-ABI representation mismatch this ADR's inliner later removed — so `map`/`filter`/`reduce` are now generic-and-unboxed, while the numeric reductions (`sum`/`min`/`maxBy`/…) stay `Json` pending a `<T: Numeric>` constraint and the iterable ops live in `std/iter` (ADR-051). The one behavioural note from that pass survives: `at`/`set`/`indexOf` no longer accept a non-array `Json` (e.g. `range(0,10).at(5)` reports `expected Int32[]`); wrap an iterator in an array first.
 
-## ADR-045: `Error` built-in type + `is Error`; `await` enforces Error handling via `T | Error` (no nominal Promise type)
+## ADR-045: `Error` built-in type + `is Error`; `await` enforces Error handling via `T | Error`; first-class `Promise<T>`
+
+> **Update (first-class `Promise<T>`).** The "no nominal Promise type" decision below was later
+> reversed: `Type::Promise<T>` is now a first-class opaque handle type, modelled exactly like
+> `Shared<T>`/`Stream<T>` (a boxed `TaggedVal*(TAG_PROMISE)` that does not widen to `Json`). The
+> change is purely in `lin-check` (variant + compat/zonk/resolve/collect-subs arms), threaded
+> through `lin-ir` monomorphize/lower and `lin-codegen` (representation, RC, tagged-array element
+> push) the same way `Stream<T>` already is — **no runtime change** (TAG_PROMISE + box/unbox/await
+> helpers already existed). The async surface is now precisely typed: `async: <T>(() => T) =>
+> Promise<T>`, `await: <T>(Promise<T>) => T | Error`, and `race`/`timeout`/`retry`/`poolAsync`
+> carry `Promise<T>` in and out; `std/stream.promise` returns `Promise<Null>`. The codegen
+> crash that motivated the original "await, not async" workaround (next paragraph) does **not**
+> recur, because `Promise<T>` is its own opaque pointer representation — the union is never applied
+> to the promise handle itself, only to the awaited result. The "forgot to `await`" gap noted in
+> the **Known limitation** below is now closed: a `Promise<T>` is not assignable to its inner `T`.
+> The historical reasoning is preserved unchanged below for context.
 
 **Background — the `Error` type and `is Error`.** `Error` is a built-in type resolving to the
 structural shape `{ "type": String, "message": String }` (`resolve.rs::error_type`) — the
