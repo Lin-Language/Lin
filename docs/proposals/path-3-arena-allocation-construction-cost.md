@@ -232,3 +232,62 @@ The H8 read-only-arg borrow prototype (cited elsewhere) returns **wrong values**
 
 ### How this composes with what DID land
 Path 1 Steps 1+2 (in-place packed iteration, 4.5× — see path-1 findings) fix cost #2 but **not** construction RC (#3). For the build-heavy phases (RAPTOR LOAD/PREP, interp tokenize) #3 remains untouched, so **inferred arenas remain the open, highest-value next lever for construction cost** — composable with the now-landed in-place ABI. The proposal's "Path 1 + Path 3" headline composition stands: Path 1's half is built (scalar scope); Path 3's half is unbuilt.
+
+---
+
+## ADDITIONAL FINDINGS (2026-06-09, NOT merged)
+
+> **Work reference (durable handles — the worktree branches are ephemeral; cite the commits):** B2 RC
+> elision `a7366c4` · region allocator mechanism `1e78e9c` · inline-`.for` leak fix `6c1d4e0`/`22c9db1`.
+> `git log <hash>` to recover.
+
+A separate overnight pass built **two** pieces the findings above list as unbuilt: a first sound bite of
+escape-based RC elision (the "B2" suppression), and the bump-allocator mechanism the inferred arena would
+sit on. **The arena *inference* is still deliberately unbuilt — the region-drop-UAF seam — which agrees
+with the "NOT attempted" verdict above.**
+
+### B2 — escape-based RC elision for non-escaping heap-field sealed records: BUILT + sound + ASan-proven (`a7366c4`)
+The findings above note escape-driven RC suppression already works for *all-scalar* non-escaping records
+(alloca + register + RC suppressed). This pass extended it one strict step to a class that section leaves
+open: a sealed record with a **heap field** (e.g. `{ name: String, x: Int32 }`) **cannot** stack-alloc
+(its drop must release the heap field), but if built locally and provably non-escaping, the owning model's
+per-*read* `Retain`s on it are redundant churn `rc_elide` cannot remove (its one-to-one pairing bails when
+N>1 reads bunch their scope-exit `Release`s at function exit). B2 keeps the value on the heap, drops all
+read-`Retain`s, and keeps exactly **one** `Release` (the construction owner's drop). Strict tri-condition
+gate, failing toward *not* suppressing (the UAF seam): (1) class does not escape (a call may only borrow);
+(2) **all** the class's `Release`s live in one basic block (no branchy drop); (3) `#Release == #Retain + 1`
+exactly. Any failure keeps 100% of RC ops — byte-identical to today's codegen.
+
+**Independently re-verified (not self-reported):** the sealed ASan harness was run with B2 on, then
+`escape.rs` reverted to the base commit and re-run — **byte-identical** (same 10 pre-existing
+`sort`/`tail_thread` FAILs, same exact leak counts; 30 PASS). So **B2 introduced zero new leaks and zero
+UAF/double-free**; the harness FAILs are pre-existing leaks unrelated to this work (they fail on *all*
+shape families including `scalar`, which B2 never touches). Fixture: 4 retains + 5 releases → 0 + 1, value
+correct; ASan multi-N (200/2k/20k) constant 35 B residual. **This is the genuinely shippable Path-3 piece**
+— the class `rc_elide` and the all-scalar stack path both leave behind.
+
+### S3b — bump-pointer region allocator MECHANISM: BUILT, dead/gated (`1e78e9c`)
+`crates/lin-runtime/src/region.rs`: `lin_region_push/alloc/pop`, chunked, nested, heap fallback; 3 unit
+tests, ASan-clean. **No compiler caller → dead in a normal build, zero behaviour change.** This is the
+substrate the inferred arena would call; the inference itself (region-confined-graph detection +
+promote-on-escape) was **not** wired, for exactly the region-drop-UAF reason the verdict above gives. The
+real prerequisite that section identifies (suppress per-iteration `Retain/Release` *emission* for
+region/stack-resident values) is partially discharged by B2 for the non-escaping heap-field class.
+
+### Cross-references
+- **path-2 (inline caches):** its diagnosis found an owning `lin_tagged_clone` on every dynamic field read
+  is a dominant per-read cost — construction/RC churn in this path's domain, and a candidate for the same
+  escape-driven elision B2 applies (drop the clone where the read result is consumed borrowed).
+- **path-0 (`Trip|Null` leak `f0d02bf`):** same branch; a discrete RC/codegen leak fix complementary to B2.
+- **The H8 borrow prototype:** this pass re-confirmed it UNSOUND (wrong values, construct-in-`.for`-closure
+  shape) — matching "do NOT resurrect it" above. **B2 is the *sound* alternative bite of the same cost:**
+  it elides redundant RC on a heap-resident value instead of stack/borrowing it, so there is no
+  caller/callee layout mismatch to get wrong.
+
+### Bonus fix (orthogonal, real) — commits `6c1d4e0`/`22c9db1`
+The inline `range(0,N).for(n => …)` path leaked ~16 B/iter when the callback body boxed the `Json`/union
+element param for a dynamic op (`lin_box_int32` shell never reclaimed; 303,634 B at N=20k). Fixed by
+reclaiming the scalar→union param-bind box across all inline combinators (`6c1d4e0`, `22c9db1`): leak →
+18 B constant, ASan-clean across for/map/filter/reduce/range-for + a push-transfer attack, suite green,
+RAPTOR digest identical. Pre-existing and orthogonal to the arena work, but a genuine construction-cost
+leak worth landing.

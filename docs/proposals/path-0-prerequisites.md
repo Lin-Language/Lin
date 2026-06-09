@@ -104,3 +104,18 @@ Typed `tripsByRoute: { String: Trip[] }`, full `bench.lin`, digest byte-identica
 **The branch is decided: typing alone does NOT win RAPTOR — Path 1's in-place ABI IS the prerequisite.** Concrete reason: `Trip` has String + nested-record fields, so under the current gate (scalar+Bool only) it **cannot pack** — it stays a boxed `Object[]`, and the query phase (RANGE ~300s + GROUP ~97s of the ~360s) is dominated by the combinators (`for`/`length`/scan) reading it, not by isolated field reads. This **empirically reconciles H5 (>5× regression on naive retype) with H5b (~3.5× read-micro projection):** typing wins only when the value can *pack* AND the combinators read it *in place* — neither held for `Trip` until Path 1 Steps 1+2 land (see path-1 findings) and the heap-field gate widens (still blocked — see path-1 + path-3 findings).
 
 **Net Path-0 verdict:** prerequisite #1 already done; #2 fixed soundly; the measurement says RAPTOR needs Path 1's in-place ABI (now partially built) before typing trips pays off — and even then only once heap-field records can pack (the open repr-oracle blocker).
+
+### Independent corroboration (2026-06-09, NOT merged; durable handle: commit `f0d02bf`)
+A separate overnight pass (the path-2/path-3 work) reached **both** Path-0 conclusions independently, on a
+different line of work, which mutually corroborates them:
+- **Fix 1 (`get<T,D>` record-array monomorphization):** also could not reproduce on current master
+  (`get(byRoute,"R1",[])` over `{ String: Trip[] }`, nested `StopTime[]`, cross-fn — all build + run
+  correct). Confirms the prerequisite is already satisfied.
+- **Fix 2 (`Trip|Null` tail-recursive leak):** independently found and fixed the **same** bug — commit
+  `f0d02bf` vs `04bec70` (the path-1 work above). The two fixes target the same `lower.rs` union-box /
+  tail-call-release seam from slightly different angles; **either is merge-worthy on its own — do not merge
+  both, pick one and drop the duplicate.** `f0d02bf` measured the residual at a constant 24 B/call (vs
+  `04bec70`'s 88 B/8-allocs constant) — both non-scaling, both ASan-clean.
+
+This is a good example of the fan-out discipline paying off: one real bug, surfaced and fixed twice
+independently, raising confidence it is genuine and the fix is correct.
