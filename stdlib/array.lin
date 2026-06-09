@@ -184,8 +184,9 @@ export val unique = <T>(arr: T[]): T[] =>
   val result: T[] = []
   arr.for(item =>
     val key = lin_value_key(item)
-    if seen[key] == null then push(result, item)
-    if seen[key] == null then seen[key] = true
+    if seen[key] == null then
+      push(result, item)
+      seen[key] = true
   )
   result
 

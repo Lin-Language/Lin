@@ -56,6 +56,19 @@ val streamRecordsStr = (path: String): String =>
     is Error => "ERR: ${outcome["message"]}"
     else => outcome
 
+// Concatenate "name=age" for every record, proving the header is applied to EVERY row
+// (not just the first) when recordRows streams more than one data row.
+val streamRecordsPairs = (path: String): String =>
+  val outcome = readStream(path)
+    .recordRows()
+    .reduce("", (acc, rec) =>
+      val pair = "${rec["name"]}=${rec["age"]}"
+      if acc == "" then pair else "${acc} :: ${pair}"
+    )
+  match outcome
+    is Error => "ERR: ${outcome["message"]}"
+    else => outcome
+
 val streamErr = (path: String): String =>
   val outcome = readStream(path)
     .csvRows()
@@ -257,6 +270,13 @@ val s = suite("std/csv", [
     writeFile("/tmp/lin_csv_test_rec.csv", "id,note\n1,\"line one\nline two\"\n2,plain\n")
     [
       expect(streamRecordsStr("/tmp/lin_csv_test_rec.csv")).toBe("line one\nline two :: plain")
+    ]
+  ),
+
+  test("recordRows applies the header to every row across a 3-row stream", () =>
+    writeFile("/tmp/lin_csv_test_rec3.csv", "name,age\nAda,36\nBob,42\nCleo,7\n")
+    [
+      expect(streamRecordsPairs("/tmp/lin_csv_test_rec3.csv")).toBe("Ada=36 :: Bob=42 :: Cleo=7")
     ]
   ),
 
