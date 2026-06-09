@@ -17793,3 +17793,37 @@ main()
     assert_eq!(output, vec!["7 11 22 33 44"]);
 }
 
+// Regression (Path 9 TCO param-slot leak): a HEAP-BEARING sealed (packed) record (`Trip` with a
+// `String` and a sealed-`ST[]` field) threaded through a self-tail-recursive parameter slot, with a
+// FRESH record built each iteration, must release the PRIOR slot value before the back-edge
+// overwrites it. `Codegen::tco_param_needs_release` formerly carved out ALL sealed records
+// (`sealed_fields(ty).is_none()`), gating off both the back-edge `emit_tco_release_old` and the
+// loop-exit `emit_tco_release_final` — so each iteration overwrote the slot with a fresh packed
+// struct and leaked the old struct + its heap fields (linear scaling: ASan-measured ~367 B/iter on
+// this shape, going CONSTANT after the fix). The carve-out is now narrowed to PURELY-scalar sealed
+// records (stack-resident, RC-suppressed); a heap-bearing sealed record participates in TCO param
+// release via the packed `emit_sealed_release` path. The result must be correct (a missing/wrong
+// release would corrupt the packed struct read back next iteration or double-free → crash). The
+// ASan leak-scaling proof is via the tools/sealed-harness-style measurement; this guards
+// correctness + no-UAF under `cargo test`.
+#[test]
+fn test_sealed_heap_record_tail_recursive_param_no_leak() {
+    let output = run(r#"import { print } from "std/io"
+import { length } from "std/array"
+
+type ST = { "stop": String, "at": Int32 }
+type Trip = { "id": String, "stops": ST[] }
+
+val makeTrip = (n: Int32): Trip =>
+  { "id": "trip-${n}", "stops": [{ "stop": "s${n}", "at": n }, { "stop": "t${n}", "at": n + 1 }] }
+
+val loop = (n: Int32, t: Trip): Int32 =>
+  if n == 0 then t["stops"].length()
+  else loop(n - 1, makeTrip(n))
+
+val main = () => print("${loop(1000, makeTrip(0))}")
+main()
+"#);
+    assert_eq!(output, vec!["2"]);
+}
+

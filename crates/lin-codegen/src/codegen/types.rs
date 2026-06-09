@@ -119,17 +119,47 @@ impl<'ctx> Codegen<'ctx> {
         )
     }
 
+    /// True when `ty` is a sealed (packed) record carrying at least one HEAP field (String / Array /
+    /// Map / nested-sealed — anything `sealed_field_kind` recognises). Such a record is a heap-
+    /// allocated `lin_sealed_*` struct whose header refcount + per-field heap pointers must be
+    /// released (`lin_sealed_release` walks the heap fields). A PURELY-scalar sealed record, by
+    /// contrast, holds no owned heap references — it is (or may be) a stack-resident immortal-rc
+    /// value, so releasing it is at best a no-op (and may defeat SROA). This distinction is the
+    /// basis of the TCO-param carve-out narrowing below.
+    pub(crate) fn sealed_record_is_heap_bearing(ty: &Type) -> bool {
+        match Self::sealed_fields(ty) {
+            Some(fields) => fields.values().any(|fty| Self::sealed_field_kind(fty).is_some()),
+            None => false,
+        }
+    }
+
     /// True if a TCO-loop param of type `ty` holds an owned, heap-refcounted value whose PRIOR
     /// slot value must be released before a tail-call back-edge overwrites it (the per-iteration
-    /// TCO leak fix). This is the owning set (`ty_is_concrete_rc` ∪ `is_union_type`) MINUS sealed
-    /// records: a sealed scalar/heap record (`sealed_fields(ty).is_some()`) is RC-SUPPRESSED and
-    /// often stack-resident (an immortal-rc `sealed_stack` alloca), so emitting `lin_sealed_release`
-    /// on it is at best a no-op and at worst defeats SROA promotion of the stack value (the very
-    /// thing the sealed-records Stage-4 RC-suppression milestone enables) — keep it OUT. A sealed
-    /// record threaded through a TCO loop therefore keeps its pre-existing (no per-iteration
-    /// release) behavior; this fix neither helps nor regresses it.
+    /// TCO leak fix). This is the owning set (`ty_is_concrete_rc` ∪ `is_union_type`) plus
+    /// HEAP-BEARING sealed records, but MINUS purely-scalar sealed records.
+    ///
+    /// Path 9 packs heap-field records (e.g. `Trip { id: String, stops: StopTime[] }`) as
+    /// `lin_sealed_*` structs. When such a record is threaded through a self-tail-recursive
+    /// param slot, each iteration overwrites the slot with a fresh packed struct WITHOUT releasing
+    /// the prior one — the old struct + ALL its heap fields (stopTimes buffer, maps, strings) leak
+    /// once per iteration (linear scaling). Including heap-bearing sealed records here arms the
+    /// back-edge `emit_tco_release_old` + loop-exit `emit_tco_release_final` for them (both route
+    /// through `emit_release_repr` → `emit_sealed_release`, which decrements the header rc and walks
+    /// the heap fields). The alias guards in those helpers prevent double-freeing a struct still
+    /// referenced by a new arg / the returned value / a borrowed entry param.
+    ///
+    /// A PURELY-scalar sealed record (`sealed_record_is_heap_bearing` is false) is RC-SUPPRESSED and
+    /// often stack-resident (an immortal-rc `sealed_stack` alloca): it holds no owned heap reference,
+    /// so emitting `lin_sealed_release` on it is at best a no-op and at worst defeats SROA promotion
+    /// of the stack value (the sealed-records Stage-4 RC-suppression milestone). It therefore stays
+    /// OUT and keeps its pre-existing (no per-iteration release) behavior.
     pub(crate) fn tco_param_needs_release(ty: &Type) -> bool {
-        (Self::ty_is_concrete_rc(ty) || Self::is_union_type(ty)) && Self::sealed_fields(ty).is_none()
+        if Self::sealed_fields(ty).is_some() {
+            // A sealed record participates in TCO param-slot release ONLY when it carries heap
+            // fields (those are what leak). Purely-scalar sealed records stay suppressed.
+            return Self::sealed_record_is_heap_bearing(ty);
+        }
+        Self::ty_is_concrete_rc(ty) || Self::is_union_type(ty)
     }
 
     /// Tag for how a value of `ty` is BOXED as a scalar TaggedVal — i.e. the byte stored in
