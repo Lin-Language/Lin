@@ -52,3 +52,29 @@ fn snap_unknown_type() {
     let errors = check_errors("val x: NonExistentType = 1");
     insta::assert_debug_snapshot!(errors);
 }
+
+/// Like `check_errors` but captures the help text too, so the snapshot records the
+/// scalar-annotation-on-array-literal hint as well as the primary message.
+fn check_errors_with_help(source: &str) -> Vec<String> {
+    let mut lexer = Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::new(tokens);
+    let module = parser.parse_module();
+    let mut checker = Checker::new();
+    match checker.check_module(&module) {
+        Ok(_) => vec![],
+        Err(diags) => diags
+            .iter()
+            .map(|d| match &d.help {
+                Some(h) => format!("{}\n  help: {}", d.message, h),
+                None => d.message.clone(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn snap_scalar_annotation_on_array_literal() {
+    let errors = check_errors_with_help("val x: UInt8 = [1, 2, 3]");
+    insta::assert_debug_snapshot!(errors);
+}

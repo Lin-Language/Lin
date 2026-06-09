@@ -403,3 +403,63 @@ val handle = (): R => other()
     let result = parse_and_check(src);
     assert!(result.is_err(), "bare Json body vs structured object return must still error (ADR-045)");
 }
+
+// A SCALAR numeric annotation on an ARRAY literal is a genuine type error and must STAY one —
+// but the message must (a) report the TRUE value type (the array `Int32[]`, NOT the bogus
+// "UInt32") and (b) suggest the `T[]` element-annotation fix.
+#[test]
+fn test_scalar_annotation_on_array_literal_errors_with_hint() {
+    let result = parse_and_check("val x: UInt8 = [1, 2, 3]");
+    let diags = result.expect_err("scalar annotation on an array literal must error");
+    let diag = &diags[0];
+    // Primary message names the array value type, not the scalar/wrong-default-element token.
+    assert!(
+        diag.message.contains("Int32[]"),
+        "message must name the array value type `Int32[]`, got: {}",
+        diag.message
+    );
+    assert!(
+        diag.message.contains("UInt8"),
+        "message must name the scalar annotation `UInt8`, got: {}",
+        diag.message
+    );
+    assert!(
+        !diag.message.contains("UInt32"),
+        "message must NOT contain the bogus `UInt32` token, got: {}",
+        diag.message
+    );
+    // Help suggests the element-annotation fix.
+    let help = diag.help.as_deref().unwrap_or("");
+    assert!(
+        help.contains("UInt8[]"),
+        "help must suggest `UInt8[]`, got: {:?}",
+        diag.help
+    );
+}
+
+// Regression: the array-element annotation already works and must keep compiling.
+#[test]
+fn test_scalar_element_array_annotation_compiles() {
+    let result = parse_and_check("val x: UInt8[] = [1, 2, 3]");
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+}
+
+// Regression: a scalar literal against a scalar annotation must keep compiling (literal adoption).
+#[test]
+fn test_scalar_literal_scalar_annotation_compiles() {
+    let result = parse_and_check("val x: UInt8 = 1");
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+}
+
+// The hint is scoped: a scalar annotation on a NON-numeric array (string elements) errors but
+// must NOT carry the `UInt8[]` element-annotation suggestion.
+#[test]
+fn test_scalar_annotation_on_string_array_no_hint() {
+    let result = parse_and_check("val x: UInt8 = [\"a\", \"b\"]");
+    let diags = result.expect_err("scalar annotation on a string array must error");
+    assert!(
+        diags[0].help.is_none(),
+        "no element-annotation hint for a non-numeric array, got: {:?}",
+        diags[0].help
+    );
+}

@@ -1,0 +1,7 @@
+---
+source: crates/lin-check/tests/snapshots.rs
+expression: errors
+---
+[
+    "Expected type UInt8, got Int32[]\n  help: did you mean `UInt8[]`? (the value is an array; annotate the array element type with `[]`)",
+]
