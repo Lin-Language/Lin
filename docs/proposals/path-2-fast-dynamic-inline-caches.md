@@ -156,3 +156,94 @@ a *speculative* (guarded) speedup, **novel for an AOT/LLVM backend** (highest im
 and does not deliver contiguous-layout iteration bandwidth. Best if avoiding a new
 type/representation/language-change is paramount and a pervasive-but-speculative speedup is acceptable
 over a static guarantee.
+
+---
+
+## IMPLEMENTATION FINDINGS (2026-06-09, NOT merged)
+
+> **Work reference (durable handles — the worktree branches are ephemeral and will be GC'd; cite the commits):** Path 2 was built across commits `4806324` (shape ids) · `8750517` (inline cache) · `85746a6` (constant-key threading) · `0e0a764` (gate off by default) · `436a86c`/`568d730` (hit-rate instrumentation + diagnosis). `git log <hash>` to recover.
+
+**This path was implemented end-to-end, measured on a quiet box, and the result is a clean NEGATIVE: the
+inline-cache mechanism works exactly as designed, is sound, and buys essentially nothing on the real
+workloads. It is committed but GATED OFF by default. The diagnosis below is the valuable output — it
+pinpoints where the dynamic-read cost actually lives, and it is *not* the cache.**
+
+### The AOT feasibility unknown (the proposal's "highest unknown") — RESOLVED POSITIVE
+A standalone LLVM-22 spike (hand-written IR, separate from the Lin compiler) confirmed the per-site
+**static-mutable-global** inline cache is feasible on an AOT/LLVM backend: it compiles and runs correctly
+at `-O2`/`-O3`/LTO, mono- and megamorphic, with **no `volatile` and no special aliasing flags**. The hot
+path is exactly `load shape; cmp cached(%rip); jne miss; load offset; load field@offset` — no call. LLVM
+register-promotes the cached shape across the loop and writes it back on the miss path, and crucially does
+*not* constant-fold the cache away because the resolved offset comes from the opaque `lin_object_get`.
+Synthetic win was ~1.25–1.4× non-LTO, ~4× LTO (bounded by a cheap synthetic fallback). **So the "novel for
+AOT" risk is retired — the pattern is sound on this backend.** It just doesn't help the real programs (see
+below), for reasons that have nothing to do with AOT.
+
+### What was built (sound, committed, gated off)
+- **S2.0 shape ids (always-on, transparent):** `LinObject.shape_id@40` + a process-global interned
+  ordered-key-sequence table; lazy compute/cache/invalidate. Header growth is transparent to the inline
+  `MakeObject` path (objstress digest-identical, ASan-clean).
+- **S2.1 inline cache:** `lin_object_get_cached(obj, key, *LinIcSlot)` with a single packed-`u64` slot
+  (`shape<<32 | offset`, atomically read/written → no torn read → **no key-reconfirm needed** → thread-safe
+  by construction, answering the proposal's S2.3 concern). Codegen `emit_ic_object_get` emits the guarded
+  fast path inline. `Index.key_const` was threaded through the IR so the IC fires on `Json["lit"]` and the
+  `arr[i]["lit"]` RAPTOR shape (runtime `obj[k]` correctly stays uncached).
+- **Correctness verified FIRST (the H8 lesson):** mono/megamorphic/absent-key/chained-runtime-key fixtures
+  all produce identical values IC-on vs IC-off; the **full 683-test integration suite passes with the IC
+  both ON and OFF**; RAPTOR digest byte-identical both ways (`group=26203913 range=773022892 journeys=139`).
+
+### The measurement — marginal and MIXED, not a win (quiet box, load ≈ 0.4, digest-identical both ways)
+| workload | IC off | IC on | Δ |
+|---|---|---|---|
+| RAPTOR GROUP | 99 510 ms | 96 240 ms | ~3.3% faster |
+| RAPTOR RANGE | 290 965 ms | 301 898 ms | ~3.8% **slower** |
+| interp | baseline | — | ~2.5% **slower** |
+
+An earlier same-session A/B had reported ~7.6% GROUP; the quiet-box re-measure shows that was noise. Net
+across phases the IC is a **wash-to-slight-loss**, which is why it ships gated off (`LIN_INLINE_CACHE=1`
+to enable; default build is byte-identical to pre-Path-2 codegen).
+
+### WHY it doesn't win — the decisive diagnosis (this is the real finding)
+LIN_COUNT-gated instrumentation on the IC fast path over the full RAPTOR bench measured a **99.56% hit
+rate** (656.6M inline hits / 659.5M sites; only 0.44% reached the runtime — essentially all lazy
+first-miss-per-object shape warming). **So the cache is near-perfect; low hit rate is NOT the problem**
+(this also kills the "eager shape assignment at construction" idea — it could only convert that 0.44%).
+Inspecting the emitted IR/asm at an IC site confirms the hit path is the clean spike design (`load
+shape@40; icmp; br; const-offset load`, no call) — but the **per-read machinery the IC does not touch
+dominates it**: every `trips[i]["field"]` read still pays out-of-line `lin_string_literal` (key intern),
+`lin_unbox_ptr`, `lin_get_tag`, and `lin_tagged_clone` (the owning +1). Those four calls dwarf the
+~10-instruction inline hit. **The inline cache optimizes the cheapest part of a dynamic read.**
+
+### Reconciliation with the path's premise, and the corrected next lever
+The thesis "make the dynamic read a const-offset load" was achieved literally (99.56% of reads *are* now a
+guarded const-offset load) — and it still didn't move the needle, because a Lin dynamic field read is not
+just the offset resolution; it is offset-resolution **wrapped in** key-interning + unboxing + tag-dispatch
++ an owning clone. **The real Json-read lever is therefore NOT the inline cache** but: (1) hoist
+key-literal interning out of loops (intern once, reuse the `LinString*`), (2) fold unbox + tag-dispatch
+into the read site, and (3) drop the owning `lin_tagged_clone` where the result is consumed borrowed. Each
+is independent of the IC and worth more than it. This redraws the path's "field reads: yes" claim: the IC
+delivers the offset half cheaply, but the surrounding ABI is the actual cost — a finding that **also
+explains §H6** (cheap packed reads recovered only ~6%: same shape, the read *wrapper* dominates, not the
+offset).
+
+### Cross-references to the other paths' findings
+- **path-0 (`Trip|Null` tail-recursive leak):** this branch independently found and fixed the *same*
+  universal RC/codegen leak the `path1-packed-records` agent fixed (their `04bec70`; this branch's
+  `f0d02bf`) — two independent fixes of one real bug, mutually corroborating. Both are merge-worthy on
+  their own; pick one.
+- **path-1 (in-place packed ABI):** path-1's measured 4.5× on packed iteration is a *real* win where the
+  value packs — orthogonal to and larger than this path's. The two are not in competition: path-1 helps
+  statically-packable types; this path's residual lever (the read-wrapper above) helps the `Json`/boxed
+  reads path-1 can't pack (e.g. RAPTOR's heap-field `Trip`).
+- **path-3 (escape-based RC elision):** the owning `lin_tagged_clone` identified above as a dominant
+  per-read cost is exactly the construction/RC-churn family path-3 attacks; the B2 RC-suppression
+  (`a7366c4`, see path-3 findings) is a first concrete bite of it.
+
+### Net verdict (revised)
+The inline cache is **sound, correct, near-perfect hit rate, and not worth enabling.** Keep it gated off
+(or drop it). The path's *real* contribution turned out to be diagnostic: it proved the AOT IC pattern
+works, then proved the dynamic-read bottleneck is the read **wrapper** (key-intern + unbox + tag + clone),
+not the offset resolution the IC accelerates. Spend the next effort on the wrapper, not the cache. The
+~2.5% interp regression (interp's hot reads are packed records that bypass `lin_object_get` entirely, so
+the IC sites that fire are pure guard overhead there) independently confirms the IC is not the interp
+lever either.
