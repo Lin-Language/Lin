@@ -2950,15 +2950,19 @@ fn auto_import_edit(source: &str, name: &str, module: &str) -> Option<TextEdit> 
                 if bindings.iter().any(|b| b.name == name || b.alias.as_deref() == Some(name)) {
                     return None;
                 }
-                // Insert `, name` just before the closing `}` of this import's brace list.
-                // The stmt span covers only the `import` keyword, so scan to the line end.
+                // Insert `, name` right after the last existing binding in this import's brace
+                // list. The stmt span covers only the `import` keyword, so scan to the line end.
                 // `span.start` is a CHAR offset; convert to a byte index to slice the source, then
-                // lift the located `}` byte position back to a CHAR offset for `offset_to_position`.
+                // lift the insertion byte position back to a CHAR offset for `offset_to_position`.
                 let start = char_offset_to_byte(source, span.start as usize);
                 let line_end = source[start..].find('\n').map(|i| start + i).unwrap_or(source.len());
                 let stmt_src = source.get(start..line_end)?;
                 let brace = stmt_src.find('}')?;
-                let insert_at = start + brace; // byte offset of `}`
+                // Insert before the whitespace run that precedes `}`, not at the `}` itself, so the
+                // formatter's trailing space before `}` is preserved (`{ a, b }` stays
+                // `{ a, b, name }`, not `{ a, b , name}`).
+                let after_last_binding = stmt_src[..brace].trim_end().len();
+                let insert_at = start + after_last_binding; // byte offset just past last binding
                 let pos = offset_to_position(source, byte_offset_to_char(source, insert_at));
                 return Some(TextEdit {
                     range: Range { start: pos, end: pos },
@@ -6403,6 +6407,19 @@ val _helper = 3
         Url::parse("file:///tmp/lsp_test.lin").unwrap()
     }
 
+    /// Apply a single `TextEdit` to `src`, returning the new document. Uses the same
+    /// position→char→byte conversion discipline as production so the result matches what a
+    /// client would compute.
+    fn apply_text_edit(src: &str, edit: &TextEdit) -> String {
+        let start = char_offset_to_byte(src, position_to_offset(src, edit.range.start));
+        let end = char_offset_to_byte(src, position_to_offset(src, edit.range.end));
+        let mut out = String::with_capacity(src.len() + edit.new_text.len());
+        out.push_str(&src[..start]);
+        out.push_str(&edit.new_text);
+        out.push_str(&src[end..]);
+        out
+    }
+
     /// Build `CodeActionParams` requesting actions over the whole document, with the freshly
     /// analysed diagnostics supplied as context (what a real client would echo back).
     fn code_action_params(src: &str, diags: Vec<Diagnostic>) -> CodeActionParams {
@@ -7108,10 +7125,36 @@ val _helper = 3
     fn auto_import_edit_merges_existing_module_import() {
         let src = "import { print } from \"std/io\"\nval x = printErr(\"e\")\n";
         let edit = auto_import_edit(src, "printErr", "std/io").expect("expected a merge edit");
-        // A merge inserts `, printErr` (not a whole new import line).
+        // A merge inserts `, printErr` (not a whole new import line); the inserted TEXT is
+        // unchanged by the spacing fix.
         assert_eq!(edit.new_text, ", printErr");
         // Inserted on line 0 (the existing import line).
         assert_eq!(edit.range.start.line, 0);
+        // The insertion lands right after the last binding (`print`), NOT at the `}` — so the
+        // char immediately before the insertion point is `t` (end of `print`), preserving the
+        // formatter's trailing space before `}`.
+        let byte_at = char_offset_to_byte(src, position_to_offset(src, edit.range.start));
+        assert_eq!(src.as_bytes()[byte_at - 1], b't');
+        // Applying the edit yields a well-spaced merged line.
+        let merged = apply_text_edit(src, &edit);
+        assert_eq!(
+            merged.lines().next().unwrap(),
+            "import { print, printErr } from \"std/io\""
+        );
+    }
+
+    /// The exact user-reported shape: MULTIPLE existing bindings with a trailing space before `}`.
+    /// The merge must produce `{ a, b, c }` — no `b , c` and no `c}`.
+    #[test]
+    fn auto_import_edit_merges_multi_binding_preserves_spacing() {
+        let src = "import { a, b } from \"std/iter\"\nval x = c(1)\n";
+        let edit = auto_import_edit(src, "c", "std/iter").expect("expected a merge edit");
+        assert_eq!(edit.new_text, ", c");
+        let merged = apply_text_edit(src, &edit);
+        assert_eq!(
+            merged.lines().next().unwrap(),
+            "import { a, b, c } from \"std/iter\""
+        );
     }
 
     /// Already-imported name from the module → no edit (nothing to add).
