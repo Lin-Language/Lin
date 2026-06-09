@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 use tower_lsp::jsonrpc::Result;
@@ -18,6 +19,10 @@ struct Backend {
     client: Client,
     /// In-memory buffer for every open document, keyed by URI.
     docs: RwLock<HashMap<Url, String>>,
+    /// Whether the client advertised `completionItem.snippetSupport` in `initialize`. Gates the
+    /// smart-parens completion: snippet inserts (`name($0)`) are only emitted when true, else we fall
+    /// back to a plaintext `name()` (never a literal `$0`). Captured once in `initialize`.
+    snippet_support: AtomicBool,
 }
 
 #[tower_lsp::async_trait]
@@ -40,6 +45,20 @@ impl LanguageServer for Backend {
         if let Some(root) = &root {
             *WORKSPACE_ROOT.write().unwrap_or_else(|e| e.into_inner()) = Some(root.clone());
         }
+
+        // Capture whether the client supports snippet completion items
+        // (`capabilities.textDocument.completion.completionItem.snippetSupport`). Smart-parens
+        // completion emits LSP snippets (`name($0)`); without this we must fall back to plaintext so a
+        // non-snippet client never shows a literal `$0`.
+        let snippet_support = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|td| td.completion.as_ref())
+            .and_then(|c| c.completion_item.as_ref())
+            .and_then(|ci| ci.snippet_support)
+            .unwrap_or(false);
+        self.snippet_support.store(snippet_support, Ordering::Relaxed);
 
         // Build the cross-file index: seed stdlib, then enumerate + index every
         // `*.lin` file under the workspace root. Files are re-indexed on edit, and
@@ -289,6 +308,12 @@ impl LanguageServer for Backend {
         // the receiver's type category (e.g. "array", "string", "object").
         let (in_dot_context, receiver_category) = dot_receiver_category(&source, offset, &analysis.span_type_map);
 
+        // Smart-parens inputs: does the client support snippet inserts, and is the char immediately
+        // after the cursor already a `(` (the user is editing an existing call — don't double the
+        // parens)? `next_char_is_paren` checks the very next source char at the cursor offset.
+        let snippet_support = self.snippet_support.load(Ordering::Relaxed);
+        let next_char_is_paren = source[offset..].chars().next() == Some('(');
+
         let mut items: Vec<CompletionItem> = Vec::new();
 
         // Classify the cursor's position so each completion source is offered only where it makes
@@ -329,7 +354,7 @@ impl LanguageServer for Backend {
                         } else {
                             CompletionItemKind::VARIABLE
                         };
-                        items.push(CompletionItem {
+                        let mut ci = CompletionItem {
                             label: name.to_string(),
                             kind: Some(kind),
                             detail: Some(clean_type_string(ty_str)),
@@ -337,7 +362,11 @@ impl LanguageServer for Backend {
                             // (lazily, for the selected item only) from this file's own decl.
                             data: completion_resolve_data(uri, name),
                             ..Default::default()
-                        });
+                        };
+                        // Plain (non-dot) call: a function-typed binding inserts `name()` with the
+                        // cursor placed by its full arity.
+                        apply_function_parens(&mut ci, ty_str, false, snippet_support, next_char_is_paren);
+                        items.push(ci);
                     }
                 }
                 // (b) structural scope binders (covers unreferenced names absent from span_type_map).
@@ -362,13 +391,19 @@ impl LanguageServer for Backend {
                     } else {
                         CompletionItemKind::VARIABLE
                     };
-                    items.push(CompletionItem {
+                    let mut ci = CompletionItem {
                         label: b.name.clone(),
                         kind: Some(kind),
-                        detail,
+                        detail: detail.clone(),
                         data: completion_resolve_data(uri, &b.name),
                         ..Default::default()
-                    });
+                    };
+                    // Plain (non-dot) call. Only function-typed binders get parens — drive arity off
+                    // the binder's type-string (its inferred/annotated detail).
+                    if let Some(sig) = detail.as_deref() {
+                        apply_function_parens(&mut ci, sig, false, snippet_support, next_char_is_paren);
+                    }
+                    items.push(ci);
                 }
             }
 
@@ -451,7 +486,7 @@ impl LanguageServer for Backend {
                 Some(t) if t.contains("=>") => CompletionItemKind::FUNCTION,
                 _ => CompletionItemKind::VALUE,
             };
-            items.push(CompletionItem {
+            let mut ci = CompletionItem {
                 label: imp.name.clone(),
                 kind: Some(kind),
                 detail: imp.ty.as_deref().map(clean_type_string),
@@ -461,7 +496,13 @@ impl LanguageServer for Backend {
                 documentation: Some(Documentation::String(format!("from {}", imp.module))),
                 data: completion_resolve_data(uri, &imp.name),
                 ..Default::default()
-            });
+            };
+            // Smart-parens for an imported FUNCTION. Dot context uses the receiver-fills-first-param
+            // arity rule (arity − 1); plain expression position uses the full arity.
+            if let Some(sig) = imp.ty.as_deref() {
+                apply_function_parens(&mut ci, sig, in_dot_context, snippet_support, next_char_is_paren);
+            }
+            items.push(ci);
         }
 
         // 5. UNIMPORTED stdlib combinators/methods in dot-context (FIX B). In addition to the
@@ -479,6 +520,8 @@ impl LanguageServer for Backend {
                 prefix,
                 &already,
                 uri,
+                snippet_support,
+                next_char_is_paren,
             ));
         }
 
@@ -2205,6 +2248,8 @@ fn stdlib_dot_completion_items<'a>(
     prefix: &str,
     already: &HashSet<String>,
     uri: &Url,
+    snippet_support: bool,
+    next_char_is_paren: bool,
 ) -> Vec<CompletionItem> {
     let mut out = Vec::new();
     for cand in candidates {
@@ -2218,14 +2263,19 @@ fn stdlib_dot_completion_items<'a>(
         if !dot_item_applies(receiver_cat, first_param_cat.as_deref()) {
             continue;
         }
-        out.push(CompletionItem {
+        let mut item = CompletionItem {
             label: cand.name.clone(),
             kind: Some(CompletionItemKind::FUNCTION),
             detail: Some(format!("{}  (from {})", clean_type_string(&cand.ty), cand.module)),
             documentation: Some(Documentation::String(format!("from {}", cand.module))),
             data: completion_resolve_data_stdlib(uri, &cand.name, &cand.module),
             ..Default::default()
-        });
+        };
+        // These are stdlib combinators reached via a dot receiver, so the receiver fills the first
+        // parameter (`xs.map(f)` == `map(xs, f)`): args-to-fill = arity − 1. The auto-import edit is
+        // attached lazily in `completion_resolve` — `insert_text` here is an independent field.
+        apply_function_parens(&mut item, &cand.ty, true, snippet_support, next_char_is_paren);
+        out.push(item);
     }
     out
 }
@@ -4194,6 +4244,85 @@ fn function_param_types(sig: &str) -> Option<Vec<String>> {
     Some(split_top_level(params))
 }
 
+/// Arity (parameter count) of a rendered function-type string, or `None` when `sig` isn't a function
+/// type. Thin wrapper over `function_param_types` so the smart-parens logic reuses the SAME splitter
+/// the signature-help code uses rather than re-parsing the signature.
+fn function_arity(sig: &str) -> Option<usize> {
+    function_param_types(sig).map(|p| p.len())
+}
+
+/// How many call arguments the user still has to fill in once a FUNCTION completion is accepted,
+/// derived from the function's type-string `sig`:
+///   - dot-completion (`receiver.method`): the receiver fills the first parameter (Lin dot-application
+///     is `recv.f()` == `f(recv)`), so args-to-fill = arity − 1.
+///   - plain call (`f` at expression position): args-to-fill = arity.
+/// `None` when arity can't be determined (not a function type / unparsable) — callers then default to
+/// the safe cursor-inside form.
+fn args_to_fill(sig: &str, is_dot: bool) -> Option<usize> {
+    let arity = function_arity(sig)?;
+    Some(if is_dot { arity.saturating_sub(1) } else { arity })
+}
+
+/// Pure decision for what text a FUNCTION completion inserts and in which format.
+///
+/// - `name`            — the function's label.
+/// - `args_to_fill`    — call args the user must still supply (`None` = unknown → safe cursor-inside).
+/// - `snippet_support` — whether the client advertised `completionItem.snippetSupport`.
+/// - `next_char_is_paren` — whether the char immediately after the cursor is already `(` (the user is
+///   editing an existing call) — in which case we must NOT add another `()`.
+///
+/// Returns `(text, is_snippet)`. When `is_snippet` is false the text is a literal plaintext insert
+/// (no `$0` ever leaks). Snippet `$0` is the final cursor stop: `name($0)` places it between the
+/// parens (args to fill); `name()$0` places it after (nothing to fill).
+fn function_insert_text(
+    name: &str,
+    args_to_fill: Option<usize>,
+    snippet_support: bool,
+    next_char_is_paren: bool,
+) -> (String, bool) {
+    // Editing an existing call (`foo(` already follows): inserting parens would double them up.
+    if next_char_is_paren {
+        return (name.to_string(), false);
+    }
+    if !snippet_support {
+        // No snippet support — insert `name()` as plaintext; the client positions the cursor. Never
+        // emit a `$0` (it would show literally).
+        return (format!("{name}()"), false);
+    }
+    match args_to_fill {
+        // Nothing to fill → cursor AFTER the closing paren.
+        Some(0) => (format!("{name}()$0"), true),
+        // Args to fill (or unknown) → cursor BETWEEN the parens.
+        _ => (format!("{name}($0)"), true),
+    }
+}
+
+/// Apply `function_insert_text`'s decision to a `CompletionItem` in place: sets `insert_text` +
+/// `insert_text_format` for a function, leaving non-functions (and the no-op plain-name case)
+/// untouched so the client falls back to inserting the `label`. `additional_text_edits`
+/// (auto-import) and `documentation` are independent fields and are NOT disturbed.
+fn apply_function_parens(
+    item: &mut CompletionItem,
+    sig: &str,
+    is_dot: bool,
+    snippet_support: bool,
+    next_char_is_paren: bool,
+) {
+    // Only functions get parens. A function type renders as `(...) => R`.
+    if !sig.contains("=>") {
+        return;
+    }
+    let (text, is_snippet) =
+        function_insert_text(&item.label, args_to_fill(sig, is_dot), snippet_support, next_char_is_paren);
+    // Plain bare-name insert == the label: leave `insert_text`/format unset so nothing changes.
+    if text == item.label {
+        return;
+    }
+    item.insert_text = Some(text);
+    item.insert_text_format =
+        Some(if is_snippet { InsertTextFormat::SNIPPET } else { InsertTextFormat::PLAIN_TEXT });
+}
+
 /// Index of the `)` that closes the `(` at byte 0 of `s` (depth-balanced over `()[]{}<>`).
 ///
 /// Scans a RENDERED TYPE string, where `<>` legitimately delimit generic arguments (`Foo<Bar>`). The
@@ -5473,6 +5602,7 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         docs: RwLock::new(HashMap::new()),
+        snippet_support: AtomicBool::new(false),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
@@ -5826,9 +5956,11 @@ mod tests {
         items.iter().find(|i| i.label == name)
     }
 
-    /// `map` IS offered on an array receiver, labelled with the bare NAME (a plain identifier insert,
-    /// no `insert_text`/snippet), with a clean `detail` (no raw `?T`) noting its source module, and a
-    /// `data` payload carrying the owner module so `completion_resolve` can attach the import edit.
+    /// `map` IS offered on an array receiver, with a clean `detail` (no raw `?T`) noting its source
+    /// module, and a `data` payload carrying the owner module so `completion_resolve` can attach the
+    /// import edit. With snippet support it inserts a smart-parens SNIPPET: `map` is a 2-param
+    /// combinator dot-called (`xs.map(f)` == `map(xs, f)`), so the receiver fills the first param and
+    /// ONE arg remains → cursor BETWEEN the parens (`map($0)`).
     #[test]
     fn stdlib_dot_offers_map_on_array_receiver() {
         // The real `map` signature (first param `?T[] | Iterator | Stream`) → category "array".
@@ -5838,10 +5970,12 @@ mod tests {
             "(?T9002[] | Iterator<?T4294967295> | Stream<?T4294967295>, (?T9002, Int32) => ?T9003) => ?T9003[]",
         )];
         let already = HashSet::new();
-        let items = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri());
+        let items =
+            stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri(), true, false);
         let map = item_named(&items, "map").expect("`map` must be offered on an array receiver");
-        // Plain identifier insert — no snippet/insert_text.
-        assert!(map.insert_text.is_none(), "must insert the bare NAME, not a snippet");
+        // Smart-parens snippet, cursor between the parens (one arg still to fill).
+        assert_eq!(map.insert_text.as_deref(), Some("map($0)"));
+        assert_eq!(map.insert_text_format, Some(InsertTextFormat::SNIPPET));
         assert_eq!(map.kind, Some(CompletionItemKind::FUNCTION));
         // Clean detail (FIX A): no raw solver ids leak; the source module is shown.
         let detail = map.detail.as_deref().unwrap();
@@ -5884,7 +6018,7 @@ mod tests {
         let cands = vec![cand("map", "std/iter", "(?T9002[], (?T9002, Int32) => ?T9003) => ?T9003[]")];
         let mut already = HashSet::new();
         already.insert("map".to_string());
-        let items = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri());
+        let items = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri(), false, false);
         assert!(item_named(&items, "map").is_none(), "an already-offered `map` must not be re-offered");
     }
 
@@ -5899,11 +6033,11 @@ mod tests {
         ];
         let already = HashSet::new();
         // Array receiver: `range` (number first param) is gated OUT; `map` (array) is kept.
-        let on_array = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri());
+        let on_array = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri(), false, false);
         assert!(item_named(&on_array, "range").is_none(), "`range` must be gated out on an array receiver");
         assert!(item_named(&on_array, "map").is_some(), "`map` should be offered on an array receiver");
         // String receiver: `map` (array first param) is gated OUT.
-        let on_string = stdlib_dot_completion_items(cands.iter(), "string", "", &already, &fixb_uri());
+        let on_string = stdlib_dot_completion_items(cands.iter(), "string", "", &already, &fixb_uri(), false, false);
         assert!(item_named(&on_string, "map").is_none(), "`map` (array first param) must be gated out on a string receiver");
     }
 
@@ -5917,7 +6051,7 @@ mod tests {
             "(?T4294967295, (?T4294967295, Int32) => ?T4294967295) => Null",
         )];
         let already = HashSet::new();
-        let items = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri());
+        let items = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri(), false, false);
         let for_item = item_named(&items, "for").expect("`for` must be offered on an array receiver");
         assert_eq!(parse_completion_resolve_module(for_item.data.as_ref()).as_deref(), Some("std/iter"));
     }
@@ -5928,7 +6062,7 @@ mod tests {
     #[test]
     fn stdlib_dot_real_candidates_offer_iter_combinators_on_array() {
         let already = HashSet::new();
-        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "", &already, &fixb_uri());
+        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "", &already, &fixb_uri(), false, false);
         for name in ["map", "filter", "for"] {
             let it = item_named(&items, name)
                 .unwrap_or_else(|| panic!("`{name}` should be offered on an array receiver from the real stdlib"));
@@ -5941,7 +6075,7 @@ mod tests {
         // `range` (number first param) is gated out even from the real set.
         assert!(item_named(&items, "range").is_none(), "`range` must be gated out on an array receiver");
         // Prefix filter: only `map` survives a "ma" prefix.
-        let only_ma = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "ma", &already, &fixb_uri());
+        let only_ma = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "ma", &already, &fixb_uri(), false, false);
         assert!(item_named(&only_ma, "map").is_some());
         assert!(item_named(&only_ma, "filter").is_none(), "prefix `ma` must exclude `filter`");
     }
@@ -6005,7 +6139,7 @@ val _helper = 3
         );
         // Genuinely-exported array ops ARE still offered on an array receiver.
         let already = HashSet::new();
-        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "", &already, &fixb_uri());
+        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "", &already, &fixb_uri(), false, false);
         assert!(item_named(&items, "push").is_some(), "exported `push` should still be offered");
         assert!(item_named(&items, "_bisect").is_none(), "private `_bisect` must not be offered");
     }
@@ -6372,6 +6506,114 @@ val _helper = 3
         // Not a function type.
         assert_eq!(function_param_types("Int32"), None);
         assert_eq!(function_param_types("(Int32)"), None);
+    }
+
+    /// Arity counts top-level params (a function-typed param like `(T, Int32) => U` stays one piece).
+    #[test]
+    fn function_arity_counts_top_level_params() {
+        // `map`'s rendered shape: 2 params (the array, the lambda) — the lambda's inner comma must
+        // NOT inflate the count.
+        assert_eq!(function_arity("(T[], (T, Int32) => U) => U[]"), Some(2));
+        assert_eq!(function_arity("(Int32) => Int32"), Some(1));
+        assert_eq!(function_arity("() => Int32"), Some(0));
+        // Non-function type strings → no arity.
+        assert_eq!(function_arity("Int32"), None);
+        assert_eq!(function_arity("String"), None);
+    }
+
+    /// Args-to-fill differs between a dot call (receiver fills param 0 → arity − 1) and a plain call
+    /// (arity). A 1-param fn dot-called has ZERO args to fill.
+    #[test]
+    fn args_to_fill_dot_vs_plain() {
+        // `map` (2 params) dot-called → 1 arg to fill; plain → 2.
+        assert_eq!(args_to_fill("(T[], (T, Int32) => U) => U[]", true), Some(1));
+        assert_eq!(args_to_fill("(T[], (T, Int32) => U) => U[]", false), Some(2));
+        // `toString` (1 param) dot-called → 0 args to fill (cursor after); plain → 1.
+        assert_eq!(args_to_fill("(Json) => String", true), Some(0));
+        assert_eq!(args_to_fill("(Json) => String", false), Some(1));
+        // Zero-arg fn: dot saturates at 0 (can't go negative).
+        assert_eq!(args_to_fill("() => Int32", true), Some(0));
+        assert_eq!(args_to_fill("() => Int32", false), Some(0));
+        // Unknown arity.
+        assert_eq!(args_to_fill("Int32", true), None);
+    }
+
+    /// The pure insert-text decision: snippet form, cursor placement, double-paren suppression,
+    /// no-snippet fallback, and the never-leak-`$0` guarantee.
+    #[test]
+    fn function_insert_text_decisions() {
+        // Args to fill > 0 → cursor BETWEEN the parens.
+        assert_eq!(
+            function_insert_text("map", Some(1), true, false),
+            ("map($0)".to_string(), true)
+        );
+        // Args to fill == 0 → cursor AFTER the closing paren.
+        assert_eq!(
+            function_insert_text("toString", Some(0), true, false),
+            ("toString()$0".to_string(), true)
+        );
+        // Unknown arity → safe cursor-inside form.
+        assert_eq!(
+            function_insert_text("f", None, true, false),
+            ("f($0)".to_string(), true)
+        );
+        // Next char is already `(` → plain bare name, NO parens (regardless of arity).
+        assert_eq!(
+            function_insert_text("toString", Some(0), true, true),
+            ("toString".to_string(), false)
+        );
+        assert_eq!(
+            function_insert_text("map", Some(1), true, true),
+            ("map".to_string(), false)
+        );
+        // No snippet support → plaintext `name()`, and crucially NO literal `$0`.
+        let (text, is_snippet) = function_insert_text("toString", Some(0), false, false);
+        assert_eq!(text, "toString()");
+        assert!(!is_snippet);
+        assert!(!text.contains("$0"), "plaintext must never contain a literal $0");
+        let (text2, _) = function_insert_text("map", Some(1), false, false);
+        assert_eq!(text2, "map()");
+        assert!(!text2.contains("$0"));
+    }
+
+    /// `apply_function_parens` is a no-op for non-functions (no `insert_text`/format set), so the
+    /// client falls back to inserting the bare label.
+    #[test]
+    fn apply_function_parens_skips_non_functions() {
+        let mut item = CompletionItem { label: "count".to_string(), ..Default::default() };
+        apply_function_parens(&mut item, "Int32", false, true, false);
+        assert!(item.insert_text.is_none(), "a non-function must not get parens");
+        assert!(item.insert_text_format.is_none());
+    }
+
+    /// A 1-param function dot-called (`i.toString` == `toString(i)`) → 0 args to fill → snippet with
+    /// cursor AFTER the parens (`toString()$0`).
+    #[test]
+    fn apply_function_parens_dot_one_param_cursor_after() {
+        let mut item = CompletionItem { label: "toString".to_string(), ..Default::default() };
+        apply_function_parens(&mut item, "(Json) => String", true, true, false);
+        assert_eq!(item.insert_text.as_deref(), Some("toString()$0"));
+        assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
+    }
+
+    /// A 2-param combinator dot-called (`xs.map`) → 1 arg to fill → snippet with cursor BETWEEN the
+    /// parens (`map($0)`).
+    #[test]
+    fn apply_function_parens_dot_two_param_cursor_inside() {
+        let mut item = CompletionItem { label: "map".to_string(), ..Default::default() };
+        apply_function_parens(&mut item, "(T[], (T, Int32) => U) => U[]", true, true, false);
+        assert_eq!(item.insert_text.as_deref(), Some("map($0)"));
+        assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
+    }
+
+    /// Double-paren suppression at the item level: when the next source char is `(`, no parens are
+    /// inserted regardless of arity (the user is editing an existing call like `i.toS()`).
+    #[test]
+    fn apply_function_parens_suppressed_before_existing_paren() {
+        let mut item = CompletionItem { label: "toString".to_string(), ..Default::default() };
+        apply_function_parens(&mut item, "(Json) => String", true, true, true);
+        assert!(item.insert_text.is_none(), "must not double the parens before an existing `(`");
+        assert!(item.insert_text_format.is_none());
     }
 
     /// End to end: cursor inside `add(1, │2)` resolves the callee's signature and marks the SECOND
