@@ -668,6 +668,8 @@ fn monomorphize_inner(
         }
     }
 
+    let direct_callable_fn_slots = collect_direct_callable_fn_slots(module);
+
     let mut state = MonoState {
         generics,
         aliases,
@@ -684,6 +686,7 @@ fn monomorphize_inner(
         rehomed_intrinsics: HashMap::new(),
         rehome_binding_cache: HashMap::new(),
         rehome_intrinsic_cache: HashMap::new(),
+        direct_callable_fn_slots,
     };
 
     // 2. Walk the whole module, rewriting calls to generic functions and queuing specializations.
@@ -1308,6 +1311,13 @@ struct MonoState<'a> {
     rehome_binding_cache: HashMap<(String, String), usize>,
     /// Dedup: (origin_path, intrinsic-name) → fresh importer slot already minted.
     rehome_intrinsic_cache: HashMap<(String, String), usize>,
+    /// Module-level slots that name a DIRECT-CALLABLE function: a top-level `val f = (…) => …` or an
+    /// imported/FFI function binding. A bare reference to one of these as a combinator callback can
+    /// be eta-expanded to `(p…) => f(p…)` (a genuinely CAPTURE-LESS lambda — `f` is a module symbol,
+    /// not a captured slot) so `try_inline_combinator_wrapper` routes it through the inline intrinsic.
+    /// A first-class function PARAMETER, a stored closure, or a local fn-typed `val` is NOT here, so
+    /// it keeps the closure-call path. Populated once in `monomorphize_with_imports`.
+    direct_callable_fn_slots: std::collections::HashSet<usize>,
 }
 
 struct SpecInfo {
@@ -1405,6 +1415,45 @@ fn collect_generic_aliases(
         }
     }
     aliases
+}
+
+/// Collect the module-level slots that name a DIRECT-CALLABLE function — a binding whose bare
+/// reference may be eta-expanded to `(p…) => f(p…)` (capture-less, since `f` is a module symbol) at a
+/// combinator call site. These are: top-level `val f = (…) => …` (function literals), and
+/// imported / FFI function bindings (their slots carry a `Type::Function`). Deliberately EXCLUDES a
+/// fn-typed top-level `val` whose RHS is NOT a literal function (an alias / stored closure) — calling
+/// it is still indirect — and of course any nested local binding or parameter (those aren't
+/// module-level statements). See `MonoState::direct_callable_fn_slots` and `eta_expand_named_arg`.
+fn collect_direct_callable_fn_slots(module: &TypedModule) -> std::collections::HashSet<usize> {
+    let mut out = std::collections::HashSet::new();
+    for stmt in &module.statements {
+        match stmt {
+            // A top-level function definition (`val f = (…) => …`). A non-function val RHS is not a
+            // direct-callable symbol (it's data); a generic one is still a top-level fn and remains
+            // direct-callable, but the combinator-inline path only fires for a NON-generic callback
+            // anyway (a generic callback isn't a concrete combinator argument here).
+            TypedStmt::Val { slot, value: TypedExpr::Function { .. }, .. } => {
+                out.insert(*slot);
+            }
+            // Imported functions and FFI functions: direct-callable by their mangled symbol.
+            TypedStmt::Import { bindings, .. } => {
+                for b in bindings {
+                    if matches!(b.ty, Type::Function { .. }) {
+                        out.insert(b.slot);
+                    }
+                }
+            }
+            TypedStmt::ForeignImport { bindings, .. } => {
+                for b in bindings {
+                    if matches!(b.ty, Type::Function { .. }) {
+                        out.insert(b.slot);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Highest slot index referenced anywhere in the module (Val/Var/param/destructure/LocalGet).
@@ -1817,11 +1866,70 @@ fn combinator_intrinsic(name: &str) -> bool {
     matches!(name, "lin_map" | "lin_filter" | "lin_reduce")
 }
 
+/// If `arg` is a bare reference to a direct-callable module function (see
+/// `MonoState::direct_callable_fn_slots`) with a known `Function` type, eta-expand it IN PLACE into
+/// the capture-less lambda `(p0, p1, …) => f(p0, p1, …)`. This is the rewrite that lets a bare-fn
+/// combinator callback (`.map(square)`) take the same inline-intrinsic path as a literal lambda
+/// (`.map(x => square(x))`): the resulting `Function` has no captures (its only free name is the
+/// module symbol `f`), so `try_inline_combinator_wrapper`'s capture-less-lambda gate accepts it and
+/// the call is routed through `lin_map`/… to `lower_*`, which inlines the body with a DIRECT call to
+/// `f` — no closure alloc, no per-element indirect dispatch. Returns true if it rewrote `arg`.
+///
+/// Fresh param slots come from `state.next_slot` (the same allocator used for re-homing), so they
+/// cannot collide with any real or re-homed slot. Fails safe (returns false, leaves `arg` untouched)
+/// for anything that is not a bare direct-callable fn reference — an opaque `Function` parameter, a
+/// stored closure, or a non-function value all keep the existing closure-call specialization path.
+fn eta_expand_named_arg(arg: &mut TypedExpr, state: &mut MonoState<'_>) -> bool {
+    let (slot, fn_ty, span) = match arg {
+        TypedExpr::LocalGet { slot, ty, span } if state.direct_callable_fn_slots.contains(slot) => {
+            (*slot, ty.clone(), *span)
+        }
+        _ => return false,
+    };
+    let (param_tys, ret) = match &fn_ty {
+        Type::Function { params, ret, .. } => (params.clone(), (**ret).clone()),
+        _ => return false,
+    };
+    let params: Vec<TypedParam> = param_tys
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| {
+            let s = state.next_slot;
+            state.next_slot += 1;
+            TypedParam { slot: s, name: format!("__eta{}", i), ty: ty.clone(), default: None }
+        })
+        .collect();
+    let call_args: Vec<TypedExpr> = params
+        .iter()
+        .map(|p| TypedExpr::LocalGet { slot: p.slot, ty: p.ty.clone(), span })
+        .collect();
+    let body = TypedExpr::Call {
+        func: Box::new(TypedExpr::LocalGet { slot, ty: fn_ty, span }),
+        args: call_args,
+        result_type: ret.clone(),
+        is_tail: false,
+        partial: false,
+        span,
+    };
+    *arg = TypedExpr::Function {
+        name: None,
+        params,
+        body: Box::new(body),
+        ret_type: ret,
+        captures: vec![],
+        span,
+    };
+    true
+}
+
 /// Try to inline a thin intrinsic-combinator wrapper call (`map`/`filter`/`reduce`) at the call
 /// site when its callback argument is a CAPTURE-LESS LITERAL lambda. On success, repoints the call's
 /// `func` at a (re-homed) intrinsic slot for `lin_map`/`lin_filter`/`lin_reduce` so the call lowers
 /// straight through the intrinsic — exposing the literal lambda to `lower_map`/… which inlines its
 /// body into the loop (zero per-element box/unbox/closure-call). Returns true if it rewrote the call.
+///
+/// A bare direct-callable function callback (`.map(square)`) is first eta-expanded to the equivalent
+/// capture-less lambda by `eta_expand_named_arg`, so it qualifies for this same inline path.
 ///
 /// Conditions (all required):
 ///   - the generic is a thin intrinsic wrapper for a combinator intrinsic (`thin_intrinsic_wrapper`);
@@ -1871,6 +1979,15 @@ fn try_inline_combinator_wrapper(
         && args.first().map(|a| mentions_sealed(&a.ty())).unwrap_or(false)
     {
         return false;
+    }
+    // ETA-EXPAND a bare direct-callable function callback (`.map(square)`) into the equivalent
+    // capture-less lambda `(p…) => square(p…)`, so the capture-less-lambda gate below accepts it and
+    // the call routes through `lin_map`/… → `lower_*` (inline body + DIRECT call to `square`), the
+    // same fast path a literal lambda takes. The combinator wrapper forwards its params 1:1, so the
+    // callback is always the LAST argument (`map(arr,f)`/`filter(arr,p)`/`reduce(arr,init,f)`). A
+    // no-op for a literal lambda (already a `Function`) or an opaque fn-value (not direct-callable).
+    if let Some(last) = args.last_mut() {
+        eta_expand_named_arg(last, state);
     }
     // Exactly one capture-less literal-lambda argument qualifies.
     let mut lambda_args = 0;
