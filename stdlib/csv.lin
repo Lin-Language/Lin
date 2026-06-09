@@ -16,9 +16,13 @@ val CR = 13    // \r
 val LF = 10    // \n
 
 // ── options ───────────────────────────────────────────────────────────────
-// A CsvOptions record is `{ "delimiter": String, "trim": Boolean }`; both keys optional. We read
-// the delimiter's first byte once (validated to be a single ASCII byte that is not `"`/CR/LF).
-val optDelimByte = (opts: Json): Int32 =>
+// Parser/serialiser options; both keys optional (an omitted key reads as `Null`, taking the
+// default). `delimiter` must be a single ASCII byte that is not `"`/CR/LF; `trim` strips ASCII
+// space/tab from unquoted fields.
+export type CsvOptions = { "delimiter": String | Null, "trim": Boolean | Null }
+
+// We read the delimiter's first byte once (validated to be a single ASCII byte that is not `"`/CR/LF).
+val optDelimByte = (opts: CsvOptions): Int32 =>
   val d = opts["delimiter"]
   if d == null then
     44 // ','
@@ -27,7 +31,7 @@ val optDelimByte = (opts: Json): Int32 =>
 
 // True if the delimiter option is invalid: not exactly one byte, or one of `"`/CR/LF. A single
 // ASCII codepoint is exactly one UTF-8 byte, so a 1-byte length is the single-ASCII-codepoint test.
-val optDelimInvalid = (opts: Json): Boolean =>
+val optDelimInvalid = (opts: CsvOptions): Boolean =>
   val d = opts["delimiter"]
   if d == null then
     false
@@ -36,7 +40,7 @@ val optDelimInvalid = (opts: Json): Boolean =>
     val b0 = byteAt(d, 0)
     n != 1 || b0 == QUOTE || b0 == CR || b0 == LF
 
-val optTrim = (opts: Json): Boolean =>
+val optTrim = (opts: CsvOptions): Boolean =>
   opts["trim"] == true
 
 // Trim leading/trailing ASCII space (32) and tab (9) from an unquoted field. Byte-scanned.
@@ -220,7 +224,7 @@ val scanRows = (rows: Json[], s: String, n: Int32, pos: Int32, delim: Int32, tri
 // @returns the parsed rows, or an Error on an invalid delimiter option or malformed input (an
 //          unterminated quoted field or a stray quote).
 // @example parse("a,b\n1,2")  // [["a", "b"], ["1", "2"]]
-export val parse = (s: String, opts: Json = {  }): String[][] | Error =>
+export val parse = (s: String, opts: CsvOptions = {  }): String[][] | Error =>
   if optDelimInvalid(opts) then
     {
       "type": "error",
@@ -276,7 +280,7 @@ val mapRecords = (records: { String: String }[], parsed: Json, header: Json, i: 
 // @param opts  optional options, as for `parse`.
 // @returns the data rows as keyed records (empty if there is only a header / no rows), or an Error
 //          if the underlying parse fails.
-export val parseWithHeader = (s: String, opts: Json = {  }): { String: String }[] | Error =>
+export val parseWithHeader = (s: String, opts: CsvOptions = {  }): { String: String }[] | Error =>
   val parsed = parse(s, opts)
   match parsed
     is Error =>
@@ -322,7 +326,7 @@ val renderField = (field: String, delim: Int32): String =>
   else
     field
 
-val delimString = (opts: Json): String =>
+val delimString = (opts: CsvOptions): String =>
   val d = opts["delimiter"]
   if d == null then "," else d
 
@@ -339,7 +343,7 @@ val renderRow = (row: Json, delim: Int32, sep: String): String =>
 // @param rows  the rows to render (each a list of String fields).
 // @param opts  accepts `{ delimiter }`; the delimiter defaults to `,`.
 // @returns the CSV text, or "" for no rows.
-export val stringify = (rows: String[][], opts: Json = {  }): String =>
+export val stringify = (rows: String[][], opts: CsvOptions = {  }): String =>
   val delim = optDelimByte(opts)
   val sep = delimString(opts)
   if length(rows) == 0 then
@@ -397,7 +401,7 @@ val appendRecordRows = (records: Json, header: String[], rows: Json[], i: Int32,
 // @param opts     accepts `{ delimiter }`; the delimiter defaults to `,`.
 // @returns the CSV text (header line first), or "" for no records. Column order follows the
 //          record map's key-iteration order — deterministic, but not necessarily first-seen.
-export val stringifyRecords = (records: { String: String }[], opts: Json = {  }): String =>
+export val stringifyRecords = (records: { String: String }[], opts: CsvOptions = {  }): String =>
   val total = length(records)
   if total == 0 then
     ""
@@ -426,7 +430,7 @@ import foreign "lin-runtime"
 // @param src  the source byte stream (e.g. from `readStream`).
 // @param opts  accepts `{ delimiter, trim }`; the delimiter defaults to ",".
 // @returns a `Stream<String[]>` of rows.
-export val rows = (src: Stream<UInt8[]>, opts: Json = {  }): Stream<String[]> =>
+export val rows = (src: Stream<UInt8[]>, opts: CsvOptions = {  }): Stream<String[]> =>
   lin_stream_csv_rows(src, optDelimByte(opts))
 
 import foreign "lin-runtime"
@@ -438,5 +442,5 @@ import foreign "lin-runtime"
 // @param src  the source byte stream.
 // @param opts  accepts `{ delimiter, trim }`; the delimiter defaults to ",".
 // @returns a `Stream` yielding `{ String: String }` records.
-export val recordRows = (src: Stream<UInt8[]>, opts: Json = {  }): Stream =>
+export val recordRows = (src: Stream<UInt8[]>, opts: CsvOptions = {  }): Stream =>
   lin_stream_csv_records(src, optDelimByte(opts))

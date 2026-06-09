@@ -41,6 +41,16 @@ import foreign "lin-runtime"
   val lin_fs_touch: (String) => Json
   val lin_fs_realpath: (String) => Json
 
+// Option records for the filesystem operations. Every field is optional — an omitted key reads as
+// `Null` (the same as not passing it), so `{}` and a partial literal like `{ "recursive": true }`
+// are both accepted. Pass `null` (or, for `stat`, omit the argument) to take all defaults.
+export type StatOpts = { "follow": Boolean | Null }
+export type LsOpts = { "recursive": Boolean | Null }
+export type MkdirOpts = { "parents": Boolean | Null }
+export type RmOpts = { "recursive": Boolean | Null }
+export type WriteJsonOpts = { "compact": Boolean | Null }
+export type TempFileOpts = { "prefix": String | Null, "suffix": String | Null }
+
 // Read the entire contents of a file as a UTF-8 string.
 // @param path  the file to read.
 // @returns the file contents as a String, or an Error if it cannot be read.
@@ -81,7 +91,7 @@ export val readJson = (path: String): Json | Error =>
 // @param opts  accepts `{ compact }`; when true, output is minified rather than pretty-printed.
 // @returns Null on success, or an Error if the write fails.
 // @example writeJson("config.json", { "version": 2 }, { "compact": true })
-export val writeJson = (path: String, value: Json, opts: Json): Null | Error =>
+export val writeJson = (path: String, value: Json, opts: WriteJsonOpts | Null): Null | Error =>
   if opts == null then
     lin_fs_write_json(path, value)
   else if opts["compact"] == true then
@@ -117,7 +127,7 @@ export type FileStat = { "size": Int64, "modified": Int64, "created": Int64, "is
 //   itself rather than following it (equivalent to `lstat`).
 // @returns a `FileStat`, or an Error if the path cannot be read.
 // @example stat("main.lin")["size"]   // file size in bytes
-export val stat = (path: String, opts: Json = null): FileStat | Error =>
+export val stat = (path: String, opts: StatOpts | Null = null): FileStat | Error =>
   if opts == null then
     lin_fs_stat(path)
   else if opts["follow"] == false then
@@ -131,7 +141,7 @@ export val stat = (path: String, opts: Json = null): FileStat | Error =>
 // @returns an array of entry paths, or an Error if `path` cannot be read.
 // @example ls("src", {})                       // one level
 // @example ls("src", { "recursive": true })    // whole tree, relative paths
-export val ls = (path: String, opts: Json): String[] | Error =>
+export val ls = (path: String, opts: LsOpts | Null): String[] | Error =>
   if opts == null then
     lin_fs_list_dir(path)
   else if opts["recursive"] == true then
@@ -146,7 +156,7 @@ export val ls = (path: String, opts: Json): String[] | Error =>
 // @returns Null on success, or an Error (e.g. a missing parent without `parents`).
 // @example mkdir("output", {})
 // @example mkdir("output/reports/2024", { "parents": true })
-export val mkdir = (path: String, opts: Json): Null | Error =>
+export val mkdir = (path: String, opts: MkdirOpts | Null): Null | Error =>
   if opts == null then
     lin_fs_mkdir(path)
   else if opts["parents"] == true then
@@ -161,7 +171,7 @@ export val mkdir = (path: String, opts: Json): Null | Error =>
 // @returns Null on success, or an Error.
 // @example rm("temp.txt", {})
 // @example rm("build/", { "recursive": true })
-export val rm = (path: String, opts: Json): Null | Error =>
+export val rm = (path: String, opts: RmOpts | Null): Null | Error =>
   if opts == null then
     lin_fs_rm(path, 0)
   else if opts["recursive"] == true then
@@ -214,12 +224,14 @@ export val glob = (pattern: String): String[] | Error =>
 // it with `rm`); prefer withTempFile unless the file must outlive a single lexical scope.
 // @param opts  accepts `{ prefix, suffix }` to shape the generated name (e.g. a `.ext` suffix).
 // @returns the new file's absolute path, or an Error if it cannot be created.
-export val tempFile = (opts: Json): String | Error =>
+export val tempFile = (opts: TempFileOpts | Null): String | Error =>
   if opts == null then
     lin_fs_temp_file("", "")
   else
-    val prefix = if opts["prefix"] == null then "" else opts["prefix"]
-    val suffix = if opts["suffix"] == null then "" else opts["suffix"]
+    val p = opts["prefix"]
+    val s = opts["suffix"]
+    val prefix = if p is String then p else ""
+    val suffix = if s is String then s else ""
     lin_fs_temp_file(prefix, suffix)
 
 // Create a unique temp directory and return its absolute path. Performs no cleanup (delete it with
