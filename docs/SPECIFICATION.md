@@ -429,9 +429,16 @@ counts["apple"] = 3
 val n = counts["apple"]      // type: Int32 | Null
 ```
 
-The key type is `String` (the only key type in v1). `{ String: T }` reads "any number of string
-keys, each mapping to `T`". It is a distinct type from a fixed-field record `{ "f": T, … }`: a value
-is *either* a fixed record *or* an index-signature map, never both.
+The key type must be `String` — either written literally, or **named by a type alias that resolves
+to `String`** (e.g. `type StopID = String` then `{ StopID: T }`). The key is written as a bare
+identifier (not a quoted string — that is how the index-signature form is told apart from a fixed
+record), and that identifier is resolved as a type expression: any alias that unfolds to `String` is
+accepted, at any nesting depth and in any key position; an identifier that resolves to a non-`String`
+type is a compile-time error (`Map key type must be String, but it resolves to …`). The key type is
+preserved as-written so the formatter round-trips the alias name. `String` is the only *underlying*
+key type in v1. `{ String: T }` reads "any number of string keys, each mapping to `T`". It is a
+distinct type from a fixed-field record `{ "f": T, … }`: a value is *either* a fixed record *or* an
+index-signature map, never both.
 
 - `m[k]` yields `T | Null` (a missing key is `Null`, consistent with the §6.1 safe-bracket rule).
   For the *defaulted* read `m[k] ?? default` the idiomatic form is `object.get(m, k, default)`

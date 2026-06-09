@@ -1632,6 +1632,17 @@ Surface and checker rules:
   permits) — and it falls out for free: an `is`/`has` pattern parses only a `Pattern::TypeName`
   (a bare identifier), so `{ String: T }` is simply not spellable in pattern position.
 
+**Alias keys (follow-up).** The key position originally required the *literal* identifier `String`,
+hardcoded in the parser. This was relaxed so the key may be **any type alias that resolves to
+`String`** (`type StopID = String` ⇒ `{ StopID: T }`). The parser now recognises the index-signature
+form on *any* bare `Ident` followed by `:` (records use quoted-string keys, so the two forms stay
+disjoint) and parses the key as a full type-expr; `TypeExpr::IndexSig` carries that key type-expr
+(it was value-only before). The "key must be `String`" check **moved from parse time to resolution
+time** (`resolve.rs`), where aliases are expanded with the same cycle-visiting set — a key resolving
+to anything but `Type::Str` is `Map key type must be String, but it resolves to <T>`. The key
+type-expr is preserved (not collapsed to `String`) so the formatter round-trips the alias the user
+wrote. Underlying key type is still `String`-only; this is purely a spelling/aliasing convenience.
+
 **Backing-representation choice — a distinct `LinMap`, values boxed-but-hashed.** A separate
 container (rather than retrofitting a hash side-index onto `LinObject`, the #4b
 `hashed-json-object.md` route) **sidesteps the inline `MakeObject` codegen ABI constraint** entirely
