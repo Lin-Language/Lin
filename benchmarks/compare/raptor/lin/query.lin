@@ -21,13 +21,16 @@ val ONE_DAY = 86400
 // guard means the stop always has an arrival, so the `!= null` guard narrows the read.
 val getFoundStations = (kConnections: { String: { String: Conn } }, bestArrivals: { String: Int64 }): Json =>
   var origins: Json = {}
-  keys(kConnections).for(stop =>
-    if length(keys(kConnections[stop])) > 0 then
-      val best = bestArrivals[stop]
-      if best != null then
-        val v = best - ONE_DAY
-        origins[stop] = if v > 1i64 then v else 1i64
-  )
+  kConnections
+    .keys()
+    .for(stop =>
+      val conns = kConnections[stop]
+      if conns != null && conns.keys().length() > 0 then
+        val best = bestArrivals[stop]
+        if best != null then
+          val v = best - ONE_DAY
+          origins[stop] = if v > 1i64 then v else 1i64
+    )
   origins
 
 val mergeJourneys = (journeyA: Json, journeyB: Json): Json =>
@@ -56,7 +59,8 @@ val completeJourneys = (resultsFactoryConnections: { String: { String: Conn } },
 val getJourneysFromConnections = (kConnections: { String: { String: Conn } }, prevConnections: { String: { String: Conn } }[], destinations: Json): Json =>
   var initial: Json = []
   destinations.for(d =>
-    if length(keys(kConnections[d])) > 0 then
+    val conns = kConnections[d]
+    if conns != null && conns.keys().length() > 0 then
       getResults(kConnections, d).for(j => push(initial, j))
   )
   // reduce over reversed prevConnections

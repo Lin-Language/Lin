@@ -11,7 +11,7 @@ use crate::types::Type;
 /// A flow-narrowing derived from an `if`/`else` condition that is a type/null test on a simple
 /// identifier. Carries the binding's narrowed static type for each branch (or `None` when that
 /// branch does not tighten the type). See `Checker::null_test_narrowing`.
-struct NarrowTest {
+pub(crate) struct NarrowTest {
     name: String,
     then_ty: Option<Type>,
     else_ty: Option<Type>,
@@ -757,7 +757,7 @@ impl Checker {
     /// matched-member (`then` for `is`) narrowing fires whenever `X` is an exact member, which is
     /// the case the union/complement check already guarantees. Composes with — and does not replace
     /// — the existing `match`/`is` narrowing.
-    fn null_test_narrowing(&self, condition: &Expr) -> Option<NarrowTest> {
+    pub(crate) fn null_test_narrowing(&self, condition: &Expr) -> Option<NarrowTest> {
         // `x == null` / `x != null` against the `null` literal (either operand order).
         let (name, matched, then_gets_matched) = match condition {
             Expr::BinaryOp { left, op, right, .. }
@@ -814,7 +814,7 @@ impl Checker {
     /// original slot via `define_narrowed` so `LocalGet` reads the same TaggedVal pointer (the value
     /// is bit-identical — only the static type tightens). Must be called immediately after
     /// `push_scope` for the branch and undone by the matching `pop_scope`.
-    fn apply_null_narrowing(&mut self, narrowing: &Option<NarrowTest>, entering_then: bool) {
+    pub(crate) fn apply_null_narrowing(&mut self, narrowing: &Option<NarrowTest>, entering_then: bool) {
         if let Some(test) = narrowing {
             let narrowed_ty = if entering_then { &test.then_ty } else { &test.else_ty };
             if let Some(narrowed_ty) = narrowed_ty {
