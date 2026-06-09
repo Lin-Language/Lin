@@ -5689,10 +5689,22 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
     // registered as scope-owned (that would release once AFTER the loop, leaking per-iteration).
     let boxed = Type::TypeVar(u32::MAX);
     emit_index_loop(iterable, &iterable_ty, &read_elem_ty, builder, ctx, |i, elem, b, _| {
-        // The optional 0-based SOURCE index (`(item, i) => …`); narrowed Int64→Int32. Truncated
-        // away by `call_body_closure_with_elem_boxes` when the callback declares only `(item)`.
-        let idx = narrow_loop_index(i, b);
-        let (ret, elem_boxes) = call_body_closure_with_elem_boxes(body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &param_tys, &boxed, b);
+        // The optional 0-based SOURCE index (`(item, i) => …`); narrowed Int64→Int32 and, WHEN the
+        // callback actually declares it, BOXED in IR. The boxing matters for RC: the uniform closure
+        // ABI takes every arg as a `TaggedVal*`, so codegen would otherwise box this `Int32` itself — a
+        // fresh per-iteration box invisible to the IR and therefore never freed (the per-iteration
+        // index-box leak, ASan-confirmed ~16 B/iter independent of source representation). Boxing here
+        // makes it a tracked union temp that joins `elem_boxes` below and is reclaimed each iteration;
+        // codegen sees an already-boxed ptr and passes it through (no double-box). When the callback
+        // declares only `(item)` the index arg is truncated away by `call_body_closure_with_elem_boxes`,
+        // so we leave it a raw `Int32` (no orphan box to leak) — it is never passed.
+        let idx_raw = narrow_loop_index(i, b);
+        let (idx, idx_ty) = if param_tys.len() >= 2 {
+            (box_to_json(idx_raw, &Type::Int32, b), Type::TypeVar(u32::MAX))
+        } else {
+            (idx_raw, Type::Int32)
+        };
+        let (ret, elem_boxes) = call_body_closure_with_elem_boxes(body, &[(elem, elem_ty.clone()), (idx, idx_ty)], &param_tys, &boxed, b);
         // Release the callback-RETURN box (a fresh, independently-owned +1; `for` discards it).
         // This fully reclaims it (inner + shell). The callback CAN return (an alias of) the
         // element box — e.g. `x => x`, or `acc = f(acc, x)` where `f` yields its element — in which
@@ -5798,10 +5810,21 @@ fn lower_range_for(
     } else {
         let body = body.expect("non-inline range-for lowers the callback closure");
         // The callback receives `i` (Int32) as BOTH the element and the optional 0-based source index
-        // (for a range, element == index). `call_body_closure_with_elem_boxes` boxes `i` per the ABI and
-        // truncates the surplus index arg when the callback declares only `(item)`.
+        // (for a range, element == index). Box BOTH in IR up front: the uniform closure ABI takes every
+        // arg as a `TaggedVal*`, so codegen would otherwise box each raw `Int32` itself — fresh
+        // per-iteration boxes invisible to the IR and therefore never freed (the index-box leak; see
+        // the generic `for` path). Boxing here makes them tracked union temps that join `elem_boxes`
+        // and are reclaimed each iteration; codegen passes the already-boxed ptr through (no double-box).
+        // The index is only boxed/passed when the callback declares it (else it is truncated away — no
+        // orphan box to leak); the element box is always passed.
+        let json = Type::TypeVar(u32::MAX);
+        let elem_box = box_to_json(i, &Type::Int32, builder);
+        let mut raw_args = vec![(elem_box, json.clone())];
+        if param_tys.len() >= 2 {
+            raw_args.push((box_to_json(i, &Type::Int32, builder), json.clone()));
+        }
         let (ret, elem_boxes) = call_body_closure_with_elem_boxes(
-            body, &[(i, elem_ty.clone()), (i, Type::Int32)], param_tys, &boxed, builder,
+            body, &raw_args, param_tys, &boxed, builder,
         );
         // Release the callback-RETURN box, then reclaim each element box SHELL if distinct — identical
         // to the generic `for` path (see `lower_for` for the full rationale).
