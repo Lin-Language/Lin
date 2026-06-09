@@ -17214,6 +17214,15 @@ main()
     assert_eq!(output, vec!["4"]);
 }
 
+// Regression (Path 0): a `T | Null` value (T a record with a NESTED heap field) threaded through a
+// self-tail-recursive parameter must not be a use-after-free. The `else => scan(.., trip, ..)`
+// pass-through and the `if new != null then scan(.., new, ..)` arms both re-box a match-narrowed
+// concrete record into the `T | Null` union for the tail call; the resulting box must OWN its inner
+// (the threaded slot keeps it across the back-edge), so the caller-owned-shell box arg is retained
+// before `release_owned_for_tail_call` releases its source temp. Without the retain the box's inner
+// is freed out from under the next iteration (ASan: heap-use-after-free in lin_rc_retain inside the
+// recursive callee). This is the RAPTOR `scanRouteAt`/`Trip | Null` shape. Output 190000 verified
+// against the equivalent non-recursive evaluation and ASan-clean (leaks-on + leaks-off).
 #[test]
 fn test_union_record_nested_field_tail_recursive_param_no_uaf() {
     let output = run(r#"import { print } from "std/io"
