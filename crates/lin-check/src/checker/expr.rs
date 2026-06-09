@@ -277,10 +277,28 @@ impl Checker {
         }
 
         if !self.types_compatible(&actual_ty, expected) {
-            return Err(Diagnostic::error(
+            let mut diag = Diagnostic::error(
                 expr.span(),
                 format!("Expected type {}, got {}", expected, actual_ty),
-            ));
+            );
+            // Hint for the common slip of a SCALAR annotation on an ARRAY literal value
+            // (`val x: UInt8 = [1, 2, 3]`). The annotation describes one scalar but the value
+            // is an array; if the array's elements are compatible with the scalar, the user
+            // almost certainly meant to annotate the element type with `[]` (`UInt8[]`).
+            if let (Type::Array(elem_ty), true) =
+                (&actual_ty, expected.is_numeric() && matches!(expr, Expr::Array(..)))
+            {
+                // The element type is compatible with the scalar annotation either directly
+                // (`UInt8` ← `UInt8`) or via numeric family (the literal default `Int32` vs a
+                // narrower/unsigned `UInt8` annotation — same family, so `UInt8[]` is the fix).
+                if self.types_compatible(elem_ty, expected) || elem_ty.is_numeric() {
+                    diag = diag.with_help(format!(
+                        "did you mean `{0}[]`? (the value is an array; annotate the array element type with `[]`)",
+                        expected
+                    ));
+                }
+            }
+            return Err(diag);
         }
 
         if &actual_ty != expected && actual_ty.is_numeric() && expected.is_numeric() {
