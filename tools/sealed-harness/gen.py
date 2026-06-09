@@ -105,6 +105,20 @@ def op_map_field(s):
             f'  ds[0]\n')
     return body, lambda N: sum(range(N))
 
+def op_for_field(s):
+    # PATH-1 in-place packed iteration: `for` over a packed T[] reading a scalar field each
+    # iteration into a captured `var`. Exercises the const-offset packed-element read path
+    # (`try_lower_packed_elem_field`) AND its per-iteration RC (the element is NOT materialized, so
+    # there must be NO per-iteration leak — a sound in-place read allocates nothing per element).
+    lit, read = s[1], s[2]
+    body = (f'  var ts: T[] = []\n'
+            f'  push(ts, {lit("i")})\n'
+            f'  push(ts, {lit("0")})\n'
+            f'  var acc: Int32 = 0\n'
+            f'  ts.for(p => acc = acc + {read("p")})\n'
+            f'  acc\n')   # i + 0 == i
+    return body, lambda N: sum(range(N))
+
 OPS = {
     "build_read": op_build_read,
     "factory_return": op_factory_return,
@@ -114,6 +128,7 @@ OPS = {
     "array_drop": op_array_drop,
     "tail_thread": op_tail_thread,
     "map_field": op_map_field,
+    "for_field": op_for_field,
 }
 
 def main():
