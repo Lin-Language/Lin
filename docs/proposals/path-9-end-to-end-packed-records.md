@@ -182,3 +182,39 @@ With 9C in place, widening `is_sealed_array_field_packable` to `Str|StrLit` (typ
 
 ### Net (this line)
 Heap-field **String** packing is shippable-quality end-to-end on `perf/path9a-widen-on-9c`: blocker fixed, all hard gates green, the linear-scan→const-offset mechanism verified. The remaining work to the **headline** win is **9-D** (retype RAPTOR's `Json` trips → `Trip`) + cleaning up the two inherited pre-existing leaks (one already fixed on the 8.1 branch). The repr-oracle blocker that stalled this path for weeks is solved; the producer/consumer asymmetry is solved; what's left is plumbing (typed RAPTOR source) and pre-existing leak cleanup, not a new design problem.
+
+---
+
+## ✅ RESULTS 2026-06-09 (second exploration line) — 9D MEASURED the end-to-end thread + the 9C-branch reconciliation (all UNMERGED)
+
+A parallel exploration line (branch lineage `perf/path9c-face2` → `perf/path9c-nested-materializer` → `perf/path9d-measure`) carried the end-to-end thread to a **measured verdict** and reconciled the competing 9C branches. This refines — and in one place corrects the *root-cause* attribution of — the "not-yet-a-win" status above.
+
+### 9-D — end-to-end RAPTOR retype: MEASURED, REGRESSES catastrophically, **confirms the all-or-nothing thesis AND locates the precise remaining blocker**
+`perf/path9d-measure` (head `15a5fbab`, off the full-retype `perf/path9-raptor-payoff`, current master merged). Trips typed end-to-end (`createRaptor(tripsIn: Trip[])`, `tripsByRoute: { String: Trip[] }`, scan path threaded with a concrete `Trip` + a `Boolean hasTrip` deliberately avoiding the boxed `Trip|Null` union, `Service.days/dates: { String: Boolean }` to make `Trip` packable, loader reached).
+- **Correct** — 9/9 RAPTOR `.test.lin`, `run.lin` prints the right journey, 696 integration + 72/72 lin green; the `Json` baseline (same compiler) reproduces the digest **byte-identical** `group=26203913 range=773022892 journeys=139`.
+- **Performance: CATASTROPHIC regression — the query phase ran 16+ min CPU at 25 GB RSS and *did not complete*** (baseline finishes ~7.5 min at 2.4 GB; killed). Wall-clock A/B was therefore *infeasible* (typed never completes) — reported as a non-completion, not a median.
+- **Mechanism SPLIT (the diagnostic):** static `lin_object_get` per hot fn, Json → typed:
+  - concrete-`Trip`-**param** fns WIN: `scanRouteAt` 6→2, `getRouteId` 4→0, `indexRoute` 6→4 (const-offset reads).
+  - **map-READ** fns REGRESS: `getTrip` 7→**28** (+2 `sealed_array_to_tagged`), `scanBack` 8→**13** (+a new `lin_sealed_array_alloc`+push).
+- **ROOT CAUSE precisely located — the `{ String: Trip[] }` MAP-VALUE seam** (this path's Prereq #3/#4, NOT closed): `routeTrips = get(scanner["tripsByRoute"], routeId)` reads a `Trip[]` out of a **boxed** map, so `routeTrips[i]["stopTimes"][k]` **materializes the entire `StopTime[]` per access** (a `lin_sealed_array_alloc` + per-element push loop) inside the *innermost backward-scan loop* — O(stopTimes) work + a leaked array every step. This is the exact H5/H9 materialize-on-read regression, now pinned to the map boundary rather than vaguely "construction." Functions reading a `Trip` *param* got the genuine const-offset win; functions reading trips *out of the map* regress and dominate.
+- **This is a *refinement* of the `perf/path9-raptor-payoff` "gated on a drop-walk codegen fix + boxed `Trip|Null` construction" note above:** the dominant cost is not the drop-walk or the union construction per se — it is the **per-access whole-array materialize at the boxed-map-value read** in the hottest loop. ASan: leak-only, linear-scaling, ~7× amplified by the per-read materialize, **no new mem-safety class**.
+- **VERDICT: CONFIRMS all-or-nothing.** The concrete-param win is real but swamped by the map-read regression; leaving the map value boxed reintroduces the materialize boundary exactly as the thesis predicted.
+
+### The remaining blocker → **Path 9-E: extend `BoxKeepPacked` to MAP VALUES**
+The single thing between current capability and RAPTOR's win: a `Trip[]` read out of a boxed `{ String: Trip[] }` map must be a **borrowed const-offset packed** read, not materialize-per-access — i.e. extend the `BoxKeepPacked` direction (see `project_repr_pass` / ADR-062) from record fields to **map values**. 9-B/9-C/9-A covered record fields and the worker boundary; **none covered map values.** Until that lands, no end-to-end RAPTOR thread can avoid the regression — this is now the well-scoped next move, not a new design problem.
+
+### 9C-branch reconciliation — the two competing 9C implementations: use `perf/path9c-face2`, do NOT merge the seal-propagation branch on top of it
+Two branches fix the **same** nested-all-scalar sealed-record-array corruption (`outer["items"][0]["a"]`: master `7 7 0 7 0` garbage → both `7 11 22 33 44` correct) at **different layers** — verified by running both repros on both branches:
+- **`perf/path9c-face2`** (codegen + repr): makes `compile_ir_sealed_array_field_get` **repr-adaptive** (runtime `elem_tag` dispatch: 0xFE→const-offset, else boxed) + projects boxed→packed in `unbox_value` + **widens the gate to String**. Fixes the corruption on the **read side** (boxed-tolerant).
+- **`perf/path9c-seal-propagation`** (checker only): seal-propagates the producer literal so it builds packed to match the consumer; **gate stays scalar+Bool**. Fixes the corruption on the **write side**.
+- Each is green **alone** (face-2 690/0, seal-prop 696/0; both pass the RAPTOR tail-recursive UAF regression test → `190000`). They cherry-pick cleanly — **but the COMBINATION IS UNSOUND:** the combined build crashes `test_union_record_nested_field_tail_recursive_param_no_uaf` (misaligned deref `0xa` at `object.rs:218`). Mechanism: face-2's String-gate widen makes `StopTime{stop:String,…}` packable → seal-propagation then auto-seals the producer to a **packed** nested array → the `Trip|Null` union-box + tail-recursive re-box path can't handle a packed nested heap-field array → crash. (This is *exactly* what the seal-propagation commit message predicted would happen once the gate widens.)
+- **RECOMMENDATION:** base **9-E / the RAPTOR thread on `perf/path9c-face2`** — it already widens the gate and carries the repr-adaptive read path 9-E needs, and stays sound under widening because its reads are repr-adaptive rather than producer-contingent. The seal-propagation branch's producer-symmetry is worth landing **only** for its corruption fix in isolation, or later once codegen handles packed nested arrays through the union-box + TCO re-box path (the same codegen work as face-2's still-open `sealed_array_rebuild_from_boxed` large-array defect — a packed scalar `{a:Int32}` threaded repeatedly through a generic indirect call at N≳realloc size silently yields `0`). **Do not naively merge the two** — it reintroduces the `Trip|Null` tail-recursive nested-heap-field UAF.
+
+### Branch map (this line, all UNMERGED, off master; durable handles)
+| Branch | Carries | Status |
+|---|---|---|
+| `perf/path9a-cheap-typed-reads` | cheap borrowed heap-field read (9-A capability), gate dormant scalar+Bool | verified, dormant |
+| `perf/raptor-dict-on-json-typing` | dict→Map (`routeScanPosition` memo), 783 k dict reads→`map_get` | digest-identical, fidelity (not a measurable speedup) |
+| `perf/path9c-face2` | repr-adaptive reads + boxed→packed projection + **String gate** + nested-array materializer fix | the recommended 9-E base |
+| `perf/path9c-seal-propagation` | checker-only producer seal-propagation, gate scalar+Bool | green alone; land for corruption fix only, NOT on top of face-2 |
+| `perf/path9d-measure` | full RAPTOR retype + the measured regression + NOTES | the verdict + the located map-value blocker |
