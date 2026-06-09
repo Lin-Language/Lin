@@ -294,6 +294,12 @@ fn collect_subs(pattern: &Type, actual: &Type, subs: &mut HashMap<u32, Type>) {
         (Type::Array(p), Type::FixedArray(ats)) => {
             for a in ats { collect_subs(p, a, subs); }
         }
+        // Positional tuple unification (`[String, T]` vs `[String, Int32]`) — the type parameter is
+        // nested inside a fixed-array (tuple) shape, as in `fromEntries(pairs: [String, T][])`.
+        // Mirrors the `FixedArray` arm in lin-check's `collect_type_subs`.
+        (Type::FixedArray(ps), Type::FixedArray(ats)) => {
+            for (p, a) in ps.iter().zip(ats.iter()) { collect_subs(p, a, subs); }
+        }
         // A generic `T[]` (or `Iterator<T>`) param unified against a `Json` value (the MAX
         // wildcard) — e.g. a stdlib fn calling a sibling generic on its own `Json` param. Bind
         // the element TypeVar(s) to the Json wildcard so the specialization is keyed at the

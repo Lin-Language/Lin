@@ -617,6 +617,15 @@ val s = suite("std/array", [
     ]
   ),
 
+  test("min/max preserve heap (String) elements", () =>
+    val lo = ["pear", "fig", "apple"].min()
+    val hi = ["pear", "fig", "apple"].max()
+    [
+      expect(lo).toBe("apple"),
+      expect(hi).toBe("pear")
+    ]
+  ),
+
   test("minBy returns element with smallest key", () =>
     val result = [{ "n": 3 }, { "n": 1 }, { "n": 2 }].minBy(x => x["n"])
     [

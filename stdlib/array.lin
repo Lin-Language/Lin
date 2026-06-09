@@ -21,7 +21,7 @@ import foreign "lin-runtime"
 // functions below that need them internally (reverse/partition/zip/unique/chunk/sort/scan/groupBy/
 // countBy) import them back here. std/array is the HIGHER-LEVEL module: std/iter must NOT import
 // from std/array (avoids an array->iter->array import cycle).
-import { for, take, concat } from "std/iter"
+import { for, take, concat, reduce } from "std/iter"
 
 // Append `item` to the end of `arr`, mutating it in place. The primitive for building up an
 // accumulator (`val acc: Int32[] = []; xs.for(x => acc.push(x))`).
@@ -479,17 +479,14 @@ export val product = (arr: Json[]): Json =>
 // Find the smallest element of `arr` by natural `<` ordering.
 // @param arr  a non-empty array of comparable elements.
 // @returns the minimum element.
-export val min = (arr: Json[]): Json =>
-  // Not generic: a concrete `T` monomorphization corrupts heap (String/Array) elements through the
-  // fold, returning a blank value instead of the real element.
-  _reduceJ(arr, arr[0], (acc, x) => if x < acc then x else acc)
+export val min = <T>(arr: T[]): T =>
+  arr.reduce(arr[0], (acc, x) => if x < acc then x else acc)
 
 // Find the largest element of `arr` by natural `>` ordering.
 // @param arr  a non-empty array of comparable elements.
 // @returns the maximum element.
-export val max = (arr: Json[]): Json =>
-  // Not generic, for the same heap-element reason as `min`.
-  _reduceJ(arr, arr[0], (acc, x) => if x > acc then x else acc)
+export val max = <T>(arr: T[]): T =>
+  arr.reduce(arr[0], (acc, x) => if x > acc then x else acc)
 
 // Find the element with the smallest key under `keyFn`.
 // @param arr    a non-empty array.
