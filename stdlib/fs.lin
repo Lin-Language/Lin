@@ -6,7 +6,7 @@
 // ls, mkdir, rm, and writeJson selects a variant via keys such as `{ recursive }`, `{ parents }`,
 // or `{ compact }`. For incremental reads, openRead returns a lazy byte stream.
 //
-// import { readFile, writeFile, readJson, ls, mkdir, exists, isFile, isDir } from "std/fs"
+//   import { readFile, writeFile, readJson, ls, mkdir, exists, isFile, isDir } from "std/fs"
 import foreign "lin-runtime"
   val lin_fs_read_file: (String) => Json
   val lin_fs_write_file: (String, String) => Json

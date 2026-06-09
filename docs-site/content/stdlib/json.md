@@ -1,17 +1,15 @@
 # std/json
 
-std/json — type-directed JSON decoding (ADR-031).
+std/json — type-directed JSON decoding.
 
-`fromJson` is a compiler special form: the type checker recognises the surface name
-`fromJson` at the call site (in both the `Person.fromJson(json)` dot form and the
-`fromJson(Person, json)` direct form) and decodes the Json value against the target type T,
-returning `T | Error`. Decoding stops at the first structural mismatch and returns a single
-Error value: { "type": "error", "message": String, "path": String } (the `path` is a
-JSONPath-ish location such as `$.address.city`).
+`fromJson` decodes a Json value against a target type T, written either as `Person.fromJson(json)`
+or `fromJson(Person, json)`, and returns `T | Error`. Decoding stops at the first structural
+mismatch and returns a single Error value: { "type": "error", "message": String, "path": String },
+where `path` is a JSONPath-style location such as `$.address.city`.
 
-Number policy is target-driven: an integer target requires an in-range integral number; a
-float target accepts any number; a Json/unconstrained target accepts any number as-is.
-Union targets pick the FIRST structurally-matching variant.
+Number handling is driven by the target: an integer target requires an in-range integral number,
+a float target accepts any number, and a Json or unconstrained target accepts any number as-is.
+Union targets pick the first structurally-matching variant.
 
 ## Reference
 
@@ -21,14 +19,12 @@ Union targets pick the FIRST structurally-matching variant.
 val fromJson = (_: Json, value: Json): Json
 ```
 
-Decode a Json value against a target type (compiler special form; see the module header).
-- **`_`** — the target TYPE (e.g. `Person`); use the `Person.fromJson(json)` or
-  `fromJson(Person, json)` form. No ordinary value-level wrapper can express a type argument.
+Decode a Json value against a target type (see the module header).
+- **`_`** — the target type (e.g. `Person`); use the `Person.fromJson(json)` or
+  `fromJson(Person, json)` form.
 - **`value`** — the Json value to decode.
 - **Returns** the decoded `T`, or an `Error` `{ type, message, path }` at the first structural
-  mismatch. (The export exists so the import resolves and `lin check` does not flag `fromJson`;
-  its body is never evaluated — the checker rewrites real call sites into the decode special
-  form.)
+  mismatch.
 
 #### `toJsonString`
 
@@ -50,4 +46,9 @@ Recursively serialize ANY Lin value to a strict, valid JSON string.
 - **`value`** — the value to serialize; arrays and objects recurse arbitrarily deep.
 - **Returns** the JSON text. Strings (and object keys) are escaped+quoted; numbers/bools/null become
   JSON literals (non-finite floats become `null`, matching JSON.stringify).
-- **Example:** toJson({ "a": 1, "b": [true, null] })  // {"a":1,"b":[true,null]}
+
+**Example:**
+
+```lin
+toJson({ "a": 1, "b": [true, null] })  // {"a":1,"b":[true,null]}
+```

@@ -2,18 +2,16 @@
 
 std/bignum — arbitrary-precision signed integers.
 
-A `BigInt` is an opaque, immutable, refcounted heap handle (the Timer/Stream/Shared family),
-backed by `num-bigint` in the runtime. It has no size limit other than memory; every operation
-returns a fresh `BigInt`. With no operator overloading, arithmetic is written with named
-functions and reads left-to-right via dot-application: `a.mul(x).add(b)`.
+A `BigInt` is an opaque, immutable, refcounted heap value. It has no size limit other than
+available memory, and every operation returns a fresh `BigInt`. There is no operator
+overloading, so arithmetic is written with named functions and reads left-to-right via
+dot-application: `a.mul(x).add(b)`.
 
-`BigInt` is a type alias to `Json` because the value is carried as a universal opaque tagged
-box — the runtime tags it `TAG_BIGNUM` so its refcount/destructor are dispatched correctly.
-Fallible functions return `BigInt | Error` (the canonical `{ "type":"error", "message" }`,
-matched with `is Error`).
+Fallible functions return `BigInt | Error`, where the error is the canonical
+`{ "type": "error", "message" }` shape matched with `is Error`.
 
-NOTE: cross-worker transfer of a BigInt is NOT supported in v1 (the handle is a raw pointer that
-cannot be shared across a thread boundary); bignum math is main-thread.
+A BigInt cannot be transferred across workers: the handle is a pointer that cannot be shared
+across a thread boundary, so bignum math runs on the main thread.
 
 ## Reference
 
@@ -45,7 +43,12 @@ val parseBigInt = (s: String): BigInt | Error
 Parse a base-10 integer string of any length into a `BigInt`.
 - **`s`** — the decimal string (optional leading `-`).
 - **Returns** the `BigInt`, or an `Error` if `s` is not a valid integer.
-- **Example:** parseBigInt("2").pow(100).toString()  // "1267650600228229401496703205376"
+
+**Example:**
+
+```lin
+parseBigInt("2").pow(100).toString()  // "1267650600228229401496703205376"
+```
 
 #### `zero`
 

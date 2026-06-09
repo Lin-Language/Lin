@@ -7,7 +7,9 @@ which mutate in place. This module also carries the sorted-array search layer (b
 lowerBound/upperBound, insertSorted, countInRange) and the keyed aggregators (sortBy, minBy,
 maxBy, groupBy, countBy).
 
+```lin
 import { sort, sortBy, length, push, slice, sum } from "std/array"
+```
 
 The iterable combinators (map, filter, reduce, for, while, take, drop, find, some, every,
 flatMap, takeWhile, dropWhile, flatten, concat) and the iterator constructors (range, rangeStep,
@@ -27,7 +29,12 @@ accumulator (`val acc: Int32[] = []; xs.for(x => acc.push(x))`).
 - **`arr`** — the array to mutate; its element type pins `T` for element checking.
 - **`item`** — the element to append; must be assignable to `T` (`push(intArr, "s")` is a compile error).
 - **Returns** `null`.
-- **Example:** val xs: Int32[] = []; xs.push(1); xs.push(2)   // xs: [1, 2]
+
+**Example:**
+
+```lin
+val xs: Int32[] = []; xs.push(1); xs.push(2)   // xs: [1, 2]
+```
 
 #### `slice`
 
@@ -41,10 +48,30 @@ yields a `UInt8[]`, an `Int32[]` an `Int32[]`, a `Json[]` a `Json[]`).
 - **`start`** — start index (inclusive); negative counts from the end; clamped to `[0, length]`.
 - **`end`** — end index (exclusive); defaults to `length(arr)`; negative counts from the end; clamped to `[0, length]`.
 - **Returns** a new `T[]` holding the selected elements.
-- **Example:** [10, 20, 30, 40, 50].slice(1, 4)   // [20, 30, 40]
-- **Example:** [1, 2, 3, 4, 5].slice(1)           // [2, 3, 4, 5]  (omitted end -> length)
-- **Example:** [1, 2, 3, 4, 5].slice(1, -1)       // [2, 3, 4]
-- **Example:** [1, 2, 3, 4, 5].slice(-2)          // [4, 5]
+
+**Example:**
+
+```lin
+[10, 20, 30, 40, 50].slice(1, 4)   // [20, 30, 40]
+```
+
+**Example:**
+
+```lin
+[1, 2, 3, 4, 5].slice(1)           // [2, 3, 4, 5]  (omitted end -> length)
+```
+
+**Example:**
+
+```lin
+[1, 2, 3, 4, 5].slice(1, -1)       // [2, 3, 4]
+```
+
+**Example:**
+
+```lin
+[1, 2, 3, 4, 5].slice(-2)          // [4, 5]
+```
 
 #### `arrayAllocate`
 
@@ -64,8 +91,8 @@ val arrayAllocateFilled = <T>(n: Int32, fill: T): T[]
 ```
 
 Allocate a length-`n` array with every slot set to `fill`. The element type is inferred from
-`fill`, so codegen allocates a FLAT unboxed array for a concrete scalar (`Int32[]`, `Float64[]`,
-…) and a tagged array otherwise; untyped use (`arrayAllocateFilled(n, 0)`) needs no annotation.
+`fill`, so a concrete scalar (`Int32[]`, `Float64[]`, …) yields a flat unboxed array and anything
+else a tagged array; untyped use (`arrayAllocateFilled(n, 0)`) needs no annotation.
 - **`n`** — the length of the array to allocate.
 - **`fill`** — the value placed in every slot; pins the element type `T`.
 - **Returns** a `T[]` of length `n` with every element equal to `fill`.
@@ -79,9 +106,24 @@ val length = (x: Json): Int32
 The number of elements in an array (or characters/entries in a string/object).
 - **`x`** — any array, string, or object.
 - **Returns** the element/character/entry count as an `Int32`.
-- **Example:** length([1, 2, 3])     // 3
-- **Example:** length("hello")       // 5
-- **Example:** length({ "a": 1 })    // 1
+
+**Example:**
+
+```lin
+length([1, 2, 3])     // 3
+```
+
+**Example:**
+
+```lin
+length("hello")       // 5
+```
+
+**Example:**
+
+```lin
+length({ "a": 1 })    // 1
+```
 
 #### `indexOf`
 
@@ -94,9 +136,24 @@ Find the index of the first element equal to `target` (deep `==`), scanning left
 - **`target`** — the value to look for; must be assignable to the element type `T`.
 - **`fromIndex`** — index to start from (default `0`); negative counts from the end.
 - **Returns** the index of the first match at or after `fromIndex`, or `-1` if none.
-- **Example:** [10, 20, 30].indexOf(20)     // 1
-- **Example:** [1, 2, 1, 2].indexOf(2, 2)   // 3
-- **Example:** [1, 2, 1, 2].indexOf(1, -1)  // -1   (search starts at index 3)
+
+**Example:**
+
+```lin
+[10, 20, 30].indexOf(20)     // 1
+```
+
+**Example:**
+
+```lin
+[1, 2, 1, 2].indexOf(2, 2)   // 3
+```
+
+**Example:**
+
+```lin
+[1, 2, 1, 2].indexOf(1, -1)  // -1   (search starts at index 3)
+```
 
 #### `reverse`
 
@@ -136,23 +193,53 @@ and the default never pollutes the element type. Subsumes the old `at`/`atOr` pa
 - **`index`** — the index; negative counts from the end.
 - **`default`** — value returned when `index` is out of bounds; defaults to `null`, pinning `D`.
 - **Returns** the element at `index`, or `default` (typed `T | D`) when out of bounds.
-- **Example:** [10, 20, 30].at(0)         // 10
-- **Example:** [10, 20, 30].at(-1)        // 30   (negative wraps)
-- **Example:** [].at(0)                   // null               (omitted default -> T | Null)
-- **Example:** [10, 20, 30].at(5, -1)     // -1   (out of bounds -> default)
-- **Example:** [10, 20, 30].at(9, "n/a")  // "n/a"              (independent default type -> Int32 | String)
+
+**Example:**
+
+```lin
+[10, 20, 30].at(0)         // 10
+```
+
+**Example:**
+
+```lin
+[10, 20, 30].at(-1)        // 30   (negative wraps)
+```
+
+**Example:**
+
+```lin
+[].at(0)                   // null               (omitted default -> T | Null)
+```
+
+**Example:**
+
+```lin
+[10, 20, 30].at(5, -1)     // -1   (out of bounds -> default)
+```
+
+**Example:**
+
+```lin
+[10, 20, 30].at(9, "n/a")  // "n/a"              (independent default type -> Int32 | String)
+```
 
 #### `partition`
 
 ```lin
-val partition = <T>(arr: T[], f: (T, Int32)
+val partition = <T>(arr: T[], f: (T, Int32) => Boolean): T[][]
 ```
 
 Split `arr` into the elements that satisfy `f` and those that do not, in source order.
 - **`arr`** — the array to partition.
 - **`f`** — predicate `(item, index?) => Boolean`; the trailing 0-based `Int32` index is optional.
 - **Returns** a 2-element array `[pass, fail]`, each a `T[]` (`result[0]` = matches, `result[1]` = the rest).
-- **Example:** val [evens, odds] = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)   // evens: [2, 4], odds: [1, 3, 5]
+
+**Example:**
+
+```lin
+val [evens, odds] = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)   // evens: [2, 4], odds: [1, 3, 5]
+```
 
 #### `zip`
 
@@ -190,30 +277,35 @@ Split `arr` into consecutive sub-arrays of at most `size` elements (the last may
 #### `compact`
 
 ```lin
-val compact = (arr: Json): Json
+val compact = <T>(arr: (T | Null)[]): T[]
 ```
 
 Return a new array with all `null` elements removed.
-- **`arr`** — any array (typed `Json` so it accepts any element type).
-- **Returns** a new array of the non-null elements, in source order.
+- **`arr`** — an array of `T | Null`.
+- **Returns** a new `T[]` of the non-null elements, in source order.
 
 #### `sort`
 
 ```lin
-val sort = <T>(arr: T[], cmp: (T, T)
+val sort = <T>(arr: T[], cmp: (T, T) => Int32): T[]
 ```
 
-STABLE, O(n log n) sort (bottom-up merge sort, O(n) extra space). Equal elements keep their
+Stable, O(n log n) sort (bottom-up merge sort, O(n) extra space). Equal elements keep their
 original input order, and it scales to large inputs. Does not mutate `arr`.
 - **`arr`** — the array to sort.
 - **`cmp`** — comparator `(a, b) => Int32`: negative if `a` sorts before `b`, positive if after, 0 if equal.
 - **Returns** a new sorted `T[]`; ties retain their original relative order.
-- **Example:** [3, 1, 4, 1, 5].sort((a, b) => a - b)   // [1, 1, 3, 4, 5]
+
+**Example:**
+
+```lin
+[3, 1, 4, 1, 5].sort((a, b) => a - b)   // [1, 1, 3, 4, 5]
+```
 
 #### `sortBy`
 
 ```lin
-val sortBy = <T>(arr: T[], keyFn: (T)
+val sortBy = <T>(arr: T[], keyFn: (T) => Json): T[]
 ```
 
 Stably sort `arr` by a key extracted from each element, comparing keys with Lin's natural
@@ -221,19 +313,24 @@ Stably sort `arr` by a key extracted from each element, comparing keys with Lin'
 - **`arr`** — the array to sort.
 - **`keyFn`** — maps an element to its (comparable `Json`) sort key; must accept the element type `T`.
 - **Returns** a new `T[]` sorted ascending by key, ties in original order.
-- **Example:** people.sortBy(p => p["name"])
+
+**Example:**
+
+```lin
+people.sortBy(p => p["name"])
+```
 
 ### Sortedarray search layer (binary search / bounds / sortedinsert)
 
 #### `lowerBound`
 
 ```lin
-val lowerBound = <T>(arr: T[], target: T, compare: (T, T)
+val lowerBound = <T>(arr: T[], target: T, compare: (T, T) => Int32): Int32
 ```
 
 Leftmost insertion index: the first `i` with `compare(arr[i], target) >= 0`. If `target` is
 present this is the index of its first occurrence; if absent it is the gap before the first
-greater element. O(log n) (Python's `bisect_left` / C++ `lower_bound`). PRECONDITION: `arr` sorted by `compare`.
+greater element. O(log n) (Python's `bisect_left` / C++ `lower_bound`). Precondition: `arr` is sorted by `compare`.
 - **`arr`** — a sorted array.
 - **`target`** — the value to locate.
 - **`compare`** — the same comparator `arr` is sorted by.
@@ -242,12 +339,12 @@ greater element. O(log n) (Python's `bisect_left` / C++ `lower_bound`). PRECONDI
 #### `upperBound`
 
 ```lin
-val upperBound = <T>(arr: T[], target: T, compare: (T, T)
+val upperBound = <T>(arr: T[], target: T, compare: (T, T) => Int32): Int32
 ```
 
 Rightmost insertion index: the first `i` with `compare(arr[i], target) > 0`. If `target` is
 present this is one past its last occurrence, so `upperBound - lowerBound` is its occurrence count.
-O(log n) (Python's `bisect_right` / C++ `upper_bound`). PRECONDITION: `arr` sorted by `compare`.
+O(log n) (Python's `bisect_right` / C++ `upper_bound`). Precondition: `arr` is sorted by `compare`.
 - **`arr`** — a sorted array.
 - **`target`** — the value to locate.
 - **`compare`** — the same comparator `arr` is sorted by.
@@ -256,7 +353,7 @@ O(log n) (Python's `bisect_right` / C++ `upper_bound`). PRECONDITION: `arr` sort
 #### `bisectLeft`
 
 ```lin
-val bisectLeft = <T>(arr: T[], target: T, compare: (T, T)
+val bisectLeft = <T>(arr: T[], target: T, compare: (T, T) => Int32): Int32
 ```
 
 Alias of `lowerBound`, named for readers coming from Python's `bisect`.
@@ -265,7 +362,7 @@ Alias of `lowerBound`, named for readers coming from Python's `bisect`.
 #### `bisectRight`
 
 ```lin
-val bisectRight = <T>(arr: T[], target: T, compare: (T, T)
+val bisectRight = <T>(arr: T[], target: T, compare: (T, T) => Int32): Int32
 ```
 
 Alias of `upperBound`, named for readers coming from Python's `bisect`.
@@ -274,10 +371,10 @@ Alias of `upperBound`, named for readers coming from Python's `bisect`.
 #### `binarySearch`
 
 ```lin
-val binarySearch = <T>(arr: T[], target: T, compare: (T, T)
+val binarySearch = <T>(arr: T[], target: T, compare: (T, T) => Int32): { "found": Boolean, "index": Int32 }
 ```
 
-Binary search a sorted array for `target`. O(log n). PRECONDITION: `arr` sorted by `compare`.
+Binary search a sorted array for `target`. O(log n). Precondition: `arr` is sorted by `compare`.
 - **`arr`** — a sorted array.
 - **`target`** — the value to find.
 - **`compare`** — the same comparator `arr` is sorted by (negative if a before b, positive if after, 0 if equal).
@@ -287,12 +384,12 @@ Binary search a sorted array for `target`. O(log n). PRECONDITION: `arr` sorted 
 #### `searchBy`
 
 ```lin
-val searchBy = <T>(arr: T[], key: Json, f: (T)
+val searchBy = <T>(arr: T[], key: Json, f: (T) => Json): { "found": Boolean, "index": Int32 }
 ```
 
 Key-extractor variant of `binarySearch`, mirroring `sortBy`: search an array sorted by `f`'s key
 for the element whose key equals `key` (keys compared by natural `<`/`>`, as `sortBy` uses, so
-`arr.sortBy(f)` then `arr.searchBy(k, f)` are a matched pair). O(log n). PRECONDITION: `arr` sorted by `f`'s key.
+`arr.sortBy(f)` then `arr.searchBy(k, f)` are a matched pair). O(log n). Precondition: `arr` is sorted by `f`'s key.
 - **`arr`** — the array, sorted by `f`'s key.
 - **`key`** — the comparable key value to find.
 - **`f`** — the same key extractor `arr` was sorted by.
@@ -301,13 +398,13 @@ for the element whose key equals `key` (keys compared by natural `<`/`>`, as `so
 #### `insertSorted`
 
 ```lin
-val insertSorted = <T>(arr: T[], item: T, compare: (T, T)
+val insertSorted = <T>(arr: T[], item: T, compare: (T, T) => Int32): T[]
 ```
 
 Return a new array with `item` inserted into the sorted `arr` at `lowerBound(arr, item)`, before
 any existing equal elements (a stable left-insert, matching Python's `insort_left`). Does not
 modify `arr`. O(log n) to find the position + O(n) to build the result. Repeated `insertSorted`
-maintains a running sorted collection without a full re-sort. PRECONDITION: `arr` sorted by `compare`.
+maintains a running sorted collection without a full re-sort. Precondition: `arr` is sorted by `compare`.
 - **`arr`** — the sorted array.
 - **`item`** — the element to insert.
 - **`compare`** — the same comparator `arr` is sorted by.
@@ -316,12 +413,12 @@ maintains a running sorted collection without a full re-sort. PRECONDITION: `arr
 #### `countInRange`
 
 ```lin
-val countInRange = <T>(arr: T[], lo: T, hi: T, compare: (T, T)
+val countInRange = <T>(arr: T[], lo: T, hi: T, compare: (T, T) => Int32): Int32
 ```
 
 Count the elements of the sorted `arr` in the half-open range [lo, hi) — those `x` with
 `compare(x, lo) >= 0` and `compare(x, hi) < 0`. O(log n), not a scan. A common analytics
-primitive (histogram buckets, "values between X and Y"). PRECONDITION: `arr` sorted by `compare`.
+primitive (histogram buckets, "values between X and Y"). Precondition: `arr` is sorted by `compare`.
 - **`arr`** — the sorted array.
 - **`lo`** — inclusive lower bound.
 - **`hi`** — exclusive upper bound.
@@ -331,47 +428,47 @@ primitive (histogram buckets, "values between X and Y"). PRECONDITION: `arr` sor
 #### `sum`
 
 ```lin
-val sum = (arr: Json[]): Json
+val sum = <T>(arr: T[]): T
 ```
 
 Sum the elements of `arr`.
-- **`arr`** — an array of numeric `Json` values.
+- **`arr`** — an array of numeric elements.
 - **Returns** the sum (`0` for an empty array).
 
 #### `product`
 
 ```lin
-val product = (arr: Json[]): Json
+val product = <T>(arr: T[]): T
 ```
 
 Multiply the elements of `arr` together.
-- **`arr`** — an array of numeric `Json` values.
+- **`arr`** — an array of numeric elements.
 - **Returns** the product (`1` for an empty array).
 
 #### `min`
 
 ```lin
-val min = (arr: Json[]): Json
+val min = <T>(arr: T[]): T
 ```
 
 Find the smallest element of `arr` by natural `<` ordering.
-- **`arr`** — a non-empty array of comparable `Json` values.
+- **`arr`** — a non-empty array of comparable elements.
 - **Returns** the minimum element.
 
 #### `max`
 
 ```lin
-val max = (arr: Json[]): Json
+val max = <T>(arr: T[]): T
 ```
 
 Find the largest element of `arr` by natural `>` ordering.
-- **`arr`** — a non-empty array of comparable `Json` values.
+- **`arr`** — a non-empty array of comparable elements.
 - **Returns** the maximum element.
 
 #### `minBy`
 
 ```lin
-val minBy = <T>(arr: T[], keyFn: (T)
+val minBy = <T>(arr: T[], keyFn: (T) => Number): T
 ```
 
 Find the element with the smallest key under `keyFn`.
@@ -382,7 +479,7 @@ Find the element with the smallest key under `keyFn`.
 #### `maxBy`
 
 ```lin
-val maxBy = <T>(arr: T[], keyFn: (T)
+val maxBy = <T>(arr: T[], keyFn: (T) => Number): T
 ```
 
 Find the element with the largest key under `keyFn`.
@@ -396,7 +493,7 @@ Find the element with the largest key under `keyFn`.
 val append = <T>(arr: T[], item: T): T[]
 ```
 
-Append `item` to the end of `arr`, returning a NEW array (does not mutate `arr`). A flat array
+Append `item` to the end of `arr`, returning a new array (does not mutate `arr`). A flat array
 (e.g. `UInt8[]`) stays flat; a tagged `Json[]` stays tagged.
 - **`arr`** — the source array; its element type pins `T` for element checking.
 - **`item`** — the element to append; must be assignable to `T` (`append(intArr, "s")` is a compile error).
@@ -408,8 +505,8 @@ Append `item` to the end of `arr`, returning a NEW array (does not mutate `arr`)
 val prepend = <T>(arr: T[], item: T): T[]
 ```
 
-Prepend `item` to the front of `arr`, returning a NEW array (does not mutate `arr`). Same
-flat-preservation and RC discipline as `append`.
+Prepend `item` to the front of `arr`, returning a new array (does not mutate `arr`). Preserves
+flatness like `append`.
 - **`arr`** — the source array; its element type pins `T`.
 - **`item`** — the element to prepend; must be assignable to `T`.
 - **Returns** a new `T[]` with `item` at the front.
@@ -417,7 +514,7 @@ flat-preservation and RC discipline as `append`.
 #### `scan`
 
 ```lin
-val scan = <T, U>(arr: T[], init: U, f: (U, T)
+val scan = <T, U>(arr: T[], init: U, f: (U, T) => U): U[]
 ```
 
 Like `reduce`, but return every intermediate accumulator value, including `init`.
@@ -429,7 +526,7 @@ Like `reduce`, but return every intermediate accumulator value, including `init`
 #### `groupBy`
 
 ```lin
-val groupBy = <T>(arr: T[], keyFn: (T)
+val groupBy = <T>(arr: T[], keyFn: (T) => String): { String: T[] }
 ```
 
 Group elements into buckets by a string key (a global, hashed grouping).
@@ -440,7 +537,7 @@ Group elements into buckets by a string key (a global, hashed grouping).
 #### `countBy`
 
 ```lin
-val countBy = <T>(arr: T[], keyFn: (T)
+val countBy = <T>(arr: T[], keyFn: (T) => String): { String: Int32 }
 ```
 
 Count elements by a string key.
@@ -451,7 +548,7 @@ Count elements by a string key.
 #### `findIndex`
 
 ```lin
-val findIndex = <T>(arr: T[], f: (T, Int32)
+val findIndex = <T>(arr: T[], f: (T, Int32) => Boolean): Int32
 ```
 
 Index of the first element for which `f` returns `true` (the index-returning sibling of `find`).
@@ -462,7 +559,7 @@ Index of the first element for which `f` returns `true` (the index-returning sib
 #### `findLast`
 
 ```lin
-val findLast = <T>(arr: T[], f: (T, Int32)
+val findLast = <T>(arr: T[], f: (T, Int32) => Boolean): T | Null
 ```
 
 Find the last element for which `f` returns `true`.
@@ -473,7 +570,7 @@ Find the last element for which `f` returns `true`.
 #### `findLastIndex`
 
 ```lin
-val findLastIndex = <T>(arr: T[], f: (T, Int32)
+val findLastIndex = <T>(arr: T[], f: (T, Int32) => Boolean): Int32
 ```
 
 Index of the last element for which `f` returns `true`.
@@ -484,10 +581,10 @@ Index of the last element for which `f` returns `true`.
 #### `dedupBy`
 
 ```lin
-val dedupBy = <T>(arr: T[], f: (T)
+val dedupBy = <T>(arr: T[], f: (T) => Json): T[][]
 ```
 
-Group CONSECUTIVE elements with the same key into sub-arrays (maximal runs of adjacent
+Group consecutive elements with the same key into sub-arrays (maximal runs of adjacent
 equal-keyed elements, in order). The positional analogue of `groupBy` (which is global and hashed).
 - **`arr`** — the array to scan.
 - **`f`** — maps each element to its (comparable `Json`) run key.

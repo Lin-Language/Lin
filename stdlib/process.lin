@@ -8,7 +8,7 @@
 // former std/os) reports machine and process facts; the compile-time ones (platform / arch) and the
 // always-available ones (cpuCount / pid) are total, the rest can return an Error.
 //
-// import { exec, shell, cwd, chdir, spawn, wait, kill } from "std/process"
+//   import { exec, shell, cwd, chdir, spawn, wait, kill } from "std/process"
 import foreign "lin-runtime"
   val lin_process_exec: (String, String[]) => Json
   val lin_os_hostname: () => Json

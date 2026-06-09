@@ -5,7 +5,7 @@
 // lowerBound/upperBound, insertSorted, countInRange) and the keyed aggregators (sortBy, minBy,
 // maxBy, groupBy, countBy).
 //
-// import { sort, sortBy, length, push, slice, sum } from "std/array"
+//   import { sort, sortBy, length, push, slice, sum } from "std/array"
 //
 // The iterable combinators (map, filter, reduce, for, while, take, drop, find, some, every,
 // flatMap, takeWhile, dropWhile, flatten, concat) and the iterator constructors (range, rangeStep,

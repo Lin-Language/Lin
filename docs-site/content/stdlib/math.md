@@ -7,7 +7,9 @@ The constants PI, E, INFINITY, and NAN are Float64 values. Most functions take a
 for any numeric type. `random` returns a uniform Float64 in [0, 1). Note NaN: `x == NAN` is always
 false under IEEE 754, so test with `isNaN(x)` instead.
 
+```lin
 import { abs, floor, ceil, round, sqrt, pow, PI, E } from "std/math"
+```
 
 ## Reference
 
@@ -92,7 +94,12 @@ val sqrt = (x: Float64): Float64
 Compute the non-negative square root of `x`.
 - **`x`** — the radicand.
 - **Returns** the square root of `x`, or `NaN` if `x` is negative.
-- **Example:** sqrt(9.0)   // 3.0
+
+**Example:**
+
+```lin
+sqrt(9.0)   // 3.0
+```
 
 #### `pow`
 
@@ -104,7 +111,12 @@ Raise `base` to the power `exp`.
 - **`base`** — the base.
 - **`exp`** — the exponent.
 - **Returns** `base` raised to `exp`.
-- **Example:** pow(2.0, 10.0)   // 1024.0
+
+**Example:**
+
+```lin
+pow(2.0, 10.0)   // 1024.0
+```
 
 #### `exp`
 
@@ -260,7 +272,12 @@ Constrain `x` to the range [`lo`, `hi`].
 - **`lo`** — the lower bound.
 - **`hi`** — the upper bound.
 - **Returns** `lo` if `x < lo`, `hi` if `x > hi`, otherwise `x`.
-- **Example:** clamp(15, 1, 10)   // 10
+
+**Example:**
+
+```lin
+clamp(15, 1, 10)   // 10
+```
 
 #### `sign`
 
@@ -282,7 +299,12 @@ Test whether `x` is the floating-point "not a number" value.
 - **`x`** — the value to test.
 - **Returns** `true` if `x` is `NaN`, otherwise `false`. Use this rather than `x == NAN`, which is
   always false under IEEE 754.
-- **Example:** isNaN(NAN)   // true
+
+**Example:**
+
+```lin
+isNaN(NAN)   // true
+```
 
 #### `isFinite`
 
@@ -313,4 +335,9 @@ Format `x` with a fixed number of decimal places.
 - **`x`** — the value to format.
 - **`decimals`** — the number of digits after the decimal point.
 - **Returns** the formatted string.
-- **Example:** toFixed(3.14159, 2)   // "3.14"
+
+**Example:**
+
+```lin
+toFixed(3.14159, 2)   // "3.14"
+```

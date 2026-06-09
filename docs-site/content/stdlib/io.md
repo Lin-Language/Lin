@@ -6,14 +6,16 @@ Functions for reading from stdin, writing to stdout/stderr, accessing the comman
 arguments, and exiting the process. `print` stringifies any value (strings unquoted, everything
 else as JSON); the read functions return `String | Null` so EOF narrows with a plain `== null`.
 
-  import { print, readLine, args, exit } from "std/io"
+```lin
+import { print, readLine, args, exit } from "std/io"
+```
 
 ## Reference
 
 #### `readLine`
 
 ```lin
-val readLine = (): Json
+val readLine = (): String | Null
 ```
 
 Read one line from standard input (without the trailing newline).
@@ -45,9 +47,24 @@ val print = (x: Json): Null
 
 Print a value to standard output, followed by a newline.
 - **`x`** — the value to print (stringified).
-- **Example:** print("hello")     // hello
-- **Example:** print([1, 2, 3])   // [1, 2, 3]
-- **Example:** print({ "a": 1 })  // {"a":1}
+
+**Example:**
+
+```lin
+print("hello")     // hello
+```
+
+**Example:**
+
+```lin
+print([1, 2, 3])   // [1, 2, 3]
+```
+
+**Example:**
+
+```lin
+print({ "a": 1 })  // {"a":1}
+```
 
 #### `printErr`
 
@@ -70,7 +87,7 @@ The process command-line arguments.
 #### `prompt`
 
 ```lin
-val prompt = (message: String): Json
+val prompt = (message: String): String | Null
 ```
 
 Print a prompt and read one line of input.
@@ -89,8 +106,8 @@ Terminate the process with the given exit code.
 #### `stdinStream`
 
 ```lin
-val stdinStream = (): Stream
+val stdinStream = (): Stream<UInt8[]>
 ```
 
-Wrap the process's standard input as a lazy byte `Stream<UInt8[]>` (streams brief §4).
-- **Returns** a `Stream` that pulls from stdin until EOF; pair with `lines`/`map`/… from std/stream.
+Wrap the process's standard input as a lazy byte stream.
+- **Returns** a `Stream<UInt8[]>` that pulls from stdin until EOF; pair with `lines`/`map`/… from std/stream.
