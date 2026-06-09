@@ -841,6 +841,24 @@ pub unsafe extern "C" fn lin_object_eq(a: *const LinObject, b: *const LinObject)
     let a_len = (*a).len;
     let b_len = (*b).len;
     if a_len != b_len { return 0; }
+    // Positional fast path: when both objects list their keys in the SAME ORDER (the common case —
+    // same record type, or same-shape JSON), keys line up slot-for-slot and are usually pointer-
+    // identical (interned literals). Walk in parallel comparing values; bail to the order-independent
+    // path the moment a key position diverges. Zero allocation, no hashing.
+    let mut positional_ok = true;
+    for i in 0..a_len {
+        let ae = (*a).entries.add(i as usize);
+        let be = (*b).entries.add(i as usize);
+        if !lin_string_key_eq((*ae).key, (*be).key) {
+            positional_ok = false;
+            break;
+        }
+        let av = &(*ae).value as *const TaggedVal;
+        let bv = &(*be).value as *const TaggedVal;
+        if !tagged_val_eq(av, bv) { return 0; }   // same key, different value → definitively unequal
+    }
+    if positional_ok { return 1; }
+    // else fall through to the existing ensure_index / linear order-independent path.
     // Large objects (>= HASH_INDEX_THRESHOLD): use B's O(1) hash side-index for the inner lookup
     // instead of a per-key linear scan, turning O(n*m) into O(n) average. Equality stays
     // order-independent — the index finds the key regardless of its slot. `ensure_index` builds
@@ -873,6 +891,85 @@ pub unsafe extern "C" fn lin_object_eq(a: *const LinObject, b: *const LinObject)
             let b_key = (*be).key;
             if lin_string_key_eq(a_key, b_key) {
                 // Compare values.
+                let av = &(*ae).value as *const TaggedVal;
+                let bv = &(*be).value as *const TaggedVal;
+                if !tagged_val_eq(av, bv) { return 0; }
+                found = true;
+                break;
+            }
+        }
+        if !found { return 0; }
+    }
+    1
+}
+
+// ── SPIKE-ONLY benchmark variants (object-eq positional fast path) ──────────────────────────────
+// These replicate the BASELINE-LINEAR (pre-index) and SHIPPED-INDEX (current master, no positional
+// walk) code paths so a single benchmark binary can A/B all three eq strategies apples-to-apples
+// without three separate runtime rebuilds. They have access to the private helpers (ensure_index,
+// index_probe, lin_string_key_eq, tagged_val_eq). NOT for production use — remove before shipping.
+
+/// BASELINE-LINEAR: pure O(n*m) order-independent scan (the pre-index implementation, parent of
+/// 6af9284c). No hashing, no positional walk.
+#[doc(hidden)]
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_eq_spike_linear(a: *const LinObject, b: *const LinObject) -> u8 {
+    if a == b { return 1; }
+    if a.is_null() || b.is_null() { return 0; }
+    let a_len = (*a).len;
+    let b_len = (*b).len;
+    if a_len != b_len { return 0; }
+    for i in 0..a_len {
+        let ae = (*a).entries.add(i as usize);
+        let a_key = (*ae).key;
+        let mut found = false;
+        for j in 0..b_len {
+            let be = (*b).entries.add(j as usize);
+            let b_key = (*be).key;
+            if lin_string_key_eq(a_key, b_key) {
+                let av = &(*ae).value as *const TaggedVal;
+                let bv = &(*be).value as *const TaggedVal;
+                if !tagged_val_eq(av, bv) { return 0; }
+                found = true;
+                break;
+            }
+        }
+        if !found { return 0; }
+    }
+    1
+}
+
+/// SHIPPED-INDEX: the current-master implementation WITHOUT the positional fast path — hash-index
+/// probe for large B, linear scan otherwise.
+#[doc(hidden)]
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_eq_spike_index(a: *const LinObject, b: *const LinObject) -> u8 {
+    if a == b { return 1; }
+    if a.is_null() || b.is_null() { return 0; }
+    let a_len = (*a).len;
+    let b_len = (*b).len;
+    if a_len != b_len { return 0; }
+    if ensure_index(b as *mut LinObject) {
+        for i in 0..a_len {
+            let ae = (*a).entries.add(i as usize);
+            let a_key = (*ae).key;
+            let slot = index_probe(b, a_key);
+            if slot == u32::MAX { return 0; }
+            let be = (*b).entries.add(slot as usize);
+            let av = &(*ae).value as *const TaggedVal;
+            let bv = &(*be).value as *const TaggedVal;
+            if !tagged_val_eq(av, bv) { return 0; }
+        }
+        return 1;
+    }
+    for i in 0..a_len {
+        let ae = (*a).entries.add(i as usize);
+        let a_key = (*ae).key;
+        let mut found = false;
+        for j in 0..b_len {
+            let be = (*b).entries.add(j as usize);
+            let b_key = (*be).key;
+            if lin_string_key_eq(a_key, b_key) {
                 let av = &(*ae).value as *const TaggedVal;
                 let bv = &(*be).value as *const TaggedVal;
                 if !tagged_val_eq(av, bv) { return 0; }
@@ -1348,6 +1445,85 @@ mod tests {
             assert_eq!(lin_object_eq(sa, sb), 0, "small value difference detected");
             lin_object_release(sa);
             lin_object_release(sb);
+        }
+    }
+
+    // POSITIONAL FAST PATH (spike): the early-return-0-on-value-mismatch is only sound while keys
+    // are still aligned. Build objects with SHARED key pointers (models same-record-type / interned
+    // literals so slot-for-slot keys are pointer-identical and the positional walk's `key==key`
+    // shortcut fires). Covers: equal same-order (fast 1), equal reversed-order (fallback 1),
+    // value-diff same-order (early 0), key-rename (0), small same-order (1).
+    #[test]
+    fn object_eq_positional_fast_path_is_exact() {
+        unsafe {
+            // Shared key set (pointer-identical between objects), sizes spanning the threshold.
+            for &n in &[4usize, 16, 24, 32] {
+                let keys: Vec<*mut LinString> = (0..n).map(|i| mk_string(&format!("k{i}"))).collect();
+
+                let build = |reversed: bool, diff_at: Option<usize>| -> *mut LinObject {
+                    let obj = lin_object_alloc(n as u32);
+                    let order: Vec<usize> =
+                        if reversed { (0..n).rev().collect() } else { (0..n).collect() };
+                    for &i in &order {
+                        let val = if Some(i) == diff_at { 999u64 } else { i as u64 };
+                        let v = alloc_tagged(TAG_INT32, val) as *const TaggedVal;
+                        lin_object_set(obj, keys[i], v); // shares key ptr
+                        crate::tagged::lin_tagged_release(v as *mut u8);
+                    }
+                    obj
+                };
+
+                // 1) equal, SAME order → positional fast path returns 1.
+                let a = build(false, None);
+                let b = build(false, None);
+                assert_eq!(lin_object_eq(a, b), 1, "n={n}: equal same-order");
+                assert_eq!(lin_object_eq(b, a), 1, "n={n}: symmetric");
+
+                // 2) equal, REVERSED order → positional walk fails (keys diverge), fallback returns 1.
+                let c = build(true, None);
+                assert_eq!(lin_object_eq(a, c), 1, "n={n}: equal reversed-order via fallback");
+                assert_eq!(lin_object_eq(c, a), 1, "n={n}: reversed symmetric");
+
+                // 3) value-diff, SAME order → positional early-return 0 (keys aligned at the diff slot).
+                let d = build(false, Some(n / 2));
+                assert_eq!(lin_object_eq(a, d), 0, "n={n}: value-diff same-order");
+                assert_eq!(lin_object_eq(d, a), 0, "n={n}: value-diff symmetric");
+
+                // 4) value-diff, REVERSED order → keys diverge before the diff slot, fallback returns 0.
+                let e = build(true, Some(n / 2));
+                assert_eq!(lin_object_eq(a, e), 0, "n={n}: value-diff reversed via fallback");
+
+                lin_object_release(a);
+                lin_object_release(b);
+                lin_object_release(c);
+                lin_object_release(d);
+                lin_object_release(e);
+
+                // 5) key-rename: same count, same values, one key replaced → unequal. Use a fresh,
+                // non-shared key so slot keys diverge there (forces fallback miss).
+                let f = build(false, None);
+                let g = lin_object_alloc(n as u32);
+                for i in 0..n {
+                    let v = alloc_tagged(TAG_INT32, i as u64) as *const TaggedVal;
+                    if i == n / 2 {
+                        let kx = mk_string("RENAMED");
+                        lin_object_set(g, kx, v);
+                        crate::string::lin_string_release(kx);
+                    } else {
+                        lin_object_set(g, keys[i], v);
+                    }
+                    crate::tagged::lin_tagged_release(v as *mut u8);
+                }
+                assert_eq!((*g).len, n as u32, "n={n}: same key count after rename");
+                assert_eq!(lin_object_eq(f, g), 0, "n={n}: key-rename detected");
+                assert_eq!(lin_object_eq(g, f), 0, "n={n}: key-rename symmetric");
+                lin_object_release(f);
+                lin_object_release(g);
+
+                for k in keys {
+                    crate::string::lin_string_release(k);
+                }
+            }
         }
     }
 
