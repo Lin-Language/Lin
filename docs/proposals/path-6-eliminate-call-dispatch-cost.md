@@ -204,3 +204,16 @@ polymorphic dispatch (6b), inline the leaf helpers LLVM is blind to (6c). Zero u
 the existing inlining + monomorphization machinery, and it is the only proposal grounded in the one
 measurement that isolates the recoverable cost. The companion string-allocation frontier (RAPTOR query)
 is real and separate. **This is the recommended primary direction.**
+
+### ✅ Corroborating note 2026-06-09 — the biggest shipped RAPTOR win is a "kill the hot call" win, by type change
+This path's "call-bound, not data-bound" thesis is *reinforced* by the single largest RAPTOR speedup on
+master, which no path claimed: typing the `Json` *dictionaries* (`routeStopIndex`/`bestArrivals`/
+`kConnections`) as `{ String: T }` maps measured **PREP 144 s → 25.7 s (~5.6×)** (`8859f713`). Mechanism:
+`m[k]` on a `Json` object is a non-inlined `lin_object_get` call (+ box the result); typing it routes to
+a lean `lin_map_get` — i.e. it **removes a hot non-inlined call**, exactly the axis this path targets,
+but via a type annotation rather than an inliner. The strategic lesson for this path: when enumerating
+"the hot calls to make disappear" (6a–6c), include `lin_object_get` on `Json` **dictionaries** — the
+cheapest way to kill that call is often to type the value as a `Map` (no compiler change needed), not to
+inline the call. Run path-0's per-call-site-CLASS profile FIRST to find which hot `lin_object_get`s are
+dictionary-shaped (delete by typing) vs record-shaped (need 6a–6c or packing). See path-0 RETROSPECTIVE
+2026-06-09 for why this win was invisible to the aggregate-`lin_object_get` profile that framed the paths.
