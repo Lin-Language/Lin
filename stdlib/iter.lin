@@ -198,18 +198,13 @@ export val every = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): 
   )
   result
 
-// Map each item to an inner iterable and concatenate all the results into one array.
-// @param arr  any iterable.
-// @param f    `(item, index?) => iterable`; the trailing 0-based `Int32` index is optional.
-// @returns the concatenation of every produced inner iterable, in order.
+// Map each item to an inner array and concatenate all the results into one array.
+// @param arr  an Array, Iterator, or Stream of `T`.
+// @param f    `(item, index?) => U[]`; the trailing 0-based `Int32` index is optional.
+// @returns a `U[]` — the concatenation of every produced inner array, in order.
 // @example [1, 2, 3].flatMap(x => [x, x * 2])   // [1, 2, 2, 4, 3, 6]
-export val flatMap = (arr: Json, f: (Json, Int32) => Json): Json =>
-  // Stays `Json`: with a concrete element type the inner `inner.for(x => push(result, x))` both
-  // MOVES each element into `result` (via push) AND has `for`'s per-iteration reclaim release it,
-  // double-freeing heap elements (corruption / unaligned-free). `for`'s reclaim is only sound when
-  // the body does not move the element out — which a flattening push does. The tagged `Json` read
-  // makes push retain rather than move, side-stepping it. Revisit if `for`+push ownership is reworked.
-  val result: Json[] = []
+export val flatMap = <T, U>(arr: T[] | Iterator | Stream, f: (T, Int32) => U[]): U[] =>
+  val result: U[] = []
   var idx = 0
   arr.for(item =>
     val inner = f(item, idx)

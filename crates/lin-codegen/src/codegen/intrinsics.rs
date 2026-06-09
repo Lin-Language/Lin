@@ -290,7 +290,17 @@ impl<'ctx> Codegen<'ctx> {
                     // (flat or tagged) slot. This is the `push$Json` / `push(jsonArr, …)` case (e.g.
                     // `(a: Json) => push(a, 1)` applied to a flat `Int32[]`).
                     let arr_elem_dynamic = matches!(&arr_ty, Type::Array(e) if Self::is_union_type(e));
-                    if Self::is_union_type(&arr_ty) || arr_elem_flat || arr_elem_dynamic {
+                    // A UNION/Json element pushed into a CONCRETE heap `T[]` (e.g. a `Json`-typed
+                    // loop element flowing into a `String[]` accumulator — flatMap's inner
+                    // `inner.for(x => push(result, x))`). The lin-ir `transfer_into_container`
+                    // ownership accounting assumes `Push` RETAINS a union element's inner (it skips
+                    // the balancing retain for a union arg), so the move push (`lin_array_push_tagged`,
+                    // no retain) would leave the result holding a borrowed inner that the source frees
+                    // → UAF. Route through the retaining `lin_push_dyn` to honour that contract. The
+                    // element is already a boxed TaggedVal (union), so no fresh box / extra release.
+                    let union_elem_into_concrete = Self::is_union_type(&elem_ty)
+                        && matches!(&arr_ty, Type::Array(_));
+                    if Self::is_union_type(&arr_ty) || arr_elem_flat || arr_elem_dynamic || union_elem_into_concrete {
                         // arr may be a boxed TaggedVal* wrapping a LinArray* (flat or tagged), or a
                         // raw flat LinArray*. Unbox if boxed, then lin_push_dyn dispatches on elem_tag.
                         let arr_raw = if Self::is_union_type(&arr_ty) {
