@@ -9,7 +9,7 @@
 // Full IANA timezone support (DST, historical offsets) is out of scope; componentsAt/formatAt take a
 // fixed UTC offset.
 //
-// import { now, sleep, toIso, fromIso, format, parse, startTimer, elapsed } from "std/time"
+//   import { now, sleep, toIso, fromIso, format, parse, startTimer, elapsed } from "std/time"
 import { toString, join } from "std/string"
 import { push } from "std/array"
 

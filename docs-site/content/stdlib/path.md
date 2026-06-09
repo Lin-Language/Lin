@@ -6,7 +6,9 @@ Every function here is a pure string transform — nothing is read from or writt
 `resolve` is the one exception: it consults the current working directory to make a path
 absolute. Use std/fs for actual filesystem operations.
 
-  import { join, basename, dirname, extname, stem, normalize, resolve } from "std/path"
+```lin
+import { join, basename, dirname, extname, stem, normalize, resolve } from "std/path"
+```
 
 ## Reference
 
@@ -39,8 +41,18 @@ val extname = (p: String): String
 The file extension of a path, including the leading dot.
 - **`p`** — the path.
 - **Returns** the extension, e.g. `extname("c.txt")` is `".txt"` (empty if none).
-- **Example:** extname("archive.tar.gz")  // ".gz"
-- **Example:** extname("README")          // ""
+
+**Example:**
+
+```lin
+extname("archive.tar.gz")  // ".gz"
+```
+
+**Example:**
+
+```lin
+extname("README")          // ""
+```
 
 #### `stem`
 
@@ -51,8 +63,18 @@ val stem = (p: String): String
 The basename of a path with its extension removed.
 - **`p`** — the path.
 - **Returns** the stem, e.g. `stem("/a/c.txt")` is `"c"`.
-- **Example:** stem("main.lin")        // "main"
-- **Example:** stem("archive.tar.gz")  // "archive.tar"
+
+**Example:**
+
+```lin
+stem("main.lin")        // "main"
+```
+
+**Example:**
+
+```lin
+stem("archive.tar.gz")  // "archive.tar"
+```
 
 #### `isAbsolute`
 
@@ -73,8 +95,18 @@ val normalize = (p: String): String
 Collapse `.`/`..` segments and redundant separators in a path (lexical, no filesystem access).
 - **`p`** — the path.
 - **Returns** the normalized path.
-- **Example:** normalize("a/b/../c")  // "a/c"
-- **Example:** normalize("/a/./b/c")  // "/a/b/c"
+
+**Example:**
+
+```lin
+normalize("a/b/../c")  // "a/c"
+```
+
+**Example:**
+
+```lin
+normalize("/a/./b/c")  // "/a/b/c"
+```
 
 #### `resolve`
 
@@ -95,8 +127,18 @@ val join = (parts: String[]): String
 Join path components with the platform separator and normalize the result.
 - **`parts`** — the path components, in order.
 - **Returns** the joined, normalized path (empty string if `parts` is empty).
-- **Example:** join(["usr", "local", "bin"])  // "usr/local/bin"
-- **Example:** join(["/usr", "local/bin"])    // "/usr/local/bin"
+
+**Example:**
+
+```lin
+join(["usr", "local", "bin"])  // "usr/local/bin"
+```
+
+**Example:**
+
+```lin
+join(["/usr", "local/bin"])    // "/usr/local/bin"
+```
 
 #### `split`
 

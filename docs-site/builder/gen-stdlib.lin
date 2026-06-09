@@ -69,15 +69,37 @@ val nameUntilDelim = (s: String, i: Int32): String =>
     else
       nameUntilDelim(s, i + 1)
 
-// Build the display signature from an export line. Functions: everything before "=>". Consts:
-// everything before " = ". Types: the whole declaration. The leading "export " is stripped.
+// Find the index of the function-body arrow: the first `=>` at bracket depth 0. A higher-order
+// signature like `(s: String, body: (Ptr) => T): T =>` has the callback's arrow nested inside
+// parens (depth 1), so a naive search on the first `=>` truncates the signature mid-parameter.
+// Brackets `( [ { <` open a level and `) ] } >` close one; a `=>` is matched as a whole token so
+// the `>` it ends with is not counted as a closing bracket. Returns -1 if there is no top-level
+// arrow (a plain `val` constant).
+val topLevelArrow = (s: String, i: Int32, depth: Int32): Int32 =>
+  if i >= length(s) then
+    -1
+  else if substring(s, i, i + 2) == "=>" then
+    if depth == 0 then i else topLevelArrow(s, i + 2, depth)
+  else
+    val c = substring(s, i, i + 1)
+    val next = if c == "(" || c == "[" || c == "{" || c == "<" then
+      depth + 1
+    else if c == ")" || c == "]" || c == "}" || c == ">" then
+      depth - 1
+    else
+      depth
+    topLevelArrow(s, i + 1, next)
+
+// Build the display signature from an export line. Functions: everything before the body `=>`.
+// Consts: everything before " = ". Types: the whole declaration. The leading "export " is stripped.
 val signature = (line: String): String =>
   val t = trim(line)
   val noExport = substring(t, 7, length(t)) // drop "export "
+  val arrow = topLevelArrow(noExport, 0, 0)
   if startsWith(noExport, "type ") then
     noExport
-  else if contains(noExport, "=>") then
-    trim(substring(noExport, 0, indexOf(noExport, "=>")))
+  else if arrow != -1 then
+    trim(substring(noExport, 0, arrow))
   else if contains(noExport, " = ") then
     trim(substring(noExport, 0, indexOf(noExport, " = ")))
   else

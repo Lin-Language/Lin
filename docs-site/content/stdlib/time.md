@@ -11,7 +11,9 @@ durations are likewise just milliseconds (seconds/minutes/hours/days), so they c
 Full IANA timezone support (DST, historical offsets) is out of scope; componentsAt/formatAt take a
 fixed UTC offset.
 
+```lin
 import { now, sleep, toIso, fromIso, format, parse, startTimer, elapsed } from "std/time"
+```
 
 ## Reference
 
@@ -22,7 +24,12 @@ val now = (): Int64
 ```
 
 The current wall-clock time as a Unix timestamp in milliseconds (UTC).
-- **Example:** now()   // e.g. 1716825600000
+
+**Example:**
+
+```lin
+now()   // e.g. 1716825600000
+```
 
 #### `sleep`
 
@@ -51,7 +58,12 @@ val startTimer = (): Int64
 Start a monotonic timer and return its opaque handle. Pair with `elapsed`; use this rather than
 `now` for measuring durations, as it is unaffected by wall-clock adjustments.
 - **Returns** a timer handle to pass to `elapsed`.
-- **Example:** val t = startTimer()   // ...work... print("took ${elapsed(t)}ms")
+
+**Example:**
+
+```lin
+val t = startTimer()   // ...work... print("took ${elapsed(t)}ms")
+```
 
 #### `elapsed`
 
@@ -72,7 +84,12 @@ val toIso = (ms: Int64): String
 Render a Unix-millisecond timestamp as an ISO 8601 UTC string.
 - **`ms`** — the timestamp in Unix milliseconds.
 - **Returns** the ISO 8601 representation.
-- **Example:** toIso(0)   // "1970-01-01T00:00:00.000Z"
+
+**Example:**
+
+```lin
+toIso(0)   // "1970-01-01T00:00:00.000Z"
+```
 
 #### `format`
 
@@ -84,7 +101,12 @@ Render a Unix-millisecond timestamp (UTC) with a strftime-style pattern.
 - **`ms`** — the timestamp in Unix milliseconds.
 - **`pattern`** — a strftime-style format string (e.g. "%Y-%m-%d").
 - **Returns** the formatted string.
-- **Example:** format(now(), "%Y-%m-%d")   // "2025-05-27"
+
+**Example:**
+
+```lin
+format(now(), "%Y-%m-%d")   // "2025-05-27"
+```
 
 #### `fromIso`
 
@@ -95,7 +117,12 @@ val fromIso = (s: String): Int64 | Error
 Parse an ISO 8601 date/datetime string to a Unix-millisecond timestamp.
 - **`s`** — the ISO 8601 string to parse.
 - **Returns** the timestamp in Unix milliseconds, or an Error if `s` is not valid ISO 8601.
-- **Example:** fromIso("2024-01-15T10:30:00Z")   // 1705313400000
+
+**Example:**
+
+```lin
+fromIso("2024-01-15T10:30:00Z")   // 1705313400000
+```
 
 #### `parse`
 
@@ -107,21 +134,34 @@ Parse a date string against a strftime-style pattern to a Unix-millisecond times
 - **`s`** — the string to parse.
 - **`pattern`** — the strftime-style format the string is expected to match.
 - **Returns** the timestamp in Unix milliseconds, or an Error if `s` does not match `pattern`.
-- **Example:** parse("2024-01-15", "%Y-%m-%d")   // 1705276800000
 
-#### `components`
+**Example:**
 
 ```lin
-val components = (ts: Int64): Json
+parse("2024-01-15", "%Y-%m-%d")   // 1705276800000
+```
+
+#### `TimeComponents`
+
+```lin
+type TimeComponents = { "year": Int32, "month": Int32, "day": Int32, "hour": Int32, "minute": Int32, "second": Int32, "millis": Int32, "weekday": Int32, "yearDay": Int32 }
 ```
 
 Break a Unix-millisecond timestamp into its UTC calendar fields. Never fails — every Int64 is a
 valid instant; pre-1970 (negative `ts`) and far-future years use the proleptic Gregorian
 calendar, so `year` may be negative.
+The fixed calendar-fields record returned by `components`/`componentsAt`: stable integer fields,
+every one always present. `weekday` is 0=Sunday..6=Saturday; `yearDay` is 1-366.
+
+#### `components`
+
+```lin
+val components = (ts: Int64): TimeComponents
+```
+
 - **`ts`** — the timestamp in Unix milliseconds.
-- **Returns** a Json object with stable integer fields year, month (1-12), day (1-31), hour (0-23),
-  minute/second (0-59), millis (0-999), weekday (0=Sunday..6=Saturday), yearDay (1-366). Typed
-  `Json` because that is how the runtime hands back the built object.
+- **Returns** a `TimeComponents` record: year, month (1-12), day (1-31), hour (0-23),
+  minute/second (0-59), millis (0-999), weekday (0=Sunday..6=Saturday), yearDay (1-366).
 
 #### `fromComponents`
 
@@ -342,7 +382,7 @@ Render a millisecond duration as a compact human string using the largest non-ze
 #### `componentsAt`
 
 ```lin
-val componentsAt = (ts: Int64, offsetMinutes: Int32): Json
+val componentsAt = (ts: Int64, offsetMinutes: Int32): TimeComponents
 ```
 
 Like `components`, but for a fixed UTC offset: `offsetMinutes` is added to the instant before
@@ -351,7 +391,7 @@ offset would read (the instant itself is unchanged). Full IANA tz (DST, historic
 out of scope.
 - **`ts`** — the timestamp in Unix milliseconds.
 - **`offsetMinutes`** — the UTC offset in minutes (e.g. -300 for UTC-5, 330 for UTC+5:30).
-- **Returns** the calendar-fields Json object for that local time (same shape as `components`).
+- **Returns** the `TimeComponents` record for that local time (same shape as `components`).
 
 #### `formatAt`
 

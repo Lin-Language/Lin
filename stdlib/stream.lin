@@ -7,10 +7,18 @@
 // that drives the graph one item at a time with bounded memory. Building a pipeline allocates
 // the lazy nodes but reads nothing; the terminal driver pulls it to completion.
 //
-//   import { readStream, writeLines, drain } from "std/stream"
-//   import { map, filter, take, for } from "std/iter"
+// A pipeline imports its sources and sinks from std/stream and its combinators from std/iter,
+// then chains them onto an open stream:
 //
-//   readStream("in.csv").lines().map(transform).filter(notEmpty).writeLines("out.csv").drain()
+//   import { readStream, lines, writeLines, drain } from "std/stream"
+//   import { map, filter } from "std/iter"
+//
+//   val pipeline = readStream("in.csv")
+//     .lines()
+//     .map(parseRow)
+//     .filter(notEmpty)
+//     .writeLines("out.csv")
+//   drain(pipeline)
 //
 // Errors are threaded in-band: the first read error poisons the upstream and short-circuits to
 // the terminal op, so error handling lives only at the terminal, not at every adapter.
@@ -61,21 +69,14 @@ export val linesMax = (s: Stream<UInt8[]>, maxBytes: Int32): Stream<String> =>
 export val chunks = (s: Stream<UInt8[]>, n: Int32): Stream<UInt8[]> =>
   lin_stream_chunks(s, n)
 
-// The generic combinators (map/filter/take/drop/reduce/for/find/some/every/flatMap/takeWhile/
-// dropWhile/flatten/concat) are not exported here. They come from `std/iter` and dispatch to the
-// lazy stream backend on a stream receiver. std/stream keeps only stream-specific ops (readStream/
-// writeStream/writeLines/drain/collect/readText/promise/close/lines/linesMax/chunks). A user writes:
-//   import { map, filter, take, reduce, for } from "std/iter"
-//   import { readStream, writeStream, drain } from "std/stream"
-// and `readStream(p).map(f).filter(g).take(10).reduce(...)` works lazily.
 // Sink: write each item's bytes verbatim (raw) to `path`, concatenated with no separator (a String
-// writes its UTF-8 bytes, a UInt8[] its raw bytes). The raw sink is what lets binary pipelines (e.g.
-// `gzip(s).writeStream("x.gz")`) produce an uncorrupted file. Lazy. Use `writeLines` for
-// newline-delimited output.
+// writes its UTF-8 bytes, a `UInt8[]` its raw bytes). The raw sink is what lets binary pipelines
+// (such as `gzip` followed by `writeStream`) produce an uncorrupted file. Lazy. Use `writeLines`
+// for newline-delimited output.
 // @param s     the upstream stream to write.
 // @param path  the destination file path.
 // @returns a sink `Stream` node; nothing is written until a terminal driver runs it.
-// @example readStream("data.txt").gzip().writeStream("data.gz").drain()   // raw bytes, valid .gz
+// @example val sink = bytes.gzip().writeStream("data.gz")   // then drain(sink) to run it
 export val writeStream = (s: Stream, path: String): Stream =>
   lin_stream_write(s, path)
 
@@ -84,12 +85,12 @@ export val writeStream = (s: Stream, path: String): Stream =>
 // @param s     the upstream stream to write.
 // @param path  the destination file path.
 // @returns a sink `Stream` node; nothing is written until a terminal driver runs it.
-// @example readStream("in.csv").lines().map(transform).writeLines("out.csv").drain()
+// @example val sink = rows.writeLines("out.csv")   // rows: a Stream<String> of lines to write
 export val writeLines = (s: Stream, path: String): Stream =>
   lin_stream_write_lines(s, path)
 
-// Terminal drivers — these consume the stream on the CALLING thread and close it afterwards.
-// Terminal: force a sink (or any pipeline) to completion.
+// Terminal: force a sink (or any pipeline) to completion. Terminal drivers consume the stream on
+// the calling thread and close it afterwards.
 // @param s  the pipeline to drive.
 // @returns `Null` on success, or an `Error` if a read/transform faulted.
 export val drain = (s: Stream): Null | Error =>
@@ -114,17 +115,14 @@ export val readText = (s: Stream): String | Error =>
 export val close = (s: Stream): Null =>
   lin_stream_close(s)
 
-// `for` is not exported here: the single unified `for` comes from std/iter and dispatches to the
-// stream backend on a stream receiver. Import `for` from std/iter to consume a stream:
-// `stream.lines().for(println)`.
 // Terminal: drive the pipeline on a worker thread for real concurrency and fault isolation. The
 // stream is moved onto the worker, which owns the whole pipeline and drives it to EOF. Run several
-// with `parallel([...])`.
+// at once with `parallel([...])`.
 // @param s  the pipeline to drive off-thread.
 // @returns a `Promise<Null>`; awaiting it yields `Null` on success, or an `Error` if a
 //   read/transform faulted (caught at the async boundary). `await` reattaches the `Null | Error`
 //   union, so the `Error` case must be handled (see std/async).
-// @example val p = readStream("big.log").lines().filter(isError).writeLines("errors.log").promise()
+// @example val p = pipeline.promise()   // pipeline: a sink built with readStream/lines/writeLines
 // @example match await(p) is Error => print("failed") else => print("done")
 export val promise = (s: Stream): Promise<Null> =>
   lin_stream_promise(s)

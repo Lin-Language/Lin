@@ -2,20 +2,18 @@
 
 std/decimal — exact base-10 fixed-point arithmetic for money and other exact-decimal work.
 
-A `Decimal` is an opaque, immutable, refcounted heap handle (the Timer/Stream/Shared family),
-backed by `rust_decimal` (28–29 significant digits). It represents a value as an integer
-coefficient scaled by a power of ten, so there is NO binary rounding error: `decimal("0.1")`
-plus `decimal("0.2")` is exactly `decimal("0.3")`.
+A `Decimal` is an opaque, immutable, refcounted heap value carrying 28–29 significant digits.
+It represents a value as an integer coefficient scaled by a power of ten, so there is no binary
+rounding error: `decimal("0.1")` plus `decimal("0.2")` is exactly `decimal("0.3")`.
 
-`add`/`sub`/`mul` are ALWAYS exact and never round. `div`, `round`, and `setScale` REQUIRE an
-explicit rounding mode + scale — there is no silent default (that is how money bugs ship). The
-canonical money flow is: build values from strings, add/mul exactly, then `round(x, 2, …)` ONCE
-at the presentation boundary.
+`add`, `sub`, and `mul` are always exact and never round. `div`, `round`, and `setScale`
+require an explicit rounding mode and scale; there is no silent default, which is a common
+source of money bugs. The recommended flow is to build values from strings, add and multiply
+exactly, then `round(x, 2, …)` once at the presentation boundary.
 
-`Decimal` is a type alias to `Json` (an opaque tagged box tagged `TAG_DECIMAL` at runtime).
 Fallible functions return `Decimal | Error`, matched with `is Error`.
 
-NOTE: cross-worker transfer of a Decimal is NOT supported in v1 (raw-pointer handle).
+A Decimal cannot be transferred across workers, since the handle is a pointer.
 
 ## Reference
 
@@ -87,10 +85,15 @@ val decimal = (s: String): Decimal | Error
 ```
 
 Parse a base-10 numeral into an exact `Decimal`, preserving the written scale (`"1.50"` → scale 2).
-The PREFERRED constructor — exact, with no float intermediary.
+This is the preferred constructor: it is exact, with no float intermediary.
 - **`s`** — the decimal numeral.
 - **Returns** the `Decimal`, or an `Error` if `s` is not a valid number.
-- **Example:** decimal("0.1").add(decimal("0.2")).toString()  // "0.3" (exact, no binary error)
+
+**Example:**
+
+```lin
+decimal("0.1").add(decimal("0.2")).toString()  // "0.3" (exact, no binary error)
+```
 
 #### `fromInt`
 
@@ -108,8 +111,8 @@ Build a `Decimal` from an integer (exact, scale 0).
 val fromFloat = (f: Float64): Decimal
 ```
 
-Build a `Decimal` from a Float64. LOSSY — a Float64 already carries binary rounding error;
-NEVER use this for money (use `decimal` on a string instead).
+Build a `Decimal` from a Float64. This is lossy, because a Float64 already carries binary
+rounding error; do not use it for money — use `decimal` on a string instead.
 - **`f`** — the float value.
 - **Returns** the `Decimal` nearest to `f`.
 
@@ -164,8 +167,8 @@ Exact product.
 val div = (a: Decimal, b: Decimal, scale: Int32, mode: RoundingMode): Decimal | Error
 ```
 
-Divide `a` by `b`, rounding to `scale` decimal places with `mode`. The ONLY rounding
-arithmetic — division has no exact result in general, so a target scale + mode are required.
+Divide `a` by `b`, rounding to `scale` decimal places with `mode`. This is the only rounding
+arithmetic: division has no exact result in general, so a target scale and mode are required.
 - **`scale`** — number of decimal places in the result.
 - **`mode`** — one of the `Round*` constants.
 - **Returns** `a / b` rounded, or an `Error` if `b` is zero.
@@ -197,7 +200,7 @@ val abs = (a: Decimal): Decimal
 Absolute value.
 - **Returns** `|a|`.
 
-### Comparison (by numeric VALUE, ignoring scale)
+### Comparison (by numeric value, ignoring scale)
 
 #### `cmp`
 

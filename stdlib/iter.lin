@@ -18,8 +18,8 @@
 // third parameter `(acc, item, i)`. The index is always the source position. The key-extractor
 // combinators (sortBy/minBy/maxBy/groupBy/countBy, in std/array) take no index.
 //
-// import { map, filter, reduce, take, drop } from "std/iter"
-// import { range, rangeStep, iter, iterOf } from "std/iter"
+//   import { map, filter, reduce, take, drop } from "std/iter"
+//   import { range, rangeStep, iter, iterOf } from "std/iter"
 //
 // Array-shaped operations (push, slice, sort, sum, …) live in std/array; stream sources and sinks
 // (readStream, writeStream, lines, drain, …) live in std/stream. The combinators here are the single

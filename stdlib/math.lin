@@ -5,7 +5,7 @@
 // for any numeric type. `random` returns a uniform Float64 in [0, 1). Note NaN: `x == NAN` is always
 // false under IEEE 754, so test with `isNaN(x)` instead.
 //
-// import { abs, floor, ceil, round, sqrt, pow, PI, E } from "std/math"
+//   import { abs, floor, ceil, round, sqrt, pow, PI, E } from "std/math"
 import foreign "lin-runtime"
   val lin_math_pi: () => Float64
   val lin_math_e: () => Float64

@@ -7,8 +7,11 @@
 //
 //   import { readStream } from "std/stream"
 //   import { gunzip } from "std/compress"
-//   import { untar, manifest, files } from "std/archive"
-//   readStream("data.tar.gz").gunzip().untar((meta, data) => ...)
+//   import { untar } from "std/archive"
+//
+//   readStream("data.tar.gz")
+//     .gunzip()
+//     .untar((meta, data) => print("${meta["name"]}: ${meta["size"]} bytes"))
 //
 // Each function consumes the parent stream: it is moved in, and the source binding cannot be used
 // again afterwards.

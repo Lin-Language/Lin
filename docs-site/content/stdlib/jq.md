@@ -8,7 +8,9 @@ result set as an array; `jqFirst` returns just the first (or null). Both compile
 `is Error`. With dot-application a filter reads naturally as the tail of a pipeline, e.g.
 `readFile("deploy.yaml").parse().jq(".spec.containers[].image")`.
 
-  import { jq, jqFirst } from "std/jq"
+```lin
+import { jq, jqFirst } from "std/jq"
+```
 
 The engine covers essentially the full jq language: path expressions (`.a.b`, `.[0]`, `.[1:3]`,
 `.[]`, `..`, optional `?`), combinators (`|`, `,`, `//`), object/array construction, arithmetic
@@ -20,7 +22,7 @@ and logic, and the standard builtins (`select`, `map`, `keys`, `has`, `length`, 
 #### `jq`
 
 ```lin
-val jq = (input: Json, filter: String): Json
+val jq = (input: Json, filter: String): Json | Error
 ```
 
 Run a jq filter over a Json value and collect all results.
@@ -28,13 +30,23 @@ Run a jq filter over a Json value and collect all results.
 - **`filter`** — the jq filter expression.
 - **Returns** a `Json[]` of the filter's outputs, or an `Error` object if the filter is invalid or
   fails to evaluate.
-- **Example:** jq({ "users": [{ "name": "Ada" }] }, ".users[] | .name")  // ["Ada"]
-- **Example:** jq({ "xs": [1, 2, 3] }, ".xs | add")                      // [6]
+
+**Example:**
+
+```lin
+jq({ "users": [{ "name": "Ada" }] }, ".users[] | .name")  // ["Ada"]
+```
+
+**Example:**
+
+```lin
+jq({ "xs": [1, 2, 3] }, ".xs | add")                      // [6]
+```
 
 #### `jqFirst`
 
 ```lin
-val jqFirst = (input: Json, filter: String): Json
+val jqFirst = (input: Json, filter: String): Json | Error
 ```
 
 Run a jq filter and return only its first result.
@@ -42,4 +54,9 @@ Run a jq filter and return only its first result.
 - **`filter`** — the jq filter expression.
 - **Returns** the first output value, `null` if the filter produced none, or the `Error` object if the
   query failed.
-- **Example:** jqFirst({ "users": [{ "name": "Ada" }] }, ".users[0].name")  // "Ada"
+
+**Example:**
+
+```lin
+jqFirst({ "users": [{ "name": "Ada" }] }, ".users[0].name")  // "Ada"
+```
