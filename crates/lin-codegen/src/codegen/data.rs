@@ -177,7 +177,14 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
         match val_ty {
-            Type::TypeVar(_) | Type::Union(_) => self.push_tagged_val(arr, val, val_ty),
+            // Boxed opaque handles (Promise/Shared/Stream) are `TaggedVal*` with their own tag, so
+            // they push into a tagged array exactly like a union/TypeVar value: copy the 16-byte
+            // TaggedVal so the element carries `(tag, payload)`. `lin_race` and friends read the
+            // element's payload as the inner handle pointer — a flat raw-pointer push (the `_` arm,
+            // tag 0) would store the box pointer in the payload slot AND mis-tag it, so the runtime
+            // would deref the box header as the inner handle.
+            Type::TypeVar(_) | Type::Union(_) | Type::Promise(_) | Type::Shared(_) | Type::Stream(_) =>
+                self.push_tagged_val(arr, val, val_ty),
             _ => {
                 let tag_val = Self::type_tag(val_ty);
                 let tag = i8_ty.const_int(tag_val as u64, false);

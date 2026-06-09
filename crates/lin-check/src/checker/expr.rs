@@ -1606,7 +1606,7 @@ pub(crate) fn is_discriminated_sum_union(ty: &Type) -> bool {
 pub(crate) fn type_mentions_strlit(ty: &Type) -> bool {
     match ty {
         Type::StrLit(_) => true,
-        Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) | Type::Stream(inner) => type_mentions_strlit(inner),
+        Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) | Type::Stream(inner) | Type::Promise(inner) => type_mentions_strlit(inner),
         Type::FixedArray(elems) => elems.iter().any(type_mentions_strlit),
         Type::Union(variants) => variants.iter().any(type_mentions_strlit),
         Type::Object { fields, .. } => fields.values().any(type_mentions_strlit),
@@ -1627,6 +1627,7 @@ pub(crate) fn erase_generic_type_vars(ty: &Type) -> Type {
         Type::Iterator(t) => Type::Iterator(Box::new(erase_generic_type_vars(t))),
         Type::Shared(t) => Type::Shared(Box::new(erase_generic_type_vars(t))),
         Type::Stream(t) => Type::Stream(Box::new(erase_generic_type_vars(t))),
+        Type::Promise(t) => Type::Promise(Box::new(erase_generic_type_vars(t))),
         Type::Map(t) => Type::Map(Box::new(erase_generic_type_vars(t))),
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(erase_generic_type_vars).collect()),
         Type::Union(ts) => Type::Union(ts.iter().map(erase_generic_type_vars).collect()),
@@ -1648,7 +1649,7 @@ pub(crate) fn erase_generic_type_vars(ty: &Type) -> Type {
 pub(crate) fn type_mentions_generic_tv(ty: &Type) -> bool {
     match ty {
         Type::TypeVar(id) => *id != u32::MAX,
-        Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) | Type::Stream(inner) | Type::Map(inner) => type_mentions_generic_tv(inner),
+        Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) | Type::Stream(inner) | Type::Promise(inner) | Type::Map(inner) => type_mentions_generic_tv(inner),
         Type::FixedArray(elems) => elems.iter().any(type_mentions_generic_tv),
         Type::Union(variants) => variants.iter().any(type_mentions_generic_tv),
         Type::Object { fields, .. } => fields.values().any(type_mentions_generic_tv),

@@ -71,6 +71,13 @@ pub enum Type {
     /// boundary is a MOVE (CAP_MOVE, Stage 7). Covariant in `T`. Constructed only by the stream
     /// source intrinsics' return types; it cannot be spelled in source annotations.
     Stream(Box<Type>),
+    /// `Promise<T>` — an opaque handle to a value being computed on a background thread
+    /// (`async`/`parallel`/`race`/`timeout`/`retry`/`poolAsync`). A sibling to `Shared`/`Stream`:
+    /// an opaque boxed pointer (`TaggedVal*(TAG_PROMISE)` at runtime), NOT structurally compatible
+    /// with `T` or `Json`, so the only operation is resolving it via `await` (which yields
+    /// `T | Error`). Covariant in `T`. Spellable in source as `Promise<T>` / bare `Promise`
+    /// (= `Promise<Json>`); see `resolve.rs`.
+    Promise(Box<Type>),
     TypeVar(u32),
     Never,
     /// A named type alias reference (used for recursive types that cannot be eagerly expanded).
@@ -117,6 +124,7 @@ impl PartialEq for Type {
             (Iterator(a), Iterator(b)) => a == b,
             (Shared(a), Shared(b)) => a == b,
             (Stream(a), Stream(b)) => a == b,
+            (Promise(a), Promise(b)) => a == b,
             (TypeVar(a), TypeVar(b)) => a == b,
             (Named(a), Named(b)) => a == b,
             _ => false,
@@ -274,7 +282,7 @@ impl Type {
     pub fn contains_type_var(&self) -> bool {
         match self {
             Type::TypeVar(_) => true,
-            Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) => inner.contains_type_var(),
+            Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) | Type::Shared(inner) | Type::Promise(inner) => inner.contains_type_var(),
             Type::FixedArray(elems) => elems.iter().any(|t| t.contains_type_var()),
             Type::Union(variants) => variants.iter().any(|t| t.contains_type_var()),
             Type::Object { fields, .. } => fields.values().any(|t| t.contains_type_var()),
@@ -430,6 +438,7 @@ impl fmt::Display for Type {
             Type::Iterator(inner) => write!(f, "Iterator<{}>", inner),
             Type::Shared(inner) => write!(f, "Shared<{}>", inner),
             Type::Stream(inner) => write!(f, "Stream<{}>", inner),
+            Type::Promise(inner) => write!(f, "Promise<{}>", inner),
             // `TypeVar(u32::MAX)` is the dynamic `Json` marker — render it as `Json`, not a raw id.
             // Other ids are unresolved generic/inference variables; they render as `?T<id>` so the
             // LSP's `clean_type_string` can assign distinct positional names (`T`/`U`/…) while
