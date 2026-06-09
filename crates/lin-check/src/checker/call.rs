@@ -437,7 +437,22 @@ impl Checker {
                         let object_lit_against_concrete_map = matches!(arg, Expr::Object(..))
                             && matches!(param_ty, Type::Map(_))
                             && !param_ty.contains_type_var();
-                        let typed = if array_lit_against_concrete_array || object_lit_against_concrete_map {
+                        // Array-of-TUPLE param (`[String, T][]`, i.e. `Array(FixedArray([...]))`)
+                        // where a type parameter is nested inside the tuple. A 2+-element literal
+                        // `["a", 1]` infers bottom-up to the unioned `(String | Int32)[]` (a plain
+                        // Array), never a tuple, so it can neither bind `T` positionally nor match
+                        // the param. Route such a literal through expected-type-directed checking:
+                        // each inner literal is checked against the tuple shape `[String, T]`, which
+                        // yields a `FixedArray([String, Int32])` actual, and the `FixedArray`
+                        // positional arm in `collect_type_subs` then binds `T = Int32`. Needed for
+                        // `fromEntries(pairs: [String, T][])` and the keyed-pair builders.
+                        let array_lit_against_tuple_array = matches!(arg, Expr::Array(..))
+                            && matches!(param_ty, Type::Array(inner)
+                                if matches!(**inner, Type::FixedArray(_)));
+                        let typed = if array_lit_against_concrete_array
+                            || object_lit_against_concrete_map
+                            || array_lit_against_tuple_array
+                        {
                             self.check_expr(arg, param_ty)?
                         } else {
                             self.infer_expr(arg)?

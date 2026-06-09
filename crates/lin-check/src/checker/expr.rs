@@ -57,9 +57,33 @@ impl Checker {
             let typed_elements: Result<Vec<_>, _> =
                 elements.iter().map(|e| self.check_expr(e, expected_elem)).collect();
             let typed_elements = typed_elements?;
+            // When the expected element is a TUPLE shape carrying an unresolved generic TypeVar
+            // (e.g. the `[String, T]` of a `[String, T][]` param), checking each element resolves it
+            // concretely (`[String, Int32]`), but `expected_elem` itself still mentions `T`. Adopt
+            // the FIRST checked element's concrete type as the array element so the literal's recorded
+            // type is `[String, Int32][]`, not `[String, T][]` — that is what lets the monomorphizer
+            // bind `T` positionally from the argument (`fromEntries`, keyed-pair builders). Gated to a
+            // FixedArray (tuple) expected element with a NON-Json TypeVar: a bare `Json[]` element
+            // (`TypeVar(MAX)`) must keep its wildcard so a heterogeneous `[1, "two", true]` stays a
+            // tagged `Json[]`, and a plain `T[]`/`Int32[]` element is unaffected (no tuple to rebuild).
+            let tuple_elem_has_generic_tv = matches!(&**expected_elem, Type::FixedArray(ts)
+                if ts.iter().any(type_mentions_generic_tv));
+            let elem_ty = if tuple_elem_has_generic_tv {
+                // Non-empty: adopt the first checked element's concrete tuple type. Empty: there is no
+                // element to pin the tuple's generic `T`, and the result is an empty container whose
+                // element representation is irrelevant — erase the tuple's generic TypeVars to the
+                // `Json` wildcard so a bare `fromEntries([])` still monomorphizes (to an empty map)
+                // rather than leaving `T` unconstrained ("cannot infer").
+                match typed_elements.first() {
+                    Some(t) => t.ty(),
+                    None => erase_generic_type_vars(expected_elem),
+                }
+            } else {
+                (**expected_elem).clone()
+            };
             return Ok(TypedExpr::MakeArray {
                 elements: typed_elements,
-                ty: Type::Array(expected_elem.clone()),
+                ty: Type::Array(Box::new(elem_ty)),
                 span: *span,
             });
         }
@@ -1544,6 +1568,48 @@ pub(crate) fn type_mentions_strlit(ty: &Type) -> bool {
         Type::Object { fields, .. } => fields.values().any(type_mentions_strlit),
         Type::Function { params, ret, .. } => {
             params.iter().any(type_mentions_strlit) || type_mentions_strlit(ret)
+        }
+        _ => false,
+    }
+}
+
+/// Replace every GENERIC (quantified, non-Json-wildcard) `TypeVar` in `ty` with the `Json` wildcard.
+/// Used to erase the unconstrained tuple element type of an empty array literal flowing into a
+/// `[String, T][]` param, so the empty container monomorphizes instead of leaving `T` unsolved.
+pub(crate) fn erase_generic_type_vars(ty: &Type) -> Type {
+    match ty {
+        Type::TypeVar(id) if *id != u32::MAX => Type::TypeVar(u32::MAX),
+        Type::Array(t) => Type::Array(Box::new(erase_generic_type_vars(t))),
+        Type::Iterator(t) => Type::Iterator(Box::new(erase_generic_type_vars(t))),
+        Type::Shared(t) => Type::Shared(Box::new(erase_generic_type_vars(t))),
+        Type::Stream(t) => Type::Stream(Box::new(erase_generic_type_vars(t))),
+        Type::Map(t) => Type::Map(Box::new(erase_generic_type_vars(t))),
+        Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(erase_generic_type_vars).collect()),
+        Type::Union(ts) => Type::Union(ts.iter().map(erase_generic_type_vars).collect()),
+        Type::Object { fields, sealed } => Type::Object {
+            fields: fields.iter().map(|(k, v)| (k.clone(), erase_generic_type_vars(v))).collect(),
+            sealed: *sealed,
+        },
+        Type::Function { params, ret, required } => Type::Function {
+            params: params.iter().map(erase_generic_type_vars).collect(),
+            ret: Box::new(erase_generic_type_vars(ret)),
+            required: *required,
+        },
+        _ => ty.clone(),
+    }
+}
+
+/// True when `ty` mentions a GENERIC (quantified, non-Json-wildcard) `TypeVar`. The `Json` wildcard
+/// `TypeVar(u32::MAX)` is excluded — it is a concrete dynamic type, not an unresolved type parameter.
+pub(crate) fn type_mentions_generic_tv(ty: &Type) -> bool {
+    match ty {
+        Type::TypeVar(id) => *id != u32::MAX,
+        Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) | Type::Stream(inner) | Type::Map(inner) => type_mentions_generic_tv(inner),
+        Type::FixedArray(elems) => elems.iter().any(type_mentions_generic_tv),
+        Type::Union(variants) => variants.iter().any(type_mentions_generic_tv),
+        Type::Object { fields, .. } => fields.values().any(type_mentions_generic_tv),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(type_mentions_generic_tv) || type_mentions_generic_tv(ret)
         }
         _ => false,
     }

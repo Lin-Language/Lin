@@ -76,6 +76,14 @@ pub(crate) fn collect_type_subs(pattern: &Type, actual: &Type, subs: &mut std::c
         (Type::Array(pt), Type::FixedArray(ats)) => {
             for at in ats { collect_type_subs(pt, at, subs); }
         }
+        // Positional tuple unification: a `[String, T]` param against a `[String, Int32]` actual
+        // binds `T = Int32` element-by-element. Needed for `fromEntries(pairs: [String, T][])` and
+        // the keyed-pair builders, whose type parameter is nested inside a fixed-array (tuple) shape.
+        // (The actual is a FixedArray only when the arg was routed through expected-type-directed
+        // checking against the tuple param — see the tuple-literal path in `call.rs`.)
+        (Type::FixedArray(pts), Type::FixedArray(ats)) => {
+            for (pt, at) in pts.iter().zip(ats.iter()) { collect_type_subs(pt, at, subs); }
+        }
         // A generic `T[]` param unified against a `Json` value (the MAX wildcard): bind the
         // element TypeVar(s) to the Json wildcard so the function monomorphizes to a tagged
         // `$Json` instance (representation-consistent) rather than leaving `T` unbound. Same

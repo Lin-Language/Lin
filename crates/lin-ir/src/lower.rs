@@ -6094,17 +6094,26 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
 
     builder.switch_to(body);
-    let elem = builder.alloc_temp(elem_ty.clone());
+    // Read the element at the TAGGED (Json) representation, not its concrete static type. The
+    // per-iteration `ReleaseIfDistinct` below relies on the element being a freshly-OWNED +1 box
+    // (the `lin_array_get_tagged` contract). A concrete heap element type (e.g. a monomorphized
+    // `String` from a generic `reduce<T>`) would instead lower the Index to the BORROWED
+    // `lin_array_get`, so releasing it each iteration over-releases the array's own reference and
+    // frees live elements (a non-mutating reducer then returns a dangling pointer → blank/garbage).
+    // A flat scalar element keeps its concrete read (no owned box to balance); only heap/union
+    // elements are forced tagged here.
+    let read_elem_ty = if is_inline_scalar(&elem_ty) { elem_ty.clone() } else { json.clone() };
+    let elem = builder.alloc_temp(read_elem_ty.clone());
     builder.emit(Instruction::Index {
         dst: elem, object: iterable, key: i,
-        obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+        obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
     });
     // acc_next = f(acc, elem[, i]). acc is carried as Json; coerce both args to the reducer's
     // declared param types. A 3-param reducer `(acc, item, i) => …` also receives the OPTIONAL
     // 0-based SOURCE index (narrowed Int64→Int32); a 2-param reducer omits it (its closure wrapper
     // has only two parameters, so passing a third would be ABI UB).
     let acc_arg = coerce_arg_to_param(acc, &json, param_tys.first(), builder);
-    let elem_arg = coerce_arg_to_param(elem, &elem_ty, param_tys.get(1), builder);
+    let elem_arg = coerce_arg_to_param(elem, &read_elem_ty, param_tys.get(1), builder);
     let mut call_args = vec![acc_arg, elem_arg];
     if param_tys.len() >= 3 {
         let idx = narrow_loop_index(i, builder);

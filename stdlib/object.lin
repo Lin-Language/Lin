@@ -49,13 +49,12 @@ export val entries = (obj: Json): Json[] =>
 
 // Build an object from a list of `[key, value]` pairs (the inverse of `entries`). Later pairs with
 // the same key overwrite earlier ones.
-// @param pairs  an array of `[String, value]` pairs (typed `Json`).
-// @returns a `Json` object mapping each key to its value.
+// @param pairs  an array of `[String, T]` pairs.
+// @returns a `{ String: T }` map from each key to its value.
 // @example fromEntries([["a", 1], ["b", 2]])   // { "a": 1, "b": 2 }
 // @example entries(obj).map(([k, v]) => [k, v * 2]).fromEntries()   // double every value
-export val fromEntries = (pairs: Json): Json =>
-  // Stays `Json` rather than a generic `[String, T][] -> { String: T }`, which inference cannot yet recover.
-  var result: {  } = {}
+export val fromEntries = <T>(pairs: [String, T][]): { String: T } =>
+  var result: { String: T } = {}
   pairs.for(pair =>
     result[pair[0]] = pair[1]
   )
