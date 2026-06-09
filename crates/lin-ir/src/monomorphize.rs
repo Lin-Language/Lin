@@ -829,6 +829,46 @@ fn find_exported_fn(module: &TypedModule, name: &str) -> Option<TypedExpr> {
 
 /// How a free (non-local) slot referenced inside a re-homed cross-module body resolves in the
 /// origin module — used to pick the importer-side construct it should be rewritten into.
+/// True if a cross-module generic's body has a FREE reference to a top-level mutable `var` of its
+/// origin module (e.g. `std/random`'s global `g: Rng` read by `pick`/`shuffled`). Such a global is
+/// genuine shared state living in the origin module; a native specialization clones the body into
+/// the IMPORTER, where that global is NOT in scope — `classify_origin_slot` cannot re-home a `Var`
+/// (it has no exported symbol), so the reference is silently dropped (its `LocalGet` produces no
+/// value → the call to a function taking it loses an argument → codegen arity error). Detecting this
+/// lets the caller route to the boxed (type-erased) fallback, which keeps the original body in the
+/// origin module where the global resolves.
+fn body_refs_origin_global_var(body: &TypedExpr, origin: &TypedModule) -> bool {
+    // Origin top-level `var` slots (the genuine module globals).
+    let mut origin_var_slots = std::collections::HashSet::new();
+    for stmt in &origin.statements {
+        if let TypedStmt::Var { slot, .. } = stmt {
+            origin_var_slots.insert(*slot);
+        }
+    }
+    if origin_var_slots.is_empty() {
+        return false;
+    }
+    // Slots bound locally inside the body (params/vals/vars) are not the origin globals.
+    let mut locals = std::collections::HashSet::new();
+    collect_local_slots(body, &mut locals);
+    let mut found = false;
+    walk_local_slot_refs(body, &mut |slot| {
+        if origin_var_slots.contains(&slot) && !locals.contains(&slot) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Visit every `LocalGet`/`LocalSet` slot referenced anywhere in `expr`.
+fn walk_local_slot_refs(expr: &TypedExpr, f: &mut impl FnMut(usize)) {
+    match expr {
+        TypedExpr::LocalGet { slot, .. } | TypedExpr::LocalSet { slot, .. } => f(*slot),
+        _ => {}
+    }
+    for_each_child(expr, &mut |c| walk_local_slot_refs(c, f));
+}
+
 enum OriginRef {
     /// An intrinsic (origin's `intrinsics[slot]` = name). Merged into the importer's intrinsic map.
     Intrinsic(String),
@@ -1615,7 +1655,23 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                     let sealed_arg = subs.values().any(mentions_sealed);
                     let unsound_combinator = combinator_unsound_over_sealed(&g_name(state, gslot));
 
-                    if fully_concrete && sealed_arg && unsound_combinator {
+                    // A cross-module generic whose body reads a top-level `var` GLOBAL of its origin
+                    // module (e.g. `std/random`'s `pick`/`shuffled` over the global `g: Rng`) cannot
+                    // be native-specialized: the spec is cloned into THIS module, where that global
+                    // is out of scope and the reference is dropped (an arg to a call vanishes →
+                    // codegen arity error). Route to the boxed (type-erased) original, which stays in
+                    // the origin module where the global resolves.
+                    let refs_origin_global = state.generics.get(&gslot)
+                        .and_then(|gf| gf.origin.as_ref())
+                        .and_then(|p| state.imports.get(p).map(|m| (p.clone(), m)))
+                        .map(|(_, m)| body_refs_origin_global_var(&body, m))
+                        .unwrap_or(false);
+
+                    if fully_concrete && refs_origin_global {
+                        // Boxed fallback: keep the origin-module body (global in scope), share one copy.
+                        state.boxed_fallback_used.insert(gslot);
+                        boxed_fallback_call(expr, gslot, &params, &ret_type, state);
+                    } else if fully_concrete && sealed_arg && unsound_combinator {
                         // Materialize-to-boxed boundary: keep the type-erased generic original and
                         // route this call through it. `box_value` converts the sealed array/record
                         // to its boxed view at the arg boundary; the wrapping Coerce re-seals the
