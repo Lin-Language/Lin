@@ -83,3 +83,24 @@ The unconditional first move. It removes RAPTOR's `Json` tax, fixes two real com
 language change and no strategy commitment, and — most importantly — its measurement is what tells you
 whether you need Path 1's expensive ABI at all and whether Path 1 or Path 2 is the right read strategy.
 **Do Path 0, measure, then choose `{1 or 2}` + `3`.**
+
+---
+
+## IMPLEMENTATION FINDINGS (2026-06-09, branch `path1-packed-records`, NOT merged)
+
+> **Work reference:** branch **`path1-packed-records`** (durable handle — `git log path1-packed-records`; worktree `.claude/worktrees/path1-packed` is ephemeral). The Path-0 deliverable is commit **`04bec701`** (the `Trip|Null` tail-recursive UAF fix — merge-worthy on its own). Full commit chain + the Path-1 work that builds on it is in path-1's IMPLEMENTATION FINDINGS section.
+
+Worked through Path 0 in full. Outcome: **the two bug fixes are real and one landed sound; the decisive RAPTOR measurement was taken and it settles the H5-vs-H5b contradiction empirically.**
+
+### Fix 1 — `get<T,D>` monomorphization for record-array `T`: NOT a bug on current master
+Could not reproduce the proposal's "link error" (`undefined reference to std_array_get__val`) on any minimal cross-module repro or on the real RAPTOR retype (`tripsByRoute: { String: Trip[] }` builds end-to-end). The underlying cross-module generic-capturing-closure checker bug had **already been fixed and merged** before this work. So this prerequisite is **already satisfied** — strike it from the path.
+
+### Fix 2 — `Trip|Null` tail-recursive scan-param UAF: REAL, FIXED, ASan-verified, committed (`04bec70`)
+A genuine universal RC/codegen soundness bug (the `scanRouteAt` shape). Root cause in `lower.rs`: a concrete heap record (`match`-narrowed `Trip`) re-boxed into a `T|Null` union for a self-tail-call arg becomes the next iteration's param-slot value, but `box_value`(Object→union) wraps a *borrowed* inner; `release_owned_for_tail_call` then frees the narrowed source on the live back-edge → the threaded box dangles. Fix: `Retain` the caller-owned-shell box arg so the +1 transfers into the threaded box. **Verified by me independently:** ASan-clean (no UAF/double-free), correct output (1999 / 199999 across the shape), leak **constant** 88 B / 8 allocs at N=1k AND N=100k (no per-iteration scaling). Regression test added. This fix is **merge-worthy on its own**, independent of the perf roadmap.
+
+### The decisive measurement — RAPTOR is in the COMBINATOR-DOMINATED branch
+Typed `tripsByRoute: { String: Trip[] }`, full `bench.lin`, digest byte-identical (`group=26203913 range=773022892 journeys=139`). Per-phase timing was **perf-NEUTRAL** vs the `Json` baseline (LOAD/PREP/GROUP/RANGE all within noise). 
+
+**The branch is decided: typing alone does NOT win RAPTOR — Path 1's in-place ABI IS the prerequisite.** Concrete reason: `Trip` has String + nested-record fields, so under the current gate (scalar+Bool only) it **cannot pack** — it stays a boxed `Object[]`, and the query phase (RANGE ~300s + GROUP ~97s of the ~360s) is dominated by the combinators (`for`/`length`/scan) reading it, not by isolated field reads. This **empirically reconciles H5 (>5× regression on naive retype) with H5b (~3.5× read-micro projection):** typing wins only when the value can *pack* AND the combinators read it *in place* — neither held for `Trip` until Path 1 Steps 1+2 land (see path-1 findings) and the heap-field gate widens (still blocked — see path-1 + path-3 findings).
+
+**Net Path-0 verdict:** prerequisite #1 already done; #2 fixed soundly; the measurement says RAPTOR needs Path 1's in-place ABI (now partially built) before typing trips pays off — and even then only once heap-field records can pack (the open repr-oracle blocker).

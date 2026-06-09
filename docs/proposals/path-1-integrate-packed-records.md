@@ -289,3 +289,33 @@ distinction the grammar already carries (`{"age":UInt8}` = struct; `{String:UInt
 answers "a struct field read is cheap, full stop" *once Step 1 + packed-by-default land* (the latter
 gated on the structural-subtyping soundness hardening). It does not touch construction RC — compose with
 Path 3's inferred arenas for that. Best if the goal is the win with zero language-surface change.
+
+---
+
+## IMPLEMENTATION FINDINGS (2026-06-09, branch `path1-packed-records`, NOT merged)
+
+> **Work reference (the code is all here):** branch **`path1-packed-records`** (tip `39f8329c`), checked out at worktree `.claude/worktrees/path1-packed`. The worktree is ephemeral; the **branch is the durable handle** — `git log path1-packed-records`. Commit chain from master base `29d39237`:
+> - `04bec701` fix(ir): Trip|Null tail-recursive self-tail-call UAF (Path 0)
+> - `568756b0` fix(ir): per-iteration index/element box leak in non-inline for loops
+> - `470ea0ad` perf(ir): **Path-1 Step 1+2** — in-place packed-array `for`/`length`, no materialize
+> - `4de04817` perf(ir): **Path-1 Step 1+2** — in-place packed `map`/`reduce` field reads
+> - `39f8329c` perf(ir): **Path-1 Step 3** — in-place String field read capability; gate stays scalar+Bool (oracle blocker)
+>
+> Mergeable subset (the 4.5× win, scalar scope): `470ea0ad` + `4de04817` on top of the two fixes.
+
+**Steps 1+2 (the in-place packed-array op ABI — "the unsolved core") are SOLVED and measured-winning. Step 3 (pack heap-field records by default) hit the predicted repr-oracle wall and is built-but-dormant.** All numbers below independently re-verified, not just agent-reported.
+
+### Steps 1+2 — DONE (commits `470ea0ad`, `4de04817`)
+The whole-array materialization on combinator entry — the dominant cost #2 — is **eliminated** for packed sealed-scalar arrays in `for`/`length`/`map`/`reduce`.
+- **Mechanism (a) chosen** (representation-dispatched lowering, not monomorphization): a `std_iter_for` / `std_array_length` call over a packed array is redirected at the import-fn dispatch site to the `lin_for`/`lin_length` intrinsic at the **concrete** element type, dissolving the `Json`-param boundary that forced `lin_sealed_array_to_tagged`. The element binds to a borrowed `(array, index)` **view** (`ctx.packed_elem_slots`); `p["field"]` lowers to a const-offset `SealedArrayFieldGet` straight off the `0xFE` buffer. `length` loads the u64 at offset 8 directly.
+- **Soundness guard** (`elem_used_only_for_scalar_fields`): the in-place path fires ONLY when the body uses the element solely for scalar field reads; whole-value uses (`push(out, p)`, comparisons, `filter`'s keep) fall back to the existing materialize path — byte-identical to master, **no correctness regression**.
+- **IR criterion proven (by me):** `Pt[].for(p => … p["x"] …)` emits **0** `sealed_array_to_tagged` (was 2) and **0** `lin_object_get` for the element — only const-offset `getelementptr`+`load`. Same for `map`/`reduce`.
+- **Measured (by me, low load): 2.84s → 0.63s ≈ 4.5×** on a packed-`Pt[]` iteration microbench, output identical (29970000000). interp **neutral** (0.44s, RESULT 10460000), records **neutral**, RAPTOR digest **byte-identical**, 682 integration tests green, ASan-clean (constant 72 B leak at N=1k and N=100k — no scaling). This is the first time across the whole effort that cost #2 was both eliminated AND shown a wall-clock win — two prior agents stopped short here (one reverted a fixable operand-box leak; this run fixed it via a concrete-type read coerced to the param's `Json` type with the box owned by the body scope).
+
+### Step 3 — pack fixed-key records by default: PARTIAL, blocked at the repr oracle (the §H4/H5 seam, now precisely located)
+- **Scalar fixed-key records already pack by default** (verified) and now iterate in place — that IS the win above.
+- **String-field widening is built but DORMANT.** The in-place String field read (borrowed `load ptr` + retain-if-escapes) is implemented and harness-leak-clean for build/push/index/map/for/reduce (commit `39f8329c`). But flipping `Type::is_sealed_array_field_packable` to admit String **trips the repr Stage-2 oracle**: an `Index` on a packed String-field array threaded through a `T|Null` tail-recursive param has the *old type predicate* saying `Packed` while the *dataflow repr analysis* correctly demotes to `Boxed(Opaque)` at the union boundary. This is the §H4/H5 packed/boxed classification divergence — now pinned to a specific contradiction between the type-predicate gate and the repr pass at the union/tail-recursive boundary, rather than vaguely "hard." Gate reverted to scalar+Bool; the capability stays present, dormant.
+- **The remaining work to finish Step 3 is precise:** reconcile the repr oracle/verifier with the widened gate — make the type-predicate gate agree with the dataflow repr at the `T|Null`/union/Index boundary (or drive packability purely off the repr pass, the ADR-062 single-owner direction) — *before* the gate widens. This is the named "highest-risk step," and it is genuinely the multi-day repr-pass reconciliation, not a one-liner.
+
+### Net Path-1 verdict
+The in-place ABI thesis is **validated**: Steps 1+2 make packed-scalar-array iteration ~4.5× faster with no regression, proving the materialization boundary (cost #2) was the right target and is fixable soundly. The lever for RAPTOR specifically, however, needs Step 3 (heap-field default-pack) because `Trip` has String/nested fields — and Step 3 is gated on the repr-oracle reconciliation above. **Mergeable now: Steps 1+2 (conservative scalar-only scope, 4.5× win, all gates green).** Deferred: Step 3 heap-field widening, blocked on the precisely-located repr-oracle divergence.

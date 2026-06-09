@@ -212,3 +212,23 @@ userland change**, via inferred arenas (primary, lowest-risk, reuses existing es
 escape-based RC elision (the H8-cliff fix, built correctly this time — the prototype was unsound).
 Orthogonal and composable with every other path; **Path 1 + Path 3 is the no-language-change combination
 that covers all three costs.** Best pursued *in parallel* with a reads path, not alone.
+
+---
+
+## IMPLEMENTATION FINDINGS (2026-06-09)
+
+> **Work reference:** no Path-3 code was written (see below) — but it composes with branch **`path1-packed-records`** (durable handle — `git log path1-packed-records`; worktree `.claude/worktrees/path1-packed` is ephemeral), which landed Path 1's in-place ABI (the read/iteration half) that Path 3's arenas (the construction half) would sit alongside.
+
+Path 3 was in scope alongside Path 0/1 but was **not implemented** — the foundation was verified and the full inferred-arena deferred as out-of-scope-for-this-pass, with two concrete findings.
+
+### The escape-analysis foundation is live and effective (the thing Path 3 would generalize)
+Verified the existing escape analysis (`crates/lin-ir/src/escape.rs`, ADR-012 / sealed Stage-4) is wired into the pipeline and works *today*: a non-escaping all-scalar sealed record in a tight 200M-iter loop compiles to ~0 runtime — alloca'd, SROA'd to registers, RC fully suppressed (the historically-documented ~12% stack-alloc regression is gone; emission-side RC-suppression fixed it). This is the live substrate Path 3's inferred arenas would extend from a single inline value to a *graph* + a region lifetime.
+
+### Full inferred arena: NOT attempted (multi-week, highest-soundness-risk; deferred deliberately)
+A true inferred arena (bump allocator + region-lifetime tracking on the escape graph + escape-promotion at the boundary + bulk-free of heap-field children) is a multi-week effort whose named hazard is region-drop UAF (a missed escape = use-after-free when the region drops). Per the "soundness is the gate" discipline, a half-built version that risks UAF was not landed. Characterized as deferred with the foundation confirmed.
+
+### The boundary-RC half (escape-RC-elision / borrow-ABI) is confirmed UNSOUND as prototyped — do NOT resurrect it
+The H8 read-only-arg borrow prototype (cited elsewhere) returns **wrong values** on the construct-in-`.for`-closure shape — a caller/callee layout mismatch (caller builds the stack record boxed, borrowed callee reads it packed). Independently reproduced: a trivial N=5 program prints garbage (`-1491889465` etc.) instead of `30`; the green test suite proved nothing because the borrow gate fired 0× across all integration tests and ASan is blind to a wrong-*value* read. **The boundary borrow is therefore secondary to inferred arenas** (which this path already states), and if pursued must build the construction-side codegen correctly and value-verify — not productionize the prototype.
+
+### How this composes with what DID land
+Path 1 Steps 1+2 (in-place packed iteration, 4.5× — see path-1 findings) fix cost #2 but **not** construction RC (#3). For the build-heavy phases (RAPTOR LOAD/PREP, interp tokenize) #3 remains untouched, so **inferred arenas remain the open, highest-value next lever for construction cost** — composable with the now-landed in-place ABI. The proposal's "Path 1 + Path 3" headline composition stands: Path 1's half is built (scalar scope); Path 3's half is unbuilt.
