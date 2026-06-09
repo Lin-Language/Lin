@@ -13253,6 +13253,44 @@ val x = trim(42)
 }
 
 #[test]
+fn test_index_sig_map_key_string_alias_checks() {
+    // A type alias that resolves to `String` is a valid index-signature (map) key. The literal
+    // `String` key form must keep working too.
+    let (ok, output) = check_source(
+        r#"type StopID = String
+type Stops = { StopID: { String: UInt8 } }
+val s: Stops = {}
+"#,
+    );
+    assert!(
+        ok,
+        "expected a String-alias map key to type-check, but it failed:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_index_sig_map_key_non_string_alias_rejected() {
+    // An index-signature key whose alias does NOT resolve to `String` is rejected at
+    // type-resolution time with a clear diagnostic.
+    let (ok, output) = check_source(
+        r#"type Bad = Int32
+val m: { Bad: Int32 } = {}
+"#,
+    );
+    assert!(
+        !ok,
+        "expected a non-String map key alias to be rejected, but it passed:\n{}",
+        output
+    );
+    assert!(
+        output.contains("Map key type must be String"),
+        "expected the map-key error, got:\n{}",
+        output
+    );
+}
+
+#[test]
 fn test_check_accepts_valid_imported_symbol_program() {
     let (ok, output) = check_source(
         r#"import { trim } from "std/string"

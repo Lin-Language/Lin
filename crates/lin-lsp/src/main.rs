@@ -2890,7 +2890,10 @@ fn collect_type_spans_in_type(ty: &lin_parse::ast::TypeExpr, out: &mut Vec<lin_c
             collect_type_spans_in_type(ret, out);
         }
         T::Object(fields, _) => fields.iter().for_each(|(_, t)| collect_type_spans_in_type(t, out)),
-        T::IndexSig(inner, _) => collect_type_spans_in_type(inner, out),
+        T::IndexSig(key, value, _) => {
+            collect_type_spans_in_type(key, out);
+            collect_type_spans_in_type(value, out);
+        }
         T::StringLit(_, _) => {}
     }
 }
