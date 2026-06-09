@@ -7,7 +7,7 @@
 // widening). The fixed-width casts (toUInt8/toInt8/…/toUInt64) take a UInt64 and truncate/reinterpret
 // to the target width — the building blocks for the bit-level packing in std/bytes.
 //
-// import { parseInt32, parseFloat64, toInt32, toFloat64, isInt32, isFloat64 } from "std/number"
+//   import { parseInt32, parseFloat64, toInt32, toFloat64, isInt32, isFloat64 } from "std/number"
 import foreign "lin-runtime"
   val lin_parse_int32: (String) => Int32
   val lin_parse_float64: (String) => Float64

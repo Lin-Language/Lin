@@ -8,7 +8,9 @@ main thread on `waitSignal(2)` for SIGINT/Ctrl-C and clean up before exiting). T
 first blocked in the thread's mask and consumed with `sigwait`, so a signal that arrives during
 setup is not lost; no handler is installed.
 
-  import { waitSignal } from "std/signal"
+```lin
+import { waitSignal } from "std/signal"
+```
 
 ## Reference
 

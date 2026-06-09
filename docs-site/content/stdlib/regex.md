@@ -2,24 +2,16 @@
 
 std/regex — RE2-style regular expressions (linear time, no backtracking, no ReDoS).
 
-Compile a pattern once into an opaque `Regex` handle, then match / search / replace / split
-against any string. The matching engine is the Rust `regex` crate behind `lin_regex_*`
-intrinsics. All offsets exposed here are CODEPOINT offsets (Lin strings are codepoint-aware).
+Compile a pattern once into an opaque `Regex` handle, then match, search, replace, or split
+against any string. All offsets exposed here are codepoint offsets, since Lin strings are
+codepoint-aware.
 
-`Regex` is a program-lifetime IMMORTAL handle (like `Timer` from std/time): a compiled
-pattern is never freed, which makes it freely shareable and removes a whole class of
-use-after-free handle bugs. Under the hood the handle is a pointer to the leaked compiled
-engine, boxed as an `Int64`; treat it as opaque.
+A `Regex` is a program-lifetime handle: a compiled pattern is never freed, which makes it
+freely shareable. Treat it as an opaque value.
 
-`Regex` is aliased to `Json` (not `Int64`) deliberately: an `X | Error` union with a
-*scalar* member `X` hits an `is Error` narrowing/codegen gap (the else branch is not
-narrowed, and an `Int64 | Error` PHI miscompiles) — see DEVIATIONS in docs/STDLIB.md. A
-boxed `Json` member narrows correctly, so `if compile(p) is Error then ... else isMatch(re, ...)`
-— the proposal's primary idiom — type-checks and runs.
-
-The only fault case in the module is an invalid pattern, which surfaces as the canonical
-`Error` value from `compile`. Everything downstream of a successfully compiled `Regex` is
-total (returns Null / Boolean / arrays, never Error).
+The only fault case in the module is an invalid pattern, which surfaces as an `Error` value
+from `compile`. Everything downstream of a successfully compiled `Regex` is total: it returns
+Null, a Boolean, or an array, and never an Error.
 
 ## Reference
 
@@ -36,12 +28,9 @@ type Regex = Json
 type Match = { "text": String, "start": Int32, "end": Int32, "groups": Json, "named": Json }
 ```
 
-A single match. NOTE (deviation from the proposal): `groups` is typed `Json` rather than
-`(String | Null)[]`, because the parser does not accept a postfix `[]` on a parenthesized
-union type (`(String | Null)[]`) — the same limitation `std/array.compact` documents. The
-runtime value is still a heap array whose participating groups are `String` and whose
-non-participating positional holes are genuine `Null`; `m["groups"][1]` indexes it exactly
-as the proposal describes. `named` is a `Json` object (absent named groups read as `Null`).
+A single match. `groups` is the array of positional capture groups: participating groups are
+`String`, and non-participating positional holes are `Null`, so `m["groups"][1]` indexes it
+directly. `named` is an object of named capture groups; an absent named group reads as `Null`.
 
 #### `compile`
 
@@ -49,15 +38,11 @@ as the proposal describes. `named` is a `Json` object (absent named groups read 
 val compile = (pattern: String): Regex | Error
 ```
 
-compile returns either a boxed Int64 handle or an Error object => declared Json. The handle is
-passed back into the other intrinsics as a boxed Json value (Regex = Json); the Rust side reads
-the leaked-engine pointer out of the boxed Int64 payload. find / find_all return freshly-built
-Match objects => declared Json, re-annotated. replace returns a bare LinString.
-Compile a pattern into a reusable Regex handle. The only fault case in the module.
+Compile a pattern into a reusable Regex handle. This is the only fault case in the module.
 - **`pattern`** — the RE2 source pattern.
 - **Returns** the compiled Regex, or an Error (detect with `is Error`) if the pattern is not valid
          RE2 syntax — an unbalanced group, an unterminated class, or an unsupported
-         backreference / lookaround construct.
+         backreference or lookaround construct.
 
 #### `isMatch`
 
@@ -69,7 +54,12 @@ Test whether `re` matches anywhere within `s`. Cheapest operation; allocates no 
 - **`re`** — the compiled pattern.
 - **`s`** — the subject string.
 - **Returns** true if there is a match anywhere in `s`.
-- **Example:** matches("\\d+", "abc123")  // true
+
+**Example:**
+
+```lin
+matches("\\d+", "abc123")  // true
+```
 
 #### `find`
 
@@ -99,7 +89,7 @@ Find every non-overlapping match of `re` in `s`, left to right.
 val replace = (re: Regex, s: String, replacement: String): String
 ```
 
-Replace the FIRST match of `re` in `s`.
+Replace the first match of `re` in `s`.
 - **`re`** — the compiled pattern.
 - **`s`** — the subject string.
 - **`replacement`** — the replacement template ($1 / ${name} / $$ substitution).
@@ -111,7 +101,7 @@ Replace the FIRST match of `re` in `s`.
 val replaceAll = (re: Regex, s: String, replacement: String): String
 ```
 
-Replace EVERY non-overlapping match of `re` in `s`.
+Replace every non-overlapping match of `re` in `s`.
 - **`re`** — the compiled pattern.
 - **`s`** — the subject string.
 - **`replacement`** — the replacement template ($1 / ${name} / $$ substitution).

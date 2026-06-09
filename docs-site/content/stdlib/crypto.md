@@ -2,14 +2,13 @@
 
 std/crypto — security-grade hashing, HMAC, CSPRNG, UUID, and constant-time compare.
 
-Distinct from std/hash (a NON-cryptographic structural hash for map keys/equality, never for
-security). Digests and MACs operate over UInt8[] byte buffers (§35.1); the *Hex variants return
-lowercase hex strings. Everything lowers to Rust runtime intrinsics — block-compression and the
-OS entropy pool are not expressible in Lin.
+Distinct from std/hash (a non-cryptographic structural hash for map keys/equality, never for
+security). Digests and MACs operate over UInt8[] byte buffers; the *Hex variants return lowercase
+hex strings.
 
-SECURITY: sha1 and md5 are CRYPTOGRAPHICALLY BROKEN and present only for legacy interop (old Git
-ids, S3 ETags, file checksums). Never use them for signatures or adversarial integrity; use
-sha256/sha512. randomBytes is the OS CSPRNG — NOT std/math `random` (which is predictable).
+Security: sha1 and md5 are cryptographically broken and present only for legacy interop (old Git
+ids, S3 ETags, file checksums). Avoid them for signatures or adversarial integrity; use
+sha256/sha512. randomBytes is the OS CSPRNG, not std/math `random` (which is predictable).
 
 ## Reference
 
@@ -19,9 +18,8 @@ sha256/sha512. randomBytes is the OS CSPRNG — NOT std/math `random` (which is 
 type Hasher = Int64
 ```
 
-An opaque incremental-hash handle (like ProcessHandle / Timer — an Int64 id the runtime
-interprets, not Json and not subscriptable). Created by newHasher, fed by update, finalised by
-digest/digestHex.
+An opaque incremental-hash handle: an Int64 id the runtime interprets, not subscriptable. Created
+by newHasher, fed by update, finalised by digest/digestHex.
 
 ### SHA256
 
@@ -68,7 +66,7 @@ SHA-512 as a 128-char lowercase hex string.
 - **`data`** — the bytes to hash.
 - **Returns** the digest as lowercase hex.
 
-### SHA1 (LEGACY / INSECURE)
+### SHA1 (legacy / insecure)
 
 #### `sha1`
 
@@ -76,7 +74,7 @@ SHA-512 as a 128-char lowercase hex string.
 val sha1 = (data: UInt8[]): UInt8[]
 ```
 
-Hash bytes with SHA-1. Broken (practical collisions) — interop ONLY (e.g. Git object ids).
+Hash bytes with SHA-1. Broken (practical collisions) — interop only (e.g. Git object ids).
 - **`data`** — the bytes to hash.
 - **Returns** the 20-byte raw digest.
 
@@ -90,7 +88,7 @@ SHA-1 as a 40-char lowercase hex string. Legacy interop only; see sha1.
 - **`data`** — the bytes to hash.
 - **Returns** the digest as lowercase hex.
 
-### MD5 (LEGACY / INSECURE)
+### MD5 (legacy / insecure)
 
 #### `md5`
 
@@ -126,7 +124,12 @@ functions when the algorithm is fixed; use this for the dynamic case.
 - **`algorithm`** — "sha256" | "sha512" | "sha1" | "md5" (case-insensitive); an unknown name
                   falls back to sha256.
 - **Returns** the digest as lowercase hex.
-- **Example:** hashString("abc", "sha256")  // "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+**Example:**
+
+```lin
+hashString("abc", "sha256")  // "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+```
 
 ### HMACSHA256
 
@@ -162,8 +165,8 @@ val randomBytes = (n: Int32): UInt8[]
 ```
 
 Generate cryptographically-secure random bytes from the OS CSPRNG (getrandom/urandom). For
-tokens, salts, nonces, key material. NOT std/math `random`.
-- **`n`** — the number of bytes; must be >= 0 (0 returns an empty buffer).
+tokens, salts, nonces, key material. Not std/math `random`.
+- **`n`** — the number of bytes; should be >= 0 (0 returns an empty buffer).
 - **Returns** a fresh buffer of `n` random bytes.
 
 ### UUID
@@ -226,19 +229,19 @@ Lowercase-hex encode a byte buffer (two chars/byte, no separators). Never fails.
 #### `fromHex`
 
 ```lin
-val fromHex = (s: String): Json
+val fromHex = (s: String): UInt8[] | Error
 ```
 
 Decode a hex string to bytes (upper/lowercase accepted) — the only fallible codec here.
 - **`s`** — the hex string to decode.
-- **Returns** the decoded bytes, or an Error for odd length or a non-hex character.
+- **Returns** the decoded bytes (`UInt8[]`), or an Error for odd length or a non-hex character.
 
 ### streaming Hasher
 
 #### `newHasher`
 
 ```lin
-val newHasher = (algorithm: String): Json
+val newHasher = (algorithm: String): Hasher | Error
 ```
 
 Create an incremental hasher. Construction is the validation point, so update/digest never fail.

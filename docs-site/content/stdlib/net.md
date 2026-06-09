@@ -12,20 +12,38 @@ Every fallible call returns the `T | Error` result shape (an `Error` is an objec
 `"type": "error"`). A non-blocking read with no data available yet returns `Null`, so a poll
 loop reads naturally:
 
-  import { tcpListen, tcpAccept, tcpRecv, tcpSend, tcpClose } from "std/net"
-  import { udpBind, udpRecv, udpRecvFrom, udpSendTo, udpClose } from "std/net"
+```lin
+import { tcpListen, tcpAccept, tcpRecv, tcpSend, tcpClose } from "std/net"
+import { udpBind, udpRecv, udpRecvFrom, udpSendTo, udpClose } from "std/net"
+```
 
 For a higher-level lazy byte stream over a connection, see `tcpStream` (feeds std/stream
 adapters).
 
 ## Reference
 
+#### `Datagram`
+
+```lin
+type Datagram = { "len": Int32, "addr": String, "port": Int32 }
+```
+
+A received UDP datagram's metadata: byte count plus the sender's address and port.
+
+#### `TcpPeer`
+
+```lin
+type TcpPeer = { "fd": Int32, "addr": String, "port": Int32 }
+```
+
+An accepted TCP connection: the new client socket's descriptor and the peer's address/port.
+
 ### UDP
 
 #### `udpBind`
 
 ```lin
-val udpBind = (port: Int32): Json
+val udpBind = (port: Int32): Int32 | Error
 ```
 
 Bind a UDP socket to `port` on all interfaces.
@@ -35,7 +53,7 @@ Bind a UDP socket to `port` on all interfaces.
 #### `udpRecv`
 
 ```lin
-val udpRecv = (fd: Int32, buf: UInt8[]): Json
+val udpRecv = (fd: Int32, buf: UInt8[]): Int32 | Null | Error
 ```
 
 Receive a UDP datagram into `buf` (sender address discarded).
@@ -48,22 +66,43 @@ Receive a UDP datagram into `buf` (sender address discarded).
 #### `udpRecvFrom`
 
 ```lin
-val udpRecvFrom = (fd: Int32, buf: UInt8[]): Json
+val udpRecvFrom = (fd: Int32, buf: UInt8[]): Datagram | Null | Error
 ```
 
 Receive a UDP datagram into `buf`, keeping the sender's address.
 - **`fd`** — the socket descriptor from `udpBind`.
 - **`buf`** — the byte buffer to fill.
-- **Returns** `{ bytes, addr, port }` for the datagram, or an `Error` on failure.
-- **Example:** val sock = udpBind(39303)
-- **Example:** udpSendTo(sock, "127.0.0.1", 39303, [72, 105, 33])   // 3 bytes sent ("Hi!")
-- **Example:** val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
-- **Example:** val res = udpRecvFrom(sock, buf)   // res["len"] == 3, res["addr"] == "127.0.0.1"
+- **Returns** a `Datagram` (`{ len, addr, port }`) for the received packet, `Null` if non-blocking
+  and nothing is pending, or an `Error` on failure.
+
+**Example:**
+
+```lin
+val sock = udpBind(39303)
+```
+
+**Example:**
+
+```lin
+udpSendTo(sock, "127.0.0.1", 39303, [72, 105, 33])   // 3 bytes sent ("Hi!")
+```
+
+**Example:**
+
+```lin
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+```
+
+**Example:**
+
+```lin
+val res = udpRecvFrom(sock, buf)   // res["len"] == 3, res["addr"] == "127.0.0.1"
+```
 
 #### `udpSendTo`
 
 ```lin
-val udpSendTo = (fd: Int32, addr: String, port: Int32, buf: UInt8[]): Json
+val udpSendTo = (fd: Int32, addr: String, port: Int32, buf: UInt8[]): Int32 | Error
 ```
 
 Send the bytes in `buf` as a UDP datagram to `addr:port`.
@@ -76,7 +115,7 @@ Send the bytes in `buf` as a UDP datagram to `addr:port`.
 #### `udpSetNonblocking`
 
 ```lin
-val udpSetNonblocking = (fd: Int32, on: Boolean): Json
+val udpSetNonblocking = (fd: Int32, on: Boolean): Null | Error
 ```
 
 Set or clear non-blocking mode on a UDP socket.
@@ -87,19 +126,19 @@ Set or clear non-blocking mode on a UDP socket.
 #### `udpClose`
 
 ```lin
-val udpClose = (fd: Int32): Json
+val udpClose = (fd: Int32): Null
 ```
 
 Close a UDP socket.
 - **`fd`** — the socket descriptor to close.
-- **Returns** `Null` on success, or an `Error` on failure.
+- **Returns** `Null` (always succeeds).
 
 ### TCP
 
 #### `tcpListen`
 
 ```lin
-val tcpListen = (port: Int32): Json
+val tcpListen = (port: Int32): Int32 | Error
 ```
 
 Listen for TCP connections on `port` on all interfaces.
@@ -109,49 +148,102 @@ Listen for TCP connections on `port` on all interfaces.
 #### `tcpAccept`
 
 ```lin
-val tcpAccept = (fd: Int32): Json
+val tcpAccept = (fd: Int32): TcpPeer | Null | Error
 ```
 
-Accept the next pending connection on a listening socket (blocks until one arrives).
+Accept the next pending connection on a listening socket (blocks until one arrives, unless the
+listener is non-blocking).
 - **`fd`** — the listening socket descriptor from `tcpListen`.
-- **Returns** the connected client socket descriptor, or an `Error` on failure.
-- **Example:** val listener = tcpListen(8080)
-- **Example:** val client = tcpAccept(listener)   // blocks until a connection arrives
-- **Example:** val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
-- **Example:** val n = tcpRecv(client, buf)
-- **Example:** tcpSend(client, slice(buf, 0, n))  // echo it back (slice from std/array)
+- **Returns** a `TcpPeer` (`{ fd, addr, port }`) for the accepted connection, `Null` if non-blocking
+  and none is pending, or an `Error` on failure.
+
+**Example:**
+
+```lin
+val listener = tcpListen(8080)
+```
+
+**Example:**
+
+```lin
+val client = tcpAccept(listener)   // blocks until a connection arrives
+```
+
+**Example:**
+
+```lin
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+```
+
+**Example:**
+
+```lin
+val n = tcpRecv(client, buf)
+```
+
+**Example:**
+
+```lin
+tcpSend(client, slice(buf, 0, n))  // echo it back (slice from std/array)
+```
 
 #### `tcpConnect`
 
 ```lin
-val tcpConnect = (host: String, port: Int32): Json
+val tcpConnect = (host: String, port: Int32): Int32 | Error
 ```
 
 Open a TCP connection to `host:port`.
 - **`host`** — the destination host/IP.
 - **`port`** — the destination port.
 - **Returns** the connected socket descriptor, or an `Error` if the connect failed.
-- **Example:** val fd = tcpConnect("127.0.0.1", 8080)
-- **Example:** tcpSend(fd, [104, 105])        // "hi"
-- **Example:** val buf: UInt8[] = [0, 0, 0, 0]
-- **Example:** val n = tcpRecv(fd, buf)       // bytes read; 0 = peer closed
-- **Example:** tcpClose(fd)
+
+**Example:**
+
+```lin
+val fd = tcpConnect("127.0.0.1", 8080)
+```
+
+**Example:**
+
+```lin
+tcpSend(fd, [104, 105])        // "hi"
+```
+
+**Example:**
+
+```lin
+val buf: UInt8[] = [0, 0, 0, 0]
+```
+
+**Example:**
+
+```lin
+val n = tcpRecv(fd, buf)       // bytes read; 0 = peer closed
+```
+
+**Example:**
+
+```lin
+tcpClose(fd)
+```
 
 #### `tcpRecv`
 
 ```lin
-val tcpRecv = (fd: Int32, buf: UInt8[]): Json
+val tcpRecv = (fd: Int32, buf: UInt8[]): Int32 | Null | Error
 ```
 
 Receive bytes from a connected TCP socket into `buf`.
 - **`fd`** — the connected socket descriptor.
 - **`buf`** — the byte buffer to fill.
-- **Returns** the number of bytes received (0 at EOF), or an `Error` on failure.
+- **Returns** the number of bytes received (0 at EOF), `Null` if non-blocking and nothing is pending,
+  or an `Error` on failure.
 
 #### `tcpSend`
 
 ```lin
-val tcpSend = (fd: Int32, buf: UInt8[]): Json
+val tcpSend = (fd: Int32, buf: UInt8[]): Int32 | Error
 ```
 
 Send the bytes in `buf` over a connected TCP socket.
@@ -162,7 +254,7 @@ Send the bytes in `buf` over a connected TCP socket.
 #### `tcpSetNonblocking`
 
 ```lin
-val tcpSetNonblocking = (fd: Int32, on: Boolean): Json
+val tcpSetNonblocking = (fd: Int32, on: Boolean): Null | Error
 ```
 
 Set or clear non-blocking mode on a TCP socket.
@@ -173,19 +265,19 @@ Set or clear non-blocking mode on a TCP socket.
 #### `tcpClose`
 
 ```lin
-val tcpClose = (fd: Int32): Json
+val tcpClose = (fd: Int32): Null
 ```
 
 Close a TCP socket.
 - **`fd`** — the socket descriptor to close.
-- **Returns** `Null` on success, or an `Error` on failure.
+- **Returns** `Null` (always succeeds).
 
 #### `tcpStream`
 
 ```lin
-val tcpStream = (fd: Int32): Stream
+val tcpStream = (fd: Int32): Stream<UInt8[]>
 ```
 
-Wrap a connected TCP socket as a lazy byte `Stream<UInt8[]>` (streams brief §4).
+Wrap a connected TCP socket as a lazy byte stream.
 - **`fd`** — the connected socket descriptor.
-- **Returns** a `Stream` that pulls from the socket until EOF; closing the stream closes the socket.
+- **Returns** a `Stream<UInt8[]>` that pulls from the socket until EOF; closing the stream closes the socket.

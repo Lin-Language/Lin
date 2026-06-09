@@ -6,7 +6,9 @@ Read, set, unset, and snapshot the process environment. `getEnv` returns `String
 missing variable narrows with a plain `== null` test. `setEnv`/`unsetEnv` affect the current
 process and any child processes spawned afterwards.
 
-  import { getEnv, setEnv, unsetEnv, environ } from "std/env"
+```lin
+import { getEnv, setEnv, unsetEnv, environ } from "std/env"
+```
 
 ## Reference
 

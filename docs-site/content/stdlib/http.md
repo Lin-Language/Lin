@@ -6,12 +6,14 @@ All client functions are synchronous and blocking. Requests return an HttpRespon
 shape (`{ "type": "error", ... }`) that you narrow with `is Error`. On the server side, write a
 handler `(HttpRequest) -> HttpResponse` and pass it to `serve`; build responses with json / text
 / redirect / badRequest / notFound, route with matchPath, and read request bodies with parseBody.
-The handler is the FIRST argument to serve, so the dot-call form `handler.serve(port)` reads
+The handler is the first argument to serve, so the dot-call form `handler.serve(port)` reads
 naturally. The URL layer (Url / parse / build / join / withQuery / withPath, folded in from the
 former std/url) splits a string into RFC 3986 components verbatim — no percent-decoding.
 
+```lin
 import { fetch, fetchJson, fetchWith, postJson } from "std/http"
 import { serve, json, text, redirect, notFound, badRequest, matchPath, parseBody } from "std/http"
+```
 
 ## Reference
 
@@ -44,49 +46,69 @@ Options for `fetchWith`: HTTP method, request headers, and body.
 #### `fetch`
 
 ```lin
-val fetch = (url: String): Json
+val fetch = (url: String): HttpResponse | Error
 ```
 
 GET `url`.
 - **`url`** — the URL to fetch.
-- **Returns** the response object, or an `Error` (`{ "type":"error", ... }`) if the request fails.
-- **Example:** val result = fetch("https://example.com/ping")   // then result["status"]
+- **Returns** an `HttpResponse`, or an `Error` (`{ "type":"error", ... }`) if the request fails.
+
+**Example:**
+
+```lin
+val result = fetch("https://example.com/ping")   // then result["status"]
+```
 
 #### `fetchWith`
 
 ```lin
-val fetchWith = (url: String, options: Json): Json
+val fetchWith = (url: String, options: Json): HttpResponse | Error
 ```
 
 Issue a request to `url` with a custom method/headers/body.
 - **`url`** — the URL to request.
 - **`options`** — an `HttpOptions`-shaped record (method, headers, body).
-- **Returns** the response object, or an `Error` if the request fails.
-- **Example:** fetchWith("https://api.example.com/items", { "method": "DELETE", "headers": {}, "body": "" })
+- **Returns** an `HttpResponse`, or an `Error` if the request fails.
+
+**Example:**
+
+```lin
+fetchWith("https://api.example.com/items", { "method": "DELETE", "headers": {}, "body": "" })
+```
 
 #### `fetchJson`
 
 ```lin
-val fetchJson = (url: String): Json
+val fetchJson = (url: String): Json | Error
 ```
 
 GET `url` and parse the response body as JSON.
 - **`url`** — the URL to fetch.
 - **Returns** the parsed JSON value, or an `Error` if the request fails (the error is passed through
          unparsed).
-- **Example:** val users = fetchJson("https://api.example.com/users")   // then users.for(u => ...)
+
+**Example:**
+
+```lin
+val users = fetchJson("https://api.example.com/users")   // then users.for(u => ...)
+```
 
 #### `postJson`
 
 ```lin
-val postJson = (url: String, body: Json): Json
+val postJson = (url: String, body: Json): HttpResponse | Error
 ```
 
 POST `body` to `url` as `application/json`.
 - **`url`** — the target URL.
 - **`body`** — any JSON-serialisable value; sent as the JSON request body.
-- **Returns** the response object, or an `Error` if the request fails.
-- **Example:** postJson("https://api.example.com/users", { "name": "Alice" })
+- **Returns** an `HttpResponse`, or an `Error` if the request fails.
+
+**Example:**
+
+```lin
+postJson("https://api.example.com/users", { "name": "Alice" })
+```
 
 #### `json`
 
@@ -141,7 +163,7 @@ Build a 400 Bad Request response carrying `message` as the body.
 #### `parseBody`
 
 ```lin
-val parseBody = (req: Json): Json
+val parseBody = (req: Json): Json | Error
 ```
 
 Parse a request's body as JSON.
@@ -158,7 +180,12 @@ Match a request path against a route pattern (e.g. `/users/:id`), extracting pat
 - **`path`** — the concrete request path.
 - **`pattern`** — the route pattern with `:name` capture segments.
 - **Returns** a map of captured params if the path matches, or a non-match result otherwise.
-- **Example:** matchPath("/users/42", "/users/:id")   // { "id": "42" }
+
+**Example:**
+
+```lin
+matchPath("/users/42", "/users/:id")   // { "id": "42" }
+```
 
 #### `serve`
 
@@ -170,7 +197,12 @@ Start a blocking HTTP server on `port`, dispatching each request to `handler`.
 - **`handler`** — a function `(HttpRequest) -> HttpResponse`.
 - **`port`** — the TCP port to listen on.
 - **Returns** never returns under normal operation (runs the accept loop).
-- **Example:** handler.serve(3000)   // handler = req => match req["path"] is "/ping" => text(200, "pong") else => notFound
+
+**Example:**
+
+```lin
+handler.serve(3000)   // handler = req => match req["path"] is "/ping" => text(200, "pong") else => notFound
+```
 
 ### URL parsing/building (folded in from the former std/url module)
 
@@ -180,14 +212,14 @@ Start a blocking HTTP server on `port`, dispatching each request to `handler`.
 type Url = { "scheme": String, "userinfo": String | Null, "host": String, "port": Int32 | Null, "path": String, "query": String | Null, "fragment": String | Null }
 ```
 
-A parsed URL, split into its RFC 3986 components (each emitted/stored verbatim, NOT decoded):
+A parsed URL, split into its RFC 3986 components (each emitted/stored verbatim, not decoded):
   scheme    "https"; lowercased; "" if the input was relative
   userinfo  raw "user:pass" between "//" and "@", undecoded; Null if absent
   host      "example.com", "[::1]"; "" if no authority
-  port      443; Null if absent (scheme defaults are NOT filled in)
+  port      443; Null if absent (scheme defaults are not filled in)
   path      "/a/b"; raw, percent-encoding preserved
-  query     raw, WITHOUT the leading "?"; Null if absent
-  fragment  raw, WITHOUT the leading "#"; Null if absent
+  query     raw, without the leading "?"; Null if absent
+  fragment  raw, without the leading "#"; Null if absent
 
 #### `parse`
 
@@ -195,7 +227,7 @@ A parsed URL, split into its RFC 3986 components (each emitted/stored verbatim, 
 val parse = (s: String): Url | Error
 ```
 
-Parse `s` as an RFC 3986 URI (or relative reference). Components are split, NOT decoded.
+Parse `s` as an RFC 3986 URI (or relative reference). Components are split, not decoded.
 - **`s`** — the URL string.
 - **Returns** the parsed `Url`, or an `Error` if `s` violates the generic URI syntax.
 

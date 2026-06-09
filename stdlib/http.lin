@@ -8,8 +8,8 @@
 // naturally. The URL layer (Url / parse / build / join / withQuery / withPath, folded in from the
 // former std/url) splits a string into RFC 3986 components verbatim — no percent-decoding.
 //
-// import { fetch, fetchJson, fetchWith, postJson } from "std/http"
-// import { serve, json, text, redirect, notFound, badRequest, matchPath, parseBody } from "std/http"
+//   import { fetch, fetchJson, fetchWith, postJson } from "std/http"
+//   import { serve, json, text, redirect, notFound, badRequest, matchPath, parseBody } from "std/http"
 import foreign "lin-runtime"
   val lin_http_fetch: (String) => Json
   val lin_url_parse: (String) => Json

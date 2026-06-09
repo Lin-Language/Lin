@@ -9,7 +9,9 @@ reads one byte without blocking (null when nothing is ready), so a real app poll
 sleeping briefly between empty reads (e.g. via std/time's `sleepMicros`) to avoid busy-spinning.
 Multi-byte sequences (arrow/function keys) arrive one byte at a time.
 
-  import { rawMode, readKey } from "std/tty"
+```lin
+import { rawMode, readKey } from "std/tty"
+```
 
 ## Reference
 
