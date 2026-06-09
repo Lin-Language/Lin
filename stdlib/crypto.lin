@@ -169,7 +169,7 @@ export val fromHex = (s: String): UInt8[] | Error =>
 // Create an incremental hasher. Construction is the validation point, so update/digest never fail.
 // @param algorithm  "sha256" | "sha512" | "sha1" | "md5" (case-insensitive).
 // @returns a Hasher handle, or an Error for an unknown algorithm.
-export val newHasher = (algorithm: String): Json =>
+export val newHasher = (algorithm: String): Hasher | Error =>
   lin_crypto_hasher_new(algorithm)
 
 // Feed bytes into a running digest.

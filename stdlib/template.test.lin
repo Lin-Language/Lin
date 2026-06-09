@@ -92,9 +92,12 @@ val s = suite("std/template", [
       "{% extends \"base.jinja\" %}{% block body %}Hi {{ name }}{% endblock %}"
     )
     val result = render("${tmpDir}/child.jinja", { "name": "Lin" })
-    [
-      expect(result.contains("<body>Hi Lin</body>")).toBe(true)
-    ]
+    if result is Error then
+      [expect(false).toBe(true)]
+    else
+      [
+        expect(result.contains("<body>Hi Lin</body>")).toBe(true)
+      ]
   )
 ])
 

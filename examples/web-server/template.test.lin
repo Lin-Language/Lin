@@ -2,18 +2,25 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { render } from "std/template"
 import { contains } from "std/string"
 
+// `render` returns `String | Error`; unwrap the success arm (a render failure becomes a sentinel
+// that fails the contains-assertions rather than masking a regression).
+val rendered = (r: String | Error): String =>
+  match r
+    is Error => "<render-error>"
+    else => r
+
 // Templating coverage (absorbed from the standalone template demo): render the
 // server's HTML view and assert the {{ ... }} holes are filled from the data object.
 // index.jinja `{% extends "base.jinja" %}` and the base `{% include "footer.jinja" %}`,
 // so this also exercises the layout/inheritance loader (ADR-048).
 val s = suite("template", [
   test("renders index.jinja filling all holes", () =>
-    val out = render("examples/web-server/views/index.jinja", {
+    val out = rendered(render("examples/web-server/views/index.jinja", {
       "title": "T",
       "heading": "H",
       "status": "ok",
       "version": "1.0"
-    })
+    }))
     [
       expect(out.contains("<title>T</title>")).toBe(true),
       expect(out.contains("<h1>H</h1>")).toBe(true),
@@ -23,12 +30,12 @@ val s = suite("template", [
   ),
 
   test("inherits base layout and includes the footer partial", () =>
-    val out = render("examples/web-server/views/index.jinja", {
+    val out = rendered(render("examples/web-server/views/index.jinja", {
       "title": "T",
       "heading": "H",
       "status": "ok",
       "version": "1.0"
-    })
+    }))
     [
       // <!DOCTYPE>/<body> come from base.jinja, not index.jinja — proves {% extends %}.
       expect(out.contains("<!DOCTYPE html>")).toBe(true),
@@ -38,12 +45,12 @@ val s = suite("template", [
   ),
 
   test("leaves no unfilled {{ }} holes", () =>
-    val out = render("examples/web-server/views/index.jinja", {
+    val out = rendered(render("examples/web-server/views/index.jinja", {
       "title": "T",
       "heading": "H",
       "status": "ok",
       "version": "1.0"
-    })
+    }))
     [
       expect(out.contains("{{")).toBe(false)
     ]
