@@ -944,15 +944,39 @@ function activate(context) {
     transport: TransportKind.stdio,
   };
 
+  // Snapshot the granular inlay-hint toggles to hand the server at startup. Defaults to true
+  // (matching the package.json `default: true`) so a fresh install behaves as before.
+  const inlayCfg = () => {
+    const cfg = workspace.getConfiguration("lin");
+    return {
+      variableTypes: cfg.get("inlayHints.variableTypes", true),
+      parameterTypes: cfg.get("inlayHints.parameterTypes", true),
+    };
+  };
+
   const clientOptions = {
     documentSelector: [{ scheme: "file", language: "lin" }],
     synchronize: {
       fileEvents: workspace.createFileSystemWatcher("**/*.lin"),
+      // Push the whole `lin` settings subtree to the server on any change. The LanguageClient
+      // sends `workspace/didChangeConfiguration` automatically; the server re-reads
+      // `inlayHints.{variableTypes,parameterTypes}` from it (see did_change_configuration).
+      configurationSection: "lin",
     },
+    // Hand the current toggles to the server at `initialize` so the first inlay-hint request is
+    // already gated correctly (before any config-change notification arrives).
+    initializationOptions: { inlayHints: inlayCfg() },
     outputChannelName: "Lin Language Server",
   };
 
   client = new LanguageClient("lin-lsp", "Lin Language Server", serverOptions, clientOptions);
+
+  // The toggles reach the server two ways: `initializationOptions` at startup, and — on any later
+  // change — the `workspace/didChangeConfiguration` notification the LanguageClient sends
+  // automatically because of `synchronize.configurationSection: "lin"` above. VSCode itself
+  // re-requests inlay hints after a configuration change settles, so the new gating takes effect
+  // without an edit or scroll; no manual refresh call is needed (and `workspace/inlayHint/refresh`
+  // is a server→client request, not something the client may send).
 
   client.start().catch((err) => {
     window.showErrorMessage(
