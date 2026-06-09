@@ -1432,16 +1432,34 @@ impl Checker {
             }
         }
         self.in_tail_position = saved_tail;
-        // Carry the EXPECTED type's seal flag onto the refined literal's own type (Path-9C). When
-        // the literal is directed against a sealed named record (`(): Trip => { ... }`, or an
-        // element of a sealed-record array), recording it SEALED makes the PRODUCER build the same
-        // packed/sealed representation the CONSUMER reads it back at — the symmetry that keeps the
-        // two sides' repr classification (and thus codegen layout) in agreement. A field directed
-        // only because of a nested `StrLit`/`Map`/sealed field (the outer literal itself unsealed)
-        // keeps the historical UNSEALED result, so discriminant narrowing / map key-widening is
-        // unchanged. Note: `Type` equality/subtyping ignores the seal flag (types.rs), so this is
-        // representation-only and never changes assignability.
-        let ty = if sealed { Type::sealed_object(obj_type) } else { Type::object(obj_type) };
+        // Carry the EXPECTED type's seal flag onto the refined literal's own type (Path-9C) — but
+        // ONLY when every field is gate-packable. This is the producer/consumer SEAL SYMMETRY fix:
+        // recording the literal SEALED makes the PRODUCER build the same packed representation the
+        // CONSUMER reads back at, keeping the two sides' repr classification (and codegen layout) in
+        // agreement. The packability AND is load-bearing, not merely an optimisation:
+        //   - Gate-packable fields (scalar+Bool today): a sealed element flows into a sealed-scalar
+        //     array (`is_sealed_scalar_array`) → the array PACKS, the element is laid out inline, no
+        //     box. The consumer reads it packed. Symmetric, leak-free.
+        //   - A NON-packable field (e.g. String under the scalar+Bool gate): the consumer reads the
+        //     array BOXED (its repr pass uses the SAME gate). If we sealed the producer's element
+        //     anyway, the array stays boxed (`is_sealed_scalar_array` is false) but each element is
+        //     now a SEALED STRUCT that the boxed-array lowering MATERIALIZES to a `LinObject` and
+        //     then LEAKS the transient struct (~one alloc/field/element/build, ASan-confirmed). So
+        //     for an unpackable record we keep the element UNSEALED — the producer builds the boxed
+        //     `LinObject` directly (the historical path), which is ALSO what the consumer reads:
+        //     still symmetric, and leak-free.
+        // When the gate later widens to String (Path-9A), those records become packable and this AND
+        // automatically starts sealing them — no further checker change needed. `Type`
+        // equality/subtyping ignores the seal flag (types.rs), so this is representation-only and
+        // never changes assignability. A field directed only because of a nested `StrLit`/`Map`
+        // (the outer literal itself unsealed) keeps the historical UNSEALED result.
+        let all_fields_packable =
+            !obj_type.is_empty() && obj_type.values().all(|t| t.is_sealed_array_field_packable());
+        let ty = if sealed && all_fields_packable {
+            Type::sealed_object(obj_type)
+        } else {
+            Type::object(obj_type)
+        };
         Ok(TypedExpr::MakeObject { fields: typed_fields, spreads: Vec::new(), ty, span })
     }
 
