@@ -68,7 +68,17 @@ impl Parser {
     pub(crate) fn parse_val(&mut self, exported: bool) -> Stmt {
         let span_start = self.current_span();
         self.advance(); // skip 'val'
-        let pattern = self.parse_binding_pattern();
+        // Missing-name guard: if the binding target is absent (next token is `:` or `=` —
+        // neither can begin a name/pattern), emit ONE clear diagnostic and leave the cursor
+        // on the `:`/`=` so the type-annotation + `=` parsing below still consumes
+        // `: Type = value` cleanly (no cascade). Without this guard `parse_binding_pattern`
+        // would advance past the `:`, desyncing the stream into a misleading "expected Eq".
+        let pattern = if self.is_binding_target_start() {
+            self.parse_binding_pattern()
+        } else {
+            self.missing_binding_name("val", self.current_span());
+            Pattern::Wildcard(span_start)
+        };
         let type_ann = if self.check(TokenKind::Colon) {
             self.advance();
             Some(self.parse_type_expr())
@@ -85,7 +95,15 @@ impl Parser {
         let span_start = self.current_span();
         self.advance(); // skip 'var'
         let name_span = self.current_span();
-        let name = self.expect_ident();
+        // Missing-name guard, mirroring `parse_val`: a bare `var: T = ...` would otherwise
+        // produce the unhelpful "expected identifier, got Colon". Emit the same clear
+        // diagnostic and fall through so `: Type = value` still parses (no cascade).
+        let name = if self.is_binding_target_start() {
+            self.expect_ident()
+        } else {
+            self.missing_binding_name("var", name_span);
+            String::new()
+        };
         let type_ann = if self.check(TokenKind::Colon) {
             self.advance();
             Some(self.parse_type_expr())
