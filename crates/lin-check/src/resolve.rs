@@ -86,9 +86,18 @@ fn resolve_type_inner(
             }
             Ok(Type::object(resolved))
         }
-        TypeExpr::IndexSig(value, _span) => {
+        TypeExpr::IndexSig(key, value, _span) => {
             // `{ String: T }` — a typed index-signature object type (ADR-055). Distinct from a
-            // fixed record; backed by the hashed `LinMap` at runtime.
+            // fixed record; backed by the hashed `LinMap` at runtime. The key type-expr (which may
+            // be a type alias) must resolve to `String`; validate that here, where aliases are
+            // expanded.
+            let key_ty = resolve_type_inner(key, env, visiting)?;
+            if key_ty != Type::Str {
+                return Err(format!(
+                    "Map key type must be String, but it resolves to {}",
+                    key_ty
+                ));
+            }
             let val_ty = resolve_type_inner(value, env, visiting)?;
             Ok(Type::Map(Box::new(val_ty)))
         }

@@ -1208,7 +1208,7 @@ fn fmt_type(ty: &TypeExpr) -> String {
                 .collect();
             format!("{{ {} }}", fs.join(", "))
         }
-        TypeExpr::IndexSig(value, _) => format!("{{ String: {} }}", fmt_type(value)),
+        TypeExpr::IndexSig(key, value, _) => format!("{{ {}: {} }}", fmt_type(key), fmt_type(value)),
         TypeExpr::StringLit(s, _) => format!("\"{}\"", s),
     }
 }
