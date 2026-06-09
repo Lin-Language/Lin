@@ -1415,6 +1415,60 @@ fn extract_exports(module: &TypedModule) -> Vec<(String, Type)> {
         .collect()
 }
 
+/// The set of top-level names declared with `export` in a PARSED module. We need this because the
+/// `export` flag is DROPPED when the AST is lowered to a `TypedModule` (`TypedStmt::Val` has no
+/// `exported` field), so `extract_exports(&typed)` returns ALL top-level `val`s — including private
+/// helpers like `_bisect` (declared `val _bisect`, not `export val`). Callers that must honour the
+/// real export surface (e.g. the stdlib dot-completion candidate builder) intersect the typed
+/// name→type map with this set. The flag lives on `Stmt::Val { exported }` / `Stmt::Var { exported }`
+/// (verified in `lin-parse/src/ast.rs`); we read it from the AST, then join by name to the typed
+/// types. `val`-binding names come from the binding `Pattern` (a simple `export val foo = …` is a
+/// `Pattern::Ident`); destructuring exports are uncommon at stdlib top level and need no special case
+/// here (each bound name is still surfaced via the typed module — they just won't appear in this set,
+/// which is the conservative/correct behaviour for an export filter).
+fn ast_exported_names(module: &lin_parse::ast::Module) -> HashSet<String> {
+    use lin_parse::ast::Pattern;
+    let mut out = HashSet::new();
+    for stmt in &module.statements {
+        match stmt {
+            Stmt::Val { exported: true, pattern, .. } => {
+                collect_pattern_names(pattern, &mut out);
+            }
+            Stmt::Var { exported: true, name, .. } => {
+                out.insert(name.clone());
+            }
+            _ => {}
+        }
+    }
+    // Helper that walks a binding pattern, collecting the simple/identifier binders it introduces.
+    fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
+        match pat {
+            Pattern::Ident(n, _) => {
+                out.insert(n.clone());
+            }
+            Pattern::Object(fields, rest, _) => {
+                for f in fields {
+                    collect_pattern_names(&f.pattern, out);
+                }
+                if let Some(r) = rest {
+                    out.insert(r.clone());
+                }
+            }
+            Pattern::Array(items, rest, _) => {
+                for p in items {
+                    collect_pattern_names(p, out);
+                }
+                if let Some(r) = rest {
+                    out.insert(r.clone());
+                }
+            }
+            // TypeName/Literal/Wildcard introduce no value binder.
+            _ => {}
+        }
+    }
+    out
+}
+
 // ── type-string display cleaning ──────────────────────────────────────────────
 
 /// Decimal text of `u32::MAX`, the `TypeVar` id the checker uses as the `Json` marker
@@ -2119,6 +2173,12 @@ fn build_stdlib_dot_candidates() -> Vec<StdlibCandidate> {
     let mut out = Vec::new();
     for &module in DOT_CANDIDATE_MODULES {
         for (name, ty) in stdlib_module_exports(module) {
+            // Defensive secondary filter: never offer a `_`-prefixed name. `stdlib_module_exports`
+            // already drops non-`export`ed helpers, but `_` is the stdlib's private-helper naming
+            // convention — even an accidentally-exported `_foo` is conventionally internal.
+            if name.starts_with('_') {
+                continue;
+            }
             out.push(StdlibCandidate { name, module: module.to_string(), ty: ty.to_string() });
         }
     }
@@ -2170,9 +2230,12 @@ fn stdlib_dot_completion_items<'a>(
     out
 }
 
-/// Type-check a single stdlib module (resolving its own imports first) and return its `val` exports
-/// as `(name, Type)`. Returns empty on a parse/check failure (degrades gracefully — the dot-
-/// completion just won't offer that module's symbols).
+/// Type-check a single stdlib module (resolving its own imports first) and return its genuinely
+/// `export`ed `val`s as `(name, Type)`. The export flag is read from the PARSED AST (the typed
+/// module drops it), so private helpers like `_bisect` — declared `val`, not `export val` — are NOT
+/// returned even though they're top-level `val`s; their types still come from the typed module.
+/// Returns empty on a parse/check failure (degrades gracefully — the dot-completion just won't offer
+/// that module's symbols).
 fn stdlib_module_exports(module_id: &str) -> Vec<(String, Type)> {
     let Some(src) = stdlib_source(module_id) else {
         return Vec::new();
@@ -2196,13 +2259,22 @@ fn stdlib_module_exports(module_id: &str) -> Vec<(String, Type)> {
         }
     }
 
+    // The genuinely-`export`ed names, read from the AST (the typed module drops the flag — see
+    // `ast_exported_names`). We INTERSECT the typed name→type pairs with this set so only real
+    // exports become dot-completion candidates; private helpers like `_bisect` (declared `val`, not
+    // `export val`) are filtered out while their TYPES still come from the typed module.
+    let exported = ast_exported_names(&ast);
+
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
     // Trusted stdlib: it legitimately references `lin_*` intrinsics and forwards Json (ADR-060).
     checker.lenient_json = true;
     checker.allow_intrinsics = true;
     match checker.check_module(&ast) {
-        Ok(typed) => extract_exports(&typed),
+        Ok(typed) => extract_exports(&typed)
+            .into_iter()
+            .filter(|(name, _)| exported.contains(name))
+            .collect(),
         Err(_) => Vec::new(),
     }
 }
@@ -5868,6 +5940,70 @@ mod tests {
         let only_ma = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "ma", &already, &fixb_uri());
         assert!(item_named(&only_ma, "map").is_some());
         assert!(item_named(&only_ma, "filter").is_none(), "prefix `ma` must exclude `filter`");
+    }
+
+    // ── FIX 2: only EXPORTED (non-`_`) stdlib symbols are offered ────────────────
+
+    /// `ast_exported_names` reads the `export` flag from the PARSED AST. On a small mixed source it
+    /// returns ONLY the `export`ed names — a plain `val`/`var` (not exported) and an `export val`
+    /// helper named `_priv` are still reported faithfully (the export filter proper lives in the
+    /// candidate builder, which separately drops `_`-prefixed names). Destructuring exports surface
+    /// each bound name.
+    #[test]
+    fn ast_exported_names_reads_export_flag() {
+        let src = "\
+export val pub = 1
+val priv_v = 2
+export var counter = 0
+var hidden = 9
+export val { a, b } = pt
+val _helper = 3
+";
+        let names = ast_exported_names(&parse(src));
+        assert!(names.contains("pub"), "exported `val pub` missing: {names:?}");
+        assert!(names.contains("counter"), "exported `var counter` missing: {names:?}");
+        assert!(names.contains("a") && names.contains("b"), "destructured exports missing: {names:?}");
+        // NOT exported → absent.
+        assert!(!names.contains("priv_v"), "non-exported `val priv_v` leaked: {names:?}");
+        assert!(!names.contains("hidden"), "non-exported `var hidden` leaked: {names:?}");
+        assert!(!names.contains("_helper"), "non-exported `val _helper` leaked: {names:?}");
+    }
+
+    /// `stdlib_module_exports` honours the AST `export` flag: over the REAL std/array source it returns
+    /// the genuinely-exported `lowerBound`/`sort`/`push` but NOT the private `val _bisect` helper
+    /// (declared `val`, not `export val`) that `extract_exports(&typed)` would otherwise include.
+    #[test]
+    fn stdlib_module_exports_excludes_private_helpers() {
+        let exports = stdlib_module_exports("std/array");
+        let names: HashSet<String> = exports.into_iter().map(|(n, _)| n).collect();
+        assert!(!names.is_empty(), "std/array must type-check and export something");
+        for pub_name in ["lowerBound", "sort", "push", "length"] {
+            assert!(names.contains(pub_name), "expected exported `{pub_name}`, got {names:?}");
+        }
+        assert!(!names.contains("_bisect"), "private `val _bisect` leaked into exports: {names:?}");
+    }
+
+    /// The real dot-candidate set (the source of the leak in the report) no longer offers `_bisect`
+    /// (or any `_`-prefixed/unexported helper), while genuinely-exported functions remain. Tested on
+    /// an array receiver where both an array-shaped export (`push`) and `_bisect` would qualify by
+    /// first-param category, so only the export filter explains `_bisect`'s absence.
+    #[test]
+    fn stdlib_dot_candidates_exclude_underscore_helpers() {
+        // `_bisect` must not appear ANYWHERE in the memoised candidate set.
+        assert!(
+            !STDLIB_DOT_CANDIDATES.iter().any(|c| c.name == "_bisect"),
+            "`_bisect` leaked into the dot-candidate set"
+        );
+        // And no `_`-prefixed name at all (the defensive convention filter).
+        assert!(
+            !STDLIB_DOT_CANDIDATES.iter().any(|c| c.name.starts_with('_')),
+            "an `_`-prefixed helper leaked into the dot-candidate set"
+        );
+        // Genuinely-exported array ops ARE still offered on an array receiver.
+        let already = HashSet::new();
+        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "", &already, &fixb_uri());
+        assert!(item_named(&items, "push").is_some(), "exported `push` should still be offered");
+        assert!(item_named(&items, "_bisect").is_none(), "private `_bisect` must not be offered");
     }
 
     /// Cyclic import graph (A imports B, B imports A) must terminate, not
