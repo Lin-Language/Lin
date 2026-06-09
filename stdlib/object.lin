@@ -21,30 +21,31 @@ import foreign "lin-runtime"
 import { push, length } from "std/array"
 import { for, some } from "std/iter"
 
-// `keys`/`values`/`entries` are typed `Json` rather than generic. They are tag-aware at runtime, so
-// the same function serves both a plain `Json`/`{}` record (insertion order) and a typed
-// index-signature map `{ String: T }` (hash order). Typing the parameter as `{ String: T }` would
-// reject the common case of introspecting an arbitrary record (e.g. `keys(parsedConfig)`).
+// `keys`/`values`/`entries` are tag-aware at runtime, so one function serves both a record
+// (`{}`/`{ String: T }`, insertion order) and an index-signature map (hash order). The parameter is
+// the union `{ String: Json } | {}` — accepting a record literal, a typed map, or a `Json` value
+// (any of which may carry an object), while REJECTING a non-object argument (`keys(1)`, `keys("s")`,
+// `keys([…])` are compile errors). A `Json` holding a non-object yields an empty result at runtime.
 //
 // Return the keys of an object or map.
-// @param obj  any `Json`/`{}` record or `{ String: T }` map.
+// @param obj  a record, an index-signature map, or a `Json` object.
 // @returns a `String[]` of the keys (insertion order for a record, hash order for a map).
 // @example keys({ "a": 1, "b": 2 })   // ["a", "b"]
-export val keys = (obj: Json): String[] =>
+export val keys = (obj: { String: Json } | {  }): String[] =>
   lin_keys_any(obj)
 
 // Return the values of an object or map.
-// @param obj  any `Json`/`{}` record or `{ String: T }` map.
+// @param obj  a record, an index-signature map, or a `Json` object.
 // @returns a `Json[]` of the values, in key order.
 // @example values({ "a": 1, "b": 2 })   // [1, 2]
-export val values = (obj: Json): Json[] =>
+export val values = (obj: { String: Json } | {  }): Json[] =>
   lin_values_any(obj)
 
 // Return the key/value pairs of an object or map.
-// @param obj  any `Json`/`{}` record or `{ String: T }` map.
+// @param obj  a record, an index-signature map, or a `Json` object.
 // @returns a `Json[]` of `[key, value]` pairs, in key order.
 // @example entries({ "a": 1, "b": 2 })   // [["a", 1], ["b", 2]]
-export val entries = (obj: Json): Json[] =>
+export val entries = (obj: { String: Json } | {  }): Json[] =>
   lin_entries_any(obj)
 
 // Build an object from a list of `[key, value]` pairs (the inverse of `entries`). Later pairs with
