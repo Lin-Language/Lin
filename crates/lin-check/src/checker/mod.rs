@@ -103,6 +103,15 @@ pub struct Checker {
     import_origins: std::collections::HashMap<String, (String, String)>,
     /// Collected `replace` overrides (ADR-046), threaded into `TypedModule::replacements`.
     replacements: Vec<crate::typed_ir::Replacement>,
+    /// Definition-site (`name_span`, inferred `Type`) entry for EVERY function/lambda parameter
+    /// with a name span — recorded when the param is typed in `infer_function`(`_with_hints`),
+    /// whether or not the param is ever used. At the end of `check_module` each `Type` is zonked
+    /// (so a parameter whose type was inferred from the call context resolves to the concrete
+    /// type, not an unsolved `?T`) and appended to `span_type_map` as a self-entry
+    /// (`use_span == def_span == name_span`). This makes a parameter's inferred type recoverable
+    /// directly at its name span for LSP inlay hints, including UNUSED unannotated params (which
+    /// `infer_ident` never records, since only USES populate `span_type_map`). Metadata-only.
+    param_def_span_types: Vec<(Span, Type)>,
 }
 
 impl Default for Checker {
@@ -141,6 +150,7 @@ impl Checker {
             array_alloc_elem_hint: None,
             import_origins: std::collections::HashMap::new(),
             replacements: Vec::new(),
+            param_def_span_types: Vec::new(),
         }
     }
 
@@ -193,6 +203,18 @@ impl Checker {
             // Zonking pass: replace solved TypeVar nodes with their concrete types.
             let subs = self.solved_type_vars.clone();
             crate::zonk::zonk_module(&mut typed_module, &subs);
+            // Append a definition-site entry to `span_type_map` for every function/lambda
+            // parameter, using the FINAL zonked type (so a parameter whose type was inferred from
+            // its call context resolves to the concrete type, not an unsolved `?T`). The use-span
+            // IS the def-span (the param's name span), making the parameter's inferred type
+            // recoverable directly at its name span for LSP inlay hints — including UNUSED
+            // unannotated params, which `infer_ident` never records (only USES populate the map).
+            // Purely additive metadata: it never affects `typed_module`, inferred types, or
+            // diagnostics. See `param_def_span_types`.
+            for (name_span, ty) in std::mem::take(&mut self.param_def_span_types) {
+                let resolved = crate::zonk::zonk_type(&ty, &subs);
+                self.span_type_map.push((name_span, resolved.to_string(), Some(name_span)));
+            }
             Ok(typed_module)
         }
     }
@@ -209,23 +231,28 @@ impl Checker {
     /// phantom capture set (which would give a top-level function a spurious closure env and break
     /// its call ABI). Restore only ever TRUNCATES (never grows) — a clean attempt leaves the lengths
     /// unchanged, so this is a no-op on the success path.
-    pub(crate) fn checker_state_snapshot(&self) -> (usize, usize, usize, Option<String>, bool) {
+    pub(crate) fn checker_state_snapshot(&self) -> (usize, usize, usize, Option<String>, bool, usize) {
         (
             self.function_scope_depths.len(),
             self.capture_stack.len(),
             self.env.scope_depth(),
             self.current_function.clone(),
             self.in_tail_position,
+            // Drop any param def-site entries pushed by the discarded speculative attempt, so a
+            // failed hint can't leave a wrongly-typed parameter entry in `span_type_map` — only
+            // the kept attempt's params are recorded.
+            self.param_def_span_types.len(),
         )
     }
 
-    pub(crate) fn restore_checker_state(&mut self, snap: (usize, usize, usize, Option<String>, bool)) {
-        let (fsd_len, cap_len, scope_len, cur_fn, tail) = snap;
+    pub(crate) fn restore_checker_state(&mut self, snap: (usize, usize, usize, Option<String>, bool, usize)) {
+        let (fsd_len, cap_len, scope_len, cur_fn, tail, param_types_len) = snap;
         self.function_scope_depths.truncate(fsd_len);
         self.capture_stack.truncate(cap_len);
         self.env.truncate_scopes(scope_len);
         self.current_function = cur_fn;
         self.in_tail_position = tail;
+        self.param_def_span_types.truncate(param_types_len);
     }
 
     pub(crate) fn types_compatible(&self, value: &Type, target: &Type) -> bool {
