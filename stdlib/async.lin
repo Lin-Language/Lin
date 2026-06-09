@@ -22,7 +22,7 @@
 //
 //   val p = async(() => expensiveComputation())   // ... do other work ...
 //   match await(p) is Error => print("failed") else => print("${await(p)}")
-export val async = (f: Json): Json =>
+export val async = <T>(f: () => T): Promise<T> =>
   lin_async(f)
 
 // Resolve a promise to its value.
@@ -30,7 +30,7 @@ export val async = (f: Json): Json =>
 // @returns the resolved value, or an `Error` if the thunk faulted. The `T | Error` union must be
 //   handled (e.g. `match … is Error => … else => …`); assigning it to a bare binding that ignores
 //   the Error arm is a compile-time error.
-export val await = <T>(p: T): T | Error =>
+export val await = <T>(p: Promise<T>): T | Error =>
   lin_await(p)
 
 // Run a list of thunks concurrently and collect their results in order.
@@ -44,7 +44,7 @@ export val parallel = (tasks: Json): Json[] =>
 // @param promises  an array of `Promise` handles (passed as `Json`).
 // @returns an opaque `Promise` handle for the first settled result; resolve with `await`.
 // @example val fastest = await(race([async(() => fetchFrom("a")), async(() => fetchFrom("b"))]))
-export val race = (promises: Json): Json =>
+export val race = <T>(promises: Promise<T>[]): Promise<T> =>
   lin_race(promises)
 
 // Return a promise that fails with a timeout `Error` if `p` does not settle within `ms`.
@@ -52,7 +52,7 @@ export val race = (promises: Json): Json =>
 // @param ms  the timeout in milliseconds.
 // @returns an opaque `Promise` handle; awaiting it yields `p`'s value or a timeout `Error`.
 // @example match await(timeout(longOp, 5000)) is Null => print("timed out") is Error => print("failed") else => print("ok")
-export val timeout = (p: Json, ms: Int32): Json =>
+export val timeout = <T>(p: Promise<T>, ms: Int32): Promise<T> =>
   lin_timeout(p, ms)
 
 // Retry a faulting thunk up to `times` attempts.
@@ -60,7 +60,7 @@ export val timeout = (p: Json, ms: Int32): Json =>
 // @param times  the maximum number of attempts.
 // @returns an opaque `Promise` handle; awaiting it yields the first success, or the last `Error`.
 // @example val data = await(retry(() => unstableFetch(), 3))
-export val retry = (f: Json, times: Int32): Json =>
+export val retry = <T>(f: () => T, times: Int32): Promise<T> =>
   lin_retry(f, times)
 
 // Create a fixed-size pool of worker threads.
@@ -77,7 +77,7 @@ export val threadPool = (size: Int32): Json =>
 // @returns an opaque `Promise` handle for the result; resolve with `await`.
 // @example val pool = threadPool(8)
 // @example val result = await(pool.poolAsync(() => heavyWork()))
-export val poolAsync = (pool: Json, f: Json): Json =>
+export val poolAsync = <T>(pool: Json, f: () => T): Promise<T> =>
   lin_pool_async(pool, f)
 
 // Spawn a long-lived worker thread that owns thread-confined state.

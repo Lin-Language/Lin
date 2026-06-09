@@ -399,7 +399,6 @@ Several names that appear in prose and in conceptual signatures are **not** reso
 | --- | --- | --- |
 | `Number` | conceptual union over numeric families; not resolvable | `Json`, or a concrete family (`Int32`, `Float64`, …) |
 | `Iterable<T>` | conceptual ("arrays and iterators"); not resolvable | `Iterator<T>`, or `Json[]` for arrays |
-| `Promise<T>` | opaque runtime value, erased to `Json`; not a nominal type | annotate as `Json` (see §24.2, ADR-045) |
 | `ThreadPool` | opaque runtime value, erased to `Json`; not a nominal type | annotate as `Json` (see §24.5) |
 | `Worker<Msg, Reply>` | opaque runtime value, erased to `Json`; not a nominal type | annotate as `Json` (see §24.6) |
 
@@ -1863,11 +1862,11 @@ Closures capture bindings from their defining scope. Mutable bindings are captur
 
 Concurrency in Lin follows the same pattern as iteration: opaque runtime values constructed with built-in functions, consumed by built-in functions. No new syntax is introduced. Functions do not carry an "async" colour — whether a function runs synchronously or on a separate thread is decided at the call site, not in the function's definition.
 
-The concurrency runtime values — promises, thread pools, and workers — are **opaque** and are erased to `Json` in the type system (§4.1). `Promise<T>`, `ThreadPool`, and `Worker<Msg, Reply>` are conceptual notations used below for clarity; they are not resolvable type-annotation names. Where you must annotate one, use `Json`.
+The concurrency runtime values — promises, thread pools, and workers — are **opaque** handles. `Promise<T>` is a first-class, resolvable opaque type (like `Shared<T>` and `Stream<T>`): `async` returns `Promise<T>`, `await` consumes it, and the checker tracks the payload `T` through the combinators (`race`/`timeout`/`retry`/`poolAsync`). It does not widen to `Json`. `ThreadPool` and `Worker<Msg, Reply>` remain conceptual notations that are not resolvable annotation names — where you must annotate one, use `Json`.
 
 ### 24.2 Promises
 
-A promise (conceptually `Promise<T>`) represents a value of type `T` being computed on another OS thread. At runtime it is an opaque handle.
+A promise (`Promise<T>`) represents a value of type `T` being computed on another OS thread. At runtime it is an opaque handle.
 
 `T` must be a **transferable** type: JSON-compatible values (`String`, `Boolean`, `Null`, all numeric types, `T[]`, and object types whose fields are transferable). Functions, iterators, workers, thread pools, and promises are not transferable. Attempting to spawn a thunk that returns a non-transferable type is a compile-time error where statically detectable, and a runtime error otherwise.
 
@@ -1926,7 +1925,7 @@ val p = async(() => 1 + 1)
 val v: Int32 = await(p)   // compile error: Int32 | Error is not assignable to Int32
 ```
 
-> **Implementation note (ADR-045).** The `T | Error` union is attached at `await`, not at `async`. A promise handle in flight is an opaque value (erased to `Json`); only `await` materialises a result that can be an `Error`. The checker therefore enforces "must handle the `Error`" but does not catch "forgot to `await`" (using a promise where its resolved value is expected).
+> **Implementation note (ADR-045).** The `T | Error` union is attached at `await`, not at `async`. A promise handle in flight has the opaque type `Promise<T>` — it does not widen to `Json` — and only `await` materialises a result that can be an `Error`. The checker enforces "must handle the `Error`" after `await` AND, because `Promise<T>` is its own type, catches "forgot to `await`" (passing a `Promise<T>` where its resolved value is expected is a type error).
 
 #### 24.2.3 Nested Promises
 
@@ -2945,7 +2944,7 @@ val parseAge = (input: String): Result<Int32, String> =>
 ### B.2 Known Gaps and Deferred Work
 
 - **`Float8` / `Float16`.** Listed in earlier drafts; not implemented. Only `Float32`/`Float64` exist.
-- **Nominal `Promise<T>` / `ThreadPool` / `Worker<Msg,Reply>` types.** These are opaque runtime values erased to `Json` (§4.1, §24.1). The checker enforces "handle the `Error` after `await`" but cannot catch "forgot to `await`" (ADR-045).
+- **Nominal `ThreadPool` / `Worker<Msg,Reply>` types.** These remain opaque runtime values erased to `Json` (§4.1, §24.1). (`Promise<T>` *is* now a first-class resolvable opaque type — §24.1, ADR-045 — so "forgot to `await`" is caught.)
 - **`Number` / `Iterable<T>` as resolvable names.** Conceptual only; use `Json` or concrete families / `Iterator<T>`.
 - **Mutual tail-call optimisation.** Only direct self-recursive tail calls are optimised (§28.3).
 - **Bytecode or JIT target.** Native code via LLVM only.

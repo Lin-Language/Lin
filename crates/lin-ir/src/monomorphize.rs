@@ -57,7 +57,7 @@ const GENERIC_TV_BASE: u32 = 9001;
 fn mentions_generic_tv(ty: &Type) -> bool {
     match ty {
         Type::TypeVar(id) => *id >= GENERIC_TV_BASE && *id != u32::MAX,
-        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Map(t) => mentions_generic_tv(t),
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Promise(t) | Type::Map(t) => mentions_generic_tv(t),
         Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(mentions_generic_tv),
         Type::Object { fields, .. } => fields.values().any(mentions_generic_tv),
         Type::Function { params, ret, .. } => {
@@ -95,7 +95,7 @@ fn mentions_sealed(ty: &Type) -> bool {
         Type::Object { fields, sealed: true } =>
             !fields.is_empty() && fields.values().all(field_packed_scalar),
         Type::Object { fields, sealed: false } => fields.values().any(mentions_sealed),
-        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Map(t) => mentions_sealed(t),
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Promise(t) | Type::Map(t) => mentions_sealed(t),
         Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(mentions_sealed),
         Type::Function { params, ret, .. } => {
             params.iter().any(mentions_sealed) || mentions_sealed(ret)
@@ -191,6 +191,7 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
         Type::Iterator(t) => Type::Iterator(Box::new(subst_type(t, subs))),
         Type::Shared(t) => Type::Shared(Box::new(subst_type(t, subs))),
         Type::Stream(t) => Type::Stream(Box::new(subst_type(t, subs))),
+        Type::Promise(t) => Type::Promise(Box::new(subst_type(t, subs))),
         Type::Map(t) => Type::Map(Box::new(subst_type(t, subs))),
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| subst_type(t, subs)).collect()),
         Type::Union(ts) => {
@@ -274,6 +275,7 @@ fn erase_nonconcrete_typevars(ty: &Type) -> Type {
         Type::Iterator(t) => Type::Iterator(Box::new(erase_nonconcrete_typevars(t))),
         Type::Shared(t) => Type::Shared(Box::new(erase_nonconcrete_typevars(t))),
         Type::Stream(t) => Type::Stream(Box::new(erase_nonconcrete_typevars(t))),
+        Type::Promise(t) => Type::Promise(Box::new(erase_nonconcrete_typevars(t))),
         Type::Map(t) => Type::Map(Box::new(erase_nonconcrete_typevars(t))),
         Type::FixedArray(ts) => {
             Type::FixedArray(ts.iter().map(erase_nonconcrete_typevars).collect())
@@ -333,6 +335,7 @@ fn collect_subs(pattern: &Type, actual: &Type, subs: &mut HashMap<u32, Type>) {
         (Type::Iterator(p), Type::Iterator(a)) => collect_subs(p, a, subs),
         (Type::Shared(p), Type::Shared(a)) => collect_subs(p, a, subs),
         (Type::Stream(p), Type::Stream(a)) => collect_subs(p, a, subs),
+        (Type::Promise(p), Type::Promise(a)) => collect_subs(p, a, subs),
         // An index-signature map param `{ String: T }` unified against a concrete `{ String: A }`
         // value (or the `Json` wildcard): recover the element TypeVar from the value type, exactly
         // like the `Array`/`Iterator` element cases above.
@@ -465,6 +468,7 @@ fn mangle_type(ty: &Type) -> String {
         Type::Array(t) => format!("Arr_{}", mangle_type(t)),
         Type::Iterator(t) => format!("Iter_{}", mangle_type(t)),
         Type::Stream(t) => format!("Stream_{}", mangle_type(t)),
+        Type::Promise(t) => format!("Promise_{}", mangle_type(t)),
         // Object records must mangle by SHAPE, not collapse to a single `Object`. Two distinct
         // record types instantiated at the same generic param (e.g. `push(Route[], route)` and
         // `push(Leg[], leg)`) would otherwise both produce `push$Object` — a SYMBOL COLLISION:
@@ -2306,7 +2310,7 @@ fn collect_quantified_ids(ty: &Type, out: &mut std::collections::HashSet<u32>) {
         Type::TypeVar(id) if *id >= GENERIC_TV_BASE && *id != u32::MAX => {
             out.insert(*id);
         }
-        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) => collect_quantified_ids(t, out),
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Promise(t) => collect_quantified_ids(t, out),
         Type::FixedArray(ts) | Type::Union(ts) => {
             ts.iter().for_each(|t| collect_quantified_ids(t, out))
         }
