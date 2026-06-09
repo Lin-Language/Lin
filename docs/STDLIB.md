@@ -1556,8 +1556,9 @@ val product: (arr: Number[]) -> Number
 Returns the product of all elements in `arr`. Returns `1` for an empty array.
 
 ```txt
-product([1, 2, 3, 4])   // 24
-product([])              // 1
+product([1, 2, 3, 4])      // 24
+val empty: Int32[] = []
+product(empty)             // 1   (an empty array needs an element-type annotation)
 ```
 
 ---
@@ -1689,8 +1690,9 @@ val sum: (arr: Number[]) -> Number
 Returns the sum of all elements in `arr`. Returns `0` for an empty array.
 
 ```txt
-sum([1, 2, 3, 4])   // 10
-sum([])              // 0
+sum([1, 2, 3, 4])      // 10
+val empty: Int32[] = []
+sum(empty)             // 0   (an empty array needs an element-type annotation)
 ```
 
 ---
