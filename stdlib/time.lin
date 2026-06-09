@@ -88,11 +88,14 @@ export val parse = (s: String, pattern: String): Int64 | Error =>
 // Break a Unix-millisecond timestamp into its UTC calendar fields. Never fails — every Int64 is a
 // valid instant; pre-1970 (negative `ts`) and far-future years use the proleptic Gregorian
 // calendar, so `year` may be negative.
+// The fixed calendar-fields record returned by `components`/`componentsAt`: stable integer fields,
+// every one always present. `weekday` is 0=Sunday..6=Saturday; `yearDay` is 1-366.
+export type TimeComponents = { "year": Int32, "month": Int32, "day": Int32, "hour": Int32, "minute": Int32, "second": Int32, "millis": Int32, "weekday": Int32, "yearDay": Int32 }
+
 // @param ts  the timestamp in Unix milliseconds.
-// @returns a Json object with stable integer fields year, month (1-12), day (1-31), hour (0-23),
-//   minute/second (0-59), millis (0-999), weekday (0=Sunday..6=Saturday), yearDay (1-366). Typed
-//   `Json` because that is how the runtime hands back the built object.
-export val components = (ts: Int64): Json =>
+// @returns a `TimeComponents` record: year, month (1-12), day (1-31), hour (0-23),
+//   minute/second (0-59), millis (0-999), weekday (0=Sunday..6=Saturday), yearDay (1-366).
+export val components = (ts: Int64): TimeComponents =>
   lin_time_components(ts)
 
 // Build a Unix-millisecond timestamp (UTC) from calendar fields. Out-of-range fields are rejected,
@@ -268,8 +271,8 @@ export val formatDuration = (ms: Int64): String =>
 // out of scope.
 // @param ts  the timestamp in Unix milliseconds.
 // @param offsetMinutes  the UTC offset in minutes (e.g. -300 for UTC-5, 330 for UTC+5:30).
-// @returns the calendar-fields Json object for that local time (same shape as `components`).
-export val componentsAt = (ts: Int64, offsetMinutes: Int32): Json =>
+// @returns the `TimeComponents` record for that local time (same shape as `components`).
+export val componentsAt = (ts: Int64, offsetMinutes: Int32): TimeComponents =>
   components(ts + minutes(offsetMinutes))
 
 // Like `format`, but renders the local wall-clock at a fixed UTC offset (see componentsAt).

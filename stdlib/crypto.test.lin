@@ -6,6 +6,16 @@ import { sha256, sha256Hex, sha512, sha512Hex, sha1, sha1Hex, md5, md5Hex, hashS
 // std/crypto — verified against published known-answer test vectors (NIST FIPS 180,
 // RFC 1321 for MD5, RFC 4231 for HMAC-SHA-256). ASan-green is not sufficient; every digest
 // below is byte-checked against the canonical reference value.
+
+// `fromHex` returns `UInt8[] | Error`, so the Error arm must be handled before `toHex`. For a
+// valid hex string the decode never fails; the `is Error` arm returns a sentinel that fails the
+// equality check rather than masking a regression.
+val hexRoundTrip = (hex: String): String =>
+  val bytes = fromHex(hex)
+  match bytes
+    is Error => "<error>"
+    else => toHex(bytes)
+
 val s = suite("std/crypto", [
   // --- SHA-256 KATs --------------------------------------------------------
   test("sha256Hex(\"abc\") matches FIPS 180", () => [
@@ -128,11 +138,11 @@ val s = suite("std/crypto", [
   ),
 
   test("fromHex round-trips toHex", () => [
-    expect(toHex(fromHex("deadbeef"))).toBe("deadbeef")
+    expect(hexRoundTrip("deadbeef")).toBe("deadbeef")
   ]),
 
   test("fromHex accepts uppercase", () => [
-    expect(toHex(fromHex("DEADBEEF"))).toBe("deadbeef")
+    expect(hexRoundTrip("DEADBEEF")).toBe("deadbeef")
   ]),
 
   test("fromHex odd length is an Error", () => [

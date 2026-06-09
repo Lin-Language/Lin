@@ -45,7 +45,7 @@ export type ProcessHandle = Int64
 // @returns an ExecResult with the exit status and captured stdout/stderr, or an Error if the
 //   process cannot be launched.
 // @example val r = exec("git", ["status", "--short"])   // then r["status"], r["stdout"]
-export val exec = (command: String, args: String[]): Json =>
+export val exec = (command: String, args: String[]): ExecResult | Error =>
   lin_process_exec(command, args)
 
 // Run `command` through the system shell (`/bin/sh -c`). Prefer `exec` to avoid shell injection.
@@ -53,7 +53,7 @@ export val exec = (command: String, args: String[]): Json =>
 // @returns an ExecResult with the exit status and captured stdout/stderr, or an Error if it
 //   cannot be launched.
 // @example shell("ls -la | wc -l")["stdout"].trim()
-export val shell = (command: String): Json =>
+export val shell = (command: String): ExecResult | Error =>
   lin_process_shell(command)
 
 // The absolute path of the current working directory.
