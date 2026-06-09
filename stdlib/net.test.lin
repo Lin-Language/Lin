@@ -131,6 +131,7 @@ val s = suite("std/net", [
         tcpClose(srvFd)
         tcpClose(lis)
         [
+          expect(cli >= 0).toBe(true),
           expect(acc["addr"]).toBe("127.0.0.1"),
           expect(sent).toBe(3),
           expect(got).toBe(3),
