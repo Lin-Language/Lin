@@ -226,6 +226,20 @@ delivers the offset half cheaply, but the surrounding ABI is the actual cost —
 explains §H6** (cheap packed reads recovered only ~6%: same shape, the read *wrapper* dominates, not the
 offset).
 
+### ⚠️ The cheaper alternative this path's measurement implies (2026-06-09): type the DICTIONARIES, don't cache them
+This path's own finding — "99.56% of reads are now a guarded const-offset load and it still didn't move
+the needle, because the cost is the read *wrapper* (key-intern + unbox + tag-dispatch + owning clone),
+not the offset" — has a direct, cheaper corollary the path didn't draw: **where the `Json` is a
+DICTIONARY** (string→value, the RAPTOR `routeStopIndex`/`bestArrivals`/`kConnections` shape), typing it
+`{ String: T }` routes `m[k]` to `lin_map_get`, which **deletes the entire wrapper** (no key-intern, no
+tag-dispatch, no per-lookup box) rather than caching the offset inside it. Measured: **~5.6× on RAPTOR
+PREP** (`8859f713`, on master) — orders of magnitude more than this IC's ±3%. The IC only earns its keep
+on genuinely *record-shaped* `Json` that is neither a typed map nor a packable struct. Before any further
+IC investment, run path-0's per-call-site-CLASS profile to confirm the residual hot `lin_object_get`s are
+record-shaped, not dictionary-shaped — the latter are removable by a type annotation. This *reinforces*
+the "IC not worth enabling" verdict below. (See path-0 RETROSPECTIVE 2026-06-09 for why this dict-vs-record
+distinction was invisible to the aggregate `lin_object_get` profile that launched these paths.)
+
 ### Cross-references to the other paths' findings
 - **path-0 (`Trip|Null` tail-recursive leak):** this branch independently found and fixed the *same*
   universal RC/codegen leak the `path1-packed-records` agent fixed (their `04bec70`; this branch's

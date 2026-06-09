@@ -338,3 +338,15 @@ The whole-array materialization on combinator entry — the dominant cost #2 —
 
 ### Net Path-1 verdict
 The in-place ABI thesis is **validated**: Steps 1+2 make packed-scalar-array iteration ~4.5× faster with no regression, proving the materialization boundary (cost #2) was the right target and is fixable soundly. The lever for RAPTOR specifically, however, needs Step 3 (heap-field default-pack) because `Trip` has String/nested fields — and Step 3 is gated on the repr-oracle reconciliation above. **Mergeable now: Steps 1+2 (conservative scalar-only scope, 4.5× win, all gates green).** Deferred: Step 3 heap-field widening, blocked on the precisely-located repr-oracle divergence.
+
+### ⚠️ Note 2026-06-09 — packing records and typing DICTIONARIES are different, non-competing levers
+This path packs `Json`/record *values* into structs. A **distinct, cheaper** lever — typing `Json`
+*dictionaries* as `{ String: T }` maps — is what actually delivered the biggest RAPTOR speedup on master:
+`8859f713` (`routeStopIndex` etc.) measured **PREP 144 s → 25.7 s (~5.6×)**, by routing `m[k]` to
+`lin_map_get` instead of `lin_object_get`+box. It needs **none** of this path's machinery (no gate, no
+packing, no repr oracle) — it's a type annotation. Keep the two separate when reasoning about RAPTOR: the
+dictionary win is **already banked** (it's why master PREP is ~26 s now, not ~144 s); this path's
+remaining target is the *record* values (`Trip`/`StopTime`) the query phase iterates, which a typed map
+does not help. See path-0's RETROSPECTIVE 2026-06-09 — the two were conflated under one "de-`Json`-ing"
+heading, which is part of why the dictionary win went uncredited to any path and the profiling pointed
+five agents at the harder record/packing half.

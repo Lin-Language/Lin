@@ -113,9 +113,90 @@ different line of work, which mutually corroborates them:
   correct). Confirms the prerequisite is already satisfied.
 - **Fix 2 (`Trip|Null` tail-recursive leak):** independently found and fixed the **same** bug — commit
   `f0d02bf` vs `04bec70` (the path-1 work above). The two fixes target the same `lower.rs` union-box /
-  tail-call-release seam from slightly different angles; **either is merge-worthy on its own — do not merge
-  both, pick one and drop the duplicate.** `f0d02bf` measured the residual at a constant 24 B/call (vs
-  `04bec70`'s 88 B/8-allocs constant) — both non-scaling, both ASan-clean.
+  tail-call-release seam from slightly different angles; both non-scaling, both ASan-clean (`f0d02bf`
+  measured a constant 24 B/call residual; `04bec70` 88 B/8 allocs).
+  **RESOLVED — now ON master as `158a5508`** ("fix(ir): two RC-soundness fixes for concrete values
+  crossing the union boundary", its *Bug B* is this exact `scanRouteAt Trip|Null` UAF). Linus merged the
+  consolidated version — "the cleaner of the competing implementations … plus the best regression test
+  from another." So **neither `f0d02bf` nor `04bec70` should be cherry-picked — master already has it.**
 
-This is a good example of the fan-out discipline paying off: one real bug, surfaced and fixed twice
-independently, raising confidence it is genuine and the fix is correct.
+This is a good example of the fan-out discipline paying off: one real bug, surfaced and fixed
+independently by multiple parallel agents, then consolidated into a single master commit (`158a5508`) —
+the independent rediscovery raised confidence it was genuine and the fix correct.
+
+---
+
+## ⚠️ RETROSPECTIVE 2026-06-09 — the win this path's measurement structurally could not see: "de-`Json`-ing" is TWO levers, not one
+
+This path (and Paths 1–7 that branch off its H9 result) treat "get RAPTOR's hot data off `Json`" as a
+single lever and conclude, from H9, that it **regresses** ("typing the trips made GROUP/RANGE 2× slower;
+reads were never the bottleneck"). That conclusion is correct *for the lever H9 actually pulled* — but it
+was over-generalised onto a **different** lever that, measured in isolation, is the **single biggest
+RAPTOR speedup on master to date.** The two were conflated because the taxonomy ("de-`Json` the hot
+data") was too coarse to separate them:
+
+1. **`Json`-as-DICTIONARY → typed `{ String: T }` map.** `kConnections`, `routeStopIndex`,
+   `bestArrivals`/`kArrivals` were dynamic `Json` association objects; typing them as index-signature
+   maps changes the emitted access from `lin_object_get` (tag-check + intern-compare + **box the result
+   into a `TaggedVal`** + an LLVM optimisation barrier) to a lean `lin_map_get` returning the value
+   directly. **This is the lever that paid:** `8859f713` measured **PREP 144 s → 25.7 s (~5.6×)** from
+   typing the ~16k-key `routeStopIndex` alone; `8ee79a8d` (bestArrivals/kArrivals) and `3c4ed0b8`/
+   `ea1569c2` (the last dict, `kConnections`) followed. *(The win is mostly the cheaper emitted path +
+   un-blocking the optimiser, not purely O(n)→O(1): large `Json` objects were already hash-indexed.)*
+   All four are **ON master** and digest-byte-identical.
+2. **`Json`-as-RECORD → packed sealed struct** (`Trip`/`StopTime` field reads as const-offset). This is
+   the lever H9 pulled, and it **regresses 2×** — because a `Trip` can't pack (String + nested-record
+   fields under a scalar+Bool gate) so it stays boxed *and* every store/​combinator now crosses a
+   materialize/box boundary the `Json` baseline didn't have. H9 is right about **this** lever.
+
+**Both are "type the hot data off `Json`." One is a ~10-line type annotation that wins 5.6×; the other
+is the multi-month packed-record saga that loses.** This path's measurement plan ("after the retype,
+measure LOAD/PREP/GROUP/RANGE") *did* record the dictionary win — H9's own table notes **LOAD −38%** and
+calls it "the tell, construction is the lever" — but the framing then (a) scoped LOAD/PREP out as
+"one-time setup, optimise GROUP/RANGE" and (b) folded the dict result into the record result under one
+"typing" verdict, so the cheap, shipped, sub-dominant-phase win was never isolated as its own
+experiment. Five agents were then pointed at the residual (construction/RC/calls in the query phase) —
+the genuinely hard, architectural half — while the cheap half had already been banked by hand, credited
+to no path.
+
+### Why the profiling missed it (root cause, for next time)
+- **One aggregate counter hid two cost-classes with opposite fixes.** "756M `lin_object_get` in the
+  query phase" launched the read-strategy paths, but `lin_object_get` fires for **both** record-field
+  reads **and** `Json`-dictionary lookups. Nobody split that count by **call-site kind**. "Make reads
+  fast" therefore pointed at the record half (hard) when a large share was the dictionary half (a type
+  annotation).
+- **The apparatus measured the world *after* the biggest lever had already fired.** The dict-typing
+  campaign (`8859f713`…`ea1569c2`, 2026-06-05/06) was done as "obvious prerequisite de-`Json`-ing."
+  H9 and the ceiling test ran against that already-improved baseline, correctly found "the residual is
+  construction/calls," and redirected onto the residual — never having watched the cheap win happen.
+- **The phase that won was excluded by definition.** Every path optimises GROUP/RANGE and scopes
+  LOAD/PREP out as "setup" — but PREP is exactly where dict-typing won 5.6×.
+- **The paths (0–8) are one hypothesis chain on one cost model, two programs.** They are not independent
+  bets — each is "written after the previous was falsified," all anchored to the same H9 + ceiling
+  measurements on RAPTOR-query + interp. A shared blind spot (no per-call-site-class attribution;
+  sub-dominant phases scoped out) propagates to all of them. (Path 8, added 2026-06-09, is the sharpest
+  on mechanism — it correctly names `lin_object_get` as an opaque non-inlined call — and the
+  dictionary-typing win is a *confirming* instance of its thesis: see path-8's corroborating note.)
+
+### Methodology fix (recommended, cheap, do before the next architectural bet)
+- **Profile by call-site CLASS, not by symbol.** Break the query-phase `lin_object_get` / `lin_map_get` /
+  box-alloc counts into **dict-lookup-on-`Json`** vs **record-field-read** vs **small-map**, attributed
+  to source lines. That one breakdown answers the question the whole roadmap skipped: *how much of the
+  remaining cost is still dictionary-shaped and cheaply typeable, vs genuinely the packed/call problem
+  the other paths target?*
+- **Sweep de-`Json`-ing by syntactic kind as SEPARATE experiments** (dict→`Map`, record→packed,
+  arg→typed) and never let one's result stand in for another's. H9's "trips regressed" must not imply
+  "typing dicts regresses" — measured, the opposite.
+- **Don't scope any phase out of the optimisation target before measuring its sensitivity.** LOAD/PREP
+  were where typing won.
+- **Run cheap annotation-level wins on a separate budget from the architectural bets** — a 10-line change
+  worth 5.6× should not be competing for attention (or a measurement baseline) with a tracing-GC
+  proposal; different risk classes, different queues.
+
+> **Honest caveat on the numbers:** the 5.6× PREP figure is from the controlled measurement recorded in
+> commit `8859f713`, re-confirmed here only by re-reading the commit + verifying the four dict-typing
+> commits are on master (`8859f713`/`8ee79a8d`/`3c4ed0b8`/`ea1569c2`). A fresh head-to-head was attempted
+> 2026-06-09 but the host was load-contended (swinging 6→62) and the before-point (`f872eec9`) does not
+> compile under its own `slice` generic-inference gap, so a same-revision A/B was not obtained this
+> session. The mechanism (dict `lin_object_get`+box → `lin_map_get`) and the commit-recorded number stand;
+> a clean re-bench + the per-call-site-class profile above is the recommended next measurement.
