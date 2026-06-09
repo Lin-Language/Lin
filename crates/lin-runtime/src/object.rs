@@ -1373,7 +1373,7 @@ mod tests {
             let b_addr = b as usize;
             let mut handles = Vec::new();
             for t in 0..8 {
-                handles.push(std::thread::spawn(move || unsafe {
+                handles.push(std::thread::spawn(move || {
                     let bp = b_addr as *const LinObject;
                     // Each thread builds its OWN equal probe object (reversed order to force the
                     // index path to do real work) and compares it against the shared frozen b.
