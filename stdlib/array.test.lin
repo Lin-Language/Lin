@@ -599,9 +599,17 @@ val s = suite("std/array", [
   ),
 
   test("sum of empty array returns 0", () =>
-    val result = [].sum()
+    val empty: Int32[] = []
+    val result = empty.sum()
     [
       expect(result).toBe(0)
+    ]
+  ),
+
+  test("sum of floats widens correctly", () =>
+    val result: Float64 = [1.5, 2.5, 3.0].sum()
+    [
+      expect(result).toBe(7.0)
     ]
   ),
 
@@ -613,7 +621,8 @@ val s = suite("std/array", [
   ),
 
   test("product of empty array returns 1", () =>
-    val result = [].product()
+    val empty: Int32[] = []
+    val result = empty.product()
     [
       expect(result).toBe(1)
     ]
