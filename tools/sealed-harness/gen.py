@@ -27,7 +27,7 @@ SHAPES = {
 PRELUDE = '''import { print } from "std/io"
 import { toString } from "std/string"
 import { push, length, sort } from "std/array"
-import { for, range, map, filter } from "std/iter"
+import { for, range, map, filter, reduce } from "std/iter"
 '''
 
 # ---- operations: each returns (body-of-`once(i)`, expect-per-call). `once` returns an Int32. ----
@@ -105,6 +105,30 @@ def op_map_field(s):
             f'  ds[0]\n')
     return body, lambda N: sum(range(N))
 
+def op_reduce_field(s):
+    # PATH-1 in-place packed iteration via reduce: fold a scalar field into a scalar accumulator.
+    # Exercises the const-offset packed-element read in the reduce inline-scalar-accumulator path.
+    lit, read = s[1], s[2]
+    body = (f'  var ts: T[] = []\n'
+            f'  push(ts, {lit("i")})\n'
+            f'  push(ts, {lit("0")})\n'
+            f'  reduce(ts, 0, (acc, p) => acc + {read("p")})\n')   # i + 0 == i
+    return body, lambda N: sum(range(N))
+
+def op_for_field(s):
+    # PATH-1 in-place packed iteration: `for` over a packed T[] reading a scalar field each
+    # iteration into a captured `var`. Exercises the const-offset packed-element read path
+    # (`try_lower_packed_elem_field`) AND its per-iteration RC (the element is NOT materialized, so
+    # there must be NO per-iteration leak — a sound in-place read allocates nothing per element).
+    lit, read = s[1], s[2]
+    body = (f'  var ts: T[] = []\n'
+            f'  push(ts, {lit("i")})\n'
+            f'  push(ts, {lit("0")})\n'
+            f'  var acc: Int32 = 0\n'
+            f'  ts.for(p => acc = acc + {read("p")})\n'
+            f'  acc\n')   # i + 0 == i
+    return body, lambda N: sum(range(N))
+
 OPS = {
     "build_read": op_build_read,
     "factory_return": op_factory_return,
@@ -114,6 +138,8 @@ OPS = {
     "array_drop": op_array_drop,
     "tail_thread": op_tail_thread,
     "map_field": op_map_field,
+    "for_field": op_for_field,
+    "reduce_field": op_reduce_field,
 }
 
 def main():

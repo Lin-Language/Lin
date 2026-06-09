@@ -217,6 +217,17 @@ impl Type {
     /// — the "spike B" / cheap-typed-reads work. The KIND_MAP/descriptor/transfer runtime plumbing is
     /// kept intact (dormant) for that re-land; only this gate predicate is narrowed.
     pub fn is_sealed_array_field_packable(&self) -> bool {
+        // Stage 3a: scalars + Bool ONLY. (PATH-1 Step 3 — String widening: ATTEMPTED on top of the
+        // in-place packed iteration ABI; the harness was leak-clean and the in-place String field read
+        // — `try_lower_packed_elem_field`, borrowed `load ptr` + retain-if-escapes — works, BUT
+        // widening this gate to String tripped the repr Stage-2 ORACLE: an `Index` on a packed
+        // String-field array threaded through a `T|Null` tail-recursive param has the OLD type
+        // predicate saying `Packed` while the dataflow repr analysis correctly demotes it to
+        // `Boxed(Opaque)` at the union/tail-param boundary — a genuine packed/boxed CLASSIFICATION
+        // divergence, the exact §H4/H5 risk class. Re-landing String packing therefore requires the
+        // repr oracle/verifier to be RECONCILED with the widened gate FIRST — see the proposal's Step-3
+        // sequencing. The in-place String read above stays in place but dormant for arrays the gate
+        // keeps boxed.)
         self.is_flat_scalar() || matches!(self, Type::Bool)
     }
 
