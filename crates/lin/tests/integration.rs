@@ -17141,3 +17141,37 @@ main()
     let _ = fs::remove_file(&inp);
     assert_eq!(output, vec!["4"]);
 }
+
+#[test]
+fn test_union_record_nested_field_tail_recursive_param_no_uaf() {
+    let output = run(r#"import { print } from "std/io"
+
+type StopTime = { "stop": String, "arrivalTime": Int32 }
+type Service = { "days": Json }
+type Trip = { "tripId": String, "stopTimes": StopTime[], "service": Service }
+
+val mkTrip = (id: String): Trip =>
+  { "tripId": id, "stopTimes": [{ "stop": "A", "arrivalTime": 10 }], "service": { "days": {} } }
+
+val getTrip = (i: Int32): Trip | Null =>
+  if i % 3 == 0 then null else mkTrip("t")
+
+val scan = (pi: Int32, n: Int32, trip: Trip | Null, acc: Int32): Int32 =>
+  if pi >= n then acc
+  else if trip != null then
+    val st = trip["stopTimes"][0]
+    val newAcc = acc + st["arrivalTime"]
+    val newTrip = getTrip(pi)
+    if newTrip != null then scan(pi + 1, n, newTrip, newAcc) else scan(pi + 1, n, trip, newAcc)
+  else
+    scan(pi + 1, n, getTrip(pi), acc)
+
+val driver = (k: Int32, total: Int32): Int32 =>
+  if k <= 0 then total else driver(k - 1, total + scan(0, 40, null, 0))
+
+val main = () => print("${driver(500, 0)}")
+main()
+"#);
+    assert_eq!(output, vec!["190000"]);
+}
+
