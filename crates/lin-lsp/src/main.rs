@@ -6775,6 +6775,48 @@ export val thingCount = 7
         assert!(item_named(&by_make, "makeThing").is_some(), "`makeThing` should match prefix `make`");
     }
 
+    // ── PART 3: undefined-name code action covers userland exports ───────────────
+
+    /// The undefined-name code action offers an "Import ... from <relative>" action for a USERLAND
+    /// export matching the undefined name (the `myArr.for(print)`-in-another-file fix path). The
+    /// code action already searched ALL index files (user + stdlib) via `modules_exporting`, so this
+    /// pins the userland behaviour and the correct relative import specifier.
+    #[test]
+    fn auto_import_action_offers_userland_import() {
+        // helpers.lin exports `myArr`; main.lin uses it undefined.
+        let helpers = "export val myArr = [1, 2, 3]\n";
+        let helpers_path = "/proj/helpers.lin";
+        let main_path = "/proj/main.lin";
+        let main_src = "val total = myArr\n";
+        let index = index_from(&[(helpers_path, helpers), (main_path, main_src)]);
+        let base = Path::new("/proj");
+
+        // modules_exporting must surface the userland owner as a relative specifier.
+        let mods = index.modules_exporting("myArr", Some(base));
+        assert!(mods.contains(&"helpers".to_string()), "expected userland owner `helpers`, got {mods:?}");
+
+        // The code action (over a synthetic undefined-`myArr` diagnostic) offers the import.
+        let diag = Diagnostic {
+            range: Range { start: Position { line: 0, character: 12 }, end: Position { line: 0, character: 17 } },
+            message: "Undefined variable 'myArr'".to_string(),
+            ..Default::default()
+        };
+        let main_uri = Url::from_file_path(main_path).unwrap();
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: main_uri.clone() },
+            range: diag.range,
+            context: CodeActionContext { diagnostics: vec![diag], only: None, trigger_kind: None },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let actions = code_actions(main_src, &main_uri, &params, &index, Some(base));
+        let titles = action_titles(&actions);
+        assert!(
+            titles.iter().any(|t| t == "Import `myArr` from \"helpers\""),
+            "expected a userland auto-import action, got {titles:?}",
+        );
+    }
+
     /// Cyclic import graph (A imports B, B imports A) must terminate, not
     /// stack-overflow. Cyclic imports are a supported language feature; the LSP
     /// previously recursed unconditionally and crashed the server on open/edit.
