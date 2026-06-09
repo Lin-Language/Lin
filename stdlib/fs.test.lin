@@ -350,12 +350,15 @@ val s = suite("std/fs", [
         f.writeFile("echo hi")
         f.chmod(493)
         val s = f.stat()
-        val mode = s["mode"]
-        dir.rm({ "recursive": true })
-        [
-          // mode includes the file-type bits; mask to the permission bits (0o777 == 511).
-          expect(mode - (mode / 512) * 512).toBe(493)
-        ]
+        match s
+          is Error => [expect(false).toBe(true)]
+          else =>
+            val mode = s["mode"]
+            dir.rm({ "recursive": true })
+            [
+              // mode includes the file-type bits; mask to the permission bits (0o777 == 511).
+              expect(mode - (mode / 512) * 512).toBe(493)
+            ]
   ),
 
   test("lstat reports isSymlink true for a link, stat reports false", () =>
