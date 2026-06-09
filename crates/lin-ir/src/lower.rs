@@ -5359,7 +5359,15 @@ fn inline_lambda_body_packed_view(
 /// representations already match. (A two-directional companion to `coerce_arg_to_param`, which only
 /// boxes — the inliner can also need to UNBOX, e.g. a Json element bound to a concrete scalar param.)
 fn coerce_arg_to_param_repr(arg: Temp, arg_ty: &Type, param_ty: &Type, builder: &mut FuncBuilder) -> Temp {
-    if !type_repr_differs(arg_ty, param_ty) {
+    // Two distinct numeric WIDTHS (e.g. an `Int32` element bound to an `Int64` callback param) are the
+    // same *representation* (both unboxed scalars, so `type_repr_differs` is false) but NOT the same
+    // physical width — a `Coerce` (sext/zext/sitofp/trunc) is still required, else the body computes on
+    // the wrong-width value (`shl i32 %x, i64 1` — operand-width mismatch). This fires for a combinator
+    // callback whose numeric param widens/narrows the element relative to the source array's element
+    // type (`[1,2,3].map((x: Int64) => …)`, or a widening bare-fn callback's eta-expanded inline body).
+    let numeric_width_differs =
+        arg_ty.is_numeric() && param_ty.is_numeric() && arg_ty != param_ty;
+    if !type_repr_differs(arg_ty, param_ty) && !numeric_width_differs {
         return arg;
     }
     let dst = builder.alloc_temp(param_ty.clone());
@@ -5501,8 +5509,17 @@ fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp,
     let push_dst = builder.alloc_temp(Type::Null);
     match flat {
         Some(kind) => {
-            // Flat arrays store raw scalars; unbox the value if it arrived boxed (Json).
-            let scalar = if is_union_ty(val_ty) {
+            // Flat arrays store raw scalars at the OUTPUT element width. Coerce the value when it
+            // arrived BOXED (Json → unbox) OR as a concrete numeric of a DIFFERENT width than the
+            // output element — e.g. an `Int32` element read from a `[1,2,3]` literal pushed into an
+            // `Int64`-elem output, which happens when a combinator callback's WIDER param widens the
+            // result element (`[1,2,3].map((x: Int64) => …)`, or a widening bare-fn callback whose
+            // eta-expanded inline body now reaches this push). Without the width coercion the raw i32
+            // feeds the i64 flat-push intrinsic — an LLVM signature mismatch (`Both operands … not of
+            // the same type` / wrong push-arg width).
+            let scalar = if is_union_ty(val_ty)
+                || (val_ty.is_numeric() && elem_ty.is_numeric() && val_ty != elem_ty)
+            {
                 let dst = builder.alloc_temp(elem_ty.clone());
                 builder.emit(Instruction::Coerce {
                     dst, src: val, from_ty: val_ty.clone(), to_ty: elem_ty.clone(),

@@ -1275,6 +1275,29 @@ print(toString(n))
 }
 
 #[test]
+fn test_combinator_bare_fn_widening_callback() {
+    // Regression: a bare (named) combinator callback whose numeric param is WIDER than the source
+    // array's element type. The bare-fn eta-expansion routes this through the inline loop; without a
+    // width coercion at the element bind (and at the flat-result push) it emitted invalid LLVM
+    // (`shl i32 %x, i64 1` / i32-into-i64 flat-push). Covers map (Int32→Int64, Int32→Float64) and a
+    // widening filter predicate. The same-width and lambda forms already worked.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter } from "std/iter"
+
+val widenMul = (x: Int64) => x * 2
+print(toString([1, 2, 3].map(widenMul)))
+
+val toFloat = (x: Int32) => x * 1.5
+print(toString([1, 2, 3].map(toFloat)))
+
+val widenPred = (x: Int64) => x > 1
+print(toString([1, 2, 3].filter(widenPred)))
+"#);
+    assert_eq!(output, vec!["[2, 4, 6]", "[1.5, 3.0, 4.5]", "[2, 3]"]);
+}
+
+#[test]
 fn test_map_filter_reduce() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
