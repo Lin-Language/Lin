@@ -60,6 +60,22 @@ import { for } from "std/iter"
 
 `for` returns `null`; it is used for side effects.
 
+## Passing functions directly
+
+A combinator's callback is just a function value, so wherever a named function already does what you want, pass it directly instead of wrapping it in a lambda:
+
+```lin
+import { print } from "std/io"
+import { for, map } from "std/iter"
+
+val square = (x: Int32) => x * x
+
+["a", "b", "c"].for(print)        // same as .for(x => print(x))
+[1, 2, 3, 4].map(square)          // same as .map(x => square(x)) — [1, 4, 9, 16]
+```
+
+This works because functions are first-class values. It also tolerates an arity mismatch in the callback's favour: the combinators pass each element *and* its 0-based index (`for`'s callback is `(T, Int32) => Null`), but a one-argument function like `print` simply ignores the extra index. So `.for(print)` and `.for(x => print(x))` are equivalent — both receive the element and discard the index.
+
 ## `range` — integer ranges
 
 ```lin

@@ -217,3 +217,31 @@ cheapest way to kill that call is often to type the value as a `Map` (no compile
 inline the call. Run path-0's per-call-site-CLASS profile FIRST to find which hot `lin_object_get`s are
 dictionary-shaped (delete by typing) vs record-shaped (need 6a–6c or packing). See path-0 RETROSPECTIVE
 2026-06-09 for why this win was invisible to the aggregate-`lin_object_get` profile that framed the paths.
+
+---
+
+## IMPLEMENTATION FINDINGS (2026-06-09, branch `worktree-agent-aa197d6e37235b188`, NOT merged) — verified-by-me numbers
+
+> **Work reference:** branch `worktree-agent-aa197d6e37235b188`. Carries (off master): Stage 0/1 + leak fixes + path-6 6a fusion + 6b length-dispatch + the (regressing) RAPTOR full-typing `.lin` commits. Every number below is from a **tight interleaved same-compiler same-low-load-window A/B** (the only trustworthy method on this 128-core bandwidth-contended box — see the methodological lesson).
+
+### 6a — combinator/closure inlining + fusion: **LIVE WIN, ~3.3× (verified)**
+Per-element closure-call elimination was already shipped (Stage 1 in-place `for` + `inlinable_capturing_lambda`/`inline_lambda_body`/`emit_index_loop`). The NEW piece built here = **combinator-chain FUSION**: `xs.map(f).filter(g).reduce(h)` → a SINGLE loop, no intermediate array per stage, no per-stage closure call (`lower.rs` +381: `FuseStage`/`extract_fuse_chain`/`lower_fused_reduce`/`emit_fused_loop`, wired into `lower_reduce`+`lower_for`). GATED to inline-SCALAR element flow (base elem + every map output scalar); heap/sealed sources bail to the sound per-stage path (a packed-sealed `map(field-projection)` has a PRE-EXISTING double-`lin_sealed_release` UAF, confirmed on HEAD~1, out of scope). **Verified by me:** `range().map().filter().reduce()` 200M, master 0.817s vs branch 0.247s = **~3.3×**, identical result, leak-scaling `detect_leaks=1` N=100/1000 = ZERO leaks, 972 workspace tests 0-fail, correct values. interp NEUTRAL (recursion-bound, fusion rarely fires; no regression). Commits `192a7d1`+`363bde0`.
+
+### 6b — monomorphic/specialized dispatch: **LIVE WIN (narrow), ~1.35× on length-bound loops**
+Spike branch `spike/monomorphic-dispatch` `6e46fae7`. Finding: **only `length` needs it** — `push`/`get` are ALREADY specialized by the existing monomorphizer (generic `<T>`, IR confirms no Json box). `std/array.length` is non-generic `(x:Json):Int32` → concrete `length(Token[])` BOXES into the Json ABI (4 extra calls/call + dynamic tag dispatch). Fix (42 lines `lower.rs`, route-b): redirect concrete-receiver `std_array_length`/`push` to the `Length`/`Push` intrinsic (no Json coerce), gated Array/FixedArray/Iterator/Str ONLY (records/maps keep dynamic path — first cut returned `length(rec)=32` reading a packed-struct byte; fail-safe gate fixed it). **Verified by me:** length-heavy loop master 1.27s vs spike 0.94s = **~1.35×** (agent's 2.7× was a tighter length-only microbench — both real; win ∝ how length-dominated the loop is). ASan `detect_leaks=0`+`=1`-scaling clean, 684+72 tests 0-fail. Composes with 6a (complementary: fusion inlines literal closures, 6b specializes named stdlib ops). ~1 day to productionize.
+
+### 6c — leaf-helper inlining: NOT attempted (lowest-charted; deferred).
+
+### The RAPTOR full-typing experiment (Option-1) — FALSIFIED, ~2× SLOWER (verified, reconciles H9)
+Fully typing RAPTOR's hot path off `Json` (`Scanner` record + `routeScanner`/`raptor`/`query`/`filter`/`scanResults` typed; `transfers`/`interchange`/`Conn` left Json) — commits `9741f9bf`+`3a75024d`. An agent reported "~2× FASTER than master" — **that was a cross-window LOAD ARTIFACT** (compared vs a master baseline measured under heavy load at GROUP 94s/RANGE 280s). I rebuilt master's all-Json raptor `.lin` with the SAME branch compiler (isolates typing from compiler) and interleaved tightly under load 2–5, 3 pairs:
+| | GROUP | RANGE |
+|---|---|---|
+| all-Json (master sources) | ~24.0s | ~71s |
+| fully-typed | ~49.2s | ~140s |
+**Fully-typed is ~2× SLOWER, consistently** (digest byte-identical both). Same direction as H9's half-typed result — full typing did NOT fix it. **WHY (not "types are slow"):** typing DID remove the dynamic reads (IR: `getTrip` obj_get 7→0, `scanBack` map_get 5→0, `scanRouteAt` `lin_array_get_tagged` 3→0) — but it ADDED (a) per-element sealed-struct **materialize** in typed iteration (`reduce`/`map` over `Trip[]` calls generic `std_iter_reduce`, materialize-per-element — NOT in-place like Stage-1's `for`) and (b) `lin_box` at the `Trip|Null` union-threading tail-call boundaries (`scanRouteAt` lin_box 7→15). The all-Json version pointer-chases SHARED boxed objects with NO per-element materialize + NO union box. Net loss. **Verdict: the RAPTOR-typing `.lin` commits are a regression, must NOT be kept as a perf change.**
+
+### The convergent next lever (every dead end points here): cheap typed ITERATION
+Typing RAPTOR loses *only because* typed-array iteration materializes per element. Extend Stage-1's in-place borrowed-element `for` (proven ~3.2×) to **`reduce`/`map`** so they read the element by borrowed const-offset pointer, no per-element materialize. THEN typing could pay (no dynamic reads AND no per-element copy). This is 6a's natural next increment; it is also what Option-2 (keep-packed) explicitly named as "the only lever that would help RAPTOR or any typed-value-through-Json program."
+
+### Methodological lesson (cost real time — fooled TWO agents)
+RAPTOR absolute timings swing ~4× run-to-run on this 128-core box from memory-bandwidth contention. ONLY a tight interleaved same-window A/B with the **compiler held constant** (compare typed-`.lin` vs Json-`.lin` on the SAME binary) is trustworthy. Two agents reported "typing wins RAPTOR" off cross-window comparisons; both were artifacts; both were ~2× regressions when measured properly.
