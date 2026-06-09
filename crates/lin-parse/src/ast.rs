@@ -349,8 +349,12 @@ pub enum TypeExpr {
     Function(Vec<TypeExpr>, Box<TypeExpr>, Span),
     Object(Vec<(String, TypeExpr)>, Span),
     /// A typed index-signature object type `{ String: T }` (ADR-055): a dictionary keyed by
-    /// arbitrary strings, each mapping to value type `T`. The key type is `String` only for v1.
-    IndexSig(Box<TypeExpr>, Span),
+    /// arbitrary strings, each mapping to value type `T`. The first box is the KEY type-expr, the
+    /// second is the VALUE type-expr. The key type-expr must resolve to `String` (it may be a type
+    /// alias such as `StopID = String`); this is validated at type-resolution time. The key
+    /// type-expr is preserved (rather than collapsed to `String`) so the formatter can round-trip
+    /// the alias name the user wrote.
+    IndexSig(Box<TypeExpr>, Box<TypeExpr>, Span),
     TaggedUnion(Vec<TypeExpr>, Span),
     /// A string-literal singleton type, e.g. `"success"` in type position.
     StringLit(String, Span),

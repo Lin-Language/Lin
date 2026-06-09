@@ -114,18 +114,20 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
                 self.skip_newlines();
-                // Index-signature form `{ String: T }` (ADR-055): a bare `String` key (an Ident,
-                // not a string literal) followed by `:`. The key type is `String` only for v1; the
-                // grammar is left open for an `Int`-keyed form later, but that is not built.
-                let is_index_sig = matches!(self.peek_kind(), TokenKind::Ident(name) if name == "String")
+                // Index-signature form `{ Key: T }` (ADR-055): a bare identifier key (an Ident,
+                // not a string literal) followed by `:`. The key may be any type expression — it
+                // must resolve to `String` (possibly via a type alias such as `StopID = String`),
+                // which is validated at type-resolution time, not here. Records use string-literal
+                // keys, so a bare `Ident` + `:` is unambiguously the index-sig form.
+                let is_index_sig = matches!(self.peek_kind(), TokenKind::Ident(_))
                     && self.check_ahead(TokenKind::Colon, 1);
                 if is_index_sig {
-                    self.advance(); // String
-                    self.advance(); // :
+                    let key_ty = self.parse_type_expr();
+                    self.expect(TokenKind::Colon);
                     let val_ty = self.parse_type_expr();
                     self.skip_newlines();
                     self.expect(TokenKind::RBrace);
-                    TypeExpr::IndexSig(Box::new(val_ty), span)
+                    TypeExpr::IndexSig(Box::new(key_ty), Box::new(val_ty), span)
                 } else {
                     let mut fields = Vec::new();
                     while !self.check(TokenKind::RBrace) && !self.is_at_end() {
