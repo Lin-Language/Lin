@@ -1,5 +1,5 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { udpBind, udpRecv, udpRecvFrom, udpSendTo, udpSetNonblocking, udpClose, tcpListen, tcpAccept, tcpConnect, tcpRecv, tcpSend, tcpSetNonblocking, tcpClose } from "std/net"
+import { udpBind, udpRecv, udpRecvFrom, udpSendTo, udpSetNonblocking, udpClose, tcpListen, tcpAccept, tcpConnect, tcpRecv, tcpSend, tcpSetNonblocking, tcpClose, TcpPeer, Datagram } from "std/net"
 import { sleep } from "std/time"
 
 // std/net: UDP loopback on a single thread is deterministic — send to self on
@@ -22,25 +22,35 @@ import { sleep } from "std/time"
 // Poll a non-blocking listener until accept() yields a connection (or the retry
 // budget is exhausted). Forward-declared at module scope so the self-recursion
 // type-checks (a function-valued `val` is pre-scanned; ADR-012).
-val acceptWithRetry = (lis: Json, tries: Int32): Json =>
+val acceptWithRetry = (lis: Int32, tries: Int32): TcpPeer | Null | Error =>
   val acc = tcpAccept(lis)
   if acc == null && tries > 0 then
     sleep(2)
     acceptWithRetry(lis, tries - 1)
   else
     acc
+
+// Narrow an `Int32 | Error` fd to the bare descriptor (-1 on Error), so the body can use it as the
+// concrete `Int32` the socket calls expect. The loopback binds below never fail, so the Error arm
+// is just a type-safe fallthrough that would fail the test's assertions rather than mask a bug.
+val unwrapFd = (r: Int32 | Error): Int32 =>
+  match r
+    is Error => -1
+    else => r
 val s = suite("std/net", [
   test("udpBind returns a non-error fd handle", () =>
     val sock = udpBind(39301)
-    val ok = sock["type"] != "error"
-    udpClose(sock)
+    val ok = match sock
+      is Error => false
+      else => true
+    udpClose(unwrapFd(sock))
     [
       expect(ok).toBe(true)
     ]
   ),
 
   test("non-blocking udpRecv with no data returns Null", () =>
-    val sock = udpBind(39302)
+    val sock = unwrapFd(udpBind(39302))
     udpSetNonblocking(sock, true)
     val empty: UInt8[] = [0, 0, 0, 0]
     val r = udpRecv(sock, empty)
@@ -51,7 +61,7 @@ val s = suite("std/net", [
   ),
 
   test("UDP loopback send-to-self round-trips bytes", () =>
-    val sock = udpBind(39303)
+    val sock = unwrapFd(udpBind(39303))
     val msg: UInt8[] = [72, 105, 33]
     val sent = udpSendTo(sock, "127.0.0.1", 39303, msg)
     val buf: UInt8[] = [
@@ -66,27 +76,32 @@ val s = suite("std/net", [
     ]
     val res = udpRecvFrom(sock, buf)
     udpClose(sock)
-    [
-      expect(sent).toBe(3),
-      expect(res["len"]).toBe(3),
-      expect(res["addr"]).toBe("127.0.0.1"),
-      expect(buf[0]).toBe(72),
-      expect(buf[1]).toBe(105),
-      expect(buf[2]).toBe(33)
-    ]
+    match res
+      is Datagram =>
+        [
+          expect(sent).toBe(3),
+          expect(res["len"]).toBe(3),
+          expect(res["addr"]).toBe("127.0.0.1"),
+          expect(buf[0]).toBe(72),
+          expect(buf[1]).toBe(105),
+          expect(buf[2]).toBe(33)
+        ]
+      else => [expect(false).toBe(true)]
   ),
 
   test("tcpListen returns a non-error fd handle", () =>
     val lis = tcpListen(39401)
-    val ok = lis["type"] != "error"
-    tcpClose(lis)
+    val ok = match lis
+      is Error => false
+      else => true
+    tcpClose(unwrapFd(lis))
     [
       expect(ok).toBe(true)
     ]
   ),
 
   test("non-blocking tcpAccept with no pending connection returns Null", () =>
-    val lis = tcpListen(39402)
+    val lis = unwrapFd(tcpListen(39402))
     tcpSetNonblocking(lis, true)
     val acc = tcpAccept(lis)
     tcpClose(lis)
@@ -96,33 +111,37 @@ val s = suite("std/net", [
   ),
 
   test("TCP loopback connect/accept/send/recv round-trips bytes", () =>
-    val lis = tcpListen(39403)
+    val lis = unwrapFd(tcpListen(39403))
     tcpSetNonblocking(lis, true)
-    val cli = tcpConnect("127.0.0.1", 39403)
-    val connectOk = cli["type"] != "error"
+    val cli = unwrapFd(tcpConnect("127.0.0.1", 39403))
     val acc = acceptWithRetry(lis, 50)
-    val srvFd = acc["fd"]
-    val msg: UInt8[] = [65, 66, 67]
-    val sent = tcpSend(cli, msg)
-    val buf: UInt8[] = [
-      0,
-      0,
-      0,
-      0
-    ]
-    val got = tcpRecv(srvFd, buf)
-    tcpClose(cli)
-    tcpClose(srvFd)
-    tcpClose(lis)
-    [
-      expect(connectOk).toBe(true),
-      expect(acc["addr"]).toBe("127.0.0.1"),
-      expect(sent).toBe(3),
-      expect(got).toBe(3),
-      expect(buf[0]).toBe(65),
-      expect(buf[1]).toBe(66),
-      expect(buf[2]).toBe(67)
-    ]
+    match acc
+      is TcpPeer =>
+        val srvFd = acc["fd"]
+        val msg: UInt8[] = [65, 66, 67]
+        val sent = tcpSend(cli, msg)
+        val buf: UInt8[] = [
+          0,
+          0,
+          0,
+          0
+        ]
+        val got = tcpRecv(srvFd, buf)
+        tcpClose(cli)
+        tcpClose(srvFd)
+        tcpClose(lis)
+        [
+          expect(acc["addr"]).toBe("127.0.0.1"),
+          expect(sent).toBe(3),
+          expect(got).toBe(3),
+          expect(buf[0]).toBe(65),
+          expect(buf[1]).toBe(66),
+          expect(buf[2]).toBe(67)
+        ]
+      else =>
+        tcpClose(cli)
+        tcpClose(lis)
+        [expect(false).toBe(true)]
   )
 ])
 

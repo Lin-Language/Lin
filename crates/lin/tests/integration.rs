@@ -10305,36 +10305,43 @@ fn test_net_udp_loopback_roundtrip() {
     // Bind one UDP socket and send a datagram to itself, then recvFrom it.
     // udpBind binds a fixed port (the API doesn't surface an OS-assigned port),
     // so we use a high port and send to 127.0.0.1:<port>.
-    let out = run(r#"import { udpBind, udpSendTo, udpRecv, udpRecvFrom, udpSetNonblocking, udpClose } from "std/net"
+    let out = run(r#"import { udpBind, udpSendTo, udpRecv, udpRecvFrom, udpSetNonblocking, udpClose, Datagram } from "std/net"
 import { print } from "std/io"
 import { toString } from "std/string"
 
 val port = 39201
-val sock = udpBind(port)
-print("bound: ${toString(sock["type"] != "error")}")
+val bound = udpBind(port)
+print("bound: ${toString(!(bound is Error))}")
+if bound is Error then
+  print("(bind failed)")
+else
+  val sock = bound
 
-// Non-blocking recv with no data pending must return Null.
-val nb = udpSetNonblocking(sock, true)
-val empty: UInt8[] = [0, 0, 0, 0]
-val none = udpRecv(sock, empty)
-print("empty-recv-null: ${toString(none == null)}")
+  // Non-blocking recv with no data pending must return Null.
+  val nb = udpSetNonblocking(sock, true)
+  val empty: UInt8[] = [0, 0, 0, 0]
+  val none = udpRecv(sock, empty)
+  print("empty-recv-null: ${toString(none == null)}")
 
-// Back to blocking for the round-trip.
-val nb2 = udpSetNonblocking(sock, false)
-val msg: UInt8[] = [72, 105, 33, 10]
-val sent = udpSendTo(sock, "127.0.0.1", port, msg)
-print("sent: ${toString(sent)}")
+  // Back to blocking for the round-trip.
+  val nb2 = udpSetNonblocking(sock, false)
+  val msg: UInt8[] = [72, 105, 33, 10]
+  val sent = udpSendTo(sock, "127.0.0.1", port, msg)
+  print("sent: ${toString(sent)}")
 
-val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
-val res = udpRecvFrom(sock, buf)
-print("len: ${toString(res["len"])}")
-print("addr: ${toString(res["addr"])}")
-print("b0: ${toString(buf[0])}")
-print("b1: ${toString(buf[1])}")
-print("b2: ${toString(buf[2])}")
-print("b3: ${toString(buf[3])}")
+  val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+  val res = udpRecvFrom(sock, buf)
+  if res is Datagram then
+    print("len: ${toString(res["len"])}")
+    print("addr: ${toString(res["addr"])}")
+    print("b0: ${toString(buf[0])}")
+    print("b1: ${toString(buf[1])}")
+    print("b2: ${toString(buf[2])}")
+    print("b3: ${toString(buf[3])}")
+  else
+    print("(recv failed)")
 
-val c = udpClose(sock)
+  val c = udpClose(sock)
 "#);
     assert_eq!(
         out,
@@ -10358,41 +10365,48 @@ fn test_net_tcp_loopback_echo() {
     // completes the handshake into the listener backlog), then a blocking accept
     // immediately returns the pending connection. The server then reads the
     // client's bytes. After the client closes, the server's recv returns 0.
-    let out = run(r#"import { tcpListen, tcpAccept, tcpConnect, tcpRecv, tcpSend, tcpClose } from "std/net"
+    let out = run(r#"import { tcpListen, tcpAccept, tcpConnect, tcpRecv, tcpSend, tcpClose, TcpPeer } from "std/net"
 import { print } from "std/io"
 import { toString } from "std/string"
 
 val port = 39202
-val listener = tcpListen(port)
-print("listening: ${toString(listener["type"] != "error")}")
+val lis = tcpListen(port)
+print("listening: ${toString(!(lis is Error))}")
+val cli = tcpConnect("127.0.0.1", port)
+print("connected: ${toString(!(cli is Error))}")
+if lis is Error then
+  print("(listen failed)")
+else if cli is Error then
+  print("(connect failed)")
+else
+  val listener = lis
+  val client = cli
+  val accepted = tcpAccept(listener)
+  print("accepted: ${toString(accepted is TcpPeer)}")
+  if accepted is TcpPeer then
+    val server = accepted["fd"]
+    val payload: UInt8[] = [76, 105, 110, 33]
+    val sent = tcpSend(client, payload)
+    print("sent: ${toString(sent)}")
 
-val client = tcpConnect("127.0.0.1", port)
-print("connected: ${toString(client["type"] != "error")}")
+    val buf: UInt8[] = [0, 0, 0, 0, 0, 0]
+    val n = tcpRecv(server, buf)
+    print("recv: ${toString(n)}")
+    print("b0: ${toString(buf[0])}")
+    print("b1: ${toString(buf[1])}")
+    print("b2: ${toString(buf[2])}")
+    print("b3: ${toString(buf[3])}")
 
-val accepted = tcpAccept(listener)
-val server = accepted["fd"]
-print("accepted: ${toString(accepted["type"] != "error")}")
+    // Close the client; the server's next recv must return 0 (peer closed).
+    val cc = tcpClose(client)
+    val buf2: UInt8[] = [0, 0, 0, 0]
+    val n2 = tcpRecv(server, buf2)
+    print("recv-after-close: ${toString(n2)}")
 
-val payload: UInt8[] = [76, 105, 110, 33]
-val sent = tcpSend(client, payload)
-print("sent: ${toString(sent)}")
-
-val buf: UInt8[] = [0, 0, 0, 0, 0, 0]
-val n = tcpRecv(server, buf)
-print("recv: ${toString(n)}")
-print("b0: ${toString(buf[0])}")
-print("b1: ${toString(buf[1])}")
-print("b2: ${toString(buf[2])}")
-print("b3: ${toString(buf[3])}")
-
-// Close the client; the server's next recv must return 0 (peer closed).
-val cc = tcpClose(client)
-val buf2: UInt8[] = [0, 0, 0, 0]
-val n2 = tcpRecv(server, buf2)
-print("recv-after-close: ${toString(n2)}")
-
-val sc = tcpClose(server)
-val lc = tcpClose(listener)
+    val sc = tcpClose(server)
+    val lc = tcpClose(listener)
+  else
+    print("(accept failed)")
 "#);
     assert_eq!(
         out,
@@ -10494,21 +10508,31 @@ stdinStream().lines().for(line => print("got: ${line}"))
 // reach EOF, so readText returns the full payload.
 #[test]
 fn test_stream_tcp_source() {
-    let out = run(r#"import { tcpListen, tcpAccept, tcpConnect, tcpSend, tcpClose, tcpStream } from "std/net"
+    let out = run(r#"import { tcpListen, tcpAccept, tcpConnect, tcpSend, tcpClose, tcpStream, TcpPeer } from "std/net"
 import { readText } from "std/stream"
 import { print } from "std/io"
 
 val port = 39271
-val listener = tcpListen(port)
-val client = tcpConnect("127.0.0.1", port)
-val accepted = tcpAccept(listener)
-val server = accepted["fd"]
-val payload: UInt8[] = [72, 105, 33]
-tcpSend(client, payload)
-tcpClose(client)
-val text = tcpStream(server).readText()
-print("got: ${text}")
-tcpClose(listener)
+val lis = tcpListen(port)
+val cli = tcpConnect("127.0.0.1", port)
+if lis is Error then
+  print("(listen failed)")
+else if cli is Error then
+  print("(connect failed)")
+else
+  val listener = lis
+  val client = cli
+  val accepted = tcpAccept(listener)
+  if accepted is TcpPeer then
+    val server = accepted["fd"]
+    val payload: UInt8[] = [72, 105, 33]
+    tcpSend(client, payload)
+    tcpClose(client)
+    val text = tcpStream(server).readText()
+    print("got: ${text}")
+    tcpClose(listener)
+  else
+    print("(accept failed)")
 "#);
     assert_eq!(out, vec!["got: Hi!"]);
 }

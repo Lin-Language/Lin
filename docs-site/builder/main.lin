@@ -146,11 +146,10 @@ val copyStatic = (): Null =>
   val outStaticDir = "${outputDir}/static"
   mkdir(outStaticDir, { "parents": true })
   val filesJson = ls(staticDir, {})
-  if isError(filesJson) then
+  if filesJson is Error then
     print("Error listing static dir: ${errorMsg(filesJson)}")
   else
-    val files = filesJson
-    files.for(filename =>
+    filesJson.for(filename =>
       val srcPath = "${staticDir}/${filename}"
       val dstPath = "${outStaticDir}/${filename}"
       val copyResult = cp(srcPath, dstPath)
@@ -160,10 +159,10 @@ val copyStatic = (): Null =>
 
 // Main entry point
 val navResult = readJson("${contentDir}/nav.json")
-val navEntries = if isError(navResult) then [] else navResult
+val navEntries = if navResult is Error then [] else navResult
 
 val allFilesJson = ls(contentDir, { "recursive": true })
-val allFiles = if isError(allFilesJson) then [] else allFilesJson
+val allFiles = if allFilesJson is Error then [] else allFilesJson
 
 val mdFiles = allFiles.filter(f => contains(f, ".md"))
 val total = length(mdFiles)

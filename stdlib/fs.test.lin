@@ -236,14 +236,20 @@ val s = suite("std/fs", [
 
   test("readFileBytes and writeFileBytes round-trip", () =>
     val byteFile = "/tmp/lin_test_fs_bytes.bin"
-    // readFileBytes returns a packed UInt8[] byte buffer (§35.1).
+    // readFileBytes returns a packed UInt8[] byte buffer (§35.1), or an Error.
     val bytesIn = tmpRead.readFileBytes()
-    byteFile.writeFileBytes(bytesIn)
-    val bytesOut = byteFile.readFileBytes()
-    [
-      expect(bytesIn.length()).toBe(bytesOut.length()),
-      expect(bytesIn[0]).toBe(bytesOut[0])
-    ]
+    match bytesIn
+      is Error => [expect(false).toBe(true)]
+      else =>
+        byteFile.writeFileBytes(bytesIn)
+        val bytesOut = byteFile.readFileBytes()
+        match bytesOut
+          is Error => [expect(false).toBe(true)]
+          else =>
+            [
+              expect(bytesIn.length()).toBe(bytesOut.length()),
+              expect(bytesIn[0]).toBe(bytesOut[0])
+            ]
   ),
 
   test("writeLines and readLines round-trip", () =>

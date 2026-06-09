@@ -45,34 +45,34 @@ import foreign "lin-runtime"
 // @param path  the file to read.
 // @returns the file contents as a String, or an Error if it cannot be read.
 // @example val content = readFile("config.txt")   // String, or Error on failure
-export val readFile = (path: String): Json =>
+export val readFile = (path: String): String | Error =>
   lin_fs_read_file(path)
 
 // Write `content` to `path`, truncating any existing file (creates it if absent).
 // @param path  the file to write.
 // @param content  the UTF-8 string to write.
 // @returns Null on success, or an Error if the write fails.
-export val writeFile = (path: String, content: String): Json =>
+export val writeFile = (path: String, content: String): Null | Error =>
   lin_fs_write_file(path, content)
 
 // Append `content` to the end of `path` (creates it if absent).
 // @param path  the file to append to.
 // @param content  the UTF-8 string to append.
 // @returns Null on success, or an Error if the write fails.
-export val appendFile = (path: String, content: String): Json =>
+export val appendFile = (path: String, content: String): Null | Error =>
   lin_fs_append_file(path, content)
 
 // Read a file and split it into an array of lines (line terminators removed).
 // @param path  the file to read.
 // @returns a String[] of the file's lines, or an Error if it cannot be read.
-export val readLines = (path: String): Json =>
+export val readLines = (path: String): String[] | Error =>
   lin_fs_read_lines(path)
 
 // Read a file and parse its contents as JSON.
 // @param path  the file to read.
 // @returns the parsed Json value, or an Error if the file cannot be read or is not valid JSON.
 // @example val data = readJson("config.json")   // then data["version"], or Error on failure
-export val readJson = (path: String): Json =>
+export val readJson = (path: String): Json | Error =>
   lin_fs_read_json(path)
 
 // Serialise `value` to JSON and write it to `path`, truncating any existing file.
@@ -81,7 +81,7 @@ export val readJson = (path: String): Json =>
 // @param opts  accepts `{ compact }`; when true, output is minified rather than pretty-printed.
 // @returns Null on success, or an Error if the write fails.
 // @example writeJson("config.json", { "version": 2 }, { "compact": true })
-export val writeJson = (path: String, value: Json, opts: Json): Json =>
+export val writeJson = (path: String, value: Json, opts: Json): Null | Error =>
   if opts == null then
     lin_fs_write_json(path, value)
   else if opts["compact"] == true then
@@ -131,7 +131,7 @@ export val stat = (path: String, opts: Json = null): FileStat | Error =>
 // @returns an array of entry paths, or an Error if `path` cannot be read.
 // @example ls("src", {})                       // one level
 // @example ls("src", { "recursive": true })    // whole tree, relative paths
-export val ls = (path: String, opts: Json): Json =>
+export val ls = (path: String, opts: Json): String[] | Error =>
   if opts == null then
     lin_fs_list_dir(path)
   else if opts["recursive"] == true then
@@ -146,7 +146,7 @@ export val ls = (path: String, opts: Json): Json =>
 // @returns Null on success, or an Error (e.g. a missing parent without `parents`).
 // @example mkdir("output", {})
 // @example mkdir("output/reports/2024", { "parents": true })
-export val mkdir = (path: String, opts: Json): Json =>
+export val mkdir = (path: String, opts: Json): Null | Error =>
   if opts == null then
     lin_fs_mkdir(path)
   else if opts["parents"] == true then
@@ -161,7 +161,7 @@ export val mkdir = (path: String, opts: Json): Json =>
 // @returns Null on success, or an Error.
 // @example rm("temp.txt", {})
 // @example rm("build/", { "recursive": true })
-export val rm = (path: String, opts: Json): Json =>
+export val rm = (path: String, opts: Json): Null | Error =>
   if opts == null then
     lin_fs_rm(path, 0)
   else if opts["recursive"] == true then
@@ -173,34 +173,34 @@ export val rm = (path: String, opts: Json): Json =>
 // @param src  the source file.
 // @param dst  the destination path.
 // @returns Null on success, or an Error.
-export val cp = (src: String, dst: String): Json =>
+export val cp = (src: String, dst: String): Null | Error =>
   lin_fs_cp(src, dst)
 
 // Move (rename) a file or directory from `src` to `dst`.
 // @param src  the source path.
 // @param dst  the destination path.
 // @returns Null on success, or an Error.
-export val mv = (src: String, dst: String): Json =>
+export val mv = (src: String, dst: String): Null | Error =>
   lin_fs_rename(src, dst)
 
 // Read the entire contents of a file as raw bytes.
 // @param path  the file to read.
 // @returns a UInt8[] of the file's bytes, or an Error if it cannot be read.
-export val readFileBytes = (path: String): Json =>
+export val readFileBytes = (path: String): UInt8[] | Error =>
   lin_fs_read_file_bytes(path)
 
 // Write raw bytes to `path`, truncating any existing file (creates it if absent).
 // @param path  the file to write.
 // @param bytes  the bytes to write.
 // @returns Null on success, or an Error if the write fails.
-export val writeFileBytes = (path: String, bytes: UInt8[]): Json =>
+export val writeFileBytes = (path: String, bytes: UInt8[]): Null | Error =>
   lin_fs_write_file_bytes(path, bytes)
 
 // Write an array of lines to `path` (each followed by a newline), truncating any existing file.
 // @param path  the file to write.
 // @param lines  the lines to write, without terminators.
 // @returns Null on success, or an Error if the write fails.
-export val writeLines = (path: String, lines: String[]): Json =>
+export val writeLines = (path: String, lines: String[]): Null | Error =>
   lin_fs_write_lines(path, lines)
 
 // Expand a shell-glob pattern (`**`/`*`/`?`/`[…]`) to the matching paths, sorted.
