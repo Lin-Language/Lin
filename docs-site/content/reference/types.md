@@ -94,7 +94,62 @@ type Person = {
 }
 ```
 
-Object types are structural. A value with additional fields is compatible with a smaller structural type.
+Object types are structural. A value with additional fields is compatible with a smaller structural type (see [Structural typing](#structural-typing) below). Keys are quoted strings.
+
+### Sealed named records
+
+A **named** record type — `type Person = { … }` — is **sealed**: a value whose static type is `Person` holds *exactly* `Person`'s fields, no more. This is a representation guarantee that lets the compiler lay sealed records out as unboxed structs with constant-offset field access, so a typed record is dramatically faster than the equivalent dynamic `Json` object.
+
+Sealing does **not** weaken structural compatibility. When a wider value (one with extra fields) flows into a `Person`-typed slot — a parameter, an annotated `val`/`var`, a typed return, or a `Person[]` element — it is **copied** into a fresh value containing only `Person`'s fields. The extra fields are dropped *from the copy*; the original value is untouched in its own scope.
+
+```lin
+type Person = { "name": String }
+
+val wide = { "name": "Alice", "age": 99 }   // anonymous record, extra field
+val p: Person = wide                         // projects to a fresh { "name": "Alice" }
+// p["age"]   → compile error: `age` is not a field of Person
+wide["age"]                                  // still 99 — `wide` is unchanged
+```
+
+The practical consequence: a named record type can't be used as an open carrier that smuggles extra fields through to a later consumer — once a value is typed as a named record, its extra fields are gone. If you need to preserve arbitrary extra keys, type the value `Json`, not a named record.
+
+`Person.fromJson(json)` projects the same way: it validates and keeps exactly `Person`'s fields, dropping unknown keys.
+
+### Index-signature (hashmap) types
+
+A `{ String: T }` type is a **hashmap**: a dictionary with *any number* of dynamically-computed string keys, all mapping to value type `T`. This is distinct from a fixed record — a record has a known, fixed set of keys; a hashmap has an open, runtime-determined key set.
+
+```lin
+type Counts = { String: Int32 }
+
+var counts: Counts = {}
+counts["apple"] = 3
+counts["pear"]  = 7
+val n = counts["apple"]      // Int32 | Null  (a missing key reads as Null)
+```
+
+- `m[k]` yields `T | Null` (a missing key is `Null`). For a defaulted read, use `object.get(m, k, default)` from `std/object`.
+- `m[k] = v` accepts any string key `k` and requires `v : T`.
+- `keys(m) : String[]`, `values(m) : T[]`, and `entries(m)` are available via `std/object`.
+- A hashmap is backed at runtime by a hashed container giving **O(1) average** lookup/insert — unlike a dynamic `Json` object, whose small association-list layout is O(n) per access. Reach for `{ String: T }` whenever you have a genuinely large or open-keyed dictionary.
+- There is no implicit `Json → { String: T }` coercion — decode a `Json` value through `fromJson` or narrow it, exactly as for any other concrete type.
+
+**Aliased keys.** The key may be written as the literal `String`, or as **any type alias that resolves to `String`**. This lets a domain alias document intent at the call site:
+
+```lin
+type StopID = String
+
+// A nested hashmap: outer keyed by stop, inner keyed by stop, value = hop count.
+type Network = {
+  StopID: {
+    StopID: UInt8
+  }
+}
+
+val n: Network = {}
+```
+
+Both `StopID` keys above resolve to `String`, so the type checks. An alias works at any nesting depth and in any key position. A key whose alias resolves to a *non*-`String` type is a compile-time error (`Map key type must be String, but it resolves to …`) — the underlying key type is always `String`; the alias is purely a naming convenience.
 
 ## Array types
 
