@@ -78,11 +78,15 @@ export val makeGraphResults = (): Json =>
 
 export val add = (gr: Json, kConnections: { String: { String: Conn } }): Null =>
   val results = gr["results"]
-  keys(kConnections).for(destination =>
-    sortedRoundKeys(kConnections[destination]).for(k =>
-      mergePathInto(results, getPath(kConnections, k, destination))
+  kConnections
+    .keys()
+    .for(destination =>
+      val destMap = kConnections[destination]
+      if destMap != null then
+        sortedRoundKeys(destMap).for(k =>
+          mergePathInto(results, getPath(kConnections, k, destination))
+        )
     )
-  )
 
 export val finalize = (gr: Json): Json =>
   gr["results"]

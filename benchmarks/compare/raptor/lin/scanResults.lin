@@ -67,7 +67,8 @@ export val bestArrival = (results: ScanResults, stop: String): Json =>
   results["bestArrivals"][stop]
 
 export val getMarkedStops = (results: ScanResults): Json =>
-  keys(results["kArrivals"]["${results["k"]}"])
+  val round = results["kArrivals"]["${results["k"]}"]
+  if round != null then round.keys() else []
 
 // finalize returns the typed ScanResults record itself (callers read its typed
 // kConnections/bestArrivals fields — see raptor.scan / query). It previously returned a

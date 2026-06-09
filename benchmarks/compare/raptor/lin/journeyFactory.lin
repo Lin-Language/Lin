@@ -79,8 +79,11 @@ val arrAt = (legs: Json, i: Int32, transferDuration: Int32): Json =>
 
 export val getResults = (kConnections: { String: { String: Conn } }, destination: String): Json =>
   var results: Json = []
+  // `kConnections[destination]` is `{ String: Conn } | Null`; callers only reach here for a
+  // destination that has connections, so a Null map yields no rounds.
   val destMap = kConnections[destination]
-  sortedRoundKeys(destMap).for(k =>
+  val roundKeys = if destMap != null then sortedRoundKeys(destMap) else []
+  roundKeys.for(k =>
     val legs = getJourneyLegs(kConnections, k, destination)
     push(results, {
       "legs": legs,
