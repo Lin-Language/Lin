@@ -2139,15 +2139,25 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
     if is_union_ty(param_ty) != is_union_ty(arg_ty) {
         let dst = builder.alloc_temp(param_ty.clone());
         builder.emit(Instruction::Coerce { dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone() });
-        // UNBOX (union arg → concrete param): `dst` aliases the SOURCE box's inner heap payload
-        // (e.g. `concat(b,b)` returns a boxed array, unboxed to the `UInt8[]` param). The source
-        // box `arg` stays registered owned in scope, so if this arg flows into a self-tail-call
-        // (`doubleUp(concat(b,b), n)`), `release_owned_for_tail_call` must NOT fully release the
-        // box — that would free the very array now living in the param slot (a double-free). Record
-        // the alias so the box is treated as kept (its shell is left to the dead-block release, the
-        // pre-existing accepted per-tail-call shell leak). The box shell still survives non-tail use
-        // normally. Only matters when arg is unboxed from an owned box (union → concrete).
-        if is_union_ty(arg_ty) && !is_union_ty(param_ty) {
+        // UNBOX (union arg → concrete param). Two sub-cases, split on whether the unboxed value is a
+        // HEAP pointer or a SCALAR:
+        //
+        //  - HEAP payload (`param_ty` is rc): `dst` aliases the SOURCE box's inner heap payload
+        //    (e.g. `concat(b,b)` returns a boxed array, unboxed to the `UInt8[]` param). The inner
+        //    pointer now lives in the param slot, so if this arg flows into a self-tail-call
+        //    (`doubleUp(concat(b,b), n)`), `release_owned_for_tail_call` must NOT release the box —
+        //    that would free the very array threaded into the slot (a double-free). Record the alias
+        //    so the box is treated as kept (its shell is left to the dead-block release, the
+        //    pre-existing accepted per-tail-call shell leak).
+        //
+        //  - SCALAR payload (`param_ty` is e.g. Int32): the unbox reads the scalar OUT of the box;
+        //    the box's inner is NOT threaded into the slot, so the box `arg` is genuinely orphaned
+        //    after the Coerce. Recording an escape-alias here would (wrongly) make
+        //    `release_owned_for_tail_call` treat it as kept, leaking one 16-byte `TaggedVal` per loop
+        //    iteration (calc `parseTermLoop`/`parseExprLoop`, csv `scanRows`). So DON'T alias: leave
+        //    `arg` as a plain owned temp and let `release_owned_for_tail_call`'s non-arg live-block
+        //    release reclaim it before the back-edge (leg1 FINDINGS §2).
+        if is_union_ty(arg_ty) && !is_union_ty(param_ty) && is_rc_type(param_ty) {
             builder.record_escape_alias(dst, arg);
         }
         // WIDEN (concrete heap arg → union param): the Coerce `box_object`/`box_array`/… wraps the
