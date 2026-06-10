@@ -201,9 +201,7 @@ export val chunk = <T>(arr: T[], size: Int32): T[][] =>
   lin_range(0, (n + s - 1) / s).for(i =>
     val start = i * s
     val end = if start + s < n then start + s else n
-    val c: T[] = []
-    lin_range(start, end).for(j => push(c, arr[j]))
-    push(result, c)
+    push(result, slice(arr, start, end))
   )
   result
 
