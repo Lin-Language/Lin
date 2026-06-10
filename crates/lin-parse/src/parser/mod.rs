@@ -27,11 +27,21 @@ pub struct Parser {
     /// written inline within a body (`has 0 => x is Foo`) is at a strictly greater column and so
     /// is still parsed as an infix test. Reset on entry to any delimited group.
     match_arm_floor: Option<u32>,
+    /// When true, the type expression currently being parsed sits in a function-literal RETURN
+    /// position, where a trailing `=>` after the type is the function BODY arrow, not a type-level
+    /// arrow. This disambiguates a parenthesised (grouped) function return type such as
+    /// `(h): ((Json) => Json) => body`: the outer parens group a complete function type, so the
+    /// `=>` that follows them belongs to the body, not the type. Without this, the type parser
+    /// greedily consumes the body arrow and then fails to parse the value lambda as a type.
+    /// Read-and-cleared at the outermost type primary so nested types parse with normal rules
+    /// (a genuine higher-order type alias `((Json) => Json) => Json` is unaffected — it is never
+    /// parsed in return position).
+    in_return_type: bool,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0, diagnostics: Vec::new(), error_count_at_stmt_start: 0, suppress_is_has: false, match_arm_floor: None }
+        Self { tokens, pos: 0, diagnostics: Vec::new(), error_count_at_stmt_start: 0, suppress_is_has: false, match_arm_floor: None, in_return_type: false }
     }
 
     pub fn parse_module(&mut self) -> Module {
