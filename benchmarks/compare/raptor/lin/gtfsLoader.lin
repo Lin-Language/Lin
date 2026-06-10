@@ -32,6 +32,8 @@ import { StopTime, Transfer } from "./types"
 val MAX = 9007199254740991i64
 
 // Inline time parse ("HH:MM:SS" -> seconds-from-midnight, may exceed 24h).
+// The hot path goes through loadGTFS's cached wrapper (mirrors node TimeParser's
+// per-instance cache) — this is the cache-miss compute only.
 val parseTime = (time: String): Int32 =>
   val parts = split(time, ":")
   parseInt32(parts[0]) * 3600 + parseInt32(parts[1]) * 60 + parseInt32(parts[2])
@@ -114,6 +116,22 @@ val sortByKey = (list: Json): Json =>
   )
 
 export val loadGTFS = (dataDir: String): Json =>
+  // Time-parse cache (mirrors node TimeParser): parseTime is called ~4.8M times
+  // (2.37M stop_times rows x 2, plus links.txt) with heavily REPEATED strings, so
+  // the split + 3x parseInt32 is cached behind a `{ String: Int32 }` map. The cache
+  // is LOCAL to loadGTFS — a module-level `var` mutated from an exported function
+  // panics codegen (LIN_ISSUES.md #2).
+  var timeCache: { String: Int32 } = {}
+  val cachedTime = (time: String): Int32 =>
+    val hit = timeCache[time]
+    match hit
+      is Int32 =>
+        hit
+      else =>
+        val computed = parseTime(time)
+        timeCache[time] = computed
+        computed
+
   // --- calendar_dates.txt -> datesList [{ key: service_id, dates: { "<+date>": include } }] ---
   // Rows are contiguous by service_id; group by detecting changes. Streamed row by row.
   // The `started` flag marks the first row so we don't flush an empty group before the
@@ -174,8 +192,8 @@ export val loadGTFS = (dataDir: String): Json =>
     val dropOffType = row[si["drop_off_type"]]
     push(curStopTimes, makeStopTime(
       row[si["stop_id"]],
-      parseTime(row[si["departure_time"]]),
-      parseTime(row[si["arrival_time"]]),
+      cachedTime(row[si["departure_time"]]),
+      cachedTime(row[si["arrival_time"]]),
       pickupType == "0" || pickupType == "",
       dropOffType == "0" || dropOffType == ""
     ))
@@ -204,8 +222,8 @@ export val loadGTFS = (dataDir: String): Json =>
       fromStop,
       row[lki["to_stop_id"]],
       parseInt32(row[lki["duration"]]),
-      parseTime(row[lki["start_time"]]),
-      parseTime(row[lki["end_time"]])
+      cachedTime(row[lki["start_time"]]),
+      cachedTime(row[lki["end_time"]])
     )
     if transfers[fromStop] == null then transfers[fromStop] = []
     push(transfers[fromStop], t)
