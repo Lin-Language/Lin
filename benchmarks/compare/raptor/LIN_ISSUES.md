@@ -225,3 +225,53 @@ fix.
 
 RESOLVED: the parser fix landed and the RAPTOR `lin/` dir has been `lin fmt`-cleaned;
 CI's `fmt --check` over `benchmarks/` now passes.
+
+---
+
+## 8. [CORRECTNESS] factory-returned closure loses its environment when the calling closure also captures a mutable `var`
+
+**Severity: high — runtime null-deref, type-checks cleanly.** A closure that
+(a) captures a reassigned outer `var` AND (b) calls a `val` bound to a CAPTURING
+closure returned by a function call null-derefs at the call
+(`crates/lin-runtime/src/tagged.rs:272`). Drop either ingredient and it works:
+the same `val`-bound factory closure called from a closure with NO `var` capture
+is fine, and a no-capture function value alongside the `var` capture is fine.
+Same escaping-closure-env class as the obj-literal-closure-field and
+worker-captured-var bugs.
+
+Repro (null pointer dereference at runtime; works if `headerDone` is removed,
+or if `mk`'s result captures nothing):
+```lin
+import { for } from "std/iter"
+import { push } from "std/array"
+type RowFn = (Json) => Json
+var out: Json = []
+val mk = (header: Json): RowFn =>
+  val ia: Int32 = header[1]
+  (row: Json): Json =>
+    push(out, row[ia])
+val drive = (rows: Json): Json =>
+  val onRow = mk(rows[0])
+  var headerDone = false
+  rows.for(row =>
+    if headerDone then
+      onRow(row)          // <- null-deref here on the 2nd iteration
+    else
+      headerDone = true
+  )
+  null
+drive([[0, 1], [10, 20], [30, 40]])
+```
+
+Related: a function-typed `var` REASSIGNED to a capturing closure from inside a
+`.for` closure and called on later iterations null-derefs the same way (and a
+`var` assignment inside a `match` arm is rejected outright with "Cannot assign
+to immutable binding"). Also hit while writing the fix: a PARENTHESIZED function
+return type (`val mk = (h: Json): ((Json) => Json) => …`) is a parse error
+("expected Arrow, got Indent") — a named type alias is the workaround.
+
+Workaround used (gtfsLoader.lin `forEachRow`): keep the factory-returned row
+callback in a `val` and make the stream `.for` closure capture ONLY it — the
+header skip that previously needed a `var headerDone` flag moved into the lazy
+`filter(...)` + `drop(1)` stream adapters, so the driving closure has no `var`
+capture at all.
