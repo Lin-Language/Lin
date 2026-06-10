@@ -1,7 +1,69 @@
 # Path 9 — End-to-end packed records for the `Json`-read-bound case (the measured RAPTOR fix)
 
-**Status:** Open proposal. **A continuation of [Path 1](path-1-integrate-packed-records.md), not a new
-direction** — it is "Path 1 Steps 1+2 landed, Step 3 (heap-field packing) finished, then threaded
+> ## 🏁 CONCLUSION (2026-06-10) — CLOSED-NEGATIVE: end-to-end heap-field packing does not pay; salvage merged
+>
+> **The core thesis of this path is REJECTED, measured not guessed.** Three independent exploration lines
+> (agent-1, agent-2, agent-3/orchestrated) each carried heap-field record packing to a working,
+> digest-correct, end-to-end typed RAPTOR and each concluded the same thing: **packed is ~1.8× SLOWER than
+> the `Json` baseline in every phase** (same-compiler, low-load, interleaved A/B; digest byte-identical
+> `group=26203913 range=773022892 journeys=139`):
+>
+> | phase | Json baseline | typed-packed | |
+> |---|---|---|---|
+> | PREP | ~7.7 s | ~27.2 s | 3.5× slower |
+> | GROUP | ~19.9 s | ~36.2 s | 1.82× slower |
+> | RANGE | ~59.4 s | ~105.3 s | 1.77× slower |
+>
+> **Why it loses (the mechanism, IR-verified):** packing makes a leaf read const-offset where the record
+> comes straight from an array (`scanBack` `lin_object_get` 8→0, real) — but a functional program threads
+> records through MANY generic boundaries (maps, combinators, `T|Null` unions, TCO params, the loader), and
+> **each boundary is a materialize-or-leak site whose cost exceeds what the cheap read saves.** Patching one
+> boundary just reveals the next ("fix-for-a-fix all the way down"): worker-boundary → nested-record gate →
+> TCO param leak → TCO borrowed-param UAF → map-value materialize → combinator-over-packed-array
+> materialize → the `Trip|Null` **union** seam (a packed record in a union is boxed to a `LinObject`;
+> `match is Trip` narrows the *type* not the *value*, so the read rebuilds the record field-by-field —
+> `scanRouteAt` `lin_object_get` = 92). And PREP's 3.5× is **construction/loader** materialization, not even
+> a read seam. **The cost is representation-boundary materialization, not the field reads.** The remaining
+> "real fix" (a `TAG_SEALED` keep-packed-through-union repr, mirroring `TAG_SUMNODE`) is sum-type-build-sized,
+> high-UAF-risk, and the pattern predicts it just moves the cost to the next seam — **NOT recommended**
+> (6-step handoff preserved in [[project_path9_union_repr_blocker]]).
+>
+> This joins **GC** (closed-negative, [Path 7](path-7-tracing-gc-foundation.md)), **value records**
+> (breaking, [Path 5](path-5-value-records.md)), **Tier-1 bitcode** (<2%) and **Tier-3 devirt** (dead end,
+> [Path 8](path-8-make-functions-free.md)) as bets where the assumed lever was not the win.
+>
+> **✅ Salvaged + MERGED to master (verified before+after, build+test gated):**
+> - `79841ed3` — **9C seal-propagation**: fixes a LIVE silent data-corruption bug on master (a typed nested
+>   sealed-record-array read `outer[0]["items"][0]["a"]` printed `7 0` instead of `33 44`). Checker-only,
+>   gate stays scalar+Bool. *Correctness — the most important keeper.*
+> - `2f99049e` — **Step 8.1 record-combinator chain fusion (~2.07×)**: `recs.filter().map().reduce()` over a
+>   sealed-record array → one const-offset pass; + two pre-existing leak/UAF fixes in the multi-stage fuser.
+> - `9c03d3a5` — **dict→Map fidelity** (RAPTOR `.lin` only): 783k dict reads → `map_get`, digest-identical.
+>
+> **✅ Merge-ready, awaiting permission (a GENUINE master bug, NOT a packing artifact):**
+> - `441287b7` (branch `fix/tco-leak-rebased`, `85be7ae4`) — **TCO param-slot leak for heap-bearing sealed
+>   records**: a standalone heap-bearing record (e.g. `{id:String, stops:ST[]}`, which seals on master
+>   independent of the array-element gate) threaded through a self-tail-recursive param leaks ~32–328 B/iter
+>   *scaling* — the back-edge store overwrites the old slot value with no release. `codegen/types.rs`
+>   `tco_param_needs_release` carved out ALL sealed records; the fix narrows the carve-out to purely-scalar.
+>   Reproducible on master today with zero packing involvement. ASan-verified, soundness-guard test green.
+>
+> **❌ Retired — NOT merged (the packing capability chain):** `perf/path9-reconciled-mega`, `perf/path9e-*`,
+> `path9-reintegrate-177f`, `combine/path9-raptor-payoff-final`, the typed-RAPTOR `e74ca0ff`, the get-seam
+> union keep-packed `fdcc7120` (verified inert on master — IR byte-identical), the TCO-borrowed-param UAF
+> `fadd5ebf` (only exists *because* packing introduced it; not a master bug). **🔬 Kept as a tool:** the
+> Phase-0 call-site-CLASS profiler (`investigate/raptor-callsite-class`).
+>
+> **Full record:** the three agent-line findings are in the `🏁 AGENT-1/2/3 FINDINGS` sections at the bottom;
+> the merged-salvage ledger is [[project_path9_salvage_merged]]; the union-seam mechanism is
+> [[project_path9_union_repr_blocker]]. **Everything below this banner is the ORIGINAL (now-falsified)
+> proposal and its exploration history — kept for the record.**
+
+---
+
+**Status:** ❌ **CLOSED-NEGATIVE (see conclusion banner above).** Originally an open proposal — **a
+continuation of [Path 1](path-1-integrate-packed-records.md), not a new
+direction** — it was "Path 1 Steps 1+2 landed, Step 3 (heap-field packing) finished, then threaded
 end-to-end through one real program (RAPTOR)." Written after the [RAPTOR cost-attribution
 profile](path-8-make-functions-free.md) measured exactly what RAPTOR's query phase spends on. **No userland
 language change** (it is a representation change behind the grammar's existing struct-vs-map line — the
@@ -12,7 +74,9 @@ value semantics).
 `lin_object_get` are linear scans** + ~3.5 B box ops — and the *only* lever the profile shows will help is
 making those records packed sealed structs **end-to-end** (loader → index → map store → read), because
 *partial* typing measurably **regresses ~13%**. This path is the concrete, sequenced plan to do that, and
-it is blocked on two named representation gaps that are Path 1's Step 3.
+it is blocked on two named representation gaps that are Path 1's Step 3. *(Falsified — see the conclusion
+banner: the end-to-end packed version was built and measured ~1.8× slower, because the cost is
+representation-boundary materialization at the many generic seams, not the field reads.)*
 
 ---
 
