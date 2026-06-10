@@ -2325,8 +2325,8 @@ separate patch.
 
 ## ADR-064: Unboxed tagged sum types (`SumNode`) + keep-packed-through-containers via a runtime tag
 
-**Status**: Accepted (Stages 0–4 implemented + measured on `feat/sumtype-integration`; design +
-6-stage plan in `docs/UNBOXED_SUMTYPE_DESIGN.md`).
+**Status**: Accepted (Stages 0–4 implemented + measured; merged to master). Stage 5 (arena/FBIP node
+reuse) deferred as low-value for this workload.
 
 **Problem.** A recursive tagged union typed as `Json` (the interpreter/parser/compiler workload class —
 `type Ast = Num | BinOp`) compiles to boxed string-keyed `LinObject`s reached by non-inlined
