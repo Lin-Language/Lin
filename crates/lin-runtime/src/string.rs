@@ -309,14 +309,56 @@ pub extern "C" fn lin_uint_to_string(n: u64) -> *mut LinString {
     unsafe { lin_string_from_bytes(s.as_ptr(), s.len() as u32) }
 }
 
+/// Capacity of `StackBuf`. Rust's `Display` for `f64` emits the FULL decimal expansion (not
+/// scientific notation), so the longest `{}`-formatted `f64` is ~326 bytes (e.g. `f64::MIN` /
+/// subnormals near `5e-324` render as `0.000…` with hundreds of fractional digits). 384 bytes
+/// covers every finite `f64` and any `i64`/`{:.1}` form with slack; it must NEVER be exceeded
+/// or output would silently truncate (a correctness bug, not just a perf miss).
+const STACK_BUF_CAP: usize = 384;
+
+/// A fixed-capacity stack buffer that implements `core::fmt::Write`, so `write!(buf, "{}", f)`
+/// formats into it with no heap allocation. On the (impossible-for-the-numeric-inputs-here)
+/// overflow path it silently stops appending; callers only feed integer/float formats that fit.
+struct StackBuf {
+    buf: [u8; STACK_BUF_CAP],
+    len: usize,
+}
+
+impl StackBuf {
+    #[inline]
+    fn new() -> Self {
+        StackBuf { buf: [0; STACK_BUF_CAP], len: 0 }
+    }
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl std::fmt::Write for StackBuf {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        let end = self.len + bytes.len();
+        if end <= self.buf.len() {
+            self.buf[self.len..end].copy_from_slice(bytes);
+            self.len = end;
+        }
+        Ok(())
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn lin_float_to_string(f: f64) -> *mut LinString {
-    let s = if f.fract() == 0.0 && f.abs() < 1e15 {
-        format!("{:.1}", f)
+    use std::fmt::Write as _;
+    let mut buf = StackBuf::new();
+    if f.fract() == 0.0 && f.abs() < 1e15 {
+        let _ = write!(buf, "{:.1}", f);
     } else {
-        format!("{}", f)
-    };
-    unsafe { lin_string_from_bytes(s.as_ptr(), s.len() as u32) }
+        let _ = write!(buf, "{}", f);
+    }
+    let bytes = buf.as_bytes();
+    unsafe { lin_string_from_bytes(bytes.as_ptr(), bytes.len() as u32) }
 }
 
 #[no_mangle]
@@ -953,12 +995,14 @@ unsafe fn push_json_value(out: &mut String, tagged: *const TaggedVal) {
 /// Emit a finite float as a JSON number; non-finite (NaN/Inf) becomes `null` (matches
 /// JSON.stringify, since JSON has no representation for them).
 fn push_json_float(out: &mut String, f: f64) {
+    use std::fmt::Write as _;
     if !f.is_finite() {
         out.push_str("null");
     } else if f.fract() == 0.0 && f.abs() < 1e15 {
-        out.push_str(&format!("{:.1}", f));
+        // Append directly into `out` — no intermediate String.
+        let _ = write!(out, "{:.1}", f);
     } else {
-        out.push_str(&format!("{}", f));
+        let _ = write!(out, "{}", f);
     }
 }
 
