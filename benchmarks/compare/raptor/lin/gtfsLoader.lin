@@ -79,11 +79,8 @@ val indexOfColumns = (header: Json): Json =>
 // calls the prebound callback per non-empty row. Nothing is accumulated here — peak
 // transient heap is a single split line (contrast readFile + split, which holds the whole
 // file). The row callback captures and mutates the caller's accumulator vars (validated Lin
-// closure pattern). NOTE the row callback is deliberately bound in a `val` and the `.for`
-// closure captures ONLY it (the header skip lives in the stream adapters, NOT in a
-// `var headerDone` flag): a closure that captures a mutable `var` alongside a
-// factory-returned capturing closure loses the closure's environment and null-derefs
-// (LIN_ISSUES.md #8).
+// closure pattern). The header skip lives in the stream adapters (`filter` + `drop(1)`)
+// rather than a `var headerDone` flag, so the driving `.for` closure stays simple.
 // Returns the stream-driver result (Null | Error); callers invoke it for effect and discard
 // it (a missing/unreadable file yields no rows, as before).
 val forEachRow = (path: String, makeOnRow: (Json) => (Json) => Json): Json =>
@@ -129,8 +126,7 @@ export val loadGTFS = (dataDir: String): Json =>
   // Time-parse cache (mirrors node TimeParser): parseTime is called ~4.8M times
   // (2.37M stop_times rows x 2, plus links.txt) with heavily REPEATED strings, so
   // the split + 3x parseInt32 is cached behind a `{ String: Int32 }` map. The cache
-  // is LOCAL to loadGTFS — a module-level `var` mutated from an exported function
-  // panics codegen (LIN_ISSUES.md #2).
+  // is LOCAL to loadGTFS (the natural scope — it lives for the duration of the load).
   var timeCache: { String: Int32 } = {}
   val cachedTime = (time: String): Int32 =>
     val hit = timeCache[time]
