@@ -8073,7 +8073,25 @@ print("relo: ${{toString(lin_relo_add(40, 2))}}")
     // into a spawned child and are SIP-stripped; remove DYLD_LIBRARY_PATH for good measure anyway.
     run_cmd.env_remove("LD_LIBRARY_PATH");
     run_cmd.env_remove("DYLD_LIBRARY_PATH");
-    let run_out = run_cmd.output().expect("failed to run relocated binary");
+    // We just `fs::copy`'d `reloc_bin` and immediately exec it. Under the full parallel suite (600+
+    // concurrent `lin build` fork/exec cycles), another forked child can still transiently hold a
+    // write fd to the freshly-copied executable, so `execve` returns ETXTBSY ("text file busy") —
+    // an intermittent "failed to run relocated binary" panic unrelated to what this test actually
+    // checks (relative-rpath relocation). Retry a few times on that specific spawn error.
+    let run_out = {
+        let mut attempt = 0;
+        loop {
+            match run_cmd.output() {
+                Ok(out) => break out,
+                // ETXTBSY (errno 26): the copied binary is still open for write elsewhere. Transient.
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 10 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("failed to run relocated binary: {e}"),
+            }
+        }
+    };
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     let stderr = String::from_utf8_lossy(&run_out.stderr);
     assert!(
