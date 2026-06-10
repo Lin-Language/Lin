@@ -765,25 +765,57 @@ pub unsafe extern "C-unwind" fn lin_array_get_tagged(arr: *const LinArray, idx: 
     if idx < 0 || idx >= len {
         crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", actual, len));
     }
+    let tag = (*arr).elem_tag;
+    // Flat INTEGER arms: route through the small-int box cache (`lin_box_int32`/`_int64`), which
+    // returns an immutable cached static for values in `[-128, 1024)` — no malloc per read. These
+    // boxes carry no heap payload, so the get_tagged "caller owns a +1" contract is satisfied by a
+    // cached-box-safe free (`lin_tagged_release`/`lin_tagged_free_box`), which no-ops on a static.
+    // EVERY raw-`dealloc` caller of this fn was migrated to that before this change (crypto/fs/
+    // string byte-truncation loops, lin_array_slice_tagged, the object.rs tests). The widening
+    // arms preserve the EXACT prior boxing: small unsigned/signed sub-32-bit → TAG_INT32 via
+    // box_int32; UInt32 → positive TAG_INT64 via box_int64. Float/UInt64 still allocate (no int
+    // cache fits their tag), as does the tagged/default copy below.
+    match tag {
+        TAG_INT32 => {
+            let v = *((*arr).data as *const i32).add(idx as usize);
+            return crate::tagged::lin_box_int32(v) as *mut TaggedVal;
+        }
+        TAG_INT64 => {
+            let v = *((*arr).data as *const i64).add(idx as usize);
+            return crate::tagged::lin_box_int64(v) as *mut TaggedVal;
+        }
+        TAG_UINT8 => {
+            let v = *((*arr).data as *const u8).add(idx as usize);
+            return crate::tagged::lin_box_int32(v as i32) as *mut TaggedVal;
+        }
+        TAG_INT8 => {
+            let v = *((*arr).data as *const i8).add(idx as usize);
+            return crate::tagged::lin_box_int32(v as i32) as *mut TaggedVal;
+        }
+        TAG_UINT16 => {
+            let v = *((*arr).data as *const u16).add(idx as usize);
+            return crate::tagged::lin_box_int32(v as i32) as *mut TaggedVal;
+        }
+        TAG_INT16 => {
+            let v = *((*arr).data as *const i16).add(idx as usize);
+            return crate::tagged::lin_box_int32(v as i32) as *mut TaggedVal;
+        }
+        TAG_UINT32 => {
+            // Zero-extend the u32 into a positive i64 box (matches the scalar boxing of
+            // UInt32, which uses TAG_INT64-positive). A raw u32 may exceed i32 range, so
+            // TAG_INT32 would render it signed — TAG_INT64 keeps it positive and exact.
+            let v = *((*arr).data as *const u32).add(idx as usize);
+            return crate::tagged::lin_box_int64(v as i64) as *mut TaggedVal;
+        }
+        _ => {}
+    }
+    // Remaining arms allocate a fresh box (floats / UInt64 / tagged copy / sealed materialize).
     let tv_layout = Layout::from_size_align_unchecked(
         std::mem::size_of::<TaggedVal>(),
         std::mem::align_of::<TaggedVal>(),
     );
     let tv = alloc(tv_layout) as *mut TaggedVal;
-    let tag = (*arr).elem_tag;
     match tag {
-        TAG_INT32 => {
-            let v = *((*arr).data as *const i32).add(idx as usize);
-            (*tv).tag = TAG_INT32;
-            (*tv)._pad = [0; 7];
-            (*tv).payload = v as i64 as u64;
-        }
-        TAG_INT64 => {
-            let v = *((*arr).data as *const i64).add(idx as usize);
-            (*tv).tag = TAG_INT64;
-            (*tv)._pad = [0; 7];
-            (*tv).payload = v as u64;
-        }
         TAG_FLOAT32 => {
             let v = *((*arr).data as *const f32).add(idx as usize);
             (*tv).tag = TAG_FLOAT32;
@@ -795,39 +827,6 @@ pub unsafe extern "C-unwind" fn lin_array_get_tagged(arr: *const LinArray, idx: 
             (*tv).tag = TAG_FLOAT64;
             (*tv)._pad = [0; 7];
             (*tv).payload = v.to_bits();
-        }
-        TAG_UINT8 => {
-            let v = *((*arr).data as *const u8).add(idx as usize);
-            (*tv).tag = TAG_INT32;
-            (*tv)._pad = [0; 7];
-            (*tv).payload = v as i64 as u64;
-        }
-        TAG_INT8 => {
-            let v = *((*arr).data as *const i8).add(idx as usize);
-            (*tv).tag = TAG_INT32;
-            (*tv)._pad = [0; 7];
-            (*tv).payload = v as i64 as u64;
-        }
-        TAG_UINT16 => {
-            let v = *((*arr).data as *const u16).add(idx as usize);
-            (*tv).tag = TAG_INT32;
-            (*tv)._pad = [0; 7];
-            (*tv).payload = v as i64 as u64;
-        }
-        TAG_INT16 => {
-            let v = *((*arr).data as *const i16).add(idx as usize);
-            (*tv).tag = TAG_INT32;
-            (*tv)._pad = [0; 7];
-            (*tv).payload = v as i64 as u64;
-        }
-        TAG_UINT32 => {
-            // Zero-extend the u32 into a positive i64 box (matches the scalar boxing of
-            // UInt32, which uses TAG_INT64-positive). A raw u32 may exceed i32 range, so
-            // TAG_INT32 would render it signed — TAG_INT64 keeps it positive and exact.
-            let v = *((*arr).data as *const u32).add(idx as usize);
-            (*tv).tag = TAG_INT64;
-            (*tv)._pad = [0; 7];
-            (*tv).payload = v as u64;
         }
         TAG_UINT64 => {
             let v = *((*arr).data as *const u64).add(idx as usize);
@@ -883,11 +882,11 @@ pub unsafe extern "C" fn lin_array_slice_tagged(arr: *const LinArray, start: i64
         let slot = (*out).data.add(out_len as usize);
         std::ptr::copy_nonoverlapping(tv as *const u8, slot as *mut u8, std::mem::size_of::<crate::tagged::TaggedVal>());
         (*out).len = out_len + 1;
-        // Free the heap TaggedVal since we've copied it.
-        dealloc(tv as *mut u8, Layout::from_size_align_unchecked(
-            std::mem::size_of::<crate::tagged::TaggedVal>(),
-            std::mem::align_of::<crate::tagged::TaggedVal>(),
-        ));
+        // Free only the box SHELL — the 16 bytes (incl. any retained inner payload) were copied
+        // wholesale into the output slot, so the inner ref transfers there; the shell is ours to
+        // reclaim. lin_tagged_free_box is cached-box-safe (the flat-int arms may return an
+        // immutable cached static, which must never be freed) and frees only the shell.
+        crate::tagged::lin_tagged_free_box(tv as *mut u8);
     }
     out
 }

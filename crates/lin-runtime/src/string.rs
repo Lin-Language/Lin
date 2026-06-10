@@ -1138,7 +1138,8 @@ pub unsafe extern "C" fn lin_string_from_utf8(arr: *const u8) -> *mut u8 {
                 0u8
             } else {
                 let payload = (*tv_ptr).payload;
-                std::alloc::dealloc(tv_ptr as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+                // Cached-box-safe free: flat-int reads may return an immutable cached static box.
+                crate::tagged::lin_tagged_release(tv_ptr as *mut u8);
                 payload as u8
             };
             bytes.push(v);
