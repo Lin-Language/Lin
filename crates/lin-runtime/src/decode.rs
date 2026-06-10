@@ -261,14 +261,18 @@ unsafe fn validate(
         }
         KIND_UNION => {
             let nvariants = desc.u32_at(node + 1) as usize;
-            // First structurally-matching variant wins (ADR-031). Probe each in order against a
-            // SCRATCH path so failed probes don't pollute the reported path.
+            // First structurally-matching variant wins (ADR-031). Probe each in order against the
+            // SHARED path, restoring its length after each probe so a failed variant's descent
+            // doesn't pollute the reported path — same save-len/truncate pattern used for
+            // object/array fields (avoids cloning the whole path per variant).
+            let base_len = path.len();
             for i in 0..nvariants {
                 let off = desc.u32_at(node + 5 + i * 4) as usize;
-                let mut scratch = path.clone();
-                if validate(value, desc, off, &mut scratch).is_ok() {
+                if validate(value, desc, off, path).is_ok() {
+                    path.truncate(base_len);
                     return Ok(());
                 }
+                path.truncate(base_len);
             }
             Err(format!("value at {} matched none of the expected variants", path))
         }
