@@ -108,3 +108,11 @@ export type ScanResults = { "k": Int32, "curKey": String, "prevRound": { String:
 // implicit `Json -> { String: T }` coercion, spec §5.1.1) and are SMALL per-origin maps
 // (<= ~3079 keys) — they stay `Json` to avoid a conversion pass with no perf payoff.
 export type RaptorIndex = { "routeStopIndex": { String: { String: Int32 } }, "routePath": { String: String[] }, "transfers": Json, "interchange": Json, "stops": String[], "routesAtStop": { String: String[] }, "tripsByRoute": { String: Json[] } }
+
+// The RouteScanner state. `routeScanPosition` is a variable-key `routeId -> last-scanned-index`
+// memo dictionary, mutated across calls within one scan; it is typed `{ String: Int32 }` (ADR-082 /
+// spec §5.1.1) so the per-(route, round) `pos[routeId]` reads + write route to the hashed O(1)
+// `lin_map_get`/`lin_map_set` instead of the O(n) `Json` association-list scan (a remaining
+// query-phase `DICT_ON_JSON` site — see NOTES.md). The trip lists (`tripsByRoute`) keep `Json[]`
+// values (trips stay `Json`, as in RaptorIndex). `dateKey`/`dowKey` are interpolated once per scan.
+export type RouteScanner = { "tripsByRoute": { String: Json[] }, "date": Int32, "dateKey": String, "dowKey": String, "routeScanPosition": { String: Int32 } }
