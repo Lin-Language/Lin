@@ -6598,141 +6598,66 @@ fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx
     // spliced into the loop body, its param bound to the element, with no closure alloc and no
     // per-element box ABI / indirect call. The body's `Boolean` result drives the keep/stop split
     // directly: `true` continues, `false` (or exhaustion) exits. Captured slots resolve through the
-    // enclosing builder's bindings (ADR-012). Unlike `for`/`map`/`filter` this can't use
-    // `emit_index_loop` — the loop must EXIT early on a false predicate, not just skip — so the CFG is
-    // emitted directly (header → body → keep/stop → cont).
+    // enclosing builder's bindings (ADR-012). Unlike `for`/`map`/`filter`, `while` must EXIT early on
+    // a false predicate, not just skip — so it drives `emit_combinator_loop` with `LoopFlow::ContinueIf`
+    // (the helper wires the body's `keep` Bool into a `CondJump → latch / exit`).
     if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let elem_ty = read_elem_ty.clone();
-
-        let len = emit_iterable_len(iterable, &iterable_ty, builder);
-        let zero = builder.const_temp(Const::Int(0, Type::Int64));
-
-        let preheader = builder.current_block;
-        let header = builder.alloc_block("while_header");
-        let body_block = builder.alloc_block("while_body");
-        let cont_block = builder.alloc_block("while_cont");
-        let exit = builder.alloc_block("while_exit");
-
-        let i = builder.alloc_temp(Type::Int64);
-        let i_next = builder.alloc_temp(Type::Int64);
-        builder.terminate(Terminator::Jump(header));
-
-        builder.switch_to(header);
-        builder.emit(Instruction::Phi {
-            dst: i, ty: Type::Int64,
-            incomings: vec![(zero, preheader), (i_next, cont_block)],
-        });
-        let cond = builder.alloc_temp(Type::Bool);
-        builder.emit(Instruction::Binary {
-            dst: cond, op: BinOp::Lt, lhs: i, rhs: len, operand_ty: Type::Int64, ty: Type::Bool,
-        });
-        builder.terminate(Terminator::CondJump { cond, then_block: body_block, else_block: exit });
-
-        builder.switch_to(body_block);
-        let elem = builder.alloc_temp(elem_ty.clone());
-        builder.emit(Instruction::Index {
-            dst: elem, object: iterable, key: i,
-            obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
-        });
-        // keep = body(elem, i) : Bool — `inline_lambda_body` binds by the lambda's OWN param count, so
-        // a 1-param `x => …` ignores the surplus index arg.
-        let idx = narrow_loop_index(i, builder);
-        let (pred_raw, pred_ty) =
-            inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx);
-        // Coerce the predicate result to an i1 Bool (concrete-Bool body: no-op; a Json/boxed-bool body
-        // is unboxed via Coerce) — same as `lower_filter`'s inline path.
-        let keep = if matches!(pred_ty, Type::Bool) {
-            pred_raw
-        } else {
-            let d = builder.alloc_temp(Type::Bool);
-            builder.emit(Instruction::Coerce { dst: d, src: pred_raw, from_ty: pred_ty, to_ty: Type::Bool });
-            d
-        };
-        // FULLY reclaim the per-iteration element box (inner + shell): the predicate body never moves
-        // the element into a result, so the box is genuinely dropped (no-op for a flat-scalar read).
-        // Reclaimed on the common path BEFORE the keep/stop branch (both exits drop it), so it runs
-        // once regardless of which way the branch goes; `keep` is an unboxed Bool and can never alias
-        // the element box. A packed sealed-array source materialized a fresh struct — release it too.
-        // (The inlined body may have switched blocks; this runs in whatever block is now current.)
-        free_combinator_elem_box_full(elem, &elem_ty, builder);
-        free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, builder);
-        builder.terminate(Terminator::CondJump { cond: keep, then_block: cont_block, else_block: exit });
-
-        // Only `cont_block` jumps back to the header, so the phi's back-edge predecessor (recorded as
-        // `cont_block` above) is correct even when the inlined body switched blocks — no patch needed.
-        builder.switch_to(cont_block);
-        let one = builder.const_temp(Const::Int(1, Type::Int64));
-        builder.emit(Instruction::Binary {
-            dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
-        });
-        builder.terminate(Terminator::Jump(header));
-
-        builder.switch_to(exit);
+        emit_combinator_loop(iterable, &iterable_ty, ElemAccess::Materialize(&elem_ty), builder, ctx,
+            |i, elem, b, c| {
+                // keep = body(elem, i) : Bool — `inline_lambda_body` binds by the lambda's OWN param
+                // count, so a 1-param `x => …` ignores the surplus index arg.
+                let idx = narrow_loop_index(i, b);
+                let (pred_raw, pred_ty) =
+                    inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], b, c);
+                // Coerce the predicate result to an i1 Bool (concrete-Bool body: no-op; a Json/boxed-bool
+                // body is unboxed via Coerce) — same as `lower_filter`'s inline path.
+                let keep = if matches!(pred_ty, Type::Bool) {
+                    pred_raw
+                } else {
+                    let d = b.alloc_temp(Type::Bool);
+                    b.emit(Instruction::Coerce { dst: d, src: pred_raw, from_ty: pred_ty, to_ty: Type::Bool });
+                    d
+                };
+                // FULLY reclaim the per-iteration element box (inner + shell): the predicate body never
+                // moves the element into a result, so the box is genuinely dropped (no-op for a
+                // flat-scalar read). Reclaimed BEFORE the keep/stop branch (both exits drop it), so it
+                // runs once regardless of which way the branch goes; `keep` is an unboxed Bool and can
+                // never alias the element box. A packed sealed-array source materialized a fresh
+                // struct — release it too. (The inlined body may have switched blocks; this runs in
+                // whatever block is now current, which the helper then `CondJump`s from.)
+                free_combinator_elem_box_full(elem, &elem_ty, b);
+                free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
+                LoopFlow::ContinueIf(keep)
+            });
         return builder.const_temp(Const::Null);
     }
 
     let body = lower_callback_in_safe_ctx(&args[1], builder, ctx);
-
     let elem_ty = read_elem_ty;
-    // Tag-checked length (0 for a non-array Json) when the iterable is union. See emit_iterable_len.
-    let len = emit_iterable_len(iterable, &iterable_ty, builder);
-    let zero = builder.const_temp(Const::Int(0, Type::Int64));
-
-    let preheader = builder.current_block;
-    let header = builder.alloc_block("while_header");
-    let body_block = builder.alloc_block("while_body");
-    let cont_block = builder.alloc_block("while_cont");
-    let exit = builder.alloc_block("while_exit");
-
-    let i = builder.alloc_temp(Type::Int64);
-    let i_next = builder.alloc_temp(Type::Int64);
-    builder.terminate(Terminator::Jump(header));
-
-    builder.switch_to(header);
-    builder.emit(Instruction::Phi {
-        dst: i, ty: Type::Int64,
-        incomings: vec![(zero, preheader), (i_next, cont_block)],
-    });
-    let cond = builder.alloc_temp(Type::Bool);
-    builder.emit(Instruction::Binary {
-        dst: cond, op: BinOp::Lt, lhs: i, rhs: len, operand_ty: Type::Int64, ty: Type::Bool,
-    });
-    builder.terminate(Terminator::CondJump { cond, then_block: body_block, else_block: exit });
-
-    builder.switch_to(body_block);
-    let elem = builder.alloc_temp(elem_ty.clone());
-    builder.emit(Instruction::Index {
-        dst: elem, object: iterable, key: i,
-        obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
-    });
-    // keep = body(elem, i) : Bool — continue only while true. `i` (the 0-based SOURCE index) is
-    // narrowed Int64→Int32; truncated away when the callback declares only `(item)`.
-    let idx = narrow_loop_index(i, builder);
-    let (keep, elem_boxes) = call_body_closure_with_elem_boxes(body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &param_tys, &Type::Bool, builder);
-    // FULLY reclaim the per-iteration element box (inner + shell), same mechanism + safety as
-    // `lower_for`: `lin_array_get_tagged` returned a fresh +1 with its inner heap payload retained,
-    // and the predicate body never moves that inner anywhere, so it must be fully released or every
-    // heap-bearing element's inner leaks. The predicate's `Bool` return (`keep`) is an unboxed scalar,
-    // so it can NEVER alias the element box — codegen treats the non-pointer `other` as null and the
-    // release is unconditional. For a flat-scalar element box this degrades to a shell free.
-    for ebox in &elem_boxes {
-        builder.emit(Instruction::ReleaseIfDistinct { val: *ebox, other: keep });
-    }
-    // A PACKED sealed-array source materialized a fresh +1 element struct; `while` discards it
-    // (the predicate body never moves the struct out), so release it or it leaks per iteration.
-    free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, builder);
-    builder.terminate(Terminator::CondJump { cond: keep, then_block: cont_block, else_block: exit });
-
-    builder.switch_to(cont_block);
-    let one = builder.const_temp(Const::Int(1, Type::Int64));
-    builder.emit(Instruction::Binary {
-        dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
-    });
-    builder.terminate(Terminator::Jump(header));
-
-    builder.switch_to(exit);
+    emit_combinator_loop(iterable, &iterable_ty, ElemAccess::Materialize(&elem_ty), builder, ctx,
+        |i, elem, b, _| {
+            // keep = body(elem, i) : Bool — continue only while true. `i` (the 0-based SOURCE index) is
+            // narrowed Int64→Int32; truncated away when the callback declares only `(item)`.
+            let idx = narrow_loop_index(i, b);
+            let (keep, elem_boxes) = call_body_closure_with_elem_boxes(body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &param_tys, &Type::Bool, b);
+            // FULLY reclaim the per-iteration element box (inner + shell), same mechanism + safety as
+            // `lower_for`: `lin_array_get_tagged` returned a fresh +1 with its inner heap payload
+            // retained, and the predicate body never moves that inner anywhere, so it must be fully
+            // released or every heap-bearing element's inner leaks. The predicate's `Bool` return
+            // (`keep`) is an unboxed scalar, so it can NEVER alias the element box — codegen treats the
+            // non-pointer `other` as null and the release is unconditional. For a flat-scalar element
+            // box this degrades to a shell free.
+            for ebox in &elem_boxes {
+                b.emit(Instruction::ReleaseIfDistinct { val: *ebox, other: keep });
+            }
+            // A PACKED sealed-array source materialized a fresh +1 element struct; `while` discards it
+            // (the predicate body never moves the struct out), so release it or it leaks per iteration.
+            free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
+            LoopFlow::ContinueIf(keep)
+        });
     builder.const_temp(Const::Null)
 }
 
