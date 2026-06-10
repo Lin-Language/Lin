@@ -14,6 +14,12 @@
 //
 // In Lin a missing object key reads as `null`, a present `false` reads as `false`, so
 // `dates[d] == null` is exactly `!hasOwn`, and `dates[d] == true` is the include short-circuit.
+//
+// runsOn takes PRECOMPUTED key strings (dateKey = "${date}", dowKey = "${dow}") alongside
+// the numeric date (still needed for the range compare): date/dow are constant per scan,
+// so interpolating the keys per call — runsOn is called per trip in the hot backward scan —
+// was pure per-call allocation. Callers (routeScanner, createRaptor's date pre-filter)
+// compute the keys once.
 import { Service } from "./types"
 
 export val makeService = (startDate: Int32, endDate: Int32, days: Json, dates: Json): Service =>
@@ -24,12 +30,12 @@ export val makeService = (startDate: Int32, endDate: Int32, days: Json, dates: J
     "dates": dates
   }
 
-export val runsOn = (service: Service, date: Int32, dow: Int32): Boolean =>
+export val runsOn = (service: Service, date: Int32, dateKey: String, dowKey: String): Boolean =>
   val dates = service["dates"]
-  val entry = dates["${date}"]
+  val entry = dates[dateKey]
   if entry == true then
     true
   else
     val notAKey = entry == null
     val days = service["days"]
-    notAKey && service["startDate"] <= date && service["endDate"] >= date && days["${dow}"] == true
+    notAKey && service["startDate"] <= date && service["endDate"] >= date && days[dowKey] == true

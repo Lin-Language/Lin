@@ -70,10 +70,12 @@ export val createRaptor = (tripsIn: Json, transfers: Json, interchange: Json, da
       null
     is Date =>
       val dateNumber = getDateNumber(date)
-      val dow = dayOfWeek(date)
+      val dateKey = "${dateNumber}"
+      val dowKey = "${dayOfWeek(date)}"
       var filtered: Json = []
       tripsIn.for(trip =>
-        if runsOn(trip["service"], dateNumber, dow) then push(filtered, trip)
+        if runsOn(trip["service"], dateNumber, dateKey, dowKey) then
+          push(filtered, trip)
       )
       trips = filtered
 
