@@ -1309,7 +1309,9 @@ mod tests {
             // Read back the first/last of each (UAF check).
             let first_even = lin_array_get_tagged(ea, 0);
             assert_eq!((*first_even).payload as i32, 0);
-            std::alloc::dealloc(first_even as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+            // Cached-box-safe: value 0 is an immutable cached small-int static, so a raw dealloc
+            // would corrupt the cache table — release via the cached-box-safe path.
+            crate::tagged::lin_tagged_release(first_even as *mut u8);
 
             // Teardown: releasing the object frees both group arrays exactly once.
             lin_object_release(obj);
@@ -1357,7 +1359,9 @@ mod tests {
             assert_eq!(lin_array_length(oa), 50);
             let first_even = lin_array_get_tagged(ea, 0);
             assert_eq!((*first_even).payload as i32, 0);
-            std::alloc::dealloc(first_even as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+            // Cached-box-safe: value 0 is an immutable cached small-int static, so a raw dealloc
+            // would corrupt the cache table — release via the cached-box-safe path.
+            crate::tagged::lin_tagged_release(first_even as *mut u8);
 
             lin_map_release(map);
             crate::tagged::lin_tagged_free_box(map_box);

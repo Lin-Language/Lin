@@ -539,8 +539,10 @@ pub unsafe extern "C" fn lin_fs_write_file_bytes(path: *const u8, arr: *const u8
                     TAG_INT32 => payload as i32,
                     _ => payload as i32,
                 };
-                // Free the allocated TaggedVal returned by lin_array_get_tagged.
-                std::alloc::dealloc(tv_ptr as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+                // Free the box returned by lin_array_get_tagged. It may be an immutable cached
+                // small-int static (the flat-int arms route through the box cache), so use the
+                // cached-box-safe release rather than a raw dealloc.
+                crate::tagged::lin_tagged_release(tv_ptr as *mut u8);
                 v as u8
             };
             bytes.push(val);
