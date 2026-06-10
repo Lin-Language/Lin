@@ -6,7 +6,7 @@
 // (`parse`/`parseWithHeader`/`stringify`/`stringifyRecords`) reads a whole document at once; the
 // streaming API (`rows`/`recordRows`) is a quote-aware row assembler over a byte stream.
 import { push, length } from "std/array"
-import { for, range, map, while } from "std/iter"
+import { for, range, map } from "std/iter"
 import { keys } from "std/object"
 import { join, byteAt, lengthBytes, substring } from "std/string"
 
@@ -43,29 +43,35 @@ val optDelimInvalid = (opts: CsvOptions): Boolean =>
 val optTrim = (opts: CsvOptions): Boolean =>
   opts["trim"] == true
 
+// Advance `start` past leading ASCII space (32) / tab (9), stopping at `end`. Tail-recursive
+// (TCO'd to a byte loop) — no throwaway range array (the old `range(0,n).while` allocated a
+// length-n Int32 array per trimmed field).
+val trimStart = (s: String, start: Int32, end: Int32): Int32 =>
+  if start < end then
+    val b = byteAt(s, start)
+    if b == 32 || b == 9 then
+      trimStart(s, start + 1, end)
+    else
+      start
+  else
+    start
+
+// Retract `end` past trailing ASCII space / tab, stopping at `start`. Tail-recursive (TCO'd).
+val trimEnd = (s: String, start: Int32, end: Int32): Int32 =>
+  if end > start then
+    val b = byteAt(s, end - 1)
+    if b == 32 || b == 9 then
+      trimEnd(s, start, end - 1)
+    else
+      end
+  else
+    end
+
 // Trim leading/trailing ASCII space (32) and tab (9) from an unquoted field. Byte-scanned.
 val trimAsciiWs = (s: String): String =>
   val n = lengthBytes(s)
-  var start = 0
-  var end = n
-  // `while` stops at the first non-space (short-circuits; a `range(...).for` would scan the whole
-  // field even after the trim boundary).
-  range(0, n).while(_ =>
-    val b = byteAt(s, start)
-    if (b == 32 || b == 9) && start < end then
-      start = start + 1
-      true
-    else
-      false
-  )
-  range(0, n).while(_ =>
-    val b = byteAt(s, end - 1)
-    if (b == 32 || b == 9) && end > start then
-      end = end - 1
-      true
-    else
-      false
-  )
+  val start = trimStart(s, 0, n)
+  val end = trimEnd(s, start, n)
   substring(s, start, end)
 
 // ── the field scanner ────────────────────────────────────────────────────────
