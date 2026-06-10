@@ -1,5 +1,10 @@
 # Lin issues found porting RAPTOR
 
+> **HISTORICAL DOCUMENT.** This list reflects the state of the worktree on
+> 2026-06-04. All correctness/stdlib issues below (#1, #2, #3, #4a, #4b, #7)
+> have since been re-run and verified **FIXED on master (2026-06-10)** — see the
+> per-issue notes. The original text is preserved for context.
+
 A prioritized list of Lin language/stdlib problems hit while porting the RAPTOR
 journey planner (the only port of the five that needed workarounds). Each has a
 minimal repro that was run on this worktree (2026-06-04). Ordered by severity.
@@ -10,6 +15,8 @@ wrong results or crash, and a real program can hit them without any "scale" excu
 ---
 
 ## 1. [CORRECTNESS] `var` written inside an `if` is lost after the branch, in a closure
+
+**FIXED (verified 2026-06-10): the repro below now prints `[2, 2, 2]` on master.**
 
 **Severity: high — silent wrong result.** A `var` declared inside a closure, assigned
 inside an `if` branch, and read *after* the branch joins, reads its *initial* value —
@@ -59,6 +66,8 @@ if matched then g = g + 1
 
 ## 2. [CORRECTNESS] top-level `var` mutated by an exported function in an imported module panics codegen
 
+**FIXED (verified 2026-06-10): the repro below now builds and prints `1 2` on master — no panic.**
+
 **Severity: high — compiler crash, not a diagnostic.** The faithful port of the test
 helper `t()` wants a module-level `var tripId` that an exported function increments
 (`trip${tripId++}`). When that module is *imported* and the function called, codegen
@@ -93,6 +102,9 @@ it).
 
 ## 3. [ERGONOMICS / FOOTGUN] Int32 × Int64-literal overflows in Int32 even with an `Int64` target type
 
+**FIXED (verified 2026-06-10): the repro below now prints `bad=90000270000` on master — the
+mixed `Int32 * Int64` operand widens correctly.**
+
 **Severity: medium — silent overflow to a wrong (often negative) value.** `x * 1000003i64`
 where `x: Int32` computes the product in Int32 and overflows; the `i64` literal operand
 does NOT widen `x`, and neither does annotating the result `: Int64`.
@@ -113,6 +125,11 @@ Int32 operand (and ideally warn on a narrowing/overflowing multiply feeding an I
 ---
 
 ## 4. [STDLIB / PERFORMANCE] no stable O(n log n) sort; `Json` objects are O(n) per key lookup
+
+**FIXED (verified 2026-06-10), both halves:**
+**(a) `std/array.sort` is now a stable bottom-up merge sort.**
+**(b) objects with >= 16 keys are hash-indexed in `lin-runtime`, and typed `{ String: T }`
+maps (ADR-055, backed by `LinMap`) exist for dictionary-heavy workloads.**
 
 **Severity: medium — performance, but it made a real workload look "infeasible".** Two
 related gaps surfaced when running the full 240k-trip feed:
