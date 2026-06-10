@@ -8,7 +8,7 @@
 // The Base64 and hex alphabets and output are pure ASCII.
 //
 // Structural URL parsing (scheme, host, path, fragment) is out of scope — see std/url.
-import { fromCodePoints, byteAt, fromUtf8, toString, lengthBytes } from "std/string"
+import { fromCodePoints, byteAt, fromUtf8, toString, lengthBytes, join } from "std/string"
 import { length, push } from "std/array"
 import { keys } from "std/object"
 import { for } from "std/iter"
@@ -604,22 +604,12 @@ export val buildQuery = (params: { String: String[] }): String =>
         push(parts, "${ek}=${formEncode(v)}")
       )
   )
-  joinAmp(parts, length(parts), 0, "")
+  join(parts, "&")
 
 // Percent-encode for x-www-form-urlencoded: like urlEncode but space -> '+'.
 val formEncode = (s: String): String =>
   val out: Int32[] = []
   fromCodePoints(pctEncGo(s, 0, true, out))
-
-// Join already-built `k=v` ASCII parts with `&` (a local join so the module needs no exact
-// dependency on std/string.join's signature).
-val joinAmp = (parts: String[], n: Int32, i: Int32, acc: String): String =>
-  if i >= n then
-    acc
-  else if i == 0 then
-    joinAmp(parts, n, 1, parts[0])
-  else
-    joinAmp(parts, n, i + 1, "${acc}&${parts[i]}")
 
 // --- string convenience wrappers ------------------------------------------
 // UTF-8 encode `s` to bytes, then standard Base64. Use for text payloads. Never fails.
