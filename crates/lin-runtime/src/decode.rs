@@ -13,10 +13,9 @@
 
 use std::fmt::Write as _;
 
-use crate::object::{lin_object_get, lin_tagged_clone, LinObject};
+use crate::object::{lin_object_get_bytes, lin_tagged_clone, LinObject};
 use crate::array::{lin_array_length, LinArray};
 use crate::fs::make_decode_error;
-use crate::string::{lin_string_from_bytes, lin_string_release};
 use crate::tagged::{
     TaggedVal, tagged_as_f64, lin_unbox_ptr,
     TAG_NULL, TAG_BOOL, TAG_INT8, TAG_INT16, TAG_INT32, TAG_INT64,
@@ -238,13 +237,12 @@ unsafe fn validate(
                 let val_off = desc.u32_at(cur + 2 + klen + 1) as usize;
                 cur += 2 + klen + 1 + 4;
 
-                let key_str = lin_string_from_bytes(key.as_ptr(), key.len() as u32);
+                // Look up by raw key bytes — no temp LinString malloc/free per field.
                 let field = if obj.is_null() {
                     std::ptr::null()
                 } else {
-                    lin_object_get(obj, key_str)
+                    lin_object_get_bytes(obj, key.as_ptr(), key.len() as u32)
                 };
-                lin_string_release(key_str);
 
                 let field_present = !field.is_null() && (*(field as *const TaggedVal)).tag != TAG_NULL;
                 if !field_present {
