@@ -1531,6 +1531,19 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
     // Link system libraries needed by lin-runtime (libc via cc, libm for math).
     cmd.arg("-lm");
 
+    // macOS: lin-runtime statically embeds the `sysinfo` crate (std/process `memInfo`/`loadAverage`/
+    // `uptime`/…), which on macOS reaches Apple's CoreFoundation (via `objc2-core-foundation`) and
+    // IOKit. Those framework link directives live in sysinfo's build script and only fire when cargo
+    // links the final artifact — but we link the user's binary ourselves with `cc` against
+    // `liblin_runtime.a`, so they're lost and the CF/IOKit symbols come up undefined. The failure was
+    // INTERMITTENT only because `-dead_strip` drops the sysinfo objects when the program never reaches
+    // them; a program that does (e.g. calls `memInfo`) fails the link. Pass the frameworks explicitly.
+    // No-op on every other OS (the cfg is the host linker target — `lin` always links for its host).
+    if cfg!(target_os = "macos") {
+        cmd.arg("-framework").arg("CoreFoundation");
+        cmd.arg("-framework").arg("IOKit");
+    }
+
     // DWARF (--debug): pass `-g` so the link driver preserves the object's debug sections in the
     // output binary (cc/clang default behaviour, but make it explicit). On Linux lldb then reads the
     // `.debug_*` sections straight from the linked binary. `--gc-sections` (below) keeps the debug
