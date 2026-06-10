@@ -1,6 +1,69 @@
 use indexmap::IndexMap;
 use std::fmt;
 
+/// The set of syntactic lambda identities that can inhabit a `Type::Function` (Path-11 Leg 2,
+/// "lambda-set specialization", PLDI'23 / the Roc model). This is **inert metadata**: it rides
+/// along on a function type but is deliberately invisible to `Type` equality (`PartialEq` below),
+/// structural compatibility (`compat.rs` ignores it via `..`), `Display`, and the monomorphization
+/// instantiation key (which erases it — see `Type::erase_lambda_sets`). Adding it therefore cannot
+/// perturb any equality/compat/codegen-driven behaviour — exactly the discipline the `sealed` flag
+/// (ADR-057) and `StrLit` (ADR-034) established for representation/metadata markers.
+///
+/// Each syntactic lambda (and named function) is assigned a unique `u32` id by the checker
+/// (`Checker::next_lambda_id`). A bare lambda value's function type carries `Known([id])`
+/// (a singleton). When two function values merge at a union join (`if`/`match` branches selecting
+/// among lambdas), their sets union (`LambdaSet::join`). `Top` is the ⊤ element — an unknown /
+/// unbounded inhabitant set: it is the DEFAULT for every function type the checker does not
+/// populate (annotations, intrinsic signatures, FFI, function values read out of `Json` or
+/// returned from opaque/recursive positions), and it is absorbing under join.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum LambdaSet {
+    /// ⊤ — unknown / unbounded set of inhabitants. The default and the absorbing join element.
+    Top,
+    /// A known, finite, sorted-deduped set of syntactic lambda identities. An empty `Known` is
+    /// never produced (a function type with no known inhabitant stays `Top`).
+    Known(Vec<u32>),
+}
+
+impl LambdaSet {
+    /// Storage cap: a set wider than this collapses to `Top` to bound blow-up (Roc's small-set
+    /// threshold is ~8; we keep a little headroom for measurement, then give up). Classification
+    /// (`crate::lambda_set_stats`) treats anything past the small-set threshold as ⊤ anyway.
+    pub const MAX_KNOWN: usize = 16;
+
+    /// `LambdaSet::Top` as a fn pointer for `#[serde(default = ...)]`.
+    pub fn top() -> LambdaSet {
+        LambdaSet::Top
+    }
+
+    /// A singleton set — one syntactic lambda identity.
+    pub fn singleton(id: u32) -> LambdaSet {
+        LambdaSet::Known(vec![id])
+    }
+
+    /// Join two sets (the union-merge that runs when two function values merge at a control-flow
+    /// join). `Top` is absorbing; two `Known` sets union (sorted-deduped); overflow past
+    /// `MAX_KNOWN` collapses to `Top`.
+    pub fn join(&self, other: &LambdaSet) -> LambdaSet {
+        match (self, other) {
+            (LambdaSet::Top, _) | (_, LambdaSet::Top) => LambdaSet::Top,
+            (LambdaSet::Known(a), LambdaSet::Known(b)) => {
+                let mut merged = a.clone();
+                for id in b {
+                    if !merged.contains(id) {
+                        merged.push(*id);
+                    }
+                }
+                if merged.len() > LambdaSet::MAX_KNOWN {
+                    return LambdaSet::Top;
+                }
+                merged.sort_unstable();
+                LambdaSet::Known(merged)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Type {
     Null,
@@ -53,6 +116,13 @@ pub enum Type {
         /// for functions without default arguments. Excluded from structural
         /// compatibility — see `compat.rs`.
         required: usize,
+        /// Path-11 lambda-set metadata: the set of syntactic lambdas that can inhabit this
+        /// function type. INERT — invisible to equality, compatibility, Display, and the
+        /// monomorphization key (see `LambdaSet`). `#[serde(default)]` => deserializes to `Top`
+        /// for any cache/signature written before this field existed; the cache stamp is bumped
+        /// regardless so stale bincode is rejected rather than mis-decoded.
+        #[serde(default = "LambdaSet::top")]
+        lset: LambdaSet,
     },
     Iterator(Box<Type>),
     /// `Shared<T>` — opt-in shared *mutable* state (ADR-029). An opaque box over `T`; the ONLY
@@ -117,9 +187,14 @@ impl PartialEq for Type {
             (Object { fields: a, .. }, Object { fields: b, .. }) => a == b,
             (Map(a), Map(b)) => a == b,
             (Union(a), Union(b)) => a == b,
+            // Ignore `lset`: the lambda-set metadata rides along structurally but is invisible to
+            // `==` (mirrors the `sealed` flag above). Two function types with identical
+            // params/ret/required but different inhabitant sets are equal — this keeps union
+            // dedup/flatten, narrowing, exhaustiveness, zonk fixpoints, and cache identity behaving
+            // exactly as before the field existed.
             (
-                Function { params: p1, ret: r1, required: req1 },
-                Function { params: p2, ret: r2, required: req2 },
+                Function { params: p1, ret: r1, required: req1, .. },
+                Function { params: p2, ret: r2, required: req2, .. },
             ) => p1 == p2 && r1 == r2 && req1 == req2,
             (Iterator(a), Iterator(b)) => a == b,
             (Shared(a), Shared(b)) => a == b,
@@ -146,9 +221,39 @@ impl Type {
     }
 
     /// Construct a function type with no default arguments (`required == params.len()`).
+    /// The lambda set defaults to `Top` (unknown inhabitants) — populated lazily by the checker
+    /// for actual lambda values.
     pub fn func(params: Vec<Type>, ret: Type) -> Type {
         let required = params.len();
-        Type::Function { params, ret: Box::new(ret), required }
+        Type::Function { params, ret: Box::new(ret), required, lset: LambdaSet::Top }
+    }
+
+    /// Recursively rewrite every `Type::Function`'s lambda set to `Top`. Used to canonicalize a
+    /// type before it is turned into a monomorphization key (`instantiation_key` uses `Debug`), so
+    /// the lambda-set metadata can never split or merge specializations — i.e. it is byte-identical
+    /// to the pre-Path-11 keying. Purely a normalization; never observed by codegen.
+    pub fn erase_lambda_sets(&self) -> Type {
+        match self {
+            Type::Array(t) => Type::Array(Box::new(t.erase_lambda_sets())),
+            Type::Iterator(t) => Type::Iterator(Box::new(t.erase_lambda_sets())),
+            Type::Stream(t) => Type::Stream(Box::new(t.erase_lambda_sets())),
+            Type::Shared(t) => Type::Shared(Box::new(t.erase_lambda_sets())),
+            Type::Promise(t) => Type::Promise(Box::new(t.erase_lambda_sets())),
+            Type::Map(t) => Type::Map(Box::new(t.erase_lambda_sets())),
+            Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| t.erase_lambda_sets()).collect()),
+            Type::Union(ts) => Type::Union(ts.iter().map(|t| t.erase_lambda_sets()).collect()),
+            Type::Object { fields, sealed } => Type::Object {
+                fields: fields.iter().map(|(k, v)| (k.clone(), v.erase_lambda_sets())).collect(),
+                sealed: *sealed,
+            },
+            Type::Function { params, ret, required, .. } => Type::Function {
+                params: params.iter().map(|t| t.erase_lambda_sets()).collect(),
+                ret: Box::new(ret.erase_lambda_sets()),
+                required: *required,
+                lset: LambdaSet::Top,
+            },
+            other => other.clone(),
+        }
     }
 
     pub fn is_numeric(&self) -> bool {
@@ -419,7 +524,7 @@ impl fmt::Display for Type {
                 }
                 Ok(())
             }
-            Type::Function { params, ret, required } => {
+            Type::Function { params, ret, required, .. } => {
                 write!(f, "(")?;
                 for (i, p) in params.iter().enumerate() {
                     if i > 0 {

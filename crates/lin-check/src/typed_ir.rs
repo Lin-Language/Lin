@@ -221,6 +221,13 @@ pub enum TypedExpr {
         ret_type: Type,
         captures: Vec<Capture>,
         span: Span,
+        /// Path-11 lambda-set identity: a unique id assigned to this syntactic lambda by the
+        /// checker (`Checker::next_lambda_id`). The function type produced by `ty()` carries
+        /// `LambdaSet::singleton(lambda_id)`. Inert metadata for shadow inference / measurement;
+        /// `#[serde(default)]` => `0` for any cached `TypedExpr` written before this field existed
+        /// (the cache stamp is bumped, so such entries are rejected, not mis-decoded).
+        #[serde(default)]
+        lambda_id: u32,
     },
     MakeObject {
         fields: Vec<(String, TypedExpr)>,
@@ -287,11 +294,20 @@ impl TypedExpr {
             TypedExpr::Match { result_type, .. } => result_type.clone(),
             TypedExpr::Block { ty, .. } => ty.clone(),
             TypedExpr::Function {
-                params, ret_type, ..
+                params, ret_type, lambda_id, ..
             } => Type::Function {
                 params: params.iter().map(|p| p.ty.clone()).collect(),
                 ret: Box::new(ret_type.clone()),
                 required: params.iter().filter(|p| p.default.is_none()).count(),
+                // A syntactic lambda is the canonical singleton inhabitant of its own function
+                // type. `lambda_id == 0` means "unassigned" (cache-default or a synthesized
+                // function the checker never tagged) — fall back to `Top` rather than aliasing
+                // every untagged function to the id-0 set.
+                lset: if *lambda_id == 0 {
+                    crate::types::LambdaSet::Top
+                } else {
+                    crate::types::LambdaSet::singleton(*lambda_id)
+                },
             },
             TypedExpr::MakeObject { ty, .. } => ty.clone(),
             TypedExpr::MakeArray { ty, .. } => ty.clone(),

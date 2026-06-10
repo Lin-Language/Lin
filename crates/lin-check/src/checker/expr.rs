@@ -938,6 +938,12 @@ impl Checker {
                 && !self.solved_type_vars.contains_key(id));
         let then_dynamic = is_json_dynamic(&then_ty) || is_unconstrained_inference_var(&then_ty);
         let else_dynamic = is_json_dynamic(&else_ty) || is_unconstrained_inference_var(&else_ty);
+        // Path-11: snapshot the branch lambda sets BEFORE the merge consumes the branch types, so a
+        // function-typed `if` whose arms are distinct lambdas (`if c then f else g`) yields a 2-set
+        // rather than aliasing onto whichever branch the structural collapse below happens to pick
+        // (PartialEq ignores `lset`, so the collapse would otherwise silently drop one inhabitant).
+        let then_lset = top_level_lambda_set(&then_ty);
+        let else_lset = top_level_lambda_set(&else_ty);
         let result_type = if then_empty_arr != else_empty_arr {
             if then_empty_arr { else_ty } else { then_ty }
         } else if distinct_generic_params {
@@ -976,6 +982,9 @@ impl Checker {
         } else {
             Type::flatten_union(vec![then_ty, else_ty])
         };
+        // Path-11: if the merged result is itself a function type, stamp it with the JOIN of the
+        // branch sets (inert metadata; the union/collapse above used PartialEq, which ignores it).
+        let result_type = with_joined_lambda_set(result_type, &then_lset, &else_lset);
         Ok(TypedExpr::If {
             cond: Box::new(typed_cond),
             then_br: Box::new(typed_then),
@@ -1116,6 +1125,8 @@ impl Checker {
         } else {
             unify_types(&drop_empty_array_arms(&arm_types))
         };
+        // Path-11: join arm inhabitant sets onto a function-typed result (see `infer_match`).
+        let result_type = join_arm_lambda_sets(result_type, &arm_types);
 
         let exhaustiveness_diags =
             crate::exhaustiveness::check_exhaustiveness(&scrutinee_ty, &typed_arms, span);
@@ -1154,6 +1165,9 @@ impl Checker {
         }
         self.consumed_streams = consumed_union;
         let result_type = if arm_types.is_empty() { Type::Never } else { unify_types(&drop_empty_array_arms(&arm_types)) };
+        // Path-11: a function-typed match (arms returning distinct lambdas) carries the JOIN of the
+        // arms' inhabitant sets, since `unify_types`/PartialEq ignore `lset`.
+        let result_type = join_arm_lambda_sets(result_type, &arm_types);
 
         // Exhaustiveness check: emit diagnostics but don't fail — warnings stay as warnings,
         // errors are collected alongside other diagnostics and reported together.
@@ -1712,6 +1726,50 @@ pub(crate) fn type_mentions_strlit(ty: &Type) -> bool {
     }
 }
 
+/// Path-11: the lambda set carried at the TOP LEVEL of `ty` if it is a function type, else `None`
+/// (a non-function branch contributes nothing to a function-typed merge's inhabitant set).
+fn top_level_lambda_set(ty: &Type) -> Option<crate::types::LambdaSet> {
+    match ty {
+        Type::Function { lset, .. } => Some(lset.clone()),
+        _ => None,
+    }
+}
+
+/// Path-11: if `ty` is a function type and at least one branch contributed a set, stamp it with the
+/// JOIN of the two branch sets. A missing branch set (non-function branch) is treated as `Top` — a
+/// merge of a function with a non-function can only be reasoned about as ⊤. Inert: only the `lset`
+/// metadata changes; params/ret/required are untouched.
+fn with_joined_lambda_set(
+    ty: Type,
+    then_lset: &Option<crate::types::LambdaSet>,
+    else_lset: &Option<crate::types::LambdaSet>,
+) -> Type {
+    use crate::types::LambdaSet;
+    if let Type::Function { params, ret, required, .. } = ty {
+        let a = then_lset.clone().unwrap_or(LambdaSet::Top);
+        let b = else_lset.clone().unwrap_or(LambdaSet::Top);
+        Type::Function { params, ret, required, lset: a.join(&b) }
+    } else {
+        ty
+    }
+}
+
+/// Path-11: if `result` is a function type, stamp it with the JOIN of every arm's top-level lambda
+/// set. A non-function arm (or an arm with no set) contributes `Top`. Inert metadata only.
+fn join_arm_lambda_sets(result: Type, arm_types: &[Type]) -> Type {
+    use crate::types::LambdaSet;
+    if let Type::Function { params, ret, required, .. } = result {
+        let mut joined = LambdaSet::Known(vec![]);
+        for at in arm_types {
+            let s = top_level_lambda_set(at).unwrap_or(LambdaSet::Top);
+            joined = joined.join(&s);
+        }
+        Type::Function { params, ret, required, lset: joined }
+    } else {
+        result
+    }
+}
+
 /// Replace every GENERIC (quantified, non-Json-wildcard) `TypeVar` in `ty` with the `Json` wildcard.
 /// Used to erase the unconstrained tuple element type of an empty array literal flowing into a
 /// `[String, T][]` param, so the empty container monomorphizes instead of leaving `T` unsolved.
@@ -1730,10 +1788,11 @@ pub(crate) fn erase_generic_type_vars(ty: &Type) -> Type {
             fields: fields.iter().map(|(k, v)| (k.clone(), erase_generic_type_vars(v))).collect(),
             sealed: *sealed,
         },
-        Type::Function { params, ret, required } => Type::Function {
+        Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(erase_generic_type_vars).collect(),
             ret: Box::new(erase_generic_type_vars(ret)),
             required: *required,
+            lset: lset.clone(),
         },
         _ => ty.clone(),
     }
