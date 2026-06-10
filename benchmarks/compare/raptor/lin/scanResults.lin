@@ -10,7 +10,11 @@
 // hashed O(1) containers. `kConnections` was the LAST `Json` dictionary; it is now typed
 // `{ String: { String: Conn } }` (the projection-aliasing UAF that blocked it is fixed on master,
 // see types.lin / NOTES.md). Round keys are stored as strings ("${k}") because Lin map keys are
-// strings. `k` starts at 0; addRound increments and seeds an empty arrivals map.
+// strings — but the key is computed ONCE per round (addRound), not per access: the record
+// carries `curKey` plus direct `curRound`/`prevRound` references to the current/previous
+// arrival maps (maps are reference types, so the aliases mirror node's
+// `this.kArrivals[this.k - 1]` indexing without the per-access "${k}" interpolation).
+// `k` starts at 0; addRound increments and seeds an empty arrivals map.
 import { for } from "std/iter"
 import { keys } from "std/object"
 import { ScanResults, Conn } from "./types"
@@ -29,8 +33,14 @@ export val createScanResults = (stops: Json, origins: Json): ScanResults =>
   )
   var kArrivals: { String: { String: Int64 } } = {}
   kArrivals["0"] = kArrival0
+  // Round 0 seeds BOTH curRound and prevRound with the origins map. prevRound is never
+  // read before the first addRound replaces it: scan() calls addRound BEFORE the first
+  // scanRoutes (mirroring node, where previousArrival always reads k-1 >= 0).
   {
     "k": 0,
+    "curKey": "0",
+    "prevRound": kArrival0,
+    "curRound": kArrival0,
     "bestArrivals": bestArrivals,
     "kArrivals": kArrivals,
     "kConnections": kConnections
@@ -38,37 +48,43 @@ export val createScanResults = (stops: Json, origins: Json): ScanResults =>
 
 export val addRound = (results: ScanResults): Null =>
   val k = results["k"] + 1
+  val key = "${k}"
+  var round: { String: Int64 } = {}
   results["k"] = k
-  results["kArrivals"]["${k}"] = {}
+  results["curKey"] = key
+  results["prevRound"] = results["curRound"]
+  results["curRound"] = round
+  // kArrivals still indexes every round's map (round is an ALIAS of kArrivals[key]) for
+  // any consumer that walks rounds by key.
+  results["kArrivals"][key] = round
 
 // previousArrival/bestArrival read a typed `{ String: Int64 }` slot (so `m[k]` is `Int64 | Null`),
 // but they widen the result to `Json` so the arithmetic/comparison consumers in raptor.lin keep
 // their existing `!= null` guards + Json numeric ops unchanged (faithful skip-on-missing
 // semantics; see scanTransfers). The O(1) hashed read already happened on the typed-map access.
+// previousArrival is the HOTTEST read in the scan: it reads the prevRound alias directly —
+// no "${k - 1}" interpolation, no rounds-map lookup.
 export val previousArrival = (results: ScanResults, stop: String): Json =>
-  results["kArrivals"]["${results["k"] - 1}"][stop]
+  results["prevRound"][stop]
 
 export val setTrip = (results: ScanResults, trip: Json, startIndex: Int32, endIndex: Int32, interchange: Int32): Null =>
   val time = trip["stopTimes"][endIndex]["arrivalTime"] + interchange
   val stop = trip["stopTimes"][endIndex]["stop"]
-  val k = results["k"]
-  results["kArrivals"]["${k}"][stop] = time
+  results["curRound"][stop] = time
   results["bestArrivals"][stop] = time
-  results["kConnections"][stop]["${k}"] = [trip, startIndex, endIndex]
+  results["kConnections"][stop][results["curKey"]] = [trip, startIndex, endIndex]
 
 export val setTransfer = (results: ScanResults, transfer: Json, time: Json): Null =>
   val stop = transfer["destination"]
-  val k = results["k"]
-  results["kArrivals"]["${k}"][stop] = time
+  results["curRound"][stop] = time
   results["bestArrivals"][stop] = time
-  results["kConnections"][stop]["${k}"] = transfer
+  results["kConnections"][stop][results["curKey"]] = transfer
 
 export val bestArrival = (results: ScanResults, stop: String): Json =>
   results["bestArrivals"][stop]
 
 export val getMarkedStops = (results: ScanResults): Json =>
-  val round = results["kArrivals"]["${results["k"]}"]
-  if round != null then round.keys() else []
+  results["curRound"].keys()
 
 // finalize returns the typed ScanResults record itself (callers read its typed
 // kConnections/bestArrivals fields — see raptor.scan / query). It previously returned a
