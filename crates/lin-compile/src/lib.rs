@@ -1384,11 +1384,36 @@ fn select_link_detail_lines(detail: &str) -> Vec<&str> {
             || (lower.trim_start().starts_with("ld:") && !is_warning(line))
     }
 
-    const MAX_LINES: usize = 6;
+    // An indented line is a CONTINUATION of the diagnostic above it. macOS ld prints the actual
+    // missing symbol on indented lines UNDER the "Undefined symbols for architecture …:" header
+    // (`  "_lin_foo", referenced from:` / `      _bar in baz.o`), and those lines match none of the
+    // `looks_like_error` keywords. Capturing them is the whole point — the header alone doesn't name
+    // the symbol. We only treat an indented line as a continuation when it FOLLOWS a kept error line
+    // (so stray indented noise elsewhere isn't pulled in).
+    fn is_continuation(line: &str) -> bool {
+        line.starts_with(' ') || line.starts_with('\t')
+    }
+
+    const MAX_LINES: usize = 8;
     let lines = || detail.lines().filter(|l| !l.trim().is_empty());
 
-    // First choice: lines that positively look like errors.
-    let errors: Vec<&str> = lines().filter(|l| looks_like_error(l)).take(MAX_LINES).collect();
+    // First choice: error lines, each WITH the indented continuation lines beneath it (the symbol
+    // names). Walk in order so a header and its symbol list stay together and in sequence.
+    let mut errors: Vec<&str> = Vec::new();
+    let mut keeping = false;
+    for line in lines() {
+        if looks_like_error(line) {
+            keeping = true;
+            errors.push(line);
+        } else if keeping && is_continuation(line) {
+            errors.push(line);
+        } else {
+            keeping = false;
+        }
+        if errors.len() >= MAX_LINES {
+            break;
+        }
+    }
     if !errors.is_empty() {
         return errors;
     }
@@ -1505,6 +1530,19 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
 
     // Link system libraries needed by lin-runtime (libc via cc, libm for math).
     cmd.arg("-lm");
+
+    // macOS: lin-runtime statically embeds the `sysinfo` crate (std/process `memInfo`/`loadAverage`/
+    // `uptime`/…), which on macOS reaches Apple's CoreFoundation (via `objc2-core-foundation`) and
+    // IOKit. Those framework link directives live in sysinfo's build script and only fire when cargo
+    // links the final artifact — but we link the user's binary ourselves with `cc` against
+    // `liblin_runtime.a`, so they're lost and the CF/IOKit symbols come up undefined. The failure was
+    // INTERMITTENT only because `-dead_strip` drops the sysinfo objects when the program never reaches
+    // them; a program that does (e.g. calls `memInfo`) fails the link. Pass the frameworks explicitly.
+    // No-op on every other OS (the cfg is the host linker target — `lin` always links for its host).
+    if cfg!(target_os = "macos") {
+        cmd.arg("-framework").arg("CoreFoundation");
+        cmd.arg("-framework").arg("IOKit");
+    }
 
     // DWARF (--debug): pass `-g` so the link driver preserves the object's debug sections in the
     // output binary (cc/clang default behaviour, but make it explicit). On Linux lldb then reads the
@@ -1779,8 +1817,41 @@ ld: symbol(s) not found for architecture arm64";
         // The real error must survive.
         assert!(msg.contains("Undefined symbols for architecture arm64"), "lost the real error: {msg}");
         assert!(msg.contains("symbol(s) not found"), "lost the trailing ld error: {msg}");
+        // …AND the indented continuation that actually NAMES the symbol — the header alone is
+        // useless for root-causing. This is the line the first cut of this matcher dropped.
+        assert!(msg.contains("_lin_process_spawn"), "lost the symbol name continuation: {msg}");
         // The benign warnings must be deprioritised out of the details.
         assert!(!msg.contains("built for newer 'macOS' version"), "warnings leaked into details: {msg}");
+    }
+
+    #[test]
+    fn details_keep_indented_symbol_names_under_undefined_header() {
+        // The exact ld64 shape: a header, then several indented "_sym", referenced from: blocks,
+        // each followed by a further-indented "_x in y.o" location line. All of it is the diagnostic.
+        let raw = "\
+Undefined symbols for architecture arm64:
+  \"_lin_process_spawn\", referenced from:
+      _main in process.test.bin.o
+  \"_lin_process_wait\", referenced from:
+      _main in process.test.bin.o
+ld: symbol(s) not found for architecture arm64
+clang: error: linker command failed with exit code 1 (use -v to see invocation)";
+        let lines = select_link_detail_lines(raw);
+        // Both missing symbol names must appear — they're what a bug report needs.
+        assert!(lines.iter().any(|l| l.contains("_lin_process_spawn")), "missing first symbol: {lines:?}");
+        assert!(lines.iter().any(|l| l.contains("_lin_process_wait")), "missing second symbol: {lines:?}");
+        assert!(lines.iter().any(|l| l.contains("symbol(s) not found")), "missing trailing error: {lines:?}");
+    }
+
+    #[test]
+    fn details_drop_indented_lines_not_under_an_error() {
+        // An indented line that does NOT follow a kept error line is not pulled in as a continuation.
+        let raw = "\
+  some indented preamble line with no diagnostic keyword
+clang: error: linker command failed with exit code 1";
+        let lines = select_link_detail_lines(raw);
+        assert!(lines.iter().any(|l| l.contains("error: linker command failed")));
+        assert!(!lines.iter().any(|l| l.contains("indented preamble")), "stray indent leaked: {lines:?}");
     }
 
     #[test]
