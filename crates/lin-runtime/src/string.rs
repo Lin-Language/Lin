@@ -1220,6 +1220,70 @@ pub unsafe extern "C" fn lin_string_utf8_bytes(s: *const LinString) -> *mut crat
     arr as *mut LinArray
 }
 
+/// Build a `String` from an `Int32[]` of Unicode code points in one pass — the runtime form of
+/// `std/string.fromCodePoints`. Replaces the userland "build a String[] of one-char strings then
+/// join" (N small allocs + a join) on the shared tail of every base64/hex/url/form encoder.
+/// Each code point is UTF-8-encoded into one growable buffer; invalid code points (negative or
+/// not a Unicode scalar value) contribute no bytes, matching `lin_string_from_char_code`'s
+/// "" behaviour per element. Borrows `arr`; returns an OWNED (+1) raw `LinString`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_from_code_points(arr: *const u8) -> *mut LinString {
+    use crate::array::{lin_array_get_tagged, lin_array_length, LinArray};
+    use crate::tagged::{TaggedVal, TAG_ARRAY};
+    if arr.is_null() {
+        return lin_string_from_bytes(b"".as_ptr(), 0);
+    }
+    // `arr` may arrive as a TaggedVal*(Array) or a raw LinArray* (same resolution as fromUtf8).
+    let head = (arr as *const u64).read_unaligned();
+    let lin_arr = if head == TAG_ARRAY as u64 {
+        (*(arr as *const TaggedVal)).payload as *const LinArray
+    } else {
+        arr as *const LinArray
+    };
+    if lin_arr.is_null() {
+        return lin_string_from_bytes(b"".as_ptr(), 0);
+    }
+    let len = lin_array_length(lin_arr) as usize;
+    // Encoder outputs are ASCII (1 byte/cp), but handle full code points: reserve len bytes and
+    // let the buffer grow for any multibyte cp.
+    let mut out: Vec<u8> = Vec::with_capacity(len);
+    let mut cbuf = [0u8; 4];
+    let elem_tag = (*lin_arr).elem_tag;
+    if elem_tag == crate::tagged::TAG_INT32 {
+        // Flat i32 buffer (the common case — `fromCodePoints` is typed Int32[]): read raw.
+        let data = (*lin_arr).data as *const i32;
+        for i in 0..len {
+            push_code_point(&mut out, *data.add(i), &mut cbuf);
+        }
+    } else {
+        // Tagged / other-width arrays: box each element and read its payload as i32.
+        for i in 0..len as i64 {
+            let tv_ptr = lin_array_get_tagged(lin_arr, i);
+            let cp = if tv_ptr.is_null() {
+                -1
+            } else {
+                let payload = (*tv_ptr).payload as i64 as i32;
+                // Cached-box-safe free: flat-int reads may return an immutable cached static box.
+                crate::tagged::lin_tagged_release(tv_ptr as *mut u8);
+                payload
+            };
+            push_code_point(&mut out, cp, &mut cbuf);
+        }
+    }
+    lin_string_from_bytes(out.as_ptr(), out.len() as u32)
+}
+
+/// Append the UTF-8 encoding of `code` to `out`; invalid code points contribute nothing.
+#[inline]
+fn push_code_point(out: &mut Vec<u8>, code: i32, cbuf: &mut [u8; 4]) {
+    if code < 0 {
+        return;
+    }
+    if let Some(c) = char::from_u32(code as u32) {
+        out.extend_from_slice(c.encode_utf8(cbuf).as_bytes());
+    }
+}
+
 /// Serialize ANY Lin value (passed as a boxed TaggedVal*) to a strict, valid JSON string.
 ///
 /// OWNERSHIP: this BORROWS `tagged` (a read-only walk) and returns a freshly-allocated OWNED
