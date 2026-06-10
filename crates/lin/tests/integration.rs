@@ -1331,6 +1331,141 @@ print(toString(result))
     assert_eq!(output, vec!["50"]);
 }
 
+// Path-8 Step 8.1: combinator-chain fusion widened to SEALED-RECORD element sources. A
+// `trips.filter(...).map(...).reduce(...)` over a packed `Trip[]` is a SINGLE fused loop that reads
+// each record field by const-offset (no `sealed_array_to_tagged` materialize of the source array, no
+// per-stage intermediate array, no per-element indirect closure call). Asserts the values round-trip
+// — a wrong RC/projection corrupts the fold. dur>15 keeps trips 2,3,4 → dist 200,300,400 → 900.
+#[test]
+fn test_fused_record_chain_reduce() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, reduce } from "std/iter"
+
+type Trip = { "id": Int32, "dur": Int32, "dist": Int32 }
+val trips: Trip[] = [
+  { "id": 1, "dur": 10, "dist": 100 },
+  { "id": 2, "dur": 20, "dist": 200 },
+  { "id": 3, "dur": 30, "dist": 300 },
+  { "id": 4, "dur": 40, "dist": 400 }
+]
+val total = trips.filter(t => t["dur"] > 15).map(t => t["dist"]).reduce(0, (a, x) => a + x)
+print(toString(total))
+"#);
+    assert_eq!(output, vec!["900"]);
+}
+
+// Path-8 Step 8.1: array-producing fused terminals (`map`/`filter`) over a record chain — each is one
+// pass building a single result array (no intermediate per-stage array). Asserts the kept elements'
+// VALUES and order survive the fused projection/predicate (not just no-crash).
+#[test]
+fn test_fused_record_chain_array_terminals() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter } from "std/iter"
+import { length } from "std/array"
+
+type Trip = { "id": Int32, "dur": Int32, "dist": Int32 }
+val trips: Trip[] = [
+  { "id": 1, "dur": 10, "dist": 100 },
+  { "id": 2, "dur": 20, "dist": 200 },
+  { "id": 3, "dur": 30, "dist": 300 },
+  { "id": 4, "dur": 40, "dist": 400 }
+]
+// map TERMINAL: filter(dur>15) then project dist -> [200, 300, 400]
+val ds: Int32[] = trips.filter(t => t["dur"] > 15).map(t => t["dist"])
+print(toString(length(ds)))
+print(toString(ds[0]))
+print(toString(ds[2]))
+// filter TERMINAL: project dist then filter(>150) -> [200, 300, 400]
+val bs: Int32[] = trips.map(t => t["dist"]).filter(x => x > 150)
+print(toString(length(bs)))
+print(toString(bs[0]))
+"#);
+    assert_eq!(output, vec!["3", "200", "400", "3", "200"]);
+}
+
+// Path-8 Step 8.1: the for-terminal over a record chain (side-effecting) accumulating through a
+// global var — the survivor reclaim must not double-free the materialized record nor leak it.
+// dur>5 keeps all four → dist sum 1000.
+#[test]
+fn test_fused_record_chain_for_terminal() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, for } from "std/iter"
+
+type Trip = { "id": Int32, "dur": Int32, "dist": Int32 }
+val trips: Trip[] = [
+  { "id": 1, "dur": 10, "dist": 100 },
+  { "id": 2, "dur": 20, "dist": 200 },
+  { "id": 3, "dur": 30, "dist": 300 },
+  { "id": 4, "dur": 40, "dist": 400 }
+]
+var sum = 0
+trips.filter(t => t["dur"] > 5).map(t => t["dist"]).for(x => sum = sum + x)
+print(toString(sum))
+"#);
+    assert_eq!(output, vec!["1000"]);
+}
+
+// Path-8 Step 8.1: a heap-FIELD (String) record fused chain — the per-element materialize retains the
+// String field and `lin_sealed_release` releases it; the fused path must keep that RC balanced. id>1
+// keeps trips 2,3 → dist 4,6 → 10. (ASan scaling is the leak guard in the sealed-harness; this pins
+// the value, which a wrong heap-field RC free would corrupt.)
+#[test]
+fn test_fused_heap_field_record_chain() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, reduce } from "std/iter"
+
+type Trip = { "id": Int32, "name": String, "dist": Int32 }
+val trips: Trip[] = [
+  { "id": 0, "name": "a", "dist": 0 },
+  { "id": 1, "name": "b", "dist": 2 },
+  { "id": 2, "name": "c", "dist": 4 },
+  { "id": 3, "name": "d", "dist": 6 }
+]
+val total = trips.filter(t => t["id"] > 1).map(t => t["dist"]).reduce(0, (a, x) => a + x)
+print(toString(total))
+"#);
+    assert_eq!(output, vec!["10"]);
+}
+
+// Path-8 Step 8.1 regression: a 3-stage fused chain whose FIRST stage is a `map` consuming the source
+// record, followed by a `filter`, then a terminal. The map frees the per-iteration source materialize;
+// the downstream filter's drop path must NOT free it again (double-free → `lin_sealed_release` UAF on
+// the 24-byte packed element). Covers map.filter.reduce, map.filter (array terminal) and map.filter.for.
+// id 0..5 → dist*2 → keep >4 → {6,8,10} sum 24 / count 3 / for-sum 24.
+#[test]
+fn test_fused_map_first_then_filter_chain() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, reduce, for } from "std/iter"
+import { length } from "std/array"
+
+type Rec = { "id": Int32, "dur": Int32 }
+val recs: Rec[] = [
+  { "id": 0, "dur": 0 },
+  { "id": 1, "dur": 1 },
+  { "id": 2, "dur": 2 },
+  { "id": 3, "dur": 3 },
+  { "id": 4, "dur": 4 },
+  { "id": 5, "dur": 5 }
+]
+// map FIRST, then filter, then reduce
+val total = recs.map(r => r["dur"] * 2).filter(x => x > 4).reduce(0, (a, x) => a + x)
+print(toString(total))
+// map FIRST, then filter -> array terminal
+val kept: Int32[] = recs.map(r => r["dur"] * 2).filter(x => x > 4)
+print(toString(length(kept)))
+// map FIRST, then filter, then for
+var s = 0
+recs.map(r => r["dur"] * 2).filter(x => x > 4).for(x => s = s + x)
+print(toString(s))
+"#);
+    assert_eq!(output, vec!["24", "3", "24"]);
+}
+
 #[test]
 fn test_destructuring() {
     let output = run(r#"import { print } from "std/io"
