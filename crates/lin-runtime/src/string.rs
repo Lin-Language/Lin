@@ -566,129 +566,152 @@ pub unsafe extern "C" fn lin_string_join(arr: *const crate::array::LinArray, sep
     lin_string_from_bytes(result.as_ptr(), result.len() as u32)
 }
 
-/// Recursively convert a TaggedVal to its JSON string representation.
+/// Recursively convert a TaggedVal to its (lossy, display) JSON string representation.
 /// Used for toString(obj), toString(arr), and string interpolation of complex values.
+///
+/// This is the DISPLAY stringifier: unlike the strict-JSON `push_json_value`, string values
+/// and object keys are emitted UNESCAPED, container separators are `", "` (comma-space), and
+/// object entries are `"key": value`. The push_display_* helpers below append into one reused
+/// String to avoid the former `Vec<String>`+`format!`-per-element+`join` (N+1 allocs).
 pub unsafe fn tagged_to_json_string(tagged: *const TaggedVal) -> String {
+    let mut out = String::new();
+    push_display_value(&mut out, tagged);
+    out
+}
+
+/// Display float formatting for a scalar (TAG_FLOAT32/64) box: plain `{}`, no `.1` handling.
+/// (Kept distinct from the flat-array float path, which DOES apply `.1` — preserving the
+/// pre-existing behavioural split between the two.)
+fn push_display_float_plain(out: &mut String, f: f64) {
+    use std::fmt::Write as _;
+    let _ = write!(out, "{}", f);
+}
+
+/// Display float formatting for a flat scalar-array element: integral magnitudes < 1e15 render
+/// with a trailing `.1` decimal; everything else plain `{}`.
+fn push_display_float_dot1(out: &mut String, f: f64) {
+    use std::fmt::Write as _;
+    if f.fract() == 0.0 && f.abs() < 1e15 {
+        let _ = write!(out, "{:.1}", f);
+    } else {
+        let _ = write!(out, "{}", f);
+    }
+}
+
+unsafe fn push_display_value(out: &mut String, tagged: *const TaggedVal) {
+    use std::fmt::Write as _;
     if tagged.is_null() {
-        return "null".to_string();
+        out.push_str("null");
+        return;
     }
     let tag = (*tagged).tag;
     let payload = (*tagged).payload;
-    if tag == TAG_NULL { return "null".to_string(); }
-    if tag == TAG_BOOL { return if payload != 0 { "true" } else { "false" }.to_string(); }
-    if tag == TAG_INT32 { return (payload as i32).to_string(); }
-    if tag == TAG_INT64 { return (payload as i64).to_string(); }
-    if tag == crate::tagged::TAG_UINT64 { return payload.to_string(); }
+    if tag == TAG_NULL { out.push_str("null"); return; }
+    if tag == TAG_BOOL { out.push_str(if payload != 0 { "true" } else { "false" }); return; }
+    if tag == TAG_INT32 { let _ = write!(out, "{}", payload as i32); return; }
+    if tag == TAG_INT64 { let _ = write!(out, "{}", payload as i64); return; }
+    if tag == crate::tagged::TAG_UINT64 { let _ = write!(out, "{}", payload); return; }
     if tag == TAG_FLOAT32 {
-        let f = f32::from_bits(payload as u32);
-        return format!("{}", f);
+        push_display_float_plain(out, f32::from_bits(payload as u32) as f64);
+        return;
     }
     if tag == TAG_FLOAT64 {
-        let f = f64::from_bits(payload);
-        return format!("{}", f);
+        push_display_float_plain(out, f64::from_bits(payload));
+        return;
     }
     if tag == TAG_STR {
         let s = payload as *const LinString;
-        if s.is_null() { return "null".to_string(); }
-        return format!("\"{}\"", (*s).as_str());
+        if s.is_null() { out.push_str("null"); return; }
+        out.push('"');
+        out.push_str((*s).as_str());
+        out.push('"');
+        return;
     }
     if tag == TAG_ARRAY {
         let arr = payload as *const crate::array::LinArray;
-        if arr.is_null() { return "[]".to_string(); }
-        return array_to_json_string(arr);
+        if arr.is_null() { out.push_str("[]"); return; }
+        push_display_array(out, arr);
+        return;
     }
     if tag == TAG_OBJECT {
         let obj = payload as *const crate::object::LinObject;
-        if obj.is_null() { return "{}".to_string(); }
-        return object_to_json_string(obj);
+        if obj.is_null() { out.push_str("{}"); return; }
+        push_display_object(out, obj);
+        return;
     }
     if tag == crate::tagged::TAG_SUMNODE {
         // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` field reached the
         // (lossy display) object stringifier — materialize it to a real LinObject and serialize, then
         // release the transient. This makes `toString(record_with_sum_field)` correct (NOT `[object]`).
         let obj = crate::sumnode::lin_sumnode_materialize(payload as *mut u8);
-        if obj.is_null() { return "[object]".to_string(); }
-        let s = object_to_json_string(obj as *const crate::object::LinObject);
+        if obj.is_null() { out.push_str("[object]"); return; }
+        push_display_object(out, obj as *const crate::object::LinObject);
         crate::object::lin_object_release(obj as *mut crate::object::LinObject);
-        return s;
+        return;
     }
-    "[object]".to_string()
+    out.push_str("[object]");
 }
 
 unsafe fn array_to_json_string(arr: *const crate::array::LinArray) -> String {
+    let mut out = String::new();
+    push_display_array(&mut out, arr);
+    out
+}
+
+unsafe fn push_display_array(out: &mut String, arr: *const crate::array::LinArray) {
     use crate::tagged::*;
+    use std::fmt::Write as _;
     let len = (*arr).len as usize;
-    let mut parts = Vec::with_capacity(len);
     let elem_tag = (*arr).elem_tag;
+    out.push('[');
     for i in 0..len {
-        let s = match elem_tag {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        match elem_tag {
             0xFF => {
                 // Tagged array: elements are TaggedVal structs (16 bytes each).
                 let elem = (*arr).data.add(i);
-                tagged_to_json_string(elem as *const TaggedVal)
+                push_display_value(out, elem as *const TaggedVal);
             }
-            TAG_INT32 => {
-                let v = *((*arr).data as *const i32).add(i);
-                format!("{}", v)
-            }
-            TAG_INT64 => {
-                let v = *((*arr).data as *const i64).add(i);
-                format!("{}", v)
-            }
-            TAG_FLOAT32 => {
-                let v = *((*arr).data as *const f32).add(i) as f64;
-                if v.fract() == 0.0 && v.abs() < 1e15 { format!("{:.1}", v) } else { format!("{}", v) }
-            }
-            TAG_FLOAT64 => {
-                let v = *((*arr).data as *const f64).add(i);
-                if v.fract() == 0.0 && v.abs() < 1e15 { format!("{:.1}", v) } else { format!("{}", v) }
-            }
-            TAG_BOOL => {
-                let v = *((*arr).data as *const u8).add(i);
-                if v != 0 { "true".to_string() } else { "false".to_string() }
-            }
-            TAG_UINT8 => {
-                let v = *((*arr).data as *const u8).add(i);
-                format!("{}", v)
-            }
-            TAG_INT8 => {
-                let v = *((*arr).data as *const i8).add(i);
-                format!("{}", v)
-            }
-            TAG_UINT16 => {
-                let v = *((*arr).data as *const u16).add(i);
-                format!("{}", v)
-            }
-            TAG_INT16 => {
-                let v = *((*arr).data as *const i16).add(i);
-                format!("{}", v)
-            }
-            TAG_UINT32 => {
-                let v = *((*arr).data as *const u32).add(i);
-                format!("{}", v)
-            }
-            TAG_UINT64 => {
-                let v = *((*arr).data as *const u64).add(i);
-                format!("{}", v)
-            }
-            _ => "null".to_string(),
-        };
-        parts.push(s);
+            TAG_INT32 => { let _ = write!(out, "{}", *((*arr).data as *const i32).add(i)); }
+            TAG_INT64 => { let _ = write!(out, "{}", *((*arr).data as *const i64).add(i)); }
+            TAG_FLOAT32 => push_display_float_dot1(out, *((*arr).data as *const f32).add(i) as f64),
+            TAG_FLOAT64 => push_display_float_dot1(out, *((*arr).data as *const f64).add(i)),
+            TAG_BOOL => out.push_str(if *((*arr).data as *const u8).add(i) != 0 { "true" } else { "false" }),
+            TAG_UINT8 => { let _ = write!(out, "{}", *((*arr).data as *const u8).add(i)); }
+            TAG_INT8 => { let _ = write!(out, "{}", *((*arr).data as *const i8).add(i)); }
+            TAG_UINT16 => { let _ = write!(out, "{}", *((*arr).data as *const u16).add(i)); }
+            TAG_INT16 => { let _ = write!(out, "{}", *((*arr).data as *const i16).add(i)); }
+            TAG_UINT32 => { let _ = write!(out, "{}", *((*arr).data as *const u32).add(i)); }
+            TAG_UINT64 => { let _ = write!(out, "{}", *((*arr).data as *const u64).add(i)); }
+            _ => out.push_str("null"),
+        }
     }
-    format!("[{}]", parts.join(", "))
+    out.push(']');
 }
 
 unsafe fn object_to_json_string(obj: *const crate::object::LinObject) -> String {
+    let mut out = String::new();
+    push_display_object(&mut out, obj);
+    out
+}
+
+unsafe fn push_display_object(out: &mut String, obj: *const crate::object::LinObject) {
     let len = (*obj).len as usize;
-    let mut parts = Vec::with_capacity(len);
+    out.push('{');
     for i in 0..len {
+        if i > 0 {
+            out.push_str(", ");
+        }
         let entry = (*obj).entries.add(i);
         let key = (*entry).key;
-        let key_str = if key.is_null() { "null".to_string() } else { (*key).as_str().to_string() };
-        let val_str = tagged_to_json_string(&(*entry).value as *const TaggedVal);
-        parts.push(format!("\"{}\": {}", key_str, val_str));
+        out.push('"');
+        if key.is_null() { out.push_str("null"); } else { out.push_str((*key).as_str()); }
+        out.push_str("\": ");
+        push_display_value(out, &(*entry).value as *const TaggedVal);
     }
-    format!("{{{}}}", parts.join(", "))
+    out.push('}');
 }
 
 /// Convert a LinArray* to its JSON string representation.
