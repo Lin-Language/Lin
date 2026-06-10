@@ -480,8 +480,17 @@ fn mangle_type(ty: &Type) -> String {
         // Include each field's name and recursively-mangled type so structurally-distinct records
         // get distinct names. Field order is the declaration `IndexMap` order (canonical, ADR Stage
         // 0.5), so identical shapes still collapse to one specialization.
-        Type::Object { fields, .. } => {
-            let mut s = String::from("Obj");
+        //
+        // The `sealed` flag MUST be part of the name (F1): a sealed record is a packed struct, an
+        // unsealed one is a boxed `LinObject` — physically different layouts. `instantiation_key`
+        // keys on `format!("{:?}", t)`, which (via derived `Debug`) DOES include `sealed`, so a
+        // generic instantiated once at a sealed record and once at a structurally-identical unsealed
+        // one mints TWO specializations. If the name dropped `sealed` they would collide under one
+        // symbol — the second body unreachable, the surviving body reading the other layout (a
+        // misaligned-pointer crash). So the dedup key and the symbol name must agree about `sealed`:
+        // distinct key ⇒ distinct name. Identical-shape-and-seal records still collapse to one.
+        Type::Object { fields, sealed } => {
+            let mut s = String::from(if *sealed { "SObj" } else { "Obj" });
             for (k, fty) in fields.iter() {
                 s.push('_');
                 s.push_str(k);
@@ -2639,5 +2648,74 @@ fn for_each_child_stmt_mut(stmt: &mut TypedStmt, f: &mut dyn FnMut(&mut TypedExp
         TypedStmt::Destructure { value, .. } | TypedStmt::ArrayDestructure { value, .. } => f(value),
         TypedStmt::Expr(e) => f(e),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indexmap::IndexMap;
+
+    fn fields(pairs: &[(&str, Type)]) -> IndexMap<String, Type> {
+        pairs.iter().map(|(k, t)| (k.to_string(), t.clone())).collect()
+    }
+
+    // F1 invariant: whenever two instantiations have DISTINCT `instantiation_key`s, they must get
+    // DISTINCT `specialization_name`s — otherwise the monomorphizer mints two bodies under one
+    // symbol (the second unreachable; the survivor reads the other layout → misaligned crash).
+    // The historically-leaky axis is `sealed`, which the key includes (derived Debug) but the name
+    // used to drop. This asserts key-distinct ⇒ name-distinct over a panel that includes a
+    // sealed-vs-unsealed SAME-SHAPE pair.
+    #[test]
+    fn distinct_instantiation_key_implies_distinct_name() {
+        let shape = [("x", Type::Int32), ("y", Type::Str)];
+        let cases: Vec<Type> = vec![
+            Type::object(fields(&shape)),         // unsealed {x: Int32, y: String}
+            Type::sealed_object(fields(&shape)),  // sealed, SAME shape — the F1 collision pair
+            Type::Int32,
+            Type::object(fields(&[("x", Type::Int32)])),
+            Type::sealed_object(fields(&[("x", Type::Int32)])),
+        ];
+
+        for (i, a) in cases.iter().enumerate() {
+            for (j, b) in cases.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let subs_a: HashMap<u32, Type> = [(0u32, a.clone())].into_iter().collect();
+                let subs_b: HashMap<u32, Type> = [(0u32, b.clone())].into_iter().collect();
+                let key_a = instantiation_key(0, &subs_a);
+                let key_b = instantiation_key(0, &subs_b);
+                if key_a != key_b {
+                    let name_a = specialization_name("f", &subs_a);
+                    let name_b = specialization_name("f", &subs_b);
+                    assert_ne!(
+                        name_a, name_b,
+                        "distinct instantiation_key for {a:?} vs {b:?} produced colliding symbol name {name_a}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Conversely, the sealed-vs-unsealed same-shape pair must actually BE key-distinct (so the
+    // mint-two-specs branch is exercised) — the whole point of F1 is that they are two layouts.
+    #[test]
+    fn sealed_and_unsealed_same_shape_are_key_distinct_and_name_distinct() {
+        let shape = [("x", Type::Int32), ("y", Type::Str)];
+        let unsealed: HashMap<u32, Type> =
+            [(0u32, Type::object(fields(&shape)))].into_iter().collect();
+        let sealed: HashMap<u32, Type> =
+            [(0u32, Type::sealed_object(fields(&shape)))].into_iter().collect();
+        assert_ne!(
+            instantiation_key(0, &unsealed),
+            instantiation_key(0, &sealed),
+            "sealed differs in Debug so keys must differ"
+        );
+        assert_ne!(
+            specialization_name("f", &unsealed),
+            specialization_name("f", &sealed),
+            "sealed-distinct instantiations must get distinct symbol names"
+        );
     }
 }
