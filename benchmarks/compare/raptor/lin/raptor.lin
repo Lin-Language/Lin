@@ -3,7 +3,7 @@
 // createRaptor(trips, transfers, interchange, date?) prepares the indexes and returns a
 // record { routeStopIndex, routePath, transfers, interchange, stops, routesAtStop, tripsByRoute }.
 // scan(raptor, origins, date, dow) runs the rounds and returns [kConnections, bestArrivals].
-import { for } from "std/iter"
+import { for, some } from "std/iter"
 import { keys, get } from "std/object"
 import { join } from "std/string"
 import { length, push, slice, sort } from "std/array"
@@ -21,9 +21,10 @@ val OVERTAKING_ROUTE_SUFFIX = "overtakes"
 // single-level `m[k] ?? default` reads that originate from a bare `{ String: T }` map now use
 // `std/object.get` directly. This helper is RETAINED for the two reads `object.get` cannot
 // express:
-//   1. `raptor["interchange"][stop]` — `interchange` is a `Json` map (it ORIGINATES from the
-//      loader; RaptorIndex types it `Json`, and there is no implicit `Json -> { String: T }`
-//      coercion, §5.1.1), so `get`'s `{ String: T }` first param does not accept it.
+//   1. `interchange[stop]` (the map hoisted from `raptor["interchange"]` in scanRoutes) —
+//      `interchange` is a `Json` map (it ORIGINATES from the loader; RaptorIndex types it
+//      `Json`, and there is no implicit `Json -> { String: T }` coercion, §5.1.1), so
+//      `get`'s `{ String: T }` first param does not accept it.
 //   2. `raptor["routeStopIndex"][routeId][stop]` — a NESTED double-index whose intermediate is a
 //      `{ String: Int32 } | Null`; `get` is single-level and does not apply to a nested read.
 val intOr = (x: Int32 | Null, d: Int32): Int32 =>
@@ -46,10 +47,11 @@ val getRouteId = (trip: Json, tripsByRoute: { String: Json[] }): String =>
   val existing = get(tripsByRoute, routeId, [])
   val lastStop = trip["stopTimes"][length(trip["stopTimes"]) - 1]
   val arrivalTimeA = lastStop["arrivalTime"]
-  var overtakes = false
-  existing.for(t =>
+  // `some` short-circuits on the first later-arriving same-signature trip (the reference
+  // for-loop returns out of the loop) instead of scanning every existing trip.
+  val overtakes = existing.some(t =>
     val tLast = t["stopTimes"][length(t["stopTimes"]) - 1]
-    if arrivalTimeA < tLast["arrivalTime"] then overtakes = true
+    arrivalTimeA < tLast["arrivalTime"]
   )
   if overtakes then "${routeId}${OVERTAKING_ROUTE_SUFFIX}" else routeId
 
@@ -150,6 +152,9 @@ val indexRoute = (path: String[], i: Int32, trip: Json, routeId: String, routeSt
 // --- scan ---
 val scanRoutes = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json, markedStops: Json): Null =>
   val queue = getQueue(raptor["routesAtStop"], raptor["routeStopIndex"], markedStops)
+  // hoist the interchange map ONCE per round — scanRouteAt was re-projecting it from the
+  // index record on every stop of every route.
+  val interchange = raptor["interchange"]
   keys(queue).for(routeId =>
     // queue[routeId] is `String | Null`; narrow to the boarding stop (always present —
     // it was just inserted by getQueue — but the value type is not `is`-narrowable).
@@ -160,6 +165,7 @@ val scanRoutes = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json,
           raptor,
           results,
           routeScanner,
+          interchange,
           routeId,
           intOr(raptor["routeStopIndex"][routeId][stopPRaw], 0)
         )
@@ -168,128 +174,133 @@ val scanRoutes = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json,
   )
 
 // Per-route forward scan from the boarding position, threading (trip, boardingPoint).
-val scanRoute = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json, routeId: String, startPi: Int32): Null =>
+val scanRoute = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json, interchange: Json, routeId: String, startPi: Int32): Null =>
   // The route key is always present (inserted by indexRoute), so the `[]` default is dead — but
   // `get` gives a clean single-level defaulted read over the `{ String: String[] }` routePath map.
   val routePath = get(raptor["routePath"], routeId, [])
   val routePathLength = length(routePath)
   scanRouteAt(
-    raptor,
     results,
     routeScanner,
     routeId,
     routePath,
     routePathLength,
+    interchange,
     startPi,
     null,
     -1
   )
 
-val scanRouteAt = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json, routeId: String, routePath: Json, routePathLength: Int32, pi: Int32, trip: Json, boardingPoint: Int32): Null =>
+// previousArrival is a PURE read, so it is deferred onto the branches that consume it
+// (trip == null, or the trip != null else-if) instead of being computed unconditionally —
+// the setTrip fast path of the hot inner loop never needs it.
+val scanRouteAt = (results: ScanResults, routeScanner: Json, routeId: String, routePath: Json, routePathLength: Int32, interchange: Json, pi: Int32, trip: Json, boardingPoint: Int32): Null =>
   if pi >= routePathLength then
     null
   else
     val stopPi = routePath[pi]
-    val prevArrival = previousArrival(results, stopPi)
     if trip != null then
-      val ic = intOr(raptor["interchange"][stopPi], 0)
+      val ic = intOr(interchange[stopPi], 0)
       val stopTime = trip["stopTimes"][pi]
       if stopTime["dropOff"] && stopTime["arrivalTime"] + ic < bestArrival(results, stopPi) then
         setTrip(results, trip, boardingPoint, pi, ic)
         scanRouteAt(
-          raptor,
           results,
           routeScanner,
           routeId,
           routePath,
           routePathLength,
+          interchange,
           pi + 1,
           trip,
           boardingPoint
         )
-      else if prevArrival != null && prevArrival < stopTime["arrivalTime"] + ic then
-        val newTrip = getTrip(routeScanner, routeId, pi, prevArrival)
-        if newTrip != null then
+      else
+        val prevArrival = previousArrival(results, stopPi)
+        if prevArrival != null && prevArrival < stopTime["arrivalTime"] + ic then
+          val newTrip = getTrip(routeScanner, routeId, pi, prevArrival)
+          if newTrip != null then
+            scanRouteAt(
+              results,
+              routeScanner,
+              routeId,
+              routePath,
+              routePathLength,
+              interchange,
+              pi + 1,
+              newTrip,
+              pi
+            )
+          else
+            scanRouteAt(
+              results,
+              routeScanner,
+              routeId,
+              routePath,
+              routePathLength,
+              interchange,
+              pi + 1,
+              trip,
+              boardingPoint
+            )
+        else
           scanRouteAt(
-            raptor,
             results,
             routeScanner,
             routeId,
             routePath,
             routePathLength,
+            interchange,
+            pi + 1,
+            trip,
+            boardingPoint
+          )
+    else
+      val prevArrival = previousArrival(results, stopPi)
+      if prevArrival != null then
+        val newTrip = getTrip(routeScanner, routeId, pi, prevArrival)
+        if newTrip != null then
+          scanRouteAt(
+            results,
+            routeScanner,
+            routeId,
+            routePath,
+            routePathLength,
+            interchange,
             pi + 1,
             newTrip,
             pi
           )
         else
           scanRouteAt(
-            raptor,
             results,
             routeScanner,
             routeId,
             routePath,
             routePathLength,
+            interchange,
             pi + 1,
             trip,
             boardingPoint
           )
       else
         scanRouteAt(
-          raptor,
           results,
           routeScanner,
           routeId,
           routePath,
           routePathLength,
+          interchange,
           pi + 1,
           trip,
           boardingPoint
         )
-    else if prevArrival != null then
-      val newTrip = getTrip(routeScanner, routeId, pi, prevArrival)
-      if newTrip != null then
-        scanRouteAt(
-          raptor,
-          results,
-          routeScanner,
-          routeId,
-          routePath,
-          routePathLength,
-          pi + 1,
-          newTrip,
-          pi
-        )
-      else
-        scanRouteAt(
-          raptor,
-          results,
-          routeScanner,
-          routeId,
-          routePath,
-          routePathLength,
-          pi + 1,
-          trip,
-          boardingPoint
-        )
-    else
-      scanRouteAt(
-        raptor,
-        results,
-        routeScanner,
-        routeId,
-        routePath,
-        routePathLength,
-        pi + 1,
-        trip,
-        boardingPoint
-      )
 
 val scanTransfers = (raptor: RaptorIndex, results: ScanResults, markedStops: Json): Null =>
   markedStops.for(stopP =>
-    val transfers = if raptor["transfers"][stopP] == null then
-      []
-    else
-      raptor["transfers"][stopP]
+    // read the per-origin transfer list ONCE (it was projected twice: null test + use)
+    val transferList = raptor["transfers"][stopP]
+    val transfers = if transferList == null then [] else transferList
     transfers.for(transfer =>
       val stopPi = transfer["destination"]
       // On the FULL feed a transfer destination may not lie on any route path, so its
