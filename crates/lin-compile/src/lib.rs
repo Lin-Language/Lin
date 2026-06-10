@@ -1351,13 +1351,56 @@ This is likely a compiler bug — please report it at https://github.com/linusno
     );
     let detail = raw.trim();
     if !detail.is_empty() {
-        // Collapse to the first few non-empty lines so the details stay scannable.
-        let snippet: Vec<&str> = detail.lines().filter(|l| !l.trim().is_empty()).take(4).collect();
+        let snippet = select_link_detail_lines(detail);
         if !snippet.is_empty() {
             msg.push_str(&format!("\n(details: {})", snippet.join(" | ")));
         }
     }
     msg
+}
+
+/// Pick the most useful non-empty lines from raw linker output for the `(details: …)` suffix.
+///
+/// The naive "first N non-empty lines" approach is wrong on macOS, where the linker output often
+/// opens with a run of benign `ld: warning:` lines (e.g. "object file … was built for newer
+/// 'macOS' version") — taking the first few keeps only warnings and truncates away the actual
+/// error. So we prioritise lines that look like real errors and demote pure warning lines,
+/// falling back to warnings only when there is genuinely nothing else.
+fn select_link_detail_lines(detail: &str) -> Vec<&str> {
+    // A pure warning line carries no failure cause; demote it.
+    fn is_warning(line: &str) -> bool {
+        let l = line.trim();
+        l.starts_with("ld: warning:") || l.starts_with("warning:")
+    }
+    // Lines that positively look like the failure we want to surface.
+    fn looks_like_error(line: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("error")
+            || lower.contains("fatal")
+            || lower.contains("undefined")
+            || lower.contains("duplicate symbol")
+            || lower.contains("cannot find")
+            // An `ld:`-prefixed line that isn't a warning is almost always the real diagnostic.
+            || (lower.trim_start().starts_with("ld:") && !is_warning(line))
+    }
+
+    const MAX_LINES: usize = 6;
+    let lines = || detail.lines().filter(|l| !l.trim().is_empty());
+
+    // First choice: lines that positively look like errors.
+    let errors: Vec<&str> = lines().filter(|l| looks_like_error(l)).take(MAX_LINES).collect();
+    if !errors.is_empty() {
+        return errors;
+    }
+
+    // Otherwise: any non-warning lines (still better than warnings).
+    let non_warnings: Vec<&str> = lines().filter(|l| !is_warning(l)).take(MAX_LINES).collect();
+    if !non_warnings.is_empty() {
+        return non_warnings;
+    }
+
+    // Last resort: nothing but warnings — surface them so a bug report still carries something.
+    lines().take(MAX_LINES).collect()
 }
 
 fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: bool, debug: bool) -> Result<(), CompileError> {
@@ -1710,4 +1753,55 @@ fn find_runtime_lib() -> Option<PathBuf> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod link_error_tests {
+    use super::*;
+
+    #[test]
+    fn details_prefer_real_error_over_leading_warnings() {
+        // macOS-shaped output: a run of benign warnings, then the real failure last.
+        let raw = "\
+ld: warning: object file (.../liblin_runtime.a[173](curve25519.o)) was built for newer 'macOS' version (15.5) than being linked (15.0)
+ld: warning: object file (.../liblin_runtime.a[174](sha512.o)) was built for newer 'macOS' version (15.5) than being linked (15.0)
+ld: warning: object file (.../liblin_runtime.a[175](aes.o)) was built for newer 'macOS' version (15.5) than being linked (15.0)
+ld: warning: object file (.../liblin_runtime.a[176](poly1305.o)) was built for newer 'macOS' version (15.5) than being linked (15.0)
+Undefined symbols for architecture arm64:
+  \"_lin_process_spawn\", referenced from: ...
+ld: symbol(s) not found for architecture arm64";
+
+        let msg = classify_link_failure(raw);
+        assert!(
+            msg.contains("could not build your program: the final build step failed for an unrecognised reason"),
+            "top line changed: {msg}"
+        );
+        // The real error must survive.
+        assert!(msg.contains("Undefined symbols for architecture arm64"), "lost the real error: {msg}");
+        assert!(msg.contains("symbol(s) not found"), "lost the trailing ld error: {msg}");
+        // The benign warnings must be deprioritised out of the details.
+        assert!(!msg.contains("built for newer 'macOS' version"), "warnings leaked into details: {msg}");
+    }
+
+    #[test]
+    fn details_fall_back_to_warnings_when_nothing_else() {
+        let raw = "\
+ld: warning: a
+ld: warning: b";
+        let msg = classify_link_failure(raw);
+        // With nothing better, warnings are still surfaced rather than empty details.
+        assert!(msg.contains("ld: warning: a"), "expected warning fallback: {msg}");
+    }
+
+    #[test]
+    fn select_lines_prefers_errors() {
+        let raw = "\
+ld: warning: w1
+ld: warning: w2
+clang: error: linker command failed with exit code 1
+some trailing note";
+        let lines = select_link_detail_lines(raw);
+        assert!(lines.iter().any(|l| l.contains("error: linker command failed")));
+        assert!(!lines.iter().any(|l| l.contains("warning")));
+    }
 }
