@@ -8672,6 +8672,7 @@ fn register_default_adapters(
         params: params.iter().map(|p| p.ty.clone()).collect(),
         ret: Box::new(ret_type.clone()),
         required,
+        lset: lin_check::types::LambdaSet::Top,
     };
     // A monomorphized spec of a generic optional-default function can be REPRESENTATIONALLY
     // INVALID to default-fill: `at = <T, D>(…, default: D = null)` instantiated at `D = Int32`
@@ -9363,6 +9364,7 @@ fn lower_function_expr_with_id(
         params: params.iter().map(|p| p.ty.clone()).collect(),
         ret: Box::new(ret_type.clone()),
         required: params.iter().filter(|p| p.default.is_none()).count(),
+        lset: lin_check::types::LambdaSet::Top,
     };
     let dst = builder.alloc_temp(closure_ty.clone());
     builder.emit(Instruction::MakeClosure {

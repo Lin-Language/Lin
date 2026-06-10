@@ -6733,6 +6733,7 @@ mod tests {
             params: vec![Type::TypeVar(9004), Type::TypeVar(9005)],
             ret: Box::new(Type::Array(Box::new(Type::TypeVar(9004)))),
             required: 2,
+            lset: lin_check::types::LambdaSet::Top,
         };
         assert_eq!(clean_type_string(&ty.to_string()), "(T, U) => T[]");
     }

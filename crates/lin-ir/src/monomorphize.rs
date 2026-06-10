@@ -232,10 +232,11 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
             fields: fields.iter().map(|(k, v)| (k.clone(), subst_type(v, subs))).collect(),
             sealed: *sealed,
         },
-        Type::Function { params, ret, required } => Type::Function {
+        Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(|p| subst_type(p, subs)).collect(),
             ret: Box::new(subst_type(ret, subs)),
             required: *required,
+            lset: lset.clone(),
         },
         _ => ty.clone(),
     }
@@ -285,10 +286,11 @@ fn erase_nonconcrete_typevars(ty: &Type) -> Type {
             fields: fields.iter().map(|(k, v)| (k.clone(), erase_nonconcrete_typevars(v))).collect(),
             sealed: *sealed,
         },
-        Type::Function { params, ret, required } => Type::Function {
+        Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(erase_nonconcrete_typevars).collect(),
             ret: Box::new(erase_nonconcrete_typevars(ret)),
             required: *required,
+            lset: lset.clone(),
         },
         _ => ty.clone(),
     }
@@ -520,8 +522,13 @@ fn specialization_name(base: &str, subs: &HashMap<u32, Type>) -> String {
 
 /// A canonical, hashable key for an instantiation (generic slot + sorted concrete args).
 fn instantiation_key(slot: usize, subs: &HashMap<u32, Type>) -> (usize, Vec<(u32, String)>) {
+    // Erase lambda-set metadata before keying: the key uses `Debug`, and two otherwise-identical
+    // instantiations whose function-typed args carry DIFFERENT lambda sets must still collapse to
+    // ONE specialization (the set is inert metadata, never a codegen distinction). Without this the
+    // Path-11 field would silently split specializations and change which monomorphizations are
+    // emitted — a behaviour change. Erasing keeps the key byte-identical to pre-Path-11.
     let mut entries: Vec<(u32, String)> =
-        subs.iter().map(|(id, t)| (*id, format!("{:?}", t))).collect();
+        subs.iter().map(|(id, t)| (*id, format!("{:?}", t.erase_lambda_sets()))).collect();
     entries.sort();
     (slot, entries)
 }
@@ -1947,6 +1954,9 @@ fn eta_expand_named_arg(arg: &mut TypedExpr, state: &mut MonoState<'_>) -> bool 
         ret_type: ret,
         captures: vec![],
         span,
+        // Synthesized eta-expansion wrapper — runs AFTER checking, so it has no checker-assigned
+        // lambda identity; `0` => `Top` (lambda-set inference never sees this node).
+        lambda_id: 0,
     };
     true
 }
@@ -2167,6 +2177,7 @@ fn repoint_call_native(
         params: concrete_params,
         ret: Box::new(concrete_ret.clone()),
         required,
+        lset: lin_check::types::LambdaSet::Top,
     };
     let TypedExpr::Call { func, result_type, .. } = expr else { return };
     if let TypedExpr::LocalGet { slot: fslot, ty, .. } = func.as_mut() {
@@ -2224,6 +2235,7 @@ fn boxed_fallback_call(
         params: params.iter().map(|p| p.ty.clone()).collect(),
         ret: Box::new(ret_type.clone()),
         required,
+        lset: lin_check::types::LambdaSet::Top,
     };
     if let TypedExpr::LocalGet { slot: fslot, ty, .. } = func.as_mut() {
         *fslot = gslot;
