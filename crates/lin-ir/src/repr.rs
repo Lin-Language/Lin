@@ -16,10 +16,10 @@
 //!
 //! # Why a side table, not a Type attribute
 //!
-//! The same static `Type` is packed in one temp (just constructed) and boxed-wrapping-packed in
-//! another (read from a Map slot). `Repr::Boxed(Inner::WrapsPacked)` — a boxed slot whose payload is
-//! a still-packed buffer — is UNSPEAKABLE in the type system. Representation is flow-sensitive and
-//! per-occurrence; Type is flow-insensitive. See the design doc, "Why NOT on Type".
+//! Representation is flow-sensitive and per-occurrence; `Type` is flow-insensitive. The lattice
+//! carries the per-temp `Packed`/`Boxed`/`FlatScalar` fact that lets the `verify` pass catch a
+//! producer/consumer representation mismatch as a compile-time panic. See the design doc,
+//! "Why NOT on Type".
 //!
 //! # The lattice
 //!
@@ -41,21 +41,16 @@ use crate::ir::*;
 // ---------------------------------------------------------------------------
 
 /// Physical layout of a packed (un-boxed) sealed value. Two packed values share a layout iff they
-/// have the same field map (and, for arrays, the same on-heap flag), so the field `IndexMap` is the
-/// layout key. `Type::PartialEq` ignores the `sealed` flag but DOES compare field maps, so equal
-/// `fields` ⇒ equal layout — exactly what we want.
+/// have the same field map, so the field `IndexMap` is the layout key. `Type::PartialEq` ignores the
+/// `sealed` flag but DOES compare field maps, so equal `fields` ⇒ equal layout — exactly what we want.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Layout {
     /// A sealed scalar/heap-field record laid out as a packed `[u32 rc | u32 size | desc | fields…]`
     /// struct (the `Codegen::sealed_fields` representation).
     PackedStruct { fields: IndexMap<String, Type> },
     /// A `LinArray` with `elem_tag == 0xFE`: a contiguous, header-less buffer of packed sealed-record
-    /// elements (the `Codegen::sealed_array_elem` representation). `on_heap` records whether any
-    /// element field is a heap pointer (String/Array/nested-sealed) — true for Stage-3b heap-field
-    /// arrays, meaning element drop runs per-field release (`release_sealed_array_elems`). It is a
-    /// deterministic function of `elem_layout` (`elem_layout_on_heap`), so it never independently
-    /// affects the lattice join.
-    PackedSealedArray { elem_layout: IndexMap<String, Type>, on_heap: bool },
+    /// elements (the `Codegen::sealed_array_elem` representation).
+    PackedSealedArray { elem_layout: IndexMap<String, Type> },
     /// An unboxed tagged sum-type value (`lin_runtime::sumnode` — unboxed-sumtype Stage 1): a pointer
     /// to a heap `SumNode` `[u32 rc | u32 size | u64 desc | u32 tag | u32 pad | max-variant payload]`.
     /// The layout key is the WHOLE sum type's field shape: the discriminant key plus the ordered
@@ -67,15 +62,18 @@ pub enum Layout {
 }
 
 /// What a `Boxed` slot wraps.
+///
+/// Today there is exactly one inhabitant: `Opaque`. The retired keep-packed direction (Path-9,
+/// ADR-063) needed a `WrapsPacked(Layout)` variant for a boxed slot whose payload pointer is a
+/// still-packed buffer, but its only consumer (`codegen/rc.rs`) treated it identically to `Opaque`
+/// and the IR ops that produced it (`BoxKeepPacked`/`UnboxKeepPacked`) were never emitted, so it was
+/// inert. It was removed when that machinery was deleted. The enum is retained (rather than collapsing
+/// `Boxed(Inner)` to a bare `Boxed`) so re-landing a flow-sensitive boxed refinement stays a one-line
+/// variant add.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inner {
     /// A generic boxed value: `LinObject` / boxed `Object[]` / heterogeneous `TaggedVal`.
     Opaque,
-    /// KEY refinement: a boxed slot (`TaggedVal` TAG_ARRAY / TAG_OBJECT) whose payload pointer is a
-    /// STILL-PACKED `LinArray*` / packed struct*. This is the keep-packed-by-pointer representation
-    /// the static type system cannot express. (Seeded but not yet materialized into IR until later
-    /// stages; in Stage 2 it documents the boundary the design will exploit.)
-    WrapsPacked(Layout),
 }
 
 /// The fixed-width scalar a `FlatScalar` temp holds unboxed (mirrors `Codegen::is_flat_scalar`).
@@ -167,7 +165,7 @@ impl Repr {
 ///   - `Packed(_)` vs `Boxed(_)` is a CONFLICT → returns `Boxed(Opaque)` and the caller records the
 ///     class as a BOUNDARY (Stage 3+ will SPLIT it with a coercion; Stage 2 only observes).
 ///   - `FlatScalar(s)` vs `FlatScalar(s)` stays; mismatched flats demote to `Boxed(Opaque)`
-///   - `Boxed(WrapsPacked(L))` vs `Boxed(WrapsPacked(L))` stays; vs `Boxed(Opaque)` → `Boxed(Opaque)`
+///   - `Boxed(_)` vs `Boxed(_)`: the only inner is `Opaque`, so this stays `Boxed(Opaque)`
 fn join(a: &Repr, b: &Repr) -> Repr {
     use Repr::*;
     match (a, b) {
@@ -187,17 +185,11 @@ fn join(a: &Repr, b: &Repr) -> Repr {
                 Repr::boxed_opaque()
             }
         }
-        (Boxed(i1), Boxed(i2)) => Boxed(join_inner(i1, i2)),
+        // The only `Inner` is `Opaque`, so two boxed reprs always join to `Boxed(Opaque)`.
+        (Boxed(_), Boxed(_)) => Repr::boxed_opaque(),
         // Packed vs Boxed, Packed vs FlatScalar, Boxed vs FlatScalar: representation CONFLICT.
         // Fail safe to Boxed(Opaque); the design's STEP 4 (later stage) splits the class.
         _ => Repr::boxed_opaque(),
-    }
-}
-
-fn join_inner(a: &Inner, b: &Inner) -> Inner {
-    match (a, b) {
-        (Inner::WrapsPacked(l1), Inner::WrapsPacked(l2)) if l1 == l2 => Inner::WrapsPacked(l1.clone()),
-        _ => Inner::Opaque,
     }
 }
 
@@ -414,7 +406,6 @@ fn type_seed(ty: &Type) -> Repr {
     }
     if let Some(elem_fields) = sealed_array_elem(ty) {
         return Repr::Packed(Layout::PackedSealedArray {
-            on_heap: elem_layout_on_heap(elem_fields),
             elem_layout: elem_fields.clone(),
         });
     }
@@ -466,21 +457,10 @@ fn make_array_repr(elem_ty: &Type) -> Repr {
     let arr_ty = Type::Array(Box::new(elem_ty.clone()));
     if let Some(elem_fields) = sealed_array_elem(&arr_ty) {
         return Repr::Packed(Layout::PackedSealedArray {
-            on_heap: elem_layout_on_heap(elem_fields),
             elem_layout: elem_fields.clone(),
         });
     }
     Repr::boxed_opaque()
-}
-
-/// True iff a packed-element layout has ANY heap field (String / Array / nested-sealed) — i.e. an
-/// element drop must release per-field owned pointers (`release_sealed_array_elems`), not just free
-/// the contiguous scalar buffer. Recorded on `Layout::PackedSealedArray` so two layouts with the same
-/// field map but a different heap-ness (which cannot actually occur for a given field map, but the
-/// flag must stay a deterministic function of `elem_layout` so the lattice join never spuriously
-/// demotes) compare equal. Mirrors `Codegen::sealed_field_kind` heap-ness.
-fn elem_layout_on_heap(fields: &IndexMap<String, Type>) -> bool {
-    fields.values().any(is_sealed_heap_field)
 }
 
 // ---------------------------------------------------------------------------
@@ -622,7 +602,6 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
                 // read it packed (the repr.rs:1068 oracle disagreement → release-build segfault on the
                 // RAPTOR Trip{stopTimes:StopTime[]} shape). Mirrors `type_seed`'s array arm.
                 set(seeds, *dst, Repr::Packed(Layout::PackedSealedArray {
-                    on_heap: elem_layout_on_heap(elem_fields),
                     elem_layout: elem_fields.clone(),
                 }));
             } else if let Some(f) = sealed_fields(result_ty) {
@@ -636,7 +615,6 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
                 // Same as FieldGet: a packed element's nested sealed-record-ARRAY field read yields a
                 // PackedSealedArray (the dedicated packed-element field-read op).
                 set(seeds, *dst, Repr::Packed(Layout::PackedSealedArray {
-                    on_heap: elem_layout_on_heap(elem_fields),
                     elem_layout: elem_fields.clone(),
                 }));
             } else if let Some(f) = sealed_fields(result_ty) {
@@ -670,11 +648,9 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
             }
         }
         // ---- Cross-boundary reads: BOXED seeds (the dynamic boundaries the type cannot see) ----
-        // A self/direct/named Call return whose type is packed is returned by-pointer by our ABI
-        // (commitment from the design); seed Boxed(WrapsPacked) for a packed return so the use-site
-        // unbox is justified, else type_seed. For the oracle's purposes the call DST is not itself
-        // an old-predicate decide site, so any reasonable seed is acceptable as long as the join
-        // does not contradict an assume site reading it; default to type_seed (conservative).
+        // A Call return is seeded by its return type's repr (`type_seed`). For the oracle's purposes
+        // the call DST is not itself an old-predicate decide site, so the type seed is acceptable as
+        // long as the join does not contradict an assume site reading it (conservative).
         Instruction::Call { dst, ret_ty, .. } => {
             set(seeds, *dst, type_seed(ret_ty));
         }
@@ -692,22 +668,6 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
         // Box / Unbox: explicit representation changes. Box → Boxed; Unbox → the unboxed type repr.
         Instruction::Box { dst, .. } => set(seeds, *dst, Repr::boxed_opaque()),
         Instruction::Unbox { dst, result_ty, .. } => set(seeds, *dst, type_seed(result_ty)),
-        // Keep-packed coercions: BoxKeepPacked produces a Boxed(WrapsPacked(L)) handle; the inner
-        // layout comes from the source's type. UnboxKeepPacked produces a Packed(L) temp.
-        Instruction::BoxKeepPacked { dst, src, .. } => {
-            let inner = func.temp_types.get(src).cloned().unwrap_or(Type::Null);
-            let layout = match type_seed(&inner) {
-                Repr::Packed(l) => Some(l),
-                _ => None,
-            };
-            set(seeds, *dst, match layout {
-                Some(l) => Repr::Boxed(Inner::WrapsPacked(l)),
-                None => Repr::boxed_opaque(),
-            });
-        }
-        Instruction::UnboxKeepPacked { dst, ty, .. } => {
-            set(seeds, *dst, type_seed(ty));
-        }
         // PURE CARRY edges define a temp that is an ALIAS of its source: its repr comes from the
         // source's class fold (STEP 1 already unified them), NOT from a fresh seed. Seeding them by
         // their declared type would inject a spurious seed that, if it differed from the carried
