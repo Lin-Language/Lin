@@ -5896,10 +5896,130 @@ fn lower_iter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder,
     out
 }
 
-/// Emit the standard index-loop scaffold over `iterable` (length-bounded), invoking
-/// `body_fn(i, elem)` to build the loop body. `body_fn` runs with the builder positioned
-/// in the body block, receiving the current index temp and the loaded element temp; after
-/// it returns, the increment + back-edge are emitted. Leaves the builder in the exit block.
+/// How `emit_combinator_loop` obtains the per-iteration element it hands to the body callback.
+enum ElemAccess<'a> {
+    /// MATERIALIZE the element via `Instruction::Index` (`iterable[i]`) into a fresh temp of the
+    /// given type, then pass that temp to the body. The standard tagged/flat read (ADR-044).
+    Materialize(&'a Type),
+    /// PATH-1 packed VIEW: do NOT materialize — pass the (already-lowered) `iterable` temp itself
+    /// to the body so it can register a packed-element view and read fields by const-offset.
+    Packed,
+}
+
+/// What a combinator loop body decided after running — drives how the latch wires back to the header.
+enum LoopFlow {
+    /// `for`/`map`/`filter`/fusion: the body fell through (it never asks to stop the loop early);
+    /// the latch unconditionally increments and back-edges to the header.
+    Fallthrough,
+    /// `while`: continue to the next iteration only while `cond` (an i1 Bool temp) is true; a false
+    /// predicate (or exhausting the source) EXITS the loop. The body's keep/stop split is emitted
+    /// here as a `CondJump` from the body's final block.
+    ContinueIf(Temp),
+}
+
+/// THE single counted-loop emitter shared by every inline combinator (`for`/`while`/`map`/`filter`,
+/// the scalar prelude of `reduce` excepted — see its note — and the fusion appliers, which reach it
+/// through `emit_index_loop`). Emits the length-bounded `preheader → header(phi i) → body → latch →
+/// header` / `exit` skeleton ONCE, parameterized by:
+///
+///   - `access`: MATERIALIZE the element (`iterable[i]` via `Index`) vs pass a PACKED view of the
+///     iterable (no per-element materialize) — the ONE line that used to fork `emit_index_loop` from
+///     `emit_packed_index_loop`.
+///   - `body_fn(i, elem_or_iterable, …) -> LoopFlow`: builds the body and returns whether the loop
+///     falls through (`for`/`map`/`filter`) or breaks on a false predicate (`while`).
+///
+/// The body may switch basic blocks (an inner combinator / match / multi-branch `if`, or a
+/// filter keep/skip split): the latch is a DEDICATED block that the body's final block jumps into,
+/// so the header phi's back-edge predecessor is ALWAYS the latch — no `patch_phi_incoming` needed
+/// (the latch-relative patching the two hand-rolled emitters used to do is subsumed by always
+/// routing the back-edge through the latch). Leaves the builder positioned in the `exit` block.
+///
+/// ELEMENT-BOX RC is the body's responsibility and is emitted INSIDE `body_fn` (the latch only holds
+/// the index increment): the reclaim discipline is identical to before — this helper centralizes the
+/// loop SCAFFOLDING, not the per-element ownership decision. (The `Index` op for a union/Json `elem`
+/// allocates a fresh 16-byte `TaggedVal*` shell each iteration; `map`/`filter`/`for` reclaim it via
+/// their `free_combinator_*` calls, the move-vs-retain subtlety documented at those call sites.)
+fn emit_combinator_loop<F>(
+    iterable: Temp,
+    iterable_ty: &Type,
+    access: ElemAccess,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    body_fn: F,
+) where
+    F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx) -> LoopFlow,
+{
+    // len = length(iterable) — tag-checked (0 for a non-array Json) when the iterable is union.
+    let len = emit_iterable_len(iterable, iterable_ty, builder);
+    let zero = builder.const_temp(Const::Int(0, Type::Int64));
+
+    let preheader = builder.current_block;
+    let header = builder.alloc_block("for_header");
+    let body = builder.alloc_block("for_body");
+    let latch = builder.alloc_block("for_latch");
+    let exit = builder.alloc_block("for_exit");
+
+    let i = builder.alloc_temp(Type::Int64);
+    let i_next = builder.alloc_temp(Type::Int64);
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(header);
+    // The back-edge always flows through `latch` (the sole predecessor of the header on the loop
+    // back-edge), so the phi incoming can be recorded directly — no latch-relative patch needed.
+    builder.emit(Instruction::Phi {
+        dst: i, ty: Type::Int64,
+        incomings: vec![(zero, preheader), (i_next, latch)],
+    });
+    let cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary {
+        dst: cond, op: BinOp::Lt, lhs: i, rhs: len,
+        operand_ty: Type::Int64, ty: Type::Bool,
+    });
+    builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+
+    builder.switch_to(body);
+    let elem = match access {
+        ElemAccess::Materialize(elem_ty) => {
+            // elem = iterable[i]
+            let elem = builder.alloc_temp(elem_ty.clone());
+            builder.emit(Instruction::Index {
+                dst: elem, object: iterable, key: i,
+                obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+            });
+            elem
+        }
+        // Packed view: the body receives the iterable temp + index and reads fields by const-offset.
+        ElemAccess::Packed => iterable,
+    };
+    let flow = body_fn(i, elem, builder, ctx);
+    // `body_fn` may have switched blocks; whatever block it ended in flows into the latch — either
+    // unconditionally (fallthrough) or via the keep/stop predicate (while's early exit).
+    match flow {
+        LoopFlow::Fallthrough => {
+            if !builder.is_current_block_terminated() {
+                builder.terminate(Terminator::Jump(latch));
+            }
+        }
+        LoopFlow::ContinueIf(keep) => {
+            builder.terminate(Terminator::CondJump { cond: keep, then_block: latch, else_block: exit });
+        }
+    }
+
+    builder.switch_to(latch);
+    let one = builder.const_temp(Const::Int(1, Type::Int64));
+    builder.emit(Instruction::Binary {
+        dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
+        operand_ty: Type::Int64, ty: Type::Int64,
+    });
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(exit);
+}
+
+/// Materializing index-loop over `iterable` (`for`/`map`/`filter` + the fusion appliers): a thin
+/// configuration of [`emit_combinator_loop`] that reads `iterable[i]` into a fresh `elem_ty` temp
+/// and always falls through to the latch. `body_fn(i, elem)` builds the body (and owns the
+/// element-box reclaim). Leaves the builder in the exit block.
 fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
     iterable: Temp,
     iterable_ty: &Type,
@@ -5908,70 +6028,17 @@ fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
     ctx: &mut LowerCtx,
     body_fn: F,
 ) {
-    let elem_ty = elem_ty.clone();
-
-    // len = length(iterable) — tag-checked (0 for a non-array Json) when the iterable is union.
-    let len = emit_iterable_len(iterable, iterable_ty, builder);
-    let zero = builder.const_temp(Const::Int(0, Type::Int64));
-
-    let preheader = builder.current_block;
-    let header = builder.alloc_block("for_header");
-    let body = builder.alloc_block("for_body");
-    let exit = builder.alloc_block("for_exit");
-
-    let i = builder.alloc_temp(Type::Int64);
-    let i_next = builder.alloc_temp(Type::Int64);
-    builder.terminate(Terminator::Jump(header));
-
-    builder.switch_to(header);
-    builder.emit(Instruction::Phi {
-        dst: i, ty: Type::Int64,
-        incomings: vec![(zero, preheader), (i_next, body)],
-    });
-    let cond = builder.alloc_temp(Type::Bool);
-    builder.emit(Instruction::Binary {
-        dst: cond, op: BinOp::Lt, lhs: i, rhs: len,
-        operand_ty: Type::Int64, ty: Type::Bool,
-    });
-    builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
-
-    builder.switch_to(body);
-    // elem = iterable[i]
-    let elem = builder.alloc_temp(elem_ty.clone());
-    builder.emit(Instruction::Index {
-        dst: elem, object: iterable, key: i,
-        obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
-    });
-    body_fn(i, elem, builder, ctx);
-    // NOTE: the `Index` op (`lin_array_get_tagged`) allocates a fresh 16-byte `TaggedVal*` shell
-    // for a union/Json `elem` each iteration; this shell leaks (a residual, distinct from the
-    // for-callback-return leak fixed here). It is NOT reclaimed because the runtime's
-    // `lin_array_push_tagged`/`lin_array_set` MOVE an element's inner into result arrays WITHOUT
-    // retaining, so the element box's inner ownership is consumed unpredictably by the body —
-    // neither a tag-aware release nor a shell-only free is provably safe (both double-free
-    // `map`/`minBy`/`maxBy`, which move elements into result/accumulator arrays). Reclaiming it
-    // safely needs a change to those runtime move-vs-retain conventions, out of scope here.
-    // `body_fn` may have switched basic blocks (e.g. filter's keep/skip split). The increment +
-    // back-edge are emitted in whatever block is now current, and the header phi's back-edge
-    // predecessor is patched to that block (it was provisionally recorded as `body`).
-    let back_block = builder.current_block;
-    let one = builder.const_temp(Const::Int(1, Type::Int64));
-    builder.emit(Instruction::Binary {
-        dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
-        operand_ty: Type::Int64, ty: Type::Int64,
-    });
-    builder.terminate(Terminator::Jump(header));
-    builder.patch_phi_incoming(header, i, body, back_block);
-
-    builder.switch_to(exit);
+    emit_combinator_loop(iterable, iterable_ty, ElemAccess::Materialize(elem_ty), builder, ctx,
+        |i, elem, b, c| {
+            body_fn(i, elem, b, c);
+            LoopFlow::Fallthrough
+        });
 }
 
-/// PATH-1 in-place packed iteration loop: like `emit_index_loop`, but does NOT emit a materializing
-/// `Index` for the element — instead it passes the loop counter `i` (Int64) to `body_fn` along with
-/// the (already-lowered) `iterable` temp, so the body can register a packed-element VIEW and read
-/// fields by const-offset. `body_fn(i, array, builder, ctx)`. The header-phi back-edge is patched
-/// latch-relative exactly as `emit_index_loop` does, so an inlined body that emits its own blocks
-/// (inner match/if/combinator) is wired correctly.
+/// PATH-1 in-place packed iteration loop: a thin configuration of [`emit_combinator_loop`] that does
+/// NOT materialize the element — it passes the loop counter `i` (Int64) to `body_fn` along with the
+/// (already-lowered) `iterable` temp, so the body can register a packed-element VIEW and read fields
+/// by const-offset. `body_fn(i, array, builder, ctx)`.
 fn emit_packed_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
     iterable: Temp,
     iterable_ty: &Type,
@@ -5979,42 +6046,11 @@ fn emit_packed_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)
     ctx: &mut LowerCtx,
     body_fn: F,
 ) {
-    let len = emit_iterable_len(iterable, iterable_ty, builder);
-    let zero = builder.const_temp(Const::Int(0, Type::Int64));
-
-    let preheader = builder.current_block;
-    let header = builder.alloc_block("for_header");
-    let body = builder.alloc_block("for_body");
-    let exit = builder.alloc_block("for_exit");
-
-    let i = builder.alloc_temp(Type::Int64);
-    let i_next = builder.alloc_temp(Type::Int64);
-    builder.terminate(Terminator::Jump(header));
-
-    builder.switch_to(header);
-    builder.emit(Instruction::Phi {
-        dst: i, ty: Type::Int64,
-        incomings: vec![(zero, preheader), (i_next, body)],
-    });
-    let cond = builder.alloc_temp(Type::Bool);
-    builder.emit(Instruction::Binary {
-        dst: cond, op: BinOp::Lt, lhs: i, rhs: len,
-        operand_ty: Type::Int64, ty: Type::Bool,
-    });
-    builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
-
-    builder.switch_to(body);
-    body_fn(i, iterable, builder, ctx);
-    let back_block = builder.current_block;
-    let one = builder.const_temp(Const::Int(1, Type::Int64));
-    builder.emit(Instruction::Binary {
-        dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
-        operand_ty: Type::Int64, ty: Type::Int64,
-    });
-    builder.terminate(Terminator::Jump(header));
-    builder.patch_phi_incoming(header, i, body, back_block);
-
-    builder.switch_to(exit);
+    emit_combinator_loop(iterable, iterable_ty, ElemAccess::Packed, builder, ctx,
+        |i, array, b, c| {
+            body_fn(i, array, b, c);
+            LoopFlow::Fallthrough
+        });
 }
 
 // ===========================================================================================
