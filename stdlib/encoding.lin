@@ -13,6 +13,10 @@ import { length, push } from "std/array"
 import { keys } from "std/object"
 import { for } from "std/iter"
 
+// One-memcpy UTF-8 byte extraction (see `utf8Bytes`), replacing the per-byte byteAt+push scan.
+import foreign "lin-runtime"
+  val lin_string_utf8_bytes: (String) => UInt8[]
+
 // --- shared tables ---------------------------------------------------------
 // Standard Base64 alphabet (RFC 4648 §4): A-Z a-z 0-9 + /
 val b64Std: Int32[] = [
@@ -249,20 +253,7 @@ val isUnreserved = (byte: Int32): Boolean =>
 // @param s  the text to encode.
 // @returns the UTF-8 bytes of `s`.
 export val utf8Bytes = (s: String): UInt8[] =>
-  strBytes(s)
-
-// Internal: collect the raw UTF-8 bytes of `s` into a UInt8[] via byteAt.
-val strBytes = (s: String): UInt8[] =>
-  val out: UInt8[] = []
-  strBytesGo(s, 0, out)
-
-val strBytesGo = (s: String, i: Int32, out: UInt8[]): UInt8[] =>
-  val byte = byteAt(s, i)
-  if byte == -1 then
-    out
-  else
-    push(out, byte)
-    strBytesGo(s, i + 1, out)
+  lin_string_utf8_bytes(s)
 
 // Read byte `i` of a `UInt8[]` widened to Int32, or 0 if `i >= n`. NOTE: the flat read
 // `bytes[i]` is bound to its own `Int32` local before the function returns it — writing the
@@ -616,7 +607,7 @@ val formEncode = (s: String): String =>
 // @param s  the text to encode.
 // @returns the Base64 string.
 export val base64EncodeString = (s: String): String =>
-  base64Encode(strBytes(s))
+  base64Encode(utf8Bytes(s))
 
 // Standard Base64 decode, then UTF-8 decode the bytes back to a String.
 // @param s  the Base64 string to decode.

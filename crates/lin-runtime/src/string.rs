@@ -1202,6 +1202,24 @@ pub unsafe extern "C" fn lin_string_from_utf8(arr: *const u8) -> *mut u8 {
     }
 }
 
+/// UTF-8-encode a string into a fresh flat `UInt8[]` in one bulk copy — the inverse of
+/// `lin_string_from_utf8`. Replaces the per-byte `byteAt`+`push` recursion in `std/encoding`
+/// (O(n) regrowth, one cached-box round-trip per byte) that feeds every crypto-hash-of-string
+/// and the base64 string encoders. Borrows `s` (read-only); returns an OWNED (+1) flat array
+/// the caller releases with `lin_array_release`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_utf8_bytes(s: *const LinString) -> *mut crate::array::LinArray {
+    use crate::array::{lin_flat_array_alloc_u8, LinArray};
+    let len = if s.is_null() { 0 } else { (*s).len as usize };
+    // alloc_u8 floors capacity at 4; pass len as the requested cap.
+    let arr = lin_flat_array_alloc_u8(len as u64);
+    if len > 0 {
+        std::ptr::copy_nonoverlapping((*s).data.as_ptr(), (*arr).data as *mut u8, len);
+    }
+    (*arr).len = len as u64;
+    arr as *mut LinArray
+}
+
 /// Serialize ANY Lin value (passed as a boxed TaggedVal*) to a strict, valid JSON string.
 ///
 /// OWNERSHIP: this BORROWS `tagged` (a read-only walk) and returns a freshly-allocated OWNED
