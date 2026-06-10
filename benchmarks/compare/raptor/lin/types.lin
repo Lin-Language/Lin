@@ -72,6 +72,14 @@ export type Conn = [Json, Int32, Int32] | Transfer
 //   - kConnections   : StopID -> (roundStr -> Conn)  { String: { String: Conn } }
 // Arrival times use Int64 (the MAX sentinel 9007199254740991 needs it; §27 numeric).
 //
+// Round-key fields (mirror node's `this.kArrivals[this.k - 1]` direct references):
+//   - curKey    : "${k}" computed ONCE per round (addRound), not per setTrip/setTransfer.
+//   - curRound  : alias of kArrivals[curKey] — maps are reference types, so writing
+//                 through curRound is visible through kArrivals too.
+//   - prevRound : alias of the previous round's arrivals map (what previousArrival —
+//                 the hottest read in the scan — consults, with NO per-access "${k - 1}"
+//                 interpolation + double map lookup).
+//
 // kConnections is the LAST `Json` dictionary to be typed. It was kept `Json` because a typed
 // nested union-valued map triggered a use-after-free in the multi-day stitching
 // (`completeJourneys`/`prevConnections`) and the transfer-pattern walks
@@ -80,7 +88,7 @@ export type Conn = [Json, Int32, Int32] | Transfer
 // FIXED on master (`val x = obj[k]` materializes a stable owned box), so kConnections is typed
 // `{ String: { String: Conn } }`. This is a FIDELITY improvement (the query-phase maps were
 // measured perf-neutral — see NOTES.md); behaviour is byte-identical.
-export type ScanResults = { "k": Int32, "bestArrivals": { String: Int64 }, "kArrivals": { String: { String: Int64 } }, "kConnections": { String: { String: Conn } } }
+export type ScanResults = { "k": Int32, "curKey": String, "prevRound": { String: Int64 }, "curRound": { String: Int64 }, "bestArrivals": { String: Int64 }, "kArrivals": { String: { String: Int64 } }, "kConnections": { String: { String: Conn } } }
 
 // The createRaptor index struct (mirrors RaptorAlgorithm's constructor fields).
 // The dynamic-key dictionaries that createRaptor BUILDS from scratch are now typed

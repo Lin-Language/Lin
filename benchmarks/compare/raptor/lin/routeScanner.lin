@@ -9,43 +9,69 @@ import { length } from "std/array"
 import { runsOn } from "./service"
 
 export val createRouteScanner = (tripsByRoute: { String: Json[] }, date: Int32, dow: Int32): Json =>
+  // dateKey/dowKey are interpolated ONCE per scanner (= once per scan/day) and threaded
+  // to every runsOn call in the hot backward scan — not rebuilt per trip.
   {
     "tripsByRoute": tripsByRoute,
     "date": date,
-    "dow": dow,
+    "dateKey": "${date}",
+    "dowKey": "${dow}",
     "routeScanPosition": {}
   }
 
-// trip identity: tripId comparison (Lin == on objects is structural; tripId is the
-// stable per-trip key used in place of JS reference identity).
-val sameTrip = (a: Json, b: Json): Boolean =>
-  a != null && b != null && a["tripId"] == b["tripId"]
-
 // Returns the chosen trip (or null). Tail-recursive backward scan threading lastFound.
-val scanBack = (scanner: Json, routeId: String, stopIndex: Int32, time: Json, i: Int32, lastFound: Json): Json =>
+// The per-route/per-scan invariants (routeTrips, date, dateKey, dowKey, the memo map) are
+// hoisted ONCE in getTrip and passed as parameters — not re-read from the scanner record on
+// every iteration. `pos` is the routeScanPosition map itself; mutating the threaded map
+// persists (it is the same heap object the scanner record holds).
+//
+// The reference memo condition `!lastFound || lastFound === trip` is true exactly when
+// (nothing found yet) OR (runsOn matched THIS iteration — the only way lastFound === trip),
+// so it is computed from the `ran` boolean directly; no trip identity comparison at all.
+val scanBack = (routeTrips: Json, pos: Json, routeId: String, stopIndex: Int32, time: Json, date: Int32, dateKey: String, dowKey: String, i: Int32, lastFound: Json): Json =>
   if i < 0 then
     lastFound
   else
-    val routeTrips = scanner["tripsByRoute"][routeId]
     val trip = routeTrips[i]
     val stopTime = trip["stopTimes"][stopIndex]
     if stopTime["departureTime"] < time then
       lastFound
     else
-      val newLastFound = if runsOn(trip["service"], scanner["date"], scanner["dow"]) then
-        trip
-      else
-        lastFound
+      val ran = runsOn(trip["service"], date, dateKey, dowKey)
+      val newLastFound = if ran then trip else lastFound
       // update routeScanPosition under the documented condition
-      if newLastFound == null || sameTrip(newLastFound, trip) then
-        scanner["routeScanPosition"][routeId] = i
-      scanBack(scanner, routeId, stopIndex, time, i - 1, newLastFound)
+      if ran || newLastFound == null then
+        pos[routeId] = i
+      scanBack(
+        routeTrips,
+        pos,
+        routeId,
+        stopIndex,
+        time,
+        date,
+        dateKey,
+        dowKey,
+        i - 1,
+        newLastFound
+      )
 
 export val getTrip = (scanner: Json, routeId: String, stopIndex: Int32, time: Json): Json =>
   val pos = scanner["routeScanPosition"]
+  val routeTrips = scanner["tripsByRoute"][routeId]
   val start = if pos[routeId] == null then
-    length(scanner["tripsByRoute"][routeId]) - 1
+    length(routeTrips) - 1
   else
     pos[routeId]
-  if pos[routeId] == null then scanner["routeScanPosition"][routeId] = start
-  scanBack(scanner, routeId, stopIndex, time, start, null)
+  if pos[routeId] == null then pos[routeId] = start
+  scanBack(
+    routeTrips,
+    pos,
+    routeId,
+    stopIndex,
+    time,
+    scanner["date"],
+    scanner["dateKey"],
+    scanner["dowKey"],
+    start,
+    null
+  )

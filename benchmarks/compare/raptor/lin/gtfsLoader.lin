@@ -20,7 +20,7 @@
 // (stopTimesGroups, serviceList, transfers) stay resident.
 //
 // Returns { "trips": Json, "transfers": Json, "interchange": Json, "dropped": Int32 }.
-import { for } from "std/iter"
+import { for, find, filter, drop } from "std/iter"
 import { keys } from "std/object"
 import { split } from "std/string"
 import { parseInt32 } from "std/number"
@@ -32,6 +32,8 @@ import { StopTime, Transfer } from "./types"
 val MAX = 9007199254740991i64
 
 // Inline time parse ("HH:MM:SS" -> seconds-from-midnight, may exceed 24h).
+// The hot path goes through loadGTFS's cached wrapper (mirrors node TimeParser's
+// per-instance cache) — this is the cache-miss compute only.
 val parseTime = (time: String): Int32 =>
   val parts = split(time, ":")
   parseInt32(parts[0]) * 3600 + parseInt32(parts[1]) * 60 + parseInt32(parts[2])
@@ -68,26 +70,36 @@ val indexOfColumns = (header: Json): Json =>
   )
   idx
 
-// Stream a plain-CSV file line by line. The first non-empty line is the header; its
-// column-index map is passed to `onRow(fields, colIndex)` for every subsequent non-empty
-// row. Nothing is accumulated here — peak transient heap is a single split line, which is
-// freed before the next is pulled (contrast readFile + split, which holds the whole file).
-// `onRow` captures and mutates the caller's accumulator vars (validated Lin closure pattern).
-// Returns the stream-driver result (Null | Error); callers invoke it for effect and discard it.
-val forEachRow = (path: String, onRow: (Json, Json) => Json): Json =>
-  var colIndex: Json = {}
-  var headerDone = false
-  readStream(path)
+// Stream a plain-CSV file line by line. The first non-empty line is the header; it is read
+// FIRST via a bounded `find` pass (opens the stream, pulls only up to the header line), and
+// its column-index map is handed to `makeOnRow(colIndex)` ONCE — the factory binds the Int32
+// column indices into the row callback's closure, so the per-row work indexes `row[i]`
+// directly instead of doing an object-get per column per row (~19M+ across the feed). The
+// second (full) pass then skips the header with the lazy `filter` + `drop(1)` adapters and
+// calls the prebound callback per non-empty row. Nothing is accumulated here — peak
+// transient heap is a single split line (contrast readFile + split, which holds the whole
+// file). The row callback captures and mutates the caller's accumulator vars (validated Lin
+// closure pattern). NOTE the row callback is deliberately bound in a `val` and the `.for`
+// closure captures ONLY it (the header skip lives in the stream adapters, NOT in a
+// `var headerDone` flag): a closure that captures a mutable `var` alongside a
+// factory-returned capturing closure loses the closure's environment and null-derefs
+// (LIN_ISSUES.md #8).
+// Returns the stream-driver result (Null | Error); callers invoke it for effect and discard
+// it (a missing/unreadable file yields no rows, as before).
+val forEachRow = (path: String, makeOnRow: (Json) => (Json) => Json): Json =>
+  val headerLine = readStream(path)
     .lines()
-    .for(line =>
-      if length(line) > 0 then
-        val fields = split(line, ",")
-        if headerDone == false then
-          colIndex = indexOfColumns(fields)
-          headerDone = true
-        else
-          onRow(fields, colIndex)
-    )
+    .find(line => length(line) > 0)
+  match headerLine
+    is String =>
+      val onRow = makeOnRow(indexOfColumns(split(headerLine, ",")))
+      readStream(path)
+        .lines()
+        .filter(line => length(line) > 0)
+        .drop(1)
+        .for(line => onRow(split(line, ",")))
+    else =>
+      null
 
 // Binary search a list of { "key": String, ... } sorted ascending by "key".
 // Returns the matching record or null.
@@ -114,6 +126,22 @@ val sortByKey = (list: Json): Json =>
   )
 
 export val loadGTFS = (dataDir: String): Json =>
+  // Time-parse cache (mirrors node TimeParser): parseTime is called ~4.8M times
+  // (2.37M stop_times rows x 2, plus links.txt) with heavily REPEATED strings, so
+  // the split + 3x parseInt32 is cached behind a `{ String: Int32 }` map. The cache
+  // is LOCAL to loadGTFS — a module-level `var` mutated from an exported function
+  // panics codegen (LIN_ISSUES.md #2).
+  var timeCache: { String: Int32 } = {}
+  val cachedTime = (time: String): Int32 =>
+    val hit = timeCache[time]
+    match hit
+      is Int32 =>
+        hit
+      else =>
+        val computed = parseTime(time)
+        timeCache[time] = computed
+        computed
+
   // --- calendar_dates.txt -> datesList [{ key: service_id, dates: { "<+date>": include } }] ---
   // Rows are contiguous by service_id; group by detecting changes. Streamed row by row.
   // The `started` flag marks the first row so we don't flush an empty group before the
@@ -122,15 +150,19 @@ export val loadGTFS = (dataDir: String): Json =>
   var curDatesSvc = ""
   var datesStarted = false
   var curDates: Json = {}
-  forEachRow("${dataDir}calendar_dates.txt", (row, cdi) =>
-    val serviceId = row[cdi["service_id"]]
-    if datesStarted == false || serviceId != curDatesSvc then
-      if datesStarted then
-        push(datesList, { "key": curDatesSvc, "dates": curDates })
-      curDatesSvc = serviceId
-      datesStarted = true
-      curDates = {}
-    curDates["${parseInt32(row[cdi["date"]])}"] = row[cdi["exception_type"]] == "1"
+  forEachRow("${dataDir}calendar_dates.txt", cdi =>
+    val iServiceId: Int32 = cdi["service_id"]
+    val iDate: Int32 = cdi["date"]
+    val iException: Int32 = cdi["exception_type"]
+    (row: Json): Json =>
+      val serviceId = row[iServiceId]
+      if datesStarted == false || serviceId != curDatesSvc then
+        if datesStarted then
+          push(datesList, { "key": curDatesSvc, "dates": curDates })
+        curDatesSvc = serviceId
+        datesStarted = true
+        curDates = {}
+      curDates["${parseInt32(row[iDate])}"] = row[iException] == "1"
   )
   if datesStarted then
     push(datesList, { "key": curDatesSvc, "dates": curDates })
@@ -138,21 +170,32 @@ export val loadGTFS = (dataDir: String): Json =>
 
   // --- calendar.txt -> serviceList [{ key: service_id, service }] (sorted for binary search) ---
   var serviceList: Json = []
-  forEachRow("${dataDir}calendar.txt", (row, cc) =>
-    val serviceId = row[cc["service_id"]]
-    val days = {
-      "0": row[cc["sunday"]] == "1",
-      "1": row[cc["monday"]] == "1",
-      "2": row[cc["tuesday"]] == "1",
-      "3": row[cc["wednesday"]] == "1",
-      "4": row[cc["thursday"]] == "1",
-      "5": row[cc["friday"]] == "1",
-      "6": row[cc["saturday"]] == "1"
-    }
-    val dRec = bsearch(datesSorted, serviceId)
-    val d = if dRec != null then dRec["dates"] else {  }
-    val service = makeService(parseInt32(row[cc["start_date"]]), parseInt32(row[cc["end_date"]]), days, d)
-    push(serviceList, { "key": serviceId, "service": service })
+  forEachRow("${dataDir}calendar.txt", cc =>
+    val iServiceId: Int32 = cc["service_id"]
+    val iSunday: Int32 = cc["sunday"]
+    val iMonday: Int32 = cc["monday"]
+    val iTuesday: Int32 = cc["tuesday"]
+    val iWednesday: Int32 = cc["wednesday"]
+    val iThursday: Int32 = cc["thursday"]
+    val iFriday: Int32 = cc["friday"]
+    val iSaturday: Int32 = cc["saturday"]
+    val iStartDate: Int32 = cc["start_date"]
+    val iEndDate: Int32 = cc["end_date"]
+    (row: Json): Json =>
+      val serviceId = row[iServiceId]
+      val days = {
+        "0": row[iSunday] == "1",
+        "1": row[iMonday] == "1",
+        "2": row[iTuesday] == "1",
+        "3": row[iWednesday] == "1",
+        "4": row[iThursday] == "1",
+        "5": row[iFriday] == "1",
+        "6": row[iSaturday] == "1"
+      }
+      val dRec = bsearch(datesSorted, serviceId)
+      val d = if dRec != null then dRec["dates"] else {  }
+      val service = makeService(parseInt32(row[iStartDate]), parseInt32(row[iEndDate]), days, d)
+      push(serviceList, { "key": serviceId, "service": service })
   )
   val servicesSorted = sortByKey(serviceList)
 
@@ -162,23 +205,30 @@ export val loadGTFS = (dataDir: String): Json =>
   var curTrip = ""
   var tripStarted = false
   var curStopTimes: Json = []
-  forEachRow("${dataDir}stop_times.txt", (row, si) =>
-    val tripId = row[si["trip_id"]]
-    if tripStarted == false || tripId != curTrip then
-      if tripStarted then
-        push(stopTimesGroups, { "tripId": curTrip, "stopTimes": curStopTimes })
-      curTrip = tripId
-      tripStarted = true
-      curStopTimes = []
-    val pickupType = row[si["pickup_type"]]
-    val dropOffType = row[si["drop_off_type"]]
-    push(curStopTimes, makeStopTime(
-      row[si["stop_id"]],
-      parseTime(row[si["departure_time"]]),
-      parseTime(row[si["arrival_time"]]),
-      pickupType == "0" || pickupType == "",
-      dropOffType == "0" || dropOffType == ""
-    ))
+  forEachRow("${dataDir}stop_times.txt", si =>
+    val iTripId: Int32 = si["trip_id"]
+    val iPickupType: Int32 = si["pickup_type"]
+    val iDropOffType: Int32 = si["drop_off_type"]
+    val iStopId: Int32 = si["stop_id"]
+    val iDepartureTime: Int32 = si["departure_time"]
+    val iArrivalTime: Int32 = si["arrival_time"]
+    (row: Json): Json =>
+      val tripId = row[iTripId]
+      if tripStarted == false || tripId != curTrip then
+        if tripStarted then
+          push(stopTimesGroups, { "tripId": curTrip, "stopTimes": curStopTimes })
+        curTrip = tripId
+        tripStarted = true
+        curStopTimes = []
+      val pickupType = row[iPickupType]
+      val dropOffType = row[iDropOffType]
+      push(curStopTimes, makeStopTime(
+        row[iStopId],
+        cachedTime(row[iDepartureTime]),
+        cachedTime(row[iArrivalTime]),
+        pickupType == "0" || pickupType == "",
+        dropOffType == "0" || dropOffType == ""
+      ))
   )
   if tripStarted then
     push(stopTimesGroups, { "tripId": curTrip, "stopTimes": curStopTimes })
@@ -186,29 +236,39 @@ export val loadGTFS = (dataDir: String): Json =>
   // --- transfers.txt -> interchange + transfers (small maps) ---
   var transfers: Json = {}
   var interchange: Json = {}
-  forEachRow("${dataDir}transfers.txt", (row, tfi) =>
-    val fromStop = row[tfi["from_stop_id"]]
-    val toStop = row[tfi["to_stop_id"]]
-    if fromStop == toStop then
-      interchange[fromStop] = parseInt32(row[tfi["min_transfer_time"]])
-    else
-      val t = makeTransfer(fromStop, toStop, parseInt32(row[tfi["min_transfer_time"]]), 0, MAX)
-      if transfers[fromStop] == null then transfers[fromStop] = []
-      push(transfers[fromStop], t)
+  forEachRow("${dataDir}transfers.txt", tfi =>
+    val iFromStop: Int32 = tfi["from_stop_id"]
+    val iToStop: Int32 = tfi["to_stop_id"]
+    val iMinTransferTime: Int32 = tfi["min_transfer_time"]
+    (row: Json): Json =>
+      val fromStop = row[iFromStop]
+      val toStop = row[iToStop]
+      if fromStop == toStop then
+        interchange[fromStop] = parseInt32(row[iMinTransferTime])
+      else
+        val t = makeTransfer(fromStop, toStop, parseInt32(row[iMinTransferTime]), 0, MAX)
+        if transfers[fromStop] == null then transfers[fromStop] = []
+        push(transfers[fromStop], t)
   )
 
   // --- links.txt -> transfers (footpaths; date/day columns ignored) ---
-  forEachRow("${dataDir}links.txt", (row, lki) =>
-    val fromStop = row[lki["from_stop_id"]]
-    val t = makeTransfer(
-      fromStop,
-      row[lki["to_stop_id"]],
-      parseInt32(row[lki["duration"]]),
-      parseTime(row[lki["start_time"]]),
-      parseTime(row[lki["end_time"]])
-    )
-    if transfers[fromStop] == null then transfers[fromStop] = []
-    push(transfers[fromStop], t)
+  forEachRow("${dataDir}links.txt", lki =>
+    val iFromStop: Int32 = lki["from_stop_id"]
+    val iToStop: Int32 = lki["to_stop_id"]
+    val iDuration: Int32 = lki["duration"]
+    val iStartTime: Int32 = lki["start_time"]
+    val iEndTime: Int32 = lki["end_time"]
+    (row: Json): Json =>
+      val fromStop = row[iFromStop]
+      val t = makeTransfer(
+        fromStop,
+        row[iToStop],
+        parseInt32(row[iDuration]),
+        cachedTime(row[iStartTime]),
+        cachedTime(row[iEndTime])
+      )
+      if transfers[fromStop] == null then transfers[fromStop] = []
+      push(transfers[fromStop], t)
   )
 
   // --- trips.txt -> resolved trips (positional merge-join with stopTimesGroups; service via
@@ -217,25 +277,28 @@ export val loadGTFS = (dataDir: String): Json =>
   var dropped = 0
   var g = 0
   val numGroups = length(stopTimesGroups)
-  forEachRow("${dataDir}trips.txt", (row, ti) =>
-    val tripId = row[ti["trip_id"]]
-    val serviceId = row[ti["service_id"]]
-    // positional join: groups are in identical trip_id order, 1:1 with trips here.
-    // Bind the matched group into a `val` and advance `g` only on a match — clean and
-    // cursor-independent, no mutable temp needed.
-    val matched = g < numGroups && stopTimesGroups[g]["tripId"] == tripId
-    val sts = if matched then stopTimesGroups[g]["stopTimes"] else []
-    if matched then g = g + 1
-    val svcRec = bsearch(servicesSorted, serviceId)
-    if svcRec == null then
-      dropped = dropped + 1
-    else
-      push(resolvedTrips, {
-        "serviceId": serviceId,
-        "tripId": tripId,
-        "stopTimes": sts,
-        "service": svcRec["service"]
-      })
+  forEachRow("${dataDir}trips.txt", ti =>
+    val iTripId: Int32 = ti["trip_id"]
+    val iServiceId: Int32 = ti["service_id"]
+    (row: Json): Json =>
+      val tripId = row[iTripId]
+      val serviceId = row[iServiceId]
+      // positional join: groups are in identical trip_id order, 1:1 with trips here.
+      // Bind the matched group into a `val` and advance `g` only on a match — clean and
+      // cursor-independent, no mutable temp needed.
+      val matched = g < numGroups && stopTimesGroups[g]["tripId"] == tripId
+      val sts = if matched then stopTimesGroups[g]["stopTimes"] else []
+      if matched then g = g + 1
+      val svcRec = bsearch(servicesSorted, serviceId)
+      if svcRec == null then
+        dropped = dropped + 1
+      else
+        push(resolvedTrips, {
+          "serviceId": serviceId,
+          "tripId": tripId,
+          "stopTimes": sts,
+          "service": svcRec["service"]
+        })
   )
 
   {
