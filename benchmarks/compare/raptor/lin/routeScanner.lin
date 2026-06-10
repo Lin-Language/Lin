@@ -9,10 +9,13 @@ import { length } from "std/array"
 import { runsOn } from "./service"
 
 export val createRouteScanner = (tripsByRoute: { String: Json[] }, date: Int32, dow: Int32): Json =>
+  // dateKey/dowKey are interpolated ONCE per scanner (= once per scan/day) and threaded
+  // to every runsOn call in the hot backward scan — not rebuilt per trip.
   {
     "tripsByRoute": tripsByRoute,
     "date": date,
-    "dow": dow,
+    "dateKey": "${date}",
+    "dowKey": "${dow}",
     "routeScanPosition": {}
   }
 
@@ -32,7 +35,7 @@ val scanBack = (scanner: Json, routeId: String, stopIndex: Int32, time: Json, i:
     if stopTime["departureTime"] < time then
       lastFound
     else
-      val newLastFound = if runsOn(trip["service"], scanner["date"], scanner["dow"]) then
+      val newLastFound = if runsOn(trip["service"], scanner["date"], scanner["dateKey"], scanner["dowKey"]) then
         trip
       else
         lastFound
