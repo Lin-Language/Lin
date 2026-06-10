@@ -105,6 +105,29 @@ pub extern "C" fn lin_f64_from_bits(u: u64) -> f64 {
     f64::from_bits(u)
 }
 
+/// Single-pass `tryParseInt32`: validate + parse `s` in ONE scan, returning a boxed `Int32 | Null`
+/// TaggedVal (a null pointer is the `Null` arm; a small int routes through the immortal box cache).
+/// Replaces the `if lin_is_int32(s) then lin_parse_int32(s)` two-scan idiom in std/number.
+#[no_mangle]
+pub unsafe extern "C" fn lin_try_parse_int32(s: *const LinString) -> *mut u8 {
+    let st = (*s).as_str();
+    match st.trim().parse::<i32>() {
+        Ok(n) => crate::tagged::lin_box_int32(n),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Single-pass `tryParseFloat64`: validate + parse in ONE scan, returning a boxed `Float64 | Null`
+/// (null pointer = `Null`). Replaces the `lin_is_float64` + `lin_parse_float64` two-scan idiom.
+#[no_mangle]
+pub unsafe extern "C" fn lin_try_parse_float64(s: *const LinString) -> *mut u8 {
+    let st = (*s).as_str();
+    match st.trim().parse::<f64>() {
+        Ok(f) => crate::tagged::lin_box_float64(f),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn lin_is_int32(s: *const LinString) -> bool {
     unsafe {
