@@ -1585,14 +1585,16 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
         None
     };
 
-    // CAPTURE-LESS-LAMBDA INLINE (the zero-box win, ADR-044): if the callee is a thin
-    // intrinsic-combinator wrapper (`map`/`filter`/`reduce` = `lin_map`/… forwarding its params) AND
-    // the callback argument is a capture-less LITERAL lambda, inline the wrapper at THIS call site —
+    // LITERAL-LAMBDA INLINE (the zero-box win, ADR-044): if the callee is a thin intrinsic-combinator
+    // wrapper (`map`/`filter`/`reduce` = `lin_map`/… forwarding its params) AND the callback argument
+    // is a LITERAL lambda (capturing OR capture-less), inline the wrapper at THIS call site —
     // rewriting the call to a direct `lin_map(arr, <lambda>)` — so the literal lambda becomes visible
-    // to the intrinsic's IR lowering (`lower_map`/…), which inlines the lambda body straight into the
-    // loop with NO per-element box/unbox/closure-call. Done before the type-spec path so the inlined
-    // direct-intrinsic form is what lowers. Capturing lambdas and stored-fn callbacks fall through to
-    // the normal (closure-call) specialization path.
+    // to the intrinsic's IR lowering (`lower_map`/…). The lowerer's Layer-2 gate then splices the body
+    // straight into the loop with NO per-element box/unbox/closure-call when every capture is
+    // resolvable, or falls through to its boxed closure-call path when one is not (gate-divergence
+    // fix). Done before the type-spec path so the inlined direct-intrinsic form is what lowers. A
+    // stored-fn callback (a `Function` VALUE, not a literal lambda node) falls through to the normal
+    // (closure-call) specialization path.
     if let Some(gslot) = callee_generic_slot {
         if try_inline_combinator_wrapper(expr, gslot, state) {
             return;
@@ -1962,19 +1964,27 @@ fn eta_expand_named_arg(arg: &mut TypedExpr, state: &mut MonoState<'_>) -> bool 
 }
 
 /// Try to inline a thin intrinsic-combinator wrapper call (`map`/`filter`/`reduce`) at the call
-/// site when its callback argument is a CAPTURE-LESS LITERAL lambda. On success, repoints the call's
-/// `func` at a (re-homed) intrinsic slot for `lin_map`/`lin_filter`/`lin_reduce` so the call lowers
-/// straight through the intrinsic — exposing the literal lambda to `lower_map`/… which inlines its
-/// body into the loop (zero per-element box/unbox/closure-call). Returns true if it rewrote the call.
+/// site when its callback argument is a LITERAL lambda — CAPTURING or capture-less. On success,
+/// repoints the call's `func` at a (re-homed) intrinsic slot for `lin_map`/`lin_filter`/`lin_reduce`
+/// so the call lowers straight through the intrinsic — exposing the literal lambda to `lower_map`/…
+/// which inlines its body into the loop (zero per-element box/unbox/closure-call). Returns true if
+/// it rewrote the call.
 ///
 /// A bare direct-callable function callback (`.map(square)`) is first eta-expanded to the equivalent
 /// capture-less lambda by `eta_expand_named_arg`, so it qualifies for this same inline path.
 ///
+/// GATE-DIVERGENCE FIX: this Layer-1 gate previously rejected a CAPTURING literal lambda, forcing it
+/// onto the ~10× slower boxed-callback specialization (`map$T`) even though the lowerer's Layer-2
+/// gate (`inlinable_capturing_lambda`) would have inlined it. This gate now ADMITS capturing literal
+/// lambdas conservatively (it has no `builder`/`ctx` to prove a capture resolvable) and lets Layer 2
+/// be the final arbiter: a resolvable capture inlines; an unresolvable one falls through to the SAME
+/// boxed closure-call path `lower_*` always provided — byte-identical to the old behaviour. See the
+/// inline comment at the lambda-count loop for the full soundness argument.
+///
 /// Conditions (all required):
 ///   - the generic is a thin intrinsic wrapper for a combinator intrinsic (`thin_intrinsic_wrapper`);
-///   - exactly one argument is a `TypedExpr::Function` with NO captures (a capture-less literal
-///     lambda — a capturing lambda or a stored/passed `Function` value is NOT inlinable here and
-///     must keep the closure path);
+///   - exactly one argument is a `TypedExpr::Function` (a literal lambda, capturing or not — a
+///     stored/passed `Function` VALUE is NOT a `Function` node and keeps the closure path);
 ///   - the intrinsic's origin module is known (so its name is resolvable).
 /// The wrapper forwards its params 1:1, so the call args map directly to the intrinsic args.
 fn try_inline_combinator_wrapper(
@@ -2028,17 +2038,23 @@ fn try_inline_combinator_wrapper(
     if let Some(last) = args.last_mut() {
         eta_expand_named_arg(last, state);
     }
-    // Exactly one capture-less literal-lambda argument qualifies.
+    // Exactly one literal-lambda argument qualifies — CAPTURING or not (gate-divergence fix). Layer 1
+    // here runs in the monomorphizer with no `builder`/`ctx`, so it CANNOT prove a capture resolvable
+    // (that needs the enclosing builder's slot/cell/global tables). It therefore admits a capturing
+    // literal lambda CONSERVATIVELY and repoints the call onto `lin_map`/… anyway; the LOWERER's
+    // `inlinable_capturing_lambda` (Layer 2) is the FINAL arbiter. When Layer 2 proves every capture
+    // resolvable it splices the body inline (the zero-box win the existing `for`/`while` inline path
+    // already relies on); when a capture is NOT resolvable, `lower_map`/… falls through to its boxed
+    // closure-call path (`lower_callback_in_safe_ctx` builds the closure from this same `Function`
+    // arg) — byte-identical to the pre-relaxation specialized boxed-callback path. Either way the
+    // repointed call is correctly lowered, so admitting capturing lambdas here never miscompiles.
+    //
+    // A stored/passed `Function` VALUE (the ⊤ callee — not a `TypedExpr::Function` node) still does
+    // NOT match this arm and keeps the closure specialization path, exactly as before.
     let mut lambda_args = 0;
     for a in args.iter() {
-        if let TypedExpr::Function { captures, .. } = a {
-            if captures.is_empty() {
-                lambda_args += 1;
-            } else {
-                // A capturing literal lambda: do not inline (the loop body would need its captured
-                // environment, which the closure path provides). Bail to the closure specialization.
-                return false;
-            }
+        if let TypedExpr::Function { .. } = a {
+            lambda_args += 1;
         }
     }
     if lambda_args != 1 {
