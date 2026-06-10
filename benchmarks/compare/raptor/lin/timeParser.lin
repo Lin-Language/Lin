@@ -2,7 +2,9 @@
 //
 // The reference caches results in a per-instance object. A pure function suffices for
 // the unit test (the cache is a perf detail, not observable behaviour), so we expose a
-// stateless `getTime`. (Times may exceed 24h, e.g. "25:30:00", which parses fine.)
+// stateless `getTime`. The HOT loader path (gtfsLoader.loadGTFS) carries its own local
+// `{ String: Int32 }` cache mirroring the reference TimeParser — this stateless helper
+// is the unit-tested reference parse. (Times may exceed 24h, e.g. "25:30:00".)
 import { split } from "std/string"
 import { parseInt32 } from "std/number"
 
