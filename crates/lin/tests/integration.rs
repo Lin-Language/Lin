@@ -17629,3 +17629,32 @@ main()
     assert_eq!(output, vec!["190000"]);
 }
 
+// Path-9C seal-propagation symmetry: an object literal with a nested sealed-record ARRAY field,
+// built by a function returning the named record then read back, must round-trip correctly. The
+// producer (`mkTrip`'s `{ "stopTimes": [{ … }] }` literal) is now DIRECTED against the sealed
+// `StopTime[]` field type, so it adopts the SEALED element representation — matching what the
+// consumer (`trip["stopTimes"][i]`) reads it back at. Before the fix the producer fell to
+// undirected inference and built a BOXED `Object[]` while the consumer read it PACKED (the gate
+// admits this all-scalar record): a silent mis-read (`{ "arr": 33 }` read back as `0`). All-scalar
+// fields here so the field is packable under the current scalar+Bool gate — this asserts the two
+// sides agree at the gate's live edge.
+#[test]
+fn test_nested_sealed_record_array_field_producer_consumer_symmetry() {
+    let output = run(r#"import { print } from "std/io"
+
+type StopTime = { "arr": Int32, "dep": Int32 }
+type Trip = { "tripId": Int32, "stopTimes": StopTime[] }
+
+val mkTrip = (id: Int32): Trip =>
+  { "tripId": id, "stopTimes": [{ "arr": 11, "dep": 22 }, { "arr": 33, "dep": 44 }] }
+
+val main = () =>
+  val t = mkTrip(7)
+  val s0 = t["stopTimes"][0]
+  val s1 = t["stopTimes"][1]
+  print("${t["tripId"]} ${s0["arr"]} ${s0["dep"]} ${s1["arr"]} ${s1["dep"]}")
+main()
+"#);
+    assert_eq!(output, vec!["7 11 22 33 44"]);
+}
+
