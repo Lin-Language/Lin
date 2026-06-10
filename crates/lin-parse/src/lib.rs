@@ -129,6 +129,61 @@ mod format_source_tests {
     }
 
     #[test]
+    fn parenthesized_function_return_type_parses() {
+        // BUG: a parenthesised (grouped) function type in RETURN position — `((Json) => Json)` —
+        // failed to parse ("expected Arrow, got ..."): the type parser greedily consumed the
+        // function-BODY `=>` as the function-type arrow. The grouped form must parse to a
+        // function return type, identically to the unparenthesised `(Json) => Json` form.
+        let src = "val mk = (h: Json): ((Json) => Json) => (x: Json): Json => x\n";
+        let mut lexer = lin_lex::Lexer::new(src, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let module = parser.parse_module();
+        assert!(parser.diagnostics.is_empty(), "should parse, got: {:?}", parser.diagnostics);
+        let val = module.statements.iter().find_map(|s| match s {
+            Stmt::Val { value, .. } => Some(value),
+            _ => None,
+        }).expect("a val statement");
+        // The outer val binds a function literal whose return type is the grouped function type.
+        let ret = match val {
+            Expr::Function { return_type, .. } => return_type.as_ref().expect("a return type"),
+            other => panic!("expected a function literal, got {other:?}"),
+        };
+        assert!(
+            matches!(ret, TypeExpr::Function(params, _, _) if params.len() == 1),
+            "return type should be a 1-arg function type, got {ret:?}"
+        );
+    }
+
+    #[test]
+    fn higher_order_function_type_alias_still_parses() {
+        // Guard the inverse: a genuine higher-order function TYPE (not in return position)
+        // `((Json) => Json) => Json` must still parse as a function whose single PARAM is itself
+        // a function type — the return-type carve-out must not affect type-alias position.
+        let src = "type HO = ((Json) => Json) => Json\n";
+        let mut lexer = lin_lex::Lexer::new(src, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let module = parser.parse_module();
+        assert!(parser.diagnostics.is_empty(), "should parse, got: {:?}", parser.diagnostics);
+        let ty = module.statements.iter().find_map(|s| match s {
+            Stmt::TypeDecl { body, .. } => Some(body),
+            _ => None,
+        }).expect("a type declaration");
+        match ty {
+            TypeExpr::Function(params, _, _) => {
+                assert_eq!(params.len(), 1, "expected one param");
+                assert!(
+                    matches!(params[0], TypeExpr::Function(..)),
+                    "the param should itself be a function type, got {:?}",
+                    params[0]
+                );
+            }
+            other => panic!("expected a function type, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn format_source_preserves_partial_multiline_call() {
         // A long argument list that the formatter splits across lines must still re-emit
         // the trailing comma after the final argument.

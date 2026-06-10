@@ -65,6 +65,12 @@ impl Parser {
     }
 
     pub(crate) fn parse_type_primary(&mut self) -> TypeExpr {
+        // Read-and-clear the return-type context: it applies only to the OUTERMOST type primary,
+        // so the parameter types / inner return type / object & array element types all parse with
+        // normal rules. (Token-free recursion from `parse_type_expr`→`parse_type_intersection`
+        // →`parse_type_primary` carries the flag straight here for the outermost type only.)
+        let in_return_type = self.in_return_type;
+        self.in_return_type = false;
         let base = match self.peek_kind() {
             TokenKind::LParen => {
                 // Either a function type `(T1, T2) => U` OR a parenthesized (grouped) type
@@ -88,11 +94,22 @@ impl Parser {
                     }
                 }
                 self.expect(TokenKind::RParen);
+                // In return-type position, a single parenthesised type that is ITSELF a complete
+                // function type is a GROUPED return type (`(h): ((Json) => Json) => body`): the
+                // outer parens already closed the type, so a trailing `=>` is the function-body
+                // arrow, not a type-level arrow. Returning the inner function type here leaves the
+                // body `=>` for `parse_function_expr` to consume. (A genuine higher-order type
+                // alias `((Json) => Json) => Json` is never parsed in return position, so it is
+                // unaffected.)
+                let grouped_fn_return = in_return_type
+                    && !saw_comma
+                    && params.len() == 1
+                    && matches!(params[0], TypeExpr::Function(..));
                 // A `=>` makes it a function type. A single grouped type with no `=>` is just
                 // that type (and may take a postfix `[]` below). A comma-list / zero-arg with no
                 // `=>` is malformed as a grouped type, so still expect the arrow (preserving the
                 // original error) and treat it as a function type.
-                if self.check(TokenKind::Arrow) || saw_comma || params.len() != 1 {
+                if !grouped_fn_return && (self.check(TokenKind::Arrow) || saw_comma || params.len() != 1) {
                     self.expect(TokenKind::Arrow);
                     // The return parses with FULL type-expression precedence so a `|`/`&`
                     // continuation binds to the RETURN, e.g. `(Json) => Int64 | Error` is

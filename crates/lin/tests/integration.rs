@@ -1475,6 +1475,22 @@ print(toString(x))
 }
 
 #[test]
+fn test_parenthesized_function_return_type() {
+    // Regression: a parenthesised (grouped) function type in RETURN position —
+    // `((Json) => Json)` — used to be a parse error ("expected Arrow, got ...") because the
+    // type parser greedily consumed the function-BODY `=>`. It must parse, type-check, and run
+    // identically to a named-alias / unparenthesised return type.
+    let output = run(r#"import { print } from "std/io"
+
+val mk = (h: Json): ((Json) => Json) => (x: Json): Json => x
+
+val f = mk({})
+print(f(42))
+"#);
+    assert_eq!(output, vec!["42"]);
+}
+
+#[test]
 fn test_multi_param_lambda() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -8374,6 +8390,25 @@ print(toString(total))\n";
     let before = run(source);
     let after = run(&formatted);
     assert_eq!(before, after, "formatting changed program output\nformatted:\n{}", formatted);
+}
+
+#[test]
+fn test_fmt_parenthesized_function_return_type_round_trips() {
+    // The formatter must round-trip a parenthesised function return type meaning-preservingly:
+    // it may canonicalise `((Json) => Json)` to the redundant-paren-free `(Json) => Json`, but
+    // the formatted output must re-parse, re-type-check, and produce the same runtime result.
+    let source = "import { print } from \"std/io\"\n\
+val mk = (h: Json): ((Json) => Json) => (x: Json): Json => x\n\
+val f = mk({})\n\
+print(f(42))\n";
+    let formatted = fmt(source);
+    // Idempotent: formatting the formatted output is a fixed point.
+    assert_eq!(formatted, fmt(&formatted), "formatter not idempotent\n{formatted}");
+    // Run-equivalent: same output before and after formatting.
+    let before = run(source);
+    let after = run(&formatted);
+    assert_eq!(before, vec!["42"]);
+    assert_eq!(before, after, "formatting changed program output\nformatted:\n{formatted}");
 }
 
 #[test]
