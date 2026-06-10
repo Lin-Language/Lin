@@ -7414,6 +7414,88 @@ print(toString(kept[0]["y"]))
     );
 }
 
+// Regression: pushing record elements into a PACKED sealed-record array (elem_tag 0xFE) whose
+// STATIC repr is not proven Packed — the map-value fetch/push shape. `byKey["a"] = []` under a
+// `{ String: Pt[] }` annotation allocates a PACKED sealed array (lin_sealed_array_alloc, stride 8)
+// and stores it as the map value; `get(byKey, "a", [])` returns it through the generic
+// `get<T, D>(m, k, default): T | D` seam, where T's instantiation loses the `sealed` bit (seal is
+// deliberately NOT part of type identity — types.rs: `Object{sealed:true} == Object{sealed:false}`)
+// — so `push` monomorphizes to the TAGGED body, whose runtime sink (`lin_array_push`, TAG_OBJECT)
+// blind-wrote 16-byte TaggedVal slots into the 8-byte-stride packed buffer. Two pushes exactly
+// filled the 4×8-byte initial buffer (silent garbage); the THIRD wrote past the end → glibc
+// `double free or corruption (out)` / SIGABRT at exit when the buffer was freed. The dynamic sink
+// (`lin_push_dyn`) instead fell into the flat-coercion `_ => {}` arm → the push was SILENTLY LOST.
+// Root fix: the dynamic/tagged array WRITE sinks (`lin_array_push`, `lin_array_push_tagged`,
+// `lin_push_dyn`, `lin_array_set`) now dispatch on `elem_tag == 0xFE` and PACK the boxed LinObject
+// element into a fresh packed slot via the array's NAMED descriptor (`pack_named_payload_from_object`
+// — the exact WRITE-direction inverse of `lin_array_get_tagged`'s 0xFE materialize-on-read branch,
+// ADR-063 mechanism (i)). `run()` asserts a clean exit, so this test guards both halves: correct
+// values AND no heap corruption at drop. Kept UN-batched (heap-corruption isolation test).
+#[test]
+fn test_sealed_record_array_as_map_value_push_no_heap_corruption() {
+    // The original repro: packed Pt[] map value, fetched + pushed INSIDE a closure, 3 pushes
+    // (one past the 2-push buffer-exact boundary). Also reads elements back through the
+    // materialize-on-read path to prove the packed bytes are real field values, not tagged slots.
+    let closure = run(r#"import { for } from "std/iter"
+import { push, length } from "std/array"
+import { get } from "std/object"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Pt = { "x": Int32, "y": Int32 }
+val run = (): Null =>
+  var byKey: { String: Pt[] } = {}
+  byKey["a"] = []
+  [1, 2, 3].for(i =>
+    push(get(byKey, "a", []), { "x": i, "y": i * 10 })
+  )
+  val pts = get(byKey, "a", [])
+  print("len=${toString(length(pts))}")
+  print(toString(pts[0]["x"]))
+  print(toString(pts[1]["x"]))
+  print(toString(pts[2]["y"]))
+run()
+"#);
+    assert_eq!(closure, vec!["len=3", "1", "2", "30"]);
+
+    // Straight-line variant (no closure): same seam, 5 pushes — crosses the doubling boundary so
+    // the sealed grow path (realloc by stride, not by TaggedVal size) is exercised too.
+    let straight = run(r#"import { push, length } from "std/array"
+import { get } from "std/object"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Pt = { "x": Int32, "y": Int32 }
+val run = (): Null =>
+  var byKey: { String: Pt[] } = {}
+  byKey["a"] = []
+  push(get(byKey, "a", []), { "x": 1, "y": 1 })
+  push(get(byKey, "a", []), { "x": 2, "y": 2 })
+  push(get(byKey, "a", []), { "x": 3, "y": 3 })
+  push(get(byKey, "a", []), { "x": 4, "y": 4 })
+  push(get(byKey, "a", []), { "x": 5, "y": 5 })
+  val pts = get(byKey, "a", [])
+  print("len=${toString(length(pts))}")
+  print(toString(pts[4]["x"]))
+run()
+"#);
+    assert_eq!(straight, vec!["len=5", "5"]);
+
+    // Control: the direct-capture shape (no map seam) stays on the proven-Packed sealed push.
+    let direct = run(r#"import { for } from "std/iter"
+import { push, length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Pt = { "x": Int32, "y": Int32 }
+val run = (): Null =>
+  var arr: Pt[] = []
+  [1, 2, 3].for(i =>
+    push(arr, { "x": i, "y": i })
+  )
+  print("len=${toString(length(arr))}")
+run()
+"#);
+    assert_eq!(direct, vec!["len=3"]);
+}
+
 // Regression: a LITERAL-KEY field WRITE into a PACKED SEALED RECORD (`rec["f"] = …`). Before the
 // FieldSet fix, codegen routed every sealed-record `obj_ty` (Named alias or inline `{...}`) write
 // through `lin_object_set`, which reads a packed sealed struct's bytes as a LinObject header and
