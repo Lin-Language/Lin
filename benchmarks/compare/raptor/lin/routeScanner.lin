@@ -25,30 +25,56 @@ val sameTrip = (a: Json, b: Json): Boolean =>
   a != null && b != null && a["tripId"] == b["tripId"]
 
 // Returns the chosen trip (or null). Tail-recursive backward scan threading lastFound.
-val scanBack = (scanner: Json, routeId: String, stopIndex: Int32, time: Json, i: Int32, lastFound: Json): Json =>
+// The per-route/per-scan invariants (routeTrips, date, dateKey, dowKey, the memo map) are
+// hoisted ONCE in getTrip and passed as parameters — not re-read from the scanner record on
+// every iteration. `pos` is the routeScanPosition map itself; mutating the threaded map
+// persists (it is the same heap object the scanner record holds).
+val scanBack = (routeTrips: Json, pos: Json, routeId: String, stopIndex: Int32, time: Json, date: Int32, dateKey: String, dowKey: String, i: Int32, lastFound: Json): Json =>
   if i < 0 then
     lastFound
   else
-    val routeTrips = scanner["tripsByRoute"][routeId]
     val trip = routeTrips[i]
     val stopTime = trip["stopTimes"][stopIndex]
     if stopTime["departureTime"] < time then
       lastFound
     else
-      val newLastFound = if runsOn(trip["service"], scanner["date"], scanner["dateKey"], scanner["dowKey"]) then
+      val newLastFound = if runsOn(trip["service"], date, dateKey, dowKey) then
         trip
       else
         lastFound
       // update routeScanPosition under the documented condition
       if newLastFound == null || sameTrip(newLastFound, trip) then
-        scanner["routeScanPosition"][routeId] = i
-      scanBack(scanner, routeId, stopIndex, time, i - 1, newLastFound)
+        pos[routeId] = i
+      scanBack(
+        routeTrips,
+        pos,
+        routeId,
+        stopIndex,
+        time,
+        date,
+        dateKey,
+        dowKey,
+        i - 1,
+        newLastFound
+      )
 
 export val getTrip = (scanner: Json, routeId: String, stopIndex: Int32, time: Json): Json =>
   val pos = scanner["routeScanPosition"]
+  val routeTrips = scanner["tripsByRoute"][routeId]
   val start = if pos[routeId] == null then
-    length(scanner["tripsByRoute"][routeId]) - 1
+    length(routeTrips) - 1
   else
     pos[routeId]
-  if pos[routeId] == null then scanner["routeScanPosition"][routeId] = start
-  scanBack(scanner, routeId, stopIndex, time, start, null)
+  if pos[routeId] == null then pos[routeId] = start
+  scanBack(
+    routeTrips,
+    pos,
+    routeId,
+    stopIndex,
+    time,
+    scanner["date"],
+    scanner["dateKey"],
+    scanner["dowKey"],
+    start,
+    null
+  )
