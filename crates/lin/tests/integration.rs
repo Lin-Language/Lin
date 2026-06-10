@@ -15615,6 +15615,73 @@ print("${pick([["a"]], 0)}")
 }
 
 #[test]
+fn test_if_branch_calling_json_function_not_mistyped_as_other_branch() {
+    // ROOT: calling a value typed `(Json) => Json` (or the bare opaque `Function` annotation)
+    // returned a FRESH, never-constrained inference TypeVar instead of `Json`. Both the opaque
+    // `Function` and a concrete `(Json) => Json` resolve to the structurally-identical
+    // `func([TypeVar(MAX)], TypeVar(MAX))`, so the call-site `is_opaque` heuristic misclassified
+    // the concrete signature and freshened its return into a dangling var. Nothing ever solves that
+    // var, so an `if` whose then-branch is `jsonFn(x)` (typed `?T`) and whose else-branch is a
+    // concrete `Bool` collapsed the merge onto `Bool` via `types_compatible` (an unconstrained
+    // TypeVar is vacuously compatible with everything). Codegen then unboxed the Json branch's value
+    // AS a raw Bool — a NULL-pointer dereference when that value is `null` (`onRow` returns `null`).
+    // Fix: an opaque/Json-function call yields the dynamic top type `Json`, which is concrete, so
+    // the merge stays `Json` and each branch boxes into its own correct representation.
+    //
+    // This is the minimal closure-free form. The then-branch (the Json call returning `null`) is
+    // forced taken; on the buggy build this null-derefs in `lin_unbox_bool`.
+    let out = run(r#"
+import { print } from "std/io"
+val onRow = (row: Json): Json => null
+var hd = true
+val x = if hd then
+    onRow([1])
+  else
+    hd = false
+print("${x}")
+"#);
+    assert_eq!(out, vec!["null".to_string()]);
+}
+
+#[test]
+fn test_captured_json_closure_called_in_for_if_no_null_deref() {
+    // End-to-end shape of the same `(Json) => Json` mis-typing: a closure (`onRow`) returned from a
+    // function (`mk`) and captured into a `.for` callback alongside a reassigned `var headerDone`.
+    // The callback's body `if headerDone then onRow(row) else headerDone = true` merged the Json
+    // call result (mis-typed as a dangling var) with the `Bool` assignment and was lowered as a Bool
+    // — so the SECOND iteration (when `headerDone` is true and `onRow` runs, returning the `null`
+    // from `push`) unboxed that null as a Bool and aborted (`tagged.rs` null-deref). The closure /
+    // var-capture machinery is sound; the defect was purely the call-result type. Crash-isolation
+    // test (kept un-batched): a regression would SIGABRT the whole process.
+    let out = run(r#"
+import { for } from "std/iter"
+import { push } from "std/array"
+import { print } from "std/io"
+type RowFn = (Json) => Json
+var out: Json = []
+val mk = (header: Json): RowFn =>
+  val ia: Int32 = header[1]
+  (row: Json): Json =>
+    push(out, row[ia])
+val drive = (rows: Json): Json =>
+  val onRow = mk(rows[0])
+  var headerDone = false
+  rows.for(row =>
+    if headerDone then
+      onRow(row)
+    else
+      headerDone = true
+  )
+  null
+drive([[0, 1], [10, 20], [30, 40]])
+print("${out}")
+"#);
+    // rows[0] is the header (skipped). `ia = header[1] = 1`, so `onRow` reads index 1 of each later
+    // row: [10,20]->20, [30,40]->40.
+    assert_eq!(out, vec!["[20, 40]".to_string()]);
+}
+
+#[test]
 fn test_tco_typed_record_array_param_no_per_iteration_leak() {
     // A TYPED sealed-record array (`Transfer[]`, currently a boxed `Object[]` with heap fields)
     // threaded UNCHANGED through a TAIL-recursive parameter and grown via `push` must not leak a

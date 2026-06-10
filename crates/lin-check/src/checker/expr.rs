@@ -920,6 +920,24 @@ impl Checker {
         // carries the real element type, so it dominates; two empty arrays keep `Never[]`.
         let then_empty_arr = matches!(&then_ty, Type::Array(e) if matches!(**e, Type::Never));
         let else_empty_arr = matches!(&else_ty, Type::Array(e) if matches!(**e, Type::Never));
+        // An UNCONSTRAINED inference TypeVar branch (a plain inference var, id below the
+        // quantified-generic base and not the Json wildcard, that nothing ever SOLVED) must NOT
+        // collapse the merge onto the OTHER concrete branch. The classic source is calling a value
+        // typed `(Json) => Json` (or the opaque `Function` annotation): the call-site freshens its
+        // return into an inference var that is never unified against anything, so it stays unsolved
+        // through the whole check (zonking leaves it dangling). Such a var is `types_compatible`
+        // with EVERY concrete type (an unconstrained var unifies with anything), so the
+        // `else_ty`/`then_ty` collapse below would silently pick the concrete branch — e.g.
+        // `if c then jsonFn(x) /*: ?T*/ else flag /*: Bool*/` became `Bool`, after which lowering
+        // unboxed the Json branch's value AS a Bool (a null-deref when that value is `null`). The
+        // value such a var actually holds at runtime is a boxed Json, so it behaves like the dynamic
+        // top type: treat it as `Json` for the merge decision (the existing `is_json_dynamic` arm
+        // then yields `Json`, boxing both branches into the uniform Json representation).
+        let is_unconstrained_inference_var = |t: &Type| matches!(t, Type::TypeVar(id)
+            if *id < GENERIC_TV_BASE && *id != u32::MAX
+                && !self.solved_type_vars.contains_key(id));
+        let then_dynamic = is_json_dynamic(&then_ty) || is_unconstrained_inference_var(&then_ty);
+        let else_dynamic = is_json_dynamic(&else_ty) || is_unconstrained_inference_var(&else_ty);
         let result_type = if then_empty_arr != else_empty_arr {
             if then_empty_arr { else_ty } else { then_ty }
         } else if distinct_generic_params {
@@ -936,18 +954,20 @@ impl Checker {
             } else {
                 Type::flatten_union(vec![then_ty, else_ty])
             }
-        } else if is_json_dynamic(&then_ty) != is_json_dynamic(&else_ty) {
-            // Exactly one branch is the dynamic top type `Json` (`TypeVar(u32::MAX)`) and the
-            // other is a CONCRETE non-Json type (e.g. `if c then mkErr() /*: Json*/ else rows
-            // /*: String[][]*/`). `Json` unifies with everything, so the `types_compatible`
-            // collapse below would otherwise pick the CONCRETE branch's type as the result —
-            // discarding the Json branch's representation. At runtime the Json branch yields a
-            // boxed Json value (e.g. an object), but the if-expression's static type would say
-            // `String[][]`, so lowering boxes BOTH branches as the concrete representation
-            // (`lin_box_array`) and the Json branch's object is mis-tagged as an array → a
-            // wrong-tagged box that crashes/corrupts on read. `Json` is the top type and
-            // genuinely subsumes the concrete branch, so the result IS `Json` — both branches
-            // box into the uniform Json representation, consistent with how each is produced.
+        } else if then_dynamic != else_dynamic {
+            // Exactly one branch is the dynamic top type — the `Json` wildcard (`TypeVar(u32::MAX)`)
+            // OR an unconstrained inference var (an opaque/Json function-call result, see above) —
+            // and the other is a CONCRETE type (e.g. `if c then mkErr() /*: Json*/ else rows
+            // /*: String[][]*/`, or `if c then jsonFn(x) /*: ?T*/ else flag /*: Bool*/`). A dynamic
+            // type unifies with everything, so the `types_compatible` collapse below would otherwise
+            // pick the CONCRETE branch's type as the result — discarding the dynamic branch's
+            // representation. At runtime the dynamic branch yields a boxed Json value, but the
+            // if-expression's static type would say (e.g.) `String[][]`/`Bool`, so lowering boxes
+            // BOTH branches as the concrete representation and the dynamic branch's value is
+            // mis-tagged → a wrong-tagged box that crashes/corrupts on read (a Bool unbox of a Json
+            // `null` null-derefs). `Json` is the top type and genuinely subsumes the concrete
+            // branch, so the result IS `Json` — both branches box into the uniform Json
+            // representation, consistent with how each is produced.
             Type::TypeVar(u32::MAX)
         } else if self.types_compatible(&then_ty, &else_ty) {
             else_ty
