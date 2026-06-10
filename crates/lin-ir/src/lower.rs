@@ -5546,15 +5546,26 @@ fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp,
             builder.emit(Instruction::CallIntrinsic {
                 dst: push_dst, intrinsic: Intrinsic::Push, args: vec![out, boxed], ret_ty: Type::Null,
             });
-            // `Push` (`lin_array_push_tagged`) MOVES the box's inner into the result slot without
-            // retaining. When `box_to_json` made a FRESH box for a concrete `val` (val_ty not a
-            // union), its 16-byte shell is now orphaned — the inner lives on in the array. Reclaim
-            // the shell (the inner is NOT touched — that pointer belongs to the array). Skipped when
-            // `boxed == val` (val was already a union; that box is owned/freed elsewhere — e.g. the
-            // map elem box freed by `free_combinator_elem_box`). Without this a concrete-producing
-            // `map(src, x => {…})` leaked the per-element push box shell (~16 B/elem).
+            // RECLAIM the fresh per-element box when `box_to_json` allocated one for a CONCRETE `val`
+            // (`boxed != val`; skipped when `val` was already a union — that box is owned/freed
+            // elsewhere, e.g. the map elem box reclaimed by `free_combinator_elem_box`).
+            //
+            // The reclaim DEPTH must match what codegen's `Intrinsic::Push` does with the inner:
+            //   - the MOVE push (`lin_array_push_tagged`) raw-copies the box's inner into the result
+            //     slot WITHOUT retaining — the inner now lives on in the array, so only the orphaned
+            //     16-byte shell is reclaimed (`FreeBoxShell`);
+            //   - the RETAINING push (`lin_push_dyn`) BUMPS the inner's refcount so the result array
+            //     owns its OWN reference — the fresh box still holds `val`'s original +1, which must be
+            //     FULLY released (inner decrement + shell) or every element's inner heap value leaks
+            //     (the ~88 B/elem `map(src, x => {…})`-into-`Object[]`/`Rec[]` leak).
+            // A freshly-boxed concrete `val` is a Json/union value pushed into an `Array`, which is
+            // exactly codegen's retaining-push condition (`union_elem_into_concrete`, and for a
+            // union/Named result-element type also `arr_elem_dynamic`). So `boxed != val` in this
+            // tagged-store branch ALWAYS takes the retaining `lin_push_dyn` → the fresh box still owns
+            // `val`'s original +1 after the push and must be FULLY released (inner + shell), NOT just
+            // the orphaned shell. `Release` on a Json temp lowers to `lin_tagged_release`.
             if boxed != val {
-                builder.emit(Instruction::FreeBoxShell { val: boxed });
+                builder.emit(Instruction::Release { val: boxed, ty: Type::TypeVar(u32::MAX) });
             }
         }
     }
@@ -6044,7 +6055,7 @@ fn extract_fuse_chain<'a>(
     ctx: &LowerCtx,
 ) -> (&'a TypedExpr, Vec<FuseStage>) {
     let mut stages: Vec<FuseStage> = Vec::new();
-    let mut cur = recv;
+    let mut cur = peel_combinator_coerce(recv, builder, ctx);
     loop {
         let Some(name) = combinator_callee_name(cur, builder, ctx) else { break };
         let TypedExpr::Call { args, .. } = cur else { break };
@@ -6057,22 +6068,27 @@ fn extract_fuse_chain<'a>(
             break;
         }
         let Some((params, body)) = inlinable_capturing_lambda(&args[1], builder, ctx) else { break };
-        // SCALAR-ONLY GATE (sound subset): fuse only when the value FLOWING THROUGH this stage is a
-        // concrete inline scalar — the element this stage reads and (for a map) produces. This keeps
-        // fusion on the proven flat-scalar pipeline (range/map/filter/reduce of Int/Float) and bails
-        // any SEALED-RECORD / heap-element source to the existing per-stage path. The packed-sealed
-        // element materialize-and-reclaim (`free_combinator_sealed_elem`) is left to the single-
-        // combinator lowering, which the repr pass and runtime already agree on; folding it into a
-        // fused loop risks the per-element sealed-struct double-release (a separate, pre-existing hazard
-        // in packed `map`-field-projection — out of scope for this fusion).
+        // REPR GATE (Step 8.1 widening — sound subset): fuse when the value FLOWING INTO this stage
+        // has a representation whose per-element materialize-and-reclaim the fused loop's RC discipline
+        // covers (`fuse_elem_repr_reclaimable`): an inline scalar (no RC), a SEALED-SCALAR record
+        // (`free_combinator_sealed_elem` → `lin_sealed_release`), or a union/Json box
+        // (`free_combinator_elem_box_full`). This widens the original scalar-only gate to the
+        // sealed-record sources the RAPTOR scan + any record-combinator code use, reusing the SAME
+        // materialize-and-release the single-combinator path already trusts. A plain unsealed
+        // `Str[]`/`Object[]` element (neither scalar, sealed, nor union) is NOT reclaimed by either
+        // helper on the fused drop path, so it still bails to the per-stage lowering.
         let in_ty = iter_elem_type(&args[0].ty());
-        if !is_inline_scalar(&in_ty) {
+        if !fuse_elem_repr_reclaimable(&in_ty) {
             break;
         }
         let stage = if is_map {
             let (_, ret) = callback_signature(&args[1]);
-            // A map producing a non-scalar (heap/sealed/union) value would carry a boxed value into the
-            // next stage / terminal that the fused RC discipline here doesn't cover — bail.
+            // A map's OUTPUT must be an inline scalar: it becomes the carried value into the next
+            // stage / terminal. A scalar carries with no RC (the proven projection case
+            // `t => t["dist"]`); a non-scalar map output would be a fresh heap value threaded through
+            // further stages whose multi-stage carry RC is out of scope here (it works for a single
+            // map-into-terminal via the alias guard + survivor release, but to keep the fuser's
+            // invariant simple we require scalar map outputs — the dominant record-projection shape).
             if !is_inline_scalar(&ret) {
                 break;
             }
@@ -6081,16 +6097,50 @@ fn extract_fuse_chain<'a>(
             FuseStage::Filter { params: params.to_vec(), body: body.clone() }
         };
         stages.push(stage);
-        cur = &args[0];
+        cur = peel_combinator_coerce(&args[0], builder, ctx);
     }
-    // After peeling, the BASE source element must also be an inline scalar (a filter-only chain over a
-    // sealed array would otherwise fuse with a packed element source). If not, drop all stages — the
-    // caller falls back to the per-stage path for the whole chain.
-    if !is_inline_scalar(&iter_elem_type(&cur.ty())) {
+    // After peeling, the BASE source element must also have a reclaimable repr (a filter-only chain
+    // over an unsealed heap-element array would otherwise fuse with an un-reclaimed element). If not,
+    // drop all stages — the caller falls back to the per-stage path for the whole chain.
+    if !fuse_elem_repr_reclaimable(&iter_elem_type(&cur.ty())) {
         stages.clear();
     }
     stages.reverse();
     (cur, stages)
+}
+
+/// See through a representation-changing `Coerce` that wraps a FUSIBLE combinator call. A generic
+/// `std/iter` `map`/`filter` is typed `(T[]) -> T[]` / `(T[]) -> U[]` over a TYPEVAR element, so its
+/// result is a BOXED `Object[]`; when bound at a concrete `Trip[]` annotation the checker inserts an
+/// `Array(boxed) -> Array(packed-sealed)` projection `Coerce`. That projection exists ONLY to
+/// materialize the intermediate per-stage array in the concrete repr — but a FUSED chain never builds
+/// that intermediate (it reads elements straight from the base packed source and runs the terminal in
+/// one pass). So for the purpose of chain extraction the Coerce is transparent: peel it to the inner
+/// combinator call. Only peels an `Array -> Array` Coerce around a recognised combinator call (the
+/// exact generic-combinator boundary); any other Coerce is left intact (the chain stops there).
+fn peel_combinator_coerce<'a>(expr: &'a TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> &'a TypedExpr {
+    if let TypedExpr::Coerce { expr: inner, from, to, .. } = expr {
+        if matches!(from, Type::Array(_) | Type::Iterator(_))
+            && matches!(to, Type::Array(_) | Type::Iterator(_))
+            && combinator_callee_name(inner, builder, ctx).is_some()
+        {
+            return inner;
+        }
+    }
+    expr
+}
+
+/// True when an element of type `ty`, materialized per-iteration by `Instruction::Index` in a fused
+/// combinator loop, is correctly RECLAIMED by the fused drop/consume discipline
+/// (`free_combinator_sealed_elem` + `free_combinator_elem_box_full`):
+///   - an inline scalar (Int/Float/Bool) — no refcount, nothing to reclaim;
+///   - a SEALED-SCALAR record — `Instruction::Index` materializes a fresh +1 packed struct,
+///     reclaimed by `free_combinator_sealed_elem` (`lin_sealed_release`, heap-field-walking);
+///   - a union/Json box — reclaimed (shell + retained inner) by `free_combinator_elem_box_full`.
+/// A plain unsealed `Str`/`Array`/`Object` element is NOT covered by either helper, so it returns
+/// false and the chain falls back to per-stage lowering (no regression, no leak).
+fn fuse_elem_repr_reclaimable(ty: &Type) -> bool {
+    is_inline_scalar(ty) || is_sealed_scalar_repr(ty) || is_union_ty(ty)
 }
 
 /// Apply fused stages for a side-effecting terminal (a filter skip jumps to `skip_block`). Returns
@@ -6110,6 +6160,12 @@ fn apply_fuse_stages(
 ) -> Option<(Temp, Type)> {
     let src_elem = elem;
     let src_elem_ty = elem_ty.clone();
+    // OWNERSHIP of the per-iteration SOURCE materialize (`src_elem`): once an upstream map CONSUMES
+    // it (producing a fresh value that does not alias it), the map FREES it here and the source no
+    // longer owns it. A later stage that also tried to free `src_elem` would double-free (the
+    // `map.filter.reduce` UAF in `lin_sealed_release`). Track liveness so each `src_elem` reclaim
+    // happens exactly once.
+    let mut src_alive = true;
     for stage in stages {
         match stage {
             FuseStage::Filter { params, body } => {
@@ -6126,8 +6182,13 @@ fn apply_fuse_stages(
                 let drop_block = builder.alloc_block("fuse_drop");
                 builder.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
                 builder.switch_to(drop_block);
-                free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
-                free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                // Reclaim the dropped element: the SOURCE materialize (only if an upstream map has
+                // not already consumed it), plus the CURRENT carried value when it is a distinct
+                // upstream-map output (a fresh value the map produced and the source no longer owns).
+                if src_alive {
+                    free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
+                    free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                }
                 if elem != src_elem {
                     builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
                 }
@@ -6137,11 +6198,22 @@ fn apply_fuse_stages(
             FuseStage::Map { params, body, out_elem_ty } => {
                 let (mapped, mapped_ty) =
                     inline_lambda_body(params, body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx);
-                if elem != src_elem {
-                    builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
-                } else {
-                    free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
-                    free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                // ALIAS GUARD: if the body returned its INPUT unchanged (`x => x` identity, or any
+                // body whose result temp IS the incoming `elem`/`src_elem`), ownership transfers to
+                // the carried value — releasing the incoming here would be a use-after-free (the
+                // hazard the scalar-only gate originally side-stepped). Reclaim the incoming only when
+                // the map produced a genuinely-fresh result that does NOT alias it.
+                let aliases_incoming = mapped == elem || mapped == src_elem;
+                if !aliases_incoming {
+                    if elem != src_elem {
+                        builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
+                    } else {
+                        // The map consumed the SOURCE materialize → reclaim it here, exactly once,
+                        // and mark it dead so no downstream stage frees it again.
+                        free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
+                        free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                        src_alive = false;
+                    }
                 }
                 elem = mapped;
                 elem_ty = if matches!(mapped_ty, Type::TypeVar(_)) { out_elem_ty.clone() } else { mapped_ty };
@@ -6699,6 +6771,47 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
     // array mistyped as a flat `T[]` (ADR-044).
     let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
 
+    // FUSED CHAIN (path-6 6a, Step 8.1 array-producing terminal): base.map/filter chain into THIS
+    // map's loop, building ONE result array in a single pass (no intermediate per-stage array). The
+    // terminal map lambda is applied to each survivor and pushed. Requires an inlinable body lambda
+    // and at least one fusible upstream stage; bails otherwise.
+    // Gate to a SCALAR output element: the terminal map projects to a flat scalar array (the dominant
+    // `.map(t => t.field)` shape), so each push is by value with no per-element RC and no packed
+    // struct-push. A heap/sealed OUTPUT element (`map(t => t)` / `map(t => {…})` producing `Trip[]` /
+    // `Object[]`) is left to the per-stage path (the packed-struct-push repr boundary is out of scope).
+    if is_inline_scalar(&out_elem_ty) {
+    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+        let (base, stages) = extract_fuse_chain(&args[0], builder, ctx);
+        if !stages.is_empty() {
+            let lam_params = lam_params.to_vec();
+            let lam_body = lam_body.clone();
+            let base_ty = base.ty();
+            let read_elem_ty = combinator_read_elem_ty(base, builder, ctx);
+            let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+            let iterable = lower_expr(base, builder, ctx);
+            emit_fused_loop(iterable, &base_ty, &read_elem_ty, &stages, builder, ctx,
+                |val, val_ty, idx, src_elem, src_elem_ty, b, c| {
+                    let (mapped, mapped_ty) =
+                        inline_lambda_body(&lam_params, &lam_body, &[(val, val_ty.clone()), (idx, Type::Int32)], b, c);
+                    // `mapped` is the terminal lambda's freshly-owned result (+1) — MOVE into `out`.
+                    push_output(out, flat, &out_elem_ty, mapped, &mapped_ty, false, b);
+                    // Reclaim the survivor the terminal consumed (mirrors the `for` terminal): the
+                    // source-element materialize when it IS the source struct, else the upstream-map
+                    // fresh value — unless the terminal returned it unchanged (`mapped` aliases it).
+                    if mapped != val && mapped != src_elem {
+                        if val == src_elem {
+                            free_combinator_elem_box_full(src_elem, src_elem_ty, b);
+                            free_combinator_sealed_elem(src_elem, &base_ty, src_elem_ty, b);
+                        } else {
+                            b.emit(Instruction::Release { val, ty: val_ty });
+                        }
+                    }
+                });
+            return out;
+        }
+    }
+    }
+
     let iterable = lower_expr(&args[0], builder, ctx);
 
     // INLINE FAST PATH (ADR-044 + capturing-closure inline): a literal lambda — capturing OR not — is
@@ -6769,6 +6882,49 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     // Read at the source's PROVABLE representation (ADR-044): flat scalar for a provably-flat
     // producer, else tagged Json (sound for a `[]`+push array mistyped as flat).
     let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
+
+    // FUSED CHAIN (path-6 6a, Step 8.1 array-producing terminal): base.map/filter chain into THIS
+    // filter's loop, building ONE result array in a single pass. Gated to a SCALAR output element
+    // (the survivor a flat scalar, e.g. `xs.map(t => t.field).filter(x => x > k)`): each kept element
+    // pushes by value with no per-element RC. A heap/sealed survivor (a `Trip[]`-preserving filter
+    // chain) is left to the per-stage path — its packed/borrowed push RC is out of scope here.
+    if is_inline_scalar(&out_elem_ty) {
+        if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+            let (base, stages) = extract_fuse_chain(&args[0], builder, ctx);
+            if !stages.is_empty() {
+                let lam_params = lam_params.to_vec();
+                let lam_body = lam_body.clone();
+                let base_ty = base.ty();
+                let read_elem_ty = combinator_read_elem_ty(base, builder, ctx);
+                let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+                let iterable = lower_expr(base, builder, ctx);
+                emit_fused_loop(iterable, &base_ty, &read_elem_ty, &stages, builder, ctx,
+                    |val, val_ty, idx, _src_elem, _src_elem_ty, b, c| {
+                        // The survivor `val` is a flat scalar (gated). Run the terminal predicate; on
+                        // keep, push the scalar by value (no RC, no retain); on drop, discard. The
+                        // upstream stages already reclaimed any source materialize before producing the
+                        // scalar survivor, so there is nothing to free here either way.
+                        let (pred_raw, pred_ty) = inline_lambda_body(
+                            &lam_params, &lam_body, &[(val, val_ty.clone()), (idx, Type::Int32)], b, c);
+                        let keep = if matches!(pred_ty, Type::Bool) {
+                            pred_raw
+                        } else {
+                            let d = b.alloc_temp(Type::Bool);
+                            b.emit(Instruction::Coerce { dst: d, src: pred_raw, from_ty: pred_ty, to_ty: Type::Bool });
+                            d
+                        };
+                        let keep_block = b.alloc_block("ffilter_keep");
+                        let join_block = b.alloc_block("ffilter_skip");
+                        b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: join_block });
+                        b.switch_to(keep_block);
+                        push_output(out, flat, &out_elem_ty, val, &val_ty, false, b);
+                        b.terminate(Terminator::Jump(join_block));
+                        b.switch_to(join_block);
+                    });
+                return out;
+            }
+        }
+    }
 
     let iterable = lower_expr(&args[0], builder, ctx);
 
@@ -6918,6 +7074,12 @@ fn lower_fused_reduce(
         if sv == elem {
             free_combinator_elem_box_full(elem, &read_elem_ty, builder);
             free_combinator_sealed_elem(elem, &iterable_ty, &read_elem_ty, builder);
+        } else {
+            // A map stage produced a FRESH survivor (e.g. a projected heap value) distinct from the
+            // source element. The reducer READ it (a fold consumes by reference, producing the scalar
+            // acc), so nothing else owns it — release it or it leaks one per element. A scalar
+            // survivor `Release` is a no-op; a heap survivor (string/object) is reclaimed.
+            builder.emit(Instruction::Release { val: sv, ty: sv_ty.clone() });
         }
         let keep_latch_pred = builder.current_block;
         builder.terminate(Terminator::Jump(latch));
@@ -6955,6 +7117,9 @@ fn apply_fuse_stages_reduce(
 ) -> Option<(Temp, Type)> {
     let src_elem = elem;
     let src_elem_ty = elem_ty.clone();
+    // See `apply_fuse_stages`: track whether the per-iteration SOURCE materialize is still owned, so
+    // a map that consumed it followed by a filter drop does not double-free it (`lin_sealed_release`).
+    let mut src_alive = true;
     for stage in stages {
         match stage {
             FuseStage::Filter { params, body } => {
@@ -6971,8 +7136,10 @@ fn apply_fuse_stages_reduce(
                 let drop_block = builder.alloc_block("freduce_drop");
                 builder.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
                 builder.switch_to(drop_block);
-                free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
-                free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                if src_alive {
+                    free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
+                    free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                }
                 if elem != src_elem {
                     builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
                 }
@@ -6984,11 +7151,17 @@ fn apply_fuse_stages_reduce(
             FuseStage::Map { params, body, out_elem_ty } => {
                 let (mapped, mapped_ty) =
                     inline_lambda_body(params, body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx);
-                if elem != src_elem {
-                    builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
-                } else {
-                    free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
-                    free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                // ALIAS GUARD (see `apply_fuse_stages`): don't release the incoming value when the
+                // map body returned it unchanged — ownership transfers to the carried survivor.
+                let aliases_incoming = mapped == elem || mapped == src_elem;
+                if !aliases_incoming {
+                    if elem != src_elem {
+                        builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
+                    } else {
+                        free_combinator_elem_box_full(src_elem, &src_elem_ty, builder);
+                        free_combinator_sealed_elem(src_elem, iterable_ty, &src_elem_ty, builder);
+                        src_alive = false;
+                    }
                 }
                 elem = mapped;
                 elem_ty = if matches!(mapped_ty, Type::TypeVar(_)) { out_elem_ty.clone() } else { mapped_ty };
