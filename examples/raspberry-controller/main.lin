@@ -29,46 +29,53 @@ import { encodeTelemetry, decodeTelemetry, Telemetry } from "./telemetry"
 // reference. The per-tick body is a single `tick` call (no block-form `if`
 // inside the `.for` lambda, since indentation is suppressed inside parens).
 export val runController = (host: String, port: Int32): Null =>
+  // `udpBind` returns `Int32 | Error`; bail out early on failure so the rest of
+  // the loop only runs with a real socket descriptor (narrowed to `Int32`).
   val fd = udpBind(0)
-  rawMode(true)
-  print("Controls: q/a = left +/-  |  w/s = right +/-  |  space = stop  |  ESC = quit")
+  match fd
+    is Error => print("failed to open UDP socket")
+    else =>
+      rawMode(true)
+      print(
+        "Controls: q/a = left +/-  |  w/s = right +/-  |  space = stop  |  ESC = quit"
+      )
 
-  var left = 0.0
-  var right = 0.0
-  var running = true
+      var left = 0.0
+      var right = 0.0
+      var running = true
 
-  // Next [left, right] pair for a key: ESC and unknown/no-key leave speeds as-is
-  // (ESC's stop is handled in `tick`), space/q/a/w/s go through applyKey.
-  val nextPair = (key: Int32 | Null): Float64[] =>
-    if key == null then
-      [left, right]
-    else if key == 27 then
-      [left, right]
-    else
-      applyKey(key, left, right)
+      // Next [left, right] pair for a key: ESC and unknown/no-key leave speeds
+      // as-is (ESC's stop is handled in `tick`), space/q/a/w/s go through applyKey.
+      val nextPair = (key: Int32 | Null): Float64[] =>
+        if key == null then
+          [left, right]
+        else if key == 27 then
+          [left, right]
+        else
+          applyKey(key, left, right)
 
-  // One 20 Hz tick: poll a key (non-blocking), update speeds, send the packet.
-  // ESC (27) zeroes the speeds and stops the loop.
-  val tick = (): Null =>
-    val key = readKey()
-    val pair = nextPair(key)
-    left = pair[0]
-    right = pair[1]
-    if key == 27 then
-      left = 0.0
-      right = 0.0
-      running = false
-    else
-      null
-    udpSendTo(fd, host, port, encodePacket(left, right))
-    sleep(50)
+      // One 20 Hz tick: poll a key (non-blocking), update speeds, send the packet.
+      // ESC (27) zeroes the speeds and stops the loop.
+      val tick = (): Null =>
+        val key = readKey()
+        val pair = nextPair(key)
+        left = pair[0]
+        right = pair[1]
+        if key == 27 then
+          left = 0.0
+          right = 0.0
+          running = false
+        else
+          null
+        udpSendTo(fd, host, port, encodePacket(left, right))
+        sleep(50)
 
-  range(0, 100000).for(i =>
-    if running then tick() else null
-  )
+      range(0, 100000).for(i =>
+        if running then tick() else null
+      )
 
-  rawMode(false)
-  print("Stopped.")
+      rawMode(false)
+      print("Stopped.")
 
 // A non-interactive smoke run so the example is exercised by CI: encode a few
 // control packets and a telemetry frame, confirm the bytes, without touching the
