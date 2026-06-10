@@ -297,8 +297,59 @@ pub unsafe extern "C" fn lin_string_cmp(a: *const LinString, b: *const LinString
 
 // Numeric -> string conversions
 
+// Immortal small-int `toString` cache.
+//
+// `lin_int_to_string` is on the hot path of any loop that builds string keys
+// (`"k${toString(i)}"`, RAPTOR's `dateKey`/`dowKey`), where the SAME small integers stringify
+// over and over. Each call otherwise heap-allocates a fresh `LinString`. We pre-build one
+// immortal `LinString` per integer in the same `[SMALL_INT_MIN, SMALL_INT_MAX)` window the
+// scalar-box cache uses (`crate::tagged`), and return that shared pointer instead of allocating.
+//
+// SAFETY CONTRACT — identical to interned string literals (see `IMMORTAL_RC`): each cached
+// string is allocated once with refcount `IMMORTAL_RC`, so both `lin_string_inc_ref` and
+// `lin_string_release` no-op on it. It is never mutated and never freed, so returning the same
+// pointer to many owners (including across worker threads) is benign — the same basis as the
+// literal cache and `Frozen<T>`. The bytes are immutable decimal digits with no heap payload,
+// so never freeing them leaks nothing.
+//
+// Lazily built on first use via `OnceLock` (a `LinString` is a heap allocation, so it can't be
+// a compile-time `static` like the plain-data box cache). The raw pointers are wrapped in a
+// `Send`/`Sync` newtype: sound precisely because the targets are immortal + immutable.
+use std::sync::OnceLock;
+struct IntStrCache(Vec<*mut LinString>);
+// SAFETY: every pointer targets an immortal, immutable LinString (refcount = IMMORTAL_RC);
+// nothing ever writes through them or frees them, so sharing across threads cannot race.
+unsafe impl Sync for IntStrCache {}
+unsafe impl Send for IntStrCache {}
+
+static INT_STR_CACHE: OnceLock<IntStrCache> = OnceLock::new();
+
+fn int_str_cache() -> &'static IntStrCache {
+    INT_STR_CACHE.get_or_init(|| {
+        let len = (crate::tagged::SMALL_INT_MAX - crate::tagged::SMALL_INT_MIN) as usize;
+        let mut v = Vec::with_capacity(len);
+        for i in 0..len {
+            let n = crate::tagged::SMALL_INT_MIN + i as i64;
+            let s = n.to_string();
+            // SAFETY: lin_string_alloc returns a fresh, owned LinString of the right size.
+            unsafe {
+                let ptr = lin_string_alloc(s.len() as u32);
+                (*ptr).refcount = IMMORTAL_RC;
+                if !s.is_empty() {
+                    std::ptr::copy_nonoverlapping(s.as_ptr(), (*ptr).data.as_mut_ptr(), s.len());
+                }
+                v.push(ptr);
+            }
+        }
+        IntStrCache(v)
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn lin_int_to_string(n: i64) -> *mut LinString {
+    if n >= crate::tagged::SMALL_INT_MIN && n < crate::tagged::SMALL_INT_MAX {
+        return int_str_cache().0[(n - crate::tagged::SMALL_INT_MIN) as usize];
+    }
     let s = n.to_string();
     unsafe { lin_string_from_bytes(s.as_ptr(), s.len() as u32) }
 }
