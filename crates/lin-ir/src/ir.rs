@@ -507,20 +507,6 @@ pub enum Instruction {
     Box { dst: Temp, val: Temp, ty: Type },
     /// result = unbox(val, ty) — extract scalar from tagged union
     Unbox { dst: Temp, val: Temp, result_ty: Type },
-    /// KEEP-PACKED box (repr pass, Stage 4): wrap a STILL-PACKED `LinArray*` (elem_tag 0xFE) /
-    /// packed sealed struct* into a 16-byte `TaggedVal` (TAG_ARRAY / TAG_OBJECT) WITHOUT
-    /// materializing — O(1), no deep copy, no per-element retain. The box BORROWS the inner: only
-    /// the shell is a fresh +1; the inner's reference comes from the surrounding
-    /// `transfer_into_container`. `dst`'s repr is `Boxed(WrapsPacked(layout))`. Lowers to the
-    /// `box_array`-by-pointer path (boxing.rs) generalized to the 0xFE kind. `arr` is `true` for a
-    /// sealed ARRAY (TAG_ARRAY), `false` for a sealed RECORD (TAG_OBJECT). See ADR-062.
-    BoxKeepPacked { dst: Temp, src: Temp, ty: Type, arr: bool },
-    /// KEEP-PACKED unbox (repr pass, Stage 4): tag-check the `TaggedVal`, load the payload pointer as
-    /// the STILL-PACKED `LinArray*` / packed struct*, retain it (one shell +1). O(1), zero copy. The
-    /// dst is a `Packed(layout)` temp fed directly to `SealedArrayFieldGet` / packed `FieldGet` /
-    /// `Index`. Lowers to `unbox_ptr` + retain — now JUSTIFIED by the pass (the silent assumption
-    /// becomes a proven one). `ty` is the packed result type; `arr` distinguishes array vs record.
-    UnboxKeepPacked { dst: Temp, src: Temp, ty: Type, arr: bool },
     /// Bind a pattern variable: dst = source val.
     Bind { dst: Temp, src: Temp, ty: Type },
     /// Panic with a message string.

@@ -2203,18 +2203,6 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result);
                             }
                         }
-                        Instruction::BoxKeepPacked { dst, src, arr, .. } => {
-                            if let Some(&v) = temp_map.get(src) {
-                                let result = self.compile_ir_box_keep_packed(v, *arr);
-                                temp_map.insert(*dst, result);
-                            }
-                        }
-                        Instruction::UnboxKeepPacked { dst, src, arr, .. } => {
-                            if let Some(&v) = temp_map.get(src) {
-                                let result = self.compile_ir_unbox_keep_packed(v, *arr);
-                                temp_map.insert(*dst, result);
-                            }
-                        }
                         Instruction::Unary { dst, op, operand, ty } => {
                             if let Some(&v) = temp_map.get(operand) {
                                 let result = self.compile_ir_unary(v, op, ty);

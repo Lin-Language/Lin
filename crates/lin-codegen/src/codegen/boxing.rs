@@ -120,9 +120,9 @@ impl<'ctx> Codegen<'ctx> {
             // lin_tagged_eq / combinators) can read directly. `box_value` is the GENERICALLY-DYNAMIC
             // boxing entry (toString / keys / spread / heterogeneous element / closure arg), so it
             // MATERIALIZES to a tagged `Object[]` here — the fail-safe boxed view. The keep-packed
-            // container-store path (the dijkstra fix) does NOT route through `box_value`; it emits
-            // `BoxKeepPacked` directly at `emit_map_set` so only the genuinely-dynamic consumers pay
-            // the materialize (repr pass, Stage 4 boundary catalogue).
+            // container-store path does NOT route through `box_value`; `emit_map_set` calls
+            // `compile_ir_box_keep_packed` directly so only the genuinely-dynamic consumers pay the
+            // materialize.
             Type::Array(_) if val.is_pointer_value() && Self::sealed_array_elem(val_ty).is_some() => {
                 let tagged = self.sealed_array_to_tagged(val, val_ty);
                 self.builder.call(self.rt.box_array, &[tagged.into()], "boxsarr")
@@ -151,9 +151,9 @@ impl<'ctx> Codegen<'ctx> {
             // node MUST be MATERIALIZED to a real boxed `LinObject` here (boxing the raw `*SumNode` as
             // TAG_OBJECT was a latent type-confusion bug: the consumer's `object_get`/release walked a
             // SumNode header as a LinObject → garbage discriminant / crash). The keep-packed
-            // container-store boundary (Map value slot) does NOT route through `box_value`; it emits
-            // `BoxKeepPacked` (TAG_SUMNODE) directly so only the genuinely-dynamic consumers pay the
-            // materialize. Handle BEFORE the generic Union arm (a sum type IS a `Type::Union`).
+            // container-store boundary (Map value slot) does NOT route through `box_value`; it stores a
+            // TAG_SUMNODE node directly so only the genuinely-dynamic consumers pay the materialize.
+            // Handle BEFORE the generic Union arm (a sum type IS a `Type::Union`).
             Type::Union(_) if Self::is_sum_type(val_ty) && val.is_pointer_value() => {
                 let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 let obj = self.sumnode_materialize_to_object(val, val_ty, llvm_fn);
@@ -386,12 +386,13 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// KEEP-PACKED unbox (repr pass Stage 4): tag-check + load the payload pointer as the still-packed
-    /// `LinArray*` / packed struct*, then retain it (one shell +1). O(1), zero copy. This is the
-    /// justified form of the historically-unguarded `unbox_ptr` assumption: the pass proves the slot
-    /// holds a keep-packed handle (`Boxed(WrapsPacked(L))`), so reading the payload as a packed
-    /// pointer is sound. The retain pairs with the `Release` the pass schedules at the use's last
-    /// drop (the read-back temp owns a +1 of the packed buffer).
+    /// KEEP-PACKED unbox: tag-check + load the payload pointer as the still-packed `LinArray*` /
+    /// packed struct*, then retain it (one shell +1). O(1), zero copy. Called DIRECTLY from
+    /// `compile_ir_index` for a `{String: Sealed[]}` map-value read, where the slot is known to hold a
+    /// still-packed buffer wrapped in a `TaggedVal` (written by `emit_map_set`'s keep-packed store), so
+    /// reading the payload as a packed pointer is sound. The retain balances the `Release` the pass
+    /// schedules at the read-back temp's last drop. (Not driven by any IR opcode — the never-emitted
+    /// `UnboxKeepPacked` instruction was removed.)
     pub(crate) fn compile_ir_unbox_keep_packed(&mut self, val: BasicValueEnum<'ctx>, _arr: bool) -> BasicValueEnum<'ctx> {
         if !val.is_pointer_value() {
             return val;

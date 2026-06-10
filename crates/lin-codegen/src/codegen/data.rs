@@ -358,15 +358,16 @@ impl<'ctx> Codegen<'ctx> {
             } else {
                 key
             };
-            // KEEP-PACKED read-back (repr pass, Stage 4 — THE dijkstra fix): when the map value type
-            // is a PACKED sealed array / sealed record, the slot holds a keep-packed handle
-            // (BoxKeepPacked stored a TaggedVal over the still-packed buffer). Unbox it as a packed
-            // pointer + retain (UnboxKeepPacked) — a fresh +1 owner matching what the old materialize
-            // path produced (so the projection's scheduled Release balances). Zero copy: the inner
-            // buffer never materializes. `lin_map_get` returns a BORROWED interior TaggedVal*, so the
-            // retain on the unboxed payload is what gives the result its own reference. A packed
-            // sealed value can ONLY have been stored via `emit_map_set`'s BoxKeepPacked into a real
-            // `LinMap`, so the container is guaranteed TAG_MAP here — the direct `map_get` is sound.
+            // KEEP-PACKED read-back: when the map value type is a PACKED sealed array / sealed record,
+            // the slot holds a keep-packed handle (a TaggedVal wrapping the still-packed buffer, stored
+            // by `emit_map_set`'s `compile_ir_box_keep_packed`). Unbox it as a packed pointer + retain
+            // (`compile_ir_unbox_keep_packed`) — a fresh +1 owner matching what the old materialize path
+            // produced (so the projection's scheduled Release balances). Zero copy: the inner buffer
+            // never materializes. `lin_map_get` returns a BORROWED interior TaggedVal*, so the retain on
+            // the unboxed payload is what gives the result its own reference. A packed sealed value can
+            // ONLY have been stored via that keep-packed store into a real `LinMap`, so the container is
+            // guaranteed TAG_MAP here — the direct `map_get` is sound. (These helpers are called
+            // directly; the never-emitted `Box/UnboxKeepPacked` IR opcodes were removed.)
             if Self::sealed_array_elem(result_ty).is_some() {
                 let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
                 return self.compile_ir_unbox_keep_packed(tagged, /*arr=*/true);
@@ -581,15 +582,16 @@ impl<'ctx> Codegen<'ctx> {
     /// after the set (net zero on the inner; the slot's reference comes from the IR
     /// `transfer_into_container`), a union value (already a `TaggedVal*`) passes straight through.
     pub(crate) fn emit_map_set(&mut self, map_ptr: BasicValueEnum<'ctx>, key_ptr: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type, elem_ty: &Type, val_repr: &lin_ir::repr::Repr) {
-        // KEEP-PACKED (repr pass, Stage 4 — THE dijkstra fix): when the value is a PACKED sealed
-        // array / sealed record (proven by the pass: `val_repr` is `Packed(L)`), store it into the
-        // map slot by WRAPPING the still-packed pointer in a 16-byte TaggedVal (BoxKeepPacked,
-        // TAG_ARRAY / TAG_OBJECT) — O(1), NO `sealed_array_to_tagged` materialize (the O(n) copy that
-        // crashed on read-back). `lin_map_set` copies the 16 bytes inline and retains the inner; the
-        // shell is freed after. The read-back (`compile_ir_index` Map arm) unboxes it as a packed
-        // pointer (UnboxKeepPacked) feeding SealedArrayFieldGet zero-copy. Always sound: the runtime
-        // dispatches release/free on the buffer's `elem_tag` / sealed header, regardless of being
-        // wrapped in a TaggedVal slot.
+        // KEEP-PACKED: when the value is a PACKED sealed array / sealed record (proven by the pass:
+        // `val_repr` is `Packed(L)`), store it into the map slot by WRAPPING the still-packed pointer
+        // in a 16-byte TaggedVal (`compile_ir_box_keep_packed`, TAG_ARRAY / TAG_OBJECT) — O(1), NO
+        // `sealed_array_to_tagged` materialize (the O(n) copy that crashed on read-back). `lin_map_set`
+        // copies the 16 bytes inline and retains the inner; the shell is freed after. The read-back
+        // (`compile_ir_index` Map arm) unboxes it as a packed pointer (`compile_ir_unbox_keep_packed`)
+        // feeding SealedArrayFieldGet zero-copy. Always sound: the runtime dispatches release/free on
+        // the buffer's `elem_tag` / sealed header, regardless of being wrapped in a TaggedVal slot.
+        // (Driven by these helper calls directly; the matching IR opcodes were never emitted and were
+        // removed.)
         // UNBOXED SUM TYPE: a SumNode value stored into a `{ String: Expr }` map is MATERIALIZED to a
         // boxed `LinObject` (TAG_OBJECT) — the universal Json representation the map slot and the boxed
         // `Expr | Null` read-back expect. The materialized object is +1 owned; `lin_map_set` retains
@@ -619,7 +621,7 @@ impl<'ctx> Codegen<'ctx> {
             let packed_arr = val_repr.packed_sealed_array_layout().is_some();
             let packed_rec = val_repr.packed_struct_fields().is_some();
             if packed_arr || packed_rec {
-                // BoxKeepPacked: wrap the still-packed pointer (O(1) — `lin_box_array`/`box_object`
+                // keep-packed store: wrap the still-packed pointer (O(1) — `lin_box_array`/`box_object`
                 // store the pointer verbatim, NO inner retain, NO `sealed_array_to_tagged` copy).
                 // OWNERSHIP: the slot's single owning reference is supplied by the IR
                 // `transfer_into_container` retain emitted in `IndexSet` lowering (identical to the
@@ -852,8 +854,8 @@ impl<'ctx> Codegen<'ctx> {
                     // PART C (single-owner): the projection decision is read from the pass-computed
                     // representation of the RHS temp (`val_repr`), NOT a Type comparison. A verbatim
                     // pointer store is sound iff the RHS is ALREADY a packed sealed struct of the
-                    // element's exact layout; anything else (boxed LinObject / unsealed `{...}` /
-                    // WrapsPacked handle) is projected into a fresh sealed struct first. This replaces
+                    // element's exact layout; anything else (boxed LinObject / unsealed `{...}`) is
+                    // projected into a fresh sealed struct first. This replaces
                     // `sealed_repr_differs(val_ty, elem_ty)` with the dataflow fact.
                     let needs_proj = val_repr.packed_struct_fields() != Some(&elem_fields);
                     let (sealed_val, owned_here) = if needs_proj {
