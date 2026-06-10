@@ -1265,18 +1265,46 @@ impl Checker {
                 }
                 Ok(None)
             }
-            Type::Object { fields: expected_fields, .. } => {
+            Type::Object { fields: expected_fields, sealed } => {
                 // Take over with directed field-by-field checking when it would actually change
                 // the outcome — otherwise stay on the existing undirected inference path so plain
-                // structural objects are unaffected. Two cases need directing:
+                // structural objects are unaffected. Cases that need directing:
                 //   (1) a `StrLit` field — so a discriminant literal narrows to its singleton;
                 //   (2) a `Map` field (possibly nested inside a further record field) — so an
                 //       object literal in that field position key-widens to `{ String: T }`
-                //       (a `LinMap`) instead of being inferred to its own fixed-record type.
-                if !expected_fields.values().any(|t| expected_field_needs_directing(t)) {
+                //       (a `LinMap`) instead of being inferred to its own fixed-record type;
+                //   (3) THIS expected type is itself a sealed record, or a (nested) field is a
+                //       sealed record(-array) — so the producer adopts the sealed element type and
+                //       builds the same packed/sealed representation the consumer reads back at
+                //       (Path-9C seal-propagation symmetry — see `expected_field_needs_directing`).
+                if !*sealed && !expected_fields.values().any(|t| expected_field_needs_directing(t)) {
                     return Ok(None);
                 }
-                Ok(Some(self.check_object_fields(fields, expected_fields, span)?))
+                // OMISSION GUARD (§5.9.1 soundness): the directed path only checks the fields the
+                // literal actually carries — it would silently accept a literal that OMITS a
+                // required field (one whose expected type does not admit `Null`). The undirected
+                // inference + structural compatibility path catches that and reports the proper
+                // "Expected type … got …" diagnostic, so DEFER to it whenever a required field is
+                // absent. (Extending directing to sealed records — every plain all-scalar named
+                // record is sealed — made this reachable for shapes like `Point = {x,y}` that
+                // previously always deferred; without the guard, `val p: Point = { x: 1 }` would
+                // wrongly type-check. A missing field whose type INCLUDES `Null` stays directed:
+                // that is a permitted omission and the result type is unchanged from inference.)
+                let present: std::collections::HashSet<&str> = fields
+                    .iter()
+                    .filter_map(|f| match f {
+                        ObjectField::Pair(Expr::StringLit(k, _), _) => Some(k.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let omits_required = expected_fields.iter().any(|(k, ft)| {
+                    !present.contains(k.as_str())
+                        && !crate::compat::is_compatible(&Type::Null, ft)
+                });
+                if omits_required {
+                    return Ok(None);
+                }
+                Ok(Some(self.check_object_fields(fields, expected_fields, *sealed, span)?))
             }
             // An object literal checked against a typed index-signature map `{ String: T }`
             // (ADR-055): each literal value must be `T`; the result is typed `Map(T)` and lowered
@@ -1336,7 +1364,12 @@ impl Checker {
                     })
                 });
                 match chosen {
-                    Some(vf) => Ok(Some(self.check_object_fields(fields, vf, span)?)),
+                    // A union variant selected by its discriminant is a named record variant; the
+                    // chosen field map came from a `Type::Object` variant whose seal flag is not
+                    // threaded through `literal_variants` (it only kept the field maps). These
+                    // tagged-union variants are not packed as sealed scalar arrays, so directing
+                    // them UNSEALED preserves existing behaviour (the discriminant still narrows).
+                    Some(vf) => Ok(Some(self.check_object_fields(fields, vf, false, span)?)),
                     None => {
                         // No variant matched: report the valid discriminant tags.
                         let mut tags = Vec::new();
@@ -1372,6 +1405,7 @@ impl Checker {
         &mut self,
         fields: &[ObjectField],
         expected_fields: &IndexMap<String, Type>,
+        sealed: bool,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
         let mut typed_fields = Vec::new();
@@ -1398,9 +1432,35 @@ impl Checker {
             }
         }
         self.in_tail_position = saved_tail;
-        // The refined literal's own type stays UNSEALED (the seal lives on the expected named type;
-        // Stage 1 inserts the projection at the boundary). Inert in Stage 0.5.
-        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads: Vec::new(), ty: Type::object(obj_type), span })
+        // Carry the EXPECTED type's seal flag onto the refined literal's own type (Path-9C) — but
+        // ONLY when every field is gate-packable. This is the producer/consumer SEAL SYMMETRY fix:
+        // recording the literal SEALED makes the PRODUCER build the same packed representation the
+        // CONSUMER reads back at, keeping the two sides' repr classification (and codegen layout) in
+        // agreement. The packability AND is load-bearing, not merely an optimisation:
+        //   - Gate-packable fields (scalar+Bool today): a sealed element flows into a sealed-scalar
+        //     array (`is_sealed_scalar_array`) → the array PACKS, the element is laid out inline, no
+        //     box. The consumer reads it packed. Symmetric, leak-free.
+        //   - A NON-packable field (e.g. String under the scalar+Bool gate): the consumer reads the
+        //     array BOXED (its repr pass uses the SAME gate). If we sealed the producer's element
+        //     anyway, the array stays boxed (`is_sealed_scalar_array` is false) but each element is
+        //     now a SEALED STRUCT that the boxed-array lowering MATERIALIZES to a `LinObject` and
+        //     then LEAKS the transient struct (~one alloc/field/element/build, ASan-confirmed). So
+        //     for an unpackable record we keep the element UNSEALED — the producer builds the boxed
+        //     `LinObject` directly (the historical path), which is ALSO what the consumer reads:
+        //     still symmetric, and leak-free.
+        // When the gate later widens to String (Path-9A), those records become packable and this AND
+        // automatically starts sealing them — no further checker change needed. `Type`
+        // equality/subtyping ignores the seal flag (types.rs), so this is representation-only and
+        // never changes assignability. A field directed only because of a nested `StrLit`/`Map`
+        // (the outer literal itself unsealed) keeps the historical UNSEALED result.
+        let all_fields_packable =
+            !obj_type.is_empty() && obj_type.values().all(|t| t.is_sealed_array_field_packable());
+        let ty = if sealed && all_fields_packable {
+            Type::sealed_object(obj_type)
+        } else {
+            Type::object(obj_type)
+        };
+        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads: Vec::new(), ty, span })
     }
 
     pub(crate) fn infer_array(&mut self, elements: &[Expr], span: Span) -> Result<TypedExpr, Diagnostic> {
@@ -1592,14 +1652,29 @@ pub(crate) fn type_is_streamish(ty: &Type) -> bool {
 /// True if an expected field type warrants the directed object-checking path (so an object
 /// literal in that field position is checked AGAINST the type rather than freely inferred).
 /// This is the gate for `check_object_against`'s `Type::Object` arm. It fires when the type is
-/// — or transitively (in a record-field position) contains — either a `StrLit` singleton (so a
-/// discriminant narrows) or a `Map` (so a record literal key-widens to `{ String: T }`). The
-/// transitive walk handles nested records like `{ headers: { String: String } }` where the
-/// outer record has no direct `StrLit`/`Map` field but a nested field does.
+/// — or transitively (in a record-field position) contains — any of:
+///   - a `StrLit` singleton (so a discriminant narrows);
+///   - a `Map` (so a record literal key-widens to `{ String: T }`);
+///   - a SEALED record, or an `Array`/`FixedArray` whose element is (transitively) a sealed
+///     record (Path-9C seal-propagation symmetry). Directing the literal against a sealed
+///     record(-array) field makes the PRODUCER adopt the sealed element type, so the
+///     `MakeArray`/`MakeObject` it builds carries the same sealed representation the CONSUMER
+///     reads it back at (`trip["stopTimes"]` whose `result_ty` is the sealed `StopTime[]`).
+///     Without this the field falls to UNDIRECTED inference → an UNSEALED `Object[]`, and a
+///     producer/consumer representation divergence (a silent mis-read for scalar fields today;
+///     a misaligned-pointer crash once heap-field packing widens the gate).
+/// The transitive walk handles nested records like `{ headers: { String: String } }` (Map) and
+/// `{ stopTimes: StopTime[] }` (sealed-record array) where the outer record has no DIRECT
+/// directing field but a nested one does.
 pub(crate) fn expected_field_needs_directing(ty: &Type) -> bool {
     match ty {
         Type::StrLit(_) | Type::Map(_) => true,
-        Type::Object { fields, .. } => fields.values().any(expected_field_needs_directing),
+        Type::Object { sealed: true, .. } => true,
+        Type::Object { fields, sealed: false } => fields.values().any(expected_field_needs_directing),
+        Type::Array(elem) | Type::Iterator(elem) | Type::Shared(elem) | Type::Stream(elem) => {
+            expected_field_needs_directing(elem)
+        }
+        Type::FixedArray(elems) | Type::Union(elems) => elems.iter().any(expected_field_needs_directing),
         _ => false,
     }
 }
