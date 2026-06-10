@@ -361,7 +361,14 @@ impl Parser {
 
         let return_type = if self.check(TokenKind::Colon) {
             self.advance();
-            Some(self.parse_type_expr())
+            // Parse the return type in return-type context so a parenthesised (grouped) function
+            // type such as `((Json) => Json)` does not greedily consume the function-BODY `=>`
+            // that follows it. See `Parser::in_return_type`.
+            let prev = self.in_return_type;
+            self.in_return_type = true;
+            let ty = self.parse_type_expr();
+            self.in_return_type = prev;
+            Some(ty)
         } else {
             None
         };
