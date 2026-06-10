@@ -355,6 +355,33 @@ pub unsafe extern "C" fn lin_sealed_array_to_tagged(
 /// Push an element. `elem_ptr` points to the value; `tag` is the type tag.
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_push(arr: *mut LinArray, elem_ptr: *const u8, tag: u8) {
+    // A SEALED (0xFE) destination: the static type said "tagged record array" (the `sealed` bit is
+    // not part of type identity, so it can be dropped across generic/union seams — e.g. a packed
+    // map value fetched back via `std/object.get`), but the runtime buffer is packed with
+    // `elem_stride`-sized inline elements. The tagged write below would store 16-byte TaggedVal
+    // slots into it (heap-buffer overflow past 2 elements → `double free or corruption` at drop).
+    // PACK the element instead — the write-direction mirror of `lin_array_get_tagged`'s 0xFE
+    // materialize-on-read branch. Move contract preserved: this sink owns the transferred +1
+    // object reference; packing retains the heap fields into the slot, then the object is released
+    // (net: field ownership moves into the slot, the shell is freed).
+    if (*arr).elem_tag == SEALED_ARRAY_TAG {
+        if tag != crate::tagged::TAG_OBJECT {
+            crate::fault::runtime_fault(
+                "Runtime error: cannot push a non-record value into a sealed record array",
+            );
+        }
+        let obj = *(elem_ptr as *const *mut crate::object::LinObject);
+        if obj.is_null() {
+            crate::fault::runtime_fault(
+                "Runtime error: cannot push null into a sealed record array",
+            );
+        }
+        let named = (*arr).elem_named_desc;
+        let slot = lin_sealed_array_push_slot(arr);
+        crate::sealed::pack_named_payload_from_object(slot, obj, named);
+        crate::object::lin_object_release(obj);
+        return;
+    }
     let len = (*arr).len;
     let cap = (*arr).cap;
     if len == cap {
@@ -376,6 +403,24 @@ pub unsafe extern "C" fn lin_array_push(arr: *mut LinArray, elem_ptr: *const u8,
 /// The array takes ownership of the inner heap value (no retain performed).
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_push_tagged(arr: *mut LinArray, tagged: *const u8) {
+    // SEALED (0xFE) destination: pack instead of blind-copying a 16-byte TaggedVal into the
+    // stride-sized packed buffer (see `lin_array_push`). Same move contract: the array takes
+    // ownership of the inner heap value, so the inner object is consumed (released) after its
+    // fields are packed (retained) into the slot; the caller must still not release the box.
+    if (*arr).elem_tag == SEALED_ARRAY_TAG {
+        let tv = tagged as *const crate::tagged::TaggedVal;
+        if tv.is_null() || (*tv).tag != crate::tagged::TAG_OBJECT {
+            crate::fault::runtime_fault(
+                "Runtime error: cannot push a non-record value into a sealed record array",
+            );
+        }
+        let obj = (*tv).payload as *mut crate::object::LinObject;
+        let named = (*arr).elem_named_desc;
+        let slot = lin_sealed_array_push_slot(arr);
+        crate::sealed::pack_named_payload_from_object(slot, obj, named);
+        crate::object::lin_object_release(obj);
+        return;
+    }
     let len = (*arr).len;
     let cap = (*arr).cap;
     if len == cap {
@@ -406,6 +451,23 @@ pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::
     use crate::tagged::*;
     if arr.is_null() { return; }
     let elem_tag = (*arr).elem_tag;
+    // SEALED (0xFE) destination: pack the boxed record element into a fresh packed slot. This
+    // previously fell into the flat-coercion `else` below and hit its `_ => {}` arm — the push
+    // was SILENTLY DROPPED (the "throwaway copy / lost mutation" symptom). `lin_push_dyn` has
+    // RETAINING semantics (the caller keeps its box), so the packed slot takes its own +1 on each
+    // heap field and the object is left untouched.
+    if elem_tag == SEALED_ARRAY_TAG {
+        if tagged.is_null() || (*tagged).tag != TAG_OBJECT {
+            crate::fault::runtime_fault(
+                "Runtime error: cannot push a non-record value into a sealed record array",
+            );
+        }
+        let obj = (*tagged).payload as *const crate::object::LinObject;
+        let named = (*arr).elem_named_desc;
+        let slot = lin_sealed_array_push_slot(arr);
+        crate::sealed::pack_named_payload_from_object(slot, obj, named);
+        return;
+    }
     if elem_tag == 0xFF {
         // Tagged array: copy TaggedVal into slot and retain the inner heap value.
         lin_array_push_tagged(arr, tagged as *const u8);
@@ -606,6 +668,24 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
             _ => {}
         }
         std::ptr::copy_nonoverlapping(tagged as *const u8, slot as *mut u8, std::mem::size_of::<TaggedVal>());
+    } else if elem_tag == SEALED_ARRAY_TAG {
+        // SEALED (0xFE) destination: `arr[i] = record` through the tagged set path (the static
+        // type lost the `sealed` bit — see `lin_array_push`). Previously fell into the flat
+        // `_ => {}` arm below → the write was silently lost. Mirror `lin_sealed_array_set`:
+        // release the OLD element's heap fields, pack the new record's fields (retaining), then
+        // consume the transferred element reference (the 0xFF branch above is a move — the
+        // lowering supplies an owning reference and never releases it).
+        if tagged.is_null() || (*tagged).tag != TAG_OBJECT {
+            // `set` never faults (spec §6.1) — a non-record value here is unreachable from
+            // type-checked code; keep the silent no-op the flat default arm had.
+            return;
+        }
+        let obj = (*tagged).payload as *mut crate::object::LinObject;
+        let stride = (*arr).elem_stride;
+        let slot = ((*arr).data as *mut u8).add((actual as u64 * stride) as usize);
+        crate::sealed::release_payload_fields_pub(slot, (*arr).elem_desc);
+        crate::sealed::pack_named_payload_from_object(slot, obj, (*arr).elem_named_desc);
+        crate::object::lin_object_release(obj);
     } else {
         let tag = if tagged.is_null() { TAG_NULL } else { (*tagged).tag };
         let payload = if tagged.is_null() { 0u64 } else { (*tagged).payload };
