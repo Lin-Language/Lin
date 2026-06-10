@@ -271,3 +271,48 @@ End-to-end heap-field record packing makes **leaf/scan reads const-offset** (pro
 
 ### What the other two agents should be assessed against
 The open question my line did NOT resolve: **is there ANY end-to-end RAPTOR ordering of the packing fixes that nets a win, or does the per-boundary materialization always dominate?** My measured answer is "always dominates so far (PREP regresses, combinator seam unpeeled)." If another agent's line reached a *completing, bounded-RSS, faster-than-Json* typed RAPTOR, that would overturn this verdict — compare their PREP/GROUP/RANGE numbers against the Json baseline (GROUP ~76s / RANGE ~223s, RSS ~2.4GB at load ~4, confirmed this session). Absent that, the three standalone wins are the salvage and the packing chain is closed-negative.
+
+---
+
+## 🏁 AGENT-2 FINDINGS 2026-06-10 — ANSWERS agent-1's open question with the completing-RAPTOR measurement: verdict CLOSED-NEGATIVE CONFIRMED by a second independent line
+
+I (agent-2) ran the orchestrated Phase-0→9 fan-out (the "third exploration line" above is part of my line) and carried it to the one artifact agent-1 said would settle the verdict: **a completing, digest-correct, end-to-end typed RAPTOR**, then measured it against the Json baseline at low load. Everything below I ran/measured myself; agent self-reports that I could not reproduce are flagged.
+
+### ★ THE DECIDING MEASUREMENT — I reached agent-1's "completing typed RAPTOR" and it is ~1.8× SLOWER (not faster)
+agent-1 explicitly hinged its verdict on: *"if another line reached a completing, bounded-RSS, faster-than-Json typed RAPTOR, that would overturn this."* My line did reach it (the combinator/PREP seam agent-1 bailed at is **passable** — it completes, bounded RSS). Built the typed bench (`benchmarks/compare/raptor/lin/` fully de-Json'd, branch `e74ca0ff` on the `path9-reintegrate-177f` stack) AND the Json baseline (master sources) **with the SAME compiler** (isolates representation from compiler drift — the methodology two prior agents got burned by); same data dir; interleaved, 3 pairs, load <3 throughout; digests **byte-identical** both (`group=26203913 range=773022892 journeys=139`):
+
+| phase | Json baseline | typed-packed | ratio |
+|---|---|---|---|
+| LOAD | 3.5 s | 4.8 s | 1.4× slower |
+| PREP | 7.7 s | 27.2 s | 3.5× slower |
+| GROUP | ~19.9 s | ~36.2 s | **1.82× slower** |
+| RANGE | ~59.4 s | ~105.3 s | **1.77× slower** |
+
+(Runs extremely consistent: typed GROUP 36.0/36.1/36.6 s, RANGE 105.0/105.4/105.6 s. My Json GROUP ~19.9/RANGE ~59 is *faster* than agent-1's cited 76/223 — different build/load — but the **typed-vs-Json ratio on my matched same-compiler pair is the valid comparison**, and it is a clean ~1.8× regression in every phase.) **So the completing-RAPTOR test agent-1 posed is now answered: packed is slower. The verdict is NOT overturned — it is CONFIRMED by a second independent line.**
+
+### Why it still loses even though leaf reads ARE const-offset (the mechanism, IR-verified by me)
+The win and the loss are in different functions, and I pinned it by per-fn `lin_object_get` on the *real* typed bench:
+- **`scanBack` (trip read from a `Trip[]`): object_get 8→0, const-offset `sealed_array_elem_ptr`** — the packing win is REAL where the record comes straight from an array.
+- **`scanRouteAt` (trip is a `Trip | Null` param): object_get = 92; `getTrip`: = 13** — the dominant cost. IR shows `%sealed_proj_unbox = lin_unbox_ptr(%tco_pload)` then `lin_object_get(…, "arrivalTime")`. A packed record placed into a `Trip|Null` union is **boxed to a LinObject** (`box_value` sealed arm materializes it); `match is Trip` narrows the static TYPE but the runtime VALUE stays the boxed union payload, and the narrowing `Coerce{union→sealed}` **rebuilds the whole packed record field-by-field via `lin_object_get`** (`sealed_project_from`). PLUS PREP's 3.5× is construction/loader-materialization, NOT the union — a *second*, independent materialization seam. This is agent-1's "per-boundary materialization always dominates / fix-for-a-fix" pattern, measured: the union seam is just the next one after the combinator seam agent-1 named.
+- **The remaining "fix" (a `TAG_SEALED` keep-packed-through-union, mirroring `TAG_SUMNODE`) is a multi-site, high-UAF-risk effort the size of the entire prior sum-type build** — and the pattern (+ PREP's non-union 3.5× regression) predicts it reveals the next seam rather than flipping the sign. I did NOT build it speculatively (see [[project_path9_union_repr_blocker]] for the precise 6-step handoff if anyone ever wants to). **CLOSED-NEGATIVE.**
+
+### Cross-line reconciliation (the three "9-C"/blocker disputes, resolved by me)
+- **The two competing 9-C branches fix the SAME nested-scalar corruption at different layers but their COMBINATION is UNSOUND.** `perf/path9c-face2` (codegen read-side, repr-adaptive `elem_tag` dispatch + String gate) and `perf/path9c-seal-propagation` (checker write-side, producer auto-seal) each fix `7 0`→`33 44` and each pass alone — but cherry-picked TOGETHER they crash `test_union_record_nested_field_tail_recursive_param_no_uaf` (misaligned deref `0xa`, `object.rs:218`): the String-gate widen makes a nested member packable → auto-seal emits a packed nested array → the `Trip|Null` TCO re-box can't handle it. **For a standalone corruption-fix merge, take `perf/path9c-seal-propagation` ALONE (gate stays scalar+Bool — no UAF). Do NOT combine it with a gate-widening branch.** (This *refines* agent-1's "✅ MERGE 9C" — correct, but only in isolation.)
+- **Bug-1 (makeService packed-Service double-free) is GONE on current master** — subsumed by master's `63a25e0d` (the write-sink `pack_named_payload_from_object` fix). Verified: ASan exit 0, the `NKIND_SEALED` fault entered 0 times. So agent-1's `fadd5ebf` TCO-borrowed-param UAF and this double-free are both "only-exist-because-packing-introduced-them" — confirming the fix-for-a-fix diagnosis. NOT master bugs; do not merge in isolation.
+- **The map-value seam (my old "9-E / Blocker-1") was already working in the reintegrated base** (`scanBack` const-offset proves it on the real bench) — so my earlier "9-D map-value-seam is THE blocker" framing was SUPERSEDED: the real residual is the union seam above, not the map value. agent-1's standalone **map-value direct-index ~1.55×** salvage is the genuinely-bankable piece of that work (and matches my dict→Map fidelity finding — same `get<T,D>`-wrapper-boxing root cause).
+
+### My keep/discard ledger (agent-2 line; ADDITIVE to agent-1's — same KEEP verdicts, plus mine)
+| Item / branch | Verdict | Note |
+|---|---|---|
+| Step 8.1 record-combinator fusion (`perf/path8-step1-record-fusion`, ~2.3×) | ✅ **KEEP** | agreed with agent-1 — the strongest keeper; `lower.rs`-only, clean, leak/UAF fixes included |
+| 9C seal-propagation (`perf/path9c-seal-propagation`, ALONE) | ✅ **KEEP** | live `7 0` corruption fix; gate stays scalar+Bool; **must NOT be combined with a String/nested gate-widen** (UAF) |
+| dict→Map fidelity (`perf/raptor-dict-on-json-typing-rebased`, `83799f2e`) | ✅ **KEEP (minor)** | 783k dict reads→`map_get`, digest byte-identical; fidelity (correct typing), not a measured speedup |
+| map-value direct-index technique (~1.55×, in `1217cd45`) | 🔬 **EXTRACT** | not on a clean branch; bank either userland (rewrite hot `get(m,k,d)`→direct index) or codegen (`get<T,D>`→keep-packed direct read, higher leverage) |
+| Phase-0 call-site-CLASS profiler (`investigate/raptor-callsite-class`, `5353d8eb`) | 🔬 **KEEP as a TOOL** | the `LIN_COUNT`-gated per-class `object_get` counter is reusable methodology; settled "no free dict win left" + "interp records also boxed" |
+| in-place packed-scalar-array ABI | ✅ **already MERGED** (`acf35a83`) | the scalar packing win that DID land — not part of the closed-negative heap-field chain |
+| heap-field packing capability chain (`perf/path9-reconciled-mega`, `perf/path9e-*`, the reintegration `path9-reintegrate-177f`, the typed-RAPTOR `e74ca0ff`, the union/TCO/nested-record fixes) | ❌ **DISCARD as perf** | end-to-end ~1.8× regression, measured; CLOSED-NEGATIVE. Keep only as the documented record + the `TAG_SEALED` handoff |
+| Path 8 Tier-3 devirtualization | ❌ **DISCARD** | DEAD END — named-fn calls already direct, interp hot path 100% direct, devirtualizable population ~0 (see [path-8](path-8-make-functions-free.md)) |
+| Path 8 Tier-1 bitcode runtime | ❌ **DISCARD** | <2% alone (consumer stays opaque) — prior spike, confirmed |
+
+### Net (agent-2)
+Two independent lines (agent-1 + me) now agree: **heap-field record packing for the `Json`-read-bound workload is CLOSED-NEGATIVE — measured, not guessed** — joining GC, value-types, Tier-1 bitcode, and Tier-3 devirt as bets where the read-cost lever was not the win; **the cost is representation-boundary materialization, not the reads.** The salvage is small but real and master-independent: **Step 8.1 fusion (~2.3×, the headline keeper), the 9C corruption fix (alone), dict→Map fidelity, the map-value direct-index technique (~1.55×), and the call-site-class profiler as a tool.** Everything in the heap-field-packing capability stack should be retired as a perf direction. The decisive evidence that closes the question is the completing same-compiler A/B above; the precise union-seam mechanism + the (not-recommended) `TAG_SEALED` handoff are in [[project_path9_union_repr_blocker]].
