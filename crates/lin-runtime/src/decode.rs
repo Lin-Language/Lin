@@ -11,6 +11,8 @@
 //! same blob, so recursive/cyclic types are finite back-edges. The byte format MUST match the
 //! encoder. See the `KIND_*` constants below.
 
+use std::fmt::Write as _;
+
 use crate::object::{lin_object_get, lin_tagged_clone, LinObject};
 use crate::array::{lin_array_length, LinArray};
 use crate::fs::make_decode_error;
@@ -187,7 +189,9 @@ unsafe fn validate(
             for i in 0..len {
                 let elem = crate::array::lin_array_get_tagged(arr, i);
                 let base_len = path.len();
-                path.push_str(&format!("[{}]", i));
+                // Append the index directly into `path` (no throwaway String — this is the hot
+                // success path); the formatted location is only ever read on error.
+                let _ = write!(path, "[{}]", i);
                 let r = validate(elem as *const u8, desc, elem_off, path);
                 // lin_array_get_tagged allocates a fresh box we own; free it.
                 crate::tagged::lin_tagged_release(elem as *mut u8);
@@ -211,7 +215,7 @@ unsafe fn validate(
                 let off = desc.u32_at(node + 5 + i * 4) as usize;
                 let elem = crate::array::lin_array_get_tagged(arr, i as i64);
                 let base_len = path.len();
-                path.push_str(&format!("[{}]", i));
+                let _ = write!(path, "[{}]", i);
                 let r = validate(elem as *const u8, desc, off, path);
                 crate::tagged::lin_tagged_release(elem as *mut u8);
                 r?;
