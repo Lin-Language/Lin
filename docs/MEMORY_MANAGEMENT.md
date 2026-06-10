@@ -56,19 +56,25 @@ All closures — capturing and non-capturing — use this uniform 32-byte layout
 
 ## Compiler RC strategy
 
-### Current pipeline (TypedAST → LLVM)
+RC is inserted, optimised, and lowered entirely through the **LinIR pipeline** — the sole lowering path. (The earlier TypedAST-direct backend, which inserted release calls by hand at consumption points, has been removed; do not look for it.) The flow is:
 
-The compiler inserts release calls **manually at consumption points**:
+```
+TypedModule
+  → lower.rs   : scope-frame ownership inserts pessimistic Retain/Release/CloneBox/FreeBoxShell
+  → liveness.rs: backward-dataflow per-instruction live sets
+  → rc_elide.rs: Perceus-style elision of provably-redundant balanced pairs
+  → codegen/rc.rs: each Retain/Release lowered to a repr- or type-dispatched runtime call
+```
 
-- `lin_string_release` after `print` (for numeric-to-string temporaries) and inside `compile_string_interp` for string accumulator temps.
-- `lin_array_release` / `lin_object_release` after `for`/`iter` loops where the iterable is a freshly allocated value.
-- `lin_closure_release` is declared but not yet systematically emitted (see roadmap).
+### Lowering (`lin-ir/src/lower.rs`)
 
-### Planned pipeline (LinIR → LLVM)
+Lowering inserts RC **pessimistically** — the `rc_elide` pass removes provably-redundant pairs afterward (`lower.rs` line 8 comment). Ownership is tracked by a stack of **scope frames** (`scope_owned`): every freshly-owned heap/union temp is `register_owned`-ed at its origin and released when its scope pops (`pop_scope_releasing_keep`). Container inserts, call-argument boxing, var/global stores, index/field projections, and tail calls each adjust ownership at their site. The model: each owned reference has exactly one releasing owner; transfers move the obligation; borrows net to zero.
 
-The `lin-ir` crate contains a flat 3-address IR (`LinModule`) with explicit `Retain` and `Release` instructions, a backward-dataflow liveness analysis (`liveness.rs`), and a Perceus-style RC elision pass (`rc_elide.rs`). Once the LinIR pipeline is wired into production (`lin-compile/src/lib.rs`), RC will be inserted systematically during lowering and redundant pairs elided before codegen.
+The tail-call path is special: scope-exit releases emitted after a `TailCall` would land in a dead `tco_post` block and never run, so owned temps are drained on the *live* block before the back-edge (`release_owned_for_tail_call`).
 
-The lowering design (`lower.rs` line 8 comment) already specifies the intent: "RC instructions are inserted pessimistically here; the rc_elide pass removes provably redundant pairs."
+### Codegen (`codegen/rc.rs`)
+
+`Retain`/`Release` are lowered to runtime calls dispatched on the value's **physical representation** (`emit_release_repr`), not just its static type — so a sealed packed record, a packed sealed array, a `SumNode`, a plain object, and a boxed union each get the correct releaser (`lin_object_release`, the sealed releasers, `lin_sumnode_release`, `lin_tagged_release`, …). Non-packed reprs defer to the type-based `emit_release`.
 
 ---
 
@@ -115,37 +121,19 @@ Lin uses **pure reference counting with no cycle detection**. Reference cycles b
 | 1.4 Tactical TaggedVal box leak fix | ✅ Done | `lin-codegen/src/codegen.rs` |
 | Option A: Document cycle limitation | ✅ Done | `docs/DECISIONS.md` ADR-024 |
 
-### Phase 2 — Systematic RC emission in codegen (in progress)
+### Phase 2 — Systematic RC emission in the codegen-direct backend (removed)
 
-| Task | Status | Notes |
-|---|---|---|
-| `expr_is_owned_alloc` / `ty_is_heap` / `emit_release` helpers | ✅ Done | Generic dispatch by type |
-| `rt_rc_retain` / `rt_object_release` / `rt_tagged_release` declared | ✅ Done | Available for all use sites |
-| Heap-allocate `var` bindings captured mutably | ✅ Done | Fixes latent use-after-stack-frame bug |
-| Retain on array element store (non-fresh `LocalGet`) | ✅ Done | `compile_make_array` |
-| Retain on object field store (non-fresh `LocalGet`) | ✅ Done | `compile_make_object` |
-| `TypedStmt::Expr` discard release | ✅ Done | Releases discarded owned values |
-| Block scope-exit release for owned `val` bindings | ✅ Done | Releases unused owned bindings at block end |
-| Function-return release for `Function`-typed params | ✅ Done | Only `Function` params released; caller retains before passing non-owned closures |
-| Retain at call sites for non-owned `Function` args | ✅ Done | `call_direct_fn` retains non-owned closure args before passing |
-| `if`/`match` result: release when all branches own (discard + val scope-exit) | ✅ Done | Extended `expr_is_owned_alloc` to recurse into `If`, `Match`, `Block` branches |
-| `var` reassignment release (old value) | ⚠️ Gap | `compile_local_set` overwrites alloca without releasing old heap value; safe fix requires ownership tracking to avoid freeing borrowed `var` values (e.g. `var acc = init`) |
-| `var` scope-exit release | ⚠️ Gap | Block scope-exit only tracks `Val` stmts, not `Var`; heap-typed `var` bindings (e.g. `var result = {}`) are not released at scope exit; most are returned so impact is limited |
-| `if`/`match` result: mixed-ownership branches | ⚠️ Gap | When one branch returns a `LocalGet` and another a fresh alloc, ownership is mixed; emitting a retain for the `LocalGet` branch before the PHI would normalize ownership but is not yet done |
-| Match scrutinee release | ⚠️ Gap | Scrutinees from `Call` (e.g. `match f() { ... }`) are never released; safe only when scrutinee is not bound in any arm |
-| String interp TypeVar part temporaries | ⚠️ Gap | `compile_string_part_owned` marks TypeVar parts as `is_fresh=false`; `lin_tagged_to_string` result is a new `LinString*` but is not released after `string_build_n` |
-
-Key file: `lin-codegen/src/codegen.rs`
+This phase tracked RC emission inside the **TypedAST → LLVM** backend, which inserted release calls by hand at consumption points and had a list of known gaps (`var` reassignment release, match-scrutinee release, …). **That backend has been removed** — the LinIR pipeline below (Phases 3–4) is now the sole lowering path, and ownership is decided systematically in `lower.rs` rather than patched into codegen consumption sites. The old gap table is gone because the code it described no longer exists; any remaining RC subtleties live in `lower.rs`'s scope-frame ownership model.
 
 ### Phase 3 — Wire LinIR into production (complete)
 
 | Task | Status | Notes |
 |---|---|---|
 | RC insertion in `lower.rs` (pessimistic Retain/Release) | ✅ Done | `scope_owned` stack tracks owned temps; Release emitted at Block/function scope exits |
-| `compile_module_from_ir` in `codegen.rs` | ✅ Done | Handles all `Instruction` variants, translates to LLVM using existing helpers |
-| `LIN_USE_IR=1` routing in `lin-compile/src/lib.rs` | ✅ Done | Routes through `lower_module` → `elide_rc` → `compile_module_from_ir` when env var set |
+| `compile_module_from_ir` in `lin-codegen` | ✅ Done | Handles all `Instruction` variants, translates to LLVM using existing helpers |
+| LinIR is the sole lowering path | ✅ Done | `lin-compile/src/lib.rs` always routes through `lower_module` → `elide_rc` → `compile_module_from_ir`; the former env-gated routing and the TypedAST-direct fallback are gone |
 
-Key files: `lin-ir/src/lower.rs`, `lin-codegen/src/codegen.rs`, `lin-compile/src/lib.rs`
+Key files: `lin-ir/src/lower.rs`, `lin-codegen/src/codegen/`, `lin-compile/src/lib.rs`
 
 ### Phase 4 — Cross-block RC elision (complete)
 
