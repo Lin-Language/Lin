@@ -440,13 +440,21 @@ impl<'ctx> Codegen<'ctx> {
         if !tagged.is_pointer_value() { return tagged; }
         let ptr = tagged.into_pointer_value();
         match ty {
-            Type::Int32 => {
-                self.builder.call(self.rt.unbox_int32, &[ptr.into()], "ir_i32").try_as_basic_value().unwrap_basic()
+            Type::Int8 | Type::Int16 | Type::Int32 => {
+                // Boxed as TAG_INT32 (sign-extended at box time). Read i32 and truncate to the
+                // target width (a no-op bitcast for Int32). Without the Int8/Int16 arms these fell
+                // through to `_ => tagged`, leaking the raw box pointer where a narrow scalar was
+                // expected — the gate-divergence inline path's `for(x => push(buf, x))` over a
+                // `UInt8[]`/`Int8[]` with a Json-typed lambda param (codegen signature mismatch).
+                let v = self.builder.call(self.rt.unbox_int32, &[ptr.into()], "ir_i32").try_as_basic_value().unwrap_basic().into_int_value();
+                let ity = self.llvm_type(ty).into_int_type();
+                self.builder.int_truncate_or_bit_cast(v, ity, "ir_inarrow").into()
             }
-            Type::UInt32 => {
-                // Boxed as TAG_INT64 (zero-extended); read i64 and truncate to i32 width.
-                let v = self.builder.call(self.rt.unbox_int64, &[ptr.into()], "ir_u32_64").try_as_basic_value().unwrap_basic().into_int_value();
-                self.builder.int_truncate_or_bit_cast(v, self.context.i32_type(), "ir_u32").into()
+            Type::UInt8 | Type::UInt16 | Type::UInt32 => {
+                // Boxed as TAG_INT64 (zero-extended); read i64 and truncate to the target width.
+                let v = self.builder.call(self.rt.unbox_int64, &[ptr.into()], "ir_u_64").try_as_basic_value().unwrap_basic().into_int_value();
+                let ity = self.llvm_type(ty).into_int_type();
+                self.builder.int_truncate_or_bit_cast(v, ity, "ir_unarrow").into()
             }
             Type::Int64 => {
                 self.builder.call(self.rt.unbox_int64, &[ptr.into()], "ir_i64").try_as_basic_value().unwrap_basic()
