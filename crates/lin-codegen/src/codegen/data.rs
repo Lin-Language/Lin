@@ -1769,37 +1769,25 @@ impl<'ctx> Codegen<'ctx> {
         let payload = func.get_nth_param(0).unwrap().into_pointer_value();
         let new_obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(fields.len() as u64, false).into()], "smat_obj")
             .try_as_basic_value().unwrap_basic().into_pointer_value();
-        let free_box_shell = self.get_or_declare_fn("lin_tagged_free_box", self.context.void_type().fn_type(&[ptr_ty.into()], false));
         for (k, fty) in fields.iter() {
             let (off, _) = Self::sealed_field_layout(fields, k);
             let payload_off = off - Self::SEALED_HEADER;
-            let is_heap = Self::sealed_field_kind(fty).is_some();
             let llvm_fld = self.llvm_type(fty);
             let p = unsafe { self.builder.gep(self.context.i8_type(), payload, &[i64_ty.const_int(payload_off, false)], "smat_fld_p") };
             let loaded = self.builder.load(llvm_fld, p, "smat_fld");
-            // box_value(heap) wraps the BORROWED element pointer (no retain); box_value(scalar) wraps
-            // the scalar in a cached/heap box. Mirrors `sealed_materialize_to_object` exactly so the
-            // per-field RC across the Json-boundary materialize is balanced for heap fields.
+            // SCALAR-ONLY: this materializer is reached only via `sealed_array_to_tagged`, whose
+            // `fields` come from `sealed_array_elem` — the scalar-only packed-array gate
+            // (`is_sealed_array_field_packable` = scalar||Bool). So `sealed_field_kind(fty)` is always
+            // `None` here (no heap field can reach a packed 0xFE array); `box_value` boxes the scalar in
+            // a cache-safe shell. The former `is_heap` arms (fresh-owned / borrowed-shell release) were
+            // for the retired heap-field-array direction and never emitted — removed (the live twin
+            // `sealed_materialize_to_object` keeps the heap arms for nested heap RECORD fields).
             let boxed = self.box_value(loaded, fty);
             let key_str = self.compile_string_lit(k).into_pointer_value();
             self.builder.call(self.rt.object_set_fresh, &[new_obj.into(), key_str.into(), boxed.into()], "");
             if boxed.is_pointer_value() {
-                if is_heap && Self::box_value_yields_fresh_owned(fty) {
-                    // box_value produced a FRESH +1 value (a nested SEALED record materialized to a
-                    // boxed LinObject, OR a sealed-record ARRAY materialized to a fresh tagged
-                    // `Object[]`). object_set_fresh retained it (+2); full tagged_release drops the
-                    // construction +1 back to the object's owned +1 AND frees the shell. (Mirror of
-                    // `sealed_materialize_to_object`; `free_box_shell` would leak the whole inner.)
-                    self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
-                } else if is_heap {
-                    // A plain String / plain Array field's box wraps a BORROWED element inner that
-                    // object_set_fresh retained — free only the shell, leaving the borrowed element
-                    // inner untouched (the array still owns it).
-                    self.builder.call(free_box_shell, &[boxed.into()], "");
-                } else {
-                    // Scalar field: reclaim the cache-safe box shell (no inner heap).
-                    self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
-                }
+                // Scalar field: reclaim the cache-safe box shell (no inner heap).
+                self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
             }
         }
         self.builder.build_return(Some(&new_obj)).unwrap();
