@@ -3692,6 +3692,20 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
             // Coerce each element to the array's element representation. For a Json/union
             // element type (heterogeneous array) this boxes each concrete element to a
             // TaggedVal*, so codegen can push them uniformly.
+            // Each concrete element boxed into a UNION/Json element slot below produces a FRESH
+            // 16-byte `TaggedVal*` shell (`box_value`). `MakeArray`'s tagged push raw-COPIES that
+            // shell's 16 bytes into the array slot (a MOVE of the value) and the array owns the
+            // copy — but the SOURCE shell is then an orphan: its inner payload's ownership lives in
+            // the array's copy (heap inner) or in the copied scalar bytes (scalar inner), so the
+            // shell must be reclaimed or it leaks every element. This mirrors the `push()` / `for`
+            // shell-reclaim convention (`free_arg_box_shells` / `FreeBoxShellIfDistinct`); without
+            // it a `[t, i]: Json[]` (RAPTOR's `setTrip` `[trip, start, end]` kConnections row, and
+            // even a plain `[1, 2]: Json[]`) leaks one shell per boxed element per build. Collect the
+            // freshly-boxed element shells and shell-free them AFTER the array is built (the 16 bytes
+            // are already copied in). Shell-only is correct for every inner kind: a scalar box's
+            // value is in the copied bytes; a heap box wraps a pointer the array copy / raw value
+            // owns — `lin_tagged_free_box` never touches the inner. Cached-box / null safe.
+            let mut fresh_box_shells: Vec<Temp> = Vec::new();
             let lowered: Vec<Temp> = elements
                 .iter()
                 .map(|e| {
@@ -3729,7 +3743,19 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                         // pass `op_consumes_union = true` so a fresh union element is unregistered.
                         builder.transfer_into_container(t, e, true);
                     }
-                    coerce_to_slot_type(t, &ety, &elem_ty, builder)
+                    let boxed = coerce_to_slot_type(t, &ety, &elem_ty, builder);
+                    // A CONCRETE element boxed into a UNION/Json element slot just produced a FRESH
+                    // `TaggedVal*` shell (`box_value`, incl. the sealed→union materialize), distinct
+                    // from `t`. The push raw-copies its 16 bytes into the array slot, orphaning the
+                    // source shell — schedule it for a shell-free after the array is built. (A union
+                    // ELEMENT, `is_union_ty(ety)`, FLOWS its existing box into the array by copy with
+                    // no new shell; a concrete NON-union element slot — flat/sealed array, String[],
+                    // Int32[] — never routes through a TaggedVal box here. Both excluded, so those
+                    // paths stay byte-identical.)
+                    if is_union_ty(&elem_ty) && !is_union_ty(&ety) && boxed != t {
+                        fresh_box_shells.push(boxed);
+                    }
+                    boxed
                 })
                 .collect();
             let dst = builder.alloc_temp(ty.clone());
@@ -3738,6 +3764,13 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                 elements: lowered,
                 elem_ty,
             });
+            // Reclaim the freshly-boxed element shells now that their 16 bytes are copied into the
+            // array (the inner payload's ownership stays with the array's copy / the raw value's
+            // own scope-exit release — shell-only, never the inner). Done AFTER MakeArray so the
+            // push has read each shell.
+            for shell in fresh_box_shells {
+                builder.emit(Instruction::FreeBoxShell { val: shell });
+            }
             builder.register_owned(dst, ty.clone());
             dst
         }
