@@ -170,6 +170,11 @@ pub enum Intrinsic {
     StreamUntar,
     StreamManifest,
     StreamFiles,
+    // Composable tar entries adapter (std/archive): `entries(s)` splits a byte stream into a
+    // Stream<TarEntry>. `header(e)` and `body(e)` extract metadata/body from a TarEntry handle.
+    StreamTarEntries,
+    TarHeader,
+    TarBody,
     // Sink + terminal drivers (Stage 4). writeStream builds a RAW sink (item bytes verbatim, no
     // separator); writeLines builds a line-oriented sink (each item + '\n'); drain drives on the
     // calling thread; collect/readText pull-all-into-one-value. All terminals close the stream.

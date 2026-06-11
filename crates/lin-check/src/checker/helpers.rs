@@ -179,14 +179,16 @@ pub(crate) fn integer_range(ty: &Type) -> Option<(i128, i128)> {
 }
 
 /// Returns true if `ty` is definitely non-transferable across thread boundaries.
-/// Non-transferable: Function, Iterator, Stream, Never.
+/// Non-transferable: Function, Iterator, Stream, TarEntry, Never.
 /// TypeVar (unknown), Promise/Worker/ThreadPool (TypeVar-resolved), are not flagged —
 /// we only reject types we can statically prove are non-transferable (spec §24.3).
 /// `Stream` owns an OS resource, so it can never be COPIED across a thread boundary; it crosses
 /// only by MOVE (CAP_MOVE, Stage 7), which the transfer-copy path must never attempt (brief §9).
+/// `TarEntry` shares a live cursor into the parent stream — it is neither deep-copyable nor
+/// movable across a thread boundary.
 pub(crate) fn is_definitely_non_transferable(ty: &Type) -> bool {
     match ty {
-        Type::Function { .. } | Type::Iterator(_) | Type::Stream(_) | Type::Never => true,
+        Type::Function { .. } | Type::Iterator(_) | Type::Stream(_) | Type::TarEntry | Type::Never => true,
         Type::Array(inner) => is_definitely_non_transferable(inner),
         Type::Union(ts) => ts.iter().any(is_definitely_non_transferable),
         _ => false,

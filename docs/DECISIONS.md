@@ -2547,3 +2547,59 @@ chain can wrap.
 **Non-goals.** No optional-chaining `?.` (Lin's safe-bracket access already null-propagates through
 chains — §6.1 — making `?.` redundant); no `??=` compound assignment (low value, and `var` reassignment
 covers it); no bare `?` token (a lone `?` stays an unknown-character lex error as today).
+
+## ADR-067: Generation-stamped `TarEntry` opaque handles for composable tar streaming
+
+**Status**: Accepted (implemented; runtime + checker + IR + codegen + stdlib).
+
+**Context.** The existing `untar(s, callback)` terminal and `manifest`/`files` adapters do not compose
+with `std/iter`. A user wanting to `filter` archive entries before extracting must write a manual state
+machine inside the `untar` callback. The Go `tar.Reader` / Rust `tar::Entries` precedent shows that
+composable entry handles are both practical and idiomatic.
+
+**Decision.** Add three exports to `std/archive`:
+- `entries(s: Stream<UInt8[]>): Stream<TarEntry>` — splits the byte stream into entry handles.
+- `header(e: TarEntry): TarHeader` — always-valid metadata accessor (no lock needed; fields are copied at parse time).
+- `body(e: TarEntry): Stream<UInt8[]>` — one-shot body stream; failures (expired / double-taken) are in-band on first read.
+
+**`TarEntry` design axioms:**
+1. **Refcounted, not affine.** Unlike `Stream`, a `TarEntry` is refcounted and can be stored in
+   variables or arrays. It is NOT single-use — holding a reference past the stream step is the
+   basis of the `find`-style early-stop pattern.
+2. **Generation counter.** A shared `TarEntriesState` holds a `u64` generation. Each entry is
+   stamped at mint time; advancing the archive bumps the generation. `TarBodySource` re-checks
+   on every read; a mismatch → in-band Error.
+3. **Body is one-shot.** An `AtomicBool body_taken` flag prevents calling `body()` twice on
+   the same entry. The second call returns a stream that yields Error on the first read.
+4. **Header survives expiry.** Name, size, and typeflag are copied into `TarEntryBox` at parse
+   time. `lin_tar_header` reads from the copy — never from the shared state — so it is
+   lock-free and valid even after the body expires.
+5. **Parent closed when shared state drops.** `TarEntriesState::drop` closes the parent upstream.
+   The entries `StreamBox` holds an `Arc` clone; each live `TarEntry` holds another. The
+   parent closes when the last `Arc` drops — which is the last `TarEntry` handle going out of
+   scope, not when the entries stream closes. This enables the find-style pattern:
+   closing the entries stream early keeps the current entry's body alive until the handle is dropped.
+6. **Non-transferable.** `TarEntry` is listed in `is_definitely_non_transferable` in
+   `lin-check/src/checker/helpers.rs`. An async thunk that returns a `TarEntry` is a
+   compile-time error. Cross-thread capture enforcement is at the checker's return-type gate
+   (same as `Stream`); a future capture-type check could tighten this.
+
+**`lin_tar_header` calling convention.** The stdlib wrapper `header(e: TarEntry): TarHeader`
+generates code that calls `lin_object_get` directly on the return value of `lin_tar_header` (the
+codegen treats the return as an unboxed `LinObject*`). `lin_tar_header` therefore returns a raw
+`LinObject*` (NOT a `TaggedVal*` from `alloc_tagged`). The wrapper then projects fields from that
+object into a sealed `TarHeader` record. This differs from stream item objects, which ARE
+returned as `TaggedVal*` via `alloc_tagged(TAG_OBJECT, ...)` and go through `lin_unbox_ptr`
+in the `pull_tagged` path.
+
+**Rejected alternatives.**
+- **Lent (affine) body streams.** Making `body()` return an affine `Stream` that the type checker
+  bounds to the entry's scope would catch misuse at compile time, but requires an "owned-lifetime"
+  type system feature Lin does not have. The in-band Error on first read is pragmatic and explicit.
+- **Temp-file spilling.** Buffering the body to a temp file makes the body freely readable after
+  expiry but adds latency, disk I/O, and complexity. The use cases that need full body replay are
+  better served by `files()` (which already buffers to `UInt8[]`).
+- **Making `TarEntry` generic.** A `TarEntry<T>` that carries the parsed body as a `T` would
+  require the parser to be a user-supplied function, turning `entries` into a combinator. This
+  is a viable design for a typed CSV reader but wrong for a raw tar adapter where body parsing
+  is always the caller's responsibility.

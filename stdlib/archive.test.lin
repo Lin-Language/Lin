@@ -1,8 +1,8 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { readStream, readText } from "std/stream"
+import { readStream, readText, drain } from "std/stream"
 import { gunzip } from "std/compress"
-import { untar, manifest, files } from "std/archive"
-import { for } from "std/iter"
+import { untar, manifest, files, entries, header, body } from "std/archive"
+import { for, filter } from "std/iter"
 import { push, length } from "std/array"
 import { toString } from "std/string"
 
@@ -92,6 +92,116 @@ val s = suite("std/archive", [
     )
     [
       expect(r).toBe(null)
+    ]
+  ),
+
+  // entries() — composable streaming form.
+
+  // (a) entries() yields all entry handles; header() reads the metadata from each.
+  test("entries yields all handles with correct headers via header()", () =>
+    val names: String[] = []
+    val sizes: Int64[] = []
+    readStream(tarPath)
+      .entries()
+      .for(e =>
+        val h = e.header()
+        names.push(h["name"])
+        sizes.push(h["size"])
+        e.body().drain()
+      )
+    [
+      expect(length(names)).toBe(3),
+      expect(names[0]).toBe("alpha.txt"),
+      expect(names[1]).toBe("bravo.txt"),
+      expect(names[2]).toBe("large.txt"),
+      expect(sizes[0]).toBe(17),
+      expect(sizes[1]).toBe(31),
+      expect(sizes[2]).toBe(4390)
+    ]
+  ),
+
+  // (b) body() streams the correct bytes (readText on alpha entry).
+  test("entries body streams correct bytes via readText", () =>
+    var text = ""
+    readStream(tarPath)
+      .entries()
+      .for(e =>
+        if e.header()["name"] == "alpha.txt" then
+          text = unwrapStr(e.body().readText())
+        else
+          e.body().drain()
+      )
+    [
+      expect(text).toBe("hello from alpha\n")
+    ]
+  ),
+
+  // (c) filter-and-extract pattern: filter entries by header name, drain selected bodies.
+  test("entries filter and extract pattern", () =>
+    val collected: String[] = []
+    readStream(tarPath)
+      .entries()
+      .filter(e => e.header()["name"] == "bravo.txt")
+      .for(e =>
+        collected.push(unwrapStr(e.body().readText()))
+      )
+    [
+      expect(length(collected)).toBe(1),
+      expect(collected[0]).toBe("bravo file content\nsecond line\n")
+    ]
+  ),
+
+  // (d) Unread bodies are auto-skipped: header of each entry is accessible without draining the body.
+  test("entries header-only scan skips bodies automatically", () =>
+    val names: String[] = []
+    readStream(tarPath)
+      .entries()
+      .for(e =>
+        // Do NOT call body() — the driver must auto-skip.
+        names.push(e.header()["name"])
+      )
+    [
+      expect(length(names)).toBe(3),
+      expect(names[0]).toBe("alpha.txt"),
+      expect(names[1]).toBe("bravo.txt"),
+      expect(names[2]).toBe("large.txt")
+    ]
+  ),
+
+  // (e) entries() works over a tar.gz (gunzip composed with entries).
+  test("entries works over a tar.gz via gunzip", () =>
+    val names: String[] = []
+    readStream(gzPath)
+      .gunzip()
+      .entries()
+      .for(e =>
+        names.push(e.header()["name"])
+        e.body().drain()
+      )
+    [
+      expect(length(names)).toBe(3),
+      expect(names[0]).toBe("alpha.txt"),
+      expect(names[1]).toBe("bravo.txt"),
+      expect(names[2]).toBe("large.txt")
+    ]
+  ),
+
+  // (f) header() is valid after the archive has advanced past the entry (body expired).
+  test("header remains valid after entry expired", () =>
+    var expiredName = ""
+    var expiredSize: Int64 = 0
+    readStream(tarPath)
+      .entries()
+      .for(e =>
+        // Snapshot headers for all entries; drain each body to advance.
+        expiredName = e.header()["name"]
+        expiredSize = e.header()["size"]
+        e.body().drain()
+      )
+    // After the loop, the last entry's header values are still the ones we read.
+    [
+      expect(expiredName).toBe("large.txt"),
+      expect(expiredSize).toBe(4390)
     ]
   )
 ])

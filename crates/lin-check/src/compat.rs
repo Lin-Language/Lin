@@ -119,6 +119,18 @@ pub fn is_compatible_env(
         (Type::Promise(_), _) => false,
         (_, Type::Promise(_)) => false,
 
+        // `TarEntry` — opaque, non-generic, non-transferable. Only compatible with itself (or a
+        // TypeVar wildcard for generic contexts). Never widens to Json.
+        (Type::TarEntry, Type::TarEntry) => true,
+        (Type::TarEntry, Type::TypeVar(n)) if *n == u32::MAX => false,
+        (Type::TypeVar(n), Type::TarEntry) if *n == u32::MAX => false,
+        (Type::TarEntry, Type::TypeVar(_)) | (Type::TypeVar(_), Type::TarEntry) => true,
+        (Type::TarEntry, Type::Union(_)) | (Type::Union(_), Type::TarEntry) => {
+            return union_compat(value_type, target_type, env, lenient_json, depth);
+        }
+        (Type::TarEntry, _) => false,
+        (_, Type::TarEntry) => false,
+
         // Anything is assignable INTO Json (covariant sink): concrete T -> Json. (ADR-045)
         // This INCLUDES a typed index-signature map `{ String: T }` -> Json: a `LinMap` widened to
         // `Json` is only ever read back through the tag-aware `lin_*_any` bridges (keys/values/

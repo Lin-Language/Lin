@@ -853,6 +853,26 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn("lin_stream_untar", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into(), func.into()], "ir_stream_untar").try_as_basic_value().unwrap_basic()
             }
+            // entries(stream) → lin_stream_tar_entries(stream) → boxed Stream<TarEntry>. Single
+            // stream-arg adapter (moves the parent in).
+            Intrinsic::StreamTarEntries => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let fnv = self.get_or_declare_fn("lin_stream_tar_entries", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into()], "ir_tar_entries").try_as_basic_value().unwrap_basic()
+            }
+            // header(entry) → lin_tar_header(entry) → boxed Object (TarHeader). TarEntry may
+            // arrive boxed (is_union_type returns true for TarEntry); unbox to the raw *TarEntryBox.
+            Intrinsic::TarHeader => {
+                let e = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let fnv = self.get_or_declare_fn("lin_tar_header", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[e.into()], "ir_tar_header").try_as_basic_value().unwrap_basic()
+            }
+            // body(entry) → lin_tar_body(entry) → boxed Stream<UInt8[]>. Same calling convention.
+            Intrinsic::TarBody => {
+                let e = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let fnv = self.get_or_declare_fn("lin_tar_body", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[e.into()], "ir_tar_body").try_as_basic_value().unwrap_basic()
+            }
             // Stream terminals taking a single predicate/body closure: find/some/every/while →
             // (stream, closure) → boxed (X | Error). The closure may arrive boxed; unbox it.
             Intrinsic::StreamFind | Intrinsic::StreamSome | Intrinsic::StreamEvery | Intrinsic::StreamWhile => {
@@ -1422,6 +1442,8 @@ impl<'a> DescEncoder<'a> {
             | Type::Stream(_)
             // `Promise<T>` is likewise opaque and never a `fromJson` target — accept-any.
             | Type::Promise(_)
+            // `TarEntry` is opaque and never a `fromJson` target — accept-any.
+            | Type::TarEntry
             // A typed index-signature map `{ String: T }` (ADR-055) is NOT a v1 `fromJson` decode
             // target — the decoder produces a `LinObject`, not a `LinMap`, so decoding INTO a map
             // would yield the wrong representation. Treated as accept-any here only for
