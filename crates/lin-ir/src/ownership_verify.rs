@@ -268,7 +268,7 @@ pub fn owning_strategy(ty: &Type) -> OwningStrategy {
 fn is_union_owning_ty(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_)
+        Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
     )
 }
 

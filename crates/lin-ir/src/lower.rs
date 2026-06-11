@@ -1943,9 +1943,11 @@ pub fn mangle_module_key(path: &str) -> String {
 /// `Stream<T>` is likewise a boxed `TaggedVal*(TAG_STREAM)` whose RC dispatches through the
 /// tag-aware path (the TAG_STREAM arm decrements the stream box's refcount, closing the fd at
 /// zero) — so it is owning too. `Promise<T>` is a boxed `TaggedVal*(TAG_PROMISE)` on the same
-/// tag-aware RC path, so it belongs here too.
+/// tag-aware RC path, so it belongs here too. `TarEntry` is a boxed `TaggedVal*(TAG_TAR_ENTRY)`
+/// on the same tag-aware RC path — must be listed here so that closure captures CloneBox it
+/// (rather than CaptureRelease::None, which would UAF after the creating scope exits).
 fn is_union_ty(ty: &Type) -> bool {
-    matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_))
+    matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry)
 }
 
 /// True if `ty` IS a `Stream` or a `Union` containing one. A streamish capture crosses a thread
@@ -9864,8 +9866,24 @@ fn lower_function_expr_with_id(
         && is_union_ty(&body_ty)
         && !is_union_ty(&effective_ret)
         && !is_rc_type(&effective_ret);
-    let return_keep: Vec<Temp> = if unboxes_to_scalar {
-        // The unboxed scalar owns no heap pointer: keep only the result; release the orphaned box.
+    // SEALED PROJECTION from a concrete heap object: when a concrete unsealed `LinObject*`
+    // (`raw_ret`) is PROJECTED into a fresh sealed struct (`ret_temp`), the projection produces
+    // an INDEPENDENT copy — it calls `lin_object_get` for each field and retains the heap values
+    // it stores. `raw_ret` is NOT aliased by `ret_temp` (unlike the box case where the box
+    // borrows `raw_ret`'s inner pointer). Keeping `raw_ret` in `return_keep` prevents
+    // `pop_scope_releasing_keep` from emitting a Release for it → the `LinObject*` leaks (one
+    // per call). Release `raw_ret` by NOT keeping it.
+    //
+    // Gate: `ret_coerced` (a coercion happened) + `raw_ret` is a concrete RC object (not a union
+    // box, so the box-inner-aliasing concern does not apply) + `effective_ret` is a sealed scalar
+    // record (a projection, not a box). A sealed array target or a union target uses the box
+    // path and must keep `raw_ret`.
+    let sealed_projection_from_object = ret_coerced
+        && !is_union_ty(&body_ty)
+        && is_rc_type(&body_ty)
+        && is_sealed_scalar_repr(&effective_ret);
+    let return_keep: Vec<Temp> = if unboxes_to_scalar || sealed_projection_from_object {
+        // For both cases `raw_ret` does not alias `ret_temp`: release it via scope-exit.
         vec![ret_temp]
     } else {
         vec![ret_temp, raw_ret]
