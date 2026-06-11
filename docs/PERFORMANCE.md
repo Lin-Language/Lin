@@ -67,8 +67,8 @@ correctness gate):
 
 | workload | lin | rust | go | python | node |
 |----------|----:|-----:|---:|-------:|-----:|
-| records   | **200** | 224 | 624 | 23581 | 1135 |
-| pipeline  | **25**  | 100 | 116 | 1402  | 500  |
+| records   | 200 | 224 | 624 | 23581 | 1135 |
+| pipeline  | 25  | 100 | 116 | 1402  | 500  |
 | recursion | 479 | 476 | 883 | 20178 | 2193 |
 | async_io  | 202 | 202 | 202 | 230   | 216  |
 | parallel  | 168 | 104 | 172 | 18904 | 4265 |
@@ -86,7 +86,7 @@ correctness gate):
 - **`interp` is Lin's weakest cell** (~30× Rust): it is call- and allocation-bound
   — per-iteration token arrays, AST nodes, recursion, tagged-union dispatch —
   exactly the non-devirtualizable-call cost of §4.
-- **`dijkstra` trails Rust/Go** but crushes the interpreters; the gap is the
+- **`dijkstra` trails Rust/Go** but beats the interpreters; the gap is the
   linear-scan PQ and object field access in the graph representation.
 - **`parallel`/`async_io` ≈ Rust** (native threads; async_io is latency-floored,
   every language pins to the sleep floor).
@@ -144,7 +144,7 @@ cost (the materialization seam — see §5).
 
 ---
 
-## 3. Strengths (with mechanism)
+## 3. Strengths 
 
 Each of these is why a typed Lin program is fast; the mechanism is the thing to
 preserve.
@@ -193,7 +193,7 @@ preserve.
 
 ---
 
-## 4. Where it struggles (honest weaknesses)
+## 4. Where it struggles
 
 - **`Json`-read-bound code is the cliff.** `Json` field access is a string-keyed
   O(n) linear scan over the object's entries *and* an LLVM optimization barrier —
