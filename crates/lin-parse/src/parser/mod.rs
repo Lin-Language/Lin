@@ -37,11 +37,17 @@ pub struct Parser {
     /// (a genuine higher-order type alias `((Json) => Json) => Json` is unaffected — it is never
     /// parsed in return position).
     in_return_type: bool,
+    /// Set true whenever `parse_or_expr`/`parse_and_expr` consume an `||`/`&&` operator at their
+    /// OWN nesting level (i.e. not inside parentheses — a parenthesised group resets it to false on
+    /// entry to the `(`). `parse_coalesce_expr` reads this immediately after parsing each `??`
+    /// operand to enforce the JS-style "no unparenthesised mix of `??` with `&&`/`||`" rule
+    /// (ADR-065). It is a transient signal, snapshotted and reset by `parse_coalesce_expr`.
+    produced_unparenthesized_logical: bool,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0, diagnostics: Vec::new(), error_count_at_stmt_start: 0, suppress_is_has: false, match_arm_floor: None, in_return_type: false }
+        Self { tokens, pos: 0, diagnostics: Vec::new(), error_count_at_stmt_start: 0, suppress_is_has: false, match_arm_floor: None, in_return_type: false, produced_unparenthesized_logical: false }
     }
 
     pub fn parse_module(&mut self) -> Module {

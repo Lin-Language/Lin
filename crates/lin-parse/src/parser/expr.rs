@@ -12,7 +12,67 @@ fn allow_trailing_comma() -> bool {
 
 impl Parser {
     pub(crate) fn parse_expr(&mut self) -> Expr {
-        self.parse_or_expr()
+        self.parse_coalesce_expr()
+    }
+
+    /// Null-coalescing `left ?? right` — the LOWEST binary rung (rung 13, below `||`; ADR-065).
+    /// Left-associative, short-circuiting (semantics fixed in lin-check/lowering: `left` once,
+    /// `right` only when `left` is Null). To match JS, an UNPARENTHESISED mix of `??` directly with
+    /// `&&`/`||` is a parse error in BOTH directions (`a || b ?? c` and `a ?? b || c`) — wrap the
+    /// logical sub-expression in parens. Continuation lines mirror `||`/`&&` (ADR-005).
+    pub(crate) fn parse_coalesce_expr(&mut self) -> Expr {
+        // Transient signal: did the operand we are about to parse consume a TOP-LEVEL `||`/`&&`?
+        // We reset before each operand and read it right after, so a parenthesised group (which is
+        // parsed by a NESTED parse_coalesce_expr that restores the flag on exit) does not leak.
+        let saved_logical = self.produced_unparenthesized_logical;
+        self.produced_unparenthesized_logical = false;
+        let mut left = self.parse_or_expr();
+        let mut left_was_logical = self.produced_unparenthesized_logical;
+
+        // No `??` follows: nothing to coalesce, nothing to check. Restore the caller's flag (so a
+        // parenthesised `(a || b)` does not leak a top-level-logical signal upward) and return.
+        self.skip_continuation_newline(TokenKind::QuestionQuestion);
+        if !self.check(TokenKind::QuestionQuestion) {
+            self.produced_unparenthesized_logical = saved_logical;
+            return left;
+        }
+
+        loop {
+            self.skip_continuation_newline(TokenKind::QuestionQuestion);
+            if !self.check(TokenKind::QuestionQuestion) { break; }
+            let span = self.current_span();
+            // `a || b ?? c` / `a && b ?? c`: the left operand mixed `??` with `||`/`&&` unparen'd.
+            if left_was_logical {
+                self.error_mixed_coalesce(span);
+            }
+            self.advance();
+            self.skip_newlines();
+            self.produced_unparenthesized_logical = false;
+            let right = self.parse_or_expr();
+            // `a ?? b || c` / `a ?? b && c`: the right operand mixed unparenthesised.
+            if self.produced_unparenthesized_logical {
+                self.error_mixed_coalesce(span);
+            }
+            left = Expr::Coalesce {
+                left: Box::new(left),
+                right: Box::new(right),
+                span,
+            };
+            // The Coalesce node itself is not a `||`/`&&`, and we have already validated the chain,
+            // so subsequent `??` rungs see a non-logical left.
+            left_was_logical = false;
+        }
+        self.produced_unparenthesized_logical = saved_logical;
+        left
+    }
+
+    fn error_mixed_coalesce(&mut self, span: lin_common::Span) {
+        self.diagnostics.push(
+            Diagnostic::error(span, "cannot mix `||`/`&&` and `??` without parentheses")
+                .with_help(
+                    "wrap the `||`/`&&` sub-expression in parentheses, e.g. `(a || b) ?? c` or `a ?? (b || c)`",
+                ),
+        );
     }
 
     pub(crate) fn parse_expr_or_block(&mut self) -> Expr {
@@ -77,6 +137,7 @@ impl Parser {
         loop {
             self.skip_continuation_newline(TokenKind::Or);
             if !self.check(TokenKind::Or) { break; }
+            self.produced_unparenthesized_logical = true;
             let span = self.current_span();
             self.advance();
             self.skip_newlines();
@@ -96,6 +157,7 @@ impl Parser {
         loop {
             self.skip_continuation_newline(TokenKind::And);
             if !self.check(TokenKind::And) { break; }
+            self.produced_unparenthesized_logical = true;
             let span = self.current_span();
             self.advance();
             self.skip_newlines();

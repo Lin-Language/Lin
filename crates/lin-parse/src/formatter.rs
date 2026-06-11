@@ -590,6 +590,10 @@ fn collect_anchors_expr(expr: &Expr, out: &mut Vec<Anchor>) {
             collect_anchors_expr(left, out);
             collect_anchors_expr(right, out);
         }
+        Expr::Coalesce { left, right, .. } => {
+            collect_anchors_expr(left, out);
+            collect_anchors_expr(right, out);
+        }
         Expr::UnaryOp { operand, .. } => collect_anchors_expr(operand, out),
         Expr::Index { object, key, .. } => {
             collect_anchors_expr(object, out);
@@ -890,6 +894,26 @@ fn fmt_binop_operand(operand: &Expr, parent: &BinOp, is_right: bool, render: imp
     s
 }
 
+/// Format a `Coalesce` (`??`) operand, wrapping it in parentheses where the parse would otherwise
+/// change (ADR-065). `??` is the lowest-precedence binary rung, so ordinary tighter operands need
+/// no parens. The exceptions: a `&&`/`||` operand MUST be parenthesised (an unparenthesised mix is
+/// a parse error, so it can only have come from a parenthesised source); and a nested `??` on the
+/// RIGHT keeps its parens under left-associativity (`a ?? (b ?? c)`), while a left `??` does not.
+/// Author parens elsewhere are preserved via `source_parenthesized`.
+fn fmt_coalesce_operand(operand: &Expr, is_right: bool, render: impl Fn(&Expr) -> String) -> String {
+    let s = render(operand);
+    let needs = match operand {
+        Expr::BinaryOp { op: BinOp::And | BinOp::Or, .. } => true,
+        Expr::Coalesce { .. } => is_right,
+        _ => source_parenthesized(operand),
+    };
+    if needs {
+        format!("({})", s)
+    } else {
+        s
+    }
+}
+
 /// The source extent [start, end) of an expression — start of its leftmost leaf to end of its
 /// rightmost leaf. The `BinaryOp` span only covers the operator token, so paren detection needs
 /// the operand's true bounds, computed by descending the leftmost/rightmost children.
@@ -897,6 +921,7 @@ fn expr_extent(expr: &Expr) -> (u32, u32) {
     fn leftmost(e: &Expr) -> u32 {
         match e {
             Expr::BinaryOp { left, .. } => leftmost(left),
+            Expr::Coalesce { left, .. } => leftmost(left),
             Expr::DotCall { receiver, .. } => leftmost(receiver),
             Expr::Call { func, .. } => leftmost(func),
             Expr::Index { object, .. } => leftmost(object),
@@ -907,6 +932,7 @@ fn expr_extent(expr: &Expr) -> (u32, u32) {
     fn rightmost(e: &Expr) -> u32 {
         match e {
             Expr::BinaryOp { right, .. } => rightmost(right),
+            Expr::Coalesce { right, .. } => rightmost(right),
             other => other.span().end,
         }
     }
@@ -1291,6 +1317,7 @@ fn contains_call(expr: &Expr) -> bool {
     match expr {
         Expr::Call { .. } | Expr::DotCall { .. } => true,
         Expr::BinaryOp { left, right, .. } => contains_call(left) || contains_call(right),
+        Expr::Coalesce { left, right, .. } => contains_call(left) || contains_call(right),
         Expr::UnaryOp { operand, .. } => contains_call(operand),
         Expr::Index { object, key, .. } => contains_call(object) || contains_call(key),
         Expr::Is { expr, .. } | Expr::Has { expr, .. } => contains_call(expr),
@@ -1326,6 +1353,7 @@ fn is_atomic(expr: &Expr) -> bool {
         | Expr::Ident(..)
         | Expr::StringInterp(..) => true,
         Expr::BinaryOp { left, right, .. } => is_atomic(left) && is_atomic(right),
+        Expr::Coalesce { left, right, .. } => is_atomic(left) && is_atomic(right),
         Expr::UnaryOp { operand, .. } => is_atomic(operand),
         Expr::Index { object, key, .. } => is_atomic(object) && is_atomic(key),
         Expr::Call { func, args, .. } => {
@@ -1373,6 +1401,13 @@ fn fmt_inline(expr: &Expr) -> String {
                 fmt_binop_operand(left, op, false, fmt_inline),
                 binop_symbol(op),
                 fmt_binop_operand(right, op, true, fmt_inline)
+            )
+        }
+        Expr::Coalesce { left, right, .. } => {
+            format!(
+                "{} ?? {}",
+                fmt_coalesce_operand(left, false, fmt_inline),
+                fmt_coalesce_operand(right, true, fmt_inline)
             )
         }
         Expr::UnaryOp { op, operand, .. } => {
@@ -1582,6 +1617,14 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                 fmt_binop_operand(left, op, false, render),
                 binop_symbol(op),
                 fmt_binop_operand(right, op, true, render)
+            )
+        }
+        Expr::Coalesce { left, right, .. } => {
+            let render = |e: &Expr| fmt_expr(e, false, ind);
+            format!(
+                "{} ?? {}",
+                fmt_coalesce_operand(left, false, render),
+                fmt_coalesce_operand(right, true, render)
             )
         }
         Expr::UnaryOp { op, operand, .. } => {

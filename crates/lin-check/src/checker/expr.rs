@@ -1,6 +1,6 @@
 use indexmap::IndexMap;
 use lin_common::{Diagnostic, Span};
-use lin_parse::ast::{Expr, MatchArm, ObjectField, Stmt, StringPart};
+use lin_parse::ast::{BinOp, Expr, MatchArm, ObjectField, Stmt, StringPart};
 
 use super::Checker;
 use super::helpers::{check_int_literal_fits, default_int_literal_type, suffix_to_type, unify_types};
@@ -373,6 +373,7 @@ impl Checker {
             Expr::NullLit(span)      => Ok(TypedExpr::NullLit(*span)),
             Expr::Ident(name, span)  => self.infer_ident(name, *span),
             Expr::BinaryOp { left, op, right, span } => self.infer_binary_op(left, *op, right, *span),
+            Expr::Coalesce { left, right, span } => self.infer_coalesce(left, right, *span),
             Expr::UnaryOp { op, operand, span } => self.infer_unary_op(*op, operand, *span),
             Expr::Call { func, args, partial, span, .. }  => self.infer_call(func, args, *partial, *span),
             Expr::DotCall { receiver, method, args, partial, span, .. } => self.infer_dot_call(receiver, method, args, *partial, *span),
@@ -981,6 +982,105 @@ impl Checker {
             then_br: Box::new(typed_then),
             else_br: Box::new(typed_else),
             result_type,
+            span,
+        })
+    }
+
+    /// Null-coalescing `left ?? right` (ADR-065). Semantically `if left != null then left else
+    /// right`: `left` is evaluated exactly once and `right` only when `left` is Null. Coalesces
+    /// `Null` ONLY — an `Error` member of the left type flows through unchanged (Lin's value-based
+    /// error convention stays explicit).
+    ///
+    /// Typing: the left type must INCLUDE Null (bare `Null`, a union containing `Null`, or the
+    /// dynamic `Json`) — otherwise a "left operand of `??` is never null" diagnostic. The result is
+    /// `(left minus Null) | D` (D = right's type), collapsed to the bare stripped type when D is
+    /// assignable to it (mirroring `object.get`, SPECIFICATION.md §6.1).
+    ///
+    /// We DESUGAR to `{ val tmp = left; if tmp != null then tmp else right }` at the typed-IR
+    /// level (NOT in the parser — the formatter round-trips the surface `??`). This inherits the
+    /// proven if/else + `!= null` lowering, ownership, and RC-reconciliation paths verbatim
+    /// instead of hand-rolling union-temp RC (the #1 source of leaks/UAF here).
+    pub(crate) fn infer_coalesce(&mut self, left: &Expr, right: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
+        let typed_left = self.infer_expr(left)?;
+        let left_ty = typed_left.ty();
+
+        // The left type must be able to be Null. `Json` is dynamically nullable; a bare `Null` is
+        // allowed (then the value is always null and the result is just `right`'s type); a union is
+        // null-inclusive iff it has a `Null` member.
+        let is_bare_null = left_ty == Type::Null;
+        let union_has_null = matches!(&left_ty, Type::Union(vs) if vs.iter().any(|v| *v == Type::Null));
+        let left_is_json = is_json_dynamic(&left_ty);
+        if !is_bare_null && !union_has_null && !left_is_json {
+            return Err(Diagnostic::error(
+                left.span(),
+                format!("left operand of `??` is never null (its type is {})", left_ty),
+            )
+            .with_help(
+                "`??` supplies a default only when the left operand can be Null; here it never is, so the default is dead — drop the `?? …`",
+            ));
+        }
+
+        // The non-null contribution of the left operand. For `Json` it stays `Json` (which already
+        // subsumes Null and is its own normalisation below); for a `T | Null` union it is the union
+        // with `Null` removed (`without_null`); for a bare `Null` left there is nothing left, so the
+        // then-branch is dead and the result is purely `right`'s type — model that as `Never`.
+        let stripped = if left_is_json {
+            left_ty.clone()
+        } else if is_bare_null {
+            Type::Never
+        } else {
+            left_ty.without_null().unwrap_or(Type::Never)
+        };
+
+        let typed_right = self.infer_expr(right)?;
+        let right_ty = typed_right.ty();
+
+        // Result type = stripped | D, collapsed to `stripped` when D is assignable to it. A bare
+        // `Null` left collapses to `right`'s type (its stripped half is `Never`). For a `Json` left
+        // the union goes through `flatten_union`, which subsumes a concrete `D` into `Json` exactly
+        // as the documented `object.get`/if-merge normalisation does.
+        let result_type = if is_bare_null {
+            right_ty.clone()
+        } else if left_is_json {
+            Type::flatten_union(vec![stripped.clone(), right_ty.clone()])
+        } else if self.types_compatible(&right_ty, &stripped) {
+            stripped.clone()
+        } else {
+            Type::flatten_union(vec![stripped.clone(), right_ty.clone()])
+        };
+
+        // --- desugar to `{ val tmp = left; if tmp != null then tmp else right }` ---
+        // Bind `left` to a fresh anonymous slot so it is evaluated exactly once. The synthetic name
+        // can never collide with a user binding (it is not a valid identifier).
+        let tmp_slot = self.env.define("$coalesce".to_string(), left_ty.clone(), false);
+        // The then-branch reads the slot at its NON-NULL (stripped) type — mirroring how the real
+        // `if x != null then x` narrows `x` inside the then-branch. For a bare-`Null`/Json left this
+        // is `Never`/`Json` respectively; lowering coerces the branch to `result_type` regardless.
+        let then_get = TypedExpr::LocalGet { slot: tmp_slot, ty: stripped.clone(), span };
+        let cond = TypedExpr::BinaryOp {
+            left: Box::new(TypedExpr::LocalGet { slot: tmp_slot, ty: left_ty.clone(), span }),
+            op: BinOp::NotEq,
+            right: Box::new(TypedExpr::NullLit(span)),
+            result_type: Type::Bool,
+            span,
+        };
+        let if_expr = TypedExpr::If {
+            cond: Box::new(cond),
+            then_br: Box::new(then_get),
+            else_br: Box::new(typed_right),
+            result_type: result_type.clone(),
+            span,
+        };
+        Ok(TypedExpr::Block {
+            stmts: vec![TypedStmt::Val {
+                slot: tmp_slot,
+                name: None,
+                value: typed_left,
+                ty: left_ty,
+                span,
+            }],
+            expr: Box::new(if_expr),
+            ty: result_type,
             span,
         })
     }

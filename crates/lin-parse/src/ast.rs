@@ -100,6 +100,15 @@ pub enum Expr {
         right: Box<Expr>,
         span: Span,
     },
+    /// Null-coalescing `left ?? right` (ADR-065). Kept as a dedicated form (not desugared in
+    /// the parser) so the formatter round-trips `??` exactly as written. Semantics:
+    /// `if left != null then left else right` — `left` evaluated once, `right` only when `left`
+    /// is Null. Coalesces `Null` only; an `Error` value flows through unchanged.
+    Coalesce {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        span: Span,
+    },
     UnaryOp {
         op: UnaryOp,
         operand: Box<Expr>,
@@ -209,6 +218,7 @@ impl Expr {
             Expr::Ident(_, s) => *s,
             Expr::StringInterp(_, s) => *s,
             Expr::BinaryOp { span, .. } => *span,
+            Expr::Coalesce { span, .. } => *span,
             Expr::UnaryOp { span, .. } => *span,
             Expr::Call { span, .. } => *span,
             Expr::DotCall { span, .. } => *span,

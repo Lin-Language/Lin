@@ -2371,3 +2371,54 @@ untyped-object store CloneBox-on-raw-SumNode overflow, and a map-round-trip doub
 classifiers each claiming the one projected node). **Lesson: for representation changes, ASan-green ≠
 correct — a wrong-repr read is often an ASan-invisible logic error; verify the real workload shape
 behaviorally.**
+
+## ADR-065: Null-coalescing operator `??`
+
+**Status**: Accepted (implemented; lexer/parser/checker/formatter, lowering by desugar).
+
+**Decision.** Add a built-in binary operator `a ?? b` with the semantics `if a != null then a else b`:
+`a` is evaluated exactly once, and `b` only when `a` is `Null` (short-circuit). It is the lowest
+binary rung (rung 13, below `||`; SPECIFICATION.md §8.2/§8.3), left-associative, so `x ?? y ?? z`
+chains and `a ?? b == c` parses as `a ?? (b == c)`.
+
+**Why an operator, not a stdlib `or(a, b)`.** Operators in Lin are built-ins, not functions (§8.1) —
+a function form cannot short-circuit (both args are evaluated before the call), and the defaulted-read
+idiom is pervasive enough (`m[k] ?? default`, `cfg["timeout"] ?? 30`) to earn surface syntax. The
+keyed convenience `object.get(m, k, default)` already existed and stays; `??` generalises it to any
+nullable expression and is what `get` is now documented in terms of.
+
+**Coalesces `Null` only — never `Error`.** Lin's value-based error convention (§4, §20) requires
+failures to stay explicit. If the left is `T | Null | Error` and holds an `Error`, that `Error` flows
+**through** `??` unchanged — it is NOT replaced by the default (which would silently swallow real
+failures). The result type is `(T | Error) | D`. This is the single most important semantic choice and
+is regression-tested (`test_coalesce_error_passes_through`).
+
+**Never-null left is a compile error.** The left type must be able to be `Null` (bare `Null`, a union
+containing `Null`, or `Json`). A left that is never null (`5 ?? 1`) makes the default dead code, so it
+is a spanned diagnostic rather than silently accepted. The result type strips `Null` from the left and
+unions the right's type `D`, collapsing to the bare stripped type when `D` is assignable to it —
+identical to `if x != null then x else d` and to `object.get`'s documented collapse (reuses the
+existing `without_null`/`flatten_union`/`types_compatible` helpers, no new typing machinery).
+
+**JS-style no-unparenthesised-mixing rule.** `a || b ?? c` and `a ?? b || c` are parse errors telling
+the user to parenthesise. This avoids the genuinely-ambiguous reading and matches JavaScript/TypeScript
+(and Swift/C#'s spirit). It is the conservative choice: the restriction can be *relaxed* later (pick a
+precedence and allow the mix) without breaking any program that compiled under it; the reverse — adding
+a restriction later — would be a breaking change. Detected in the parser at the `??` rung via a
+transient "did this operand consume a top-level `&&`/`||`?" flag that nested parenthesised groups reset.
+
+**Lowering: desugar, do not hand-roll RC.** `??` is NOT desugared in the parser (a dedicated
+`Expr::Coalesce` AST node keeps the formatter able to round-trip `??` exactly as written, parens and
+all). It is desugared in the **checker** to `{ val tmp = left; if tmp != null then tmp else right }`
+over a fresh anonymous slot, producing ordinary `TypedExpr::Block`/`If`/`LocalGet`/`BinaryOp(NotEq)`
+nodes. This inherits the proven `if`/`else` + `!= null`-narrowing lowering, ownership, and
+RC-reconciliation paths verbatim — instead of writing new retain/release logic over a union temp, which
+is historically the #1 source of leaks/UAF in this codebase. Codegen needed **zero** changes.
+
+**Continuation lines.** A line beginning with `??` is a continuation of the previous logical line
+(suppressed INDENT/DEDENT in the lexer, exactly like the existing `&&`/`||` rule — ADR-005), so a long
+chain can wrap.
+
+**Non-goals.** No optional-chaining `?.` (Lin's safe-bracket access already null-propagates through
+chains — §6.1 — making `?.` redundant); no `??=` compound assignment (low value, and `var` reassignment
+covers it); no bare `?` token (a lone `?` stays an unknown-character lex error as today).
