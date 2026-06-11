@@ -2476,18 +2476,10 @@ fn try_lower_boxed_array_field(
     });
     // The borrowed field read becomes an owned value (snapshot semantics), exactly like the generic
     // FieldGet/Index path: a union/Json field is relocated into a fresh owned box; a concrete heap
-    // field is retained; a scalar needs nothing.
-    if is_union_ty(result_ty) {
-        let owned = builder.alloc_temp(result_ty.clone());
-        builder.emit(Instruction::CloneBox { dst: owned, src: dst, ty: result_ty.clone() });
-        builder.register_owned(owned, result_ty.clone());
-        return Some(owned);
-    }
-    if is_rc_type(result_ty) {
-        builder.emit(Instruction::Retain { val: dst, ty: result_ty.clone() });
-        builder.register_owned(dst, result_ty.clone());
-    }
-    Some(dst)
+    // field is retained; a scalar needs nothing. This is the owning-read trichotomy — route it
+    // through `own_for_read` (→ the ownership authority `owning_strategy`) instead of re-deriving the
+    // union/rc/scalar split inline.
+    Some(own_for_read(dst, result_ty, builder))
 }
 
 /// Lower `value` into a slot of declared type `slot_ty`, producing a temp in the slot's
@@ -4064,18 +4056,10 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
             // Index case above for the full rationale. A union/Json field is an INTERIOR
             // `*TaggedVal` into the (movable) container storage, so relocate it into a fresh
             // owned box (`CloneBox` → `lin_tagged_clone`); a concrete heap field is a stable
-            // pointer, dup it (retain + register owned).
-            if is_union_ty(result_type) {
-                let owned = builder.alloc_temp(result_type.clone());
-                builder.emit(Instruction::CloneBox { dst: owned, src: dst, ty: result_type.clone() });
-                builder.register_owned(owned, result_type.clone());
-                return owned;
-            }
-            if is_rc_type(result_type) {
-                builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
-                builder.register_owned(dst, result_type.clone());
-            }
-            dst
+            // pointer, dup it (retain + register owned); a scalar needs nothing. This is exactly
+            // the owning-read trichotomy — route it through `own_for_read` (→ the ownership
+            // authority `owning_strategy`) rather than re-deriving the union/rc/scalar split here.
+            own_for_read(dst, result_type, builder)
         }
 
         TypedExpr::StringInterp { parts, .. } => {
