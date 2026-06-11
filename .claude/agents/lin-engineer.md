@@ -69,6 +69,16 @@ Note: `val` for every binding; the function body is one big `if/else` expression
 whose value is returned implicitly; `else if` chains rather than `switch`;
 indentation (2 spaces) is significant and defines blocks.
 
+> ⚠️ **`Json` WARNING — do not copy the `Json` in this example.** This module types its
+> AST as `Json` only to keep the *first* example small. It is **not** the style to imitate —
+> it is the anti-pattern the "Types" section below tells you to avoid. A real evaluator types
+> its nodes as a union (`type Num = { "kind": String, "value": Int32 }`, `type Bin = { "kind":
+> String, "op": String, "left": Expr, "right": Expr }`, `type Expr = Num | Bin`) and matches on
+> them — no `Json`, no `isFailure` string-probe. **Default to typed records/unions/generics
+> everywhere; reach for `Json` only for genuinely unknowable external wire data.** If you are
+> writing `(x: Json)` and then `x["field"]`, you are doing it wrong — write the type. The typed
+> examples below (`report.lin`, `frequency.lin`) are the bar.
+
 ### Composing modules and matching on a tagged result (`calc/main.lin`)
 
 ```lin
