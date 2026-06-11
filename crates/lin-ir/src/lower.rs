@@ -6067,6 +6067,21 @@ fn emit_packed_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)
 enum FuseStage {
     Map { params: Vec<TypedParam>, body: TypedExpr, out_elem_ty: Type },
     Filter { params: Vec<TypedParam>, body: TypedExpr },
+    /// `flatMap(f)` where `f: (T, Int32) => U[]`. Unlike Map/Filter (which transform/skip the carried
+    /// value in place), a FlatMap stage WRAPS the downstream continuation in an INNER LOOP: it
+    /// evaluates `inner = f(elem, idx)` (a fresh `U[]`), then runs ALL downstream stages + the terminal
+    /// once per inner element. `inner_elem_ty` is `U` (the inner array's element type). A chain that
+    /// contains a FlatMap stage lowers via the CPS engine `emit_flatmap_chain` (single-ownership), NOT
+    /// the linear `apply_fuse_stages` path — see `chain_has_flatmap`.
+    FlatMap { params: Vec<TypedParam>, body: TypedExpr, inner_elem_ty: Type },
+}
+
+/// True when a fused chain contains a FlatMap stage — it must lower via the CPS engine
+/// (`emit_flatmap_chain`), since a FlatMap wraps the rest of the pipeline in an inner loop rather than
+/// transforming the carried value in place. A flatMap-FREE chain keeps the original linear
+/// `apply_fuse_stages`/`emit_fused_loop` lowering byte-identically.
+fn chain_has_flatmap(stages: &[FuseStage]) -> bool {
+    stages.iter().any(|s| matches!(s, FuseStage::FlatMap { .. }))
 }
 
 /// Resolve `expr` to a combinator NAME ("map"/"filter"/"reduce"/"for"/"range"/...) when it is a
@@ -6088,6 +6103,7 @@ fn combinator_callee_name(expr: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCt
         "for" => "for",
         "while" => "while",
         "range" => "range",
+        "flatMap" => "flatMap",
         _ => return None,
     })
 }
@@ -6107,7 +6123,8 @@ fn extract_fuse_chain<'a>(
         let TypedExpr::Call { args, .. } = cur else { break };
         let is_map = name == "map";
         let is_filter = name == "filter";
-        if (!is_map && !is_filter) || args.len() != 2 {
+        let is_flat_map = name == "flatMap";
+        if (!is_map && !is_filter && !is_flat_map) || args.len() != 2 {
             break;
         }
         if matches!(args[0].ty(), Type::Stream(_)) {
@@ -6127,7 +6144,18 @@ fn extract_fuse_chain<'a>(
         if !fuse_elem_repr_reclaimable(&in_ty) {
             break;
         }
-        let stage = if is_map {
+        let stage = if is_flat_map {
+            // `flatMap(f)` where `f: (T, Int32) => U[]`. The lambda's RESULT is the inner `U[]`;
+            // recover `U` from it. The inner element is read per inner-loop iteration by an
+            // `Instruction::Index` materialize, subject to the SAME reclaim discipline as the source
+            // element (`free_combinator_*`), so it must have a reclaimable repr — else bail.
+            let (_, ret) = callback_signature(&args[1]);
+            let inner_elem_ty = iter_elem_type(&ret);
+            if !fuse_elem_repr_reclaimable(&inner_elem_ty) {
+                break;
+            }
+            FuseStage::FlatMap { params: params.to_vec(), body: body.clone(), inner_elem_ty }
+        } else if is_map {
             let (_, ret) = callback_signature(&args[1]);
             // A map's OUTPUT must be an inline scalar: it becomes the carried value into the next
             // stage / terminal. A scalar carries with no RC (the proven projection case
@@ -6264,6 +6292,9 @@ fn apply_fuse_stages(
                 elem = mapped;
                 elem_ty = if matches!(mapped_ty, Type::TypeVar(_)) { out_elem_ty.clone() } else { mapped_ty };
             }
+            // A flatMap-bearing chain is routed to the CPS engine (`emit_flatmap_fused_loop`) before
+            // ever reaching the linear applier — see `chain_has_flatmap`. Unreachable here.
+            FuseStage::FlatMap { .. } => unreachable!("flatMap chains use the CPS fusion engine"),
         }
     }
     Some((elem, elem_ty))
@@ -6298,6 +6329,240 @@ fn emit_fused_loop<T>(
         }
         b.switch_to(cont);
     });
+}
+
+// ===========================================================================================
+// FLATMAP-FUSION (Wave D) — a `flatMap` stage in a fused combinator chain. PUSH-model fusion makes
+// flatMap a LOOP NEST, not a fusion barrier: the source is driven by an outer index loop; at a
+// FlatMap stage we evaluate `inner = f(elem, idx)` (a fresh `U[]`) and run ALL downstream stages +
+// the terminal once per inner element in an INNER index loop. No intermediate per-stage array is
+// built (beyond the flatMap's own `inner`, which the language semantics already materialize).
+//
+// A chain that contains a FlatMap stage lowers via the recursive CPS engine `fm_process` below
+// (single-ownership reclaim at each stage's consuming site); a flatMap-FREE chain keeps the original
+// linear `apply_fuse_stages`/`emit_fused_loop` lowering BYTE-IDENTICALLY (Wave D adds a stage; it does
+// not touch the others). The terminal is supplied as a `&mut dyn FnMut` callback so the SAME engine
+// drives `for`/`map`/`filter`/`reduce` terminals.
+//
+// OWNERSHIP (the RC crux — this fuser has a leak history): `fm_process` CONSUMES the element it is
+// handed. On the DROP path (a filter predicate is false) it reclaims the element; on the MAP path it
+// reclaims the (now-superseded) input element and threads the fresh map output downstream; on the
+// PASS-THROUGH path the element flows downstream and the eventual terminal reclaims it. Reclaim is the
+// SAME discipline the single-combinator/linear-fused paths trust — `free_combinator_elem_box_full`
+// (union/Json shell+inner) + `free_combinator_sealed_elem` (sealed struct) — a NO-OP for an inline
+// scalar. The flatMap's `inner` array is a fresh owned `U[]` released after its inner loop completes.
+// Each inner element is a fresh `Index` materialize gated to a reclaimable repr (scalar/sealed/union),
+// reclaimed identically to a source element. No alias-tracking is needed because a map stage's output
+// is always a fresh SCALAR (gated in `extract_fuse_chain`), so the reclaim of the threaded element at
+// its single consuming site never targets a stale/aliased reference (the `map.filter` double-free the
+// linear path guards with `src_alive` cannot arise — the reclaim follows the live value, not `src`).
+
+/// The position-indexed output counter for the consumer at pipeline `pos`. Downstream of a flatMap or
+/// a filter, the index a stage's lambda receives is the OUTPUT-stream position at that stage (the
+/// number of elements delivered to it so far), NOT the source index — matching the eager
+/// `arr.flatMap(f).map((y,i)=>…)` semantics where `map` sees the flattened array's positions. Each
+/// such counter is a loop-invariant `Int32` heap cell (allocated ONCE before the outer loop, init 0),
+/// incremented per element ARRIVING at that position. `None` when that position's lambda is 1-arg (no
+/// index used) — then no cell is allocated and no per-element increment is emitted.
+fn fm_next_index(counters: &[Option<Temp>], pos: usize, builder: &mut FuncBuilder) -> Temp {
+    match counters.get(pos).and_then(|c| *c) {
+        Some(cell) => {
+            let cur = builder.alloc_temp(Type::Int32);
+            builder.emit(Instruction::CellGet { dst: cur, cell, ty: Type::Int32 });
+            let one = builder.const_temp(Const::Int(1, Type::Int32));
+            let nxt = builder.alloc_temp(Type::Int32);
+            builder.emit(Instruction::Binary {
+                dst: nxt, op: BinOp::Add, lhs: cur, rhs: one, operand_ty: Type::Int32, ty: Type::Int32,
+            });
+            builder.emit(Instruction::CellSet { cell, value: nxt, ty: Type::Int32 });
+            cur
+        }
+        // 1-arg consumer at this position — the index is never read; a constant is harmless.
+        None => builder.const_temp(Const::Int(0, Type::Int32)),
+    }
+}
+
+/// Fully reclaim a per-iteration combinator element materialize (the SAME discipline the single-
+/// combinator + linear-fused paths use): a union/Json box (shell + retained inner) and/or a sealed
+/// struct. A no-op for an inline scalar. Used at every CONSUMING site in `fm_process`.
+fn fm_reclaim_elem(elem: Temp, elem_ty: &Type, builder: &mut FuncBuilder) {
+    free_combinator_elem_box_full(elem, elem_ty, builder);
+    free_combinator_sealed_elem(elem, &Type::Null, elem_ty, builder);
+}
+
+/// Recursive CPS engine for a flatMap-bearing fused chain. Processes `stages[0]` over the carried
+/// `elem` (with output index `idx`), then recurses on `stages[1..]`; an empty `stages` runs the
+/// terminal. CONSUMES `elem` (see the module note). `pos` is the pipeline position of `stages[0]`
+/// (0 = source); `counters[p]` feeds position `p`'s output index. `skip_block` is the latch of the
+/// INNERMOST loop currently in scope — a filter drop jumps there (skipping to the next element of
+/// whatever loop this stage runs in: the source loop for a pre-flatMap stage, an inner loop for a
+/// post-flatMap stage).
+#[allow(clippy::too_many_arguments)]
+fn fm_process(
+    stages: &[FuseStage],
+    elem: Temp,
+    elem_ty: Type,
+    idx: Temp,
+    counters: &[Option<Temp>],
+    pos: usize,
+    skip_block: BlockId,
+    terminal: &mut dyn FnMut(Temp, Type, Temp, &mut FuncBuilder, &mut LowerCtx),
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) {
+    let Some(stage) = stages.first() else {
+        // Terminal: the terminal callback consumes `elem` (push/fold/side-effect + its own reclaim).
+        terminal(elem, elem_ty, idx, builder, ctx);
+        return;
+    };
+    match stage {
+        FuseStage::Filter { params, body } => {
+            let (pred_raw, pred_ty) =
+                inline_lambda_body(params, body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx);
+            let keep = if matches!(pred_ty, Type::Bool) {
+                pred_raw
+            } else {
+                let d = builder.alloc_temp(Type::Bool);
+                builder.emit(Instruction::Coerce { dst: d, src: pred_raw, from_ty: pred_ty, to_ty: Type::Bool });
+                d
+            };
+            let keep_block = builder.alloc_block("fm_keep");
+            let drop_block = builder.alloc_block("fm_drop");
+            builder.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
+            // DROP: reclaim the element, jump to this loop's latch.
+            builder.switch_to(drop_block);
+            fm_reclaim_elem(elem, &elem_ty, builder);
+            builder.terminate(Terminator::Jump(skip_block));
+            // KEEP: pass the (unchanged, still-owned) element downstream at the next position.
+            builder.switch_to(keep_block);
+            let next_idx = fm_next_index(counters, pos + 1, builder);
+            fm_process(&stages[1..], elem, elem_ty, next_idx, counters, pos + 1, skip_block, terminal, builder, ctx);
+        }
+        FuseStage::Map { params, body, out_elem_ty } => {
+            let (mapped, mapped_ty) =
+                inline_lambda_body(params, body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx);
+            // The map produced a fresh SCALAR output (gated in `extract_fuse_chain`); the input
+            // `elem` is superseded — reclaim it now (a no-op for a scalar input, a real free for a
+            // sealed/union materialize). `mapped != elem` always holds for a scalar output over a
+            // distinct input, but the guard keeps a scalar identity (`x => x`, scalar-gated) safe.
+            if mapped != elem {
+                fm_reclaim_elem(elem, &elem_ty, builder);
+            }
+            let next_ty = if matches!(mapped_ty, Type::TypeVar(_)) { out_elem_ty.clone() } else { mapped_ty };
+            let next_idx = fm_next_index(counters, pos + 1, builder);
+            fm_process(&stages[1..], mapped, next_ty, next_idx, counters, pos + 1, skip_block, terminal, builder, ctx);
+        }
+        FuseStage::FlatMap { params, body, inner_elem_ty } => {
+            // Evaluate `inner = f(elem, idx)` — a fresh, fully-owned `U[]`.
+            let (inner, inner_arr_ty) =
+                inline_lambda_body(params, body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx);
+            // flatMap consumes its input element (it produced `inner` from it). `inner` is a freshly
+            // allocated array, never an alias of `elem` (different value/type), but guard anyway.
+            if inner != elem {
+                fm_reclaim_elem(elem, &elem_ty, builder);
+            }
+            // Read the inner element at the inner array's PROVABLE repr (a `[x, x*2]` literal is a flat
+            // scalar buffer; anything else reads tagged — sound for both). Reclaim uses that same type.
+            let inner_read_ty = combinator_read_elem_ty(body, builder, ctx);
+            let _ = inner_elem_ty; // the gate type; `inner_read_ty` is the read/reclaim repr.
+            let rest = &stages[1..];
+            let inner_pos = pos + 1;
+            // INNER LOOP over `inner`: run the downstream stages + terminal once per inner element.
+            emit_index_loop(inner, &inner_arr_ty, &inner_read_ty, builder, ctx, |_j, ielem, b, c| {
+                // A per-inner-element continuation: a downstream filter drop jumps HERE (the inner
+                // loop's latch), not the source loop's latch. Mirrors `emit_fused_loop`'s `cont`.
+                let cont = b.alloc_block("fm_inner_cont");
+                let inner_idx = fm_next_index(counters, inner_pos, b);
+                fm_process(rest, ielem, inner_read_ty.clone(), inner_idx, counters, inner_pos, cont, terminal, b, c);
+                if !b.is_current_block_terminated() {
+                    b.terminate(Terminator::Jump(cont));
+                }
+                b.switch_to(cont);
+            });
+            // The inner array is fully consumed — release the fresh +1 owned `U[]`.
+            builder.emit(Instruction::Release { val: inner, ty: inner_arr_ty });
+        }
+    }
+}
+
+/// Allocate the per-position output-index counter cells for a flatMap chain. A cell is allocated for
+/// position `p` (1..=stages.len(), the terminal at `stages.len()`) ONLY when that position's consumer
+/// lambda declares ≥2 params (so it actually reads an index) — otherwise `None` (no cell, no
+/// per-element increment). Position 0 (the source-driven stage) always uses the raw source index.
+/// Returns a vec indexed by position (length `stages.len()+1`); index 0 is always `None`.
+fn fm_alloc_counters(
+    stages: &[FuseStage],
+    terminal_param_count: usize,
+    builder: &mut FuncBuilder,
+) -> Vec<Option<Temp>> {
+    let n = stages.len();
+    let mut counters: Vec<Option<Temp>> = Vec::with_capacity(n + 1);
+    counters.push(None); // position 0: source index (no counter cell)
+    for p in 1..=n {
+        // The consumer at position `p` is `stages[p]` (a fuse stage) or, at `p == n`, the terminal.
+        let param_count = if p < n {
+            match &stages[p] {
+                FuseStage::Map { params, .. }
+                | FuseStage::Filter { params, .. }
+                | FuseStage::FlatMap { params, .. } => params.len(),
+            }
+        } else {
+            terminal_param_count
+        };
+        if param_count >= 2 {
+            let zero = builder.const_temp(Const::Int(0, Type::Int32));
+            let cell = builder.alloc_temp(Type::TypeVar(u32::MAX));
+            builder.emit(Instruction::MakeCell { dst: cell, init: zero, ty: Type::Int32 });
+            counters.push(Some(cell));
+        } else {
+            counters.push(None);
+        }
+    }
+    counters
+}
+
+/// Free the counter cells allocated by `fm_alloc_counters` (plain `Int32` cells — `FreeCell` just
+/// reclaims the allocation, no value release). Called after the outer loop completes.
+fn fm_free_counters(counters: &[Option<Temp>], builder: &mut FuncBuilder) {
+    for cell in counters.iter().flatten() {
+        builder.emit(Instruction::FreeCell { cell: *cell, ty: Type::Int32 });
+    }
+}
+
+/// Drive a flatMap-bearing fused chain over `base` (the source) with a terminal callback. Allocates
+/// the output-index counters, runs the source index loop, and recurses through `fm_process` per source
+/// element. `terminal(survivor, ty, out_idx)` is invoked at the leaf of the pipeline for each
+/// surviving element (and CONSUMES it — see the module note).
+#[allow(clippy::too_many_arguments)]
+fn emit_flatmap_fused_loop<T>(
+    iterable: Temp,
+    iterable_ty: &Type,
+    read_elem_ty: &Type,
+    stages: &[FuseStage],
+    terminal_param_count: usize,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    mut terminal: T,
+) where
+    T: FnMut(Temp, Type, Temp, &mut FuncBuilder, &mut LowerCtx),
+{
+    let counters = fm_alloc_counters(stages, terminal_param_count, builder);
+    let read_elem_ty = read_elem_ty.clone();
+    {
+        let counters = &counters;
+        let stages = &stages;
+        let term: &mut dyn FnMut(Temp, Type, Temp, &mut FuncBuilder, &mut LowerCtx) = &mut terminal;
+        emit_index_loop(iterable, iterable_ty, &read_elem_ty, builder, ctx, |i, elem, b, c| {
+            let cont = b.alloc_block("fm_src_cont");
+            let idx = narrow_loop_index(i, b);
+            fm_process(stages, elem, read_elem_ty.clone(), idx, counters, 0, cont, term, b, c);
+            if !b.is_current_block_terminated() {
+                b.terminate(Terminator::Jump(cont));
+            }
+            b.switch_to(cont);
+        });
+    }
+    fm_free_counters(&counters, builder);
 }
 
 /// `for(iterable, body)` → index loop calling `body(elem)` for side effects; returns Null.
@@ -6342,6 +6607,19 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
             let base_ty = base.ty();
             let read_elem_ty = combinator_read_elem_ty(base, builder, ctx);
             let iterable = lower_expr(base, builder, ctx);
+            // WAVE D: a flatMap-bearing chain lowers via the CPS engine (loop nest); the `for` body is
+            // the terminal, run once per surviving (flattened) element and discarding its result.
+            if chain_has_flatmap(&stages) {
+                emit_flatmap_fused_loop(iterable, &base_ty, &read_elem_ty, &stages, lam_params.len(),
+                    builder, ctx, |val, val_ty, idx, b, c| {
+                        let (res, res_ty) =
+                            inline_lambda_body(&lam_params, &lam_body, &[(val, val_ty.clone()), (idx, Type::Int32)], b, c);
+                        b.emit(Instruction::Release { val: res, ty: res_ty });
+                        // The `for` body never moves `val` into a result — fully reclaim the survivor.
+                        fm_reclaim_elem(val, &val_ty, b);
+                    });
+                return builder.const_temp(Const::Null);
+            }
             emit_fused_loop(iterable, &base_ty, &read_elem_ty, &stages, builder, ctx,
                 |val, val_ty, idx, src_elem, src_elem_ty, b, c| {
                     let (res, res_ty) =
@@ -6760,6 +7038,21 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
             let read_elem_ty = combinator_read_elem_ty(base, builder, ctx);
             let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
             let iterable = lower_expr(base, builder, ctx);
+            // WAVE D: flatMap-bearing chain → CPS loop nest; the terminal map runs per flattened element.
+            if chain_has_flatmap(&stages) {
+                emit_flatmap_fused_loop(iterable, &base_ty, &read_elem_ty, &stages, lam_params.len(),
+                    builder, ctx, |val, val_ty, idx, b, c| {
+                        let (mapped, mapped_ty) =
+                            inline_lambda_body(&lam_params, &lam_body, &[(val, val_ty.clone()), (idx, Type::Int32)], b, c);
+                        push_output(out, flat, &out_elem_ty, mapped, &mapped_ty, false, b);
+                        // The terminal map consumed the survivor `val` to produce a fresh scalar
+                        // `mapped` (gated scalar output ⇒ never an alias) — reclaim `val`.
+                        if mapped != val {
+                            fm_reclaim_elem(val, &val_ty, b);
+                        }
+                    });
+                return out;
+            }
             emit_fused_loop(iterable, &base_ty, &read_elem_ty, &stages, builder, ctx,
                 |val, val_ty, idx, src_elem, src_elem_ty, b, c| {
                     let (mapped, mapped_ty) =
@@ -6968,6 +7261,56 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     out
 }
 
+/// WAVE D: fused `base.<…flatMap…>.reduce(init, f)` over a SCALAR accumulator. A flatMap chain is a
+/// loop nest, so the accumulator can't ride a single loop phi (the linear `lower_fused_reduce` model);
+/// instead it lives in a heap cell carried through the CPS engine. At the terminal we load the cell,
+/// fold `acc = f(acc, survivor, outIdx)`, store it back. The accumulator is a concrete scalar (the
+/// caller gates `is_inline_scalar(result_type)`), so the cell store is a plain write (no RC) and the
+/// cell free reclaims only the allocation. The reducer's optional 3rd param is the OUTPUT index.
+#[allow(clippy::too_many_arguments)]
+fn lower_fused_reduce_flatmap(
+    base: &TypedExpr,
+    stages: &[FuseStage],
+    reducer_params: &[TypedParam],
+    reducer_body: &TypedExpr,
+    init_expr: &TypedExpr,
+    init_ty: &Type,
+    result_type: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Temp {
+    let base_ty = base.ty();
+    let acc_ty = result_type.clone();
+    let read_elem_ty = combinator_read_elem_ty(base, builder, ctx);
+    let iterable = lower_expr(base, builder, ctx);
+    let init_raw = lower_expr(init_expr, builder, ctx);
+    let init = coerce_arg_to_param_repr(init_raw, init_ty, &acc_ty, builder);
+    // Accumulator cell (scalar — no value RC on store/free).
+    let acc_cell = builder.alloc_temp(Type::TypeVar(u32::MAX));
+    builder.emit(Instruction::MakeCell { dst: acc_cell, init, ty: acc_ty.clone() });
+    // The reducer's index is its THIRD param; allocate an output counter only if it's declared.
+    let want_out_idx = reducer_params.len() >= 3;
+    emit_flatmap_fused_loop(iterable, &base_ty, &read_elem_ty, stages,
+        if want_out_idx { 2 } else { 1 }, builder, ctx,
+        |sv, sv_ty, out_idx, b, c| {
+            let cur = b.alloc_temp(acc_ty.clone());
+            b.emit(Instruction::CellGet { dst: cur, cell: acc_cell, ty: acc_ty.clone() });
+            let (acc_next_raw, acc_next_ty) = inline_lambda_body(
+                reducer_params, reducer_body,
+                &[(cur, acc_ty.clone()), (sv, sv_ty.clone()), (out_idx, Type::Int32)], b, c);
+            let acc_next = coerce_arg_to_param_repr(acc_next_raw, &acc_next_ty, &acc_ty, b);
+            b.emit(Instruction::CellSet { cell: acc_cell, value: acc_next, ty: acc_ty.clone() });
+            // The reducer READ the survivor (a fold consumes by reference) — reclaim it (no-op scalar).
+            fm_reclaim_elem(sv, &sv_ty, b);
+        });
+    // The terminal counter (position = stages.len()) was allocated INSIDE emit_flatmap_fused_loop, but
+    // the accumulator cell is ours — load the final value and free the cell.
+    let result = builder.alloc_temp(acc_ty.clone());
+    builder.emit(Instruction::CellGet { dst: result, cell: acc_cell, ty: acc_ty.clone() });
+    builder.emit(Instruction::FreeCell { cell: acc_cell, ty: acc_ty.clone() });
+    result
+}
+
 /// `reduce(iterable, init, f)` → fold `acc = f(acc, elem)` over the elements.
 /// The reducer `f` takes `(Json, Json)`, so the accumulator and element are carried as
 /// Json (boxed); the final accumulator is coerced back to `result_type`.
@@ -7137,6 +7480,8 @@ fn apply_fuse_stages_reduce(
                 elem = mapped;
                 elem_ty = if matches!(mapped_ty, Type::TypeVar(_)) { out_elem_ty.clone() } else { mapped_ty };
             }
+            // flatMap chains route to the CPS engine before reaching this linear reduce applier.
+            FuseStage::FlatMap { .. } => unreachable!("flatMap chains use the CPS fusion engine"),
         }
     }
     Some((elem, elem_ty))
@@ -7155,6 +7500,12 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
                 let lam_params = lam_params.to_vec();
                 let lam_body = lam_body.clone();
                 let init_ty = args[1].ty();
+                // WAVE D: a flatMap-bearing chain can't use the acc-PHI loop (a loop nest has no single
+                // back-edge for the phi) — carry the accumulator in a heap cell through the CPS engine.
+                if chain_has_flatmap(&stages) {
+                    return lower_fused_reduce_flatmap(
+                        base, &stages, &lam_params, &lam_body, &args[1], &init_ty, result_type, builder, ctx);
+                }
                 return lower_fused_reduce(base, &stages, &lam_params, &lam_body, &args[1], &init_ty, result_type, builder, ctx);
             }
         }
