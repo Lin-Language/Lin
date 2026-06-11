@@ -18357,3 +18357,73 @@ print(headers[0])
     assert_eq!(output, vec!["3", "alpha.txt"]);
 }
 
+// Regression test for Finding 1: TarEntry captured by an escaping closure must not UAF.
+// Before the fix, `is_union_ty` in lower.rs and `is_union_owning_ty` in ownership_verify.rs
+// both missed `Type::TarEntry`, causing CaptureRelease::None (no retain) for TarEntry captures.
+// The creating scope's exit released the TarEntry box while the escaped closure still held it —
+// a use-after-free / null-dereference at the closure call site.
+#[test]
+fn test_tar_entry_escaping_closure_no_uaf() {
+    let tar = workspace_root().join("stdlib/fixtures/sample.tar");
+    let tar_path = tar.to_str().unwrap();
+    let output = run(&format!(
+        r#"import {{ print }} from "std/io"
+import {{ readStream }} from "std/stream"
+import {{ entries, header }} from "std/archive"
+import {{ find }} from "std/iter"
+
+// Reproduces the escaping-closure shape: a TarEntry is captured by a closure that
+// outlives the scope where the entry was found.
+val pick = (): () => String =>
+  val found = readStream("{tar_path}")
+    .entries()
+    .find(e => e.header()["name"] == "bravo.txt")
+  match found
+    is Null => () => "none"
+    is Error => () => "err"
+    else =>
+      val t: TarEntry = found
+      () => t.header()["name"]
+
+val namer = pick()
+print(namer())
+print(namer())
+"#
+    ));
+    assert_eq!(output, vec!["bravo.txt", "bravo.txt"]);
+}
+
+// Regression test for Finding 2: async thunk capturing a TarEntry must be a compile-time error.
+// A TarEntry shares the archive cursor and cannot cross a thread boundary.
+#[test]
+fn test_async_captures_tar_entry_is_compile_error() {
+    let tar = workspace_root().join("stdlib/fixtures/sample.tar");
+    let tar_path = tar.to_str().unwrap();
+    let err = run_expect_err(&format!(
+        r#"import {{ print }} from "std/io"
+import {{ readStream }} from "std/stream"
+import {{ entries, header }} from "std/archive"
+import {{ find }} from "std/iter"
+import {{ async, await }} from "std/async"
+
+val found = readStream("{tar_path}")
+  .entries()
+  .find(e => e.header()["name"] == "bravo.txt")
+
+match found
+  is Null => print("none")
+  is Error => print("err")
+  else =>
+    val t: TarEntry = found
+    val p = async(() => t.header()["name"])
+    match await(p)
+      is Error => print("err")
+      else => print(await(p))
+"#
+    ));
+    assert!(
+        err.contains("non-transferable"),
+        "expected 'non-transferable' in compile error, got:\n{err}"
+    );
+}
+
