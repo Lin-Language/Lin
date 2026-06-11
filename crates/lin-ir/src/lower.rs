@@ -2179,7 +2179,10 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
         //    iteration (calc `parseTermLoop`/`parseExprLoop`, csv `scanRows`). So DON'T alias: leave
         //    `arg` as a plain owned temp and let `release_owned_for_tail_call`'s non-arg live-block
         //    release reclaim it before the back-edge (leg1 FINDINGS §2).
-        if is_union_ty(arg_ty) && !is_union_ty(param_ty) && is_rc_type(param_ty) {
+        // (both the UNBOX heap/scalar split below and the WIDEN sealed-record exception further down
+        // are now decided by the single ownership authority `escape_alias_convention`, which encodes
+        // exactly this `is_union_ty`/`is_rc_type`/`is_sealed_scalar_repr` predicate — see its doc.)
+        if crate::ownership_verify::escape_alias_convention(arg_ty, param_ty, is_sealed_scalar_repr(arg_ty)) {
             builder.record_escape_alias(dst, arg);
         }
         // WIDEN (concrete heap arg → union param): the Coerce `box_object`/`box_array`/… wraps the
@@ -2210,13 +2213,8 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
         // the TCO release-old reclaims it (its retained heap fields too). So DON'T alias for a sealed
         // arg — let the source struct be released before the back-edge. (Non-sealed heap args keep
         // the alias: their box genuinely shares the inner pointer threaded into the slot.)
-        if !is_union_ty(arg_ty)
-            && is_union_ty(param_ty)
-            && is_rc_type(arg_ty)
-            && !is_sealed_scalar_repr(arg_ty)
-        {
-            builder.record_escape_alias(dst, arg);
-        }
+        // [Both the UNBOX and this WIDEN decision are made by the single `escape_alias_convention`
+        // call above — the predicate it evaluates is exactly the union of these two conditions.]
         return dst;
     }
     // Numeric width/kind mismatch between two concrete numeric types.
