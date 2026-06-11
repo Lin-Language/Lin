@@ -1,0 +1,99 @@
+// raptor/RouteScanner — backward trip scan with a stateful routeScanPosition memo.
+//
+// A scanner record: { "tripsByRoute", "date", "dow", "routeScanPosition" }.
+// getTrip remembers, per route, the last index it scanned from (init trips.length-1),
+// iterates BACKWARD, breaks when stopTime.departureTime < time, records the last reachable
+// trip whose service runs that day, and updates the memo under (!lastFound || lastFound === trip).
+// The memo is stateful across calls within one scan (a fresh scanner per scan/day).
+import { length } from "std/array"
+import { runsOn } from "./service"
+import { RouteScanner, Trip } from "./types"
+
+// Narrow an `Int32 | Null` typed-map read to `Int32` (positive-arm idiom; ADR-055). A
+// `{ String: T }` value type is not `is`-narrowable and `if x == null` does not refine it, so the
+// `routeScanPosition[routeId]` scalar read uses this coalescer (the key is always present when this
+// branch runs — the `pos[routeId] != null` guard ran first — so the default is dead).
+val intOr = (x: Int32 | Null, d: Int32): Int32 =>
+  match x
+    is Int32 =>
+      x
+    else =>
+      d
+
+export val createRouteScanner = (tripsByRoute: { String: Trip[] }, date: Int32, dow: Int32): RouteScanner =>
+  // dateKey/dowKey are interpolated ONCE per scanner (= once per scan/day) and threaded
+  // to every runsOn call in the hot backward scan — not rebuilt per trip.
+  {
+    "tripsByRoute": tripsByRoute,
+    "date": date,
+    "dateKey": "${date}",
+    "dowKey": "${dow}",
+    "routeScanPosition": {}
+  }
+
+// Returns the chosen trip (or null). Tail-recursive backward scan threading lastFound.
+// The per-route/per-scan invariants (routeTrips, date, dateKey, dowKey, the memo map) are
+// hoisted ONCE in getTrip and passed as parameters — not re-read from the scanner record on
+// every iteration. `pos` is the routeScanPosition map itself; mutating the threaded map
+// persists (it is the same heap object the scanner record holds).
+//
+// The reference memo condition `!lastFound || lastFound === trip` is true exactly when
+// (nothing found yet) OR (runsOn matched THIS iteration — the only way lastFound === trip),
+// so it is computed from the `ran` boolean directly; no trip identity comparison at all.
+val scanBack = (routeTrips: Trip[], pos: { String: Int32 }, routeId: String, stopIndex: Int32, time: Json, date: Int32, dateKey: String, dowKey: String, i: Int32, lastFound: Trip | Null): Trip | Null =>
+  if i < 0 then
+    lastFound
+  else
+    val trip: Trip = routeTrips[i]
+    val stopTime = trip["stopTimes"][stopIndex]
+    if stopTime["departureTime"] < time then
+      lastFound
+    else
+      val ran = runsOn(trip["service"], date, dateKey, dowKey)
+      val newLastFound = if ran then trip else lastFound
+      // update routeScanPosition under the documented condition
+      if ran || newLastFound == null then
+        pos[routeId] = i
+      scanBack(
+        routeTrips,
+        pos,
+        routeId,
+        stopIndex,
+        time,
+        date,
+        dateKey,
+        dowKey,
+        i - 1,
+        newLastFound
+      )
+
+export val getTrip = (scanner: RouteScanner, routeId: String, stopIndex: Int32, time: Json): Trip | Null =>
+  val pos = scanner["routeScanPosition"]
+  // `scanner["tripsByRoute"][routeId]` is a typed-map read -> `Trip[] | Null`. This route key
+  // is always present (every routeId on a scan path was inserted by indexRoute), so a Null read
+  // is dead; narrow it with a `match … is` (the value type is not `is`-narrowable via `if`),
+  // falling back to an empty `Trip[]` for the (unreachable) miss.
+  val routeTripsRaw = scanner["tripsByRoute"][routeId]
+  var routeTrips: Trip[] = []
+  match routeTripsRaw
+    is Null =>
+      null
+    else =>
+      routeTrips = routeTripsRaw
+  val start = if pos[routeId] == null then
+    length(routeTrips) - 1
+  else
+    intOr(pos[routeId], 0)
+  if pos[routeId] == null then pos[routeId] = start
+  scanBack(
+    routeTrips,
+    pos,
+    routeId,
+    stopIndex,
+    time,
+    scanner["date"],
+    scanner["dateKey"],
+    scanner["dowKey"],
+    start,
+    null
+  )
