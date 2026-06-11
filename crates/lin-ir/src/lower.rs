@@ -3702,14 +3702,34 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                         return t;
                     }
                     let t = lower_expr(e, builder, ctx);
-                    // The array owns a reference to each heap element (lin_array_release
-                    // recursively releases them when the array is freed) — apply the standard
-                    // container-insert ownership rule on the RAW value before boxing/coercing.
-                    // `lin_array_push_tagged` raw-copies the element's TaggedVal struct without
-                    // retaining its inner (a MOVE), so a union element is CONSUMED here too —
-                    // pass `op_consumes_union = true` so a fresh union element is unregistered.
-                    builder.transfer_into_container(t, e, true);
-                    coerce_to_slot_type(t, &e.ty(), &elem_ty, builder)
+                    let ety = e.ty();
+                    // A SEALED-record element coerced into a BOXED `LinObject` element (the heap-field
+                    // `Trip[]` branch: `elem_ty` is the unsealed Object form) is MATERIALIZED by
+                    // `coerce_to_slot_type`'s Coerce — `compile_ir_coerce` builds a FRESH `LinObject`,
+                    // retaining the struct's HEAP FIELDS into it, and leaves the source struct fully
+                    // INDEPENDENT (its pointer never enters the array; the array owns the fresh box).
+                    // So the container-insert ownership rule must NOT fire: a `transfer_into_container`
+                    // Retain on the source struct has no balancing release (the array releases the
+                    // fresh box, never the struct), so it leaks the whole struct — and with it the
+                    // `id` String / `stops` array it recursively owns — every iteration (the
+                    // `val t: Trip = mk(i); val arr: Trip[] = [t]` per-iteration leak, ASan-confirmed).
+                    // The source struct keeps its own scope-exit release; only the FRESH box transfers
+                    // into the array (a MOVE, balanced by the array's recursive element release). When
+                    // the element instead FLOWS (shares its pointer) into the array — every non-sealed
+                    // heap element, incl. a String/Array boxed to a union TaggedVal that wraps the same
+                    // pointer — the container-insert retain is still required, so this is gated tightly
+                    // on the sealed→boxed materialize and everything else stays byte-identical.
+                    let materializes_fresh_box = is_sealed_scalar_repr(&ety) && !is_sealed_scalar_repr(&elem_ty);
+                    if !materializes_fresh_box {
+                        // The array owns a reference to each heap element (lin_array_release
+                        // recursively releases them when the array is freed) — apply the standard
+                        // container-insert ownership rule on the RAW value before boxing/coercing.
+                        // `lin_array_push_tagged` raw-copies the element's TaggedVal struct without
+                        // retaining its inner (a MOVE), so a union element is CONSUMED here too —
+                        // pass `op_consumes_union = true` so a fresh union element is unregistered.
+                        builder.transfer_into_container(t, e, true);
+                    }
+                    coerce_to_slot_type(t, &ety, &elem_ty, builder)
                 })
                 .collect();
             let dst = builder.alloc_temp(ty.clone());
