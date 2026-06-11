@@ -743,9 +743,9 @@ fn monomorphize_inner(
     // Coverage attribution for cross-module specializations: spec slot → origin module path.
     let mut spec_origins: HashMap<usize, String> = HashMap::new();
     while let Some(key) = state.worklist.pop() {
-        let (generic_slot, spec_slot, spec_name, subs) = {
+        let (generic_slot, spec_slot, spec_name, subs, callback_devirt) = {
             let info = &state.specs[&key];
-            (info.generic_slot, info.slot, info.name.clone(), info.subs.clone())
+            (info.generic_slot, info.slot, info.name.clone(), info.subs.clone(), info.callback_devirt.clone())
         };
         let origin = state.generics[&generic_slot].origin.clone();
         let mut func = state.generics[&generic_slot].func.clone();
@@ -763,6 +763,15 @@ fn monomorphize_inner(
         // re-monomorphization of nested generic calls sees importer-stable slots.
         if let Some(origin_path) = &origin {
             rehome_imported_body(&mut func, origin_path, &mut state);
+        }
+        // WAVE C: substitute the callback parameter with the named no-capture function `L`. Runs
+        // AFTER rehome so the callback param's slot is in the importer's numbering, and BEFORE
+        // `rewrite_expr` so the resulting direct `L(item)` call is seen by the call rewriter as an
+        // ordinary named call (it lowers to a Direct call via `global_fn_slots`). The substitution
+        // reaches into the nested `item => …f…` closure passed to `lin_while`: rewriting `f`→`L`
+        // there removes `f` from that closure's capture set (it now names a top-level symbol).
+        if let Some(cb) = &callback_devirt {
+            apply_callback_devirt(&mut func, cb, &mut state);
         }
         // Re-monomorphize calls inside the now-concrete body (worklist fixpoint).
         rewrite_expr(&mut func, &mut state);
@@ -1156,6 +1165,57 @@ fn rehome_imported_body(func: &mut TypedExpr, origin_path: &str, state: &mut Mon
     rehome_walk(func, &origin, origin_path, &locals, &mut remap, state);
 }
 
+/// WAVE C callback devirt: rewrite the cloned spec body so the callback parameter is replaced by a
+/// direct reference to the named no-capture function `L`. `func` is the freshly-cloned-and-rehomed
+/// spec `Function`; `cb.param_index` selects the callback parameter (its slot is read from `func`'s
+/// own param list, already in importer numbering). Every `LocalGet` of that slot becomes a
+/// `LocalGet` of `cb.l_slot` (typed as `L`), and any call THROUGH that slot is truncated to `L`'s
+/// arity (a predicate `(T) => Boolean` passed where the body calls `f(item, idx)`). References inside
+/// the nested `item => …f…` closure are rewritten too, and `f` drops out of that closure's capture
+/// set — it now names a top-level symbol, not a captured slot, so the per-element call lowers Direct.
+fn apply_callback_devirt(func: &mut TypedExpr, cb: &CallbackDevirt, state: &MonoState<'_>) {
+    let TypedExpr::Function { params, body, .. } = func else { return };
+    let Some(cb_param) = params.get(cb.param_index) else { return };
+    let cb_slot = cb_param.slot;
+    let l_ty = match state.no_capture_fn_slots.get(&cb.l_slot) {
+        Some(t) => t.clone(),
+        None => return,
+    };
+    devirt_walk(body, cb_slot, cb.l_slot, &l_ty, cb.l_arity);
+}
+
+/// Recursive worker for `apply_callback_devirt`. Rewrites `LocalGet{cb_slot}` → `LocalGet{l_slot}`,
+/// truncates calls through the callback slot to `l_arity` args, and removes the callback from any
+/// nested closure's capture set.
+fn devirt_walk(expr: &mut TypedExpr, cb_slot: usize, l_slot: usize, l_ty: &Type, l_arity: usize) {
+    // A call THROUGH the callback slot: repoint the callee to `L` and truncate args to `L`'s arity.
+    if let TypedExpr::Call { func, args, .. } = expr {
+        if let TypedExpr::LocalGet { slot, .. } = func.as_ref() {
+            if *slot == cb_slot {
+                if let TypedExpr::LocalGet { slot, ty, .. } = func.as_mut() {
+                    *slot = l_slot;
+                    *ty = l_ty.clone();
+                }
+                if args.len() > l_arity {
+                    args.truncate(l_arity);
+                }
+            }
+        }
+    }
+    // Drop the callback from any nested closure's capture set — it now references a top-level symbol.
+    if let TypedExpr::Function { captures, .. } = expr {
+        captures.retain(|c| c.outer_slot != cb_slot);
+    }
+    // Rewrite a bare reference (non-call use, or the callee just repointed above is now `l_slot`).
+    if let TypedExpr::LocalGet { slot, ty, .. } = expr {
+        if *slot == cb_slot {
+            *slot = l_slot;
+            *ty = l_ty.clone();
+        }
+    }
+    for_each_child_mut(expr, &mut |c| devirt_walk(c, cb_slot, l_slot, l_ty, l_arity));
+}
+
 /// Resolve the importer slot a free origin slot should be rewritten to, minting + registering the
 /// re-homed binding/intrinsic on first encounter (deduped per origin+name).
 fn rehome_free_slot(
@@ -1359,10 +1419,13 @@ struct MonoState<'a> {
     /// A first-class function PARAMETER, a stored closure, or a local fn-typed `val` is NOT here, so
     /// it keeps the closure-call path. Populated once in `monomorphize_with_imports`.
     direct_callable_fn_slots: std::collections::HashSet<usize>,
-    /// Module-level slots naming a top-level NO-CAPTURE function (see `collect_no_capture_fn_slots`).
-    /// A bare reference to one of these passed as a HOF callback can be devirtualized: the callback
-    /// param is substituted with a direct reference to this symbol inside a per-callback spec.
-    no_capture_fn_slots: std::collections::HashSet<usize>,
+    /// Module-level slots naming a top-level NO-CAPTURE function (see `collect_no_capture_fn_slots`),
+    /// mapped to the function's type. A bare reference to one of these passed as a HOF callback can
+    /// be devirtualized: the callback param is substituted with a direct reference to this symbol
+    /// inside a per-callback spec. The type gives `L`'s param arity, used to truncate the call args
+    /// (a predicate `(T) => Boolean` accepts the optional index, so the body's `f(item, idx)` call
+    /// must drop the extra `idx` when devirted to a 1-param `L`).
+    no_capture_fn_slots: HashMap<usize, Type>,
 }
 
 struct SpecInfo {
@@ -1384,6 +1447,10 @@ struct CallbackDevirt {
     param_index: usize,
     /// Module slot of the top-level no-capture function `L` to substitute in.
     l_slot: usize,
+    /// Number of params `L` actually declares. The HOF body may call its callback with MORE args
+    /// than `L` accepts (a predicate `(T) => Boolean` is passed where the body calls `f(item, idx)`);
+    /// the devirted direct call to `L` must be truncated to this arity.
+    l_arity: usize,
 }
 
 /// True if `slot` names a generic function or an alias of one.
@@ -1523,26 +1590,26 @@ fn collect_direct_callable_fn_slots(module: &TypedModule) -> std::collections::H
 /// substituted with a DIRECT reference to `L` inside a per-callback specialization (Wave C devirt).
 /// A capturing local closure, a first-class function PARAMETER, or a generic fn is deliberately
 /// EXCLUDED — those keep the existing indirect closure-call path.
-fn collect_no_capture_fn_slots(module: &TypedModule) -> std::collections::HashSet<usize> {
-    let mut out = std::collections::HashSet::new();
+fn collect_no_capture_fn_slots(module: &TypedModule) -> HashMap<usize, Type> {
+    let mut out = HashMap::new();
     for stmt in &module.statements {
         match stmt {
-            TypedStmt::Val { slot, value: TypedExpr::Function { captures, .. }, .. } => {
+            TypedStmt::Val { slot, value: value @ TypedExpr::Function { captures, .. }, .. } => {
                 if captures.is_empty() {
-                    out.insert(*slot);
+                    out.insert(*slot, value.ty());
                 }
             }
             TypedStmt::Import { bindings, .. } => {
                 for b in bindings {
                     if matches!(b.ty, Type::Function { .. }) {
-                        out.insert(b.slot);
+                        out.insert(b.slot, b.ty.clone());
                     }
                 }
             }
             TypedStmt::ForeignImport { bindings, .. } => {
                 for b in bindings {
                     if matches!(b.ty, Type::Function { .. }) {
-                        out.insert(b.slot);
+                        out.insert(b.slot, b.ty.clone());
                     }
                 }
             }
@@ -1893,10 +1960,13 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                                 return None;
                             }
                             match args.get(i) {
-                                Some(TypedExpr::LocalGet { slot, .. })
-                                    if state.no_capture_fn_slots.contains(slot) =>
-                                {
-                                    Some(CallbackDevirt { param_index: i, l_slot: *slot })
+                                Some(TypedExpr::LocalGet { slot, .. }) => {
+                                    let l_ty = state.no_capture_fn_slots.get(slot)?;
+                                    let l_arity = match l_ty {
+                                        Type::Function { params, .. } => params.len(),
+                                        _ => return None,
+                                    };
+                                    Some(CallbackDevirt { param_index: i, l_slot: *slot, l_arity })
                                 }
                                 _ => None,
                             }
