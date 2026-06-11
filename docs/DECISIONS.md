@@ -2414,3 +2414,85 @@ untyped-object store CloneBox-on-raw-SumNode overflow, and a map-round-trip doub
 classifiers each claiming the one projected node). **Lesson: for representation changes, ASan-green ≠
 correct — a wrong-repr read is often an ASan-invisible logic error; verify the real workload shape
 behaviorally.**
+
+## ADR-065: Ownership as an IR fact, one combinator loop emitter, push-model flatMap fusion, and lambda-set devirtualization
+
+**Status**: Accepted (landed incrementally on master, 2026-06-11; the ownership-fact migration is
+ongoing — 3 of ~14 per-site heuristics consumed, the rest staged behind the same verifier).
+
+**Context**: A four-subsystem coherence audit found one recurring failure mode across the IR/codegen
+boundary: **the same fact was decided in N independent places that had to be kept byte-for-byte in
+lockstep, with any drift an ASan-only-catchable UAF.** Three instances drove this ADR's structural work,
+plus one perf opportunity the audit surfaced:
+- **Refcount ownership** was re-derived ad hoc at every site that retains/releases (`own_for_read`,
+  `own_for_store`, the Index-result lifetime, the borrowed-container-base gate, the intrinsic
+  retain/release table). No single source said what a function/intrinsic does to its arguments'
+  ownership, so each site guessed and the guesses could disagree (the leg1 leak class).
+- **The counted-loop scaffold** was hand-copied across six combinator emitters (`for`/`map`/`filter`/
+  the fusion engine/`emit_index_loop`/`emit_packed_index_loop`) and again in `lower_while` — ~95%
+  identical CFG with subtly different early-exit/phi-back-edge handling (`calls.md §3`).
+- **flatMap** was treated as a fusion *barrier* (it splits a chain), forcing a materialized intermediate
+  array where the rest of the chain fused to a zero-allocation loop.
+- **The non-devirtualizable call boundary** (ADR-044, `docs/PERFORMANCE.md` §4): a combinator calling
+  its callback through the uniform boxed-closure ABI boxes each element and unboxes the result across an
+  opaque indirect call. The path-8 finding said named-call devirt is a dead end (named calls are already
+  direct); the real lever is *lambda-set*-shaped — the callback site *inside* a stdlib combinator body.
+
+**Decision**: Replace each "decided in N places" pattern with a single authority, and take the one
+devirtualization the profile justified.
+
+1. **Ownership is a first-class IR fact, verified, then consumed.** `LinFunction` carries
+   `param_conventions: Vec<Convention>` and a `ret_convention`, where `Convention ::= Borrow | Own |
+   Inout`, inferred during lowering and seeded from a hand-audited intrinsic ownership table
+   (`crates/lin-ir/src/ownership_verify.rs`). A report-only `LIN_OWNERSHIP_SHADOW` pass walks every
+   call edge and checks RC balance against the declared conventions — it ships **inert** (zero behaviour
+   change) and is the standing oracle. Per-site RC heuristics are then **migrated to read the fact**
+   instead of re-deriving it: consumed so far are the **Index-result lifetime** (`609a4f10` →
+   `index_result_convention`), the **owning-read / owning-store strategy** trichotomy (`ea7e59dc` →
+   `owning_strategy`, the single authority `own_for_read`/`own_for_store` mirror), and the
+   **borrowed-container-base gate** (`9dcd8945`). Each migration is proven byte-identical (sorted-IR
+   diff = 0, ASan A/B identical, RAPTOR digest exact). The remaining ~11 sites (notably `tco_owns` —
+   not byte-identical — and the full intrinsic table, taken last) are staged behind the same verifier.
+2. **One combinator loop emitter.** `emit_combinator_loop` (`lin-ir/src/lower.rs`) is the single
+   counted-loop scaffold, parameterized by element access (`Materialize` vs `Packed` view) and a
+   `LoopFlow` return (`Fallthrough` vs `ContinueIf` for early-exit), with a dedicated latch block so the
+   header phi back-edge is always latch-relative (no `patch_phi_incoming`). `emit_index_loop` /
+   `emit_packed_index_loop` become thin wrappers, and `lower_while` is re-expressed through it. Output
+   is byte-identical on the run-equivalence corpus for `for`/`map`/`filter`/fusion/`while`.
+3. **flatMap fuses as a push-model loop-nest stage**, not a barrier. `FuseStage::FlatMap` lowers a
+   flatMap-bearing chain via a recursive CPS engine (`fm_process`/`emit_flatmap_fused_loop`) that wraps
+   the downstream pipeline in an inner loop over each `f(elem, idx)` inner array; flatMap-free chains
+   keep the original linear lowering byte-identically. Output-position indices thread via per-stage
+   counter cells; the inner array is released after its inner loop and inner elements reclaim through the
+   existing `free_combinator_*` discipline. A barrier mid-chain *splits* the chain — it does not kill
+   fusion. Empty-inner (`x => []`), lone, string-inner, and barrier-split cases are all covered.
+4. **Lambda-set devirtualization for `find`/`some`/`every` with a named no-capture callback.** The
+   monomorphizer gains a per-callback specialization axis: a call to `find`/`some`/`every` with a bare
+   reference to a top-level no-capture function `L` mints a specialization keyed on `(type args,
+   callback identity)`, then **substitutes the callback parameter with `L`** inside the combinator body,
+   turning the per-element boxed indirect call into a direct `@L(i32)` call. A capturing lambda or a
+   stored/passed `Function` value correctly stays on the indirect path. This is the realized, narrow
+   form of the lambda-set thesis (the path-11 direction); the general whole-surface case is unsolved.
+
+**Consequences**:
+- **Coherence**: ownership, the loop scaffold, and the fusion stage each now have one authority. Future
+  RC work edits the convention table / `ownership_verify`, not N call sites; future loop work edits
+  `emit_combinator_loop`, not seven copies. The `LIN_OWNERSHIP_SHADOW` verifier makes a convention
+  drift a reported violation rather than a silent UAF.
+- **Perf** (all measured; see `docs/PERFORMANCE.md` §5): Wave C devirt measured **2.54×** on a
+  `find`+`some` microbench (2 M `Int32[]`, 200 iters: 32.6 s→12.85 s), RAPTOR IR byte-identical (it has
+  no inline-named-callback `find`/`some`/`every` site). The capturing-lambda inline re-land (ADR-044
+  update) measured **~3.9×** on a local-capture map/reduce microbench. The loop-emitter unification and
+  the ownership migrations are **not** perf wins themselves — they are byte-identical refactors that buy
+  coherence; flatMap fusion removes the materialized intermediate where the rest of the chain already
+  fused.
+- **Soundness / verification discipline**: every ownership migration and the loop unification are gated
+  on **byte-identical IR** (sorted-IR diff = 0) plus ASan A/B and the RAPTOR digest, not just a green
+  `cargo test` — consistent with the repr-work lesson that ASan-green ≠ correct for representation/RC
+  changes (ADR-062/064). The capturing-lambda inline's earlier revert (a per-iteration loop-body
+  `alloca` → stack overflow at scale, invisible to the single-cell harness) is why the re-land hoists
+  the scratch alloca to the entry block and is verified on a 100 k-element scaling fixture.
+- **Staging**: the ownership-fact migration is deliberately incremental — the fact ships inert first,
+  each consumer is a separate byte-identical step, and the not-byte-identical consumers (`tco_owns`) and
+  the broad intrinsic table are sequenced last so the high-confidence wins land without waiting on the
+  hard cases.
