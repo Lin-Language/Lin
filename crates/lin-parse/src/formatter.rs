@@ -848,6 +848,7 @@ fn needs_postfix_parens(base: &Expr) -> bool {
     matches!(
         base,
         Expr::BinaryOp { .. }
+            | Expr::Coalesce { .. }
             | Expr::UnaryOp { .. }
             | Expr::If { .. }
             | Expr::Match { .. }
@@ -879,19 +880,42 @@ fn fmt_postfix_base(base: &Expr, render: impl Fn(&Expr) -> String) -> String {
 /// The rendering closure `render` produces the operand's own (paren-free) text.
 fn fmt_binop_operand(operand: &Expr, parent: &BinOp, is_right: bool, render: impl Fn(&Expr) -> String) -> String {
     let s = render(operand);
-    if let Expr::BinaryOp { op: child_op, .. } = operand {
-        let (cp, pp) = (binop_prec(child_op), binop_prec(parent));
-        // Parenthesise when precedence REQUIRES it (a looser child, or equal precedence on the
-        // right under left-associativity), OR when the AUTHOR wrote parens around this
-        // sub-expression in the source. The parser discards parens, so we recover the author's
-        // grouping from the source extent and preserve it rather than stripping "redundant"
-        // parens (which, though value-equal, read worse — e.g. `(a / b) * c`).
-        let needs = cp < pp || (cp == pp && is_right) || source_parenthesized(operand);
-        if needs {
-            return format!("({})", s);
+    match operand {
+        Expr::BinaryOp { op: child_op, .. } => {
+            let (cp, pp) = (binop_prec(child_op), binop_prec(parent));
+            // Parenthesise when precedence REQUIRES it (a looser child, or equal precedence on the
+            // right under left-associativity), OR when the AUTHOR wrote parens around this
+            // sub-expression in the source. The parser discards parens, so we recover the author's
+            // grouping from the source extent and preserve it rather than stripping "redundant"
+            // parens (which, though value-equal, read worse — e.g. `(a / b) * c`).
+            let needs = cp < pp || (cp == pp && is_right) || source_parenthesized(operand);
+            if needs {
+                return format!("({})", s);
+            }
         }
+        // `??` is the LOOSEST binary rung — below every `BinOp`, including `||`/`&&` (parser
+        // `parse_coalesce_expr`). A `Coalesce` operand of any binary operator therefore always
+        // binds strictly looser than its parent and MUST be parenthesised to preserve the parse:
+        // `(m["x"] ?? 0) + 1` reparses as `m["x"] ?? (0 + 1)` if the parens are dropped. This is
+        // unconditional, independent of whether the source happened to have parens.
+        Expr::Coalesce { .. } => return format!("({})", s),
+        _ => {}
     }
     s
+}
+
+/// Format an operand of a construct that binds TIGHTER than `??` (unary `!`/`~`, and the left side
+/// of an `is`/`has` test, both parsed at postfix/shift level). `??` is the loosest binary rung, so a
+/// `Coalesce` here can only have come from a parenthesised source, and the parens are load-bearing:
+/// `(a ?? b) is X` reparses as `a ?? (b is X)`, `!(a ?? b)` as `(!a) ?? b`, if they are dropped.
+/// Wrap a `Coalesce` operand to preserve the parse.
+fn fmt_tighter_than_coalesce_operand(operand: &Expr, render: impl Fn(&Expr) -> String) -> String {
+    let s = render(operand);
+    if matches!(operand, Expr::Coalesce { .. }) {
+        format!("({})", s)
+    } else {
+        s
+    }
 }
 
 /// Format a `Coalesce` (`??`) operand, wrapping it in parentheses where the parse would otherwise
@@ -1411,7 +1435,7 @@ fn fmt_inline(expr: &Expr) -> String {
             )
         }
         Expr::UnaryOp { op, operand, .. } => {
-            format!("{}{}", unaryop_symbol(op), fmt_inline(operand))
+            format!("{}{}", unaryop_symbol(op), fmt_tighter_than_coalesce_operand(operand, fmt_inline))
         }
         Expr::Call { func, args, partial, .. } => {
             let fs = fmt_postfix_base(func, fmt_inline);
@@ -1448,10 +1472,10 @@ fn fmt_inline(expr: &Expr) -> String {
             format!("{{ {} }}", fs.join(", "))
         }
         Expr::Is { expr, pattern, .. } => {
-            format!("{} is {}", fmt_inline(expr), fmt_pattern(pattern))
+            format!("{} is {}", fmt_tighter_than_coalesce_operand(expr, fmt_inline), fmt_pattern(pattern))
         }
         Expr::Has { expr, pattern, .. } => {
-            format!("{} has {}", fmt_inline(expr), fmt_pattern(pattern))
+            format!("{} has {}", fmt_tighter_than_coalesce_operand(expr, fmt_inline), fmt_pattern(pattern))
         }
         Expr::Assign { target, value, .. } => format!("{} = {}", target, fmt_inline(value)),
         Expr::IndexAssign { object, key, value, .. } => {
@@ -1628,7 +1652,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
             )
         }
         Expr::UnaryOp { op, operand, .. } => {
-            format!("{}{}", unaryop_symbol(op), fmt_expr(operand, false, ind))
+            format!("{}{}", unaryop_symbol(op), fmt_tighter_than_coalesce_operand(operand, |e| fmt_expr(e, false, ind)))
         }
         Expr::Assign { target, value, .. } => {
             format!("{} = {}", target, fmt_expr(value, false, ind))
@@ -1646,10 +1670,10 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
             format!("{}[{}]", base, fmt_expr(key, false, ind))
         }
         Expr::Is { expr, pattern, .. } => {
-            format!("{} is {}", fmt_expr(expr, false, ind), fmt_pattern(pattern))
+            format!("{} is {}", fmt_tighter_than_coalesce_operand(expr, |e| fmt_expr(e, false, ind)), fmt_pattern(pattern))
         }
         Expr::Has { expr, pattern, .. } => {
-            format!("{} has {}", fmt_expr(expr, false, ind), fmt_pattern(pattern))
+            format!("{} has {}", fmt_tighter_than_coalesce_operand(expr, |e| fmt_expr(e, false, ind)), fmt_pattern(pattern))
         }
         Expr::TupleArgs(args, _) => {
             let ss: Vec<String> = args.iter().map(|a| fmt_expr(a, false, ind)).collect();
