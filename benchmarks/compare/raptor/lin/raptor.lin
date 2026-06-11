@@ -9,7 +9,7 @@ import { join } from "std/string"
 import { length, push, slice, sort } from "std/array"
 import { runsOn } from "./service"
 import { getDateNumber, dayOfWeek } from "./dateUtil"
-import { Date, RaptorIndex, ScanResults } from "./types"
+import { Date, RaptorIndex, RouteScanner, ScanResults } from "./types"
 import { getQueue } from "./queueFactory"
 import { createRouteScanner, getTrip } from "./routeScanner"
 import { createScanResults, addRound, previousArrival, setTrip, setTransfer, bestArrival, getMarkedStops, finalize } from "./scanResults"
@@ -150,7 +150,7 @@ val indexRoute = (path: String[], i: Int32, trip: Json, routeId: String, routeSt
     )
 
 // --- scan ---
-val scanRoutes = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json, markedStops: Json): Null =>
+val scanRoutes = (raptor: RaptorIndex, results: ScanResults, routeScanner: RouteScanner, markedStops: Json): Null =>
   val queue = getQueue(raptor["routesAtStop"], raptor["routeStopIndex"], markedStops)
   // hoist the interchange map ONCE per round — scanRouteAt was re-projecting it from the
   // index record on every stop of every route.
@@ -174,7 +174,7 @@ val scanRoutes = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json,
   )
 
 // Per-route forward scan from the boarding position, threading (trip, boardingPoint).
-val scanRoute = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json, interchange: Json, routeId: String, startPi: Int32): Null =>
+val scanRoute = (raptor: RaptorIndex, results: ScanResults, routeScanner: RouteScanner, interchange: Json, routeId: String, startPi: Int32): Null =>
   // The route key is always present (inserted by indexRoute), so the `[]` default is dead — but
   // `get` gives a clean single-level defaulted read over the `{ String: String[] }` routePath map.
   val routePath = get(raptor["routePath"], routeId, [])
@@ -194,7 +194,7 @@ val scanRoute = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json, 
 // previousArrival is a PURE read, so it is deferred onto the branches that consume it
 // (trip == null, or the trip != null else-if) instead of being computed unconditionally —
 // the setTrip fast path of the hot inner loop never needs it.
-val scanRouteAt = (results: ScanResults, routeScanner: Json, routeId: String, routePath: Json, routePathLength: Int32, interchange: Json, pi: Int32, trip: Json, boardingPoint: Int32): Null =>
+val scanRouteAt = (results: ScanResults, routeScanner: RouteScanner, routeId: String, routePath: Json, routePathLength: Int32, interchange: Json, pi: Int32, trip: Json, boardingPoint: Int32): Null =>
   if pi >= routePathLength then
     null
   else
@@ -325,7 +325,7 @@ export val scan = (raptor: RaptorIndex, origins: Json, date: Int32, dow: Int32):
   scanRounds(raptor, results, routeScanner, keys(origins))
   finalize(results)
 
-val scanRounds = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json, markedStops: Json): Null =>
+val scanRounds = (raptor: RaptorIndex, results: ScanResults, routeScanner: RouteScanner, markedStops: Json): Null =>
   if length(markedStops) > 0 then
     addRound(results)
     scanRoutes(raptor, results, routeScanner, markedStops)

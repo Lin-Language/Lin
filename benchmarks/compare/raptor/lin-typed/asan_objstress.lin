@@ -1,0 +1,32 @@
+// ASan stress program for the lazy Json hash side-index (RAPTOR #4b).
+// Builds a large dictionary by repeated `obj[k] = v` (the lin_object_set path), overwrites a
+// subset, looks up every key, and reads keys() back — exercising build / grow / overwrite /
+// release on objects well past the index threshold. Prints a digest so a wrong/stale slot
+// returned by the index would change the number.
+import { print } from "std/io"
+import { keys } from "std/object"
+import { length } from "std/array"
+import { range, for, reduce } from "std/iter"
+import { toString } from "std/string"
+
+val N = 2000
+
+// Build a dictionary keyed by stringified index -> index*7.
+var dict: Json = {}
+range(0, N).for(i =>
+  dict[toString(i)] = i * 7
+)
+
+// Overwrite every 5th key with a new value (overwrite branch: same slot, no index change).
+range(0, N).for(i =>
+  if i % 5 == 0 then
+    dict[toString(i)] = i * 7 + 1
+  else
+    0
+)
+
+// Sum every value back via lookup (index probe path).
+val total = range(0, N).reduce(0, (acc, i) => acc + dict[toString(i)])
+val nKeys = length(keys(dict))
+
+print("ASAN objstress total=${toString(total)} keys=${toString(nKeys)}")

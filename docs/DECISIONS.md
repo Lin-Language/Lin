@@ -805,6 +805,17 @@ Two supporting fixes: (1) `subst_expr` now substitutes the declared-type field o
 
 **Status.** Accepted. This is the shipped completion of the zero-per-element-box array pipeline.
 
+> **Updated (2026-06-11).** The "a capturing lambda is NOT inlined — it falls through to the
+> boxed closure path" restriction below (items 2–3) no longer holds: **capturing literal lambdas
+> now also inline at the Layer-1 combinator gate** (`perf/gate-divergence-v2`, re-landed `cbd37826`).
+> An earlier admit attempt was reverted as a leak; the real fault was a *stack* overflow (a per-iteration
+> `alloca` emitted into the loop body), fixed by hoisting the scratch alloca to the entry block
+> (`entry_block_alloca`). A *stored/passed* `Function` value still falls to the boxed closure path; the
+> devirtualizable subset of *named* callbacks is attacked separately by Wave C (see ADR-065). The
+> hand-rolled per-combinator loop emitters this ADR describes were also unified behind one
+> `emit_combinator_loop` scaffold this session (byte-identical; ADR-065) — a refactor under the same
+> decision, not a change to it.
+
 **Context (the LINCHPIN goal).** The generics/perf milestone targets ZERO per-element boxing in a
 monomorphic array pipeline `range(0,n).map(x=>x*2).filter(x=>x%3==0).reduce(0,(a,x)=>a+x)`. The
 blocker is the UNIFORM ALL-PTR BOXED CLOSURE ABI: a closure's stored `fn_ptr` is a `__cls_wrapb_*`
@@ -2118,6 +2129,26 @@ for later; the clean sound rule for records is "fields must agree or error".
 repr-consuming opcode; the producer/consumer literal-drift prerequisite is fixed; heap-field array
 packing characterized as a sound partial with one whole-program blocker — see Consequences).
 
+> **Updated (2026-06-11).** Two corrections after the path-9 close-out and a dead-code sweep:
+> 1. **The `BoxKeepPacked`/`UnboxKeepPacked` *IR opcodes* described below were deleted** (`22a769b0`):
+>    they had **zero construction sites** workspace-wide (the Stage-4 keep-packed-through-containers
+>    machinery was never emitted on the live path). The *codegen helpers* `compile_ir_box_keep_packed`/
+>    `compile_ir_unbox_keep_packed` survive and are still called directly from `emit_map_set` /
+>    `compile_ir_index` for the `{String: Sealed[]}` map-value keep-packed store/read — so the zero-copy
+>    box/unbox-by-pointer behaviour the lattice relies on is intact; only the never-fired IR-instruction
+>    wrappers are gone. Concurrently `Inner::WrapsPacked(Layout)` (its only consumer treated it as
+>    `Opaque`, and it was producible only via the dead seed) and the unread `PackedSealedArray.on_heap`
+>    field were removed. `Inner` is kept as an enum (just `Opaque`) for cheap re-land.
+> 2. **Heap-field record-array packing is now CLOSED-NEGATIVE, not "a sound partial pending one
+>    blocker."** The "remaining whole-program blocker" framing in Consequences was the *capability*
+>    question; the *value* question was answered by path-9 (see `docs/PERFORMANCE.md` §5 and the ADR-063
+>    update): fully packing heap-field record graphs end-to-end through generic boundaries measured
+>    **~1.8–3.5× SLOWER** (RAPTOR), because the cost is representation-boundary **materialization**, not
+>    the field read. The gate therefore stays scalar-only **by decision, not by missing engineering**.
+>    The all-scalar sealed-record path (the part that *did* pay — ADR-057, the `records` win) is
+>    unaffected. This ADR's machinery (the lattice, the single-owner direction, the verify/oracle gates)
+>    remains the live representation pass; only the heap-field *extension* is abandoned.
+
 **Context**: Sealed records (ADR-057) and sealed-record arrays are laid out as a *packed* physical
 representation — a header-less `[rc|size|desc|fields…]` struct, and a contiguous `elem_tag == 0xFE`
 `LinArray` of such payloads — that the dynamic `LinObject`/`TaggedVal` machinery cannot read. Whether
@@ -2221,7 +2252,19 @@ instead of re-deriving from `Type`.
 
 ## ADR-063: Stage 3b — whole-program record-representation consistency (the heap-field-array packing unlock)
 
-**Status**: Proposed (design + verification harness; implementation gated on the harness landing first).
+**Status**: ~~Proposed~~ **ABANDONED — CLOSED-NEGATIVE (2026-06-11).** Stage 3b's premise — that
+packing heap-field record graphs end-to-end would move RAPTOR's query phase toward Go/Node — was
+**built and measured, and is false.** Three independent agents produced digest-correct end-to-end
+typed RAPTOR; it ran **~1.8–3.5× SLOWER** (PREP 7.7 s→27.2 s, GROUP 19.9 s→36.2 s, RANGE 59.4 s→105.3 s).
+The dominant cost is **representation-boundary materialization**, not the field read this ADR set out
+to make constant-offset: functional code threads records through many generic boundaries (worker
+boundary → nested-record gate → TCO param leak → `Trip|Null` union boxing → map-value
+materialize-per-access), and each is a materialize-or-leak seam — "fix-for-a-fix all the way down."
+The full record + mechanism is in `docs/PERFORMANCE.md` §5 (path-9). **Do not re-attempt heap-field
+end-to-end packing for perf.** The orthogonal win that *did* pay (typing RAPTOR's dictionaries off
+`Json` → O(1) `LinMap`, ~5.6× PREP) shipped separately (ADR-055). The all-scalar sealed-record packing
+(ADR-057) is unaffected and remains Lin's headline strength. The design below is retained as the
+record of what was tried and why it was closed, **not as a roadmap.**
 
 **End goal (do not lose sight of this).** The point of Stage 3b is NOT "pack heap-field record
 arrays" for its own sake. It is to let real typed-record-heavy programs — the RAPTOR benchmark being
@@ -2372,7 +2415,89 @@ classifiers each claiming the one projected node). **Lesson: for representation 
 correct — a wrong-repr read is often an ASan-invisible logic error; verify the real workload shape
 behaviorally.**
 
-## ADR-065: Null-coalescing operator `??`
+## ADR-065: Ownership as an IR fact, one combinator loop emitter, push-model flatMap fusion, and lambda-set devirtualization
+
+**Status**: Accepted (landed incrementally on master, 2026-06-11; the ownership-fact migration is
+ongoing — 3 of ~14 per-site heuristics consumed, the rest staged behind the same verifier).
+
+**Context**: A four-subsystem coherence audit found one recurring failure mode across the IR/codegen
+boundary: **the same fact was decided in N independent places that had to be kept byte-for-byte in
+lockstep, with any drift an ASan-only-catchable UAF.** Three instances drove this ADR's structural work,
+plus one perf opportunity the audit surfaced:
+- **Refcount ownership** was re-derived ad hoc at every site that retains/releases (`own_for_read`,
+  `own_for_store`, the Index-result lifetime, the borrowed-container-base gate, the intrinsic
+  retain/release table). No single source said what a function/intrinsic does to its arguments'
+  ownership, so each site guessed and the guesses could disagree (the leg1 leak class).
+- **The counted-loop scaffold** was hand-copied across six combinator emitters (`for`/`map`/`filter`/
+  the fusion engine/`emit_index_loop`/`emit_packed_index_loop`) and again in `lower_while` — ~95%
+  identical CFG with subtly different early-exit/phi-back-edge handling (`calls.md §3`).
+- **flatMap** was treated as a fusion *barrier* (it splits a chain), forcing a materialized intermediate
+  array where the rest of the chain fused to a zero-allocation loop.
+- **The non-devirtualizable call boundary** (ADR-044, `docs/PERFORMANCE.md` §4): a combinator calling
+  its callback through the uniform boxed-closure ABI boxes each element and unboxes the result across an
+  opaque indirect call. The path-8 finding said named-call devirt is a dead end (named calls are already
+  direct); the real lever is *lambda-set*-shaped — the callback site *inside* a stdlib combinator body.
+
+**Decision**: Replace each "decided in N places" pattern with a single authority, and take the one
+devirtualization the profile justified.
+
+1. **Ownership is a first-class IR fact, verified, then consumed.** `LinFunction` carries
+   `param_conventions: Vec<Convention>` and a `ret_convention`, where `Convention ::= Borrow | Own |
+   Inout`, inferred during lowering and seeded from a hand-audited intrinsic ownership table
+   (`crates/lin-ir/src/ownership_verify.rs`). A report-only `LIN_OWNERSHIP_SHADOW` pass walks every
+   call edge and checks RC balance against the declared conventions — it ships **inert** (zero behaviour
+   change) and is the standing oracle. Per-site RC heuristics are then **migrated to read the fact**
+   instead of re-deriving it: consumed so far are the **Index-result lifetime** (`609a4f10` →
+   `index_result_convention`), the **owning-read / owning-store strategy** trichotomy (`ea7e59dc` →
+   `owning_strategy`, the single authority `own_for_read`/`own_for_store` mirror), and the
+   **borrowed-container-base gate** (`9dcd8945`). Each migration is proven byte-identical (sorted-IR
+   diff = 0, ASan A/B identical, RAPTOR digest exact). The remaining ~11 sites (notably `tco_owns` —
+   not byte-identical — and the full intrinsic table, taken last) are staged behind the same verifier.
+2. **One combinator loop emitter.** `emit_combinator_loop` (`lin-ir/src/lower.rs`) is the single
+   counted-loop scaffold, parameterized by element access (`Materialize` vs `Packed` view) and a
+   `LoopFlow` return (`Fallthrough` vs `ContinueIf` for early-exit), with a dedicated latch block so the
+   header phi back-edge is always latch-relative (no `patch_phi_incoming`). `emit_index_loop` /
+   `emit_packed_index_loop` become thin wrappers, and `lower_while` is re-expressed through it. Output
+   is byte-identical on the run-equivalence corpus for `for`/`map`/`filter`/fusion/`while`.
+3. **flatMap fuses as a push-model loop-nest stage**, not a barrier. `FuseStage::FlatMap` lowers a
+   flatMap-bearing chain via a recursive CPS engine (`fm_process`/`emit_flatmap_fused_loop`) that wraps
+   the downstream pipeline in an inner loop over each `f(elem, idx)` inner array; flatMap-free chains
+   keep the original linear lowering byte-identically. Output-position indices thread via per-stage
+   counter cells; the inner array is released after its inner loop and inner elements reclaim through the
+   existing `free_combinator_*` discipline. A barrier mid-chain *splits* the chain — it does not kill
+   fusion. Empty-inner (`x => []`), lone, string-inner, and barrier-split cases are all covered.
+4. **Lambda-set devirtualization for `find`/`some`/`every` with a named no-capture callback.** The
+   monomorphizer gains a per-callback specialization axis: a call to `find`/`some`/`every` with a bare
+   reference to a top-level no-capture function `L` mints a specialization keyed on `(type args,
+   callback identity)`, then **substitutes the callback parameter with `L`** inside the combinator body,
+   turning the per-element boxed indirect call into a direct `@L(i32)` call. A capturing lambda or a
+   stored/passed `Function` value correctly stays on the indirect path. This is the realized, narrow
+   form of the lambda-set thesis (the path-11 direction); the general whole-surface case is unsolved.
+
+**Consequences**:
+- **Coherence**: ownership, the loop scaffold, and the fusion stage each now have one authority. Future
+  RC work edits the convention table / `ownership_verify`, not N call sites; future loop work edits
+  `emit_combinator_loop`, not seven copies. The `LIN_OWNERSHIP_SHADOW` verifier makes a convention
+  drift a reported violation rather than a silent UAF.
+- **Perf** (all measured; see `docs/PERFORMANCE.md` §5): Wave C devirt measured **2.54×** on a
+  `find`+`some` microbench (2 M `Int32[]`, 200 iters: 32.6 s→12.85 s), RAPTOR IR byte-identical (it has
+  no inline-named-callback `find`/`some`/`every` site). The capturing-lambda inline re-land (ADR-044
+  update) measured **~3.9×** on a local-capture map/reduce microbench. The loop-emitter unification and
+  the ownership migrations are **not** perf wins themselves — they are byte-identical refactors that buy
+  coherence; flatMap fusion removes the materialized intermediate where the rest of the chain already
+  fused.
+- **Soundness / verification discipline**: every ownership migration and the loop unification are gated
+  on **byte-identical IR** (sorted-IR diff = 0) plus ASan A/B and the RAPTOR digest, not just a green
+  `cargo test` — consistent with the repr-work lesson that ASan-green ≠ correct for representation/RC
+  changes (ADR-062/064). The capturing-lambda inline's earlier revert (a per-iteration loop-body
+  `alloca` → stack overflow at scale, invisible to the single-cell harness) is why the re-land hoists
+  the scratch alloca to the entry block and is verified on a 100 k-element scaling fixture.
+- **Staging**: the ownership-fact migration is deliberately incremental — the fact ships inert first,
+  each consumer is a separate byte-identical step, and the not-byte-identical consumers (`tco_owns`) and
+  the broad intrinsic table are sequenced last so the high-confidence wins land without waiting on the
+  hard cases.
+
+## ADR-066: Null-coalescing operator `??`
 
 **Status**: Accepted (implemented; lexer/parser/checker/formatter, lowering by desugar).
 

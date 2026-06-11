@@ -1,0 +1,60 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { makeService, runsOn } from "./service"
+
+// makeService's days/dates are now typed `{ String: Boolean }` maps (the typed RAPTOR), so the
+// literals are annotated to the map type (there is no implicit record -> map coercion).
+val allDays: { String: Boolean } = {
+  "0": true,
+  "1": true,
+  "2": true,
+  "3": true,
+  "4": true,
+  "5": true,
+  "6": true
+}
+
+// all days except Monday ("1"). Spelled out because spreading a typed `{ String: Boolean }` into
+// a map literal (`{ ...allDays, "1": false }`) collapses to a closed record type, not a map — a
+// checker friction; the explicit literal is the faithful equivalent.
+val allButMonday: { String: Boolean } = {
+  "0": true,
+  "1": false,
+  "2": true,
+  "3": true,
+  "4": true,
+  "5": true,
+  "6": true
+}
+
+val noDates: { String: Boolean } = {}
+val includeDate: { String: Boolean } = { "20181022": true }
+val excludeDate: { String: Boolean } = { "20181022": false }
+
+// runsOn takes the precomputed key strings alongside the numeric date (the keys are
+// hoisted per scan in the planner — see service.lin); the tests pass both forms.
+val s = suite("Service", [
+  test("checks the start date", () => [
+    expect(runsOn(makeService(20181001, 20181015, allDays, noDates), 20180930, "20180930", "1")).toBe(false)
+  ]),
+
+  test("checks the end date", () => [
+    expect(runsOn(makeService(20181001, 20181015, allDays, noDates), 20181016, "20181016", "1")).toBe(false)
+  ]),
+
+  test("checks dates within range", () => [
+    expect(runsOn(makeService(20181001, 20181015, allDays, noDates), 20181010, "20181010", "1")).toBe(true)
+  ]),
+
+  test("checks the day of the week", () => [
+    expect(runsOn(makeService(20181001, 20991231, allButMonday, noDates), 20181016, "20181016", "1")).toBe(false)
+  ]),
+
+  test("checks include days", () => [
+    expect(runsOn(makeService(20991231, 20991231, allDays, includeDate), 20181022, "20181022", "1")).toBe(true)
+  ]),
+
+  test("checks exclude days", () => [
+    expect(runsOn(makeService(20181001, 20991231, allDays, excludeDate), 20181022, "20181022", "1")).toBe(false)
+  ])
+])
+run(s)

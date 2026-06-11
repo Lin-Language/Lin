@@ -1331,6 +1331,141 @@ print(toString(result))
     assert_eq!(output, vec!["50"]);
 }
 
+// Path-8 Step 8.1: combinator-chain fusion widened to SEALED-RECORD element sources. A
+// `trips.filter(...).map(...).reduce(...)` over a packed `Trip[]` is a SINGLE fused loop that reads
+// each record field by const-offset (no `sealed_array_to_tagged` materialize of the source array, no
+// per-stage intermediate array, no per-element indirect closure call). Asserts the values round-trip
+// — a wrong RC/projection corrupts the fold. dur>15 keeps trips 2,3,4 → dist 200,300,400 → 900.
+#[test]
+fn test_fused_record_chain_reduce() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, reduce } from "std/iter"
+
+type Trip = { "id": Int32, "dur": Int32, "dist": Int32 }
+val trips: Trip[] = [
+  { "id": 1, "dur": 10, "dist": 100 },
+  { "id": 2, "dur": 20, "dist": 200 },
+  { "id": 3, "dur": 30, "dist": 300 },
+  { "id": 4, "dur": 40, "dist": 400 }
+]
+val total = trips.filter(t => t["dur"] > 15).map(t => t["dist"]).reduce(0, (a, x) => a + x)
+print(toString(total))
+"#);
+    assert_eq!(output, vec!["900"]);
+}
+
+// Path-8 Step 8.1: array-producing fused terminals (`map`/`filter`) over a record chain — each is one
+// pass building a single result array (no intermediate per-stage array). Asserts the kept elements'
+// VALUES and order survive the fused projection/predicate (not just no-crash).
+#[test]
+fn test_fused_record_chain_array_terminals() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter } from "std/iter"
+import { length } from "std/array"
+
+type Trip = { "id": Int32, "dur": Int32, "dist": Int32 }
+val trips: Trip[] = [
+  { "id": 1, "dur": 10, "dist": 100 },
+  { "id": 2, "dur": 20, "dist": 200 },
+  { "id": 3, "dur": 30, "dist": 300 },
+  { "id": 4, "dur": 40, "dist": 400 }
+]
+// map TERMINAL: filter(dur>15) then project dist -> [200, 300, 400]
+val ds: Int32[] = trips.filter(t => t["dur"] > 15).map(t => t["dist"])
+print(toString(length(ds)))
+print(toString(ds[0]))
+print(toString(ds[2]))
+// filter TERMINAL: project dist then filter(>150) -> [200, 300, 400]
+val bs: Int32[] = trips.map(t => t["dist"]).filter(x => x > 150)
+print(toString(length(bs)))
+print(toString(bs[0]))
+"#);
+    assert_eq!(output, vec!["3", "200", "400", "3", "200"]);
+}
+
+// Path-8 Step 8.1: the for-terminal over a record chain (side-effecting) accumulating through a
+// global var — the survivor reclaim must not double-free the materialized record nor leak it.
+// dur>5 keeps all four → dist sum 1000.
+#[test]
+fn test_fused_record_chain_for_terminal() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, for } from "std/iter"
+
+type Trip = { "id": Int32, "dur": Int32, "dist": Int32 }
+val trips: Trip[] = [
+  { "id": 1, "dur": 10, "dist": 100 },
+  { "id": 2, "dur": 20, "dist": 200 },
+  { "id": 3, "dur": 30, "dist": 300 },
+  { "id": 4, "dur": 40, "dist": 400 }
+]
+var sum = 0
+trips.filter(t => t["dur"] > 5).map(t => t["dist"]).for(x => sum = sum + x)
+print(toString(sum))
+"#);
+    assert_eq!(output, vec!["1000"]);
+}
+
+// Path-8 Step 8.1: a heap-FIELD (String) record fused chain — the per-element materialize retains the
+// String field and `lin_sealed_release` releases it; the fused path must keep that RC balanced. id>1
+// keeps trips 2,3 → dist 4,6 → 10. (ASan scaling is the leak guard in the sealed-harness; this pins
+// the value, which a wrong heap-field RC free would corrupt.)
+#[test]
+fn test_fused_heap_field_record_chain() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, reduce } from "std/iter"
+
+type Trip = { "id": Int32, "name": String, "dist": Int32 }
+val trips: Trip[] = [
+  { "id": 0, "name": "a", "dist": 0 },
+  { "id": 1, "name": "b", "dist": 2 },
+  { "id": 2, "name": "c", "dist": 4 },
+  { "id": 3, "name": "d", "dist": 6 }
+]
+val total = trips.filter(t => t["id"] > 1).map(t => t["dist"]).reduce(0, (a, x) => a + x)
+print(toString(total))
+"#);
+    assert_eq!(output, vec!["10"]);
+}
+
+// Path-8 Step 8.1 regression: a 3-stage fused chain whose FIRST stage is a `map` consuming the source
+// record, followed by a `filter`, then a terminal. The map frees the per-iteration source materialize;
+// the downstream filter's drop path must NOT free it again (double-free → `lin_sealed_release` UAF on
+// the 24-byte packed element). Covers map.filter.reduce, map.filter (array terminal) and map.filter.for.
+// id 0..5 → dist*2 → keep >4 → {6,8,10} sum 24 / count 3 / for-sum 24.
+#[test]
+fn test_fused_map_first_then_filter_chain() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, reduce, for } from "std/iter"
+import { length } from "std/array"
+
+type Rec = { "id": Int32, "dur": Int32 }
+val recs: Rec[] = [
+  { "id": 0, "dur": 0 },
+  { "id": 1, "dur": 1 },
+  { "id": 2, "dur": 2 },
+  { "id": 3, "dur": 3 },
+  { "id": 4, "dur": 4 },
+  { "id": 5, "dur": 5 }
+]
+// map FIRST, then filter, then reduce
+val total = recs.map(r => r["dur"] * 2).filter(x => x > 4).reduce(0, (a, x) => a + x)
+print(toString(total))
+// map FIRST, then filter -> array terminal
+val kept: Int32[] = recs.map(r => r["dur"] * 2).filter(x => x > 4)
+print(toString(length(kept)))
+// map FIRST, then filter, then for
+var s = 0
+recs.map(r => r["dur"] * 2).filter(x => x > 4).for(x => s = s + x)
+print(toString(s))
+"#);
+    assert_eq!(output, vec!["24", "3", "24"]);
+}
+
 #[test]
 fn test_destructuring() {
     let output = run(r#"import { print } from "std/io"
@@ -4765,6 +4900,31 @@ print(toString(nums.every(x => x > 2)))
     assert_eq!(output, vec!["4", "null", "true", "false", "true", "false"]);
 }
 
+// Wave C: find/some/every called with a NAMED no-capture function (not an inline lambda) are
+// devirtualized — the predicate is substituted directly into a per-callback specialization. This
+// pins correctness across: two distinct named predicates on the same HOF (two specs), the no-match
+// path, AND a capturing-lambda call (must keep the old indirect path and stay correct).
+#[test]
+fn test_wavec_named_callback_devirt_find_some_every() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { find, some, every } from "std/iter"
+
+val isEven = (x: Int32) => x % 2 == 0
+val isBig = (x: Int32) => x > 100
+
+val xs = [1, 3, 5, 6, 7, 8]
+print(toString(find(xs, isEven)))    // 6  (devirt → @isEven)
+print(toString(find(xs, isBig)))     // null (devirt, no match)
+print(toString(some(xs, isEven)))    // true
+print(toString(every(xs, isEven)))   // false
+print(toString(every(xs, isBig)))    // false
+var threshold = 4
+print(toString(find(xs, x => x > threshold)))   // 5 (capturing lambda — old path)
+"#);
+    assert_eq!(output, vec!["6", "null", "true", "false", "false", "5"]);
+}
+
 #[test]
 fn test_stdlib_array_flatmap_indexof_reverse() {
     let output = run(r#"import { print } from "std/io"
@@ -4782,6 +4942,102 @@ val rev = nums.reverse()
 rev.for(x => print(toString(x)))
 "#);
     assert_eq!(output, vec!["1", "10", "2", "20", "3", "30", "1", "-1", "3", "2", "1"]);
+}
+
+// WAVE D: a `flatMap(...).filter(...)` chain (a flatMap stage with a downstream FILTER terminal)
+// must fuse via the CPS loop-nest engine — `lower_filter` previously lacked the `chain_has_flatmap`
+// routing that for/map/reduce have, so the linear applier hit `unreachable!`. Locks in the fix.
+#[test]
+fn test_stdlib_flatmap_filter_chain() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { flatMap, filter, map } from "std/iter"
+
+print([1, 2, 3].flatMap(x => [x, x * 10]).filter(y => y > 5).toString())
+print([1, 2, 3].flatMap(x => [x, x * 10]).filter(y => y > 5).map(z => z + 1).toString())
+print([1, 2, 3].flatMap(x => []).filter(y => y > 5).toString())
+"#);
+    assert_eq!(output, vec!["[10, 20, 30]", "[11, 21, 31]", "[]"]);
+}
+
+// WAVE D: a flatMap whose INNER array is heap-element (String[]) — `s => [s, s, s]` — fused into a
+// downstream map/filter/reduce chain. The inner element is read as a BORROWED interior pointer, so
+// the consume-site reclaim is a no-op and a scalar-output terminal never moves it; RC-correct, no
+// per-inner-element leak. Also exercises the entry-block-alloca hoist (the inner literal is built in
+// the fused source loop's body). Verifies value equivalence with the eager lowering.
+#[test]
+fn test_stdlib_flatmap_string_inner_chain() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { flatMap, filter, map, reduce } from "std/iter"
+import { length } from "std/array"
+
+print(["x", "y"].flatMap(s => [s, s]).toString())
+print(toString(["aaa", "bb", "c"].flatMap(s => [s, s]).map(z => length(z)).filter(n => n > 1).reduce(0, (a, n) => a + n)))
+print(["a", "bb"].flatMap(s => [s, s]).map(z => "${z}!").toString())
+"#);
+    assert_eq!(output, vec![
+        "[\"x\", \"x\", \"y\", \"y\"]",
+        "10",
+        "[\"a!\", \"a!\", \"bb!\", \"bb!\"]",
+    ]);
+}
+
+// WAVE D — LONE flatMap: `xs.flatMap(f)` with no downstream combinator stage now fuses to a CPS
+// loop nest (the inner loop pushes straight into the result) instead of running the eager stdlib
+// body. Covers scalar inner, String (heap) inner, the index callback, the provably-empty `x => []`
+// inner, and a flatMap whose receiver is itself a map/filter chain. Byte-equivalent to the eager
+// lowering it replaces.
+#[test]
+fn test_stdlib_lone_flatmap_fuses() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { flatMap, map, filter } from "std/iter"
+
+print([1, 2, 3].flatMap(x => [x, x * 10]).toString())
+print(["x", "y"].flatMap(s => [s, s]).toString())
+print(["a", "b"].flatMap((x, i) => [x, "${i}"]).toString())
+print([1, 2, 3].flatMap(x => []).toString())
+print([1, 2, 3].map(x => x + 1).flatMap(x => [x, x]).toString())
+print([1, 2, 3, 4].filter(x => x > 1).flatMap(x => [x, x * 10]).toString())
+"#);
+    assert_eq!(output, vec![
+        "[1, 10, 2, 20, 3, 30]",
+        "[\"x\", \"x\", \"y\", \"y\"]",
+        "[\"a\", \"0\", \"b\", \"1\"]",
+        "[]",
+        "[2, 2, 3, 3, 4, 4]",
+        "[2, 20, 3, 30, 4, 40]",
+    ]);
+}
+
+// WAVE D — BARRIER SPLITS, NOT KILLS: a chain with a mid-chain UNFUSABLE stage (a `map` with a
+// heap/non-scalar output, which the fuser gates off) must terminate the current fused run by
+// materialising ONE intermediate array and start a fresh fused run for the downstream stages — two
+// fused passes, not N unfused. This already falls out of the recursive lowering: `extract_fuse_chain`
+// stops peeling at the barrier and `lower_expr(base)` recursively re-fuses the prefix. Locks in the
+// value equivalence across the split (and over a flatMap-bearing downstream run).
+#[test]
+fn test_stdlib_fusion_barrier_split() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { filter, map, reduce, flatMap } from "std/iter"
+import { length } from "std/array"
+
+// filter+map (fused) → map(heap-out) BARRIER → map+filter+reduce (fused)
+print(toString([1, 2, 3, 4, 5, 6].filter(x => x > 1).map(x => x + 1).map(x => [x, x, x]).map(ys => length(ys)).filter(n => n > 0).reduce(0, (a, n) => a + n)))
+// barrier with a flatMap downstream run
+print([1, 2, 3].map(x => [x, x]).flatMap(ys => ys).toString())
+// flatMap upstream, heap-out map barrier, scalar map+reduce downstream
+print(toString([1, 2, 3].flatMap(x => [x, x * 10]).map(x => [x, x]).map(ys => length(ys)).reduce(0, (a, n) => a + n)))
+"#);
+    assert_eq!(output, vec![
+        // filter>1 → [2,3,4,5,6]; +1 → [3,4,5,6,7]; →[[x,x,x]]; length → [3,3,3,3,3]; >0 all; sum=15
+        "15",
+        "[1, 1, 2, 2, 3, 3]",
+        // flatMap → [1,10,2,20,3,30]; map [x,x]; length → six 2s; sum=12
+        "12",
+    ]);
 }
 
 #[test]
@@ -8073,7 +8329,25 @@ print("relo: ${{toString(lin_relo_add(40, 2))}}")
     // into a spawned child and are SIP-stripped; remove DYLD_LIBRARY_PATH for good measure anyway.
     run_cmd.env_remove("LD_LIBRARY_PATH");
     run_cmd.env_remove("DYLD_LIBRARY_PATH");
-    let run_out = run_cmd.output().expect("failed to run relocated binary");
+    // We just `fs::copy`'d `reloc_bin` and immediately exec it. Under the full parallel suite (600+
+    // concurrent `lin build` fork/exec cycles), another forked child can still transiently hold a
+    // write fd to the freshly-copied executable, so `execve` returns ETXTBSY ("text file busy") —
+    // an intermittent "failed to run relocated binary" panic unrelated to what this test actually
+    // checks (relative-rpath relocation). Retry a few times on that specific spawn error.
+    let run_out = {
+        let mut attempt = 0;
+        loop {
+            match run_cmd.output() {
+                Ok(out) => break out,
+                // ETXTBSY (errno 26): the copied binary is still open for write elsewhere. Transient.
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 10 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("failed to run relocated binary: {e}"),
+            }
+        }
+    };
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     let stderr = String::from_utf8_lossy(&run_out.stderr);
     assert!(
@@ -17629,7 +17903,7 @@ main()
     assert_eq!(output, vec!["190000"]);
 }
 
-// ── Null-coalescing operator `??` (ADR-065) ───────────────────────────────────
+// ── Null-coalescing operator `??` (ADR-066) ───────────────────────────────────
 // `a ?? b` ≡ `if a != null then a else b`: `a` once, `b` only when `a` is Null.
 // Coalesces Null ONLY — an Error value flows through. Lowers to the proven if/else
 // + `!= null` desugaring (no hand-rolled union-temp RC).
@@ -17885,5 +18159,68 @@ fn test_fmt_roundtrips_coalesce() {
 
     let withEq = "val e = a ?? b == c\n";
     assert_eq!(fmt(withEq), withEq, "?? below == must round-trip without parens");
+}
+
+// Path-9C seal-propagation symmetry: an object literal with a nested sealed-record ARRAY field,
+// built by a function returning the named record then read back, must round-trip correctly. The
+// producer (`mkTrip`'s `{ "stopTimes": [{ … }] }` literal) is now DIRECTED against the sealed
+// `StopTime[]` field type, so it adopts the SEALED element representation — matching what the
+// consumer (`trip["stopTimes"][i]`) reads it back at. Before the fix the producer fell to
+// undirected inference and built a BOXED `Object[]` while the consumer read it PACKED (the gate
+// admits this all-scalar record): a silent mis-read (`{ "arr": 33 }` read back as `0`). All-scalar
+// fields here so the field is packable under the current scalar+Bool gate — this asserts the two
+// sides agree at the gate's live edge.
+#[test]
+fn test_nested_sealed_record_array_field_producer_consumer_symmetry() {
+    let output = run(r#"import { print } from "std/io"
+
+type StopTime = { "arr": Int32, "dep": Int32 }
+type Trip = { "tripId": Int32, "stopTimes": StopTime[] }
+
+val mkTrip = (id: Int32): Trip =>
+  { "tripId": id, "stopTimes": [{ "arr": 11, "dep": 22 }, { "arr": 33, "dep": 44 }] }
+
+val main = () =>
+  val t = mkTrip(7)
+  val s0 = t["stopTimes"][0]
+  val s1 = t["stopTimes"][1]
+  print("${t["tripId"]} ${s0["arr"]} ${s0["dep"]} ${s1["arr"]} ${s1["dep"]}")
+main()
+"#);
+    assert_eq!(output, vec!["7 11 22 33 44"]);
+}
+
+// Regression (Path 9 TCO param-slot leak): a HEAP-BEARING sealed (packed) record (`Trip` with a
+// `String` and a sealed-`ST[]` field) threaded through a self-tail-recursive parameter slot, with a
+// FRESH record built each iteration, must release the PRIOR slot value before the back-edge
+// overwrites it. `Codegen::tco_param_needs_release` formerly carved out ALL sealed records
+// (`sealed_fields(ty).is_none()`), gating off both the back-edge `emit_tco_release_old` and the
+// loop-exit `emit_tco_release_final` — so each iteration overwrote the slot with a fresh packed
+// struct and leaked the old struct + its heap fields (linear scaling: ASan-measured ~367 B/iter on
+// this shape, going CONSTANT after the fix). The carve-out is now narrowed to PURELY-scalar sealed
+// records (stack-resident, RC-suppressed); a heap-bearing sealed record participates in TCO param
+// release via the packed `emit_sealed_release` path. The result must be correct (a missing/wrong
+// release would corrupt the packed struct read back next iteration or double-free → crash). The
+// ASan leak-scaling proof is via the tools/sealed-harness-style measurement; this guards
+// correctness + no-UAF under `cargo test`.
+#[test]
+fn test_sealed_heap_record_tail_recursive_param_no_leak() {
+    let output = run(r#"import { print } from "std/io"
+import { length } from "std/array"
+
+type ST = { "stop": String, "at": Int32 }
+type Trip = { "id": String, "stops": ST[] }
+
+val makeTrip = (n: Int32): Trip =>
+  { "id": "trip-${n}", "stops": [{ "stop": "s${n}", "at": n }, { "stop": "t${n}", "at": n + 1 }] }
+
+val loop = (n: Int32, t: Trip): Int32 =>
+  if n == 0 then t["stops"].length()
+  else loop(n - 1, makeTrip(n))
+
+val main = () => print("${loop(1000, makeTrip(0))}")
+main()
+"#);
+    assert_eq!(output, vec!["2"]);
 }
 

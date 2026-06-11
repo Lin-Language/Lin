@@ -11,10 +11,11 @@
 //! same blob, so recursive/cyclic types are finite back-edges. The byte format MUST match the
 //! encoder. See the `KIND_*` constants below.
 
-use crate::object::{lin_object_get, lin_tagged_clone, LinObject};
+use std::fmt::Write as _;
+
+use crate::object::{lin_object_get_bytes, lin_tagged_clone, LinObject};
 use crate::array::{lin_array_length, LinArray};
 use crate::fs::make_decode_error;
-use crate::string::{lin_string_from_bytes, lin_string_release};
 use crate::tagged::{
     TaggedVal, tagged_as_f64, lin_unbox_ptr,
     TAG_NULL, TAG_BOOL, TAG_INT8, TAG_INT16, TAG_INT32, TAG_INT64,
@@ -187,7 +188,9 @@ unsafe fn validate(
             for i in 0..len {
                 let elem = crate::array::lin_array_get_tagged(arr, i);
                 let base_len = path.len();
-                path.push_str(&format!("[{}]", i));
+                // Append the index directly into `path` (no throwaway String — this is the hot
+                // success path); the formatted location is only ever read on error.
+                let _ = write!(path, "[{}]", i);
                 let r = validate(elem as *const u8, desc, elem_off, path);
                 // lin_array_get_tagged allocates a fresh box we own; free it.
                 crate::tagged::lin_tagged_release(elem as *mut u8);
@@ -211,7 +214,7 @@ unsafe fn validate(
                 let off = desc.u32_at(node + 5 + i * 4) as usize;
                 let elem = crate::array::lin_array_get_tagged(arr, i as i64);
                 let base_len = path.len();
-                path.push_str(&format!("[{}]", i));
+                let _ = write!(path, "[{}]", i);
                 let r = validate(elem as *const u8, desc, off, path);
                 crate::tagged::lin_tagged_release(elem as *mut u8);
                 r?;
@@ -234,13 +237,12 @@ unsafe fn validate(
                 let val_off = desc.u32_at(cur + 2 + klen + 1) as usize;
                 cur += 2 + klen + 1 + 4;
 
-                let key_str = lin_string_from_bytes(key.as_ptr(), key.len() as u32);
+                // Look up by raw key bytes — no temp LinString malloc/free per field.
                 let field = if obj.is_null() {
                     std::ptr::null()
                 } else {
-                    lin_object_get(obj, key_str)
+                    lin_object_get_bytes(obj, key.as_ptr(), key.len() as u32)
                 };
-                lin_string_release(key_str);
 
                 let field_present = !field.is_null() && (*(field as *const TaggedVal)).tag != TAG_NULL;
                 if !field_present {
@@ -261,14 +263,18 @@ unsafe fn validate(
         }
         KIND_UNION => {
             let nvariants = desc.u32_at(node + 1) as usize;
-            // First structurally-matching variant wins (ADR-031). Probe each in order against a
-            // SCRATCH path so failed probes don't pollute the reported path.
+            // First structurally-matching variant wins (ADR-031). Probe each in order against the
+            // SHARED path, restoring its length after each probe so a failed variant's descent
+            // doesn't pollute the reported path — same save-len/truncate pattern used for
+            // object/array fields (avoids cloning the whole path per variant).
+            let base_len = path.len();
             for i in 0..nvariants {
                 let off = desc.u32_at(node + 5 + i * 4) as usize;
-                let mut scratch = path.clone();
-                if validate(value, desc, off, &mut scratch).is_ok() {
+                if validate(value, desc, off, path).is_ok() {
+                    path.truncate(base_len);
                     return Ok(());
                 }
+                path.truncate(base_len);
             }
             Err(format!("value at {} matched none of the expected variants", path))
         }

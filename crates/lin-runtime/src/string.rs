@@ -297,8 +297,59 @@ pub unsafe extern "C" fn lin_string_cmp(a: *const LinString, b: *const LinString
 
 // Numeric -> string conversions
 
+// Immortal small-int `toString` cache.
+//
+// `lin_int_to_string` is on the hot path of any loop that builds string keys
+// (`"k${toString(i)}"`, RAPTOR's `dateKey`/`dowKey`), where the SAME small integers stringify
+// over and over. Each call otherwise heap-allocates a fresh `LinString`. We pre-build one
+// immortal `LinString` per integer in the same `[SMALL_INT_MIN, SMALL_INT_MAX)` window the
+// scalar-box cache uses (`crate::tagged`), and return that shared pointer instead of allocating.
+//
+// SAFETY CONTRACT — identical to interned string literals (see `IMMORTAL_RC`): each cached
+// string is allocated once with refcount `IMMORTAL_RC`, so both `lin_string_inc_ref` and
+// `lin_string_release` no-op on it. It is never mutated and never freed, so returning the same
+// pointer to many owners (including across worker threads) is benign — the same basis as the
+// literal cache and `Frozen<T>`. The bytes are immutable decimal digits with no heap payload,
+// so never freeing them leaks nothing.
+//
+// Lazily built on first use via `OnceLock` (a `LinString` is a heap allocation, so it can't be
+// a compile-time `static` like the plain-data box cache). The raw pointers are wrapped in a
+// `Send`/`Sync` newtype: sound precisely because the targets are immortal + immutable.
+use std::sync::OnceLock;
+struct IntStrCache(Vec<*mut LinString>);
+// SAFETY: every pointer targets an immortal, immutable LinString (refcount = IMMORTAL_RC);
+// nothing ever writes through them or frees them, so sharing across threads cannot race.
+unsafe impl Sync for IntStrCache {}
+unsafe impl Send for IntStrCache {}
+
+static INT_STR_CACHE: OnceLock<IntStrCache> = OnceLock::new();
+
+fn int_str_cache() -> &'static IntStrCache {
+    INT_STR_CACHE.get_or_init(|| {
+        let len = (crate::tagged::SMALL_INT_MAX - crate::tagged::SMALL_INT_MIN) as usize;
+        let mut v = Vec::with_capacity(len);
+        for i in 0..len {
+            let n = crate::tagged::SMALL_INT_MIN + i as i64;
+            let s = n.to_string();
+            // SAFETY: lin_string_alloc returns a fresh, owned LinString of the right size.
+            unsafe {
+                let ptr = lin_string_alloc(s.len() as u32);
+                (*ptr).refcount = IMMORTAL_RC;
+                if !s.is_empty() {
+                    std::ptr::copy_nonoverlapping(s.as_ptr(), (*ptr).data.as_mut_ptr(), s.len());
+                }
+                v.push(ptr);
+            }
+        }
+        IntStrCache(v)
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn lin_int_to_string(n: i64) -> *mut LinString {
+    if n >= crate::tagged::SMALL_INT_MIN && n < crate::tagged::SMALL_INT_MAX {
+        return int_str_cache().0[(n - crate::tagged::SMALL_INT_MIN) as usize];
+    }
     let s = n.to_string();
     unsafe { lin_string_from_bytes(s.as_ptr(), s.len() as u32) }
 }
@@ -309,14 +360,56 @@ pub extern "C" fn lin_uint_to_string(n: u64) -> *mut LinString {
     unsafe { lin_string_from_bytes(s.as_ptr(), s.len() as u32) }
 }
 
+/// Capacity of `StackBuf`. Rust's `Display` for `f64` emits the FULL decimal expansion (not
+/// scientific notation), so the longest `{}`-formatted `f64` is ~326 bytes (e.g. `f64::MIN` /
+/// subnormals near `5e-324` render as `0.000…` with hundreds of fractional digits). 384 bytes
+/// covers every finite `f64` and any `i64`/`{:.1}` form with slack; it must NEVER be exceeded
+/// or output would silently truncate (a correctness bug, not just a perf miss).
+const STACK_BUF_CAP: usize = 384;
+
+/// A fixed-capacity stack buffer that implements `core::fmt::Write`, so `write!(buf, "{}", f)`
+/// formats into it with no heap allocation. On the (impossible-for-the-numeric-inputs-here)
+/// overflow path it silently stops appending; callers only feed integer/float formats that fit.
+struct StackBuf {
+    buf: [u8; STACK_BUF_CAP],
+    len: usize,
+}
+
+impl StackBuf {
+    #[inline]
+    fn new() -> Self {
+        StackBuf { buf: [0; STACK_BUF_CAP], len: 0 }
+    }
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl std::fmt::Write for StackBuf {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        let end = self.len + bytes.len();
+        if end <= self.buf.len() {
+            self.buf[self.len..end].copy_from_slice(bytes);
+            self.len = end;
+        }
+        Ok(())
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn lin_float_to_string(f: f64) -> *mut LinString {
-    let s = if f.fract() == 0.0 && f.abs() < 1e15 {
-        format!("{:.1}", f)
+    use std::fmt::Write as _;
+    let mut buf = StackBuf::new();
+    if f.fract() == 0.0 && f.abs() < 1e15 {
+        let _ = write!(buf, "{:.1}", f);
     } else {
-        format!("{}", f)
-    };
-    unsafe { lin_string_from_bytes(s.as_ptr(), s.len() as u32) }
+        let _ = write!(buf, "{}", f);
+    }
+    let bytes = buf.as_bytes();
+    unsafe { lin_string_from_bytes(bytes.as_ptr(), bytes.len() as u32) }
 }
 
 #[no_mangle]
@@ -524,129 +617,152 @@ pub unsafe extern "C" fn lin_string_join(arr: *const crate::array::LinArray, sep
     lin_string_from_bytes(result.as_ptr(), result.len() as u32)
 }
 
-/// Recursively convert a TaggedVal to its JSON string representation.
+/// Recursively convert a TaggedVal to its (lossy, display) JSON string representation.
 /// Used for toString(obj), toString(arr), and string interpolation of complex values.
+///
+/// This is the DISPLAY stringifier: unlike the strict-JSON `push_json_value`, string values
+/// and object keys are emitted UNESCAPED, container separators are `", "` (comma-space), and
+/// object entries are `"key": value`. The push_display_* helpers below append into one reused
+/// String to avoid the former `Vec<String>`+`format!`-per-element+`join` (N+1 allocs).
 pub unsafe fn tagged_to_json_string(tagged: *const TaggedVal) -> String {
+    let mut out = String::new();
+    push_display_value(&mut out, tagged);
+    out
+}
+
+/// Display float formatting for a scalar (TAG_FLOAT32/64) box: plain `{}`, no `.1` handling.
+/// (Kept distinct from the flat-array float path, which DOES apply `.1` — preserving the
+/// pre-existing behavioural split between the two.)
+fn push_display_float_plain(out: &mut String, f: f64) {
+    use std::fmt::Write as _;
+    let _ = write!(out, "{}", f);
+}
+
+/// Display float formatting for a flat scalar-array element: integral magnitudes < 1e15 render
+/// with a trailing `.1` decimal; everything else plain `{}`.
+fn push_display_float_dot1(out: &mut String, f: f64) {
+    use std::fmt::Write as _;
+    if f.fract() == 0.0 && f.abs() < 1e15 {
+        let _ = write!(out, "{:.1}", f);
+    } else {
+        let _ = write!(out, "{}", f);
+    }
+}
+
+unsafe fn push_display_value(out: &mut String, tagged: *const TaggedVal) {
+    use std::fmt::Write as _;
     if tagged.is_null() {
-        return "null".to_string();
+        out.push_str("null");
+        return;
     }
     let tag = (*tagged).tag;
     let payload = (*tagged).payload;
-    if tag == TAG_NULL { return "null".to_string(); }
-    if tag == TAG_BOOL { return if payload != 0 { "true" } else { "false" }.to_string(); }
-    if tag == TAG_INT32 { return (payload as i32).to_string(); }
-    if tag == TAG_INT64 { return (payload as i64).to_string(); }
-    if tag == crate::tagged::TAG_UINT64 { return payload.to_string(); }
+    if tag == TAG_NULL { out.push_str("null"); return; }
+    if tag == TAG_BOOL { out.push_str(if payload != 0 { "true" } else { "false" }); return; }
+    if tag == TAG_INT32 { let _ = write!(out, "{}", payload as i32); return; }
+    if tag == TAG_INT64 { let _ = write!(out, "{}", payload as i64); return; }
+    if tag == crate::tagged::TAG_UINT64 { let _ = write!(out, "{}", payload); return; }
     if tag == TAG_FLOAT32 {
-        let f = f32::from_bits(payload as u32);
-        return format!("{}", f);
+        push_display_float_plain(out, f32::from_bits(payload as u32) as f64);
+        return;
     }
     if tag == TAG_FLOAT64 {
-        let f = f64::from_bits(payload);
-        return format!("{}", f);
+        push_display_float_plain(out, f64::from_bits(payload));
+        return;
     }
     if tag == TAG_STR {
         let s = payload as *const LinString;
-        if s.is_null() { return "null".to_string(); }
-        return format!("\"{}\"", (*s).as_str());
+        if s.is_null() { out.push_str("null"); return; }
+        out.push('"');
+        out.push_str((*s).as_str());
+        out.push('"');
+        return;
     }
     if tag == TAG_ARRAY {
         let arr = payload as *const crate::array::LinArray;
-        if arr.is_null() { return "[]".to_string(); }
-        return array_to_json_string(arr);
+        if arr.is_null() { out.push_str("[]"); return; }
+        push_display_array(out, arr);
+        return;
     }
     if tag == TAG_OBJECT {
         let obj = payload as *const crate::object::LinObject;
-        if obj.is_null() { return "{}".to_string(); }
-        return object_to_json_string(obj);
+        if obj.is_null() { out.push_str("{}"); return; }
+        push_display_object(out, obj);
+        return;
     }
     if tag == crate::tagged::TAG_SUMNODE {
         // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` field reached the
         // (lossy display) object stringifier — materialize it to a real LinObject and serialize, then
         // release the transient. This makes `toString(record_with_sum_field)` correct (NOT `[object]`).
         let obj = crate::sumnode::lin_sumnode_materialize(payload as *mut u8);
-        if obj.is_null() { return "[object]".to_string(); }
-        let s = object_to_json_string(obj as *const crate::object::LinObject);
+        if obj.is_null() { out.push_str("[object]"); return; }
+        push_display_object(out, obj as *const crate::object::LinObject);
         crate::object::lin_object_release(obj as *mut crate::object::LinObject);
-        return s;
+        return;
     }
-    "[object]".to_string()
+    out.push_str("[object]");
 }
 
 unsafe fn array_to_json_string(arr: *const crate::array::LinArray) -> String {
+    let mut out = String::new();
+    push_display_array(&mut out, arr);
+    out
+}
+
+unsafe fn push_display_array(out: &mut String, arr: *const crate::array::LinArray) {
     use crate::tagged::*;
+    use std::fmt::Write as _;
     let len = (*arr).len as usize;
-    let mut parts = Vec::with_capacity(len);
     let elem_tag = (*arr).elem_tag;
+    out.push('[');
     for i in 0..len {
-        let s = match elem_tag {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        match elem_tag {
             0xFF => {
                 // Tagged array: elements are TaggedVal structs (16 bytes each).
                 let elem = (*arr).data.add(i);
-                tagged_to_json_string(elem as *const TaggedVal)
+                push_display_value(out, elem as *const TaggedVal);
             }
-            TAG_INT32 => {
-                let v = *((*arr).data as *const i32).add(i);
-                format!("{}", v)
-            }
-            TAG_INT64 => {
-                let v = *((*arr).data as *const i64).add(i);
-                format!("{}", v)
-            }
-            TAG_FLOAT32 => {
-                let v = *((*arr).data as *const f32).add(i) as f64;
-                if v.fract() == 0.0 && v.abs() < 1e15 { format!("{:.1}", v) } else { format!("{}", v) }
-            }
-            TAG_FLOAT64 => {
-                let v = *((*arr).data as *const f64).add(i);
-                if v.fract() == 0.0 && v.abs() < 1e15 { format!("{:.1}", v) } else { format!("{}", v) }
-            }
-            TAG_BOOL => {
-                let v = *((*arr).data as *const u8).add(i);
-                if v != 0 { "true".to_string() } else { "false".to_string() }
-            }
-            TAG_UINT8 => {
-                let v = *((*arr).data as *const u8).add(i);
-                format!("{}", v)
-            }
-            TAG_INT8 => {
-                let v = *((*arr).data as *const i8).add(i);
-                format!("{}", v)
-            }
-            TAG_UINT16 => {
-                let v = *((*arr).data as *const u16).add(i);
-                format!("{}", v)
-            }
-            TAG_INT16 => {
-                let v = *((*arr).data as *const i16).add(i);
-                format!("{}", v)
-            }
-            TAG_UINT32 => {
-                let v = *((*arr).data as *const u32).add(i);
-                format!("{}", v)
-            }
-            TAG_UINT64 => {
-                let v = *((*arr).data as *const u64).add(i);
-                format!("{}", v)
-            }
-            _ => "null".to_string(),
-        };
-        parts.push(s);
+            TAG_INT32 => { let _ = write!(out, "{}", *((*arr).data as *const i32).add(i)); }
+            TAG_INT64 => { let _ = write!(out, "{}", *((*arr).data as *const i64).add(i)); }
+            TAG_FLOAT32 => push_display_float_dot1(out, *((*arr).data as *const f32).add(i) as f64),
+            TAG_FLOAT64 => push_display_float_dot1(out, *((*arr).data as *const f64).add(i)),
+            TAG_BOOL => out.push_str(if *((*arr).data as *const u8).add(i) != 0 { "true" } else { "false" }),
+            TAG_UINT8 => { let _ = write!(out, "{}", *((*arr).data as *const u8).add(i)); }
+            TAG_INT8 => { let _ = write!(out, "{}", *((*arr).data as *const i8).add(i)); }
+            TAG_UINT16 => { let _ = write!(out, "{}", *((*arr).data as *const u16).add(i)); }
+            TAG_INT16 => { let _ = write!(out, "{}", *((*arr).data as *const i16).add(i)); }
+            TAG_UINT32 => { let _ = write!(out, "{}", *((*arr).data as *const u32).add(i)); }
+            TAG_UINT64 => { let _ = write!(out, "{}", *((*arr).data as *const u64).add(i)); }
+            _ => out.push_str("null"),
+        }
     }
-    format!("[{}]", parts.join(", "))
+    out.push(']');
 }
 
 unsafe fn object_to_json_string(obj: *const crate::object::LinObject) -> String {
+    let mut out = String::new();
+    push_display_object(&mut out, obj);
+    out
+}
+
+unsafe fn push_display_object(out: &mut String, obj: *const crate::object::LinObject) {
     let len = (*obj).len as usize;
-    let mut parts = Vec::with_capacity(len);
+    out.push('{');
     for i in 0..len {
+        if i > 0 {
+            out.push_str(", ");
+        }
         let entry = (*obj).entries.add(i);
         let key = (*entry).key;
-        let key_str = if key.is_null() { "null".to_string() } else { (*key).as_str().to_string() };
-        let val_str = tagged_to_json_string(&(*entry).value as *const TaggedVal);
-        parts.push(format!("\"{}\": {}", key_str, val_str));
+        out.push('"');
+        if key.is_null() { out.push_str("null"); } else { out.push_str((*key).as_str()); }
+        out.push_str("\": ");
+        push_display_value(out, &(*entry).value as *const TaggedVal);
     }
-    format!("{{{}}}", parts.join(", "))
+    out.push('}');
 }
 
 /// Convert a LinArray* to its JSON string representation.
@@ -953,12 +1069,14 @@ unsafe fn push_json_value(out: &mut String, tagged: *const TaggedVal) {
 /// Emit a finite float as a JSON number; non-finite (NaN/Inf) becomes `null` (matches
 /// JSON.stringify, since JSON has no representation for them).
 fn push_json_float(out: &mut String, f: f64) {
+    use std::fmt::Write as _;
     if !f.is_finite() {
         out.push_str("null");
     } else if f.fract() == 0.0 && f.abs() < 1e15 {
-        out.push_str(&format!("{:.1}", f));
+        // Append directly into `out` — no intermediate String.
+        let _ = write!(out, "{:.1}", f);
     } else {
-        out.push_str(&format!("{}", f));
+        let _ = write!(out, "{}", f);
     }
 }
 
@@ -1071,7 +1189,8 @@ pub unsafe extern "C" fn lin_string_from_utf8(arr: *const u8) -> *mut u8 {
                 0u8
             } else {
                 let payload = (*tv_ptr).payload;
-                std::alloc::dealloc(tv_ptr as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+                // Cached-box-safe free: flat-int reads may return an immutable cached static box.
+                crate::tagged::lin_tagged_release(tv_ptr as *mut u8);
                 payload as u8
             };
             bytes.push(v);
@@ -1080,6 +1199,88 @@ pub unsafe extern "C" fn lin_string_from_utf8(arr: *const u8) -> *mut u8 {
     match std::str::from_utf8(&bytes) {
         Ok(s) => alloc_tagged(TAG_STR, lin_string_from_bytes(s.as_ptr(), s.len() as u32) as u64),
         Err(_) => make_error_tagged("fromUtf8: invalid UTF-8 byte sequence"),
+    }
+}
+
+/// UTF-8-encode a string into a fresh flat `UInt8[]` in one bulk copy — the inverse of
+/// `lin_string_from_utf8`. Replaces the per-byte `byteAt`+`push` recursion in `std/encoding`
+/// (O(n) regrowth, one cached-box round-trip per byte) that feeds every crypto-hash-of-string
+/// and the base64 string encoders. Borrows `s` (read-only); returns an OWNED (+1) flat array
+/// the caller releases with `lin_array_release`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_utf8_bytes(s: *const LinString) -> *mut crate::array::LinArray {
+    use crate::array::{lin_flat_array_alloc_u8, LinArray};
+    let len = if s.is_null() { 0 } else { (*s).len as usize };
+    // alloc_u8 floors capacity at 4; pass len as the requested cap.
+    let arr = lin_flat_array_alloc_u8(len as u64);
+    if len > 0 {
+        std::ptr::copy_nonoverlapping((*s).data.as_ptr(), (*arr).data as *mut u8, len);
+    }
+    (*arr).len = len as u64;
+    arr as *mut LinArray
+}
+
+/// Build a `String` from an `Int32[]` of Unicode code points in one pass — the runtime form of
+/// `std/string.fromCodePoints`. Replaces the userland "build a String[] of one-char strings then
+/// join" (N small allocs + a join) on the shared tail of every base64/hex/url/form encoder.
+/// Each code point is UTF-8-encoded into one growable buffer; invalid code points (negative or
+/// not a Unicode scalar value) contribute no bytes, matching `lin_string_from_char_code`'s
+/// "" behaviour per element. Borrows `arr`; returns an OWNED (+1) raw `LinString`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_from_code_points(arr: *const u8) -> *mut LinString {
+    use crate::array::{lin_array_get_tagged, lin_array_length, LinArray};
+    use crate::tagged::{TaggedVal, TAG_ARRAY};
+    if arr.is_null() {
+        return lin_string_from_bytes(b"".as_ptr(), 0);
+    }
+    // `arr` may arrive as a TaggedVal*(Array) or a raw LinArray* (same resolution as fromUtf8).
+    let head = (arr as *const u64).read_unaligned();
+    let lin_arr = if head == TAG_ARRAY as u64 {
+        (*(arr as *const TaggedVal)).payload as *const LinArray
+    } else {
+        arr as *const LinArray
+    };
+    if lin_arr.is_null() {
+        return lin_string_from_bytes(b"".as_ptr(), 0);
+    }
+    let len = lin_array_length(lin_arr) as usize;
+    // Encoder outputs are ASCII (1 byte/cp), but handle full code points: reserve len bytes and
+    // let the buffer grow for any multibyte cp.
+    let mut out: Vec<u8> = Vec::with_capacity(len);
+    let mut cbuf = [0u8; 4];
+    let elem_tag = (*lin_arr).elem_tag;
+    if elem_tag == crate::tagged::TAG_INT32 {
+        // Flat i32 buffer (the common case — `fromCodePoints` is typed Int32[]): read raw.
+        let data = (*lin_arr).data as *const i32;
+        for i in 0..len {
+            push_code_point(&mut out, *data.add(i), &mut cbuf);
+        }
+    } else {
+        // Tagged / other-width arrays: box each element and read its payload as i32.
+        for i in 0..len as i64 {
+            let tv_ptr = lin_array_get_tagged(lin_arr, i);
+            let cp = if tv_ptr.is_null() {
+                -1
+            } else {
+                let payload = (*tv_ptr).payload as i64 as i32;
+                // Cached-box-safe free: flat-int reads may return an immutable cached static box.
+                crate::tagged::lin_tagged_release(tv_ptr as *mut u8);
+                payload
+            };
+            push_code_point(&mut out, cp, &mut cbuf);
+        }
+    }
+    lin_string_from_bytes(out.as_ptr(), out.len() as u32)
+}
+
+/// Append the UTF-8 encoding of `code` to `out`; invalid code points contribute nothing.
+#[inline]
+fn push_code_point(out: &mut Vec<u8>, code: i32, cbuf: &mut [u8; 4]) {
+    if code < 0 {
+        return;
+    }
+    if let Some(c) = char::from_u32(code as u32) {
+        out.extend_from_slice(c.encode_utf8(cbuf).as_bytes());
     }
 }
 

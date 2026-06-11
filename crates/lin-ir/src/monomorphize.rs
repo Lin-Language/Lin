@@ -232,10 +232,11 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
             fields: fields.iter().map(|(k, v)| (k.clone(), subst_type(v, subs))).collect(),
             sealed: *sealed,
         },
-        Type::Function { params, ret, required } => Type::Function {
+        Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(|p| subst_type(p, subs)).collect(),
             ret: Box::new(subst_type(ret, subs)),
             required: *required,
+            lset: lset.clone(),
         },
         _ => ty.clone(),
     }
@@ -285,10 +286,11 @@ fn erase_nonconcrete_typevars(ty: &Type) -> Type {
             fields: fields.iter().map(|(k, v)| (k.clone(), erase_nonconcrete_typevars(v))).collect(),
             sealed: *sealed,
         },
-        Type::Function { params, ret, required } => Type::Function {
+        Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(erase_nonconcrete_typevars).collect(),
             ret: Box::new(erase_nonconcrete_typevars(ret)),
             required: *required,
+            lset: lset.clone(),
         },
         _ => ty.clone(),
     }
@@ -480,8 +482,17 @@ fn mangle_type(ty: &Type) -> String {
         // Include each field's name and recursively-mangled type so structurally-distinct records
         // get distinct names. Field order is the declaration `IndexMap` order (canonical, ADR Stage
         // 0.5), so identical shapes still collapse to one specialization.
-        Type::Object { fields, .. } => {
-            let mut s = String::from("Obj");
+        //
+        // The `sealed` flag MUST be part of the name (F1): a sealed record is a packed struct, an
+        // unsealed one is a boxed `LinObject` — physically different layouts. `instantiation_key`
+        // keys on `format!("{:?}", t)`, which (via derived `Debug`) DOES include `sealed`, so a
+        // generic instantiated once at a sealed record and once at a structurally-identical unsealed
+        // one mints TWO specializations. If the name dropped `sealed` they would collide under one
+        // symbol — the second body unreachable, the surviving body reading the other layout (a
+        // misaligned-pointer crash). So the dedup key and the symbol name must agree about `sealed`:
+        // distinct key ⇒ distinct name. Identical-shape-and-seal records still collapse to one.
+        Type::Object { fields, sealed } => {
+            let mut s = String::from(if *sealed { "SObj" } else { "Obj" });
             for (k, fty) in fields.iter() {
                 s.push('_');
                 s.push_str(k);
@@ -509,12 +520,27 @@ fn specialization_name(base: &str, subs: &HashMap<u32, Type>) -> String {
     format!("{}${}", base, parts.join("_"))
 }
 
-/// A canonical, hashable key for an instantiation (generic slot + sorted concrete args).
-fn instantiation_key(slot: usize, subs: &HashMap<u32, Type>) -> (usize, Vec<(u32, String)>) {
+/// Canonical hashable key for a specialization: generic slot + sorted concrete type args + optional
+/// callback-devirt identity.
+type SpecKey = (usize, Vec<(u32, String)>, Option<CallbackDevirt>);
+
+/// A canonical, hashable key for an instantiation (generic slot + sorted concrete args + optional
+/// callback-devirt identity). Two calls with identical type args but DIFFERENT named callbacks (or
+/// one devirted and one not) must key distinctly so each gets its own specialization.
+fn instantiation_key(
+    slot: usize,
+    subs: &HashMap<u32, Type>,
+    devirt: &Option<CallbackDevirt>,
+) -> (usize, Vec<(u32, String)>, Option<CallbackDevirt>) {
+    // Erase lambda-set metadata before keying: the key uses `Debug`, and two otherwise-identical
+    // instantiations whose function-typed args carry DIFFERENT lambda sets must still collapse to
+    // ONE specialization (the set is inert metadata, never a codegen distinction). Without this the
+    // Path-11 field would silently split specializations and change which monomorphizations are
+    // emitted — a behaviour change. Erasing keeps the key byte-identical to pre-Path-11.
     let mut entries: Vec<(u32, String)> =
-        subs.iter().map(|(id, t)| (*id, format!("{:?}", t))).collect();
+        subs.iter().map(|(id, t)| (*id, format!("{:?}", t.erase_lambda_sets()))).collect();
     entries.sort();
-    (slot, entries)
+    (slot, entries, devirt.clone())
 }
 
 /// Cheap pre-check: does the module declare any top-level generic function? Lets callers skip the
@@ -682,6 +708,7 @@ fn monomorphize_inner(
     }
 
     let direct_callable_fn_slots = collect_direct_callable_fn_slots(module);
+    let no_capture_fn_slots = collect_no_capture_fn_slots(module);
 
     let mut state = MonoState {
         generics,
@@ -700,6 +727,7 @@ fn monomorphize_inner(
         rehome_binding_cache: HashMap::new(),
         rehome_intrinsic_cache: HashMap::new(),
         direct_callable_fn_slots,
+        no_capture_fn_slots,
     };
 
     // 2. Walk the whole module, rewriting calls to generic functions and queuing specializations.
@@ -715,9 +743,9 @@ fn monomorphize_inner(
     // Coverage attribution for cross-module specializations: spec slot → origin module path.
     let mut spec_origins: HashMap<usize, String> = HashMap::new();
     while let Some(key) = state.worklist.pop() {
-        let (generic_slot, spec_slot, spec_name, subs) = {
+        let (generic_slot, spec_slot, spec_name, subs, callback_devirt) = {
             let info = &state.specs[&key];
-            (info.generic_slot, info.slot, info.name.clone(), info.subs.clone())
+            (info.generic_slot, info.slot, info.name.clone(), info.subs.clone(), info.callback_devirt.clone())
         };
         let origin = state.generics[&generic_slot].origin.clone();
         let mut func = state.generics[&generic_slot].func.clone();
@@ -735,6 +763,15 @@ fn monomorphize_inner(
         // re-monomorphization of nested generic calls sees importer-stable slots.
         if let Some(origin_path) = &origin {
             rehome_imported_body(&mut func, origin_path, &mut state);
+        }
+        // WAVE C: substitute the callback parameter with the named no-capture function `L`. Runs
+        // AFTER rehome so the callback param's slot is in the importer's numbering, and BEFORE
+        // `rewrite_expr` so the resulting direct `L(item)` call is seen by the call rewriter as an
+        // ordinary named call (it lowers to a Direct call via `global_fn_slots`). The substitution
+        // reaches into the nested `item => …f…` closure passed to `lin_while`: rewriting `f`→`L`
+        // there removes `f` from that closure's capture set (it now names a top-level symbol).
+        if let Some(cb) = &callback_devirt {
+            apply_callback_devirt(&mut func, cb, &mut state);
         }
         // Re-monomorphize calls inside the now-concrete body (worklist fixpoint).
         rewrite_expr(&mut func, &mut state);
@@ -1128,6 +1165,57 @@ fn rehome_imported_body(func: &mut TypedExpr, origin_path: &str, state: &mut Mon
     rehome_walk(func, &origin, origin_path, &locals, &mut remap, state);
 }
 
+/// WAVE C callback devirt: rewrite the cloned spec body so the callback parameter is replaced by a
+/// direct reference to the named no-capture function `L`. `func` is the freshly-cloned-and-rehomed
+/// spec `Function`; `cb.param_index` selects the callback parameter (its slot is read from `func`'s
+/// own param list, already in importer numbering). Every `LocalGet` of that slot becomes a
+/// `LocalGet` of `cb.l_slot` (typed as `L`), and any call THROUGH that slot is truncated to `L`'s
+/// arity (a predicate `(T) => Boolean` passed where the body calls `f(item, idx)`). References inside
+/// the nested `item => …f…` closure are rewritten too, and `f` drops out of that closure's capture
+/// set — it now names a top-level symbol, not a captured slot, so the per-element call lowers Direct.
+fn apply_callback_devirt(func: &mut TypedExpr, cb: &CallbackDevirt, state: &MonoState<'_>) {
+    let TypedExpr::Function { params, body, .. } = func else { return };
+    let Some(cb_param) = params.get(cb.param_index) else { return };
+    let cb_slot = cb_param.slot;
+    let l_ty = match state.no_capture_fn_slots.get(&cb.l_slot) {
+        Some(t) => t.clone(),
+        None => return,
+    };
+    devirt_walk(body, cb_slot, cb.l_slot, &l_ty, cb.l_arity);
+}
+
+/// Recursive worker for `apply_callback_devirt`. Rewrites `LocalGet{cb_slot}` → `LocalGet{l_slot}`,
+/// truncates calls through the callback slot to `l_arity` args, and removes the callback from any
+/// nested closure's capture set.
+fn devirt_walk(expr: &mut TypedExpr, cb_slot: usize, l_slot: usize, l_ty: &Type, l_arity: usize) {
+    // A call THROUGH the callback slot: repoint the callee to `L` and truncate args to `L`'s arity.
+    if let TypedExpr::Call { func, args, .. } = expr {
+        if let TypedExpr::LocalGet { slot, .. } = func.as_ref() {
+            if *slot == cb_slot {
+                if let TypedExpr::LocalGet { slot, ty, .. } = func.as_mut() {
+                    *slot = l_slot;
+                    *ty = l_ty.clone();
+                }
+                if args.len() > l_arity {
+                    args.truncate(l_arity);
+                }
+            }
+        }
+    }
+    // Drop the callback from any nested closure's capture set — it now references a top-level symbol.
+    if let TypedExpr::Function { captures, .. } = expr {
+        captures.retain(|c| c.outer_slot != cb_slot);
+    }
+    // Rewrite a bare reference (non-call use, or the callee just repointed above is now `l_slot`).
+    if let TypedExpr::LocalGet { slot, ty, .. } = expr {
+        if *slot == cb_slot {
+            *slot = l_slot;
+            *ty = l_ty.clone();
+        }
+    }
+    for_each_child_mut(expr, &mut |c| devirt_walk(c, cb_slot, l_slot, l_ty, l_arity));
+}
+
 /// Resolve the importer slot a free origin slot should be rewritten to, minting + registering the
 /// re-homed binding/intrinsic on first encounter (deduped per origin+name).
 fn rehome_free_slot(
@@ -1297,9 +1385,9 @@ struct MonoState<'a> {
     /// Alias slot -> underlying generic slot (`val f = id`).
     aliases: HashMap<usize, usize>,
     /// Deduped specializations, keyed by (generic slot + sorted concrete args).
-    specs: HashMap<(usize, Vec<(u32, String)>), SpecInfo>,
+    specs: HashMap<SpecKey, SpecInfo>,
     /// Spec keys awaiting materialization (worklist for the fixpoint).
-    worklist: Vec<(usize, Vec<(u32, String)>)>,
+    worklist: Vec<SpecKey>,
     /// Native specialization count per generic slot (for the budget).
     per_generic_count: HashMap<usize, usize>,
     /// Generic slots that have emitted the one-time budget-overflow diagnostic.
@@ -1331,6 +1419,13 @@ struct MonoState<'a> {
     /// A first-class function PARAMETER, a stored closure, or a local fn-typed `val` is NOT here, so
     /// it keeps the closure-call path. Populated once in `monomorphize_with_imports`.
     direct_callable_fn_slots: std::collections::HashSet<usize>,
+    /// Module-level slots naming a top-level NO-CAPTURE function (see `collect_no_capture_fn_slots`),
+    /// mapped to the function's type. A bare reference to one of these passed as a HOF callback can
+    /// be devirtualized: the callback param is substituted with a direct reference to this symbol
+    /// inside a per-callback spec. The type gives `L`'s param arity, used to truncate the call args
+    /// (a predicate `(T) => Boolean` accepts the optional index, so the body's `f(item, idx)` call
+    /// must drop the extra `idx` when devirted to a 1-param `L`).
+    no_capture_fn_slots: HashMap<usize, Type>,
 }
 
 struct SpecInfo {
@@ -1338,6 +1433,24 @@ struct SpecInfo {
     slot: usize,
     name: String,
     subs: HashMap<u32, Type>,
+    /// Wave C callback devirt: when set, this specialization binds the callback parameter at
+    /// `(param_index)` to the top-level no-capture function symbol at module slot `L_slot`. During
+    /// materialization the cloned body's callback-param references are rewritten to `L_slot` (a
+    /// direct named-fn ref), turning the per-element indirect call into a direct call. `None` for an
+    /// ordinary type-only specialization.
+    callback_devirt: Option<CallbackDevirt>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct CallbackDevirt {
+    /// Index of the callback parameter in the generic's param list.
+    param_index: usize,
+    /// Module slot of the top-level no-capture function `L` to substitute in.
+    l_slot: usize,
+    /// Number of params `L` actually declares. The HOF body may call its callback with MORE args
+    /// than `L` accepts (a predicate `(T) => Boolean` is passed where the body calls `f(item, idx)`);
+    /// the devirted direct call to `L` must be truncated to this arity.
+    l_arity: usize,
 }
 
 /// True if `slot` names a generic function or an alias of one.
@@ -1469,6 +1582,53 @@ fn collect_direct_callable_fn_slots(module: &TypedModule) -> std::collections::H
     out
 }
 
+/// Module-level slots naming a top-level function that captures NOTHING — a `val f = (…) => …`
+/// whose `captures` list is empty (it may reference module globals/intrinsics, but those are not
+/// runtime captures), or an imported/FFI function binding (which never captures). A bare reference
+/// to one of these passed as a higher-order combinator's callback (`find(xs, isEven)`) names a
+/// stable top-level symbol `L` with no closure environment, so the callback parameter can be
+/// substituted with a DIRECT reference to `L` inside a per-callback specialization (Wave C devirt).
+/// A capturing local closure, a first-class function PARAMETER, or a generic fn is deliberately
+/// EXCLUDED — those keep the existing indirect closure-call path.
+fn collect_no_capture_fn_slots(module: &TypedModule) -> HashMap<usize, Type> {
+    let mut out = HashMap::new();
+    for stmt in &module.statements {
+        match stmt {
+            TypedStmt::Val { slot, value: value @ TypedExpr::Function { captures, .. }, .. } => {
+                if captures.is_empty() {
+                    out.insert(*slot, value.ty());
+                }
+            }
+            TypedStmt::Import { bindings, .. } => {
+                for b in bindings {
+                    if matches!(b.ty, Type::Function { .. }) {
+                        out.insert(b.slot, b.ty.clone());
+                    }
+                }
+            }
+            TypedStmt::ForeignImport { bindings, .. } => {
+                for b in bindings {
+                    if matches!(b.ty, Type::Function { .. }) {
+                        out.insert(b.slot, b.ty.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Higher-order generic combinators for which Wave C devirtualizes a named no-capture callback by
+/// minting a per-callback specialization whose callback parameter is substituted with the callback
+/// symbol `L`. Restricted to these three short-circuiting scan combinators for now: each invokes its
+/// callback `f` from inside a nested `item => …f…` closure passed to `lin_while`, so devirting `f`
+/// turns the per-element indirect boxed call into a direct call to `L`. Other HOFs (`flatMap`,
+/// `sortBy`, `groupBy`, …) are deferred — the mechanism is general but the gate is conservative.
+fn devirt_callback_combinator(name: &str) -> bool {
+    matches!(name, "find" | "some" | "every")
+}
+
 /// Highest slot index referenced anywhere in the module (Val/Var/param/destructure/LocalGet).
 fn max_slot(module: &TypedModule) -> usize {
     let mut m = 0usize;
@@ -1569,14 +1729,16 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
         None
     };
 
-    // CAPTURE-LESS-LAMBDA INLINE (the zero-box win, ADR-044): if the callee is a thin
-    // intrinsic-combinator wrapper (`map`/`filter`/`reduce` = `lin_map`/… forwarding its params) AND
-    // the callback argument is a capture-less LITERAL lambda, inline the wrapper at THIS call site —
+    // LITERAL-LAMBDA INLINE (the zero-box win, ADR-044): if the callee is a thin intrinsic-combinator
+    // wrapper (`map`/`filter`/`reduce` = `lin_map`/… forwarding its params) AND the callback argument
+    // is a LITERAL lambda (capturing OR capture-less), inline the wrapper at THIS call site —
     // rewriting the call to a direct `lin_map(arr, <lambda>)` — so the literal lambda becomes visible
-    // to the intrinsic's IR lowering (`lower_map`/…), which inlines the lambda body straight into the
-    // loop with NO per-element box/unbox/closure-call. Done before the type-spec path so the inlined
-    // direct-intrinsic form is what lowers. Capturing lambdas and stored-fn callbacks fall through to
-    // the normal (closure-call) specialization path.
+    // to the intrinsic's IR lowering (`lower_map`/…). The lowerer's Layer-2 gate then splices the body
+    // straight into the loop with NO per-element box/unbox/closure-call when every capture is
+    // resolvable, or falls through to its boxed closure-call path when one is not (gate-divergence
+    // fix). Done before the type-spec path so the inlined direct-intrinsic form is what lowers. A
+    // stored-fn callback (a `Function` VALUE, not a literal lambda node) falls through to the normal
+    // (closure-call) specialization path.
     if let Some(gslot) = callee_generic_slot {
         if try_inline_combinator_wrapper(expr, gslot, state) {
             return;
@@ -1784,6 +1946,35 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                         .map(|(_, m)| body_refs_origin_global_var(&body, m))
                         .unwrap_or(false);
 
+                    // WAVE C CALLBACK DEVIRT: for a known short-circuiting scan combinator
+                    // (`find`/`some`/`every`) whose callback argument is a bare reference to a
+                    // top-level NO-CAPTURE function `L`, mint a per-callback specialization. The
+                    // callback param is substituted with `L` during materialization, turning the
+                    // per-element indirect boxed call into a direct call. Only fires when the spec is
+                    // otherwise sound to native-specialize (no sealed/unsound routing); a ⊤ callback
+                    // (field/index/Json), a capturing closure, or an inline lambda is NOT a bare
+                    // no-capture-fn `LocalGet`, so it stays on the existing indirect path.
+                    let callback_devirt = if devirt_callback_combinator(&g_name(state, gslot)) {
+                        params.iter().enumerate().find_map(|(i, p)| {
+                            if !matches!(p.ty, Type::Function { .. }) {
+                                return None;
+                            }
+                            match args.get(i) {
+                                Some(TypedExpr::LocalGet { slot, .. }) => {
+                                    let l_ty = state.no_capture_fn_slots.get(slot)?;
+                                    let l_arity = match l_ty {
+                                        Type::Function { params, .. } => params.len(),
+                                        _ => return None,
+                                    };
+                                    Some(CallbackDevirt { param_index: i, l_slot: *slot, l_arity })
+                                }
+                                _ => None,
+                            }
+                        })
+                    } else {
+                        None
+                    };
+
                     if fully_concrete && refs_origin_global {
                         // Boxed fallback: keep the origin-module body (global in scope), share one copy.
                         state.boxed_fallback_used.insert(gslot);
@@ -1799,12 +1990,12 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                         // Sound to native-specialize (no sealed arg, or a sealed arg through a
                         // projection-style combinator that reads the packed element correctly).
                         // Respect the per-generic native-specialization budget.
-                        let key = instantiation_key(gslot, &subs);
+                        let key = instantiation_key(gslot, &subs, &callback_devirt);
                         let known = state.specs.contains_key(&key);
                         let count = *state.per_generic_count.get(&gslot).unwrap_or(&0);
                         if known || count < state.budget {
                             let base_name = g_name(state, gslot);
-                            let spec_slot = native_spec_slot(state, gslot, &base_name, key, subs.clone());
+                            let spec_slot = native_spec_slot(state, gslot, &base_name, key, subs.clone(), callback_devirt.clone());
                             repoint_call_native(expr, &params, &ret_type, &body, &subs, spec_slot);
                         } else {
                             // Budget exceeded: fall back to one shared boxed copy of the original.
@@ -1857,16 +2048,25 @@ fn native_spec_slot(
     state: &mut MonoState<'_>,
     gslot: usize,
     base_name: &str,
-    key: (usize, Vec<(u32, String)>),
+    key: SpecKey,
     subs: HashMap<u32, Type>,
+    callback_devirt: Option<CallbackDevirt>,
 ) -> usize {
     if let Some(info) = state.specs.get(&key) {
         return info.slot;
     }
     let s = state.next_slot;
     state.next_slot += 1;
-    let name = specialization_name(base_name, &subs);
-    state.specs.insert(key.clone(), SpecInfo { generic_slot: gslot, slot: s, name, subs });
+    // Suffix the symbol name with the devirted callback's slot so two callback-distinct specs of the
+    // same type instantiation get distinct names (the type-only `specialization_name` would collide).
+    let name = match &callback_devirt {
+        Some(cb) => format!("{}__cb{}", specialization_name(base_name, &subs), cb.l_slot),
+        None => specialization_name(base_name, &subs),
+    };
+    state.specs.insert(
+        key.clone(),
+        SpecInfo { generic_slot: gslot, slot: s, name, subs, callback_devirt },
+    );
     *state.per_generic_count.entry(gslot).or_insert(0) += 1;
     state.worklist.push(key);
     s
@@ -1938,24 +2138,35 @@ fn eta_expand_named_arg(arg: &mut TypedExpr, state: &mut MonoState<'_>) -> bool 
         ret_type: ret,
         captures: vec![],
         span,
+        // Synthesized eta-expansion wrapper — runs AFTER checking, so it has no checker-assigned
+        // lambda identity; `0` => `Top` (lambda-set inference never sees this node).
+        lambda_id: 0,
     };
     true
 }
 
 /// Try to inline a thin intrinsic-combinator wrapper call (`map`/`filter`/`reduce`) at the call
-/// site when its callback argument is a CAPTURE-LESS LITERAL lambda. On success, repoints the call's
-/// `func` at a (re-homed) intrinsic slot for `lin_map`/`lin_filter`/`lin_reduce` so the call lowers
-/// straight through the intrinsic — exposing the literal lambda to `lower_map`/… which inlines its
-/// body into the loop (zero per-element box/unbox/closure-call). Returns true if it rewrote the call.
+/// site when its callback argument is a LITERAL lambda — CAPTURING or capture-less. On success,
+/// repoints the call's `func` at a (re-homed) intrinsic slot for `lin_map`/`lin_filter`/`lin_reduce`
+/// so the call lowers straight through the intrinsic — exposing the literal lambda to `lower_map`/…
+/// which inlines its body into the loop (zero per-element box/unbox/closure-call). Returns true if
+/// it rewrote the call.
 ///
 /// A bare direct-callable function callback (`.map(square)`) is first eta-expanded to the equivalent
 /// capture-less lambda by `eta_expand_named_arg`, so it qualifies for this same inline path.
 ///
+/// GATE-DIVERGENCE FIX: this Layer-1 gate previously rejected a CAPTURING literal lambda, forcing it
+/// onto the ~10× slower boxed-callback specialization (`map$T`) even though the lowerer's Layer-2
+/// gate (`inlinable_capturing_lambda`) would have inlined it. This gate now ADMITS capturing literal
+/// lambdas conservatively (it has no `builder`/`ctx` to prove a capture resolvable) and lets Layer 2
+/// be the final arbiter: a resolvable capture inlines; an unresolvable one falls through to the SAME
+/// boxed closure-call path `lower_*` always provided — byte-identical to the old behaviour. See the
+/// inline comment at the lambda-count loop for the full soundness argument.
+///
 /// Conditions (all required):
 ///   - the generic is a thin intrinsic wrapper for a combinator intrinsic (`thin_intrinsic_wrapper`);
-///   - exactly one argument is a `TypedExpr::Function` with NO captures (a capture-less literal
-///     lambda — a capturing lambda or a stored/passed `Function` value is NOT inlinable here and
-///     must keep the closure path);
+///   - exactly one argument is a `TypedExpr::Function` (a literal lambda, capturing or not — a
+///     stored/passed `Function` VALUE is NOT a `Function` node and keeps the closure path);
 ///   - the intrinsic's origin module is known (so its name is resolvable).
 /// The wrapper forwards its params 1:1, so the call args map directly to the intrinsic args.
 fn try_inline_combinator_wrapper(
@@ -2009,17 +2220,23 @@ fn try_inline_combinator_wrapper(
     if let Some(last) = args.last_mut() {
         eta_expand_named_arg(last, state);
     }
-    // Exactly one capture-less literal-lambda argument qualifies.
+    // Exactly one literal-lambda argument qualifies — CAPTURING or not (gate-divergence fix). Layer 1
+    // here runs in the monomorphizer with no `builder`/`ctx`, so it CANNOT prove a capture resolvable
+    // (that needs the enclosing builder's slot/cell/global tables). It therefore admits a capturing
+    // literal lambda CONSERVATIVELY and repoints the call onto `lin_map`/… anyway; the LOWERER's
+    // `inlinable_capturing_lambda` (Layer 2) is the FINAL arbiter. When Layer 2 proves every capture
+    // resolvable it splices the body inline (the zero-box win the existing `for`/`while` inline path
+    // already relies on); when a capture is NOT resolvable, `lower_map`/… falls through to its boxed
+    // closure-call path (`lower_callback_in_safe_ctx` builds the closure from this same `Function`
+    // arg) — byte-identical to the pre-relaxation specialized boxed-callback path. Either way the
+    // repointed call is correctly lowered, so admitting capturing lambdas here never miscompiles.
+    //
+    // A stored/passed `Function` VALUE (the ⊤ callee — not a `TypedExpr::Function` node) still does
+    // NOT match this arm and keeps the closure specialization path, exactly as before.
     let mut lambda_args = 0;
     for a in args.iter() {
-        if let TypedExpr::Function { captures, .. } = a {
-            if captures.is_empty() {
-                lambda_args += 1;
-            } else {
-                // A capturing literal lambda: do not inline (the loop body would need its captured
-                // environment, which the closure path provides). Bail to the closure specialization.
-                return false;
-            }
+        if let TypedExpr::Function { .. } = a {
+            lambda_args += 1;
         }
     }
     if lambda_args != 1 {
@@ -2158,6 +2375,7 @@ fn repoint_call_native(
         params: concrete_params,
         ret: Box::new(concrete_ret.clone()),
         required,
+        lset: lin_check::types::LambdaSet::Top,
     };
     let TypedExpr::Call { func, result_type, .. } = expr else { return };
     if let TypedExpr::LocalGet { slot: fslot, ty, .. } = func.as_mut() {
@@ -2215,6 +2433,7 @@ fn boxed_fallback_call(
         params: params.iter().map(|p| p.ty.clone()).collect(),
         ret: Box::new(ret_type.clone()),
         required,
+        lset: lin_check::types::LambdaSet::Top,
     };
     if let TypedExpr::LocalGet { slot: fslot, ty, .. } = func.as_mut() {
         *fslot = gslot;
@@ -2639,5 +2858,74 @@ fn for_each_child_stmt_mut(stmt: &mut TypedStmt, f: &mut dyn FnMut(&mut TypedExp
         TypedStmt::Destructure { value, .. } | TypedStmt::ArrayDestructure { value, .. } => f(value),
         TypedStmt::Expr(e) => f(e),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indexmap::IndexMap;
+
+    fn fields(pairs: &[(&str, Type)]) -> IndexMap<String, Type> {
+        pairs.iter().map(|(k, t)| (k.to_string(), t.clone())).collect()
+    }
+
+    // F1 invariant: whenever two instantiations have DISTINCT `instantiation_key`s, they must get
+    // DISTINCT `specialization_name`s — otherwise the monomorphizer mints two bodies under one
+    // symbol (the second unreachable; the survivor reads the other layout → misaligned crash).
+    // The historically-leaky axis is `sealed`, which the key includes (derived Debug) but the name
+    // used to drop. This asserts key-distinct ⇒ name-distinct over a panel that includes a
+    // sealed-vs-unsealed SAME-SHAPE pair.
+    #[test]
+    fn distinct_instantiation_key_implies_distinct_name() {
+        let shape = [("x", Type::Int32), ("y", Type::Str)];
+        let cases: Vec<Type> = vec![
+            Type::object(fields(&shape)),         // unsealed {x: Int32, y: String}
+            Type::sealed_object(fields(&shape)),  // sealed, SAME shape — the F1 collision pair
+            Type::Int32,
+            Type::object(fields(&[("x", Type::Int32)])),
+            Type::sealed_object(fields(&[("x", Type::Int32)])),
+        ];
+
+        for (i, a) in cases.iter().enumerate() {
+            for (j, b) in cases.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let subs_a: HashMap<u32, Type> = [(0u32, a.clone())].into_iter().collect();
+                let subs_b: HashMap<u32, Type> = [(0u32, b.clone())].into_iter().collect();
+                let key_a = instantiation_key(0, &subs_a, &None);
+                let key_b = instantiation_key(0, &subs_b, &None);
+                if key_a != key_b {
+                    let name_a = specialization_name("f", &subs_a);
+                    let name_b = specialization_name("f", &subs_b);
+                    assert_ne!(
+                        name_a, name_b,
+                        "distinct instantiation_key for {a:?} vs {b:?} produced colliding symbol name {name_a}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Conversely, the sealed-vs-unsealed same-shape pair must actually BE key-distinct (so the
+    // mint-two-specs branch is exercised) — the whole point of F1 is that they are two layouts.
+    #[test]
+    fn sealed_and_unsealed_same_shape_are_key_distinct_and_name_distinct() {
+        let shape = [("x", Type::Int32), ("y", Type::Str)];
+        let unsealed: HashMap<u32, Type> =
+            [(0u32, Type::object(fields(&shape)))].into_iter().collect();
+        let sealed: HashMap<u32, Type> =
+            [(0u32, Type::sealed_object(fields(&shape)))].into_iter().collect();
+        assert_ne!(
+            instantiation_key(0, &unsealed, &None),
+            instantiation_key(0, &sealed, &None),
+            "sealed differs in Debug so keys must differ"
+        );
+        assert_ne!(
+            specialization_name("f", &unsealed),
+            specialization_name("f", &sealed),
+            "sealed-distinct instantiations must get distinct symbol names"
+        );
     }
 }

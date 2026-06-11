@@ -939,6 +939,12 @@ impl Checker {
                 && !self.solved_type_vars.contains_key(id));
         let then_dynamic = is_json_dynamic(&then_ty) || is_unconstrained_inference_var(&then_ty);
         let else_dynamic = is_json_dynamic(&else_ty) || is_unconstrained_inference_var(&else_ty);
+        // Path-11: snapshot the branch lambda sets BEFORE the merge consumes the branch types, so a
+        // function-typed `if` whose arms are distinct lambdas (`if c then f else g`) yields a 2-set
+        // rather than aliasing onto whichever branch the structural collapse below happens to pick
+        // (PartialEq ignores `lset`, so the collapse would otherwise silently drop one inhabitant).
+        let then_lset = top_level_lambda_set(&then_ty);
+        let else_lset = top_level_lambda_set(&else_ty);
         let result_type = if then_empty_arr != else_empty_arr {
             if then_empty_arr { else_ty } else { then_ty }
         } else if distinct_generic_params {
@@ -977,6 +983,9 @@ impl Checker {
         } else {
             Type::flatten_union(vec![then_ty, else_ty])
         };
+        // Path-11: if the merged result is itself a function type, stamp it with the JOIN of the
+        // branch sets (inert metadata; the union/collapse above used PartialEq, which ignores it).
+        let result_type = with_joined_lambda_set(result_type, &then_lset, &else_lset);
         Ok(TypedExpr::If {
             cond: Box::new(typed_cond),
             then_br: Box::new(typed_then),
@@ -1216,6 +1225,8 @@ impl Checker {
         } else {
             unify_types(&drop_empty_array_arms(&arm_types))
         };
+        // Path-11: join arm inhabitant sets onto a function-typed result (see `infer_match`).
+        let result_type = join_arm_lambda_sets(result_type, &arm_types);
 
         let exhaustiveness_diags =
             crate::exhaustiveness::check_exhaustiveness(&scrutinee_ty, &typed_arms, span);
@@ -1254,6 +1265,9 @@ impl Checker {
         }
         self.consumed_streams = consumed_union;
         let result_type = if arm_types.is_empty() { Type::Never } else { unify_types(&drop_empty_array_arms(&arm_types)) };
+        // Path-11: a function-typed match (arms returning distinct lambdas) carries the JOIN of the
+        // arms' inhabitant sets, since `unify_types`/PartialEq ignore `lset`.
+        let result_type = join_arm_lambda_sets(result_type, &arm_types);
 
         // Exhaustiveness check: emit diagnostics but don't fail — warnings stay as warnings,
         // errors are collected alongside other diagnostics and reported together.
@@ -1365,18 +1379,46 @@ impl Checker {
                 }
                 Ok(None)
             }
-            Type::Object { fields: expected_fields, .. } => {
+            Type::Object { fields: expected_fields, sealed } => {
                 // Take over with directed field-by-field checking when it would actually change
                 // the outcome — otherwise stay on the existing undirected inference path so plain
-                // structural objects are unaffected. Two cases need directing:
+                // structural objects are unaffected. Cases that need directing:
                 //   (1) a `StrLit` field — so a discriminant literal narrows to its singleton;
                 //   (2) a `Map` field (possibly nested inside a further record field) — so an
                 //       object literal in that field position key-widens to `{ String: T }`
-                //       (a `LinMap`) instead of being inferred to its own fixed-record type.
-                if !expected_fields.values().any(|t| expected_field_needs_directing(t)) {
+                //       (a `LinMap`) instead of being inferred to its own fixed-record type;
+                //   (3) THIS expected type is itself a sealed record, or a (nested) field is a
+                //       sealed record(-array) — so the producer adopts the sealed element type and
+                //       builds the same packed/sealed representation the consumer reads back at
+                //       (Path-9C seal-propagation symmetry — see `expected_field_needs_directing`).
+                if !*sealed && !expected_fields.values().any(|t| expected_field_needs_directing(t)) {
                     return Ok(None);
                 }
-                Ok(Some(self.check_object_fields(fields, expected_fields, span)?))
+                // OMISSION GUARD (§5.9.1 soundness): the directed path only checks the fields the
+                // literal actually carries — it would silently accept a literal that OMITS a
+                // required field (one whose expected type does not admit `Null`). The undirected
+                // inference + structural compatibility path catches that and reports the proper
+                // "Expected type … got …" diagnostic, so DEFER to it whenever a required field is
+                // absent. (Extending directing to sealed records — every plain all-scalar named
+                // record is sealed — made this reachable for shapes like `Point = {x,y}` that
+                // previously always deferred; without the guard, `val p: Point = { x: 1 }` would
+                // wrongly type-check. A missing field whose type INCLUDES `Null` stays directed:
+                // that is a permitted omission and the result type is unchanged from inference.)
+                let present: std::collections::HashSet<&str> = fields
+                    .iter()
+                    .filter_map(|f| match f {
+                        ObjectField::Pair(Expr::StringLit(k, _), _) => Some(k.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let omits_required = expected_fields.iter().any(|(k, ft)| {
+                    !present.contains(k.as_str())
+                        && !crate::compat::is_compatible(&Type::Null, ft)
+                });
+                if omits_required {
+                    return Ok(None);
+                }
+                Ok(Some(self.check_object_fields(fields, expected_fields, *sealed, span)?))
             }
             // An object literal checked against a typed index-signature map `{ String: T }`
             // (ADR-055): each literal value must be `T`; the result is typed `Map(T)` and lowered
@@ -1436,7 +1478,12 @@ impl Checker {
                     })
                 });
                 match chosen {
-                    Some(vf) => Ok(Some(self.check_object_fields(fields, vf, span)?)),
+                    // A union variant selected by its discriminant is a named record variant; the
+                    // chosen field map came from a `Type::Object` variant whose seal flag is not
+                    // threaded through `literal_variants` (it only kept the field maps). These
+                    // tagged-union variants are not packed as sealed scalar arrays, so directing
+                    // them UNSEALED preserves existing behaviour (the discriminant still narrows).
+                    Some(vf) => Ok(Some(self.check_object_fields(fields, vf, false, span)?)),
                     None => {
                         // No variant matched: report the valid discriminant tags.
                         let mut tags = Vec::new();
@@ -1472,6 +1519,7 @@ impl Checker {
         &mut self,
         fields: &[ObjectField],
         expected_fields: &IndexMap<String, Type>,
+        sealed: bool,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
         let mut typed_fields = Vec::new();
@@ -1498,9 +1546,35 @@ impl Checker {
             }
         }
         self.in_tail_position = saved_tail;
-        // The refined literal's own type stays UNSEALED (the seal lives on the expected named type;
-        // Stage 1 inserts the projection at the boundary). Inert in Stage 0.5.
-        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads: Vec::new(), ty: Type::object(obj_type), span })
+        // Carry the EXPECTED type's seal flag onto the refined literal's own type (Path-9C) — but
+        // ONLY when every field is gate-packable. This is the producer/consumer SEAL SYMMETRY fix:
+        // recording the literal SEALED makes the PRODUCER build the same packed representation the
+        // CONSUMER reads back at, keeping the two sides' repr classification (and codegen layout) in
+        // agreement. The packability AND is load-bearing, not merely an optimisation:
+        //   - Gate-packable fields (scalar+Bool today): a sealed element flows into a sealed-scalar
+        //     array (`is_sealed_scalar_array`) → the array PACKS, the element is laid out inline, no
+        //     box. The consumer reads it packed. Symmetric, leak-free.
+        //   - A NON-packable field (e.g. String under the scalar+Bool gate): the consumer reads the
+        //     array BOXED (its repr pass uses the SAME gate). If we sealed the producer's element
+        //     anyway, the array stays boxed (`is_sealed_scalar_array` is false) but each element is
+        //     now a SEALED STRUCT that the boxed-array lowering MATERIALIZES to a `LinObject` and
+        //     then LEAKS the transient struct (~one alloc/field/element/build, ASan-confirmed). So
+        //     for an unpackable record we keep the element UNSEALED — the producer builds the boxed
+        //     `LinObject` directly (the historical path), which is ALSO what the consumer reads:
+        //     still symmetric, and leak-free.
+        // When the gate later widens to String (Path-9A), those records become packable and this AND
+        // automatically starts sealing them — no further checker change needed. `Type`
+        // equality/subtyping ignores the seal flag (types.rs), so this is representation-only and
+        // never changes assignability. A field directed only because of a nested `StrLit`/`Map`
+        // (the outer literal itself unsealed) keeps the historical UNSEALED result.
+        let all_fields_packable =
+            !obj_type.is_empty() && obj_type.values().all(|t| t.is_sealed_array_field_packable());
+        let ty = if sealed && all_fields_packable {
+            Type::sealed_object(obj_type)
+        } else {
+            Type::object(obj_type)
+        };
+        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads: Vec::new(), ty, span })
     }
 
     pub(crate) fn infer_array(&mut self, elements: &[Expr], span: Span) -> Result<TypedExpr, Diagnostic> {
@@ -1692,14 +1766,29 @@ pub(crate) fn type_is_streamish(ty: &Type) -> bool {
 /// True if an expected field type warrants the directed object-checking path (so an object
 /// literal in that field position is checked AGAINST the type rather than freely inferred).
 /// This is the gate for `check_object_against`'s `Type::Object` arm. It fires when the type is
-/// — or transitively (in a record-field position) contains — either a `StrLit` singleton (so a
-/// discriminant narrows) or a `Map` (so a record literal key-widens to `{ String: T }`). The
-/// transitive walk handles nested records like `{ headers: { String: String } }` where the
-/// outer record has no direct `StrLit`/`Map` field but a nested field does.
+/// — or transitively (in a record-field position) contains — any of:
+///   - a `StrLit` singleton (so a discriminant narrows);
+///   - a `Map` (so a record literal key-widens to `{ String: T }`);
+///   - a SEALED record, or an `Array`/`FixedArray` whose element is (transitively) a sealed
+///     record (Path-9C seal-propagation symmetry). Directing the literal against a sealed
+///     record(-array) field makes the PRODUCER adopt the sealed element type, so the
+///     `MakeArray`/`MakeObject` it builds carries the same sealed representation the CONSUMER
+///     reads it back at (`trip["stopTimes"]` whose `result_ty` is the sealed `StopTime[]`).
+///     Without this the field falls to UNDIRECTED inference → an UNSEALED `Object[]`, and a
+///     producer/consumer representation divergence (a silent mis-read for scalar fields today;
+///     a misaligned-pointer crash once heap-field packing widens the gate).
+/// The transitive walk handles nested records like `{ headers: { String: String } }` (Map) and
+/// `{ stopTimes: StopTime[] }` (sealed-record array) where the outer record has no DIRECT
+/// directing field but a nested one does.
 pub(crate) fn expected_field_needs_directing(ty: &Type) -> bool {
     match ty {
         Type::StrLit(_) | Type::Map(_) => true,
-        Type::Object { fields, .. } => fields.values().any(expected_field_needs_directing),
+        Type::Object { sealed: true, .. } => true,
+        Type::Object { fields, sealed: false } => fields.values().any(expected_field_needs_directing),
+        Type::Array(elem) | Type::Iterator(elem) | Type::Shared(elem) | Type::Stream(elem) => {
+            expected_field_needs_directing(elem)
+        }
+        Type::FixedArray(elems) | Type::Union(elems) => elems.iter().any(expected_field_needs_directing),
         _ => false,
     }
 }
@@ -1737,6 +1826,50 @@ pub(crate) fn type_mentions_strlit(ty: &Type) -> bool {
     }
 }
 
+/// Path-11: the lambda set carried at the TOP LEVEL of `ty` if it is a function type, else `None`
+/// (a non-function branch contributes nothing to a function-typed merge's inhabitant set).
+fn top_level_lambda_set(ty: &Type) -> Option<crate::types::LambdaSet> {
+    match ty {
+        Type::Function { lset, .. } => Some(lset.clone()),
+        _ => None,
+    }
+}
+
+/// Path-11: if `ty` is a function type and at least one branch contributed a set, stamp it with the
+/// JOIN of the two branch sets. A missing branch set (non-function branch) is treated as `Top` — a
+/// merge of a function with a non-function can only be reasoned about as ⊤. Inert: only the `lset`
+/// metadata changes; params/ret/required are untouched.
+fn with_joined_lambda_set(
+    ty: Type,
+    then_lset: &Option<crate::types::LambdaSet>,
+    else_lset: &Option<crate::types::LambdaSet>,
+) -> Type {
+    use crate::types::LambdaSet;
+    if let Type::Function { params, ret, required, .. } = ty {
+        let a = then_lset.clone().unwrap_or(LambdaSet::Top);
+        let b = else_lset.clone().unwrap_or(LambdaSet::Top);
+        Type::Function { params, ret, required, lset: a.join(&b) }
+    } else {
+        ty
+    }
+}
+
+/// Path-11: if `result` is a function type, stamp it with the JOIN of every arm's top-level lambda
+/// set. A non-function arm (or an arm with no set) contributes `Top`. Inert metadata only.
+fn join_arm_lambda_sets(result: Type, arm_types: &[Type]) -> Type {
+    use crate::types::LambdaSet;
+    if let Type::Function { params, ret, required, .. } = result {
+        let mut joined = LambdaSet::Known(vec![]);
+        for at in arm_types {
+            let s = top_level_lambda_set(at).unwrap_or(LambdaSet::Top);
+            joined = joined.join(&s);
+        }
+        Type::Function { params, ret, required, lset: joined }
+    } else {
+        result
+    }
+}
+
 /// Replace every GENERIC (quantified, non-Json-wildcard) `TypeVar` in `ty` with the `Json` wildcard.
 /// Used to erase the unconstrained tuple element type of an empty array literal flowing into a
 /// `[String, T][]` param, so the empty container monomorphizes instead of leaving `T` unsolved.
@@ -1755,10 +1888,11 @@ pub(crate) fn erase_generic_type_vars(ty: &Type) -> Type {
             fields: fields.iter().map(|(k, v)| (k.clone(), erase_generic_type_vars(v))).collect(),
             sealed: *sealed,
         },
-        Type::Function { params, ret, required } => Type::Function {
+        Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(erase_generic_type_vars).collect(),
             ret: Box::new(erase_generic_type_vars(ret)),
             required: *required,
+            lset: lset.clone(),
         },
         _ => ty.clone(),
     }

@@ -1,0 +1,16 @@
+// gtfs/TimeParser — "HH:MM:SS" -> seconds from midnight.
+//
+// The reference caches results in a per-instance object. A pure function suffices for
+// the unit test (the cache is a perf detail, not observable behaviour), so we expose a
+// stateless `getTime`. The HOT loader path (gtfsLoader.loadGTFS) carries its own local
+// `{ String: Int32 }` cache mirroring the reference TimeParser — this stateless helper
+// is the unit-tested reference parse. (Times may exceed 24h, e.g. "25:30:00".)
+import { split } from "std/string"
+import { parseInt32 } from "std/number"
+
+export val getTime = (time: String): Int32 =>
+  val parts = split(time, ":")
+  val hh = parseInt32(parts[0])
+  val mm = parseInt32(parts[1])
+  val ss = parseInt32(parts[2])
+  hh * 60 * 60 + mm * 60 + ss

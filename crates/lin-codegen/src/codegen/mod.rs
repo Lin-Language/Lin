@@ -248,6 +248,19 @@ impl<'ctx> Codegen<'ctx> {
         // type-erased call that crashes a concrete use site.
         let mut ir_module =
             lin_ir::lower_import_module_with_imports(module, &module_key, imports, replaced_exports);
+        // Ownership conventions (Path-10/11 Leg 1) — SHADOW MODE for imported/stdlib modules too,
+        // so the corpus run covers std/* and example imports. Inference is pure data; the verifier
+        // (gated by LIN_OWNERSHIP_SHADOW) is report-only. Neither changes codegen output.
+        lin_ir::ownership_verify::infer_conventions(&mut ir_module);
+        if std::env::var("LIN_OWNERSHIP_SHADOW").is_ok() {
+            for v in lin_ir::ownership_verify::verify_module(&ir_module) {
+                if v.kind == lin_ir::ownership_verify::ViolationKind::UnauditedIntrinsic {
+                    eprintln!("[ownership-shadow]   GAP unaudited-intrinsic {} (import {} fn {})", v.detail, module_key, v.func);
+                } else {
+                    eprintln!("[ownership-shadow]   {} import={} fn={} block={}: {}", v.kind.label(), module_key, v.func, v.block, v.detail);
+                }
+            }
+        }
         // Representation-inference pass (repr.rs) — STAGE 3; runs before rc_elide on the same IR
         // shape as the main module. Stores the per-temp repr table on each `func.repr` for codegen
         // to consume at DECIDE / ASSUME sites, and (debug builds) asserts the oracle + verifier.
@@ -2200,18 +2213,6 @@ impl<'ctx> Codegen<'ctx> {
                         Instruction::Unbox { dst, val, result_ty } => {
                             if let Some(&v) = temp_map.get(val) {
                                 let result = self.compile_ir_unbox(v, result_ty);
-                                temp_map.insert(*dst, result);
-                            }
-                        }
-                        Instruction::BoxKeepPacked { dst, src, arr, .. } => {
-                            if let Some(&v) = temp_map.get(src) {
-                                let result = self.compile_ir_box_keep_packed(v, *arr);
-                                temp_map.insert(*dst, result);
-                            }
-                        }
-                        Instruction::UnboxKeepPacked { dst, src, arr, .. } => {
-                            if let Some(&v) = temp_map.get(src) {
-                                let result = self.compile_ir_unbox_keep_packed(v, *arr);
                                 temp_map.insert(*dst, result);
                             }
                         }

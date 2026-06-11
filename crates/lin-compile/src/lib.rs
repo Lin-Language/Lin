@@ -158,6 +158,13 @@ fn check_front_end(source_path: &Path) -> Result<CheckedFrontEnd, CompileError> 
     let (typed_module, check_warnings) = check_module_with_imports(&ast_module, &imported_modules, false)
         .map_err(CompileError::TypeCheck)?;
 
+    // Path-11 Leg 2, Stage 1 — shadow lambda-set statistics (env-gated; zero cost when off).
+    // Aggregates the main module + every (transitively) imported module so the distribution covers
+    // user code AND the stdlib combinators it pulls in. Pure measurement — no IR/codegen effect.
+    if lin_check::lambda_set_stats::enabled() {
+        emit_lambda_set_stats(&module_name, &typed_module, &imported_modules);
+    }
+
     Ok(CheckedFrontEnd {
         source,
         module_name,
@@ -167,6 +174,36 @@ fn check_front_end(source_path: &Path) -> Result<CheckedFrontEnd, CompileError> 
         import_sources,
         warnings: check_warnings,
     })
+}
+
+/// Emit Path-11 lambda-set call-site statistics to stderr. Reports the main module and the union
+/// of all imported modules (stdlib + user imports) separately, then a grand total. Static counts
+/// (one per syntactic call site) — see FINDINGS.md for the dynamic-weighting caveat.
+fn emit_lambda_set_stats(
+    module_name: &str,
+    main: &lin_check::TypedModule,
+    imports: &HashMap<String, lin_check::TypedModule>,
+) {
+    use lin_check::lambda_set_stats::{collect_module, Stats};
+    let main_stats = collect_module(main);
+    let mut import_stats = Stats::default();
+    // Sort import keys for deterministic output.
+    let mut keys: Vec<&String> = imports.keys().collect();
+    keys.sort();
+    for k in keys {
+        import_stats.add(&collect_module(&imports[k]));
+    }
+    let mut total = main_stats.clone();
+    total.add(&import_stats);
+
+    eprintln!("=== LIN_LAMBDA_STATS: {module_name} ===");
+    eprintln!("[main]    callback-args : {}", main_stats.callback_args.summary());
+    eprintln!("[main]    indirect-callees: {}", main_stats.indirect_callees.summary());
+    eprintln!("[imports] callback-args : {}", import_stats.callback_args.summary());
+    eprintln!("[imports] indirect-callees: {}", import_stats.indirect_callees.summary());
+    eprintln!("[TOTAL]   callback-args : {}", total.callback_args.summary());
+    eprintln!("[TOTAL]   indirect-callees: {}", total.indirect_callees.summary());
+    eprintln!("[TOTAL]   ALL closure call sites: {}", total.combined().summary());
 }
 
 /// Type-check `opts.source_path` and all of its (transitive) imports, stopping before any
@@ -325,6 +362,15 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         // table on each `func.repr` for codegen to consume at every packed-vs-boxed DECIDE / ASSUME
         // site; in debug builds also asserts the Stage-2 oracle (new analysis == old type
         // predicates) + the soundness verifier.
+        // Ownership conventions (Path-10/11 Leg 1) — SHADOW MODE. Infer per-param/per-return
+        // conventions and, when `LIN_OWNERSHIP_SHADOW` is set, run the report-only verifier over the
+        // lowered IR (BEFORE repr/rc_elide, so it sees the lowerer's own RC emission and dead-block
+        // shape verbatim). Inference is pure data on the IR; codegen ignores the convention fields
+        // this round, so neither call changes any output.
+        lin_ir::ownership_verify::infer_conventions(&mut ir_module);
+        if std::env::var("LIN_OWNERSHIP_SHADOW").is_ok() {
+            emit_ownership_shadow_report(&ir_module, &opts.source_path.to_string_lossy());
+        }
         lin_ir::repr::run(&mut ir_module);
         rc_elide::elide_rc(&mut ir_module);
         // Sealed-records Stage 4: mark non-escaping all-scalar sealed-record constructions for
@@ -399,7 +445,10 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
 // `Object(IndexMap)` to a struct variant `Object { fields, sealed }`, altering the bincode
 // layout of every serialized `Type`. A `.typed`/`.sig` written by a v1 binary must be rejected
 // rather than mis-deserialized. See ADR-057 (Type serialization changed → cache version bump).
-const CACHE_FORMAT_VERSION: u32 = 2;
+// v3 (Path-11): `Type::Function` gained an inert `lset: LambdaSet` field and `TypedExpr::Function`
+// gained `lambda_id: u32`, changing the bincode layout of every serialized `Type`/`TypedStmt`.
+// A `.typed`/`.sig` written by a v2 binary must be rejected (stale layout → mis-decode).
+const CACHE_FORMAT_VERSION: u32 = 3;
 
 /// Magic prefix written at the head of every `.typed`/`.sig` cache file. Combined with the
 /// compiler version and `CACHE_FORMAT_VERSION`, this is the on-disk compatibility stamp checked
@@ -1122,6 +1171,45 @@ fn register_resolved(
         }
         order.push(path.clone());
         cache.insert(path.clone(), typed.clone());
+    }
+}
+
+/// Emit the SHADOW-MODE ownership report (Path-10/11 Leg 1) to stderr. Report-only: it never
+/// changes compilation. Prints a one-line per-module summary (function/param convention split +
+/// violation counts by kind) and the individual violations, so a corpus run can be grepped and
+/// classified. Gated by the `LIN_OWNERSHIP_SHADOW` env var at the single call site.
+fn emit_ownership_shadow_report(module: &lin_ir::LinModule, source: &str) {
+    use lin_ir::ownership_verify::{shadow_summary, ViolationKind};
+    let s = shadow_summary(module);
+    let mut by_kind: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+    for v in &s.violations {
+        *by_kind.entry(v.kind.label()).or_insert(0) += 1;
+    }
+    eprintln!(
+        "[ownership-shadow] {src}: fns={fns} params={pt} (borrow={b} own={o} inout={io}) violations={nv} {bk:?}",
+        src = source,
+        fns = s.functions,
+        pt = s.params_total,
+        b = s.params_borrow,
+        o = s.params_own,
+        io = s.params_inout,
+        nv = s.violations.len(),
+        bk = by_kind,
+    );
+    for v in &s.violations {
+        // Suppress the un-audited-intrinsic noise from the per-violation dump unless it is the only
+        // kind present — those are a table-completeness checklist, summarized in the count line.
+        if v.kind == ViolationKind::UnauditedIntrinsic {
+            eprintln!("[ownership-shadow]   GAP unaudited-intrinsic {} (fn {})", v.detail, v.func);
+            continue;
+        }
+        eprintln!(
+            "[ownership-shadow]   {kind} fn={fn_} block={blk}: {detail}",
+            kind = v.kind.label(),
+            fn_ = v.func,
+            blk = v.block,
+            detail = v.detail,
+        );
     }
 }
 

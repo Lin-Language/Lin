@@ -112,6 +112,11 @@ pub struct Checker {
     /// directly at its name span for LSP inlay hints, including UNUSED unannotated params (which
     /// `infer_ident` never records, since only USES populate `span_type_map`). Metadata-only.
     param_def_span_types: Vec<(Span, Type)>,
+    /// Path-11 lambda-set inference: monotonic id generator for syntactic lambdas. Each
+    /// `TypedExpr::Function` the checker builds is stamped with a fresh id (≥1; 0 means
+    /// "unassigned"), so its function type can carry `LambdaSet::singleton(id)`. Inert metadata —
+    /// used only by the shadow-mode classification/statistics pass (`crate::lambda_set_stats`).
+    next_lambda_id: u32,
 }
 
 impl Default for Checker {
@@ -151,7 +156,16 @@ impl Checker {
             import_origins: std::collections::HashMap::new(),
             replacements: Vec::new(),
             param_def_span_types: Vec::new(),
+            next_lambda_id: 1,
         }
+    }
+
+    /// Mint a fresh syntactic-lambda identity (Path-11 lambda sets). Ids start at 1; 0 is reserved
+    /// for "unassigned" (cache-default / synthesized functions), which `ty()` maps to `Top`.
+    pub(crate) fn next_lambda_id(&mut self) -> u32 {
+        let id = self.next_lambda_id;
+        self.next_lambda_id += 1;
+        id
     }
 
     pub fn check_module(&mut self, module: &Module) -> Result<TypedModule, Vec<Diagnostic>> {
@@ -409,6 +423,7 @@ impl Checker {
                             params: param_types,
                             ret: Box::new(ret_type),
                             required,
+                            lset: crate::types::LambdaSet::Top,
                         };
                         let slot = self.env.define(name, fn_type, false);
                         self.forward_declared.insert(slot);

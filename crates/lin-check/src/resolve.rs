@@ -229,10 +229,11 @@ fn expand_named_body(
             }
             Ok(Type::sealed_object(out))
         }
-        Type::Function { params, ret, required } => Ok(Type::Function {
+        Type::Function { params, ret, required, lset } => Ok(Type::Function {
             params: params.iter().map(|p| expand_named_body(p, env, visiting)).collect::<Result<_, _>>()?,
             ret: Box::new(expand_named_body(ret, env, visiting)?),
             required: *required,
+            lset: lset.clone(),
         }),
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(expand_named_body(inner, env, visiting)?))),
         Type::Stream(inner) => Ok(Type::Stream(Box::new(expand_named_body(inner, env, visiting)?))),
@@ -332,6 +333,7 @@ fn substitute(
             params: fn_params,
             ret,
             required,
+            lset,
         } => Ok(Type::Function {
             params: fn_params
                 .iter()
@@ -339,6 +341,7 @@ fn substitute(
                 .collect::<Result<_, _>>()?,
             ret: Box::new(substitute(ret, params, args, env, visiting)?),
             required: *required,
+            lset: lset.clone(),
         }),
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(substitute(inner, params, args, env, visiting)?))),
         Type::Stream(inner) => Ok(Type::Stream(Box::new(substitute(inner, params, args, env, visiting)?))),

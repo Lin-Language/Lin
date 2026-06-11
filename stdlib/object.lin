@@ -86,7 +86,8 @@ export val merge = <T>(a: { String: T }, b: { String: T }): { String: T } =>
 export val pick = <T>(obj: { String: T }, ks: String[]): { String: T } =>
   var result: { String: T } = {}
   ks.for(k =>
-    if obj[k] != null then result[k] = obj[k]
+    val v = obj[k]
+    if v != null then result[k] = v
   )
   result
 

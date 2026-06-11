@@ -9,6 +9,40 @@ use inkwell::module::Module;
 use inkwell::values::FunctionValue;
 use inkwell::AddressSpace;
 
+// ---------------------------------------------------------------------------
+// Ownership conventions of the runtime intrinsics (Path-10/11 Leg 1) — CROSS-CHECK ANCHOR.
+//
+// The load-bearing hand-audited table lives in `lin_ir::ownership_verify::intrinsic_conventions`
+// (it must sit in `lin-ir`, which `lin-codegen` depends on, not the other way round). It is
+// documented HERE next to the matching LLVM `declare`s so the two stay in sync by eye, and so a
+// future Wave-2 consumer reads the conventions right where the C-ABI signatures are emitted.
+//
+// SHADOW MODE (this round): the table is only inferred + verified, NEVER consumed by codegen — no
+// declaration or call below changes based on it. The convention summary, grounded in the runtime
+// semantics in `lin-runtime/src/`:
+//
+//   lin_object_get(borrow obj, borrow key)        -> borrow   (interior pointer; caller must clone
+//                                                              before it escapes — see own_for_read)
+//   lin_object_set(inout obj, own key, own val)   -> own/void (obj mutated in place; key+val stored)
+//   lin_object_has / lin_object_eq / lin_string_eq(borrow, borrow) -> scalar
+//   lin_array_get(borrow arr, own i)              -> borrow   (borrowed element; the `_tagged`
+//                                                              variant returns a fresh +1 instead)
+//   lin_push / lin_array_push(inout arr, own v)   -> void     (canonical (inout, own))
+//   lin_*_length / lin_string_length(borrow)      -> scalar
+//   lin_string_concat(borrow, borrow)             -> own      (fresh string; inputs copied)
+//   lin_array_alloc / lin_object_alloc / lin_map_alloc(own cap) -> own (fresh +1)
+//   lin_keys(borrow obj)                          -> own      (fresh String[])
+//   lin_print(borrow s)                           -> void     (reads only — today's lowering
+//                                                              over-owns this; a Wave-2 win)
+//   lin_box_*(borrow inner)                        -> own      (fresh shell; inner borrowed)
+//   lin_int_to_string / float / bool / tagged_to_string(borrow) -> own (fresh string)
+//
+// Entries the author is UNSURE about (see FINDINGS.md §3): lin_array_allocate_filled fill-value
+// (borrow vs own per-slot retain), lin_value_key, lin_to_json. The async/worker/stream/compress/
+// archive families and lin_from_json are NOT audited this round (the verifier flags them as
+// `unaudited-intrinsic` gaps) — they are off the RAPTOR/interp hot paths Leg 1 targets.
+// ---------------------------------------------------------------------------
+
 /// The full set of `lin-runtime` symbols the codegen calls into. Constructed once via
 /// [`RuntimeFns::new`], which emits the matching `declare` directives into `module`.
 pub(crate) struct RuntimeFns<'ctx> {
