@@ -119,6 +119,21 @@ that holds for **sealed all-scalar** records (the `records` bench — constant-o
 loads), but for **heap-field** records threaded through maps and unions, naive full
 typing currently costs ~2×.
 
+A per-function IR profile pins the dominant seam: the **`Trip | Null` union threaded
+through the route scan** (`scanRouteAt`) accounts for the bulk of it — narrowing a
+boxed union member to the packed `Trip` repr forces a deep field-by-field
+re-projection *and re-seal* (`lin_sealed_alloc` ×15) plus a re-box on every
+thread-back through the union (hot-path `lin_object_get` 5 → 62 vs the `Json` form).
+The secondary seam is `scanBack`'s `val trip: Trip = routeTrips[i]`: binding a typed
+record out of a *boxed* `Trip[]` eagerly re-packs every field (incl. the unused
+nested `Service`) even though the array is boxed so the reads stay `lin_object_get`
+regardless. This is the same union/array-element repr boundary that the path-9
+end-to-end-packing work was CLOSED-NEGATIVE on (§5) — keeping the *value* (not just
+the type) packed across these boundaries is precisely the chain that measured net
+slower. Note the typed RAPTOR is now **leak-free** (RSS bounded/flat over the full
+run, ASan-clean — the three `Trip[]` RC fixes); the residual ~2× is pure
+materialization *time*, not allocation churn.
+
 The orthogonal win that *did* pay: typing the **dictionaries** — the
 `{String: Int32}`/`{String: Trip[]}` index and scan-state maps that were `Json`
 objects — replaced O(n) association-list scans with O(1) hashed `LinMap` lookups
