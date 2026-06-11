@@ -353,7 +353,14 @@ impl<'ctx> Codegen<'ctx> {
         let i8_ty = self.context.i8_type();
         let i64_ty = self.context.i64_type();
         let tagged_ty = self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false);
-        let alloca = self.builder.alloca(tagged_ty, "tv");
+        // Place the scratch slot at the TOP of the function entry block, NOT at the current insert
+        // point. This TaggedVal is a fixed-size, immediately-consumed temporary (lin_map_set/… copy
+        // the value out), so one entry-block slot can be safely reused every iteration. Emitting it
+        // at the current position would, on an inlined-combinator loop body (the Layer-1 capturing-
+        // lambda inline path), allocate one stack slot PER iteration — `alloca` outside the entry
+        // block is not reclaimed until function return — and overflow the stack at scale (the
+        // map_flat_scalar segfault). Mirrors the home-alloca hoist in mod.rs.
+        let alloca = self.entry_block_alloca(tagged_ty, "tv");
 
         let tag = Self::type_tag(val_ty);
         let tag_val = i8_ty.const_int(tag as u64, false);
@@ -365,6 +372,29 @@ impl<'ctx> Codegen<'ctx> {
         let payload = self.tagged_payload_i64(val, val_ty);
         self.builder.store(payload_ptr, payload);
         alloca
+    }
+
+    /// Emit an `alloca` at the TOP of the current function's entry block (not the current insert
+    /// point), then restore the builder to its previous position. Use for fixed-size scratch slots
+    /// that are written/consumed immediately each time, so a SINGLE entry-block slot is reused for
+    /// the whole function rather than leaking one stack slot per loop iteration (an `alloca` in a
+    /// loop body is never reclaimed until the function returns — at scale that overflows the stack).
+    /// Mirrors the home-alloca hoist in `mod.rs`.
+    pub(crate) fn entry_block_alloca<T: inkwell::types::BasicType<'ctx>>(
+        &self,
+        ty: T,
+        name: &str,
+    ) -> PointerValue<'ctx> {
+        let cur_block = self.builder.get_insert_block().unwrap();
+        let llvm_fn = cur_block.get_parent().unwrap();
+        let entry_bb = llvm_fn.get_first_basic_block().unwrap();
+        match entry_bb.get_first_instruction() {
+            Some(first) => self.builder.position_before(&first),
+            None => self.builder.position_at_end(entry_bb),
+        }
+        let slot = self.builder.alloca(ty, name);
+        self.builder.position_at_end(cur_block);
+        slot
     }
 
     /// KEEP-PACKED box (repr pass Stage 4): wrap a still-packed `LinArray*` (elem_tag 0xFE) / packed
