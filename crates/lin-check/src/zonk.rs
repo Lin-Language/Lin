@@ -37,10 +37,11 @@ pub(crate) fn zonk_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
         Type::Stream(inner) => Type::Stream(Box::new(zonk_type(inner, subs))),
         Type::Promise(inner) => Type::Promise(Box::new(zonk_type(inner, subs))),
         Type::Union(ts) => Type::flatten_union(ts.iter().map(|t| zonk_type(t, subs)).collect()),
-        Type::Function { params, ret, required } => Type::Function {
+        Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(|p| zonk_type(p, subs)).collect(),
             ret: Box::new(zonk_type(ret, subs)),
             required: *required,
+            lset: lset.clone(),
         },
         Type::Object { fields, sealed } => {
             // Zonking substitutes TypeVars in field types; it must PRESERVE the sealed marker

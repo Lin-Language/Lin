@@ -457,6 +457,7 @@ impl Checker {
             body_ty
         };
 
+        let lambda_id = self.next_lambda_id();
         Ok(TypedExpr::Function {
             name: None,
             params: typed_params,
@@ -464,6 +465,7 @@ impl Checker {
             ret_type,
             captures,
             span,
+            lambda_id,
         })
     }
 
@@ -766,6 +768,7 @@ impl Checker {
                     format!("Function body has type {}, declared return type is Number (a numeric type)", body_ty),
                 ).with_help("a `Number` return requires the body to evaluate to a numeric family".to_string()));
             }
+            let lambda_id = self.next_lambda_id();
             return Ok(TypedExpr::Function {
                 name: None,
                 params: typed_params,
@@ -773,6 +776,7 @@ impl Checker {
                 ret_type: body_ty,
                 captures,
                 span,
+                lambda_id,
             });
         }
 
@@ -812,6 +816,7 @@ impl Checker {
             body_ty
         };
 
+        let lambda_id = self.next_lambda_id();
         Ok(TypedExpr::Function {
             name: None,
             params: typed_params,
@@ -819,6 +824,7 @@ impl Checker {
             ret_type,
             captures,
             span,
+            lambda_id,
         })
     }
 }

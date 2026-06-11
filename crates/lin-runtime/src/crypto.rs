@@ -63,17 +63,17 @@ unsafe fn read_byte_buf(arr: *const u8) -> Vec<u8> {
         }
     } else {
         // Fallback for tagged / other-width arrays (e.g. a Json array of small ints): box each
-        // element, take its low byte, and free the transient box (matches fs.rs).
+        // element, take its low byte, and free the transient box (matches fs.rs). The box may be
+        // an immutable cached small-int static (lin_array_get_tagged routes flat ints through the
+        // box cache), so free it via lin_tagged_release (cached-box-safe) — NOT a raw dealloc,
+        // which would corrupt the static table.
         for i in 0..len as i64 {
             let tv_ptr = crate::array::lin_array_get_tagged(lin_arr, i);
             let v = if tv_ptr.is_null() {
                 0u8
             } else {
                 let payload = (*tv_ptr).payload;
-                std::alloc::dealloc(
-                    tv_ptr as *mut u8,
-                    std::alloc::Layout::new::<TaggedVal>(),
-                );
+                crate::tagged::lin_tagged_release(tv_ptr as *mut u8);
                 payload as u8
             };
             bytes.push(v);

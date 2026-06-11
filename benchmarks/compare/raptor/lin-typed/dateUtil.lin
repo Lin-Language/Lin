@@ -1,0 +1,82 @@
+// query/DateUtil — date handling in UTC.
+//
+// The reference uses a JS `Date` (UTC midnight). We model a calendar date as the
+// named record type `Date` (types.lin): { "year": Int32, "month": Int32 (1-12),
+// "day": Int32 (1-31) } — fully concrete, so a sealed-record unboxed candidate.
+// `getDateNumber` -> YYYYMMDD integer (Service.runsOn comparable).
+// `dayOfWeek`     -> Sunday=0 .. Saturday=6 (matches JS Date.getDay in UTC).
+// `addDays`       -> real calendar arithmetic with month/year rollover.
+//
+// A date string "2018-10-16" is parsed by `parseDate`.
+import { split } from "std/string"
+import { parseInt32 } from "std/number"
+import { Date } from "./types"
+
+export val parseDate = (s: String): Date =>
+  val parts = split(s, "-")
+  {
+    "year": parseInt32(parts[0]),
+    "month": parseInt32(parts[1]),
+    "day": parseInt32(parts[2])
+  }
+
+export val getDateNumber = (date: Date): Int32 =>
+  date["year"] * 10000 + date["month"] * 100 + date["day"]
+
+val isLeap = (y: Int32): Boolean =>
+  (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+
+val daysInMonth = (y: Int32, m: Int32): Int32 =>
+  if m == 2 then
+    if isLeap(y) then 29 else 28
+  else if m == 4 || m == 6 || m == 9 || m == 11 then
+    30
+  else
+    31
+
+export val addDay = (date: Date): Date =>
+  val y = date["year"]
+  val m = date["month"]
+  val d = date["day"]
+  val dim = daysInMonth(y, m)
+  if d < dim then
+    {
+      "year": y,
+      "month": m,
+      "day": d + 1
+    }
+  else if m < 12 then
+    {
+      "year": y,
+      "month": m + 1,
+      "day": 1
+    }
+  else
+    {
+      "year": y + 1,
+      "month": 1,
+      "day": 1
+    }
+
+// Day of week via Sakamoto's algorithm. Returns 0=Sunday .. 6=Saturday (JS getDay, UTC).
+val tTable = [
+  0,
+  3,
+  2,
+  5,
+  0,
+  3,
+  5,
+  1,
+  4,
+  6,
+  2,
+  4
+]
+
+export val dayOfWeek = (date: Date): Int32 =>
+  val m = date["month"]
+  val y0 = date["year"]
+  val y = if m < 3 then y0 - 1 else y0
+  val t = tTable[m - 1]
+  (y + y / 4 - y / 100 + y / 400 + t + date["day"]) % 7

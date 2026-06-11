@@ -350,7 +350,7 @@ impl Checker {
         let func_ty = typed_func.ty();
 
         let (typed_args, result_type) = match &func_ty {
-            Type::Function { params, ret, required } => {
+            Type::Function { params, ret, required, .. } => {
                 // Opaque `Function` annotation (resolve.rs: `func([TypeVar(MAX)], TypeVar(MAX))`):
                 // a bare `Function` type means "any function" — accept any arity and return a
                 // fresh inference var. This must NOT match a *concrete* signature that merely
@@ -775,6 +775,7 @@ impl Checker {
                             params: remaining_params,
                             ret: Box::new(concrete_ret),
                             required: remaining_required,
+                            lset: crate::types::LambdaSet::Top,
                         }
                     } else {
                         concrete_ret
@@ -983,7 +984,7 @@ impl Checker {
 
         // Look up method type for TypeVar substitution.
         if let Some(method_ty) = self.env.effective_type(method) {
-            if let Type::Function { params: method_params, ret, required: method_required } = method_ty.clone() {
+            if let Type::Function { params: method_params, ret, required: method_required, .. } = method_ty.clone() {
                 // Build all arg expressions: [receiver, ...args]
                 let all_arg_exprs: Vec<&Expr> = std::iter::once(receiver)
                     .chain(args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]).iter())
@@ -1289,6 +1290,7 @@ impl Checker {
                             params: remaining,
                             ret: Box::new(concrete_ret),
                             required: remaining_required,
+                            lset: crate::types::LambdaSet::Top,
                         }
                     } else {
                         concrete_ret
@@ -1396,7 +1398,7 @@ impl Checker {
         }
         if let Some(ty) = self.env.effective_type(method) {
             let result_type = match &ty {
-                Type::Function { params, ret, required } => {
+                Type::Function { params, ret, required, .. } => {
                     if partial {
                         if all_args.len() < params.len() {
                             let remaining = params[all_args.len()..].to_vec();
@@ -1404,6 +1406,7 @@ impl Checker {
                                 params: remaining,
                                 ret: ret.clone(),
                                 required: required.saturating_sub(all_args.len()),
+                                lset: crate::types::LambdaSet::Top,
                             }
                         } else {
                             *ret.clone()

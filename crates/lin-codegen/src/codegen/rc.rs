@@ -150,11 +150,9 @@ impl<'ctx> Codegen<'ctx> {
                 );
                 return;
             }
-            // A boxed slot (Opaque OR WrapsPacked-by-pointer): the box is a TaggedVal/LinObject whose
-            // release is the tag-dispatched one. WrapsPacked borrows its inner packed buffer; the box
-            // shell's release (tagged_release) decrements the inner via the runtime's tag dispatch.
-            // Fall through to the type-based dispatch which already picks the right boxed releaser for
-            // the static type (object/array/tagged/map/closure/stream).
+            // A boxed slot (Opaque): the box is a TaggedVal/LinObject whose release is the
+            // tag-dispatched one. Fall through to the type-based dispatch which already picks the right
+            // boxed releaser for the static type (object/array/tagged/map/closure/stream).
             Repr::Boxed(_) | Repr::FlatScalar(_) | Repr::Unknown | Repr::Bottom => {}
         }
         self.emit_release(val, ty);

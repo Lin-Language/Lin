@@ -264,6 +264,45 @@ impl CaptureRelease {
     }
 }
 
+/// Ownership convention of a function parameter or return value (Path-10/11 Leg 1).
+///
+/// This makes ownership a *verified IR fact* rather than an emergent property of scattered
+/// retain/release emission. It is declared on every `LinFunction` signature and on every
+/// runtime intrinsic (the hand-audited table in `RuntimeFns`). In SHADOW MODE (this round) the
+/// convention is *inferred and verified* but NEVER consumed by codegen — every signature defaults
+/// to `Own`, which is exactly today's behaviour, so emitting it changes no output. A later wave
+/// can consume the conventions to delete the per-site RC heuristics.
+///
+/// Semantics (Swift SIL / Lean "Counting Immutable Beans" model):
+/// - `Own`    — the value is TRANSFERRED to the callee/return. The caller hands over one owned
+///   reference (+1) and must not release it afterward; the callee (or the returned-to context)
+///   is responsible for releasing it. This is the conservative default — today's behaviour, where
+///   every boundary materializes/clones defensively.
+/// - `Borrow` — the callee only READS the value and does not extend its lifetime: it does not
+///   store it in a container, capture it in a closure, return it, or otherwise let it (or an alias)
+///   outlive the call. Ownership stays with the caller, who must keep the value alive across the
+///   call and release it afterward. No +1 is transferred.
+/// - `Inout`  — the value is passed by mutable reference (a `var`-slot/cell or an in-place
+///   container mutation): the callee may mutate it in place, ownership stays with the caller.
+///   Used conservatively — only when clearly an in-place mutation, else `Own`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Convention {
+    Borrow,
+    Own,
+    Inout,
+}
+
+impl Convention {
+    /// The single-letter mnemonic used in IR dumps / shadow reports.
+    pub fn mnemonic(self) -> &'static str {
+        match self {
+            Convention::Borrow => "borrow",
+            Convention::Own => "own",
+            Convention::Inout => "inout",
+        }
+    }
+}
+
 /// Element kinds for unboxed (flat) scalar arrays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FlatElemKind {
@@ -507,20 +546,6 @@ pub enum Instruction {
     Box { dst: Temp, val: Temp, ty: Type },
     /// result = unbox(val, ty) — extract scalar from tagged union
     Unbox { dst: Temp, val: Temp, result_ty: Type },
-    /// KEEP-PACKED box (repr pass, Stage 4): wrap a STILL-PACKED `LinArray*` (elem_tag 0xFE) /
-    /// packed sealed struct* into a 16-byte `TaggedVal` (TAG_ARRAY / TAG_OBJECT) WITHOUT
-    /// materializing — O(1), no deep copy, no per-element retain. The box BORROWS the inner: only
-    /// the shell is a fresh +1; the inner's reference comes from the surrounding
-    /// `transfer_into_container`. `dst`'s repr is `Boxed(WrapsPacked(layout))`. Lowers to the
-    /// `box_array`-by-pointer path (boxing.rs) generalized to the 0xFE kind. `arr` is `true` for a
-    /// sealed ARRAY (TAG_ARRAY), `false` for a sealed RECORD (TAG_OBJECT). See ADR-062.
-    BoxKeepPacked { dst: Temp, src: Temp, ty: Type, arr: bool },
-    /// KEEP-PACKED unbox (repr pass, Stage 4): tag-check the `TaggedVal`, load the payload pointer as
-    /// the STILL-PACKED `LinArray*` / packed struct*, retain it (one shell +1). O(1), zero copy. The
-    /// dst is a `Packed(layout)` temp fed directly to `SealedArrayFieldGet` / packed `FieldGet` /
-    /// `Index`. Lowers to `unbox_ptr` + retain — now JUSTIFIED by the pass (the silent assumption
-    /// becomes a proven one). `ty` is the packed result type; `arr` distinguishes array vs record.
-    UnboxKeepPacked { dst: Temp, src: Temp, ty: Type, arr: bool },
     /// Bind a pattern variable: dst = source val.
     Bind { dst: Temp, src: Temp, ty: Type },
     /// Panic with a message string.
@@ -613,6 +638,18 @@ pub struct LinFunction {
     /// Whether this is a closure (first param is an implicit env pointer).
     pub is_closure: bool,
     pub ret_ty: Type,
+    /// Ownership convention of each parameter, PARALLEL to `params` (Path-10/11 Leg 1).
+    /// Inferred at lowering (`infer_conventions`): `Borrow` for a read-only-never-escaping
+    /// param, `Own` (today's behaviour) when it is stored/captured/returned or on any doubt,
+    /// `Inout` for an in-place-mutated cell. SHADOW MODE: populated + verified, never consumed by
+    /// codegen. Empty until the inference pass runs (a function with no params has an empty vec
+    /// either way); `param_convention(i)` fails safe to `Own` if absent.
+    pub param_conventions: Vec<Convention>,
+    /// Ownership convention of the return value (Path-10/11 Leg 1): `Own` (the caller receives a
+    /// +1 it must release — today's behaviour) or `Borrow` (the function returns a value it does
+    /// not own, e.g. a bare-param pass-through; the caller must not release it). `Inout` is never
+    /// a return convention. SHADOW MODE: inferred + verified, never consumed.
+    pub ret_convention: Convention,
     pub blocks: Vec<BasicBlock>,
     /// Type of every temp in this function.
     pub temp_types: HashMap<Temp, Type>,
@@ -641,6 +678,14 @@ impl LinFunction {
 
     pub fn block(&self, id: BlockId) -> Option<&BasicBlock> {
         self.blocks.iter().find(|b| b.id == id)
+    }
+
+    /// The ownership convention of parameter `i` (Path-10/11 Leg 1). Fails safe to `Own` (today's
+    /// behaviour) when the inference pass has not populated the table or `i` is out of range —
+    /// exactly mirroring the conservative default so an un-inferred param is never treated as a
+    /// borrow (which would be unsound for a consumer).
+    pub fn param_convention(&self, i: usize) -> Convention {
+        self.param_conventions.get(i).copied().unwrap_or(Convention::Own)
     }
 
     /// The physical representation of temp `t` (Stage 3: codegen's single source of truth at every

@@ -181,6 +181,28 @@ val s = suite("std/array", [
     ]
   ),
 
+  // WAVE D: a flatMap whose inner array is HEAP-element (String[]) fused into a downstream chain.
+  // The inner element is a borrowed Index read; a map/filter/reduce terminal consumes it without
+  // moving it (scalar output), so the heap inner is RC-correct (no per-inner-element leak).
+  test("flatMap with String inner fuses into a downstream map+filter+reduce", () =>
+    val total = ["aaa", "bb", "c"]
+      .flatMap(s => [s, s])
+      .map(z => length(z))
+      .filter(n => n > 1)
+      .reduce(0, (a, n) => a + n)
+    [
+      // lengths [3,3,2,2,1,1], keep >1 → [3,3,2,2], sum = 10
+      expect(total).toBe(10)
+    ]
+  ),
+
+  test("flatMap with String inner into a String-preserving lone terminal", () =>
+    val result = ["x", "y"].flatMap(s => [s, s])
+    [
+      expect(result.toString()).toBe("[\"x\", \"x\", \"y\", \"y\"]")
+    ]
+  ),
+
   test("indexOf returns index of found element", () =>
     val result = [10, 20, 30].indexOf(20)
     [

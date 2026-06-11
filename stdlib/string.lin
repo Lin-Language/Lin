@@ -23,6 +23,7 @@ import foreign "lin-runtime"
   val lin_string_char_code: (String, Int32) => Int32
   val lin_string_byte_at: (String, Int32) => Int32
   val lin_string_from_char_code: (Int32) => String
+  val lin_string_from_code_points: (Int32[]) => String
   val lin_string_last_index_of: (String, String) => Int32
   val lin_string_join_arr: (String[], String) => String
   val lin_string_replace_all: (String, String, String) => String
@@ -247,9 +248,7 @@ export val codePointAt = (s: String, index: Int32): Int32 =>
 // @param codes  the code point values, in order.
 // @returns the concatenation of the corresponding characters.
 export val fromCodePoints = (codes: Int32[]): String =>
-  val chars: String[] = []
-  codes.for(code => lin_push(chars, lin_string_from_char_code(code)))
-  lin_string_join_arr(chars, "")
+  lin_string_from_code_points(codes)
 
 // Left-pad `s` with `pad` until it is at least `width` characters wide.
 // @param s      the string to pad.

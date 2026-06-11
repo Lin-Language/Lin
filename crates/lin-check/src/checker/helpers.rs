@@ -138,10 +138,11 @@ pub(crate) fn apply_type_subs(ty: &Type, subs: &std::collections::HashMap<u32, T
         Type::Union(ts) => {
             Type::flatten_union(ts.iter().map(|t| apply_type_subs(t, subs)).collect())
         }
-        Type::Function { params, ret, required } => Type::Function {
+        Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(|p| apply_type_subs(p, subs)).collect(),
             ret: Box::new(apply_type_subs(ret, subs)),
             required: *required,
+            lset: lset.clone(),
         },
         // Record/object fields can hold type parameters (`type Box<T> = { value: T }`,
         // `type Result<T,E> = { value: T } | { error: E }`). Without recursing here, a

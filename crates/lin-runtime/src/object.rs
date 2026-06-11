@@ -103,6 +103,18 @@ unsafe fn migrate_inline_to_heap(obj: *mut LinObject, new_cap: u32) {
 // reconfirmed with `lin_string_key_eq` before it is trusted, and the fuzz/oracle test asserts
 // agreement with a linear scan on every key including absent ones.
 
+/// FNV-1a over a raw byte slice. The single hashing core shared by the LinString-keyed and
+/// byte-keyed lookups, so both probe the SAME index table consistently.
+#[inline]
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 /// FNV-1a over the key bytes. Cheap, good enough distribution for short string keys.
 #[inline]
 unsafe fn hash_key(key: *const LinString) -> u64 {
@@ -111,13 +123,20 @@ unsafe fn hash_key(key: *const LinString) -> u64 {
     }
     let len = (*key).len as usize;
     let data = (*key).data.as_ptr();
-    let bytes = std::slice::from_raw_parts(data, len);
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+    hash_bytes(std::slice::from_raw_parts(data, len))
+}
+
+/// True if the entry key's bytes equal `bytes` (the byte-key analogue of `lin_string_key_eq`).
+#[inline]
+unsafe fn key_eq_bytes(key: *const LinString, bytes: &[u8]) -> bool {
+    if key.is_null() {
+        return false;
     }
-    h
+    if (*key).len as usize != bytes.len() {
+        return false;
+    }
+    let key_slice = std::slice::from_raw_parts((*key).data.as_ptr(), (*key).len as usize);
+    key_slice == bytes
 }
 
 unsafe fn index_table_layout(cap: u32) -> Layout {
@@ -596,6 +615,61 @@ pub unsafe extern "C" fn lin_object_get(obj: *const LinObject, key: *const LinSt
     for i in 0..len {
         let entry = (*obj).entries.add(i as usize);
         if lin_string_key_eq((*entry).key, key) {
+            return &(*entry).value;
+        }
+    }
+    std::ptr::null()
+}
+
+/// Probe the index for the raw key bytes `bytes`. Byte-keyed analogue of `index_probe` (uses the
+/// same FNV-1a core, so it probes the identical table). Returns the matching entry slot or
+/// `u32::MAX`. Caller must have ensured the index is built and clean.
+#[inline]
+unsafe fn index_probe_bytes(obj: *const LinObject, bytes: &[u8]) -> u32 {
+    let table = (*obj).index;
+    let cap = (*obj).index_cap;
+    let mask = (cap - 1) as u64;
+    let mut i = hash_bytes(bytes) & mask;
+    loop {
+        let cell = *table.add(i as usize);
+        if cell == 0 {
+            return u32::MAX;
+        }
+        let slot = cell - 1;
+        let entry = (*obj).entries.add(slot as usize);
+        if key_eq_bytes((*entry).key, bytes) {
+            return slot;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+/// Read-only field lookup by raw key bytes — the byte-keyed analogue of `lin_object_get`. Avoids
+/// allocating a temporary `LinString` just to compare keys (the decode/`fromJson` validator
+/// looks up each object field this way). `key_ptr`/`key_len` describe a UTF-8 key; the scan
+/// compares key bytes directly. Returns a borrowed `*const TaggedVal` into the object's entries,
+/// or null if absent. Uses the same hash index as `lin_object_get` for large objects.
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_get_bytes(
+    obj: *const LinObject,
+    key_ptr: *const u8,
+    key_len: u32,
+) -> *const TaggedVal {
+    if obj.is_null() {
+        return std::ptr::null();
+    }
+    let bytes = std::slice::from_raw_parts(key_ptr, key_len as usize);
+    if ensure_index(obj as *mut LinObject) {
+        let slot = index_probe_bytes(obj, bytes);
+        if slot == u32::MAX {
+            return std::ptr::null();
+        }
+        return &(*(*obj).entries.add(slot as usize)).value;
+    }
+    let len = (*obj).len;
+    for i in 0..len {
+        let entry = (*obj).entries.add(i as usize);
+        if key_eq_bytes((*entry).key, bytes) {
             return &(*entry).value;
         }
     }
@@ -1235,7 +1309,9 @@ mod tests {
             // Read back the first/last of each (UAF check).
             let first_even = lin_array_get_tagged(ea, 0);
             assert_eq!((*first_even).payload as i32, 0);
-            std::alloc::dealloc(first_even as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+            // Cached-box-safe: value 0 is an immutable cached small-int static, so a raw dealloc
+            // would corrupt the cache table — release via the cached-box-safe path.
+            crate::tagged::lin_tagged_release(first_even as *mut u8);
 
             // Teardown: releasing the object frees both group arrays exactly once.
             lin_object_release(obj);
@@ -1283,7 +1359,9 @@ mod tests {
             assert_eq!(lin_array_length(oa), 50);
             let first_even = lin_array_get_tagged(ea, 0);
             assert_eq!((*first_even).payload as i32, 0);
-            std::alloc::dealloc(first_even as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+            // Cached-box-safe: value 0 is an immutable cached small-int static, so a raw dealloc
+            // would corrupt the cache table — release via the cached-box-safe path.
+            crate::tagged::lin_tagged_release(first_even as *mut u8);
 
             lin_map_release(map);
             crate::tagged::lin_tagged_free_box(map_box);

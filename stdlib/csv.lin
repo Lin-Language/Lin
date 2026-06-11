@@ -6,7 +6,7 @@
 // (`parse`/`parseWithHeader`/`stringify`/`stringifyRecords`) reads a whole document at once; the
 // streaming API (`rows`/`recordRows`) is a quote-aware row assembler over a byte stream.
 import { push, length } from "std/array"
-import { for, range, map, while } from "std/iter"
+import { for, range, map } from "std/iter"
 import { keys } from "std/object"
 import { join, byteAt, lengthBytes, substring } from "std/string"
 
@@ -43,29 +43,35 @@ val optDelimInvalid = (opts: CsvOptions): Boolean =>
 val optTrim = (opts: CsvOptions): Boolean =>
   opts["trim"] == true
 
+// Advance `start` past leading ASCII space (32) / tab (9), stopping at `end`. Tail-recursive
+// (TCO'd to a byte loop) — no throwaway range array (the old `range(0,n).while` allocated a
+// length-n Int32 array per trimmed field).
+val trimStart = (s: String, start: Int32, end: Int32): Int32 =>
+  if start < end then
+    val b = byteAt(s, start)
+    if b == 32 || b == 9 then
+      trimStart(s, start + 1, end)
+    else
+      start
+  else
+    start
+
+// Retract `end` past trailing ASCII space / tab, stopping at `start`. Tail-recursive (TCO'd).
+val trimEnd = (s: String, start: Int32, end: Int32): Int32 =>
+  if end > start then
+    val b = byteAt(s, end - 1)
+    if b == 32 || b == 9 then
+      trimEnd(s, start, end - 1)
+    else
+      end
+  else
+    end
+
 // Trim leading/trailing ASCII space (32) and tab (9) from an unquoted field. Byte-scanned.
 val trimAsciiWs = (s: String): String =>
   val n = lengthBytes(s)
-  var start = 0
-  var end = n
-  // `while` stops at the first non-space (short-circuits; a `range(...).for` would scan the whole
-  // field even after the trim boundary).
-  range(0, n).while(_ =>
-    val b = byteAt(s, start)
-    if (b == 32 || b == 9) && start < end then
-      start = start + 1
-      true
-    else
-      false
-  )
-  range(0, n).while(_ =>
-    val b = byteAt(s, end - 1)
-    if (b == 32 || b == 9) && end > start then
-      end = end - 1
-      true
-    else
-      false
-  )
+  val start = trimStart(s, 0, n)
+  val end = trimEnd(s, start, n)
   substring(s, start, end)
 
 // ── the field scanner ────────────────────────────────────────────────────────
@@ -73,71 +79,76 @@ val trimAsciiWs = (s: String): String =>
 //   { "value": String, "pos": Int32, "ok": Boolean }
 // `pos` on return points at the delimiter / CR / LF / EOF that terminates the field. `ok` is false
 // only for a malformed field (a stray `"` in an unquoted field, or EOF inside a quoted field).
+// Walk a quoted field from byte `i`, accumulating spans between escaped quotes into `parts`
+// (threaded as a parameter, like `scanRows` threads `rows`). Doubling `""` -> `"`. Returns a cursor
+//   { "pos": Int32, "ok": Boolean }
+// — `pos` points just past the closing quote, `ok` is false on EOF inside the quote. Tail-recursive
+// (TCO'd to a byte loop), so it allocates ZERO throwaway arrays — unlike `range(0,n).while`, which
+// materialised a length-n Int32 array on EVERY field, making `parse` O(N²) in allocation.
+val scanQuotedSpans = (s: String, n: Int32, i: Int32, segStart: Int32, parts: String[]): Json =>
+  val b = byteAt(s, i)
+  if b == -1 then
+    // EOF inside a quoted field -> unterminated quote.
+    {
+      "pos": n,
+      "ok": false
+    }
+  else if b == QUOTE then
+    val next = byteAt(s, i + 1)
+    if next == QUOTE then
+      // Escaped quote: emit the span up to and including this quote's position, skip the pair.
+      push(parts, substring(s, segStart, i + 1))
+      scanQuotedSpans(s, n, i + 2, i + 2, parts)
+    else
+      // Closing quote: emit the final span, terminate.
+      push(parts, substring(s, segStart, i))
+      {
+        "pos": i + 1,
+        "ok": true
+      }
+  else
+    scanQuotedSpans(s, n, i + 1, segStart, parts)
+
+// Walk an unquoted field from byte `i` to the delimiter / CR / LF / EOF. A `"` mid-field is a
+// stray-quote error. Returns a cursor { "pos": Int32, "ok": Boolean }. Tail-recursive (TCO'd to a
+// byte loop) — zero throwaway arrays (the old `range(0,n+1).while` allocated a length-n array per
+// field).
+val scanUnquoted = (s: String, n: Int32, i: Int32, delim: Int32): Json =>
+  val b = byteAt(s, i)
+  if b == -1 || b == delim || b == CR || b == LF then
+    {
+      "pos": i,
+      "ok": true
+    }
+  else if b == QUOTE then
+    {
+      "pos": i,
+      "ok": false
+    }
+  else
+    scanUnquoted(s, n, i + 1, delim)
+
 val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean): Json =>
   val first = byteAt(s, start)
   if first == QUOTE then
-    // Quoted field: scan to the matching close quote, doubling `""` -> `"`. We accumulate spans
-    // between escaped quotes and join them, so the common (no-escape) case is a single slice.
-    var i = start + 1
-    var segStart = start + 1
+    // Quoted field: accumulate spans between escaped quotes and join them, so the common
+    // (no-escape) case is a single slice.
     val parts: String[] = []
-    var ok = false
-    var endPos = n
-    // Bounded walk via `while` (which SHORT-CIRCUITS — `range(...).for` would run the full bound
-    // even after the field ends, making the parser O(n²)). The callback returns true to continue,
-    // false to stop. Each step advances `i` by >= 1, so it terminates in O(field length).
-    range(0, n).while(_ =>
-      val b = byteAt(s, i)
-      if b == -1 then
-        // EOF inside a quoted field -> unterminated quote.
-        ok = false
-        endPos = n
-        false
-      else if b == QUOTE then
-        val next = byteAt(s, i + 1)
-        if next == QUOTE then
-          // Escaped quote: emit the span up to and including this quote's position, skip the pair.
-          push(parts, substring(s, segStart, i + 1))
-          i = i + 2
-          segStart = i
-          true
-        else
-          // Closing quote: emit the final span, terminate.
-          push(parts, substring(s, segStart, i))
-          i = i + 1
-          ok = true
-          endPos = i
-          false
-      else
-        i = i + 1
-        true
-    )
+    val res = scanQuotedSpans(s, n, start + 1, start + 1, parts)
     {
       "value": join(parts, ""),
-      "pos": endPos,
-      "ok": ok
+      "pos": res["pos"],
+      "ok": res["ok"]
     }
   else
     // Unquoted field: scan to delimiter / CR / LF / EOF. A `"` mid-field is a stray-quote error.
-    // `while` short-circuits (a `range(...).for` would run the full bound — O(n²)).
-    var i = start
-    var ok = true
-    range(0, n + 1).while(_ =>
-      val b = byteAt(s, i)
-      if b == -1 || b == delim || b == CR || b == LF then
-        false
-      else if b == QUOTE then
-        ok = false
-        false
-      else
-        i = i + 1
-        true
-    )
+    val res = scanUnquoted(s, n, start, delim)
+    val i: Int32 = res["pos"]
     val raw = substring(s, start, i)
     {
       "value": if trim then trimAsciiWs(raw) else raw,
       "pos": i,
-      "ok": ok
+      "ok": res["ok"]
     }
 
 // Parse ONE record (a row) starting at byte `start`. Returns ONE consistent shape:
@@ -145,40 +156,49 @@ val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean)
 // `pos` points just past the record terminator (the byte after LF / after CRLF), or at EOF. `ok`
 // false propagates a malformed-field error. A record is at least one field (CSV has no zero-field
 // row).
+// Scan fields from byte `pos`, pushing each onto `fields` (threaded as a parameter). Returns a
+// cursor { "pos": Int32, "ok": Boolean } once the record terminator (delimiter run ends at CR / LF /
+// CRLF / EOF) is reached. Tail-recursive (TCO'd) — one field per step, no throwaway arrays (the old
+// `range(0,n+1).while` allocated a length-n Int32 array per record).
+val scanRecordFields = (s: String, n: Int32, pos: Int32, delim: Int32, trim: Boolean, fields: String[]): Json =>
+  val cur = scanField(s, n, pos, delim, trim)
+  if cur["ok"] != true then
+    {
+      "pos": pos,
+      "ok": false
+    }
+  else
+    push(fields, cur["value"])
+    val fieldEnd: Int32 = cur["pos"]
+    val b = byteAt(s, fieldEnd)
+    if b == delim then
+      scanRecordFields(s, n, fieldEnd + 1, delim, trim, fields) // another field follows
+    else if b == CR then
+      // CR or CRLF terminates the record.
+      val nb = byteAt(s, fieldEnd + 1)
+      {
+        "pos": if nb == LF then fieldEnd + 2 else fieldEnd + 1,
+        "ok": true
+      }
+    else if b == LF then
+      {
+        "pos": fieldEnd + 1,
+        "ok": true
+      }
+    else
+      // EOF terminates the final record.
+      {
+        "pos": fieldEnd,
+        "ok": true
+      }
+
 val scanRecord = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean): Json =>
   val fields: String[] = []
-  var pos = start
-  var ok = true
-  // `while` short-circuits at the record terminator (a `range(...).for` would run the full bound —
-  // making the whole parse O(n²)). One field is scanned per iteration; bounded by n+1 fields.
-  range(0, n + 1).while(_ =>
-    val cur = scanField(s, n, pos, delim, trim)
-    if cur["ok"] != true then
-      ok = false
-      false
-    else
-      push(fields, cur["value"])
-      pos = cur["pos"]
-      val b = byteAt(s, pos)
-      if b == delim then
-        pos = pos + 1 // another field follows
-        true
-      else if b == CR then
-        // CR or CRLF terminates the record.
-        val nb = byteAt(s, pos + 1)
-        pos = if nb == LF then pos + 2 else pos + 1
-        false
-      else if b == LF then
-        pos = pos + 1
-        false
-      else
-        // EOF terminates the final record.
-        false
-  )
+  val res = scanRecordFields(s, n, start, delim, trim, fields)
   {
     "fields": fields,
-    "pos": pos,
-    "ok": ok
+    "pos": res["pos"],
+    "ok": res["ok"]
   }
 
 // ── eager parse ──────────────────────────────────────────────────────────────

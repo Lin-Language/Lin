@@ -120,9 +120,9 @@ impl<'ctx> Codegen<'ctx> {
             // lin_tagged_eq / combinators) can read directly. `box_value` is the GENERICALLY-DYNAMIC
             // boxing entry (toString / keys / spread / heterogeneous element / closure arg), so it
             // MATERIALIZES to a tagged `Object[]` here — the fail-safe boxed view. The keep-packed
-            // container-store path (the dijkstra fix) does NOT route through `box_value`; it emits
-            // `BoxKeepPacked` directly at `emit_map_set` so only the genuinely-dynamic consumers pay
-            // the materialize (repr pass, Stage 4 boundary catalogue).
+            // container-store path does NOT route through `box_value`; `emit_map_set` calls
+            // `compile_ir_box_keep_packed` directly so only the genuinely-dynamic consumers pay the
+            // materialize.
             Type::Array(_) if val.is_pointer_value() && Self::sealed_array_elem(val_ty).is_some() => {
                 let tagged = self.sealed_array_to_tagged(val, val_ty);
                 self.builder.call(self.rt.box_array, &[tagged.into()], "boxsarr")
@@ -151,9 +151,9 @@ impl<'ctx> Codegen<'ctx> {
             // node MUST be MATERIALIZED to a real boxed `LinObject` here (boxing the raw `*SumNode` as
             // TAG_OBJECT was a latent type-confusion bug: the consumer's `object_get`/release walked a
             // SumNode header as a LinObject → garbage discriminant / crash). The keep-packed
-            // container-store boundary (Map value slot) does NOT route through `box_value`; it emits
-            // `BoxKeepPacked` (TAG_SUMNODE) directly so only the genuinely-dynamic consumers pay the
-            // materialize. Handle BEFORE the generic Union arm (a sum type IS a `Type::Union`).
+            // container-store boundary (Map value slot) does NOT route through `box_value`; it stores a
+            // TAG_SUMNODE node directly so only the genuinely-dynamic consumers pay the materialize.
+            // Handle BEFORE the generic Union arm (a sum type IS a `Type::Union`).
             Type::Union(_) if Self::is_sum_type(val_ty) && val.is_pointer_value() => {
                 let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 let obj = self.sumnode_materialize_to_object(val, val_ty, llvm_fn);
@@ -353,7 +353,14 @@ impl<'ctx> Codegen<'ctx> {
         let i8_ty = self.context.i8_type();
         let i64_ty = self.context.i64_type();
         let tagged_ty = self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false);
-        let alloca = self.builder.alloca(tagged_ty, "tv");
+        // Place the scratch slot at the TOP of the function entry block, NOT at the current insert
+        // point. This TaggedVal is a fixed-size, immediately-consumed temporary (lin_map_set/… copy
+        // the value out), so one entry-block slot can be safely reused every iteration. Emitting it
+        // at the current position would, on an inlined-combinator loop body (the Layer-1 capturing-
+        // lambda inline path), allocate one stack slot PER iteration — `alloca` outside the entry
+        // block is not reclaimed until function return — and overflow the stack at scale (the
+        // map_flat_scalar segfault). Mirrors the home-alloca hoist in mod.rs.
+        let alloca = self.entry_block_alloca(tagged_ty, "tv");
 
         let tag = Self::type_tag(val_ty);
         let tag_val = i8_ty.const_int(tag as u64, false);
@@ -365,6 +372,29 @@ impl<'ctx> Codegen<'ctx> {
         let payload = self.tagged_payload_i64(val, val_ty);
         self.builder.store(payload_ptr, payload);
         alloca
+    }
+
+    /// Emit an `alloca` at the TOP of the current function's entry block (not the current insert
+    /// point), then restore the builder to its previous position. Use for fixed-size scratch slots
+    /// that are written/consumed immediately each time, so a SINGLE entry-block slot is reused for
+    /// the whole function rather than leaking one stack slot per loop iteration (an `alloca` in a
+    /// loop body is never reclaimed until the function returns — at scale that overflows the stack).
+    /// Mirrors the home-alloca hoist in `mod.rs`.
+    pub(crate) fn entry_block_alloca<T: inkwell::types::BasicType<'ctx>>(
+        &self,
+        ty: T,
+        name: &str,
+    ) -> PointerValue<'ctx> {
+        let cur_block = self.builder.get_insert_block().unwrap();
+        let llvm_fn = cur_block.get_parent().unwrap();
+        let entry_bb = llvm_fn.get_first_basic_block().unwrap();
+        match entry_bb.get_first_instruction() {
+            Some(first) => self.builder.position_before(&first),
+            None => self.builder.position_at_end(entry_bb),
+        }
+        let slot = self.builder.alloca(ty, name);
+        self.builder.position_at_end(cur_block);
+        slot
     }
 
     /// KEEP-PACKED box (repr pass Stage 4): wrap a still-packed `LinArray*` (elem_tag 0xFE) / packed
@@ -386,12 +416,13 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// KEEP-PACKED unbox (repr pass Stage 4): tag-check + load the payload pointer as the still-packed
-    /// `LinArray*` / packed struct*, then retain it (one shell +1). O(1), zero copy. This is the
-    /// justified form of the historically-unguarded `unbox_ptr` assumption: the pass proves the slot
-    /// holds a keep-packed handle (`Boxed(WrapsPacked(L))`), so reading the payload as a packed
-    /// pointer is sound. The retain pairs with the `Release` the pass schedules at the use's last
-    /// drop (the read-back temp owns a +1 of the packed buffer).
+    /// KEEP-PACKED unbox: tag-check + load the payload pointer as the still-packed `LinArray*` /
+    /// packed struct*, then retain it (one shell +1). O(1), zero copy. Called DIRECTLY from
+    /// `compile_ir_index` for a `{String: Sealed[]}` map-value read, where the slot is known to hold a
+    /// still-packed buffer wrapped in a `TaggedVal` (written by `emit_map_set`'s keep-packed store), so
+    /// reading the payload as a packed pointer is sound. The retain balances the `Release` the pass
+    /// schedules at the read-back temp's last drop. (Not driven by any IR opcode — the never-emitted
+    /// `UnboxKeepPacked` instruction was removed.)
     pub(crate) fn compile_ir_unbox_keep_packed(&mut self, val: BasicValueEnum<'ctx>, _arr: bool) -> BasicValueEnum<'ctx> {
         if !val.is_pointer_value() {
             return val;
@@ -439,13 +470,21 @@ impl<'ctx> Codegen<'ctx> {
         if !tagged.is_pointer_value() { return tagged; }
         let ptr = tagged.into_pointer_value();
         match ty {
-            Type::Int32 => {
-                self.builder.call(self.rt.unbox_int32, &[ptr.into()], "ir_i32").try_as_basic_value().unwrap_basic()
+            Type::Int8 | Type::Int16 | Type::Int32 => {
+                // Boxed as TAG_INT32 (sign-extended at box time). Read i32 and truncate to the
+                // target width (a no-op bitcast for Int32). Without the Int8/Int16 arms these fell
+                // through to `_ => tagged`, leaking the raw box pointer where a narrow scalar was
+                // expected — the gate-divergence inline path's `for(x => push(buf, x))` over a
+                // `UInt8[]`/`Int8[]` with a Json-typed lambda param (codegen signature mismatch).
+                let v = self.builder.call(self.rt.unbox_int32, &[ptr.into()], "ir_i32").try_as_basic_value().unwrap_basic().into_int_value();
+                let ity = self.llvm_type(ty).into_int_type();
+                self.builder.int_truncate_or_bit_cast(v, ity, "ir_inarrow").into()
             }
-            Type::UInt32 => {
-                // Boxed as TAG_INT64 (zero-extended); read i64 and truncate to i32 width.
-                let v = self.builder.call(self.rt.unbox_int64, &[ptr.into()], "ir_u32_64").try_as_basic_value().unwrap_basic().into_int_value();
-                self.builder.int_truncate_or_bit_cast(v, self.context.i32_type(), "ir_u32").into()
+            Type::UInt8 | Type::UInt16 | Type::UInt32 => {
+                // Boxed as TAG_INT64 (zero-extended); read i64 and truncate to the target width.
+                let v = self.builder.call(self.rt.unbox_int64, &[ptr.into()], "ir_u_64").try_as_basic_value().unwrap_basic().into_int_value();
+                let ity = self.llvm_type(ty).into_int_type();
+                self.builder.int_truncate_or_bit_cast(v, ity, "ir_unarrow").into()
             }
             Type::Int64 => {
                 self.builder.call(self.rt.unbox_int64, &[ptr.into()], "ir_i64").try_as_basic_value().unwrap_basic()
