@@ -287,6 +287,50 @@ fn is_concrete_rc_ty(ty: &Type) -> bool {
     )
 }
 
+/// Whether the box/unbox `Coerce` emitted across the union boundary produces a `dst` that ALIASES the
+/// source `arg`'s inner heap payload — i.e. whether `lower::record_escape_alias(dst, arg)` must fire.
+/// This is the single ownership fact the lowerer's union-boundary `Coerce` arm needs: when the coerced
+/// box and the source share the SAME inner heap pointer, that source must be treated as KEPT whenever
+/// the box is threaded into a self-tail-call param slot (releasing it on the back-edge would free the
+/// inner pointer the slot now holds → double-free); when they do NOT share an inner pointer, the
+/// source is a genuine orphan after the `Coerce` and must be released before the back-edge (aliasing it
+/// would leak it every iteration).
+///
+/// Two directions, exactly one of which applies inside the `is_union_ty(param) != is_union_ty(arg)`
+/// arm (the boolean inequality guarantees exactly one operand is a union):
+///
+/// - **UNBOX** (union `arg` → concrete `param`): alias iff the unboxed payload is a HEAP pointer
+///   (`is_rc_type(param)`) — that pointer is what lands in the param slot, so the source box is kept.
+///   A SCALAR unbox (`param` not rc) reads the value OUT of the box, leaving the box a genuine orphan
+///   → do NOT alias (else a 16-byte `TaggedVal` leaks per loop iteration).
+/// - **WIDEN** (concrete `arg` → union `param`): the `box_*` wraps the inner WITHOUT bumping its rc, so
+///   the box `dst` aliases `arg`'s inner — alias it so the inner survives a back-edge. EXCEPTION: a
+///   SEALED scalar record arg is materialized to a FRESH independent `LinObject` (its heap fields
+///   retained), so the box does NOT alias the source struct; the source is a genuine orphan and must be
+///   released → do NOT alias (else the whole packed struct + its String/array fields leak per iteration,
+///   the RAPTOR `Trip | Null` RANGE-phase scaling leak).
+///
+/// Relocated VERBATIM from the two inline `record_escape_alias` gates in `lower::lower_coerce_arg`
+/// (the box/unbox arm). `is_union_ty` / `is_rc_type` are mirrored here as `is_union_owning_ty` /
+/// `is_concrete_rc_ty`; the one predicate that lives only in `lower` — `is_sealed_scalar_repr`, a
+/// recursive sealed-field tree that must stay codegen's single source of truth — is passed in by the
+/// caller as `arg_is_sealed_scalar_repr` rather than re-derived here (re-deriving it would fork that
+/// gate). The lowerer reads this and emits (or skips) the same `record_escape_alias`, so the resulting
+/// IR — and therefore the RC — is byte-identical.
+pub fn escape_alias_convention(arg_ty: &Type, param_ty: &Type, arg_is_sealed_scalar_repr: bool) -> bool {
+    let arg_union = is_union_owning_ty(arg_ty);
+    let param_union = is_union_owning_ty(param_ty);
+    // UNBOX: union arg → concrete heap param.
+    if arg_union && !param_union && is_concrete_rc_ty(param_ty) {
+        return true;
+    }
+    // WIDEN: concrete heap arg → union param, excluding the sealed-record materialize case.
+    if !arg_union && param_union && is_concrete_rc_ty(arg_ty) && !arg_is_sealed_scalar_repr {
+        return true;
+    }
+    false
+}
+
 // ===========================================================================
 // 2. Convention inference at lowering
 // ===========================================================================
@@ -1023,5 +1067,24 @@ mod tests {
     fn intrinsic_table_push_is_inout_own() {
         let c = intrinsic_conventions(&Intrinsic::Push).unwrap();
         assert_eq!(c.params, vec![Convention::Inout, Convention::Own]);
+    }
+
+    /// `escape_alias_convention` mirrors the two former inline `record_escape_alias` gates in
+    /// `lower::lower_coerce_arg`'s box/unbox arm. Pin each decision so a future edit cannot drift it.
+    #[test]
+    fn escape_alias_unbox_and_widen_gates() {
+        let arr = Type::Array(Box::new(Type::Int32));
+        let json = Type::TypeVar(u32::MAX); // a union/boxed view
+        // UNBOX union arg → concrete HEAP param: alias.
+        assert!(escape_alias_convention(&json, &arr, false));
+        // UNBOX union arg → concrete SCALAR param: do NOT alias (box is orphaned).
+        assert!(!escape_alias_convention(&json, &Type::Int32, false));
+        // WIDEN concrete heap arg → union param, non-sealed: alias.
+        assert!(escape_alias_convention(&arr, &json, false));
+        // WIDEN concrete heap arg → union param, SEALED record source: do NOT alias (materialized).
+        assert!(!escape_alias_convention(&arr, &json, true));
+        // Same-side (both concrete / both union): not in the box/unbox arm → never alias.
+        assert!(!escape_alias_convention(&arr, &arr, false));
+        assert!(!escape_alias_convention(&json, &json, false));
     }
 }
