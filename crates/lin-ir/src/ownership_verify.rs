@@ -402,6 +402,39 @@ fn needs_owning_insert(ty: &Type) -> bool {
     is_concrete_rc_ty(ty) || is_union_owning_ty(ty)
 }
 
+/// Whether widening a value of `value_ty` into a `slot_ty` cell/slot (a `var` init, a captured-heap
+/// `CellSet`, a module-global `GlobalValSet`) produces a FRESH, DISTINCT 16-byte `TaggedVal*` shell
+/// whose inner payload's ownership lives ELSEWHERE — so the shell must be reclaimed (`FreeBoxShell`
+/// → `lin_tagged_free_box`) once its bytes have been move-copied/cloned into the owned store(s).
+///
+/// This is the single ownership fact the lowerer's box-shell-reclaim sites need. When a CONCRETE
+/// value is stored into a UNION/Json slot whose representation differs, `coerce_to_slot_type`
+/// allocates a fresh transient box wrapping the raw value; the raw value keeps its OWN +1 (released
+/// at scope exit), and the owning-store / owning-read clones produce the slot's and the result's
+/// independent references. The transient box is then an ORPHAN: its 16-byte shell is unreferenced,
+/// its inner is owned by the raw value's scope-exit release — so freeing ONLY the shell
+/// (`lin_tagged_free_box` never touches the inner) exactly balances it, and without it the shell
+/// leaks per store (`var x: Json = 1_000_000` / a `var`/global reassignment to a concrete value).
+///
+/// True iff the slot is a boxed union (`is_union_owning_ty`), the value is NOT already a union (so a
+/// new box really is allocated rather than the existing box forwarded), AND their representations
+/// differ (`repr_differs`). When the slot is concrete (no union box made) or the value is already a
+/// boxed union (the box is a clone/forward owned elsewhere) the result is `false` — nothing to free.
+///
+/// Relocated VERBATIM from the three identical inline `made_fresh_box` gates that drive the
+/// `FreeBoxShell` reclaim in `lower.rs` (`coerce_and_own_store`, the captured-cell `LocalSet`, and
+/// the module-global `LocalSet`): `is_union_ty(slot) && !is_union_ty(value) && type_repr_differs(value, slot)`.
+/// `is_union_ty` is mirrored here as `is_union_owning_ty`; the one predicate that lives only in
+/// `lower` — `type_repr_differs`, a deep recursive walk entangled with `is_sealed_scalar_repr` /
+/// `repr::sum_type_eligible` / `param_elem_is_boxed_repr` that must stay codegen's single source of
+/// truth — is computed by the caller and passed in as `repr_differs` (exactly as
+/// `escape_alias_convention` takes `is_sealed_scalar_repr` and `container_insert_convention` takes
+/// `source_is_fresh_alloc` by argument). The lowerer reads this and emits (or skips) the same
+/// `FreeBoxShell`, so the resulting IR — and therefore the RC — is byte-identical.
+pub fn box_shell_reclaim(value_ty: &Type, slot_ty: &Type, repr_differs: bool) -> bool {
+    is_union_owning_ty(slot_ty) && !is_union_owning_ty(value_ty) && repr_differs
+}
+
 // ===========================================================================
 // 2. Convention inference at lowering
 // ===========================================================================
@@ -1179,5 +1212,25 @@ mod tests {
         assert_eq!(container_insert_convention(&arr, false, false), ContainerInsert::Retain);
         assert_eq!(container_insert_convention(&arr, true, true), ContainerInsert::Transfer);
         assert_eq!(container_insert_convention(&arr, true, false), ContainerInsert::Retain);
+    }
+
+    /// `box_shell_reclaim` mirrors the three identical inline `made_fresh_box` gates that drive the
+    /// `FreeBoxShell` reclaim in `lower.rs` (`coerce_and_own_store`, the captured-cell + global
+    /// `LocalSet`): `is_union_ty(slot) && !is_union_ty(value) && type_repr_differs`. Pin each outcome
+    /// so a future edit cannot drift the fresh-distinct-shell-must-be-reclaimed decision.
+    #[test]
+    fn box_shell_reclaim_widen_gate() {
+        let arr = Type::Array(Box::new(Type::Int32));
+        let json = Type::TypeVar(u32::MAX); // a union/boxed slot view
+        // Concrete value → union slot, repr differs (a fresh box really made): reclaim the shell.
+        assert!(box_shell_reclaim(&arr, &json, true));
+        assert!(box_shell_reclaim(&Type::Int32, &json, true));
+        // Same case but repr does NOT differ (no box made — caller's type_repr_differs said so):
+        // nothing to free.
+        assert!(!box_shell_reclaim(&arr, &json, false));
+        // Slot is concrete (not a union): no union box is ever made → never reclaim.
+        assert!(!box_shell_reclaim(&arr, &arr, true));
+        // Value is ALREADY a union (the box is a clone/forward owned elsewhere): never reclaim here.
+        assert!(!box_shell_reclaim(&json, &json, true));
     }
 }
