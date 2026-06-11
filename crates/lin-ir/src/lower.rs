@@ -1602,7 +1602,14 @@ fn own_for_store(t: Temp, ty: &Type, builder: &mut FuncBuilder) -> Temp {
 /// `b`'s 16-byte shell (NOT its inner) to avoid a per-store box leak. When no transient box
 /// was created (already-union value, or non-union slot), nothing extra is freed.
 fn coerce_and_own_store(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
-    let made_fresh_box = is_union_ty(slot_ty) && !is_union_ty(value_ty) && type_repr_differs(value_ty, slot_ty);
+    // Box-shell-reclaim ownership fact (whether widening into the union slot made a fresh distinct
+    // shell that must be `FreeBoxShell`d) lives in the ownership authority; `type_repr_differs` is the
+    // lower-only repr predicate it requires, passed in.
+    let made_fresh_box = crate::ownership_verify::box_shell_reclaim(
+        value_ty,
+        slot_ty,
+        type_repr_differs(value_ty, slot_ty),
+    );
     let coerced = coerce_to_slot_type(t, value_ty, slot_ty, builder);
     let stored = own_for_store(coerced, slot_ty, builder);
     if made_fresh_box {
@@ -3227,9 +3234,11 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                     // cell's owned reference and once for the assignment result, then free the
                     // orphaned `v` shell (its inner is owned by the raw value's scope-exit release).
                     // Mirrors the Var-init path's `coerce_and_own_store` and the global path below.
-                    let made_fresh_box = is_union_ty(&cell_ty)
-                        && !is_union_ty(&value.ty())
-                        && type_repr_differs(&value.ty(), &cell_ty);
+                    let made_fresh_box = crate::ownership_verify::box_shell_reclaim(
+                        &value.ty(),
+                        &cell_ty,
+                        type_repr_differs(&value.ty(), &cell_ty),
+                    );
                     // The cell owns an INDEPENDENT reference to its value: take an owned copy on
                     // store so it survives the producing scope's own release, and codegen
                     // releases the cell's OLD reference on reassignment (fixing the
@@ -3273,8 +3282,11 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                 // owned by the raw value's scope-exit release, NOT by `v`). Mirrors the Var-init
                 // path's `coerce_and_own_store`. When no fresh box was made (already-union value,
                 // or non-union slot), nothing extra is freed.
-                let made_fresh_box =
-                    is_union_ty(&gty) && !is_union_ty(&value.ty()) && type_repr_differs(&value.ty(), &gty);
+                let made_fresh_box = crate::ownership_verify::box_shell_reclaim(
+                    &value.ty(),
+                    &gty,
+                    type_repr_differs(&value.ty(), &gty),
+                );
                 // The global owns an INDEPENDENT reference to its value (symmetric owning model,
                 // mirroring the captured-cell path above). For unions this CLONES the box
                 // (`own_for_store` → `CloneBox`/`lin_tagged_clone`) so the global gets its OWN
