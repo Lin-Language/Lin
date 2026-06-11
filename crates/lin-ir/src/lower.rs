@@ -1579,15 +1579,17 @@ fn needs_owning(ty: &Type) -> bool {
 /// Mirrors `own_for_read`; together with codegen's release-old these keep the four sides
 /// (store/read/release-old/teardown) symmetric for both concrete and union slot types.
 fn own_for_store(t: Temp, ty: &Type, builder: &mut FuncBuilder) -> Temp {
-    if is_union_ty(ty) {
-        let dst = builder.alloc_temp(ty.clone());
-        builder.emit(Instruction::CloneBox { dst, src: t, ty: ty.clone() });
-        dst
-    } else if is_rc_type(ty) {
-        builder.emit(Instruction::Retain { val: t, ty: ty.clone() });
-        t
-    } else {
-        t
+    match crate::ownership_verify::owning_strategy(ty) {
+        crate::ownership_verify::OwningStrategy::Clone => {
+            let dst = builder.alloc_temp(ty.clone());
+            builder.emit(Instruction::CloneBox { dst, src: t, ty: ty.clone() });
+            dst
+        }
+        crate::ownership_verify::OwningStrategy::Retain => {
+            builder.emit(Instruction::Retain { val: t, ty: ty.clone() });
+            t
+        }
+        crate::ownership_verify::OwningStrategy::Trivial => t,
     }
 }
 
@@ -1618,17 +1620,19 @@ fn coerce_and_own_store(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut 
 ///   exit never frees the cell's box) + register the cloned temp.
 /// Returns the temp to use as the read result.
 fn own_for_read(t: Temp, ty: &Type, builder: &mut FuncBuilder) -> Temp {
-    if is_union_ty(ty) {
-        let dst = builder.alloc_temp(ty.clone());
-        builder.emit(Instruction::CloneBox { dst, src: t, ty: ty.clone() });
-        builder.register_owned(dst, ty.clone());
-        dst
-    } else if is_rc_type(ty) {
-        builder.emit(Instruction::Retain { val: t, ty: ty.clone() });
-        builder.register_owned(t, ty.clone());
-        t
-    } else {
-        t
+    match crate::ownership_verify::owning_strategy(ty) {
+        crate::ownership_verify::OwningStrategy::Clone => {
+            let dst = builder.alloc_temp(ty.clone());
+            builder.emit(Instruction::CloneBox { dst, src: t, ty: ty.clone() });
+            builder.register_owned(dst, ty.clone());
+            dst
+        }
+        crate::ownership_verify::OwningStrategy::Retain => {
+            builder.emit(Instruction::Retain { val: t, ty: ty.clone() });
+            builder.register_owned(t, ty.clone());
+            t
+        }
+        crate::ownership_verify::OwningStrategy::Trivial => t,
     }
 }
 
