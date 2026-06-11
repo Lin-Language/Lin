@@ -257,6 +257,51 @@ pub(crate) fn is_legal_ffi_type(ty: &Type) -> bool {
     }
 }
 
+/// Returns true if a *captured* value of this type is unsafe to transfer to a worker thread.
+///
+/// Narrower than `is_definitely_non_transferable`: `Function` values are intentionally excluded
+/// here (they are safe to copy across threads — closures over immutable vals are purely
+/// referentially transparent). `Stream` is excluded because it crosses thread boundaries legally
+/// via CAP_MOVE. Only opaque cursor-sharing handles (`TarEntry`, `Iterator`) are rejected at the
+/// capture site.
+fn is_non_transferable_capture_ty(ty: &Type) -> bool {
+    match ty {
+        Type::TarEntry | Type::Iterator(_) => true,
+        Type::Array(inner) => is_non_transferable_capture_ty(inner),
+        Type::Union(ts) => ts.iter().any(is_non_transferable_capture_ty),
+        _ => false,
+    }
+}
+
+/// Returns the name and type of the first captured binding in a directly-nested
+/// `TypedExpr::Function` whose type is non-transferable (i.e. `TarEntry` or `Iterator`), or
+/// `None` if there are none. Used by the async-thunk capture gate.
+///
+/// Note: `Stream` and `Function` captures are intentionally NOT rejected here — streams cross
+/// thread boundaries by MOVE (CAP_MOVE); functions are pure value types safe to copy across
+/// threads. This helper only fires for the opaque cursor-sharing types (`TarEntry` primarily).
+///
+/// Does NOT recurse into inner functions (same scope restriction as `first_mutable_capture`).
+pub(crate) fn first_non_transferable_capture(
+    expr: &TypedExpr,
+) -> Option<(String, Type)> {
+    match expr {
+        TypedExpr::Function { captures, .. } => {
+            captures.iter().find_map(|c| {
+                if is_non_transferable_capture_ty(&c.ty) {
+                    Some((c.name.clone(), c.ty.clone()))
+                } else {
+                    None
+                }
+            })
+        }
+        TypedExpr::MakeArray { elements, .. } => {
+            elements.iter().find_map(first_non_transferable_capture)
+        }
+        _ => None,
+    }
+}
+
 /// Returns the name of the first mutable capture (or global var reference) found in a
 /// directly-nested `TypedExpr::Function`, or `None` if there are none.
 /// Does NOT recurse into inner functions.
