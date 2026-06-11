@@ -1991,7 +1991,26 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.gep(self.context.i8_type(), obj, &[i64_ty.const_int(offset, false)], "sealed_set_p")
             };
             self.builder.store(p, stored);
-            let owned = *already_owned || repr_change;
+            // A representation-changing coerce USUALLY produces a FRESH +1-owned value — a sealed
+            // record/array PROJECTION (allocates), a flat-array WIDEN (fresh buffer), or a Json→Map
+            // MATERIALIZE (fresh LinMap) — so the struct can store it verbatim and own it. BUT the
+            // union/Json → concrete-HEAP unbox (a `String`, a BOXED `Object[]` — e.g. `StopTime[]`,
+            // whose String fields keep it boxed — or a non-sealed object field) routes through
+            // `unbox_tagged_val_to_type` → `lin_unbox_ptr`, which returns the source box's interior
+            // pointer BORROWED, with NO new reference. Treating that as owned (the old `owned =
+            // repr_change`) skipped the retain, so when the lowerer releases the source box at scope
+            // exit the field's buffer is freed and the struct dangles — the `Trip { stopTimes:
+            // StopTime[] }`-built-from-a-`Json`-array use-after-free (a packed `Trip[]` then read
+            // garbage lengths / corrupted data). Detect that borrowing path and fall through to the
+            // retain below so the struct takes its own +1. Sealed-record / packed-sealed-array / Map
+            // fields are EXCLUDED (their coerce genuinely allocates a fresh +1) — unchanged, so those
+            // paths stay byte-identical.
+            let coerce_borrowed = repr_change
+                && Self::is_union_type(val_ty)
+                && Self::sealed_fields(&fld_ty).is_none()
+                && Self::sealed_array_elem(&fld_ty).is_none()
+                && !matches!(fld_ty, Type::Map(_));
+            let owned = (*already_owned || repr_change) && !coerce_borrowed;
             if Self::sealed_field_kind(&fld_ty).is_some() && !owned && stored.is_pointer_value() {
                 self.builder.call(self.rt.rc_retain, &[stored.into_pointer_value().into()], "sealed_fld_retain");
             }
