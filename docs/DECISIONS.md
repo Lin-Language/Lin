@@ -2592,6 +2592,15 @@ object into a sealed `TarHeader` record. This differs from stream item objects, 
 returned as `TaggedVal*` via `alloc_tagged(TAG_OBJECT, ...)` and go through `lin_unbox_ptr`
 in the `pull_tagged` path.
 
+**`body().promise()` semantics.** A body sub-stream MAY be moved to a worker via `.promise()`;
+the compiler does not refuse it (body returns a `Stream<UInt8[]>`, and streams are legally
+CAP_MOVE'd). Cross-thread reads are mutex-serialized against the shared cursor state and will
+almost always observe generation mismatch — the archive will have advanced before the worker
+thread reads — yielding an in-band Error on the first read. This is memory-safe: all cursor state
+is behind `Arc<Mutex>` and TarEntry refcounts are atomic. A dedicated non-transferable refusal
+for body sub-streams was considered and deferred; the current guidance is to drain the body on
+the calling thread (documented in the `body` stdlib doc comment).
+
 **Rejected alternatives.**
 - **Lent (affine) body streams.** Making `body()` return an affine `Stream` that the type checker
   bounds to the entry's scope would catch misuse at compile time, but requires an "owned-lifetime"
