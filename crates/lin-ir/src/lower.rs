@@ -928,6 +928,11 @@ impl FuncBuilder {
             params: self.params,
             is_closure: self.is_closure,
             ret_ty: self.ret_ty,
+            // Conventions are inferred by a dedicated pass (`infer_conventions`) AFTER the whole
+            // module is lowered (it needs the finished blocks + liveness). Default to the
+            // conservative `Own` everywhere here — byte-for-byte today's behaviour.
+            param_conventions: Vec::new(),
+            ret_convention: Convention::Own,
             blocks: self.blocks,
             temp_types: self.temp_types,
             temp_count: self.temp_count,

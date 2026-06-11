@@ -362,6 +362,15 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         // table on each `func.repr` for codegen to consume at every packed-vs-boxed DECIDE / ASSUME
         // site; in debug builds also asserts the Stage-2 oracle (new analysis == old type
         // predicates) + the soundness verifier.
+        // Ownership conventions (Path-10/11 Leg 1) — SHADOW MODE. Infer per-param/per-return
+        // conventions and, when `LIN_OWNERSHIP_SHADOW` is set, run the report-only verifier over the
+        // lowered IR (BEFORE repr/rc_elide, so it sees the lowerer's own RC emission and dead-block
+        // shape verbatim). Inference is pure data on the IR; codegen ignores the convention fields
+        // this round, so neither call changes any output.
+        lin_ir::ownership_verify::infer_conventions(&mut ir_module);
+        if std::env::var("LIN_OWNERSHIP_SHADOW").is_ok() {
+            emit_ownership_shadow_report(&ir_module, &opts.source_path.to_string_lossy());
+        }
         lin_ir::repr::run(&mut ir_module);
         rc_elide::elide_rc(&mut ir_module);
         // Sealed-records Stage 4: mark non-escaping all-scalar sealed-record constructions for
@@ -1161,6 +1170,45 @@ fn register_resolved(
         }
         order.push(path.clone());
         cache.insert(path.clone(), typed.clone());
+    }
+}
+
+/// Emit the SHADOW-MODE ownership report (Path-10/11 Leg 1) to stderr. Report-only: it never
+/// changes compilation. Prints a one-line per-module summary (function/param convention split +
+/// violation counts by kind) and the individual violations, so a corpus run can be grepped and
+/// classified. Gated by the `LIN_OWNERSHIP_SHADOW` env var at the single call site.
+fn emit_ownership_shadow_report(module: &lin_ir::LinModule, source: &str) {
+    use lin_ir::ownership_verify::{shadow_summary, ViolationKind};
+    let s = shadow_summary(module);
+    let mut by_kind: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+    for v in &s.violations {
+        *by_kind.entry(v.kind.label()).or_insert(0) += 1;
+    }
+    eprintln!(
+        "[ownership-shadow] {src}: fns={fns} params={pt} (borrow={b} own={o} inout={io}) violations={nv} {bk:?}",
+        src = source,
+        fns = s.functions,
+        pt = s.params_total,
+        b = s.params_borrow,
+        o = s.params_own,
+        io = s.params_inout,
+        nv = s.violations.len(),
+        bk = by_kind,
+    );
+    for v in &s.violations {
+        // Suppress the un-audited-intrinsic noise from the per-violation dump unless it is the only
+        // kind present — those are a table-completeness checklist, summarized in the count line.
+        if v.kind == ViolationKind::UnauditedIntrinsic {
+            eprintln!("[ownership-shadow]   GAP unaudited-intrinsic {} (fn {})", v.detail, v.func);
+            continue;
+        }
+        eprintln!(
+            "[ownership-shadow]   {kind} fn={fn_} block={blk}: {detail}",
+            kind = v.kind.label(),
+            fn_ = v.func,
+            blk = v.block,
+            detail = v.detail,
+        );
     }
 }
 
