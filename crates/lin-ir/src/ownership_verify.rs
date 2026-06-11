@@ -435,6 +435,37 @@ pub fn box_shell_reclaim(value_ty: &Type, slot_ty: &Type, repr_differs: bool) ->
     is_union_owning_ty(slot_ty) && !is_union_owning_ty(value_ty) && repr_differs
 }
 
+/// Whether widening a value of `value_ty` into a UNION/Json `slot_ty` slot that a BINDING owns
+/// directly (the box IS the value the slot holds — no clone) produces a fresh union box that takes
+/// over the source's +1 inner reference, so the lowerer must MOVE that reference: `unregister_owned`
+/// the raw source (its single +1 transfers INTO the box) and `register_owned` the box for the
+/// binding's scope-exit release.
+///
+/// This is the BINDING sibling of `box_shell_reclaim` (the CELL/global case). There the slot owns a
+/// CLONE of the box, so the transient shell is reclaimed (`FreeBoxShell`) and the raw keeps its own
+/// reference. Here the slot owns the box ITSELF, so there is no shell to reclaim — instead the box
+/// becomes the union representation and the inner's single +1 is moved from the raw into the box
+/// (`coerce_to_slot_type_owning_bind`'s `made_fresh_box` arm: `unregister_owned(raw)` +
+/// `register_owned(box)`). Without the move the inner is owned twice (raw scope-exit AND the box's
+/// `lin_tagged_release`) → double-free; without the register the box's shell + inner leak.
+///
+/// True iff the slot is a boxed union (`is_union_owning_ty`), the value is a CONCRETE refcounted heap
+/// value (`is_concrete_rc_ty` — this is the load-bearing difference from `box_shell_reclaim`, which
+/// also fires on a SCALAR value whose box carries no inner heap +1 to move), the value is NOT already
+/// a union (so a new box really is allocated rather than the existing box forwarded), AND their
+/// representations differ (`repr_differs`).
+///
+/// Relocated VERBATIM from the inline `made_fresh_box` gate in `coerce_to_slot_type_owning_bind`:
+/// `is_union_ty(slot) && !is_union_ty(value) && is_rc_type(value) && type_repr_differs(value, slot)`.
+/// `is_union_ty` / `is_rc_type` are mirrored here as `is_union_owning_ty` / `is_concrete_rc_ty`; the
+/// lower-only `type_repr_differs` is computed by the caller and passed in as `repr_differs` (exactly
+/// as `box_shell_reclaim` and `escape_alias_convention` take their lower-only predicates by argument).
+/// The lowerer reads this and performs the same `unregister_owned`/`register_owned` move, so the
+/// resulting IR — and therefore the RC — is byte-identical.
+pub fn bound_box_moves_inner(value_ty: &Type, slot_ty: &Type, repr_differs: bool) -> bool {
+    is_union_owning_ty(slot_ty) && !is_union_owning_ty(value_ty) && is_concrete_rc_ty(value_ty) && repr_differs
+}
+
 // ===========================================================================
 // 2. Convention inference at lowering
 // ===========================================================================
@@ -1232,5 +1263,28 @@ mod tests {
         assert!(!box_shell_reclaim(&arr, &arr, true));
         // Value is ALREADY a union (the box is a clone/forward owned elsewhere): never reclaim here.
         assert!(!box_shell_reclaim(&json, &json, true));
+    }
+
+    /// `bound_box_moves_inner` mirrors the inline `made_fresh_box` gate in
+    /// `lower::coerce_to_slot_type_owning_bind`:
+    /// `is_union_ty(slot) && !is_union_ty(value) && is_rc_type(value) && type_repr_differs`. Pin each
+    /// outcome — in particular the SCALAR difference from `box_shell_reclaim` (the load-bearing
+    /// `is_rc_type` conjunct) — so a future edit cannot drift the inner-+1-move decision.
+    #[test]
+    fn bound_box_moves_inner_gate() {
+        let arr = Type::Array(Box::new(Type::Int32));
+        let json = Type::TypeVar(u32::MAX); // a union/boxed slot view
+        // Concrete RC value → union slot, repr differs: the box takes the inner +1 → move it.
+        assert!(bound_box_moves_inner(&arr, &json, true));
+        // SCALAR value → union slot: box_shell_reclaim fires here, but bound_box_moves_inner does NOT
+        // (no inner heap +1 to move — the box wraps copied scalar bytes). THE load-bearing difference.
+        assert!(!bound_box_moves_inner(&Type::Int32, &json, true));
+        assert!(box_shell_reclaim(&Type::Int32, &json, true)); // contrast
+        // repr does NOT differ (no box made): nothing to move.
+        assert!(!bound_box_moves_inner(&arr, &json, false));
+        // Slot is concrete (not a union): no union box ever made → never move.
+        assert!(!bound_box_moves_inner(&arr, &arr, true));
+        // Value is ALREADY a union (box is a clone/forward owned elsewhere): never move here.
+        assert!(!bound_box_moves_inner(&json, &json, true));
     }
 }

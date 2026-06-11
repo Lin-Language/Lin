@@ -2638,10 +2638,16 @@ fn try_lower_sum_literal(
 /// elsewhere) or non-rc (scalar→union boxing carries no inner heap payload to balance — the cached
 /// scalar box has nothing to release, and the raw scalar is not registered owned anyway).
 fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
-    let made_fresh_box = is_union_ty(slot_ty)
-        && !is_union_ty(value_ty)
-        && is_rc_type(value_ty)
-        && type_repr_differs(value_ty, slot_ty);
+    // Box-transfer ownership fact (whether widening this concrete-rc value into the union slot makes
+    // a fresh box that takes over the source's inner +1 — so the lowerer must MOVE that reference)
+    // lives in the ownership authority; `type_repr_differs` is the lower-only repr predicate it
+    // requires, passed in. Distinct from `box_shell_reclaim` (the cell/global clone case) by the
+    // `is_rc_type(value)` conjunct it folds in — see `bound_box_moves_inner`.
+    let made_fresh_box = crate::ownership_verify::bound_box_moves_inner(
+        value_ty,
+        slot_ty,
+        type_repr_differs(value_ty, slot_ty),
+    );
     // A flat scalar array kind/width change (e.g. UInt8[] → Int32[]) MATERIALIZES a fresh,
     // independent +1-owned buffer (codegen's `flat_array_widen`) — the source array keeps its own
     // reference (released by its own scope). Unlike the union-box case the source is NOT consumed,
