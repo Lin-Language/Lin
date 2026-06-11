@@ -61,12 +61,20 @@ pub fn lower_module_with_imports(
     for stmt in &module.statements {
         if let TypedStmt::Val {
             slot,
-            value: TypedExpr::Function { .. },
+            value: TypedExpr::Function { name, .. },
             ..
         } = stmt
         {
             let fid = ctx.alloc_func_id();
             global_fn_slots.insert(*slot, fid);
+            // WAVE D: tag a monomorphized `std/iter` `flatMap` specialization so the fusion engine's
+            // `combinator_callee_name` can recognise its call. The spec's `name` is the original
+            // export name (`flatMap`) or a mangled monomorph (`flatMap$Int32_…`); match the base.
+            if let Some(n) = name {
+                if combinator_base_name(n) == Some("flatMap") {
+                    ctx.combinator_spec_slots.insert(*slot, "flatMap");
+                }
+            }
         }
     }
     ctx.global_fn_slots = global_fn_slots.clone();
@@ -580,6 +588,15 @@ struct LowerCtx {
     /// Populated for: stdlib imports (matched by export name) and stdlib-internal calls (matched
     /// in `lower_import_module`). Used alongside the intrinsic combinators (`lin_for` etc.).
     safe_combinator_slots: HashMap<usize, usize>,
+    /// Top-level function slots that are a monomorphized stdlib `flatMap` specialization
+    /// (`std/iter`'s `flatMap$…`), mapped to the canonical combinator name `"flatMap"`. Unlike
+    /// `map`/`filter`/`reduce` (thin intrinsic wrappers rewritten to `lin_*` slots by
+    /// `try_inline_combinator_wrapper`, so they carry an intrinsic slot), `flatMap` is a genuine
+    /// generic that monomorphizes to a top-level spec resolved via `global_fn_slots` — neither an
+    /// intrinsic nor an import slot. `combinator_callee_name` consults this map so a `flatMap` stage
+    /// is recognised by the fusion engine (Wave D). Populated in the top-level pre-scan by matching
+    /// the spec's `name` against the `std_iter_flatMap`/`flatMap$…` shape.
+    combinator_spec_slots: HashMap<usize, &'static str>,
     /// >0 while lowering an expression that is a SYNCHRONOUS, non-retained callback argument
     /// to a known consuming combinator (for/while/map/filter/reduce). A closure literal
     /// (`MakeClosure`) lowered while this is >0 is PROVABLY consumed-and-discarded by the
@@ -651,6 +668,7 @@ impl LowerCtx {
             pending_adapters: Vec::new(),
             default_descriptors: HashMap::new(),
             safe_combinator_slots: HashMap::new(),
+            combinator_spec_slots: HashMap::new(),
             safe_callback_depth: 0,
             packed_elem_slots: HashMap::new(),
             import_var_init_prologue: None,
@@ -6084,11 +6102,30 @@ fn chain_has_flatmap(stages: &[FuseStage]) -> bool {
     stages.iter().any(|s| matches!(s, FuseStage::FlatMap { .. }))
 }
 
-/// Resolve `expr` to a combinator NAME ("map"/"filter"/"reduce"/"for"/"range"/...) when it is a
-/// direct call to one (via an intrinsic slot or an imported stdlib export); else None.
+/// The combinator base name of a (possibly monomorphized) symbol: strip a `$…` monomorph suffix and
+/// a leading `std_iter_`/`std_array_` module prefix, returning the bare export name. Used to detect a
+/// `flatMap` specialization (`flatMap`, `flatMap$Int32_…`, `std_iter_flatMap`). Returns the matched
+/// canonical name for the names the fusion engine cares about, else None.
+fn combinator_base_name(sym: &str) -> Option<&'static str> {
+    let base = sym.split('$').next().unwrap_or(sym);
+    let base = base.rsplit('_').next().unwrap_or(base);
+    match base {
+        "flatMap" => Some("flatMap"),
+        _ => None,
+    }
+}
+
+/// Resolve `expr` to a combinator NAME ("map"/"filter"/"reduce"/"for"/"range"/"flatMap"/...) when it
+/// is a direct call to one (via an intrinsic slot, an imported stdlib export, or — for `flatMap`, a
+/// genuine generic with no intrinsic — a monomorphized top-level spec tagged in `combinator_spec_slots`);
+/// else None.
 fn combinator_callee_name(expr: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> Option<&'static str> {
     let TypedExpr::Call { func, .. } = expr else { return None };
     let TypedExpr::LocalGet { slot, .. } = func.as_ref() else { return None };
+    // A monomorphized `flatMap` spec resolves via `global_fn_slots`, not an intrinsic/import slot.
+    if let Some(name) = ctx.combinator_spec_slots.get(slot) {
+        return Some(name);
+    }
     let trailing = if let Some(intr) = builder.intrinsic_slots.get(slot) {
         intr.strip_prefix("lin_").unwrap_or(intr)
     } else if let Some((sym, _)) = ctx.import_fn_slots.get(slot) {
@@ -6151,7 +6188,14 @@ fn extract_fuse_chain<'a>(
             // element (`free_combinator_*`), so it must have a reclaimable repr — else bail.
             let (_, ret) = callback_signature(&args[1]);
             let inner_elem_ty = iter_elem_type(&ret);
-            if !fuse_elem_repr_reclaimable(&inner_elem_ty) {
+            // The inner element is read per inner-loop iteration by an `Instruction::Index`
+            // materialize, subject to the SAME reclaim discipline as the source element
+            // (`free_combinator_*`), so its repr must be reclaimable — UNLESS it is `Never`, the
+            // element type of an `[]`-only flatMap (`x => []`): the inner array is provably empty, so
+            // the inner loop runs zero times and nothing is ever materialized to reclaim. Admitting
+            // `Never` lets the empty-inner case fuse (and so reclaim its fresh empty `inner` array on
+            // the fused drop path) rather than fall back to the per-stage path.
+            if !matches!(inner_elem_ty, Type::Never) && !fuse_elem_repr_reclaimable(&inner_elem_ty) {
                 break;
             }
             FuseStage::FlatMap { params: params.to_vec(), body: body.clone(), inner_elem_ty }
