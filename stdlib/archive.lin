@@ -75,8 +75,9 @@ export val files = (s: Stream<UInt8[]>): Stream<TarFile> =>
 // Each `TarEntry` is a generation-stamped, refcounted handle. The header is always readable (fields
 // are copied out at parse time). The body is a one-shot stream valid only while this entry is the
 // archive's CURRENT entry. Advancing the `Stream<TarEntry>` (by pulling the next element) expires
-// all prior bodies. Closing the entries stream early (e.g. stopping a `.for`) closes the parent
-// upstream immediately; the body of the last-touched entry remains readable until the handle drops.
+// all prior bodies. Closing the entries stream early (e.g. stopping a `.for`) does NOT close the
+// parent upstream immediately; the parent stays open until the last live entry handle drops, at
+// which point it closes deterministically.
 //
 // One rule: read or drain `e.body()` before pulling the next `TarEntry`.
 //
@@ -97,5 +98,9 @@ export val header = (e: TarEntry): TarHeader =>
 // `Error` on first read.
 // @param e  the entry handle.
 // @returns `Stream<UInt8[]>` — the body bytes; drain before pulling the next `TarEntry`.
+//
+// Note: a body handed to `.promise()` races the archive's advancement. Cross-thread reads are
+// mutex-serialized against the cursor and will typically read as expired (in-band Error on the
+// first read). Drain the body on the calling thread instead.
 export val body = (e: TarEntry): Stream<UInt8[]> =>
   lin_tar_body(e)
