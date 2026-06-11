@@ -18151,14 +18151,14 @@ fn test_fmt_roundtrips_coalesce() {
     assert_eq!(fmt(chain), chain, "?? chain must round-trip");
     assert_eq!(fmt(&fmt(chain)), fmt(chain), "?? formatting must be idempotent");
 
-    let parenLogical = "val q = w ?? (false || true)\n";
-    assert_eq!(fmt(parenLogical), parenLogical, "parens around a logical RHS must survive");
+    let paren_logical = "val q = w ?? (false || true)\n";
+    assert_eq!(fmt(paren_logical), paren_logical, "parens around a logical RHS must survive");
 
-    let rightNested = "val n = a ?? (b ?? 3)\n";
-    assert_eq!(fmt(rightNested), rightNested, "right-nested ?? parens must survive");
+    let right_nested = "val n = a ?? (b ?? 3)\n";
+    assert_eq!(fmt(right_nested), right_nested, "right-nested ?? parens must survive");
 
-    let withEq = "val e = a ?? b == c\n";
-    assert_eq!(fmt(withEq), withEq, "?? below == must round-trip without parens");
+    let with_eq = "val e = a ?? b == c\n";
+    assert_eq!(fmt(with_eq), with_eq, "?? below == must round-trip without parens");
 }
 
 // Path-9C seal-propagation symmetry: an object literal with a nested sealed-record ARRAY field,
