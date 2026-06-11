@@ -331,6 +331,77 @@ pub fn escape_alias_convention(arg_ty: &Type, param_ty: &Type, arg_is_sealed_sca
     false
 }
 
+/// How the lowerer must balance the refcount of a value being STORED into a container that takes
+/// ownership of one reference (an array element, an object field, a `push` / `set`). This is the
+/// single ownership fact the lowerer's `transfer_into_container` site needs: when a value flows into
+/// a slot, does it flow in BY MOVE (the source already holds the only +1 — drop it from the owning
+/// scope so scope-exit does not also free it, the container's drop accounts for it), does it need a
+/// fresh +1 RETAIN (a shared/borrowed heap value — so the slot's copy and the original owner each
+/// release independently), or is there NOTHING to balance (a scalar, or a retain-semantics union op
+/// whose runtime already took its own inner reference)?
+///
+/// Three outcomes, decided in this priority order (preserved verbatim from the inline gate):
+///
+/// - **`Nothing`** — either the value is not refcounted (`!needs_owning`: a scalar / sum node),
+///   OR it is a UNION element flowing into a RETAIN-semantics op (`is_union && !op_consumes`):
+///   `Push` (`lin_push_dyn`) / `object_set` RETAIN the boxed value's inner payload, so the slot
+///   gets its own reference and the source box stays owned by its current owner — there is nothing
+///   to balance at this site.
+/// - **`Transfer`** — the source is a FRESH allocation (`source_is_fresh_alloc`) that already holds
+///   the only +1: MOVE it into the slot by un-registering the temp from the owning scope so
+///   scope-exit will not double-free it (the container's drop now accounts for that reference).
+/// - **`Retain`** — a BORROWED / shared heap value (e.g. a `LocalGet`): take an independent +1 so
+///   the container's copy and the original owner can each release exactly once.
+///
+/// `op_consumes_union` records whether the container op, for a UNION element, MOVES the box into the
+/// slot (raw struct copy, no inner retain — `lin_array_set`) rather than retaining the inner
+/// (`Push` / `object_set`). For a CONCRETE rc element every op consumes (codegen never retains a
+/// concrete element on insert), so `op_consumes_union` is irrelevant there and the fresh-vs-borrowed
+/// split applies regardless.
+///
+/// Relocated VERBATIM from the inline three-way branch in `lower::transfer_into_container`.
+/// `needs_owning` / `is_union_ty` are mirrored here as `needs_owning_insert` (= `is_concrete_rc_ty`
+/// ∨ `is_union_owning_ty`) / `is_union_owning_ty`; the one predicate that lives only in `lower` —
+/// `expr_is_fresh_alloc`, a recursive walk over the SOURCE AST that has no business in `lin-ir`'s
+/// ownership authority — is computed by the caller and passed in as `source_is_fresh_alloc` (exactly
+/// as `escape_alias_convention` takes `is_sealed_scalar_repr` by argument). The lowerer reads this
+/// and performs the matching action (un-register / `Retain` / nothing), so the resulting IR — and
+/// therefore the RC — is byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerInsert {
+    /// Nothing to balance: a scalar, or a union element a retain-semantics op already +1'd.
+    Nothing,
+    /// Fresh +1 source: MOVE it in by un-registering the temp from the owning scope.
+    Transfer,
+    /// Borrowed/shared heap value: take an independent `Retain` (+1) so each owner frees once.
+    Retain,
+}
+
+/// THE authority for `ContainerInsert` — see the enum doc. Mirrors `lower::transfer_into_container`
+/// branch-for-branch: not-owning OR retain-semantics-union ⇒ `Nothing`; else fresh ⇒ `Transfer`,
+/// else borrowed ⇒ `Retain`.
+pub fn container_insert_convention(elem_ty: &Type, op_consumes_union: bool, source_is_fresh_alloc: bool) -> ContainerInsert {
+    if !needs_owning_insert(elem_ty) {
+        return ContainerInsert::Nothing;
+    }
+    if is_union_owning_ty(elem_ty) && !op_consumes_union {
+        // Retain-semantics op (Push / object_set): the runtime took its own inner reference; the
+        // source box stays owned by its current owner. Nothing to balance here.
+        return ContainerInsert::Nothing;
+    }
+    if source_is_fresh_alloc {
+        ContainerInsert::Transfer
+    } else {
+        ContainerInsert::Retain
+    }
+}
+
+/// A type that participates in container-insert ownership balancing — concrete rc OR boxed union.
+/// Mirrors `lower::needs_owning` (= `is_rc_type` ∨ `is_union_ty`).
+fn needs_owning_insert(ty: &Type) -> bool {
+    is_concrete_rc_ty(ty) || is_union_owning_ty(ty)
+}
+
 // ===========================================================================
 // 2. Convention inference at lowering
 // ===========================================================================
@@ -1086,5 +1157,27 @@ mod tests {
         // Same-side (both concrete / both union): not in the box/unbox arm → never alias.
         assert!(!escape_alias_convention(&arr, &arr, false));
         assert!(!escape_alias_convention(&json, &json, false));
+    }
+
+    /// `container_insert_convention` mirrors the three-way branch in `lower::transfer_into_container`.
+    /// Pin each outcome so a future edit cannot drift the fresh-vs-retain (move-vs-+1) decision.
+    #[test]
+    fn container_insert_three_way() {
+        let arr = Type::Array(Box::new(Type::Int32));
+        let json = Type::TypeVar(u32::MAX); // a union/boxed view
+        // Non-owning scalar: nothing to balance, regardless of op/fresh.
+        assert_eq!(container_insert_convention(&Type::Int32, true, true), ContainerInsert::Nothing);
+        assert_eq!(container_insert_convention(&Type::Int32, false, false), ContainerInsert::Nothing);
+        // Union element into a RETAIN-semantics op (op_consumes=false): nothing — runtime +1'd inner.
+        assert_eq!(container_insert_convention(&json, false, true), ContainerInsert::Nothing);
+        assert_eq!(container_insert_convention(&json, false, false), ContainerInsert::Nothing);
+        // Union element into a CONSUMING op: fresh ⇒ transfer, borrowed ⇒ retain.
+        assert_eq!(container_insert_convention(&json, true, true), ContainerInsert::Transfer);
+        assert_eq!(container_insert_convention(&json, true, false), ContainerInsert::Retain);
+        // Concrete rc element: op_consumes irrelevant; fresh ⇒ transfer, borrowed ⇒ retain.
+        assert_eq!(container_insert_convention(&arr, false, true), ContainerInsert::Transfer);
+        assert_eq!(container_insert_convention(&arr, false, false), ContainerInsert::Retain);
+        assert_eq!(container_insert_convention(&arr, true, true), ContainerInsert::Transfer);
+        assert_eq!(container_insert_convention(&arr, true, false), ContainerInsert::Retain);
     }
 }

@@ -1049,18 +1049,16 @@ impl FuncBuilder {
     /// insert), so the original fresh-vs-borrowed rule applies regardless of `op_consumes_union`.
     fn transfer_into_container(&mut self, temp: Temp, source: &TypedExpr, op_consumes_union: bool) {
         let ty = source.ty();
-        if !needs_owning(&ty) {
-            return;
-        }
-        if is_union_ty(&ty) && !op_consumes_union {
-            // Retain-semantics op (Push / object_set): the runtime took its own inner reference;
-            // the source box stays owned by its current owner. Nothing to balance here.
-            return;
-        }
-        if expr_is_fresh_alloc(source) {
-            self.unregister_owned(temp);
-        } else {
-            self.emit(Instruction::Retain { val: temp, ty });
+        // The fresh-vs-borrowed (move vs +1-retain) decision now lives in the single ownership
+        // authority `container_insert_convention`, which encodes the exact same three-way branch
+        // (not-owning / retain-semantics-union ⇒ nothing; fresh ⇒ transfer; borrowed ⇒ retain).
+        // `expr_is_fresh_alloc` is the one `lower`-only AST predicate, computed here and passed in
+        // (mirroring how `escape_alias_convention` takes `is_sealed_scalar_repr`); the lowerer
+        // performs the matching action, so the emitted IR — and the RC — is byte-identical.
+        match crate::ownership_verify::container_insert_convention(&ty, op_consumes_union, expr_is_fresh_alloc(source)) {
+            crate::ownership_verify::ContainerInsert::Nothing => {}
+            crate::ownership_verify::ContainerInsert::Transfer => self.unregister_owned(temp),
+            crate::ownership_verify::ContainerInsert::Retain => self.emit(Instruction::Retain { val: temp, ty }),
         }
     }
 
