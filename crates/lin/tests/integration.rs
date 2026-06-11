@@ -18161,6 +18161,82 @@ fn test_fmt_roundtrips_coalesce() {
     assert_eq!(fmt(with_eq), with_eq, "?? below == must round-trip without parens");
 }
 
+#[test]
+fn test_fmt_coalesce_required_parens_round_trip() {
+    // Regression: `??` is the LOOSEST binary rung, so when a `??` sub-expression is an operand of a
+    // TIGHTER-binding operator the wrapping parens are SEMANTICALLY REQUIRED — dropping them changes
+    // the parse (`(a ?? b) + 1` would reparse as `a ?? (b + 1)`). The formatter formerly stripped
+    // them (it only descended into `BinaryOp` operands, never `Coalesce`), changing program meaning.
+    // Every line below MUST keep its parens, exactly, and the formatting must be idempotent.
+    let cases = [
+        // arithmetic / comparison parents
+        "val a = (m ?? 0) + 1\n",
+        "val a = (m ?? 0) - 1\n",
+        "val a = (m ?? 0) * 2\n",
+        "val a = (m ?? 0) < 5\n",
+        "val a = (m ?? 0) > 5\n",
+        "val a = (m ?? 0) == 5\n",
+        "val a = (m ?? 0) != 5\n",
+        // logical parents (an unparenthesised `??`/`&&`/`||` mix is a parse error, so the parens
+        // must survive)
+        "val a = (m ?? false) && true\n",
+        "val a = (m ?? false) || true\n",
+        // unary / is / has parents (bind tighter than `??`)
+        "val a = !(m ?? false)\n",
+        "val a = (m ?? 0) is Int32\n",
+        "val a = (m ?? z) has y\n",
+        // `??` as a postfix base
+        "val a = (m ?? other).field\n",
+        // a `??` on BOTH sides of a tighter parent
+        "val a = (m ?? 0) + (n ?? 1)\n",
+    ];
+    for src in cases {
+        let out = fmt(src);
+        assert_eq!(out, src, "required parens around a `??` operand must survive formatting");
+        assert_eq!(fmt(&out), out, "?? required-parens formatting must be idempotent");
+    }
+
+    // And confirm we do NOT now over-parenthesise: a bare `??` (and a redundant-paren source) needs
+    // no parens, and `??` as a TIGHTER child than its parent (`a + (b ?? c)` is the right operand of
+    // `+`, but written that way it parses as `a + b ?? c`... which is actually `(a + b) ?? c`) — so
+    // the canonical paren-free forms must stay paren-free.
+    assert_eq!(fmt("val c = m ?? 0\n"), "val c = m ?? 0\n", "standalone `??` needs no parens");
+    assert_eq!(fmt("val c = (m ?? 0)\n"), "val c = m ?? 0\n", "redundant outer parens are stripped");
+}
+
+#[test]
+fn test_fmt_coalesce_run_equivalence() {
+    // The gate that SHOULD have caught the required-parens bug: compile+run a program that mixes
+    // `??` with `+`, `-`, `<`, `>`, `==`, `&&`, `||`, nested `??`, unary `!`, `is`, and `??` inside
+    // string interpolation, BOTH before and after `lin fmt`. The runtime output must be identical —
+    // i.e. the formatter must not have changed the parse of any load-bearing-parens `??` operand.
+    let source = "import { print } from \"std/io\"\n\
+val mi: { String: Int32 } = { \"a\": 5 }\n\
+val mb: { String: Boolean } = { \"t\": true }\n\
+val plus: Int32 = (mi[\"a\"] ?? 0) + 1\n\
+val minus: Int32 = (mi[\"x\"] ?? 10) - 3\n\
+val lt: Boolean = (mi[\"a\"] ?? 0) < 100\n\
+val gt: Boolean = (mi[\"x\"] ?? 0) > 100\n\
+val eq: Boolean = (mi[\"a\"] ?? 0) == 5\n\
+val andL: Boolean = (mb[\"t\"] ?? false) && true\n\
+val orL: Boolean = (mb[\"x\"] ?? false) || true\n\
+val nested: Int32 = mi[\"x\"] ?? mi[\"a\"] ?? 9\n\
+val notC: Boolean = !(mb[\"x\"] ?? false)\n\
+val isC: Boolean = (mi[\"a\"] ?? 0) is Int32\n\
+print(\"${plus} ${minus} ${lt} ${gt} ${eq} ${andL} ${orL} ${nested} ${notC} ${isC} ${(mi[\"a\"] ?? 0) + 100}\")\n";
+    let formatted = fmt(source);
+    let before = run(source);
+    let after = run(&formatted);
+    assert_eq!(
+        before, after,
+        "formatting changed the meaning of a `??` expression\nformatted:\n{}",
+        formatted
+    );
+    // Idempotent re-format must also still run-equal.
+    let reformatted = fmt(&formatted);
+    assert_eq!(formatted, reformatted, "?? formatting not idempotent");
+}
+
 // Path-9C seal-propagation symmetry: an object literal with a nested sealed-record ARRAY field,
 // built by a function returning the named record then read back, must round-trip correctly. The
 // producer (`mkTrip`'s `{ "stopTimes": [{ … }] }` literal) is now DIRECTED against the sealed
