@@ -1,0 +1,889 @@
+import { expect, toBe, toSatisfy, test, suite, run } from "std/test"
+import { t, st, tf, j, setDefaultTrip, journeysEq, allDays, service2 } from "./testutil"
+import { makeService } from "./service"
+import { createRaptor } from "./raptor"
+import { planDepartAfter } from "./query"
+import { parseDate } from "./dateUtil"
+
+// makeService's days/dates are typed `{ String: Boolean }` maps (the typed RAPTOR), so the
+// calendar literals are annotated to the map type (no implicit record -> map coercion). The
+// "all but Monday" map is spelled out — spreading a typed map collapses to a closed record.
+val noDates: { String: Boolean } = {}
+val allButMonday: { String: Boolean } = {
+  "0": true,
+  "1": false,
+  "2": true,
+  "3": true,
+  "4": true,
+  "5": true,
+  "6": true
+}
+val includeOct22: { String: Boolean } = { "20181022": true }
+val excludeOct22: { String: Boolean } = { "20181022": false }
+
+// query.plan(origin, dest, dateStr, time) with optional maxSearchDays (default 3).
+val plan = (trips: Json, transfers: Json, interchange: Json, origin: String, dest: String, dateStr: String, time: Int32, maxDays: Int32): Json =>
+  val raptor = createRaptor(trips, transfers, interchange, null)
+  val result = planDepartAfter(raptor, origin, dest, parseDate(dateStr), time, maxDays)
+  setDefaultTrip(result)
+  result
+
+// Multi-day cases need to inspect result[0]; helpers keep the bodies out of expect(...)'s
+// parens (a multi-statement block is not a valid argument expression there).
+val firstArrival = (trips: Json, dateStr: String, time: Int32): Int32 =>
+  val r = plan(trips, {}, {}, "A", "E", dateStr, time, 2)
+  r[0]["arrivalTime"]
+
+val nextDayTrips = [
+  t([
+    st("A", null, 1000),
+    st("B", 1035, 1035),
+    st("C", 1100, null)
+  ]),
+  t([
+    st("D", null, 1000),
+    st("B", 1030, 1030),
+    st("E", 1100, null)
+  ])
+]
+
+val overnightFirstLegs = (): Json =>
+  val r = plan(nextDayTrips, {}, {}, "A", "E", "2018-10-16", 900, 2)
+  r[0]["legs"]
+
+val incrementDayTrips = (): Json =>
+  val trip2 = t([
+    st("D", null, 1000),
+    st("B", 1035, 1035),
+    st("E", 1100, null)
+  ])
+  trip2["service"] = service2
+  [
+    t([
+      st("A", null, 1000),
+      st("B", 1030, 1030),
+      st("C", 1100, null)
+    ]),
+    trip2
+  ]
+
+// The 4 calendar tests build a B->C trip with a custom service and search on a date that
+// includes/excludes it; the expected journey always uses the 1040->1110 alternative.
+val calendarTrips = (svc: Json): Json =>
+  val trip = t([
+    st("B", null, 1030),
+    st("C", 1100, null)
+  ])
+  trip["service"] = svc
+  [
+    t([
+      st("A", null, 1000),
+      st("B", 1030, null)
+    ]),
+    trip,
+    t([
+      st("B", null, 1040),
+      st("C", 1110, null)
+    ])
+  ]
+
+val expectedChange = (): Json =>
+  j([
+    [
+      st("A", null, 1000),
+      st("B", 1030, null)
+    ],
+    [
+      st("B", null, 1040),
+      st("C", 1110, null)
+    ]
+  ])
+
+val s = suite("DepartAfterQuery", [
+  test("finds journeys with direct connections", () => [
+    expect(plan(
+      [t([st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)])],
+      {},
+      {},
+      "A",
+      "C",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)]])
+      ])
+    )
+  ]),
+
+  test("finds the earliest calendars", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1400),
+          st("B", 1430, 1435),
+          st("C", 1500, null)
+        ]),
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1035),
+          st("C", 1100, null)
+        ])
+      ],
+      {},
+      {},
+      "A",
+      "C",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)]])
+      ])
+    )
+  ]),
+
+  test("finds journeys with a single connection", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1035),
+          st("C", 1100, null)
+        ]),
+        t([
+          st("D", null, 1000),
+          st("B", 1030, 1035),
+          st("E", 1100, null)
+        ])
+      ],
+      {},
+      {},
+      "A",
+      "E",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([
+          [
+            st("A", null, 1000),
+            st("B", 1030, 1035)
+          ],
+          [
+            st("B", 1030, 1035),
+            st("E", 1100, null)
+          ]
+        ])
+      ])
+    )
+  ]),
+
+  test("does not return journeys that cannot be made", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1035, 1035),
+          st("C", 1100, null)
+        ]),
+        t([
+          st("D", null, 1000),
+          st("B", 1030, 1030),
+          st("E", 1100, null)
+        ])
+      ],
+      {},
+      {},
+      "A",
+      "E",
+      "2018-10-16",
+      900,
+      1
+    )).toSatisfy(r => journeysEq(r, []))
+  ]),
+
+  test("returns the fastest and the least changes", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1030),
+          st("C", 1200, null)
+        ]),
+        t([
+          st("B", null, 1030),
+          st("C", 1100, null)
+        ])
+      ],
+      {},
+      {},
+      "A",
+      "C",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("A", null, 1000), st("B", 1030, 1030), st("C", 1200, null)]]),
+        j([
+          [
+            st("A", null, 1000),
+            st("B", 1030, 1030)
+          ],
+          [
+            st("B", null, 1030),
+            st("C", 1100, null)
+          ]
+        ])
+      ])
+    )
+  ]),
+
+  test("chooses the fastest journey where the number of journeys is the same", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1030),
+          st("C", 1100, null)
+        ]),
+        t([
+          st("C", null, 1200),
+          st("D", 1230, 1230),
+          st("E", 1300, null)
+        ]),
+        t([
+          st("A", null, 1100),
+          st("F", 1130, 1130),
+          st("G", 1200, null)
+        ]),
+        t([
+          st("G", null, 1200),
+          st("H", 1230, 1230),
+          st("E", 1255, null)
+        ])
+      ],
+      {},
+      {},
+      "A",
+      "E",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([
+          [
+            st("A", null, 1100),
+            st("F", 1130, 1130),
+            st("G", 1200, null)
+          ],
+          [
+            st("G", null, 1200),
+            st("H", 1230, 1230),
+            st("E", 1255, null)
+          ]
+        ])
+      ])
+    )
+  ]),
+
+  test("chooses an arbitrary journey when they are the same", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1030),
+          st("C", 1100, null)
+        ]),
+        t([
+          st("C", null, 1200),
+          st("D", 1230, 1230),
+          st("E", 1300, null)
+        ]),
+        t([
+          st("A", null, 1100),
+          st("F", 1130, 1130),
+          st("G", 1200, null)
+        ]),
+        t([
+          st("G", null, 1200),
+          st("H", 1230, 1230),
+          st("E", 1300, null)
+        ])
+      ],
+      {},
+      {},
+      "A",
+      "E",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([
+          [
+            st("A", null, 1000),
+            st("B", 1030, 1030),
+            st("C", 1100, null)
+          ],
+          [
+            st("C", null, 1200),
+            st("D", 1230, 1230),
+            st("E", 1300, null)
+          ]
+        ])
+      ])
+    )
+  ]),
+
+  test("chooses the correct change point", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1030, null)
+        ]),
+        t([
+          st("A", null, 1030),
+          st("C", 1200, null)
+        ]),
+        t([
+          st("C", null, 1000),
+          st("B", 1030, 1030),
+          st("E", 1100, null)
+        ]),
+        t([
+          st("C", null, 1200),
+          st("B", 1230, 1230),
+          st("E", 1300, null)
+        ])
+      ],
+      {},
+      {},
+      "A",
+      "E",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([
+          [
+            st("A", null, 1000),
+            st("B", 1030, null)
+          ],
+          [
+            st("B", 1030, 1030),
+            st("E", 1100, null)
+          ]
+        ])
+      ])
+    )
+  ]),
+
+  test("finds journeys with a transfer", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1035),
+          st("C", 1100, null)
+        ]),
+        t([
+          st("D", null, 1200),
+          st("E", 1300, null)
+        ])
+      ],
+      { "C": [tf("C", "D", 10)] },
+      {},
+      "A",
+      "E",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([
+          [
+            st("A", null, 1000),
+            st("B", 1030, 1035),
+            st("C", 1100, null)
+          ],
+          tf("C", "D", 10),
+          [
+            st("D", null, 1200),
+            st("E", 1300, null)
+          ]
+        ])
+      ])
+    )
+  ]),
+
+  test("uses a transfer if it is faster", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1030),
+          st("C", 1100, null)
+        ]),
+        t([
+          st("C", null, 1130),
+          st("D", 1200, null)
+        ])
+      ],
+      { "C": [tf("C", "D", 10)] },
+      {},
+      "A",
+      "D",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([
+          [
+            st("A", null, 1000),
+            st("B", 1030, 1030),
+            st("C", 1100, null)
+          ],
+          tf("C", "D", 10)
+        ])
+      ])
+    )
+  ]),
+
+  test("doesn't allow pick up from locations without pickup specified", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1030),
+          st("C", 1200, null)
+        ]),
+        t([
+          st("E", null, 1000),
+          st("B", 1030, null),
+          st("C", 1100, null)
+        ])
+      ],
+      {},
+      {},
+      "A",
+      "C",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("A", null, 1000), st("B", 1030, 1030), st("C", 1200, null)]])
+      ])
+    )
+  ]),
+
+  test("doesn't allow drop off at non-drop off locations", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", null, 1030),
+          st("C", 1200, null)
+        ]),
+        t([
+          st("E", null, 1000),
+          st("B", 1030, 1030),
+          st("C", 1100, null)
+        ])
+      ],
+      {},
+      {},
+      "A",
+      "C",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("A", null, 1000), st("B", null, 1030), st("C", 1200, null)]])
+      ])
+    )
+  ]),
+
+  test("applies interchange times", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1030),
+          st("C", 1200, null)
+        ]),
+        t([
+          st("B", null, 1030),
+          st("C", 1100, null)
+        ]),
+        t([
+          st("B", null, 1040),
+          st("C", 1110, null)
+        ])
+      ],
+      {},
+      { "B": 10 },
+      "A",
+      "C",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("A", null, 1000), st("B", 1030, 1030), st("C", 1200, null)]]),
+        j([
+          [
+            st("A", null, 1000),
+            st("B", 1030, 1030)
+          ],
+          [
+            st("B", null, 1040),
+            st("C", 1110, null)
+          ]
+        ])
+      ])
+    )
+  ]),
+
+  test("applies interchange times to transfers", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1030, null)
+        ]),
+        t([
+          st("C", null, 1030),
+          st("D", 1100, null)
+        ]),
+        t([
+          st("C", null, 1050),
+          st("D", 1110, null)
+        ]),
+        t([
+          st("C", null, 1100),
+          st("D", 1120, null)
+        ])
+      ],
+      { "B": [tf("B", "C", 10)] },
+      { "B": 10, "C": 10 },
+      "A",
+      "D",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([
+          [
+            st("A", null, 1000),
+            st("B", 1030, null)
+          ],
+          tf("B", "C", 10),
+          [
+            st("C", null, 1100),
+            st("D", 1120, null)
+          ]
+        ])
+      ])
+    )
+  ]),
+
+  test("finds journeys after gaps in rounds", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1035),
+          st("C", 1400, null)
+        ]),
+        t([
+          st("B", null, 1035),
+          st("D", 1100, null)
+        ]),
+        t([
+          st("D", null, 1100),
+          st("E", 1130, null)
+        ]),
+        t([
+          st("E", null, 1130),
+          st("C", 1200, null)
+        ]),
+        t([
+          st("A", null, 1000),
+          st("E", 1135, null)
+        ]),
+        t([
+          st("E", null, 1135),
+          st("C", 1330, null)
+        ])
+      ],
+      {},
+      {},
+      "A",
+      "C",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("A", null, 1000), st("B", 1030, 1035), st("C", 1400, null)]]),
+        j([
+          [
+            st("A", null, 1000),
+            st("E", 1135, null)
+          ],
+          [
+            st("E", null, 1135),
+            st("C", 1330, null)
+          ]
+        ]),
+        j([
+          [
+            st("A", null, 1000),
+            st("B", 1030, 1035)
+          ],
+          [
+            st("B", null, 1035),
+            st("D", 1100, null)
+          ],
+          [
+            st("D", null, 1100),
+            st("E", 1130, null)
+          ],
+          [
+            st("E", null, 1130),
+            st("C", 1200, null)
+          ]
+        ])
+      ])
+    )
+  ]),
+
+  test("puts overtaken trains in different routes", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1030),
+          st("C", 1100, 1110),
+          st("D", 1130, 1130),
+          st("E", 1200, null)
+        ]),
+        t([
+          st("A", null, 1010),
+          st("B", 1040, 1040),
+          st("C", 1050, 1100),
+          st("D", 1120, 1120),
+          st("E", 1150, null)
+        ])
+      ],
+      {},
+      {},
+      "A",
+      "E",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([
+          [
+            st("A", null, 1010),
+            st("B", 1040, 1040),
+            st("C", 1050, 1100),
+            st("D", 1120, 1120),
+            st("E", 1150, null)
+          ]
+        ])
+      ])
+    )
+  ]),
+
+  test("finds journeys that can only be made by waiting for the next day", () => [
+    expect(overnightFirstLegs()).toSatisfy(legs =>
+      val expected = j([
+        [
+          st("A", null, 1000),
+          st("B", 1035, 1035)
+        ],
+        [
+          st("B", 1030, 1030),
+          st("E", 1100, null)
+        ]
+      ])
+      journeysEq(
+        [{ "legs": legs, "departureTime": 0, "arrivalTime": 0 }],
+        [{ "legs": expected["legs"], "departureTime": 0, "arrivalTime": 0 }]
+      )
+    )
+  ]),
+
+  test("adds a day to the arrival time of journeys that are made overnight", () => [
+    expect(firstArrival(nextDayTrips, "2018-10-16", 900)).toBe(1100 + 86400)
+  ]),
+
+  test("increments the day when searching subsequent days", () => [
+    expect(firstArrival(incrementDayTrips(), "2018-12-31", 900)).toBe(1100 + 86400)
+  ]),
+
+  test("uses all results from every day", () => [
+    expect(plan(
+      [
+        t([
+          st("A", null, 1900),
+          st("B", 1930, 1935),
+          st("C", 2000, null)
+        ]),
+        t([
+          st("B", null, 1035),
+          st("D", 1100, null)
+        ]),
+        t([
+          st("D", null, 1100),
+          st("E", 1130, null)
+        ]),
+        t([
+          st("C", null, 1130),
+          st("E", 1200, null)
+        ])
+      ],
+      {},
+      {},
+      "A",
+      "E",
+      "2019-04-23",
+      900,
+      2
+    )).toSatisfy(r =>
+      val noChange = j([
+        [
+          st("A", null, 1900),
+          st("B", 1930, 1935),
+          st("C", 2000, null)
+        ],
+        [
+          st("C", null, 1130),
+          st("E", 1200, null)
+        ]
+      ])
+      val change = j([
+        [
+          st("A", null, 1900),
+          st("B", 1930, 1935)
+        ],
+        [
+          st("B", null, 1035),
+          st("D", 1100, null)
+        ],
+        [
+          st("D", null, 1100),
+          st("E", 1130, null)
+        ]
+      ])
+      noChange["arrivalTime"] = noChange["arrivalTime"] + 86400
+      change["arrivalTime"] = change["arrivalTime"] + 86400
+      journeysEq(r, [noChange, change])
+    )
+  ]),
+
+  test("does not return overnight journeys that cannot be made", () => [
+    expect(firstArrival(
+      [
+        t([
+          st("A", null, 86000),
+          st("B", 86400, 86400),
+          st("C", 86400 + 3600 + 3600, null)
+        ]),
+        t([
+          st("C", null, 3600),
+          st("D", 3635, 3635),
+          st("E", 3700, null)
+        ]),
+        t([
+          st("C", null, 3600 + 3600),
+          st("D", 3635 + 3600, 3635 + 3600),
+          st("E", 3700 + 3600, null)
+        ])
+      ],
+      "2018-12-31",
+      50000
+    )).toBe(86400 + 3700 + 3600)
+  ]),
+
+  test("omits calendars not running that day", () => [
+    expect(plan(
+      calendarTrips(makeService(20181001, 20181015, allDays, noDates)),
+      {},
+      {},
+      "A",
+      "C",
+      "2018-10-16",
+      900,
+      3
+    )).toSatisfy(r => journeysEq(r, [expectedChange()]))
+  ]),
+
+  test("omits calendars not running that day of the week", () => [
+    expect(plan(
+      calendarTrips(makeService(20181001, 20991231, allButMonday, noDates)),
+      {},
+      {},
+      "A",
+      "C",
+      "2018-10-22",
+      900,
+      3
+    )).toSatisfy(r => journeysEq(r, [expectedChange()]))
+  ]),
+
+  test("includes calendars with an include day", () => [
+    expect(plan(
+      calendarTrips(makeService(20991231, 20991231, allDays, includeOct22)),
+      {},
+      {},
+      "A",
+      "C",
+      "2018-10-22",
+      900,
+      3
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([
+          [
+            st("A", null, 1000),
+            st("B", 1030, null)
+          ],
+          [
+            st("B", null, 1030),
+            st("C", 1100, null)
+          ]
+        ])
+      ])
+    )
+  ]),
+
+  test("omits calendars with an exclude day", () => [
+    expect(plan(
+      calendarTrips(makeService(20181001, 20991231, allDays, excludeOct22)),
+      {},
+      {},
+      "A",
+      "C",
+      "2018-10-22",
+      900,
+      3
+    )).toSatisfy(r => journeysEq(r, [expectedChange()]))
+  ])
+])
+run(s)
