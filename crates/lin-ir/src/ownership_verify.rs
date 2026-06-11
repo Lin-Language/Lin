@@ -64,10 +64,13 @@ impl IntrinsicConv {
 
 use Convention::{Borrow, Inout, Own};
 
-/// THE hand-audited table. Returns `None` for an intrinsic whose convention has not been audited
-/// individually — the verifier treats that as the conservative blanket default (all params `Own`,
-/// return `Own`), and ALSO records it as an "un-audited intrinsic" gap so the shadow report shows
-/// exactly which intrinsics still need an entry before Wave 2.
+/// THE hand-audited table. The match is now EXHAUSTIVE over `Intrinsic` — every runtime intrinsic
+/// (including the previously-un-audited async / worker / Shared / Stream families and `FromJson`)
+/// has an individually-audited convention. The signature stays `-> Option<…>` so the verifier's gap
+/// enumeration and any Wave-2 consumer keep their existing shape, but it never returns `None` today.
+/// A NEW intrinsic added to the enum is a compile error here (non-exhaustive match), forcing its
+/// convention to be audited up-front rather than silently degrading into an unaudited gap. The
+/// verifier's "un-audited intrinsic" gap check therefore now reports ZERO gaps over the corpus.
 ///
 /// Each audited entry cites WHY, grounded in the runtime semantics in `lin-runtime/src/` and the
 /// `RuntimeFns` declarations. The recurring question is "does this symbol store/retain the pointer
@@ -126,9 +129,12 @@ pub fn intrinsic_conventions(intr: &Intrinsic) -> Option<IntrinsicConv> {
         ArrayAlloc | ObjectAlloc => IntrinsicConv::new(vec![Own], Own),
         // FlatArrayAlloc(kind)(cap) -> fresh array.
         FlatArrayAlloc(_) => IntrinsicConv::new(vec![Own], Own),
-        // ArrayAllocate / ArrayAllocateFilled: size (+ fill) -> fresh array. The fill value (arg 1
-        // of Filled) is COPIED into every slot → the runtime retains it per slot, caller keeps its
-        // own reference, so the fill is a Borrow. UNSURE on the fill (see FINDINGS).
+        // ArrayAllocate / ArrayAllocateFilled: size (+ fill) -> fresh array. CONFIRMED on the fill
+        // (was UNSURE): codegen's `ArrayAllocateFilled` arm (intrinsics.rs ~1114-1146) emits one
+        // `lin_tagged_retain(fill)` per slot before each `lin_array_set` for a heap-payload fill, and
+        // documents verbatim "the caller's original borrowed reference is left intact for its own
+        // scope" — so every slot gets its own +1 and the fill is BORROWED, never consumed. A flat
+        // scalar fill carries no heap payload → no retain, still Borrow. ret is the fresh +1 array.
         ArrayAllocate => IntrinsicConv::new(vec![Own], Own),
         ArrayAllocateFilled => IntrinsicConv::new(vec![Own, Borrow], Own),
         // lin_alloc(size) -> raw buffer: scalar in, fresh out.
@@ -153,10 +159,13 @@ pub fn intrinsic_conventions(intr: &Intrinsic) -> Option<IntrinsicConv> {
         // ---- keys / values / introspection: read, return fresh +1 ----
         // lin_keys(obj) -> fresh String[]: reads obj, returns a fresh array. CONFIDENT.
         Keys => IntrinsicConv::new(vec![Borrow], Own),
-        // ValueKey(v): canonicalize a value to a string key — reads, returns fresh string. UNSURE.
+        // ValueKey(v): canonicalize a value to a string key. CONFIRMED (was UNSURE): `lin_value_key`
+        // (string.rs:804) only READS the tagged value via `tagged_to_key_string` and builds a FRESH
+        // `LinString` with `lin_string_from_bytes` — input borrowed, ret fresh +1 (Own).
         ValueKey => IntrinsicConv::new(vec![Borrow], Own),
-        // ToJson(v): structural conversion — reads, returns fresh boxed value. UNSURE (some paths
-        // may share the input by reference).
+        // ToJson(v): structural serialization. CONFIRMED (was UNSURE — the input is NEVER shared):
+        // `lin_to_json` (string.rs:1294) walks the value into a NEW `String` (`push_json_value`) and
+        // returns a fresh `LinString` (`lin_string_from_bytes`) — input borrowed, ret fresh +1 (Own).
         ToJson => IntrinsicConv::new(vec![Borrow], Own),
 
         // ---- Box family: wrap a value, return a fresh box ----
@@ -176,12 +185,188 @@ pub fn intrinsic_conventions(intr: &Intrinsic) -> Option<IntrinsicConv> {
         Panic => IntrinsicConv::new(vec![Borrow], Own),
         Exit => IntrinsicConv::new(vec![Own], Own),
 
-        // Everything else (the async/worker/stream/compress/archive families, FromJson, etc.) is NOT
-        // individually audited this round — they are rare on the RAPTOR/interp hot paths the brief
-        // targets, and several have value-dependent or move semantics that need their own study.
-        // Returning None makes the verifier use the conservative all-Own blanket AND flag them as
-        // gaps, so the shadow report enumerates precisely what is left to audit.
-        _ => return None,
+        // =====================================================================================
+        // Async / concurrency family (std/async — runtime in `async_rt.rs`). RECURRING SHAPE: the
+        // runtime READS each closure/promise/array arg (it deep-COPIES the captured env or
+        // deep-CLONES values for cross-thread transfer — it never frees the caller's arg), and
+        // returns a FRESH +1 result (a `LinPromise`/`LinArray`/handle, boxed by codegen). So the
+        // family is overwhelmingly Borrow-in / Own-out. The two exceptions are documented inline:
+        // `Worker` (RETAINS its handler closures → Own) and `StreamPromise` (MOVES its stream → Own).
+        // =====================================================================================
+
+        // async(thunk) → lin_async_spawn(thunk): reads the thunk's fn/env/cap fields and deep-COPIES
+        // the env for the worker (`transfer_clone_env`); the thunk closure itself is NOT freed. The
+        // `pool.async(f)` 2-arg form is lin_pool_async_one(pool, thunk): pool read (Borrow), thunk
+        // read+env-copied (Borrow). ret = a fresh LinPromise (boxed → Own). CONFIDENT (async_rt.rs
+        // :202 lin_async_spawn, :653 lin_pool_async_one). A scalar pad in the 1-arg form is Borrow-safe.
+        Async => IntrinsicConv::new(vec![Borrow, Borrow], Own),
+        // await(promise) → lin_await_promise(promise): reads the promise, joins its thread, and hands
+        // the resolved TaggedVal* OUT (ownership transfers to caller). The promise itself is consumed
+        // logically (its join handle is taken) but its box is freed by the caller's scope, not here —
+        // so at the pointer level it is read (Borrow); ret = the owned result (Own). CONFIDENT
+        // (async_rt.rs:312).
+        Await => IntrinsicConv::new(vec![Borrow], Own),
+        // parallel(tasks) → lin_parallel(tasks): reads the (unboxed) task array, spawning thunks /
+        // awaiting promises and DEEP-COPYING each result into a FRESH result array — the source array
+        // and its elements are borrowed (never consumed). ret = fresh +1 array (Own). CONFIDENT
+        // (async_rt.rs:511 — "tasks is the raw array … ownership of the result array transfers to the
+        // caller").
+        Parallel => IntrinsicConv::new(vec![Borrow], Own),
+        // race(promises) → lin_race(promises): reads the promise array, DEEP-CLONES the winning value
+        // (`lin_transfer_clone`) so the result is independent of the still-live source promises — the
+        // array is borrowed. ret = fresh promise (boxed → Own). CONFIDENT (async_rt.rs:377).
+        Race => IntrinsicConv::new(vec![Borrow], Own),
+        // timeout(promise, ms) → lin_timeout(promise, ms): polls the promise, DEEP-CLONES its value
+        // into a fresh settled promise — promise borrowed, ms scalar. ret = fresh promise (Own).
+        // CONFIDENT (async_rt.rs:409).
+        Timeout => IntrinsicConv::new(vec![Borrow, Own], Own),
+        // retry(thunk, n) → lin_retry(thunk, n): re-spawns the SAME thunk up to n times (reading it
+        // each attempt — never freeing it), n scalar. ret = fresh settled promise (Own). CONFIDENT
+        // (async_rt.rs:438).
+        Retry => IntrinsicConv::new(vec![Borrow, Own], Own),
+        // threadPool(n) → lin_thread_pool_new(n): scalar in, fresh *LinThreadPool out (boxed handle →
+        // Own). CONFIDENT (async_rt.rs:632).
+        ThreadPool => IntrinsicConv::new(vec![Own], Own),
+        // worker(handler, onClose) → lin_worker_new(…): EXCEPTION — the runtime takes an OWNING
+        // reference to BOTH closure structs (`lin_rc_retain` on on_msg_cls / on_close_cls), holding
+        // them for the worker thread's whole lifetime and releasing them in `lin_worker_close`. This
+        // is the textbook Own (ownership transferred into the worker). ret = fresh *LinWorker (boxed
+        // handle → Own). CONFIDENT (async_rt.rs:717 lin_worker_new + :829 lin_worker_close). NOTE: the
+        // IR `args` are the 2 closure VALUES (handler, onClose); codegen later explodes each into
+        // fn/env/has/cls C-ABI args, but the table is positional over the IR `args` vector.
+        Worker => IntrinsicConv::new(vec![Own, Own], Own),
+        // serve(handler, port) → lin_serve(…): reads the handler closure (invoked per request; blocks
+        // forever, never returns), port scalar. ret = Null. The handler is borrowed (the call never
+        // returns to free anything; treat as read). CONFIDENT (intrinsics.rs:512; server.rs lin_serve).
+        Serve => IntrinsicConv::new(vec![Borrow, Own], Own),
+        // shared(v) → lin_shared_new(v): DEEP-CLONES v into a private box (`lin_transfer_clone`) — v
+        // borrowed; ret = fresh boxed Shared (Own). CONFIDENT (shared.rs:61).
+        SharedNew => IntrinsicConv::new(vec![Borrow], Own),
+        // get(s) → lin_shared_get(s): reads the Shared handle under a read-lock and DEEP-CLONES a
+        // snapshot OUT — handle borrowed; ret = fresh snapshot (Own). CONFIDENT (shared.rs:73).
+        SharedGet => IntrinsicConv::new(vec![Borrow], Own),
+        // set(s, v) → lin_shared_set(s, v): reads the handle, DEEP-CLONES v into the box's slot
+        // (releasing the OLD inner internally — not the arg) — handle + v both borrowed; ret = Null.
+        // CONFIDENT (shared.rs:86).
+        SharedSet => IntrinsicConv::new(vec![Borrow, Borrow], Own),
+        // withLock(s, f) → lin_shared_with_lock(s, f): reads the handle + the closure f (called under
+        // the write-lock; never freed), DEEP-CLONES f's result OUT — both borrowed; ret fresh (Own).
+        // CONFIDENT (shared.rs:112).
+        SharedWithLock => IntrinsicConv::new(vec![Borrow, Borrow], Own),
+        // frozen(v) → lin_freeze(v): SEALS the graph rooted at v IN PLACE (immortalizes its rc) and
+        // returns the SAME pointer v unchanged — not a fresh +1. So v is mutated-in-place (Inout) and
+        // the result is the borrowed-through same value (ret Borrow). CONFIDENT (frozen.rs:79 returns
+        // `v` as-is; intrinsics.rs:584 returns the original `v`, freeing only a transient box shell).
+        Freeze => IntrinsicConv::new(vec![Inout], Borrow),
+        // w.request(w, msg) → lin_worker_request(w, msg): reads the worker handle, DEEP-CLONES msg for
+        // transfer (`lin_transfer_clone`) — both borrowed; ret = the reply (Own). CONFIDENT
+        // (async_rt.rs:799).
+        Request => IntrinsicConv::new(vec![Borrow, Borrow], Own),
+        // w.message(w, msg) → lin_worker_message(w, msg): reads the worker, DEEP-CLONES msg — both
+        // borrowed; ret = Null (void). CONFIDENT (async_rt.rs:818).
+        Message => IntrinsicConv::new(vec![Borrow, Borrow], Own),
+        // w.close(w) → lin_worker_close(w): reads the worker handle, releases the closures it RETAINED
+        // in worker_new (internal balance, not the arg) — handle borrowed; ret = Null. CONFIDENT
+        // (async_rt.rs:829).
+        Close => IntrinsicConv::new(vec![Borrow], Own),
+
+        // =====================================================================================
+        // Stream<T> family (std/stream, std/fs, std/compress, std/archive — runtime in `stream.rs`).
+        // RECURRING SHAPE confirmed for EVERY adapter + terminal: the upstream stream is taken via
+        // `own_upstream` which RETAINS its own +1 (`lin_stream_retain_box`) — the caller keeps its
+        // reference, released at its own scope exit (stream.rs:1686 "the affine check makes the
+        // double-use a compile-time error, but the runtime RC stays balanced either way"). Closures
+        // are taken via `retain_closure` (own +1, caller keeps its ref). Boxed value args
+        // (sep / b / value / arr / init) are taken via `lin_tagged_clone` (own copy, caller keeps its
+        // ref). Terminals `unwrap_stream` + `close_box` but do NOT release the caller's outer box.
+        // => Streams, closures, and cloned value-args are all BORROW; adapters/terminals return a
+        // FRESH +1 (a new Stream box, or a boxed result/error union) = Own. EXCEPTIONS: `StreamReduce`'s
+        // INIT accumulator is CONSUMED (Own), and `StreamPromise` MOVES its stream (Own). Both inline.
+        // =====================================================================================
+
+        // open/read/close (StreamOpen=lin_fs_open(path), StreamRead=lin_stream_read(s),
+        // StreamClose=lin_stream_close(s)): each reads its single arg (path String / stream box) and
+        // returns a fresh boxed value (Stream|Error / chunk-or-EOF-or-Error union / Null). The stream
+        // box is borrowed; close is idempotent and does not free the caller's box. CONFIDENT
+        // (stream.rs:409, :1654, :1677).
+        StreamOpen => IntrinsicConv::new(vec![Borrow], Own),
+        StreamRead | StreamClose => IntrinsicConv::new(vec![Borrow], Own),
+        // Single-stream-arg lazy adapters → fresh Stream. All `own_upstream(s)` (retain → Borrow s).
+        // flatten/pairwise/dedup/manifest/files take only the stream; the gzip/inflate/deflate codecs
+        // likewise. CONFIDENT (stream.rs:1766/1789/1805/2635/2753/1857/1869/1881/1893).
+        StreamFlatten | StreamPairwise | StreamDedup | StreamManifest | StreamFiles
+        | StreamGunzip | StreamGzip | StreamInflate | StreamDeflate => IntrinsicConv::new(vec![Borrow], Own),
+        // (stream, closure) lazy adapters: map/filter/takeWhile/dropWhile/flatMap. own_upstream(s) +
+        // retain_closure(f) → both Borrow; fresh Stream out. CONFIDENT (stream.rs:1712/1720/1742/1750/1758).
+        StreamMap | StreamFilter | StreamTakeWhile | StreamDropWhile | StreamFlatMap => {
+            IntrinsicConv::new(vec![Borrow, Borrow], Own)
+        }
+        // (stream, i64) lazy adapters: take/drop/lines/chunks/sliding. own_upstream(s) → Borrow s;
+        // count/size scalar (Own-neutral). Fresh Stream out. CONFIDENT (stream.rs:1728/1735/1905/1914/1781).
+        StreamTake | StreamDrop | StreamLines | StreamChunks | StreamSliding => {
+            IntrinsicConv::new(vec![Borrow, Own], Own)
+        }
+        // (stream, path) lazy SINKS: writeStream/writeLines. own_upstream(s) → Borrow s; path String
+        // is read (resolve_lin_str, Borrow). Fresh Stream out. CONFIDENT (stream.rs:1925/1935).
+        StreamWrite | StreamWriteLines => IntrinsicConv::new(vec![Borrow, Borrow], Own),
+        // (stream, boxed-value) adapter: intersperse(s, sep). own_upstream(s) → Borrow; sep taken via
+        // lin_tagged_clone (own copy) → Borrow. Fresh Stream out. CONFIDENT (stream.rs:1797).
+        StreamIntersperse => IntrinsicConv::new(vec![Borrow, Borrow], Own),
+        // zipWith(s, b, f): own_upstream(s) → Borrow; b cloned (Borrow); retain_closure(f) → Borrow.
+        // Fresh Stream out. CONFIDENT (stream.rs:1813).
+        StreamZipWith => IntrinsicConv::new(vec![Borrow, Borrow, Borrow], Own),
+        // concat(a, b): BOTH streams own_upstream'd (each retained) → both Borrow. Fresh Stream out.
+        // CONFIDENT (stream.rs:1773).
+        StreamConcat => IntrinsicConv::new(vec![Borrow, Borrow], Own),
+        // SOURCE adapters (no upstream): count(start, step) scalars; repeat(value, n) clones value
+        // (Borrow) + scalar n; cycle(arr) clones arr (Borrow). Fresh Stream out. CONFIDENT
+        // (stream.rs:1828/1835/1844).
+        StreamCount => IntrinsicConv::new(vec![Own, Own], Own),
+        StreamRepeat => IntrinsicConv::new(vec![Borrow, Own], Own),
+        StreamCycle => IntrinsicConv::new(vec![Borrow], Own),
+        // Unified OS sources: tcp(fd)/stdout(handle)/stdin(): scalar/no args → fresh Stream (Own).
+        // CONFIDENT (stream.rs:388/394/400).
+        StreamTcp | StreamStdout => IntrinsicConv::new(vec![Own], Own),
+        StreamStdin => IntrinsicConv::new(vec![], Own),
+        // Single-stream-arg TERMINALS: drain/collect/readText. unwrap_stream(s) + close_box(s) — the
+        // caller's outer box is NOT released here (it owns its own ref). s Borrow; fresh boxed result
+        // (Null|Error / UInt8[]|Error / String|Error) out (Own). CONFIDENT (stream.rs:1946/2229/2255).
+        StreamDrain | StreamCollect | StreamReadText => IntrinsicConv::new(vec![Borrow], Own),
+        // (stream, closure) TERMINALS: for/find/some/every/while/untar. retain_closure(body) → Borrow;
+        // s Borrow (terminal close_box doesn't free the caller's box). Fresh boxed result out (Own).
+        // CONFIDENT (stream.rs:1978/2059/2098/2137/2177/2508).
+        StreamFor | StreamFind | StreamSome | StreamEvery | StreamWhile | StreamUntar => {
+            IntrinsicConv::new(vec![Borrow, Borrow], Own)
+        }
+        // reduce(s, init, f) TERMINAL: EXCEPTION — `init` arrives as an OWNED +1 and the runtime takes
+        // ownership of the running accumulator, releasing the previous one each step and on error
+        // (stream.rs:2013 "the caller hands us an owned +1 ref … we own the running accumulator").
+        // So init = Own (CONSUMED). s Borrow; retain_closure(f) → Borrow. Fresh boxed U|Error out (Own).
+        // NOTE: the lowerer does NOT `unregister_owned` the init temp — it relies on init being a fresh
+        // transient box (a scalar boxed by codegen, or a fresh-alloc) so there is no scope-registered
+        // owner to double-free. See FINDINGS: a NON-fresh heap init (e.g. an owned `var` passed to
+        // reduce) would be released by BOTH the runtime and the caller's scope. CONFIDENT on the
+        // convention; the double-free risk is a SEPARATE codegen question, not a table error.
+        StreamReduce => IntrinsicConv::new(vec![Borrow, Own, Borrow], Own),
+        // .promise() (StreamPromise=lin_stream_promise(s)): EXCEPTION — MOVES the stream onto a worker
+        // thread; the lowerer `unregister_owned`s the stream arg (lower.rs:4807) and the worker drives
+        // + releases it via `lin_stream_drive_owned` (stream.rs:2222 lin_tagged_release(s)). So the
+        // stream is CONSUMED (Own); ret = fresh Promise (boxed → Own). CONFIDENT (async_rt.rs:279).
+        StreamPromise => IntrinsicConv::new(vec![Own], Own),
+
+        // fromJson(value) → lin_from_json(value, desc): the runtime BORROWS the input (decode.rs:289
+        // "the input is borrowed (never consumed)") and returns either the same pointer cloned (+1) on
+        // success or a fresh Error — unconditionally a fresh +1 union (Own). The IR `args` is `[value]`
+        // only (the schema descriptor is a codegen-built static global, NOT an IR arg). CONFIDENT
+        // (lower.rs:5844 lower_from_json, decode.rs:289).
+        FromJson { .. } => IntrinsicConv::new(vec![Borrow], Own),
+
+        // The match is now EXHAUSTIVE over `Intrinsic` — every intrinsic is individually audited, so
+        // there is no longer a conservative all-Own blanket / gap fall-through. The return type stays
+        // `Option` so the verifier's gap-enumeration (and Wave-2 consumers) keep their existing shape,
+        // but in practice this never returns `None`. Deliberately NO `_ =>` arm: a NEW intrinsic added
+        // later is then a COMPILE ERROR here (non-exhaustive match), forcing its convention to be
+        // audited at the point it is introduced rather than silently degrading to an unaudited gap.
     };
     Some(conv)
 }
@@ -1202,6 +1387,53 @@ mod tests {
     fn intrinsic_table_push_is_inout_own() {
         let c = intrinsic_conventions(&Intrinsic::Push).unwrap();
         assert_eq!(c.params, vec![Convention::Inout, Convention::Own]);
+    }
+
+    /// Async/worker/shared/stream/FromJson families are now audited (no longer table GAPs). Pin the
+    /// load-bearing decisions — including the two consuming EXCEPTIONS (`Worker`, `StreamPromise`,
+    /// `StreamReduce` init) and the borrowed-through `Freeze` — so a future edit cannot drift them.
+    #[test]
+    fn intrinsic_table_async_stream_families_audited() {
+        // Borrow-in / Own-out is the dominant async/stream shape.
+        let map = intrinsic_conventions(&Intrinsic::StreamMap).unwrap();
+        assert_eq!(map.params, vec![Convention::Borrow, Convention::Borrow]);
+        assert_eq!(map.ret, Convention::Own);
+        assert_eq!(intrinsic_conventions(&Intrinsic::Async).unwrap().ret, Convention::Own);
+        assert_eq!(intrinsic_conventions(&Intrinsic::SharedNew).unwrap().params, vec![Convention::Borrow]);
+
+        // EXCEPTION 1 — Worker RETAINS both handler closures → Own (ownership into the worker).
+        assert_eq!(
+            intrinsic_conventions(&Intrinsic::Worker).unwrap().params,
+            vec![Convention::Own, Convention::Own]
+        );
+        // EXCEPTION 2 — StreamPromise MOVES (consumes) its stream → Own.
+        assert_eq!(intrinsic_conventions(&Intrinsic::StreamPromise).unwrap().params, vec![Convention::Own]);
+        // EXCEPTION 3 — StreamReduce CONSUMES its init accumulator (arg 1 = Own), borrows s + f.
+        assert_eq!(
+            intrinsic_conventions(&Intrinsic::StreamReduce).unwrap().params,
+            vec![Convention::Borrow, Convention::Own, Convention::Borrow]
+        );
+        // Freeze SEALS in place and returns the SAME pointer (not a fresh +1): Inout arg, Borrow ret.
+        let fr = intrinsic_conventions(&Intrinsic::Freeze).unwrap();
+        assert_eq!(fr.params, vec![Convention::Inout]);
+        assert_eq!(fr.ret, Convention::Borrow);
+
+        // FromJson borrows the input, returns a fresh +1 union.
+        let fj = intrinsic_conventions(&Intrinsic::FromJson {
+            target: Box::new(Type::Null),
+            named_defs: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(fj.params, vec![Convention::Borrow]);
+        assert_eq!(fj.ret, Convention::Own);
+
+        // The previously-UNSURE entries are now confirmed Borrow-fill / Borrow-in.
+        assert_eq!(
+            intrinsic_conventions(&Intrinsic::ArrayAllocateFilled).unwrap().params,
+            vec![Convention::Own, Convention::Borrow]
+        );
+        assert_eq!(intrinsic_conventions(&Intrinsic::ValueKey).unwrap().params, vec![Convention::Borrow]);
+        assert_eq!(intrinsic_conventions(&Intrinsic::ToJson).unwrap().params, vec![Convention::Borrow]);
     }
 
     /// `escape_alias_convention` mirrors the two former inline `record_escape_alias` gates in
