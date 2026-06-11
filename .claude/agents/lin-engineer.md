@@ -259,6 +259,9 @@ val squares = range(1, 4).map(n => n * n)     // [1, 4, 9]
 
 ### Types
 - **Avoid `Json`. It is an escape hatch, not a default.** Reach for it ONLY when a value's shape is genuinely dynamic and unknowable at compile time — parsing arbitrary external JSON, a recursive AST indexed by per-variant fields, untyped wire data. The rest of the time — which is almost always — use a **named record type, a generic, or a union**. `Json` defeats the type checker (no field checking, no arithmetic without narrowing/decoding), defeats width-subtyping, and is a real performance cliff: field access on `Json` is an optimisation barrier the backend can't hoist or fold, where typed records get inlined to a constant slot load. If you find yourself writing `(x: Json)` and then `x["field"]`, stop and write the record type instead.
+
+If you need a hashmap, define one as `{ String: SomeType }`. 
+
 - Structural and width-subtyped: an object with extra fields satisfies a narrower object type. Prefer naming your shapes: `type Record = { "name": String, "score": Int32 }` and typing functions `(r: Record): ...`, not `(r: Json)`.
 - Unions `A | B | C`; narrow with `is`/`has`.
 - Typed maps use an index signature: `{ String: Int32 }`, missing key → `Null`. Arrays are `T[]`; fixed tuples are positional `[T1, T2]`.
