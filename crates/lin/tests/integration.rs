@@ -4900,6 +4900,31 @@ print(toString(nums.every(x => x > 2)))
     assert_eq!(output, vec!["4", "null", "true", "false", "true", "false"]);
 }
 
+// Wave C: find/some/every called with a NAMED no-capture function (not an inline lambda) are
+// devirtualized — the predicate is substituted directly into a per-callback specialization. This
+// pins correctness across: two distinct named predicates on the same HOF (two specs), the no-match
+// path, AND a capturing-lambda call (must keep the old indirect path and stay correct).
+#[test]
+fn test_wavec_named_callback_devirt_find_some_every() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { find, some, every } from "std/iter"
+
+val isEven = (x: Int32) => x % 2 == 0
+val isBig = (x: Int32) => x > 100
+
+val xs = [1, 3, 5, 6, 7, 8]
+print(toString(find(xs, isEven)))    // 6  (devirt → @isEven)
+print(toString(find(xs, isBig)))     // null (devirt, no match)
+print(toString(some(xs, isEven)))    // true
+print(toString(every(xs, isEven)))   // false
+print(toString(every(xs, isBig)))    // false
+var threshold = 4
+print(toString(find(xs, x => x > threshold)))   // 5 (capturing lambda — old path)
+"#);
+    assert_eq!(output, vec!["6", "null", "true", "false", "false", "5"]);
+}
+
 #[test]
 fn test_stdlib_array_flatmap_indexof_reverse() {
     let output = run(r#"import { print } from "std/io"
