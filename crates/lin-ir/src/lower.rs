@@ -2197,7 +2197,24 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
         // inner survives into the slot, exactly as the source-box does in the unbox direction. No RC
         // accounting changes for non-tail calls (the alias is only consulted by the tail-call keep
         // expansion).
-        if !is_union_ty(arg_ty) && is_union_ty(param_ty) && is_rc_type(arg_ty) {
+        //
+        // EXCEPTION — a SEALED scalar record arg: the Coerce is NOT a cheap pointer-wrap. It runs
+        // `sealed_materialize_to_object` → `box_object`, building a FRESH, INDEPENDENT `LinObject`
+        // (it RETAINS the struct's heap fields into the new object), so the box `dst` does NOT alias
+        // `arg`'s inner — `arg` (the source packed struct) is a genuine orphan once the box is built.
+        // Recording the escape-alias here would mark that orphan as KEPT across the back-edge, so
+        // `release_owned_for_tail_call` never releases it → the whole sealed struct (and the `id`
+        // String / `stops` array it owns) leaks every iteration: the `scanRouteAt(…, mk(pi), …)`
+        // tail-recursive `Trip | Null` threading leak (ASan-confirmed scaling, the RAPTOR RANGE-phase
+        // RSS growth). The materialized box `dst` is the tail-call arg; the back-edge keeps it and
+        // the TCO release-old reclaims it (its retained heap fields too). So DON'T alias for a sealed
+        // arg — let the source struct be released before the back-edge. (Non-sealed heap args keep
+        // the alias: their box genuinely shares the inner pointer threaded into the slot.)
+        if !is_union_ty(arg_ty)
+            && is_union_ty(param_ty)
+            && is_rc_type(arg_ty)
+            && !is_sealed_scalar_repr(arg_ty)
+        {
             builder.record_escape_alias(dst, arg);
         }
         return dst;
