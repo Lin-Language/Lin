@@ -1398,18 +1398,6 @@ fn lower_sum_scrutinee_raw(
 /// container. This MUST mirror codegen's dispatch in `compile_ir_index` (data.rs): the `Map`
 /// branch is checked FIRST, then `is_array_access = Array/FixedArray(obj_ty) || numeric key`.
 ///
-/// The distinction matters for ownership: a union Index result is normally relocated off its
-/// (borrowed, movable) container slot via `CloneBox`. But when the source is ALREADY a fresh
-/// +1 box (the array path), that extra clone leaks the original box once per evaluation — the
-/// dominant per-scanned-stop leak in `routeScanner.scanBack`'s `routeTrips[i]`. Register the
-/// fresh box owned directly instead (mirrors the sealed-record-by-dynamic-key fresh-box case).
-fn index_result_is_fresh_owned_box(obj_ty: &Type, key_ty: &Type) -> bool {
-    if matches!(obj_ty, Type::Map(_)) {
-        return false;
-    }
-    matches!(obj_ty, Type::Array(_) | Type::FixedArray(_)) || key_ty.is_numeric()
-}
-
 /// True when `ty` is a SEALED RECORD — a `Type::Object { sealed: true }` all of whose fields are
 /// either unboxed scalars (numeric or Bool) — Stage 1 — OR eligible HEAP fields (String, Array,
 /// nested sealed record) — Stage 2. MUST mirror `Codegen::sealed_fields` EXACTLY: the two decide,
@@ -3857,9 +3845,14 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
             let obj_ty_is_sealed = is_sealed_scalar_repr(&obj_ty);
             // Whether codegen's array path (`lin_array_get_tagged`) produces a FRESH +1 box for
             // this index — if so, the union relocation below must NOT clone it again (that leaks
-            // the original box, once per evaluation). Computed before `obj_ty`/`key_ty` are moved
+            // the original box, once per evaluation). Read the ownership fact from the ownership
+            // authority (`Own` = fresh +1; `Borrow` = interior pointer into the container) rather
+            // than re-deriving it from type shape here. Computed before `obj_ty`/`key_ty` are moved
             // into the `Index` instruction.
-            let result_is_fresh_owned = index_result_is_fresh_owned_box(&obj_ty, &key_ty);
+            let result_is_fresh_owned = matches!(
+                crate::ownership_verify::index_result_convention(&obj_ty, &key_ty),
+                crate::ir::Convention::Own
+            );
             builder.emit(Instruction::Index {
                 dst,
                 object: obj_temp,

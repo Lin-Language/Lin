@@ -186,6 +186,40 @@ pub fn intrinsic_conventions(intr: &Intrinsic) -> Option<IntrinsicConv> {
     Some(conv)
 }
 
+/// The ownership convention of the VALUE PRODUCED by an `Index` (`obj[key]`) operation, decided from
+/// the container + key types. This is the ownership authority for the projection-result lifetime — it
+/// answers the single question the lowerer's RC insertion needs: does codegen hand back a FRESH +1 box
+/// the binding already owns (`Own`), or a BORROWED interior pointer into the (movable) container that
+/// must be relocated off its slot before it escapes (`Borrow`)?
+///
+/// - `Own` (fresh +1): the array / fixed-array path (`lin_array_get_tagged` allocates a standalone
+///   `TaggedVal` — for a flat array it boxes the scalar, for a tagged array it copies the element box),
+///   and any NUMERIC-keyed container projection (codegen materializes + clones into a fresh box). In
+///   both cases `dst` is already an owned, container-independent value, so the union-relocation
+///   `CloneBox` (or the sealed/scalar retain) must be SKIPPED — cloning a fresh box leaks the original
+///   once per evaluation (the dominant per-scanned-stop leak in `routeScanner.scanBack`'s
+///   `routeTrips[i]`).
+/// - `Borrow` (interior pointer): the object / `Map` path (`lin_object_get` returns a `*TaggedVal`
+///   INTO the container — exactly the `ObjectGet` return `Borrow` in the table above). The value MUST
+///   be relocated off the slot (`CloneBox` / retain) before it escapes, or it dangles when the
+///   container grows/moves.
+///
+/// Relocated verbatim (same predicate, expressed in `Convention` terms) from the former
+/// `index_result_is_fresh_owned_box` heuristic in `lower.rs`, so the fresh-vs-borrowed projection
+/// fact now lives in the ownership authority alongside the intrinsic table it mirrors
+/// (`ArrayGet` ret `Borrow` for the plain get, fresh +1 for the `_tagged` variant), rather than being
+/// re-derived inline at the RC-insertion site.
+pub fn index_result_convention(obj_ty: &Type, key_ty: &Type) -> Convention {
+    if matches!(obj_ty, Type::Map(_)) {
+        return Borrow;
+    }
+    if matches!(obj_ty, Type::Array(_) | Type::FixedArray(_)) || key_ty.is_numeric() {
+        Own
+    } else {
+        Borrow
+    }
+}
+
 // ===========================================================================
 // 2. Convention inference at lowering
 // ===========================================================================
