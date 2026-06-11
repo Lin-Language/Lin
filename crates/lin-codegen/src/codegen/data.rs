@@ -1197,6 +1197,13 @@ impl<'ctx> Codegen<'ctx> {
                         let offset = Self::sumnode_field_offset(&payload, k);
                         heap.push((offset, Self::KIND_SUMNODE));
                         any_heap = true;
+                    } else if let Some(kind) = Self::sealed_field_kind(fty) {
+                        // Heap-field SumNode Stage 3: String/Array/nested-sealed fields need a
+                        // descriptor entry so the runtime drop walk releases them. Uses the same
+                        // KIND_STRING/KIND_ARRAY/KIND_SEALED constants as sealed records.
+                        let offset = Self::sumnode_field_offset(&payload, k);
+                        heap.push((offset, kind));
+                        any_heap = true;
                     }
                 }
             }
@@ -2265,6 +2272,19 @@ impl<'ctx> Codegen<'ctx> {
                 // `transfer_into_container` discipline — so codegen must NOT add another retain here
                 // (that would double-count the child, never balanced by the single drop-walk release).
                 self.builder.store(p, *val);
+            } else if Self::sealed_field_kind(&fld_ty).is_some() && !Self::is_sum_scalar_field(&fld_ty) {
+                // Heap field (String/Array/nested-sealed) Stage 3: store the heap pointer and RETAIN
+                // so the node owns an independent +1. The caller's temp (the field expression's result)
+                // retains its own +1 which scope-exit releases; the node takes a second +1 here that
+                // the descriptor's drop walk releases when the node is freed. This mirrors
+                // sealed_construct's unconditional retain for non-owned fields. We always retain (no
+                // `already_owned` flag in the SumNode construct API) — the heap-field temp is NEVER
+                // transferred into the SumNode by the lowerer (only recursive children are).
+                let stored = if val_ty == &fld_ty { *val } else { self.compile_ir_coerce(*val, val_ty, &fld_ty) };
+                self.builder.store(p, stored);
+                if stored.is_pointer_value() {
+                    self.builder.call(self.rt.rc_retain, &[stored.into_pointer_value().into()], "sumnode_heap_fld_retain");
+                }
             } else {
                 // Scalar field: reconcile a wider/narrower numeric literal into the stored width.
                 let stored = if val_ty == &fld_ty { *val } else { self.compile_ir_coerce(*val, val_ty, &fld_ty) };
@@ -2527,6 +2547,20 @@ impl<'ctx> Codegen<'ctx> {
                     }
                     continue;
                 }
+                // Heap-field SumNode Stage 3: a heap field (String/Array/nested-sealed) is stored
+                // as an owned interior pointer in the node. Read it directly (BORROWED — the node
+                // still owns it), box it, set it in the object (object_set_fresh retains), then
+                // release our fresh-box shell. The node remains the owner; the object takes its own
+                // reference via object_set_fresh's retain.
+                if Self::sealed_field_kind(fty).is_some() && !Self::is_sum_scalar_field(fty) {
+                    let v = self.sumnode_field_get(node, k, payload, fty);
+                    let boxed = self.box_value(v, fty);
+                    self.builder.call(self.rt.object_set_fresh, &[obj.into(), key_str.into(), boxed.into()], "");
+                    if boxed.is_pointer_value() {
+                        self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                    }
+                    continue;
+                }
                 let v = self.sumnode_field_get(node, k, payload, fty);
                 let boxed = self.box_value(v, fty);
                 self.builder.call(self.rt.object_set_fresh, &[obj.into(), key_str.into(), boxed.into()], "");
@@ -2760,17 +2794,34 @@ impl<'ctx> Codegen<'ctx> {
 
     pub(crate) fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, obj_ty: &Type, result_ty: &Type, obj_repr: &lin_ir::repr::Repr) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        // UNBOXED SUM TYPE (unboxed-sumtype Stage 2): a field read on a value that is physically a
-        // `SumNode` (repr Packed(SumNode)) — emitted by the lowerer for a narrowed-variant scrutinee
-        // whose variant carries a recursive child (so it cannot be projected to a sealed struct, and
-        // ALL its field reads must go directly to the node, never via materialize-to-boxed which would
-        // release the borrowed children). A RECURSIVE CHILD field is a const-offset `*SumNode` pointer
-        // load (borrowed interior); a SCALAR field is a const-offset value load. The variant is
-        // resolved by field NAME (each field appears in exactly the variant(s) declaring it, at a
-        // consistent offset — the access is only reachable when the tag selects such a variant). Guard
-        // on the repr so a mis-seeded boxed value can never read at a raw payload offset.
+        // UNBOXED SUM TYPE (Stage 2/3): a field read on a value that is physically a `SumNode`
+        // (repr Packed(SumNode)) — emitted by the lowerer for a narrowed-variant scrutinee.
+        // A RECURSIVE CHILD field is a const-offset `*SumNode` pointer load (borrowed interior);
+        // a SCALAR field is a const-offset value load; a HEAP field (Stage 3) is a const-offset
+        // pointer load + Retain (the lowerer already emits the Retain above). The variant offset
+        // is resolved by field NAME — for recursive-child/scalar fields this is unambiguous (each
+        // field has a unique name or consistent offset across variants), so `sum_ty` is used.
+        // For HEAP fields, the lowerer passes the NARROWED variant type as `obj_ty` (an unsealed
+        // Object) so we use that variant's payload for the exact offset rather than scanning all
+        // variants — correct when the same field name appears in multiple variants at different
+        // offsets (e.g. after heap-field slots shift the position of a shared trailing scalar).
+        // Guard on the repr so a mis-seeded boxed value never reads at a raw payload offset.
         if let Some(sum_ty) = obj_repr.sumnode_sum_ty() {
             if obj.is_pointer_value() {
+                // Heap-field direct read (Stage 3): obj_ty is the NARROWED variant Object
+                // (sealed or not, passed by the lowerer to carry the correct variant payload
+                // layout). Use its payload for the field offset so we get the variant-specific
+                // position rather than scanning all variants (which gives the wrong offset when
+                // the same field name appears in multiple variants at different positions due to
+                // preceding heap-field slots). Fall back to the full-sum scan for non-narrowed
+                // FieldGets (scalar/recursive-child reads where sum_ty is passed directly).
+                if let Type::Object { fields: variant_fields, .. } = obj_ty {
+                    if variant_fields.contains_key(field) && !variant_fields.is_empty() {
+                        let disc_key = Self::sum_type_discriminant(sum_ty).unwrap_or_default();
+                        let payload = Self::sumnode_variant_payload_fields(variant_fields, &disc_key);
+                        return self.sumnode_field_get(obj, field, &payload, result_ty);
+                    }
+                }
                 let sum_ty = sum_ty.clone();
                 return self.sumnode_field_get_by_name(obj, field, &sum_ty, result_ty);
             }

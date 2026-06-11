@@ -527,10 +527,11 @@ impl<'ctx> Codegen<'ctx> {
     ///   (1) every variant is a `Type::Object` (sealed or not — the union itself is the seal);
     ///   (2) a SHARED key exists whose value is a distinct `StrLit` on every variant (the
     ///       discriminant — same soundness rule as the shipped union-discrimination);
-    ///   (3) every OTHER field of every variant is EITHER an unboxed scalar OR (Stage 2) a RECURSIVE
-    ///       self-child (`Type::Named(self_name)`, stored as an owned `*SumNode` pointer). NO heap
-    ///       (String/Array)/union/nested-non-recursive-record/foreign-Named field. Any violation →
-    ///       `None` → fall back to the boxed union (fail-safe).
+    ///   (3) every OTHER field of every variant is EITHER a sealed-eligible field (scalar, String,
+    ///       Array, nested-sealed) OR (Stage 2) a RECURSIVE self-child (`Type::Named(self_name)`,
+    ///       stored as an owned `*SumNode` pointer). Heap fields → heap-field SumNode Stage 3
+    ///       (descriptor + construct + materializer extended). Any violation → `None` → fall back to
+    ///       the boxed union (fail-safe).
     /// A `Null` member disqualifies (a nullable sum stays boxed — fail-safe, strict scope).
     pub(crate) fn sum_type_discriminant(ty: &Type) -> Option<String> {
         let variants = match ty {
@@ -570,7 +571,8 @@ impl<'ctx> Codegen<'ctx> {
                     _ => continue 'keys, // missing/non-StrLit on some variant
                 }
             }
-            // Every OTHER field of every variant must be an unboxed scalar OR a recursive self-child.
+            // Every OTHER field of every variant must be a sealed-eligible field OR a recursive
+            // self-child. Heap fields (String/Array/nested-sealed) are now admitted (Stage 3).
             for rec in &recs {
                 for (fk, fty) in rec.iter() {
                     if fk == key {
@@ -581,11 +583,13 @@ impl<'ctx> Codegen<'ctx> {
                         return None;
                     }
                     // Stage 2: a recursive self-child (`Named(self_name)`) is an 8-byte `*SumNode`
-                    // slot. Any OTHER `Named` (foreign type) / heap / union field → not packable.
+                    // slot. Any OTHER `Named` (foreign type) / union field → not packable.
                     let is_recursive_child = self_name
                         .as_deref()
                         .is_some_and(|n| Self::is_sum_recursive_child(fty, n));
-                    if !Self::is_sum_scalar_field(fty) && !is_recursive_child {
+                    // Heap-field SumNode Stage 3: admit any sealed-eligible field (scalar, String,
+                    // Array, nested-sealed). MUST stay in lockstep with repr.rs.
+                    if !Self::is_sealed_field(fty) && !is_recursive_child {
                         return None;
                     }
                 }
@@ -652,11 +656,14 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Byte width of one variant-payload field SLOT. A scalar occupies its natural width (1/2/4/8); a
-    /// RECURSIVE child (`Type::Named`, Stage 2) occupies an 8-byte `*SumNode` pointer slot. (Any other
-    /// non-scalar would never reach here — the gate rejects it.)
+    /// RECURSIVE child (`Type::Named`, Stage 2) occupies an 8-byte `*SumNode` pointer slot. A HEAP
+    /// field (String/Array/nested-sealed, Stage 3) occupies an 8-byte owned pointer slot (same as the
+    /// recursive child — both are RC heap pointers). Scalars use their natural width.
     fn sumnode_slot_size(fty: &Type) -> u64 {
         if matches!(fty, Type::Named(_)) {
             8 // recursive child: owned *SumNode pointer slot
+        } else if Self::sealed_field_kind(fty).is_some() && !Self::is_sum_scalar_field(fty) {
+            8 // heap field (String/Array/nested-sealed): owned heap pointer slot (Stage 3)
         } else {
             fty.bit_width().map(|b| (b as u64) / 8).unwrap_or(1).max(1)
         }

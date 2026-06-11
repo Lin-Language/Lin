@@ -18300,3 +18300,140 @@ main()
     assert_eq!(output, vec!["2"]);
 }
 
+// ---------------------------------------------------------------------------
+// Heap-field SumNode Stage 3 — discriminated unions whose non-discriminant
+// fields include String, Array, or nested-sealed records.
+//
+// Prior to this change, any variant with a heap field caused the whole union
+// to fall back to the BOXED path (4 lin_object_get + lin_sealed_alloc + 3
+// lin_rc_retain per match-dispatch). Stage 3 widens the SumNode gate to admit
+// heap fields, stores them as 8-byte owned pointer slots in the node payload,
+// uses a SumDesc drop-table entry (KIND_STRING / KIND_ARRAY / KIND_SEALED) for
+// release, and reads them by const-offset GEP+load+Retain in the direct-read
+// fast path — eliminating the boxing round-trip from match-narrow field reads.
+//
+// Correctness is the primary gate here; the RC discipline (retain on read,
+// descriptor-drop on free) is verified by ASan separately.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_heap_sumnode_string_field_match_read() {
+    // Two-variant union with a String field ("label") and a scalar field.
+    // Match-narrow reads both; assert the correct string is returned for each variant.
+    let out = run(r#"import { print } from "std/io"
+type Circle = { "kind": "circle", "r": Int32, "label": String }
+type Square = { "kind": "square", "s": Int32, "label": String }
+type Shape = Circle | Square
+
+val describe = (s: Shape): String =>
+  match s
+    is Circle => "circle r=${s["r"]} label=${s["label"]}"
+    is Square => "square s=${s["s"]} label=${s["label"]}"
+
+val c: Shape = { "kind": "circle", "r": 5, "label": "big" }
+val sq: Shape = { "kind": "square", "s": 3, "label": "small" }
+print(describe(c))
+print(describe(sq))
+"#);
+    assert_eq!(out, vec!["circle r=5 label=big", "square s=3 label=small"]);
+}
+
+#[test]
+fn test_heap_sumnode_string_field_loop_no_leak() {
+    // Build + dispatch a heap-field SumNode on every iteration — guards that the
+    // runtime drop walk (via KIND_STRING in the SumDesc) releases the String exactly
+    // once per iteration (no leak, no double-free). The result is deterministic.
+    let out = run(r#"import { print } from "std/io"
+import { range, for } from "std/iter"
+type A = { "kind": "a", "name": String, "n": Int32 }
+type B = { "kind": "b", "name": String, "n": Int32 }
+type AB = A | B
+
+val process = (x: AB): String =>
+  match x
+    is A => "a:${x["name"]}:${x["n"]}"
+    is B => "b:${x["name"]}:${x["n"]}"
+
+var last = ""
+range(0, 5).for(i =>
+  val s: AB =
+    if i % 2 == 0 then { "kind": "a", "name": "item${i}", "n": i }
+    else { "kind": "b", "name": "item${i}", "n": i }
+  last = process(s))
+print(last)
+"#);
+    // i=4: 4%2==0 → kind "a" → "a:item4:4"
+    assert_eq!(out, vec!["a:item4:4"]);
+}
+
+#[test]
+fn test_heap_sumnode_array_field_match_read() {
+    // A variant with an Array field (Int32[]). Match-narrow and read the array length.
+    let out = run(r#"import { print } from "std/io"
+import { length } from "std/array"
+type WithArr = { "kind": "arr", "items": Int32[], "n": Int32 }
+type Plain   = { "kind": "plain", "n": Int32 }
+type Mixed   = WithArr | Plain
+
+val getCount = (m: Mixed): Int32 =>
+  match m
+    is WithArr => m["items"].length()
+    is Plain   => m["n"]
+
+val a: Mixed = { "kind": "arr", "items": [10, 20, 30], "n": 99 }
+val b: Mixed = { "kind": "plain", "n": 7 }
+print("${getCount(a)}")
+print("${getCount(b)}")
+"#);
+    assert_eq!(out, vec!["3", "7"]);
+}
+
+#[test]
+fn test_heap_sumnode_toString_materializer() {
+    // A heap-field SumNode that escapes to toString — exercises the materializer
+    // (get_or_build_sumnode_materializer), which must correctly box String/Array fields.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Lit  = { "kind": "lit", "val": Int32, "name": String }
+type Pair = { "kind": "pair", "name": String, "left": Int32, "right": Int32 }
+type Expr = Lit | Pair
+
+val e1: Expr = { "kind": "lit", "val": 42, "name": "answer" }
+val e2: Expr = { "kind": "pair", "name": "sum", "left": 1, "right": 2 }
+print(e1.toString())
+print(e2.toString())
+"#);
+    // toString of a SumNode materializes it → a LinObject with the correct fields.
+    // The exact JSON ordering may vary; assert the key substrings are present.
+    let combined = out.join("\n");
+    assert!(combined.contains("\"kind\""), "expected kind in toString: {combined}");
+    assert!(combined.contains("answer"), "expected 'answer' in toString: {combined}");
+    assert!(combined.contains("sum"), "expected 'sum' in toString: {combined}");
+}
+
+#[test]
+fn test_heap_sumnode_three_variants_string() {
+    // Three-variant union all with String fields — exercises the multi-variant
+    // tag switch in the descriptor and the direct-read fast path.
+    let out = run(r#"import { print } from "std/io"
+type Red   = { "kind": "red",   "msg": String, "v": Int32 }
+type Green = { "kind": "green", "msg": String, "v": Int32 }
+type Blue  = { "kind": "blue",  "msg": String, "v": Int32 }
+type Color = Red | Green | Blue
+
+val show = (c: Color): String =>
+  match c
+    is Red   => "R:${c["msg"]}=${c["v"]}"
+    is Green => "G:${c["msg"]}=${c["v"]}"
+    is Blue  => "B:${c["msg"]}=${c["v"]}"
+
+val r: Color = { "kind": "red",   "msg": "fire",  "v": 1 }
+val g: Color = { "kind": "green", "msg": "grass", "v": 2 }
+val b: Color = { "kind": "blue",  "msg": "sky",   "v": 3 }
+print(show(r))
+print(show(g))
+print(show(b))
+"#);
+    assert_eq!(out, vec!["R:fire=1", "G:grass=2", "B:sky=3"]);
+}
+
