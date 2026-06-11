@@ -448,7 +448,9 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
 // v3 (Path-11): `Type::Function` gained an inert `lset: LambdaSet` field and `TypedExpr::Function`
 // gained `lambda_id: u32`, changing the bincode layout of every serialized `Type`/`TypedStmt`.
 // A `.typed`/`.sig` written by a v2 binary must be rejected (stale layout → mis-decode).
-const CACHE_FORMAT_VERSION: u32 = 3;
+// v4 (feat/tar-entries): `Type::TarEntry` added as a new enum variant (after `Promise`), shifting
+// the bincode discriminant of every variant that follows. Stale v3 `.typed`/`.sig` must be rejected.
+const CACHE_FORMAT_VERSION: u32 = 4;
 
 /// Magic prefix written at the head of every `.typed`/`.sig` cache file. Combined with the
 /// compiler version and `CACHE_FORMAT_VERSION`, this is the on-disk compatibility stamp checked

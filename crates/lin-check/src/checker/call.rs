@@ -1492,7 +1492,7 @@ fn is_std_iter_stream_combinator(export_name: &str) -> bool {
 /// `lin_stream_*` intrinsic that moves the boxed-stream pointer, so a later use of the same binding
 /// must be a compile-time error — mirrors the IR's type-based `move_streamish_arg`.
 fn is_std_archive_consuming_export(export_name: &str) -> bool {
-    matches!(export_name, "untar" | "manifest" | "files")
+    matches!(export_name, "untar" | "manifest" | "files" | "entries")
 }
 
 /// True when `param_ty` can structurally ACCEPT a `Stream` argument: a `Stream<U>` (incl. the

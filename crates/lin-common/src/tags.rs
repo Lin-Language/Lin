@@ -54,3 +54,10 @@ pub const TAG_BIGNUM: u8 = 22;
 /// as `TAG_BIGNUM`: a `*const DecimalBox` wrapping a `rust_decimal::Decimal`, refcounted via the
 /// `TAG_DECIMAL` arm of the tag-aware retain/release.
 pub const TAG_DECIMAL: u8 = 23;
+/// `TarEntry` — an opaque, generation-stamped handle to a single tar archive entry. Carries a
+/// copy of the header metadata (always valid) and a shared cursor into the parent byte stream
+/// (valid only while this entry is current). RC-managed like `TAG_STREAM`/`TAG_BIGNUM`: the
+/// payload is a `*const TarEntryBox` whose refcount is decremented by `lin_tar_entry_release_box`
+/// (the TAG_TAR_ENTRY arm of tag-aware release). Non-transferable across worker threads (shares a
+/// live cursor; the checker + transfer path both reject it).
+pub const TAG_TAR_ENTRY: u8 = 24;

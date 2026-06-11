@@ -37,7 +37,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/process`](#stdprocess) | Run/manage external processes, plus OS introspection (formerly std/os) |
 | [`std/stream`](#stdstream) | Lazy, fallible byte/value streams over OS resources |
 | [`std/compress`](#stdcompress) | Streaming gzip/DEFLATE byte-stream adapters |
-| [`std/archive`](#stdarchive) | Tar splitting over a byte stream (untar / manifest / files) |
+| [`std/archive`](#stdarchive) | Tar splitting over a byte stream (entries / header / body / untar / manifest / files) |
 | [`std/tty`](#stdtty) | Raw terminal mode and key reads |
 | [`std/signal`](#stdsignal) | Blocking wait for OS signals |
 | [`std/async`](#stdasync) | Async, concurrency and workers |
@@ -4146,7 +4146,7 @@ without buffering the whole archive — the parent stream is pulled one chunk at
 `.tar.gz` is just `gunzip()` (`std/compress`) composed with the tar splitter. Only the tar format
 is supported (zip is not).
 
-All three surfaces consume the parent stream (it is moved in); the source binding may not be used
+All functions consume the parent stream (it is moved in); the source binding may not be used
 again after the call — the affine stream check rejects a reuse (re-open the source for a second pass).
 
 Two record types describe the entries:
@@ -4156,24 +4156,83 @@ TarHeader = { name: String, size: Int64, typeflag: String, isDir: Boolean }
 TarFile   = { name: String, data: UInt8[], size: Int64, typeflag: String, isDir: Boolean }
 ```
 
-`manifest` yields `TarHeader` values, `files` yields `TarFile` values, and `untar` passes a
-`TarHeader` as the callback's `meta`. In each, `typeflag` is the tar type byte as a one-character
-string (`"0"` = regular file, `"5"` = directory) and `isDir` is `true` iff `typeflag == "5"`.
+`typeflag` is the tar type byte as a one-character string (`"0"` = regular file, `"5"` = directory)
+and `isDir` is `true` iff `typeflag == "5"`.
+
+**Composable form (idiomatic)** — `entries` returns a `Stream<TarEntry>` that composes with the
+`std/iter` combinators. `header` and `body` are the two operations on a `TarEntry` handle:
 
 ```txt
-import { readStream, drain, writeStream } from "std/stream"
+import { readStream, drain } from "std/stream"
 import { gunzip } from "std/compress"
-import { untar, manifest, files } from "std/archive"
-import { for } from "std/iter"
+import { entries, header, body } from "std/archive"
+import { filter, for } from "std/iter"
 
-// List a .tar.gz's contents without extracting anything:
-readStream("data.tar.gz").gunzip().manifest().for((m) => print(m["name"]))
-
-// Extract every member to disk in constant memory (each body streamed straight to its file):
-readStream("data.tar.gz").gunzip().untar((meta, data) =>
-  data.writeStream("out/${meta["name"]}").drain()
-)
+readStream("data.tar.gz")
+  .gunzip()
+  .entries()
+  .filter(e => e.header()["name"].startsWith("data/"))
+  .for(e => e.body().drain())
 ```
+
+**One rule:** read or drain `body(e)` before pulling the next `TarEntry`. Advancing the stream
+to the next entry expires all prior bodies. Attempting to read an expired body returns an in-band
+`Error` on the first read; the header remains readable forever.
+
+**Anti-pattern** — collecting handles before reading bodies:
+```txt
+val all = s.entries().toArray()  // WRONG: all bodies expire as the array is built
+all[0].body().readText()         // first read returns Error: entry expired
+```
+
+**Terminal / convenience forms** — `untar` (streaming, callback-based), `manifest` (headers only),
+and `files` (bodies buffered) remain available for simpler or legacy use cases.
+
+### entries
+
+```txt
+val entries: (Stream<UInt8[]>) -> Stream<TarEntry>
+```
+
+The composable streaming form. Returns a `Stream<TarEntry>` where each `TarEntry` is a
+generation-stamped, refcounted handle to one archive entry. Composes with all `std/iter`
+combinators (`filter`/`map`/`take`/`find`/`for`/…).
+
+The parent upstream is closed when the last reference to the shared state drops (the entries
+stream AND all live `TarEntry` handles), not when the entries stream closes. This means a
+`find`-style early stop returns a live entry whose body can still be read before the handle drops:
+
+```txt
+import { find } from "std/iter"
+
+val entry = s.entries().find(e => e.header()["name"] == "target.txt")
+match entry
+  is Null => print("not found")
+  else e  => e.body().readText()   // body still valid — shared state is alive via this handle
+```
+
+### header
+
+```txt
+val header: (TarEntry) -> TarHeader
+```
+
+Reads the entry's header metadata — always valid, even after the archive has advanced past the
+entry or the body has been consumed. Returns a `TarHeader` with `name`, `size`, `typeflag`, and
+`isDir`.
+
+### body
+
+```txt
+val body: (TarEntry) -> Stream<UInt8[]>
+```
+
+Opens the entry's body as a byte stream. **One-shot**: calling `body` a second time on the same
+entry returns a stream that immediately yields an `Error` on first read. Calling `body` after the
+archive has advanced to a later entry also returns an immediately-erroring stream. In both cases
+the header is unaffected and remains readable.
+
+One rule: drain or read the body before pulling the next `TarEntry` from the parent stream.
 
 ### untar
 
@@ -4215,7 +4274,7 @@ val files: (Stream<UInt8[]>) -> Stream<TarFile>
 
 An adapter yielding a `TarFile` per entry, where `data` is the entry's full body buffered into a
 `UInt8[]`. A convenience for normal-sized files; composes with `std/iter`. Because each body is
-buffered in memory, prefer `untar` for arbitrarily large entries.
+buffered in memory, prefer `entries`/`body` or `untar` for arbitrarily large entries.
 
 ---
 

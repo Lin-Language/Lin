@@ -186,6 +186,9 @@ impl<'ctx> Codegen<'ctx> {
             // Promise<T> is a boxed TaggedVal*(TAG_PROMISE); its release dispatches the tag-aware
             // `lin_tagged_release`, whose TAG_PROMISE arm joins/drops the promise box. Owning model.
             Type::Promise(_) => { self.builder.call(self.rt.tagged_release, &[ptr.into()], ""); }
+            // TarEntry is a boxed TaggedVal*(TAG_TAR_ENTRY); its release decrements the TarEntryBox
+            // refcount, freeing it (and releasing the Arc clone) when zero. Owning model.
+            Type::TarEntry => { self.builder.call(self.rt.tagged_release, &[ptr.into()], ""); }
             _ => {} // scalars: nothing to release
         }
     }
