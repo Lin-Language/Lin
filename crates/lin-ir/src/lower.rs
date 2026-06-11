@@ -4287,6 +4287,16 @@ fn lower_call(
         if let Some(name) = builder.intrinsic_slots.get(slot).cloned() {
             return lower_intrinsic_call(&name, args, result_type, builder, ctx);
         }
+        // WAVE D — LONE `flatMap`: `base.<…>.flatMap(f)` with no downstream combinator stage. Unlike
+        // map/filter/reduce/for (intrinsics handled above), `flatMap` is a genuine generic with no
+        // intrinsic, so its lone call reaches the generic dispatch below and would run the eager
+        // stdlib body. Route it through the CPS fusion engine (loop nest pushing into the result)
+        // when the callback is inlinable; bail to the eager call (fall through) otherwise.
+        if !partial && !is_tail && callee_is_flatmap(func, ctx) {
+            if let Some(out) = lower_flatmap_terminal(args, result_type, builder, ctx) {
+                return out;
+            }
+        }
         // Total declared arity of the callee — used to detect a default-fill call (fewer
         // non-partial args than parameters), which routes to a per-arity adapter symbol.
         let total_arity = match func.ty() {
@@ -6152,9 +6162,17 @@ fn combinator_callee_name(expr: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCt
     })
 }
 
-/// Peel a chain of FUSIBLE map/filter stages off a terminal's receiver `recv`, returning the base
-/// source + the stages in SOURCE ORDER. Stops at the first non-fusible stage (non-literal lambda,
-/// Stream receiver, wrong arity), so the caller falls back to per-stage lowering for the prefix.
+/// Peel a chain of FUSIBLE map/filter/flatMap stages off a terminal's receiver `recv`, returning the
+/// base source + the stages in SOURCE ORDER. Stops at the first non-fusible stage (a non-literal
+/// lambda, a heap/non-scalar map output, a Stream receiver, wrong arity), returning THAT stage's call
+/// as the `base`.
+///
+/// BARRIER SPLITS, NOT KILLS (Wave D): a mid-chain unfusable stage does NOT de-fuse the whole chain.
+/// The stages peeled BELOW the barrier (downstream) are kept and fused into the terminal; the `base`
+/// returned is the barrier call itself, which the caller lowers via `lower_expr` — and that recurses
+/// straight back into this terminal lowering, re-running `extract_fuse_chain` on the barrier's own
+/// receiver. So the barrier materialises exactly ONE intermediate array between two FUSED runs (a
+/// downstream pass over the barrier's output + an upstream pass producing it), never N unfused stages.
 fn extract_fuse_chain<'a>(
     recv: &'a TypedExpr,
     builder: &FuncBuilder,
@@ -6224,9 +6242,13 @@ fn extract_fuse_chain<'a>(
         stages.push(stage);
         cur = peel_combinator_coerce(&args[0], builder, ctx);
     }
-    // After peeling, the BASE source element must also have a reclaimable repr (a filter-only chain
-    // over an unsealed heap-element array would otherwise fuse with an un-reclaimed element). If not,
-    // drop all stages — the caller falls back to the per-stage path for the whole chain.
+    // After peeling, the BASE source element must also have a reclaimable repr. If not, drop the
+    // peeled stages so the terminal lowers its receiver via `lower_expr` (which recurses and re-fuses
+    // any sub-chain). This is the BARRIER-AT-THE-BASE case: it splits at the base boundary exactly as
+    // a mid-chain barrier splits — never an N-stage de-fusion. With the Wave-D heap-element widening
+    // (`is_borrowed_heap_elem`) this now fires only for a genuinely non-reclaimable base (e.g. a raw
+    // `Map` element), which combinator chains effectively never have (`values()`/`keys()` interpose a
+    // fresh scalar/heap array), so it is close to dead in practice.
     if !fuse_elem_repr_reclaimable(&iter_elem_type(&cur.ty())) {
         stages.clear();
     }
@@ -6256,16 +6278,35 @@ fn peel_combinator_coerce<'a>(expr: &'a TypedExpr, builder: &FuncBuilder, ctx: &
 }
 
 /// True when an element of type `ty`, materialized per-iteration by `Instruction::Index` in a fused
-/// combinator loop, is correctly RECLAIMED by the fused drop/consume discipline
-/// (`free_combinator_sealed_elem` + `free_combinator_elem_box_full`):
+/// combinator loop, is correctly handled by the fused drop/consume discipline. Three reclaim classes,
+/// each with a proven discipline at every consuming site (`free_combinator_*` / `fm_reclaim_elem`):
 ///   - an inline scalar (Int/Float/Bool) — no refcount, nothing to reclaim;
 ///   - a SEALED-SCALAR record — `Instruction::Index` materializes a fresh +1 packed struct,
 ///     reclaimed by `free_combinator_sealed_elem` (`lin_sealed_release`, heap-field-walking);
-///   - a union/Json box — reclaimed (shell + retained inner) by `free_combinator_elem_box_full`.
-/// A plain unsealed `Str`/`Array`/`Object` element is NOT covered by either helper, so it returns
-/// false and the chain falls back to per-stage lowering (no regression, no leak).
+///   - a union/Json box — a fresh +1 box, reclaimed (shell + retained inner) by
+///     `free_combinator_elem_box_full`;
+///   - a plain heap value (`Str`/`Array`/`Object`/`Iterator`) — `Instruction::Index` on an array
+///     source lowers to `lin_array_get` + `unbox_ptr`, a BORROWED interior pointer with NO +1. So
+///     there is nothing to reclaim: both `free_combinator_*` helpers (union-only / sealed-only) and
+///     `fm_reclaim_elem` correctly NO-OP on it. The one hazard — a terminal that MOVES the borrowed
+///     element into a result without taking its own reference — cannot arise in the linear fused
+///     paths: every array-producing terminal there is gated to `is_inline_scalar(out_elem_ty)` (so a
+///     filter-preserve / heap-map-output never fuses), and the `for`/`reduce` terminals consume by
+///     reference. The flatMap CPS engine's terminals DO push the (borrowed) survivor, so they push
+///     with `borrowed = is_borrowed_heap_elem(ty)` (retain into the result), mirroring the eager
+///     `push(result, x)` retain exactly. (WAVE D: widened from the original scalar/sealed/union gate
+///     so heap-element SOURCES and heap flatMap INNER arrays — `["a","b"].flatMap(s => [s, s])` — fuse.)
 fn fuse_elem_repr_reclaimable(ty: &Type) -> bool {
-    is_inline_scalar(ty) || is_sealed_scalar_repr(ty) || is_union_ty(ty)
+    is_inline_scalar(ty) || is_sealed_scalar_repr(ty) || is_union_ty(ty) || is_borrowed_heap_elem(ty)
+}
+
+/// True when `ty` is a plain heap value (`Str`/`Array`/`Object`/`Iterator`) read from an array source
+/// as a BORROWED interior pointer (no +1) by `Instruction::Index`. Such an element needs no reclaim
+/// on a drop/consume path, but DOES need a retain when MOVED into a result array (a combinator that
+/// pushes it must use `borrowed = true`, mirroring the eager `push`). Excludes sealed records (a
+/// fresh +1 materialize) and unions (a fresh +1 box) — those take the dedicated reclaim helpers.
+fn is_borrowed_heap_elem(ty: &Type) -> bool {
+    !is_sealed_scalar_repr(ty) && !is_union_ty(ty) && is_heap_ty(ty)
 }
 
 /// Apply fused stages for a side-effecting terminal (a filter skip jumps to `skip_block`). Returns
@@ -7056,6 +7097,90 @@ fn free_combinator_sealed_elem(elem: Temp, _iterable_ty: &Type, elem_ty: &Type, 
     }
 }
 
+/// True when `func` resolves to a `flatMap` combinator (a monomorphized top-level spec tagged in
+/// `combinator_spec_slots`, or an imported `std_iter_flatMap` symbol) — the lone-`flatMap` dispatch
+/// the fusion engine should drive directly rather than calling the eager stdlib body. Mirrors the
+/// `combinator_callee_name` resolution, restricted to `flatMap` (the only generic combinator with no
+/// intrinsic). A genuine intrinsic combinator never reaches here (it dispatched earlier in `lower_call`).
+fn callee_is_flatmap(func: &TypedExpr, ctx: &LowerCtx) -> bool {
+    let TypedExpr::LocalGet { slot, .. } = func else { return false };
+    if ctx.combinator_spec_slots.get(slot) == Some(&"flatMap") {
+        return true;
+    }
+    ctx.import_fn_slots
+        .get(slot)
+        .map(|(sym, _)| combinator_base_name(sym) == Some("flatMap"))
+        .unwrap_or(false)
+}
+
+/// WAVE D — LONE `flatMap`: fuse `base.<…>.flatMap(f)` with NO downstream stage into the CPS loop
+/// nest, pushing each flattened inner element straight into the result array (no eager stdlib body,
+/// no per-source-element closure call). Returns `None` (caller falls back to the eager call) when the
+/// `flatMap` callback is not an inlinable lambda, the receiver is a lazy `Stream`, or an element repr
+/// in the chain is not fuse-reclaimable.
+///
+/// OWNERSHIP of the push terminal — the inner element `val` arrives from the FlatMap stage's inner
+/// `Index` read at one of three reprs, each pushed + reclaimed to mirror the eager `inner.for(x =>
+/// push(result, x))` exactly:
+///   - SCALAR — pushed by value into a flat result (no RC); `fm_reclaim_elem` is a no-op.
+///   - BORROWED HEAP (`Str`/`Array`/`Object`) — a borrowed interior pointer (no +1). `push_output`
+///     with `borrowed = true` RETAINS it into the (tagged) result and self-balances the fresh box it
+///     allocates; `fm_reclaim_elem` is a no-op (not union/sealed). Net: result owns +1, the borrow is
+///     untouched (the inner array's release drops its own element ref). Mirrors eager `push` (retains).
+///   - UNION/SEALED — a FRESH +1 box/struct. `push_output` (borrowed=false) takes the retaining
+///     `lin_push_dyn` (the result owns its own ref) and does NOT release the box; `fm_reclaim_elem`
+///     fully releases the original +1 box/struct. Net balanced.
+fn lower_flatmap_terminal(
+    args: &[TypedExpr],
+    result_type: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    if args.len() != 2 {
+        return None;
+    }
+    // A lazy Stream receiver stays lazy (driven by the runtime) — never fused.
+    if matches!(args[0].ty(), Type::Stream(_)) {
+        return None;
+    }
+    let (fm_params, fm_body) = inlinable_capturing_lambda(&args[1], builder, ctx)?;
+    let fm_params = fm_params.to_vec();
+    let fm_body = fm_body.clone();
+    // The flatMap inner element repr must be fuse-reclaimable (or `Never`, the provably-empty
+    // `x => []` inner) — same gate as `extract_fuse_chain`'s FlatMap arm.
+    let (_, ret) = callback_signature(&args[1]);
+    let inner_elem_ty = iter_elem_type(&ret);
+    if !matches!(inner_elem_ty, Type::Never) && !fuse_elem_repr_reclaimable(&inner_elem_ty) {
+        return None;
+    }
+    // Peel any upstream map/filter/flatMap stages off the receiver, then append THIS flatMap as the
+    // final (downstream-most) stage. `extract_fuse_chain` may have cleared the upstream stages if the
+    // base element repr is not reclaimable — re-check it ourselves so we never fuse over a leaky base.
+    let (base, mut stages) = extract_fuse_chain(&args[0], builder, ctx);
+    if !fuse_elem_repr_reclaimable(&iter_elem_type(&base.ty())) {
+        return None;
+    }
+    stages.push(FuseStage::FlatMap { params: fm_params, body: fm_body, inner_elem_ty });
+    let base_ty = base.ty();
+    let read_elem_ty = combinator_read_elem_ty(base, builder, ctx);
+    let out_elem_ty = match result_type {
+        Type::Array(t) | Type::Iterator(t) => (**t).clone(),
+        _ => Type::TypeVar(u32::MAX),
+    };
+    let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+    let iterable = lower_expr(base, builder, ctx);
+    // The push terminal reads no output index → terminal_param_count = 1 (no counter cell allocated).
+    emit_flatmap_fused_loop(iterable, &base_ty, &read_elem_ty, &stages, 1, builder, ctx,
+        |val, val_ty, _idx, b, _c| {
+            let borrowed = is_borrowed_heap_elem(&val_ty);
+            push_output(out, flat, &out_elem_ty, val, &val_ty, borrowed, b);
+            // Reclaim the survivor: a no-op for a scalar / borrowed-heap (push_output self-balanced
+            // those), a full release for a fresh +1 union/sealed box (the result took its own ref).
+            fm_reclaim_elem(val, &val_ty, b);
+        });
+    Some(out)
+}
+
 /// `map(iterable, f)` → new array of `f(elem)` for each element.
 fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
@@ -7213,6 +7338,40 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
                 let read_elem_ty = combinator_read_elem_ty(base, builder, ctx);
                 let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
                 let iterable = lower_expr(base, builder, ctx);
+                // WAVE D: a flatMap-bearing chain → CPS loop nest; the terminal filter runs per
+                // flattened element. The survivor is a flat scalar (gated `is_inline_scalar` above),
+                // so a kept element pushes by value (no RC) and a dropped one is discarded — the
+                // `fm_reclaim_elem` (no-op for a scalar) keeps the consume-site discipline uniform.
+                if chain_has_flatmap(&stages) {
+                    emit_flatmap_fused_loop(iterable, &base_ty, &read_elem_ty, &stages, lam_params.len(),
+                        builder, ctx, |val, val_ty, idx, b, c| {
+                            let (pred_raw, pred_ty) = inline_lambda_body(
+                                &lam_params, &lam_body, &[(val, val_ty.clone()), (idx, Type::Int32)], b, c);
+                            let keep = if matches!(pred_ty, Type::Bool) {
+                                pred_raw
+                            } else {
+                                let d = b.alloc_temp(Type::Bool);
+                                b.emit(Instruction::Coerce { dst: d, src: pred_raw, from_ty: pred_ty, to_ty: Type::Bool });
+                                d
+                            };
+                            let keep_block = b.alloc_block("fm_ffilter_keep");
+                            let drop_block = b.alloc_block("fm_ffilter_drop");
+                            let join_block = b.alloc_block("fm_ffilter_skip");
+                            b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
+                            // KEEP: push the scalar by value (gated), then reclaim the survivor (no-op
+                            // for a scalar — keeps the consume-site discipline uniform with the engine).
+                            b.switch_to(keep_block);
+                            push_output(out, flat, &out_elem_ty, val, &val_ty, false, b);
+                            fm_reclaim_elem(val, &val_ty, b);
+                            b.terminate(Terminator::Jump(join_block));
+                            // DROP: reclaim the discarded survivor (no-op scalar).
+                            b.switch_to(drop_block);
+                            fm_reclaim_elem(val, &val_ty, b);
+                            b.terminate(Terminator::Jump(join_block));
+                            b.switch_to(join_block);
+                        });
+                    return out;
+                }
                 emit_fused_loop(iterable, &base_ty, &read_elem_ty, &stages, builder, ctx,
                     |val, val_ty, idx, _src_elem, _src_elem_ty, b, c| {
                         // The survivor `val` is a flat scalar (gated). Run the terminal predicate; on

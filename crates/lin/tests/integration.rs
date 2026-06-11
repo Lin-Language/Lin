@@ -4944,6 +4944,102 @@ rev.for(x => print(toString(x)))
     assert_eq!(output, vec!["1", "10", "2", "20", "3", "30", "1", "-1", "3", "2", "1"]);
 }
 
+// WAVE D: a `flatMap(...).filter(...)` chain (a flatMap stage with a downstream FILTER terminal)
+// must fuse via the CPS loop-nest engine — `lower_filter` previously lacked the `chain_has_flatmap`
+// routing that for/map/reduce have, so the linear applier hit `unreachable!`. Locks in the fix.
+#[test]
+fn test_stdlib_flatmap_filter_chain() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { flatMap, filter, map } from "std/iter"
+
+print([1, 2, 3].flatMap(x => [x, x * 10]).filter(y => y > 5).toString())
+print([1, 2, 3].flatMap(x => [x, x * 10]).filter(y => y > 5).map(z => z + 1).toString())
+print([1, 2, 3].flatMap(x => []).filter(y => y > 5).toString())
+"#);
+    assert_eq!(output, vec!["[10, 20, 30]", "[11, 21, 31]", "[]"]);
+}
+
+// WAVE D: a flatMap whose INNER array is heap-element (String[]) — `s => [s, s, s]` — fused into a
+// downstream map/filter/reduce chain. The inner element is read as a BORROWED interior pointer, so
+// the consume-site reclaim is a no-op and a scalar-output terminal never moves it; RC-correct, no
+// per-inner-element leak. Also exercises the entry-block-alloca hoist (the inner literal is built in
+// the fused source loop's body). Verifies value equivalence with the eager lowering.
+#[test]
+fn test_stdlib_flatmap_string_inner_chain() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { flatMap, filter, map, reduce } from "std/iter"
+import { length } from "std/array"
+
+print(["x", "y"].flatMap(s => [s, s]).toString())
+print(toString(["aaa", "bb", "c"].flatMap(s => [s, s]).map(z => length(z)).filter(n => n > 1).reduce(0, (a, n) => a + n)))
+print(["a", "bb"].flatMap(s => [s, s]).map(z => "${z}!").toString())
+"#);
+    assert_eq!(output, vec![
+        "[\"x\", \"x\", \"y\", \"y\"]",
+        "10",
+        "[\"a!\", \"a!\", \"bb!\", \"bb!\"]",
+    ]);
+}
+
+// WAVE D — LONE flatMap: `xs.flatMap(f)` with no downstream combinator stage now fuses to a CPS
+// loop nest (the inner loop pushes straight into the result) instead of running the eager stdlib
+// body. Covers scalar inner, String (heap) inner, the index callback, the provably-empty `x => []`
+// inner, and a flatMap whose receiver is itself a map/filter chain. Byte-equivalent to the eager
+// lowering it replaces.
+#[test]
+fn test_stdlib_lone_flatmap_fuses() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { flatMap, map, filter } from "std/iter"
+
+print([1, 2, 3].flatMap(x => [x, x * 10]).toString())
+print(["x", "y"].flatMap(s => [s, s]).toString())
+print(["a", "b"].flatMap((x, i) => [x, "${i}"]).toString())
+print([1, 2, 3].flatMap(x => []).toString())
+print([1, 2, 3].map(x => x + 1).flatMap(x => [x, x]).toString())
+print([1, 2, 3, 4].filter(x => x > 1).flatMap(x => [x, x * 10]).toString())
+"#);
+    assert_eq!(output, vec![
+        "[1, 10, 2, 20, 3, 30]",
+        "[\"x\", \"x\", \"y\", \"y\"]",
+        "[\"a\", \"0\", \"b\", \"1\"]",
+        "[]",
+        "[2, 2, 3, 3, 4, 4]",
+        "[2, 20, 3, 30, 4, 40]",
+    ]);
+}
+
+// WAVE D — BARRIER SPLITS, NOT KILLS: a chain with a mid-chain UNFUSABLE stage (a `map` with a
+// heap/non-scalar output, which the fuser gates off) must terminate the current fused run by
+// materialising ONE intermediate array and start a fresh fused run for the downstream stages — two
+// fused passes, not N unfused. This already falls out of the recursive lowering: `extract_fuse_chain`
+// stops peeling at the barrier and `lower_expr(base)` recursively re-fuses the prefix. Locks in the
+// value equivalence across the split (and over a flatMap-bearing downstream run).
+#[test]
+fn test_stdlib_fusion_barrier_split() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { filter, map, reduce, flatMap } from "std/iter"
+import { length } from "std/array"
+
+// filter+map (fused) → map(heap-out) BARRIER → map+filter+reduce (fused)
+print(toString([1, 2, 3, 4, 5, 6].filter(x => x > 1).map(x => x + 1).map(x => [x, x, x]).map(ys => length(ys)).filter(n => n > 0).reduce(0, (a, n) => a + n)))
+// barrier with a flatMap downstream run
+print([1, 2, 3].map(x => [x, x]).flatMap(ys => ys).toString())
+// flatMap upstream, heap-out map barrier, scalar map+reduce downstream
+print(toString([1, 2, 3].flatMap(x => [x, x * 10]).map(x => [x, x]).map(ys => length(ys)).reduce(0, (a, n) => a + n)))
+"#);
+    assert_eq!(output, vec![
+        // filter>1 → [2,3,4,5,6]; +1 → [3,4,5,6,7]; →[[x,x,x]]; length → [3,3,3,3,3]; >0 all; sum=15
+        "15",
+        "[1, 1, 2, 2, 3, 3]",
+        // flatMap → [1,10,2,20,3,30]; map [x,x]; length → six 2s; sum=12
+        "12",
+    ]);
+}
+
 #[test]
 fn test_forward_reference_between_functions() {
     let output = run(r#"import { print } from "std/io"
