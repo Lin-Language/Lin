@@ -3817,10 +3817,10 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                     return t;
                 }
             }
-            // UNBOXED SUM TYPE (unboxed-sumtype Stage 2 — narrow-then-fieldget direct read): a
-            // `node["field"]` whose scrutinee is physically a `SumNode` (the slot's STORED type is the
-            // sum type — a `match node is Variant => node["field"]` arm, where `obj_ty` here is the
-            // NARROWED variant). The default lowering of `node` (a `LocalGet` of the sum slot) emits a
+            // UNBOXED SUM TYPE (Stage 2/3 — narrow-then-fieldget direct read): a `node["field"]`
+            // whose scrutinee is physically a `SumNode` (the slot's STORED type is the sum type —
+            // a `match node is Variant => node["field"]` arm, where `obj_ty` here is the NARROWED
+            // variant). The default lowering of `node` (a `LocalGet` of the sum slot) emits a
             // union→variant Coerce that MATERIALIZES the node into a fresh boxed/sealed record
             // (`lin_sealed_alloc` + copy payload + read + release) just to read one field already at a
             // constant SumNode payload offset — the `is Num => node["value"]` interp hot-path waste
@@ -3831,10 +3831,10 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
             //     recursion re-enters the tag switch). The variant carrying a recursive child is NOT
             //     `is_sealed_scalar_repr`, so this is the only path for it.
             //   - a NON-RC SCALAR field (numeric / Bool): a const-offset value load (no alloc, no RC).
-            // An RC scalar field (String / Array) is NOT read direct — it would yield a BORROWED
-            // interior heap pointer into the node, and an escaping read (stored/returned/pushed) must
-            // own an independent value; that ownership is handled correctly by the materialize path, so
-            // such fields FALL THROUGH (correctness first; the interp win is the non-RC `value` field).
+            //   - a HEAP field (String/Array/nested-sealed, Stage 3): a const-offset BORROWED pointer
+            //     load + Retain (the node owns the interior pointer; the Retain hands the caller an
+            //     independent +1 that the owning model releases at scope exit). This eliminates the
+            //     `lin_sealed_alloc` + `lin_object_get` round-trip for heap-field SumNodes.
             //
             // The emitted FieldGet carries the SUM type as `obj_ty` (not the narrowed variant), so the
             // Stage-2 verify oracle's `sealed_fields(obj_ty)` is `None` and AGREES with the operand's
@@ -3843,28 +3843,63 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
             // dispatches on that repr (`sumnode_field_get_by_name`), reading by const offset.
             if let TypedExpr::StringLit(name, _, _) = key.as_ref() {
                 let recursive_child = sum_recursive_child_field_ty(&obj_ty, name).is_some();
-                let scalar_nonrc = !is_rc_type(result_type);
-                if recursive_child || scalar_nonrc {
+                // Heap-field SumNode Stage 3: `scalar_nonrc` (the fast path for non-RC payload
+                // fields) requires that the scrutinee's static `obj_ty` is an OBJECT (a narrowed
+                // match-arm variant), NOT the full Union. When `obj_ty` is the whole Union (e.g.
+                // `r["type"]` without variant narrowing), the payload offset is variant-dependent
+                // and `sumnode_field_get_by_name` only handles recursive children — non-recursive
+                // payload reads from an un-narrowed union fall through to the general `Index` path
+                // (which materializes the SumNode, then calls `lin_object_get`). Without this guard,
+                // discriminant-field reads (`r["type"] == "success"`) on a newly-SumNode-eligible
+                // union returned null (discriminant is excluded from the payload map).
+                let scalar_nonrc = !is_rc_type(result_type) && matches!(obj_ty, Type::Object { .. });
+                // Heap-field SumNode Stage 3: an RC heap field (String/Array) in a heap-field SumNode
+                // can be read directly with a Retain (same discipline as sealed record heap field reads).
+                // Detect: the scrutinee's stored sum type is now sum-eligible (gate widened), AND the
+                // result type is an RC heap type (String/Array). We emit FieldGet then Retain+register_owned.
+                let heap_field_in_sumnode = is_rc_type(result_type)
+                    && !recursive_child
+                    && {
+                        // Only when the scrutinee is actually a sum-type slot (not a sealed record that
+                        // happens to contain a heap field).
+                        matches!(obj_ty, Type::Object { .. })
+                            && lower_sum_scrutinee_raw(object, builder, ctx).is_some()
+                    };
+                if recursive_child || scalar_nonrc || heap_field_in_sumnode {
                     if let Some((obj_temp, sum_ty)) = lower_sum_scrutinee_raw(object, builder, ctx) {
                         // Result type: the child sum type for a recursive child (so it seeds
                         // Packed(SumNode) and the recursion re-enters the tag switch), else the field's
-                        // declared `result_type` (a flat scalar).
+                        // declared `result_type` (a flat scalar or heap ptr).
                         let child_sum_ty = sum_recursive_child_field_ty(&obj_ty, name);
+                        let is_recursive = child_sum_ty.is_some();
                         let res_ty = child_sum_ty.unwrap_or_else(|| result_type.clone());
                         let dst = builder.alloc_temp(res_ty.clone());
+                        // Pass the NARROWED variant type as `obj_ty` for ALL non-recursive SumNode
+                        // direct reads (scalars and heap fields). This lets codegen look up the
+                        // correct variant-specific payload offset rather than scanning all variants
+                        // with sumnode_field_get_by_name (which gives the wrong offset when the same
+                        // field name appears in multiple variants at different positions — e.g. a
+                        // shared trailing scalar after a heap-field slot that shifts its position).
+                        // The oracle allows a sealed obj_ty + Packed(SumNode) repr (updated at the
+                        // two FieldGet oracle sites in repr.rs). For recursive-child fields, use
+                        // sum_ty so codegen recognizes the field as a *SumNode child.
+                        let field_obj_ty = if is_recursive { sum_ty } else { obj_ty.clone() };
                         builder.emit(Instruction::FieldGet {
                             dst,
                             object: obj_temp,
                             field: name.clone(),
-                            obj_ty: sum_ty,
+                            obj_ty: field_obj_ty,
                             result_ty: res_ty.clone(),
                         });
-                        // A recursive-child result is a BORROWED interior `*SumNode` (the parent owns
-                        // it, releases it via its KIND_SUMNODE drop walk). A consumer that BORROWS it
-                        // (the recursive `evalNode(node["left"])` callee retains+releases its own
-                        // scrutinee, net 0) needs no owning reference here. A SCALAR result is a value
-                        // (no RC). So: no retain/own here in either case. (Mirrors the borrowed
-                        // sealed-array element read.)
+                        if heap_field_in_sumnode {
+                            // Heap field: the FieldGet yields a BORROWED interior pointer; Retain to
+                            // give the caller an independent owned +1. The descriptor drop walk releases
+                            // the node's copy; the Retain here gives the consumer its own reference.
+                            builder.emit(Instruction::Retain { val: dst, ty: res_ty.clone() });
+                            builder.register_owned(dst, res_ty);
+                        }
+                        // Recursive-child: BORROWED interior *SumNode — no retain (parent owns it via
+                        // KIND_SUMNODE drop walk). Scalar: value type — no RC. Neither needs an owned ref.
                         return dst;
                     }
                 }
@@ -4121,7 +4156,19 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
             let val_ty = expr.ty();
             let raw = lower_expr(expr, builder, ctx);
             // HasPattern inspects an object via a boxed TaggedVal*; box a concrete object.
-            let val_temp = box_to_json(raw, &val_ty, builder);
+            // Heap-field SumNode Stage 3: if the union is SumNode-eligible, the physical value
+            // is a `*SumNode` (TAG_SUMNODE). HasPattern needs a boxed TAG_OBJECT. Coerce to
+            // Json first so codegen materializes the SumNode → boxed LinObject at this boundary.
+            let val_temp = if crate::repr::sum_type_eligible(&val_ty) {
+                let json = Type::TypeVar(u32::MAX);
+                let dst_coerce = builder.alloc_temp(json.clone());
+                builder.emit(Instruction::Coerce {
+                    dst: dst_coerce, src: raw, from_ty: val_ty.clone(), to_ty: json,
+                });
+                dst_coerce
+            } else {
+                box_to_json(raw, &val_ty, builder)
+            };
             let dst = builder.alloc_temp(Type::Bool);
             let required_fields = pattern_required_fields(pattern);
             builder.emit(Instruction::HasPattern {
@@ -4658,6 +4705,56 @@ fn lower_call(
         return builder.alloc_temp(result_type.clone());
     }
 
+    // UNBOXED SUM TYPE (unboxed-sumtype Stage 3 — indirect-call ABI bridge):
+    // An anonymous closure always returns a BOXED TaggedVal* (`TypeVar(MAX)` ABI — see
+    // `lower_function_expr_with_id`). When the DECLARED `result_type` is a SumNode-eligible
+    // union (e.g. `Result<Int32, String>`), the closure materializes its SumNode to a boxed
+    // LinObject and returns it as a +1 TaggedVal*. WITHOUT a Coerce, the repr pass seeds the
+    // `Call dst` as `Packed(SumNode)` (from `type_seed(SumNode)`) even though the physical
+    // value is a boxed ptr — a CloneBox on that temp calls `lin_rc_retain` on a TaggedVal*,
+    // treating offset-0 (the tag byte) as the refcount: silent data corruption.
+    //
+    // Fix: emit the Call with `ret_ty = TypeVar(MAX)` (the ACTUAL closure return type so the
+    // repr pass seeds it `Boxed`), then emit a `Coerce { from: TypeVar(MAX), to: SumNode }`.
+    // Codegen compiles that Coerce to `sumnode_project_from_boxed` (the pfb tag-dispatch):
+    // TAG_SUMNODE → unwrap+retain; TAG_OBJECT → project a fresh node. The intermediate box is
+    // registered owned (closure SumNode returns ARE +1 — materialization always allocates a
+    // fresh box) so scope-exit releases it; the Coerce result (fresh +1 SumNode) is the
+    // value consumed downstream.
+    if crate::repr::sum_type_eligible(result_type) {
+        let json_ty = Type::TypeVar(u32::MAX);
+        // Emit the call with the ACTUAL closure ABI return type (boxed union) so the repr
+        // pass assigns Boxed(Opaque) to the call result, not Packed(SumNode).
+        let call_dst = builder.alloc_temp(json_ty.clone());
+        builder.emit(Instruction::Call {
+            dst: call_dst,
+            callee: CallTarget::Indirect(fn_temp),
+            args: lowered_args,
+            ret_ty: json_ty.clone(),
+        });
+        free_arg_box_shells(&shell_boxes, call_dst, builder);
+        for (b, bty) in &full_release_boxes {
+            builder.emit(Instruction::Release { val: *b, ty: bty.clone() });
+        }
+        // The closure returns a fresh +1 boxed TaggedVal for SumNode result types (the SumNode
+        // is always materialized before returning in anonymous-closure ABI). Register the box
+        // as owned so scope-exit releases it after the Coerce consumes it.
+        builder.register_owned(call_dst, json_ty.clone());
+        // Coerce from boxed → SumNode; codegen compiles this to `sumnode_project_from_boxed`,
+        // producing a fresh +1 *SumNode the caller uses. The intermediate box is owned (above)
+        // and released at scope-exit; the Coerce result is NOT registered (SumNode ownership is
+        // tracked per-construction, not via `needs_owning` — consistent with the construction
+        // site in `try_lower_sum_literal` and named call Coerce paths).
+        let coerce_dst = builder.alloc_temp(result_type.clone());
+        builder.emit(Instruction::Coerce {
+            dst: coerce_dst,
+            src: call_dst,
+            from_ty: json_ty,
+            to_ty: result_type.clone(),
+        });
+        let _ = &escape_lits;
+        return coerce_dst;
+    }
     let dst = builder.alloc_temp(result_type.clone());
     builder.emit(Instruction::Call {
         dst,
@@ -9106,11 +9203,32 @@ fn lower_object_pattern_test(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> PatternTest {
+    // Heap-field SumNode Stage 3: `HasPattern` (→ `lin_value_has_field`) checks the tag byte at
+    // offset 0 of the pointer, expecting TAG_OBJECT. A raw `*SumNode` has its RC field at offset 0
+    // (not a tag byte), so `lin_value_has_field` misidentifies it and returns false for every field.
+    // When the scrutinee is a SumNode-eligible union, coerce it to Json (materialize to a boxed
+    // `LinObject`) first, so `HasPattern` and the discriminant `Index` value-constraints see a
+    // valid tagged object. The materialized pointer is registered as owned and released at scope end.
+    let json_ty = Type::TypeVar(u32::MAX);
+    builder.push_scope();
+    let actual_scrut = {
+        let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(json_ty.clone());
+        if crate::repr::sum_type_eligible(&scrut_ty) {
+            let materialized = builder.alloc_temp(json_ty.clone());
+            builder.emit(Instruction::Coerce {
+                dst: materialized, src: scrut, from_ty: scrut_ty, to_ty: json_ty.clone(),
+            });
+            builder.register_owned(materialized, json_ty.clone());
+            materialized
+        } else {
+            scrut
+        }
+    };
     let required_fields = pattern_required_fields(tp);
     let mut cond = builder.alloc_temp(Type::Bool);
     builder.emit(Instruction::HasPattern {
         dst: cond,
-        val: scrut,
+        val: actual_scrut,
         pattern: HasDesc { required_fields },
     });
     // For object fields with a value constraint (e.g. `{ "type": "success" }`), also require
@@ -9118,24 +9236,23 @@ fn lower_object_pattern_test(
     // literal, fetched field) are scoped so they're released in THIS test block — not at the
     // enclosing scope exit, which a per-arm test block does not dominate.
     if let TypedPattern::Object { fields, .. } = tp {
-        let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
-        builder.push_scope();
+        let obj_ty = builder.temp_types.get(&actual_scrut).cloned().unwrap_or(json_ty.clone());
         for field in fields {
             if let Some(vp) = &field.value_pattern {
                 let lit_ty = vp.ty();
                 let lit_raw = lower_expr(vp, builder, ctx);
                 let lit = box_to_json(lit_raw, &lit_ty, builder);
-                // got = scrut[key]
+                // got = actual_scrut[key]
                 let key_temp = builder.const_temp(Const::Str(field.key.clone()));
-                let got = builder.alloc_temp(Type::TypeVar(u32::MAX));
+                let got = builder.alloc_temp(json_ty.clone());
                 builder.emit(Instruction::Index {
-                    dst: got, object: scrut, key: key_temp,
-                    obj_ty: scrut_ty.clone(), key_ty: Type::Str, result_ty: Type::TypeVar(u32::MAX),
+                    dst: got, object: actual_scrut, key: key_temp,
+                    obj_ty: obj_ty.clone(), key_ty: Type::Str, result_ty: json_ty.clone(),
                 });
                 let eq = builder.alloc_temp(Type::Bool);
                 builder.emit(Instruction::Binary {
                     dst: eq, op: BinOp::Eq, lhs: got, rhs: lit,
-                    operand_ty: Type::TypeVar(u32::MAX), ty: Type::Bool,
+                    operand_ty: json_ty.clone(), ty: Type::Bool,
                 });
                 let combined = builder.alloc_temp(Type::Bool);
                 builder.emit(Instruction::Binary {
@@ -9145,10 +9262,10 @@ fn lower_object_pattern_test(
                 cond = combined;
             }
         }
-        // `cond` is a Bool (not RC), so it survives; only the transient RC temps
-        // (literal strings, fetched fields) are released here.
-        builder.pop_scope_releasing(Temp(u32::MAX));
     }
+    // `cond` is a Bool (not RC), so it survives the scope pop. The transient RC temps
+    // (literal strings, fetched fields, and the materialized SumNode object if any) are released.
+    builder.pop_scope_releasing(Temp(u32::MAX));
     PatternTest::Cond(cond)
 }
 
