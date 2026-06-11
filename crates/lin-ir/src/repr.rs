@@ -1092,6 +1092,8 @@ mod tests {
             params,
             is_closure: false,
             ret_ty: Type::Null,
+            param_conventions: Vec::new(),
+            ret_convention: Convention::Own,
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 label: None,

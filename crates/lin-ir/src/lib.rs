@@ -4,6 +4,7 @@ pub mod ir;
 pub mod lower;
 pub mod liveness;
 pub mod monomorphize;
+pub mod ownership_verify;
 pub mod rc_elide;
 pub mod repr;
 
