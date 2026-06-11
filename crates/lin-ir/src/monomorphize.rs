@@ -520,8 +520,18 @@ fn specialization_name(base: &str, subs: &HashMap<u32, Type>) -> String {
     format!("{}${}", base, parts.join("_"))
 }
 
-/// A canonical, hashable key for an instantiation (generic slot + sorted concrete args).
-fn instantiation_key(slot: usize, subs: &HashMap<u32, Type>) -> (usize, Vec<(u32, String)>) {
+/// Canonical hashable key for a specialization: generic slot + sorted concrete type args + optional
+/// callback-devirt identity.
+type SpecKey = (usize, Vec<(u32, String)>, Option<CallbackDevirt>);
+
+/// A canonical, hashable key for an instantiation (generic slot + sorted concrete args + optional
+/// callback-devirt identity). Two calls with identical type args but DIFFERENT named callbacks (or
+/// one devirted and one not) must key distinctly so each gets its own specialization.
+fn instantiation_key(
+    slot: usize,
+    subs: &HashMap<u32, Type>,
+    devirt: &Option<CallbackDevirt>,
+) -> (usize, Vec<(u32, String)>, Option<CallbackDevirt>) {
     // Erase lambda-set metadata before keying: the key uses `Debug`, and two otherwise-identical
     // instantiations whose function-typed args carry DIFFERENT lambda sets must still collapse to
     // ONE specialization (the set is inert metadata, never a codegen distinction). Without this the
@@ -530,7 +540,7 @@ fn instantiation_key(slot: usize, subs: &HashMap<u32, Type>) -> (usize, Vec<(u32
     let mut entries: Vec<(u32, String)> =
         subs.iter().map(|(id, t)| (*id, format!("{:?}", t.erase_lambda_sets()))).collect();
     entries.sort();
-    (slot, entries)
+    (slot, entries, devirt.clone())
 }
 
 /// Cheap pre-check: does the module declare any top-level generic function? Lets callers skip the
@@ -698,6 +708,7 @@ fn monomorphize_inner(
     }
 
     let direct_callable_fn_slots = collect_direct_callable_fn_slots(module);
+    let no_capture_fn_slots = collect_no_capture_fn_slots(module);
 
     let mut state = MonoState {
         generics,
@@ -716,6 +727,7 @@ fn monomorphize_inner(
         rehome_binding_cache: HashMap::new(),
         rehome_intrinsic_cache: HashMap::new(),
         direct_callable_fn_slots,
+        no_capture_fn_slots,
     };
 
     // 2. Walk the whole module, rewriting calls to generic functions and queuing specializations.
@@ -1313,9 +1325,9 @@ struct MonoState<'a> {
     /// Alias slot -> underlying generic slot (`val f = id`).
     aliases: HashMap<usize, usize>,
     /// Deduped specializations, keyed by (generic slot + sorted concrete args).
-    specs: HashMap<(usize, Vec<(u32, String)>), SpecInfo>,
+    specs: HashMap<SpecKey, SpecInfo>,
     /// Spec keys awaiting materialization (worklist for the fixpoint).
-    worklist: Vec<(usize, Vec<(u32, String)>)>,
+    worklist: Vec<SpecKey>,
     /// Native specialization count per generic slot (for the budget).
     per_generic_count: HashMap<usize, usize>,
     /// Generic slots that have emitted the one-time budget-overflow diagnostic.
@@ -1347,6 +1359,10 @@ struct MonoState<'a> {
     /// A first-class function PARAMETER, a stored closure, or a local fn-typed `val` is NOT here, so
     /// it keeps the closure-call path. Populated once in `monomorphize_with_imports`.
     direct_callable_fn_slots: std::collections::HashSet<usize>,
+    /// Module-level slots naming a top-level NO-CAPTURE function (see `collect_no_capture_fn_slots`).
+    /// A bare reference to one of these passed as a HOF callback can be devirtualized: the callback
+    /// param is substituted with a direct reference to this symbol inside a per-callback spec.
+    no_capture_fn_slots: std::collections::HashSet<usize>,
 }
 
 struct SpecInfo {
@@ -1354,6 +1370,20 @@ struct SpecInfo {
     slot: usize,
     name: String,
     subs: HashMap<u32, Type>,
+    /// Wave C callback devirt: when set, this specialization binds the callback parameter at
+    /// `(param_index)` to the top-level no-capture function symbol at module slot `L_slot`. During
+    /// materialization the cloned body's callback-param references are rewritten to `L_slot` (a
+    /// direct named-fn ref), turning the per-element indirect call into a direct call. `None` for an
+    /// ordinary type-only specialization.
+    callback_devirt: Option<CallbackDevirt>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct CallbackDevirt {
+    /// Index of the callback parameter in the generic's param list.
+    param_index: usize,
+    /// Module slot of the top-level no-capture function `L` to substitute in.
+    l_slot: usize,
 }
 
 /// True if `slot` names a generic function or an alias of one.
@@ -1483,6 +1513,53 @@ fn collect_direct_callable_fn_slots(module: &TypedModule) -> std::collections::H
         }
     }
     out
+}
+
+/// Module-level slots naming a top-level function that captures NOTHING — a `val f = (…) => …`
+/// whose `captures` list is empty (it may reference module globals/intrinsics, but those are not
+/// runtime captures), or an imported/FFI function binding (which never captures). A bare reference
+/// to one of these passed as a higher-order combinator's callback (`find(xs, isEven)`) names a
+/// stable top-level symbol `L` with no closure environment, so the callback parameter can be
+/// substituted with a DIRECT reference to `L` inside a per-callback specialization (Wave C devirt).
+/// A capturing local closure, a first-class function PARAMETER, or a generic fn is deliberately
+/// EXCLUDED — those keep the existing indirect closure-call path.
+fn collect_no_capture_fn_slots(module: &TypedModule) -> std::collections::HashSet<usize> {
+    let mut out = std::collections::HashSet::new();
+    for stmt in &module.statements {
+        match stmt {
+            TypedStmt::Val { slot, value: TypedExpr::Function { captures, .. }, .. } => {
+                if captures.is_empty() {
+                    out.insert(*slot);
+                }
+            }
+            TypedStmt::Import { bindings, .. } => {
+                for b in bindings {
+                    if matches!(b.ty, Type::Function { .. }) {
+                        out.insert(b.slot);
+                    }
+                }
+            }
+            TypedStmt::ForeignImport { bindings, .. } => {
+                for b in bindings {
+                    if matches!(b.ty, Type::Function { .. }) {
+                        out.insert(b.slot);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Higher-order generic combinators for which Wave C devirtualizes a named no-capture callback by
+/// minting a per-callback specialization whose callback parameter is substituted with the callback
+/// symbol `L`. Restricted to these three short-circuiting scan combinators for now: each invokes its
+/// callback `f` from inside a nested `item => …f…` closure passed to `lin_while`, so devirting `f`
+/// turns the per-element indirect boxed call into a direct call to `L`. Other HOFs (`flatMap`,
+/// `sortBy`, `groupBy`, …) are deferred — the mechanism is general but the gate is conservative.
+fn devirt_callback_combinator(name: &str) -> bool {
+    matches!(name, "find" | "some" | "every")
 }
 
 /// Highest slot index referenced anywhere in the module (Val/Var/param/destructure/LocalGet).
@@ -1802,6 +1879,32 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                         .map(|(_, m)| body_refs_origin_global_var(&body, m))
                         .unwrap_or(false);
 
+                    // WAVE C CALLBACK DEVIRT: for a known short-circuiting scan combinator
+                    // (`find`/`some`/`every`) whose callback argument is a bare reference to a
+                    // top-level NO-CAPTURE function `L`, mint a per-callback specialization. The
+                    // callback param is substituted with `L` during materialization, turning the
+                    // per-element indirect boxed call into a direct call. Only fires when the spec is
+                    // otherwise sound to native-specialize (no sealed/unsound routing); a ⊤ callback
+                    // (field/index/Json), a capturing closure, or an inline lambda is NOT a bare
+                    // no-capture-fn `LocalGet`, so it stays on the existing indirect path.
+                    let callback_devirt = if devirt_callback_combinator(&g_name(state, gslot)) {
+                        params.iter().enumerate().find_map(|(i, p)| {
+                            if !matches!(p.ty, Type::Function { .. }) {
+                                return None;
+                            }
+                            match args.get(i) {
+                                Some(TypedExpr::LocalGet { slot, .. })
+                                    if state.no_capture_fn_slots.contains(slot) =>
+                                {
+                                    Some(CallbackDevirt { param_index: i, l_slot: *slot })
+                                }
+                                _ => None,
+                            }
+                        })
+                    } else {
+                        None
+                    };
+
                     if fully_concrete && refs_origin_global {
                         // Boxed fallback: keep the origin-module body (global in scope), share one copy.
                         state.boxed_fallback_used.insert(gslot);
@@ -1817,12 +1920,12 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                         // Sound to native-specialize (no sealed arg, or a sealed arg through a
                         // projection-style combinator that reads the packed element correctly).
                         // Respect the per-generic native-specialization budget.
-                        let key = instantiation_key(gslot, &subs);
+                        let key = instantiation_key(gslot, &subs, &callback_devirt);
                         let known = state.specs.contains_key(&key);
                         let count = *state.per_generic_count.get(&gslot).unwrap_or(&0);
                         if known || count < state.budget {
                             let base_name = g_name(state, gslot);
-                            let spec_slot = native_spec_slot(state, gslot, &base_name, key, subs.clone());
+                            let spec_slot = native_spec_slot(state, gslot, &base_name, key, subs.clone(), callback_devirt.clone());
                             repoint_call_native(expr, &params, &ret_type, &body, &subs, spec_slot);
                         } else {
                             // Budget exceeded: fall back to one shared boxed copy of the original.
@@ -1875,16 +1978,25 @@ fn native_spec_slot(
     state: &mut MonoState<'_>,
     gslot: usize,
     base_name: &str,
-    key: (usize, Vec<(u32, String)>),
+    key: SpecKey,
     subs: HashMap<u32, Type>,
+    callback_devirt: Option<CallbackDevirt>,
 ) -> usize {
     if let Some(info) = state.specs.get(&key) {
         return info.slot;
     }
     let s = state.next_slot;
     state.next_slot += 1;
-    let name = specialization_name(base_name, &subs);
-    state.specs.insert(key.clone(), SpecInfo { generic_slot: gslot, slot: s, name, subs });
+    // Suffix the symbol name with the devirted callback's slot so two callback-distinct specs of the
+    // same type instantiation get distinct names (the type-only `specialization_name` would collide).
+    let name = match &callback_devirt {
+        Some(cb) => format!("{}__cb{}", specialization_name(base_name, &subs), cb.l_slot),
+        None => specialization_name(base_name, &subs),
+    };
+    state.specs.insert(
+        key.clone(),
+        SpecInfo { generic_slot: gslot, slot: s, name, subs, callback_devirt },
+    );
     *state.per_generic_count.entry(gslot).or_insert(0) += 1;
     state.worklist.push(key);
     s
@@ -2712,8 +2824,8 @@ mod tests {
                 }
                 let subs_a: HashMap<u32, Type> = [(0u32, a.clone())].into_iter().collect();
                 let subs_b: HashMap<u32, Type> = [(0u32, b.clone())].into_iter().collect();
-                let key_a = instantiation_key(0, &subs_a);
-                let key_b = instantiation_key(0, &subs_b);
+                let key_a = instantiation_key(0, &subs_a, &None);
+                let key_b = instantiation_key(0, &subs_b, &None);
                 if key_a != key_b {
                     let name_a = specialization_name("f", &subs_a);
                     let name_b = specialization_name("f", &subs_b);
@@ -2736,8 +2848,8 @@ mod tests {
         let sealed: HashMap<u32, Type> =
             [(0u32, Type::sealed_object(fields(&shape)))].into_iter().collect();
         assert_ne!(
-            instantiation_key(0, &unsealed),
-            instantiation_key(0, &sealed),
+            instantiation_key(0, &unsealed, &None),
+            instantiation_key(0, &sealed, &None),
             "sealed differs in Debug so keys must differ"
         );
         assert_ne!(
