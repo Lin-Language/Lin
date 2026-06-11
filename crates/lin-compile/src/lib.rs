@@ -956,6 +956,7 @@ fn walk_expr(expr: &lin_parse::ast::Expr, f: &mut impl FnMut(&lin_parse::ast::Ex
     macro_rules! go { ($e:expr) => { walk_expr($e, f) }; }
     match expr {
         Expr::BinaryOp { left, right, .. } => { go!(left); go!(right); }
+        Expr::Coalesce { left, right, .. } => { go!(left); go!(right); }
         Expr::UnaryOp { operand, .. } => go!(operand),
         Expr::Call { func, args, .. } => { go!(func); for a in args { go!(a); } }
         Expr::DotCall { receiver, args, .. } => {

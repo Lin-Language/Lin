@@ -73,6 +73,7 @@ pub enum TokenKind {
     GtEq,
     And,
     Or,
+    QuestionQuestion, // ?? (null-coalescing — coalesces Null only, never Error; ADR-065)
     Eq,
     Arrow,    // =>
     Dot,

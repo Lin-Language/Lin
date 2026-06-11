@@ -207,7 +207,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | --- | --- | --- |
 | [`entries`](#entries) | `(Json) -> [String, Json][]` | Array of `[key, value]` pairs (tag-aware: object or typed map) |
 | [`fromEntries`](#fromEntries) | `([String, Json][]) -> {}` | Build an object from key-value pairs |
-| [`get`](#get) | `<T, D>({ String: T }, String, D = null) -> T \| D` | Value at key, or the default (`null` if omitted) when absent (the `m[k] ?? default` idiom) |
+| [`get`](#get) | `<T, D>({ String: T }, String, D = null) -> T \| D` | Value at key, or the default (`null` if omitted) when absent — the keyed convenience for the built-in `m[k] ?? default` (`??`, SPECIFICATION.md §8.3) |
 | [`isEmpty`](#isEmpty) | `(Json) -> Boolean` | True if object, array, or string is empty |
 | [`keys`](#keys) | `(Json) -> String[]` | Array of object keys (tag-aware: object or typed map) |
 | [`mapValues`](#mapValues) | `<V,W>({ String: V }, (V) -> W) -> { String: W }` | Transform all values, keeping keys |
@@ -2403,7 +2403,8 @@ import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, 
 >   a value annotated `{ String: T }`).
 >
 > A typed map also supports the built-in `m[k]` (yields `T | Null`) and `m[k] = v` directly. For a
-> *defaulted* read — the `m[k] ?? default` idiom — use [`get`](#get), which returns a bare `T`
+> *defaulted* read, `m[k] ?? default` uses the built-in null-coalescing operator `??`
+> (SPECIFICATION.md §8.3); for a keyed default [`get`](#get) is the convenience, returning a bare `T`
 > (the present value or the default), so the result needs no `null` guard.
 > `fromEntries` keeps a `Json` signature pending a compiler fix (a type parameter nested in a
 > `[String, T][]` argument is not yet inferable).

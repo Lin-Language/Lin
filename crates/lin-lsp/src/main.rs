@@ -3767,6 +3767,7 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
     use lin_parse::ast::{Expr as E, ObjectField, StringPart};
     match expr {
         E::BinaryOp { left, right, .. } => { f(left); f(right); }
+        E::Coalesce { left, right, .. } => { f(left); f(right); }
         E::UnaryOp { operand, .. } => f(operand),
         E::Call { func, args, .. } => { f(func); for a in args { f(a); } }
         E::DotCall { receiver, args, .. } => {

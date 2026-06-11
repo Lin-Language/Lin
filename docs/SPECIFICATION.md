@@ -440,9 +440,10 @@ distinct type from a fixed-field record `{ "f": T, … }`: a value is *either* a
 index-signature map, never both.
 
 - `m[k]` yields `T | Null` (a missing key is `Null`, consistent with the §6.1 safe-bracket rule).
-  For the *defaulted* read `m[k] ?? default` the idiomatic form is `object.get(m, k, default)`
-  (`std/object`). Its default has an independent type `D`, so the result is `T | D` (and `T | Null`
-  when the default is omitted); a same-typed default collapses `T | D` to a bare `T`.
+  For the *defaulted* read, `m[k] ?? default` uses the built-in null-coalescing operator `??`
+  (§8.3); for a keyed default the dot-applicable `object.get(m, k, default)` (`std/object`) remains
+  the convenience. Both give the default an independent type `D`, so the result is `T | D` (and
+  `T | Null` when the default is omitted); a same-typed default collapses `T | D` to a bare `T`.
 - `m[k] = v` requires `v : T` and `k : String`.
 - An empty `{}` literal infers `{ String: T }` from its context (the annotated binding / return
   type). An **evidence-free** empty `{}` — no annotation, no contextual type, no contents — is a
@@ -778,6 +779,7 @@ A `Json` value is **not** implicitly convertible to a concrete structured object
 +   -   *   /   %
 ==  !=  >   <   >=  <=
 &&  ||  !
+??                        (null-coalescing — see §8.3)
 &   |   ^   <<  >>  ~      (bitwise — see §27.2)
 ```
 
@@ -810,9 +812,38 @@ Precedence follows the standard convention used by C-family languages, from high
 10. |                  (bitwise or)
 11. &&
 12. ||
+13. ??                 (null-coalescing; lowest binary rung — see §8.3)
 ```
 
 All binary arithmetic, comparison, and bitwise operators are left-associative. `&&` and `||` are left-associative and short-circuiting. The unary operators `~` and `!` are right-associative and bind tighter than `*` but looser than postfix, so `!a == b` parses as `(!a) == b`.
+
+`??` is the lowest-precedence binary operator (rung 13, below `||`), left-associative, and short-circuiting — so `x ?? y ?? z` parses as `(x ?? y) ?? z`, and `a ?? b == c` parses as `a ?? (b == c)` (the same grouping JavaScript gives). To avoid the well-known ambiguity, an **unparenthesised mix of `??` directly with `&&` or `||` is a parse error** in either direction (`a || b ?? c` and `a ?? b || c`); wrap the logical sub-expression in parentheses — `(a || b) ?? c` or `a ?? (b || c)`.
+
+### 8.3 Null-coalescing (`??`)
+
+`a ?? b` evaluates to `a` when `a` is non-null, and to `b` otherwise. It is exactly equivalent to `if a != null then a else b`: `a` is evaluated **once**, and `b` is evaluated **only when `a` is `Null`** (short-circuit).
+
+```txt
+val counts: { String: Int32 } = {}
+val n = counts["missing"] ?? 0     // n : Int32  (the absent-key Null is replaced)
+```
+
+**It coalesces `Null` only — never `Error`.** Lin's value-based error convention (§4, §20) must stay explicit, so a left operand of type `T | Null | Error` that holds an `Error` value flows that `Error` **through** to the result; it is *not* replaced by the default. The result type is `(T | Error) | D`:
+
+```txt
+val r = lookup(key) ?? fallback   // lookup : (String) => Trip | Null | Error
+match r
+  is Error => …    // a real failure still surfaces — the default did NOT swallow it
+  else     => …    // a present Trip, or the fallback when the key was merely absent (Null)
+```
+
+Typing rules:
+
+- The left operand's type **must include `Null`** — `Null` itself, a union containing `Null`, or `Json` (which is dynamically nullable). Otherwise it is a compile-time error (*"left operand of `??` is never null"*), since the default would be dead. A bare `Null` left operand is allowed (the result is just the right operand's type).
+- The result type is `(left type with Null stripped) | D`, where `D` is the right operand's type. When `D` is assignable to the stripped left type, the union **collapses to the bare stripped type** — so `counts[k] ?? 0` (with `counts[k] : Int32 | Null` and `0 : Int32`) is a plain `Int32`, usable in arithmetic without further narrowing. This mirrors the documented behaviour of `object.get` (§6.1).
+- For a `Json` left operand the result is `Json | D` (which normalises to `Json`, since `Json` already subsumes any concrete `D`).
+
+`??` is the operator form of the *defaulted read*; for a keyed map/object default the dot-applicable `object.get(m, k, default)` (§6.1, `std/object`) remains the convenience, and the two agree on the collapse-to-bare-`T` rule.
 
 ## 9. Equality
 

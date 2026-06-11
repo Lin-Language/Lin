@@ -17629,3 +17629,261 @@ main()
     assert_eq!(output, vec!["190000"]);
 }
 
+// ── Null-coalescing operator `??` (ADR-065) ───────────────────────────────────
+// `a ?? b` ≡ `if a != null then a else b`: `a` once, `b` only when `a` is Null.
+// Coalesces Null ONLY — an Error value flows through. Lowers to the proven if/else
+// + `!= null` desugaring (no hand-rolled union-temp RC).
+
+#[test]
+fn test_coalesce_scalar_and_heap() {
+    // Null left → default; non-null left → left value. Cover a scalar (Int32) and a heap
+    // value (String) on both the null and non-null path.
+    let output = run(r#"import { print } from "std/io"
+
+val ni: Int32 | Null = null
+val si: Int32 | Null = 5
+print("${ni ?? 99}")
+print("${si ?? 99}")
+
+val ns: String | Null = null
+val ss: String | Null = "hi"
+print(ns ?? "default")
+print(ss ?? "default")
+"#);
+    assert_eq!(output, vec!["99", "5", "default", "hi"]);
+}
+
+#[test]
+fn test_coalesce_record_left() {
+    // A heap RECORD union on the left: non-null keeps the record, null falls to the default
+    // record. The result is usable as the record type (field read works without narrowing).
+    let output = run(r#"import { print } from "std/io"
+type Point = { "x": Int32, "y": Int32 }
+
+val present: Point | Null = { "x": 1, "y": 2 }
+val absent: Point | Null = null
+val a = present ?? { "x": 0, "y": 0 }
+val b = absent ?? { "x": 7, "y": 8 }
+print("${a["x"]} ${a["y"]}")
+print("${b["x"]} ${b["y"]}")
+"#);
+    assert_eq!(output, vec!["1 2", "7 8"]);
+}
+
+#[test]
+fn test_coalesce_short_circuits_rhs() {
+    // The RHS is only evaluated when the left is Null. A side-effecting default function must
+    // NOT run when the left is non-null, and MUST run (exactly once) when it is null.
+    let output = run(r#"import { print } from "std/io"
+
+val sideEffect = (label: String): Int32 =>
+  print("evaluated ${label}")
+  -1
+
+val nonNull: Int32 | Null = 5
+val nullVal: Int32 | Null = null
+
+print("${nonNull ?? sideEffect("A")}")
+print("${nullVal ?? sideEffect("B")}")
+"#);
+    // "A" never printed (left non-null); "B" printed once before its result is used.
+    assert_eq!(output, vec!["5", "evaluated B", "-1"]);
+}
+
+#[test]
+fn test_coalesce_chaining() {
+    // `x ?? y ?? z` is left-associative. First-wins and fall-through-to-last.
+    let output = run(r#"import { print } from "std/io"
+
+val a: Int32 | Null = null
+val b: Int32 | Null = null
+val c: Int32 | Null = 3
+
+val firstWins: Int32 | Null = 1
+print("${firstWins ?? b ?? 7}")
+print("${a ?? c ?? 7}")
+print("${a ?? b ?? 7}")
+"#);
+    assert_eq!(output, vec!["1", "3", "7"]);
+}
+
+#[test]
+fn test_coalesce_map_read_usable_as_bare_type() {
+    // `m[k] ?? default` on a `{ String: Int32 }`: present and absent keys, and the result is a
+    // bare `Int32` usable in arithmetic with no further narrowing.
+    let output = run(r#"import { print } from "std/io"
+
+val m: { String: Int32 } = {}
+m["a"] = 5
+
+val present = m["a"] ?? 99
+val absent = m["b"] ?? 99
+print("${present + 1}")
+print("${absent + 1}")
+
+val annotated: Int32 = m["b"] ?? 10
+print("${annotated * 2}")
+"#);
+    assert_eq!(output, vec!["6", "100", "20"]);
+}
+
+#[test]
+fn test_coalesce_error_passes_through() {
+    // Left of type `T | Null | Error` holding an Error value: `??` yields the Error, NOT the
+    // default. Lin's value-based error convention stays explicit.
+    let output = run(r#"import { print } from "std/io"
+type Trip = { "id": Int32 }
+
+val lookup = (k: String): Trip | Null | Error =>
+  if k == "bad" then { "type": "error", "message": "nope" }
+  else if k == "miss" then null
+  else { "id": 42 }
+
+val onError = lookup("bad") ?? { "id": 0 }
+match onError
+  is Error => print("error: ${onError["message"]}")
+  has { id } => print("value: ${id}")
+  else => print("other")
+
+val onMiss = lookup("miss") ?? { "id": 0 }
+match onMiss
+  is Error => print("error")
+  has { id } => print("default: ${id}")
+  else => print("other")
+"#);
+    assert_eq!(output, vec!["error: nope", "default: 0"]);
+}
+
+#[test]
+fn test_coalesce_bare_null_left() {
+    // A bare `Null` left is allowed; the result is just the right operand's type/value.
+    let output = run(r#"import { print } from "std/io"
+val d = null ?? "fallback"
+print(d)
+"#);
+    assert_eq!(output, vec!["fallback"]);
+}
+
+#[test]
+fn test_coalesce_continuation_line() {
+    // The RHS may sit on a continuation line, mirroring `||`/`&&` (ADR-005).
+    let output = run(r#"import { print } from "std/io"
+val a: Int32 | Null = null
+val r = a
+  ?? 42
+print("${r}")
+"#);
+    assert_eq!(output, vec!["42"]);
+}
+
+#[test]
+fn test_coalesce_precedence_below_equality() {
+    // `a ?? b == c` groups as `a ?? (b == c)` (`??` is the lowest binary rung, like JS).
+    let output = run(r#"import { print } from "std/io"
+val a: Boolean | Null = null
+val r = a ?? 1 == 1
+print("${r}")
+"#);
+    // a is null → result is `1 == 1` → true. (If `??` bound tighter than `==`, this would be a
+    // type error comparing a Boolean to an Int32.)
+    assert_eq!(output, vec!["true"]);
+}
+
+#[test]
+fn test_coalesce_parenthesized_logical_rhs() {
+    // `a ?? (b || c)` is legal (the logical op is parenthesised) and runs.
+    let output = run(r#"import { print } from "std/io"
+val y: Boolean | Null = null
+val z = y ?? (false || true)
+print("${z}")
+"#);
+    assert_eq!(output, vec!["true"]);
+}
+
+#[test]
+fn test_coalesce_never_null_left_is_compile_error() {
+    let err = run_expect_err(r#"import { print } from "std/io"
+val x = 5 ?? 1
+print("${x}")
+"#);
+    assert!(
+        err.contains("never null"),
+        "expected never-null diagnostic, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_coalesce_unparenthesized_mix_or_is_parse_error() {
+    // `a || b ?? c` — left operand mixes `||` with `??` unparenthesised.
+    let err = run_expect_err(r#"val x = true || false ?? false
+"#);
+    assert!(
+        err.contains("cannot mix") && err.contains("??"),
+        "expected mixing diagnostic, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_coalesce_unparenthesized_mix_rhs_is_parse_error() {
+    // `a ?? b || c` — right operand mixes `??` with `||` unparenthesised.
+    let err = run_expect_err(r#"val y: Boolean | Null = null
+val x = y ?? false || true
+"#);
+    assert!(
+        err.contains("cannot mix") && err.contains("??"),
+        "expected mixing diagnostic, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_coalesce_rc_soundness_loop_heap_values() {
+    // Exercise `??` over heap values (String / record union `T | Null`) many times in a hot
+    // loop — values must stay correct (no UAF / corruption), and a freshly-allocated record
+    // RHS on the null path is built and reclaimed each iteration. Sums a deterministic series
+    // so a single wrong/freed value would change the total.
+    let output = run(r#"import { print } from "std/io"
+type Box = { "v": Int32 }
+
+val step = (i: Int32, acc: Int32): Int32 =>
+  if i <= 0 then acc
+  else
+    // Alternate the left between a real heap record and null, forcing both the keep-left and
+    // build-fresh-RHS paths every other iteration.
+    val maybe: Box | Null = if i % 2 == 0 then { "v": i } else null
+    val chosen = maybe ?? { "v": 100 }
+    val s: String | Null = if i % 3 == 0 then null else "x"
+    val tag = s ?? "y"
+    // Read the chosen String through `==` so the freshly-allocated default actually flows out
+    // and is consumed (the heap-RHS short-circuit path), contributing a deterministic +1.
+    val bump = if tag == "x" then 1 else 1
+    step(i - 1, acc + chosen["v"] + bump)
+print("${step(2000, 0)}")
+"#);
+    // Deterministic; the exact total is asserted so any dropped/corrupted heap value is caught.
+    // even i → v=i ; odd i → v=100. bump is always 1. Sum over i=1..2000.
+    // even sum = 2+4+...+2000 = 1001000 ; odd count = 1000 → odd v contributes 1000*100=100000
+    // bump total = 2000. Total = 1001000 + 100000 + 2000 = 1103000.
+    assert_eq!(output, vec!["1103000"]);
+}
+
+#[test]
+fn test_fmt_roundtrips_coalesce() {
+    // The formatter must print `??` back faithfully, and keep parens around a parenthesised
+    // logical RHS / right-nested `??` (ADR-065). Idempotent.
+    let chain = "val r = a ?? b ?? 7\n";
+    assert_eq!(fmt(chain), chain, "?? chain must round-trip");
+    assert_eq!(fmt(&fmt(chain)), fmt(chain), "?? formatting must be idempotent");
+
+    let parenLogical = "val q = w ?? (false || true)\n";
+    assert_eq!(fmt(parenLogical), parenLogical, "parens around a logical RHS must survive");
+
+    let rightNested = "val n = a ?? (b ?? 3)\n";
+    assert_eq!(fmt(rightNested), rightNested, "right-nested ?? parens must survive");
+
+    let withEq = "val e = a ?? b == c\n";
+    assert_eq!(fmt(withEq), withEq, "?? below == must round-trip without parens");
+}
+

@@ -186,6 +186,12 @@ impl Lexer {
         if ch == '|' && self.peek_at(1) == Some('|') {
             return;
         }
+        // A line beginning with `??` is a null-coalescing continuation of the previous expression
+        // (ADR-065), exactly like a `&&`/`||` continuation line above. Suppress INDENT/DEDENT so the
+        // `??` glues to the previous logical line instead of opening a block.
+        if ch == '?' && self.peek_at(1) == Some('?') {
+            return;
+        }
         // A line beginning with `.method` is a dot-chain continuation of the previous
         // expression, not a new block (spec §2.2; mirrors the `&&`/`||` suppression above
         // and ADR-005/013). Suppressing INDENT/DEDENT here keeps the enclosing block's
@@ -678,6 +684,12 @@ impl Lexer {
             }
             '^' => TokenKind::Caret,
             '~' => TokenKind::Tilde,
+            '?' if self.pos < self.source.len() && self.source[self.pos] == '?' => {
+                // `??` null-coalescing (ADR-065). A lone `?` is left to the Ident catch-all
+                // below so it stays an unknown-character lex error exactly as today.
+                self.pos += 1;
+                TokenKind::QuestionQuestion
+            }
             _ => TokenKind::Ident(ch.to_string()),
         };
         Token::new(kind, self.span(start, self.pos))
@@ -825,5 +837,31 @@ val y = 2
         // Indentation precedes `//` and is consumed before capture, so text starts at `//`.
         assert_eq!(comments[0].text, "// body comment");
         assert!(comments[0].own_line);
+    }
+
+    #[test]
+    fn double_question_is_one_token() {
+        // `??` lexes as a single QuestionQuestion (ADR-065), distinct from two unknown `?` chars.
+        let toks = tokens("a ?? b");
+        let kinds: Vec<_> = toks.iter().map(|t| &t.kind).collect();
+        assert!(
+            kinds.contains(&&TokenKind::QuestionQuestion),
+            "expected a QuestionQuestion token, got {:?}",
+            kinds
+        );
+        // The `??` token spans exactly two source chars.
+        let qq = toks.iter().find(|t| t.kind == TokenKind::QuestionQuestion).unwrap();
+        assert_eq!(qq.span.end - qq.span.start, 2);
+    }
+
+    #[test]
+    fn single_question_is_not_double_question() {
+        // A lone `?` must NOT produce a QuestionQuestion token (it stays the unknown-char Ident
+        // catch-all, an error the parser reports — no bare `?` operator exists; ADR-065).
+        let toks = tokens("a ? b");
+        assert!(
+            !toks.iter().any(|t| t.kind == TokenKind::QuestionQuestion),
+            "a single `?` must not lex as `??`"
+        );
     }
 }
