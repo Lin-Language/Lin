@@ -8,6 +8,30 @@ use lin_check::types::Type;
 use super::Codegen;
 
 impl<'ctx> Codegen<'ctx> {
+    /// Allocate a SCRATCH stack slot in the function's ENTRY block (the standard LLVM idiom; see
+    /// `sealed_construct_stack` for the same pattern). Use this for short-lived scratch the value is
+    /// COPIED OUT of immediately at its use site (e.g. an `arr_cell` whose bytes `lin_array_push`
+    /// copies into the array before the next statement) — emitting the `alloca` at the (loop-body)
+    /// use site instead makes the stack GROW one slot per iteration, a stack overflow at high N (the
+    /// inline-heap-array-literal-in-a-fused-loop overflow: `xs.flatMap(s => [s, s, s])` spliced into a
+    /// 100k iteration loop). An entry-block alloca is allocated ONCE per call and the slot is reused
+    /// every iteration — sound here precisely because the cell is dead the instant `lin_array_push`
+    /// returns, so the next iteration's overwrite races nothing.
+    pub(crate) fn entry_alloca<T: BasicType<'ctx>>(&self, ty: T, name: &str) -> inkwell::values::PointerValue<'ctx> {
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let saved = self.builder.get_insert_block();
+        let entry = llvm_fn.get_first_basic_block().expect("function has an entry block");
+        match entry.get_first_instruction() {
+            Some(first) => self.builder.position_before(&first),
+            None => self.builder.position_at_end(entry),
+        }
+        let cell = self.builder.alloca(ty, name);
+        if let Some(bb) = saved {
+            self.builder.position_at_end(bb);
+        }
+        cell
+    }
+
     /// Push a scalar into a flat unboxed array.
     ///
     /// INLINED (like `flat_array_get`): `lin_flat_array_push_<sfx>` lives in the separately
@@ -170,7 +194,7 @@ impl<'ctx> Codegen<'ctx> {
                 let obj = self.sealed_materialize_to_object(val, &fields);
                 let tag = i8_ty.const_int(Self::type_tag(val_ty) as u64, false);
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
-                let cell = self.builder.alloca(ptr_ty, "arr_cell");
+                let cell = self.entry_alloca(ptr_ty, "arr_cell");
                 self.builder.store(cell, obj);
                 self.builder.call(self.rt.array_push, &[arr.into(), cell.into(), tag.into()], "arr_push");
                 return;
@@ -199,14 +223,14 @@ impl<'ctx> Codegen<'ctx> {
                 let cell = match val_ty {
                     Type::Str | Type::StrLit(_) | Type::Array(_) | Type::Object { .. } | Type::Iterator(_) | Type::Function { .. } => {
                         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
-                        let cell = self.builder.alloca(ptr_ty, "arr_cell");
+                        let cell = self.entry_alloca(ptr_ty, "arr_cell");
                         self.builder.store(cell, val);
                         cell
                     }
                     _ => {
                         let i64_ty = self.context.i64_type();
                         let payload = self.tagged_payload_i64(&val, val_ty);
-                        let cell = self.builder.alloca(i64_ty, "arr_cell");
+                        let cell = self.entry_alloca(i64_ty, "arr_cell");
                         self.builder.store(cell, payload);
                         cell
                     }
