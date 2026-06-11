@@ -1661,7 +1661,12 @@ fn lower_container_base_borrowed(
     ctx: &mut LowerCtx,
 ) -> Option<Temp> {
     let TypedExpr::LocalGet { slot, ty, .. } = object else { return None };
-    if is_union_ty(ty) || !is_rc_type(ty) {
+    // The borrowed-container shortcut applies only when the slot's owning strategy is `Retain`
+    // (a concrete refcounted heap value). A `Clone`-strategy union/Json slot owns its own box and
+    // a `Trivial` scalar carries no reference — neither is a borrowable concrete container. This is
+    // exactly `!is_union_ty(ty) && is_rc_type(ty)` (the sets are disjoint), now read off the
+    // ownership authority instead of re-derived from the type shape.
+    if crate::ownership_verify::owning_strategy(ty) != crate::ownership_verify::OwningStrategy::Retain {
         return None;
     }
     // Module-level mutable `var` (global): plain load, no owning clone.
@@ -1704,7 +1709,9 @@ fn lower_container_base_borrowed(
 /// Must stay in lockstep with `lower_container_base_borrowed` (every `Some` path here is `true`).
 fn lower_container_base_borrowed_check(object: &TypedExpr, ctx: &LowerCtx) -> bool {
     let TypedExpr::LocalGet { slot, ty, .. } = object else { return false };
-    if is_union_ty(ty) || !is_rc_type(ty) {
+    // Mirror `lower_container_base_borrowed`'s strategy gate exactly (Retain == concrete-rc,
+    // non-union container).
+    if crate::ownership_verify::owning_strategy(ty) != crate::ownership_verify::OwningStrategy::Retain {
         return false;
     }
     if ctx.global_var_slots.contains(slot) {
