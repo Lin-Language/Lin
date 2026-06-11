@@ -220,6 +220,73 @@ pub fn index_result_convention(obj_ty: &Type, key_ty: &Type) -> Convention {
     }
 }
 
+/// How codegen takes an INDEPENDENT owning reference to a value of a given slot/cell type — the
+/// single decision the lowerer's owning-read (`own_for_read`) and owning-store (`own_for_store`)
+/// model needs, and which today each re-derives inline from the type shape. A `var` cell / module
+/// global / scope-exit register owns ONE reference to its value; producing that reference depends
+/// only on the value's repr kind:
+///
+/// - `Clone` — a boxed Json/union value (`is_union_ty`: `Union`/`TypeVar`/`Named`/`Shared`/`Stream`/
+///   `Promise`). The owner must own its OWN `TaggedVal*` box, not an alias of a borrowed caller box,
+///   so codegen emits `CloneBox` (→ `lin_tagged_clone`); release-old can then free it safely.
+/// - `Retain` — a concrete refcounted heap value (`is_rc_type`: `Str`/`StrLit`/`Array`/`FixedArray`/
+///   `Object`/`Map`/`Iterator`/`Function`). The owner shares the same heap pointer with one extra
+///   reference, so codegen emits `Retain` (rc + 1) in place.
+/// - `Trivial` — a scalar (`Int`/`Bool`/`Float`/`Null`/sum-node/…): no heap reference exists, so
+///   owning is a no-op and the value is used unchanged.
+///
+/// Relocated verbatim (same `is_union_ty` / `is_rc_type` trichotomy, in the same priority order)
+/// from the inline classification in `own_for_read` / `own_for_store` in `lower.rs`, so the
+/// "how do I own a value of this type" fact lives in the ownership authority instead of being
+/// re-derived at each RC-insertion site. The lowerer reads this and emits the matching op, so the
+/// produced IR — and therefore the RC — is byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwningStrategy {
+    /// Boxed union/Json value: own via `CloneBox`.
+    Clone,
+    /// Concrete refcounted heap value: own via `Retain` (rc + 1) in place.
+    Retain,
+    /// Scalar: no heap reference; owning is a no-op.
+    Trivial,
+}
+
+/// THE authority for `OwningStrategy` — see the enum doc. Mirrors `lower::own_for_read` /
+/// `lower::own_for_store`: union check FIRST (the two type sets are disjoint, so priority is not
+/// load-bearing, but it is preserved verbatim), then concrete-rc, else trivial.
+pub fn owning_strategy(ty: &Type) -> OwningStrategy {
+    if is_union_owning_ty(ty) {
+        OwningStrategy::Clone
+    } else if is_concrete_rc_ty(ty) {
+        OwningStrategy::Retain
+    } else {
+        OwningStrategy::Trivial
+    }
+}
+
+/// Boxed Json/union value types (the `CloneBox` owning set). Kept in the authority alongside
+/// `owning_strategy`; mirrors `lower::is_union_ty`.
+fn is_union_owning_ty(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_)
+    )
+}
+
+/// Concrete refcounted heap value types (the `Retain` owning set). Mirrors `lower::is_rc_type`.
+fn is_concrete_rc_ty(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Str
+            | Type::StrLit(_)
+            | Type::Array(_)
+            | Type::FixedArray(_)
+            | Type::Object { .. }
+            | Type::Map(_)
+            | Type::Iterator(_)
+            | Type::Function { .. }
+    )
+}
+
 // ===========================================================================
 // 2. Convention inference at lowering
 // ===========================================================================
