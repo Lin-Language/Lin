@@ -201,11 +201,8 @@ import { for } from "std/iter"
 export val count = (words: String[]): { String: Int32 } =>
   var counts: { String: Int32 } = {}
   words.for(w =>
-    val prev = counts[w]
-    val n = match prev
-      is Int32 => prev
-      else => 0          // first sight of the word: Null -> start at 0
-    counts[w] = n + 1
+    // counts[w] is Int32 | Null (missing key -> Null); `?? 0` supplies the default.
+    counts[w] = (counts[w] ?? 0) + 1
   )
   counts
 ```
@@ -295,8 +292,16 @@ val describe = (e: NamedEntity): String =>
 
 `&` resolves to a single structural `Type::Object` with the merged fields, so the result is width-subtyped and field access stays inline-fast — none of the `Json` penalties.
 
-### Bracket access
-- Bracket access is **safe**: a missing object key yields `Null`, and `Null` propagates through a chain (`obj["a"]["b"]`). Array out-of-bounds is a runtime error. Don't conflate a `Null` miss with an empty string — narrow with `is Null`.
+### Null handling — `??` and baked-in optional chaining
+- **Optional chaining is built into bracket access.** `obj["a"]["b"]["c"]` traverses safely: a missing key (or any `Null` link) makes the whole chain evaluate to `Null` — it does NOT error. So **do not write `match … is Null` chains to guard each step** of a traversal; just chain the accesses and handle the final `T | Null`. (Note: on a *typed* record, accessing a field the type doesn't declare is a type warning — null-propagation is for genuinely nullable intermediates like `{ String: T }` map reads, not for poking absent fields on a known shape.)
+- **`??` is the null-coalescing operator** — `x ?? fallback` yields `x` when non-null, else `fallback`. This is THE idiom for defaults. It replaces all of:
+  - `if x != null then x else d`  →  `x ?? d`
+  - `match x is Null => d else => x`  →  `x ?? d`
+  - `match prev is Int32 => prev else => 0`  →  `prev ?? 0`
+  - a `get(m, k, d)` fallback call  →  `m[k] ?? d`
+  - `??` chains: `m["y"] ?? m["x"] ?? -1`.
+- Combined: `val name = user["profile"]["name"] ?? "anonymous"` — safe-traverse, then default, in one line. Reach for `match`/`is Null` only when you need to branch on *more* than presence (different handling per type), not merely supply a default.
+- Array out-of-bounds is still a runtime error (only object/map key misses yield `Null`). Don't conflate a `Null` miss with an empty string.
 
 ### Imports and the stdlib
 - Import everything explicitly. `std/...` is the embedded stdlib; other paths resolve relative to the importing file (`./calc`).
