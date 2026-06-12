@@ -524,6 +524,225 @@ fn specialization_name(base: &str, subs: &HashMap<u32, Type>) -> String {
 /// callback-devirt identity.
 type SpecKey = (usize, Vec<(u32, String)>, Option<CallbackDevirt>);
 
+// ---------------------------------------------------------------------------
+// D3 anon-layout specialization (Stage 1)
+// ---------------------------------------------------------------------------
+
+/// True if `ty` is an ANONYMOUS structural parameter type — an `Object { sealed: false }` shape
+/// written inline in a parameter annotation. Named records resolve to a SEALED type and are NOT
+/// in scope here; they already share via §5.9.1 projection. This is the per-parameter axis of D3:
+/// a direct call with a wider concrete sealed record is monomorphised per concrete layout so the
+/// parameter reads/writes at the CALLER's offsets — preserving sharing, no copy.
+fn is_anon_struct_param(ty: &Type) -> bool {
+    matches!(ty, Type::Object { sealed: false, fields } if !fields.is_empty())
+}
+
+/// A top-level function with at least one anonymous structural parameter that qualifies for
+/// per-layout specialisation.
+struct AnonFn {
+    name: String,
+    func: TypedExpr,
+}
+
+/// Canonical hashable key for an anon-layout specialisation: function slot + per-(param-index,
+/// concrete-arg-type-debug-string) pairs, sorted by param index.
+type AnonLayoutKey = (usize, Vec<(usize, String)>);
+
+fn anon_layout_key(fn_slot: usize, layouts: &[(usize, &Type)]) -> AnonLayoutKey {
+    let mut pairs: Vec<(usize, String)> = layouts
+        .iter()
+        .map(|(i, t)| (*i, format!("{:?}", t.erase_lambda_sets())))
+        .collect();
+    pairs.sort_by_key(|(i, _)| *i);
+    (fn_slot, pairs)
+}
+
+struct AnonSpecInfo {
+    fn_slot: usize,
+    slot: usize,
+    name: String,
+    /// Per-param-index concrete type substituted for the anon param.
+    layouts: Vec<(usize, Type)>,
+}
+
+/// Substitute an anonymous-structural type (`Object { sealed: false, fields: X }`) appearing in
+/// `ty` with its concrete counterpart from `anon_subs`, keyed by the anon type's debug string.
+/// Unlike `subst_type` which handles TypeVar ids, this handles direct object-type substitutions.
+fn subst_anon_type(ty: &Type, anon_subs: &HashMap<String, Type>) -> Type {
+    // Check if this exact type is a registered anon param type.
+    if matches!(ty, Type::Object { sealed: false, .. }) {
+        let key = format!("{:?}", ty.erase_lambda_sets());
+        if let Some(concrete) = anon_subs.get(&key) {
+            return concrete.clone();
+        }
+    }
+    // Recurse structurally.
+    match ty {
+        Type::Array(t) => Type::Array(Box::new(subst_anon_type(t, anon_subs))),
+        Type::Iterator(t) => Type::Iterator(Box::new(subst_anon_type(t, anon_subs))),
+        Type::Shared(t) => Type::Shared(Box::new(subst_anon_type(t, anon_subs))),
+        Type::Stream(t) => Type::Stream(Box::new(subst_anon_type(t, anon_subs))),
+        Type::Promise(t) => Type::Promise(Box::new(subst_anon_type(t, anon_subs))),
+        Type::Map(t) => Type::Map(Box::new(subst_anon_type(t, anon_subs))),
+        Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| subst_anon_type(t, anon_subs)).collect()),
+        Type::Union(ts) => Type::Union(ts.iter().map(|t| subst_anon_type(t, anon_subs)).collect()),
+        Type::Object { fields, sealed } => Type::Object {
+            fields: fields.iter().map(|(k, v)| (k.clone(), subst_anon_type(v, anon_subs))).collect(),
+            sealed: *sealed,
+        },
+        Type::Function { params, ret, required, lset } => Type::Function {
+            params: params.iter().map(|p| subst_anon_type(p, anon_subs)).collect(),
+            ret: Box::new(subst_anon_type(ret, anon_subs)),
+            required: *required,
+            lset: lset.clone(),
+        },
+        _ => ty.clone(),
+    }
+}
+
+/// Substitute anon-structural types throughout a `TypedExpr` tree (the D3 analogue of `subst_expr`
+/// for the TypeVar → concrete generic substitution). Updates all type annotations that mention the
+/// anon param type so the specialised body reads/writes at the concrete record's offsets.
+fn subst_expr_anon(expr: &mut TypedExpr, anon_subs: &HashMap<String, Type>) {
+    match expr {
+        TypedExpr::IntLit(_, ty, _) | TypedExpr::FloatLit(_, ty, _) | TypedExpr::StringLit(_, ty, _) => {
+            *ty = subst_anon_type(ty, anon_subs);
+        }
+        TypedExpr::BoolLit(..) | TypedExpr::NullLit(..) => {}
+        TypedExpr::LocalGet { ty, .. } | TypedExpr::LocalSet { ty, .. } => {
+            *ty = subst_anon_type(ty, anon_subs);
+        }
+        TypedExpr::BinaryOp { result_type, .. } | TypedExpr::UnaryOp { result_type, .. } => {
+            *result_type = subst_anon_type(result_type, anon_subs);
+        }
+        TypedExpr::Coerce { from, to, .. } => {
+            *from = subst_anon_type(from, anon_subs);
+            *to = subst_anon_type(to, anon_subs);
+        }
+        TypedExpr::Call { result_type, .. } => {
+            *result_type = subst_anon_type(result_type, anon_subs);
+        }
+        TypedExpr::If { result_type, .. } => {
+            *result_type = subst_anon_type(result_type, anon_subs);
+        }
+        TypedExpr::FromJson { target, result_type, .. } => {
+            *target = subst_anon_type(target, anon_subs);
+            *result_type = subst_anon_type(result_type, anon_subs);
+        }
+        TypedExpr::Match { result_type, arms, .. } => {
+            *result_type = subst_anon_type(result_type, anon_subs);
+            for arm in arms.iter_mut() {
+                subst_match_pattern_anon(&mut arm.pattern, anon_subs);
+            }
+        }
+        TypedExpr::Block { ty, .. } => {
+            *ty = subst_anon_type(ty, anon_subs);
+        }
+        TypedExpr::Function { params, ret_type, captures, .. } => {
+            for p in params.iter_mut() {
+                p.ty = subst_anon_type(&p.ty, anon_subs);
+                if let Some(d) = p.default.as_mut() { subst_expr_anon(d, anon_subs); }
+            }
+            *ret_type = subst_anon_type(ret_type, anon_subs);
+            for c in captures.iter_mut() { c.ty = subst_anon_type(&c.ty, anon_subs); }
+        }
+        TypedExpr::MakeObject { ty, .. } | TypedExpr::MakeArray { ty, .. } => {
+            *ty = subst_anon_type(ty, anon_subs);
+        }
+        TypedExpr::Index { result_type, .. } | TypedExpr::FieldGet { result_type, .. } => {
+            *result_type = subst_anon_type(result_type, anon_subs);
+        }
+        TypedExpr::IndexSet { obj_ty, .. } => {
+            *obj_ty = subst_anon_type(obj_ty, anon_subs);
+        }
+        TypedExpr::Is { pattern, .. } | TypedExpr::Has { pattern, .. } => {
+            subst_pattern_anon(pattern, anon_subs);
+        }
+        TypedExpr::StringInterp { .. } => {}
+    }
+    if let TypedExpr::Block { stmts, .. } = expr {
+        for s in stmts.iter_mut() {
+            subst_stmt_types_anon(s, anon_subs);
+        }
+    }
+    for_each_child_mut(expr, &mut |c| subst_expr_anon(c, anon_subs));
+}
+
+fn subst_match_pattern_anon(pat: &mut TypedMatchPattern, anon_subs: &HashMap<String, Type>) {
+    match pat {
+        TypedMatchPattern::Is(p) | TypedMatchPattern::Has(p) => subst_pattern_anon(p, anon_subs),
+        TypedMatchPattern::Else => {}
+    }
+}
+
+fn subst_pattern_anon(pat: &mut TypedPattern, anon_subs: &HashMap<String, Type>) {
+    match pat {
+        TypedPattern::TypeCheck(ty, _) => *ty = subst_anon_type(ty, anon_subs),
+        TypedPattern::TypeCheckDeep(ty, named_defs, _) => {
+            *ty = subst_anon_type(ty, anon_subs);
+            for (_, t) in named_defs.iter_mut() { *t = subst_anon_type(t, anon_subs); }
+        }
+        TypedPattern::Literal(e) => subst_expr_anon(e, anon_subs),
+        TypedPattern::Object { fields, .. } => {
+            for f in fields.iter_mut() {
+                f.ty = subst_anon_type(&f.ty, anon_subs);
+                if let Some(vp) = f.value_pattern.as_mut() { subst_expr_anon(vp, anon_subs); }
+            }
+        }
+        TypedPattern::Array { elements, .. } => {
+            for e in elements.iter_mut() { subst_pattern_anon(e, anon_subs); }
+        }
+        TypedPattern::Binding(_, ty, _) => *ty = subst_anon_type(ty, anon_subs),
+        TypedPattern::Wildcard(_) => {}
+    }
+}
+
+fn subst_stmt_types_anon(stmt: &mut TypedStmt, anon_subs: &HashMap<String, Type>) {
+    match stmt {
+        TypedStmt::Val { ty, .. } | TypedStmt::Var { ty, .. } => {
+            *ty = subst_anon_type(ty, anon_subs);
+        }
+        TypedStmt::Destructure { obj_ty, fields, .. } => {
+            *obj_ty = subst_anon_type(obj_ty, anon_subs);
+            for (_, _, fty) in fields.iter_mut() { *fty = subst_anon_type(fty, anon_subs); }
+        }
+        TypedStmt::ArrayDestructure { elem_ty, elements, rest, .. } => {
+            *elem_ty = subst_anon_type(elem_ty, anon_subs);
+            for (_, _, ety) in elements.iter_mut() { *ety = subst_anon_type(ety, anon_subs); }
+            if let Some((_, rty)) = rest { *rty = subst_anon_type(rty, anon_subs); }
+        }
+        TypedStmt::Expr(_) | TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. } => {}
+    }
+}
+
+/// True if `concrete_ty` is a concrete sealed record that satisfies the `anon_param_ty` anonymous
+/// structural constraint — i.e. every field of `anon_param_ty` is present in `concrete_ty` with
+/// a compatible type — AND the two types differ (so specialisation is actually needed). A call
+/// with `concrete_ty == anon_param_ty` already works today (no copy) and is not re-specialised.
+fn anon_layout_needs_spec(anon_param_ty: &Type, concrete_ty: &Type) -> bool {
+    let Type::Object { fields: param_fields, sealed: false } = anon_param_ty else { return false };
+    let Type::Object { fields: arg_fields, sealed: true } = concrete_ty else { return false };
+    // Every required field of the anon param must be present in the concrete arg.
+    if !param_fields.keys().all(|k| arg_fields.contains_key(k)) {
+        return false;
+    }
+    // Only specialise when the concrete type is actually different (wider or sealed-only flip)
+    // — if they are equal under Type PartialEq (ignoring sealed) AND the only difference is sealed,
+    // we still specialise because sealed changes the lowering path.
+    true
+}
+
+/// True when a module declares any top-level function with an anonymous structural parameter.
+pub fn module_has_anon_param_fn(module: &TypedModule) -> bool {
+    module.statements.iter().any(|stmt| {
+        if let TypedStmt::Val { value: TypedExpr::Function { params, .. }, .. } = stmt {
+            params.iter().any(|p| is_anon_struct_param(&p.ty))
+        } else {
+            false
+        }
+    })
+}
+
 /// A canonical, hashable key for an instantiation (generic slot + sorted concrete args + optional
 /// callback-devirt identity). Two calls with identical type args but DIFFERENT named callbacks (or
 /// one devirted and one not) must key distinctly so each gets its own specialization.
@@ -560,9 +779,13 @@ pub fn module_has_generic_fn(module: &TypedModule) -> bool {
 /// function from another module? When neither holds, monomorphization is skipped entirely and the
 /// module lowers byte-for-byte as before (the no-op invariant). An imported binding is "generic" if
 /// its declared type mentions a quantified TypeVar — the importing module's `ImportSlot.ty` carries
-/// the origin module's generic signature.
+/// the origin module's generic signature. Also returns true when the module has any function with
+/// an anonymous structural parameter — those are eligible for D3 per-layout specialisation.
 pub fn module_uses_generic(module: &TypedModule, imports: &HashMap<String, TypedModule>) -> bool {
     if module_has_generic_fn(module) {
+        return true;
+    }
+    if module_has_anon_param_fn(module) {
         return true;
     }
     module.statements.iter().any(|stmt| {
@@ -645,6 +868,8 @@ fn monomorphize_inner(
 ) -> Vec<Diagnostic> {
     // 1. Discover top-level generic functions defined in THIS module (slot -> GenericFn).
     let mut generics: HashMap<usize, GenericFn> = HashMap::new();
+    // D3: also discover functions with anonymous structural parameters.
+    let mut anon_fns: HashMap<usize, AnonFn> = HashMap::new();
     for stmt in &module.statements {
         if let TypedStmt::Val { slot, name: Some(name), value, .. } = stmt {
             if let TypedExpr::Function { params, ret_type, .. } = value {
@@ -652,6 +877,12 @@ fn monomorphize_inner(
                     || mentions_generic_tv(ret_type);
                 if is_generic {
                     generics.insert(*slot, GenericFn { name: name.clone(), func: value.clone(), origin: None });
+                }
+                // D3: a function with any anon-structural param is eligible for layout specialisation.
+                // A function that is ALSO generic is handled by the generic path (its TypeVar subs
+                // already change the body; the anon params in a generic fn are resolved there too).
+                if !is_generic && params.iter().any(|p| is_anon_struct_param(&p.ty)) {
+                    anon_fns.insert(*slot, AnonFn { name: name.clone(), func: value.clone() });
                 }
             }
         }
@@ -686,7 +917,7 @@ fn monomorphize_inner(
             }
         }
     }
-    if generics.is_empty() {
+    if generics.is_empty() && anon_fns.is_empty() {
         return Vec::new(); // No-op for ordinary modules.
     }
 
@@ -728,6 +959,10 @@ fn monomorphize_inner(
         rehome_intrinsic_cache: HashMap::new(),
         direct_callable_fn_slots,
         no_capture_fn_slots,
+        anon_fns,
+        anon_specs: HashMap::new(),
+        anon_worklist: Vec::new(),
+        anon_per_fn_count: HashMap::new(),
     };
 
     // 2. Walk the whole module, rewriting calls to generic functions and queuing specializations.
@@ -792,6 +1027,43 @@ fn monomorphize_inner(
             span,
         });
     }
+
+    // 3a-D3: Drain the anon-layout specialization worklist: materialize each per-concrete-layout
+    // specialisation of an anonymous-structural-param function. The body is cloned, each anon param
+    // type replaced with the concrete arg type (so FieldGet/FieldSet in the body uses the concrete
+    // record's offsets), and the call is re-examined for further specialization opportunities.
+    while let Some(key) = state.anon_worklist.pop() {
+        let (fn_slot, spec_slot, spec_name, layouts) = {
+            let info = &state.anon_specs[&key];
+            (info.fn_slot, info.slot, info.name.clone(), info.layouts.clone())
+        };
+        let mut func = state.anon_fns[&fn_slot].func.clone();
+        let span = func.span();
+        // Build the anon-subs map: anon-type-debug-string → concrete type.
+        let anon_subs: HashMap<String, Type> = if let TypedExpr::Function { params, .. } = &func {
+            layouts.iter().filter_map(|(pidx, concrete_ty)| {
+                params.get(*pidx).map(|p| (format!("{:?}", p.ty.erase_lambda_sets()), concrete_ty.clone()))
+            }).collect()
+        } else {
+            HashMap::new()
+        };
+        // Substitute the anon types throughout the body.
+        subst_expr_anon(&mut func, &anon_subs);
+        if let TypedExpr::Function { name, .. } = &mut func {
+            *name = Some(spec_name.clone());
+        }
+        // Re-run the call rewriter so any generic calls inside the specialised body are handled.
+        rewrite_expr(&mut func, &mut state);
+        let ty = func.ty();
+        materialized.push(TypedStmt::Val {
+            slot: spec_slot,
+            name: Some(spec_name),
+            value: func,
+            ty,
+            span,
+        });
+    }
+
     // Deterministic order so codegen/IR output is stable across runs.
     materialized.sort_by_key(|s| if let TypedStmt::Val { slot, .. } = s { *slot } else { 0 });
 
@@ -1426,6 +1698,16 @@ struct MonoState<'a> {
     /// (a predicate `(T) => Boolean` accepts the optional index, so the body's `f(item, idx)` call
     /// must drop the extra `idx` when devirted to a 1-param `L`).
     no_capture_fn_slots: HashMap<usize, Type>,
+
+    // D3 anon-layout specialization fields -----------------------------------
+    /// Top-level functions with at least one anonymous structural parameter, keyed by slot.
+    anon_fns: HashMap<usize, AnonFn>,
+    /// Deduped anon-layout specializations, keyed by (fn_slot, per-param concrete-type-string).
+    anon_specs: HashMap<AnonLayoutKey, AnonSpecInfo>,
+    /// Anon-layout spec keys awaiting materialization.
+    anon_worklist: Vec<AnonLayoutKey>,
+    /// Per-anon-fn specialization count (shares the same SPECIALIZATION_BUDGET).
+    anon_per_fn_count: HashMap<usize, usize>,
 }
 
 struct SpecInfo {
@@ -2030,6 +2312,81 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                     } else {
                         // No substitution at all (e.g. a generic used purely as a value here).
                         state.used_generic_slots.insert(gslot);
+                    }
+                }
+            }
+        }
+    }
+
+    // D3: anon-layout specialization. Detect a direct call to a function with anonymous structural
+    // parameters where at least one argument is a wider concrete sealed record. Mint a per-layout
+    // specialisation so the body reads/writes at the caller's concrete offsets (sharing, no copy).
+    if let TypedExpr::Call { func, args, .. } = expr {
+        if let TypedExpr::LocalGet { slot: fn_slot, .. } = func.as_ref() {
+            let fn_slot = *fn_slot;
+            if state.anon_fns.contains_key(&fn_slot) {
+                // Collect per-param concrete layouts for params that are anon structural types AND
+                // whose argument is a wider/different concrete sealed type.
+                let layouts: Vec<(usize, Type)> = if let TypedExpr::Function { params, .. } = &state.anon_fns[&fn_slot].func {
+                    params.iter().enumerate().filter_map(|(i, param)| {
+                        if !is_anon_struct_param(&param.ty) { return None; }
+                        let arg_ty = args.get(i)?.ty();
+                        if anon_layout_needs_spec(&param.ty, &arg_ty) { Some((i, arg_ty)) } else { None }
+                    }).collect()
+                } else {
+                    vec![]
+                };
+                if !layouts.is_empty() {
+                    let key = anon_layout_key(fn_slot, &layouts.iter().map(|(i, t)| (*i, t)).collect::<Vec<_>>());
+                    let spec_slot = if let Some(info) = state.anon_specs.get(&key) {
+                        info.slot
+                    } else {
+                        let count = *state.anon_per_fn_count.get(&fn_slot).unwrap_or(&0);
+                        if count < state.budget {
+                            let base_name = &state.anon_fns[&fn_slot].name.clone();
+                            let layout_suffix: String = layouts.iter()
+                                .map(|(i, t)| format!("p{}_{}", i, mangle_type(t)))
+                                .collect::<Vec<_>>()
+                                .join("_");
+                            let spec_name = format!("{}$L{}", base_name, layout_suffix);
+                            let s = state.next_slot;
+                            state.next_slot += 1;
+                            state.anon_specs.insert(key.clone(), AnonSpecInfo {
+                                fn_slot,
+                                slot: s,
+                                name: spec_name,
+                                layouts: layouts.clone(),
+                            });
+                            *state.anon_per_fn_count.entry(fn_slot).or_insert(0) += 1;
+                            state.anon_worklist.push(key);
+                            s
+                        } else {
+                            // Budget exhausted — leave the call as-is (falls back to today's copy path).
+                            return;
+                        }
+                    };
+                    // Repoint the call to the specialisation. The specialised function's param types
+                    // ARE the concrete arg types, so no coercion is inserted by lower_coerce_arg.
+                    let anon_fn = &state.anon_fns[&fn_slot];
+                    let TypedExpr::Function { params, ret_type, .. } = &anon_fn.func else { return };
+                    // Build the specialised param types (anon params replaced by concrete, rest unchanged).
+                    let spec_params: Vec<Type> = params.iter().enumerate().map(|(i, p)| {
+                        if let Some((_, t)) = layouts.iter().find(|(li, _)| *li == i) {
+                            t.clone()
+                        } else {
+                            p.ty.clone()
+                        }
+                    }).collect();
+                    let required = params.iter().filter(|p| p.default.is_none()).count();
+                    let spec_fn_ty = Type::Function {
+                        params: spec_params,
+                        ret: Box::new(ret_type.clone()),
+                        required,
+                        lset: lin_check::types::LambdaSet::Top,
+                    };
+                    if let TypedExpr::LocalGet { slot: fslot, ty, .. } = func.as_mut() {
+                        *fslot = spec_slot;
+                        *ty = spec_fn_ty;
                     }
                 }
             }
