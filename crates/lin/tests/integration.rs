@@ -2326,6 +2326,73 @@ print(toString(length(m["r1"])))
 }
 
 #[test]
+fn test_object_index_by_total_literal_union_drops_null() {
+    // Indexing a record by a key whose TYPE is a closed union of string literals, ALL of which
+    // are declared fields, is provably total: the safe-bracket `Null` (§6.1, missing-key
+    // fallback) must NOT be added. `dow: DayOfWeek` (= the seven day literals) indexing a
+    // `ServiceDays` record keyed by exactly those seven reads precisely `Boolean` — so a
+    // `: Boolean` return annotation type-checks. Before the fix the body inferred
+    // `Boolean | … | Boolean | Null` and failed the return-type check. This is the exact shape
+    // from the user's GTFS `service.lin`, run end-to-end: the literal-union argument refinement
+    // (a bare `"Monday"` narrows to the `DayOfWeek` member) lets `runsOn` be CALLED with a literal.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type DayOfWeek = "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday" | "Sunday"
+type ServiceDays = { "Monday": Boolean, "Tuesday": Boolean, "Wednesday": Boolean, "Thursday": Boolean, "Friday": Boolean, "Saturday": Boolean, "Sunday": Boolean }
+
+val runsOn = (days: ServiceDays, dow: DayOfWeek): Boolean => days[dow]
+
+val d: ServiceDays = { "Monday": true, "Tuesday": false, "Wednesday": false, "Thursday": false, "Friday": false, "Saturday": false, "Sunday": false }
+print(toString(runsOn(d, "Monday")))
+print(toString(d.runsOn("Tuesday")))
+"#);
+    assert_eq!(output, vec!["true", "false"]);
+}
+
+#[test]
+fn test_bare_string_literal_refines_to_literal_union() {
+    // A bare string literal narrows to a member of an expected closed string-literal union
+    // (ADR-034 pushdown, extended from a single `StrLit` to a union of them) — in val-binding,
+    // argument, and return positions. Previously the literal stayed `String` and was rejected
+    // against the union target ("got String"). A non-member literal is still an error.
+    let output = run(r#"import { print } from "std/io"
+
+type Dir = "north" | "south" | "east" | "west"
+
+val opposite = (d: Dir): Dir =>
+  if d == "north" then "south"
+  else if d == "south" then "north"
+  else if d == "east" then "west"
+  else "east"
+
+val start: Dir = "north"
+print(opposite(start))
+print(opposite("east"))
+"#);
+    assert_eq!(output, vec!["south", "west"]);
+
+    // Non-member literal is rejected against the union (val-binding position).
+    let err = run_expect_err(r#"type Dir = "north" | "south"
+val d: Dir = "up"
+"#);
+    assert!(err.contains("north") && err.contains("up"), "expected union-mismatch error, got: {err}");
+}
+
+#[test]
+fn test_object_index_by_partial_literal_union_keeps_null() {
+    // Soundness counterpart: when the key-type union has a literal that is NOT a field of the
+    // record, the access genuinely might miss, so the safe-bracket `Null` stays. The result
+    // collapses duplicates (`Boolean | Null`, not `Boolean | Boolean | Null`) but still carries
+    // `Null`, so a bare `: Boolean` return is correctly rejected.
+    let err = run_expect_err(r#"type Two = "a" | "z"
+type Rec = { "a": Boolean, "b": Boolean }
+val f = (r: Rec, k: Two): Boolean => r[k]
+"#);
+    assert!(err.contains("Boolean | Null"), "expected collapsed `Boolean | Null`, got: {err}");
+}
+
+#[test]
 fn test_index_place_narrowing_else_branch_and_no_leak() {
     // Two soundness facets of index-place narrowing:
     //   (a) `== null` narrows the ELSE branch to non-null: `if m[k] == null then [] else m[k]`
