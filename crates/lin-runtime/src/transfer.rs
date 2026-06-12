@@ -259,7 +259,7 @@ unsafe fn clone_object(src: *const LinObject) -> *mut LinObject {
 /// Transfer one tagged payload (the 8-byte field) by kind: scalars copy verbatim; heap
 /// pointers are deep-copied.
 unsafe fn transfer_payload(tag: u8, payload: u64) -> u64 {
-    use crate::tagged::{TAG_SHARED, TAG_MAP};
+    use crate::tagged::{TAG_SHARED, TAG_MAP, TAG_TAR_ENTRY};
     match tag {
         TAG_STR => clone_string(payload as *const LinString) as u64,
         TAG_ARRAY => clone_array(payload as *const LinArray) as u64,
@@ -273,6 +273,14 @@ unsafe fn transfer_payload(tag: u8, payload: u64) -> u64 {
         }
         // Scalars: copy verbatim. (TAG_FUNCTION is not transferable data — the checker
         // prevents it appearing here; pass through as a last resort.)
+        // TarEntry is NOT transferable (holds a shared cursor into a live stream). If one
+        // somehow reaches this path despite the checker gate, retain and copy to avoid a dangling
+        // pointer in the worker (the worker will then hold an aliased entry, which is incorrect
+        // but at least not a UAF — the checker is the primary guard). Ideally this is unreachable.
+        TAG_TAR_ENTRY => {
+            crate::stream::lin_tar_entry_retain_box(payload as *const u8);
+            payload
+        }
         _ => payload,
     }
 }

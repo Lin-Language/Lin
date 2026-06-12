@@ -323,6 +323,25 @@ impl Checker {
             Type::func(vec![any_stream()], any_stream()));
         self.define_intrinsic("lin_stream_files",
             Type::func(vec![any_stream()], any_stream()));
+        // entries/header/body — composable streaming tar adapter (std/archive).
+        //   lin_stream_tar_entries: (Stream<UInt8[]>) -> Stream<TarEntry>
+        //   lin_tar_header: (TarEntry) -> TarHeader
+        //   lin_tar_body: (TarEntry) -> Stream<UInt8[]>
+        let byte_chunk_stream = || Type::Stream(Box::new(byte_chunk()));
+        self.define_intrinsic("lin_stream_tar_entries",
+            Type::func(vec![byte_chunk_stream()], Type::Stream(Box::new(Type::TarEntry))));
+        let tar_header_type = Type::object({
+            let mut fields = indexmap::IndexMap::new();
+            fields.insert("name".to_string(), Type::Str);
+            fields.insert("size".to_string(), Type::Int64);
+            fields.insert("typeflag".to_string(), Type::Str);
+            fields.insert("isDir".to_string(), Type::Bool);
+            fields
+        });
+        self.define_intrinsic("lin_tar_header",
+            Type::func(vec![Type::TarEntry], tar_header_type));
+        self.define_intrinsic("lin_tar_body",
+            Type::func(vec![Type::TarEntry], byte_chunk_stream()));
         // Net-new terminals (Stage 4): reduce → U | Error; find → T | Null | Error; some/every →
         // Boolean | Error; while → Null | Error. All consume + close the stream.
         self.define_intrinsic("lin_stream_reduce", Type::func(vec![

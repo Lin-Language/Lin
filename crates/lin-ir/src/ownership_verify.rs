@@ -338,6 +338,16 @@ pub fn intrinsic_conventions(intr: &Intrinsic) -> Option<IntrinsicConv> {
         StreamFor | StreamFind | StreamSome | StreamEvery | StreamWhile | StreamUntar => {
             IntrinsicConv::new(vec![Borrow, Borrow], Own)
         }
+        // entries(s) (lin_stream_tar_entries): single-stream-arg lazy adapter, same shape as
+        // manifest/files — own_upstream(s) retains → Borrow s; fresh Stream<TarEntry> out (Own).
+        // CONFIDENT (stream.rs lin_stream_tar_entries: own_upstream + StreamBox::new_boxed).
+        StreamTarEntries => IntrinsicConv::new(vec![Borrow], Own),
+        // header(e) (lin_tar_header): reads the TarEntryBox's COPIED metadata (no retain/release of
+        // the entry box) → e Borrow; returns a FRESH LinObject* at rc=1 (make_meta_object_unboxed)
+        // → Own. body(e) (lin_tar_body): reads the entry's generation/body_taken and clones the
+        // internal Arc (no entry-box RC change) → e Borrow; mints a fresh StreamBox (rc=1) → Own.
+        // CONFIDENT (stream.rs lin_tar_header/lin_tar_body).
+        TarHeader | TarBody => IntrinsicConv::new(vec![Borrow], Own),
         // reduce(s, init, f) TERMINAL: EXCEPTION — `init` arrives as an OWNED +1 and the runtime takes
         // ownership of the running accumulator, releasing the previous one each step and on error
         // (stream.rs:2013 "the caller hands us an owned +1 ref … we own the running accumulator").
@@ -453,7 +463,7 @@ pub fn owning_strategy(ty: &Type) -> OwningStrategy {
 fn is_union_owning_ty(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_)
+        Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
     )
 }
 

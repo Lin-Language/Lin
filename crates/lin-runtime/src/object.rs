@@ -313,6 +313,7 @@ unsafe fn release_tagged_payload(tv: &TaggedVal) {
         TAG_STREAM => crate::stream::lin_stream_release_box(payload as *const u8),
         TAG_BIGNUM => crate::bignum::lin_bignum_release_box(payload as *const u8),
         TAG_DECIMAL => crate::decimal::lin_decimal_release_box(payload as *const u8),
+        TAG_TAR_ENTRY => crate::stream::lin_tar_entry_release_box(payload as *const u8),
         _ => {}
     }
 }
@@ -378,6 +379,9 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
         }
         TAG_DECIMAL => {
             crate::decimal::lin_decimal_retain_box(payload as *const u8);
+        }
+        TAG_TAR_ENTRY => {
+            crate::stream::lin_tar_entry_retain_box(payload as *const u8);
         }
         _ => {} // scalars: no heap payload
     }

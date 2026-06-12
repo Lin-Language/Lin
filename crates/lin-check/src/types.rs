@@ -148,6 +148,12 @@ pub enum Type {
     /// `T | Error`). Covariant in `T`. Spellable in source as `Promise<T>` / bare `Promise`
     /// (= `Promise<Json>`); see `resolve.rs`.
     Promise(Box<Type>),
+    /// `TarEntry` — an opaque, generation-stamped handle to a single tar archive entry produced
+    /// by the `entries` adapter (`std/archive`). Carries copied header metadata (always valid)
+    /// and a shared cursor into the parent byte stream (valid only while this entry is current).
+    /// Non-transferable across threads (shares a live cursor). Not generic (no type parameter).
+    /// Spellable in source as the bare name `TarEntry`; see `resolve.rs`.
+    TarEntry,
     TypeVar(u32),
     Never,
     /// A named type alias reference (used for recursive types that cannot be eagerly expanded).
@@ -200,6 +206,7 @@ impl PartialEq for Type {
             (Shared(a), Shared(b)) => a == b,
             (Stream(a), Stream(b)) => a == b,
             (Promise(a), Promise(b)) => a == b,
+            (TarEntry, TarEntry) => true,
             (TypeVar(a), TypeVar(b)) => a == b,
             (Named(a), Named(b)) => a == b,
             _ => false,
@@ -544,6 +551,7 @@ impl fmt::Display for Type {
             Type::Shared(inner) => write!(f, "Shared<{}>", inner),
             Type::Stream(inner) => write!(f, "Stream<{}>", inner),
             Type::Promise(inner) => write!(f, "Promise<{}>", inner),
+            Type::TarEntry => write!(f, "TarEntry"),
             // `TypeVar(u32::MAX)` is the dynamic `Json` marker — render it as `Json`, not a raw id.
             // Other ids are unresolved generic/inference variables; they render as `?T<id>` so the
             // LSP's `clean_type_string` can assign distinct positional names (`T`/`U`/…) while

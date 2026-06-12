@@ -7,11 +7,33 @@
 //
 //   import { readStream } from "std/stream"
 //   import { gunzip } from "std/compress"
-//   import { untar } from "std/archive"
+//   import { entries, header, body } from "std/archive"
+//   import { filter } from "std/iter"
 //
 //   readStream("data.tar.gz")
 //     .gunzip()
-//     .untar((meta, data) => print("${meta["name"]}: ${meta["size"]} bytes"))
+//     .entries()
+//     .filter(e => e.header()["name"].startsWith("data/"))
+//     .for(e => e.body().collect())
+//
+// `entries` is the composable streaming form: it returns a `Stream<TarEntry>` where each
+// `TarEntry` is a generation-stamped, refcounted handle to a single archive entry. The header
+// is always readable (it is copied out when the entry is minted). The body is a one-shot
+// `Stream<UInt8[]>` valid only while that entry is the archive's CURRENT entry — read or drain
+// the body before advancing the stream to the next entry. Anything that buffers entries
+// (`.toArray()`, `.collect()`) expires every body behind it; the headers survive expiry.
+//
+// Anti-pattern:
+//   val allEntries = s.entries().toArray()  // all bodies are expired at this point
+//   allEntries[0].body().readText()         // ERROR: entry expired
+//
+// Pattern — process bodies inline:
+//   s.entries().for(e =>
+//     val text = e.body().readText()   // drain body while this entry is current
+//   )
+//
+// The lower-level `untar` terminal, `manifest` (headers only), and `files` (buffered bodies)
+// are also available; see their individual docs below.
 //
 // Each function consumes the parent stream: it is moved in, and the source binding cannot be used
 // again afterwards.
@@ -47,3 +69,38 @@ export val manifest = (s: Stream<UInt8[]>): Stream<TarHeader> =>
 // @returns a `Stream<TarFile>`, where each entry's `data` is the body as a `UInt8[]`; composes with std/iter.
 export val files = (s: Stream<UInt8[]>): Stream<TarFile> =>
   lin_stream_files(s)
+
+// Split a byte stream into a composable stream of `TarEntry` handles — the idiomatic streaming form.
+//
+// Each `TarEntry` is a generation-stamped, refcounted handle. The header is always readable (fields
+// are copied out at parse time). The body is a one-shot stream valid only while this entry is the
+// archive's CURRENT entry. Advancing the `Stream<TarEntry>` (by pulling the next element) expires
+// all prior bodies. Closing the entries stream early (e.g. stopping a `.for`) does NOT close the
+// parent upstream immediately; the parent stays open until the last live entry handle drops, at
+// which point it closes deterministically.
+//
+// One rule: read or drain `e.body()` before pulling the next `TarEntry`.
+//
+// @param s  the upstream byte stream (moved in).
+// @returns a `Stream<TarEntry>` — compose with std/iter.
+export val entries = (s: Stream<UInt8[]>): Stream<TarEntry> =>
+  lin_stream_tar_entries(s)
+
+// Extract the header metadata of a `TarEntry`. Safe to call at any time, including after the body
+// has been consumed or the entry has been expired by archive advancement.
+// @param e  the entry handle.
+// @returns `TarHeader` with `name`, `size`, `typeflag`, and `isDir`.
+export val header = (e: TarEntry): TarHeader =>
+  lin_tar_header(e)
+
+// Open the body of a `TarEntry` as a byte stream. One-shot: calling `body` a second time, or calling
+// it after the archive has advanced to a later entry, returns a stream that immediately yields an
+// `Error` on first read.
+// @param e  the entry handle.
+// @returns `Stream<UInt8[]>` — the body bytes; drain before pulling the next `TarEntry`.
+//
+// Note: a body handed to `.promise()` races the archive's advancement. Cross-thread reads are
+// mutex-serialized against the cursor and will typically read as expired (in-band Error on the
+// first read). Drain the body on the calling thread instead.
+export val body = (e: TarEntry): Stream<UInt8[]> =>
+  lin_tar_body(e)
