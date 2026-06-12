@@ -2281,6 +2281,88 @@ print(toString(out))
 }
 
 #[test]
+fn test_captured_var_array_inplace_push_in_for() {
+    // Repro 1 (natural form): a captured `var` array mutated in place by `push` inside a `.for`
+    // loop accumulates correctly across iterations (the heap slot is shared by reference, ADR-012).
+    // `push` is in-place and returns Null, so the accumulator is NOT reassigned — `push(acc, x)`,
+    // not `acc = push(acc, x)` (the latter would assign Null, a genuine — and correct — type error).
+    let output = run(r#"import { range, for } from "std/iter"
+import { push, length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+var acc: Int32[] = []
+range(0, 5).for(i => push(acc, i * 10))
+print(toString(length(acc)))
+print(toString(acc))
+"#);
+    assert_eq!(output, vec!["5", "[0, 10, 20, 30, 40]"]);
+}
+
+#[test]
+fn test_map_index_place_narrows_through_if_null_test() {
+    // Repro 2: the `{String:T}` map-build idiom. A map-index read `m[k]` is typed `T | Null`
+    // (safe-bracket §6.1); `if m[k] != null then m[k] else []` must narrow the then-branch re-read
+    // of `m[k]` to `T` so it is assignable to a `T[]` binding. Before the fix this failed with
+    // "Expected type Int32[], got Int32[] | Null" — narrowing only fired for simple identifiers,
+    // not index places. The whole loop builds a 2-key map (k = "r0"/"r1"), 3 entries each.
+    let output = run(r#"import { range, for } from "std/iter"
+import { push, length } from "std/array"
+import { keys } from "std/object"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+var m: { String: Int32[] } = {}
+range(0, 6).for(i =>
+  val k = "r${i % 2}"
+  var cur: Int32[] = if m[k] != null then m[k] else []
+  m[k] = cur
+  push(cur, i))
+print(toString(length(keys(m))))
+print(toString(length(m["r0"])))
+print(toString(length(m["r1"])))
+"#);
+    assert_eq!(output, vec!["2", "3", "3"]);
+}
+
+#[test]
+fn test_index_place_narrowing_else_branch_and_no_leak() {
+    // Two soundness facets of index-place narrowing:
+    //   (a) `== null` narrows the ELSE branch to non-null: `if m[k] == null then [] else m[k]`
+    //       reads `m[k]` as `Int32[]` in the else arm.
+    //   (b) the narrowing does NOT leak past the `if` — a bare `m[k]` afterwards is still
+    //       `Int32[] | Null`, which the `length` arg accepts (length is total) but a `T[]`-typed
+    //       binding would reject. Here we just confirm the else-branch read compiles + runs.
+    let output = run(r#"import { length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+var m: { String: Int32[] } = {}
+m["x"] = [9, 8, 7]
+val a: Int32[] = if m["x"] == null then [] else m["x"]
+print(toString(length(a)))
+"#);
+    assert_eq!(output, vec!["3"]);
+}
+
+#[test]
+fn test_index_place_narrowing_does_not_leak_past_if() {
+    // The narrowing must be scoped to the matched branch: a read of `m[k]` OUTSIDE the `if` keeps
+    // its `T | Null` type, so assigning it to a `T[]` binding is still a type error. Guards against
+    // the index narrowing leaking into following statements.
+    let err = run_expect_err(r#"import { print } from "std/io"
+var m: { String: Int32[] } = {}
+val a: Int32[] = if m["x"] != null then m["x"] else []
+val b: Int32[] = m["x"]
+print(toString(a))
+"#);
+    assert!(
+        err.contains("Int32[] | Null") || err.contains("got Int32[] | Null"),
+        "expected a non-narrowed `Int32[] | Null` error outside the if, got:\n{err}"
+    );
+}
+
+#[test]
 fn test_float32_widens_to_float64() {
     // A Float32 must widen to Float64 (fpext) across every numeric context, per spec §21
     // (widening is always to a type that represents both). Codegen's Coerce had no
