@@ -1,17 +1,52 @@
-import { expect, toBe, test, suite, run } from "std/test"
+import { expect, toSatisfy, test, suite, run } from "std/test"
 import { for, range } from "std/iter"
-import { length, push } from "std/array"
+import { keys } from "std/object"
+import { length } from "std/array"
 import { t, st } from "./testutil"
-import { makeStringResults, add, finalize } from "./stringResults"
+import { makeStringResults, add, finalize, StringResults, StringSet } from "./stringResults"
 import { Conn } from "./types"
 
+// Deep equality over the typed `{ String: StringSet }` result (the typed-map rep lacks the
+// structural `toBe`/`toString` the `Json` rep had, so the result is checked with a typed walk).
+val setEq = (a: StringSet, b: StringSet): Boolean =>
+  if length(keys(a)) != length(keys(b)) then
+    false
+  else
+    var ok = true
+    keys(a).for(k =>
+      val av = a[k] ?? false
+      val bv = b[k] ?? false
+      if av != bv then ok = false
+    )
+    ok
+
+val resultsEq = (actual: { String: StringSet }, expected: { String: StringSet }): Boolean =>
+  if length(keys(actual)) != length(keys(expected)) then
+    false
+  else
+    var ok = true
+    var emptySet: StringSet = {}
+    keys(expected).for(k =>
+      val ea = expected[k] ?? emptySet
+      val aa = actual[k] ?? emptySet
+      if setEq(aa, ea) == false then ok = false
+    )
+    ok
+
+// Build a typed `{ String: StringSet }` from [key, set] entries (a non-empty record literal
+// infers a closed record, not a map).
+type ResultEntry = [String, StringSet]
+
+val resultsOf = (entries: ResultEntry[]): { String: StringSet } =>
+  var m: { String: StringSet } = {}
+  entries.for(e => m[e[0]] = e[1])
+  m
+
 // Build the synthetic kConnections the reference spec feeds in:
-//   for i in 1..path.length:
-//     kConnections[path[i]] = { i: [Trip(stopTimes:[{stop: path[i-1]}]), 0, 1] }
-// then tree.add(kConnections). The Conn tuple's first element is the typed `Trip` record now, so
-// the fixture builds a real Trip (via testutil t/st) whose stopTimes[0].stop is the origin —
-// walkPath reads connection[0]["stopTimes"][connection[1]==0]["stop"].
-val mergePath = (tree: Json, path: Json): Null =>
+//   for i in 1..path.length: kConnections[path[i]][i] = [Trip(stopTimes:[{stop: path[i-1]}]), 0, 1]
+// then tree.add(kConnections). walkPath reads connection[0]["stopTimes"][connection[1]==0]["stop"].
+// The round dimension is a MAP keyed by the round string ("1", "2", …) — the structure under test.
+val mergePath = (tree: StringResults, path: String[]): Null =>
   var kConnections: { String: { String: Conn } } = {}
   range(1, length(path)).for(i =>
     val origin = path[i - 1]
@@ -22,40 +57,46 @@ val mergePath = (tree: Json, path: Json): Null =>
   add(tree, kConnections)
 
 // A Set is modelled as an object keyed by member (value true).
-val setOf = (members: Json): Json =>
-  var s: Json = {}
+val setOf = (members: String[]): StringSet =>
+  var s: StringSet = {}
   members.for(m => s[m] = true)
   s
 
-val build = (paths: Json): Json =>
+val build = (paths: String[][]): { String: StringSet } =>
   val tree = makeStringResults()
   paths.for(p => mergePath(tree, p))
   finalize(tree)
 
 val s = suite("StringResults", [
   test("Merges duplicate paths", () => [
-    expect(build([["A", "B", "C", "D"], ["A", "B", "C"]])).toBe({
-      "AB": setOf([""]),
-      "AC": setOf(["B"]),
-      "AD": setOf(["B,C"])
-    })
+    expect(build([["A", "B", "C", "D"], ["A", "B", "C"]])).toSatisfy(r =>
+      resultsEq(r, resultsOf([
+        ["AB", setOf([""])],
+        ["AC", setOf(["B"])],
+        ["AD", setOf(["B,C"])]
+      ]))
+    )
   ]),
 
   test("Orders results", () => [
-    expect(build([["C", "B", "A"], ["C", "D", "B"], ["C", "B", "E"]])).toBe({
-      "AC": setOf(["B"]),
-      "BC": setOf(["", "D"]),
-      "CE": setOf(["B"]),
-      "CD": setOf([""])
-    })
+    expect(build([["C", "B", "A"], ["C", "D", "B"], ["C", "B", "E"]])).toSatisfy(r =>
+      resultsEq(r, resultsOf([
+        ["AC", setOf(["B"])],
+        ["BC", setOf(["", "D"])],
+        ["CE", setOf(["B"])],
+        ["CD", setOf([""])]
+      ]))
+    )
   ]),
 
   test("Adds different paths", () => [
-    expect(build([["A", "B", "C", "D"], ["A", "C", "B", "D"]])).toBe({
-      "AC": setOf(["", "B"]),
-      "AB": setOf(["", "C"]),
-      "AD": setOf(["B,C", "C,B"])
-    })
+    expect(build([["A", "B", "C", "D"], ["A", "C", "B", "D"]])).toSatisfy(r =>
+      resultsEq(r, resultsOf([
+        ["AC", setOf(["", "B"])],
+        ["AB", setOf(["", "C"])],
+        ["AD", setOf(["B,C", "C,B"])]
+      ]))
+    )
   ])
 ])
 run(s)
