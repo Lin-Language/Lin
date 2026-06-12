@@ -433,12 +433,33 @@ The key type must be `String` — either written literally, or **named by a type
 to `String`** (e.g. `type StopID = String` then `{ StopID: T }`). The key is written as a bare
 identifier (not a quoted string — that is how the index-signature form is told apart from a fixed
 record), and that identifier is resolved as a type expression: any alias that unfolds to `String` is
-accepted, at any nesting depth and in any key position; an identifier that resolves to a non-`String`
-type is a compile-time error (`Map key type must be String, but it resolves to …`). The key type is
+accepted, at any nesting depth and in any key position. The key type is
 preserved as-written so the formatter round-trips the alias name. `String` is the only *underlying*
-key type in v1. `{ String: T }` reads "any number of string keys, each mapping to `T`". It is a
-distinct type from a fixed-field record `{ "f": T, … }`: a value is *either* a fixed record *or* an
-index-signature map, never both.
+key type for the dynamic map form. `{ String: T }` reads "any number of string keys, each mapping
+to `T`". It is a distinct type from a fixed-field record `{ "f": T, … }`: a value is *either* a
+fixed record *or* an index-signature map, never both.
+
+**Literal-union key — sugar for a fixed record.** When the key identifier instead resolves to a
+**closed union of string literals** (or a single string-literal type), the `{ K: V }` form is
+**sugar** for the fixed record with one field per literal, all of value type `V`:
+
+```txt
+type DayOfWeek = "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday" | "Sunday"
+type Calendar  = { DayOfWeek: Boolean }
+// exactly equivalent to:
+// type Calendar = { "Monday": Boolean, "Tuesday": Boolean, … , "Sunday": Boolean }
+```
+
+This is an ordinary fixed record (not a map): structurally identical to the hand-written form and
+interchangeable with it. Indexing it by a key of the *same* literal union is **provably total** —
+`calendar[dow]` has type `Boolean`, with no `| Null`, because every member of the union is a present
+field (§6.1's missing-key `Null` cannot arise). A key identifier that resolves to neither `String`
+nor a string-literal union is a compile-time error
+(`Index-signature key type must be String or a union of string literals, but it resolves to …`).
+
+Because the meaning of `{ K: V }` depends on what `K` resolves to — `String` ⇒ dynamic map,
+string-literal union ⇒ fixed record — these two have different runtime representations; changing a
+key alias from one to the other changes the type. See ADR-055.
 
 - `m[k]` yields `T | Null` (a missing key is `Null`, consistent with the §6.1 safe-bracket rule).
   For the *defaulted* read, `m[k] ?? default` uses the built-in null-coalescing operator `??`
