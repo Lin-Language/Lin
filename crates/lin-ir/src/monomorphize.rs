@@ -1011,8 +1011,15 @@ fn monomorphize_inner(
         let mut func = state.generics[&generic_slot].func.clone();
         let span = func.span();
         subst_expr(&mut func, &subs);
-        if let TypedExpr::Function { name, .. } = &mut func {
+        if let TypedExpr::Function { name, body, .. } = &mut func {
             *name = Some(spec_name.clone());
+            // Rename inner named closures (e.g. `val inner = () => …` inside the generic body) so
+            // each specialization gets distinct LLVM symbols. Without this, `pick$Int32` and
+            // `pick$String` would both register `@inner`; codegen's get_function/add_function
+            // dedup would keep whichever body landed first, causing the other specialization to
+            // run the wrong closure body (misaligned-pointer deref / type mismatch).
+            let inner_suffix = spec_name.trim_start_matches(|c: char| c != '$');
+            rename_inner_fns(body, inner_suffix);
         }
         // For a CROSS-MODULE generic, the cloned body's free references (sibling calls,
         // intrinsics, the origin module's own imports/vals) and its local slots are numbered in
@@ -1469,6 +1476,12 @@ fn rehome_imported_body(func: &mut TypedExpr, origin_path: &str, state: &mut Mon
     //    importer-side binding the first time it is seen.
     rehome_walk(func, &origin, origin_path, &locals, &mut remap, state);
 }
+
+// NOTE: `rename_inner_fns` (the shared inner-closure symbol de-collision pass — see its definition
+// earlier in this file) is called by ALL THREE spec drains: the generic axis, the Wave-C
+// CallbackDevirt axis, and the D3a anonymous-structural-parameter axis. Every new spec axis MUST
+// call it with that spec's suffix, or specialisations with inner named closures silently run each
+// other's bodies (the pre-2026-06 generic-axis crash class).
 
 /// WAVE C callback devirt: rewrite the cloned spec body so the callback parameter is replaced by a
 /// direct reference to the named no-capture function `L`. `func` is the freshly-cloned-and-rehomed
