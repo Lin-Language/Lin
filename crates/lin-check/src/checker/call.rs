@@ -676,6 +676,27 @@ impl Checker {
                             typed_args[i] = TypedExpr::FloatLit(*v, Type::Float32, *lit_span);
                         }
                     }
+                    // String-literal counterpart (ADR-034): a bare string literal infers to `Str`,
+                    // but a parameter of a closed string-literal union (e.g. `DayOfWeek =
+                    // "Monday" | … | "Sunday"`, possibly behind a `Named` alias) accepts it when its
+                    // value is one of the members — re-type the argument to that member's `StrLit`
+                    // so `arg_compatible` admits it. Mirrors `check_expr`'s pushdown for the
+                    // val-binding/return positions; without it a call like `runsOn(d, "Monday")`
+                    // fails with "Argument has type String, expected …". Single-`StrLit` params are
+                    // already handled by `arg_compatible` (a `Str` arg is compatible with `StrLit`).
+                    if let TypedExpr::StringLit(s, ty, lit_span) = &typed_args[i] {
+                        if matches!(ty, Type::Str) {
+                            if let Some(members) = self.closed_string_literal_keys(param_ty) {
+                                if members.iter().any(|m| m == s) {
+                                    typed_args[i] = TypedExpr::StringLit(
+                                        s.clone(),
+                                        Type::StrLit(s.clone()),
+                                        *lit_span,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Enforce the NUMERIC bound (ADR-014, reversed). A `Number` parameter resolved to a
@@ -1213,6 +1234,22 @@ impl Checker {
                     if let TypedExpr::FloatLit(v, ty, lit_span) = &all_args[i] {
                         if matches!(param_ty, Type::Float32) && matches!(ty, Type::Float64) {
                             all_args[i] = TypedExpr::FloatLit(*v, Type::Float32, *lit_span);
+                        }
+                    }
+                    // String-literal counterpart (see direct-call site): a bare string literal
+                    // argument into a closed string-literal-union parameter is re-typed to the
+                    // matching member's `StrLit` so `arg_compatible` admits it.
+                    if let TypedExpr::StringLit(s, ty, lit_span) = &all_args[i] {
+                        if matches!(ty, Type::Str) {
+                            if let Some(members) = self.closed_string_literal_keys(param_ty) {
+                                if members.iter().any(|m| m == s) {
+                                    all_args[i] = TypedExpr::StringLit(
+                                        s.clone(),
+                                        Type::StrLit(s.clone()),
+                                        *lit_span,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
