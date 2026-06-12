@@ -1,32 +1,32 @@
 // results/JourneyFactory — kConnections -> Journey[].
 //
 // getResults(kConnections, destination): for each round k (NUMERIC ascending, contract #1),
-// build legs by walking connections back to k=1, compute departure/arrival times.
-import { for } from "std/iter"
-import { parseInt32 } from "std/number"
+// build legs by walking connections back to k=1, compute departure/arrival times. The round
+// dimension is an ARRAY indexed by round number (rounds are intrinsically ordered).
+import { for, range } from "std/iter"
 import { length, push, slice, reverse } from "std/array"
-import { sortedRoundKeys } from "./roundKeys"
 import { Conn, Leg, Journey, TimetableLeg, Transfer } from "./types"
 
 // Walk connections from finalDestination back to k=1, accumulating legs (in reverse), then reverse.
-val getJourneyLegs = (kConnections: { String: { String: Conn } }, k: String, finalDestination: String): Leg[] =>
+val getJourneyLegs = (kConnections: { String: (Conn | Null)[] }, k: Int32, finalDestination: String): Leg[] =>
   var legs: Leg[] = []
-  buildLegs(kConnections, parseInt32(k), finalDestination, legs)
+  buildLegs(kConnections, k, finalDestination, legs)
   reverse(legs)
 
-val buildLegs = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, legs: Leg[]): Null =>
+val buildLegs = (kConnections: { String: (Conn | Null)[] }, i: Int32, destination: String, legs: Leg[]): Null =>
   if i <= 0 then
     null
   else
-    // kConnections[destination] is `{ String: Conn } | Null`; the round always exists on the walk
-    // back, so narrow with a `match … is`. The inner `["${i}"]` is `Conn | Null`, narrowed the same
-    // way — a Transfer (footpath) vs the [trip, start, end] tuple.
+    // kConnections[destination] is `(Conn | Null)[] | Null`; the round always exists on the walk
+    // back, so narrow with a `match … is`. `round[i]` is `Conn | Null` (Null where a stop saw no
+    // improvement that round, or the round is past the array's length) — a Transfer (footpath) vs
+    // the [trip, start, end] tuple.
     val round = kConnections[destination]
     match round
       is Null =>
         null
       else =>
-        val connection = round["${i}"]
+        val connection = if i >= length(round) then null else round[i]
         match connection
           is Null =>
             null
@@ -77,19 +77,21 @@ val arrAt = (legs: Leg[], i: Int32, transferDuration: Int32): Int32 =>
         val sts = leg["stopTimes"]
         sts[length(sts) - 1]["arrivalTime"] + transferDuration
 
-export val getResults = (kConnections: { String: { String: Conn } }, destination: String): Journey[] =>
+export val getResults = (kConnections: { String: (Conn | Null)[] }, destination: String): Journey[] =>
   var results: Journey[] = []
-  // `kConnections[destination]` is `{ String: Conn } | Null`; callers only reach here for a
-  // destination that has connections, so a Null map yields no rounds.
-  val destMap = kConnections[destination]
-  val roundKeys = if destMap != null then sortedRoundKeys(destMap) else []
-  roundKeys.for(k =>
-    val legs = getJourneyLegs(kConnections, k, destination)
-    val journey: Journey = {
-      "legs": legs,
-      "departureTime": getDepartureTime(legs),
-      "arrivalTime": getArrivalTime(legs)
-    }
-    push(results, journey)
+  // `kConnections[destination]` is `(Conn | Null)[] | Null`; coalesce to a non-null array (`?? []`)
+  // before iterating (indexing a captured `… | Null` narrowed only by `if != null` inside a closure
+  // mis-reads). Walking the array indices in ascending order IS the numeric round order — skip the
+  // Null slots (rounds that didn't improve this stop).
+  val destConns = kConnections[destination] ?? []
+  range(0, length(destConns)).for(k =>
+    if destConns[k] != null then
+      val legs = getJourneyLegs(kConnections, k, destination)
+      val journey: Journey = {
+        "legs": legs,
+        "departureTime": getDepartureTime(legs),
+        "arrivalTime": getArrivalTime(legs)
+      }
+      push(results, journey)
   )
   results
