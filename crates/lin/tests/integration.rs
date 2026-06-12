@@ -18722,3 +18722,245 @@ print(show(b))
     assert_eq!(out, vec!["R:fire=1", "G:grass=2", "B:sky=3"]);
 }
 
+
+// ============================================================================
+// REPRESENTATION-RESET Stage-0 behaviour pins (docs/project-actually-improve-performance.md §6).
+//
+// Each `reset_pin_` test PINS today's observable behaviour where the reset will deliberately
+// change it. The stage that changes a behaviour FLIPS the assertion in the same commit — a pin
+// failing in any other circumstance is an unintended regression. The non-pin tests in this
+// section are permanent correctness tests for the bare-record-map-value fix that Stage-0
+// probing surfaced.
+// ============================================================================
+
+// D5 pin: array-push aliasing is REPRESENTATION-DEPENDENT today — a packed record array's push
+// COPIES the element (mutating the source afterwards is NOT visible through the array), while a
+// Json array's push SHARES the pointer (mutation IS visible). End-state (Stage 1 flips the packed
+// half): share-always — both observe 5.
+#[test]
+fn test_reset_pin_d5_push_aliasing_split() {
+    let out = run(r#"import { print } from "std/io"
+import { push } from "std/array"
+type P = { "x": Int32, "y": Int32 }
+val main = () =>
+  var arr: P[] = [{ "x": 1, "y": 2 }]
+  val t: P = { "x": 9, "y": 9 }
+  push(arr, t)
+  t["x"] = 5
+  print("packed=${arr[1]["x"]}")
+  var jarr: Json = [{ "x": 1, "y": 2 }]
+  val jt: Json = { "x": 9, "y": 9 }
+  push(jarr, jt)
+  jt["x"] = 5
+  print("json=${jarr[1]["x"]}")
+main()
+"#);
+    // TODAY: packed copies (9), json shares (5). Stage 1 end-state: both 5.
+    assert_eq!(out, vec!["packed=9", "json=5"]);
+}
+
+// D8/D4 pin: Json-widening aliasing is REPRESENTATION-DEPENDENT today — widening a PACKED record
+// to Json materializes a copy (mutation through the record is NOT visible via the Json alias),
+// while a BOXED record (unpackable Function field) shares. The boxed half is the D8 wrap-not-copy
+// invariant and must hold through Stages 1–5; the packed half flips to share when the record→
+// AnyVal boundary carries the pointer (D4, Stage 6).
+#[test]
+fn test_reset_pin_d8_json_widening_aliasing_split() {
+    let out = run(r#"import { print } from "std/io"
+type P = { "x": Int32, "y": Int32 }
+val main = () =>
+  val r: P = { "x": 1, "y": 2 }
+  val j: Json = r
+  r["x"] = 99
+  print("packed=${j["x"]}")
+  val f = (n: Int32): Int32 => n + 1
+  val b = { "fn": f, "x": 1 }
+  val jb: Json = b
+  b["x"] = 99
+  print("boxed=${jb["x"]}")
+main()
+"#);
+    // TODAY: packed widening copies (1), boxed widening shares (99).
+    assert_eq!(out, vec!["packed=1", "boxed=99"]);
+}
+
+// D3 pin: width-subtyping into anonymous-structural slots is REPRESENTATION-DEPENDENT today —
+// a BOXED wide record (unpackable Json field) SHARES through an anon param and an anon-typed
+// array element (mutation visible), a PACKED wide record COPIES (materialized at the boundary).
+// End-state (D3): direct params monomorphise (share, all reprs); non-param slots project-copy
+// (the boxed array-elem half flips to copy at Stage 1).
+#[test]
+fn test_reset_pin_d3_anon_slot_aliasing_split() {
+    let out = run(r#"import { print } from "std/io"
+import { push } from "std/array"
+type Wide = { "type": String, "extra": Int32 }
+val mutAnon = (r: { "type": String }) =>
+  r["type"] = "mutated"
+val main = () =>
+  val jx: Json = 7
+  val bw = { "type": "orig", "blob": jx }
+  mutAnon(bw)
+  print("boxed-param=${bw["type"]}")
+  val bw2 = { "type": "orig2", "blob": jx }
+  var barr: { "type": String }[] = []
+  push(barr, bw2)
+  bw2["type"] = "mut2"
+  print("boxed-elem=${barr[0]["type"]}")
+  val pw: Wide = { "type": "orig3", "extra": 7 }
+  mutAnon(pw)
+  print("packed-param=${pw["type"]}")
+  val pw2: Wide = { "type": "orig4", "extra": 7 }
+  var parr: { "type": String }[] = []
+  push(parr, pw2)
+  pw2["type"] = "mut4"
+  print("packed-elem=${parr[0]["type"]}")
+main()
+"#);
+    // TODAY: boxed shares everywhere, packed copies everywhere.
+    assert_eq!(out, vec![
+        "boxed-param=mutated",
+        "boxed-elem=mut2",
+        "packed-param=orig3",
+        "packed-elem=orig4",
+    ]);
+}
+
+// D2 pin: a record with a Function field can be widened into Json TODAY. Stage 6 flips this to a
+// compile error (AnyVal transitivity rule: only transitively value-shaped records widen).
+#[test]
+fn test_reset_pin_d2_handle_record_widens_into_json_today() {
+    let out = run(r#"import { print } from "std/io"
+val main = () =>
+  val f = (n: Int32): Int32 => n + 1
+  val h = { "fn": f, "n": 1 }
+  val jh: Json = h
+  print("n=${jh["n"]}")
+main()
+"#);
+    assert_eq!(out, vec!["n=1"]);
+}
+
+// §5.7 invariant (NOT a pin — must hold at every stage): a typed (packed) record compares equal
+// to a structurally-equal Json object, order-independently. This is the cross-form equality that
+// guards the D8 transitional period.
+#[test]
+fn test_reset_crossform_record_json_equality() {
+    let out = run(r#"import { print } from "std/io"
+type P = { "x": Int32, "y": Int32 }
+val main = () =>
+  val a: P = { "x": 1, "y": 2 }
+  val jb: Json = { "y": 2, "x": 1 }
+  print("eq=${a == jb}")
+main()
+"#);
+    assert_eq!(out, vec!["eq=true"]);
+}
+
+// ============================================================================
+// Bare-record map values (the Stage-0 discovery fix). A bare packed sealed record stored as a
+// `{ String: T }` map VALUE was keep-packed in the slot (TAG_OBJECT wrapping a sealed struct that
+// is NOT a LinObject) while every read path assumed a boxed object → lin_object_get read sealed
+// bytes as a LinObject header: index-cap underflow panic (heap-field records) or silent
+// corruption/abort (all-scalar records). Map record slots now hold a MATERIALIZED boxed object
+// (emit_map_set falls through to box_value), and a narrowed bare-record read projects it back to
+// a fresh sealed struct. Sealed ARRAYS as map values keep their (sound, tag-dispatched)
+// keep-packed path.
+// ============================================================================
+
+#[test]
+fn test_map_bare_record_value_roundtrip() {
+    // heap-field record (String field): union read + narrow — panicked before the fix.
+    let out = run(r#"import { print } from "std/io"
+type Wide = { "type": String, "extra": Int32 }
+val main = () =>
+  val w: Wide = { "type": "a", "extra": 7 }
+  var m: { String: Wide } = {}
+  m["k"] = w
+  val got = m["k"]
+  if got != null then
+    print("got=${got["type"]} extra=${got["extra"]}")
+main()
+"#);
+    assert_eq!(out, vec!["got=a extra=7"]);
+}
+
+#[test]
+fn test_map_bare_record_value_all_scalar() {
+    // all-scalar record: silently produced no output / aborted before the fix.
+    let out = run(r#"import { print } from "std/io"
+type P = { "x": Int32, "y": Int32 }
+val main = () =>
+  val p: P = { "x": 1, "y": 2 }
+  var m: { String: P } = {}
+  m["k"] = p
+  val got = m["k"]
+  if got != null then
+    print("x=${got["x"]} y=${got["y"]}")
+  else
+    print("missing")
+main()
+"#);
+    assert_eq!(out, vec!["x=1 y=2"]);
+}
+
+#[test]
+fn test_map_bare_record_value_coalesce_and_named_narrow() {
+    // ?? coalesce read (bare-T result) and a 5.9.1 named-narrow projection store — both panicked.
+    let out = run(r#"import { print } from "std/io"
+type Wide = { "type": String, "extra": Int32 }
+type Narrow = { "type": String }
+val main = () =>
+  val w: Wide = { "type": "a", "extra": 7 }
+  var m: { String: Wide } = {}
+  m["k"] = w
+  val d: Wide = { "type": "dflt", "extra": 0 }
+  val got: Wide = m["k"] ?? d
+  print("coalesce=${got["type"]}")
+  val miss: Wide = m["absent"] ?? d
+  print("miss=${miss["type"]}")
+  val w2: Wide = { "type": "b", "extra": 7 }
+  var m2: { String: Narrow } = {}
+  m2["k"] = w2
+  val g2 = m2["k"]
+  if g2 != null then print("narrowstore=${g2["type"]}")
+main()
+"#);
+    assert_eq!(out, vec!["coalesce=a", "miss=dflt", "narrowstore=b"]);
+}
+
+#[test]
+fn test_map_bare_record_value_narrowed_index_read() {
+    // index-place narrowing gives the second m["k"] a BARE Wide result type — exercises the
+    // boxed-slot → fresh-sealed projection read arm.
+    let out = run(r#"import { print } from "std/io"
+type Wide = { "type": String, "extra": Int32 }
+val main = () =>
+  val w: Wide = { "type": "nr", "extra": 7 }
+  var m: { String: Wide } = {}
+  m["k"] = w
+  if m["k"] != null then
+    print("narrowed=${m["k"]["type"]} extra=${m["k"]["extra"]}")
+main()
+"#);
+    assert_eq!(out, vec!["narrowed=nr extra=7"]);
+}
+
+#[test]
+fn test_map_bare_record_value_overwrite_no_leak_smoke() {
+    // Overwrite the same keys many times: each store releases the previous materialized slot
+    // object. (The RSS-flat scaling proof lives in the Stage-0 baseline notes; this is the
+    // correctness smoke — values must be the LAST write's.)
+    let out = run(r#"import { print } from "std/io"
+import { range, for } from "std/iter"
+type Wide = { "type": String, "extra": Int32 }
+val main = () =>
+  var m: { String: Wide } = {}
+  range(0, 1000).for(i =>
+    m["k${i % 10}"] = { "type": "t${i}", "extra": i }
+  )
+  val g = m["k3"]
+  if g != null then print("last=${g["extra"]}")
+main()
+"#);
+    assert_eq!(out, vec!["last=993"]);
+}
