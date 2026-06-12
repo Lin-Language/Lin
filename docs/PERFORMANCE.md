@@ -96,51 +96,69 @@ correctness gate):
 RAPTOR is the load-bearing real-world workload — a GTFS journey planner threaded
 through many generic boundaries. We measured a **fully-typed** RAPTOR (trips as
 `Trip{tripId, stopTimes: StopTime[], service}` records, the route map as
-`{String: Trip[]}`) against the `Json` baseline on the same compiler — 5
-interleaved rounds, medians, digest byte-identical both ways:
+`{String: Trip[]}`) against the `Json` baseline on the same compiler, full feed,
+O2, single-run min, digest byte-identical (`group=26203913 range=773022892
+journeys=139`). The "naive typed" column is the straightforward typed port; the
+"typed" column is after the **de-materialization** pass described below:
 
-| phase | `Json` (ms) | typed (ms) | typed / `Json` |
-|-------|----:|----:|----:|
-| LOAD  | 15942 | 16796 | 1.05× |
-| PREP  | 29107 | 46157 | 1.59× |
-| GROUP | 62055 | 126505 | **2.04×** |
-| RANGE | 182685 | 367949 | **2.01×** |
+| phase | `Json` (ms) | naive typed | typed (de-mat) | typed / `Json` |
+|-------|----:|----:|----:|----:|
+| LOAD  | 15779 | 16209 | 17353 | 1.10× |
+| PREP  | 28365 | 119567 | 104264 | **3.67×** |
+| GROUP | 62040 | 140221 | 114583 | 1.85× |
+| RANGE | 184475 | 401310 | 334286 | 1.81× |
+| total | 290759 | 677807 | 571086 | **1.96×** |
 
-**Honest result: fully typing RAPTOR's heap-field records *penalizes* the query
-phases ~2×.** The mechanism is specific and important: a record with heap fields
-(`Trip` holds a `String` and a `StopTime[]`) does **not** reach the packed flat
-layout — it is a boxed object, the same as the `Json` form — but a *typed* read
-**materializes the record per access** (re-projecting it field-by-field as it is
-read out of the `{String: Trip[]}` map / narrowed from a `Trip | Null`), where the
-`Json` read just scans for the one key it needs. The cost is the
-representation-boundary *materialization*, not the field read (the §5 path-9
-finding, reproduced here). This **refines** the "`Json` is ~70× slower" headline:
-that holds for **sealed all-scalar** records (the `records` bench — constant-offset
-loads), but for **heap-field** records threaded through maps and unions, naive full
-typing currently costs ~2×.
+**Two distinct costs, with opposite outlooks — this is the key finding.**
 
-A per-function IR profile pins the dominant seam: the **`Trip | Null` union threaded
-through the route scan** (`scanRouteAt`) accounts for the bulk of it — narrowing a
-boxed union member to the packed `Trip` repr forces a deep field-by-field
-re-projection *and re-seal* (`lin_sealed_alloc` ×15) plus a re-box on every
-thread-back through the union (hot-path `lin_object_get` 5 → 62 vs the `Json` form).
-The secondary seam is `scanBack`'s `val trip: Trip = routeTrips[i]`: binding a typed
-record out of a *boxed* `Trip[]` eagerly re-packs every field (incl. the unused
-nested `Service`) even though the array is boxed so the reads stay `lin_object_get`
-regardless. This is the same union/array-element repr boundary that the path-9
-end-to-end-packing work was CLOSED-NEGATIVE on (§5) — keeping the *value* (not just
-the type) packed across these boundaries is precisely the chain that measured net
-slower. Note the typed RAPTOR is now **leak-free** (RSS bounded/flat over the full
-run, ASan-clean — the three `Trip[]` RC fixes); the residual ~2× is pure
+A typed heap-field record (`Trip` holds a `String` and a `StopTime[]`) does **not**
+reach the packed flat layout — it is boxed, like the `Json` form — and a *typed*
+read **materializes the record per access** (a `lin_sealed_alloc` re-projection as
+it is read out of a `{String: Trip[]}` map, narrowed from a `Trip | Null`, or bound
+out of a boxed `Trip[]`). The naive typed port paid this everywhere, for the ~2×
+query penalty.
+
+1. **Query READ materialization is de-materializable — and we fixed it.** Wherever
+   the hot path only needs a *field*, read it directly by **fused const-offset
+   index** off the packed array (`trip["stopTimes"][i]["arrivalTime"]`) instead of
+   binding the whole record (`val st = trip["stopTimes"][i]`); and thread loop state
+   as an **`Int32` index**, not a materialized `Trip | Null`, materializing the one
+   chosen record at the end. Applied to `scanRouteAt`/`scanBack` (query) and the
+   `getRouteId`/`buildRoutes` per-stop loops (PREP), this cut `lin_sealed_alloc`
+   **299.6M → 184.5M** and pulled the query phases from ~2.2–2.3× to **~1.8×**,
+   digest-exact. The earlier "`Trip | Null` union in `scanRouteAt` is the dominant
+   seam" read (from an IR-op *count*) was a partial red herring: the dominant
+   *time* was per-step whole-record binds, which this idiom removes.
+
+2. **PREP construction/regroup materialization is largely INHERENT.** PREP stays
+   **3.67×** because it does not *read* records, it *builds and copies* them:
+   `tripsByRoute[routeId]` is grown by `push(arr, sorted[i])`, and a packed value
+   array **copies each `Trip` record in** (a required `lin_sealed_alloc`), where the
+   `Json` form copies a pointer. The stable `sort` likewise binds whole `Trip`s per
+   comparison. De-materialization removed only the incidental per-stop `StopTime`
+   binds (the −13% PREP delta); the regroup/sort copies are the price of value
+   semantics for a construct-heavy workload and are not addressable without storing
+   indices in place of records. **Typing reaches ~1.8× on read-heavy query work, but
+   record construction/regrouping carries an inherent copy cost `Json`'s pointer
+   sharing avoids.**
+
+Two honesty notes: (a) the comparison is kept **algorithmically faithful to the
+reference** (node/go/rust) — a `runsOn`-by-`serviceId` memo that would have shaved
+another ~20s was *dropped*, not added, because the reference does not memoize and
+mirroring it into the `Json` port would have let Lin cheat cross-language; (b) the
+typed RAPTOR is **leak-free** (RSS bounded/flat, ASan-clean), so the residual gap is
 materialization *time*, not allocation churn.
 
-The orthogonal win that *did* pay: typing the **dictionaries** — the
-`{String: Int32}`/`{String: Trip[]}` index and scan-state maps that were `Json`
-objects — replaced O(n) association-list scans with O(1) hashed `LinMap` lookups
-for a **~5.6× PREP** win, with no query-phase penalty. So the guidance is nuanced:
-typing your *dictionaries* and *scalar records* is a clear win; fully typing
-*heap-field record graphs* threaded through generic boundaries is, today, a ~2×
-cost (the materialization seam — see §5).
+The orthogonal win that *did* pay independently of all this: typing the
+**dictionaries** — the `{String: Int32}`/`{String: Trip[]}` index and scan-state
+maps that were `Json` objects — replaced O(n) association-list scans with O(1)
+hashed `LinMap` lookups. So the guidance is nuanced: typing your *dictionaries* and
+*scalar records* is a clear win; typing *heap-field record graphs* is a clear win
+for the **read** path (use the const-offset-index idiom) but carries an inherent
+copy cost on the **construct/regroup** path. The one remaining *representation*
+lever (unshipped) is teaching `match` on a union to narrow the **value** to a packed
+repr, not just the type — the boxed-record-in-a-union seam (`Conn = Boarding |
+Transfer`) that still materializes per read (see §5).
 
 ---
 
