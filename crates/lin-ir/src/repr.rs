@@ -318,7 +318,11 @@ fn sum_type_discriminant(ty: &Type) -> Option<String> {
                 let is_recursive_child = self_name
                     .as_deref()
                     .is_some_and(|n| is_sum_recursive_child(fty, n));
-                if !is_sealed_scalar_field(fty) && !is_recursive_child {
+                // Heap-field SumNode Stage 3: admit String/Array/nested-sealed fields in addition to
+                // flat scalars and recursive children. The runtime drop walk (release_heap_fields) +
+                // codegen descriptor (sumnode_descriptor) handle heap-field release; the
+                // materializer (get_or_build_sumnode_materializer) boxes them for dynamic boundaries.
+                if !is_sealed_field(fty) && !is_recursive_child {
                     return None;
                 }
             }
@@ -776,11 +780,23 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                 // so the swap is provably byte identical: (forward) the old predicate ⇒ repr Packed,
                 // AND (reverse) repr Packed-struct ⇒ the old predicate fired (else codegen would take
                 // the packed path where it previously boxed).
+                //
+                // Heap-field SumNode Stage 3 extension: a sealed-variant obj_ty + Packed(SumNode)
+                // repr is a VALID combination — it is a direct heap-field read from a narrowed match
+                // arm where the lowerer passes the narrowed (sealed) variant type as obj_ty so
+                // compile_ir_field_get can compute the correct variant-specific payload offset. The
+                // object is NOT a packed struct (it is a SumNode), so the old check would false-fire.
+                // We exempt this: if repr is Packed(SumNode), the sealed obj_ty is a valid narrowed
+                // variant hint, and the sum_type_eligible path in the per-function verify (below)
+                // covers the SumNode consistency. Only Packed(struct) requires the sealed obj_ty
+                // invariant, so we additionally check !is_packed_struct to avoid the contradiction.
                 Instruction::FieldGet { object, obj_ty, .. } => {
                     let r = &repr[object.0 as usize];
                     match sealed_fields(obj_ty) {
                         Some(f) => {
-                            if !is_packed_struct(r, f) {
+                            // Heap-field SumNode: a sealed obj_ty with Packed(SumNode) repr is the
+                            // narrowed-variant hint from the lowerer — skip the struct check.
+                            if r.sumnode_sum_ty().is_none() && !is_packed_struct(r, f) {
                                 report(&mut bad, "FieldGet(object packed)", *object, "Packed(struct)", r);
                             }
                         }
@@ -938,7 +954,12 @@ pub fn verify(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                             ));
                         }
                     } else if let Some(f) = sealed_fields(obj_ty) {
-                        if !is_packed_struct(&repr[object.0 as usize], f) {
+                        // Heap-field SumNode Stage 3: a sealed obj_ty + Packed(SumNode) repr is valid
+                        // (the lowerer passes the narrowed variant as obj_ty so codegen can compute
+                        // the correct variant-specific payload offset — not a Packed(struct) mismatch).
+                        if repr[object.0 as usize].sumnode_sum_ty().is_none()
+                            && !is_packed_struct(&repr[object.0 as usize], f)
+                        {
                             bad.push(format!(
                                 "{fname}: FieldGet requires Packed(struct) of t{}, has {:?}",
                                 object.0, repr[object.0 as usize]
@@ -1152,8 +1173,11 @@ mod tests {
     }
 
     #[test]
-    fn sum_type_gate_rejects_heap_field_variant() {
-        // A variant with a String (non-scalar) field is out of Stage-1 scope → fall back to boxed.
+    fn sum_type_gate_accepts_heap_field_variant() {
+        // Stage 3: a variant with a String (eligible heap) field is now SumNode-eligible.
+        // The gate admits String/Array/nested-sealed fields; the descriptor drop walk and
+        // materializer handle heap-field RC. Only truly ineligible fields (union/Named-non-self/
+        // unsupported heap types) fall back to boxed.
         let mut a = IndexMap::new();
         a.insert("kind".into(), Type::StrLit("a".into()));
         a.insert("name".into(), Type::Str);
@@ -1164,7 +1188,24 @@ mod tests {
             Type::Object { fields: a, sealed: true },
             Type::Object { fields: b, sealed: true },
         ]);
-        assert!(!super::sum_type_eligible(&u), "heap-field variant must be boxed");
+        assert!(super::sum_type_eligible(&u), "String-field variant is eligible (Stage 3)");
+        assert_eq!(super::sum_type_discriminant(&u).as_deref(), Some("kind"));
+    }
+
+    #[test]
+    fn sum_type_gate_rejects_non_sealed_heap_field_variant() {
+        // A variant with a non-sealed Union/TypeVar field is still ineligible (not an is_sealed_field).
+        let mut a = IndexMap::new();
+        a.insert("kind".into(), Type::StrLit("a".into()));
+        a.insert("data".into(), Type::TypeVar(0)); // generic/unknown type — not packable
+        let mut b = IndexMap::new();
+        b.insert("kind".into(), Type::StrLit("b".into()));
+        b.insert("n".into(), Type::Int32);
+        let u = Type::Union(vec![
+            Type::Object { fields: a, sealed: true },
+            Type::Object { fields: b, sealed: true },
+        ]);
+        assert!(!super::sum_type_eligible(&u), "TypeVar/generic field must keep union boxed");
     }
 
     #[test]

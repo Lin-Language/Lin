@@ -1,15 +1,64 @@
-import { expect, toBe, test, suite, run } from "std/test"
+import { expect, toSatisfy, test, suite, run } from "std/test"
 import { for, range } from "std/iter"
+import { keys } from "std/object"
 import { length } from "std/array"
 import { t, st } from "./testutil"
-import { makeGraphResults, add, finalize } from "./graphResults"
+import { makeGraphResults, add, finalize, GraphResults, TreeNode } from "./graphResults"
 import { Conn } from "./types"
+
+// Deep equality over the typed `{ String: TreeNode[] }` graph (the typed-map rep lacks the
+// structural `toBe`/`toString` the `Json` rep had, so the result is checked with a typed walk).
+val nodeEq = (a: TreeNode | Null, b: TreeNode | Null): Boolean =>
+  match a
+    is Null =>
+      match b
+        is Null =>
+          true
+        else =>
+          false
+    else =>
+      match b
+        is Null =>
+          false
+        else =>
+          a["label"] == b["label"] && nodeEq(a["parent"], b["parent"])
+
+val nodesEq = (a: TreeNode[], b: TreeNode[]): Boolean =>
+  if length(a) != length(b) then
+    false
+  else
+    var ok = true
+    range(0, length(a)).for(i =>
+      if nodeEq(a[i], b[i]) == false then ok = false
+    )
+    ok
+
+val graphEq = (actual: { String: TreeNode[] }, expected: { String: TreeNode[] }): Boolean =>
+  if length(keys(actual)) != length(keys(expected)) then
+    false
+  else
+    var ok = true
+    keys(expected).for(k =>
+      val ea = expected[k] ?? []
+      val aa = actual[k] ?? []
+      if nodesEq(aa, ea) == false then ok = false
+    )
+    ok
+
+// Build a typed `{ String: TreeNode[] }` from [key, nodes] entries (a non-empty record literal
+// infers a closed record, not a map, so the expected graphs are assembled this way).
+type GraphEntry = [String, TreeNode[]]
+
+val graphOf = (entries: GraphEntry[]): { String: TreeNode[] } =>
+  var m: { String: TreeNode[] } = {}
+  entries.for(e => m[e[0]] = e[1])
+  m
 
 // Build a real typed `Trip` whose stopTimes[0].stop is `origin` (the walk reads
 // connection[0]["stopTimes"][connection[1]==0]["stop"]). The Conn tuple's first element is the
-// typed `Trip` record now (composite Json no longer flows into the named Trip slot), so the fixture
-// must build a proper Trip rather than a partial `{ "stopTimes": [...] }` literal.
-val mergePath = (tree: Json, path: Json): Null =>
+// typed `Trip` record, so the fixture builds a proper Trip rather than a partial literal. The round
+// dimension is a MAP keyed by the round string ("1", "2", …) — the structure under test.
+val mergePath = (tree: GraphResults, path: String[]): Null =>
   var kConnections: { String: { String: Conn } } = {}
   range(1, length(path)).for(i =>
     val origin = path[i - 1]
@@ -19,33 +68,41 @@ val mergePath = (tree: Json, path: Json): Null =>
   )
   add(tree, kConnections)
 
-val build = (paths: Json): Json =>
+val build = (paths: String[][]): { String: TreeNode[] } =>
   val tree = makeGraphResults()
   paths.for(p => mergePath(tree, p))
   finalize(tree)
 
 // Expected TreeNodes: parent chains toward the root (parent null).
-val A = { "label": "A", "parent": null }
-val B = { "label": "B", "parent": A }
-val C = { "label": "C", "parent": B }
-val D = { "label": "D", "parent": C }
-val D1 = { "label": "D", "parent": B }
+val A: TreeNode = { "label": "A", "parent": null }
+val B: TreeNode = { "label": "B", "parent": A }
+val C: TreeNode = { "label": "C", "parent": B }
+val D: TreeNode = { "label": "D", "parent": C }
+val D1: TreeNode = { "label": "D", "parent": B }
 
 val s = suite("GraphResults", [
   test("Merges a path into an empty tree", () => [
-    expect(build([["A", "B", "C"]])).toBe({ "A": [A], "B": [B], "C": [C] })
+    expect(build([["A", "B", "C"]])).toSatisfy(r =>
+      graphEq(r, graphOf([["A", [A]], ["B", [B]], ["C", [C]]]))
+    )
   ]),
 
   test("Merges duplicate paths", () => [
-    expect(build([["A", "B", "C"], ["A", "B"]])).toBe({ "A": [A], "B": [B], "C": [C] })
+    expect(build([["A", "B", "C"], ["A", "B"]])).toSatisfy(r =>
+      graphEq(r, graphOf([["A", [A]], ["B", [B]], ["C", [C]]]))
+    )
   ]),
 
   test("Appends to existing paths", () => [
-    expect(build([["A", "B"], ["A", "B", "C"]])).toBe({ "A": [A], "B": [B], "C": [C] })
+    expect(build([["A", "B"], ["A", "B", "C"]])).toSatisfy(r =>
+      graphEq(r, graphOf([["A", [A]], ["B", [B]], ["C", [C]]]))
+    )
   ]),
 
   test("Appends different paths", () => [
-    expect(build([["A", "B", "C", "D"], ["A", "B", "D"]])).toBe({ "A": [A], "B": [B], "C": [C], "D": [D, D1] })
+    expect(build([["A", "B", "C", "D"], ["A", "B", "D"]])).toSatisfy(r =>
+      graphEq(r, graphOf([["A", [A]], ["B", [B]], ["C", [C]], ["D", [D, D1]]]))
+    )
   ])
 ])
 run(s)
