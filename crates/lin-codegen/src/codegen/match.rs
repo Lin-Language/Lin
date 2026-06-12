@@ -368,6 +368,13 @@ impl<'ctx> Codegen<'ctx> {
             }
             return m;
         }
+        // D3b: Unsealed Object widening into a NARROWER unsealed Object slot. Both are physically
+        // LinObject*; the source has extra or different fields the slot does not. Project-copy into
+        // a fresh LinObject with exactly to_ty's fields, severing sharing.
+        if let (Type::Object { sealed: false, fields: to_fields }, Type::Object { sealed: false, .. }) = (to_ty, from_ty) {
+            let tf = to_fields.clone();
+            return self.boxed_object_project(val, &tf);
+        }
         // Box to union. Use heap boxing (lin_box_*) rather than a stack alloca, because
         // a coerced value may escape its defining function (returned, stored in an array,
         // captured) — a stack TaggedVal would dangle.

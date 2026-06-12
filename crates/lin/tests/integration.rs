@@ -18867,9 +18867,10 @@ val main = () =>
 main()
 "#);
     // D3a: anon-structural params monomorphised per concrete layout → packed-param shares too.
+    // D3b: non-param anon slots PROJECT-COPY → boxed-elem severed (orig2, not mut2).
     assert_eq!(out, vec![
         "boxed-param=mutated",
-        "boxed-elem=mut2",
+        "boxed-elem=orig2",
         "packed-param=mutated",
         "packed-elem=orig4",
     ]);
@@ -18993,6 +18994,67 @@ main()
     let _ = std::fs::remove_dir_all(&dir);
     // Cross-module anon-param calls copy today (no monomorphisation across modules yet).
     assert_eq!(output, vec!["v=1"]);
+}
+
+// ============================================================================
+// D3b: anon-structural non-param slot project-copy.
+// A WIDER unsealed boxed object flowing into a NARROWER unsealed object slot (array element,
+// map value) must PROJECT-COPY — building a fresh LinObject with only the slot's fields,
+// severing sharing and dropping extra fields. Exact-shape pass-through (F_src == F_slot) must
+// NOT copy (no projection when fields are identical).
+// ============================================================================
+
+// D3b: boxed wide source pushed into a narrower-typed array slot → extras dropped, mutation severed.
+#[test]
+fn test_d3b_array_elem_boxed_projects() {
+    let out = run(r#"import { print } from "std/io"
+import { push } from "std/array"
+val main = () =>
+  val jx: Json = 0
+  val wide = { "type": "orig", "extra": 42, "blob": jx }
+  var arr: { "type": String }[] = []
+  push(arr, wide)
+  wide["type"] = "changed"
+  print("elem=${arr[0]["type"]} extras_dropped=${arr[0]["extra"] ?? "null"}")
+main()
+"#);
+    // D3b: projection severs sharing (elem stays "orig") and drops "extra" field.
+    assert_eq!(out, vec!["elem=orig extras_dropped=null"]);
+}
+
+// D3b: exact-shape match — same field set → no projection, mutation IS visible.
+#[test]
+fn test_d3b_array_elem_exact_shape_shares() {
+    let out = run(r#"import { print } from "std/io"
+import { push } from "std/array"
+val main = () =>
+  val jx: Json = 0
+  val exact = { "type": "orig", "blob": jx }
+  var arr: { "type": String, "blob": Json }[] = []
+  push(arr, exact)
+  exact["type"] = "changed"
+  print("elem=${arr[0]["type"]}")
+main()
+"#);
+    // Exact same shape → no projection → mutation still visible through the slot.
+    assert_eq!(out, vec!["elem=changed"]);
+}
+
+// D3b: boxed wide source stored as a narrower-typed map value → extras dropped, mutation severed.
+#[test]
+fn test_d3b_map_value_anon_slot_projects() {
+    let out = run(r#"import { print } from "std/io"
+val main = () =>
+  val jx: Json = 0
+  val wide = { "type": "orig", "extra": 99, "blob": jx }
+  var m: { String: { "type": String } } = {}
+  m["key"] = wide
+  wide["type"] = "changed"
+  print("val=${m["key"]["type"]} extras_dropped=${m["key"]["extra"] ?? "null"}")
+main()
+"#);
+    // D3b: projection severs sharing (val stays "orig") and drops "extra" field.
+    assert_eq!(out, vec!["val=orig extras_dropped=null"]);
 }
 
 // D2 pin: a record with a Function field can be widened into Json TODAY. Stage 6 flips this to a

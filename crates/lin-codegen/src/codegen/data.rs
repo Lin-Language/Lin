@@ -2176,6 +2176,44 @@ impl<'ctx> Codegen<'ctx> {
         self.sealed_construct(target_fields, &vals)
     }
 
+    /// Project a WIDER boxed `LinObject*` into a FRESH boxed `LinObject*` with exactly
+    /// `target_fields`. D3b: the boxed→boxed-narrower slot boundary (anon-struct widening severs
+    /// sharing). Non-mutating: `src` is untouched (its owner releases it); extra fields are
+    /// ignored; the result is a fresh +1 independent owned `LinObject*`.
+    ///
+    /// RC contract per field:
+    /// - `lin_object_get` returns a BORROWED interior `TaggedVal*` pointer (do NOT release).
+    /// - `lin_object_set_fresh` copies the 16-byte `TaggedVal` and RETAINS the inner payload (+1).
+    /// - No extra per-field cleanup is needed; `set_fresh` handles retention.
+    pub(crate) fn boxed_object_project(
+        &mut self,
+        src: BasicValueEnum<'ctx>,
+        target_fields: &indexmap::IndexMap<String, Type>,
+    ) -> BasicValueEnum<'ctx> {
+        let i32_ty = self.context.i32_type();
+        let new_obj = self.builder.call(
+            self.rt.object_alloc,
+            &[i32_ty.const_int(target_fields.len() as u64, false).into()],
+            "anon_proj_obj",
+        ).try_as_basic_value().unwrap_basic().into_pointer_value();
+        for k in target_fields.keys() {
+            let key_str = self.compile_string_lit(k).into_pointer_value();
+            // Borrow the entry from the source object (interior ptr, never release).
+            let entry = self.builder.call(
+                self.rt.object_get,
+                &[src.into(), key_str.into()],
+                "anon_proj_get",
+            ).try_as_basic_value().unwrap_basic();
+            // object_set_fresh copies the TaggedVal and retains the inner.
+            self.builder.call(
+                self.rt.object_set_fresh,
+                &[new_obj.into(), key_str.into(), entry.into()],
+                "",
+            );
+        }
+        new_obj.into()
+    }
+
     /// Field-wise equality of two sealed scalar records of the SAME type (`fields`). Loads each
     /// field by offset and compares with the scalar equality for that field type, AND-ing. Returns
     /// an i1.

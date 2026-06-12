@@ -78,6 +78,9 @@ pub fn lower_module_with_imports(
         }
     }
     ctx.global_fn_slots = global_fn_slots.clone();
+    // D3b: record cross-module monomorphized spec slots so the call lowering can apply
+    // array-element / container-insertion slot projection instead of anon-param sharing.
+    ctx.spec_origin_slots = module.spec_origins.keys().copied().collect();
 
     // Pre-scan for `var` slots mutably captured by closures — these become heap cells.
     for stmt in &module.statements {
@@ -621,6 +624,12 @@ struct LowerCtx {
     /// exported entry point reads them. Cleared (taken) after one prologue is emitted so
     /// nested closures within the body do not re-run init.
     import_var_init_prologue: Option<String>,
+    /// Slots of CROSS-MODULE generic monomorphization specs (e.g. `push$Obj_type_String` cloned
+    /// from `std/array`). Populated from `module.spec_origins`. Used by D3b: when calling a
+    /// cross-module spec with a wider unsealed object arg than the param type, project-copy the
+    /// arg to the narrower slot type. This does NOT apply to local anon-param functions (D3a
+    /// sharing takes priority for those).
+    spec_origin_slots: std::collections::HashSet<usize>,
 }
 
 /// A default-fill adapter to be synthesized and lowered. `f@k` takes the first `k` parameters
@@ -672,6 +681,7 @@ impl LowerCtx {
             safe_callback_depth: 0,
             packed_elem_slots: HashMap::new(),
             import_var_init_prologue: None,
+            spec_origin_slots: std::collections::HashSet::new(),
         }
     }
 
@@ -2605,6 +2615,16 @@ fn try_lower_sum_literal(
     Some(dst)
 }
 
+/// True when `from` and `to` are BOTH UNSEALED OBJECTS with DIFFERENT field sets
+/// (D3b anon-slot widen): both are physically `LinObject*` but different shapes — the
+/// source is WIDER (or merely different) and the slot must project-copy to sever sharing.
+/// Only fires for a genuine field mismatch; exact-shape pass-through is a no-op.
+fn anon_object_slot_repr_differs(from: &Type, to: &Type) -> bool {
+    matches!((from, to),
+        (Type::Object { sealed: false, fields: ff }, Type::Object { sealed: false, fields: tf })
+        if ff != tf)
+}
+
 /// Coerce a value into a (plain, non-cell) local/global SLOT the binding will OWN, transferring
 /// ownership of any transient coercion box into the scope's owned set so scope-exit reclaims it.
 ///
@@ -3752,6 +3772,28 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                     // fresh box, never the struct), so it leaks the whole struct — and with it the
                     // `id` String / `stops` array it recursively owns — every iteration (the
                     // `val t: Trip = mk(i); val arr: Trip[] = [t]` per-iteration leak, ASan-confirmed).
+                    // D3b: a wider unsealed Object element projected into a NARROWER unsealed Object
+                    // array slot — build a fresh copy carrying only the slot fields, severing sharing
+                    // across the insertion boundary. The original `t` keeps its own +1 (released at
+                    // scope exit). The fresh projected copy (RC=1 from codegen) is transferred
+                    // directly into the array — NO additional retain is needed (it's a Move).
+                    // This replaces the element before `transfer_into_container`, which we skip for
+                    // the original `t` (it's not going into the array).
+                    let (t, ety, d3b_projected) = if anon_object_slot_repr_differs(&ety, &elem_ty) {
+                        let proj = builder.alloc_temp(elem_ty.clone());
+                        builder.emit(Instruction::Coerce {
+                            dst: proj,
+                            src: t,
+                            from_ty: ety.clone(),
+                            to_ty: elem_ty.clone(),
+                        });
+                        // `proj` is fresh (RC=1); the array's MakeArray takes sole ownership.
+                        // Do NOT register for scope-exit (it's transferred into the array).
+                        // Do NOT call transfer_into_container (d3b_projected skips it below).
+                        (proj, elem_ty.clone(), true)
+                    } else {
+                        (t, ety, false)
+                    };
                     // The source struct keeps its own scope-exit release; only the FRESH box transfers
                     // into the array (a MOVE, balanced by the array's recursive element release). When
                     // the element instead FLOWS (shares its pointer) into the array — every non-sealed
@@ -3759,7 +3801,9 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                     // pointer — the container-insert retain is still required, so this is gated tightly
                     // on the sealed→boxed materialize and everything else stays byte-identical.
                     let materializes_fresh_box = is_sealed_scalar_repr(&ety) && !is_sealed_scalar_repr(&elem_ty);
-                    if !materializes_fresh_box {
+                    // D3b-projected element is already fresh (RC=1) — skip the retain/transfer that
+                    // `transfer_into_container` would emit; the MakeArray takes sole ownership as-is.
+                    if !materializes_fresh_box && !d3b_projected {
                         // The array owns a reference to each heap element (lin_array_release
                         // recursively releases them when the array is freed) — apply the standard
                         // container-insert ownership rule on the RAW value before boxing/coercing.
@@ -4236,6 +4280,32 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                     let val_temp = lower_expr(value, builder, ctx);
                     (obj_temp, key_temp, val_temp)
                 };
+            // D3b: unsealed boxed Object value stored into a narrower unsealed Object Map slot —
+            // project into a fresh narrower copy so extra fields are severed before insertion.
+            // The projected temp is fresh (RC=1 from codegen projection); the container's
+            // `lin_object_set` will retain it, so we use Transfer semantics (unregister) rather
+            // than Retain to avoid RC inflation.  The original val_temp stays owned and is
+            // released at scope exit (via its existing entry in the owned-temps table).
+            let (val_temp, val_ty) = if let Type::Map(map_val_ty) = &obj_ty {
+                if anon_object_slot_repr_differs(&val_ty, map_val_ty) {
+                    let narrow_ty = *map_val_ty.clone();
+                    let proj = builder.alloc_temp(narrow_ty.clone());
+                    builder.emit(Instruction::Coerce {
+                        dst: proj,
+                        src: val_temp,
+                        from_ty: val_ty.clone(),
+                        to_ty: narrow_ty.clone(),
+                    });
+                    // Fresh — transfer (not retain): unregister so the map's retain is the sole ref.
+                    builder.register_owned(proj, narrow_ty.clone());
+                    builder.unregister_owned(proj);
+                    (proj, narrow_ty)
+                } else {
+                    (val_temp, val_ty)
+                }
+            } else {
+                (val_temp, val_ty)
+            };
             // `arr[i] = v` transfers a reference into the container exactly like the
             // `lin_array_set`/`lin_object_set` intrinsics (codegen routes both through the
             // same `emit_array_set`/`emit_object_set` helpers). Balance ownership of the
@@ -4574,6 +4644,26 @@ fn lower_call(
                     }
                     if let Some(lit) = raw_lit {
                         escape_lits.push(lit);
+                    }
+                    // D3b: cross-module monomorphized spec (e.g. push$Obj_type_String) receiving a
+                    // wider unsealed boxed-object arg — project into a fresh narrower copy so the
+                    // extra fields are not visible inside the callee or through the stored element.
+                    // Guarded by spec_origin_slots so local anon-param functions (D3a sharing)
+                    // are unaffected.
+                    if ctx.spec_origin_slots.contains(slot) {
+                        if let Some(param_ty) = param_tys.get(i) {
+                            if anon_object_slot_repr_differs(&a.ty(), param_ty) {
+                                let proj = builder.alloc_temp(param_ty.clone());
+                                builder.emit(Instruction::Coerce {
+                                    dst: proj,
+                                    src: arg,
+                                    from_ty: a.ty(),
+                                    to_ty: param_ty.clone(),
+                                });
+                                builder.register_owned(proj, param_ty.clone());
+                                return proj;
+                            }
+                        }
                     }
                     arg
                 })
