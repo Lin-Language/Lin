@@ -16,22 +16,82 @@ backend immaturity, but because of **one early representation decision**: typed 
 thing). Field access on a record therefore became a key lookup and an LLVM optimization barrier, even
 when the field set is statically known, and the compiler grew a flow-sensitive representation-inference
 pass (ADR-062) to *claw back* struct speed occurrence-by-occurrence — the origin of every "path-9"
-dead end. This document proposes the fix along **two clearly separated axes**:
+dead end. The fix is along **two clearly separated axes**: a record's *representation* becomes a flat
+packed struct with constant-offset access (the performance lever), while its *semantics* stay
+**reference** — `val b = a` shares, `mutateObj(b)` mutating its parameter is still visible (no userland
+behaviour change from the axis we keep). And the conflated JSON object is dissolved: dynamic data is
+either a real **hashmap** (`{ String: T }`) or **`AnyVal`** (née `Json`), and `LinObject` ceases to
+exist. The typed-vs-Go gap then closes as a *consequence* of drawing three clean lines — types,
+hashmaps, and a dynamic value type — rather than as a perpetual fight.
 
-- **Representation (the performance lever — this is what must change):** a record's representation
-  becomes a **flat packed struct with constant-offset field access**, never a string-keyed object.
-  Dynamic data is either a real **hashmap** (`{ String: T }`) or the **`Any`** top type (née `Json`).
-  The boxed string-keyed object (`LinObject`) ceases to exist.
-- **Semantics (a deliberate, separate choice — and we are keeping today's behaviour):** records stay
-  **reference types**. `val b = a` shares; `mutateObj(b)` mutating its parameter is still visible
-  through `b`. This is the Java/C# object model — reference semantics with a *flat* layout and O(1)
-  field access — and it was never the source of the slowness.
+---
 
-The crucial realisation is that these two axes are independent. The accident was the *representation*
-(string-keyed), not the *reference semantics*. Fixing the representation makes typed code fast;
-keeping reference semantics preserves every piece of current userland behaviour. The typed-vs-Go gap
-then closes as a *consequence* of drawing three clean lines — types, hashmaps, and a dynamic top
-type — rather than as a perpetual fight.
+## 0.5 Stage-0 decisions (PINNED — everything keys off these)
+
+These resolve the design holes found in review. They are decisions, not open questions; the staged
+plan (§6) assumes them.
+
+- **D1 — Representation vs semantics are separate axes.** Representation: records become flat packed
+  structs (constant-offset access), required. Semantics: records stay **reference** types (Java/C#
+  model — flat layout, O(1) fields, pointer-shared). Passing records to functions, `val b = a`
+  aliasing, and in-place mutation through a parameter are **unchanged**.
+
+- **D2 — `Json` → `AnyVal`, a single JSON-shaped value union, with NO opaque handles.**
+  `AnyVal = Null | Bool | Int* | Float* | String | AnyVal[] | { String: AnyVal } | <any record>`.
+  It is **value-shaped only**: it cannot hold a `Function`, `Iterator`, `Stream`, `Shared`, `Promise`,
+  or `TarEntry`. There is **no** separate handle-carrying top type above it — handles stay statically
+  typed and cannot be widened into `AnyVal`. This is deliberate: it preserves the gates that depend on
+  the dynamic type being JSON-shaped (cross-thread transferability, the async-thunk return
+  restriction, foreign-signature exclusions). The project goal is to **retire almost all uses of
+  `AnyVal`** — most values currently typed `Json` get a precise type (a record, a hashmap, a union);
+  `AnyVal` survives only as the genuine "unknown wire shape" escape hatch. (Naming note: it is called
+  `AnyVal`, not `Any`, precisely because it is *not* a true top type — `print`/display/serialization
+  accept `AnyVal`, the set of *displayable value shapes*, not anything-including-handles.)
+
+- **D3 — Anonymous structural parameter types monomorphise per concrete argument layout.** A function
+  over `(r: { "type": String })` is specialised per caller's concrete record layout (offset of `type`
+  may differ), exactly as generics already monomorphise. This preserves sharing and adds no new
+  concept. The residual — a **stored closure** `(Named) => _` invoked with heterogeneous layouts — uses
+  **project-copy at the closure boundary** as the uniform fallback (the closure already crosses an
+  opaque boundary, so a copy there is acceptable). This extends §5.3 from literals to parameter
+  boundaries.
+
+- **D4 — The record↔`AnyVal` boundary is a defined single-direction conversion, not a reconciliation
+  oracle.** `record → AnyVal` **carries the record pointer + its descriptor** (preserving reference
+  semantics and aliasing through the dynamic boundary; **no** deep O(graph) hashmap conversion). This
+  is the **v1** design, not a later optimization — it is the compatibility-preserving option, because
+  converting to a `{String:AnyVal}` hashmap would sever the aliasing that widening-to-`Json` has today.
+  `AnyVal → record` validates-and-projects (the §5.9.1 projection). There is no bidirectional
+  packed-or-boxed oracle — that was the path-9 trap. (`PERFORMANCE.md`'s path-9 epitaph "each boundary
+  is a materialize-or-leak seam" applied to a *reconciliation*; this is a one-way conversion.)
+
+- **D5 — Aliasing is unified to share-always; this is a real, intended, observable change.** Today a
+  packed-value array `push` **copies** the element (the measured PREP 3.67×; §2.4) while a boxed array
+  `push` **shares** a pointer — so `push(arr, t); t["x"] = 5; arr[i]["x"]` already differs by
+  representation. Unifying to one representation makes it consistently observe `5`. This is the better
+  semantics (one representation, one behaviour), but it is a behaviour change and means **digest
+  stability across stages is an *expectation*, not a guarantee** — a stage that breaks the RAPTOR
+  digest may have found *this intended change*, not a bug. A directed test pins the intended behaviour.
+
+- **D6 — `keys`/`values`/`entries` apply to hashmaps and `AnyVal`, not records.** A record has a
+  fixed, statically-known field set; dynamic key enumeration uses a hashmap. `std/object` currently
+  applies to any object; narrowing it to hashmaps/`AnyVal` is a visible change.
+
+- **D7 — Descriptors are a KEPT runtime concept.** Deleting `LinObject` deletes string-keyed
+  *storage*, but record field-name/offset **descriptors** remain (they already half-exist for sealed
+  records) and drive: order-independent equality, `toString`/display, `is T`/`has T` after a value has
+  been through `AnyVal`, `fromJson` validation, worker deep-copy, and JSON serialization. The "net line
+  count goes down" claim (§3) is judged against this residual.
+
+- **D8 — The boxed shadow survives for `AnyVal`-flowing records until Stage 6 (transitional).** During
+  Stages 1–5, `LinObject` still exists, so a record widened into an `AnyVal` slot keeps a boxed/
+  descriptor form until the `AnyVal` refounding (Stage 6). Stage 1's "removes the boxed-shadow arm" and
+  §3's deletion list are therefore fully realised only at Stage 6; before then they apply to
+  non-`AnyVal`-flowing records.
+
+The honest count of userland-visible changes is therefore **four** (§7.2): the `Json → AnyVal` rename,
+ordered-iteration migration, `keys`/`values`/`entries` off records (D6), and the aliasing unification
+(D5).
 
 ---
 
@@ -44,15 +104,16 @@ type — rather than as a perpetual fight.
   vs Rust 224 ms vs Go 624 ms** — Lin wins. The compilation model is not the problem.
 - **Eager combinator chains beat Rust ~4×** (fused to a single zero-allocation loop). Not the problem.
 - **A tracing GC would not help.** Measured (`LIN_NO_RC` ceiling): deleting *all* allocation + RC
-  recovers ~0% on every workload, including RAPTOR's textbook-GC-bait retention profile. No workload
-  is allocation-bound. The cost is *work per access*, not allocate/reclaim. RC stays.
+  recovers ~0% on every workload. No workload is allocation-bound. RC stays.
 - **The gap is concentrated at the typed-record representation boundary.** Fully-typed RAPTOR runs
-  **1.96×** the `Json` port (after this session's de-materialization work; 2.33× before). The residual
-  splits into: (a) reading heap-field records out of maps/arrays/unions — *per-access string-keyed
-  materialization*; (b) constructing/regrouping record collections — a *copy* cost **that this session
-  measured as "inherent," but that result is specific to a value-semantics layout — see §2.4**; (c)
-  generic closure call boundaries — *box/unbox*. All three trace back to the representation, not to
-  reference semantics. See `docs/PERFORMANCE.md` §2.
+  **1.96×** the `Json` port. The residual is per-access string-keyed materialization (reads), a copy
+  cost on construct/regroup (value-layout-specific; §2.4), and generic closure call boundaries — all
+  tracing back to the representation, not to reference semantics. See `docs/PERFORMANCE.md` §2.
+- **Not every workload is repr-bound — interp is not.** A direct op-cycle profile of the `interp`
+  benchmark puts boxed-record reads at ~6%, box/unbox at ~4%, strings at ~0.5%; the bulk is the
+  generated code's call/control-flow overhead. The representation reset helps interp only marginally —
+  interp needs a separate call-cost/inlining project. This is scoped *out* of this document (it is the
+  residual "call axis"), but recorded so the reset is not oversold as a universal fix.
 
 ### 1.2 The root cause
 
@@ -66,30 +127,26 @@ load-bearing consequence is one thing, not two:
 > access is an association-list / hashed lookup and an LLVM optimization barrier — *even when the
 > field set is known at compile time*.
 
-Records *also* ended up with reference semantics (`val b = a; a["k"]=v` is visible through `b`),
-because two bindings can hold the same `LinObject` pointer. **This part is fine and we are keeping
-it** — reference semantics with a flat layout is exactly the Java/C# model and is fast. It was never
-the villain; the string-keyed representation was. The mistake to undo is the conflation, not the
-sharing.
+Records *also* ended up with reference semantics because two bindings can hold the same `LinObject`
+pointer. **This part is fine and we are keeping it** — reference semantics with a flat layout is the
+Java/C# model and is fast. It was never the villain; the string-keyed representation was. The mistake
+to undo is the conflation, not the sharing.
 
 The representation-inference pass (ADR-062, `lin-ir/src/repr.rs`) exists solely to *recover* struct
-speed from the boxed default — deciding, occurrence by occurrence, "packed when freshly constructed,
-boxed when read back from a slot." It is the single largest source of implementation complexity and
-the origin of every "path-9" dead end. It is a workaround for the wrong default. With one flat
-representation per record, it collapses to a layout calculator.
+speed from the boxed default. It is the single largest source of implementation complexity and the
+origin of every "path-9" dead end. With one flat representation per record, it collapses to a layout
+calculator.
 
 *(Note on §5.9.1: the spec's "non-mutating projection" copies a value when it is narrowed to a record
-type `T`, dropping extra fields. That is a **field-dropping narrowing** operation and is compatible
-with either value or reference assignment semantics — it does **not** mandate value semantics, and the
-earlier reading of it as "the spec leans value" was an over-read. Under reference semantics, narrowing
-to `T` still produces a fresh flat struct with exactly `T`'s fields; same-type assignment shares.)*
+type `T`, dropping extra fields. That is a field-dropping narrowing operation, compatible with either
+value or reference assignment semantics — it does not mandate value semantics.)*
 
 ---
 
 ## 2. The target model
 
 There are exactly these kinds of values. Nothing else. In particular there is **no boxed
-string-keyed object**.
+string-keyed object**, and **no value type above `AnyVal`**.
 
 | Kind | Type form | Representation | Semantics | Field/elem access |
 |------|-----------|----------------|-----------|-------------------|
@@ -99,342 +156,283 @@ string-keyed object**.
 | Hashmap | `{ String: T }` | hashed `LinMap` | reference | O(1) hash lookup |
 | Record | `type P = {…}` / anon structural | **flat packed struct** (heap, pointer-shared) | **reference** | **constant-offset load** |
 | Union | `A \| B`, `T \| Null` | tag word + payload (ptr, or nullable ptr) | follows member | `match … is T` → read payload at `T`'s layout |
-| Any | `Any` (née `Json`) | recursive tagged union; see §2.5 | reference | dispatch on tag |
-| Opaque handle | `Function`, `Iterator`, `Promise`, `Stream`, `Shared`, `Frozen`, `TarEntry` | nominal runtime handle | reference | n/a |
+| AnyVal | `AnyVal` (née `Json`) | tagged union over the value kinds + record-ptr+descriptor; see §2.5 | reference | dispatch on tag |
+| Opaque handle | `Function`, `Iterator`, `Promise`, `Stream`, `Shared`, `Frozen`, `TarEntry` | nominal runtime handle | reference | n/a — **not** an `AnyVal` member |
 
 The three lines the current design blurs, drawn sharply:
 
 - **Types** (records) — fixed fields, **reference** semantics, **flat struct** layout, constant-offset access.
 - **Hashmaps** (`{ String: T }`) — dynamic string keys, a real dictionary, O(1) lookup.
-- **A dynamic top type** (`Any`) — "I don't know the shape; dispatch at runtime and pay for it."
+- **A dynamic value type** (`AnyVal`) — "I don't know the shape; dispatch at runtime and pay for it" —
+  but JSON-shaped, so it cannot smuggle a handle.
 
-### 2.1 The two axes, decided
+### 2.1 The two axes, decided (D1)
 
 - **Representation (required): records are flat packed structs.** A record is a pointer to a
-  contiguous heap struct: scalar fields inline at their natural offset, heap fields (`String`, array,
-  map, nested record) as 8-byte owned pointer slots. Field access is **always** a constant-offset
-  load — never a key lookup — whether the record was just constructed or read out of an array, map, or
-  union. There is no boxed shadow and no "read from a slot makes it string-keyed" arm. This is the
-  whole performance change.
+  contiguous heap struct: scalar fields inline, heap fields (`String`, array, map, nested record) as
+  8-byte owned pointer slots. Field access is **always** a constant-offset load. There is no boxed
+  shadow (modulo the D8 transitional `AnyVal` path). This is the whole performance change.
 - **Semantics (chosen): records are reference types.** Assignment and parameter passing **share** the
-  pointer; there is no copy and no behaviour change from today. `val b = a` makes `b` and `a` the same
-  record; `mutateObj(b)` mutating its parameter is visible through `b`. Mutation writes through the
-  shared pointer, visible to all aliases — exactly the current observable behaviour. *(A `val` binding
-  is still immutable as a binding; reference semantics is about what assignment/passing does with the
-  record, which is share.)*
-
-This is the Java/C# object model: reference types, flat layout, O(1) fields. The only userland-visible
-changes in the whole project are the `Json → Any` rename (§2.5) and the loss of `Json`-object
-insertion-order iteration (§2.6). **Passing records to functions does not change. Aliasing does not
-change. In-place mutation through a parameter does not change.**
+  pointer. `val b = a` makes `b` and `a` the same record; `mutateObj(b)` mutating its parameter is
+  visible through `b`. Mutation writes through the shared pointer, visible to all aliases.
 
 ### 2.2 Why reference semantics here is fast *and* simpler
 
-- **Constant-offset field access** through the pointer is the entire query-side win — the string-keyed
-  scan is gone. One extra pointer dereference vs. an inline value layout, but every step is O(1).
-- **No correctness obligation on aliasing analysis.** A value-semantics model needs move/last-use
-  analysis to avoid copying on every assignment; reference semantics shares by default, so the
-  analysis (Perceus, §5.4) becomes a pure *optimization*, never a correctness requirement.
-- **Share-into-collections is cheap.** Because `T[]`/`{String:T}` are pointer-backed (§2.3),
-  `push(routeArr, trip)` shares a pointer — like the `Json` form, no copy. This is what dissolves the
-  RAPTOR PREP "inherent regroup copy" (§2.4): it was inherent only to a value/inline layout.
+- **Constant-offset field access** through the pointer is the entire query-side win.
+- **No correctness obligation on aliasing analysis.** Reference shares by default, so Perceus (§5.4)
+  becomes a pure *optimization*, never a correctness requirement.
+- **Share-into-collections is cheap.** Pointer-backed `T[]`/`{String:T}` make `push(routeArr, trip)` a
+  pointer share — like the `Json` form, no copy. This dissolves the PREP "inherent regroup copy"
+  (§2.4).
 
 ### 2.3 Arrays and maps are pointer-backed
 
-- `T[]` is a buffer of pointers to flat record structs (like Java `T[]`), **not** a buffer of
-  string-keyed objects. `arr[i]` is a deref to the shared record; `arr[i]["f"]` is deref +
-  constant-offset; `arr[i]["f"] = v` writes the shared record in place (visible to aliases);
-  `push(arr, r)` appends a shared pointer (cheap).
+- `T[]` is a buffer of pointers to flat record structs (like Java `T[]`). `arr[i]["f"]` is deref +
+  constant-offset; `arr[i]["f"] = v` writes the shared record in place; `push(arr, r)` appends a shared
+  pointer.
 - `{ String: T }` stores record pointers as values; reads return the shared record.
-- The key change from today is **what the pointer points at**: a flat struct (constant-offset) instead
-  of a string-keyed object. The pointer-backed array structure itself is largely as it is now, so the
-  "arrays of heap-field records stay boxed" limitation (§5.9.1) stops mattering — the elements are fast
-  because they are flat, with no need to make the array inline-contiguous.
-- **Optional later optimization:** for scalar-dense, non-escaping arrays the compiler may inline
-  elements contiguously (Go `[]T`, better cache locality). This needs escape/uniqueness analysis and
-  is *not* required for the core win; it is the one place a value-style layout buys something, and it
-  is deferred (§6, optional stage). Scalar arrays are already inline (`lin_flat_array_*`).
+- The key change from today is **what the pointer points at**: a flat struct instead of a string-keyed
+  object — so the "arrays of heap-field records stay boxed" limitation stops mattering without an
+  inline-array rewrite.
+- **Optional later optimization:** inline contiguous element layout for non-escaping `T[]` (Go `[]T`)
+  via escape analysis — better cache locality, not required for the core win (§5.6).
 
-### 2.4 What this does to the "inherent PREP copy" finding
+### 2.4 What this does to the "inherent PREP copy" finding (and D5)
 
-`docs/PERFORMANCE.md` §2 records PREP's ~3.67× as an *inherent* cost: regrouping trips into
-`tripsByRoute` copies each `Trip`. **That is inherent only under value-semantics / inline-array
-layout.** Under reference semantics with pointer-backed arrays, the regroup shares a pointer — cheap,
-like `Json` — so the "inherent" caveat **does not apply** to this model. PREP becomes fast for the
-same reason the query path does: flat records + pointer sharing. (Once this model lands, that section
-of `PERFORMANCE.md` should be updated.)
+`docs/PERFORMANCE.md` §2 records PREP's ~3.67× as an *inherent* copy cost. **That is inherent only
+under value-semantics / inline-array layout.** Under reference + pointer-backed arrays, the regroup
+shares a pointer — cheap. The flip side is **D5**: today, the *currently-packed* cases copy on `push`,
+so unifying to share-always is an observable aliasing change (`push(arr,t); t["x"]=5; arr[i]["x"]`
+flips to `5`). This is intended and better, but it is named as a behaviour change with a directed test,
+and it is why digest stability across stages is an *expectation*, not a guarantee (§6 preamble).
 
-### 2.5 `Any` is a type, not a representation (the `Json` dissolution)
+### 2.5 `AnyVal` is a JSON-shaped dynamic value type (the `Json` dissolution) — D2, D4
 
-`Json` is renamed and re-founded as **`Any`** — the dynamic top type. It is a recursive union:
+`Json` is renamed and re-founded as **`AnyVal`** — a recursive **value** union:
 
 ```
-Any  =  Null | Bool | Int* | Float* | String | Any[] | { String: Any } | <opaque handle>
+AnyVal  =  Null | Bool | Int* | Float* | String | AnyVal[] | { String: AnyVal } | <any record>
 ```
 
 - Its representation is the **tagged-union machinery you already have** (the tagged value / SumNode
-  family, ADR-064). It is **not** a bespoke object.
-- A *"JSON object"* is therefore just a `{ String: Any }` **hashmap**. There is no third thing.
-- Index/field access on an `Any` dispatches on the tag: hashmap → hash lookup; array → index;
-  otherwise the safe-access rule yields `Null`. Appropriately dynamic, and honestly slow — which is
-  what `Any` is *for*.
-- The boundary, and the only place dynamic↔typed conversion happens:
-  - **`T` → `Any`**: box. Start simple — project the record to a `{ String: Any }` hashmap (you have
-    lost the static type at the dynamic boundary anyway). Later optimization: carry a record pointer +
-    descriptor and fast-path the round trip.
-  - **`Any` → `T`**: a validating projection / `fromJson`-style construction of a flat `T` struct
-    (already specified by §5.9.1's projection).
-- Rename rationale: `Any` reads as exactly what it is and stops implying a special JSON runtime
-  object. JSON becomes purely a **wire format** — parsed into records/hashmaps/`Any`, serialized out
-  of them — never a thing resident in memory.
+  family, ADR-064), with the record case carried as **record pointer + descriptor** (D4). It is **not**
+  a bespoke object, and it has **no opaque-handle case** (D2): an `AnyVal` can never hold a
+  `Function`/`Iterator`/`Stream`/`Shared`/`Promise`/`TarEntry`.
+- A *"JSON object"* with statically-unknown keys is a `{ String: AnyVal }` **hashmap**. There is no
+  third thing.
+- Index/field access on an `AnyVal` dispatches on the tag: hashmap → hash lookup; record → descriptor
+  offset; array → index; otherwise the safe-access rule yields `Null`.
+- The boundary (D4), the only place dynamic↔typed conversion happens:
+  - **`T` → `AnyVal`**: carry the record pointer + descriptor. **Shares** the record (preserves
+    reference semantics and aliasing through the boundary); no deep hashmap conversion. v1 design.
+  - **`AnyVal` → `T`**: validating projection / `fromJson`-style construction (§5.9.1).
+- `print`, display, and serialization accept **`AnyVal`** — the set of displayable value shapes — not a
+  handle-carrying top type. JSON is purely a **wire format**: parsed into records/hashmaps/`AnyVal`,
+  serialized out of them, never resident in memory.
 
 ### 2.6 The wrinkle: iteration order
 
-The current "Json object" quietly provides **insertion-ordered** key iteration, and a little code
-leans on it. Concretely: RAPTOR's `getQueue` keeps `Json` *specifically* because the within-round
-tie-break between equal-arrival trips depends on key insertion order; a hash-ordered map changed which
-trip a journey boarded and broke the cross-language digest (documented in
-`benchmarks/compare/raptor/lin-typed/queueFactory.lin`).
-
-A `{ String: T }` hashmap iterates in hash order. So when the Json object is dissolved, the ordering
-guarantee must move somewhere **explicit**: either an *ordered-map* container variant (a linked
-hashmap that preserves insertion order) for the few places that need it, or those places switch to a
-list of `(key, value)` pairs. The right outcome is that ordering becomes an explicit property of an
-explicit container, not a hidden affordance — but it is a conscious migration, not a free swap. This
-is one of only two userland-visible changes (the other being the `Json → Any` rename).
+The current "Json object" provides **insertion-ordered** key iteration, and a little code leans on it
+(RAPTOR's `getQueue` keeps `Json` for the within-round tie-break; hash order broke the digest). When
+the Json object is dissolved, that guarantee moves to an **explicit** ordered-map container (a linked
+hashmap) for the few cases that need it, or those cases switch to a list of `(key, value)` pairs. One
+of the four userland-visible changes.
 
 ---
 
-## 3. What gets deleted
+## 3. What gets deleted (and what is kept — D7)
 
-This is a *simplifying* rewrite. The net line count goes **down**, and the mental model gets smaller.
+A *simplifying* rewrite. Net line count goes **down**, judged against the kept descriptor residual.
 
-- `lin-runtime/src/object.rs` and `lin_object_get`'s string-keyed scan — **gone**. No value exists on
-  which you do a string-keyed lookup over an unknown field set; dynamic access is a hashmap O(1)
-  lookup or an `Any` tag dispatch.
-- The reconciliation arms of `lin-ir/src/repr.rs` (the flow-sensitive "packed-or-boxed" oracle/verify
-  logic, the ADR-062 §H4/H5 machinery). What remains is a *layout calculator* (compute offsets;
-  choose inline scalar vs owned-pointer field slots). Because every record has **one** representation
-  (a flat struct), there is no packed-vs-boxed to reconcile.
-- `BoxKeepPacked` and the keep-packed-across-boundary machinery — there is no second representation to
-  keep packed against.
+- `lin-runtime/src/object.rs` and `lin_object_get`'s string-keyed **storage + scan** — gone. Dynamic
+  access is a hashmap O(1) lookup or an `AnyVal` tag dispatch (record case → descriptor offset).
+- The reconciliation arms of `lin-ir/src/repr.rs` (the flow-sensitive packed-or-boxed oracle/verify).
+  What remains is a *layout calculator*. (Fully realised at Stage 6 per D8.)
+- `BoxKeepPacked` and the keep-packed-across-boundary machinery.
 - The boxed-shadow paths in `lin-codegen/src/codegen/boxing.rs`, the per-access materialize in
   `data.rs`, and `sealed.rs`'s rebuild-from-boxed.
-- Essentially the entire "path-9" problem space, because it was the symptom of having two
-  representations for one thing.
+- Essentially the entire "path-9" problem space.
+
+**KEPT (D7): record descriptors** — field-name/offset tables (already half-present for sealed records).
+They drive equality (order-independent), `toString`/display, `is T`/`has T` after `AnyVal`, `fromJson`
+validation, worker deep-copy, and JSON serialization. "Delete `object.rs`" means "replace string-keyed
+storage with descriptor-driven walks," not "remove all runtime knowledge of field names."
 
 ---
 
 ## 4. What we are explicitly NOT changing (non-goals)
 
-- **Userland record semantics are unchanged.** Reference semantics, parameter passing, aliasing,
-  in-place mutation through a parameter — all identical to today. (Only `Json → Any` and the
-  ordered-iteration wrinkle are visible.)
-- **Memory management stays Perceus-style RC.** Measured not alloc-bound; a tracing GC buys ~0%.
-- **Concurrency stays share-nothing** (deep-copy on transfer, `Shared`/`Frozen`, worker-owned state).
+- **Userland record semantics on the reference axis are unchanged.** Passing, aliasing, in-place
+  mutation through a parameter — identical to today. (The four visible changes are listed in §7.2.)
+- **Memory management stays Perceus-style RC.** Measured not alloc-bound.
+- **Concurrency stays share-nothing.** `AnyVal`'s no-handle rule (D2) keeps transferability intact.
 - **Eager combinator fusion stays.** Already beats Rust; untouched.
-- **The surface syntax is unchanged.** Braces still mean a record when the field set is statically
-  known and a hashmap when the context type is `{ String: T }`.
-- **No new general-purpose value/move feature is required.** Reference-by-default needs none. (If a
-  value-type record mode is ever wanted as an opt-in for cache-dense data, it is a *future* addition,
-  not part of this work.)
+- **The surface syntax is unchanged.** Braces mean a record when fields are known, a hashmap under a
+  `{ String: T }` context.
+- **interp's call-cost axis is out of scope** (§1.1) — a separate project.
 
 ---
 
 ## 5. Design details that need to be right
 
-### 5.1 Record ↔ `Any` boundary cost
+### 5.1 Record ↔ `AnyVal` boundary (D4)
 
-Boxing a record to `Any` by converting to a `{ String: Any }` hashmap is a real cost paid at the
-moment you go dynamic. Acceptable (it is the escape hatch), but: keep the typed path wide so values
-rarely *need* to become `Any`, and plan the later optimization where `Any` carries a record pointer +
-descriptor and the `Any → T` projection fast-paths when the descriptor already matches `T`.
+`T → AnyVal` carries pointer + descriptor (shares, O(1)); `AnyVal → T` validates-and-projects. No deep
+conversion, no oracle. Keep the typed path wide so values rarely become `AnyVal` at all.
 
 ### 5.2 Unions and `match` narrowing the *value*
 
-With a single flat representation per record, `match x is T => …` narrows not just the static type but
-the **value/representation**: the body reads the payload at `T`'s known layout, no re-projection, no
-re-seal. This deletes the `Conn = Boarding | Transfer` / `Trip | Null` materialization seam the
-performance work kept hitting (`docs/PERFORMANCE.md` §2). `T | Null` where `T` is a record collapses to
-a **nullable pointer** (one word, like Go `*T`).
+With a single flat representation per record, `match x is T => …` narrows the **value/representation**:
+the body reads the payload at `T`'s known layout, no re-projection. This deletes the
+`Conn = Boarding | Transfer` / `Trip | Null` materialization seam. `T | Null` where `T` is a record
+collapses to a **nullable pointer**.
 
-### 5.3 Anonymous structural records
+### 5.3 Structural types — literals *and* parameter boundaries (D3)
 
-`{ "x": 1, "y": 2 }` with no annotation infers an anonymous structural record type with a known field
-set → flat struct, same as a named record. It becomes a hashmap only when the context type is
-`{ String: T }`, and `Any` only when typed `Any`. The disambiguation is by type context and is
-essentially already how inference behaves; it just needs to be the *explicit, documented* rule.
+- A literal `{ "x": 1, "y": 2 }` infers an anonymous structural record → flat struct (same as a named
+  record), a hashmap under `{ String: T }` context, `AnyVal` under `AnyVal`.
+- A **parameter** of anonymous structural type (`(r: { "type": String })`) is **monomorphised per
+  concrete argument layout** (like generics) — each specialisation reads `type` at that caller's
+  offset, preserving sharing at zero new conceptual cost.
+- A **stored closure** `(Named) => _` invoked with heterogeneous concrete layouts cannot monomorphise;
+  it uses **project-copy at the closure boundary** as the uniform fallback. This is the one spot where
+  width-subtyping over anonymous types costs a copy.
 
 ### 5.4 Perceus is an optimization here, not a correctness requirement
 
-Reference semantics shares by default, so nothing about correctness depends on move analysis. But
-`lin-ir/src/rc_elide.rs` still pays for itself as an optimization:
-- **Reuse-in-place.** A record whose last reference is dropped can have its buffer reused for the next
-  allocation of the same shape, cutting allocator traffic.
-- **RC elision.** Dead retains/releases around borrows are removed (already what it does).
-This is upside, sequenced after the core win, and never a blocker — a contrast with the value-semantics
-plan, where move analysis would have been load-bearing for *avoiding copies*.
+Reference shares by default, so correctness never depends on move analysis. `rc_elide.rs` still pays:
+reuse-in-place for dead record buffers; RC elision around borrows. Upside, never a blocker.
 
-### 5.5 Records and dynamic key iteration
+### 5.5 `keys`/`values`/`entries` apply to hashmaps and `AnyVal`, not records (D6)
 
-Decide explicitly: do records support `keys(record)` / dynamic field enumeration? The clean answer
-consistent with "types vs hashmaps are different things" is **no** — a record has a fixed, known field
-set; if you want to iterate dynamic keys, use a hashmap. `std/object.keys` then applies to hashmaps /
-`Any`, not records. Small but real spec decision; settle it before stage work.
+A record's field set is fixed and known; dynamic enumeration uses a hashmap. `std/object`'s
+enumeration narrows to hashmaps/`AnyVal`. One of the four visible changes.
 
 ### 5.6 The optional inline-array (value-layout) optimization
 
-The one thing a value/inline layout buys over pointer-backed arrays is cache locality on dense
-iteration (Go `[]T` vs Java `T[]`). Under reference semantics this is a *local optimization*: where a
-`T[]` provably does not alias-escape its elements, lay them out inline. It requires escape/uniqueness
-analysis, is not needed for the core win, and is deferred. Calling it out so it is on the roadmap as
-the route to *closing the last constant* on Go for scan-dense code.
+Where a `T[]` provably does not alias-escape its elements, lay them out contiguously (Go `[]T`) for
+cache locality. Needs escape/uniqueness analysis; deferred; the route to closing the last constant on
+Go for scan-dense code.
 
 ---
 
 ## 6. Implementation plan (staged, gated)
 
-The change is pervasive but **stageable by value-shape**, and — because semantics are unchanged —
-each stage is a pure *representation* swap that the existing gates catch byte-for-byte. Reference
-semantics makes the hardest part of the original plan (inline-contiguous record arrays) **optional**:
-the win flows through pointer-backed arrays automatically once records are flat (Stage 2).
+Stageable by value-shape. Reference semantics makes the hardest part of the original plan
+(inline-contiguous record arrays) **optional**: the win flows through pointer-backed arrays once
+records are flat (Stage 2).
 
-### Per-stage gate (every stage must hold all of these)
+### Per-stage gate
 
 - `cargo build --workspace && cargo test --workspace` — 0 failures.
-- `lin test stdlib/ examples/` — full green (currently 72/72).
-- RAPTOR cross-language **digest byte-identical** (`group=26203913 range=773022892 journeys=139`),
-  both `lin/` and `lin-typed/`.
-- ASan clean; RSS (`VmHWM`) bounded/flat over the full RAPTOR run (no scaling leak).
-- Cross-language bench: `records` still beats Go/Rust; RAPTOR typed does not regress and trends toward
-  Go.
-- `lin fmt --check` over `stdlib/`/`examples/`/`benchmarks/`.
-
-Because record semantics do not change, **the RAPTOR digest is expected to stay byte-identical through
-every stage** — there is no behaviour migration interleaved with the representation work (that is the
-big advantage of choosing reference over value). The only deliberately behaviour-affecting work is
-Stage 6 (the `Json`/ordered-iteration migration), which is isolated at the end.
+- `lin test stdlib/ examples/` — full green.
+- RAPTOR cross-language digest matches (`group=26203913 range=773022892 journeys=139`) — **expected,
+  not guaranteed**: per D5, a stage may *intentionally* change the digest where the old behaviour
+  depended on representation-specific aliasing; such a change must be matched by an updated directed
+  test, not silently accepted.
+- ASan clean; RSS (`VmHWM`) bounded/flat; `records` still beats Go; RAPTOR trends toward Go; `lin fmt
+  --check`.
 
 ### Stage 0 — Pin the decisions (no code)
 
-- Spec/ADR: record the **two axes** — representation becomes flat packed struct (required); semantics
-  stay **reference** (chosen, no userland change). State that `LinObject` is removed and there is one
-  representation per record.
-- Spec/ADR: **`Any` is the dynamic top type, a recursive union; there is no boxed string-keyed
-  object.** Record the `Json → Any` rename and "JSON is a wire format only."
-- Decide §5.5 (records do not support dynamic key enumeration) and §2.6 (ordered-map strategy).
-- New ADR capturing the inversion + this document as its rationale; supersede/annotate ADR-062.
-- **Deliverable:** signed-off decisions. Everything below keys off them.
+- Ratify **D1–D8** (§0.5) in spec + a new ADR (supersede/annotate ADR-062). In particular: the
+  reference-semantics + flat-layout decision; the `Json → AnyVal` no-handle union; D3 structural
+  parameter monomorphisation + closure-boundary copy; the D4 single-direction `AnyVal` boundary with
+  descriptor-carrying as v1; the D5 aliasing-unification (named + directed test); D6 enumeration; D7
+  descriptors kept; D8 transitional boxed shadow.
+- **Deliverable:** signed-off decisions.
 
 ### Stage 1 — All-scalar records: one flat representation, unconditional
 
-- These already pack today, so this stage mostly **removes** the boxed-shadow arm in `repr.rs` and the
-  "boxed when read from a slot" paths for the all-scalar case, making the flat struct the sole
-  representation. Reference semantics is unchanged, so this is a pure internal simplification.
-- Lowest risk (the `records` bench is already this path); proves the deletion model.
-- **Payoff:** none directly; the safe beachhead, and it deletes real reconciliation code.
+- Remove the boxed-shadow arm in `repr.rs` for the all-scalar, **non-`AnyVal`-flowing** case (D8);
+  flat struct becomes the representation. Pure internal simplification; lowest risk.
 
 ### Stage 2 — Heap-field records: flat struct with constant-offset fields, unconditional
 
-- Make const-offset reads of `String`/array/map/nested-record fields the sole representation (the
-  layout §5.9.1 already describes). Remove the string-keyed materialization on read.
-- Because arrays and maps are pointer-backed, **this automatically makes `Trip[]` / `{String:Trip}`
-  fast** — the elements are now flat structs behind the existing pointers. The "arrays of heap-field
-  records stay boxed" problem dissolves without an inline-array rewrite.
-- **Payoff:** the big one — kills the query-side read seam *and* (with pointer-backed collections) the
-  PREP regroup cost, at the source.
+- Const-offset reads of `String`/array/map/nested-record fields as the sole representation
+  (non-`AnyVal`-flowing). Pointer-backed collections make `Trip[]` / `{String:Trip}` fast
+  automatically. **The big one** — kills the read seam and (with pointer sharing) the regroup cost.
 
 ### Stage 3 — Unions of records: tagged value + `match` narrows representation
 
-- `T | Null` → nullable pointer; `A | B` → tag + payload-pointer; narrowing reads the payload at the
-  known layout (generalize SumNode, ADR-064).
-- **Payoff:** deletes the `Conn` / `Trip | Null` materialization seam — the last representation lever
-  from the perf work.
+- `T | Null` → nullable pointer; `A | B` → tag + payload-pointer; narrowing reads payload at known
+  layout. Deletes the `Conn`/`Trip | Null` seam.
 
 ### Stage 4 — Repoint Perceus/`rc_elide` as a record optimization
 
-- Reuse-in-place for dead record buffers; tidy RC around borrows. Pure upside; never a blocker
-  (semantics already correct without it).
-- **Payoff:** cuts allocator traffic; tightens the constant vs Go.
+- Reuse-in-place for dead record buffers; tidy RC around borrows. Pure upside.
 
 ### Stage 5 — Hashmap/array value representation polish
 
-- Ensure `{ String: T }` and `T[]` store record pointers uniformly and reads return the shared record
-  with no materialization. (Largely falls out of Stage 2; this is the cleanup/verify pass.)
-- **Payoff:** confirms no residual materialization at map/array boundaries.
+- Confirm `{ String: T }` / `T[]` store record pointers uniformly, reads return the shared record with
+  no materialization. Largely falls out of Stage 2.
 
-### Stage 6 — Dissolve `LinObject`; re-found `Any` (the only userland migration)
+### Stage 6 — Dissolve `LinObject`; re-found `AnyVal` (the userland migration)
 
-- Object literals default to records; statically-unknown shapes become `{ String: Any }` hashmaps or
-  `Any`; `Json → Any` rename throughout (`lin-check`, stdlib, docs, examples).
-- Delete `object.rs` / `lin_object_get`.
-- Provide an explicit **ordered-map** for the ordering-dependent cases (or migrate them to pair lists),
-  per §2.6.
-- **Payoff:** the slow string-keyed path ceases to exist; the model is finally coherent. This is the
-  one stage with deliberate userland-visible change; isolating it last keeps Stages 1–5 digest-stable.
+- Object literals default to records; statically-unknown shapes become `{ String: AnyVal }` hashmaps
+  or `AnyVal`; `Json → AnyVal` rename throughout. Implement the D4 record-ptr+descriptor `AnyVal`
+  boundary; retire the transitional boxed shadow (D8). Delete `object.rs`'s string-keyed storage
+  (descriptors kept, D7). Provide the explicit ordered-map (§2.6). Narrow `keys`/`values`/`entries` to
+  hashmaps/`AnyVal` (D6). This stage carries the visible-change surface (§7.2); isolating it last keeps
+  Stages 1–5 as close to digest-stable as D5 allows.
 
 ### Optional later — inline-array (value-layout) optimization (§5.6)
-
-- Escape/uniqueness analysis to lay non-escaping `T[]` elements out contiguously for cache locality.
-- **Payoff:** closes the last constant on Go for scan-dense code. Not required for the headline result.
 
 ### Closing work
 
 - Update `docs/SPECIFICATION.md`, `docs/STDLIB.md`, `docs/DECISIONS.md`, `docs/PERFORMANCE.md`
-  (including removing the "inherent PREP copy" caveat — §2.4).
-- Re-measure RAPTOR typed vs Go (the new success metric — see §7).
+  (remove the "inherent PREP copy" caveat — §2.4). Re-measure RAPTOR typed vs Go.
 
 ---
 
-## 7. Success criteria, risks, and the (small) breaking change
+## 7. Success criteria, risks, and the breaking change
 
 ### 7.1 Success criteria
 
-The success metric **changes** under the new model. Today we compare "typed vs `Json` port." After
-this work there is no race for the same data: if you type it, it is a record (fast); if you do not, it
-is `Any` (slow, *by your choice*). So success is:
+There is no longer a "typed vs `Json`" race for the same data: typed → record (fast); untyped →
+`AnyVal` (slow, by choice). So:
 
 - **Typed RAPTOR approaches Go**, not "approaches the Json port." Expect a small residual constant from
-  per-record pointer indirection + per-record allocation (the price of reference + pointer-backed
-  arrays); the optional inline-array optimization (§5.6) closes that for scan-dense code.
-- **`Any` is the only slow path, and only when explicitly chosen.** "Json is terrible" becomes a
-  property of *opting into dynamic*, exactly as intended.
-- The compiler is **smaller**: `repr.rs` reconciliation, `object.rs`, `BoxKeepPacked`, the path-9
-  machinery all deleted.
+  per-record pointer indirection + per-record allocation; the optional inline-array optimization
+  (§5.6) closes it for scan-dense code.
+- **`AnyVal` is the only slow path, and only when explicitly chosen.**
+- The compiler is **smaller**: `repr.rs` reconciliation, `object.rs` string-keyed storage,
+  `BoxKeepPacked`, the path-9 machinery all deleted (descriptors kept, D7).
 
-### 7.2 The breaking change (now small)
+### 7.2 The breaking change — four userland-visible changes (honest count)
 
-Because semantics are unchanged, the userland-visible surface is just:
+1. **`Json → AnyVal` rename** — mechanical but wide (stdlib signatures, examples, docs). `AnyVal` also
+   *narrows* the old `Json` (D2): code that smuggled a handle through `Json` no longer type-checks and
+   must keep the value statically typed.
+2. **Insertion-order iteration** moves to an explicit ordered container (§2.6).
+3. **`keys`/`values`/`entries` no longer apply to records** (D6) — use a hashmap for dynamic keys.
+4. **Aliasing unified to share-always** (D5) — `push`-then-mutate is now consistently visible for the
+   previously-packed cases.
 
-- **`Json → Any` rename** — mechanical but wide (stdlib signatures, examples, docs).
-- **`Json`-object insertion-order iteration** moves to an explicit ordered container (§2.6).
-
-That is all. **`val b = a` aliasing, passing records to functions, and in-place mutation through a
-parameter (`mutateObj(b)`) are unchanged** — they keep today's reference behaviour. This is the
-central reason for choosing reference semantics: the performance win with essentially no behaviour
-migration.
+Note **passing records to functions and in-place mutation through a parameter are unchanged** — the
+reference axis (D1) is preserved. (#4 is about the *array/map element* aliasing, not the parameter.)
 
 ### 7.3 Risks
 
-- **Large change, but subtractive and digest-stable.** It touches `lin-check`, `lin-ir`
-  (`repr`/`lower`/`rc_elide`), all of `lin-codegen` (`data`/`boxing`/`types`/`match`/`rc`), and
-  `lin-runtime` (`object`/`sealed`/`map`/array) — but Stages 1–5 do not change behaviour, so the
-  RAPTOR digest and the full suite are expected to stay byte-identical throughout, which is a strong,
-  cheap guard. A stage that *cannot* hold the digest has found a real representation bug, not a
-  semantics migration.
-- **Pointer indirection / allocation residual** vs Go's inline arrays. Mitigation: the optional
-  inline-array optimization (§5.6); and per-record allocation is already measured not-bottleneck.
-- **`Any` boundary conversion cost** (record ↔ hashmap). Mitigation: keep the typed path wide; plan
-  the descriptor-carrying fast path.
-- **Scope discipline.** Each stage has a defined payoff and gate; ship stage-by-stage on `master`, not
-  on a long-lived branch.
+- **Large change, but subtractive.** Touches `lin-check`, `lin-ir`, all of `lin-codegen`, and
+  `lin-runtime`. Stages 1–5 are *close to* behaviour-preserving (D5 is the named exception), so the
+  digest + suite are a strong guard — with the D5 caveat that a digest break may be the intended
+  aliasing change.
+- **Width-subtyping over anonymous structural types** (D3) is the subtlest correctness area — the
+  stored-closure fallback (project-copy) must be applied uniformly or a heterogeneous-layout call reads
+  a wrong offset.
+- **The `AnyVal` boundary** must stay a single-direction conversion (D4); reintroducing a reconciliation
+  oracle re-opens path-9.
+- **Pointer indirection / allocation residual** vs Go's inline arrays — mitigated by §5.6.
+- **Scope discipline.** Ship stage-by-stage on `master`; interp's call-cost axis is a separate project.
 
 ---
 
 ## 8. The one-sentence version
 
 Stop representing "a record" as a string-keyed JSON object: make a record a pointer to a **flat packed
-struct** with constant-offset access (keeping today's **reference** semantics, so no userland behaviour
-changes), make dynamic data either a real hashmap or the `Any` top type, delete `LinObject`, and the
-typed-vs-Go gap closes as a *consequence* — with the only userland changes being `Json → Any` and a
-small ordered-iteration migration.
+struct** with constant-offset access (keeping today's **reference** semantics), make dynamic data a
+real hashmap or the JSON-shaped **`AnyVal`** value type (no handles, descriptor-carrying boundary),
+delete `LinObject`'s string-keyed storage (keep descriptors), and the typed-vs-Go gap closes as a
+*consequence* — with four named userland changes and the parameter-passing behaviour you wanted
+preserved.
