@@ -155,8 +155,9 @@ spellable as an `is`-pattern**, so `if x == null` / `is Null` cannot refine it. 
 narrowing form is the **positive `is T` match arm**. This port uses it via small helpers and
 inline matches:
 
-- `intOr(x: Int32 | Null, d): Int32` — `raptor.lin` (interchange/routeStopIndex reads feeding
-  arithmetic) and `queueFactory.lin` (`isStopBefore`).
+- `?? 0` directly coalesces the `Int32 | Null` reads in `queueFactory.lin` (`isStopBefore`) and
+  `raptor.lin` (interchange/routeStopIndex reads feeding arithmetic) — the old `intOr` helper is
+  gone; `(m[k] ?? 0)` parenthesises tighter than the surrounding `<`/arithmetic (fmt preserves it).
 - An inline `match queue[routeId] is String =>` in `scanRoutes` to narrow the boarding stop
   key before the `routeStopIndex[routeId][stopP]` read.
 - `pathOr(x: String[] | Null): Json` — note an ARRAY value type also isn't `is`-narrowable,
