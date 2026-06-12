@@ -2,7 +2,7 @@
 //
 // createRaptor(trips, transfers, interchange, date?) prepares the indexes and returns a
 // RaptorIndex. scan(raptor, origins, date, dow) runs the rounds and returns the ScanResults.
-import { for, some } from "std/iter"
+import { for, some, range } from "std/iter"
 import { keys } from "std/object"
 import { join } from "std/string"
 import { length, push, sort } from "std/array"
@@ -20,21 +20,27 @@ val MAX = 9007199254740991i64
 // getRouteId(trip, tripsByRoute): comma-joined "stop + pickUpBit + dropOffBit", with an
 // "overtakes" suffix when an earlier trip on the same routeId arrives later (contract #2).
 val getRouteId = (trip: Trip, tripsByRoute: { String: Trip[] }): String =>
+  // Iterate stops by INDEX, reading the three signature fields directly off the packed StopTime[]
+  // (fused const-offset reads). The old `.for(s => …)` bound each whole StopTime — a `sealed_alloc`
+  // materialize per stop per trip, the dominant de-materialisable cost of the PREP index build.
+  val sts = trip["stopTimes"]
+  val n = length(sts)
   var parts: String[] = []
-  trip["stopTimes"].for(s =>
-    val pu = if s["pickUp"] then "1" else "0"
-    val doff = if s["dropOff"] then "1" else "0"
-    push(parts, "${s["stop"]}${pu}${doff}")
+  range(0, n).for(k =>
+    val pu = if sts[k]["pickUp"] then "1" else "0"
+    val doff = if sts[k]["dropOff"] then "1" else "0"
+    push(parts, "${sts[k]["stop"]}${pu}${doff}")
   )
   val routeId = join(parts, ",")
   val existing = tripsByRoute[routeId] ?? []
-  val lastStop = trip["stopTimes"][length(trip["stopTimes"]) - 1]
-  val arrivalTimeA = lastStop["arrivalTime"]
+  // Direct chained read of the last stop's arrival — no whole-StopTime bind.
+  val arrivalTimeA = sts[n - 1]["arrivalTime"]
   // `some` short-circuits on the first later-arriving same-signature trip (the reference
-  // for-loop returns out of the loop) instead of scanning every existing trip.
+  // for-loop returns out of the loop) instead of scanning every existing trip. The inner last-stop
+  // arrival is read directly off `t`'s packed StopTime[] (no whole-StopTime bind).
   val overtakes = existing.some(t =>
-    val tLast = t["stopTimes"][length(t["stopTimes"]) - 1]
-    arrivalTimeA < tLast["arrivalTime"]
+    val tsts = t["stopTimes"]
+    arrivalTimeA < tsts[length(tsts) - 1]["arrivalTime"]
   )
   if overtakes then "${routeId}${OVERTAKING_ROUTE_SUFFIX}" else routeId
 
@@ -117,8 +123,13 @@ val buildRoutes = (sorted: Trip[], i: Int32, routeStopIndex: { String: { String:
     null
   else
     val trip = sorted[i]
+    // Build the path by INDEX off the packed StopTime[] — the old `.for(s => …)` bound each whole
+    // StopTime just to read its `stop` string (a per-stop materialize). `trip` itself is still
+    // bound: it is pushed into `tripsByRoute` below, so its materialize is inherent to the regroup.
+    val sts = trip["stopTimes"]
+    val pathLen = length(sts)
     var path: String[] = []
-    trip["stopTimes"].for(s => push(path, s["stop"]))
+    range(0, pathLen).for(k => push(path, sts[k]["stop"]))
     val routeId = getRouteId(trip, tripsByRoute)
 
     if routeStopIndex[routeId] == null then
@@ -232,12 +243,14 @@ val scanRouteAt = (results: ScanResults, routeScanner: RouteScanner, routeId: St
     match trip
       is Trip =>
         val ic = interchange[stopPi] ?? 0
-        val stopTime = trip["stopTimes"][pi]
         // The stop is always seeded in createScanResults, so bestArrival is never Null on the scan
         // path; `?? MAX` re-types it to Int64 for the comparison (bound to a `val` so `??` is not
         // mixed with `<`/`+`).
         val best = bestArrival(results, stopPi) ?? MAX
-        if stopTime["dropOff"] && stopTime["arrivalTime"] + ic < best then
+        // Read the two needed StopTime fields DIRECTLY (fused const-offset reads) rather than binding
+        // the whole record. `val stopTime = trip["stopTimes"][pi]` MATERIALIZES the StopTime (a
+        // `lin_sealed_alloc` + copies + RC) on every forward-scan step — the dominant hot-loop cost.
+        if trip["stopTimes"][pi]["dropOff"] && trip["stopTimes"][pi]["arrivalTime"] + ic < best then
           setTrip(results, trip, boardingPoint, pi, ic)
           scanRouteAt(
             results,
@@ -256,7 +269,7 @@ val scanRouteAt = (results: ScanResults, routeScanner: RouteScanner, routeId: St
           // trip's arrival. The null-check is its own `if` (a plain `if x != null then` narrows
           // `prevArrival` to Int64 in the body; an `&&`-folded guard does not).
           if prevArrival != null then
-            if prevArrival < stopTime["arrivalTime"] + ic then
+            if prevArrival < trip["stopTimes"][pi]["arrivalTime"] + ic then
               val newTrip = getTrip(routeScanner, routeId, pi, prevArrival)
               match newTrip
                 is Trip =>
