@@ -26,32 +26,36 @@ export val createRouteScanner = (tripsByRoute: { String: Trip[] }, date: Int32, 
 // The reference memo condition `!lastFound || lastFound === trip` is true exactly when (nothing
 // found yet) OR (runsOn matched THIS iteration — the only way lastFound === trip), so it is
 // computed from the `ran` boolean directly; no trip identity comparison.
-val scanBack = (routeTrips: Trip[], pos: { String: Int32 }, routeId: String, stopIndex: Int32, time: Int64, date: Int32, dateKey: String, dowKey: String, i: Int32, lastFound: Trip | Null): Trip | Null =>
+// `lastFound` is threaded as an INDEX into `routeTrips` (-1 = none) rather than as a materialized
+// `Trip | Null`. Reading a whole `Trip` out of the boxed `Trip[]` MATERIALIZES it (a
+// `lin_sealed_alloc` + field copies + RC) on every backward-scan step — the dominant hot-loop cost.
+// By keeping the position as a plain Int32 and reading only the needed fields DIRECTLY (fused
+// const-offset reads off `routeTrips[i]`), no intermediate Trip record is ever allocated in the
+// loop. getTrip materializes the chosen Trip exactly once at the end.
+val scanBack = (routeTrips: Trip[], pos: { String: Int32 }, routeId: String, stopIndex: Int32, time: Int64, date: Int32, dateKey: String, dowKey: String, i: Int32, lastFoundIdx: Int32): Int32 =>
   if i < 0 then
-    lastFound
+    lastFoundIdx
+  else if routeTrips[i]["stopTimes"][stopIndex]["departureTime"] < time then
+    // Fused field read — no whole-record bind, no materialization.
+    lastFoundIdx
   else
-    val trip: Trip = routeTrips[i]
-    val stopTime = trip["stopTimes"][stopIndex]
-    if stopTime["departureTime"] < time then
-      lastFound
-    else
-      val ran = runsOn(trip["service"], date, dateKey, dowKey)
-      val newLastFound = if ran then trip else lastFound
-      // update routeScanPosition under the documented condition
-      if ran || newLastFound == null then
-        pos[routeId] = i
-      scanBack(
-        routeTrips,
-        pos,
-        routeId,
-        stopIndex,
-        time,
-        date,
-        dateKey,
-        dowKey,
-        i - 1,
-        newLastFound
-      )
+    val ran = runsOn(routeTrips[i]["service"], date, dateKey, dowKey)
+    val newLastFoundIdx = if ran then i else lastFoundIdx
+    // update routeScanPosition under the documented condition
+    if ran || newLastFoundIdx < 0 then
+      pos[routeId] = i
+    scanBack(
+      routeTrips,
+      pos,
+      routeId,
+      stopIndex,
+      time,
+      date,
+      dateKey,
+      dowKey,
+      i - 1,
+      newLastFoundIdx
+    )
 
 export val getTrip = (scanner: RouteScanner, routeId: String, stopIndex: Int32, time: Int64): Trip | Null =>
   val pos = scanner["routeScanPosition"]
@@ -60,7 +64,7 @@ export val getTrip = (scanner: RouteScanner, routeId: String, stopIndex: Int32, 
   val routeTrips = scanner["tripsByRoute"][routeId] ?? []
   val start = pos[routeId] ?? (length(routeTrips) - 1)
   if pos[routeId] == null then pos[routeId] = start
-  scanBack(
+  val foundIdx = scanBack(
     routeTrips,
     pos,
     routeId,
@@ -70,5 +74,7 @@ export val getTrip = (scanner: RouteScanner, routeId: String, stopIndex: Int32, 
     scanner["dateKey"],
     scanner["dowKey"],
     start,
-    null
+    -1
   )
+  // Materialize the chosen Trip exactly once (the loop threaded an index, never a record).
+  if foundIdx < 0 then null else routeTrips[foundIdx]
