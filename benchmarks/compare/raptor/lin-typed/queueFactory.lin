@@ -18,19 +18,11 @@
 import { for } from "std/iter"
 import { get } from "std/object"
 
-// Narrow an `Int32 | Null` typed-map read to `Int32` (positive-arm idiom; ADR-055). Needed for the
-// NESTED double-index `routeStopIndex[routeId][stop]` (an inner `{ String: Int32 } | Null` map,
-// then a scalar read) — `?? 0` works too, but a `??` mixed with `<` needs parenthesising the
-// formatter strips, so the explicit coalescer keeps the comparison clean.
-val intOr = (x: Int32 | Null, d: Int32): Int32 =>
-  match x
-    is Int32 =>
-      x
-    else =>
-      d
-
+// The NESTED double-index `routeStopIndex[routeId][stop]` reads an inner `{ String: Int32 } | Null`
+// map then a scalar, so each side is `Int32 | Null`; `?? 0` coalesces the absent-stop case. The
+// parentheses bind the coalesce tighter than `<` (and the formatter preserves them).
 val isStopBefore = (routeStopIndex: { String: { String: Int32 } }, routeId: String, stopA: String, stopB: String): Boolean =>
-  intOr(routeStopIndex[routeId][stopA], 0) < intOr(routeStopIndex[routeId][stopB], 0)
+  (routeStopIndex[routeId][stopA] ?? 0) < (routeStopIndex[routeId][stopB] ?? 0)
 
 export val getQueue = (routesAtStop: { String: String[] }, routeStopIndex: { String: { String: Int32 } }, markedStops: String[]): Json =>
   var queue: Json = {}
