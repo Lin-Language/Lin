@@ -1181,6 +1181,58 @@ print(toString([1, 2, 3].every(x => x > 0)))
     assert_eq!(output, vec!["[2, 4, 6]", "[3, 4]", "10", "3", "true", "true"]);
 }
 
+// Regression (var-cell loop leak): a `var` declared INSIDE an inlined outer loop body (e.g.
+// `range(0,N).for(_ => var arr = []; ...)`) allocates a MakeCell in the loop-body block (non-
+// entry). The function-exit FreeCell only fires for entry-block cells (dominance), so the cell
+// leaked on every outer iteration — O(N) RSS growth. Fix: `inline_lambda_body_tracking_elem_boxes`
+// now emits FreeCell for cells created during the inline body before popping the body scope.
+// This test asserts: (a) values are correct (no double-free / UAF), and (b) the loop executes
+// without visible corruption regardless of REPS count.
+#[test]
+fn test_var_in_inline_loop_body_cell_freed_per_iteration() {
+    let output = run(r#"import { push } from "std/array"
+import { range, for } from "std/iter"
+import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+type P = { "x": Int32, "y": Int32 }
+// Each outer iteration allocates a fresh arr, fills it with 5 elements, then drops it.
+// If the cell isn't freed each iteration, RSS grows with REPS (the leak).
+// Assertion: last iteration's arr length = 5 (no corruption from over-release or UAF).
+var last_len = 0
+range(0, 10).for(_ =>
+  var arr: P[] = []
+  range(0, 5).for(i => push(arr, { "x": i, "y": i * 2 }))
+  last_len = length(arr)
+)
+print(toString(last_len))
+"#);
+    assert_eq!(output, vec!["5"]);
+}
+
+// Regression (var-cell loop leak, typed record array variant): same as above but uses a typed
+// array annotation and reads back a field to confirm no UAF corruption from the cell free.
+#[test]
+fn test_var_array_in_inline_loop_body_cell_freed_values_correct() {
+    let output = run(r#"import { push } from "std/array"
+import { range, for } from "std/iter"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Q = { "v": Int32 }
+var sum = 0
+range(0, 20).for(outer =>
+  var arr: Q[] = []
+  range(0, 100).for(i => push(arr, { "v": i }))
+  var s = 0
+  arr.for(q => s = s + q["v"])
+  sum = sum + s
+)
+// Each outer iter: sum(0..99) = 4950; 20 outer * 4950 = 99000.
+print(toString(sum))
+"#);
+    assert_eq!(output, vec!["99000"]);
+}
+
 // Regression (call-arg-box leak): passing a CONCRETE array to a Json-typed param (`for`'s
 // iterable) inside an outer loop boxes the array into a fresh TaggedVal* shell each outer
 // iteration. The shell was never freed → one-box-per-iteration leak. Caller now frees the
