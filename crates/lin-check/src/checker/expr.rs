@@ -8,11 +8,40 @@ use crate::resolve::resolve_type;
 use crate::typed_ir::*;
 use crate::types::Type;
 
+/// The "place" a flow-narrowing applies to: either a simple identifier (`x`) or an index read
+/// (`obj[key]`) where the object is a simple identifier and the key is a string-literal or a
+/// simple identifier. Index places are the `{String:T}`-map idiom `if m[k] != null then m[k]`.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum NarrowPlace {
+    Ident(String),
+    /// `obj[key]`; `key` is the canonical key — a string-literal value or an identifier name.
+    Index { obj: String, key: IndexKey },
+}
+
+/// The key half of a narrowable index place. Only stable, side-effect-free keys are admitted so
+/// that two reads of `obj[key]` are guaranteed to denote the same slot.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum IndexKey {
+    /// A string literal key (`m["foo"]`).
+    StrLit(String),
+    /// A simple identifier key (`m[k]`). Sound only while `k` is not reassigned in the branch.
+    Ident(String),
+}
+
+/// An active index-place narrowing recorded on `Checker::index_narrowings`. `infer_index`
+/// consults the stack: a read whose object/key match `place` is tightened to `ty`.
+#[derive(Clone)]
+pub(crate) struct IndexNarrow {
+    pub(crate) obj: String,
+    pub(crate) key: IndexKey,
+    pub(crate) ty: Type,
+}
+
 /// A flow-narrowing derived from an `if`/`else` condition that is a type/null test on a simple
-/// identifier. Carries the binding's narrowed static type for each branch (or `None` when that
-/// branch does not tighten the type). See `Checker::null_test_narrowing`.
+/// identifier OR an index place (`m[k]`). Carries the place's narrowed static type for each
+/// branch (or `None` when that branch does not tighten the type). See `Checker::null_test_narrowing`.
 pub(crate) struct NarrowTest {
-    name: String,
+    place: NarrowPlace,
     then_ty: Option<Type>,
     else_ty: Option<Type>,
 }
@@ -500,6 +529,17 @@ impl Checker {
     pub(crate) fn infer_index(&mut self, object: &Expr, key: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
         let typed_obj = self.infer_expr(object)?;
         let typed_key = self.infer_expr(key)?;
+        // Flow-narrowing for an index place (`m[k]`) under an active `if m[k] != null` test: read
+        // the tightened type instead of the default `T | Null`. Sound because the same stable
+        // `obj`/`key` denote the same slot; the narrowing only drops `Null`.
+        if let Some(narrowed) = self.lookup_index_narrowing(object, key) {
+            return Ok(TypedExpr::Index {
+                object: Box::new(typed_obj),
+                key: Box::new(typed_key),
+                result_type: narrowed,
+                span,
+            });
+        }
         let obj_ty = typed_obj.ty();
         let result_type = match &obj_ty {
             Type::Array(elem) => *elem.clone(),
@@ -778,22 +818,24 @@ impl Checker {
     /// — the existing `match`/`is` narrowing.
     pub(crate) fn null_test_narrowing(&self, condition: &Expr) -> Option<NarrowTest> {
         // `x == null` / `x != null` against the `null` literal (either operand order).
-        let (name, matched, then_gets_matched) = match condition {
+        let (place, matched, then_gets_matched) = match condition {
             Expr::BinaryOp { left, op, right, .. }
                 if matches!(op, lin_parse::ast::BinOp::Eq | lin_parse::ast::BinOp::NotEq) =>
             {
-                let ident = match (left.as_ref(), right.as_ref()) {
-                    (Expr::Ident(n, _), Expr::NullLit(_)) => Some(n),
-                    (Expr::NullLit(_), Expr::Ident(n, _)) => Some(n),
+                let place = match (left.as_ref(), right.as_ref()) {
+                    (operand, Expr::NullLit(_)) | (Expr::NullLit(_), operand) => {
+                        self.narrow_place_of(operand)
+                    }
                     _ => None,
                 }?;
                 // `== null`: Null (the matched type) holds in THEN. `!= null`: Null holds in ELSE.
                 let then_gets_matched = matches!(op, lin_parse::ast::BinOp::Eq);
-                (ident.clone(), Type::Null, then_gets_matched)
+                (place, Type::Null, then_gets_matched)
             }
             // `x is X`: `X` (the matched type) holds in THEN, the complement in ELSE. `X` may be
             // `Null`, a scalar (`Int32`), a named/structural type, or `Error` (the structural
-            // alias).
+            // alias). Only simple-identifier subjects are narrowed here (index places use the
+            // `== null`/`!= null` form above).
             Expr::Is { expr, pattern, .. } => {
                 let ident = match expr.as_ref() {
                     Expr::Ident(n, _) => n,
@@ -810,22 +852,70 @@ impl Checker {
                     }
                     _ => return None,
                 };
-                (ident.clone(), matched, true)
+                (NarrowPlace::Ident(ident.clone()), matched, true)
             }
             _ => return None,
         };
-        let info = self.env.lookup(&name)?;
+        // The place's current static type — for an ident it is the binding's type; for an index
+        // place it is the index read's result type (`T | Null` for a `{String:T}` map).
+        let place_ty = self.narrow_place_type(&place)?;
         // The complement (union minus the matched member) — also confirms `matched` is an exact
         // member of the union, the precondition for narrowing in either direction.
-        let complement = info.ty.without_variant(&matched)?;
-        // The matched branch narrows the binding to the matched member alone; the other branch to
+        let complement = place_ty.without_variant(&matched)?;
+        // The matched branch narrows the place to the matched member alone; the other branch to
         // the complement.
         let (then_ty, else_ty) = if then_gets_matched {
             (Some(matched), Some(complement))
         } else {
             (Some(complement), Some(matched))
         };
-        Some(NarrowTest { name, then_ty, else_ty })
+        Some(NarrowTest { place, then_ty, else_ty })
+    }
+
+    /// If `expr` is a narrowable place — a simple identifier, or an `obj[key]` index where `obj`
+    /// is a simple identifier and `key` is a string-literal or a simple identifier — return the
+    /// corresponding `NarrowPlace`. Otherwise `None` (the expression is not stably re-readable, so
+    /// narrowing it would be unsound).
+    fn narrow_place_of(&self, expr: &Expr) -> Option<NarrowPlace> {
+        match expr {
+            Expr::Ident(n, _) => Some(NarrowPlace::Ident(n.clone())),
+            Expr::Index { object, key, .. } => {
+                let obj = match object.as_ref() {
+                    Expr::Ident(n, _) => n.clone(),
+                    _ => return None,
+                };
+                let key = match key.as_ref() {
+                    Expr::StringLit(s, _) => IndexKey::StrLit(s.clone()),
+                    Expr::Ident(k, _) => IndexKey::Ident(k.clone()),
+                    _ => return None,
+                };
+                Some(NarrowPlace::Index { obj, key })
+            }
+            _ => None,
+        }
+    }
+
+    /// The current static type of a narrowable place. For an identifier this is the binding's
+    /// declared/narrowed type; for an `obj[key]` index it is the type a read of that index would
+    /// produce — modelled here for the `Type::Map` (`{String:T}` → `T | Null`) and `Type::Array`
+    /// (`T[]` → element type) cases. Other object shapes are not narrowed (return `None`), keeping
+    /// the change scoped to the map/array idiom that motivated it.
+    fn narrow_place_type(&self, place: &NarrowPlace) -> Option<Type> {
+        match place {
+            NarrowPlace::Ident(name) => Some(self.env.lookup(name)?.ty.clone()),
+            NarrowPlace::Index { obj, .. } => {
+                let obj_ty = &self.env.lookup(obj)?.ty;
+                match obj_ty {
+                    Type::Map(val_ty) => {
+                        Some(Type::flatten_union(vec![(**val_ty).clone(), Type::Null]))
+                    }
+                    // `T[]` indexed: element type (array reads are not `| Null`, so a null test on
+                    // one cannot narrow — `without_variant(Null)` will fail and bail out).
+                    Type::Array(elem) => Some((**elem).clone()),
+                    _ => None,
+                }
+            }
+        }
     }
 
     /// Apply a flow-narrowing (from `null_test_narrowing`) within the CURRENT scope, using the
@@ -837,12 +927,56 @@ impl Checker {
         if let Some(test) = narrowing {
             let narrowed_ty = if entering_then { &test.then_ty } else { &test.else_ty };
             if let Some(narrowed_ty) = narrowed_ty {
-                if let Some(info) = self.env.lookup(&test.name) {
-                    let slot = info.slot;
-                    self.env.define_narrowed(test.name.clone(), narrowed_ty.clone(), slot);
+                match &test.place {
+                    NarrowPlace::Ident(name) => {
+                        if let Some(info) = self.env.lookup(name) {
+                            let slot = info.slot;
+                            self.env.define_narrowed(name.clone(), narrowed_ty.clone(), slot);
+                        }
+                    }
+                    // Index places are narrowed via the `index_narrowings` stack, which
+                    // `infer_index` consults. The caller (`infer_if`) records the stack depth
+                    // before the branch and truncates back to it afterwards.
+                    NarrowPlace::Index { obj, key } => {
+                        self.index_narrowings.push(IndexNarrow {
+                            obj: obj.clone(),
+                            key: key.clone(),
+                            ty: narrowed_ty.clone(),
+                        });
+                    }
                 }
             }
         }
+    }
+
+    /// Invalidate any active index-narrowing whose object identifier is `name` (e.g. after an
+    /// `obj = …` reassignment or `obj[…] = …` write inside the branch — the value at `obj[key]`
+    /// may have changed, so the tightened type no longer holds). Called from assignment checking.
+    pub(crate) fn clear_index_narrowings_for(&mut self, name: &str) {
+        self.index_narrowings.retain(|n| n.obj != name);
+    }
+
+    /// Look up an active index-narrowing for `obj[key]`. `infer_index` calls this with the syntactic
+    /// object/key; a hit returns the tightened (`Null`-stripped) read type.
+    pub(crate) fn lookup_index_narrowing(&self, object: &Expr, key: &Expr) -> Option<Type> {
+        if self.index_narrowings.is_empty() {
+            return None;
+        }
+        let obj = match object {
+            Expr::Ident(n, _) => n,
+            _ => return None,
+        };
+        let key = match key {
+            Expr::StringLit(s, _) => IndexKey::StrLit(s.clone()),
+            Expr::Ident(k, _) => IndexKey::Ident(k.clone()),
+            _ => return None,
+        };
+        // Last match wins (innermost/most-recent narrowing).
+        self.index_narrowings
+            .iter()
+            .rev()
+            .find(|n| n.obj == *obj && n.key == key)
+            .map(|n| n.ty.clone())
     }
 
     pub(crate) fn infer_if(&mut self, condition: &Expr, then_branch: &Expr, else_branch: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
@@ -861,11 +995,16 @@ impl Checker {
         // narrowing is scoped: pushed before the relevant branch and popped after, so it never
         // leaks past the `if`.
         let narrowing = self.null_test_narrowing(condition);
+        // Depth of the index-narrowing stack before this `if`; index-place narrowings pushed for
+        // a branch are truncated back to here after the branch is checked (the ident-place
+        // narrowings are scoped by push_scope/pop_scope instead).
+        let index_narrow_base = self.index_narrowings.len();
         let typed_then = {
             self.env.push_scope();
             self.apply_null_narrowing(&narrowing, true);
             let r = self.infer_expr(then_branch);
             self.env.pop_scope();
+            self.index_narrowings.truncate(index_narrow_base);
             r?
         };
         let consumed_then = self.consumed_streams.clone();
@@ -876,6 +1015,7 @@ impl Checker {
             self.apply_null_narrowing(&narrowing, false);
             let r = self.infer_expr(else_branch);
             self.env.pop_scope();
+            self.index_narrowings.truncate(index_narrow_base);
             r?
         };
         // Merge: union of both branches' consumed sets.
@@ -1629,12 +1769,23 @@ impl Checker {
         let typed_value = self.check_expr(value, &expected_ty)?;
         self.span_type_map.push((span, expected_ty.to_string(), def_span));
         self.env.clear_narrowing(target);
+        // Reassigning `target` invalidates any active index-narrowing that uses it as the indexed
+        // object (`target[..]`) or as the key (`m[target]`) — both denote a possibly-different
+        // value now.
+        self.index_narrowings.retain(|n| {
+            n.obj != target && n.key != IndexKey::Ident(target.to_string())
+        });
         Ok(TypedExpr::LocalSet { slot, value: Box::new(typed_value), ty: expected_ty, span })
     }
 
     pub(crate) fn infer_index_assign(&mut self, object: &Expr, key: &Expr, value: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
         let typed_obj = self.infer_expr(object)?;
         let typed_key = self.infer_expr(key)?;
+        // A write `obj[..] = ..` invalidates any active index-narrowing on `obj` — the value at
+        // `obj[key]` may have changed (e.g. `if m[k] == null then m[k] = []` followed by a read).
+        if let Expr::Ident(obj_name, _) = object {
+            self.clear_index_narrowings_for(obj_name);
+        }
         let obj_ty = typed_obj.ty();
         let typed_value = match &obj_ty {
             Type::Object { fields, .. } => {
