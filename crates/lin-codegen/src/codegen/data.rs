@@ -396,9 +396,16 @@ impl<'ctx> Codegen<'ctx> {
                 let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
                 return self.compile_ir_unbox_keep_packed(tagged, /*arr=*/true);
             }
-            if Self::sealed_fields(result_ty).is_some() {
+            // Bare sealed-record result (a NARROWED `m[k]` read — index-place narrowing can give the
+            // Index a bare `T` result type): the slot holds a MATERIALIZED boxed `LinObject` (see
+            // `emit_map_set` — bare records are never keep-packed in map slots, a sealed struct is
+            // not a `LinObject` and cannot be tag-dispatched). PROJECT the boxed object into a fresh
+            // +1 sealed struct — the same ownership the old unbox-keep-packed read produced, so the
+            // projection's scheduled Release balances identically.
+            if let Some(fields) = Self::sealed_fields(result_ty) {
+                let fields = fields.clone();
                 let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
-                return self.compile_ir_unbox_keep_packed(tagged, /*arr=*/false);
+                return self.sealed_project_from(tagged, &Type::TypeVar(u32::MAX), &fields);
             }
             // GENERAL read. `container` is a RAW pointer (the `{ String: T }` ABI passes the unboxed
             // container, not a boxed TaggedVal), so its tag is NOT readable here — we rely on the
@@ -643,10 +650,20 @@ impl<'ctx> Codegen<'ctx> {
         }
         if value.is_pointer_value() {
             let packed_arr = val_repr.packed_sealed_array_layout().is_some();
-            let packed_rec = val_repr.packed_struct_fields().is_some();
-            if packed_arr || packed_rec {
-                // keep-packed store: wrap the still-packed pointer (O(1) — `lin_box_array`/`box_object`
-                // store the pointer verbatim, NO inner retain, NO `sealed_array_to_tagged` copy).
+            // ARRAYS ONLY. A packed sealed ARRAY is a real `LinArray` (elem_tag 0xFE) — every
+            // dynamic consumer tag-dispatches on it, so wrapping the still-packed pointer is sound.
+            // A bare packed sealed RECORD is NOT a `LinObject`: wrapping it in TAG_OBJECT type-
+            // confuses every boxed read-back (`m[k]` is `T | Null`, a union — the general read path
+            // hands the payload to `lin_object_get`, which reads sealed bytes as a LinObject header:
+            // the index-cap underflow crash / silent corruption). Bare records fall through to the
+            // GENERAL path below: `box_value` MATERIALIZES the sealed struct to a fresh boxed
+            // `LinObject` (`sealed_materialize_to_object`), the slot owns the fresh box, and the
+            // source struct stays owned by its scope — the IndexSet lowering's
+            // `set_sealed_elem_into_tagged` carve-out already skips `transfer_into_container` for
+            // exactly this materialize contract (same as the sealed-elem-into-tagged-array store).
+            if packed_arr {
+                // keep-packed store: wrap the still-packed pointer (O(1) — `lin_box_array`
+                // stores the pointer verbatim, NO inner retain, NO `sealed_array_to_tagged` copy).
                 // OWNERSHIP: the slot's single owning reference is supplied by the IR
                 // `transfer_into_container` retain emitted in `IndexSet` lowering (identical to the
                 // materialize path's contract). `lin_map_set` ALSO retains the inner into the slot, so
@@ -655,7 +672,7 @@ impl<'ctx> Codegen<'ctx> {
                 // ZERO (retain then release), leaving exactly the IR transfer's +1 as the slot's
                 // reference — so the map drop's per-slot release frees it exactly once (ASan
                 // detect_leaks verified). Mirrors `emit_object_set`'s fresh-box contract.
-                let boxed = self.compile_ir_box_keep_packed(value, /*arr=*/packed_arr);
+                let boxed = self.compile_ir_box_keep_packed(value, /*arr=*/true);
                 self.builder.call(self.rt.map_set,
                     &[map_ptr.into(), key_ptr.into(), boxed.into()], "");
                 if boxed.is_pointer_value() {
