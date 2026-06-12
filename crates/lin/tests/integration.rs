@@ -18964,3 +18964,77 @@ main()
 "#);
     assert_eq!(out, vec!["last=993"]);
 }
+
+// ---------------------------------------------------------------------------
+// Regression: generic inner-function LLVM symbol collision.
+// When a generic function's body contains a NAMED inner function (`val inner = () => …`), every
+// specialisation previously emitted the same LLVM symbol for `inner`. Codegen's
+// `get_function`/`add_function` name-dedup silently kept the first body for ALL
+// specialisations — so e.g. `pick$Int32` and `pick$String` both ran the first-minted closure
+// body, causing a misaligned-pointer deref (Int32 tag `0x7` dereferenced as a pointer).
+// Fix: `rename_inner_fns` in the worklist drain appends the spec's `$…` suffix to every inner
+// named function so each spec has distinct LLVM symbols.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_generic_inner_named_fn_collision_basic() {
+    // Repro from the original bug report: three specialisations of `pick` — two Int32 and one
+    // String — each must run ITS OWN `inner` closure and return the correct first argument.
+    let out = run(r#"import { print } from "std/io"
+val pick = <T>(x: T, y: T): T =>
+  val inner = () => x
+  inner()
+val main = () =>
+  print("int=${pick(7, 8)}")
+  print("str=${pick("a", "b")}")
+  print("int2=${pick(42, 43)}")
+main()
+"#);
+    assert_eq!(out, vec!["int=7", "str=a", "int2=42"]);
+}
+
+#[test]
+fn test_generic_inner_named_fn_captures_and_mutates() {
+    // Variant: inner closure captures the generic param AND a `var` counter. Each specialisation
+    // must capture its own `x` value (not bleed across specialisations).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val accumulate = <T>(x: T): (() => T) =>
+  var seen = 0
+  val capture = () =>
+    seen = seen + 1
+    x
+  capture
+val main = () =>
+  val getInt = accumulate(99)
+  val getStr = accumulate("hello")
+  print(toString(getInt()))
+  print(getStr())
+  print(toString(getInt()))
+main()
+"#);
+    assert_eq!(out, vec!["99", "hello", "99"]);
+}
+
+#[test]
+fn test_generic_inner_named_fn_callback_devirt_axis() {
+    // CallbackDevirt-axis variant: a user HOF with an inner named function is called with two
+    // distinct named no-capture predicates, minting two devirt specs. Each spec's `inner` must
+    // get a distinct LLVM symbol (the same collision would occur on the devirt spec as on the
+    // generic spec if rename_inner_fns were not applied in the shared worklist drain).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/iter"
+val applyCount = <T>(xs: T[], pred: (T) => Boolean): Int32 =>
+  val inner = (x: T) => pred(x)
+  var count = 0
+  xs.for(x => if inner(x) then count = count + 1)
+  count
+val isEven = (x: Int32) => x % 2 == 0
+val isBig  = (x: Int32) => x > 5
+val xs = [1, 2, 3, 4, 6, 8]
+print(toString(applyCount(xs, isEven)))
+print(toString(applyCount(xs, isBig)))
+"#);
+    assert_eq!(out, vec!["4", "2"]);
+}

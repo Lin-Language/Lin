@@ -751,8 +751,15 @@ fn monomorphize_inner(
         let mut func = state.generics[&generic_slot].func.clone();
         let span = func.span();
         subst_expr(&mut func, &subs);
-        if let TypedExpr::Function { name, .. } = &mut func {
+        if let TypedExpr::Function { name, body, .. } = &mut func {
             *name = Some(spec_name.clone());
+            // Rename inner named closures (e.g. `val inner = () => …` inside the generic body) so
+            // each specialization gets distinct LLVM symbols. Without this, `pick$Int32` and
+            // `pick$String` would both register `@inner`; codegen's get_function/add_function
+            // dedup would keep whichever body landed first, causing the other specialization to
+            // run the wrong closure body (misaligned-pointer deref / type mismatch).
+            let inner_suffix = spec_name.trim_start_matches(|c: char| c != '$');
+            rename_inner_fns(body, inner_suffix);
         }
         // For a CROSS-MODULE generic, the cloned body's free references (sibling calls,
         // intrinsics, the origin module's own imports/vals) and its local slots are numbered in
@@ -1163,6 +1170,29 @@ fn rehome_imported_body(func: &mut TypedExpr, origin_path: &str, state: &mut Mon
     // 3. Resolve (or mint) the importer slot for a free origin slot, registering the matching
     //    importer-side binding the first time it is seen.
     rehome_walk(func, &origin, origin_path, &locals, &mut remap, state);
+}
+
+/// Rename every inner named function (a nested `Function` node with `name: Some(x)`) in the given
+/// expression tree by appending `suffix`. The OUTER function (the spec itself) is already renamed by
+/// the caller; this only touches nested lambdas/closures that carry a name (e.g. `val get = () => …`
+/// inside the spec body). Without this, the spec's inner closure and the original function's inner
+/// closure share the same LLVM symbol, and codegen's `get_function`/`add_function` deduplication
+/// reuses the first body for both — causing a garbage read or type mismatch when the other
+/// specialization is called.
+fn rename_inner_fns(expr: &mut TypedExpr, suffix: &str) {
+    // `for_each_child_mut` descends into Block stmts via `for_each_child_stmt_mut` (which calls
+    // `f(value)` for Val/Var bindings), so every nested Function literal — including those bound by
+    // inner `val`/`var` statements — is reached exactly once without an explicit Block loop.
+    for_each_child_mut(expr, &mut |c| {
+        if let TypedExpr::Function { name, body, .. } = c {
+            if let Some(n) = name {
+                *n = format!("{}{}", n, suffix);
+            }
+            rename_inner_fns(body, suffix);
+        } else {
+            rename_inner_fns(c, suffix);
+        }
+    });
 }
 
 /// WAVE C callback devirt: rewrite the cloned spec body so the callback parameter is replaced by a
