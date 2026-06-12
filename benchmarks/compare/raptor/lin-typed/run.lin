@@ -10,7 +10,7 @@ import { parseDate } from "./dateUtil"
 import { createRaptor } from "./raptor"
 import { planDepartAfter } from "./query"
 import { loadGTFS } from "./gtfsLoader"
-import { Transfer } from "./types"
+import { Transfer, Journey } from "./types"
 
 val DATA_DIR = "/home/linus/Work/linusnorton/lin-lang/benchmarks/compare/raptor/data/"
 val ORIGIN = "TBW"
@@ -30,8 +30,8 @@ val fmt = (s: Int32): String =>
   "${pad2(hh)}:${pad2(mm)}:${pad2(ss)}"
 
 // Sort by departureTime asc, then arrivalTime asc.
-val sortJourneys = (journeys: Json): Json =>
-  sort(journeys, (a, b) =>
+val sortJourneys = (journeys: Journey[]): Journey[] =>
+  sort(journeys, (a: Journey, b: Journey) =>
     if a["departureTime"] != b["departureTime"] then
       a["departureTime"] - b["departureTime"]
     else

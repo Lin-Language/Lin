@@ -7,28 +7,29 @@
 // The sort MUST be stable (contract #4) — std/array.sort is stable (merge sort).
 import { for } from "std/iter"
 import { length, push, sort } from "std/array"
+import { Journey } from "./types"
 
 // earliestArrival(a, b): b arrives before or at the same time as a.
-val earliestArrival = (a: Json, b: Json): Boolean =>
+val earliestArrival = (a: Journey, b: Journey): Boolean =>
   b["arrivalTime"] <= a["arrivalTime"]
 
 // leastChanges(a, b): b has the same or fewer changes than a.
-val leastChanges = (a: Json, b: Json): Boolean =>
+val leastChanges = (a: Journey, b: Journey): Boolean =>
   length(b["legs"]) <= length(a["legs"])
 
-val dominates = (a: Json, b: Json): Boolean =>
+val dominates = (a: Journey, b: Journey): Boolean =>
   earliestArrival(a, b) && leastChanges(a, b)
 
-val cmp = (a: Json, b: Json): Int32 =>
+val cmp = (a: Journey, b: Journey): Int32 =>
   if a["departureTime"] != b["departureTime"] then
     a["departureTime"] - b["departureTime"]
   else
     b["arrivalTime"] - a["arrivalTime"]
 
-export val apply = (journeys: Json): Json =>
+export val apply = (journeys: Journey[]): Journey[] =>
   val sorted = sort(journeys, cmp)
   val n = length(sorted)
-  var result: Json = []
+  var result: Journey[] = []
   var i = 0
   sorted.for(a =>
     // keep `a` unless some later journey (index > i) dominates it

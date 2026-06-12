@@ -3,122 +3,72 @@
 // These mirror the reference TypeScript types (planarnetwork/raptor:
 // src/gtfs/GTFS.ts, src/gtfs/Service.ts, src/results/Journey.ts). Lin type
 // aliases live in one module and are imported where needed (§22.3 ADR-035).
-//
-// FIXED-SHAPE records are typed here. The createRaptor index dictionaries are now
-// TYPED `{ String: T }` index-signature maps via the `RaptorIndex` type below
-// (ADR-082 / spec §5.1.1) — routeStopIndex/routePath/routesAtStop/tripsByRoute became
-// hashed O(1) containers (the PREP-phase perf lever, see NOTES.md). The scan-state maps
-// (kArrivals, bestArrivals) AND kConnections — the LAST `Json` dictionary, now typed
-// `{ String: { String: Conn } }` (the projection-aliasing UAF that blocked it is fixed on
-// master) — are typed via the `ScanResults` record. The createRaptor INPUT maps
-// (transfers/interchange), getQueue's return, and the loader's intermediate maps stay
-// `Json` — their consumers need structural-equality / `toString` the hashed map rep lacks,
-// or there is no `Json -> { String: T }` coercion at the loader boundary. See NOTES.md
-// "what's typed, what stays Json, and why" for the precise list.
-//
-// USAGE STATUS (see NOTES.md "Typed records" section for the full map):
-//   ACTIVELY THREADED through code: Date (dateUtil/query/raptor), Service
-//   (service/routeScanner/raptor), StopTime + Transfer (gtfsLoader constructors),
-//   RaptorIndex (raptor/query/queueFactory/routeScanner/bench), Conn (the kConnections
-//   value, via ScanResults — scanResults/raptor/query/journeyFactory/graphResults/
-//   stringResults). Trip is referenced as the typed field of Service-carrying records but
-//   trips themselves stay `Json` (built from `Json`-map sources). The kConnections CONNECTION
-//   values now narrow via `match … is Transfer`; the Leg/TimetableLeg/Journey leg OBJECTS that
-//   journeyFactory BUILDS are still `Json` literals consumed via field-tests, so those types
-//   stay REFERENCE-ONLY for now (the intended shape of the built legs).
-//
-// A calendar date (UTC), modelling the reference's JS Date. month is 1-12,
-// day is 1-31. Fully concrete -> sealed-record unboxed-struct candidate.
+
+// A calendar date (UTC), modelling the reference's JS Date. month is 1-12, day is 1-31.
 export type Date = { "year": Int32, "month": Int32, "day": Int32 }
 
-// GTFS stop time. Fully concrete -> sealed-record unboxed-struct candidate.
+// GTFS stop time.
 export type StopTime = { "stop": String, "arrivalTime": Int32, "departureTime": Int32, "pickUp": Boolean, "dropOff": Boolean }
 
-// GTFS calendar service ("runsOn") record. startDate/endDate are YYYYMMDD
-// integers. `days` ({ "<dow>": Bool }) and `dates` ({ "<date>": Bool }) are
-// dynamic-key index maps, now typed `{ String: Boolean }` (ADR-055 / spec §5.1.1) and
-// built typed at the loader source (gtfsLoader's calendar passes).
+// GTFS calendar service ("runsOn"). startDate/endDate are YYYYMMDD integers. `days`
+// (dow -> runs) and `dates` (date -> include/exclude) are dynamic-key index maps.
 export type Service = { "startDate": Int32, "endDate": Int32, "days": { String: Boolean }, "dates": { String: Boolean } }
 
 // GTFS trip. stopTimes is a typed StopTime[]; service is the typed Service.
 export type Trip = { "tripId": String, "serviceId": String, "stopTimes": StopTime[], "service": Service }
 
 // A footpath / interchange transfer. endTime can be the MAX sentinel
-// (9007199254740991), so it is Int64 (the existing representation).
+// (9007199254740991), so it is Int64.
 export type Transfer = { "origin": String, "destination": String, "duration": Int32, "startTime": Int32, "endTime": Int64 }
 
 // A timetable leg (a ride on a trip between two stops on its path).
 export type TimetableLeg = { "stopTimes": StopTime[], "origin": String, "destination": String, "trip": Trip }
 
-// AnyLeg: a journey leg is either a Transfer or a TimetableLeg. Discriminated
-// structurally — a Transfer has "origin", a TimetableLeg has "stopTimes".
+// A journey leg is either a Transfer (footpath) or a TimetableLeg (a ride). Discriminated
+// structurally — a Transfer has "origin"/"destination" scalars, a TimetableLeg has "stopTimes".
 export type Leg = Transfer | TimetableLeg
 
-// A planned journey. legs is a typed Leg[]; departure/arrival are
-// seconds-from-midnight (may exceed 24h, but fit Int32 for these feeds).
+// A planned journey. departure/arrival are seconds-from-midnight (may exceed 24h).
 export type Journey = { "legs": Leg[], "departureTime": Int32, "arrivalTime": Int32 }
 
-// A scan connection: a timetable boarding `[Trip, startIndex, endIndex]` or a footpath `Transfer`.
-// The trip element of the boarding tuple is the typed `Trip` — it is stored by `setTrip` into a
-// `Conn` tuple inside a union-valued map (`kConnections : { String: { String: Conn } }`) and read
-// back `connection[0]["stopTimes"]…` by the journey/graph/string result walks. (HISTORICAL: this
-// element used to be `Json`. `Trip` is a boxed `Object[]`-of-records here — its `String`/`StopTime[]`
-// fields keep it off the packed-scalar gate — so the seam was NOT the packed-record-in-union repr
-// oracle but the same `sealed_construct` borrowing-coerce UAF the loader hit: the union-member store
-// borrowed without retaining. With that codegen fix in place the typed `Trip` round-trips through the
-// tuple and the union map correctly, so the LAST `Json` trip slot is now typed.)
+// A scan connection: a timetable boarding `[Trip, startIndex, endIndex]` or a footpath
+// `Transfer`. start/end are stop offsets into a route path (Int32 — routes can be long).
+// The boarding tuple's first element is the typed `Trip`; the journey/graph/string result walks
+// read it back as `connection[0]["stopTimes"]…`.
 export type Conn = [Trip, Int32, Int32] | Transfer
 
-// The per-scan ScanResults state (mirrors ScanResults). The arrival-time dictionaries it
-// threads are now typed `{ String: T }` index-signature maps (ADR-055 / spec §5.1.1) — a
-// hashed O(1) container in place of the O(n) association-list `Json` object — the scan/query
-// (GROUP/RANGE) perf lever:
-//   - bestArrivals  : StopID -> arrival time        { String: Int64 }
-//   - kArrivals      : roundStr -> (StopID -> time)  { String: { String: Int64 } }
-//   - kConnections   : StopID -> (roundStr -> Conn)  { String: { String: Conn } }
-// Arrival times use Int64 (the MAX sentinel 9007199254740991 needs it; §27 numeric).
+// The per-scan ScanResults state (mirrors ScanResults). Arrival times use Int64 (the MAX
+// sentinel 9007199254740991 needs it). The round dimension stays a MAP keyed by the round
+// string ("1", "2", …) — NOT an array indexed by round number — because per-stop rounds are
+// SPARSE: a stop is improved on only a few of the rounds, so an array would pad every stop out
+// to the max round depth (≈2.3× the resident heap on the full feed). The map only stores the
+// rounds a stop actually has, which is the algorithmically-right structure here.
+//
+//   - bestArrivals : StopID -> best arrival                     { String: Int64 }
+//   - kArrivals    : roundStr -> (StopID -> arrival)            { String: { String: Int64 } }
+//   - kConnections : StopID -> (roundStr -> Conn)               { String: { String: Conn } }
 //
 // Round-key fields (mirror node's `this.kArrivals[this.k - 1]` direct references):
 //   - curKey    : "${k}" computed ONCE per round (addRound), not per setTrip/setTransfer.
-//   - curRound  : alias of kArrivals[curKey] — maps are reference types, so writing
-//                 through curRound is visible through kArrivals too.
-//   - prevRound : alias of the previous round's arrivals map (what previousArrival —
-//                 the hottest read in the scan — consults, with NO per-access "${k - 1}"
-//                 interpolation + double map lookup).
-//
-// kConnections is the LAST `Json` dictionary to be typed. It was kept `Json` because a typed
-// nested union-valued map triggered a use-after-free in the multi-day stitching
-// (`completeJourneys`/`prevConnections`) and the transfer-pattern walks
-// (graphResults/stringResults): a `match`-narrowed connection read off the map, `push`-ed into a
-// shared array, then consumed by a recursive slicing walk. That projection-aliasing UAF is now
-// FIXED on master (`val x = obj[k]` materializes a stable owned box), so kConnections is typed
-// `{ String: { String: Conn } }`. This is a FIDELITY improvement (the query-phase maps were
-// measured perf-neutral — see NOTES.md); behaviour is byte-identical.
+//   - curRound  : alias of kArrivals[curKey] — maps are reference types, so writing through
+//                 curRound is visible through kArrivals too.
+//   - prevRound : alias of the previous round's arrivals map (what previousArrival — the hottest
+//                 read in the scan — consults, with NO per-access "${k - 1}" interpolation).
 export type ScanResults = { "k": Int32, "curKey": String, "prevRound": { String: Int64 }, "curRound": { String: Int64 }, "bestArrivals": { String: Int64 }, "kArrivals": { String: { String: Int64 } }, "kConnections": { String: { String: Conn } } }
 
-// The createRaptor index struct (mirrors RaptorAlgorithm's constructor fields).
-// The dynamic-key dictionaries that createRaptor BUILDS from scratch are now typed
-// `{ String: T }` index-signature maps (ADR-055 / spec §5.1.1) — a hashed O(1)
-// container, vs the O(n) association-list `Json` object the port used before this type
-// existed. This is the headline PERFORMANCE lever for the index build (PREP phase),
-// where the routeId-keyed indexes (~16k distinct keys) were the O(16k)-scan-per-trip hot
-// path over 240k trips:
-//   - routeStopIndex : RouteID -> (StopID -> position)   nested typed map (Int32)
-//   - routePath      : RouteID -> StopID[]               String[] value
-//   - routesAtStop   : StopID  -> RouteID[]              String[] value
-//   - tripsByRoute   : RouteID -> Trip[]   (the typed `Trip[]` packed-record array; trips
-//                       are built typed at the loader source and threaded end-to-end)
-//   - stops          : StopID[]  (keys(transfers))
-//
-// `transfers` and `interchange` ORIGINATE from the loader as `Json` maps (there is no
-// implicit `Json -> { String: T }` coercion, spec §5.1.1) and are SMALL per-origin maps
-// (<= ~3079 keys) — they stay `Json` to avoid a conversion pass with no perf payoff.
-export type RaptorIndex = { "routeStopIndex": { String: { String: Int32 } }, "routePath": { String: String[] }, "transfers": Json, "interchange": Json, "stops": String[], "routesAtStop": { String: String[] }, "tripsByRoute": { String: Trip[] } }
+// The createRaptor index struct (mirrors RaptorAlgorithm's constructor fields). The dynamic-key
+// dictionaries createRaptor builds are typed `{ String: T }` index-signature maps (ADR-055 /
+// spec §5.1.1) — hashed O(1) containers (the PREP-phase perf lever; the routeId-keyed indexes
+// hold ~16k distinct keys):
+//   - routeStopIndex : RouteID -> (StopID -> position)
+//   - routePath      : RouteID -> StopID[]
+//   - routesAtStop   : StopID  -> RouteID[]
+//   - tripsByRoute   : RouteID -> Trip[]
+//   - stops          : StopID[]
+//   - transfers      : StopID  -> Transfer[]
+//   - interchange    : StopID  -> seconds
+export type RaptorIndex = { "routeStopIndex": { String: { String: Int32 } }, "routePath": { String: String[] }, "transfers": { String: Transfer[] }, "interchange": { String: Int32 }, "stops": String[], "routesAtStop": { String: String[] }, "tripsByRoute": { String: Trip[] } }
 
-// The RouteScanner state. `routeScanPosition` is a variable-key `routeId -> last-scanned-index`
-// memo dictionary, mutated across calls within one scan; it is typed `{ String: Int32 }` (ADR-082 /
-// spec §5.1.1) so the per-(route, round) `pos[routeId]` reads + write route to the hashed O(1)
-// `lin_map_get`/`lin_map_set` instead of the O(n) `Json` association-list scan (a remaining
-// query-phase `DICT_ON_JSON` site — see NOTES.md). The trip lists (`tripsByRoute`) carry the typed
-// `Trip[]` values (as in RaptorIndex). `dateKey`/`dowKey` are interpolated once per scan.
+// The RouteScanner state. `routeScanPosition` is a `routeId -> last-scanned-index` memo,
+// mutated across calls within one scan. `dateKey`/`dowKey` are interpolated once per scan.
 export type RouteScanner = { "tripsByRoute": { String: Trip[] }, "date": Int32, "dateKey": String, "dowKey": String, "routeScanPosition": { String: Int32 } }

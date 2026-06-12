@@ -3,30 +3,30 @@
 // State record (the typed `ScanResults` in types.lin):
 //   { "k": Int32, "bestArrivals": { String: Int64 }, "kArrivals": { String: { String: Int64 } },
 //     "kConnections": { String: { String: Conn } } }
-// A connection (Conn) is either a Transfer (object with "origin") or a [trip, startIndex, endIndex]
-// tuple (the trip element stays Json — composite Json does not flow into the named Trip record).
+// A connection (Conn) is either a Transfer (footpath, with "origin") or a [trip, startIndex,
+// endIndex] tuple whose head is the typed Trip.
 //
 // All three dictionaries are typed `{ String: T }` index-signature maps (ADR-082 / spec §5.1.1) —
-// hashed O(1) containers. `kConnections` was the LAST `Json` dictionary; it is now typed
-// `{ String: { String: Conn } }` (the projection-aliasing UAF that blocked it is fixed on master,
-// see types.lin / NOTES.md). Round keys are stored as strings ("${k}") because Lin map keys are
-// strings — but the key is computed ONCE per round (addRound), not per access: the record
-// carries `curKey` plus direct `curRound`/`prevRound` references to the current/previous
-// arrival maps (maps are reference types, so the aliases mirror node's
-// `this.kArrivals[this.k - 1]` indexing without the per-access "${k}" interpolation).
-// `k` starts at 0; addRound increments and seeds an empty arrivals map.
+// hashed O(1) containers. The per-stop round dimension stays a MAP keyed by the round string
+// ("1", "2", …) because per-stop rounds are SPARSE (a stop is improved on only a few of the rounds)
+// — an array indexed by round number would pad every stop out to the max round depth and blow up
+// memory. Round keys are stored as strings ("${k}") because Lin map keys are strings — but the key
+// is computed ONCE per round (addRound), not per access: the record carries `curKey` plus direct
+// `curRound`/`prevRound` references to the current/previous arrival maps (maps are reference types,
+// so the aliases mirror node's `this.kArrivals[this.k - 1]` indexing without the per-access "${k}"
+// interpolation). `k` starts at 0; addRound increments and seeds an empty arrivals map.
 import { for } from "std/iter"
 import { keys } from "std/object"
-import { ScanResults, Conn, Trip } from "./types"
+import { ScanResults, Conn, Trip, Transfer } from "./types"
 
 val MAX = 9007199254740991i64
 
-export val createScanResults = (stops: Json, origins: Json): ScanResults =>
+export val createScanResults = (stops: String[], origins: { String: Int64 }): ScanResults =>
   var bestArrivals: { String: Int64 } = {}
   var kArrival0: { String: Int64 } = {}
   var kConnections: { String: { String: Conn } } = {}
   stops.for(stop =>
-    val t = if origins[stop] != null then origins[stop] else MAX
+    val t = origins[stop] ?? MAX
     bestArrivals[stop] = t
     kArrival0[stop] = t
     kConnections[stop] = {}
@@ -58,13 +58,10 @@ export val addRound = (results: ScanResults): Null =>
   // any consumer that walks rounds by key.
   results["kArrivals"][key] = round
 
-// previousArrival/bestArrival read a typed `{ String: Int64 }` slot (so `m[k]` is `Int64 | Null`),
-// but they widen the result to `Json` so the arithmetic/comparison consumers in raptor.lin keep
-// their existing `!= null` guards + Json numeric ops unchanged (faithful skip-on-missing
-// semantics; see scanTransfers). The O(1) hashed read already happened on the typed-map access.
-// previousArrival is the HOTTEST read in the scan: it reads the prevRound alias directly —
-// no "${k - 1}" interpolation, no rounds-map lookup.
-export val previousArrival = (results: ScanResults, stop: String): Json =>
+// previousArrival — the HOTTEST read in the scan — reads the prevRound alias directly (no "${k - 1}"
+// interpolation, no rounds-map lookup). The slot is `Int64 | Null` (a missing stop reads back Null),
+// which the scan loop's `?? MAX` / `!= null` guards handle as the faithful skip-on-missing.
+export val previousArrival = (results: ScanResults, stop: String): Int64 | Null =>
   results["prevRound"][stop]
 
 export val setTrip = (results: ScanResults, trip: Trip, startIndex: Int32, endIndex: Int32, interchange: Int32): Null =>
@@ -74,22 +71,19 @@ export val setTrip = (results: ScanResults, trip: Trip, startIndex: Int32, endIn
   results["bestArrivals"][stop] = time
   results["kConnections"][stop][results["curKey"]] = [trip, startIndex, endIndex]
 
-export val setTransfer = (results: ScanResults, transfer: Json, time: Json): Null =>
+export val setTransfer = (results: ScanResults, transfer: Transfer, time: Int64): Null =>
   val stop = transfer["destination"]
   results["curRound"][stop] = time
   results["bestArrivals"][stop] = time
   results["kConnections"][stop][results["curKey"]] = transfer
 
-export val bestArrival = (results: ScanResults, stop: String): Json =>
+export val bestArrival = (results: ScanResults, stop: String): Int64 | Null =>
   results["bestArrivals"][stop]
 
-export val getMarkedStops = (results: ScanResults): Json =>
+export val getMarkedStops = (results: ScanResults): String[] =>
   results["curRound"].keys()
 
 // finalize returns the typed ScanResults record itself (callers read its typed
-// kConnections/bestArrivals fields — see raptor.scan / query). It previously returned a
-// `[kConnections, bestArrivals]` `Json` array, but a heterogeneous typed-map array literal is
-// not inferred as a tuple, and a named tuple-type alias is not indexable, so the record is the
-// clean typed carrier.
+// kConnections/bestArrivals fields — see raptor.scan / query).
 export val finalize = (results: ScanResults): ScanResults =>
   results

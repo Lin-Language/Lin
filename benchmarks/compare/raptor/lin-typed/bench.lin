@@ -18,7 +18,7 @@ import { createRaptor } from "./raptor"
 import { planGroup } from "./query"
 import { apply } from "./filter"
 import { loadGTFS } from "./gtfsLoader"
-import { RaptorIndex } from "./types"
+import { RaptorIndex, Journey } from "./types"
 
 val DATA_DIR = "/home/linus/Work/linusnorton/lin-lang/benchmarks/compare/raptor/data/"
 val DATE = "2025-09-02"
@@ -175,20 +175,20 @@ val RANGE_QUERIES = [
 
 // Order-independent digest contribution of one journey. Mixed Int32 * Int64-literal
 // arithmetic widens the Int32 operand to Int64 before multiplying (so no overflow).
-val journeyDigest = (j: Json): Int64 =>
+val journeyDigest = (j: Journey): Int64 =>
   val dep: Int32 = j["departureTime"] % 1000000000
   val arr: Int32 = j["arrivalTime"] % 1000000000
   val legs: Int64 = length(j["legs"])
   (dep * 1000003i64 + arr * 31i64 + legs) % MOD
 
-val accumulate = (journeys: Json, acc: Int64): Int64 =>
+val accumulate = (journeys: Journey[], acc: Int64): Int64 =>
   var a = acc
   journeys.for(j => a = (a + journeyDigest(j)) % MOD)
   a
 
 // Sort journeys by departureTime asc, then arrivalTime asc (for the take-N slice).
-val sortJourneys = (journeys: Json): Json =>
-  sort(journeys, (a, b) =>
+val sortJourneys = (journeys: Journey[]): Journey[] =>
+  sort(journeys, (a: Journey, b: Journey) =>
     if a["departureTime"] != b["departureTime"] then
       a["departureTime"] - b["departureTime"]
     else
@@ -196,17 +196,13 @@ val sortJourneys = (journeys: Json): Json =>
   )
 
 // "next N journeys departing after startTime" — the RangeQuery profile loop, capped at N.
-val nextN = (raptor: RaptorIndex, origin: String, destination: String, n: Int32): Json =>
-  var results: Json = []
+val nextN = (raptor: RaptorIndex, origin: String, destination: String, n: Int32): Journey[] =>
+  var results: Journey[] = []
   nextNStep(raptor, origin, destination, RANGE_START, n, results)
-  // Annotate `Json[]` so `slice`'s element type-parameter is pinned: applying a generic
-  // `slice` to a `sort(...)`-returned bare `Json` otherwise leaves the type var unresolved
-  // at monomorphization (a pre-existing generic-inference gap, surfaced now that bench.lin
-  // type-checks all the way through to this RANGE-phase code).
-  val sorted: Json[] = sortJourneys(results)
+  val sorted: Journey[] = sortJourneys(results)
   if length(sorted) > n then slice(sorted, 0, n) else sorted
 
-val nextNStep = (raptor: RaptorIndex, origin: String, destination: String, time: Int32, n: Int32, results: Json): Null =>
+val nextNStep = (raptor: RaptorIndex, origin: String, destination: String, time: Int32, n: Int32, results: Journey[]): Null =>
   if length(results) >= n then
     null
   else
