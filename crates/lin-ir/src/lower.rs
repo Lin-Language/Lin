@@ -4780,6 +4780,22 @@ fn lower_call(
             if let Some(lit) = raw_lit {
                 escape_lits.push(lit);
             }
+            // D3b: indirect (stored-closure) call with a WIDER unsealed object arg — project into
+            // a fresh narrower copy so extra fields are not visible inside the callee and the
+            // caller's mutation can't affect the closure's copy after the call.
+            if let Some(param_ty) = param_tys.get(i) {
+                if anon_object_slot_repr_differs(&a.ty(), param_ty) {
+                    let proj = builder.alloc_temp(param_ty.clone());
+                    builder.emit(Instruction::Coerce {
+                        dst: proj,
+                        src: arg,
+                        from_ty: a.ty(),
+                        to_ty: param_ty.clone(),
+                    });
+                    builder.register_owned(proj, param_ty.clone());
+                    return proj;
+                }
+            }
             arg
         })
         .collect();
@@ -10046,7 +10062,8 @@ fn lower_function_expr_with_id(
     let ret_temp = if !inner_builder.is_current_block_terminated()
         && (type_repr_differs(&body_ty, &effective_ret)
             || scalar_numeric_repr_differs(&body_ty, &effective_ret)
-            || flat_scalar_array_repr_differs(&body_ty, &effective_ret))
+            || flat_scalar_array_repr_differs(&body_ty, &effective_ret)
+            || anon_object_slot_repr_differs(&body_ty, &effective_ret))
     {
         let dst = inner_builder.alloc_temp(effective_ret.clone());
         inner_builder.emit(Instruction::Coerce {
@@ -10094,7 +10111,15 @@ fn lower_function_expr_with_id(
         && !is_union_ty(&body_ty)
         && is_rc_type(&body_ty)
         && is_sealed_scalar_repr(&effective_ret);
-    let return_keep: Vec<Temp> = if unboxes_to_scalar || sealed_projection_from_object {
+    // D3b ANON OBJECT PROJECTION: same logic as sealed_projection_from_object but the result
+    // is an unsealed LinObject* (not a packed sealed struct). `boxed_object_project` produces a
+    // FRESH +1 LinObject with only the target fields — `raw_ret` is not aliased by `ret_temp`.
+    // Must release `raw_ret` via scope-exit rather than keeping it, to avoid a per-call leak.
+    let anon_object_projection_from_object = ret_coerced
+        && !is_union_ty(&body_ty)
+        && is_rc_type(&body_ty)
+        && anon_object_slot_repr_differs(&body_ty, &effective_ret);
+    let return_keep: Vec<Temp> = if unboxes_to_scalar || sealed_projection_from_object || anon_object_projection_from_object {
         // For both cases `raw_ret` does not alias `ret_temp`: release it via scope-exit.
         vec![ret_temp]
     } else {
