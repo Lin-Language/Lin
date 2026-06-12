@@ -16618,6 +16618,56 @@ print("${length(nums)} ${nums[0]} ${nums[5]}")
 }
 
 #[test]
+fn test_nested_sealed_array_as_outer_array_element_read() {
+    // REGRESSION: indexing into a `P[][]` (outer array whose elements are pointer-backed sealed
+    // arrays) panicked the repr oracle with a `SealedArrayFieldGet(array packed)` disagreement.
+    // The `Index` seed in `repr.rs` was missing the `sealed_array_elem(result_ty)` arm: when the
+    // result of `nest[0]` is `P[]`, the dst temp folded to `Boxed(Opaque)` while the old gate
+    // predicate read it `Packed(sealed array)` — a debug panic and a release UAF.
+    // Fixed by seeding `Packed(PackedSealedArray)` when `result_ty` is a sealed array.
+    let out = run(r#"
+import { print } from "std/io"
+import { push } from "std/array"
+type P = { "x": Int32, "y": Int32 }
+val main = () =>
+  var arr: P[] = [{ "x": 1, "y": 2 }]
+  push(arr, { "x": 9, "y": 9 })
+  var nest: P[][] = []
+  push(nest, arr)
+  print("n=${nest[0][1]["x"]}")
+main()
+"#);
+    assert_eq!(out, vec!["n=9"]);
+}
+
+#[test]
+fn test_nested_sealed_array_outer_element_share_on_push() {
+    // REGRESSION + share-on-push (D5): when a `P[]` is pushed into a `P[][]`, the outer slot holds
+    // the SHARED pointer to the inner array. Mutations through the inner binding are visible through
+    // the outer slot (D5 share-always for pointer-backed sealed arrays).
+    let out = run(r#"
+import { print } from "std/io"
+import { push } from "std/array"
+type P = { "x": Int32, "y": Int32 }
+val main = () =>
+  var arr: P[] = [{ "x": 1, "y": 2 }]
+  push(arr, { "x": 3, "y": 4 })
+  var nest: P[][] = []
+  push(nest, arr)
+  // arr and nest[0] share the same P[]; bind a local alias out of the outer slot
+  val inner: P[] = nest[0]
+  push(inner, { "x": 5, "y": 6 })
+  // all three aliases see the push: arr, nest[0], and inner are the same array
+  print("arr_len=${arr[2]["x"]}")
+  print("nest_len=${nest[0][2]["x"]}")
+  print("inner_len=${inner[2]["x"]}")
+main()
+"#);
+    // All three aliases share the same backing P[]; the push through `inner` is visible to all.
+    assert_eq!(out, vec!["arr_len=5", "nest_len=5", "inner_len=5"]);
+}
+
+#[test]
 fn test_sealed_array_index_set_in_callee() {
     // REGRESSION: `arr[i] = { .. }` over a SCALAR sealed-record array, performed inside a CALLEE
     // (recursive overwrite loop). In a callee context the RHS structural literal is typed as an
