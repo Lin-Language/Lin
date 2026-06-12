@@ -18755,8 +18755,8 @@ val main = () =>
   print("json=${jarr[1]["x"]}")
 main()
 "#);
-    // TODAY: packed copies (9), json shares (5). Stage 1 end-state: both 5.
-    assert_eq!(out, vec!["packed=9", "json=5"]);
+    // Stage 1 done: pointer-backed arrays share — both now observe 5.
+    assert_eq!(out, vec!["packed=5", "json=5"]);
 }
 
 // D8/D4 pin: Json-widening aliasing is REPRESENTATION-DEPENDENT today — widening a PACKED record

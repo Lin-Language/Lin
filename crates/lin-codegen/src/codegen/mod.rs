@@ -1770,30 +1770,21 @@ impl<'ctx> Codegen<'ctx> {
                             let arr_repr = func.repr_of(*dst);
                             let arr = if let Some(fields) = arr_repr.packed_sealed_array_layout() {
                                 let fields = fields.clone();
-                                let stride = Self::sealed_array_stride(&fields);
-                                let desc = self.sealed_descriptor(&fields); // NULL for scalar-only
                                 let named_desc = self.sealed_named_descriptor(&fields); // ADR-063 (i)
-                                let has_heap = fields.values().any(|t| Self::sealed_field_kind(t).is_some());
+                                // Stage 1 pointer-backed array: alloc via lin_sealed_ptr_array_alloc(cap, named_desc).
+                                // Each element struct `ev` is a BORROWED standalone struct (owned by its own temp,
+                                // released at scope exit). lin_sealed_ptr_array_push retains the struct pointer (+1),
+                                // so the array and the temp are both independent owners until the temp's scope-exit
+                                // release (which drops back to the array's sole ownership when the temp goes out of
+                                // scope). After Stage 1: push(arr, t); t["x"] = 5 IS visible through arr[i]["x"].
                                 let alloc_fn = self.get_or_declare_fn(
-                                    "lin_sealed_array_alloc",
-                                    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into(), ptr_ty.into()], false));
+                                    "lin_sealed_ptr_array_alloc",
+                                    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false));
                                 let arr_v = self.builder.call(alloc_fn,
-                                    &[cap.into(), i64_ty.const_int(stride, false).into(), desc.into(), named_desc.into()],
-                                    "ir_sarr").try_as_basic_value().unwrap_basic();
-                                // Construct: each element struct `ev` is a BORROWED standalone struct
-                                // (owned by its own temp, released at this scope's exit). A heap-field
-                                // array must take its OWN +1 on every heap field as it copies the
-                                // payload into the slot (`..._retaining`) — else the array's
-                                // release-on-drop would double-free the still-borrowed inner. A
-                                // scalar-only record has no heap field, so the plain payload copy
-                                // (NULL desc → retaining push is a no-op for fields) is identical.
-                                let push_name = if has_heap {
-                                    "lin_sealed_array_push_struct_retaining"
-                                } else {
-                                    "lin_sealed_array_push_struct"
-                                };
+                                    &[cap.into(), named_desc.into()],
+                                    "ir_sptrr").try_as_basic_value().unwrap_basic();
                                 let push_fn = self.get_or_declare_fn(
-                                    push_name,
+                                    "lin_sealed_ptr_array_push",
                                     self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                                 for e_temp in elements {
                                     if let Some(&ev) = temp_map.get(e_temp) {

@@ -420,6 +420,14 @@ unsafe fn materialize_sealed_struct(ptr: *const u8, named_desc: *const u8) -> *m
     materialize_named_payload(ptr.add(SEALED_HEADER), named_desc)
 }
 
+/// Public wrapper around `materialize_sealed_struct` for use by the pointer-backed array path in
+/// `lin_array_get_tagged`. Takes the struct base pointer (WITH 16-byte header) + named descriptor;
+/// returns a fresh +1-owned `LinObject` for the caller to box and return. Non-null assumption: the
+/// caller checks for null before calling.
+pub unsafe fn materialize_sealed_struct_pub(ptr: *mut u8, named_desc: *const u8) -> *mut crate::object::LinObject {
+    materialize_sealed_struct(ptr as *const u8, named_desc)
+}
+
 /// Materialize element `idx`'s packed payload of a 0xFE sealed-record array into a FRESH +1-owned
 /// keyed `LinObject`, wrapped in a fresh `TaggedVal*` tagged `TAG_OBJECT`. The caller OWNS the
 /// returned box and must `lin_tagged_release` it (matching `lin_array_get_tagged`'s contract). Heap
@@ -551,6 +559,49 @@ pub unsafe fn pack_named_payload_from_object(
             }
         }
     }
+}
+
+/// Compute the total struct size (header + payload) from a named descriptor, for dynamic alloc
+/// paths that don't have the size statically. Walks the named descriptor to find the maximum
+/// `byte_offset + field_byte_size` across all fields, pads to 8-byte alignment. Returns
+/// `SEALED_HEADER` (16) minimum (an empty record). NULL descriptor → 16.
+unsafe fn struct_size_from_named_desc(named_desc: *const u8) -> usize {
+    if named_desc.is_null() {
+        return SEALED_HEADER;
+    }
+    let field_count = u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)]) as usize;
+    let mut max_end: usize = SEALED_HEADER;
+    let mut cur = 4usize;
+    for _ in 0..field_count {
+        let (offset, nkind, _nested, _name, next) = read_named_field(named_desc, cur);
+        cur = next;
+        let field_size: usize = match nkind {
+            NKIND_INT32 => 4,
+            NKIND_INT64 | NKIND_UINT64 | NKIND_FLOAT64 => 8,
+            NKIND_BOOL => 1,
+            // heap fields and anything else: pointer = 8 bytes
+            _ => 8,
+        };
+        let end = offset as usize + field_size;
+        if end > max_end { max_end = end; }
+    }
+    // Pad to 8-byte alignment.
+    (max_end + 7) & !7
+}
+
+/// Allocate a fresh sealed struct from a `LinObject` using the named descriptor, for the
+/// dynamic push path on a 0xFD pointer-backed array. Returns a +1-owned struct pointer.
+/// Caller is responsible for releasing it (or transferring its ownership to the array).
+pub unsafe fn alloc_sealed_struct_from_object(
+    obj: *const crate::object::LinObject,
+    named_desc: *const u8,
+) -> *mut u8 {
+    let size = struct_size_from_named_desc(named_desc);
+    // Alloc with NULL heap-only desc (scalar-only for Stage 1). rc=1.
+    let sptr = lin_sealed_alloc(size, std::ptr::null());
+    // Pack the object's fields into the struct payload.
+    pack_named_payload_from_object(sptr.add(SEALED_HEADER), obj, named_desc);
+    sptr
 }
 
 #[cfg(test)]

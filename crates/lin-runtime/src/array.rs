@@ -40,6 +40,13 @@ pub struct LinArray {
 /// `Codegen::SEALED_ARRAY_TAG`.
 pub const SEALED_ARRAY_TAG: u8 = 0xFE;
 
+/// `elem_tag` sentinel for an array of 8-byte POINTERS to sealed-record structs (Stage 1 pointer-
+/// backed representation). Each slot is a `*mut u8` sealed struct pointer (with full 16-byte header
+/// + field payload). The array SHARES elements: `push(arr, t)` retains `t`'s refcount, so `t["x"]=5`
+/// is visible through `arr[i]["x"]`. The `elem_named_desc` on the array drives dynamic dispatch
+/// (materialize-on-read, toString, eq). Kept in lockstep with `Codegen::SEALED_PTR_ARRAY_TAG`.
+pub const SEALED_PTR_ARRAY_TAG: u8 = 0xFD;
+
 #[repr(C)]
 pub struct LinArrayElem {
     pub tag: u8,
@@ -148,6 +155,13 @@ pub unsafe extern "C" fn lin_array_free(arr: *mut LinArray) {
         dealloc(arr as *mut u8, array_layout());
         return;
     }
+    if (*arr).elem_tag == SEALED_PTR_ARRAY_TAG {
+        // Pointer-backed sealed-record arrays: each slot is an 8-byte pointer; free with 8-byte stride.
+        let data_layout = Layout::from_size_align_unchecked(8 * cap, 8);
+        dealloc((*arr).data as *mut u8, data_layout);
+        dealloc(arr as *mut u8, array_layout());
+        return;
+    }
     let (esize, ealign) = flat_elem_size_align((*arr).elem_tag);
     let data_layout = Layout::from_size_align_unchecked(esize * cap, ealign);
     dealloc((*arr).data as *mut u8, data_layout);
@@ -200,6 +214,17 @@ pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
             // fields BEFORE freeing the buffer. A scalar-only record has a NULL `elem_desc` (no heap
             // fields) → this loop is skipped and the array is a single free.
             crate::sealed::release_sealed_array_elems((*arr).data as *mut u8, (*arr).len, (*arr).elem_stride, (*arr).elem_desc);
+        } else if (*arr).elem_tag == SEALED_PTR_ARRAY_TAG {
+            // Pointer-backed sealed-record array: each slot is a retained sealed struct pointer.
+            // Release each one (decrement rc; free if rc reaches 0).
+            let len = (*arr).len as usize;
+            let slots = (*arr).data as *const *mut u8;
+            for i in 0..len {
+                let sptr = *slots.add(i);
+                if !sptr.is_null() {
+                    crate::sealed::lin_sealed_release_self(sptr);
+                }
+            }
         }
         lin_array_free(arr);
     }
@@ -325,6 +350,131 @@ pub unsafe extern "C" fn lin_sealed_array_set(arr: *mut LinArray, idx: i64, obj:
     crate::sealed::retain_sealed_payload_fields(slot, desc);
 }
 
+// -------------------------------------------------------------------------
+// Pointer-backed sealed-record arrays (Stage 1 representation): 8-byte struct pointers.
+// -------------------------------------------------------------------------
+//
+// A `SEALED_PTR_ARRAY_TAG (0xFD)` array's `data` buffer holds 8-byte pointers to fully-headed
+// sealed-record structs (`lin_sealed_alloc`'d, 16-byte header + fields). The array RETAINS each
+// struct on push (rc+1), so push(arr, t); t["x"] = 5 IS visible through arr[i]["x"]. The named
+// descriptor (`elem_named_desc`) stays on the array for dynamic dispatch (materialize, toString, eq).
+// Field access in codegen: load the struct pointer from `data + idx*8`, then GEP `ptr + field_off`
+// using the full struct-relative field offset (including SEALED_HEADER) — no subtraction needed.
+
+unsafe fn ptr_array_data_layout(cap: u64) -> Layout {
+    Layout::from_size_align_unchecked((8 * cap.max(1)) as usize, 8)
+}
+
+/// Allocate an empty pointer-backed sealed-record array. Each slot is 8 bytes (a struct pointer).
+/// `initial_cap` is the element capacity; `named_desc` drives dynamic materialize/toString/eq.
+/// `elem_stride` is set to 8 (pointer size) and `elem_desc` is NULL.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_ptr_array_alloc(initial_cap: u64, named_desc: *const u8) -> *mut LinArray {
+    let cap = initial_cap.max(4);
+    let ptr = alloc(array_layout()) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).elem_tag = SEALED_PTR_ARRAY_TAG;
+    (*ptr)._pad3 = [0; 3];
+    (*ptr).len = 0;
+    (*ptr).cap = cap;
+    (*ptr).data = alloc(ptr_array_data_layout(cap)) as *mut LinArrayElem;
+    (*ptr).elem_stride = 8;
+    (*ptr).elem_desc = std::ptr::null();
+    (*ptr).elem_named_desc = named_desc;
+    ptr
+}
+
+/// Push a sealed struct pointer into a pointer-backed array, RETAINING the struct (+1 rc).
+/// The caller keeps its own reference; the array gets an independent +1. Grows by doubling.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_ptr_array_push(arr: *mut LinArray, sptr: *mut u8) {
+    if sptr.is_null() { return; }
+    let len = (*arr).len;
+    let cap = (*arr).cap;
+    if len == cap {
+        let new_cap = cap * 2;
+        let old_layout = ptr_array_data_layout(cap);
+        (*arr).data = realloc((*arr).data as *mut u8, old_layout, (8 * new_cap) as usize) as *mut LinArrayElem;
+        (*arr).cap = new_cap;
+    }
+    // Retain the struct (+1): the array is now an independent owner.
+    crate::memory::lin_rc_retain(sptr as *mut u32);
+    // Store the pointer in the slot.
+    let slot = ((*arr).data as *mut *mut u8).add(len as usize);
+    *slot = sptr;
+    (*arr).len = len + 1;
+}
+
+/// Get the sealed struct pointer at index `idx` (bounds-checked, Python-style negative index).
+/// Returns the RAW pointer BORROWED from the array slot — the caller must retain it if it outlives
+/// any potential array mutation. Used by codegen static field-read paths (which GEP into the struct
+/// inline, not outliving the array).
+#[no_mangle]
+pub unsafe extern "C-unwind" fn lin_sealed_ptr_array_get_ptr(arr: *const LinArray, idx: i64) -> *mut u8 {
+    let len = (*arr).len as i64;
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual < 0 || actual >= len {
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
+    }
+    let slot = ((*arr).data as *const *mut u8).add(actual as usize);
+    *slot
+}
+
+/// Set element at index in a pointer-backed sealed-record array (0xFD). Releases the OLD struct
+/// pointer and stores the new one (retaining it, since the array takes shared ownership). The
+/// `new_sptr` must be a valid sealed-struct pointer; ownership is transferred to the slot (array
+/// takes its own +1 via retain, so the caller's ref is NOT consumed — use with RETAINING semantics).
+/// No-op if index is out of bounds or the array is null.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_ptr_array_set(arr: *mut LinArray, idx: i64, new_sptr: *mut u8) {
+    if arr.is_null() || new_sptr.is_null() { return; }
+    let len = (*arr).len as i64;
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual < 0 || actual >= len { return; }
+    let slot = ((*arr).data as *mut *mut u8).add(actual as usize);
+    let old_sptr = *slot;
+    // Retain the new struct FIRST (in case old == new), then release the old one.
+    // Sealed structs have a u32 refcount at offset 0 — the same as any RC object, so lin_rc_retain works.
+    crate::memory::lin_rc_retain(new_sptr as *mut u32);
+    if !old_sptr.is_null() {
+        crate::sealed::lin_sealed_release_self(old_sptr);
+    }
+    *slot = new_sptr;
+}
+
+/// Materialize a pointer-backed sealed-record array (0xFD) into a TAGGED `LinArray` (Json `Object[]`):
+/// each struct pointer is materialized into a fresh boxed `LinObject` via the NAMED descriptor on the
+/// array. Used at the Json boundary where the generic reader can't process struct pointers. Returns a
+/// fresh +1-owned tagged array. The source array is BORROWED (not consumed).
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_ptr_array_to_tagged(arr: *const LinArray) -> *mut LinArray {
+    use crate::tagged::*;
+    if arr.is_null() { return lin_array_alloc(4); }
+    let len = (*arr).len;
+    let out = lin_array_alloc(len.max(4));
+    let named_desc = (*arr).elem_named_desc;
+    for i in 0..len {
+        let sptr = *(((*arr).data as *const *mut u8).add(i as usize));
+        let obj = if sptr.is_null() {
+            std::ptr::null_mut()
+        } else {
+            crate::sealed::materialize_sealed_struct_pub(sptr, named_desc) as *mut u8
+        };
+        let slot = (*out).data.add(i as usize);
+        if obj.is_null() {
+            (*slot).tag = TAG_NULL;
+            (*slot)._pad = [0; 7];
+            (*slot).payload = 0;
+        } else {
+            (*slot).tag = TAG_OBJECT;
+            (*slot)._pad = [0; 7];
+            (*slot).payload = obj as u64;
+        }
+    }
+    (*out).len = len;
+    out
+}
+
 /// Materialize a sealed-record array into a TAGGED `LinArray` (Json `Object[]`): each inline element
 /// becomes a boxed `LinObject` via the per-type codegen materializer. Stage 3 routes
 /// combinators / Json-boundary through this fail-safe boxed view rather than special-casing every
@@ -382,6 +532,43 @@ pub unsafe extern "C" fn lin_array_push(arr: *mut LinArray, elem_ptr: *const u8,
         crate::object::lin_object_release(obj);
         return;
     }
+    if (*arr).elem_tag == SEALED_PTR_ARRAY_TAG {
+        // MOVE semantics (caller transfers its +1 ref to the destination).
+        // elem_ptr holds a *mut LinObject (TAG_OBJECT) — the monomorphized `push$<T>` path and the
+        // `tagged_array_push_value` codegen path both arrive here with a `*mut *mut LinObject` cell
+        // (arr_cell containing the LinObject pointer).  Convert the LinObject to a fresh sealed
+        // struct, store it (ownership transferred to slot), and release the caller's LinObject ref.
+        if tag != crate::tagged::TAG_OBJECT {
+            crate::fault::runtime_fault(
+                "Runtime error: cannot push a non-record value into a sealed-ptr record array",
+            );
+        }
+        // elem_ptr is an arr_cell: a pointer to a *mut LinObject.
+        let obj = *(elem_ptr as *const *mut crate::object::LinObject);
+        if obj.is_null() {
+            crate::fault::runtime_fault(
+                "Runtime error: cannot push null into a sealed-ptr record array",
+            );
+        }
+        let named = (*arr).elem_named_desc;
+        // Allocate a sealed struct from the LinObject (rc=1 on the new struct).
+        let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named);
+        // Release the transferred LinObject ref (the struct slot owns the data now).
+        crate::object::lin_object_release(obj);
+        // Store sptr into the slot (no extra retain — we transfer the alloc rc=1 to the slot).
+        let len = (*arr).len;
+        let cap = (*arr).cap;
+        if len == cap {
+            let new_cap = cap * 2;
+            let old_layout = ptr_array_data_layout(cap);
+            (*arr).data = realloc((*arr).data as *mut u8, old_layout, (8 * new_cap) as usize) as *mut LinArrayElem;
+            (*arr).cap = new_cap;
+        }
+        let slot = ((*arr).data as *mut *mut u8).add(len as usize);
+        *slot = sptr; // transfer ownership (rc=1 from alloc, no additional retain)
+        (*arr).len = len + 1;
+        return;
+    }
     let len = (*arr).len;
     let cap = (*arr).cap;
     if len == cap {
@@ -419,6 +606,38 @@ pub unsafe extern "C" fn lin_array_push_tagged(arr: *mut LinArray, tagged: *cons
         let slot = lin_sealed_array_push_slot(arr);
         crate::sealed::pack_named_payload_from_object(slot, obj, named);
         crate::object::lin_object_release(obj);
+        return;
+    }
+    if (*arr).elem_tag == SEALED_PTR_ARRAY_TAG {
+        // MOVE semantics: the TaggedVal holds a LinObject (TAG_OBJECT) whose ownership is being
+        // transferred. Convert to a fresh sealed struct, store (transfer alloc rc=1 to slot), and
+        // release the LinObject.
+        let tv = tagged as *const crate::tagged::TaggedVal;
+        if tv.is_null() || (*tv).tag != crate::tagged::TAG_OBJECT {
+            crate::fault::runtime_fault(
+                "Runtime error: cannot push a non-record value into a sealed-ptr record array",
+            );
+        }
+        let obj = (*tv).payload as *mut crate::object::LinObject;
+        if obj.is_null() {
+            crate::fault::runtime_fault(
+                "Runtime error: cannot push null into a sealed-ptr record array",
+            );
+        }
+        let named = (*arr).elem_named_desc;
+        let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named);
+        crate::object::lin_object_release(obj);
+        let len = (*arr).len;
+        let cap = (*arr).cap;
+        if len == cap {
+            let new_cap = cap * 2;
+            let old_layout = ptr_array_data_layout(cap);
+            (*arr).data = realloc((*arr).data as *mut u8, old_layout, (8 * new_cap) as usize) as *mut LinArrayElem;
+            (*arr).cap = new_cap;
+        }
+        let slot = ((*arr).data as *mut *mut u8).add(len as usize);
+        *slot = sptr; // transfer alloc rc=1 to slot
+        (*arr).len = len + 1;
         return;
     }
     let len = (*arr).len;
@@ -466,6 +685,24 @@ pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::
         let named = (*arr).elem_named_desc;
         let slot = lin_sealed_array_push_slot(arr);
         crate::sealed::pack_named_payload_from_object(slot, obj, named);
+        return;
+    }
+    if elem_tag == SEALED_PTR_ARRAY_TAG {
+        // Pointer-backed sealed-record array: allocate a fresh sealed struct from the boxed object,
+        // then push the pointer. `lin_sealed_ptr_array_push` retains (+1), and the alloc starts at
+        // rc=1; we pass ownership to the array by calling push WITHOUT the extra retain then releasing
+        // our alloc ref — or equivalently: alloc (rc=1), push (retains→rc=2), release alloc ref (rc=1).
+        // `lin_push_dyn` has RETAINING semantics: the caller keeps its object; obj is NOT consumed.
+        if tagged.is_null() || (*tagged).tag != TAG_OBJECT {
+            crate::fault::runtime_fault(
+                "Runtime error: cannot push a non-record value into a sealed-ptr record array",
+            );
+        }
+        let obj = (*tagged).payload as *const crate::object::LinObject;
+        let named = (*arr).elem_named_desc;
+        let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named);
+        lin_sealed_ptr_array_push(arr, sptr); // retains: sptr rc goes 1→2
+        crate::sealed::lin_sealed_release_self(sptr); // release our alloc ref: rc goes 2→1
         return;
     }
     if elem_tag == 0xFF {
@@ -686,6 +923,18 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
         crate::sealed::release_payload_fields_pub(slot, (*arr).elem_desc);
         crate::sealed::pack_named_payload_from_object(slot, obj, (*arr).elem_named_desc);
         crate::object::lin_object_release(obj);
+    } else if elem_tag == SEALED_PTR_ARRAY_TAG {
+        // Pointer-backed (0xFD): release the OLD struct pointer and store the new one (transferred).
+        if tagged.is_null() || (*tagged).tag != TAG_OBJECT {
+            return;
+        }
+        let sptr = (*tagged).payload as *mut u8;
+        let slot = ((*arr).data as *mut *mut u8).add(actual as usize);
+        let old = *slot;
+        if !old.is_null() {
+            crate::sealed::lin_sealed_release_self(old);
+        }
+        *slot = sptr; // transfer ownership (no additional retain)
     } else {
         let tag = if tagged.is_null() { TAG_NULL } else { (*tagged).tag };
         let payload = if tagged.is_null() { 0u64 } else { (*tagged).payload };
@@ -846,6 +1095,23 @@ pub unsafe extern "C-unwind" fn lin_array_get_tagged(arr: *const LinArray, idx: 
             dealloc(tv as *mut u8, tv_layout);
             let payload = ((*arr).data as *const u8).add((idx as u64 * (*arr).elem_stride) as usize);
             return crate::sealed::materialize_sealed_elem_boxed(payload, (*arr).elem_named_desc);
+        }
+        SEALED_PTR_ARRAY_TAG => {
+            // Pointer-backed sealed-record array (Stage 1): each slot is a `*mut u8` struct pointer.
+            // Load the struct pointer, then materialize a fresh LinObject via the named descriptor.
+            // The materialized object retains each field (for scalar fields there's nothing to retain;
+            // for heap fields the object takes its own +1). The struct keeps its own +1 untouched.
+            // Return the caller's owned +1 box, matching the get_tagged contract.
+            dealloc(tv as *mut u8, tv_layout);
+            let sptr = *(((*arr).data as *const *mut u8).add(idx as usize));
+            if sptr.is_null() {
+                return crate::tagged::lin_box_null() as *mut TaggedVal;
+            }
+            // `materialize_sealed_struct` takes the struct base pointer (with header) + named_desc
+            // and returns a fresh +1 LinObject. Wrap it in a TAG_OBJECT box for the caller.
+            use crate::tagged::{TAG_OBJECT, alloc_tagged};
+            let obj = crate::sealed::materialize_sealed_struct_pub(sptr, (*arr).elem_named_desc);
+            return alloc_tagged(TAG_OBJECT, obj as u64) as *mut TaggedVal;
         }
         _ => {
             // Tagged array: elem is already a LinArrayElem (16 bytes) = TaggedVal layout.

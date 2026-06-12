@@ -199,6 +199,10 @@ impl<'ctx> Codegen<'ctx> {
     /// `lin_runtime::sealed::SEALED_HEADER` (16). Sealed-record field payload begins here.
     pub(crate) const SEALED_HEADER: u64 = 16;
 
+    /// `elem_tag` for POINTER-BACKED sealed-record arrays (Stage 1 representation). Each slot is an
+    /// 8-byte sealed struct pointer. Kept in lockstep with `lin_runtime::array::SEALED_PTR_ARRAY_TAG`.
+    pub(crate) const SEALED_PTR_ARRAY_TAG: u8 = 0xFD;
+
     /// Immortal-refcount sentinel for STACK-allocated sealed records (sealed-records Stage 4). A
     /// record whose header rc is `>= IMMORTAL_RC` is inert to refcounting: `lin_rc_retain` and
     /// `lin_sealed_release` are no-ops on it (it lives on the stack and is never heap-freed). This
