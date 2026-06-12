@@ -26,10 +26,14 @@ hashmaps, and a dynamic value type — rather than as a perpetual fight.
 
 ---
 
-## 0.5 Stage-0 decisions (PINNED — everything keys off these)
+## 0.5 Working design decisions (D1–D8 — the direction to implement against)
 
-These resolve the design holes found in review. They are decisions, not open questions; the staged
-plan (§6) assumes them.
+These resolve the design holes found in review and are the agreed **direction** the implementation
+targets — not a frozen specification. **The order is implement-then-document:** we build against
+D1–D8, let the details settle through implementation (they always shift), and write the authoritative
+`SPECIFICATION.md` / ADR text *afterward* to match what was actually built. So treat D1–D8 as firm on
+intent but provisional on detail; where implementation contradicts one, the implementation wins and
+the decision is updated here, then ratified in the spec at the end (§6 closing work).
 
 - **D1 — Representation vs semantics are separate axes.** Representation: records become flat packed
   structs (constant-offset access), required. Semantics: records stay **reference** types (Java/C#
@@ -333,14 +337,16 @@ records are flat (Stage 2).
 - ASan clean; RSS (`VmHWM`) bounded/flat; `records` still beats Go; RAPTOR trends toward Go; `lin fmt
   --check`.
 
-### Stage 0 — Pin the decisions (no code)
+### Stage 0 — Agree the direction (no code, no spec yet)
 
-- Ratify **D1–D8** (§0.5) in spec + a new ADR (supersede/annotate ADR-062). In particular: the
-  reference-semantics + flat-layout decision; the `Json → AnyVal` no-handle union; D3 structural
-  parameter monomorphisation + closure-boundary copy; the D4 single-direction `AnyVal` boundary with
-  descriptor-carrying as v1; the D5 aliasing-unification (named + directed test); D6 enumeration; D7
-  descriptors kept; D8 transitional boxed shadow.
-- **Deliverable:** signed-off decisions.
+- Sign off **D1–D8** (§0.5) as the working design to build against — a lightweight agreement, **not** a
+  spec/ADR rewrite. Per the implement-then-document order, the authoritative `SPECIFICATION.md` text and
+  the new ADR (superseding/annotating ADR-062) are written in the closing work, *after* the
+  implementation has shaken the details out. Stage 0's only job is alignment on intent: the
+  reference-semantics + flat-layout axes; the `Json → AnyVal` no-handle union; D3–D8.
+- Stand up the directed tests that encode the *intended* behaviour changes (D5 aliasing unification in
+  particular) so the implementation has a target to converge on, even though the spec prose comes later.
+- **Deliverable:** agreed direction + the behaviour-change tests. No production code, no spec edits.
 
 ### Stage 1 — All-scalar records: one flat representation, unconditional
 
@@ -378,10 +384,15 @@ records are flat (Stage 2).
 
 ### Optional later — inline-array (value-layout) optimization (§5.6)
 
-### Closing work
+### Closing work — write the spec to match what was built (implement-then-document)
 
-- Update `docs/SPECIFICATION.md`, `docs/STDLIB.md`, `docs/DECISIONS.md`, `docs/PERFORMANCE.md`
-  (remove the "inherent PREP copy" caveat — §2.4). Re-measure RAPTOR typed vs Go.
+- **Now** write the authoritative docs against the *as-built* design: `docs/SPECIFICATION.md` (records
+  are value-layout/reference-semantics; `AnyVal` replaces `Json`; the §5.3 structural-parameter rule;
+  the four behaviour changes), a new ADR superseding/annotating ADR-062, `docs/STDLIB.md`
+  (`AnyVal`/`keys` surface), and `docs/PERFORMANCE.md` (remove the "inherent PREP copy" caveat — §2.4).
+  Reconcile D1–D8 with whatever the implementation actually settled on; the as-built behaviour is
+  authoritative, the decisions list is updated to match.
+- Re-measure RAPTOR typed vs Go.
 
 ---
 
