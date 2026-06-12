@@ -18300,7 +18300,6 @@ main()
     assert_eq!(output, vec!["2"]);
 }
 
-<<<<<<< HEAD
 // TarEntry entries/header/body composable adapter end-to-end tests.
 // Fixtures live at stdlib/fixtures/sample.tar (3 entries: alpha.txt/17B, bravo.txt/31B, large.txt/4390B).
 
@@ -18502,7 +18501,8 @@ match found
         err.contains("non-transferable"),
         "expected 'non-transferable' in compile error, got:\n{err}"
     );
-=======
+}
+
 // ---------------------------------------------------------------------------
 // Heap-field SumNode Stage 3 — discriminated unions whose non-discriminant
 // fields include String, Array, or nested-sealed records.
@@ -18638,6 +18638,5 @@ print(show(g))
 print(show(b))
 "#);
     assert_eq!(out, vec!["R:fire=1", "G:grass=2", "B:sky=3"]);
->>>>>>> master
 }
 
