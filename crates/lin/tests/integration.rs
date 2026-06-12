@@ -18866,13 +18866,133 @@ val main = () =>
   print("packed-elem=${parr[0]["type"]}")
 main()
 "#);
-    // TODAY: boxed shares everywhere, packed copies everywhere.
+    // D3a: anon-structural params monomorphised per concrete layout → packed-param shares too.
     assert_eq!(out, vec![
         "boxed-param=mutated",
         "boxed-elem=mut2",
-        "packed-param=orig3",
+        "packed-param=mutated",
         "packed-elem=orig4",
     ]);
+}
+
+// D3a: mutation-through-param for both packed and boxed wide records.
+#[test]
+fn test_d3a_mutation_through_param_packed() {
+    let out = run(r#"import { print } from "std/io"
+type Wide = { "x": Int32, "y": Int32 }
+val setX = (r: { "x": Int32 }) =>
+  r["x"] = 99
+val main = () =>
+  val w: Wide = { "x": 1, "y": 2 }
+  setX(w)
+  print("x=${w["x"]} y=${w["y"]}")
+main()
+"#);
+    // D3a: packed wide record param is specialised → shared; mutation visible in caller.
+    assert_eq!(out, vec!["x=99 y=2"]);
+}
+
+#[test]
+fn test_d3a_mutation_through_param_boxed() {
+    let out = run(r#"import { print } from "std/io"
+val setType = (r: { "type": String }) =>
+  r["type"] = "changed"
+val main = () =>
+  val jx: Json = 0
+  val w = { "type": "orig", "blob": jx }
+  setType(w)
+  print("type=${w["type"]}")
+main()
+"#);
+    // Boxed wide records already share through anon params (boxed path unchanged).
+    assert_eq!(out, vec!["type=changed"]);
+}
+
+// D3a: exact-shape call (arg type exactly matches param type) must keep working.
+#[test]
+fn test_d3a_exact_shape_call() {
+    let out = run(r#"import { print } from "std/io"
+val setX = (r: { "x": Int32 }) =>
+  r["x"] = 42
+val main = () =>
+  val w = { "x": 1 }
+  setX(w)
+  print("x=${w["x"]}")
+main()
+"#);
+    assert_eq!(out, vec!["x=42"]);
+}
+
+// D3a: two different concrete layouts calling the same anon-param function → two specialisations.
+#[test]
+fn test_d3a_two_different_layouts_two_specs() {
+    let out = run(r#"import { print } from "std/io"
+type A = { "v": Int32, "a": Int32 }
+type B = { "v": Int32, "b": String }
+val setV = (r: { "v": Int32 }) =>
+  r["v"] = 77
+val main = () =>
+  val wa: A = { "v": 1, "a": 10 }
+  val wb: B = { "v": 2, "b": "hello" }
+  setV(wa)
+  setV(wb)
+  print("a=${wa["v"]} b=${wb["v"]}")
+main()
+"#);
+    // Each layout gets its own specialisation; mutations through both are visible.
+    assert_eq!(out, vec!["a=77 b=77"]);
+}
+
+// D3a regression: 4-cell matrix — all combinations of (direct/closure-captured param) ×
+// (inferred-literal arg / annotated-sealed arg) must produce the correct value.
+// The bug was: spec's inner closure `get` and the original's inner closure `get` shared the same
+// LLVM symbol, causing the original's closure to run the spec's sealed-offset body → garbage.
+#[test]
+fn test_d3a_closure_captured_param_inferred_literal_matrix() {
+    let out = run(r#"import { print } from "std/io"
+type Sealed = { "n": Int32, "extra": String }
+val direct = (r: { "n": Int32 }): Int32 => r["n"]
+val direct2 = (r: { "n": Int32 }): Int32 => r["n"]
+val viaClosure = (r: { "n": Int32 }): Int32 =>
+  val get = () => r["n"]
+  get()
+val main = () =>
+  val jLit = { "n": 7, "extra": "e" }
+  val sLit: Sealed = { "n": 7, "extra": "e" }
+  print("case1=${direct(jLit)}")
+  print("case2=${direct2(sLit)}")
+  print("case3=${viaClosure(sLit)}")
+  print("case4=${viaClosure(jLit)}")
+main()
+"#);
+    assert_eq!(out, vec!["case1=7", "case2=7", "case3=7", "case4=7"]);
+}
+
+// D3a cross-module scoping pin: a same-module anon-param call shares (mutation visible), but an
+// IMPORTED anon-param call does NOT share today (mutation not visible) — cross-module
+// monomorphisation is not yet implemented. Recorded here so the inconsistency is explicit.
+// A follow-up leg will either monomorphise imports or amend the design doc's D3 description.
+#[test]
+fn test_d3a_cross_module_anon_param_no_share_pin() {
+    // Two-module fixture: imported anon-param fn `stamp`, wider record arg `w`.
+    // Cross-module call: mutation through the param is NOT visible (today's pre-D3 behaviour).
+    let dir = std::env::temp_dir().join(format!("lin_d3a_xmod_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("stamp.lin"),
+        "export val stamp = (r: { \"v\": Int32 }) => r[\"v\"] = 99\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ stamp }} from "{}/stamp"
+type Wide = {{ "v": Int32, "extra": String }}
+val main = () =>
+  val w: Wide = {{ "v": 1, "extra": "x" }}
+  stamp(w)
+  print("v=${{w["v"]}}")
+main()
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    // Cross-module anon-param calls copy today (no monomorphisation across modules yet).
+    assert_eq!(output, vec!["v=1"]);
 }
 
 // D2 pin: a record with a Function field can be widened into Json TODAY. Stage 6 flips this to a
