@@ -1,10 +1,10 @@
 import { expect, toSatisfy, test, suite, run } from "std/test"
 import { for, range } from "std/iter"
 import { keys } from "std/object"
-import { length } from "std/array"
+import { length, push, set } from "std/array"
 import { t, st } from "./testutil"
 import { makeGraphResults, add, finalize, GraphResults, TreeNode } from "./graphResults"
-import { Conn } from "./types"
+import { Conn, Boarding } from "./types"
 
 // Deep equality over the typed `{ String: TreeNode[] }` graph (the typed-map rep lacks the
 // structural `toBe`/`toString` the `Json` rep had, so the result is checked with a typed walk).
@@ -57,14 +57,18 @@ val graphOf = (entries: GraphEntry[]): { String: TreeNode[] } =>
 // Build a real typed `Trip` whose stopTimes[0].stop is `origin` (the walk reads
 // connection[0]["stopTimes"][connection[1]==0]["stop"]). The Conn tuple's first element is the
 // typed `Trip` record, so the fixture builds a proper Trip rather than a partial literal. The round
-// dimension is a MAP keyed by the round string ("1", "2", …) — the structure under test.
+// dimension is an ARRAY indexed by the round number (Null-padded up to round i) — the structure
+// under test.
 val mergePath = (tree: GraphResults, path: String[]): Null =>
-  var kConnections: { String: { String: Conn } } = {}
+  var kConnections: { String: (Conn | Null)[] } = {}
   range(1, length(path)).for(i =>
     val origin = path[i - 1]
     val destination = path[i]
-    kConnections[destination] = {}
-    kConnections[destination]["${i}"] = [t([st(origin, null, 1000)]), 0, 1]
+    var conns: (Conn | Null)[] = []
+    range(0, i + 1).for(j => push(conns, null))
+    val boarding: Boarding = [t([st(origin, null, 1000)]), 0, 1]
+    set(conns, i, boarding)
+    kConnections[destination] = conns
   )
   add(tree, kConnections)
 

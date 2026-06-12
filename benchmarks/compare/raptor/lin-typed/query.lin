@@ -14,8 +14,8 @@ import { Date, RaptorIndex, Conn, Journey, Leg } from "./types"
 
 val ONE_DAY = 86400
 
-// A connection index is the kConnections map of one scanned day (StopID -> roundStr -> Conn).
-type ConnIndex = { String: { String: Conn } }
+// A connection index is the kConnections map of one scanned day (StopID -> round# -> Conn|Null).
+type ConnIndex = { String: (Conn | Null)[] }
 
 // A journey filter (MultipleCriteriaFilter etc.): transforms a journey list.
 type Filter = (Journey[]) => Journey[]
@@ -27,7 +27,7 @@ val getFoundStations = (kConnections: ConnIndex, bestArrivals: { String: Int64 }
     .keys()
     .for(stop =>
       val conns = kConnections[stop]
-      if conns != null && conns.keys().length() > 0 then
+      if conns != null && length(conns) > 0 then
         val best = bestArrivals[stop]
         if best != null then
           val v = best - ONE_DAY
@@ -64,7 +64,7 @@ val getJourneysFromConnections = (kConnections: ConnIndex, prevConnections: Conn
   var initial: Journey[] = []
   destinations.for(d =>
     val conns = kConnections[d]
-    if conns != null && conns.keys().length() > 0 then
+    if conns != null && length(conns) > 0 then
       getResults(kConnections, d).for(j => push(initial, j))
   )
   reduceReversed(prevConnections, length(prevConnections) - 1, initial)

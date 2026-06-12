@@ -31,30 +31,37 @@ export type Leg = Transfer | TimetableLeg
 // A planned journey. departure/arrival are seconds-from-midnight (may exceed 24h).
 export type Journey = { "legs": Leg[], "departureTime": Int32, "arrivalTime": Int32 }
 
-// A scan connection: a timetable boarding `[Trip, startIndex, endIndex]` or a footpath
-// `Transfer`. start/end are stop offsets into a route path (Int32 — routes can be long).
-// The boarding tuple's first element is the typed `Trip`; the journey/graph/string result walks
-// read it back as `connection[0]["stopTimes"]…`.
-export type Conn = [Trip, Int32, Int32] | Transfer
+// A timetable boarding: `[Trip, startIndex, endIndex]`. start/end are stop offsets into a route
+// path (Int32 — routes can be long). The tuple's first element is the typed `Trip`. Naming the
+// boarding tuple lets a producer bind it as `val b: Boarding = [trip, s, e]` (a bare tuple literal
+// coerces to a bare tuple type) and then WIDEN that value into a `Conn`/`Conn | Null` slot — a
+// heterogeneous tuple literal does NOT coerce directly to a tuple-bearing union written inline.
+export type Boarding = [Trip, Int32, Int32]
+
+// A scan connection: a timetable boarding or a footpath `Transfer`. The journey/graph/string
+// result walks read a boarding back as `connection[0]["stopTimes"]…`.
+export type Conn = Boarding | Transfer
 
 // The per-scan ScanResults state (mirrors ScanResults). Arrival times use Int64 (the MAX
-// sentinel 9007199254740991 needs it). The round dimension stays a MAP keyed by the round
-// string ("1", "2", …) — NOT an array indexed by round number — because per-stop rounds are
-// SPARSE: a stop is improved on only a few of the rounds, so an array would pad every stop out
-// to the max round depth (≈2.3× the resident heap on the full feed). The map only stores the
-// rounds a stop actually has, which is the algorithmically-right structure here.
+// sentinel 9007199254740991 needs it). The round dimension is an ARRAY indexed by the round
+// NUMBER (0, 1, …): a stop maps to a `(Conn | Null)[]` whose i-th slot is the connection that
+// improved that stop on round i (Null where the stop saw no improvement that round). The array
+// makes ascending round order INTRINSIC — no string keys to parse and re-sort — so the former
+// `sortedRoundKeys` / `roundKeys.lin` helper is gone. A stop's array is padded with Null up to
+// the current round on write (a stop only grows its array when it is actually improved).
 //
 //   - bestArrivals : StopID -> best arrival                     { String: Int64 }
-//   - kArrivals    : roundStr -> (StopID -> arrival)            { String: { String: Int64 } }
-//   - kConnections : StopID -> (roundStr -> Conn)               { String: { String: Conn } }
+//   - kArrivals    : round# -> (StopID -> arrival)              ({ String: Int64 })[]
+//   - kConnections : StopID -> (round# -> Conn|Null)            { String: (Conn | Null)[] }
 //
-// Round-key fields (mirror node's `this.kArrivals[this.k - 1]` direct references):
-//   - curKey    : "${k}" computed ONCE per round (addRound), not per setTrip/setTransfer.
-//   - curRound  : alias of kArrivals[curKey] — maps are reference types, so writing through
+// Round fields (mirror node's `this.kArrivals[this.k - 1]` direct references):
+//   - k         : current round number (Int32) — the array index for writes/reads. The round
+//                 dimension is no longer stringified ("${k}") anywhere.
+//   - curRound  : alias of kArrivals[k] — maps are reference types, so writing through
 //                 curRound is visible through kArrivals too.
 //   - prevRound : alias of the previous round's arrivals map (what previousArrival — the hottest
-//                 read in the scan — consults, with NO per-access "${k - 1}" interpolation).
-export type ScanResults = { "k": Int32, "curKey": String, "prevRound": { String: Int64 }, "curRound": { String: Int64 }, "bestArrivals": { String: Int64 }, "kArrivals": { String: { String: Int64 } }, "kConnections": { String: { String: Conn } } }
+//                 read in the scan — consults, with NO per-access round indexing).
+export type ScanResults = { "k": Int32, "prevRound": { String: Int64 }, "curRound": { String: Int64 }, "bestArrivals": { String: Int64 }, "kArrivals": { String: Int64 }[], "kConnections": { String: (Conn | Null)[] } }
 
 // The createRaptor index struct (mirrors RaptorAlgorithm's constructor fields). The dynamic-key
 // dictionaries createRaptor builds are typed `{ String: T }` index-signature maps (ADR-055 /

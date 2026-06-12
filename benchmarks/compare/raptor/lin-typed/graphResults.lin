@@ -8,11 +8,9 @@
 //   mergePath([head, ...tail]): results[head] ||= []; find node whose parent chain
 //   `isSame` as tail; if none, create { label: head, parent: tail?mergePath(tail):null }.
 //   isSame(path, node): walk node.parent chain comparing each label to path[i].
-import { for } from "std/iter"
+import { for, range } from "std/iter"
 import { keys } from "std/object"
-import { parseInt32 } from "std/number"
 import { length, push, slice } from "std/array"
-import { sortedRoundKeys } from "./roundKeys"
 import { Conn, Transfer } from "./types"
 
 // A node in the transfer-pattern DAG; `parent` chains toward the root (Null at the root).
@@ -21,10 +19,10 @@ export type GraphResults = { "results": { String: TreeNode[] } }
 
 // path = [finalDestination, origin1, origin2, ...] built by appending each origin
 // while walking k back to 1 (reference getPath uses push, so this order is correct).
-val getPath = (kConnections: { String: { String: Conn } }, k: String, finalDestination: String): String[] =>
-  walk(kConnections, parseInt32(k), finalDestination, [finalDestination])
+val getPath = (kConnections: { String: (Conn | Null)[] }, k: Int32, finalDestination: String): String[] =>
+  walk(kConnections, k, finalDestination, [finalDestination])
 
-val walk = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, path: String[]): String[] =>
+val walk = (kConnections: { String: (Conn | Null)[] }, i: Int32, destination: String, path: String[]): String[] =>
   if i <= 0 then
     path
   else
@@ -33,7 +31,7 @@ val walk = (kConnections: { String: { String: Conn } }, i: Int32, destination: S
       is Null =>
         path
       else =>
-        val connection = round["${i}"]
+        val connection = if i >= length(round) then null else round[i]
         match connection
           is Null =>
             path
@@ -90,16 +88,20 @@ val mergePathInto = (results: { String: TreeNode[] }, path: String[]): TreeNode 
 export val makeGraphResults = (): GraphResults =>
   { "results": {  } }
 
-export val add = (gr: GraphResults, kConnections: { String: { String: Conn } }): Null =>
+export val add = (gr: GraphResults, kConnections: { String: (Conn | Null)[] }): Null =>
   val results = gr["results"]
   kConnections
     .keys()
     .for(destination =>
-      val destMap = kConnections[destination]
-      if destMap != null then
-        sortedRoundKeys(destMap).for(k =>
+      // Coalesce the map read to a non-null array (`?? []`) before iterating: indexing a captured
+      // `(Conn | Null)[] | Null` narrowed only by `if != null` inside a closure mis-reads.
+      val destConns = kConnections[destination] ?? []
+      // Array index order IS numeric round order; skip Null slots (rounds that didn't improve
+      // this stop).
+      range(0, length(destConns)).for(k =>
+        if destConns[k] != null then
           mergePathInto(results, getPath(kConnections, k, destination))
-        )
+      )
     )
 
 export val finalize = (gr: GraphResults): { String: TreeNode[] } =>
