@@ -4925,23 +4925,29 @@ fn lower_intrinsic_call(
     // null/cached-box safe). This is the per-element box leak inside `map`'s
     // `lin_array_set(result, i, f(item))`.
     let mut shell_to_free: Option<Temp> = None;
-    // Stage 1 pointer-backed sealed-record array: `push(arr, elem)` RETAINS the sealed struct
-    // pointer into the array. The array IS an independent owner of the struct, so the standard
-    // ownership transfer APPLIES: `transfer_into_container` increments the retain count so the
-    // source and the array are both +1 owners (the source's scope-exit release drops it back to
-    // 1 sole owner in the array). Do NOT skip ownership transfer — the array holds a real ref.
+    // `push(arr, elem)` ownership accounting — three sealed cases:
     //
-    // `push(arr, elem)` where `elem` is a SEALED-repr record (`{tag:Int32, bytes:Int32[]}`, the
-    // generic `push$Object` over a `Field[]`) into a TAGGED array: codegen MATERIALIZES the sealed
-    // struct into a fresh boxed LinObject (retaining its heap fields) and stores THAT — it does NOT
-    // store the sealed struct pointer. The source struct must STAY OWNED (released at scope exit,
-    // dropping its heap fields, balancing the per-field retains the materialization took). Skip the
-    // transfer here to avoid a double-retain of the sealed source whose +1 the array never holds.
+    // A. `elem` is sealed-repr AND `arr` is a pointer-backed sealed array (0xFD, Stage 1):
+    //    `lin_sealed_ptr_array_push` takes its OWN +1 retain internally. The caller keeps its
+    //    own +1 which the scope-exit release reclaims. Do NOT emit an extra retain here — that
+    //    would leave rc=3 (push-retain + caller-borrow-retain + extra-retain) with only rc-1 at
+    //    scope exit → leak.
+    //
+    // B. `elem` is sealed-repr AND `arr` is a TAGGED array (the `push$Object` materialization
+    //    path): codegen MATERIALIZES the sealed struct into a fresh boxed LinObject and stores
+    //    THAT — it does NOT store the sealed struct pointer. The source struct must STAY OWNED
+    //    (released at scope exit) — skip transfer to avoid double-retain.
+    //
+    // C. All other cases: standard `transfer_into_container` ownership.
+    let push_sealed_elem_into_ptr_array = matches!(intrinsic, Intrinsic::Push)
+        && args.last().map(|a| is_sealed_scalar_repr(&a.ty())).unwrap_or(false)
+        && args.first().map(|a| is_sealed_scalar_array(&a.ty())).unwrap_or(false);
     let push_sealed_elem_into_tagged = matches!(intrinsic, Intrinsic::Push)
         && args.last().map(|a| is_sealed_scalar_repr(&a.ty())).unwrap_or(false)
         && args.first().map(|a| !is_sealed_scalar_array(&a.ty())).unwrap_or(false);
     if matches!(intrinsic, Intrinsic::Push | Intrinsic::ArraySetDyn | Intrinsic::ObjectSetDyn)
         && !push_sealed_elem_into_tagged
+        && !push_sealed_elem_into_ptr_array
     {
         if let (Some(elem_expr), Some(&elem_temp)) = (args.last(), lowered_args.last()) {
             // For a UNION element, only `lin_array_set` (ArraySetDyn) moves the box (raw struct
