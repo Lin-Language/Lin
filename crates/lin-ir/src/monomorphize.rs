@@ -715,6 +715,31 @@ fn subst_stmt_types_anon(stmt: &mut TypedStmt, anon_subs: &HashMap<String, Type>
     }
 }
 
+/// Rename every INNER named function (a nested `Function` node with `name: Some(x)`) in the
+/// given expression tree by appending `suffix`. The OUTER function (the spec itself) is already
+/// renamed by the caller; this only touches nested lambdas/closures that have a name (e.g.
+/// `val get = () => …` inside the spec body). Without this, the spec's inner closure and the
+/// original function's inner closure would share the same LLVM symbol name, and codegen's
+/// `get_function`/`add_function` deduplication would reuse the first body (sealed offset reads
+/// from the spec) for both — causing a garbage read when the original is called with an unsealed
+/// argument (the "closure-captured param + inferred-literal arg" cell).
+fn rename_inner_fns(expr: &mut TypedExpr, suffix: &str) {
+    // Visit each immediate child. `for_each_child_mut` descends into Block stmts via
+    // `for_each_child_stmt_mut` (which calls `f(value)` for Val/Var), so every nested Function
+    // literal — including those bound by inner `val`/`var` statements — is reached exactly once.
+    for_each_child_mut(expr, &mut |c| {
+        if let TypedExpr::Function { name, body, .. } = c {
+            if let Some(n) = name {
+                *n = format!("{}{}", n, suffix);
+            }
+            // Recurse into the inner function's body to rename any further-nested functions.
+            rename_inner_fns(body, suffix);
+        } else {
+            rename_inner_fns(c, suffix);
+        }
+    });
+}
+
 /// True if `concrete_ty` is a concrete sealed record that satisfies the `anon_param_ty` anonymous
 /// structural constraint — i.e. every field of `anon_param_ty` is present in `concrete_ty` with
 /// a compatible type — AND the two types differ (so specialisation is actually needed). A call
@@ -1049,8 +1074,16 @@ fn monomorphize_inner(
         };
         // Substitute the anon types throughout the body.
         subst_expr_anon(&mut func, &anon_subs);
-        if let TypedExpr::Function { name, .. } = &mut func {
+        if let TypedExpr::Function { name, body, .. } = &mut func {
             *name = Some(spec_name.clone());
+            // Rename inner named functions (nested closures/lambdas) with the spec's layout
+            // suffix so they get distinct LLVM symbol names from the original body's inner
+            // functions. Without this, the spec's `val get = () => …` and the original's `val
+            // get = () => …` both register the LLVM symbol "get"; codegen's
+            // `get_function`/`add_function` deduplication reuses the first body (sealed offset
+            // reads) for both → garbage when the original is called with an unsealed argument.
+            let inner_suffix = spec_name.trim_start_matches(|c: char| c != '$');
+            rename_inner_fns(body, inner_suffix);
         }
         // Re-run the call rewriter so any generic calls inside the specialised body are handled.
         rewrite_expr(&mut func, &mut state);
