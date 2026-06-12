@@ -2,7 +2,7 @@ use lin_common::{Diagnostic, Span};
 use lin_parse::ast::Expr;
 
 use super::Checker;
-use super::helpers::{apply_type_subs, first_mutable_capture, integer_range, is_definitely_non_transferable};
+use super::helpers::{apply_type_subs, first_mutable_capture, first_non_transferable_capture, integer_range, is_definitely_non_transferable};
 use crate::resolve::{error_type, json_type};
 use crate::typed_ir::*;
 use crate::types::Type;
@@ -833,34 +833,51 @@ impl Checker {
         };
 
         // var-capture check and transferability check for `async(f)` / `async(fs)`.
-        if let Expr::Ident(name, _) = func {
-            if name == "lin_async" {
-                let globals = self.mutable_global_slots.clone();
-                for arg in &typed_args {
-                    if let Some(var_name) = first_mutable_capture(arg, &globals) {
+        // Fires on the raw intrinsic `lin_async` (stdlib-trusted code) AND on the user-facing
+        // stdlib wrapper `async` (identified by its Promise<T> return type), so that user code
+        // like `async(() => t.header())` where `t: TarEntry` is caught at compile time.
+        let is_async_spawn = if let Expr::Ident(name, _) = func {
+            name == "lin_async" || (name == "async" && matches!(result_type, Type::Promise(_)))
+        } else {
+            false
+        };
+        if is_async_spawn {
+            let globals = self.mutable_global_slots.clone();
+            for arg in &typed_args {
+                if let Some(var_name) = first_mutable_capture(arg, &globals) {
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        format!(
+                            "async thunk captures mutable variable '{}' — sharing mutable state across threads is not allowed",
+                            var_name
+                        ),
+                    ).with_help("capture an immutable copy: `val snap = {}; async(() => snap)`".to_string()));
+                }
+                // Capture-type check: reject captures of non-transferable opaque handles
+                // (TarEntry, Iterator). Stream captures are legal via CAP_MOVE and excluded.
+                if let Some((cap_name, cap_ty)) = first_non_transferable_capture(arg) {
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        format!(
+                            "async thunk captures non-transferable value '{}' of type '{}' — a {} shares the archive cursor and cannot cross a thread boundary",
+                            cap_name, cap_ty, cap_ty
+                        ),
+                    ).with_help("drain the body on the calling thread before launching the async thunk".to_string()));
+                }
+                // Transferability: thunk return type must not be Function/Iterator/etc.
+                let ret_ty = match arg.ty() {
+                    Type::Function { ret, .. } => Some(*ret),
+                    _ => None,
+                };
+                if let Some(ret) = ret_ty {
+                    if is_definitely_non_transferable(&ret) {
                         self.diagnostics.push(Diagnostic::error(
                             span,
                             format!(
-                                "async thunk captures mutable variable '{}' — sharing mutable state across threads is not allowed",
-                                var_name
+                                "async thunk returns non-transferable type '{}' — async results must be JSON-compatible values",
+                                ret
                             ),
-                        ).with_help("capture an immutable copy: `val snap = {}; async(() => snap)`".to_string()));
-                    }
-                    // Transferability: thunk return type must not be Function/Iterator/etc.
-                    let ret_ty = match arg.ty() {
-                        Type::Function { ret, .. } => Some(*ret),
-                        _ => None,
-                    };
-                    if let Some(ret) = ret_ty {
-                        if is_definitely_non_transferable(&ret) {
-                            self.diagnostics.push(Diagnostic::error(
-                                span,
-                                format!(
-                                    "async thunk returns non-transferable type '{}' — async results must be JSON-compatible values",
-                                    ret
-                                ),
-                            ).with_help("return a JSON-serializable value (String, Boolean, Null, numeric, array, or object)".to_string()));
-                        }
+                        ).with_help("return a JSON-serializable value (String, Boolean, Null, numeric, array, or object)".to_string()));
                     }
                 }
             }
@@ -1321,6 +1338,15 @@ impl Checker {
                                 ),
                             ).with_help("capture an immutable copy: `val snap = {}; pool.async(() => snap)`".to_string()));
                         }
+                        if let Some((cap_name, cap_ty)) = first_non_transferable_capture(arg) {
+                            self.diagnostics.push(Diagnostic::error(
+                                span,
+                                format!(
+                                    "async thunk captures non-transferable value '{}' of type '{}' — a {} shares the archive cursor and cannot cross a thread boundary",
+                                    cap_name, cap_ty, cap_ty
+                                ),
+                            ).with_help("drain the body on the calling thread before launching the async thunk".to_string()));
+                        }
                     }
                 }
 
@@ -1393,6 +1419,15 @@ impl Checker {
                             var_name
                         ),
                     ).with_help("capture an immutable copy: `val snap = {}; pool.async(() => snap)`".to_string()));
+                }
+                if let Some((cap_name, cap_ty)) = first_non_transferable_capture(arg) {
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        format!(
+                            "async thunk captures non-transferable value '{}' of type '{}' — a {} shares the archive cursor and cannot cross a thread boundary",
+                            cap_name, cap_ty, cap_ty
+                        ),
+                    ).with_help("drain the body on the calling thread before launching the async thunk".to_string()));
                 }
             }
         }
@@ -1492,7 +1527,7 @@ fn is_std_iter_stream_combinator(export_name: &str) -> bool {
 /// `lin_stream_*` intrinsic that moves the boxed-stream pointer, so a later use of the same binding
 /// must be a compile-time error — mirrors the IR's type-based `move_streamish_arg`.
 fn is_std_archive_consuming_export(export_name: &str) -> bool {
-    matches!(export_name, "untar" | "manifest" | "files")
+    matches!(export_name, "untar" | "manifest" | "files" | "entries")
 }
 
 /// True when `param_ty` can structurally ACCEPT a `Stream` argument: a `Stream<U>` (incl. the

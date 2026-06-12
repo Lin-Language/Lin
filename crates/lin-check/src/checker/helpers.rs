@@ -179,14 +179,16 @@ pub(crate) fn integer_range(ty: &Type) -> Option<(i128, i128)> {
 }
 
 /// Returns true if `ty` is definitely non-transferable across thread boundaries.
-/// Non-transferable: Function, Iterator, Stream, Never.
+/// Non-transferable: Function, Iterator, Stream, TarEntry, Never.
 /// TypeVar (unknown), Promise/Worker/ThreadPool (TypeVar-resolved), are not flagged —
 /// we only reject types we can statically prove are non-transferable (spec §24.3).
 /// `Stream` owns an OS resource, so it can never be COPIED across a thread boundary; it crosses
 /// only by MOVE (CAP_MOVE, Stage 7), which the transfer-copy path must never attempt (brief §9).
+/// `TarEntry` shares a live cursor into the parent stream — it is neither deep-copyable nor
+/// movable across a thread boundary.
 pub(crate) fn is_definitely_non_transferable(ty: &Type) -> bool {
     match ty {
-        Type::Function { .. } | Type::Iterator(_) | Type::Stream(_) | Type::Never => true,
+        Type::Function { .. } | Type::Iterator(_) | Type::Stream(_) | Type::TarEntry | Type::Never => true,
         Type::Array(inner) => is_definitely_non_transferable(inner),
         Type::Union(ts) => ts.iter().any(is_definitely_non_transferable),
         _ => false,
@@ -252,6 +254,51 @@ pub(crate) fn is_legal_ffi_type(ty: &Type) -> bool {
             params.iter().all(is_legal_ffi_value_type) && is_legal_ffi_value_type(ret)
         }
         _ => false,
+    }
+}
+
+/// Returns true if a *captured* value of this type is unsafe to transfer to a worker thread.
+///
+/// Narrower than `is_definitely_non_transferable`: `Function` values are intentionally excluded
+/// here (they are safe to copy across threads — closures over immutable vals are purely
+/// referentially transparent). `Stream` is excluded because it crosses thread boundaries legally
+/// via CAP_MOVE. Only opaque cursor-sharing handles (`TarEntry`, `Iterator`) are rejected at the
+/// capture site.
+fn is_non_transferable_capture_ty(ty: &Type) -> bool {
+    match ty {
+        Type::TarEntry | Type::Iterator(_) => true,
+        Type::Array(inner) => is_non_transferable_capture_ty(inner),
+        Type::Union(ts) => ts.iter().any(is_non_transferable_capture_ty),
+        _ => false,
+    }
+}
+
+/// Returns the name and type of the first captured binding in a directly-nested
+/// `TypedExpr::Function` whose type is non-transferable (i.e. `TarEntry` or `Iterator`), or
+/// `None` if there are none. Used by the async-thunk capture gate.
+///
+/// Note: `Stream` and `Function` captures are intentionally NOT rejected here — streams cross
+/// thread boundaries by MOVE (CAP_MOVE); functions are pure value types safe to copy across
+/// threads. This helper only fires for the opaque cursor-sharing types (`TarEntry` primarily).
+///
+/// Does NOT recurse into inner functions (same scope restriction as `first_mutable_capture`).
+pub(crate) fn first_non_transferable_capture(
+    expr: &TypedExpr,
+) -> Option<(String, Type)> {
+    match expr {
+        TypedExpr::Function { captures, .. } => {
+            captures.iter().find_map(|c| {
+                if is_non_transferable_capture_ty(&c.ty) {
+                    Some((c.name.clone(), c.ty.clone()))
+                } else {
+                    None
+                }
+            })
+        }
+        TypedExpr::MakeArray { elements, .. } => {
+            elements.iter().find_map(first_non_transferable_capture)
+        }
+        _ => None,
     }
 }
 

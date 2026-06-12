@@ -18300,6 +18300,209 @@ main()
     assert_eq!(output, vec!["2"]);
 }
 
+<<<<<<< HEAD
+// TarEntry entries/header/body composable adapter end-to-end tests.
+// Fixtures live at stdlib/fixtures/sample.tar (3 entries: alpha.txt/17B, bravo.txt/31B, large.txt/4390B).
+
+// entries() lists all entry names via header(); body() is drained inline.
+#[test]
+fn test_tar_entries_header_body_drain() {
+    let tar = workspace_root().join("stdlib/fixtures/sample.tar");
+    let tar_path = tar.to_str().unwrap();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, drain }} from "std/stream"
+import {{ entries, header, body }} from "std/archive"
+import {{ for }} from "std/iter"
+import {{ push, length }} from "std/array"
+import {{ toString }} from "std/string"
+
+val names: String[] = []
+readStream("{tar_path}")
+  .entries()
+  .for(e =>
+    names.push(e.header()["name"])
+    e.body().drain()
+  )
+print(toString(length(names)))
+print(names[0])
+print(names[1])
+print(names[2])
+"#));
+    assert_eq!(output, vec!["3", "alpha.txt", "bravo.txt", "large.txt"]);
+}
+
+// entries() with bodies auto-skipped (header-only scan).
+#[test]
+fn test_tar_entries_header_only_auto_skip() {
+    let tar = workspace_root().join("stdlib/fixtures/sample.tar");
+    let tar_path = tar.to_str().unwrap();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, drain }} from "std/stream"
+import {{ entries, header }} from "std/archive"
+import {{ for }} from "std/iter"
+import {{ push, length }} from "std/array"
+import {{ toString }} from "std/string"
+
+val names: String[] = []
+readStream("{tar_path}")
+  .entries()
+  .for(e =>
+    names.push(e.header()["name"])
+  )
+print(toString(length(names)))
+print(names[0])
+"#));
+    assert_eq!(output, vec!["3", "alpha.txt"]);
+}
+
+// body() returns the correct bytes via readText.
+#[test]
+fn test_tar_entries_body_readtext() {
+    let tar = workspace_root().join("stdlib/fixtures/sample.tar");
+    let tar_path = tar.to_str().unwrap();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, readText, drain }} from "std/stream"
+import {{ entries, header, body }} from "std/archive"
+import {{ for }} from "std/iter"
+import {{ toString }} from "std/string"
+
+readStream("{tar_path}")
+  .entries()
+  .for(e =>
+    val h = e.header()
+    if h["name"] == "alpha.txt" then
+      val raw = e.body().readText()
+      val text = match raw
+        is Error => "err"
+        else => raw
+      print(text)
+    else
+      e.body().drain()
+  )
+"#));
+    // alpha.txt has content "hello from alpha\n" — print trims trailing newline
+    assert_eq!(output, vec!["hello from alpha"]);
+}
+
+// entries() correctly reports header size in Int64.
+#[test]
+fn test_tar_entries_header_size() {
+    let tar = workspace_root().join("stdlib/fixtures/sample.tar");
+    let tar_path = tar.to_str().unwrap();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream }} from "std/stream"
+import {{ entries, header }} from "std/archive"
+import {{ for }} from "std/iter"
+import {{ toString }} from "std/string"
+
+readStream("{tar_path}")
+  .entries()
+  .for(e =>
+    val h = e.header()
+    print("${{h["name"]}}:${{toString(h["size"])}}")
+  )
+"#));
+    assert_eq!(output, vec!["alpha.txt:17", "bravo.txt:31", "large.txt:4390"]);
+}
+
+// TarEntry handles can be stored in variables and used after the stream step. This verifies that
+// TarEntry is refcounted (not affine) — a handle held across a stream step stays usable for
+// header reads (though body would be expired at that point).
+#[test]
+fn test_tar_entry_stored_in_variable() {
+    let tar = workspace_root().join("stdlib/fixtures/sample.tar");
+    let tar_path = tar.to_str().unwrap();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, drain }} from "std/stream"
+import {{ entries, header, body }} from "std/archive"
+import {{ for }} from "std/iter"
+import {{ push, length }} from "std/array"
+import {{ toString }} from "std/string"
+
+// TarEntry is refcounted: store headers from all entries in a var array.
+// (Bodies are drained inline; header reads after the loop are still valid.)
+val headers: Json[] = []
+readStream("{tar_path}")
+  .entries()
+  .for(e =>
+    headers.push(e.header()["name"])
+    e.body().drain()
+  )
+print(toString(length(headers)))
+print(headers[0])
+"#));
+    assert_eq!(output, vec!["3", "alpha.txt"]);
+}
+
+// Regression test for Finding 1: TarEntry captured by an escaping closure must not UAF.
+// Before the fix, `is_union_ty` in lower.rs and `is_union_owning_ty` in ownership_verify.rs
+// both missed `Type::TarEntry`, causing CaptureRelease::None (no retain) for TarEntry captures.
+// The creating scope's exit released the TarEntry box while the escaped closure still held it —
+// a use-after-free / null-dereference at the closure call site.
+#[test]
+fn test_tar_entry_escaping_closure_no_uaf() {
+    let tar = workspace_root().join("stdlib/fixtures/sample.tar");
+    let tar_path = tar.to_str().unwrap();
+    let output = run(&format!(
+        r#"import {{ print }} from "std/io"
+import {{ readStream }} from "std/stream"
+import {{ entries, header }} from "std/archive"
+import {{ find }} from "std/iter"
+
+// Reproduces the escaping-closure shape: a TarEntry is captured by a closure that
+// outlives the scope where the entry was found.
+val pick = (): () => String =>
+  val found = readStream("{tar_path}")
+    .entries()
+    .find(e => e.header()["name"] == "bravo.txt")
+  match found
+    is Null => () => "none"
+    is Error => () => "err"
+    else =>
+      val t: TarEntry = found
+      () => t.header()["name"]
+
+val namer = pick()
+print(namer())
+print(namer())
+"#
+    ));
+    assert_eq!(output, vec!["bravo.txt", "bravo.txt"]);
+}
+
+// Regression test for Finding 2: async thunk capturing a TarEntry must be a compile-time error.
+// A TarEntry shares the archive cursor and cannot cross a thread boundary.
+#[test]
+fn test_async_captures_tar_entry_is_compile_error() {
+    let tar = workspace_root().join("stdlib/fixtures/sample.tar");
+    let tar_path = tar.to_str().unwrap();
+    let err = run_expect_err(&format!(
+        r#"import {{ print }} from "std/io"
+import {{ readStream }} from "std/stream"
+import {{ entries, header }} from "std/archive"
+import {{ find }} from "std/iter"
+import {{ async, await }} from "std/async"
+
+val found = readStream("{tar_path}")
+  .entries()
+  .find(e => e.header()["name"] == "bravo.txt")
+
+match found
+  is Null => print("none")
+  is Error => print("err")
+  else =>
+    val t: TarEntry = found
+    val p = async(() => t.header()["name"])
+    match await(p)
+      is Error => print("err")
+      else => print(await(p))
+"#
+    ));
+    assert!(
+        err.contains("non-transferable"),
+        "expected 'non-transferable' in compile error, got:\n{err}"
+    );
+=======
 // ---------------------------------------------------------------------------
 // Heap-field SumNode Stage 3 — discriminated unions whose non-discriminant
 // fields include String, Array, or nested-sealed records.
@@ -18435,5 +18638,6 @@ print(show(g))
 print(show(b))
 "#);
     assert_eq!(out, vec!["R:fire=1", "G:grass=2", "B:sky=3"]);
+>>>>>>> master
 }
 

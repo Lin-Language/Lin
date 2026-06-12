@@ -369,6 +369,7 @@ Float32 Float64
 Function
 Iterator<T>
 Shared<T>
+TarEntry
 ```
 
 plus any user-declared `type` alias (§5) and any `type` imported from another module (§22).
@@ -389,7 +390,7 @@ The last form above is informal shorthand: a `Json`-valued object is any object 
 
 `Error` is a built-in structural alias for the conventional error value `{ "type": String, "message": String }` (§20). It composes in unions and is discriminated with `is Error`. As a structural alias it is **not** a sealed named record (§5.9.1): an `Error`-typed value may carry extra fields, and `is Error` permits them.
 
-`Function` is an opaque type that accepts a function of any arity. `Iterator<T>` is the opaque runtime traversal type (§18). `Shared<T>` is the opt-in shared-mutable-state box used with the concurrency accessors (§24.5).
+`Function` is an opaque type that accepts a function of any arity. `Iterator<T>` is the opaque runtime traversal type (§18). `Shared<T>` is the opt-in shared-mutable-state box used with the concurrency accessors (§24.5). `TarEntry` is a generation-stamped, refcounted handle to a single tar archive entry, minted by `std/archive.entries` (§27 / ADR-068). It is non-transferable across thread boundaries.
 
 ### 4.1 Conceptual vs. resolvable type names
 
