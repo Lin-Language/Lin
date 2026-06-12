@@ -392,7 +392,17 @@ representation with pointer-share semantics, retiring the `LinObject` form and t
 form. Stageable by record-shape. Reference semantics makes inline-contiguous record arrays
 **optional** (§5.6): the win flows through pointer-backed arrays once records are flat (Stage 2).
 
-### Per-stage gate (every stage holds all of these before merge)
+**Branch policy (master never regresses):** stages land on the project branch **`reset/main`**, not
+on `master`. Several stages are deliberate *enablers* that cost performance before the wins arrive
+(Stage 1's pointer-backing regressed the §2.3 scan sentinel ~1.9× — the measured trigger for this
+policy); `master` must not carry that interim state. `reset/main` merges to `master` only when the
+benchmark suite is **net-positive vs master** — no benchmark worse without a larger compensating win
+landed in the same merge (realistically: at/after Stage 2's RAPTOR gain). Behaviour-neutral pieces
+(bug fixes, test pins, baselines, docs — e.g. all of Stage 0) land on `master` directly. `master` is
+merged INTO `reset/main` regularly so the branch never drifts. The per-stage gate below applies to
+every merge into `reset/main`; the net-positive rule additionally gates `reset/main → master`.
+
+### Per-stage gate (every stage holds all of these before merge into `reset/main`)
 
 - `cargo build --workspace && cargo test --workspace` — 0 failures.
 - `lin test stdlib/ examples/` — full green.
@@ -580,7 +590,8 @@ reference axis (D1) is preserved. (#4 is about the *array/map element* aliasing,
 - **The `AnyVal` boundary** must stay a single-direction conversion (D4); reintroducing a reconciliation
   oracle re-opens path-9.
 - **Pointer indirection / allocation residual** vs Go's inline arrays — mitigated by §5.6.
-- **Scope discipline.** Ship stage-by-stage on `master`; interp's call-cost axis is a separate project.
+- **Scope discipline.** Ship stage-by-stage on `reset/main` (§6 branch policy — `master` only takes
+  the project when net-positive); interp's call-cost axis is a separate project.
 
 ---
 
