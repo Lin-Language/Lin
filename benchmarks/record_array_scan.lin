@@ -1,0 +1,39 @@
+// Representation-reset Stage-0 sentinel (docs/project-actually-improve-performance.md §2.3).
+//
+// Scan-dense iteration over a large ALL-SCALAR record array — today's inline-stride packed
+// element buffer (`lin_sealed_array_alloc`, elements at data + idx*stride, best cache locality).
+// Stage 1 switches record arrays to pointer-backed sealed structs (share-always, D5); this bench
+// is the named cache-locality regression sentinel for that switch: if it regresses meaningfully,
+// §5.6 (escape-analysis inline element layout) is promoted from "optional later" into the plan.
+//
+// Prints SCAN ms=<dur> sum=<checksum> — compare ms across stages; sum must never change.
+import { print } from "std/io"
+import { push } from "std/array"
+import { range, for } from "std/iter"
+import { now } from "std/time"
+
+type P = { "a": Int32, "b": Int32, "c": Int64 }
+
+val N = 1000000
+val PASSES = 20
+
+val main = () =>
+  var arr: P[] = []
+  range(0, N).for(i =>
+    push(arr, {
+      "a": i,
+      "b": i * 3,
+      "c": 7i64
+    })
+  )
+  val t0 = now()
+  var sum = 0i64
+  range(0, PASSES).for(_ =>
+    range(0, N).for(i =>
+      sum = sum + arr[i]["a"] + arr[i]["b"] + arr[i]["c"]
+    )
+  )
+  val ms = now() - t0
+  print("SCAN ms=${ms} sum=${sum}")
+
+main()
