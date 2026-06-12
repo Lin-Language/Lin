@@ -274,8 +274,11 @@ impl<'ctx> Codegen<'ctx> {
                     // the `sealed_array_elem` all-scalar gate. Oracle-proven equal to the former
                     // `sealed_array_elem(&arr_ty).is_some()` decision.
                     if arg_reprs.first().and_then(|r| r.packed_sealed_array_layout()).is_some() {
+                        // Stage 1 pointer-backed array: push retains the struct pointer (+1).
+                        // The source struct stays owned (lower.rs no longer skips the ownership
+                        // transfer for this case — the array DOES take a ref now).
                         let push_fn = self.get_or_declare_fn(
-                            "lin_sealed_array_push_struct_retaining",
+                            "lin_sealed_ptr_array_push",
                             self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                         self.builder.call(push_fn, &[arr.into(), elem.into()], "");
                         return ptr_ty.const_null().into();
