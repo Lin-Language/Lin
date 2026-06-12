@@ -11,8 +11,8 @@ import { now } from "std/time"
 import { loadGTFS } from "./gtfsLoader"
 import { loadGTFSTar } from "./gtfsLoaderTar"
 
-val DATA_DIR = "/home/linus/Work/linusnorton/lin-lang/.claude/worktrees/agent-a440d9142f649412d/benchmarks/compare/raptor/data/"
-val TAR_GZ = "/home/linus/Work/linusnorton/lin-lang/.claude/worktrees/agent-a440d9142f649412d/benchmarks/compare/raptor/gtfs.tar.gz"
+val DATA_DIR = "/home/linus/Work/linusnorton/lin-lang/benchmarks/compare/raptor/data/"
+val TAR_GZ = "/home/linus/Work/linusnorton/lin-lang/benchmarks/compare/raptor/gtfs.tar.gz"
 
 // Cheap equivalence digest over one loader result:
 //   trips           — length of the trips array
