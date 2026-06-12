@@ -2393,6 +2393,71 @@ val f = (r: Rec, k: Two): Boolean => r[k]
 }
 
 #[test]
+fn test_index_sig_literal_union_key_expands_to_record() {
+    // `{ <literal-union>: V }` is sugar for a fixed record with one field per literal (value type
+    // V). `{ DayOfWeek: Boolean }` ≡ `{ "Monday": Boolean, …, "Sunday": Boolean }`. Indexing it by
+    // a key of the same union is provably total (no `Null`), so `runsOn` returns `Boolean`. Run
+    // end-to-end with a record literal supplying all seven fields.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type DayOfWeek = "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday" | "Sunday"
+type Calendar = { DayOfWeek: Boolean }
+
+val runsOn = (c: Calendar, dow: DayOfWeek): Boolean => c[dow]
+
+val c: Calendar = { "Monday": true, "Tuesday": false, "Wednesday": false, "Thursday": false, "Friday": false, "Saturday": false, "Sunday": false }
+print(toString(runsOn(c, "Monday")))
+print(toString(c.runsOn("Sunday")))
+"#);
+    assert_eq!(output, vec!["true", "false"]);
+}
+
+#[test]
+fn test_index_sig_literal_union_record_equiv_to_handwritten() {
+    // The sugar produces a record STRUCTURALLY IDENTICAL to the hand-written one: a `Calendar`
+    // (= `{ DayOfWeek: Boolean }`) value is assignable to the equivalent explicit record type and
+    // vice versa. This pins that the expansion is plain structural typing, not a distinct kind.
+    let output = run(r#"import { print } from "std/io"
+
+type DayOfWeek = "Mon" | "Tue"
+type Calendar = { DayOfWeek: Boolean }
+type Hand = { "Mon": Boolean, "Tue": Boolean }
+
+val asHand = (c: Calendar): Hand => c
+val asCal = (h: Hand): Calendar => h
+
+val c: Calendar = { "Mon": true, "Tue": false }
+val h: Hand = asHand(c)
+val back: Calendar = asCal(h)
+print(if back["Mon"] then "ok" else "no")
+"#);
+    assert_eq!(output, vec!["ok"]);
+}
+
+#[test]
+fn test_index_sig_string_key_still_map_and_bad_key_errors() {
+    // The `{ String: V }` map form is UNCHANGED: arbitrary string keys, read yields `V | Null`.
+    let output = run(r#"import { print } from "std/io"
+
+type Seen = { String: Boolean }
+var s: Seen = {}
+s["x"] = true
+print(if s["x"] != null then "present" else "absent")
+print(if s["y"] != null then "present" else "absent")
+"#);
+    assert_eq!(output, vec!["present", "absent"]);
+
+    // A key type that is neither String nor a string-literal union is rejected.
+    let err = run_expect_err(r#"type R = { Int32: Boolean }
+"#);
+    assert!(
+        err.contains("Index-signature key type must be String or a union of string literals"),
+        "expected index-sig key error, got: {err}"
+    );
+}
+
+#[test]
 fn test_index_place_narrowing_else_branch_and_no_leak() {
     // Two soundness facets of index-place narrowing:
     //   (a) `== null` narrows the ELSE branch to non-null: `if m[k] == null then [] else m[k]`
@@ -14013,8 +14078,8 @@ val m: { Bad: Int32 } = {}
         output
     );
     assert!(
-        output.contains("Map key type must be String"),
-        "expected the map-key error, got:\n{}",
+        output.contains("Index-signature key type must be String or a union of string literals"),
+        "expected the index-sig key error, got:\n{}",
         output
     );
 }
