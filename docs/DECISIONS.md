@@ -2548,7 +2548,50 @@ chain can wrap.
 chains — §6.1 — making `?.` redundant); no `??=` compound assignment (low value, and `var` reassignment
 covers it); no bare `?` token (a lone `?` stays an unknown-character lex error as today).
 
-## ADR-067: Generation-stamped `TarEntry` opaque handles for composable tar streaming
+## ADR-067: Heap-field discriminated SumNodes; and the `T | Null` repr frontier
+
+**Status**: Accepted/partial (heap-field SumNodes landed 2026-06-12; `T | Null` packing is an
+identified, scoped frontier — see below). Extends ADR-064.
+
+**Context**: ADR-064 introduced the `SumNode` repr — a discriminated union of records (≥2 `Object`
+variants sharing a `StrLit` discriminant) compiled as a **tagged, packed** value with const-offset
+field reads, where the runtime's ~17 dynamic consumers (`toString`/`eq`/`toJson`/`keys`/release/…)
+dispatch on `TAG_SUMNODE`. The gate originally admitted only **scalar/Bool** non-discriminant fields:
+a variant carrying a `String`/`Array`/nested-sealed field fell back to the boxed `LinObject` path,
+where every match-narrow field read costs a `lin_object_get` key-lookup **plus** a `sealed_alloc`
+re-materialization. This is the same boxed/Json decay the PERFORMANCE.md §2 RAPTOR penalty traces to:
+a typed record that *looks* like JSON should not be *represented* as JSON.
+
+**Decision (landed)**: Widen the SumNode gate to admit **heap-field** variants. A discriminated union
+whose variants carry `String`/`Array`/nested-sealed fields now uses the packed SumNode repr; the
+runtime already supported heap-field SumNodes (per-variant heap-field drop table in `sumnode.rs`), so
+the change was codegen-side: the gate mirror (`repr.rs` + `codegen/types.rs`, which **must** agree or
+repr/codegen disagree → miscompile), heap-field slot sizing, the SumDesc drop table, `sumnode_construct`
+retain, the materializer's boxing at dynamic boundaries, and the match-narrow direct-read. Measured: a
+2-variant heap union's match-narrow reads go from 20 `lin_object_get` + `sealed_alloc` to **0** —
+replaced by const-offset GEP loads — with the digest unchanged, ASan-clean RC balance, and byte-identical
+output for existing scalar SumNodes. Two non-obvious traps were found and fixed: (1) `has`-pattern
+matches must materialize a SumNode scrutinee (its tag is `TAG_SUMNODE`, not `TAG_OBJECT`); (2) a closure
+whose declared return type is SumNode-eligible returns a boxed `TaggedVal*`, so the indirect-call result
+must be coerced back via `sumnode_project_from_boxed` rather than treated as a raw SumNode (else a
+`CloneBox` reads the tag byte as a refcount → silent corruption).
+
+**The `T | Null` frontier (NOT yet landed — documented to prevent re-treading the dead end)**: RAPTOR's
+dominant residual cost is `Trip | Null` — a **single** sealed-record variant plus `Null`, which is not a
+discriminated SumNode (no second record variant, no `StrLit` discriminant). A `NullableSealed` repr that
+made `T | Null` a **raw packed pointer** (null = `Null`, non-null = `*T`) was built and *measurably
+works* for the hot path (RAPTOR `scanRouteAt` `lin_object_get` 62 → 0, `scanBack` 13 → 0, digest exact,
+RAPTOR ASan-clean) — but it is **unsound**: a raw, *untagged* pointer that escapes to a dynamic consumer
+(`toString`/`eq`/…) is misread as a boxed value, producing intermittent heap corruption (the test suite
+went from a reliable 72/72 to an intermittent 71/72 with a random victim). Enumerating escape sites to
+materialise at each (map-store, then `toString`, then …) is a fix-for-a-fix chain that never closes. The
+**sound** direction, consistent with ADR-064, is to give `T | Null` a **distinct tag** (a nullable
+SumNode: tag distinguishes `Null` from the packed `T`) so it is self-describing and the existing dynamic
+consumers dispatch on it correctly — soundness by construction, no escape analysis. The tag check adds a
+small per-read cost over the raw pointer, but eliminates the corruption. This is the recommended path to
+round off the typed-RAPTOR cliff; the raw-pointer approach is retired as CLOSED-NEGATIVE-UNSOUND.
+
+## ADR-068: Generation-stamped `TarEntry` opaque handles for composable tar streaming
 
 **Status**: Accepted (implemented; runtime + checker + IR + codegen + stdlib).
 
