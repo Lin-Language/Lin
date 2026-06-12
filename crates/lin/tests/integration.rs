@@ -19057,6 +19057,43 @@ main()
     assert_eq!(out, vec!["val=orig extras_dropped=null"]);
 }
 
+// D3b: return type annotation — wide body type narrowed at return boundary → projection copy.
+#[test]
+fn test_d3b_return_type_anon_slot_projects() {
+    let out = run(r#"import { print } from "std/io"
+val narrow = (w: { "type": String, "extra": Int32 }) : { "type": String } =>
+  w
+val main = () =>
+  val wide = { "type": "orig", "extra": 42 }
+  val r = narrow(wide)
+  wide["type"] = "changed"
+  print("ret=${r["type"]} extra=${r["extra"] ?? "null"}")
+main()
+"#);
+    // D3b: return type annotation projects a fresh copy — mutation of wide is severed,
+    // extra field is dropped from the returned object.
+    assert_eq!(out, vec!["ret=orig extra=null"]);
+}
+
+// D3b: stored closure — wide arg projected at call boundary → extras dropped, mutation severed.
+#[test]
+fn test_d3b_stored_closure_arg_projects() {
+    let out = run(r#"import { print } from "std/io"
+val main = () =>
+  var result = "init"
+  val stored: (({ "type": String }) => Null) = (r: { "type": String }) =>
+    result = r["type"]
+  val wide = { "type": "orig", "extra": 42 }
+  stored(wide)
+  wide["type"] = "changed"
+  print("captured=${result} wide=${wide["type"]}")
+main()
+"#);
+    // D3b: stored closure receives a projected copy — closure reads "type" from the projected
+    // copy ("orig"), and wide can change independently afterwards.
+    assert_eq!(out, vec!["captured=orig wide=changed"]);
+}
+
 // D2 pin: a record with a Function field can be widened into Json TODAY. Stage 6 flips this to a
 // compile error (AnyVal transitivity rule: only transitively value-shaped records widen).
 #[test]
