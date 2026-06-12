@@ -71,8 +71,12 @@ the decision is updated here, then ratified in the spec at the end (§6 closing 
   (`(Named) => _` invoked with heterogeneous layouts) take the same project-copy fallback. **This is
   itself a semantics change vs today** (spec §5.9 lets anonymous params receive wider values that
   share and keep their extra fields — the very thing §5.9.1's "Consequence" paragraph contrasts named
-  records against), so it counts in the visible-change list (§7.2 #5). Probably rare in practice, but
-  the rule and the count both say it.
+  records against), so it counts in the visible-change list (§7.2 #5). **Stage-0 probing scoped it
+  further**: today the share-through-anon-slot behaviour only actually holds for **boxed** records;
+  a **packed** wide record already materializes a copy at every anonymous boundary (param, array
+  element, …) — so change #5 in practice only alters the boxed-record cases, and the packed cases
+  already behave as the end-state prescribes for non-param slots. Probably rare in practice, but the
+  rule and the count both say it.
 
 - **D4 — The record↔`AnyVal` boundary is a defined single-direction conversion, not a reconciliation
   oracle.** `record → AnyVal` **carries the record pointer + its descriptor** (preserving reference
@@ -101,17 +105,20 @@ the decision is updated here, then ratified in the spec at the end (§6 closing 
   been through `AnyVal`, `fromJson` validation, worker deep-copy, and JSON serialization. The "net line
   count goes down" claim (§3) is judged against this residual.
 
-- **D8 — The boxed shadow survives for `AnyVal`-flowing records until Stage 6 (transitional), and it
-  WRAPS the live record buffer — never copies.** During Stages 1–5, `LinObject` still exists, so a
-  record widened into a `Json`/`AnyVal` slot keeps a boxed/descriptor form until the `AnyVal`
-  refounding (Stage 6). **The transitional form must wrap the same live record buffer** (today's
-  §5.9.1 "boxed-wrapping-the-packed-buffer" behaviour) so aliasing through the dynamic widening stays
-  visible throughout — if it were a boxed *copy*, Stages 1–5 would sever `Json`-alias mutation
-  visibility and Stage 6's D4 design would restore it: an introduce-then-revert behaviour wobble
-  mid-project. Consequences owned plainly: Stages 1–5 keep a **scoped flow-sensitive pass** (which
-  records flow into `AnyVal`), so the `repr.rs` deletion payoff is **back-loaded to Stage 6**; Stage
-  1's "removes the boxed-shadow arm" and §3's deletion list apply to non-`AnyVal`-flowing records
-  until then.
+- **D8 — The boxed shadow survives for `AnyVal`-flowing records until Stage 6 (transitional); for
+  records that are BOXED today its aliasing must keep wrapping the live buffer.** During Stages 1–5,
+  `LinObject` still exists, so a record widened into a `Json`/`AnyVal` slot keeps a boxed/descriptor
+  form until the `AnyVal` refounding (Stage 6). **Stage-0 probing corrected the premise here**:
+  today's `Json`-widening aliasing is itself representation-dependent — a **boxed** record (unpackable
+  field) widens by sharing the live object (mutation stays visible through the `Json` alias), but a
+  **packed** record widens by **materializing a copy** (aliasing severed). So the transitional
+  invariant is scoped to what is true: records that take the boxed form keep live-buffer sharing
+  through Stages 1–5 (no introduce-then-revert wobble for them), while the packed-widening copy is
+  simply one more instance of the D5 representation-dependent aliasing split, and flips to share at
+  the D4 pointer-carrying boundary (Stage 6) as part of the same unification. Consequences owned
+  plainly: Stages 1–5 keep a **scoped flow-sensitive pass** (which records flow into `AnyVal`), so
+  the `repr.rs` deletion payoff is **back-loaded to Stage 6**; Stage 1's "removes the boxed-shadow
+  arm" and §3's deletion list apply to non-`AnyVal`-flowing records until then.
 
 The honest count of userland-visible changes is therefore **five** (§7.2): the `Json → AnyVal` rename,
 ordered-iteration migration, `keys`/`values`/`entries` off records (D6), the aliasing unification
@@ -407,26 +414,38 @@ Per implement-then-document, no spec/ADR edits here — the authoritative text c
 work, written against the as-built design.
 
 - Sign off **D1–D8** (§0.5) as the working direction.
-- **Directed tests, written FIRST as pins.** Each initially asserts *today's* behaviour where it will
+- **Directed tests, written FIRST as pins** (landed: the `test_reset_pin_*` suite in
+  `crates/lin/tests/integration.rs`). Each asserts *today's probe-verified* behaviour where it will
   change, with the intended end-state documented beside it; the stage that changes it flips the
-  assertion deliberately:
-  - **D5 aliasing**: packed-array `push` copies today / boxed-array `push` shares — end-state
-    share-always (`push(arr,t); t["x"]=5; arr[i]["x"]` observes `5`).
-  - **D3 width-subtyping, all slot kinds**: wider record into an anonymous-structural *parameter*
-    (stays shared — monomorphised); wider record into an anonymous-structural *array element / record
-    field / map value / return / stored closure* (today shares + keeps extras; end-state
-    project-copies — §7.2 #5 flips these).
-  - **D2 transitivity**: a record with a `Function`/`Iterator` field widened into `Json` — works today;
-    end-state compile error at the `AnyVal` boundary (flips at Stage 6).
-  - **D8 wrap-not-copy**: mutation through a record remains visible through its `Json`-widened alias
-    at every stage (pins today's boxed-wrapping-the-live-buffer behaviour; must NEVER flip).
-  - **§5.7 cross-form equality**: flat sealed record `==` boxed record of the same type.
-- **Scan microbench**: all-scalar-record-array iteration (today's inline-stride path) — the §2.3
-  regression sentinel for pointer-backing.
-- **Baselines recorded**: RAPTOR digest + per-phase times, `records`, the new microbench, suite
-  counts, sealed_alloc count on RAPTOR.
-- **Deliverable:** agreed direction + the test/bench suite merged to `master` (tests pin today's
-  behaviour, so this merge is behaviour-neutral).
+  assertion deliberately. The probes corrected two premises (D3/D8 notes in §0.5): today's sharing
+  through anon slots AND through `Json`-widening only holds for **boxed** records — packed records
+  already copy at those boundaries. As-built pins:
+  - **D5 aliasing split**: packed-array `push` copies / `Json`-array `push` shares — Stage 1 flips
+    the packed half to share-always.
+  - **D8/D4 widening split**: packed record → `Json` copies / boxed record → `Json` shares; the
+    boxed half holds through Stages 1–5 (wrap-not-copy), the packed half flips at the D4 boundary.
+  - **D3 anon-slot split**: boxed wide record shares through anon param + anon array element; packed
+    wide record copies at both — end-state: params share (monomorphised), non-param slots
+    project-copy.
+  - **D2 transitivity**: a record with a `Function` field widens into `Json` today; flips to a
+    compile error at Stage 6.
+  - **§5.7 cross-form equality**: typed (packed) record `==` structurally-equal `Json` object,
+    order-independent — must hold at every stage.
+- **Stage-0 discovery (fixed, not pinned): bare-record map values were broken on master.** A packed
+  sealed record stored as a `{ String: T }` map *value* was keep-packed into the slot (TAG_OBJECT
+  wrapping a sealed struct that is not a `LinObject`) while every read assumed a boxed object —
+  `lin_object_get` read sealed bytes as a LinObject header: index-cap-underflow panic (heap-field
+  records), silent abort (all-scalar), and the same for `??`-coalesce and named-narrow stores.
+  Fixed conservatively per the reset's own direction: map record slots are **always materialized
+  boxed** (`emit_map_set` restricts keep-packed to sealed *arrays*, which are real tag-dispatchable
+  `LinArray`s and stay fast — the RAPTOR pattern); a narrowed bare-record read projects the boxed
+  slot to a fresh sealed struct. Ownership balances via the existing materialize carve-out in
+  `IndexSet` lowering (RSS flat at 10× store volume). Regression tests:
+  `test_map_bare_record_value_*`.
+- **Scan microbench** (landed: `benchmarks/record_array_scan.lin`): all-scalar-record-array
+  iteration (today's inline-stride path) — the §2.3 regression sentinel for pointer-backing.
+- **Baselines recorded**: see the Appendix.
+- **Deliverable:** agreed direction + the test/bench suite + the map-value fix merged to `master`.
 
 ### Stage 1 — All-scalar records: promote the sealed struct to the sole representation
 
@@ -573,3 +592,32 @@ real hashmap or the JSON-shaped **`AnyVal`** value type (no handles, descriptor-
 delete `LinObject`'s string-keyed storage (keep descriptors), and the typed-vs-Go gap closes as a
 *consequence* — with five named userland changes and the parameter-passing behaviour you wanted
 preserved.
+
+---
+
+## Appendix: Stage-0 baselines (recorded 2026-06-12, this machine, O2, single run)
+
+The "before" numbers every stage compares against.
+
+**RAPTOR full feed** (digest `group=26203913 range=773022892 journeys=139`, identical for both ports
+and re-confirmed after the Stage-0 map-value fix):
+
+| Phase | `Json` port (ms) | typed port (ms) | typed / Json |
+|-------|----:|----:|----:|
+| LOAD  | 15779 | 17353 | 1.10× |
+| PREP  | 28365 | 104264 | 3.67× |
+| GROUP | 62040 | 114583 | 1.85× |
+| RANGE | 184475 | 334286 | 1.81× |
+| total | 290759 | 571086 | **1.96×** |
+
+**Other baselines:**
+- `records` cross-language bench: **Lin 200 ms** vs Rust 224 / Go 624 (`docs/PERFORMANCE.md` §2).
+- `benchmarks/record_array_scan.lin` (the §2.3 inline-stride sentinel): **SCAN ms=12,
+  sum=40000100000000** (1M × 3-field records, 20 passes — the sum is the cross-stage correctness
+  check; the ms is the cache-locality sentinel).
+- Suites: `lin test stdlib/ examples/` = **72/72**; `cargo test --workspace` green (integration
+  count grows with the Stage-0 pin suite).
+- `lin_sealed_alloc` count on typed RAPTOR: not re-measured at Stage 0 (the known figures —
+  299.6M pre-de-materialization, 184.5M with the since-reverted memo — don't match current master
+  exactly). **Re-measure at the start of Stage 2**, whose payoff claim ("sealed_alloc collapses to
+  construction-only") needs the precise before-number.
