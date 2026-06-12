@@ -152,6 +152,13 @@ impl Checker {
         // `String`, but when checked against an expected `StrLit("t")` it is accepted iff its
         // value equals `t`, and the resulting typed expression is narrowed to `StrLit("t")` so
         // it satisfies the literal target (e.g. a discriminant field).
+        //
+        // The expected type may also be a UNION of string literals (e.g. `DayOfWeek =
+        // "Monday" | … | "Sunday"`), possibly behind a `Named` alias. A bare literal that equals
+        // one member narrows to that member's `StrLit`, so a `DayOfWeek`-typed binding/argument/
+        // return accepts `"Monday"`. Without this, the literal stays `String` and is rejected
+        // against the literal-union target. `closed_string_literal_keys` peels `Named` and returns
+        // the member literals only when EVERY member is a `StrLit` (the closed-literal-union case).
         if let Expr::StringLit(s, span) = expr {
             if let Type::StrLit(t) = expected {
                 if s == t {
@@ -160,6 +167,19 @@ impl Checker {
                 return Err(Diagnostic::error(
                     *span,
                     format!("Expected literal type \"{}\", got \"{}\"", t, s),
+                ));
+            }
+            // Closed-literal-union target: narrow to the matching member, else error against the
+            // whole union. Scoped via `closed_string_literal_keys` so an OPEN union that merely
+            // CONTAINS `Str` (e.g. `String | Null`) is untouched — a bare literal stays `String`
+            // there and is accepted by ordinary `Str` compatibility downstream.
+            if let Some(members) = self.closed_string_literal_keys(expected) {
+                if members.iter().any(|m| m == s) {
+                    return Ok(TypedExpr::StringLit(s.clone(), Type::StrLit(s.clone()), *span));
+                }
+                return Err(Diagnostic::error(
+                    *span,
+                    format!("Expected type {}, got \"{}\"", expected, s),
                 ));
             }
         }
@@ -574,7 +594,7 @@ impl Checker {
                     }
                     fields.get(key_str).cloned().unwrap_or(Type::Null)
                 } else {
-                    Type::Union(vec![Type::Union(fields.values().cloned().collect()), Type::Null])
+                    self.object_index_nonliteral(fields, &typed_key.ty())
                 }
             }
             // Typed index-signature map `{ String: T }` (ADR-055): a key access yields `T | Null`
@@ -693,6 +713,54 @@ impl Checker {
         }
     }
 
+    /// If `ty` denotes a CLOSED set of string-literal keys — a single `StrLit` or a union whose
+    /// every member is a `StrLit` (after peeling `Named` aliases) — return that set of literal
+    /// strings. Otherwise return `None`.
+    ///
+    /// Used by the index-result computation: when an object is indexed by a non-literal key whose
+    /// TYPE is such a closed literal set AND every literal is a declared field, the access is
+    /// provably total, so the safe-bracket `Null` (§6.1, missing-key fallback) must NOT be added.
+    /// A `dow: DayOfWeek` (= `"Monday" | … | "Sunday"`) indexing a `ServiceDays` record whose keys
+    /// are exactly those seven literals reads precisely `Boolean`, never `Boolean | Null`.
+    pub(crate) fn closed_string_literal_keys(&self, ty: &Type) -> Option<Vec<String>> {
+        let resolved = self.resolve_named_body(ty)?;
+        match resolved {
+            Type::StrLit(s) => Some(vec![s]),
+            Type::Union(variants) => {
+                let mut keys = Vec::with_capacity(variants.len());
+                for v in &variants {
+                    match self.resolve_named_body(v)? {
+                        Type::StrLit(s) => keys.push(s),
+                        _ => return None,
+                    }
+                }
+                Some(keys)
+            }
+            _ => None,
+        }
+    }
+
+    /// Compute the result type of indexing an `Object`'s `fields` with a non-literal key of type
+    /// `key_ty`. Returns the precise union of just the addressed fields' types (NO safe-bracket
+    /// `Null`) when `key_ty` is a closed set of string literals all present in `fields`; otherwise
+    /// the conservative `<all field types> | Null`. Shared by both `infer_index` and
+    /// `infer_index_into` so the precise-totality rule applies through `Named`-alias objects too.
+    fn object_index_nonliteral(&self, fields: &IndexMap<String, Type>, key_ty: &Type) -> Type {
+        if let Some(keys) = self.closed_string_literal_keys(key_ty) {
+            if keys.iter().all(|k| fields.contains_key(k)) {
+                return Type::flatten_union(
+                    keys.iter().map(|k| fields[k].clone()).collect(),
+                );
+            }
+        }
+        // Conservative fallback: any field value, plus the safe-bracket `Null` (§6.1). Routed
+        // through `flatten_union` so duplicate value types collapse (`Boolean | Boolean | Null`
+        // → `Boolean | Null`) — duplicates were what surfaced the un-collapsed `Boolean × 7`.
+        let mut members: Vec<Type> = fields.values().cloned().collect();
+        members.push(Type::Null);
+        Type::flatten_union(members)
+    }
+
     /// The body of `infer_index`'s result-type computation, factored out so the `Type::Named` arm
     /// can recurse after resolving the alias. Re-runs `infer_index` on an already-typed object and
     /// key against an explicitly-provided object type (`obj_ty`). This is only entered from the
@@ -735,7 +803,7 @@ impl Checker {
                     }
                     fields.get(key_str).cloned().unwrap_or(Type::Null)
                 } else {
-                    Type::Union(vec![Type::Union(fields.values().cloned().collect()), Type::Null])
+                    self.object_index_nonliteral(fields, &typed_key.ty())
                 }
             }
             Type::Map(val_ty) => Type::flatten_union(vec![(**val_ty).clone(), Type::Null]),
