@@ -577,6 +577,17 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
                 set(seeds, *dst, Repr::Packed(Layout::SumNode { sum_ty: result_ty.clone() }));
             } else if let Some(f) = sealed_fields(result_ty) {
                 set(seeds, *dst, Repr::Packed(Layout::PackedStruct { fields: f.clone() }));
+            } else if let Some(elem_fields) = sealed_array_elem(result_ty) {
+                // An index into an outer container (e.g. `P[][]` → `nest[0]` : `P[]`) where the
+                // RESULT is itself a packed sealed array. The outer array is a regular LinArray
+                // (P[][] is not a packed sealed array — its elements are arrays, not scalar records).
+                // `unbox_tagged_val_to_type` recognises the sealed-array target type and returns the
+                // stored 0xFD pointer directly, so the result IS a PackedSealedArray. Without this
+                // seed the dst folded to Boxed(Opaque), disagreeing with the old gate predicate at
+                // the downstream SealedArrayFieldGet oracle check → debug panic, release UAF.
+                set(seeds, *dst, Repr::Packed(Layout::PackedSealedArray {
+                    elem_layout: elem_fields.clone(),
+                }));
             } else if let Some(s) = ScalarTy::from_type(result_ty) {
                 // Flat element read (only when the array is genuinely flat — but the result type
                 // already encodes that for the assume site; the oracle checks the site precisely).
