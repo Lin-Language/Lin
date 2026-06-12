@@ -117,6 +117,14 @@ pub struct Checker {
     /// "unassigned"), so its function type can carry `LambdaSet::singleton(id)`. Inert metadata —
     /// used only by the shadow-mode classification/statistics pass (`crate::lambda_set_stats`).
     next_lambda_id: u32,
+    /// Active flow-narrowings for INDEX PLACES (`obj[key]`) derived from an `if`/`else`
+    /// null-test condition (`if m[k] != null then m[k] else …`). `infer_index` consults this
+    /// to tighten a matching read's static type (drop `Null`) while the relevant branch is being
+    /// checked. Pushed before a branch (`apply_null_narrowing`) and truncated back after it
+    /// (`infer_if`). Sound because re-reading `obj[key]` with `obj`/`key` unchanged yields the
+    /// same value — the narrowing only tightens the type, never widens. Any assignment to `obj`
+    /// (or `key`) within the branch invalidates the matching entries (`clear_index_narrowings_for`).
+    pub(crate) index_narrowings: Vec<crate::checker::expr::IndexNarrow>,
 }
 
 impl Default for Checker {
@@ -157,6 +165,7 @@ impl Checker {
             replacements: Vec::new(),
             param_def_span_types: Vec::new(),
             next_lambda_id: 1,
+            index_narrowings: Vec::new(),
         }
     }
 
