@@ -1,0 +1,57 @@
+// Load-phase-only harness: load the GTFS feed BOTH ways — extracted files (loadGTFS) and
+// straight from gtfs.tar.gz in one archive pass (loadGTFSTar) — and print a cheap
+// equivalence digest for each. The DIGEST_FILES / DIGEST_TAR lines must match EXACTLY;
+// that is the correctness gate for the tar port. LOAD_* ms lines are informational.
+import { for, range } from "std/iter"
+import { keys } from "std/object"
+import { length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+import { now } from "std/time"
+import { loadGTFS, GTFSData } from "./gtfsLoader"
+import { loadGTFSTar } from "./gtfsLoaderTar"
+
+val DATA_DIR = "/home/linus/Work/linusnorton/lin-lang/.claude/worktrees/agent-a10986fe27955dba6/benchmarks/compare/raptor/data/"
+val TAR_GZ = "/home/linus/Work/linusnorton/lin-lang/.claude/worktrees/agent-a10986fe27955dba6/benchmarks/compare/raptor/gtfs.tar.gz"
+
+// Cheap equivalence digest over one loader result:
+//   trips           — length of the trips array
+//   dropped         — trips dropped for a missing calendar row
+//   transferKeys    — number of origins in the transfers map
+//   interchangeKeys — number of stations with an interchange time
+//   stSum2000       — sum of length(stopTimes) over the first 2000 trips
+//   firstDepSum     — sum of the first trip's stopTimes departureTimes
+//   transferTotal   — total transfer count summed across all origins
+val digest = (label: String, loaded: GTFSData): Null =>
+  val trips = loaded["trips"]
+  val nTrips = length(trips)
+  val transfers = loaded["transfers"]
+
+  var stSum2000 = 0
+  val n2000 = if nTrips < 2000 then nTrips else 2000
+  range(0, n2000).for(i => stSum2000 = stSum2000 + length(trips[i]["stopTimes"]))
+
+  var firstDepSum = 0i64
+  if nTrips > 0 then
+    trips[0]["stopTimes"].for(st => firstDepSum = firstDepSum + st["departureTime"])
+
+  var transferTotal = 0
+  keys(transfers).for(origin => transferTotal = transferTotal + length(transfers[origin] ?? []))
+
+  print(
+    "${label} trips=${toString(nTrips)} dropped=${toString(loaded["dropped"])} transferKeys=${length(keys(transfers))} interchangeKeys=${length(keys(loaded["interchange"]))} stSum2000=${toString(stSum2000)} firstDepSum=${toString(firstDepSum)} transferTotal=${toString(transferTotal)}"
+  )
+
+val main = (): Null =>
+  val t0 = now()
+  val a = loadGTFS(DATA_DIR)
+  print("LOAD_FILES ms=${toString(now() - t0)}")
+
+  val t1 = now()
+  val b = loadGTFSTar(TAR_GZ)
+  print("LOAD_TAR ms=${toString(now() - t1)}")
+
+  digest("DIGEST_FILES", a)
+  digest("DIGEST_TAR", b)
+
+main()
