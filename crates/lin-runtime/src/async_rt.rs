@@ -461,20 +461,21 @@ pub unsafe extern "C" fn lin_retry(thunk: *mut u8, n: i32) -> *mut LinPromise {
 /// True if `v` is an Error-shaped object `{ "type": "error", ... }` (the runtime's fault/Error
 /// representation). Used by `retry` to decide success vs. failure.
 unsafe fn is_error_value(v: *mut u8) -> bool {
-    use crate::object::{lin_object_get, LinObject};
+    use crate::object::{lin_object_get, LinObject, tagged_as_object};
     use crate::string::lin_string_from_bytes;
-    use crate::tagged::{TaggedVal, TAG_OBJECT, TAG_STR};
+    use crate::tagged::{TaggedVal, TAG_STR};
     if v.is_null() {
         return false;
     }
-    let tv = &*(v as *const TaggedVal);
-    if tv.tag != TAG_OBJECT {
-        return false;
-    }
-    let obj = tv.payload as *const LinObject;
+    let tv = v as *const TaggedVal;
+    let (obj, owned) = match tagged_as_object(tv) {
+        Some(pair) => pair,
+        None => return false,
+    };
     let key = lin_string_from_bytes("type".as_ptr(), 4);
     let got = lin_object_get(obj, key);
     crate::string::lin_string_release(key);
+    if owned { crate::object::lin_object_release(obj as *mut LinObject); }
     if got.is_null() {
         return false;
     }

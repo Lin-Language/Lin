@@ -969,17 +969,53 @@ pub unsafe extern "C" fn lin_object_has(obj: *const LinObject, key: *const LinSt
     0
 }
 
+/// Normalize a dynamic value (TaggedVal*) to a LinObject pointer for cold consumers.
+///
+/// - TAG_OBJECT  → returns the payload pointer directly; `owned = false` (no alloc).
+/// - TAG_RECORD  → materializes a transient LinObject from the sealed-struct payload;
+///                 `owned = true`.  Caller MUST call `lin_object_release` when done.
+/// - anything else / null → returns None.
+///
+/// This is the standard bridge for cold direct-LinObject consumers that received a
+/// TAG_RECORD in a dynamic slot (Stage 6a). Hot paths (lin_tagged_index etc.) use their
+/// own descriptor-driven fast path; do NOT use this there.
+pub unsafe fn tagged_as_object(tv: *const TaggedVal) -> Option<(*const LinObject, bool)> {
+    use crate::tagged::{TAG_OBJECT, TAG_RECORD};
+    if tv.is_null() { return None; }
+    match (*tv).tag {
+        TAG_OBJECT => {
+            let obj = (*tv).payload as *const LinObject;
+            if obj.is_null() { return None; }
+            Some((obj, false))
+        }
+        TAG_RECORD => {
+            let sealed = (*tv).payload as *mut u8;
+            if sealed.is_null() { return None; }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let mat = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
+            if mat.is_null() { return None; }
+            Some((mat as *const LinObject, true))
+        }
+        _ => None,
+    }
+}
+
 /// Check if a boxed value (TaggedVal*) is an object that has `key`. Returns 0 for null
 /// or non-object values. Does the tag check + unbox internally so callers need no
 /// branching (used by the IR `has`-pattern lowering).
 #[no_mangle]
 pub unsafe extern "C" fn lin_value_has_field(tagged: *const u8, key: *const LinString) -> u8 {
-    use crate::tagged::{TaggedVal, TAG_OBJECT};
+    use crate::tagged::TaggedVal;
     if tagged.is_null() { return 0; }
-    let tv = &*(tagged as *const TaggedVal);
-    if tv.tag != TAG_OBJECT { return 0; }
-    let obj = tv.payload as *const LinObject;
-    lin_object_has(obj, key)
+    let tv = tagged as *const TaggedVal;
+    match tagged_as_object(tv) {
+        Some((obj, owned)) => {
+            let result = lin_object_has(obj, key);
+            if owned { lin_object_release(obj as *mut LinObject); }
+            result
+        }
+        None => 0,
+    }
 }
 
 /// Check if a boxed value (TaggedVal*) is an array of length `n` (exact) or `>= n` when

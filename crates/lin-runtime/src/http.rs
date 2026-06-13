@@ -1,7 +1,7 @@
 /// HTTP fetch intrinsics for compiled Lin programs.
 use crate::fs::{make_string, resolve_lin_str};
 use crate::tagged::{TAG_INT32, TAG_STR, TAG_OBJECT, alloc_tagged};
-use crate::object::{lin_object_alloc, lin_object_set};
+use crate::object::{lin_object_alloc, lin_object_set, tagged_as_object};
 use crate::tagged::TaggedVal;
 
 unsafe fn make_response_object(status: u16, body: &str) -> *mut u8 {
@@ -86,69 +86,66 @@ pub unsafe extern "C" fn lin_http_fetch_with(url: *const u8, opts: *const u8) ->
         None => return make_error_object("invalid URL"),
     };
 
-    let method = if opts.is_null() {
-        "GET".to_string()
-    } else {
-        let tv = opts as *const TaggedVal;
-        if (*tv).tag == TAG_OBJECT {
-            let obj = (*tv).payload as *const crate::object::LinObject;
-            let method_key = "method";
-            let mut found = "GET".to_string();
-            let len = (*obj).len as usize;
-            for i in 0..len {
-                let entry = (*obj).entries.add(i);
-                let key_s = (*entry).key;
-                let slice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
-                if let Ok(k) = std::str::from_utf8(slice) {
-                    if k == method_key {
-                        let val_tv = &(*entry).value;
-                        if val_tv.tag == TAG_STR {
-                            let vs = val_tv.payload as *const crate::string::LinString;
-                            let vs_slice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
-                            if let Ok(s) = std::str::from_utf8(vs_slice) {
-                                found = s.to_uppercase();
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-            found
-        } else {
-            "GET".to_string()
-        }
+    // Normalize opts to a LinObject* (handles both TAG_OBJECT and TAG_RECORD).
+    let tv = if opts.is_null() { std::ptr::null() } else { opts as *const TaggedVal };
+    let (opts_obj, opts_owned) = match tagged_as_object(tv) {
+        Some(pair) => (pair.0, pair.1),
+        None => (std::ptr::null(), false),
     };
 
-    let body_str: Option<String> = if opts.is_null() {
-        None
+    let method = if opts_obj.is_null() {
+        "GET".to_string()
     } else {
-        let tv = opts as *const TaggedVal;
-        if (*tv).tag == TAG_OBJECT {
-            let obj = (*tv).payload as *const crate::object::LinObject;
-            let len = (*obj).len as usize;
-            let mut found = None;
-            for i in 0..len {
-                let entry = (*obj).entries.add(i);
-                let key_s = (*entry).key;
-                let slice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
-                if let Ok(k) = std::str::from_utf8(slice) {
-                    if k == "body" {
-                        let val_tv = &(*entry).value;
-                        if val_tv.tag == TAG_STR {
-                            let vs = val_tv.payload as *const crate::string::LinString;
-                            let vs_slice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
-                            if let Ok(s) = std::str::from_utf8(vs_slice) {
-                                found = Some(s.to_string());
-                            }
+        let obj = opts_obj;
+        let method_key = "method";
+        let mut found = "GET".to_string();
+        let len = (*obj).len as usize;
+        for i in 0..len {
+            let entry = (*obj).entries.add(i);
+            let key_s = (*entry).key;
+            let slice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
+            if let Ok(k) = std::str::from_utf8(slice) {
+                if k == method_key {
+                    let val_tv = &(*entry).value;
+                    if val_tv.tag == TAG_STR {
+                        let vs = val_tv.payload as *const crate::string::LinString;
+                        let vs_slice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
+                        if let Ok(s) = std::str::from_utf8(vs_slice) {
+                            found = s.to_uppercase();
                         }
-                        break;
                     }
+                    break;
                 }
             }
-            found
-        } else {
-            None
         }
+        found
+    };
+
+    let body_str: Option<String> = if opts_obj.is_null() {
+        None
+    } else {
+        let obj = opts_obj;
+        let len = (*obj).len as usize;
+        let mut found = None;
+        for i in 0..len {
+            let entry = (*obj).entries.add(i);
+            let key_s = (*entry).key;
+            let slice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
+            if let Ok(k) = std::str::from_utf8(slice) {
+                if k == "body" {
+                    let val_tv = &(*entry).value;
+                    if val_tv.tag == TAG_STR {
+                        let vs = val_tv.payload as *const crate::string::LinString;
+                        let vs_slice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
+                        if let Ok(s) = std::str::from_utf8(vs_slice) {
+                            found = Some(s.to_string());
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        found
     };
 
     let req = ureq::request(&method, &url_str);
@@ -157,6 +154,8 @@ pub unsafe extern "C" fn lin_http_fetch_with(url: *const u8, opts: *const u8) ->
     } else {
         req.call()
     };
+
+    if opts_owned { crate::object::lin_object_release(opts_obj as *mut crate::object::LinObject); }
 
     match result {
         Ok(resp) => {
