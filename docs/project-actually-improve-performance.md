@@ -595,8 +595,14 @@ it pays one honest tag-check, and that is correct. Concretely:
    `AnyVal` slot* to emit `TAG_RECORD` (wrap, no copy) instead of `sealed_materialize_to_object`.
    Leave every other `TAG_OBJECT` producer alone. **Gate: corpus digest-exact + RAPTOR exact + suites
    + ASan + RSS-flat** — proves the new repr is sound *before* anything is deleted. ← **the first 6a leg**.
-2. Route `fromJson`/parse of objects to `TAG_RECORD` (descriptor built from the parsed keys) or
-   `TAG_MAP` per D6; migrate dynamic object literals.
+2. Route `fromJson`/parse of objects to `TAG_RECORD` — **a JSON object parses to a normal record,
+   exactly the value you'd get constructing it in code** (Linus, 2026-06-13). NOT a string-keyed
+   dictionary: `fromJson` synthesizes a named descriptor from the parsed keys and builds a sealed
+   struct + `TAG_RECORD`, structurally equal (§5.8 descriptor walk) to a code-emitted record of the
+   same shape. The explicit `Map` (`{String:T}`) type remains the only string-keyed dictionary — you
+   reach for it deliberately, you don't get one from parsing. Also migrate any remaining dynamic
+   object literals. (Open implementation detail for the leg: lifetime of the *runtime-synthesized*
+   descriptor — intern by shape, or own-per-record — decide during impl, don't guess.)
 3. Migrate the remaining `lin_object_get`/`object_set` consumers (≈39 codegen sites across
    `data.rs`/`mod.rs`/`intrinsics.rs`/`types.rs`/`runtime.rs`) to tag-dispatch.
 4. **Delete `TAG_OBJECT` + `object.rs`'s `LinObject` string-keyed storage**; delete the `repr.rs`
