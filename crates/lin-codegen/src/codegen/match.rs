@@ -5,7 +5,7 @@ use inkwell::{AddressSpace, IntPredicate};
 use lin_check::types::Type;
 use lin_ir::ir as lir;
 use super::Codegen;
-use lin_common::tags::{TAG_OBJECT, TAG_RECORD};
+use lin_common::tags::{TAG_NULL, TAG_OBJECT, TAG_RECORD};
 
 impl<'ctx> Codegen<'ctx> {
     pub(crate) fn compile_ir_is_type(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> inkwell::values::IntValue<'ctx> {
@@ -144,6 +144,101 @@ impl<'ctx> Codegen<'ctx> {
         src_repr: &lin_ir::repr::Repr,
         llvm_fn: inkwell::values::FunctionValue<'ctx>,
     ) -> BasicValueEnum<'ctx> {
+        // Stage 3 NullableRecord: the source is a raw nullable sealed struct pointer.
+        // Three coerce directions:
+        //   NullableRecord → sealed T (PackedStruct): the match-arm narrowing after `is T` succeeds.
+        //     Forward the pointer as-is (the branch guarantee ensures it is non-null).
+        //   NullableRecord → Null: forward null ptr.
+        //   NullableRecord → Json / AnyVal / union: box sealed ptr as TAG_RECORD if non-null,
+        //     box null as TAG_NULL otherwise.
+        if src_repr.nullable_record_fields().is_some() {
+            // to_ty = sealed T → identity (non-null guaranteed by the match branch)
+            if Self::sealed_fields(to_ty).is_some() {
+                return val; // same raw pointer, just re-typed
+            }
+            // to_ty = Null → null ptr
+            if matches!(to_ty, Type::Null) {
+                return self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into();
+            }
+            // to_ty = Json / AnyVal / multi-variant union: box with null-guard
+            if val.is_pointer_value() {
+                let p = val.into_pointer_value();
+                let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                let i64_ty = self.context.i64_type();
+                let pi = self.builder.ptr_to_int(p, i64_ty, "nr_box_p2i");
+                let is_null = self.builder.int_compare(
+                    inkwell::IntPredicate::EQ, pi, i64_ty.const_zero(), "nr_box_isnull");
+                let null_bb = self.context.append_basic_block(llvm_fn, "nr_box_null");
+                let nn_bb = self.context.append_basic_block(llvm_fn, "nr_box_nn");
+                let merge_bb = self.context.append_basic_block(llvm_fn, "nr_box_merge");
+                self.builder.conditional_branch(is_null, null_bb, nn_bb);
+                self.builder.position_at_end(null_bb);
+                let null_box = self.builder.call(self.rt.box_null, &[], "nr_boxnull")
+                    .try_as_basic_value().unwrap_basic();
+                let null_pred = self.builder.get_insert_block().unwrap();
+                self.builder.unconditional_branch(merge_bb);
+                self.builder.position_at_end(nn_bb);
+                // box_record: retain the sealed struct + wrap as TAG_RECORD
+                let rec_box = self.builder.call(self.rt.box_record, &[p.into()], "nr_boxrec")
+                    .try_as_basic_value().unwrap_basic();
+                let nn_pred = self.builder.get_insert_block().unwrap();
+                self.builder.unconditional_branch(merge_bb);
+                self.builder.position_at_end(merge_bb);
+                let phi = self.builder.phi(ptr_ty, "nr_box_phi");
+                phi.add_incoming(&[(&null_box, null_pred), (&rec_box, nn_pred)]);
+                return phi.as_basic_value();
+            }
+            return val;
+        }
+        // Stage 3 NullableRecord (reverse): PackedStruct source coerced into a NullableRecord
+        // destination (`Trip → Trip|Null`). The sealed ptr carries directly — no boxing needed.
+        // Also covers `Union([Named("T"), Null])` — self-recursive Named alias form — where
+        // `nullable_sealed_record_type` cannot resolve the fields but the PassThrough is still safe.
+        if Self::nullable_sealed_record_type(to_ty).is_some()
+            || Self::is_named_nullable_union(to_ty)
+        {
+            if src_repr.packed_struct_fields().is_some() {
+                return val; // sealed struct ptr → NullableRecord: identity
+            }
+            // A null/Null source into a NullableRecord slot: return null ptr.
+            if matches!(from_ty, Type::Null) || !val.is_pointer_value() {
+                return self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into();
+            }
+            // A boxed/union source → project into the sealed inner type, null-guarded.
+            // The source may carry TAG_NULL (null path); return null ptr in that case.
+            if let Type::Union(members) = to_ty {
+                let inner = members.iter().find(|m| !matches!(*m, Type::Null));
+                if let Some(inner_ty) = inner {
+                    if let Some(tf) = Self::sealed_fields(inner_ty) {
+                        let tf = tf.clone();
+                        // Emit: tag = get_tag(val); is_null = (tag == TAG_NULL); if is_null → null ptr else project.
+                        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                        let i8_ty = self.context.i8_type();
+                        let tag = self.builder.call(self.rt.get_tag, &[val.into()], "nr_proj_tag")
+                            .try_as_basic_value().unwrap_basic().into_int_value();
+                        let is_null = self.builder.int_compare(
+                            inkwell::IntPredicate::EQ, tag,
+                            i8_ty.const_int(TAG_NULL as u64, false),
+                            "nr_proj_isnull");
+                        let null_bb = self.context.append_basic_block(llvm_fn, "nr_proj_null");
+                        let nn_bb = self.context.append_basic_block(llvm_fn, "nr_proj_nn");
+                        let merge_bb = self.context.append_basic_block(llvm_fn, "nr_proj_merge");
+                        self.builder.conditional_branch(is_null, null_bb, nn_bb);
+                        self.builder.position_at_end(null_bb);
+                        let null_pred = self.builder.get_insert_block().unwrap();
+                        self.builder.unconditional_branch(merge_bb);
+                        self.builder.position_at_end(nn_bb);
+                        let proj = self.sealed_project_from(val, from_ty, &tf);
+                        let nn_pred = self.builder.get_insert_block().unwrap();
+                        self.builder.unconditional_branch(merge_bb);
+                        self.builder.position_at_end(merge_bb);
+                        let phi = self.builder.phi(ptr_ty, "nr_proj_phi");
+                        phi.add_incoming(&[(&ptr_ty.const_null(), null_pred), (&proj, nn_pred)]);
+                        return phi.as_basic_value();
+                    }
+                }
+            }
+        }
         if let Some(sum_ty) = src_repr.sumnode_sum_ty() {
             let sum_ty = sum_ty.clone();
             // sum → SAME sum type (e.g. an identity widening, or a union-to-union no-op): carry the

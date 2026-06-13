@@ -1415,6 +1415,28 @@ fn lower_sum_scrutinee_raw(
 /// it like any object — only its physical layout and its `emit_release`/construct/field-read codegen
 /// differ (routed via the sealed runtime). The function name is kept for call-site stability across
 /// the (now generalized) Stage 1 + Stage 2 gate.
+/// True when `ty` is a Stage-3 NullableRecord param: `T|Null` where `T` is a sealed record or
+/// `Named("T")` resolving to one. Covers both the fully-resolved `Union([Object{sealed}, Null])`
+/// (caught by `nullable_sealed_record`) and the `Union([Named("T"), Null])` Named-alias form that
+/// appears in self-recursive functions before Named is expanded. Used by `lower_coerce_arg` to
+/// avoid boxing a concrete sealed arg into a boxing Coerce for such a param.
+fn is_nullable_record_param(ty: &Type) -> bool {
+    if crate::repr::nullable_sealed_record(ty).is_some() {
+        return true;
+    }
+    // Named-alias union form: Union([Named(n), Null]) or Union([Null, Named(n)]).
+    let Type::Union(members) = ty else { return false };
+    let mut has_named_non_null = false;
+    for m in members {
+        match m {
+            Type::Null => {}
+            Type::Named(_) => { has_named_non_null = true; }
+            _ => return false, // other non-null, non-Named variant: not a simple nullable record
+        }
+    }
+    has_named_non_null
+}
+
 fn is_sealed_scalar_repr(ty: &Type) -> bool {
     matches!(ty, Type::Object { fields, sealed: true }
         if !fields.is_empty() && fields.values().all(is_sealed_field_ty))
@@ -1577,7 +1599,7 @@ fn is_sealed_field_ty(ty: &Type) -> bool {
 /// teardown must ALL use this predicate together — an asymmetry causes a double-free
 /// (release without matching retain) or a leak (retain without matching release).
 fn needs_owning(ty: &Type) -> bool {
-    is_rc_type(ty) || is_union_ty(ty)
+    is_rc_type(ty) || is_union_ty(ty) || is_nullable_sealed_record(ty)
 }
 
 /// STORE side of the owning model: produce a value the cell/global will OWN.
@@ -1966,8 +1988,21 @@ pub fn mangle_module_key(path: &str) -> String {
 /// tag-aware RC path, so it belongs here too. `TarEntry` is a boxed `TaggedVal*(TAG_TAR_ENTRY)`
 /// on the same tag-aware RC path — must be listed here so that closure captures CloneBox it
 /// (rather than CaptureRelease::None, which would UAF after the creating scope exits).
+///
+/// Stage 3 NullableRecord: `T | Null` where T is a sealed record is EXCLUDED from `is_union_ty`.
+/// Such a union is represented as a raw nullable sealed-struct pointer (NOT a `TaggedVal*` box),
+/// so it must not flow through any of the `TaggedVal` boxing/cloning/releasing paths. The repr
+/// pass seeds it as `Packed(NullableRecord)` and codegen dispatches on that repr separately.
 fn is_union_ty(ty: &Type) -> bool {
+    if is_nullable_sealed_record(ty) { return false; }
     matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry)
+}
+
+/// True iff `ty` is a `T | Null` union where `T` is a sealed record — the Stage-3 NullableRecord
+/// repr. Such a value is physically a raw nullable `*sealed_T` pointer (not a `TaggedVal*`).
+/// Delegates to `repr::nullable_sealed_record` as the single gate definition.
+fn is_nullable_sealed_record(ty: &Type) -> bool {
+    crate::repr::nullable_sealed_record(ty).is_some()
 }
 
 /// True if `ty` IS a `Stream` or a `Union` containing one. A streamish capture crosses a thread
@@ -2176,6 +2211,22 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
         builder.emit(Instruction::Coerce { dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone() });
         builder.register_owned(dst, param_ty.clone());
         return dst;
+    }
+    // Stage 3 NullableRecord: `T → T|Null` where the param is NullableRecord-eligible. The
+    // raw sealed struct ptr IS the NullableRecord repr — pass through with no coerce/boxing.
+    // Similarly `Null → T|Null` and `T|Null → T|Null` (same type) pass through naturally.
+    // Also handles `Union([Named("T"), Null])` — a self-recursive Named alias in the union;
+    // the Named is the sealed record type and passes through identically.
+    if is_nullable_record_param(param_ty) {
+        // Check that the arg type is a NullableRecord-eligible sealed record (all fields sealable),
+        // NOT just any sealed:true record. Trip{Service{Json}} is sealed:true but NOT NullableRecord.
+        let arg_is_nullable_record_eligible = crate::repr::sealed_fields(arg_ty).is_some();
+        let arg_is_null = matches!(arg_ty, Type::Null);
+        let arg_is_nullable = crate::repr::nullable_sealed_record(arg_ty).is_some()
+            || is_nullable_record_param(arg_ty);
+        if arg_is_nullable_record_eligible || arg_is_null || arg_is_nullable {
+            return arg;
+        }
     }
     // Box/unbox across the union boundary.
     if is_union_ty(param_ty) != is_union_ty(arg_ty) {
@@ -3119,6 +3170,8 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                 // The global holds the var's declared representation; narrow to the requested
                 // concrete type if this use wants one (e.g. a Json global read as Int32).
                 let narrowed = is_union_ty(&gty) && !is_union_ty(ty);
+                // Stage 3: NullableRecord global `var x: T | Null` read at type `T` (post null-check).
+                let narrowed_from_nullable = is_nullable_sealed_record(&gty) && is_sealed_scalar_repr(ty);
                 if narrowed {
                     // Narrow the loaded box to the requested concrete type. Unboxing (Coerce)
                     // does not add a reference, so the narrowed concrete value aliases the
@@ -3126,6 +3179,12 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                     // the inner in place + register, so it survives a later global reassignment
                     // (release-old) and is freed at scope exit. (`own_for_read` with the
                     // concrete `ty` retains in place — not a box clone.)
+                    let d = builder.alloc_temp(ty.clone());
+                    builder.emit(Instruction::Coerce { dst: d, src: dst, from_ty: gty.clone(), to_ty: ty.clone() });
+                    return own_for_read(d, ty, builder);
+                }
+                if narrowed_from_nullable {
+                    // Identity ptr cast (NullableRecord → PackedStruct): retain and own.
                     let d = builder.alloc_temp(ty.clone());
                     builder.emit(Instruction::Coerce { dst: d, src: dst, from_ty: gty.clone(), to_ty: ty.clone() });
                     return own_for_read(d, ty, builder);
@@ -3152,6 +3211,14 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                 // type — e.g. a Json param narrowed to String inside a match arm — unbox it.
                 let stored_ty = builder.temp_types.get(&t).cloned().unwrap_or_else(|| ty.clone());
                 let narrowed = is_union_ty(&stored_ty) && !is_union_ty(ty);
+                // Stage 3 NullableRecord: a `T | Null` slot read at type `T` (the non-null
+                // branch after a `?? default` or explicit null-check). The Coerce is an identity
+                // ptr cast (NullableRecord → PackedStruct carry the same raw pointer; the branch
+                // guarantees non-null). Like `narrowed_to_sealed` (union projection), the Coerce
+                // seeds a fresh `Packed(PackedStruct)` for the dst (no allocation, just re-typing),
+                // so retain the underlying struct and register it as an owned read.
+                let narrowed_from_nullable = is_nullable_sealed_record(&stored_ty)
+                    && is_sealed_scalar_repr(ty);
                 // A union narrowed to a SEALED scalar record is a PROJECTION (`sealed_project_from`):
                 // the Coerce ALLOCATES a FRESH +1 owned struct (retaining the source's heap fields),
                 // NOT a borrowed alias of the box's inner. So it must be registered owned but NOT
@@ -3162,7 +3229,7 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                 // the `match trip is Trip => trip["dep"]` arm-narrowing leak (ASan-confirmed, both
                 // recursive and non-recursive).
                 let narrowed_to_sealed = narrowed && is_sealed_scalar_repr(ty);
-                let t = if narrowed {
+                let t = if narrowed || narrowed_from_nullable {
                     let dst = builder.alloc_temp(ty.clone());
                     builder.emit(Instruction::Coerce {
                         dst, src: t, from_ty: stored_ty, to_ty: ty.clone(),
@@ -3173,6 +3240,11 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                 };
                 if narrowed_to_sealed {
                     // Fresh +1 projection: register for scope-exit release, no retain.
+                    builder.register_owned(t, ty.clone());
+                } else if narrowed_from_nullable {
+                    // Identity ptr cast (NullableRecord → PackedStruct); retain the underlying
+                    // struct so the owning read balances against the scope-exit release.
+                    builder.emit(Instruction::Retain { val: t, ty: ty.clone() });
                     builder.register_owned(t, ty.clone());
                 } else if is_rc_type(ty) {
                     // Pessimistically retain heap values on every read — rc_elide removes redundant pairs.
@@ -5996,6 +6068,39 @@ fn type_repr_differs(from: &Type, to: &Type) -> bool {
     }
     if crate::repr::sum_type_eligible(from) != crate::repr::sum_type_eligible(to) {
         return true;
+    }
+    // Stage 3: NullableRecord boundary. A nullable sealed ptr (`T | Null`) and a sealed struct
+    // (`T`) or Null have the SAME physical layout on the nullable side (raw ptr). The boundary
+    // only fires when one side is NullableRecord and the other is some BOXED/union type (e.g.
+    // a bare `Union` that is NOT a nullable sealed record). sealed → NullableRecord and
+    // Null → NullableRecord are IDENTITY (no coerce needed); NullableRecord → union/Json IS a
+    // change (needs boxing via the null-guarded TAG_RECORD path).
+    // Mirror: `is_nullable_sealed_record` is excluded from `is_union_ty`, so the union arm below
+    // does NOT fire for `T | Null`. We only need to coerce when NullableRecord meets a boxed slot.
+    //
+    // IMPORTANT: return false EARLY for the identity cases (sealed↔NullableRecord and Null↔NullableRecord).
+    // Without an early return the sealed-mismatch check below (is_sealed_scalar_repr(from) !=
+    // is_sealed_scalar_repr(to)) would fire for `Trip → Trip|Null` and wrongly emit a coerce.
+    if is_nullable_sealed_record(from) || is_nullable_sealed_record(to) {
+        // One side is NullableRecord. Determine whether a coerce is needed.
+        if is_nullable_sealed_record(from) && !is_nullable_sealed_record(to) {
+            // NullableRecord → sealed T (identity) or Null (identity): no coerce.
+            if is_sealed_scalar_repr(to) || matches!(to, Type::Null) {
+                return false;
+            }
+            // NullableRecord → Json/union/boxed: box with null-guard.
+            return true;
+        }
+        if !is_nullable_sealed_record(from) && is_nullable_sealed_record(to) {
+            // sealed T → NullableRecord (identity) or Null → NullableRecord (identity): no coerce.
+            if is_sealed_scalar_repr(from) || matches!(from, Type::Null) {
+                return false;
+            }
+            // Json/union/boxed → NullableRecord: project.
+            return true;
+        }
+        // Both NullableRecord: same repr, no coerce (equal types short-circuit before we get here).
+        return false;
     }
     // The union/Json box boundary.
     if is_union_ty(from) != is_union_ty(to) {

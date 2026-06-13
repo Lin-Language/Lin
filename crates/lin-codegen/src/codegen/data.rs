@@ -407,6 +407,34 @@ impl<'ctx> Codegen<'ctx> {
                 let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
                 return self.sealed_project_from(tagged, &Type::TypeVar(u32::MAX), &fields);
             }
+            // Stage 3 NullableRecord: `T | Null` result where T is a sealed record. The slot holds
+            // a MATERIALIZED TAG_OBJECT (see `emit_map_set` — bare records materialize before store).
+            // `lin_map_get` returns a borrowed TaggedVal*(TAG_OBJECT) for a hit, or null for a miss.
+            // Project the hit into a fresh +1 sealed struct; return null ptr for a miss.
+            // NullableRecord repr = raw `*T` (non-null) or null — no TaggedVal wrapper.
+            if let Some(fields) = Self::nullable_sealed_record_type(result_ty) {
+                let fields = fields.clone();
+                let ptr_ty_local = self.context.ptr_type(AddressSpace::default());
+                let i64_ty = self.context.i64_type();
+                let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget_nr").try_as_basic_value().unwrap_basic();
+                // Null-guard: miss → return null ptr (no projection on null).
+                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let pi = self.builder.ptr_to_int(tagged.into_pointer_value(), i64_ty, "nr_mget_p2i");
+                let is_null = self.builder.int_compare(
+                    inkwell::IntPredicate::EQ, pi, i64_ty.const_zero(), "nr_mget_isnull");
+                let hit_bb = self.context.append_basic_block(llvm_fn, "nr_mget_hit");
+                let merge_bb = self.context.append_basic_block(llvm_fn, "nr_mget_merge");
+                self.builder.conditional_branch(is_null, merge_bb, hit_bb);
+                let miss_pred = self.builder.get_insert_block().unwrap();
+                self.builder.position_at_end(hit_bb);
+                let projected = self.sealed_project_from(tagged, &Type::TypeVar(u32::MAX), &fields);
+                let hit_pred = self.builder.get_insert_block().unwrap();
+                self.builder.unconditional_branch(merge_bb);
+                self.builder.position_at_end(merge_bb);
+                let phi = self.builder.phi(ptr_ty_local, "nr_mget_phi");
+                phi.add_incoming(&[(&ptr_ty_local.const_null(), miss_pred), (&projected, hit_pred)]);
+                return phi.as_basic_value();
+            }
             // GENERAL read. `container` is a RAW pointer (the `{ String: T }` ABI passes the unboxed
             // container, not a boxed TaggedVal), so its tag is NOT readable here — we rely on the
             // Json→Map coercion boundary (`compile_ir_coerce`) having already materialized any
@@ -2976,6 +3004,18 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 let sum_ty = sum_ty.clone();
                 return self.sumnode_field_get_by_name(obj, field, &sum_ty, result_ty);
+            }
+            return ptr_ty.const_null().into();
+        }
+        // NULLABLE RECORD (Stage 3 Avenue B): the object is a raw sealed ptr that is guaranteed
+        // non-null in the branch we are in (the IsType/null check guards the outer `if`). The
+        // physical layout is identical to PackedStruct — delegate to sealed_field_get directly.
+        if let Some(fields) = obj_repr.nullable_record_fields() {
+            if !fields.contains_key(field) {
+                return self.null_value_for(result_ty);
+            }
+            if obj.is_pointer_value() {
+                return self.sealed_field_get(obj, field, fields, result_ty);
             }
             return ptr_ty.const_null().into();
         }

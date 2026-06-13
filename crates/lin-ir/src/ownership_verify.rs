@@ -459,8 +459,10 @@ pub fn owning_strategy(ty: &Type) -> OwningStrategy {
 }
 
 /// Boxed Json/union value types (the `CloneBox` owning set). Kept in the authority alongside
-/// `owning_strategy`; mirrors `lower::is_union_ty`.
+/// `owning_strategy`; mirrors `lower::is_union_ty`. Stage 3: NullableRecord unions are EXCLUDED
+/// (they use Retain, not Clone — a raw nullable ptr, not a TaggedVal shell).
 fn is_union_owning_ty(ty: &Type) -> bool {
+    if crate::repr::nullable_sealed_record(ty).is_some() { return false; }
     matches!(
         ty,
         Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
@@ -468,7 +470,11 @@ fn is_union_owning_ty(ty: &Type) -> bool {
 }
 
 /// Concrete refcounted heap value types (the `Retain` owning set). Mirrors `lower::is_rc_type`.
+/// Stage 3: NullableRecord unions are included here — they are raw nullable `*sealed_T` pointers
+/// whose RC (at offset 0 of the sealed struct) is managed via `lin_rc_retain`/`lin_sealed_release`,
+/// exactly like a sealed struct (`Type::Object{sealed:true}`). `lin_rc_retain` already null-guards.
 fn is_concrete_rc_ty(ty: &Type) -> bool {
+    if crate::repr::nullable_sealed_record(ty).is_some() { return true; }
     matches!(
         ty,
         Type::Str
