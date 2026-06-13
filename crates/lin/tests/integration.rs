@@ -11913,6 +11913,92 @@ print(loop(0, 100, 0))
 }
 
 #[test]
+fn test_index_assign_evaluates_to_assigned_value() {
+    // Spec §8 / §27 rule 8: an assignment expression evaluates to the assigned value. This held
+    // for `var x = v` (`LocalSet`) but `m[k] = v` (`IndexSet`) wrongly evaluated to `Null`. Now an
+    // index/field assignment can be the value of an `if` branch / block tail, so the memoizing
+    // cache idiom `if m[k] == null then m[k] = compute() else m[k]` type-checks and returns the
+    // stored value directly — no intermediate `val` needed.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { split } from "std/string"
+import { parseInt32 } from "std/number"
+
+val createTimeParser = () =>
+  val timeCache: { String: Int32 } = {}
+  (time: String): Int32 =>
+    if timeCache[time] == null then
+      val [hh, mm, ss] = time.split(":")
+      timeCache[time] = parseInt32(hh) * 60 * 60 + parseInt32(mm) * 60 + parseInt32(ss)
+    else
+      timeCache[time]
+
+val parse = createTimeParser()
+print(toString(parse("01:02:03")))
+print(toString(parse("01:02:03")))
+print(toString(parse("00:01:00")))
+"#);
+    assert_eq!(out, vec!["3723", "3723", "60"]);
+}
+
+#[test]
+fn test_index_assign_value_result_map_object_array() {
+    // The assigned-value result across container kinds and value kinds, each consumed directly:
+    //   - map scalar value (returned and printed),
+    //   - object field STRING value (heap rc) returned from a block,
+    //   - array index value used in an expression.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+// map, scalar value: the assignment IS the returned value
+val m: { String: Int32 } = {}
+print(toString(m["a"] = 42))
+
+// object field, heap (String) value
+type Rec = { "name": String }
+val r: Rec = { "name": "" }
+val n: String = r["name"] = "lin"
+print(n)
+
+// array slot, scalar value used in arithmetic
+var xs: Int32[] = [0, 0, 0]
+print(toString((xs[1] = 7) + 1))
+print(toString(length(xs)))
+"#);
+    assert_eq!(out, vec!["42", "lin", "8", "3"]);
+}
+
+#[test]
+fn test_void_function_body_may_end_in_assignment() {
+    // A `: Null` (void) function's body value is DISCARDED, so it may now END in an assignment
+    // expression (value-typed per spec §8) without an artificial `; null` tail. This is the
+    // `addPair`-style multimap accumulator from `std/encoding`'s query parser. The heap (`String[]`)
+    // value the assignment produces must be RELEASED at scope exit (void functions `Return(None)`),
+    // not leaked — the ASan CI leg and the constant-RSS check guard that; here we assert behaviour.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+
+val addPair = (m: { String: String[] }, k: String, v: String): Null =>
+  val cur = m[k]
+  if cur == null then
+    val fresh: String[] = [v]
+    m[k] = fresh
+  else
+    push(cur, v)
+
+var m: { String: String[] } = {}
+addPair(m, "a", "x")
+addPair(m, "a", "y")
+addPair(m, "b", "z")
+print(toString(length(m["a"])))
+print(toString(length(m["b"])))
+"#);
+    assert_eq!(out, vec!["2", "1"]);
+}
+
+#[test]
 fn object_index_assign_of_callback_param() {
     // Regression: `obj[key] = value` where `value` is a for/map callback PARAMETER used to
     // store NULL. Under the uniform closure ABI a callback param arrives BOXED (a TaggedVal*),

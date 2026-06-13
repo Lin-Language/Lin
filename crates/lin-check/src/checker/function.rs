@@ -431,7 +431,17 @@ impl Checker {
         captures.sort_by_key(|c| c.outer_slot);
 
         let ret_type = if let Some(declared) = declared_ret {
-            if !checked_against_declared && !self.types_compatible(&body_ty, &declared) {
+            // A `: Null` declared return is the unit/void position: the body's value is DISCARDED
+            // (codegen gives such a function a void LLVM signature and `Return(None)`). Accept ANY
+            // body type there — this is what lets a void-returning function END in an assignment
+            // expression (now value-typed per spec §8: `m[k] = v` evaluates to `v`) or any other
+            // value statement without an artificial `; null` tail. The body value is released at
+            // scope exit (see `lower_function_expr`'s void return-keep handling).
+            let null_discards = matches!(declared, Type::Null);
+            if !null_discards
+                && !checked_against_declared
+                && !self.types_compatible(&body_ty, &declared)
+            {
                 return Err(Diagnostic::error(
                     span,
                     format!(

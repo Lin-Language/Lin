@@ -4212,8 +4212,13 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                             obj_ty: obj_ty.clone(),
                             val_ty,
                         });
-                        // FieldSet evaluates to Null.
-                        return builder.const_temp(Const::Null);
+                        // The assignment evaluates to the assigned value (spec §8). Unlike the
+                        // generic path, `FieldSet` does NOT transfer/consume the source (codegen
+                        // retains its own field reference and releases the old), so `val_temp` is
+                        // still the scope-owned value `lower_expr` produced — return it directly as
+                        // the (already independently-owned) result. Adding another `own_for_read`
+                        // here would leave an unbalanced +1 (a per-write leak).
+                        return val_temp;
                     }
                 }
             }
@@ -4274,16 +4279,25 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
                 value: val_temp,
                 obj_ty: obj_ty.clone(),
                 key_ty,
-                val_ty,
+                val_ty: val_ty.clone(),
             });
+            // The assignment EXPRESSION evaluates to the assigned value (spec §8 / §27 rule 8).
+            // The container now owns ONE reference to the value (supplied by `transfer_into_container`
+            // / the runtime store). The result must be an INDEPENDENTLY-owned value so a consuming
+            // caller (block tail, `if` merge, `return`) can release it without touching the
+            // container's distinct reference — exactly the `LocalSet` model. `own_for_read` retains
+            // (concrete rc) / clones the box (union) / is a no-op (scalar) and registers the result
+            // for scope-exit release. Done BEFORE `FreeBoxShell` so a union clone reads the box
+            // before its orphaned shell is reclaimed.
+            let result = own_for_read(val_temp, &val_ty, builder);
             // A fresh union box consumed by `lin_array_set` leaves an orphaned 16-byte shell
             // (the slot owns the inner; the source box header is unreferenced) — free it after
-            // the set has read from it. Mirrors the `ArraySetDyn` intrinsic path.
+            // the set has read from it. Mirrors the `ArraySetDyn` intrinsic path. (`result` is a
+            // DISTINCT box for the union case, so freeing `val_temp`'s shell cannot touch it.)
             if free_shell {
                 builder.emit(Instruction::FreeBoxShell { val: val_temp });
             }
-            // IndexSet evaluates to Null.
-            builder.const_temp(Const::Null)
+            result
         }
     }
 }
@@ -10033,7 +10047,14 @@ fn lower_function_expr_with_id(
         && !is_union_ty(&body_ty)
         && is_rc_type(&body_ty)
         && is_sealed_scalar_repr(&effective_ret);
-    let return_keep: Vec<Temp> = if unboxes_to_scalar || sealed_projection_from_object {
+    let return_keep: Vec<Temp> = if void_ret {
+        // A void (`: Null`/`Never`) function emits `Return(None)` — the body value is NOT returned.
+        // Keep NOTHING, so an OWNED heap body value (now possible since a `: Null` body may be any
+        // type — e.g. ending in `m[k] = v`, which evaluates to the stored heap value) is RELEASED
+        // at scope exit rather than leaked. Previously a void body was always `Null` (a non-owning
+        // const), so keeping it was harmless; an owned body value must be dropped here.
+        vec![]
+    } else if unboxes_to_scalar || sealed_projection_from_object {
         // For both cases `raw_ret` does not alias `ret_temp`: release it via scope-exit.
         vec![ret_temp]
     } else {
