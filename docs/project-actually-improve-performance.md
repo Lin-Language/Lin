@@ -1,6 +1,19 @@
 # Project: Actually Improve Performance — the representation reset
 
-**Status:** proposal / design — not yet started.
+**Status:** IN PROGRESS on the `reset/main` project branch (§6 branch policy).
+- **Stage 0 — DONE, on master** (test pins `test_reset_pin_*`, scan sentinel, baselines appendix; plus
+  the bare-record-map-value crash fix `650c07d5` it uncovered).
+- **Stage 1 — DONE, on `reset/main`**: D5 share-on-push via 0xFD pointer-backed record arrays
+  (all-scalar class); D3a anonymous-param monomorphisation (share-on-pass); D3b non-param slot
+  project-copy. Side wins on master: the monomorphisation inner-closure LLVM symbol-collision fix
+  (`b5ccb64b` — cured the long-standing cross-module generic worker-transfer crash). Stage-1 ledger:
+  typed RAPTOR −4.7% vs baseline (digest exact), `records` ≡ master, scan sentinel ~1.9× (the §5.6
+  lever remains available); suites green. The repr.rs boxed-arm removal was re-sequenced into Stage 2.
+- **Stage 2 — IN PROGRESS**: leg 2a (heap-field record arrays → 0xFD) hit the documented
+  `{String: T[]}` map-value seam; direction decided: the `??` coalesce join PRESERVES Packed for
+  sealed arrays (hot path stays 0xFD-native) + generic LinArray runtime fns gain tag-dispatching
+  0xFD arms via the named descriptor (sound safety net, 0xFE precedent). A record-taint/forced-Boxed
+  pass was rejected (re-introduces the flow-sensitive reconciliation this project deletes).
 **Author:** drafted with Claude, 2026-06-12, from the post-RAPTOR performance retrospective.
 **Prerequisite read:** `docs/PERFORMANCE.md` (§2 typed-vs-Json RAPTOR), `docs/DECISIONS.md`
 (ADR-057 sealed records, ADR-062 representation inference, ADR-064 SumNode), `docs/SPECIFICATION.md`
