@@ -19374,3 +19374,151 @@ print(toString(applyCount(xs, isBig)))
 "#);
     assert_eq!(out, vec!["4", "2"]);
 }
+
+// ─────────────────── Sealed-record-ARRAY with HEAP fields (Stage 2a) ────────────────────
+// Stage 2a widens the `is_sealed_array_field_packable` gate to cover String / Array / Map /
+// nested-sealed fields. A `Person[]` (or any heap-field record array) now goes through the
+// 0xFD pointer-backed path: array slots hold 8-byte struct pointers, index loads the pointer
+// then GEPs at const-offset — no per-read materialization. Drop walks the descriptor via
+// `lin_sealed_release_self`.
+
+#[test]
+fn test_reset_stage2a_heapfield_push_share_string() {
+    // Push a heap-field record into a typed array; mutate the String field on the original;
+    // confirm arr[0]["id"] sees the mutation (0xFD pointer-backed share-on-push).
+    let out = run(r#"import { print } from "std/io"
+import { push } from "std/array"
+type Entry = { "id": String, "n": Int32 }
+val main = () =>
+  var arr: Entry[] = []
+  val e: Entry = { "id": "hello", "n": 1 }
+  push(arr, e)
+  e["id"] = "world"
+  print("arr0=${arr[0]["id"]}")
+  print("orig=${e["id"]}")
+main()
+"#);
+    // 0xFD: pointer-backed share-on-push — mutation visible through arr[0].
+    assert_eq!(out, vec!["arr0=world", "orig=world"]);
+}
+
+#[test]
+fn test_reset_stage2a_heapfield_index_share_both_ways() {
+    // Mutate through arr[0], confirm original shares; mutate original, confirm arr[0] shares.
+    let out = run(r#"import { print } from "std/io"
+import { push } from "std/array"
+type Entry = { "id": String, "n": Int32 }
+val main = () =>
+  var arr: Entry[] = []
+  val e: Entry = { "id": "initial", "n": 0 }
+  push(arr, e)
+  arr[0]["id"] = "via_arr"
+  print("e_after_arr_mut=${e["id"]}")
+  e["id"] = "via_orig"
+  print("arr0_after_orig_mut=${arr[0]["id"]}")
+main()
+"#);
+    assert_eq!(out, vec!["e_after_arr_mut=via_arr", "arr0_after_orig_mut=via_orig"]);
+}
+
+#[test]
+fn test_reset_stage2a_heapfield_tostring_and_eq() {
+    // toString and eq on a heap-field record array.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Person = { "name": String, "age": Int32 }
+val ps: Person[] = [{ "name": "ann", "age": 30 }, { "name": "bob", "age": 41 }]
+print(toString(ps))
+val ps2: Person[] = [{ "name": "ann", "age": 30 }, { "name": "bob", "age": 41 }]
+print(toString(ps == ps2))
+"#);
+    assert_eq!(out, vec![
+        r#"[{"name": "ann", "age": 30}, {"name": "bob", "age": 41}]"#,
+        "true",
+    ]);
+}
+
+#[test]
+fn test_reset_stage2a_heapfield_for_map_filter_typed_param() {
+    // for/map/filter over a heap-field record array with typed params.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for, map, filter } from "std/iter"
+import { length } from "std/array"
+type Person = { "name": String, "age": Int32 }
+val ps: Person[] = [
+  { "name": "ann", "age": 30 },
+  { "name": "bob", "age": 41 },
+  { "name": "cat", "age": 7 }
+]
+val names: String[] = map(ps, (p: Person) => p["name"])
+print(toString(names))
+val adults: Person[] = filter(ps, (p: Person) => p["age"] >= 18)
+print(toString(length(adults)))
+var acc = ""
+ps.for((p: Person) => acc = "${acc}${p["name"]} ")
+print(acc)
+"#);
+    assert_eq!(out, vec![
+        r#"["ann", "bob", "cat"]"#,
+        "2",
+        "ann bob cat ",
+    ]);
+}
+
+#[test]
+fn test_reset_stage2a_heapfield_json_widening() {
+    // Json-widening of a 0xFD heap-field element: accessing arr[0] as Json must still read correctly.
+    let out = run(r#"import { print } from "std/io"
+type Person = { "name": String, "age": Int32 }
+val ps: Person[] = [{ "name": "ann", "age": 30 }, { "name": "bob", "age": 41 }]
+val j: Json = ps[0]
+print("${j["name"]} ${j["age"]}")
+"#);
+    assert_eq!(out, vec!["ann 30"]);
+}
+
+#[test]
+fn test_reset_stage2a_heapfield_nested_array_of_arrays() {
+    // Nested Trip[][] — array of arrays of records (each row is a typed record array).
+    let out = run(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+type Stop = { "id": String, "time": Int32 }
+val main = () =>
+  var outer: Stop[][] = []
+  val row1: Stop[] = [{ "id": "s1", "time": 10 }, { "id": "s2", "time": 20 }]
+  val row2: Stop[] = [{ "id": "s3", "time": 30 }]
+  push(outer, row1)
+  push(outer, row2)
+  print(toString(length(outer)))
+  print(toString(length(outer[0])))
+  print("${outer[0][0]["id"]} ${outer[0][1]["time"]}")
+  print("${outer[1][0]["id"]}")
+main()
+"#);
+    assert_eq!(out, vec!["2", "2", "s1 20", "s3"]);
+}
+
+#[test]
+fn test_reset_stage2a_heapfield_map_value_store_count() {
+    // {String: Trip[]} map value — store an array of heap-field records as a map value and count it.
+    // Scope fence: the map-value boundary keeps arrays materialized-boxed (emit_map_set unchanged).
+    // Indexing a Stop[] that came out of a map causes a repr-oracle disagreement (the type says
+    // packable but the dataflow repr says Boxed at the union/map boundary). This test uses only
+    // `length` (which dispatches on the runtime tag, not via the sealed fast path) to confirm
+    // the value round-trips correctly without crossing the packed-Index fence.
+    let out = run(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+type Stop = { "id": String, "time": Int32 }
+val main = () =>
+  var routes: { String: Stop[] } = {}
+  val stops: Stop[] = [{ "id": "a", "time": 1 }, { "id": "b", "time": 2 }]
+  routes["r1"] = stops
+  val got = routes["r1"] ?? []
+  print(toString(length(got)))
+main()
+"#);
+    assert_eq!(out, vec!["2"]);
+}

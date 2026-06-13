@@ -297,7 +297,11 @@ impl<'ctx> Codegen<'ctx> {
         let to_sealed_arr = Self::sealed_array_elem(to_ty).is_some();
         let from_sealed_arr = Self::sealed_array_elem(from_ty).is_some();
         if to_sealed_arr && !from_sealed_arr {
-            // Wider/Json/Object[] source → fresh sealed-record array (each element projected).
+            // Wider/Json/Object[] or union source → fresh sealed-record array (each element projected,
+            // or a keep-packed O(1) retain when the union's inner is already 0xFD/0xFE).
+            // `sealed_array_project_from` unboxes a union source to the raw LinArray*, then checks the
+            // runtime elem_tag: 0xFD/0xFE → keep-packed (O(1) retain); otherwise → O(n) element
+            // rebuild. This handles both `Trip[]|Null → Trip[]` (O(1)) and `Json → Item[]` (O(n)).
             return self.sealed_array_project_from(val, from_ty, to_ty);
         }
         if from_sealed_arr && !to_sealed_arr {

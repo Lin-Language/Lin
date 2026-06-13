@@ -115,17 +115,16 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(box_map_fn, &[val.into()], "boxmap")
                     .try_as_basic_value().unwrap_basic()
             }
-            // A SEALED-RECORD ARRAY (Stage 3) is a contiguous unboxed buffer (elem_tag 0xFE), NOT a
-            // tagged/flat array the dynamic Json machinery (lin_array_get_tagged / lin_to_string /
-            // lin_tagged_eq / combinators) can read directly. `box_value` is the GENERICALLY-DYNAMIC
-            // boxing entry (toString / keys / spread / heterogeneous element / closure arg), so it
-            // MATERIALIZES to a tagged `Object[]` here — the fail-safe boxed view. The keep-packed
-            // container-store path does NOT route through `box_value`; `emit_map_set` calls
-            // `compile_ir_box_keep_packed` directly so only the genuinely-dynamic consumers pay the
-            // materialize.
+            // A SEALED-RECORD ARRAY (0xFD pointer-backed or 0xFE inline-packed) is boxed as a
+            // TAG_ARRAY by storing the raw LinArray* pointer directly — the elem_tag field lets
+            // runtime consumers (lin_array_get_tagged, lin_array_release, lin_tagged_release, etc.)
+            // dispatch correctly without a prior O(n) materialise to a tagged Object[] copy.
+            // Explicit materialise-before-box callers (intrinsics.rs ToString, arith.rs equality)
+            // call sealed_array_to_tagged themselves and do NOT route through box_value.
+            // The keep-packed container-store path (emit_map_set / compile_ir_box_keep_packed) also
+            // bypasses box_value.
             Type::Array(_) if val.is_pointer_value() && Self::sealed_array_elem(val_ty).is_some() => {
-                let tagged = self.sealed_array_to_tagged(val, val_ty);
-                self.builder.call(self.rt.box_array, &[tagged.into()], "boxsarr")
+                self.builder.call(self.rt.box_array, &[val.into()], "boxsarr")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Array(_) if val.is_pointer_value() => {

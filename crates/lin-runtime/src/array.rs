@@ -367,9 +367,13 @@ unsafe fn ptr_array_data_layout(cap: u64) -> Layout {
 
 /// Allocate an empty pointer-backed sealed-record array. Each slot is 8 bytes (a struct pointer).
 /// `initial_cap` is the element capacity; `named_desc` drives dynamic materialize/toString/eq.
-/// `elem_stride` is set to 8 (pointer size) and `elem_desc` is NULL.
+/// `elem_stride` is set to 8 (pointer size). `elem_desc` is derived from `named_desc` (heap-only
+/// field descriptor for the set/push-from-boxed path; NULL for scalar-only types).
 #[no_mangle]
 pub unsafe extern "C" fn lin_sealed_ptr_array_alloc(initial_cap: u64, named_desc: *const u8) -> *mut LinArray {
+    if initial_cap > 1_000_000 {
+        panic!("lin_sealed_ptr_array_alloc: suspicious initial_cap={:#x} ({})", initial_cap, initial_cap as i64);
+    }
     let cap = initial_cap.max(4);
     let ptr = alloc(array_layout()) as *mut LinArray;
     (*ptr).refcount = 1;
@@ -379,7 +383,7 @@ pub unsafe extern "C" fn lin_sealed_ptr_array_alloc(initial_cap: u64, named_desc
     (*ptr).cap = cap;
     (*ptr).data = alloc(ptr_array_data_layout(cap)) as *mut LinArrayElem;
     (*ptr).elem_stride = 8;
-    (*ptr).elem_desc = std::ptr::null();
+    (*ptr).elem_desc = crate::sealed::build_heap_desc_from_named_desc(named_desc);
     (*ptr).elem_named_desc = named_desc;
     ptr
 }
@@ -551,8 +555,9 @@ pub unsafe extern "C" fn lin_array_push(arr: *mut LinArray, elem_ptr: *const u8,
             );
         }
         let named = (*arr).elem_named_desc;
+        let heap_desc = (*arr).elem_desc;
         // Allocate a sealed struct from the LinObject (rc=1 on the new struct).
-        let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named);
+        let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
         // Release the transferred LinObject ref (the struct slot owns the data now).
         crate::object::lin_object_release(obj);
         // Store sptr into the slot (no extra retain — we transfer the alloc rc=1 to the slot).
@@ -625,7 +630,8 @@ pub unsafe extern "C" fn lin_array_push_tagged(arr: *mut LinArray, tagged: *cons
             );
         }
         let named = (*arr).elem_named_desc;
-        let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named);
+        let heap_desc = (*arr).elem_desc;
+        let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
         crate::object::lin_object_release(obj);
         let len = (*arr).len;
         let cap = (*arr).cap;
@@ -700,7 +706,8 @@ pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::
         }
         let obj = (*tagged).payload as *const crate::object::LinObject;
         let named = (*arr).elem_named_desc;
-        let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named);
+        let heap_desc = (*arr).elem_desc;
+        let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
         lin_sealed_ptr_array_push(arr, sptr); // retains: sptr rc goes 1→2
         crate::sealed::lin_sealed_release_self(sptr); // release our alloc ref: rc goes 2→1
         return;
@@ -924,17 +931,25 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
         crate::sealed::pack_named_payload_from_object(slot, obj, (*arr).elem_named_desc);
         crate::object::lin_object_release(obj);
     } else if elem_tag == SEALED_PTR_ARRAY_TAG {
-        // Pointer-backed (0xFD): release the OLD struct pointer and store the new one (transferred).
+        // Pointer-backed (0xFD): the `tagged` is a TAG_OBJECT wrapping a LinObject* (materialized
+        // by `lin_array_get_tagged`). Project it into a fresh sealed struct and store that.
+        // Contract: lin_array_set does NOT consume `tagged` — the caller retains it and will
+        // release it separately. We borrow `obj` from tagged, pack into a new sealed struct,
+        // and store the struct. No release of obj or tagged here.
         if tagged.is_null() || (*tagged).tag != TAG_OBJECT {
             return;
         }
-        let sptr = (*tagged).payload as *mut u8;
+        let obj = (*tagged).payload as *const crate::object::LinObject;
+        if obj.is_null() { return; }
+        let named = (*arr).elem_named_desc;
+        let heap_desc = (*arr).elem_desc;
+        let new_sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
         let slot = ((*arr).data as *mut *mut u8).add(actual as usize);
         let old = *slot;
         if !old.is_null() {
             crate::sealed::lin_sealed_release_self(old);
         }
-        *slot = sptr; // transfer ownership (no additional retain)
+        *slot = new_sptr; // transfer alloc rc=1 to slot
     } else {
         let tag = if tagged.is_null() { TAG_NULL } else { (*tagged).tag };
         let payload = if tagged.is_null() { 0u64 } else { (*tagged).payload };
