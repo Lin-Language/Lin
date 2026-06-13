@@ -589,17 +589,64 @@ unsafe fn struct_size_from_named_desc(named_desc: *const u8) -> usize {
     (max_end + 7) & !7
 }
 
-/// Allocate a fresh sealed struct from a `LinObject` using the named descriptor, for the
-/// dynamic push path on a 0xFD pointer-backed array. Returns a +1-owned struct pointer.
-/// Caller is responsible for releasing it (or transferring its ownership to the array).
+/// Build a heap-only field descriptor from a named descriptor, for the dynamic alloc path on
+/// 0xFD pointer-backed arrays (Stage 2a: heap fields like String/Array/Map). The returned
+/// pointer is valid for the lifetime of the process (leaked once per distinct named_desc, which
+/// is bounded by the number of distinct sealed record types). Returns NULL if there are no heap
+/// fields (scalar-only type → no descriptor needed). The allocation is intentionally leaked (one
+/// per type, not per element) because the heap descriptor must survive all structs of that type.
+pub unsafe fn build_heap_desc_from_named_desc(named_desc: *const u8) -> *const u8 {
+    if named_desc.is_null() {
+        return std::ptr::null();
+    }
+    let field_count = u32::from_le_bytes([
+        *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
+    ]) as usize;
+    // Collect heap fields: (offset, kind) pairs.
+    let mut heap_fields: Vec<(u32, u32)> = Vec::new();
+    let mut cur = 4usize;
+    for _ in 0..field_count {
+        let (offset, nkind, _nested, _name, next) = read_named_field(named_desc, cur);
+        cur = next;
+        let kind = match nkind {
+            NKIND_STRING => KIND_STRING,
+            NKIND_ARRAY  => KIND_ARRAY,
+            NKIND_MAP    => KIND_MAP,
+            NKIND_SEALED => KIND_SEALED,
+            // scalars and Bool need no heap descriptor entry
+            _ => continue,
+        };
+        heap_fields.push((offset, kind));
+    }
+    if heap_fields.is_empty() {
+        return std::ptr::null();
+    }
+    // Build the heap descriptor blob: [ u32 count | { u32 offset, u32 kind } * count ]
+    let byte_len = 4 + heap_fields.len() * 8;
+    let layout = std::alloc::Layout::from_size_align_unchecked(byte_len, 4);
+    let ptr = std::alloc::alloc(layout);
+    if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
+    *(ptr as *mut u32) = heap_fields.len() as u32;
+    for (i, (off, kind)) in heap_fields.iter().enumerate() {
+        let ent = ptr.add(4 + i * 8) as *mut u32;
+        *ent = *off;
+        *ent.add(1) = *kind;
+    }
+    ptr as *const u8
+}
+
+/// Allocate a fresh sealed struct from a `LinObject` using the named descriptor (for field
+/// names/offsets/kinds) and an optional heap-only descriptor (for RC on drop). For the dynamic
+/// push/set path on a 0xFD pointer-backed array. Returns a +1-owned struct pointer.
+/// `heap_desc` may be NULL for scalar-only records; pass `(*arr).elem_desc` for 0xFD arrays so
+/// that String/Array/Map heap fields are properly released on drop.
 pub unsafe fn alloc_sealed_struct_from_object(
     obj: *const crate::object::LinObject,
     named_desc: *const u8,
+    heap_desc: *const u8,
 ) -> *mut u8 {
     let size = struct_size_from_named_desc(named_desc);
-    // Alloc with NULL heap-only desc (scalar-only for Stage 1). rc=1.
-    let sptr = lin_sealed_alloc(size, std::ptr::null());
-    // Pack the object's fields into the struct payload.
+    let sptr = lin_sealed_alloc(size, heap_desc);
     pack_named_payload_from_object(sptr.add(SEALED_HEADER), obj, named_desc);
     sptr
 }

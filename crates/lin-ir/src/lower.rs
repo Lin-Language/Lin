@@ -1460,7 +1460,10 @@ fn is_sealed_array_elem_field_packable(ty: &Type) -> bool {
 fn param_elem_is_boxed_repr(param_ty: &Type) -> bool {
     match param_ty {
         Type::Array(elem) => matches!(elem.as_ref(),
-            Type::TypeVar(_) | Type::Union(_) | Type::Map(_)
+            // Never = an empty array literal `[]` whose element type was not yet resolved;
+            // it is physically a 0xFF tagged array and must be coerced when flowing into a
+            // sealed-record array param (e.g. `initial: Transfer[] = []` in an emitter call).
+            Type::TypeVar(_) | Type::Union(_) | Type::Map(_) | Type::Never
             | Type::Object { sealed: false, .. }),
         _ => false,
     }

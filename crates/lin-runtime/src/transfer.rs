@@ -187,9 +187,32 @@ unsafe fn clone_sealed_array(src: *const LinArray) -> *mut LinArray {
     dst
 }
 
+/// Deep-copy a pointer-backed sealed-record array (`elem_tag == 0xFD`, Stage 1) for cross-thread
+/// transfer. Share-nothing: allocate a fresh 0xFD array, then for each slot deep-clone the sealed
+/// struct pointer via `clone_sealed`. The clone starts at rc=1 (from `clone_sealed`/alloc); we push
+/// it to the new array with `lin_sealed_ptr_array_push` (which retains → rc=2), then release our
+/// construction reference (rc=1). Worker's later `lin_array_release` will release each slot once.
+unsafe fn clone_sealed_ptr_array(src: *const LinArray) -> *mut LinArray {
+    let len = (*src).len;
+    let named = (*src).elem_named_desc;
+    let dst = crate::array::lin_sealed_ptr_array_alloc(len.max(4), named);
+    let slots = (*src).data as *const *mut u8;
+    for i in 0..len as usize {
+        let sptr = *slots.add(i);
+        if sptr.is_null() {
+            continue; // null slots don't occur in valid 0xFD arrays; skip to preserve length
+        }
+        let cloned = clone_sealed(sptr);             // rc=1 from alloc
+        crate::array::lin_sealed_ptr_array_push(dst, cloned); // retains → rc=2
+        crate::sealed::lin_sealed_release_self(cloned);        // release our ref → rc=1
+    }
+    dst
+}
+
 /// Deep-copy a `LinArray`, flat, tagged, or sealed-packed. Flat scalar arrays copy their raw buffer;
 /// tagged arrays recursively transfer each element; sealed-packed (`0xFE`) arrays deep-copy the
-/// packed buffer + each element's heap fields (`clone_sealed_array`).
+/// packed buffer + each element's heap fields (`clone_sealed_array`); pointer-backed sealed arrays
+/// (`0xFD`) deep-copy each struct pointer slot (`clone_sealed_ptr_array`).
 pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
     if src.is_null() {
         return std::ptr::null_mut();
@@ -208,6 +231,12 @@ pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
         // buffer (it assumes a flat scalar width, not `elem_stride`) and drop the descriptors,
         // corrupting a packed record-array crossing a thread boundary (ADR-063 transfer bug).
         return clone_sealed_array(src);
+    }
+    if elem_tag == crate::array::SEALED_PTR_ARRAY_TAG {
+        // Pointer-backed sealed-record array: each slot is an 8-byte struct pointer.
+        // `lin_array_clone_flat` would MIS-SIZE (assumes flat scalar, not 8-byte pointers) and
+        // drop the named_desc, corrupting the clone. Deep-copy each struct pointer individually.
+        return clone_sealed_ptr_array(src);
     }
     if elem_tag != 0xFF {
         // Flat scalar array: copy the raw element buffer verbatim (no pointers inside).

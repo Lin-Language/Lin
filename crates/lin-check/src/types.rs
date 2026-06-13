@@ -317,38 +317,25 @@ impl Type {
     /// SINGLE definition. Any disagreement between the lowerer's ownership/Coerce insertion and
     /// codegen's physical layout would be a UAF / mis-read, which is exactly why this is centralised.
     ///
-    /// CURRENTLY: scalars + Bool ONLY (Stage 3a).
+    /// Stage 2a: scalars + Bool + String + Array + Map + nested sealed records.
     ///
-    /// HEAP-FIELD PACKING (String/Array/Map/nested-record — Stage 3b steps 1-4) was implemented,
-    /// shipped, and then NARROWED BACK OUT on 2026-06-08 because it is a NET LOSS in practice today:
-    ///   - It REGRESSED `benchmarks/compare/interp` ~3x (Token = {kind:String, text:String}: packing
-    ///     `Token[]` materializes a fresh boxed `LinObject` on every hot field read through the
-    ///     generic `for`/combinator path — alloc + per-field retain — where a boxed `Object[]` is a
-    ///     borrowed pointer load, strictly cheaper).
-    ///   - It CRASHED `examples/raspberry-controller/tlv.test.lin` (a soundness bug in the packed
-    ///     scalar-Array-field `{tag:Int32, bytes:Int32[]}[]` path).
-    ///   - It delivers ZERO benefit to its intended consumer (RAPTOR) TODAY: `tripsByRoute` is still
-    ///     `{String: Json[]}` and `bench.lin` packs zero sealed arrays.
-    /// ROOT CAUSE (the strategic finding): packing only WINS when the value is read by const-offset
-    /// through a TYPED PARAM (`(t: T) => t["f"]` → getelementptr+load). On the generic/boxed read
-    /// path (`for`/`map`/union/Json index) mechanism (i) materializes the whole element per read —
-    /// strictly worse than a boxed borrowed-pointer read. So heap-field packing must NOT re-land
-    /// until reads through the typed iteration path are CHEAP (borrowed const-offset, no materialize)
-    /// — the "spike B" / cheap-typed-reads work. The KIND_MAP/descriptor/transfer runtime plumbing is
-    /// kept intact (dormant) for that re-land; only this gate predicate is narrowed.
+    /// This is the Stage 2a widening from the 0xFD pointer-backed path. The previous Stage 3b
+    /// heap-field packing attempt (narrowed back out 2026-06-08) used the 0xFE INLINE contiguous
+    /// payload path, which materialized a fresh `LinObject` on every generic read — the Token[]
+    /// regression and the tlv.test.lin crash. Stage 2a uses the 0xFD POINTER-BACKED path instead:
+    /// array slots are 8-byte struct pointers; an index read loads the pointer
+    /// (`lin_sealed_ptr_array_get_ptr`) then GEPs into the struct at const-offset — no
+    /// materialization. Drop already walks the descriptor via `lin_sealed_release_self`.
+    ///
+    /// Mirrors `lin_ir::lower::is_sealed_field_ty` EXACTLY (recursive nested-sealed check included).
     pub fn is_sealed_array_field_packable(&self) -> bool {
-        // Stage 3a: scalars + Bool ONLY. (PATH-1 Step 3 — String widening: ATTEMPTED on top of the
-        // in-place packed iteration ABI; the harness was leak-clean and the in-place String field read
-        // — `try_lower_packed_elem_field`, borrowed `load ptr` + retain-if-escapes — works, BUT
-        // widening this gate to String tripped the repr Stage-2 ORACLE: an `Index` on a packed
-        // String-field array threaded through a `T|Null` tail-recursive param has the OLD type
-        // predicate saying `Packed` while the dataflow repr analysis correctly demotes it to
-        // `Boxed(Opaque)` at the union/tail-param boundary — a genuine packed/boxed CLASSIFICATION
-        // divergence, the exact §H4/H5 risk class. Re-landing String packing therefore requires the
-        // repr oracle/verifier to be RECONCILED with the widened gate FIRST — see the proposal's Step-3
-        // sequencing. The in-place String read above stays in place but dormant for arrays the gate
-        // keeps boxed.)
-        self.is_flat_scalar() || matches!(self, Type::Bool)
+        self.is_flat_scalar()
+            || matches!(self, Type::Bool)
+            || self.is_string_ish()
+            || matches!(self, Type::Array(_) | Type::FixedArray(_))
+            || matches!(self, Type::Map(_))
+            || matches!(self, Type::Object { fields, sealed: true }
+                if !fields.is_empty() && fields.values().all(|f| f.is_sealed_array_field_packable()))
     }
 
     /// Returns true for the dynamic "any" JSON type (TypeVar(u32::MAX)).

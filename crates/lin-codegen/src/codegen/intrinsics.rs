@@ -1111,6 +1111,45 @@ impl<'ctx> Codegen<'ctx> {
                 let n_i64 = self.ir_n_to_i64(args.first().copied(), arg_tys.first());
                 let fill_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
                 let fill_val = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                // Sealed element (Stage 1 pointer-backed): the fill value is a struct pointer.
+                // Allocate a 0xFD array and push the fill N times (retaining per push). This mirrors
+                // the array-literal path for sealed elements (lin_sealed_ptr_array_alloc + push).
+                // Without this special case, the `else` branch below creates a 0xFF tagged array and
+                // stores TAG_OBJECT struct-pointer TaggedVals — but later ops (IndexSet, field reads)
+                // assume 0xFD repr → wrong element layout → crash at runtime.
+                if let Some(fill_fields) = arg_reprs.get(1).and_then(|r| r.packed_struct_fields()) {
+                    let fill_fields = fill_fields.clone();
+                    let named_desc = self.sealed_named_descriptor(&fill_fields);
+                    let alloc_fn = self.get_or_declare_fn(
+                        "lin_sealed_ptr_array_alloc",
+                        ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false));
+                    let arr = self.builder.call(alloc_fn,
+                        &[n_i64.into(), named_desc.into()], "ir_filsptr")
+                        .try_as_basic_value().unwrap_basic();
+                    let push_fn = self.get_or_declare_fn(
+                        "lin_sealed_ptr_array_push",
+                        self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                    let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                    let i_alloc = self.builder.alloca(i64_ty, "ir_fis_i");
+                    self.builder.store(i_alloc, i64_ty.const_zero());
+                    let check = self.context.append_basic_block(llvm_fn, "ir_fis_check");
+                    let body = self.context.append_basic_block(llvm_fn, "ir_fis_body");
+                    let exit = self.context.append_basic_block(llvm_fn, "ir_fis_exit");
+                    self.builder.unconditional_branch(check);
+                    self.builder.position_at_end(check);
+                    let cur = self.builder.load(i64_ty, i_alloc, "ir_fis_iv").into_int_value();
+                    let cond = self.builder.int_compare(inkwell::IntPredicate::SLT, cur, n_i64, "ir_fis_cond");
+                    self.builder.conditional_branch(cond, body, exit);
+                    self.builder.position_at_end(body);
+                    // lin_sealed_ptr_array_push retains the struct pointer (+1). The fill_val is
+                    // borrowed by the array; the caller's ref is untouched.
+                    self.builder.call(push_fn, &[arr.into(), fill_val.into()], "");
+                    let next = self.builder.int_add(cur, i64_ty.const_int(1, false), "ir_fis_n");
+                    self.builder.store(i_alloc, next);
+                    self.builder.unconditional_branch(check);
+                    self.builder.position_at_end(exit);
+                    return arr;
+                }
                 if Self::is_flat_scalar(&fill_ty) {
                     let suffix = Self::flat_suffix(&fill_ty);
                     let fn_name = format!("lin_flat_array_alloc_filled_{}", suffix);

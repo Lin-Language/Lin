@@ -1647,7 +1647,10 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.gep(i8_ty, src_raw.into_pointer_value(), &[i64_ty.const_int(4, false)], "sarrp_tagp")
             };
             let etag = self.builder.load(i8_ty, tag_ptr, "sarrp_etag").into_int_value();
-            let is_packed = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFE, false), "sarrp_ispk");
+            // Accept both 0xFE (inline packed) and 0xFD (pointer-backed sealed) as already-packed.
+            let is_fe = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFE, false), "sarrp_isfe");
+            let is_fd = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFD, false), "sarrp_isfd");
+            let is_packed = self.builder.or(is_fe, is_fd, "sarrp_ispk");
             let kp_b = self.context.append_basic_block(llvm_fn, "sarrp_kp");
             let rebuild_b = self.context.append_basic_block(llvm_fn, "sarrp_rebuild");
             let merge_b = self.context.append_basic_block(llvm_fn, "sarrp_merge");
