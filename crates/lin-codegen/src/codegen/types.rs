@@ -372,26 +372,25 @@ impl<'ctx> Codegen<'ctx> {
     /// later `tagged_release` to reclaim), as opposed to wrapping a BORROWED inner pointer in a box
     /// shell (which the caller frees with `lin_tagged_free_box`, leaving the borrowed inner alone)?
     ///
-    /// `box_value` MATERIALIZES — i.e. allocates a fresh +1 — for exactly two sealed-field cases:
-    ///   - a nested SEALED record (`Type::Object` with sealed fields) → fresh boxed `LinObject`
-    ///     (`sealed_materialize_to_object`); and
-    ///   - a sealed-record ARRAY (`T[]` with sealed elements) → fresh tagged `Object[]`
-    ///     (`sealed_array_to_tagged`).
-    /// For every other heap field (plain String, plain/flat Array, Map) `box_value` boxes the
+    /// `box_value` MATERIALIZES — i.e. allocates a fresh +1 — only for nested SEALED records
+    /// (`Type::Object` with sealed fields) → fresh boxed `LinObject` (`sealed_materialize_to_object`).
+    ///
+    /// For sealed-record ARRAYS (Stage-2a: 0xFD pointer-backed), `box_value` calls `lin_box_array`
+    /// which wraps the raw `LinArray*` pointer directly (BORROWED, no retain and no fresh
+    /// materialization). The `else if is_heap` branch (free box shell only via `lin_tagged_free_box`)
+    /// is the correct cleanup path for sealed-array heap fields — NOT `tagged_release`.
+    ///
+    /// For every other heap field (plain String, plain/flat Array, Map) `box_value` also boxes the
     /// borrowed pointer with no retain.
     ///
     /// This is the single source of truth for the sealed→Json materializers' post-`object_set_fresh`
-    /// cleanup (`sealed_materialize_to_object` / `sealed_array_elem_materializer`): a fresh-owned
-    /// inner needs a full `tagged_release`; a borrowed inner needs only the box shell freed. Getting
-    /// this wrong leaks the whole materialized inner (record-with-record-array-field, the RAPTOR
-    /// `Trip { stopTimes: StopTime[] }` shape).
+    /// cleanup (`sealed_materialize_to_object`): a fresh-owned inner needs a full `tagged_release`;
+    /// a borrowed inner needs only the box shell freed. Getting this wrong UAF-s the sealed array
+    /// (the RAPTOR `Trip { stopTimes: StopTime[] }` shape and the `unionproj3.lin` TCO crash).
     pub(crate) fn box_value_yields_fresh_owned(ty: &Type) -> bool {
-        // Nested sealed record: materialized to a fresh boxed object.
-        if matches!(ty, Type::Object { .. }) && Self::sealed_fields(ty).is_some() {
-            return true;
-        }
-        // Sealed-record array: materialized to a fresh tagged Object[].
-        Self::sealed_array_elem(ty).is_some()
+        // Nested sealed record: materialized to a fresh boxed object. NOT sealed-record arrays:
+        // Stage-2a changed box_value for those to lin_box_array (borrowed pointer, no fresh alloc).
+        matches!(ty, Type::Object { .. }) && Self::sealed_fields(ty).is_some()
     }
 
     /// THE sealed-record-ARRAY gate (sealed-records Stage 3). Returns `Some(fields)` iff `ty` is an
