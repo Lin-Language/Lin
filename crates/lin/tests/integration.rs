@@ -1233,6 +1233,96 @@ print(toString(sum))
     assert_eq!(output, vec!["99000"]);
 }
 
+// Regression (escaping-var object-literal field, Bug 1): a `var` captured by closures stored as
+// FIELDS of an object literal that ESCAPES (returned / pushed to a collection). The cell must
+// outlive the creating scope; the escape analysis marks it escaping and the function-exit FreeCell
+// correctly skips it. Covers: (a) makeCounter-style factory that returns an object with `inc` /
+// `get` methods sharing a var cell; (b) the same pattern inside a range-for inline loop body
+// (where the loop creates N independent counter objects and pushes them into an outer array).
+// Verifies values are correct — a UAF (premature FreeCell) would corrupt the read.
+#[test]
+fn test_var_cell_escaping_via_object_literal_field() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val makeCounter = () =>
+  var count = 0
+  {
+    "inc": () => count = count + 1,
+    "get": () => count
+  }
+
+val c = makeCounter()
+c["inc"]()
+c["inc"]()
+c["inc"]()
+print(toString(c["get"]()))
+"#);
+    assert_eq!(output, vec!["3"]);
+}
+
+// Regression (escaping-var object-literal field in loop, Bug 1 variant): same pattern but the
+// object factory is called inside a range-for inline body. The cell is created per-iteration in
+// the loop-body block (non-entry), captured by two closures stored as object fields, and the
+// object escapes into an outer array. The inline-body FreeCell must NOT fire for escaping cells.
+#[test]
+fn test_var_cell_escaping_via_object_in_loop_body() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push } from "std/array"
+import { range, for } from "std/iter"
+
+var counters: {}[] = []
+range(0, 5).for(i =>
+  var count = i * 10
+  push(counters, {
+    "inc": () => count = count + 1,
+    "get": () => count
+  })
+)
+
+counters[0]["inc"]()
+counters[1]["inc"]()
+counters[1]["inc"]()
+print(toString(counters[0]["get"]()))
+print(toString(counters[1]["get"]()))
+print(toString(counters[2]["get"]()))
+print(toString(counters[3]["get"]()))
+print(toString(counters[4]["get"]()))
+"#);
+    assert_eq!(output, vec!["1", "12", "20", "30", "40"]);
+}
+
+// Regression (worker capturing outer var, Bug 2): a worker thunk built inside a constructor fn
+// that returns it; spec §24.6 makeCounter verbatim. The worker thread outlives the factory frame;
+// the cell must not be freed at factory-scope exit. `lin_worker_new` retains the handler closure,
+// keeping the env (and thus the cell pointer) alive for the worker's lifetime.
+#[test]
+fn test_var_cell_captured_by_worker() {
+    let output = run(r#"import { worker, request } from "std/async"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val makeCounter = () =>
+  var count = 0
+  worker(
+    (msg: Json) =>
+      count = count + 1
+      count,
+    () => null
+  )
+
+val counter = makeCounter()
+val n1 = request(counter, "tick")
+val n2 = request(counter, "tick")
+val n3 = request(counter, "tick")
+print(toString(n1))
+print(toString(n2))
+print(toString(n3))
+"#);
+    assert_eq!(output, vec!["1", "2", "3"]);
+}
+
 // Regression (call-arg-box leak): passing a CONCRETE array to a Json-typed param (`for`'s
 // iterable) inside an outer loop boxes the array into a fresh TaggedVal* shell each outer
 // iteration. The shell was never freed → one-box-per-iteration leak. Caller now frees the
