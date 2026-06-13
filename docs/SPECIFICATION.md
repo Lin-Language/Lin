@@ -461,11 +461,13 @@ Because the meaning of `{ K: V }` depends on what `K` resolves to — `String` �
 string-literal union ⇒ fixed record — these two have different runtime representations; changing a
 key alias from one to the other changes the type. See ADR-055.
 
-- `m[k]` yields `T | Null` (a missing key is `Null`, consistent with the §6.1 safe-bracket rule).
-  For the *defaulted* read, `m[k] ?? default` uses the built-in null-coalescing operator `??`
-  (§8.3); for a keyed default the dot-applicable `object.get(m, k, default)` (`std/object`) remains
-  the convenience. Both give the default an independent type `D`, so the result is `T | D` (and
-  `T | Null` when the default is omitted); a same-typed default collapses `T | D` to a bare `T`.
+- `m[k]` requires `k : String` and yields `T | Null` (a missing key is `Null`, consistent with the
+  §6.1 safe-bracket rule). A non-String key (e.g. a numeric value) is a compile-time error
+  (`a `{ String: T }` is keyed by String, but the key is `…``) — the read and write key rules are
+  symmetric. For the *defaulted* read, `m[k] ?? default` uses the built-in null-coalescing operator
+  `??` (§8.3); for a keyed default the dot-applicable `object.get(m, k, default)` (`std/object`)
+  remains the convenience. Both give the default an independent type `D`, so the result is `T | D`
+  (and `T | Null` when the default is omitted); a same-typed default collapses `T | D` to a bare `T`.
 - `m[k] = v` requires `v : T` and `k : String`.
 - An empty `{}` literal infers `{ String: T }` from its context (the annotated binding / return
   type). An **evidence-free** empty `{}` — no annotation, no contextual type, no contents — is a
@@ -1166,6 +1168,8 @@ Narrowing carries into:
 - the matched arm of a `match`,
 - nested blocks within either,
 - the right-hand side of a `&&` whose left-hand side is a narrowing test (e.g. `if input is String && input.length() > 0 ...`).
+
+A null test on an **index read** narrows a re-read of the same index place: `if m[k] != null then m[k] …` (and `m[k] ?? d`) reads `m[k]` as `T` rather than `T | Null` in the guarded branch. The place may be **compound** — an identifier root followed by any number of stable index steps (string-literal or simple-identifier keys), e.g. `service["dates"][date]` — so `if service["dates"][date] != null then service["dates"][date]` narrows the inner map read. The narrowing is invalidated if any identifier the place mentions (its root or a key variable) is reassigned, or a write lands through the same root.
 
 Narrowing is invalidated on the first assignment to a `var` whose narrowed type would no longer hold.
 
