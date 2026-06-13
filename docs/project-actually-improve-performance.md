@@ -405,11 +405,21 @@ representation with pointer-share semantics, retiring the `LinObject` form and t
 form. Stageable by record-shape. Reference semantics makes inline-contiguous record arrays
 **optional** (§5.6): the win flows through pointer-backed arrays once records are flat (Stage 2).
 
-> **Execution order (revised 2026-06-13): 0 → 1 → 2 → 4 → 5 → 6 → 3.** Stage 3 (record unions) is
-> resequenced to run **last**, after Stage 6 deletes the D8 boxed shadow — see the banner on Stage 3
-> for the three-attempt evidence. Stage numbers below are stable identities, not the execution
-> sequence. Everything through Stage 6 is repr-determinism foundation; the union repr is then a layout
-> fact, not a packed-vs-boxed reconciliation.
+> **Execution order (revised 2026-06-13, KEYSTONE-FIRST): 0 → 1 → 2 → 6a → 3 → 4 → 5 → 6b.**
+> Stage numbers below are stable identities, not the execution sequence. Rationale (decided after the
+> three failed Stage-3 attempts proved unions can't be single-repr while the boxed shadow exists):
+> **Stage 6a (delete the D8 boxed shadow → representation becomes type-determined) is the KEYSTONE that
+> unblocks everything** — Stage 3 (unions) *and* the leftover bare-record map-value packing are the
+> same packed-vs-boxed reconciliation, both unblocked only by 6a. So 6a runs as early as the
+> foundation allows (right after Stage 2's records-are-packed work), NOT last.
+>
+> Two corollaries drove this over the older `…→4→5→6→3` order: (1) the actual payoff (RAPTOR query
+> win) is gated on Stage 3, so doing parity/cleanup (4/5) first polishes a base whose value is capped
+> until 6a lands; (2) `rc_elide` (Stage 4) tuned against the *current* boxed-shadow repr would be
+> **redone** after 6a changes the RC patterns — running 4 *after* 6a writes it **once**, against the
+> final type-determined repr, where the borrow analysis is also simpler. Stage 6a is executed
+> **incrementally** (not big-bang — see Stage 6a below) so there is no multi-day red period. Stage 6b
+> (the `.lin` `Json→AnyVal` rename/retype) is mechanical + parallelizable and stays last.
 
 **Branch policy (master never regresses):** stages land on the project branch **`reset/main`**, not
 on `master`. Several stages are deliberate *enablers* that cost performance before the wins arrive
@@ -527,9 +537,9 @@ The semantic flip — riskiest per line, smallest blast radius (scalar-only reco
 > flow-reconciled — *after* Stage 6 retires the boxed shadow. Only then is `T | Null` unambiguously a
 > nullable sealed pointer at every boundary (param, return, local, array element, map value) with no
 > boxed form to reconcile, and the union repr lands as a layout fact rather than a reconciliation.
-> The interim cost is reset/main carrying RAPTOR's ~10% union-materialize regression through Stages
-> 4–6 (the A/B-measured `Trip | Null` cost); acceptable under the branch policy (master never sees
-> it). Preserved attempts: `reset/s3-A-singlerepr` (35eadb77, hybrid, crashes), `reset/s3-C-general`
+> The interim cost is reset/main carrying RAPTOR's ~10% union-materialize regression from Stage 2
+> until Stage 3 runs (now right after Stage 6a under the keystone-first order — the A/B-measured
+> `Trip | Null` cost); acceptable under the branch policy (master never sees it). Preserved attempts: `reset/s3-A-singlerepr` (35eadb77, hybrid, crashes), `reset/s3-C-general`
 > (general-tag, crashes), `reset/stage3-tnull` (dual-repr, crashes) — all archived, none merged.
 
 ### Stage 4 — Repoint Perceus/`rc_elide` (now load-bearing for parity, not just upside)
@@ -555,6 +565,49 @@ The semantic flip — riskiest per line, smallest blast radius (scalar-only reco
 - Ordered-map container (linked hashmap) for §2.6; `keys`/`values`/`entries` narrowed to
   hashmaps/`AnyVal` (D6).
 - Retire the D8 transitional boxed shadow — `repr.rs` is now a pure layout calculator.
+
+#### 6a execution thesis: `AnyVal` is a RUNTIME-tagged union, modelled on `SumNode` (ADR-064)
+
+The reason the three Stage-3 attempts (and every "path-9") failed is that they tried to recover
+struct speed for dynamic-context records via a **compile-time, flow-sensitive packed-vs-boxed oracle**
+— the reconciliation trap. 6a avoids it by making the dynamic case **uniformly runtime-tagged**, the
+already-proven `TAG_SUMNODE` pattern: an `AnyVal` is a `TaggedVal` (tag word + payload); its consumers
+(`lin_tagged_eq` / `lin_tagged_to_string` / `push_json_value` / release / field-get) dispatch on the
+tag at runtime. There is **no compile-time repr oracle for an `AnyVal` value** — it is a dynamic value,
+it pays one honest tag-check, and that is correct. Concretely:
+
+- **`AnyVal`'s record case = a new `TAG_RECORD`** carrying `sealed-ptr + descriptor`, mirroring
+  `TAG_SUMNODE` exactly (which already carries a packed sealed struct by-pointer). A typed sealed
+  record widening into an `AnyVal`/`Json` slot is **wrapped, not materialised** (D4 single-direction:
+  bump rc, tag it `TAG_RECORD`, keep its descriptor) — replacing today's `sealed_materialize_to_object`
+  → `LinObject` path. Field access on a `TAG_RECORD` is the descriptor-driven **const-offset** load,
+  not the `lin_object_get` string scan.
+- **`TAG_OBJECT` (`LinObject`, string-keyed) is then deletable** once its remaining producers
+  (`fromJson` of an unknown-shape object, dynamic object literals) are routed to either `TAG_RECORD`
+  (known/descriptor'd shape) or `TAG_MAP`/ordered-map (genuine dynamic string keys, D6) — never the
+  assoc-list scan.
+
+**Incremental, individually-gated steps (no big-bang red period):**
+
+1. **Introduce `TAG_RECORD` beside `TAG_OBJECT`.** Add the tag + a record payload (sealed-ptr +
+   descriptor) + the consumer arms (eq / to_string / json / release / field-get / `is T` descriptor
+   walk), all mirroring the `TAG_SUMNODE` arms. Route the ONE flow *typed sealed record → `Json`/
+   `AnyVal` slot* to emit `TAG_RECORD` (wrap, no copy) instead of `sealed_materialize_to_object`.
+   Leave every other `TAG_OBJECT` producer alone. **Gate: corpus digest-exact + RAPTOR exact + suites
+   + ASan + RSS-flat** — proves the new repr is sound *before* anything is deleted. ← **the first 6a leg**.
+2. Route `fromJson`/parse of objects to `TAG_RECORD` (descriptor built from the parsed keys) or
+   `TAG_MAP` per D6; migrate dynamic object literals.
+3. Migrate the remaining `lin_object_get`/`object_set` consumers (≈39 codegen sites across
+   `data.rs`/`mod.rs`/`intrinsics.rs`/`types.rs`/`runtime.rs`) to tag-dispatch.
+4. **Delete `TAG_OBJECT` + `object.rs`'s `LinObject` string-keyed storage**; delete the `repr.rs`
+   boxed arms (≈49) — `repr.rs` is now a pure layout calculator. This is the step that unblocks
+   Stage 3 + bare-record map-value packing.
+
+**Deletion checklist (site audit, reset/main 9ff11105):** ≈110 record→`LinObject` boxing/`object_alloc`
+sites in codegen (the D8-shadow producers); ≈39 `lin_object_get`/`object_set` consumer sites; ≈49
+`repr.rs` boxed arms; `object.rs` `LinObject` storage + `lin_object_get` scan. The `TAG_SUMNODE`
+implementation (`sumnode.rs` + its arms in `tagged.rs`/`object.rs`/`transfer.rs`) is the line-by-line
+template for the `TAG_RECORD` work.
 
 ### Stage 6b — The `.lin` migration (wide, parallelizable)
 
