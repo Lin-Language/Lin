@@ -1233,6 +1233,96 @@ print(toString(sum))
     assert_eq!(output, vec!["99000"]);
 }
 
+// Regression (escaping-var object-literal field, Bug 1): a `var` captured by closures stored as
+// FIELDS of an object literal that ESCAPES (returned / pushed to a collection). The cell must
+// outlive the creating scope; the escape analysis marks it escaping and the function-exit FreeCell
+// correctly skips it. Covers: (a) makeCounter-style factory that returns an object with `inc` /
+// `get` methods sharing a var cell; (b) the same pattern inside a range-for inline loop body
+// (where the loop creates N independent counter objects and pushes them into an outer array).
+// Verifies values are correct — a UAF (premature FreeCell) would corrupt the read.
+#[test]
+fn test_var_cell_escaping_via_object_literal_field() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val makeCounter = () =>
+  var count = 0
+  {
+    "inc": () => count = count + 1,
+    "get": () => count
+  }
+
+val c = makeCounter()
+c["inc"]()
+c["inc"]()
+c["inc"]()
+print(toString(c["get"]()))
+"#);
+    assert_eq!(output, vec!["3"]);
+}
+
+// Regression (escaping-var object-literal field in loop, Bug 1 variant): same pattern but the
+// object factory is called inside a range-for inline body. The cell is created per-iteration in
+// the loop-body block (non-entry), captured by two closures stored as object fields, and the
+// object escapes into an outer array. The inline-body FreeCell must NOT fire for escaping cells.
+#[test]
+fn test_var_cell_escaping_via_object_in_loop_body() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push } from "std/array"
+import { range, for } from "std/iter"
+
+var counters: {}[] = []
+range(0, 5).for(i =>
+  var count = i * 10
+  push(counters, {
+    "inc": () => count = count + 1,
+    "get": () => count
+  })
+)
+
+counters[0]["inc"]()
+counters[1]["inc"]()
+counters[1]["inc"]()
+print(toString(counters[0]["get"]()))
+print(toString(counters[1]["get"]()))
+print(toString(counters[2]["get"]()))
+print(toString(counters[3]["get"]()))
+print(toString(counters[4]["get"]()))
+"#);
+    assert_eq!(output, vec!["1", "12", "20", "30", "40"]);
+}
+
+// Regression (worker capturing outer var, Bug 2): a worker thunk built inside a constructor fn
+// that returns it; spec §24.6 makeCounter verbatim. The worker thread outlives the factory frame;
+// the cell must not be freed at factory-scope exit. `lin_worker_new` retains the handler closure,
+// keeping the env (and thus the cell pointer) alive for the worker's lifetime.
+#[test]
+fn test_var_cell_captured_by_worker() {
+    let output = run(r#"import { worker, request } from "std/async"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val makeCounter = () =>
+  var count = 0
+  worker(
+    (msg: Json) =>
+      count = count + 1
+      count,
+    () => null
+  )
+
+val counter = makeCounter()
+val n1 = request(counter, "tick")
+val n2 = request(counter, "tick")
+val n3 = request(counter, "tick")
+print(toString(n1))
+print(toString(n2))
+print(toString(n3))
+"#);
+    assert_eq!(output, vec!["1", "2", "3"]);
+}
+
 // Regression (call-arg-box leak): passing a CONCRETE array to a Json-typed param (`for`'s
 // iterable) inside an outer loop boxes the array into a fresh TaggedVal* shell each outer
 // iteration. The shell was never freed → one-box-per-iteration leak. Caller now frees the
@@ -2445,6 +2535,71 @@ val f = (r: Rec, k: Two): Boolean => r[k]
 }
 
 #[test]
+fn test_index_sig_literal_union_key_expands_to_record() {
+    // `{ <literal-union>: V }` is sugar for a fixed record with one field per literal (value type
+    // V). `{ DayOfWeek: Boolean }` ≡ `{ "Monday": Boolean, …, "Sunday": Boolean }`. Indexing it by
+    // a key of the same union is provably total (no `Null`), so `runsOn` returns `Boolean`. Run
+    // end-to-end with a record literal supplying all seven fields.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type DayOfWeek = "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday" | "Sunday"
+type Calendar = { DayOfWeek: Boolean }
+
+val runsOn = (c: Calendar, dow: DayOfWeek): Boolean => c[dow]
+
+val c: Calendar = { "Monday": true, "Tuesday": false, "Wednesday": false, "Thursday": false, "Friday": false, "Saturday": false, "Sunday": false }
+print(toString(runsOn(c, "Monday")))
+print(toString(c.runsOn("Sunday")))
+"#);
+    assert_eq!(output, vec!["true", "false"]);
+}
+
+#[test]
+fn test_index_sig_literal_union_record_equiv_to_handwritten() {
+    // The sugar produces a record STRUCTURALLY IDENTICAL to the hand-written one: a `Calendar`
+    // (= `{ DayOfWeek: Boolean }`) value is assignable to the equivalent explicit record type and
+    // vice versa. This pins that the expansion is plain structural typing, not a distinct kind.
+    let output = run(r#"import { print } from "std/io"
+
+type DayOfWeek = "Mon" | "Tue"
+type Calendar = { DayOfWeek: Boolean }
+type Hand = { "Mon": Boolean, "Tue": Boolean }
+
+val asHand = (c: Calendar): Hand => c
+val asCal = (h: Hand): Calendar => h
+
+val c: Calendar = { "Mon": true, "Tue": false }
+val h: Hand = asHand(c)
+val back: Calendar = asCal(h)
+print(if back["Mon"] then "ok" else "no")
+"#);
+    assert_eq!(output, vec!["ok"]);
+}
+
+#[test]
+fn test_index_sig_string_key_still_map_and_bad_key_errors() {
+    // The `{ String: V }` map form is UNCHANGED: arbitrary string keys, read yields `V | Null`.
+    let output = run(r#"import { print } from "std/io"
+
+type Seen = { String: Boolean }
+var s: Seen = {}
+s["x"] = true
+print(if s["x"] != null then "present" else "absent")
+print(if s["y"] != null then "present" else "absent")
+"#);
+    assert_eq!(output, vec!["present", "absent"]);
+
+    // A key type that is neither String nor a string-literal union is rejected.
+    let err = run_expect_err(r#"type R = { Int32: Boolean }
+"#);
+    assert!(
+        err.contains("Index-signature key type must be String or a union of string literals"),
+        "expected index-sig key error, got: {err}"
+    );
+}
+
+#[test]
 fn test_index_place_narrowing_else_branch_and_no_leak() {
     // Two soundness facets of index-place narrowing:
     //   (a) `== null` narrows the ELSE branch to non-null: `if m[k] == null then [] else m[k]`
@@ -2479,6 +2634,100 @@ print(toString(a))
         err.contains("Int32[] | Null") || err.contains("got Int32[] | Null"),
         "expected a non-narrowed `Int32[] | Null` error outside the if, got:\n{err}"
     );
+}
+
+#[test]
+fn test_compound_base_index_place_narrows_through_if_null_test() {
+    // Index-place null-narrowing through a COMPOUND base: `service["dates"]` is a record-field read
+    // reaching an inner `{String:T}` map, and `if service["dates"][date] != null then
+    // service["dates"][date]` must narrow the re-read to `T` (drop the safe-bracket `Null`). The
+    // narrowing place is the full path `service -> "dates" -> date`, not just a top-level
+    // identifier. Run end-to-end: an absent then a present key.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type Dates = { String: Int32 }
+type Service = { "name": String, "dates": Dates }
+
+val lookup = (service: Service, date: String): Int32 =>
+  if service["dates"][date] != null then service["dates"][date]
+  else 0 - 1
+
+var d: Dates = {}
+d["2026-06-13"] = 42
+val s: Service = { "name": "bus", "dates": d }
+print(toString(lookup(s, "2026-06-13")))
+print(toString(lookup(s, "missing")))
+"#);
+    assert_eq!(output, vec!["42", "-1"]);
+}
+
+#[test]
+fn test_compound_base_narrowing_invalidated_by_key_reassignment() {
+    // Soundness: reassigning the KEY variable after the null-test means `o["a"][k]` may denote a
+    // different slot, so the narrowing must be dropped and the re-read re-widened to `T | Null`.
+    // (`place_path_mentions` finds `k` as an identifier key in the path.)
+    let err = run_expect_err(r#"type Inner = { String: Int32 }
+type Outer = { "a": Inner }
+val f = (o: Outer): Int32 =>
+  var k = "x"
+  if o["a"][k] != null then
+    k = "y"
+    o["a"][k]
+  else
+    0
+"#);
+    assert!(
+        err.contains("Int32 | Null"),
+        "expected re-widened `Int32 | Null` after key reassignment, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_compound_base_narrowing_invalidated_by_write_through_root() {
+    // Soundness: a write through the same root (`o["a"][j] = …`) may alias the narrowed slot
+    // (`o["a"]["x"]`), so the narrowing rooted at `o` is conservatively cleared and the sibling
+    // re-read re-widens to `T | Null`.
+    let err = run_expect_err(r#"type Inner = { String: Int32 }
+type Outer = { "a": Inner }
+val f = (o: Outer, j: String): Int32 =>
+  if o["a"]["x"] != null then
+    o["a"][j] = 5
+    o["a"]["x"]
+  else
+    0
+"#);
+    assert!(
+        err.contains("Int32 | Null"),
+        "expected re-widened `Int32 | Null` after write through the root, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_map_read_with_non_string_key_rejected() {
+    // A `{ String: T }` map READ must reject a non-String key (mirrors the index-ASSIGN guard,
+    // which already did). Previously a numeric key passed type-checking and emitted invalid LLVM
+    // (`lin_map_get` takes a string pointer, so an integer key produced a malformed call — "Call
+    // parameter type does not match function signature"). Now it is a clear type error.
+    let err = run_expect_err(r#"type M = { String: Boolean }
+val f = (m: M, k: UInt32): Boolean => m[k] ?? false
+"#);
+    assert!(
+        err.contains("keyed by String") && err.contains("UInt32"),
+        "expected a String-key error mentioning UInt32, got:\n{err}"
+    );
+
+    // A genuine String key still reads fine (guard does not over-reject).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type M = { String: Boolean }
+var m: M = {}
+m["x"] = true
+val f = (m: M, k: String): Boolean => m[k] ?? false
+print(toString(f(m, "x")))
+print(toString(f(m, "y")))
+"#);
+    assert_eq!(output, vec!["true", "false"]);
 }
 
 #[test]
@@ -11754,6 +12003,92 @@ print(loop(0, 100, 0))
 }
 
 #[test]
+fn test_index_assign_evaluates_to_assigned_value() {
+    // Spec §8 / §27 rule 8: an assignment expression evaluates to the assigned value. This held
+    // for `var x = v` (`LocalSet`) but `m[k] = v` (`IndexSet`) wrongly evaluated to `Null`. Now an
+    // index/field assignment can be the value of an `if` branch / block tail, so the memoizing
+    // cache idiom `if m[k] == null then m[k] = compute() else m[k]` type-checks and returns the
+    // stored value directly — no intermediate `val` needed.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { split } from "std/string"
+import { parseInt32 } from "std/number"
+
+val createTimeParser = () =>
+  val timeCache: { String: Int32 } = {}
+  (time: String): Int32 =>
+    if timeCache[time] == null then
+      val [hh, mm, ss] = time.split(":")
+      timeCache[time] = parseInt32(hh) * 60 * 60 + parseInt32(mm) * 60 + parseInt32(ss)
+    else
+      timeCache[time]
+
+val parse = createTimeParser()
+print(toString(parse("01:02:03")))
+print(toString(parse("01:02:03")))
+print(toString(parse("00:01:00")))
+"#);
+    assert_eq!(out, vec!["3723", "3723", "60"]);
+}
+
+#[test]
+fn test_index_assign_value_result_map_object_array() {
+    // The assigned-value result across container kinds and value kinds, each consumed directly:
+    //   - map scalar value (returned and printed),
+    //   - object field STRING value (heap rc) returned from a block,
+    //   - array index value used in an expression.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+// map, scalar value: the assignment IS the returned value
+val m: { String: Int32 } = {}
+print(toString(m["a"] = 42))
+
+// object field, heap (String) value
+type Rec = { "name": String }
+val r: Rec = { "name": "" }
+val n: String = r["name"] = "lin"
+print(n)
+
+// array slot, scalar value used in arithmetic
+var xs: Int32[] = [0, 0, 0]
+print(toString((xs[1] = 7) + 1))
+print(toString(length(xs)))
+"#);
+    assert_eq!(out, vec!["42", "lin", "8", "3"]);
+}
+
+#[test]
+fn test_void_function_body_may_end_in_assignment() {
+    // A `: Null` (void) function's body value is DISCARDED, so it may now END in an assignment
+    // expression (value-typed per spec §8) without an artificial `; null` tail. This is the
+    // `addPair`-style multimap accumulator from `std/encoding`'s query parser. The heap (`String[]`)
+    // value the assignment produces must be RELEASED at scope exit (void functions `Return(None)`),
+    // not leaked — the ASan CI leg and the constant-RSS check guard that; here we assert behaviour.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+
+val addPair = (m: { String: String[] }, k: String, v: String): Null =>
+  val cur = m[k]
+  if cur == null then
+    val fresh: String[] = [v]
+    m[k] = fresh
+  else
+    push(cur, v)
+
+var m: { String: String[] } = {}
+addPair(m, "a", "x")
+addPair(m, "a", "y")
+addPair(m, "b", "z")
+print(toString(length(m["a"])))
+print(toString(length(m["b"])))
+"#);
+    assert_eq!(out, vec!["2", "1"]);
+}
+
+#[test]
 fn object_index_assign_of_callback_param() {
     // Regression: `obj[key] = value` where `value` is a for/map callback PARAMETER used to
     // store NULL. Under the uniform closure ABI a callback param arrives BOXED (a TaggedVal*),
@@ -14065,8 +14400,8 @@ val m: { Bad: Int32 } = {}
         output
     );
     assert!(
-        output.contains("Map key type must be String"),
-        "expected the map-key error, got:\n{}",
+        output.contains("Index-signature key type must be String or a union of string literals"),
+        "expected the index-sig key error, got:\n{}",
         output
     );
 }

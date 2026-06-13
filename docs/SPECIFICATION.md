@@ -433,18 +433,41 @@ The key type must be `String` — either written literally, or **named by a type
 to `String`** (e.g. `type StopID = String` then `{ StopID: T }`). The key is written as a bare
 identifier (not a quoted string — that is how the index-signature form is told apart from a fixed
 record), and that identifier is resolved as a type expression: any alias that unfolds to `String` is
-accepted, at any nesting depth and in any key position; an identifier that resolves to a non-`String`
-type is a compile-time error (`Map key type must be String, but it resolves to …`). The key type is
+accepted, at any nesting depth and in any key position. The key type is
 preserved as-written so the formatter round-trips the alias name. `String` is the only *underlying*
-key type in v1. `{ String: T }` reads "any number of string keys, each mapping to `T`". It is a
-distinct type from a fixed-field record `{ "f": T, … }`: a value is *either* a fixed record *or* an
-index-signature map, never both.
+key type for the dynamic map form. `{ String: T }` reads "any number of string keys, each mapping
+to `T`". It is a distinct type from a fixed-field record `{ "f": T, … }`: a value is *either* a
+fixed record *or* an index-signature map, never both.
 
-- `m[k]` yields `T | Null` (a missing key is `Null`, consistent with the §6.1 safe-bracket rule).
-  For the *defaulted* read, `m[k] ?? default` uses the built-in null-coalescing operator `??`
-  (§8.3); for a keyed default the dot-applicable `object.get(m, k, default)` (`std/object`) remains
-  the convenience. Both give the default an independent type `D`, so the result is `T | D` (and
-  `T | Null` when the default is omitted); a same-typed default collapses `T | D` to a bare `T`.
+**Literal-union key — sugar for a fixed record.** When the key identifier instead resolves to a
+**closed union of string literals** (or a single string-literal type), the `{ K: V }` form is
+**sugar** for the fixed record with one field per literal, all of value type `V`:
+
+```txt
+type DayOfWeek = "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday" | "Sunday"
+type Calendar  = { DayOfWeek: Boolean }
+// exactly equivalent to:
+// type Calendar = { "Monday": Boolean, "Tuesday": Boolean, … , "Sunday": Boolean }
+```
+
+This is an ordinary fixed record (not a map): structurally identical to the hand-written form and
+interchangeable with it. Indexing it by a key of the *same* literal union is **provably total** —
+`calendar[dow]` has type `Boolean`, with no `| Null`, because every member of the union is a present
+field (§6.1's missing-key `Null` cannot arise). A key identifier that resolves to neither `String`
+nor a string-literal union is a compile-time error
+(`Index-signature key type must be String or a union of string literals, but it resolves to …`).
+
+Because the meaning of `{ K: V }` depends on what `K` resolves to — `String` ⇒ dynamic map,
+string-literal union ⇒ fixed record — these two have different runtime representations; changing a
+key alias from one to the other changes the type. See ADR-055.
+
+- `m[k]` requires `k : String` and yields `T | Null` (a missing key is `Null`, consistent with the
+  §6.1 safe-bracket rule). A non-String key (e.g. a numeric value) is a compile-time error
+  (`a `{ String: T }` is keyed by String, but the key is `…``) — the read and write key rules are
+  symmetric. For the *defaulted* read, `m[k] ?? default` uses the built-in null-coalescing operator
+  `??` (§8.3); for a keyed default the dot-applicable `object.get(m, k, default)` (`std/object`)
+  remains the convenience. Both give the default an independent type `D`, so the result is `T | D`
+  (and `T | Null` when the default is omitted); a same-typed default collapses `T | D` to a bare `T`.
 - `m[k] = v` requires `v : T` and `k : String`.
 - An empty `{}` literal infers `{ String: T }` from its context (the annotated binding / return
   type). An **evidence-free** empty `{}` — no annotation, no contextual type, no contents — is a
@@ -700,11 +723,23 @@ count = count + 1
 
 `var` bindings are mutable.
 
-Assignment expressions evaluate to the assigned value.
+Assignment expressions evaluate to the assigned value. This holds for variable assignment
+(`count = count + 1`), index assignment (`m[k] = v`), and field assignment (`rec["f"] = v`) alike —
+each evaluates to the stored value, so an assignment can be the tail of a block or an `if` branch:
 
 ```txt
 val result = count = count + 1
+
+// A memoizing cache: the `then` branch's assignment yields the value it stored, so the whole `if`
+// (and the function) returns the computed-or-cached value with no intermediate binding.
+val parse = (time: String): Int32 =>
+  if cache[time] == null then cache[time] = compute(time)
+  else cache[time]
 ```
+
+A function whose declared return type is `Null` is in *void* position: its body value is discarded,
+so the body may evaluate to any type (e.g. it may end in an assignment) without an explicit `null`
+tail.
 
 Mutable bindings are captured by reference in closures.
 
@@ -1145,6 +1180,8 @@ Narrowing carries into:
 - the matched arm of a `match`,
 - nested blocks within either,
 - the right-hand side of a `&&` whose left-hand side is a narrowing test (e.g. `if input is String && input.length() > 0 ...`).
+
+A null test on an **index read** narrows a re-read of the same index place: `if m[k] != null then m[k] …` (and `m[k] ?? d`) reads `m[k]` as `T` rather than `T | Null` in the guarded branch. The place may be **compound** — an identifier root followed by any number of stable index steps (string-literal or simple-identifier keys), e.g. `service["dates"][date]` — so `if service["dates"][date] != null then service["dates"][date]` narrows the inner map read. The narrowing is invalidated if any identifier the place mentions (its root or a key variable) is reassigned, or a write lands through the same root.
 
 Narrowing is invalidated on the first assignment to a `var` whose narrowed type would no longer hold.
 

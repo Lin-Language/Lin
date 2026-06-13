@@ -87,19 +87,37 @@ fn resolve_type_inner(
             Ok(Type::object(resolved))
         }
         TypeExpr::IndexSig(key, value, _span) => {
-            // `{ String: T }` — a typed index-signature object type (ADR-055). Distinct from a
-            // fixed record; backed by the hashed `LinMap` at runtime. The key type-expr (which may
-            // be a type alias) must resolve to `String`; validate that here, where aliases are
-            // expanded.
+            // `{ K: V }` — index-signature form. The key type-expr (which may be a type alias) is
+            // resolved here, where aliases are expanded, and dispatches on what it denotes:
+            //
+            //   - `String` → a typed index-signature object (ADR-055): a dynamic `{ String: V }`
+            //     map backed by the hashed `LinMap` at runtime, arbitrary string keys.
+            //   - a CLOSED string-literal union (e.g. `DayOfWeek = "Monday" | … | "Sunday"`), or a
+            //     single string-literal singleton → SUGAR for a fixed record with one field per
+            //     literal, all of value type `V`. `{ DayOfWeek: Boolean }` ≡ `{ "Monday": Boolean,
+            //     …, "Sunday": Boolean }`. Resolved UNSEALED, exactly like an inline object-literal
+            //     type (the `TypeExpr::Object` arm above); the named-type unfold path seals it when
+            //     this is the body of a `type T = …` declaration, so `named ⇒ sealed` is inherited.
+            //     This composes with the total-literal-key index rule: indexing the record by a key
+            //     of the SAME literal union is provably total (no safe-bracket `Null`).
+            //   - anything else → an error (a non-String, non-literal key type is not indexable).
             let key_ty = resolve_type_inner(key, env, visiting)?;
-            if key_ty != Type::Str {
-                return Err(format!(
-                    "Map key type must be String, but it resolves to {}",
-                    key_ty
-                ));
-            }
             let val_ty = resolve_type_inner(value, env, visiting)?;
-            Ok(Type::Map(Box::new(val_ty)))
+            if key_ty == Type::Str {
+                Ok(Type::Map(Box::new(val_ty)))
+            } else if let Some(literals) = closed_string_literal_set(&key_ty) {
+                let mut fields = IndexMap::new();
+                for k in literals {
+                    fields.insert(k, val_ty.clone());
+                }
+                Ok(Type::object(fields))
+            } else {
+                Err(format!(
+                    "Index-signature key type must be String or a union of string literals, \
+                     but it resolves to {}",
+                    key_ty
+                ))
+            }
         }
         TypeExpr::TaggedUnion(variants, _span) => {
             let resolved: Result<Vec<Type>, String> =
@@ -107,6 +125,28 @@ fn resolve_type_inner(
             Ok(Type::flatten_union(resolved?))
         }
         TypeExpr::StringLit(s, _span) => Ok(Type::StrLit(s.clone())),
+    }
+}
+
+/// If `ty` is a CLOSED set of string literals — a single `StrLit` or a `Union` whose every member
+/// is a `StrLit` — return the literal strings (order-preserving). Otherwise `None`. Operates on an
+/// already-resolved (concrete) `Type`, so `Named` aliases were peeled by the caller; a `Union`
+/// arrives here already flattened/deduped (`flatten_union`), so the literals are distinct. Used by
+/// the index-signature arm to expand `{ <literal-union>: V }` into a fixed record.
+fn closed_string_literal_set(ty: &Type) -> Option<Vec<String>> {
+    match ty {
+        Type::StrLit(s) => Some(vec![s.clone()]),
+        Type::Union(variants) if !variants.is_empty() => {
+            let mut keys = Vec::with_capacity(variants.len());
+            for v in variants {
+                match v {
+                    Type::StrLit(s) => keys.push(s.clone()),
+                    _ => return None,
+                }
+            }
+            Some(keys)
+        }
+        _ => None,
     }
 }
 
