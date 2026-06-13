@@ -2547,6 +2547,100 @@ print(toString(a))
 }
 
 #[test]
+fn test_compound_base_index_place_narrows_through_if_null_test() {
+    // Index-place null-narrowing through a COMPOUND base: `service["dates"]` is a record-field read
+    // reaching an inner `{String:T}` map, and `if service["dates"][date] != null then
+    // service["dates"][date]` must narrow the re-read to `T` (drop the safe-bracket `Null`). The
+    // narrowing place is the full path `service -> "dates" -> date`, not just a top-level
+    // identifier. Run end-to-end: an absent then a present key.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type Dates = { String: Int32 }
+type Service = { "name": String, "dates": Dates }
+
+val lookup = (service: Service, date: String): Int32 =>
+  if service["dates"][date] != null then service["dates"][date]
+  else 0 - 1
+
+var d: Dates = {}
+d["2026-06-13"] = 42
+val s: Service = { "name": "bus", "dates": d }
+print(toString(lookup(s, "2026-06-13")))
+print(toString(lookup(s, "missing")))
+"#);
+    assert_eq!(output, vec!["42", "-1"]);
+}
+
+#[test]
+fn test_compound_base_narrowing_invalidated_by_key_reassignment() {
+    // Soundness: reassigning the KEY variable after the null-test means `o["a"][k]` may denote a
+    // different slot, so the narrowing must be dropped and the re-read re-widened to `T | Null`.
+    // (`place_path_mentions` finds `k` as an identifier key in the path.)
+    let err = run_expect_err(r#"type Inner = { String: Int32 }
+type Outer = { "a": Inner }
+val f = (o: Outer): Int32 =>
+  var k = "x"
+  if o["a"][k] != null then
+    k = "y"
+    o["a"][k]
+  else
+    0
+"#);
+    assert!(
+        err.contains("Int32 | Null"),
+        "expected re-widened `Int32 | Null` after key reassignment, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_compound_base_narrowing_invalidated_by_write_through_root() {
+    // Soundness: a write through the same root (`o["a"][j] = …`) may alias the narrowed slot
+    // (`o["a"]["x"]`), so the narrowing rooted at `o` is conservatively cleared and the sibling
+    // re-read re-widens to `T | Null`.
+    let err = run_expect_err(r#"type Inner = { String: Int32 }
+type Outer = { "a": Inner }
+val f = (o: Outer, j: String): Int32 =>
+  if o["a"]["x"] != null then
+    o["a"][j] = 5
+    o["a"]["x"]
+  else
+    0
+"#);
+    assert!(
+        err.contains("Int32 | Null"),
+        "expected re-widened `Int32 | Null` after write through the root, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_map_read_with_non_string_key_rejected() {
+    // A `{ String: T }` map READ must reject a non-String key (mirrors the index-ASSIGN guard,
+    // which already did). Previously a numeric key passed type-checking and emitted invalid LLVM
+    // (`lin_map_get` takes a string pointer, so an integer key produced a malformed call — "Call
+    // parameter type does not match function signature"). Now it is a clear type error.
+    let err = run_expect_err(r#"type M = { String: Boolean }
+val f = (m: M, k: UInt32): Boolean => m[k] ?? false
+"#);
+    assert!(
+        err.contains("keyed by String") && err.contains("UInt32"),
+        "expected a String-key error mentioning UInt32, got:\n{err}"
+    );
+
+    // A genuine String key still reads fine (guard does not over-reject).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type M = { String: Boolean }
+var m: M = {}
+m["x"] = true
+val f = (m: M, k: String): Boolean => m[k] ?? false
+print(toString(f(m, "x")))
+print(toString(f(m, "y")))
+"#);
+    assert_eq!(output, vec!["true", "false"]);
+}
+
+#[test]
 fn test_float32_widens_to_float64() {
     // A Float32 must widen to Float64 (fpext) across every numeric context, per spec §21
     // (widening is always to a type that represents both). Codegen's Coerce had no

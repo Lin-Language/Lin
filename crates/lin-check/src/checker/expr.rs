@@ -9,17 +9,31 @@ use crate::typed_ir::*;
 use crate::types::Type;
 
 /// The "place" a flow-narrowing applies to: either a simple identifier (`x`) or an index read
-/// (`obj[key]`) where the object is a simple identifier and the key is a string-literal or a
-/// simple identifier. Index places are the `{String:T}`-map idiom `if m[k] != null then m[k]`.
+/// (`base[key]…`) given as a `PlacePath`. Index places are the `{String:T}`-map idiom
+/// `if m[k] != null then m[k]`, and its nested form `if obj["a"][k] != null then obj["a"][k]`.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum NarrowPlace {
     Ident(String),
-    /// `obj[key]`; `key` is the canonical key — a string-literal value or an identifier name.
-    Index { obj: String, key: IndexKey },
+    /// An index read `base[key]…`, canonicalized as a `PlacePath` whose outermost step is an
+    /// `Index` (a bare `Root` is the `Ident` variant instead).
+    Index(PlacePath),
 }
 
-/// The key half of a narrowable index place. Only stable, side-effect-free keys are admitted so
-/// that two reads of `obj[key]` are guaranteed to denote the same slot.
+/// A canonical, stably-re-readable place expression: an identifier root with zero or more index
+/// steps. Every step's key is a `StrLit` or a simple `Ident`, and the root is an identifier, so
+/// two syntactic reads that canonicalize to the same `PlacePath` are guaranteed to denote the same
+/// slot — provided no identifier the path mentions is reassigned and no write lands through any
+/// prefix (both enforced by `clear_index_narrowings_for` / the index-assign invalidation).
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum PlacePath {
+    /// A simple identifier base (`x`).
+    Root(String),
+    /// One index step over a base path (`base[key]`).
+    Index(Box<PlacePath>, IndexKey),
+}
+
+/// The key half of a narrowable index step. Only stable, side-effect-free keys are admitted so
+/// that two reads of `base[key]` are guaranteed to denote the same slot.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum IndexKey {
     /// A string literal key (`m["foo"]`).
@@ -29,12 +43,59 @@ pub(crate) enum IndexKey {
 }
 
 /// An active index-place narrowing recorded on `Checker::index_narrowings`. `infer_index`
-/// consults the stack: a read whose object/key match `place` is tightened to `ty`.
+/// consults the stack: a read whose canonical `PlacePath` equals `path` is tightened to `ty`.
 #[derive(Clone)]
 pub(crate) struct IndexNarrow {
-    pub(crate) obj: String,
-    pub(crate) key: IndexKey,
+    pub(crate) path: PlacePath,
     pub(crate) ty: Type,
+}
+
+/// Canonicalize a place expression into a `PlacePath` if it is stably re-readable — an identifier
+/// root with index steps whose keys are each a string-literal or a simple identifier. Otherwise
+/// `None` (a call, arithmetic, etc. in the path is not guaranteed to denote the same slot twice).
+fn place_path_of_expr(expr: &Expr) -> Option<PlacePath> {
+    match expr {
+        Expr::Ident(n, _) => Some(PlacePath::Root(n.clone())),
+        Expr::Index { object, key, .. } => {
+            let base = place_path_of_expr(object)?;
+            let k = match key.as_ref() {
+                Expr::StringLit(s, _) => IndexKey::StrLit(s.clone()),
+                Expr::Ident(k, _) => IndexKey::Ident(k.clone()),
+                _ => return None,
+            };
+            Some(PlacePath::Index(Box::new(base), k))
+        }
+        _ => None,
+    }
+}
+
+/// The root identifier a `PlacePath` is anchored at.
+fn place_path_root(path: &PlacePath) -> &str {
+    match path {
+        PlacePath::Root(n) => n,
+        PlacePath::Index(base, _) => place_path_root(base),
+    }
+}
+
+/// True if `name` appears anywhere in `path` — as the root or as an identifier key. Reassigning
+/// such an identifier invalidates the narrowing (the path may denote a different slot/value).
+fn place_path_mentions(path: &PlacePath, name: &str) -> bool {
+    match path {
+        PlacePath::Root(n) => n == name,
+        PlacePath::Index(base, key) => {
+            place_path_mentions(base, name) || matches!(key, IndexKey::Ident(k) if k == name)
+        }
+    }
+}
+
+/// The root identifier of a place EXPRESSION (the object of an index-assign target), peeling index
+/// steps. Used to invalidate narrowings rooted at the same identifier after a write through it.
+fn expr_place_root(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Ident(n, _) => Some(n),
+        Expr::Index { object, .. } => expr_place_root(object),
+        _ => None,
+    }
 }
 
 /// A flow-narrowing derived from an `if`/`else` condition that is a type/null test on a simple
@@ -599,8 +660,20 @@ impl Checker {
             }
             // Typed index-signature map `{ String: T }` (ADR-055): a key access yields `T | Null`
             // (the missing-key → Null safe-bracket rule, §6.1). No per-key field tracking — the
-            // key set is dynamic by construction.
-            Type::Map(val_ty) => Type::flatten_union(vec![(**val_ty).clone(), Type::Null]),
+            // key set is dynamic by construction. The key must be String-ish (mirrors the
+            // index-assign guard): a non-String key (e.g. a numeric `date`) cannot index a string
+            // map — caught here rather than producing invalid codegen (`lin_map_get` takes a string
+            // pointer, so an integer key emits a malformed call).
+            Type::Map(val_ty) => {
+                let key_ty = typed_key.ty();
+                if !key_ty.is_string_ish() && !matches!(key_ty, Type::TypeVar(_)) {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!("a `{}` is keyed by String, but the key is `{}`", obj_ty, key_ty),
+                    ));
+                }
+                Type::flatten_union(vec![(**val_ty).clone(), Type::Null])
+            }
             Type::Null => Type::Null,
             Type::TypeVar(_) => self.env.fresh_type_var(),
             Type::Union(variants) => {
@@ -806,7 +879,17 @@ impl Checker {
                     self.object_index_nonliteral(fields, &typed_key.ty())
                 }
             }
-            Type::Map(val_ty) => Type::flatten_union(vec![(**val_ty).clone(), Type::Null]),
+            Type::Map(val_ty) => {
+                // Map key must be String-ish (mirrors `infer_index` / the index-assign guard).
+                let key_ty = typed_key.ty();
+                if !key_ty.is_string_ish() && !matches!(key_ty, Type::TypeVar(_)) {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!("a `{}` is keyed by String, but the key is `{}`", obj_ty, key_ty),
+                    ));
+                }
+                Type::flatten_union(vec![(**val_ty).clone(), Type::Null])
+            }
             Type::Null => Type::Null,
             Type::TypeVar(_) => self.env.fresh_type_var(),
             Type::Union(variants) => {
@@ -940,46 +1023,54 @@ impl Checker {
         Some(NarrowTest { place, then_ty, else_ty })
     }
 
-    /// If `expr` is a narrowable place — a simple identifier, or an `obj[key]` index where `obj`
-    /// is a simple identifier and `key` is a string-literal or a simple identifier — return the
-    /// corresponding `NarrowPlace`. Otherwise `None` (the expression is not stably re-readable, so
-    /// narrowing it would be unsound).
+    /// If `expr` is a narrowable place — a simple identifier, or an index read `base[key]…` whose
+    /// base canonicalizes to an identifier-rooted `PlacePath` and whose every key is a
+    /// string-literal or a simple identifier — return the corresponding `NarrowPlace`. Otherwise
+    /// `None` (the expression is not stably re-readable, so narrowing it would be unsound).
     fn narrow_place_of(&self, expr: &Expr) -> Option<NarrowPlace> {
-        match expr {
-            Expr::Ident(n, _) => Some(NarrowPlace::Ident(n.clone())),
-            Expr::Index { object, key, .. } => {
-                let obj = match object.as_ref() {
-                    Expr::Ident(n, _) => n.clone(),
-                    _ => return None,
-                };
-                let key = match key.as_ref() {
-                    Expr::StringLit(s, _) => IndexKey::StrLit(s.clone()),
-                    Expr::Ident(k, _) => IndexKey::Ident(k.clone()),
-                    _ => return None,
-                };
-                Some(NarrowPlace::Index { obj, key })
-            }
-            _ => None,
+        match place_path_of_expr(expr)? {
+            PlacePath::Root(n) => Some(NarrowPlace::Ident(n)),
+            path @ PlacePath::Index(..) => Some(NarrowPlace::Index(path)),
         }
     }
 
     /// The current static type of a narrowable place. For an identifier this is the binding's
-    /// declared/narrowed type; for an `obj[key]` index it is the type a read of that index would
-    /// produce — modelled here for the `Type::Map` (`{String:T}` → `T | Null`) and `Type::Array`
-    /// (`T[]` → element type) cases. Other object shapes are not narrowed (return `None`), keeping
-    /// the change scoped to the map/array idiom that motivated it.
+    /// declared/narrowed type; for an index path it is the type a read of that path would produce.
     fn narrow_place_type(&self, place: &NarrowPlace) -> Option<Type> {
         match place {
             NarrowPlace::Ident(name) => Some(self.env.lookup(name)?.ty.clone()),
-            NarrowPlace::Index { obj, .. } => {
-                let obj_ty = &self.env.lookup(obj)?.ty;
-                match obj_ty {
+            NarrowPlace::Index(path) => self.place_path_type(path),
+        }
+    }
+
+    /// The static type a READ of `path` would produce, walked from the root. The root is a binding
+    /// lookup; each index step models the read type for the base's shape — `Type::Map` (`{String:T}`
+    /// → `T | Null`, the safe-bracket rule) and `Type::Array` (`T[]` → element type). A `Named`
+    /// alias base is resolved one or more levels first. Any other base shape returns `None`, keeping
+    /// the narrowing scoped to the map/array idiom that motivated it (a fixed-record field read does
+    /// not produce a `| Null` that a null-test could strip).
+    fn place_path_type(&self, path: &PlacePath) -> Option<Type> {
+        match path {
+            PlacePath::Root(name) => Some(self.env.lookup(name)?.ty.clone()),
+            PlacePath::Index(base, key) => {
+                let base_ty = self.place_path_type(base)?;
+                let base_ty = self.resolve_named_body(&base_ty).unwrap_or(base_ty);
+                match base_ty {
                     Type::Map(val_ty) => {
-                        Some(Type::flatten_union(vec![(**val_ty).clone(), Type::Null]))
+                        Some(Type::flatten_union(vec![(*val_ty).clone(), Type::Null]))
                     }
                     // `T[]` indexed: element type (array reads are not `| Null`, so a null test on
                     // one cannot narrow — `without_variant(Null)` will fail and bail out).
-                    Type::Array(elem) => Some((**elem).clone()),
+                    Type::Array(elem) => Some((*elem).clone()),
+                    // A fixed-record field read on an INTERMEDIATE step of the path (e.g.
+                    // `service["dates"]` in `service["dates"][date]`): a string-literal key reads
+                    // the declared field type. This is how a compound place reaches the inner
+                    // Map/Array that the final step's null-test actually narrows. The field read
+                    // itself is total for a known key, so no `| Null` is introduced here.
+                    Type::Object { fields, .. } => match key {
+                        IndexKey::StrLit(k) => fields.get(k).cloned(),
+                        IndexKey::Ident(_) => None,
+                    },
                     _ => None,
                 }
             }
@@ -1005,10 +1096,9 @@ impl Checker {
                     // Index places are narrowed via the `index_narrowings` stack, which
                     // `infer_index` consults. The caller (`infer_if`) records the stack depth
                     // before the branch and truncates back to it afterwards.
-                    NarrowPlace::Index { obj, key } => {
+                    NarrowPlace::Index(path) => {
                         self.index_narrowings.push(IndexNarrow {
-                            obj: obj.clone(),
-                            key: key.clone(),
+                            path: path.clone(),
                             ty: narrowed_ty.clone(),
                         });
                     }
@@ -1017,33 +1107,35 @@ impl Checker {
         }
     }
 
-    /// Invalidate any active index-narrowing whose object identifier is `name` (e.g. after an
-    /// `obj = …` reassignment or `obj[…] = …` write inside the branch — the value at `obj[key]`
-    /// may have changed, so the tightened type no longer holds). Called from assignment checking.
+    /// Invalidate any active index-narrowing whose path MENTIONS `name` — as its root object or as
+    /// an identifier key (e.g. after an `obj = …` reassignment, or a write to a key variable `k`
+    /// used in `m[k]`). The path may now denote a different slot/value, so the tightened type no
+    /// longer holds. Conservative by design: clearing too much only loses a narrowing (re-widens to
+    /// `T | Null`), never unsoundly keeps a stale one. Called from assignment checking.
     pub(crate) fn clear_index_narrowings_for(&mut self, name: &str) {
-        self.index_narrowings.retain(|n| n.obj != name);
+        self.index_narrowings.retain(|n| !place_path_mentions(&n.path, name));
     }
 
-    /// Look up an active index-narrowing for `obj[key]`. `infer_index` calls this with the syntactic
-    /// object/key; a hit returns the tightened (`Null`-stripped) read type.
+    /// Look up an active index-narrowing for an index read. `infer_index` calls this with the
+    /// syntactic object/key; the read is canonicalized to a `PlacePath` and a hit returns the
+    /// tightened (`Null`-stripped) read type.
     pub(crate) fn lookup_index_narrowing(&self, object: &Expr, key: &Expr) -> Option<Type> {
         if self.index_narrowings.is_empty() {
             return None;
         }
-        let obj = match object {
-            Expr::Ident(n, _) => n,
-            _ => return None,
-        };
-        let key = match key {
+        // Reconstruct the full read path `object[key]` and canonicalize it.
+        let base = place_path_of_expr(object)?;
+        let k = match key {
             Expr::StringLit(s, _) => IndexKey::StrLit(s.clone()),
             Expr::Ident(k, _) => IndexKey::Ident(k.clone()),
             _ => return None,
         };
+        let path = PlacePath::Index(Box::new(base), k);
         // Last match wins (innermost/most-recent narrowing).
         self.index_narrowings
             .iter()
             .rev()
-            .find(|n| n.obj == *obj && n.key == key)
+            .find(|n| n.path == path)
             .map(|n| n.ty.clone())
     }
 
@@ -1837,22 +1929,24 @@ impl Checker {
         let typed_value = self.check_expr(value, &expected_ty)?;
         self.span_type_map.push((span, expected_ty.to_string(), def_span));
         self.env.clear_narrowing(target);
-        // Reassigning `target` invalidates any active index-narrowing that uses it as the indexed
-        // object (`target[..]`) or as the key (`m[target]`) — both denote a possibly-different
-        // value now.
-        self.index_narrowings.retain(|n| {
-            n.obj != target && n.key != IndexKey::Ident(target.to_string())
-        });
+        // Reassigning `target` invalidates any active index-narrowing whose path mentions it —
+        // whether as the root object (`target[..]`, `target["a"][k]`) or as a key (`m[target]`) —
+        // since the path may denote a possibly-different value now.
+        self.clear_index_narrowings_for(target);
         Ok(TypedExpr::LocalSet { slot, value: Box::new(typed_value), ty: expected_ty, span })
     }
 
     pub(crate) fn infer_index_assign(&mut self, object: &Expr, key: &Expr, value: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
         let typed_obj = self.infer_expr(object)?;
         let typed_key = self.infer_expr(key)?;
-        // A write `obj[..] = ..` invalidates any active index-narrowing on `obj` — the value at
-        // `obj[key]` may have changed (e.g. `if m[k] == null then m[k] = []` followed by a read).
-        if let Expr::Ident(obj_name, _) = object {
-            self.clear_index_narrowings_for(obj_name);
+        // A write `obj[..] = ..` (where `obj` may itself be a compound place like `rec["a"]`)
+        // invalidates any active index-narrowing rooted at the same identifier — the value at any
+        // path under that root may have changed (e.g. `if m[k] == null then m[k] = []` followed by
+        // a read, or a write through `rec["a"][k] = v` aliasing a narrowed `rec["a"][j]`).
+        // Conservatively keyed on the ROOT identifier: clearing all narrowings under that root is
+        // sound (over-clearing only re-widens), and avoids reasoning about index aliasing.
+        if let Some(root) = expr_place_root(object) {
+            self.clear_index_narrowings_for(root);
         }
         let obj_ty = typed_obj.ty();
         let typed_value = match &obj_ty {
