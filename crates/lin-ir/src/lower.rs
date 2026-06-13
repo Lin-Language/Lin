@@ -2622,10 +2622,17 @@ fn try_lower_sum_literal(
 /// (D3b anon-slot widen): both are physically `LinObject*` but different shapes — the
 /// source is WIDER (or merely different) and the slot must project-copy to sever sharing.
 /// Only fires for a genuine field mismatch; exact-shape pass-through is a no-op.
+///
+/// EXCEPTION (`!tf.is_empty()`): an EMPTY target `{}` is the OPEN/top object type, not a closed
+/// zero-field record. Coercing into it is a WIDEN ("any object"), so the source must pass through
+/// keeping ALL its dynamic fields — never project-copy to a 0-field object. Without this guard a
+/// value flowing into a `{}`-typed slot (e.g. a `{}[]` element, the factory-of-counters pattern)
+/// is stripped to an empty `LinObject` → every field reads `Null` (scalar) or a garbage pointer
+/// (Function field → segfault on call). Regression: `test_var_cell_escaping_via_object_in_loop_body`.
 fn anon_object_slot_repr_differs(from: &Type, to: &Type) -> bool {
     matches!((from, to),
         (Type::Object { sealed: false, fields: ff }, Type::Object { sealed: false, fields: tf })
-        if ff != tf)
+        if ff != tf && !tf.is_empty())
 }
 
 /// Coerce a value into a (plain, non-cell) local/global SLOT the binding will OWN, transferring
