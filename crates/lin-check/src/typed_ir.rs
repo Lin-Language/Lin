@@ -313,7 +313,9 @@ impl TypedExpr {
             TypedExpr::MakeArray { ty, .. } => ty.clone(),
             TypedExpr::Index { result_type, .. } => result_type.clone(),
             TypedExpr::FieldGet { result_type, .. } => result_type.clone(),
-            TypedExpr::IndexSet { .. } => Type::Null,
+            // An assignment expression evaluates to the assigned value (spec §8 / §27 rule 8),
+            // mirroring `LocalSet`. The stored value's type is the result type.
+            TypedExpr::IndexSet { value, .. } => value.ty(),
             TypedExpr::StringInterp { .. } => Type::Str,
             TypedExpr::Is { .. } => Type::Bool,
             TypedExpr::Has { .. } => Type::Bool,

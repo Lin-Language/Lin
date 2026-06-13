@@ -1669,6 +1669,27 @@ to anything but `Type::Str` is `Map key type must be String, but it resolves to 
 type-expr is preserved (not collapsed to `String`) so the formatter round-trips the alias the user
 wrote. Underlying key type is still `String`-only; this is purely a spelling/aliasing convenience.
 
+**Literal-union key ⇒ fixed-record sugar (follow-up).** The resolution-time key dispatch was
+extended with a second accepted shape: a key that resolves to a **closed string-literal union**
+(or a single `StrLit`). `{ DayOfWeek: Boolean }` where `type DayOfWeek = "Monday" | … | "Sunday"`
+is **sugar** that expands to the fixed record `{ "Monday": Boolean, …, "Sunday": Boolean }` — one
+field per literal, all of the value type. This is *not* a `Map`/`LinMap`: it resolves to an
+ordinary `Type::Object` (unsealed, exactly like an inline object-literal type; the named-type
+unfold path seals it when it is a `type T = …` body, so `named ⇒ sealed` is inherited) and is
+structurally identical to the hand-written record — assignable both ways. The three key shapes are
+disjoint and dispatched in `resolve.rs`'s `IndexSig` arm purely on what the (alias-expanded) key
+resolves to: `String` → dynamic `Map`; a closed `StrLit`-union → fixed record; anything else →
+`Index-signature key type must be String or a union of string literals, but it resolves to <T>`.
+The expansion composes with the total-literal-key index rule (ADR-035 / the safe-bracket §6.1
+exception): indexing the expanded record by a key of the *same* literal union covers every field,
+so the read is provably total — `calendar[dow] : Boolean`, no `| Null`. **Caveat (deliberate):** the
+meaning of `{ K: V }` therefore depends on `K`'s definition (a `String` alias → map; a literal-union
+alias → record); these have different runtime representations, so refactoring a key alias between
+the two silently flips the type. The overload was chosen over a distinct mapped-type syntax
+(`{ [K in U]: V }`) because it is a single additive resolver branch that turns a former *error* into
+a record (no existing valid program changes meaning); the explicit syntax is reserved for if/when
+key-dependent value types are wanted.
+
 **Backing-representation choice — a distinct `LinMap`, values boxed-but-hashed.** A separate
 container (rather than retrofitting a hash side-index onto `LinObject`, the #4b
 `hashed-json-object.md` route) **sidesteps the inline `MakeObject` codegen ABI constraint** entirely
