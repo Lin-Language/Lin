@@ -5539,6 +5539,20 @@ fn inline_lambda_body_tracking_elem_boxes(
     ctx: &mut LowerCtx,
 ) -> (Temp, Type, Vec<Temp>) {
     builder.push_scope();
+    // Snapshot: remember which cells already existed before this inline body runs, and which block
+    // we start in. Cells created DURING the body (indices >= snapshot) that were created in the
+    // current (pre-body) block are freed here at the body scope exit — they are scoped to this
+    // iteration and will not be used again. This fixes the per-iteration `var`-cell leak when an
+    // inline-inlined outer loop body declares a `var` (e.g. `var arr = []`) that it never passes
+    // to an escaping closure: the cell is non-entry-block so the function-exit FreeCell skips it,
+    // but it must die at the END of each iteration, not accumulate across the loop.
+    // SOUNDNESS: we only free cells created in the START block — a cell created in a sub-branch
+    // (conditional/nested if) does NOT dominate the post-body merge point, so we leave it leaking
+    // (the existing conservative behaviour). Non-escaping and not the body result are the same
+    // guards as the function-exit FreeCell; `raw` is never a cell pointer so the raw-keep is
+    // purely defensive.
+    let cells_before = builder.created_cells.len();
+    let body_start_block = builder.current_block;
     let mut elem_boxes: Vec<Temp> = Vec::new();
     for (i, param) in params.iter().enumerate() {
         if let Some((t, arg_ty)) = arg_temps.get(i) {
@@ -5560,6 +5574,24 @@ fn inline_lambda_body_tracking_elem_boxes(
     }
     let raw = lower_expr(body, builder, ctx);
     let body_ty = builder.temp_types.get(&raw).cloned().unwrap_or_else(|| body.ty());
+    // Free `var`-cells created during this inline body, scoped to the pre-body start block.
+    // Only if the current block is not already terminated (a diverged/early-exit body skips this,
+    // just like the function-exit FreeCell guard). Mirrors the function-exit FreeCell logic.
+    if !builder.is_current_block_terminated() {
+        let to_free: Vec<(Temp, Type)> = builder.created_cells[cells_before..]
+            .iter()
+            .filter(|(c, _, blk)| {
+                // Only free cells created in the block we started the inline in — dominance.
+                *blk == body_start_block
+                    && !builder.escaping_cells.contains(c)
+                    && *c != raw
+            })
+            .map(|(c, ty, _)| (*c, ty.clone()))
+            .collect();
+        for (cell, ty) in to_free {
+            builder.emit(Instruction::FreeCell { cell, ty });
+        }
+    }
     // Release this body scope's own locals, KEEPING the result temp AND the tracked element boxes
     // (the caller frees their shells explicitly after the iteration). The bound param temps were
     // never registered owned here (they belong to the loop), so they are not double-released.
