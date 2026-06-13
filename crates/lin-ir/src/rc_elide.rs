@@ -201,10 +201,25 @@ fn elide_rc_fn(func: &mut LinFunction) {
 }
 
 /// Types that participate in RC (reference counted heap values).
+/// Must match `ownership_verify::is_concrete_rc_ty` — both are the authority for which
+/// heap values use `lin_rc_retain`/typed-release for ownership. Divergence = missed elisions
+/// (safe but suboptimal) for the extra types; we keep them in sync to avoid perpetual gaps.
 fn is_rc_type(ty: &Type) -> bool {
+    // NullableRecord (Stage 3): T|Null where T is a sealed record — raw nullable sealed pointer
+    // managed via lin_rc_retain/lin_sealed_release, same as Object{sealed:true}.
+    if crate::repr::nullable_sealed_record(ty).is_some() {
+        return true;
+    }
     matches!(
         ty,
-        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Function { .. }
+        Type::Str
+            | Type::StrLit(_)
+            | Type::Array(_)
+            | Type::FixedArray(_)
+            | Type::Object { .. }
+            | Type::Map(_)
+            | Type::Iterator(_)
+            | Type::Function { .. }
     )
 }
 

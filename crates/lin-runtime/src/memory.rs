@@ -1,5 +1,44 @@
 /// Heap allocation and reference counting for Lin values.
 
+/// LIN_RC_COUNT instrumentation (Stage 4 measurement). When `LIN_RC_COUNT=1`, atomic counters
+/// track retain/release traffic and are printed at process exit. Zero runtime cost when env var
+/// is not set (checked once at startup via `RC_COUNT_ENABLED`).
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+pub static RC_COUNT_ENABLED: AtomicBool = AtomicBool::new(false);
+pub static RC_RETAIN_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static RC_RELEASE_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static SEALED_RETAIN_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static SEALED_RELEASE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// LIN_RC_COUNT: auto-init on first retain call (lazy). Registers lin_rc_count_print via atexit.
+fn ensure_rc_count_init() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if std::env::var("LIN_RC_COUNT").as_deref() == Ok("1") {
+            RC_COUNT_ENABLED.store(true, Ordering::Relaxed);
+            // Register print at normal process exit (complements the lin_exit path).
+            unsafe { libc::atexit(rc_count_atexit); }
+        }
+    });
+}
+
+extern "C" fn rc_count_atexit() {
+    lin_rc_count_print();
+}
+
+/// Called at program exit to print RC counts if enabled.
+#[no_mangle]
+pub extern "C" fn lin_rc_count_print() {
+    if RC_COUNT_ENABLED.load(Ordering::Relaxed) {
+        let retain = RC_RETAIN_COUNT.load(Ordering::Relaxed);
+        let release = RC_RELEASE_COUNT.load(Ordering::Relaxed);
+        let sretain = SEALED_RETAIN_COUNT.load(Ordering::Relaxed);
+        let srelease = SEALED_RELEASE_COUNT.load(Ordering::Relaxed);
+        eprintln!("RC_COUNT: retain={retain} release={release} sealed_retain={sretain} sealed_release={srelease}");
+    }
+}
+
 /// Allocate `size` bytes on the heap, returning a raw pointer.
 /// Aborts on allocation failure.
 #[no_mangle]
@@ -116,8 +155,16 @@ unsafe fn release_captures(env_ptr: *mut u8, cap_desc: *const u8) {
 
 /// Reference counting operations for heap-allocated Lin values.
 
+/// Atomic init-flag: 0=unchecked, 1=checked.
+static RC_COUNT_CHECKED: AtomicBool = AtomicBool::new(false);
+
 #[no_mangle]
 pub extern "C" fn lin_rc_retain(ptr: *mut u32) {
+    // Lazy init: check env var exactly once.
+    if !RC_COUNT_CHECKED.load(Ordering::Relaxed) {
+        RC_COUNT_CHECKED.store(true, Ordering::Relaxed);
+        ensure_rc_count_init();
+    }
     if !ptr.is_null() {
         unsafe {
             // Immortal (interned) string literals carry a saturated refcount (>= IMMORTAL_RC).
@@ -131,6 +178,9 @@ pub extern "C" fn lin_rc_retain(ptr: *mut u32) {
             }
             *ptr += 1;
         }
+    }
+    if RC_COUNT_ENABLED.load(Ordering::Relaxed) {
+        RC_RETAIN_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 }
 
