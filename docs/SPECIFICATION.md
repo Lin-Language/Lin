@@ -723,11 +723,23 @@ count = count + 1
 
 `var` bindings are mutable.
 
-Assignment expressions evaluate to the assigned value.
+Assignment expressions evaluate to the assigned value. This holds for variable assignment
+(`count = count + 1`), index assignment (`m[k] = v`), and field assignment (`rec["f"] = v`) alike —
+each evaluates to the stored value, so an assignment can be the tail of a block or an `if` branch:
 
 ```txt
 val result = count = count + 1
+
+// A memoizing cache: the `then` branch's assignment yields the value it stored, so the whole `if`
+// (and the function) returns the computed-or-cached value with no intermediate binding.
+val parse = (time: String): Int32 =>
+  if cache[time] == null then cache[time] = compute(time)
+  else cache[time]
 ```
+
+A function whose declared return type is `Null` is in *void* position: its body value is discarded,
+so the body may evaluate to any type (e.g. it may end in an assignment) without an explicit `null`
+tail.
 
 Mutable bindings are captured by reference in closures.
 
