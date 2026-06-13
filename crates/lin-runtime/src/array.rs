@@ -682,15 +682,21 @@ pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::
     // RETAINING semantics (the caller keeps its box), so the packed slot takes its own +1 on each
     // heap field and the object is left untouched.
     if elem_tag == SEALED_ARRAY_TAG {
-        if tagged.is_null() || (*tagged).tag != TAG_OBJECT {
+        if tagged.is_null() {
             crate::fault::runtime_fault(
                 "Runtime error: cannot push a non-record value into a sealed record array",
             );
         }
-        let obj = (*tagged).payload as *const crate::object::LinObject;
+        let (obj, mat_owned) = match crate::object::tagged_as_object(tagged) {
+            Some(pair) => pair,
+            None => crate::fault::runtime_fault(
+                "Runtime error: cannot push a non-record value into a sealed record array",
+            ),
+        };
         let named = (*arr).elem_named_desc;
         let slot = lin_sealed_array_push_slot(arr);
         crate::sealed::pack_named_payload_from_object(slot, obj, named);
+        if mat_owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
         return;
     }
     if elem_tag == SEALED_PTR_ARRAY_TAG {
@@ -699,17 +705,23 @@ pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::
         // rc=1; we pass ownership to the array by calling push WITHOUT the extra retain then releasing
         // our alloc ref — or equivalently: alloc (rc=1), push (retains→rc=2), release alloc ref (rc=1).
         // `lin_push_dyn` has RETAINING semantics: the caller keeps its object; obj is NOT consumed.
-        if tagged.is_null() || (*tagged).tag != TAG_OBJECT {
+        if tagged.is_null() {
             crate::fault::runtime_fault(
                 "Runtime error: cannot push a non-record value into a sealed-ptr record array",
             );
         }
-        let obj = (*tagged).payload as *const crate::object::LinObject;
+        let (obj, mat_owned) = match crate::object::tagged_as_object(tagged) {
+            Some(pair) => pair,
+            None => crate::fault::runtime_fault(
+                "Runtime error: cannot push a non-record value into a sealed-ptr record array",
+            ),
+        };
         let named = (*arr).elem_named_desc;
         let heap_desc = (*arr).elem_desc;
         let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
         lin_sealed_ptr_array_push(arr, sptr); // retains: sptr rc goes 1→2
         crate::sealed::lin_sealed_release_self(sptr); // release our alloc ref: rc goes 2→1
+        if mat_owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
         return;
     }
     if elem_tag == 0xFF {
@@ -919,37 +931,53 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
         // release the OLD element's heap fields, pack the new record's fields (retaining), then
         // consume the transferred element reference (the 0xFF branch above is a move — the
         // lowering supplies an owning reference and never releases it).
-        if tagged.is_null() || (*tagged).tag != TAG_OBJECT {
-            // `set` never faults (spec §6.1) — a non-record value here is unreachable from
-            // type-checked code; keep the silent no-op the flat default arm had.
+        if tagged.is_null() {
             return;
         }
-        let obj = (*tagged).payload as *mut crate::object::LinObject;
+        // Accept TAG_OBJECT or TAG_RECORD (Stage 6a). Materialize TAG_RECORD to a transient
+        // LinObject so pack_named_payload_from_object can walk fields uniformly.
+        let (obj, mat_owned) = match crate::object::tagged_as_object(tagged) {
+            Some(pair) => pair,
+            None => return, // non-record value — silent no-op (spec §6.1)
+        };
         let stride = (*arr).elem_stride;
         let slot = ((*arr).data as *mut u8).add((actual as u64 * stride) as usize);
         crate::sealed::release_payload_fields_pub(slot, (*arr).elem_desc);
         crate::sealed::pack_named_payload_from_object(slot, obj, (*arr).elem_named_desc);
-        crate::object::lin_object_release(obj);
+        // For TAG_OBJECT the caller owns it and will release it separately (set contract: no consume).
+        // For TAG_RECORD the transient materialization is owned here — release it.
+        if mat_owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
+        // The original TAG_OBJECT case released `obj` here, meaning `lin_array_set` CONSUMED the
+        // `tagged` argument's inner. That was the pre-existing contract (move semantics for SEALED).
+        // Preserve it for TAG_OBJECT by matching the original release:
+        if !mat_owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
     } else if elem_tag == SEALED_PTR_ARRAY_TAG {
         // Pointer-backed (0xFD): the `tagged` is a TAG_OBJECT wrapping a LinObject* (materialized
         // by `lin_array_get_tagged`). Project it into a fresh sealed struct and store that.
         // Contract: lin_array_set does NOT consume `tagged` — the caller retains it and will
         // release it separately. We borrow `obj` from tagged, pack into a new sealed struct,
         // and store the struct. No release of obj or tagged here.
-        if tagged.is_null() || (*tagged).tag != TAG_OBJECT {
+        if tagged.is_null() {
             return;
         }
-        let obj = (*tagged).payload as *const crate::object::LinObject;
-        if obj.is_null() { return; }
+        let (obj_raw, mat_owned) = match crate::object::tagged_as_object(tagged) {
+            Some(pair) => pair,
+            None => return,
+        };
+        if obj_raw.is_null() {
+            if mat_owned { crate::object::lin_object_release(obj_raw as *mut crate::object::LinObject); }
+            return;
+        }
         let named = (*arr).elem_named_desc;
         let heap_desc = (*arr).elem_desc;
-        let new_sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
+        let new_sptr = crate::sealed::alloc_sealed_struct_from_object(obj_raw, named, heap_desc);
         let slot = ((*arr).data as *mut *mut u8).add(actual as usize);
         let old = *slot;
         if !old.is_null() {
             crate::sealed::lin_sealed_release_self(old);
         }
         *slot = new_sptr; // transfer alloc rc=1 to slot
+        if mat_owned { crate::object::lin_object_release(obj_raw as *mut crate::object::LinObject); }
     } else {
         let tag = if tagged.is_null() { TAG_NULL } else { (*tagged).tag };
         let payload = if tagged.is_null() { 0u64 } else { (*tagged).payload };

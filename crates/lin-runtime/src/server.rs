@@ -1,4 +1,4 @@
-use crate::object::{lin_object_alloc, lin_object_set, LinObject};
+use crate::object::{lin_object_alloc, lin_object_set, LinObject, tagged_as_object};
 use crate::tagged::{TaggedVal, TAG_STR, TAG_OBJECT, TAG_INT32, alloc_tagged};
 use crate::fs::{make_string, resolve_lin_str, make_error_tagged};
 use crate::string::{LinString, lin_string_release};
@@ -231,15 +231,16 @@ unsafe fn serialize_response(resp: *const u8) -> Vec<u8> {
         return wire_response(500, &[], "Internal Server Error");
     }
     let tv = resp as *const TaggedVal;
-    if (*tv).tag != TAG_OBJECT {
-        return wire_response(500, &[], "Internal Server Error");
-    }
-    let obj = (*tv).payload as *const LinObject;
+    let (obj, resp_owned) = match tagged_as_object(tv) {
+        Some(pair) => pair,
+        None => return wire_response(500, &[], "Internal Server Error"),
+    };
 
     // Error-shaped result → 500.
     if let Some(t) = obj_get_string(obj, "type") {
         if t == "error" {
             let msg = obj_get_string(obj, "message").unwrap_or_else(|| "error".to_string());
+            if resp_owned { crate::object::lin_object_release(obj as *mut LinObject); }
             return wire_response(500, &[], &msg);
         }
     }
@@ -252,28 +253,32 @@ unsafe fn serialize_response(resp: *const u8) -> Vec<u8> {
     let hkey = make_string("headers");
     let htv = crate::object::lin_object_get(obj, hkey);
     lin_string_release(hkey);
-    if !htv.is_null() && (*htv).tag == TAG_OBJECT {
-        let hobj = (*htv).payload as *const LinObject;
-        let len = (*hobj).len as usize;
-        for i in 0..len {
-            let entry = (*hobj).entries.add(i);
-            let key_s = (*entry).key;
-            let kslice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
-            let name = match std::str::from_utf8(kslice) {
-                Ok(s) => s.to_string(),
-                Err(_) => continue,
-            };
-            let vtv = &(*entry).value;
-            if vtv.tag == TAG_STR {
-                let vs = vtv.payload as *const LinString;
-                let vslice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
-                if let Ok(v) = std::str::from_utf8(vslice) {
-                    headers.push((name, v.to_string()));
+    if !htv.is_null() {
+        let htv_typed = htv as *const TaggedVal;
+        if let Some((hobj, hobj_owned)) = tagged_as_object(htv_typed) {
+            let len = (*hobj).len as usize;
+            for i in 0..len {
+                let entry = (*hobj).entries.add(i);
+                let key_s = (*entry).key;
+                let kslice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
+                let name = match std::str::from_utf8(kslice) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                };
+                let vtv = &(*entry).value;
+                if vtv.tag == TAG_STR {
+                    let vs = vtv.payload as *const LinString;
+                    let vslice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
+                    if let Ok(v) = std::str::from_utf8(vslice) {
+                        headers.push((name, v.to_string()));
+                    }
                 }
             }
+            if hobj_owned { crate::object::lin_object_release(hobj as *mut LinObject); }
         }
     }
 
+    if resp_owned { crate::object::lin_object_release(obj as *mut LinObject); }
     wire_response(status, &headers, &body)
 }
 

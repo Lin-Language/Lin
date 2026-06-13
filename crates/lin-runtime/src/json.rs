@@ -1,6 +1,6 @@
 /// JSON parsing and serialization for Lin runtime.
 use crate::string::LinString;
-use crate::object::{lin_object_alloc, lin_object_set};
+use crate::object::{lin_object_alloc, lin_object_set, tagged_as_object};
 use crate::array::{LinArray, lin_array_alloc};
 use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_OBJECT, TAG_ARRAY, alloc_tagged};
 use crate::fs::{make_string, make_error_tagged, resolve_lin_str};
@@ -102,6 +102,27 @@ pub unsafe fn tagged_to_json(tv: *const u8) -> serde_json::Value {
                 map.insert(key_str, tagged_to_json(val_tv));
             }
             serde_json::Value::Object(map)
+        }
+        crate::tagged::TAG_RECORD => {
+            // Stage 6a: sealed-struct pointer in a dynamic slot. Materialize to a LinObject
+            // and serialize as an object, then release the transient.
+            match tagged_as_object(t) {
+                Some((obj, owned)) => {
+                    let len = (*obj).len as usize;
+                    let mut map = serde_json::Map::new();
+                    for i in 0..len {
+                        let entry = (*obj).entries.add(i);
+                        let key_s = (*entry).key;
+                        let slice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
+                        let key_str = std::str::from_utf8_unchecked(slice).to_owned();
+                        let val_tv = &(*entry).value as *const TaggedVal as *const u8;
+                        map.insert(key_str, tagged_to_json(val_tv));
+                    }
+                    if owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
+                    serde_json::Value::Object(map)
+                }
+                None => serde_json::Value::Null,
+            }
         }
         _ => serde_json::Value::Null,
     }
