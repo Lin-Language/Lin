@@ -1,7 +1,7 @@
 use super::builder_ext::BuilderExt;
 use inkwell::types::BasicType;
 use inkwell::values::BasicValueEnum;
-use lin_common::tags::{TAG_INT32, TAG_INT64, TAG_OBJECT, TAG_MAP};
+use lin_common::tags::{TAG_INT32, TAG_INT64, TAG_OBJECT, TAG_MAP, TAG_RECORD};
 use inkwell::{AddressSpace, IntPredicate};
 
 use lin_check::types::Type;
@@ -531,8 +531,25 @@ impl<'ctx> Codegen<'ctx> {
             // `outer[a][b]`, where `outer[a]` is `{ String: T } | Null` and is NOT spellable as
             // an `is`-pattern to narrow, ADR-055 §5.1.1) runs through this union path. Its runtime
             // value is a TAG_MAP, so dispatch on the tag: TAG_MAP → `lin_map_get` (O(1) hashed),
-            // TAG_OBJECT → `lin_object_get` (the Json association-list path), otherwise Null. Both
-            // getters return a borrowed `*const TaggedVal`, so the ownership contract is identical.
+            // TAG_OBJECT → `lin_object_get` (the Json association-list path),
+            // TAG_RECORD → `lin_record_get_field` (descriptor-driven field read, Stage 6a),
+            // otherwise Null.
+            //
+            // OWNERSHIP CONTRACT:
+            //   map_get / object_get return a BORROWED `*const TaggedVal` (interior pointer into
+            //   the container); `unbox_tagged_val_to_type` reads it without retaining.
+            //   lin_record_get_field returns an OWNED `+1 *mut TaggedVal` (a heap-allocated box
+            //   that owns a retain on heap-typed fields). To normalise ownership, the TAG_RECORD
+            //   arm unboxes the owned box and then releases it, producing a final result that
+            //   matches the borrowed-equivalent semantics of the other arms.
+            //
+            //   Control-flow structure (two-level merge):
+            //   entry → is_map? → map_b → inner_mrg
+            //         → is_obj? → obj_ok → inner_mrg
+            //         → is_rec? → rec_b → (unbox, release) → final_mrg
+            //         → no → final_mrg (null result)
+            //   inner_mrg → (unbox) → final_mrg
+            //   final_mrg holds the final unboxed value of the target result type.
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
             let obj_tag = self.builder.call(self.rt.get_tag, &[obj.into()], "ir_idx_tag").try_as_basic_value().unwrap_basic().into_int_value();
             let i8t = self.context.i8_type();
@@ -540,30 +557,82 @@ impl<'ctx> Codegen<'ctx> {
                 IntPredicate::EQ, obj_tag, i8t.const_int(TAG_MAP as u64, false), "ir_idx_is_map");
             let is_obj = self.builder.int_compare(
                 IntPredicate::EQ, obj_tag, i8t.const_int(TAG_OBJECT as u64, false), "ir_idx_is_obj");
+            let is_record = self.builder.int_compare(
+                IntPredicate::EQ, obj_tag, i8t.const_int(TAG_RECORD as u64, false), "ir_idx_is_rec");
             let map_b = self.context.append_basic_block(llvm_fn, "ir_idx_map");
             let chk_obj = self.context.append_basic_block(llvm_fn, "ir_idx_chk_obj");
             let ok = self.context.append_basic_block(llvm_fn, "ir_idx_obj_ok");
+            let chk_rec = self.context.append_basic_block(llvm_fn, "ir_idx_chk_rec");
+            let rec_b = self.context.append_basic_block(llvm_fn, "ir_idx_rec");
             let no = self.context.append_basic_block(llvm_fn, "ir_idx_obj_no");
-            let mrg = self.context.append_basic_block(llvm_fn, "ir_idx_obj_mrg");
+            let inner_mrg = self.context.append_basic_block(llvm_fn, "ir_idx_inner_mrg"); // map/obj/null
+            let final_mrg = self.context.append_basic_block(llvm_fn, "ir_idx_final_mrg"); // all paths
             self.builder.conditional_branch(is_map, map_b, chk_obj);
             self.builder.position_at_end(map_b);
             let map_entry = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget_u").try_as_basic_value().unwrap_basic();
             let map_exit = self.builder.get_insert_block().unwrap();
-            self.builder.unconditional_branch(mrg);
+            self.builder.unconditional_branch(inner_mrg);
             self.builder.position_at_end(chk_obj);
-            self.builder.conditional_branch(is_obj, ok, no);
+            self.builder.conditional_branch(is_obj, ok, chk_rec);
             self.builder.position_at_end(ok);
             let entry = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "ir_oget").try_as_basic_value().unwrap_basic();
             let ok_exit = self.builder.get_insert_block().unwrap();
-            self.builder.unconditional_branch(mrg);
+            self.builder.unconditional_branch(inner_mrg);
+            self.builder.position_at_end(chk_rec);
+            self.builder.conditional_branch(is_record, rec_b, no);
             self.builder.position_at_end(no);
             let null_res = ptr_ty.const_null();
-            self.builder.unconditional_branch(mrg);
-            self.builder.position_at_end(mrg);
-            let phi = self.builder.phi(ptr_ty, "ir_idx_obj_phi");
-            phi.add_incoming(&[(&map_entry, map_exit), (&entry, ok_exit), (&null_res, no)]);
-            let result_ptr = phi.as_basic_value();
-            return self.unbox_tagged_val_to_type(result_ptr, result_ty);
+            self.builder.unconditional_branch(inner_mrg);
+            // inner_mrg: collect borrowed TaggedVal* from map/obj/null paths, unbox, branch to final.
+            self.builder.position_at_end(inner_mrg);
+            let inner_phi = self.builder.phi(ptr_ty, "ir_idx_inner_phi");
+            inner_phi.add_incoming(&[(&map_entry, map_exit), (&entry, ok_exit), (&null_res, no)]);
+            let inner_result_ptr = inner_phi.as_basic_value();
+            let inner_unboxed = self.unbox_tagged_val_to_type(inner_result_ptr, result_ty);
+            // inner_unboxed may be a pointer or a scalar. For the phi we need a uniform type; we use
+            // ptr_ty (all LLVM values can be carried as i64 via ptrtoint/inttoptr or just ptr).
+            // Actually: we must carry the exact LLVM basic type of the result. Use the LLVM result type.
+            let inner_mrg_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(final_mrg);
+            // Stage 6a: TAG_RECORD arm — call lin_record_get_field, get owned box, unbox, release.
+            self.builder.position_at_end(rec_b);
+            let sealed_ptr = self.builder.call(self.rt.unbox_ptr, &[obj.into()], "ir_rec_sptr").try_as_basic_value().unwrap_basic();
+            let rec_get_fn = self.get_or_declare_fn("lin_record_get_field",
+                ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+            let rec_box = self.builder.call(rec_get_fn, &[sealed_ptr.into(), key_str.into()], "ir_recget").try_as_basic_value().unwrap_basic();
+            // rec_box is null (field not found) or an owned +1 TaggedVal*.
+            //
+            // TWO ownership paths depending on result_ty:
+            //
+            // (A) result_ty is Union/Json: the TaggedVal* IS the typed result (already a box).
+            //     `unbox_tagged_val_to_type` passes it through unchanged.  We must NOT release
+            //     the box — the caller now owns the +1.  (No retain needed either.)
+            //
+            // (B) result_ty is a concrete type (Int32, Str, Object, …): unbox the box payload
+            //     to extract the raw value, retain if it's a heap pointer (so the retain
+            //     outlives the box-release below), then release the box shell.
+            //     lin_rc_retain / lin_tagged_release on null are both no-ops.
+            let rec_unboxed = self.unbox_tagged_val_to_type(rec_box, result_ty);
+            if !Self::is_union_type(result_ty) {
+                // (B) Retain if this is a heap-pointer result type.
+                if Self::result_is_heap_pointer(result_ty) {
+                    if rec_unboxed.is_pointer_value() {
+                        self.builder.call(self.rt.rc_retain, &[rec_unboxed.into()], "");
+                    }
+                }
+                // Release the owned box (after the retain, the inner's RC is +2 if non-null; release
+                // drops one via the box's release action → final +1 owned by the caller).
+                self.builder.call(self.rt.tagged_release, &[rec_box.into()], "");
+            }
+            // (A) Union result: rec_box IS rec_unboxed; owned +1 handed to caller as-is.
+            let rec_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(final_mrg);
+            // final_mrg: all paths have produced the same LLVM-type result. Phi to collect.
+            self.builder.position_at_end(final_mrg);
+            let result_llvm_ty = inner_unboxed.get_type();
+            let final_phi = self.builder.phi(result_llvm_ty, "ir_idx_final");
+            final_phi.add_incoming(&[(&inner_unboxed, inner_mrg_exit), (&rec_unboxed, rec_exit)]);
+            return final_phi.as_basic_value();
         }
         let tagged = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "ir_oget").try_as_basic_value().unwrap_basic();
         self.unbox_tagged_val_to_type(tagged, result_ty)
@@ -1956,13 +2025,21 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.position_at_end(bb);
         }
 
-        // Header: rc @ 0 = IMMORTAL_RC, size @ 4 = total, desc_ptr @ 8 = NULL.
+        // Header: rc @ 0 = IMMORTAL_RC, size @ 4 = total, desc_ptr @ 8 = NULL,
+        // named_desc_ptr @ 16 = static named descriptor (Stage 6a: needed so lin_box_record on
+        // this stack-alloc produces a TAG_RECORD that lin_record_get_field can service).
         let rc_p = unsafe { self.builder.gep(i8_ty, obj, &[i64_ty.const_int(0, false)], "sealed_stk_rc") };
         self.builder.store(rc_p, i32_ty.const_int(Self::SEALED_IMMORTAL_RC as u64, false));
         let sz_p = unsafe { self.builder.gep(i8_ty, obj, &[i64_ty.const_int(4, false)], "sealed_stk_sz") };
         self.builder.store(sz_p, i32_ty.const_int(total, false));
         let desc_p = unsafe { self.builder.gep(i8_ty, obj, &[i64_ty.const_int(8, false)], "sealed_stk_desc") };
         self.builder.store(desc_p, self.context.ptr_type(AddressSpace::default()).const_null());
+        // Stage 6a: write the named descriptor at header offset 16. Without this write,
+        // `lin_box_record` called on this stack frame produces a TAG_RECORD box whose
+        // `lin_record_get_field` reads garbage at offset 16 → UAF/crash.
+        let named_desc = self.sealed_named_descriptor(fields);
+        let named_desc_p = unsafe { self.builder.gep(i8_ty, obj, &[i64_ty.const_int(16, false)], "sealed_stk_nmd") };
+        self.builder.store(named_desc_p, named_desc);
 
         // Fields: all scalars, stored inline by offset. No coerce (scalar field type == value type
         // under this gate), no retain. Skip any width-subtyping EXTRA field not in the declared
@@ -1988,7 +2065,11 @@ impl<'ctx> Codegen<'ctx> {
         let total = Self::sealed_struct_size(fields);
         let i64_ty = self.context.i64_type();
         let desc = self.sealed_descriptor(fields);
-        let obj = self.builder.call(self.rt.sealed_alloc, &[i64_ty.const_int(total, false).into(), desc.into()], "sealed_obj")
+        // Stage 6a: pass the NAMED descriptor as the 3rd arg so the sealed struct stores it at
+        // header offset 16 (`SEALED_HEADER` = 24). This enables TAG_RECORD field access via
+        // `lin_record_get_field` — it reads named_desc from offset 16 to look up field names + offsets.
+        let named_desc = self.sealed_named_descriptor(fields);
+        let obj = self.builder.call(self.rt.sealed_alloc, &[i64_ty.const_int(total, false).into(), desc.into(), named_desc.into()], "sealed_obj")
             .try_as_basic_value().unwrap_basic().into_pointer_value();
         for (name, val, val_ty, already_owned) in field_vals {
             // A literal may carry EXTRA fields beyond the declared sealed shape (width subtyping:
@@ -2151,11 +2232,21 @@ impl<'ctx> Codegen<'ctx> {
             }).collect();
             return self.sealed_construct(target_fields, &vals);
         }
-        // Source is a boxed object / Json. Unbox to the raw LinObject* if it is a union/Json box.
-        let container = if Self::is_union_type(src_ty) {
-            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sealed_proj_unbox").try_as_basic_value().unwrap_basic()
+        // Source is a boxed object / Json. For union/Json sources, use `lin_union_force_to_object`
+        // to get an OWNED +1 LinObject* that works for BOTH TAG_OBJECT and TAG_RECORD (Stage 6a).
+        // A TAG_OBJECT source is retained (uniform ownership); a TAG_RECORD sealed struct is
+        // materialized to a fresh +1 LinObject. The caller releases the container after the loop.
+        // For a non-union raw LinObject* source, no wrap needed — use `src` directly (borrowed).
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let (container, owned_container) = if Self::is_union_type(src_ty) {
+            let force_fn = self.get_or_declare_fn(
+                "lin_union_force_to_object",
+                ptr_ty.fn_type(&[ptr_ty.into()], false),
+            );
+            let c = self.builder.call(force_fn, &[src.into()], "sealed_proj_cont").try_as_basic_value().unwrap_basic();
+            (c, true)
         } else {
-            src
+            (src, false)
         };
         let target_keys: Vec<String> = target_fields.keys().cloned().collect();
         let mut vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> = Vec::with_capacity(target_keys.len());
@@ -2190,7 +2281,12 @@ impl<'ctx> Codegen<'ctx> {
             let owned = matches!(fty, Type::Object { .. }) && Self::sealed_fields(&fty).is_some();
             vals.push((k.clone(), v, fty, owned));
         }
-        self.sealed_construct(target_fields, &vals)
+        let result = self.sealed_construct(target_fields, &vals);
+        // Release the forced LinObject* when it was materialized from a union box.
+        if owned_container && container.is_pointer_value() {
+            self.builder.call(self.rt.object_release, &[container.into()], "");
+        }
+        result
     }
 
     /// Project a WIDER boxed `LinObject*` into a FRESH boxed `LinObject*` with exactly

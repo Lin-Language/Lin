@@ -308,6 +308,9 @@ unsafe fn release_tagged_payload(tv: &TaggedVal) {
         // a `*SumNode` wrapped by-pointer. Release it via the SumNode self-release, NOT
         // lin_object_release. This is hit when the OWNING record drops and walks its field payloads.
         TAG_SUMNODE => crate::sumnode::lin_sumnode_release_self(payload as *mut u8),
+        // Stage 6a: TAG_RECORD wraps a sealed-struct by-pointer in a dynamic slot. Release via
+        // sealed_release_self (reads size from offset 4), mirroring TAG_SUMNODE.
+        TAG_RECORD => crate::sealed::lin_sealed_release_self(payload as *mut u8),
         TAG_FUNCTION => crate::memory::lin_closure_release(payload as *mut u8),
         TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
         TAG_STREAM => crate::stream::lin_stream_release_box(payload as *const u8),
@@ -347,6 +350,12 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
             // KEEP-PACKED sum node: offset-0 u32 refcount, immortal-guarded — same shape as a
             // sealed record header, so the generic rc bump applies. The matching release is the
             // TAG_SUMNODE arm of release_tagged_payload.
+            let s = payload as *mut u32;
+            if !s.is_null() && *s < crate::string::IMMORTAL_RC { *s += 1; }
+        }
+        TAG_RECORD => {
+            // Stage 6a: sealed-struct pointer. The offset-0 u32 refcount is the same shape as a
+            // SumNode/sealed header, so the uniform RC bump applies. Mirrors the TAG_SUMNODE arm.
             let s = payload as *mut u32;
             if !s.is_null() && *s < crate::string::IMMORTAL_RC { *s += 1; }
         }
@@ -418,6 +427,53 @@ pub unsafe extern "C" fn lin_tagged_retain(p: *const u8) {
 /// cell/global holding a Json/union value owns its OWN box (not an alias of a borrowed
 /// caller box). Storing clones the incoming box; reading clones the cell's box; the cell's
 /// release-old and the read's scope-exit release each free a box they exclusively own. This
+/// Stage 6a: extract an OWNED +1 `LinObject*` from a union-typed `TaggedVal*` box, handling
+/// both `TAG_OBJECT` and `TAG_RECORD` sources. Used by `sealed_project_from` in codegen to
+/// get a uniform `LinObject*` view when the source is a dynamic union box.
+///
+/// - `TAG_OBJECT`: retain the existing `LinObject` (uniform owned-+1 semantics; caller MUST
+///   call `lin_object_release` after use).
+/// - `TAG_RECORD`: materialize the sealed struct to a fresh +1 `LinObject*` via the named
+///   descriptor (caller MUST call `lin_object_release` after use). The sealed struct is
+///   UNTOUCHED (a snapshot copy is taken field-by-field).
+/// - Any other tag or null: returns null (caller must handle null gracefully).
+///
+/// Ownership: the returned `LinObject*` is ALWAYS owned (+1) regardless of the source tag.
+/// Release it with `lin_object_release` once done — this is unconditional and uniform.
+#[no_mangle]
+pub unsafe extern "C" fn lin_union_force_to_object(tv: *const u8) -> *mut LinObject {
+    use crate::tagged::{TAG_OBJECT, TAG_RECORD, TaggedVal};
+    if tv.is_null() {
+        return std::ptr::null_mut();
+    }
+    let src = &*(tv as *const TaggedVal);
+    match src.tag {
+        TAG_OBJECT => {
+            let obj = src.payload as *mut LinObject;
+            if obj.is_null() {
+                return std::ptr::null_mut();
+            }
+            // Retain so caller uniformly owns +1 and calls lin_object_release.
+            (*obj).refcount += 1;
+            obj
+        }
+        TAG_RECORD => {
+            let sealed = src.payload as *mut u8;
+            if sealed.is_null() {
+                return std::ptr::null_mut();
+            }
+            // Read the named descriptor from the sealed struct header at offset 16 (Stage 6a).
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            // materialize_sealed_struct_pub: takes the struct base (WITH 24-byte header) + named
+            // descriptor; materializes header-relative offsets field-by-field into a fresh +1
+            // LinObject. Retains all heap fields into the object; the sealed struct keeps its own
+            // references untouched.
+            crate::sealed::materialize_sealed_struct_pub(sealed, named_desc)
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
 /// keeps store/read/release-old/teardown perfectly symmetric (mirroring the concrete-rc
 /// retain/release pairs) and never frees a box owned by someone else.
 ///
@@ -808,6 +864,39 @@ pub unsafe extern "C" fn lin_object_keys(obj: *const LinObject) -> *mut crate::a
     arr
 }
 
+/// Stage 6a: lin_tagged_keys — accepts a TaggedVal* that may be TAG_OBJECT *or* TAG_RECORD
+/// (sealed struct pointer). For TAG_RECORD, materializes the sealed struct to a temporary
+/// LinObject, calls lin_object_keys, then releases the temporary. For TAG_OBJECT, delegates
+/// directly. This lets `keys(sealedRecord)` work correctly when the record has been coerced to
+/// a union/Json slot and is represented as TAG_RECORD.
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_keys(tv: *const u8) -> *mut crate::array::LinArray {
+    use crate::tagged::{TAG_OBJECT, TAG_RECORD, TaggedVal, lin_unbox_ptr};
+    if tv.is_null() {
+        return crate::array::lin_array_alloc(0);
+    }
+    let src = &*(tv as *const TaggedVal);
+    match src.tag {
+        TAG_OBJECT => {
+            let obj = lin_unbox_ptr(tv) as *const LinObject;
+            lin_object_keys(obj)
+        }
+        TAG_RECORD => {
+            let sealed = src.payload as *mut u8;
+            if sealed.is_null() {
+                return crate::array::lin_array_alloc(0);
+            }
+            // Read named_desc from sealed struct header offset 16 (SEALED_HEADER=24, Stage 6a).
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let mat = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
+            let arr = lin_object_keys(mat as *const LinObject);
+            lin_object_release(mat);
+            arr
+        }
+        _ => crate::array::lin_array_alloc(0),
+    }
+}
+
 /// Return a LinArray* containing all values as TaggedVal (each stored inline).
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_values(obj: *const LinObject) -> *mut crate::array::LinArray {
@@ -1037,6 +1126,34 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
             && lin_object_eq(ao as *const LinObject, bo as *const LinObject) != 0;
         if !ao.is_null() { lin_object_release(ao as *mut LinObject); }
         if !bo.is_null() { lin_object_release(bo as *mut LinObject); }
+        return eq;
+    }
+    // Stage 6a: TAG_RECORD vs TAG_RECORD (or TAG_RECORD vs TAG_OBJECT) comparison in a record
+    // field slot (object-level equality). Materialize the TAG_RECORD side to a LinObject and compare.
+    // Note: `at == bt` holds here since we're inside tagged_val_eq after a type check at this tag.
+    // But this function is also called from lin_object_eq positional/indexed path, so handle the
+    // cross-type case defensively via the top-level lin_tagged_eq which dispatches TAG_RECORD.
+    if at == crate::tagged::TAG_RECORD {
+        let sealed = ap as *const u8;
+        if sealed.is_null() { return false; }
+        let named_desc = *((sealed.add(16)) as *const *const u8);
+        let ao = crate::sealed::materialize_sealed_struct_pub(ap as *mut u8, named_desc);
+        let bo_obj = if bt == crate::tagged::TAG_RECORD {
+            let bsealed = bp as *const u8;
+            if bsealed.is_null() { if !ao.is_null() { lin_object_release(ao); } return false; }
+            let bnamed_desc = *((bsealed.add(16)) as *const *const u8);
+            crate::sealed::materialize_sealed_struct_pub(bp as *mut u8, bnamed_desc)
+        } else if bt == crate::tagged::TAG_OBJECT {
+            bp as *mut LinObject
+        } else {
+            if !ao.is_null() { lin_object_release(ao); }
+            return false;
+        };
+        let b_was_materialized = bt == crate::tagged::TAG_RECORD;
+        let eq = !ao.is_null() && !bo_obj.is_null()
+            && lin_object_eq(ao as *const LinObject, bo_obj as *const LinObject) != 0;
+        if !ao.is_null() { lin_object_release(ao); }
+        if b_was_materialized && !bo_obj.is_null() { lin_object_release(bo_obj); }
         return eq;
     }
     // For other types (closures, iterators): pointer equality.

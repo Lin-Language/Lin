@@ -257,15 +257,25 @@ fn classify_instr(
         Instruction::Coerce { dst, src, from_ty, to_ty } => {
             if carry::coerce_is_carry(from_ty, to_ty) {
                 // Carry edge — unified above, no escape mark.
-            } else if is_stack_eligible_type(from_ty) {
-                // A representation-changing coerce whose SOURCE is a sealed scalar record ALWAYS goes
-                // through `sealed_materialize_to_object` in codegen (verified: compile_ir_coerce's
-                // `from_sealed` arm), which COPIES each field value into a FRESH boxed `LinObject`
-                // (and boxes THAT fresh object for a union/Json target) — the source struct pointer is
-                // NEVER stored in the result. So the source is only READ; the result is a distinct
-                // (heap) class analyzed independently. This is the records.lin base-case path: `s` is
-                // materialized then re-projected to a FRESH returned struct, so `s` (the param /
-                // tail-call construction class) does not escape via this coerce.
+            } else if is_stack_eligible_type(from_ty)
+                && !matches!(to_ty, Type::TypeVar(_))
+            {
+                // A representation-changing coerce whose SOURCE is a sealed scalar record and
+                // whose TARGET is NOT a TypeVar (Json/AnyVal) ALWAYS goes through
+                // `sealed_materialize_to_object` in codegen (compile_ir_coerce's `from_sealed`
+                // arm), which COPIES each field value into a FRESH boxed `LinObject` — the source
+                // struct pointer is NEVER stored in the result. So the source is only READ.
+                //
+                // EXCEPTION (Stage 6a, TypeVar target only): when the target IS a TypeVar
+                // (Json = TypeVar(u32::MAX)), codegen emits `lin_box_record` which stores the
+                // sealed struct pointer directly in the TAG_RECORD payload. The source DOES escape
+                // through this coerce (the box may outlive the frame via the Json binding).
+                // Mark the source as escaping ONLY for TypeVar targets to prevent stack-allocation
+                // of a sealed struct whose pointer will be stored in a persistent TAG_RECORD box.
+                //
+                // Union and Named targets still use `sealed_materialize_to_object` in codegen
+                // (they are if-merge/function-boundary cases, not persistent dynamic slots) —
+                // the source sealed struct is read-only (content copied, pointer not stored).
                 let _ = (dst, src);
             } else {
                 // The source is NOT a stack-eligible sealed record (e.g. a Json/union value coerced

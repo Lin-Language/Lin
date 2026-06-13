@@ -47,9 +47,14 @@
 
 use std::alloc::{alloc, dealloc, Layout};
 
-/// Header size in bytes: `u32 refcount` + `u32 size` + `u64 desc_ptr`. Field payload begins at
-/// offset 16. Kept in lockstep with `Codegen::SEALED_HEADER`.
-pub const SEALED_HEADER: usize = 16;
+/// Header size in bytes: `u32 refcount` + `u32 size` + `u64 heap_desc_ptr` + `u64 named_desc_ptr`.
+/// Field payload begins at offset 24. Kept in lockstep with `Codegen::SEALED_HEADER`.
+/// Stage 6a: extended from 16 to 24 bytes to carry BOTH the heap descriptor (at offset 8, for
+/// RC/drop/transfer field walks) AND the named descriptor (at offset 16, for dynamic field access
+/// by name — used by TAG_RECORD/lin_record_get_field). The named descriptor is the same static
+/// global emitted by `Codegen::sealed_named_descriptor`; storing its pointer in the header makes
+/// it recoverable from any sealed struct pointer without a side table.
+pub const SEALED_HEADER: usize = 24;
 
 // Field-descriptor kind codes. MUST stay in lockstep with `Codegen::sealed_field_kind`.
 /// A scalar field — NEVER appears in a descriptor (scalars need no per-field RC). Reserved.
@@ -73,19 +78,23 @@ pub const KIND_SEALED: u32 = 3;
 /// descriptor via `sealed::release_field`, so the value `4` is always interpreted in the right walk.
 pub const KIND_MAP: u32 = 4;
 
-/// Read the descriptor pointer from a sealed struct's header (offset 8). Null = no heap fields.
+/// Read the HEAP descriptor pointer from a sealed struct's header (offset 8). Null = no heap fields.
 #[inline]
 unsafe fn desc_of(ptr: *const u8) -> *const u8 {
     *((ptr.add(8)) as *const *const u8)
 }
 
 /// Allocate a sealed-record struct of `size` total bytes (header + packed fields), zero-initialised,
-/// with refcount 1, the byte `size` at offset 4, and the field descriptor pointer `desc` at offset 8
-/// (NULL for a scalar-only record). `size` is computed by codegen as `SEALED_HEADER + payload`.
-/// Aborts on allocation failure. Always 8-aligned. Heap field slots start NULL (a valid, releasable
-/// state) until codegen stores the retained payload.
+/// with refcount 1, the byte `size` at offset 4, the heap-field descriptor `heap_desc` at offset 8,
+/// and the named-field descriptor `named_desc` at offset 16. Either descriptor may be NULL.
+/// `size` is computed by codegen as `SEALED_HEADER + payload`. Aborts on allocation failure.
+/// Always 8-aligned. Heap field slots start NULL (a valid, releasable state) until stored.
+///
+/// Stage 6a: extended to store BOTH descriptors in the header. The heap descriptor (offset 8) is
+/// used by drop/transfer; the named descriptor (offset 16) is used by lin_record_get_field for
+/// dynamic key lookup on a TAG_RECORD value.
 #[no_mangle]
-pub extern "C" fn lin_sealed_alloc(size: usize, desc: *const u8) -> *mut u8 {
+pub extern "C" fn lin_sealed_alloc(size: usize, heap_desc: *const u8, named_desc: *const u8) -> *mut u8 {
     let size = size.max(SEALED_HEADER);
     unsafe {
         let layout = Layout::from_size_align_unchecked(size, 8);
@@ -99,7 +108,8 @@ pub extern "C" fn lin_sealed_alloc(size: usize, desc: *const u8) -> *mut u8 {
         let words = ptr as *mut u32;
         *words = 1; // refcount @ 0
         *words.add(1) = size as u32; // size @ 4
-        *((ptr.add(8)) as *mut *const u8) = desc; // desc_ptr @ 8
+        *((ptr.add(8)) as *mut *const u8) = heap_desc; // heap_desc @ 8
+        *((ptr.add(16)) as *mut *const u8) = named_desc; // named_desc @ 16
         ptr
     }
 }
@@ -646,9 +656,105 @@ pub unsafe fn alloc_sealed_struct_from_object(
     heap_desc: *const u8,
 ) -> *mut u8 {
     let size = struct_size_from_named_desc(named_desc);
-    let sptr = lin_sealed_alloc(size, heap_desc);
+    let sptr = lin_sealed_alloc(size, heap_desc, named_desc);
     pack_named_payload_from_object(sptr.add(SEALED_HEADER), obj, named_desc);
     sptr
+}
+
+/// Stage 6a: look up one field by name in a TAG_RECORD sealed struct and return an OWNED +1
+/// TaggedVal* for that field (or null for a missing/null field). Used by `compile_ir_index` in the
+/// union/Json string-key path when the runtime value is a TAG_RECORD (sealed struct wrapped as a
+/// dynamic value). The named descriptor pointer is read from offset 16 of the sealed struct header
+/// (the 3rd 8-byte slot, after [rc@0|size@4|heap_desc@8|named_desc@16|...]).
+/// The named descriptor was emitted by `Codegen::sealed_named_descriptor`.
+///
+/// Returns null for a null sealed pointer, a null named descriptor, or a field not in the
+/// descriptor. The returned TaggedVal* is a fresh +1-owned box — the caller must `lin_tagged_release` it.
+///
+/// RC contract per field kind:
+///  - Scalar kinds (Int32/Int64/UInt64/Float64/Bool): the scalar value is copied into a fresh box;
+///    no inner heap payload → release is a no-op on the inner (just frees the box shell).
+///  - String/Array/Map: the slot holds an owned pointer; we RETAIN it before boxing (the struct keeps
+///    its own +1; the caller's +1 release is balanced by this retain). Mirrors `box_named_heap_field`.
+///  - Sealed (nested struct): recurse materialize to a LinObject, box as TAG_OBJECT. Same contract
+///    as `box_named_heap_field(NKIND_SEALED)`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const crate::string::LinString) -> *mut u8 {
+    use crate::tagged::{TAG_INT32, TAG_INT64, TAG_UINT64, TAG_FLOAT64, TAG_BOOL, TAG_OBJECT, alloc_tagged};
+    if sealed.is_null() || key.is_null() {
+        return std::ptr::null_mut();
+    }
+    // Stage 6a: the named descriptor is at offset 16 in the sealed struct header (see SEALED_HEADER).
+    let named_desc = *((sealed.add(16)) as *const *const u8);
+    if named_desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let field_count = u32::from_le_bytes([
+        *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
+    ]) as usize;
+    let key_bytes = std::slice::from_raw_parts((*key).data.as_ptr(), (*key).len as usize);
+    let mut cur = 4usize;
+    for _ in 0..field_count {
+        let (offset, nkind, nested, name, next) = read_named_field(named_desc, cur);
+        cur = next;
+        if name.as_bytes() != key_bytes {
+            continue;
+        }
+        // Found the field. Box its value.
+        let slot = sealed.add(offset as usize);
+        let box_val = match nkind {
+            NKIND_INT32 => {
+                let v = *(slot as *const i32);
+                alloc_tagged(TAG_INT32, v as i64 as u64)
+            }
+            NKIND_INT64 => {
+                let v = *(slot as *const i64);
+                alloc_tagged(TAG_INT64, v as u64)
+            }
+            NKIND_UINT64 => {
+                let v = *(slot as *const u64);
+                alloc_tagged(TAG_UINT64, v)
+            }
+            NKIND_FLOAT64 => {
+                let v = *(slot as *const f64);
+                alloc_tagged(TAG_FLOAT64, v.to_bits())
+            }
+            NKIND_BOOL => {
+                let v = *(slot as *const u8);
+                alloc_tagged(TAG_BOOL, (v != 0) as u64)
+            }
+            NKIND_STRING => {
+                let p = *(slot as *const *mut u8);
+                if p.is_null() { return std::ptr::null_mut(); }
+                crate::memory::lin_rc_retain(p as *mut u32);
+                crate::tagged::lin_box_str(p)
+            }
+            NKIND_ARRAY => {
+                let p = *(slot as *const *mut u8);
+                if p.is_null() { return std::ptr::null_mut(); }
+                crate::memory::lin_rc_retain(p as *mut u32);
+                crate::tagged::lin_box_array(p)
+            }
+            NKIND_MAP => {
+                let p = *(slot as *const *mut u8);
+                if p.is_null() { return std::ptr::null_mut(); }
+                crate::memory::lin_rc_retain(p as *mut u32);
+                crate::tagged::lin_box_map(p)
+            }
+            NKIND_SEALED => {
+                // Nested sealed struct: recurse materialize → fresh LinObject → box as TAG_OBJECT.
+                let p = *(slot as *const *mut u8) as *const u8;
+                if p.is_null() { return std::ptr::null_mut(); }
+                let nested_obj = materialize_sealed_struct(p, nested);
+                if nested_obj.is_null() { return std::ptr::null_mut(); }
+                alloc_tagged(TAG_OBJECT, nested_obj as u64)
+            }
+            _ => return std::ptr::null_mut(),
+        };
+        return box_val;
+    }
+    // Field not found.
+    std::ptr::null_mut()
 }
 
 #[cfg(test)]
@@ -677,22 +783,22 @@ mod named_desc_tests {
         b
     }
 
-    // SCALAR record P { x: Int32, y: Int32 }. Header 16, x@16, y@20, stride = 8.
+    // SCALAR record P { x: Int32, y: Int32 }. Header 24, x@24, y@28, stride = 8.
     #[test]
     fn get_tagged_materializes_scalar_record() {
         unsafe {
             let named = build_named_desc(&[
-                ("x", 16, NKIND_INT32, std::ptr::null()),
-                ("y", 20, NKIND_INT32, std::ptr::null()),
+                ("x", 24, NKIND_INT32, std::ptr::null()),
+                ("y", 28, NKIND_INT32, std::ptr::null()),
             ]);
             let stride = 8u64;
             // Heap-only descriptor is NULL for a scalar-only record.
             let arr = crate::array::lin_sealed_array_alloc(4, stride, std::ptr::null(), named.as_ptr());
             // Push two elements by writing standalone structs and copying their payloads.
             for (xv, yv) in [(11i32, 22i32), (-3i32, 7i32)] {
-                let st = lin_sealed_alloc(SEALED_HEADER + stride as usize, std::ptr::null());
-                *((st.add(16)) as *mut i32) = xv;
-                *((st.add(20)) as *mut i32) = yv;
+                let st = lin_sealed_alloc(SEALED_HEADER + stride as usize, std::ptr::null(), std::ptr::null());
+                *((st.add(24)) as *mut i32) = xv;
+                *((st.add(28)) as *mut i32) = yv;
                 crate::array::lin_sealed_array_push_struct(arr, st);
                 lin_sealed_release_self(st);
             }
@@ -718,29 +824,29 @@ mod named_desc_tests {
         }
     }
 
-    // HEAP-FIELD record R { name: String, n: Int32 }. Header 16, name@16 (8-byte ptr), n@24, stride 16.
+    // HEAP-FIELD record R { name: String, n: Int32 }. Header 24, name@24 (8-byte ptr), n@32, stride 16.
     // Proves the materialized object takes its OWN +1 on the shared String (RC balance), and that
     // releasing both the box and the array frees the string exactly once.
     #[test]
     fn get_tagged_materializes_heap_field_record_rc_balanced() {
         unsafe {
             let named = build_named_desc(&[
-                ("name", 16, NKIND_STRING, std::ptr::null()),
-                ("n", 24, NKIND_INT32, std::ptr::null()),
+                ("name", 24, NKIND_STRING, std::ptr::null()),
+                ("n", 32, NKIND_INT32, std::ptr::null()),
             ]);
-            // Heap-only descriptor: one heap field (name @ offset 16, KIND_STRING).
+            // Heap-only descriptor: one heap field (name @ offset 24, KIND_STRING).
             let mut heap_desc = Vec::new();
             heap_desc.extend_from_slice(&1u32.to_le_bytes()); // count
-            heap_desc.extend_from_slice(&16u32.to_le_bytes()); // offset
+            heap_desc.extend_from_slice(&24u32.to_le_bytes()); // offset
             heap_desc.extend_from_slice(&KIND_STRING.to_le_bytes()); // kind
             let stride = 16u64;
             let arr = crate::array::lin_sealed_array_alloc(4, stride, heap_desc.as_ptr(), named.as_ptr());
             // Construct one element: a standalone struct owning a +1 String.
             let s = crate::string::lin_string_from_bytes(b"hello".as_ptr(), 5);
             assert_eq!((*s).refcount, 1);
-            let st = lin_sealed_alloc(SEALED_HEADER + stride as usize, heap_desc.as_ptr());
-            *((st.add(16)) as *mut *mut u8) = s as *mut u8; // struct owns the +1
-            *((st.add(24)) as *mut i32) = 42;
+            let st = lin_sealed_alloc(SEALED_HEADER + stride as usize, heap_desc.as_ptr(), std::ptr::null());
+            *((st.add(24)) as *mut *mut u8) = s as *mut u8; // struct owns the +1
+            *((st.add(32)) as *mut i32) = 42;
             // BORROWED-source push: array retains each heap field (string rc -> 2).
             crate::array::lin_sealed_array_push_struct_retaining(arr, st);
             assert_eq!((*s).refcount, 2); // struct + array

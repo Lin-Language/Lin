@@ -340,7 +340,7 @@ pub unsafe extern "C" fn lin_map_retain(map: *mut LinMap) {
 // `LinMap`). The arg is a boxed `TaggedVal*`; we dispatch on its tag. A null/other tag yields an
 // empty array. Each returns a freshly-owned `LinArray*` with its elements payload-retained.
 
-use crate::tagged::{TAG_OBJECT, TAG_MAP};
+use crate::tagged::{TAG_OBJECT, TAG_MAP, TAG_RECORD};
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArray {
@@ -351,6 +351,18 @@ pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArr
     match tv.tag {
         TAG_OBJECT => crate::object::lin_object_keys(tv.payload as *const crate::object::LinObject),
         TAG_MAP => lin_map_keys(tv.payload as *const LinMap),
+        // Stage 6a: TAG_RECORD — sealed struct pointer; materialize to a transient LinObject to
+        // enumerate its keys, then release the temporary.
+        TAG_RECORD => {
+            let sealed = tv.payload as *mut u8;
+            if sealed.is_null() { return crate::array::lin_array_alloc(0); }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let mat = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
+            if mat.is_null() { return crate::array::lin_array_alloc(0); }
+            let arr = crate::object::lin_object_keys(mat as *const crate::object::LinObject);
+            crate::object::lin_object_release(mat);
+            arr
+        }
         _ => crate::array::lin_array_alloc(0),
     }
 }
@@ -364,6 +376,17 @@ pub unsafe extern "C" fn lin_values_any(p: *const u8) -> *mut crate::array::LinA
     match tv.tag {
         TAG_OBJECT => crate::object::lin_object_values(tv.payload as *const crate::object::LinObject),
         TAG_MAP => lin_map_values(tv.payload as *const LinMap),
+        // Stage 6a: TAG_RECORD — materialize sealed struct to extract values, then release.
+        TAG_RECORD => {
+            let sealed = tv.payload as *mut u8;
+            if sealed.is_null() { return crate::array::lin_array_alloc(0); }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let mat = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
+            if mat.is_null() { return crate::array::lin_array_alloc(0); }
+            let arr = crate::object::lin_object_values(mat as *const crate::object::LinObject);
+            crate::object::lin_object_release(mat);
+            arr
+        }
         _ => crate::array::lin_array_alloc(0),
     }
 }
@@ -377,6 +400,17 @@ pub unsafe extern "C" fn lin_entries_any(p: *const u8) -> *mut crate::array::Lin
     match tv.tag {
         TAG_OBJECT => crate::object::lin_object_entries(tv.payload as *const crate::object::LinObject),
         TAG_MAP => lin_map_entries(tv.payload as *const LinMap),
+        // Stage 6a: TAG_RECORD — materialize sealed struct to extract entries, then release.
+        TAG_RECORD => {
+            let sealed = tv.payload as *mut u8;
+            if sealed.is_null() { return crate::array::lin_array_alloc(0); }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let mat = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
+            if mat.is_null() { return crate::array::lin_array_alloc(0); }
+            let arr = crate::object::lin_object_entries(mat as *const crate::object::LinObject);
+            crate::object::lin_object_release(mat);
+            arr
+        }
         _ => crate::array::lin_array_alloc(0),
     }
 }

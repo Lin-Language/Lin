@@ -5,6 +5,7 @@ use inkwell::{AddressSpace, IntPredicate};
 use lin_check::types::Type;
 use lin_ir::ir as lir;
 use super::Codegen;
+use lin_common::tags::{TAG_OBJECT, TAG_RECORD};
 
 impl<'ctx> Codegen<'ctx> {
     pub(crate) fn compile_ir_is_type(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> inkwell::values::IntValue<'ctx> {
@@ -41,13 +42,31 @@ impl<'ctx> Codegen<'ctx> {
                 if matches!(m, Type::TypeVar(_) | Type::Union(_)) {
                     continue;
                 }
-                let expected = self.type_tag_const(m);
-                let eq = self.builder.int_compare(IntPredicate::EQ, tag, expected, "ir_is_member");
+                let eq = self.compile_ir_is_type_single(tag, m);
                 acc = self.builder.or(acc, eq, "ir_is_union_acc");
             }
             return acc;
         }
-        let expected = self.type_tag_const(ty);
+        self.compile_ir_is_type_single(tag, ty)
+    }
+
+    /// Test a single concrete type `ty` against an already-extracted tag integer. Returns an i1.
+    /// Handles the Stage-6a dual-tag case: sealed Object types can appear as TAG_OBJECT (when
+    /// materialized as a LinObject) OR TAG_RECORD (when boxed via `lin_box_record` in a union
+    /// slot) — both are valid runtime representations of the same Lin type.
+    fn compile_ir_is_type_single(&mut self, tag: inkwell::values::IntValue<'ctx>, ty: &Type) -> inkwell::values::IntValue<'ctx> {
+        let bool_ty = self.context.bool_type();
+        let i8_ty = self.context.i8_type();
+        // Stage 6a: a sealed record type can be TAG_OBJECT (materialized LinObject, the pre-6a
+        // path) OR TAG_RECORD (wrapped sealed struct, the 6a path). Accept both.
+        if Self::sealed_fields(ty).is_some() {
+            let eq_obj = self.builder.int_compare(
+                IntPredicate::EQ, tag, i8_ty.const_int(TAG_OBJECT as u64, false), "ir_is_obj");
+            let eq_rec = self.builder.int_compare(
+                IntPredicate::EQ, tag, i8_ty.const_int(TAG_RECORD as u64, false), "ir_is_rec");
+            return self.builder.or(eq_obj, eq_rec, "ir_is_seal");
+        }
+        let expected = i8_ty.const_int(Self::type_tag(ty) as u64, false);
         self.builder.int_compare(IntPredicate::EQ, tag, expected, "ir_is")
     }
 
@@ -260,16 +279,38 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
         if from_sealed {
-            // MATERIALIZATION: a sealed struct → boxed LinObject (the Json/unsealed representation),
-            // then box to a union/Json TaggedVal if the target is union/Json.
+            // MATERIALIZATION: a sealed struct → dynamic/unsealed representation.
             if let Some(src_fields) = Self::sealed_scalar_fields(from_ty) {
                 let sf = src_fields.clone();
-                let obj = self.sealed_materialize_to_object(val, &sf);
+                // Stage 6a: DIRECT O(1) wrap as TAG_RECORD for the sealed→Json/AnyVal Coerce.
+                // Only applied when the target is EXACTLY the JSON/AnyVal type (TypeVar(u32::MAX)
+                // or TypeVar in general), NOT for multi-variant Union types (which are synthetic
+                // merge unions for if-branches and expect TAG_OBJECT from lin_unbox_ptr).
+                //
+                // The restriction is necessary because: multi-variant unions created by if-merge
+                // phi nodes are immediately unboxed via `lin_unbox_ptr` + `Coerce(union → Object)`,
+                // and `lin_unbox_ptr` for TAG_RECORD returns the sealed struct ptr (not LinObject*)
+                // → crashes. Only genuine Json/AnyVal slots are fully TAG_RECORD-aware via tag dispatch.
+                //
+                // `lin_box_record` retains the sealed struct (bumps its RC at offset 0) and
+                // returns a fresh +1 TaggedVal*(TAG_RECORD) wrapping the sealed ptr.
+                // Runtime consumers (lin_tagged_eq/to_string/push_json_value/transfer/field-access)
+                // all have TAG_RECORD arms that dispatch correctly via the named_desc at header offset 16.
+                // This is the ONE flow the BRIEF targets: `val j: Json = p` → O(1) wrap, no copy.
+                // Pre-6a was: sealed_materialize_to_object + box_value → TAG_OBJECT (O(n) copy).
+                if matches!(to_ty, Type::TypeVar(_)) && val.is_pointer_value() {
+                    return self.builder.call(self.rt.box_record, &[val.into()], "boxrec")
+                        .try_as_basic_value().unwrap_basic();
+                }
                 if Self::is_union_type(to_ty) {
-                    // Box the fresh LinObject* as TAG_OBJECT. The +1 of the materialized object
-                    // transfers into the box's inner; the box itself is +1 owned.
+                    // sealed → multi-variant union (if-merge, named union type): materialize to
+                    // LinObject for TAG_OBJECT. TAG_RECORD would be unboxed by lin_unbox_ptr on
+                    // the phi result, returning a sealed ptr instead of LinObject* → crash.
+                    let obj = self.sealed_materialize_to_object(val, &sf);
                     return self.box_value(obj, &Type::object(sf));
                 }
+                // sealed → unsealed object (non-union target): materialize to LinObject.
+                let obj = self.sealed_materialize_to_object(val, &sf);
                 return obj;
             }
         }

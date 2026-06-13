@@ -34,7 +34,7 @@ pub use lin_common::tags::{
     TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT32, TAG_FLOAT64, TAG_STR, TAG_OBJECT,
     TAG_ARRAY, TAG_FUNCTION, TAG_UINT8, TAG_INT8, TAG_UINT16, TAG_INT16, TAG_UINT64, TAG_UINT32,
     TAG_PROMISE, TAG_HANDLE, TAG_SHARED, TAG_STREAM, TAG_MAP, TAG_SUMNODE,
-    TAG_BIGNUM, TAG_DECIMAL, TAG_TAR_ENTRY,
+    TAG_BIGNUM, TAG_DECIMAL, TAG_TAR_ENTRY, TAG_RECORD,
 };
 
 #[repr(C)]
@@ -232,6 +232,62 @@ pub unsafe extern "C" fn lin_box_sumnode(p: *mut u8) -> *mut u8 {
     alloc_tagged(TAG_SUMNODE, p as u64)
 }
 
+/// Box a `*sealed-struct` by-pointer as a TaggedVal(TAG_RECORD) — Stage 6a dynamic-slot widening.
+/// The sealed struct carries its own descriptor at offset 8 (`[u32 rc | u32 size | u64 desc_ptr | ...]`),
+/// so no separate descriptor argument is needed. The struct is BORROWED here (the shell is the only
+/// fresh +1 added by this function); the slot's owning reference is retained by the struct itself
+/// (the RC at offset 0). The distinct TAG_RECORD tag routes the slot's release to
+/// `lin_sealed_release_self` (reads the size from offset 4), NOT `lin_object_release` (which would
+/// misinterpret the sealed header). RC contract mirrors `lin_box_sumnode` exactly.
+#[no_mangle]
+pub unsafe extern "C" fn lin_box_record(p: *mut u8) -> *mut u8 {
+    // Retain the sealed struct: the new TaggedVal shell is an additional owner (+1).
+    if !p.is_null() {
+        crate::memory::lin_rc_retain(p as *mut u32);
+    }
+    alloc_tagged(TAG_RECORD, p as u64)
+}
+
+/// Stage 6a: read one field from a union-typed TaggedVal box by name, returning an OWNED +1
+/// `TaggedVal*` (null = field missing or null source). Handles both TAG_OBJECT and TAG_RECORD:
+///   - TAG_OBJECT → `lin_object_get` (borrowed interior) → `lin_tagged_clone` → owned +1.
+///   - TAG_RECORD → `lin_record_get_field` (already owned +1).
+///   - anything else (null, scalar, array, …) → null.
+///
+/// Used by `sealed_project_from` in codegen when the source is a union-typed box — the
+/// generated code calls this once per field and then unboxes + releases the returned owned box.
+/// Ownership contract: the returned box is always OWNED by the caller (call `lin_tagged_release`
+/// when done). The source box `tv` is BORROWED and untouched (the caller releases it via its own
+/// scope).
+#[no_mangle]
+pub unsafe extern "C" fn lin_union_get_field(tv: *const u8, key: *const crate::string::LinString) -> *mut u8 {
+    if tv.is_null() || key.is_null() {
+        return std::ptr::null_mut();
+    }
+    let tag = (*(tv as *const TaggedVal)).tag;
+    let payload = (*(tv as *const TaggedVal)).payload;
+    match tag {
+        TAG_OBJECT => {
+            let obj = payload as *const crate::object::LinObject;
+            if obj.is_null() {
+                return std::ptr::null_mut();
+            }
+            // lin_object_get returns a BORROWED interior pointer; clone it into an OWNED box.
+            let borrowed = crate::object::lin_object_get(obj, key);
+            crate::object::lin_tagged_clone(borrowed as *const u8)
+        }
+        TAG_RECORD => {
+            let sealed = payload as *const u8;
+            if sealed.is_null() {
+                return std::ptr::null_mut();
+            }
+            // lin_record_get_field returns OWNED +1 directly.
+            crate::sealed::lin_record_get_field(sealed, key)
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
 /// Get the type tag of a boxed value. Returns TAG_NULL (0) for null pointer.
 #[no_mangle]
 pub unsafe extern "C" fn lin_get_tag(p: *const u8) -> u8 {
@@ -292,20 +348,32 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
     let bt = if bv.is_null() { TAG_NULL } else { (*bv).tag };
     if at == TAG_NULL && bt == TAG_NULL { return 1; }
     if at == TAG_NULL || bt == TAG_NULL { return 0; }
-    // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` (TAG_SUMNODE) escaped into
-    // a dynamic equality. Materialize either operand to a real LinObject and compare as objects
-    // (order-independent structural equality). Transient materializations released after.
-    if at == TAG_SUMNODE || bt == TAG_SUMNODE {
+    // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` (TAG_SUMNODE) or a Stage-6a
+    // sealed-record pointer (TAG_RECORD) escaped into a dynamic equality. Materialize either operand to
+    // a real LinObject and compare as objects (order-independent structural equality). Transient
+    // materializations released after. TAG_RECORD and TAG_OBJECT with equal fields compare EQUAL (§5.7).
+    if at == TAG_SUMNODE || bt == TAG_SUMNODE || at == TAG_RECORD || bt == TAG_RECORD {
         let mat = |tv: *const TaggedVal, t: u8| -> (*mut u8, bool) {
             if t == TAG_SUMNODE {
                 (crate::sumnode::lin_sumnode_materialize((*tv).payload as *mut u8), true)
+            } else if t == TAG_RECORD {
+                // Materialize a sealed struct to a LinObject via its named descriptor (offset 16).
+                let sealed = (*tv).payload as *const u8;
+                if sealed.is_null() {
+                    return (std::ptr::null_mut(), false);
+                }
+                let named_desc = *((sealed.add(16)) as *const *const u8);
+                let obj = crate::sealed::materialize_sealed_struct_pub(sealed as *mut u8, named_desc);
+                (obj as *mut u8, !obj.is_null())
             } else {
                 ((*tv).payload as *mut u8, false)
             }
         };
         let (ao, a_owned) = mat(av, at);
         let (bo, b_owned) = mat(bv, bt);
-        let eq = if (at == TAG_SUMNODE || at == TAG_OBJECT) && (bt == TAG_SUMNODE || bt == TAG_OBJECT) {
+        let is_obj_a = at == TAG_SUMNODE || at == TAG_OBJECT || at == TAG_RECORD;
+        let is_obj_b = bt == TAG_SUMNODE || bt == TAG_OBJECT || bt == TAG_RECORD;
+        let eq = if is_obj_a && is_obj_b {
             crate::object::lin_object_eq(ao as *const crate::object::LinObject, bo as *const crate::object::LinObject)
         } else {
             0
@@ -599,6 +667,11 @@ pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
         // its own size from the header), NOT lin_object_release (which would read the SumNode's
         // offset-4 size as a LinObject len → type-confusion). The matching retain bumps offset-0 RC.
         TAG_SUMNODE => crate::sumnode::lin_sumnode_release_self(payload as *mut u8),
+        // Stage 6a: TAG_RECORD wraps a sealed-struct by-pointer. Release via sealed_release_self
+        // (reads size from offset 4), exactly mirroring TAG_SUMNODE. The sealed struct's header
+        // shape ([u32 rc | u32 size | u64 desc_ptr | payload]) is the same as a SumNode's header
+        // so the generic `lin_rc_retain` works for the retain side too.
+        TAG_RECORD => crate::sealed::lin_sealed_release_self(payload as *mut u8),
         TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
         TAG_STREAM => crate::stream::lin_stream_release_box(payload as *const u8),
         // Opaque arbitrary-precision/decimal handles (std/bignum, std/decimal): refcounted Rust

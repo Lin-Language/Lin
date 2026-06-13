@@ -98,6 +98,10 @@ impl<'ctx> Codegen<'ctx> {
             // LinObject first, then box that as TAG_OBJECT. (This is the same conversion the
             // Coerce(sealed → Json) boundary performs; it is the safety net for any path that
             // boxes a sealed value directly, e.g. heterogeneous array elements or closure args.)
+            // NOTE (Stage 6a): the sealed→Json Coerce path in compile_ir_coerce emits lin_box_record
+            // DIRECTLY (bypassing this materialize path) when the target is a union/Json slot. This
+            // fallback retains the TAG_OBJECT materialize for all OTHER boxing contexts that still
+            // need a LinObject (map slots read back via sealed_project_from, closure args, etc.).
             Type::Object { .. } if Self::sealed_scalar_fields(val_ty).is_some() => {
                 let fields = Self::sealed_scalar_fields(val_ty).unwrap().clone();
                 let obj = self.sealed_materialize_to_object(val, &fields);
