@@ -20056,3 +20056,71 @@ main()
 "#);
     assert_eq!(out, vec!["scan=1"]);
 }
+
+// ── Stage 6a Leg-3: lin_parse_json(object) → TAG_RECORD ─────────────────────
+
+#[test]
+fn test_stage6a_leg3_fromjson_builds_tag_record() {
+    // Verify that readJson over an object payload produces a TAG_RECORD (sealed struct),
+    // not a TAG_OBJECT (LinObject). Field reads, string interpolation, structural equality
+    // with a code-constructed record, nested objects, and array-of-objects all exercise the
+    // new descriptor-driven sealed-struct path.
+    let tmp = std::env::temp_dir()
+        .join(format!("lin_ctest_stage6a_leg3_{}.json", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    fs::write(&tmp, r#"{"x":1,"name":"a"}"#).unwrap();
+
+    let out = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readJson }} from "std/fs"
+
+val j1 = readJson("{path}")
+// field reads
+print("${{j1["x"]}}")
+print("${{j1["name"]}}")
+// structural equality with a code-constructed record (§5.8)
+val rec = {{ "x": 1, "name": "a" }}
+print("${{j1 == rec}}")
+"#));
+    let _ = fs::remove_file(&tmp);
+    assert_eq!(out, vec!["1", "a", "true"]);
+}
+
+#[test]
+fn test_stage6a_leg3_fromjson_nested_object() {
+    // Nested object: j["p"]["q"] traversal.
+    let tmp = std::env::temp_dir()
+        .join(format!("lin_ctest_stage6a_leg3_nested_{}.json", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    fs::write(&tmp, r#"{"p":{"q":2}}"#).unwrap();
+
+    let out = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readJson }} from "std/fs"
+
+val j2 = readJson("{path}")
+print("${{j2["p"]["q"]}}")
+"#));
+    let _ = fs::remove_file(&tmp);
+    assert_eq!(out, vec!["2"]);
+}
+
+#[test]
+fn test_stage6a_leg3_fromjson_array_of_objects() {
+    // Array of objects: j[0]["v"] and j[1]["v"].
+    let tmp = std::env::temp_dir()
+        .join(format!("lin_ctest_stage6a_leg3_arr_{}.json", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    fs::write(&tmp, r#"[{"v":10},{"v":20}]"#).unwrap();
+
+    let out = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readJson }} from "std/fs"
+
+val j3 = readJson("{path}")
+print("${{j3[0]["v"]}}")
+print("${{j3[1]["v"]}}")
+"#));
+    let _ = fs::remove_file(&tmp);
+    assert_eq!(out, vec!["10", "20"]);
+}
