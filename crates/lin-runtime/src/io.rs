@@ -94,6 +94,7 @@ pub unsafe extern "C" fn lin_io_args() -> *mut u8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_exit(code: i32) -> ! {
+    crate::memory::lin_rc_count_print();
     std::process::exit(code);
 }
 

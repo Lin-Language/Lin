@@ -160,6 +160,9 @@ unsafe fn release_heap_fields(ptr: *mut u8) {
 /// decrement + free, identical to Stage 1.
 #[no_mangle]
 pub unsafe extern "C" fn lin_sealed_release(ptr: *mut u8, size: usize) {
+    if crate::memory::RC_COUNT_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        if !ptr.is_null() { crate::memory::SEALED_RELEASE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+    }
     if ptr.is_null() {
         return;
     }
