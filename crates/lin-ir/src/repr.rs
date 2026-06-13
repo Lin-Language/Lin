@@ -59,6 +59,11 @@ pub enum Layout {
     /// `PartialEq` is field-order-sensitive on each variant Object, matching the physical layout).
     /// Stage 1 is NON-RECURSIVE, SCALAR-ONLY — heap/recursive variants fall back to the boxed union.
     SumNode { sum_ty: Type },
+    /// Stage 3 NullableRecord: a `T | Null` union where `T` is a sealed record. The physical
+    /// representation is a SINGLE nullable pointer — `null` for the Null case, `*sealed_T` for T.
+    /// No box, no tag word, no SumNode header. Retain = `lin_rc_retain(ptr)` (if non-null);
+    /// release = `lin_sealed_release(ptr)` (if non-null). A null check replaces tag dispatch.
+    NullableRecord { fields: IndexMap<String, Type> },
 }
 
 /// What a `Boxed` slot wraps.
@@ -152,6 +157,16 @@ impl Repr {
             _ => None,
         }
     }
+
+    /// `Some(fields)` iff this repr is a Stage-3 nullable sealed record pointer (`Layout::NullableRecord`)
+    /// — a raw `*sealed_T` or null pointer. The codegen gate for null-check-as-type-test and
+    /// sealed-struct-field access without materialization.
+    pub fn nullable_record_fields(&self) -> Option<&IndexMap<String, Type>> {
+        match self {
+            Repr::Packed(Layout::NullableRecord { fields }) => Some(fields),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -162,8 +177,12 @@ impl Repr {
 ///   - `join(Unknown, x) = x`, `join(x, Bottom) = x`
 ///   - same `Packed(L)` stays packed (an ISLAND)
 ///   - `Packed(L)` vs `Packed(L')` (different layout) demotes to `Boxed(Opaque)`
-///   - `Packed(_)` vs `Boxed(_)` is a CONFLICT → returns `Boxed(Opaque)` and the caller records the
-///     class as a BOUNDARY (Stage 3+ will SPLIT it with a coercion; Stage 2 only observes).
+///   - `Packed(PackedStruct)` vs `Boxed(_)` / `FlatScalar` stays `Packed(PackedStruct)` — a sealed
+///     record's repr is TYPE-DETERMINED; it never lives in the same carry class as a boxed union
+///     value (the lowerer always routes the record through a Coerce before the phi, which is NOT a
+///     carry edge). The preservation rule keeps the record's own carry class intact when Stage 3
+///     NullableRecord temps appear: the NullableRecord phi's carry class is separate from the
+///     PackedStruct temps that flow into it via (non-carry) Coerce edges.
 ///   - `FlatScalar(s)` vs `FlatScalar(s)` stays; mismatched flats demote to `Boxed(Opaque)`
 ///   - `Boxed(_)` vs `Boxed(_)`: the only inner is `Opaque`, so this stays `Boxed(Opaque)`
 fn join(a: &Repr, b: &Repr) -> Repr {
@@ -171,6 +190,12 @@ fn join(a: &Repr, b: &Repr) -> Repr {
     match (a, b) {
         (Unknown, x) | (x, Unknown) => x.clone(),
         (Bottom, x) | (x, Bottom) => x.clone(),
+        // NullableRecord vs PackedStruct (same fields): a TailCall back-edge unifies the `T | Null`
+        // param with the `T` (PackedStruct) arg. A PackedStruct IS a valid non-null NullableRecord
+        // (same physical pointer), so the NullableRecord wins — the param slot's repr governs.
+        // MUST come before the generic (Packed, Packed) arm (which would otherwise demote to Boxed).
+        (Packed(Layout::NullableRecord { fields: f1 }), Packed(Layout::PackedStruct { fields: f2 })) if f1 == f2 => a.clone(),
+        (Packed(Layout::PackedStruct { fields: f1 }), Packed(Layout::NullableRecord { fields: f2 })) if f1 == f2 => b.clone(),
         (Packed(l1), Packed(l2)) => {
             if l1 == l2 {
                 Packed(l1.clone())
@@ -187,8 +212,19 @@ fn join(a: &Repr, b: &Repr) -> Repr {
         }
         // The only `Inner` is `Opaque`, so two boxed reprs always join to `Boxed(Opaque)`.
         (Boxed(_), Boxed(_)) => Repr::boxed_opaque(),
-        // Packed vs Boxed, Packed vs FlatScalar, Boxed vs FlatScalar: representation CONFLICT.
-        // Fail safe to Boxed(Opaque); the design's STEP 4 (later stage) splits the class.
+        // PackedStruct vs Boxed/FlatScalar: the sealed record repr is TYPE-DETERMINED.  A sealed
+        // record temp is NEVER in the same carry class as a boxed union value in practice (the
+        // lowerer emits a non-carry Coerce before every union phi), so this case only fires when a
+        // Stage-3 NullableRecord carry class and a PackedStruct carry class are spuriously unified —
+        // which must not happen. Preserve the PackedStruct repr rather than silently demoting.
+        (Packed(Layout::PackedStruct { .. }), _) => a.clone(),
+        (_, Packed(Layout::PackedStruct { .. })) => b.clone(),
+        // NullableRecord vs Boxed: the nullable-ptr repr is TYPE-DETERMINED (any `T | Null`
+        // param, carry-coerce result, or phi from the NullableRecord Coerce arms). Preserve it.
+        (Packed(Layout::NullableRecord { .. }), Boxed(_)) => a.clone(),
+        (Boxed(_), Packed(Layout::NullableRecord { .. })) => b.clone(),
+        // All other Packed vs Boxed, Packed vs FlatScalar, Boxed vs FlatScalar: representation
+        // CONFLICT.  Fail safe to Boxed(Opaque); Stage 3+ will SPLIT with a coercion.
         _ => Repr::boxed_opaque(),
     }
 }
@@ -224,7 +260,7 @@ fn is_sealed_field(ty: &Type) -> bool {
 
 /// Mirror of `Codegen::sealed_fields` (types.rs:210): `Some(fields)` iff `ty` is a sealed record
 /// whose fields are ALL scalars or eligible heap fields. This is the PackedStruct gate.
-fn sealed_fields(ty: &Type) -> Option<&IndexMap<String, Type>> {
+pub(crate) fn sealed_fields(ty: &Type) -> Option<&IndexMap<String, Type>> {
     match ty {
         Type::Object { fields, sealed: true }
             if !fields.is_empty() && fields.values().all(is_sealed_field) =>
@@ -361,6 +397,27 @@ pub fn sumnode_variant_by_disc(ty: &Type, disc: &str) -> Option<IndexMap<String,
     None
 }
 
+/// Stage 3 NullableRecord gate: `Some(fields)` iff `ty` is `T | Null` (or `Null | T`) where `T` is a
+/// sealed record eligible via `sealed_fields()`. The physical representation is a single nullable
+/// pointer — `*sealed_T` or null. Two-member unions only (exactly one non-Null member).
+pub fn nullable_sealed_record(ty: &Type) -> Option<&IndexMap<String, Type>> {
+    let variants = match ty {
+        Type::Union(vs) => vs,
+        _ => return None,
+    };
+    let mut record: Option<&IndexMap<String, Type>> = None;
+    for v in variants {
+        if matches!(v, Type::Null) {
+            continue;
+        }
+        match sealed_fields(v) {
+            Some(f) if record.is_none() => record = Some(f),
+            _ => return None, // non-sealed variant or second sealed variant → boxed
+        }
+    }
+    record
+}
+
 /// Delegates to the SINGLE source of truth `Type::is_sealed_array_field_packable` (ADR-063 gate
 /// consolidation), in lockstep with `Codegen::sealed_array_elem_field_packable`, lower.rs
 /// `is_sealed_array_elem_field_packable`, and `monomorphize::field_packed_scalar`.
@@ -408,6 +465,10 @@ fn type_seed(ty: &Type) -> Repr {
     if sum_type_eligible(ty) {
         return Repr::Packed(Layout::SumNode { sum_ty: ty.clone() });
     }
+    // Stage 3: a `T | Null` union where T is a sealed record → nullable pointer repr.
+    if let Some(fields) = nullable_sealed_record(ty) {
+        return Repr::Packed(Layout::NullableRecord { fields: fields.clone() });
+    }
     if let Some(elem_fields) = sealed_array_elem(ty) {
         return Repr::Packed(Layout::PackedSealedArray {
             elem_layout: elem_fields.clone(),
@@ -434,6 +495,11 @@ fn make_object_repr(ty: &Type, fields: &[(String, Temp)], spreads: &[Temp]) -> R
     // literal field's StrLit value.
     if sum_type_eligible(ty) && spreads.is_empty() {
         return Repr::Packed(Layout::SumNode { sum_ty: ty.clone() });
+    }
+    // Stage 3 NullableRecord: a MakeObject for a `T | Null` nullable union should never appear
+    // in practice (unions are formed by phi/coerce), but guard here so the oracle doesn't false-fire.
+    if nullable_sealed_record(ty).is_some() {
+        return Repr::boxed_opaque(); // fall-safe: no such MakeObject in practice
     }
     if let Some(sf) = sealed_fields(ty) {
         let all_present =
@@ -489,8 +555,31 @@ pub fn analyze(func: &LinFunction) -> Vec<Repr> {
             carry::classify_carry_edges(instr, &mut uf);
         }
         if let Terminator::TailCall { args } = &block.terminator {
-            // Self-tail-call arg i carries into param i (next iteration). Mirrors escape.rs.
-            let _ = carry::classify_tailcall_carry(args, &func.params, &mut uf);
+            // Self-tail-call arg i carries into param i (next iteration), UNLESS they have
+            // different repr seeds (e.g. Trip/PackedStruct arg → Trip|Null/NullableRecord
+            // param). A PackedStruct arg passed to a NullableRecord param is a representation-
+            // COMPATIBLE identity coerce — same raw ptr, no boxing — but their seeds differ,
+            // and unifying the classes would propagate NullableRecord back to the arg's MakeObject
+            // (oracle disagreement) or PackedStruct forward to the param (breaking null checks).
+            // In these cases we intentionally BREAK the carry edge; the TCO back-edge store in
+            // codegen handles the identity coerce transparently (both are raw `ptr` in LLVM).
+            for (i, a) in args.iter().enumerate() {
+                if let Some((p, param_ty)) = func.params.get(i) {
+                    let arg_ty = func.temp_types.get(a);
+                    let arg_seed = arg_ty.map(type_seed).unwrap_or(Repr::boxed_opaque());
+                    let param_seed = type_seed(param_ty);
+                    let repr_compat = match (&arg_seed, &param_seed) {
+                        (Repr::Packed(Layout::PackedStruct { fields: f1 }),
+                         Repr::Packed(Layout::NullableRecord { fields: f2 })) => f1 == f2,
+                        (Repr::Packed(Layout::NullableRecord { fields: f1 }),
+                         Repr::Packed(Layout::PackedStruct { fields: f2 })) => f1 == f2,
+                        _ => false,
+                    };
+                    if !repr_compat {
+                        uf.union(*a, *p);
+                    }
+                }
+            }
         }
     }
 
@@ -575,6 +664,13 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
                 // FieldGet sum arm below (the recursive-child read). The verify Index ASSUME site only
                 // constrains the OBJECT operand, never the dst, so this seed cannot trip the oracle.
                 set(seeds, *dst, Repr::Packed(Layout::SumNode { sum_ty: result_ty.clone() }));
+            } else if let Some(nrfields) = nullable_sealed_record(result_ty) {
+                // Stage 3 NullableRecord: a `{String: T}` typed-map index returning `T | Null`
+                // yields a nullable sealed pointer. Gated on obj_ty being Type::Map so a union-
+                // object index (NestedPerson|Error → Addr|Null) keeps Boxed(Opaque) repr.
+                if matches!(obj_ty, Type::Map(_)) {
+                    set(seeds, *dst, Repr::Packed(Layout::NullableRecord { fields: nrfields.clone() }));
+                }
             } else if let Some(f) = sealed_fields(result_ty) {
                 set(seeds, *dst, Repr::Packed(Layout::PackedStruct { fields: f.clone() }));
             } else if let Some(elem_fields) = sealed_array_elem(result_ty) {
@@ -807,7 +903,13 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                         Some(f) => {
                             // Heap-field SumNode: a sealed obj_ty with Packed(SumNode) repr is the
                             // narrowed-variant hint from the lowerer — skip the struct check.
-                            if r.sumnode_sum_ty().is_none() && !is_packed_struct(r, f) {
+                            // NullableRecord: a sealed obj_ty with Packed(NullableRecord) repr is the
+                            // non-null then-branch object — it is physically a raw sealed ptr, same
+                            // as PackedStruct. compile_ir_field_get handles it identically.
+                            if r.sumnode_sum_ty().is_none()
+                                && r.nullable_record_fields() != Some(f)
+                                && !is_packed_struct(r, f)
+                            {
                                 report(&mut bad, "FieldGet(object packed)", *object, "Packed(struct)", r);
                             }
                         }
@@ -968,7 +1070,10 @@ pub fn verify(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                         // Heap-field SumNode Stage 3: a sealed obj_ty + Packed(SumNode) repr is valid
                         // (the lowerer passes the narrowed variant as obj_ty so codegen can compute
                         // the correct variant-specific payload offset — not a Packed(struct) mismatch).
+                        // NullableRecord: a sealed obj_ty + Packed(NullableRecord) repr is valid in a
+                        // then-branch where non-null is guaranteed; the raw sealed ptr IS the struct.
                         if repr[object.0 as usize].sumnode_sum_ty().is_none()
+                            && repr[object.0 as usize].nullable_record_fields() != Some(f)
                             && !is_packed_struct(&repr[object.0 as usize], f)
                         {
                             bad.push(format!(

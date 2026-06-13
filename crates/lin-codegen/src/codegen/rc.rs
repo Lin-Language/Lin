@@ -150,6 +150,24 @@ impl<'ctx> Codegen<'ctx> {
                 );
                 return;
             }
+            // Stage 3 NullableRecord: a nullable sealed struct pointer. Release the sealed struct only
+            // when non-null (emit a conditional null-check + guarded emit_sealed_release).
+            Repr::Packed(lin_ir::repr::Layout::NullableRecord { fields }) => {
+                let fields = fields.clone();
+                let p = val.into_pointer_value();
+                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let pi = self.builder.ptr_to_int(p, self.context.i64_type(), "nr_p2i");
+                let is_null = self.builder.int_compare(
+                    inkwell::IntPredicate::EQ, pi, self.context.i64_type().const_zero(), "nr_isnull");
+                let rel_bb = self.context.append_basic_block(llvm_fn, "nr_rel");
+                let cont_bb = self.context.append_basic_block(llvm_fn, "nr_relcont");
+                self.builder.conditional_branch(is_null, cont_bb, rel_bb);
+                self.builder.position_at_end(rel_bb);
+                self.emit_sealed_release(val, &fields);
+                self.builder.unconditional_branch(cont_bb);
+                self.builder.position_at_end(cont_bb);
+                return;
+            }
             // A boxed slot (Opaque): the box is a TaggedVal/LinObject whose release is the
             // tag-dispatched one. Fall through to the type-based dispatch which already picks the right
             // boxed releaser for the static type (object/array/tagged/map/closure/stream).

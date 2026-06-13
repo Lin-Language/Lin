@@ -623,6 +623,40 @@ impl<'ctx> Codegen<'ctx> {
         Self::sum_type_discriminant(ty).is_some()
     }
 
+    /// Stage 3 NullableRecord: if `ty` is a union of EXACTLY ONE sealed Object type plus `Null`
+    /// (e.g. `Trip | Null` from a nullable typed-map read), return the sealed type's fields.
+    /// Such a value at runtime is a raw `*sealed_T` (non-null) or a null pointer.
+    /// True when `ty` is `Union([Named(n), Null])` — a self-recursive Named alias union where
+    /// `nullable_sealed_record_type` cannot resolve the sealed fields (Named isn't an Object).
+    /// Used to treat a PackedStruct → Named-nullable coerce as a pass-through identity.
+    pub(crate) fn is_named_nullable_union(ty: &Type) -> bool {
+        let Type::Union(members) = ty else { return false };
+        let mut has_named = false;
+        for m in members {
+            match m {
+                Type::Null => {}
+                Type::Named(_) => { has_named = true; }
+                _ => return false,
+            }
+        }
+        has_named
+    }
+
+    pub(crate) fn nullable_sealed_record_type(ty: &Type) -> Option<&indexmap::IndexMap<String, Type>> {
+        let Type::Union(members) = ty else { return None };
+        // Must not be a Stage-1 sum type — those get the SumNode path instead.
+        if Self::is_sum_type(ty) { return None; }
+        let mut record: Option<&indexmap::IndexMap<String, Type>> = None;
+        for m in members {
+            if matches!(m, Type::Null) { continue; }
+            match Self::sealed_fields(m) {
+                Some(f) if record.is_none() => record = Some(f),
+                _ => return None,
+            }
+        }
+        record
+    }
+
     /// unboxed-sumtype Stage 3: if `ty` is a union of EXACTLY a Stage-eligible sum type plus `Null`
     /// (e.g. `Expr | Null` — the static type of a `{ String: Expr }` map read, ADR-055 safe-access),
     /// return that inner sum type. Such a value at runtime is either a `*SumNode` (a real node) or a

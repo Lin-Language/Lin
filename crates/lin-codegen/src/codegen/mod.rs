@@ -974,6 +974,10 @@ impl<'ctx> Codegen<'ctx> {
                                     // corrupt the header). Read the proven repr.
                                     if func.repr_of(*val).sumnode_sum_ty().is_some() {
                                         self.builder.call(self.rt.rc_retain, &[v.into()], "");
+                                    } else if func.repr_of(*val).nullable_record_fields().is_some() {
+                                        // Stage 3 NullableRecord: raw nullable sealed ptr — NOT a
+                                        // TaggedVal. lin_rc_retain null-guards (no-op on null ptr).
+                                        self.builder.call(self.rt.rc_retain, &[v.into()], "");
                                     } else if Self::is_union_type(ty) {
                                         // A boxed TaggedVal*: bump the INNER payload's rc
                                         // (tag-aware). lin_rc_retain would hit the tag byte at
@@ -1006,6 +1010,31 @@ impl<'ctx> Codegen<'ctx> {
                                     temp_map.insert(*dst, v);
                                     continue;
                                 }
+                                // Stage 3 NullableRecord: a nullable sealed struct pointer. Retain
+                                // if non-null (null stays null — no tag word to clone). Forward same ptr.
+                                if func.repr_of(*src).nullable_record_fields().is_some() && v.is_pointer_value() {
+                                    let p = v.into_pointer_value();
+                                    let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                                    let pi = self.builder.ptr_to_int(p, i64_ty, "nr_clone_p2i");
+                                    let is_null = self.builder.int_compare(
+                                        inkwell::IntPredicate::EQ, pi, i64_ty.const_zero(), "nr_clone_isnull");
+                                    let ret_bb = self.context.append_basic_block(llvm_fn, "nr_clone_ret");
+                                    let nonnull_bb = self.context.append_basic_block(llvm_fn, "nr_clone_nn");
+                                    let merge_bb = self.context.append_basic_block(llvm_fn, "nr_clone_m");
+                                    self.builder.conditional_branch(is_null, ret_bb, nonnull_bb);
+                                    self.builder.position_at_end(ret_bb);
+                                    let null_pred = self.builder.get_insert_block().unwrap();
+                                    self.builder.unconditional_branch(merge_bb);
+                                    self.builder.position_at_end(nonnull_bb);
+                                    self.builder.call(self.rt.rc_retain, &[p.into()], "");
+                                    let nn_pred = self.builder.get_insert_block().unwrap();
+                                    self.builder.unconditional_branch(merge_bb);
+                                    self.builder.position_at_end(merge_bb);
+                                    let phi = self.builder.phi(ptr_ty, "nr_clone_phi");
+                                    phi.add_incoming(&[(&p, null_pred), (&p, nn_pred)]);
+                                    temp_map.insert(*dst, phi.as_basic_value());
+                                    continue;
+                                }
                                 let cloned = if Self::is_union_type(ty) && v.is_pointer_value() {
                                     // Allocate a fresh, independently-owned box copying the
                                     // tag+payload and retaining the inner heap payload. The
@@ -1032,6 +1061,11 @@ impl<'ctx> Codegen<'ctx> {
                         Instruction::FreeBoxShell { val } => {
                             if let Some(&v) = temp_map.get(val) {
                                 if v.is_pointer_value() {
+                                    // Stage 3 NullableRecord: no box shell (value is the raw sealed ptr,
+                                    // not a TaggedVal wrapper) — FreeBoxShell is a no-op.
+                                    if func.repr_of(*val).nullable_record_fields().is_some() {
+                                        continue;
+                                    }
                                     let free_fn = self.get_or_declare_fn(
                                         "lin_tagged_free_box",
                                         self.context.void_type().fn_type(&[ptr_ty.into()], false),
@@ -2118,7 +2152,24 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::IsType { dst, val, ty } => {
                             if let Some(&v) = temp_map.get(val) {
-                                let result = self.compile_ir_is_type(v, ty);
+                                let result = if func.repr_of(*val).nullable_record_fields().is_some()
+                                    && v.is_pointer_value()
+                                {
+                                    // Stage 3 NullableRecord: raw sealed ptr or null.
+                                    // `is T` (the sealed record type) = non-null; `is Null` = null.
+                                    let pi = self.builder.ptr_to_int(
+                                        v.into_pointer_value(), i64_ty, "nr_is_p2i");
+                                    let is_null = self.builder.int_compare(
+                                        inkwell::IntPredicate::EQ, pi, i64_ty.const_zero(), "nr_is_null");
+                                    if matches!(ty, lin_check::types::Type::Null) {
+                                        is_null
+                                    } else {
+                                        // is <sealed T>: non-null ⟺ the ptr is the T branch
+                                        self.builder.not(is_null, "nr_is_nonnull")
+                                    }
+                                } else {
+                                    self.compile_ir_is_type(v, ty)
+                                };
                                 temp_map.insert(*dst, result.into());
                             }
                         }
