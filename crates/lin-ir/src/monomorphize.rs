@@ -542,6 +542,10 @@ fn is_anon_struct_param(ty: &Type) -> bool {
 struct AnonFn {
     name: String,
     func: TypedExpr,
+    /// Set when this function was imported from another module (the origin module path). Used to
+    /// re-home the cloned body into the importing module's slot space, exactly like cross-module
+    /// generic specializations.
+    origin: Option<String>,
 }
 
 /// Canonical hashable key for an anon-layout specialisation: function slot + per-(param-index,
@@ -818,11 +822,14 @@ pub fn module_uses_generic(module: &TypedModule, imports: &HashMap<String, Typed
             if !imports.contains_key(path) {
                 return false;
             }
-            // Only a binding whose type is a function with a generic in its PARAMETERS counts —
+            // Check for TypeVar-generic params OR anon-structural-param imports.
             // mirrors the cross-module discovery rule, so intrinsic-wrapper exports whose only
             // TypeVar is in the return (e.g. `iter: (…) => Iterator<T>`) don't trip the pass.
             bindings.iter().any(|b| match &b.ty {
-                Type::Function { params, .. } => params.iter().any(mentions_generic_tv),
+                Type::Function { params, .. } => {
+                    params.iter().any(mentions_generic_tv)
+                        || params.iter().any(|p| is_anon_struct_param(p))
+                }
                 _ => false,
             })
         } else {
@@ -907,7 +914,7 @@ fn monomorphize_inner(
                 // A function that is ALSO generic is handled by the generic path (its TypeVar subs
                 // already change the body; the anon params in a generic fn are resolved there too).
                 if !is_generic && params.iter().any(|p| is_anon_struct_param(&p.ty)) {
-                    anon_fns.insert(*slot, AnonFn { name: name.clone(), func: value.clone() });
+                    anon_fns.insert(*slot, AnonFn { name: name.clone(), func: value.clone(), origin: None });
                 }
             }
         }
@@ -917,6 +924,8 @@ fn monomorphize_inner(
     //     "path"` binding whose imported definition is a generic function, register it keyed by the
     //     IMPORTER's binding slot, tagged with its origin module path. A call through that binding
     //     slot is then specialized exactly like a local generic call (the body is re-homed first).
+    // D3 cross-module: also discover anon-structural-param functions from imports so they receive
+    // per-layout specs re-homed into the importing module, exactly like cross-module TypeVar generics.
     for stmt in &module.statements {
         if let TypedStmt::Import { path, bindings, .. } = stmt {
             let Some(origin) = imports.get(path) else { continue };
@@ -935,6 +944,13 @@ fn monomorphize_inner(
                             generics.insert(
                                 b.slot,
                                 GenericFn { name: b.name.clone(), func, origin: Some(path.clone()) },
+                            );
+                        } else if params.iter().any(|p| is_anon_struct_param(&p.ty)) {
+                            // D3 cross-module: imported function with anon-structural param(s).
+                            // Register keyed by the IMPORTER's binding slot; origin path drives re-homing.
+                            anon_fns.insert(
+                                b.slot,
+                                AnonFn { name: b.name.clone(), func, origin: Some(path.clone()) },
                             );
                         }
                     }
@@ -959,6 +975,14 @@ fn monomorphize_inner(
         if g.origin.is_some() {
             let mut m = 0usize;
             max_slot_expr(&g.func, &mut m);
+            next_slot = next_slot.max(m + 1);
+        }
+    }
+    // D3 cross-module: same bump for imported anon-structural-param bodies.
+    for af in anon_fns.values() {
+        if af.origin.is_some() {
+            let mut m = 0usize;
+            max_slot_expr(&af.func, &mut m);
             next_slot = next_slot.max(m + 1);
         }
     }
@@ -1069,6 +1093,7 @@ fn monomorphize_inner(
             let info = &state.anon_specs[&key];
             (info.fn_slot, info.slot, info.name.clone(), info.layouts.clone())
         };
+        let origin = state.anon_fns[&fn_slot].origin.clone();
         let mut func = state.anon_fns[&fn_slot].func.clone();
         let span = func.span();
         // Build the anon-subs map: anon-type-debug-string → concrete type.
@@ -1091,6 +1116,12 @@ fn monomorphize_inner(
             // reads) for both → garbage when the original is called with an unsealed argument.
             let inner_suffix = spec_name.trim_start_matches(|c: char| c != '$');
             rename_inner_fns(body, inner_suffix);
+        }
+        // D3 cross-module: re-home the cloned body into the importing module's slot space, exactly
+        // like generic specializations. Must run BEFORE `rewrite_expr` so nested call rewrites
+        // see importer-stable slots. Local (same-module) anon specs skip this step.
+        if let Some(origin_path) = &origin {
+            rehome_imported_body(&mut func, origin_path, &mut state);
         }
         // Re-run the call rewriter so any generic calls inside the specialised body are handled.
         rewrite_expr(&mut func, &mut state);

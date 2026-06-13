@@ -19088,14 +19088,13 @@ main()
     assert_eq!(out, vec!["case1=7", "case2=7", "case3=7", "case4=7"]);
 }
 
-// D3a cross-module scoping pin: a same-module anon-param call shares (mutation visible), but an
-// IMPORTED anon-param call does NOT share today (mutation not visible) — cross-module
-// monomorphisation is not yet implemented. Recorded here so the inconsistency is explicit.
-// A follow-up leg will either monomorphise imports or amend the design doc's D3 description.
+// D3a cross-module: an imported anon-param fn is now monomorphised per-layout in the importing
+// module (D3 cross-module leg). The specialised body reads/writes at the CALLER's concrete record
+// offsets, so mutation through the param IS visible in the caller — same as same-module D3a.
 #[test]
-fn test_d3a_cross_module_anon_param_no_share_pin() {
+fn test_d3a_cross_module_anon_param_shares() {
     // Two-module fixture: imported anon-param fn `stamp`, wider record arg `w`.
-    // Cross-module call: mutation through the param is NOT visible (today's pre-D3 behaviour).
+    // D3 cross-module: mutation through the param IS visible (same-module D3a behaviour).
     let dir = std::env::temp_dir().join(format!("lin_d3a_xmod_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(dir.join("stamp.lin"),
@@ -19111,8 +19110,38 @@ main()
 "#, dir.to_str().unwrap());
     let output = run(&main);
     let _ = std::fs::remove_dir_all(&dir);
-    // Cross-module anon-param calls copy today (no monomorphisation across modules yet).
-    assert_eq!(output, vec!["v=1"]);
+    // D3 cross-module: mutation through the imported anon-param is now visible (shares, not copies).
+    assert_eq!(output, vec!["v=99"]);
+}
+
+// D3a cross-module inner-closure symbol collision guard: when the imported anon-param fn contains
+// an inner named closure, cross-module specialisation must call rename_inner_fns so the spec's
+// inner closure gets a distinct LLVM symbol from the original's. Without the rename, both specs
+// (original + layout-specialised clone) would register the same symbol `@inner`; codegen's
+// get_function dedup would keep the first body for both → wrong closure body runs for one caller.
+#[test]
+fn test_d3a_cross_module_inner_closure_symbol_dedup() {
+    let dir = std::env::temp_dir().join(format!("lin_d3a_xmod_inner_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    // `apply` has an inner named closure `adder` and an anon-structural param `r`.
+    std::fs::write(dir.join("apply.lin"), concat!(
+        "export val apply = (r: { \"v\": Int32 }, delta: Int32) =>\n",
+        "  val adder = (x: Int32) => x + delta\n",
+        "  r[\"v\"] = adder(r[\"v\"])\n",
+    )).unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ apply }} from "{}/apply"
+type Wide = {{ "v": Int32, "extra": String }}
+val main = () =>
+  val w: Wide = {{ "v": 10, "extra": "x" }}
+  apply(w, 5)
+  print("v=${{w["v"]}}")
+main()
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    // Inner closure runs correctly in the specialised body (v = 10 + 5 = 15).
+    assert_eq!(output, vec!["v=15"]);
 }
 
 // ============================================================================
