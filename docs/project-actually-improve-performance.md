@@ -405,6 +405,12 @@ representation with pointer-share semantics, retiring the `LinObject` form and t
 form. Stageable by record-shape. Reference semantics makes inline-contiguous record arrays
 **optional** (§5.6): the win flows through pointer-backed arrays once records are flat (Stage 2).
 
+> **Execution order (revised 2026-06-13): 0 → 1 → 2 → 4 → 5 → 6 → 3.** Stage 3 (record unions) is
+> resequenced to run **last**, after Stage 6 deletes the D8 boxed shadow — see the banner on Stage 3
+> for the three-attempt evidence. Stage numbers below are stable identities, not the execution
+> sequence. Everything through Stage 6 is repr-determinism foundation; the union repr is then a layout
+> fact, not a packed-vs-boxed reconciliation.
+
 **Branch policy (master never regresses):** stages land on the project branch **`reset/main`**, not
 on `master`. Several stages are deliberate *enablers* that cost performance before the wins arrive
 (Stage 1's pointer-backing regressed the §2.3 scan sentinel ~1.9× — the measured trigger for this
@@ -500,12 +506,31 @@ The semantic flip — riskiest per line, smallest blast radius (scalar-only reco
 - This is where RAPTOR's read seam **and** regroup copy die. Re-measure RAPTOR (digest per D5 rule;
   expect PREP and query improvements; sealed_alloc count should collapse).
 
-### Stage 3 — Unions of records: tagged value + `match` narrows representation
+### Stage 3 — Unions of records: tagged value + `match` narrows representation — **RESEQUENCED TO LAST (after Stage 6)**
 
 - `T | Null` → nullable sealed pointer (one word); `A | B` → tag + payload-pointer; `match … is T`
   reads the payload at `T`'s known layout — generalise the SumNode tag-switch (ADR-064) instead of
   re-projecting (`codegen/match.rs`, `lin-ir` lower).
 - Deletes the `Conn = Boarding | Transfer` / `Trip | Null` seam. Re-measure RAPTOR query phases.
+
+> **Resequenced to execute after Stage 6 (2026-06-13).** The `match … is T` *narrow* is the easy
+> part — three independent implementations (dual-repr, general-tag, hybrid-single-repr) all got it
+> working on every synthetic repro. They all then **crashed RAPTOR identically** at one seam:
+> `getTrip(): Trip | Null` returns a sealed Trip read from a packed array, and the **union-return ABI
+> boxes it**; the boxed value flows by TCO into scanRouteAt's nullable-sealed param and is released as
+> a sealed struct → `sealed.rs:133` misaligned deref (`0x3` = a tagged value walked as a descriptor)
+> → heap corruption in GROUP. Root cause is architectural, not a bug: **while the D8 transitional
+> boxed shadow exists (Stages 1–5), a record of type `T` can be packed *or* boxed, so a union over it
+> is genuinely dual-repr and any Stage-3 union repr must reconcile the two forms — exactly the
+> flow-sensitive packed-vs-boxed reconciliation (the path-9 / D4 trap) the reset exists to delete.**
+> Per §1, `repr.rs` only becomes a pure layout calculator — representation **type-determined**, not
+> flow-reconciled — *after* Stage 6 retires the boxed shadow. Only then is `T | Null` unambiguously a
+> nullable sealed pointer at every boundary (param, return, local, array element, map value) with no
+> boxed form to reconcile, and the union repr lands as a layout fact rather than a reconciliation.
+> The interim cost is reset/main carrying RAPTOR's ~10% union-materialize regression through Stages
+> 4–6 (the A/B-measured `Trip | Null` cost); acceptable under the branch policy (master never sees
+> it). Preserved attempts: `reset/s3-A-singlerepr` (35eadb77, hybrid, crashes), `reset/s3-C-general`
+> (general-tag, crashes), `reset/stage3-tnull` (dual-repr, crashes) — all archived, none merged.
 
 ### Stage 4 — Repoint Perceus/`rc_elide` (now load-bearing for parity, not just upside)
 
