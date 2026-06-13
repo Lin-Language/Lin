@@ -1558,10 +1558,24 @@ impl<'ctx> Codegen<'ctx> {
         // (a projected sealed array, a materialized boxed record, or an unboxed scalar), so its +1
         // transfers into the output slot — do NOT release it here (that would double-free).
         self.tagged_array_push_value(out, coerced, inner_to);
-        // The source element box from `lin_array_get_tagged` is a fresh +1 we own; release it (the
-        // coerce above took its own independent +1 into `coerced`).
+        // The source element box from `lin_array_get_tagged` is a fresh +1 we own.
+        // CASE 1: coerce produced a FRESH independent +1 (different LLVM value) — the push
+        // consumed `coerced`'s +1, but `elem_box` still holds its own +1 to the source element;
+        // release it (inner RC -1, box shell freed).
+        // CASE 2: coerce was a passthrough (coerced == elem_box, e.g. Union/TypeVar target with
+        // pointer value) — the push TRANSFERRED `elem_box`'s +1 to the output slot; releasing
+        // would over-decrement the inner RC → UAF. Only free the box shell.
         if elem_box.is_pointer_value() {
-            self.builder.call(self.rt.tagged_release, &[elem_box.into()], "");
+            use inkwell::values::{AnyValue, AsValueRef};
+            let coerce_is_passthrough = coerced.is_pointer_value()
+                && coerced.as_any_value_enum().as_value_ref() == elem_box.as_any_value_enum().as_value_ref();
+            if coerce_is_passthrough {
+                let free_box = self.get_or_declare_fn("lin_tagged_free_box",
+                    self.context.void_type().fn_type(&[self.context.ptr_type(inkwell::AddressSpace::default()).into()], false));
+                self.builder.call(free_box, &[elem_box.into()], "");
+            } else {
+                self.builder.call(self.rt.tagged_release, &[elem_box.into()], "");
+            }
         }
         let next = self.builder.int_add(i, i64_ty.const_int(1, false), "nestarr_next");
         self.builder.store(idx_slot, next);

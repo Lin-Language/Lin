@@ -19522,3 +19522,48 @@ main()
 "#);
     assert_eq!(out, vec!["2"]);
 }
+
+#[test]
+fn test_reset_stage2a_tco_union_param_heapfield_array() {
+    // Regression: TCO self-recursion threading a `Trip | Null` union param where `Trip` has an
+    // 0xFD-classed array field (`sts: St[]`). Earlier: `box_value_yields_fresh_owned` returned
+    // `true` for sealed-record arrays even after Stage-2a changed `box_value` to `lin_box_array`
+    // (borrowed pointer) — `sealed_materialize_to_object` then called `lin_tagged_release`
+    // (releases inner + frees shell) instead of `lin_tagged_free_box` → UAF on re-read.
+    // Also: `array_coerce_elementwise` over a union-element outer array released the source
+    // element box after `push_tagged_val` already transferred the +1 (passthrough coerce) → UAF.
+    let out = run(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+import { range, for } from "std/iter"
+type St = { "stop": String, "dep": Int32 }
+type Trip = { "id": String, "sts": St[] }
+val find = (arr: Trip[], i: Int32): Trip | Null =>
+  if i < length(arr) then arr[i] else null
+val scan = (arr: Trip[], pi: Int32, n: Int32, trip: Trip | Null, acc: Int32): Int32 =>
+  if pi >= n then
+    acc
+  else
+    match trip
+      is Trip =>
+        val d = trip["sts"][0]["dep"]
+        scan(arr, pi + 1, n, trip, acc + d)
+      else =>
+        val nt = find(arr, pi)
+        match nt
+          is Trip =>
+            scan(arr, pi + 1, n, nt, acc + 1)
+          else =>
+            scan(arr, pi + 1, n, null, acc)
+val main = () =>
+  var arr: Trip[] = []
+  var i = 0
+  range(0, 4).for(k =>
+    var sts: St[] = []
+    push(sts, { "stop": "s${k}", "dep": k * 10 })
+    push(arr, { "id": "t${k}", "sts": sts })
+  )
+  print("scan=${scan(arr, 0, 8, null, 0)}")
+main()
+"#);
+    assert_eq!(out, vec!["scan=1"]);
+}
