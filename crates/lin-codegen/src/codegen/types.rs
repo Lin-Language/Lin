@@ -76,6 +76,16 @@ impl<'ctx> Codegen<'ctx> {
         matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry)
     }
 
+    /// Stage 6a: Returns true if `ty` represents a value whose tagged-box payload is a HEAP POINTER
+    /// (LinString*, LinArray*, LinObject*, LinMap*) — as opposed to a scalar (Int, Float, Bool,
+    /// Null) whose payload is an integer or zero. Used to decide whether to retain the inner before
+    /// releasing an owned box (e.g. a TAG_RECORD field-lookup result from `lin_record_get_field`).
+    pub(crate) fn result_is_heap_pointer(ty: &Type) -> bool {
+        matches!(ty, Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_)
+            | Type::Object { .. } | Type::Map(_) | Type::Function { .. }
+            | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry)
+    }
+
     /// Returns the LLVM struct type for a closure header.
     ///
     /// Layout (32 bytes):
@@ -195,9 +205,11 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Byte size of `SEALED_HEADER` (refcount u32 + size u32 + desc_ptr u64). Kept in lockstep with
-    /// `lin_runtime::sealed::SEALED_HEADER` (16). Sealed-record field payload begins here.
-    pub(crate) const SEALED_HEADER: u64 = 16;
+    /// Byte size of `SEALED_HEADER` (refcount u32 + size u32 + heap_desc_ptr u64 + named_desc_ptr u64).
+    /// Kept in lockstep with `lin_runtime::sealed::SEALED_HEADER` (24). Sealed-record field payload begins here.
+    /// Stage 6a: the 3rd slot (offset 16) is the named descriptor pointer (all fields + names) for TAG_RECORD
+    /// field access via `lin_record_get_field`.
+    pub(crate) const SEALED_HEADER: u64 = 24;
 
     /// `elem_tag` for POINTER-BACKED sealed-record arrays (Stage 1 representation). Each slot is an
     /// 8-byte sealed struct pointer. Kept in lockstep with `lin_runtime::array::SEALED_PTR_ARRAY_TAG`.

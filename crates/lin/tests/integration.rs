@@ -15704,6 +15704,36 @@ print("${wide["a"]}")
     assert_eq!(out, vec!["7", "99", "3"]);
 }
 
+// ───────────────────── Stage 6a: TAG_RECORD (sealed ptr as tagged dynamic value) ─────────────────
+// A typed sealed record placed in a Json/dynamic slot must be observable as a TAG_RECORD value
+// (Stage 6a). The runtime routes `lin_box_record` (O(1) pointer wrap, no field copy) instead of
+// materializing to a LinObject. Consumer arms (eq, toString, json, field access via descriptor)
+// must all dispatch correctly on TAG_RECORD. The test below is the directed proof.
+
+#[test]
+fn test_tag_record_anyval_round_trip() {
+    // Stage 6a directed test: put a typed sealed record into a Json binding, read fields back,
+    // compare equality (TAG_RECORD == TAG_RECORD, TAG_RECORD == TAG_OBJECT same-shape), and
+    // serialize to string. Proves TAG_RECORD boxing + all consumer arms are correct.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type P = { "x": Int32, "name": String }
+val p: P = { "x": 7, "name": "ada" }
+val j: Json = p
+print("${j["x"]}")
+print("${j["name"]}")
+print(toString(j))
+val p2: P = { "x": 7, "name": "ada" }
+val j2: Json = p2
+print("${j == j2}")
+val plain = { "x": 7, "name": "ada" }
+print("${j == plain}")
+print("${plain == j}")
+"#);
+    assert_eq!(out, vec!["7", "ada", r#"{"x": 7, "name": "ada"}"#, "true", "true", "true"]);
+}
+
 #[test]
 fn test_sealed_to_json_roundtrip_prints() {
     // (c) A sealed value flowing into a Json slot materializes a boxed object that prints/serializes
@@ -19284,8 +19314,51 @@ val main = () =>
   print("boxed=${jb["x"]}")
 main()
 "#);
-    // TODAY: packed widening copies (1), boxed widening shares (99).
-    assert_eq!(out, vec!["packed=1", "boxed=99"]);
+    // Stage 6a (TAG_RECORD): packed widening now SHARES (99) — the Json alias holds a TAG_RECORD
+    // pointer to the same sealed struct; mutation is visible through the alias. Boxed widening
+    // also shares (99) unchanged. Both are 99 after Stage 6a. Pre-6a: packed=1 (copy).
+    assert_eq!(out, vec!["packed=99", "boxed=99"]);
+}
+
+// Stage 6a directed test: TAG_RECORD (sealed struct by pointer in a dynamic TaggedVal slot).
+// Exercises the new TAG_RECORD boxing: field read, equality (record ↔ record, record ↔ Json
+// object literal), toString, and fromJson round-trip. Proves the repr is correct end-to-end.
+#[test]
+fn test_tag_record_directed() {
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+import { fromJson } from "std/json"
+type P = { "x": Int32, "y": Int32 }
+val p: P = { "x": 10, "y": 20 }
+// Widen sealed record to Json (TAG_RECORD O(1) wrap)
+val j: Json = p
+// Field read through the Json alias
+print(toString(j["x"]))
+print(toString(j["y"]))
+// Equality: TAG_RECORD vs identical TAG_OBJECT literal
+val lit: Json = { "x": 10, "y": 20 }
+print(if j == lit then "eq_object" else "ne_object")
+// Equality: TAG_RECORD vs itself
+print(if j == j then "eq_self" else "ne_self")
+// toString
+print(toString(j))
+// fromJson round-trip: decode the TAG_RECORD box back into a typed P
+val decoded = fromJson(P, j)
+print(if decoded is P then "fromJson_ok" else "fromJson_fail")
+"#);
+    // Field reads return the original values.
+    // Equality: j == lit (same shape/values, order-independent) = true; j == j = true.
+    // toString: object form (key order may vary, but both keys present).
+    // fromJson successfully decodes the TAG_RECORD box as P.
+    assert_eq!(out[0], "10");
+    assert_eq!(out[1], "20");
+    assert_eq!(out[2], "eq_object");
+    assert_eq!(out[3], "eq_self");
+    // toString is an object literal — just check it contains both keys+values.
+    assert!(out[4].contains("\"x\"") && out[4].contains("10"), "toString(j) missing x: {}", out[4]);
+    assert!(out[4].contains("\"y\"") && out[4].contains("20"), "toString(j) missing y: {}", out[4]);
+    assert_eq!(out[5], "fromJson_ok");
 }
 
 // D3 pin: width-subtyping into anonymous-structural slots is REPRESENTATION-DEPENDENT today —

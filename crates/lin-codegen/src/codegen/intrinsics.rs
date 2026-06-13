@@ -1023,13 +1023,28 @@ impl<'ctx> Codegen<'ctx> {
                 ptr_ty.const_null().into()
             }
             // lin_keys(obj) => String[]. Unbox to LinObject*, call lin_object_keys.
+            // Stage 6a: when the argument is a union/Json type, it may be TAG_RECORD (sealed
+            // struct by pointer). Use lin_tagged_keys which dispatches on the tag and handles
+            // both TAG_OBJECT and TAG_RECORD (materializing the sealed struct for the latter).
             Intrinsic::Keys => {
                 if let Some(&obj_v) = args.first() {
                     let arg_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
-                    let obj_ptr = self.ir_as_raw_ptr(obj_v, &arg_ty);
-                    let f = self.get_or_declare_fn("lin_object_keys",
-                        ptr_ty.fn_type(&[ptr_ty.into()], false));
-                    self.builder.call(f, &[obj_ptr.into()], "ir_keys").try_as_basic_value().unwrap_basic()
+                    if Self::is_union_type(&arg_ty) {
+                        // obj_v is already a TaggedVal* (union is always boxed). Pass directly.
+                        let tagged_v = if obj_v.is_pointer_value() {
+                            obj_v
+                        } else {
+                            self.box_value(obj_v, &arg_ty)
+                        };
+                        let f = self.get_or_declare_fn("lin_tagged_keys",
+                            ptr_ty.fn_type(&[ptr_ty.into()], false));
+                        self.builder.call(f, &[tagged_v.into()], "ir_tagged_keys").try_as_basic_value().unwrap_basic()
+                    } else {
+                        let obj_ptr = self.ir_as_raw_ptr(obj_v, &arg_ty);
+                        let f = self.get_or_declare_fn("lin_object_keys",
+                            ptr_ty.fn_type(&[ptr_ty.into()], false));
+                        self.builder.call(f, &[obj_ptr.into()], "ir_keys").try_as_basic_value().unwrap_basic()
+                    }
                 } else { ptr_ty.const_null().into() }
             }
             // lin_value_key(val) => String. Box val→TaggedVal*, call lin_value_key.

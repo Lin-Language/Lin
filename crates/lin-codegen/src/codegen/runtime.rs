@@ -74,6 +74,10 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub box_object: FunctionValue<'ctx>,
     pub box_array: FunctionValue<'ctx>,
     pub box_sumnode: FunctionValue<'ctx>,
+    /// Stage 6a: `lin_box_record(sealed_ptr: ptr) -> ptr` — wraps a typed sealed-struct pointer into
+    /// a TAG_RECORD shell (a fresh +1 TaggedVal*). RETAINS the sealed struct (increments its RC).
+    /// Used when a typed record is widened into a Json/AnyVal dynamic slot.
+    pub box_record: FunctionValue<'ctx>,
     pub box_function: FunctionValue<'ctx>,
     pub get_tag: FunctionValue<'ctx>,
     pub unbox_int32: FunctionValue<'ctx>,
@@ -94,10 +98,12 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub object_release: FunctionValue<'ctx>,
     pub closure_release: FunctionValue<'ctx>,
     pub tagged_release: FunctionValue<'ctx>,
-    /// Sealed-record (sealed-records Stages 1–2): `lin_sealed_alloc(size: i64, desc: ptr) -> ptr`
-    /// allocates a zeroed, refcount-1 packed struct carrying the static field descriptor `desc`
-    /// (NULL for a scalar-only record); `lin_sealed_release(ptr, size: i64)` decrements its
-    /// refcount and, on zero, releases each HEAP field per the descriptor then frees the struct.
+    /// Sealed-record (sealed-records Stages 1–2): `lin_sealed_alloc(size: i64, heap_desc: ptr, named_desc: ptr) -> ptr`
+    /// allocates a zeroed, refcount-1 packed struct carrying the static heap descriptor `heap_desc`
+    /// (NULL for a scalar-only record) and the named descriptor `named_desc` (NULL when not needed for
+    /// TAG_RECORD lookup; non-NULL stores the named desc at offset 16 of the header for Stage 6a);
+    /// `lin_sealed_release(ptr, size: i64)` decrements its refcount and, on zero, releases each HEAP
+    /// field per the descriptor then frees the struct.
     pub sealed_alloc: FunctionValue<'ctx>,
     pub sealed_release: FunctionValue<'ctx>,
     /// Unboxed tagged sum type (unboxed-sumtype Stage 1): `lin_sumnode_alloc(size: i64, desc: ptr) ->
@@ -213,6 +219,8 @@ impl<'ctx> RuntimeFns<'ctx> {
         let box_object = module.add_function("lin_box_object", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_array = module.add_function("lin_box_array", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_sumnode = module.add_function("lin_box_sumnode", ptr_type.fn_type(&[ptr_type.into()], false), None);
+        // Stage 6a: lin_box_record(sealed_ptr: ptr) -> ptr (TaggedVal* with TAG_RECORD tag)
+        let box_record = module.add_function("lin_box_record", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_function = module.add_function("lin_box_function", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let get_tag = module.add_function("lin_get_tag", i8_type.fn_type(&[ptr_type.into()], false), None);
         let unbox_int32 = module.add_function("lin_unbox_int32", i32_type.fn_type(&[ptr_type.into()], false), None);
@@ -240,7 +248,7 @@ impl<'ctx> RuntimeFns<'ctx> {
         let object_release = module.add_function("lin_object_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let closure_release = module.add_function("lin_closure_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let tagged_release = module.add_function("lin_tagged_release", void_type.fn_type(&[ptr_type.into()], false), None);
-        let sealed_alloc = module.add_function("lin_sealed_alloc", ptr_type.fn_type(&[i64_type.into(), ptr_type.into()], false), None);
+        let sealed_alloc = module.add_function("lin_sealed_alloc", ptr_type.fn_type(&[i64_type.into(), ptr_type.into(), ptr_type.into()], false), None);
         let sealed_release = module.add_function("lin_sealed_release", void_type.fn_type(&[ptr_type.into(), i64_type.into()], false), None);
         let sumnode_alloc = module.add_function("lin_sumnode_alloc", ptr_type.fn_type(&[i64_type.into(), ptr_type.into()], false), None);
         let sumnode_release = module.add_function("lin_sumnode_release", void_type.fn_type(&[ptr_type.into(), i64_type.into()], false), None);
@@ -275,6 +283,7 @@ impl<'ctx> RuntimeFns<'ctx> {
             box_object,
             box_array,
             box_sumnode,
+            box_record,
             box_function,
             get_tag,
             unbox_int32,

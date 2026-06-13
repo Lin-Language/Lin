@@ -65,8 +65,23 @@ unsafe fn clone_map(src: *const crate::map::LinMap) -> *mut crate::map::LinMap {
             // a private deep copy for heap payloads).
             let key = clone_string((*slot).key);
             let src_v = &(*slot).value;
-            let cloned_payload = transfer_payload(src_v.tag, src_v.payload);
-            let v = TaggedVal { tag: src_v.tag, _pad: [0; 7], payload: cloned_payload };
+            // Stage 6a: a TAG_RECORD value in a map must be transferred as TAG_OBJECT (materialize +
+            // deep-clone), because transfer_payload returns a LinObject ptr with the original tag,
+            // which would create a TAG_RECORD-wrapping-LinObject box (wrong release semantics).
+            // Mirror clone_object's TAG_RECORD arm exactly.
+            let v = if src_v.tag == crate::tagged::TAG_RECORD {
+                let sealed = src_v.payload as *const u8;
+                let named_desc = if sealed.is_null() { std::ptr::null() } else {
+                    *((sealed.add(16)) as *const *const u8)
+                };
+                let obj = crate::sealed::materialize_sealed_struct_pub(src_v.payload as *mut u8, named_desc);
+                let cloned = clone_object(obj as *const LinObject);
+                if !obj.is_null() { crate::object::lin_object_release(obj); }
+                TaggedVal { tag: crate::tagged::TAG_OBJECT, _pad: [0; 7], payload: cloned as u64 }
+            } else {
+                let cloned_payload = transfer_payload(src_v.tag, src_v.payload);
+                TaggedVal { tag: src_v.tag, _pad: [0; 7], payload: cloned_payload }
+            };
             // lin_map_set retains the key (first insert) and retains the value payload; both are now
             // owned by the map. Drop our construction references so each entry ends at the map's +1.
             crate::map::lin_map_set(dst, key, &v);
@@ -90,9 +105,10 @@ unsafe fn clone_sealed(src: *const u8) -> *mut u8 {
         return std::ptr::null_mut();
     }
     let size = *((src as *const u32).add(1)) as usize;
-    let desc = *((src.add(8)) as *const *const u8);
-    let fresh = crate::sealed::lin_sealed_alloc(size, desc);
-    // Copy the field payload (everything past the 16-byte header). Scalars are now correct; heap
+    let desc = *((src.add(8)) as *const *const u8);   // heap descriptor @ 8
+    let named_desc = *((src.add(16)) as *const *const u8); // named descriptor @ 16 (SEALED_HEADER=24)
+    let fresh = crate::sealed::lin_sealed_alloc(size, desc, named_desc);
+    // Copy the field payload (everything past the 24-byte header). Scalars are now correct; heap
     // field slots currently ALIAS the source — fixed below. The header's rc/size/desc on `fresh`
     // are already correct from the alloc.
     if size > crate::sealed::SEALED_HEADER {
@@ -247,8 +263,23 @@ pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
     for i in 0..len as usize {
         let se = (*src).data.add(i);
         let de = (*dst).data.add(i);
-        (*de).tag = (*se).tag;
-        (*de).payload = transfer_payload((*se).tag, (*se).payload);
+        // Stage 6a: TAG_RECORD elements transfer as TAG_OBJECT (materialize + deep-clone) — mirroring
+        // clone_object's TAG_RECORD arm. transfer_payload would return a LinObject ptr under the
+        // original TAG_RECORD tag, giving wrong release semantics.
+        if (*se).tag == crate::tagged::TAG_RECORD {
+            let sealed = (*se).payload as *const u8;
+            let named_desc = if sealed.is_null() { std::ptr::null() } else {
+                *((sealed.add(8)) as *const *const u8)
+            };
+            let obj = crate::sealed::materialize_sealed_struct_pub((*se).payload as *mut u8, named_desc);
+            let cloned = clone_object(obj as *const LinObject);
+            if !obj.is_null() { crate::object::lin_object_release(obj); }
+            (*de).tag = crate::tagged::TAG_OBJECT;
+            (*de).payload = cloned as u64;
+        } else {
+            (*de).tag = (*se).tag;
+            (*de).payload = transfer_payload((*se).tag, (*se).payload);
+        }
     }
     (*dst).len = len;
     dst
@@ -275,6 +306,16 @@ unsafe fn clone_object(src: *const LinObject) -> *mut LinObject {
             // and transfer THAT as a TAG_OBJECT field. The worker then sees an ordinary object.
             let obj = crate::sumnode::lin_sumnode_materialize((*se).value.payload as *mut u8);
             TaggedVal { tag: crate::tagged::TAG_OBJECT, _pad: [0; 7], payload: obj as u64 }
+        } else if (*se).value.tag == crate::tagged::TAG_RECORD {
+            // Stage 6a: a sealed-struct pointer in a dynamic slot MUST NOT cross the thread boundary
+            // by raw pointer (share-nothing). MATERIALIZE it to a real LinObject (deep, self-contained
+            // copy) and transfer as TAG_OBJECT. Mirrors the TAG_SUMNODE arm exactly.
+            let sealed = (*se).value.payload as *const u8;
+            let named_desc = if sealed.is_null() { std::ptr::null() } else {
+                *((sealed.add(8)) as *const *const u8)
+            };
+            let obj = crate::sealed::materialize_sealed_struct_pub((*se).value.payload as *mut u8, named_desc);
+            TaggedVal { tag: crate::tagged::TAG_OBJECT, _pad: [0; 7], payload: obj as u64 }
         } else {
             let mut v = TaggedVal { tag: (*se).value.tag, _pad: [0; 7], payload: 0 };
             v.payload = transfer_payload((*se).value.tag, (*se).value.payload);
@@ -287,6 +328,11 @@ unsafe fn clone_object(src: *const LinObject) -> *mut LinObject {
 
 /// Transfer one tagged payload (the 8-byte field) by kind: scalars copy verbatim; heap
 /// pointers are deep-copied.
+/// NOTE: TAG_RECORD is NOT handled here. All call sites that may encounter a TAG_RECORD element
+/// (clone_object, clone_array tagged loop, clone_map, lin_transfer_clone) handle it directly,
+/// converting to TAG_OBJECT + LinObject clone to avoid the tag-mismatch problem of returning a
+/// LinObject ptr under the TAG_RECORD tag. TAG_RECORD in the `_ => payload` fallthrough would
+/// cross-thread-alias the sealed struct (share-nothing violation).
 unsafe fn transfer_payload(tag: u8, payload: u64) -> u64 {
     use crate::tagged::{TAG_SHARED, TAG_MAP, TAG_TAR_ENTRY};
     match tag {
@@ -322,6 +368,22 @@ pub unsafe extern "C" fn lin_transfer_clone(p: *const u8) -> *mut u8 {
         return std::ptr::null_mut();
     }
     let src = &*(p as *const TaggedVal);
+    // Stage 6a: a TAG_RECORD box wraps a sealed-struct pointer. We CANNOT call transfer_payload
+    // and reuse src.tag here because `alloc_tagged(TAG_RECORD, linobj_ptr)` would be wrong
+    // (TAG_RECORD release calls lin_sealed_release_self, not lin_object_release). Instead,
+    // materialize + deep-clone to a LinObject and box it as TAG_OBJECT (same as clone_object does
+    // for record-typed fields). The result is observationally identical — TAG_OBJECT with the same
+    // fields — because TAG_RECORD only exists for performance; its logical type is still a record.
+    if src.tag == crate::tagged::TAG_RECORD {
+        let sealed = src.payload as *const u8;
+        let named_desc = if sealed.is_null() { std::ptr::null() } else {
+            *((sealed.add(8)) as *const *const u8)
+        };
+        let obj = crate::sealed::materialize_sealed_struct_pub(src.payload as *mut u8, named_desc);
+        let cloned = clone_object(obj as *const LinObject);
+        if !obj.is_null() { crate::object::lin_object_release(obj); }
+        return crate::tagged::alloc_tagged(crate::tagged::TAG_OBJECT, cloned as u64);
+    }
     let payload = transfer_payload(src.tag, src.payload);
     crate::tagged::alloc_tagged(src.tag, payload)
 }
@@ -581,19 +643,19 @@ mod tests {
     fn clone_sealed_array_string_field_is_private_and_rc_balanced() {
         use crate::sealed::{lin_sealed_alloc, lin_sealed_release_self, SEALED_HEADER, KIND_STRING};
         unsafe {
-            // Record R { name: String @16, n: Int32 @24 }, stride 16.
+            // Record R { name: String @24, n: Int32 @32 }, stride 16. (SEALED_HEADER = 24)
             let mut heap_desc = Vec::new();
             heap_desc.extend_from_slice(&1u32.to_le_bytes()); // 1 heap field
-            heap_desc.extend_from_slice(&16u32.to_le_bytes()); // offset
+            heap_desc.extend_from_slice(&24u32.to_le_bytes()); // offset
             heap_desc.extend_from_slice(&KIND_STRING.to_le_bytes());
             let stride = 16u64;
             let src = crate::array::lin_sealed_array_alloc(4, stride, heap_desc.as_ptr(), std::ptr::null());
             // Push two elements, each owning a +1 (non-interned) String.
             for txt in ["alpha", "beta"] {
-                let st = lin_sealed_alloc(SEALED_HEADER + stride as usize, heap_desc.as_ptr());
+                let st = lin_sealed_alloc(SEALED_HEADER + stride as usize, heap_desc.as_ptr(), std::ptr::null());
                 let s = crate::string::lin_string_from_bytes(txt.as_ptr(), txt.len() as u32);
-                *((st.add(16)) as *mut *mut u8) = s as *mut u8; // struct owns the +1
-                *((st.add(24)) as *mut i32) = txt.len() as i32;
+                *((st.add(24)) as *mut *mut u8) = s as *mut u8; // struct owns the +1
+                *((st.add(32)) as *mut i32) = txt.len() as i32;
                 // Borrowed-source push: array retains each heap field (string rc -> 2).
                 crate::array::lin_sealed_array_push_struct_retaining(src, st);
                 lin_sealed_release_self(st); // string rc -> 1, owned only by the array

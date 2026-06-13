@@ -61,3 +61,12 @@ pub const TAG_DECIMAL: u8 = 23;
 /// (the TAG_TAR_ENTRY arm of tag-aware release). Non-transferable across worker threads (shares a
 /// live cursor; the checker + transfer path both reject it).
 pub const TAG_TAR_ENTRY: u8 = 24;
+/// STAGE 6a — sealed-record pointer wrapped in a TaggedVal for AnyVal/Json slots. The payload is
+/// a `*sealed-struct` (same shape as a `lin_sealed_alloc` allocation: `[u32 rc | u32 size |
+/// u64 desc_ptr | payload...]`). The descriptor pointer is recoverable from the struct at offset 8
+/// (`SealedDesc`), which also provides field names+kinds for display/equality/field-access. This
+/// avoids materialising a `LinObject` on widening (O(1) wrap vs O(n) copy). All dynamic consumers
+/// (`lin_tagged_eq` / `lin_tagged_to_string` / `push_json_value` / worker transfer / field-access)
+/// read fields via the named descriptor exactly as `TAG_SUMNODE` does via `lin_sumnode_materialize`.
+/// A `TAG_RECORD` and a `TAG_OBJECT` with identical fields compare EQUAL (`lin_tagged_eq`).
+pub const TAG_RECORD: u8 = 25;
