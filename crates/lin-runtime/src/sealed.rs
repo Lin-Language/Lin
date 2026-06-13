@@ -907,9 +907,11 @@ mod named_desc_tests {
     fn dynamic_push_packs_into_sealed_array() {
         unsafe {
             use crate::tagged::TaggedVal;
+            // Struct-relative offsets (24-byte SEALED_HEADER): x@payload0 → 24, y@payload4 → 28.
+            // Stale-offset fix (were 16/20 from the old 16-byte header).
             let named = build_named_desc(&[
-                ("x", 16, NKIND_INT32, std::ptr::null()),
-                ("y", 20, NKIND_INT32, std::ptr::null()),
+                ("x", 24, NKIND_INT32, std::ptr::null()),
+                ("y", 28, NKIND_INT32, std::ptr::null()),
             ]);
             let arr = crate::array::lin_sealed_array_alloc(4, 8, std::ptr::null(), named.as_ptr());
             // 5 pushes via lin_push_dyn (RETAINING contract: the caller keeps its object ref).
@@ -952,13 +954,16 @@ mod named_desc_tests {
     fn dynamic_push_packs_heap_field_rc_balanced() {
         unsafe {
             use crate::tagged::TaggedVal;
+            // Offsets are struct-relative (include the 24-byte SEALED_HEADER): name@payload0 → 24,
+            // n@payload8 → 32. Stale-offset fix: these read 16/24 from the OLD 16-byte header and were
+            // missed when SEALED_HEADER grew 16→24 for the TAG_RECORD named-desc slot.
             let named = build_named_desc(&[
-                ("name", 16, NKIND_STRING, std::ptr::null()),
-                ("n", 24, NKIND_INT32, std::ptr::null()),
+                ("name", 24, NKIND_STRING, std::ptr::null()),
+                ("n", 32, NKIND_INT32, std::ptr::null()),
             ]);
             let mut heap_desc = Vec::new();
             heap_desc.extend_from_slice(&1u32.to_le_bytes());
-            heap_desc.extend_from_slice(&16u32.to_le_bytes());
+            heap_desc.extend_from_slice(&24u32.to_le_bytes());
             heap_desc.extend_from_slice(&KIND_STRING.to_le_bytes());
             let arr = crate::array::lin_sealed_array_alloc(4, 16, heap_desc.as_ptr(), named.as_ptr());
             // Source object { name: "hello", n: 42 } — it owns its own +1 on the string.
