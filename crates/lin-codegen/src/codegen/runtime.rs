@@ -112,11 +112,14 @@ pub(crate) struct RuntimeFns<'ctx> {
     /// zero (Stage 1 scalar-only → no per-field release, desc may be NULL).
     pub sumnode_alloc: FunctionValue<'ctx>,
     pub sumnode_release: FunctionValue<'ctx>,
-    /// Typed index-signature map `{ String: T }` (ADR-055): the hashed `LinMap` container.
+    /// Typed index-signature map `{ K: V }` (ADR-055 + numeric-key): the hashed `LinMap` container.
     pub map_alloc: FunctionValue<'ctx>,
     pub map_set: FunctionValue<'ctx>,
     pub map_get: FunctionValue<'ctx>,
     pub map_release: FunctionValue<'ctx>,
+    /// Int-keyed map entry points (key_kind = 1).
+    pub map_get_int: FunctionValue<'ctx>,
+    pub map_set_int: FunctionValue<'ctx>,
 }
 
 impl<'ctx> RuntimeFns<'ctx> {
@@ -252,11 +255,15 @@ impl<'ctx> RuntimeFns<'ctx> {
         let sealed_release = module.add_function("lin_sealed_release", void_type.fn_type(&[ptr_type.into(), i64_type.into()], false), None);
         let sumnode_alloc = module.add_function("lin_sumnode_alloc", ptr_type.fn_type(&[i64_type.into(), ptr_type.into()], false), None);
         let sumnode_release = module.add_function("lin_sumnode_release", void_type.fn_type(&[ptr_type.into(), i64_type.into()], false), None);
-        // Typed index-signature map (ADR-055).
-        let map_alloc = module.add_function("lin_map_alloc", ptr_type.fn_type(&[i32_type.into()], false), None);
+        // Typed index-signature map (ADR-055 + numeric-key).
+        // lin_map_alloc(hint: i32, key_kind: i32) -> *LinMap
+        let map_alloc = module.add_function("lin_map_alloc", ptr_type.fn_type(&[i32_type.into(), i32_type.into()], false), None);
         let map_set = module.add_function("lin_map_set", void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false), None);
         let map_get = module.add_function("lin_map_get", ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false), None);
         let map_release = module.add_function("lin_map_release", void_type.fn_type(&[ptr_type.into()], false), None);
+        // Int-keyed map entry points: get(map, i64)->ptr, set(map, i64, val_ptr)->void
+        let map_get_int = module.add_function("lin_map_get_int", ptr_type.fn_type(&[ptr_type.into(), i64_type.into()], false), None);
+        let map_set_int = module.add_function("lin_map_set_int", void_type.fn_type(&[ptr_type.into(), i64_type.into(), ptr_type.into()], false), None);
 
         Self {
             string_literal,
@@ -312,6 +319,8 @@ impl<'ctx> RuntimeFns<'ctx> {
             map_set,
             map_get,
             map_release,
+            map_get_int,
+            map_set_int,
         }
     }
 }

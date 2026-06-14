@@ -248,7 +248,7 @@ fn is_sealed_heap_field(ty: &Type) -> bool {
     match ty {
         Type::Str | Type::StrLit(_) => true,
         Type::Array(_) | Type::FixedArray(_) => true,
-        Type::Map(_) => true,
+        Type::Map { .. } => true,
         Type::Object { .. } => sealed_fields(ty).is_some(),
         _ => false,
     }
@@ -669,7 +669,7 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
                 // Stage 3 NullableRecord: a `{String: T}` typed-map index returning `T | Null`
                 // yields a nullable sealed pointer. Gated on obj_ty being Type::Map so a union-
                 // object index (NestedPerson|Error → Addr|Null) keeps Boxed(Opaque) repr.
-                if matches!(obj_ty, Type::Map(_)) {
+                if matches!(obj_ty, Type::Map { .. }) {
                     set(seeds, *dst, Repr::Packed(Layout::NullableRecord { fields: nrfields.clone() }));
                 }
             } else if let Some(f) = sealed_fields(result_ty) {

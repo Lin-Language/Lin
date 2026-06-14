@@ -483,7 +483,7 @@ impl<'ctx> Codegen<'ctx> {
         // a map (`from_ty` is `Type::Map`): that is a verbatim pointer pass-through. The source may
         // arrive boxed (union/Json TaggedVal*) — unbox to the raw `LinObject*` first. The fresh map
         // is +1 owned (matching the `register_owned` the lowerer applies to a Coerce result).
-        if matches!(to_ty, Type::Map(_)) && !matches!(from_ty, Type::Map(_)) && val.is_pointer_value() {
+        if matches!(to_ty, Type::Map { .. }) && !matches!(from_ty, Type::Map { .. }) && val.is_pointer_value() {
             // The runtime value may be EITHER a real `LinMap` (a `{ String: T }` value flowing
             // through the Json supertype — e.g. a nested map read as `T|Null`) or a `LinObject` (an
             // empty object literal, a Json object field). The two have incompatible layouts and the

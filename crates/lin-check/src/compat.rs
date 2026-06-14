@@ -148,7 +148,7 @@ pub fn is_compatible_env(
         // (the same memory-safety precedent as the `Shared`/`Stream` arms above: a representational
         // mismatch is unsound regardless of who wrote the code). `Map -> Json` is handled by the
         // covariant-sink arm above and stays sound; `Map -> Map` covariance is below.
-        (Type::TypeVar(s), Type::Map(_)) if *s == u32::MAX => false,
+        (Type::TypeVar(s), Type::Map { .. }) if *s == u32::MAX => false,
 
         // Json -> a concrete structured Object (one with a required, non-nullable field):
         // this is the silent-unvalidated-decode hazard the cast-hole fix targets — e.g.
@@ -278,7 +278,7 @@ pub fn is_compatible_env(
         // either direction (a value is one or the other; ADR-055). A non-`Map` value can only
         // flow into a `Map` target via the TypeVar/Json arms above (and `Json -> Map` is gated as a
         // structured decode in user code).
-        (Type::Map(a), Type::Map(b)) => is_compatible_env(a, b, env, lenient_json, depth),
+        (Type::Map { key: k1, value: v1 }, Type::Map { key: k2, value: v2 }) => k1 == k2 && is_compatible_env(v1, v2, env, lenient_json, depth),
 
         _ => false,
     }
@@ -336,7 +336,7 @@ fn requires_structured_decode(target: &Type, env: Option<&TypeEnv>, depth: &mut 
         // by the dedicated `(TypeVar(MAX), Map) => false` arm in `is_compatible_env` (which fires
         // BEFORE this lenient-gated path, so it also closes the trusted-stdlib hole). This branch is
         // retained as defensive intent — it keeps the user-code rejection self-evident here too.
-        Type::Map(_) => true,
+        Type::Map { .. } => true,
         Type::Named(n) => {
             if let Some(env) = env {
                 if let Some(decl) = env.lookup_type(n) {

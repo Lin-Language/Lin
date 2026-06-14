@@ -217,7 +217,7 @@ fn is_rc_type(ty: &Type) -> bool {
             | Type::Array(_)
             | Type::FixedArray(_)
             | Type::Object { .. }
-            | Type::Map(_)
+            | Type::Map { .. }
             | Type::Iterator(_)
             | Type::Function { .. }
     )

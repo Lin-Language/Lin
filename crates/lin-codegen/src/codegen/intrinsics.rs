@@ -224,8 +224,8 @@ impl<'ctx> Codegen<'ctx> {
                             i64_ty.fn_type(&[ptr_ty.into()], false));
                         self.builder.call(obj_len_fn, &[arg.into()], "ir_olen").try_as_basic_value().unwrap_basic()
                     }
-                    // Typed index-signature map `{ String: T }` (ADR-055): entry count.
-                    Type::Map(_) => {
+                    // Typed index-signature map `{ K: V }` (ADR-055 + numeric-key): entry count.
+                    Type::Map { .. } => {
                         let map_len_fn = self.get_or_declare_fn("lin_map_length",
                             i64_ty.fn_type(&[ptr_ty.into()], false));
                         self.builder.call(map_len_fn, &[arg.into()], "ir_mlen").try_as_basic_value().unwrap_basic()
@@ -1505,7 +1505,7 @@ impl<'a> DescEncoder<'a> {
             // target — the decoder produces a `LinObject`, not a `LinMap`, so decoding INTO a map
             // would yield the wrong representation. Treated as accept-any here only for
             // exhaustiveness; a `fromJson<{String:T}>` is not part of v1 (see ADR-055).
-            | Type::Map(_) => self.put_u8(KIND_JSON),
+            | Type::Map { .. } => self.put_u8(KIND_JSON),
             Type::Array(inner) => {
                 self.put_u8(KIND_ARRAY);
                 let slot = self.reserve_u32();

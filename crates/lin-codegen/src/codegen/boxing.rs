@@ -112,8 +112,8 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
                     .try_as_basic_value().unwrap_basic()
             }
-            // Typed index-signature map (`{ String: T }`, ADR-055): box the LinMap* as TAG_MAP.
-            Type::Map(_) => {
+            // Typed index-signature map (`{ K: V }`, ADR-055 + numeric-key): box the LinMap* as TAG_MAP.
+            Type::Map { .. } => {
                 let box_map_fn = self.get_or_declare_fn("lin_box_map",
                     self.context.ptr_type(AddressSpace::default()).fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false));
                 self.builder.call(box_map_fn, &[val.into()], "boxmap")
@@ -297,7 +297,7 @@ impl<'ctx> Codegen<'ctx> {
             // (`{ String: T }`, `Type::Map`) is boxed as TAG_MAP whose payload is the raw
             // `LinMap*`; unbox it back to that pointer here too, or it leaks through the
             // closure-ABI wrapper as a TaggedVal box masquerading as a `LinMap*`.
-            Type::Object { .. } | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } | Type::Map(_) => {
+            Type::Object { .. } | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } | Type::Map { .. } => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "uptr")
                     .try_as_basic_value().unwrap_basic()
             }
@@ -520,7 +520,7 @@ impl<'ctx> Codegen<'ctx> {
             // nested store (`m[a][b] = v`) and a chained read both operate on the SHARED inner
             // container, not on the TaggedVal box (which a missing arm here would leak through,
             // making nested-map mutation a no-op).
-            Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Function { .. } | Type::Map(_) => {
+            Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Function { .. } | Type::Map { .. } => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr.into()], "ir_uptr").try_as_basic_value().unwrap_basic()
             }
             // KEEP-PACKED-THROUGH-RECORD-FIELDS read into UNION/Json position: a `sum | Null` result

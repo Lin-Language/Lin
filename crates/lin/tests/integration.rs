@@ -2590,12 +2590,22 @@ print(if s["y"] != null then "present" else "absent")
 "#);
     assert_eq!(output, vec!["present", "absent"]);
 
-    // A key type that is neither String nor a string-literal union is rejected.
-    let err = run_expect_err(r#"type R = { Int32: Boolean }
+    // A key type that is Float (not String, not integer, not string-literal union) is rejected.
+    let err = run_expect_err(r#"type R = { Float64: Boolean }
 "#);
     assert!(
-        err.contains("Index-signature key type must be String or a union of string literals"),
+        err.contains("Index-signature key type must be String"),
         "expected index-sig key error, got: {err}"
+    );
+    // Int32 is now a VALID index-signature key (numeric-key maps feature).
+    let _accepted = check_source(r#"type R = { Int32: Boolean }"#);
+    // A String-keyed map read with an int key is still rejected.
+    let err2 = run_expect_err(r#"type M = { String: Boolean }
+val f = (m: M, k: Int32): Boolean => m[k] ?? false
+"#);
+    assert!(
+        err2.contains("keyed by") && err2.contains("String") && err2.contains("Int32"),
+        "expected String-key error with Int32, got: {err2}"
     );
 }
 
@@ -2713,7 +2723,7 @@ fn test_map_read_with_non_string_key_rejected() {
 val f = (m: M, k: UInt32): Boolean => m[k] ?? false
 "#);
     assert!(
-        err.contains("keyed by String") && err.contains("UInt32"),
+        err.contains("keyed by") && err.contains("String") && err.contains("UInt32"),
         "expected a String-key error mentioning UInt32, got:\n{err}"
     );
 
@@ -14387,22 +14397,32 @@ val s: Stops = {}
 
 #[test]
 fn test_index_sig_map_key_non_string_alias_rejected() {
-    // An index-signature key whose alias does NOT resolve to `String` is rejected at
-    // type-resolution time with a clear diagnostic.
-    let (ok, output) = check_source(
+    // An index-signature key whose alias resolves to an Integer type is now accepted
+    // (numeric-key maps feature). Float aliases are still rejected.
+    let (ok, _output) = check_source(
         r#"type Bad = Int32
 val m: { Bad: Int32 } = {}
 "#,
     );
     assert!(
-        !ok,
-        "expected a non-String map key alias to be rejected, but it passed:\n{}",
-        output
+        ok,
+        "expected an Int32 alias key to be accepted (numeric-key map), but it was rejected"
+    );
+    // A Float alias key is still rejected.
+    let (ok2, output2) = check_source(
+        r#"type Bad = Float64
+val m: { Bad: Int32 } = {}
+"#,
     );
     assert!(
-        output.contains("Index-signature key type must be String or a union of string literals"),
+        !ok2,
+        "expected a Float64 map key alias to be rejected, but it passed:\n{}",
+        output2
+    );
+    assert!(
+        output2.contains("Index-signature key type must be String"),
         "expected the index-sig key error, got:\n{}",
-        output
+        output2
     );
 }
 
