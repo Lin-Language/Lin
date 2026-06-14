@@ -2488,52 +2488,52 @@ unsafe fn make_meta_object_unboxed(meta: &TarEntryMeta) -> *mut u8 {
 }
 
 unsafe fn make_meta_object(meta: &TarEntryMeta) -> *mut u8 {
-    use crate::object::{lin_object_alloc, lin_object_set};
+    use crate::map::{lin_map_alloc, lin_map_set};
     use crate::string::lin_string_release;
-    use crate::tagged::{alloc_tagged, TAG_OBJECT, TAG_STR, TAG_INT64, TAG_BOOL};
+    use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TAG_INT64, TAG_BOOL, TaggedVal};
 
-    let obj = lin_object_alloc(4);
+    let map = lin_map_alloc(4);
 
     // name
-    let k_name = crate::fs::make_string("name");
-    let v_name = crate::fs::make_string(&meta.name);
-    let mut tv_name: TaggedVal = std::mem::zeroed();
-    tv_name.tag = TAG_STR;
-    tv_name.payload = v_name as u64;
-    lin_object_set(obj, k_name, &tv_name);
-    lin_string_release(k_name);
-    lin_string_release(v_name);
+    let k = crate::fs::make_string("name");
+    let v = crate::fs::make_string(&meta.name);
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_STR;
+    tv.payload = v as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
+    lin_string_release(v);
 
     // size (Int64)
-    let k_size = crate::fs::make_string("size");
-    let mut tv_size: TaggedVal = std::mem::zeroed();
-    tv_size.tag = TAG_INT64;
-    tv_size.payload = meta.size as u64;
-    lin_object_set(obj, k_size, &tv_size);
-    lin_string_release(k_size);
+    let k = crate::fs::make_string("size");
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_INT64;
+    tv.payload = meta.size as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
 
     // typeflag (the raw single byte as a 1-char String; '0'/'\0' = file, '5' = directory)
     let tf = if meta.typeflag == 0 { '0' } else { meta.typeflag as char };
     let tf_str = tf.to_string();
-    let k_tf = crate::fs::make_string("typeflag");
-    let v_tf = crate::fs::make_string(&tf_str);
-    let mut tv_tf: TaggedVal = std::mem::zeroed();
-    tv_tf.tag = TAG_STR;
-    tv_tf.payload = v_tf as u64;
-    lin_object_set(obj, k_tf, &tv_tf);
-    lin_string_release(k_tf);
-    lin_string_release(v_tf);
+    let k = crate::fs::make_string("typeflag");
+    let v = crate::fs::make_string(&tf_str);
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_STR;
+    tv.payload = v as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
+    lin_string_release(v);
 
     // isDir (Boolean)
     let is_dir = meta.typeflag == b'5';
-    let k_dir = crate::fs::make_string("isDir");
-    let mut tv_dir: TaggedVal = std::mem::zeroed();
-    tv_dir.tag = TAG_BOOL;
-    tv_dir.payload = is_dir as u64;
-    lin_object_set(obj, k_dir, &tv_dir);
-    lin_string_release(k_dir);
+    let k = crate::fs::make_string("isDir");
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_BOOL;
+    tv.payload = is_dir as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
 
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
 /// The per-entry `data` sub-stream (untar): yields at most `current_entry_remaining` bytes from the
@@ -2735,9 +2735,9 @@ impl FilesSource {
 }
 impl StreamSource for FilesSource {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
-        use crate::object::{lin_object_alloc, lin_object_set};
+        use crate::map::{lin_map_alloc, lin_map_set};
         use crate::string::lin_string_release;
-        use crate::tagged::{alloc_tagged, TAG_OBJECT, TAG_STR, TAG_INT64, TAG_BOOL, TAG_ARRAY};
+        use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TAG_INT64, TAG_BOOL, TAG_ARRAY, TaggedVal};
 
         let header = match self.take_front(512) {
             Ok(h) => h,
@@ -2757,55 +2757,55 @@ impl StreamSource for FilesSource {
             return TaggedOutcome::Err(m);
         }
 
-        // Build { name, data, size, typeflag, isDir }.
-        let obj = lin_object_alloc(8);
+        // Build { name, data, size, typeflag, isDir } as LinMap.
+        let map = lin_map_alloc(8);
 
-        let k_name = crate::fs::make_string("name");
-        let v_name = crate::fs::make_string(&meta.name);
-        let mut tv_name: TaggedVal = std::mem::zeroed();
-        tv_name.tag = TAG_STR;
-        tv_name.payload = v_name as u64;
-        lin_object_set(obj, k_name, &tv_name);
-        lin_string_release(k_name);
-        lin_string_release(v_name);
+        let k = crate::fs::make_string("name");
+        let v = crate::fs::make_string(&meta.name);
+        let mut tv: TaggedVal = std::mem::zeroed();
+        tv.tag = TAG_STR;
+        tv.payload = v as u64;
+        lin_map_set(map, k, &tv);
+        lin_string_release(k);
+        lin_string_release(v);
 
         // data: the entry's body as a fresh UInt8[] box.
         let data_box = bytes_to_u8_array(&body);
-        let k_data = crate::fs::make_string("data");
-        let mut tv_data: TaggedVal = std::mem::zeroed();
-        tv_data.tag = TAG_ARRAY;
-        tv_data.payload = crate::tagged::lin_unbox_ptr(data_box) as u64;
-        lin_object_set(obj, k_data, &tv_data);
-        lin_string_release(k_data);
-        crate::tagged::lin_tagged_release(data_box); // object now owns its own ref to the array
+        let k = crate::fs::make_string("data");
+        let mut tv: TaggedVal = std::mem::zeroed();
+        tv.tag = TAG_ARRAY;
+        tv.payload = crate::tagged::lin_unbox_ptr(data_box) as u64;
+        lin_map_set(map, k, &tv);
+        lin_string_release(k);
+        crate::tagged::lin_tagged_release(data_box); // map now owns its own ref to the array
 
-        let k_size = crate::fs::make_string("size");
-        let mut tv_size: TaggedVal = std::mem::zeroed();
-        tv_size.tag = TAG_INT64;
-        tv_size.payload = meta.size as u64;
-        lin_object_set(obj, k_size, &tv_size);
-        lin_string_release(k_size);
+        let k = crate::fs::make_string("size");
+        let mut tv: TaggedVal = std::mem::zeroed();
+        tv.tag = TAG_INT64;
+        tv.payload = meta.size as u64;
+        lin_map_set(map, k, &tv);
+        lin_string_release(k);
 
         let tf = if meta.typeflag == 0 { '0' } else { meta.typeflag as char };
         let tf_str = tf.to_string();
-        let k_tf = crate::fs::make_string("typeflag");
-        let v_tf = crate::fs::make_string(&tf_str);
-        let mut tv_tf: TaggedVal = std::mem::zeroed();
-        tv_tf.tag = TAG_STR;
-        tv_tf.payload = v_tf as u64;
-        lin_object_set(obj, k_tf, &tv_tf);
-        lin_string_release(k_tf);
-        lin_string_release(v_tf);
+        let k = crate::fs::make_string("typeflag");
+        let v = crate::fs::make_string(&tf_str);
+        let mut tv: TaggedVal = std::mem::zeroed();
+        tv.tag = TAG_STR;
+        tv.payload = v as u64;
+        lin_map_set(map, k, &tv);
+        lin_string_release(k);
+        lin_string_release(v);
 
         let is_dir = meta.typeflag == b'5';
-        let k_dir = crate::fs::make_string("isDir");
-        let mut tv_dir: TaggedVal = std::mem::zeroed();
-        tv_dir.tag = TAG_BOOL;
-        tv_dir.payload = is_dir as u64;
-        lin_object_set(obj, k_dir, &tv_dir);
-        lin_string_release(k_dir);
+        let k = crate::fs::make_string("isDir");
+        let mut tv: TaggedVal = std::mem::zeroed();
+        tv.tag = TAG_BOOL;
+        tv.payload = is_dir as u64;
+        lin_map_set(map, k, &tv);
+        lin_string_release(k);
 
-        TaggedOutcome::Item(alloc_tagged(TAG_OBJECT, obj as u64))
+        TaggedOutcome::Item(alloc_tagged(TAG_MAP, map as u64))
     }
     fn close(&mut self) {
         unsafe { self.up.close(); }
@@ -3326,14 +3326,14 @@ unsafe fn record_to_string_array(fields: &[Vec<u8>]) -> *mut u8 {
     alloc_tagged(TAG_ARRAY, arr as u64)
 }
 
-/// Build a boxed `{ String: String }` record (TAG_OBJECT) from a header + a data row, last-wins on
+/// Build a boxed `{ String: String }` LinMap from a header + a data row, last-wins on
 /// duplicate header names, lenient on ragged rows (short row -> omit trailing keys; surplus fields
 /// dropped). Used by `recordRows`.
 unsafe fn record_to_object(header: &[Vec<u8>], row: &[Vec<u8>]) -> *mut u8 {
-    use crate::object::{lin_object_alloc, lin_object_set};
+    use crate::map::{lin_map_alloc, lin_map_set};
     use crate::string::lin_string_release;
-    use crate::tagged::{alloc_tagged, TAG_OBJECT, TAG_STR};
-    let obj = lin_object_alloc(header.len().max(1) as u32);
+    use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TaggedVal};
+    let map = lin_map_alloc(header.len().max(1) as u32);
     for (i, key_bytes) in header.iter().enumerate() {
         if i >= row.len() {
             break; // short row: omit the trailing keys
@@ -3343,11 +3343,11 @@ unsafe fn record_to_object(header: &[Vec<u8>], row: &[Vec<u8>]) -> *mut u8 {
         let mut tv: TaggedVal = std::mem::zeroed();
         tv.tag = TAG_STR;
         tv.payload = v as u64;
-        lin_object_set(obj, k, &tv); // last-wins: a repeated key overwrites
+        lin_map_set(map, k, &tv); // last-wins: a repeated key overwrites
         lin_string_release(k);
         lin_string_release(v);
     }
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
 /// `rows(s)`: a `Stream<String[]>` over a byte stream, quote-aware (see CsvAssembler). Buffers only
@@ -4350,11 +4350,9 @@ mod tests {
                 static SEEN_NAMES: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
             }
             unsafe extern "C-unwind" fn body(_env: *mut u8, meta: *mut u8, data: *mut u8) -> *mut u8 {
-                // Record the entry name from the meta object.
-                let obj = crate::tagged::lin_unbox_ptr(meta) as *const crate::object::LinObject;
-                let k = crate::fs::make_string("name");
-                let v = crate::object::lin_object_get(obj, k);
-                crate::string::lin_string_release(k);
+                // Record the entry name from the meta map.
+                let map = crate::tagged::lin_unbox_ptr(meta) as *const crate::map::LinMap;
+                let v = crate::map::lin_map_get_bytes(map, b"name".as_ptr(), 4);
                 if !v.is_null() {
                     let name_s = crate::fs::resolve_lin_str(v as *const u8).unwrap_or_default();
                     SEEN_NAMES.with(|s| s.borrow_mut().push(name_s.clone()));
@@ -4424,15 +4422,11 @@ mod tests {
             loop {
                 match pull_tagged(unwrap_stream(m)) {
                     TaggedOutcome::Item(item) => {
-                        let obj = crate::tagged::lin_unbox_ptr(item) as *const crate::object::LinObject;
-                        let kn = crate::fs::make_string("name");
-                        let vn = crate::object::lin_object_get(obj, kn);
+                        let map = crate::tagged::lin_unbox_ptr(item) as *const crate::map::LinMap;
+                        let vn = crate::map::lin_map_get_bytes(map, b"name".as_ptr(), 4);
                         names.push(crate::fs::resolve_lin_str(vn as *const u8).unwrap());
-                        crate::string::lin_string_release(kn);
-                        let ks = crate::fs::make_string("size");
-                        let vs = crate::object::lin_object_get(obj, ks);
+                        let vs = crate::map::lin_map_get_bytes(map, b"size".as_ptr(), 4);
                         sizes.push((*vs).payload as i64);
-                        crate::string::lin_string_release(ks);
                         crate::tagged::lin_tagged_release(item);
                     }
                     TaggedOutcome::Eof => break,
@@ -4465,14 +4459,12 @@ mod tests {
             loop {
                 match pull_tagged(unwrap_stream(fs)) {
                     TaggedOutcome::Item(item) => {
-                        let obj = crate::tagged::lin_unbox_ptr(item) as *const crate::object::LinObject;
-                        let kd = crate::fs::make_string("data");
-                        let vd = crate::object::lin_object_get(obj, kd);
+                        let map = crate::tagged::lin_unbox_ptr(item) as *const crate::map::LinMap;
+                        let vd = crate::map::lin_map_get_bytes(map, b"data".as_ptr(), 4);
                         let a = (*vd).payload as *const crate::array::LinArray;
                         let n = crate::array::lin_array_length(a) as usize;
                         let d = (*a).data as *const u8;
                         bodies.push(std::slice::from_raw_parts(d, n).to_vec());
-                        crate::string::lin_string_release(kd);
                         crate::tagged::lin_tagged_release(item);
                     }
                     TaggedOutcome::Eof => break,
