@@ -184,4 +184,6 @@ export val loadAverage = (): Float64[] | Error =>
 //   available), or an Error if the platform's memory facility cannot be read. Note: `free`
 //   semantics vary across operating systems — a rough capacity gauge, not exact.
 export val memInfo = (): MemInfo | Error =>
-  lin_os_mem_info()
+  val r = lin_os_mem_info()
+  if r is Error then { "type": r["type"], "message": r["message"] }
+  else { "total": r["total"], "free": r["free"] }
