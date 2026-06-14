@@ -442,7 +442,7 @@ pub unsafe extern "C" fn lin_tagged_retain(p: *const u8) {
 /// Release it with `lin_object_release` once done — this is unconditional and uniform.
 #[no_mangle]
 pub unsafe extern "C" fn lin_union_force_to_object(tv: *const u8) -> *mut LinObject {
-    use crate::tagged::{TAG_OBJECT, TAG_RECORD, TaggedVal};
+    use crate::tagged::{TAG_OBJECT, TAG_RECORD, TAG_MAP, TaggedVal};
     if tv.is_null() {
         return std::ptr::null_mut();
     }
@@ -455,6 +455,24 @@ pub unsafe extern "C" fn lin_union_force_to_object(tv: *const u8) -> *mut LinObj
             }
             // Retain so caller uniformly owns +1 and calls lin_object_release.
             (*obj).refcount += 1;
+            obj
+        }
+        TAG_MAP => {
+            // Convert LinMap → fresh +1 LinObject by iterating the hash table slots.
+            // Each slot's value is retained into the object (lin_object_set takes its own ref).
+            let map = src.payload as *const crate::map::LinMap;
+            if map.is_null() {
+                return std::ptr::null_mut();
+            }
+            let len = (*map).len;
+            let obj = lin_object_alloc(len.max(2));
+            let cap = (*map).cap as usize;
+            for i in 0..cap {
+                let slot = (*map).slots.add(i);
+                if (*slot).key.is_null() { continue; }
+                // lin_object_set retains the key and the value's payload; key RC stays balanced.
+                lin_object_set(obj, (*slot).key, &(*slot).value);
+            }
             obj
         }
         TAG_RECORD => {
