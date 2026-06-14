@@ -338,8 +338,8 @@ impl Type {
                 if !fields.is_empty() && fields.values().all(|f| f.is_sealed_array_field_packable()))
     }
 
-    /// Returns true for the dynamic "any" JSON type (TypeVar(u32::MAX)).
-    pub fn is_json(&self) -> bool {
+    /// Returns true for the `AnyVal` dynamic top type (`TypeVar(u32::MAX)`).
+    pub fn is_any_val(&self) -> bool {
         matches!(self, Type::TypeVar(u32::MAX))
     }
 
