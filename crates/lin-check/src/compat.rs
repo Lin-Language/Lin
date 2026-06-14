@@ -305,34 +305,6 @@ fn union_compat(
     }
 }
 
-#[allow(dead_code)]
-pub fn is_exact_match(value_type: &Type, target_type: &Type) -> bool {
-    if value_type == target_type {
-        return true;
-    }
-
-    match (value_type, target_type) {
-        (Type::Object { fields: value_fields, .. }, Type::Object { fields: target_fields, .. }) => {
-            value_fields.len() == target_fields.len()
-                && target_fields.iter().all(|(key, target_ty)| {
-                    value_fields
-                        .get(key)
-                        .map(|vt| is_exact_match(vt, target_ty))
-                        .unwrap_or(false)
-                })
-        }
-        (Type::Array(a), Type::Array(b)) => is_exact_match(a, b),
-        (Type::FixedArray(a), Type::FixedArray(b)) => {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b.iter())
-                    .all(|(av, bv)| is_exact_match(av, bv))
-        }
-        // Named types: treat as compatible for exact match (can't expand without env)
-        (Type::Named(a), Type::Named(b)) => a == b,
-        _ => false,
-    }
-}
 
 /// True when assigning a `Json` value into `target` would silently skip validation of a
 /// *structured object shape* — i.e. `target` is (or unfolds to) an `Object` with at least one
