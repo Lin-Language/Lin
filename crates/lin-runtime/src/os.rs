@@ -15,9 +15,9 @@
 
 use crate::array::{lin_array_alloc, lin_array_push_tagged};
 use crate::fs::{make_error_tagged, make_string};
-use crate::object::{lin_object_alloc, lin_object_set, LinObject};
+use crate::map::{LinMap, lin_map_alloc, lin_map_set};
 use crate::string::lin_string_release;
-use crate::tagged::{alloc_tagged, TaggedVal, TAG_ARRAY, TAG_FLOAT64, TAG_INT64, TAG_OBJECT, TAG_STR};
+use crate::tagged::{alloc_tagged, TaggedVal, TAG_ARRAY, TAG_FLOAT64, TAG_INT64, TAG_MAP, TAG_STR};
 
 /// A fresh owned raw `LinString*` (the ABI for a `() => String` intrinsic — codegen reads the
 /// result as a bare LinString, NOT a boxed TaggedVal; cf. `lin_process_cwd`).
@@ -275,20 +275,17 @@ pub unsafe extern "C" fn lin_os_mem_info() -> *mut u8 {
     if total == 0 {
         return make_error_tagged("memInfo: cannot read system memory");
     }
-    let obj = lin_object_alloc(4);
-    set_int64(obj, "total", total as i64);
-    set_int64(obj, "free", free as i64);
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    let map = lin_map_alloc(4);
+    map_set_int64(map, "total", total as i64);
+    map_set_int64(map, "free", free as i64);
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
-/// Set an Int64-valued field on `obj`. The key string's local +1 is released after the set
-/// (lin_object_set takes its own reference); the Int64 payload is inline (not heap), so no
-/// value release is needed.
-unsafe fn set_int64(obj: *mut LinObject, key: &str, val: i64) {
+unsafe fn map_set_int64(map: *mut LinMap, key: &str, val: i64) {
     let k = make_string(key);
     let mut tv: TaggedVal = std::mem::zeroed();
     tv.tag = TAG_INT64;
     tv.payload = val as u64;
-    lin_object_set(obj, k, &tv);
+    lin_map_set(map, k, &tv);
     lin_string_release(k);
 }
