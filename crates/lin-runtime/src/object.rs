@@ -1003,11 +1003,17 @@ pub unsafe fn tagged_as_object(tv: *const TaggedVal) -> Option<(*const LinObject
 /// Check if a boxed value (TaggedVal*) is an object that has `key`. Returns 0 for null
 /// or non-object values. Does the tag check + unbox internally so callers need no
 /// branching (used by the IR `has`-pattern lowering).
+/// Also accepts TAG_MAP: a LinMap is a valid field-presence container for structural types
+/// (e.g. `is Error` on a map-backed error value must work without reconstruction).
 #[no_mangle]
 pub unsafe extern "C" fn lin_value_has_field(tagged: *const u8, key: *const LinString) -> u8 {
-    use crate::tagged::TaggedVal;
+    use crate::tagged::{TaggedVal, TAG_MAP};
     if tagged.is_null() { return 0; }
     let tv = tagged as *const TaggedVal;
+    if (*tv).tag == TAG_MAP {
+        let map = (*tv).payload as *const crate::map::LinMap;
+        return if map.is_null() { 0 } else { crate::map::lin_map_has(map, key) };
+    }
     match tagged_as_object(tv) {
         Some((obj, owned)) => {
             let result = lin_object_has(obj, key);

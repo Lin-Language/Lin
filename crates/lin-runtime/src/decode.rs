@@ -20,7 +20,7 @@ use crate::tagged::{
     TaggedVal, tagged_as_f64, lin_unbox_ptr,
     TAG_NULL, TAG_BOOL, TAG_INT8, TAG_INT16, TAG_INT32, TAG_INT64,
     TAG_UINT8, TAG_UINT16, TAG_UINT32, TAG_UINT64, TAG_FLOAT32, TAG_FLOAT64,
-    TAG_STR, TAG_OBJECT, TAG_ARRAY, TAG_RECORD,
+    TAG_STR, TAG_OBJECT, TAG_ARRAY, TAG_RECORD, TAG_MAP,
 };
 
 // Descriptor opcodes — keep in sync with DescEncoder in lin-codegen.
@@ -223,6 +223,41 @@ unsafe fn validate(
             Ok(())
         }
         KIND_OBJECT => {
+            // Accept TAG_OBJECT, TAG_RECORD (sealed struct, Stage 6a), and TAG_MAP (map-backed
+            // structural types such as error objects returned as LinMap).
+            // For TAG_MAP: field lookup goes through lin_map_get_bytes (same byte-based lookup,
+            // no temp LinString alloc). For TAG_OBJECT/TAG_RECORD: use the existing LinObject path.
+            if tag == TAG_MAP {
+                let map = (*(value as *const TaggedVal)).payload as *const crate::map::LinMap;
+                let nfields = desc.u32_at(node + 1) as usize;
+                let mut cur = node + 5;
+                return (|| -> Result<(), String> {
+                    for _ in 0..nfields {
+                        let klen = desc.u16_at(cur) as usize;
+                        let key = desc.str_at(cur + 2, klen);
+                        let nullable = desc.u8_at(cur + 2 + klen) != 0;
+                        let val_off = desc.u32_at(cur + 2 + klen + 1) as usize;
+                        cur += 2 + klen + 1 + 4;
+                        let field = if map.is_null() {
+                            std::ptr::null()
+                        } else {
+                            crate::map::lin_map_get_bytes(map, key.as_ptr(), key.len() as u32)
+                        };
+                        let field_present = !field.is_null() && (*field).tag != TAG_NULL;
+                        if !field_present {
+                            if nullable { continue; }
+                            return Err(format!("missing required field \"{}\" at {}", key, path));
+                        }
+                        let base_len = path.len();
+                        path.push('.');
+                        path.push_str(key);
+                        let r = validate(field as *const u8, desc, val_off, path);
+                        if r.is_ok() { path.truncate(base_len); }
+                        r?;
+                    }
+                    Ok(())
+                })();
+            }
             // Stage 6a: accept TAG_RECORD (sealed struct by pointer) in addition to TAG_OBJECT.
             // Materialize the sealed struct to a transient LinObject so the field-walk logic below
             // can use `lin_object_get_bytes` uniformly. The materialized object is owned (+1) and
