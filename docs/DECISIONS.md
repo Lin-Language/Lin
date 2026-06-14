@@ -2146,7 +2146,13 @@ for later; the clean sound rule for records is "fields must agree or error".
 
 ## ADR-062: Representation-inference pass (packed-vs-boxed as a dataflow fact, not a Type attribute)
 
-**Status**: Accepted (single-owner direction landed incrementally; `verify()` now covers every
+**Status**: **SUPERSEDED by ADR-069** (the representation reset, 2026-06-14). The flow-sensitive
+packed-vs-boxed inference + `verify()` lattice + boxed-shadow this ADR introduced were the origin of
+the "path-9" dead ends; the reset makes representation **type-determined** (a record is *always* a flat
+packed struct; the dynamic case is the runtime-tagged `TAG_RECORD`/`AnyVal`), deletes the flow inference
+and the boxed shadow, and collapses `repr.rs` to a pure layout calculator. Retained below for history.
+
+> Original status: Accepted (single-owner direction landed incrementally; `verify()` now covers every
 repr-consuming opcode; the producer/consumer literal-drift prerequisite is fixed; heap-field array
 packing characterized as a sound partial with one whole-program blocker — see Consequences).
 
@@ -2676,3 +2682,73 @@ the calling thread (documented in the `body` stdlib doc comment).
   require the parser to be a user-supplied function, turning `entries` into a combinator. This
   is a viable design for a typed CSV reader but wrong for a raw tar adapter where body parsing
   is always the caller's responsibility.
+
+## ADR-069: The representation reset — records are flat packed value structs; representation is type-determined (supersedes ADR-062)
+
+**Status**: Accepted (landed incrementally on `master` over the 2026-06-12…14 reset; Stages 0–4 + 6a +
+the Stage-6b `Json`→`AnyVal` rename + the genuine-dynamic-object → `LinMap` conversion are merged).
+Full design + staged plan: `docs/project-actually-improve-performance.md` (see its §0.1 for the as-built
+status and the honest measurement). Supersedes **ADR-062** and folds in **ADR-063/064/067** (SumNode,
+the `T|Null` repr frontier) as the now-unified representation model.
+
+**Context.** ADR-062 made a record's representation a *flow-sensitive dataflow fact* (packed where
+provably safe, boxed `LinObject` otherwise), reconciled occurrence-by-occurrence by a `repr.rs`
+inference + `verify()` lattice with a "boxed shadow" join. Every hard seam (record unions, map-value
+packing, cross-module worker transfer) was a packed-vs-boxed reconciliation, and each fix spawned
+another — the "path-9" dead ends. The cost it was clawing back was real (field access on a record was a
+string-keyed `lin_object_get`, an LLVM optimisation barrier) but the mechanism never converged.
+
+**Decision.** Representation is **type-determined, not inferred**:
+
+1. **A record is always a flat packed sealed struct** (ADR-057 layout: header then inline scalar fields
+   + 8-byte owned pointer slots for heap fields). Field access is **always** a constant-offset load.
+   There is no boxed shadow and no flow-sensitive packed-vs-boxed choice. `repr.rs` is a pure layout
+   calculator. Records keep **reference semantics** (`val b = a` shares the pointer; mutation through a
+   parameter is visible) — so Perceus/`rc_elide` is a pure optimization, never a correctness obligation.
+2. **The dynamic case is runtime-tagged, not a compile-time repr.** When a record flows into a slot whose
+   static type is dynamic (`AnyVal`) or a union, it is wrapped as **`TAG_RECORD`** — a tagged sealed
+   pointer (modelled on `SumNode`, ADR-064) — and dispatched on the runtime tag. No materialization to a
+   string-keyed object on the boundary. `match … is T` narrows a union value to the **typed sealed
+   pointer**, so member reads stay constant-offset.
+3. **Unions of records have a physical repr.** `T | Null` over a sealed record is `Layout::NullableRecord`
+   (a nullable sealed pointer — no tag word, null is the discriminant); `A | B` record unions are a
+   synthesized tag + sealed payload pointer. This dissolved the union-materialization cost that three
+   prior boxed-shadow attempts could not (it required deleting the shadow *first*).
+4. **`Json` is renamed `AnyVal`** — the JSON-shaped dynamic top type. It deliberately **cannot smuggle a
+   handle**: `Stream`/`Promise`/`Shared`/`TarEntry` are rejected from widening into it (compat guards);
+   code that must carry an opaque/parametric value uses generics `<T>` (a non-wildcard TypeVar *does*
+   carry handles) or a union for a closed set. `Json` is retained as a deprecated resolver alias.
+   (Open: `Function`/`Iterator` currently still widen into `AnyVal` — a coherence wrinkle, undecided.)
+5. **The conflated "JSON object" is being dissolved into a real hashmap.** Genuinely-dynamic
+   string-keyed objects (HTTP request/URL/process/regex/env) now build a **`LinMap` (`TAG_MAP`)**, not a
+   `LinObject` — consumers already dual-dispatch `TAG_MAP` (`obj[k]`, keys/values/entries, eq, toString).
+   This drops insertion-order for those objects (hash order); the few order-sensitive cases use an
+   explicit ordered map or a pair list (§2.6 — one of the five userland-visible changes, see the project
+   doc §7.2).
+
+**Consequences.**
+- The "path-9" problem space is **deleted**, not patched: no flow inference, no boxed shadow, no
+  per-occurrence reconciliation. The compiler is *smaller* (e.g. a −135-line Stage-6a dead-code sweep).
+- **Performance is at ~parity, not faster — and that is the honest, measured outcome.** A cycle profile
+  (project doc §0.1) shows ~85% of the reference workload (typed RAPTOR) is the **call/value axis**
+  (closure/loop dispatch, control flow); representation touches ≤~4%, and `tagged_arith` is 0.0% (typed
+  arithmetic fully inlines). So the reset is an **architecture + simplification** win that removes a
+  whole class of dead ends and makes Go-style packed value layouts the model — *not* a RAPTOR speedup.
+  The real perf lever (the call/value axis) is a separate project. §5.6 inline-array layout is retired
+  (pointer-chase measured at 0.2%).
+- **Not yet finished:** `LinObject` is not fully deleted. The genuine-dynamic producers are converted,
+  but ~10 *known-shape* runtime result objects (`FileStat`, `MemInfo`, `Datagram`, `TimeComponents`,
+  the `Error` `{type,message}` shape, …) are still built as `LinObject` because they are accessed via
+  concrete record types after `is` narrowing (direct `lin_object_get`); making them `TAG_RECORD` requires
+  refactoring each runtime intrinsic to return primitives and construct the typed record Lin-side (the
+  named descriptor is a compile-time codegen global). That work is simplification-only (no perf gain) and
+  is tracked but not committed to.
+
+**Rejected alternatives.**
+- **Keep ADR-062's flow inference and harden it.** Three union attempts and the map-value seam proved the
+  packed-vs-boxed reconciliation does not converge; the boxed shadow is the root, and it had to be deleted
+  rather than reconciled.
+- **A true `Any` top type that holds handles.** Smuggling a live handle through a dynamic value type is
+  unsound (RC/identity/serialization); generics + unions cover the real cases. See §2.5 / the compat guards.
+- **A tracing GC to absorb the alloc traffic.** Measured CLOSED-NEGATIVE earlier (no workload is
+  alloc-bound; the cost is work-per-alloc on the call/value axis), independent of this ADR.
