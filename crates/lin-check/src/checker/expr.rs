@@ -650,18 +650,22 @@ impl Checker {
                     self.object_index_nonliteral(fields, &typed_key.ty())
                 }
             }
-            // Typed index-signature map `{ String: T }` (ADR-055): a key access yields `T | Null`
-            // (the missing-key → Null safe-bracket rule, §6.1). No per-key field tracking — the
-            // key set is dynamic by construction. The key must be String-ish (mirrors the
-            // index-assign guard): a non-String key (e.g. a numeric `date`) cannot index a string
-            // map — caught here rather than producing invalid codegen (`lin_map_get` takes a string
-            // pointer, so an integer key emits a malformed call).
-            Type::Map(val_ty) => {
+            // Typed index-signature map `{ K: V }` (ADR-055 + numeric-key extension): a key access
+            // yields `V | Null` (the missing-key → Null safe-bracket rule, §6.1). No per-key field
+            // tracking — the key set is dynamic by construction. The key type must be compatible with
+            // the map's declared key type.
+            Type::Map { key: map_key_ty, value: val_ty } => {
                 let key_ty = typed_key.ty();
-                if !key_ty.is_string_ish() && !matches!(key_ty, Type::TypeVar(_)) {
+                let key_ok = if map_key_ty.is_integer() {
+                    key_ty.is_integer() || matches!(key_ty, Type::TypeVar(_))
+                } else {
+                    // String-keyed map
+                    key_ty.is_string_ish() || matches!(key_ty, Type::TypeVar(_))
+                };
+                if !key_ok {
                     return Err(Diagnostic::error(
                         span,
-                        format!("a `{}` is keyed by String, but the key is `{}`", obj_ty, key_ty),
+                        format!("a `{}` is keyed by `{}`, but the key is `{}`", obj_ty, map_key_ty, key_ty),
                     ));
                 }
                 Type::flatten_union(vec![(**val_ty).clone(), Type::Null])
@@ -871,13 +875,18 @@ impl Checker {
                     self.object_index_nonliteral(fields, &typed_key.ty())
                 }
             }
-            Type::Map(val_ty) => {
-                // Map key must be String-ish (mirrors `infer_index` / the index-assign guard).
+            Type::Map { key: map_key_ty, value: val_ty } => {
+                // Map key must match the map's key type (mirrors `infer_index` / the index-assign guard).
                 let key_ty = typed_key.ty();
-                if !key_ty.is_string_ish() && !matches!(key_ty, Type::TypeVar(_)) {
+                let key_ok = if map_key_ty.is_integer() {
+                    key_ty.is_integer() || matches!(key_ty, Type::TypeVar(_))
+                } else {
+                    key_ty.is_string_ish() || matches!(key_ty, Type::TypeVar(_))
+                };
+                if !key_ok {
                     return Err(Diagnostic::error(
                         span,
-                        format!("a `{}` is keyed by String, but the key is `{}`", obj_ty, key_ty),
+                        format!("a `{}` is keyed by `{}`, but the key is `{}`", obj_ty, map_key_ty, key_ty),
                     ));
                 }
                 Type::flatten_union(vec![(**val_ty).clone(), Type::Null])
@@ -1048,7 +1057,7 @@ impl Checker {
                 let base_ty = self.place_path_type(base)?;
                 let base_ty = self.resolve_named_body(&base_ty).unwrap_or(base_ty);
                 match base_ty {
-                    Type::Map(val_ty) => {
+                    Type::Map { value: val_ty, .. } => {
                         Some(Type::flatten_union(vec![(*val_ty).clone(), Type::Null]))
                     }
                     // `T[]` indexed: element type (array reads are not `| Null`, so a null test on
@@ -1712,15 +1721,21 @@ impl Checker {
                 }
                 Ok(Some(self.check_object_fields(fields, expected_fields, *sealed, span)?))
             }
-            // An object literal checked against a typed index-signature map `{ String: T }`
-            // (ADR-055): each literal value must be `T`; the result is typed `Map(T)` and lowered
-            // into a `LinMap`. The empty `{}` literal is the common case (`var m: { String: T } =
-            // {}`), which produces an empty hashed map of the right type — this is how `{}` infers
-            // a map from its assignment-target / return-type context.
-            Type::Map(val_ty) => {
+            // An object literal checked against a typed index-signature map `{ K: V }`
+            // (ADR-055 + numeric-key extension): each literal value must be `V`; the result is
+            // typed `Map{K,V}` and lowered into a `LinMap`. The empty `{}` literal is the common
+            // case (`var m: { String: T } = {}`), which produces an empty hashed map of the right
+            // type — this is how `{}` infers a map from its assignment-target / return-type context.
+            // For Int-keyed maps, only empty `{}` literals are accepted here (no int-literal-keyed
+            // object syntax yet); non-empty int-map literals fall through to inference.
+            Type::Map { key: map_key_ty, value: val_ty } => {
                 let mut typed_fields = Vec::new();
                 for field in fields {
                     if let ObjectField::Pair(Expr::StringLit(key, _), val_expr) = field {
+                        // Only allow string-literal keys for String-keyed maps.
+                        if map_key_ty.is_integer() {
+                            return Ok(None);
+                        }
                         let typed_val = self.check_expr(val_expr, val_ty)?;
                         typed_fields.push((key.clone(), typed_val));
                     } else {
@@ -1731,7 +1746,7 @@ impl Checker {
                 Ok(Some(TypedExpr::MakeObject {
                     fields: typed_fields,
                     spreads: Vec::new(),
-                    ty: Type::Map(val_ty.clone()),
+                    ty: Type::Map { key: map_key_ty.clone(), value: val_ty.clone() },
                     span,
                 }))
             }
@@ -1953,14 +1968,19 @@ impl Checker {
                     self.infer_expr(value)?
                 }
             }
-            // Typed index-signature map `{ String: T }` (ADR-055): the key must be a String and
-            // the value must be `T`.
-            Type::Map(val_ty) => {
+            // Typed index-signature map `{ K: V }` (ADR-055 + numeric-key extension): the key must
+            // be compatible with `K` and the value must be `V`.
+            Type::Map { key: map_key_ty, value: val_ty } => {
                 let key_ty = typed_key.ty();
-                if !key_ty.is_string_ish() && !matches!(key_ty, Type::TypeVar(_)) {
+                let key_ok = if map_key_ty.is_integer() {
+                    key_ty.is_integer() || matches!(key_ty, Type::TypeVar(_))
+                } else {
+                    key_ty.is_string_ish() || matches!(key_ty, Type::TypeVar(_))
+                };
+                if !key_ok {
                     return Err(Diagnostic::error(
                         span,
-                        format!("a `{}` is keyed by String, but the key is `{}`", obj_ty, key_ty),
+                        format!("a `{}` is keyed by `{}`, but the key is `{}`", obj_ty, map_key_ty, key_ty),
                     ));
                 }
                 self.check_expr(value, val_ty)?
@@ -2087,7 +2107,7 @@ pub(crate) fn type_is_streamish(ty: &Type) -> bool {
 /// directing field but a nested one does.
 pub(crate) fn expected_field_needs_directing(ty: &Type) -> bool {
     match ty {
-        Type::StrLit(_) | Type::Map(_) => true,
+        Type::StrLit(_) | Type::Map { .. } => true,
         Type::Object { sealed: true, .. } => true,
         Type::Object { fields, sealed: false } => fields.values().any(expected_field_needs_directing),
         Type::Array(elem) | Type::Iterator(elem) | Type::Shared(elem) | Type::Stream(elem) => {
@@ -2186,7 +2206,7 @@ pub(crate) fn erase_generic_type_vars(ty: &Type) -> Type {
         Type::Shared(t) => Type::Shared(Box::new(erase_generic_type_vars(t))),
         Type::Stream(t) => Type::Stream(Box::new(erase_generic_type_vars(t))),
         Type::Promise(t) => Type::Promise(Box::new(erase_generic_type_vars(t))),
-        Type::Map(t) => Type::Map(Box::new(erase_generic_type_vars(t))),
+        Type::Map { key, value } => Type::Map { key: Box::new(erase_generic_type_vars(key)), value: Box::new(erase_generic_type_vars(value)) },
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(erase_generic_type_vars).collect()),
         Type::Union(ts) => Type::Union(ts.iter().map(erase_generic_type_vars).collect()),
         Type::Object { fields, sealed } => Type::Object {
@@ -2208,7 +2228,8 @@ pub(crate) fn erase_generic_type_vars(ty: &Type) -> Type {
 pub(crate) fn type_mentions_generic_tv(ty: &Type) -> bool {
     match ty {
         Type::TypeVar(id) => *id != u32::MAX,
-        Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) | Type::Stream(inner) | Type::Promise(inner) | Type::Map(inner) => type_mentions_generic_tv(inner),
+        Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) | Type::Stream(inner) | Type::Promise(inner) => type_mentions_generic_tv(inner),
+        Type::Map { key, value } => type_mentions_generic_tv(key) || type_mentions_generic_tv(value),
         Type::FixedArray(elems) => elems.iter().any(type_mentions_generic_tv),
         Type::Union(variants) => variants.iter().any(type_mentions_generic_tv),
         Type::Object { fields, .. } => fields.values().any(type_mentions_generic_tv),

@@ -366,15 +366,33 @@ impl<'ctx> Codegen<'ctx> {
         // The key is a String (raw LinString*, or unbox a Json/union-boxed key); the result is
         // `T | Null` — `lin_map_get` returns null for a missing key, which `unbox_tagged_val_to_type`
         // maps to the language Null.
-        if let Type::Map(map_elem) = obj_ty {
+        if let Type::Map { key: map_key_ty, value: map_elem } = obj_ty {
+            let _ = map_elem;
+            // Int-keyed map: coerce the key to i64 and call lin_map_get_int.
+            if map_key_ty.is_integer() {
+                let i64_key = if key.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(key.into_int_value(), self.context.i64_type(), "ir_mkey_i64")
+                } else if key.is_pointer_value() {
+                    let unboxed = self.unbox_value(key, &Type::Int64);
+                    unboxed.into_int_value()
+                } else {
+                    self.context.i64_type().const_zero()
+                };
+                let tagged = self.builder.call(self.rt.map_get_int, &[container.into(), i64_key.into()], "ir_mget_int").try_as_basic_value().unwrap_basic();
+                return if Self::is_union_type(result_ty) {
+                    tagged
+                } else {
+                    self.unbox_tagged_val_to_type(tagged, result_ty)
+                };
+            }
+            // String-keyed map path (existing logic).
             // unboxed-sumtype Stage 3: a `{ String: Expr }` map slot holds a KEEP-PACKED `TAG_SUMNODE`
             // (the `emit_map_set` keep-packed store). Decide the keep-packed read-back from the map's
-            // VALUE type (`obj_ty = Map(elem)`) — not `result_ty`, which is the wider `Expr | Null`
+            // VALUE type (`obj_ty = Map{value:elem}`) — not `result_ty`, which is the wider `Expr | Null`
             // safe-access view whose `Named`/`| Null` shape the codegen sum predicate may not match.
             // When the value type is a sum type, unwrap the slot's TAG_SUMNODE to the still-packed
             // `*SumNode` (+retain) — the read-back twin of the keep-packed store. A missing key unwraps
             // to a null pointer (Null). The downstream `sum|Null` consumer materializes via `box_value`.
-            let _ = map_elem;
             let key_str = if key_ty.is_string_ish() {
                 key
             } else if Self::is_union_type(key_ty) && key.is_pointer_value() {
@@ -803,6 +821,34 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Store `value` into an Int-keyed map slot via `lin_map_set_int`.
+    /// `map_ptr` is the raw `LinMap*`; `int_key` is an i64 LLVM value; `elem_ty` is the map's value type.
+    /// Mirrors `emit_map_set` but calls the int-key runtime entry point.
+    pub(crate) fn emit_map_set_int(&mut self, map_ptr: BasicValueEnum<'ctx>, int_key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type, elem_ty: &Type, val_repr: &lin_ir::repr::Repr) {
+        // Reuse the same value-boxing logic from emit_map_set, then call lin_map_set_int.
+        let _ = val_repr; // repr handling same as String-map
+        if Self::is_flat_scalar(elem_ty) {
+            let coerced = if val_ty == elem_ty {
+                value
+            } else {
+                self.compile_ir_coerce(value, val_ty, elem_ty)
+            };
+            let stack_tagged = self.build_tagged_val_alloca(&coerced, elem_ty);
+            self.builder.call(self.rt.map_set_int,
+                &[map_ptr.into(), int_key.into(), stack_tagged.into()], "");
+            return;
+        }
+        let val_is_fresh_box = !Self::is_union_type(val_ty);
+        let val_tagged = if val_is_fresh_box {
+            self.box_value(value, val_ty)
+        } else { value };
+        self.builder.call(self.rt.map_set_int,
+            &[map_ptr.into(), int_key.into(), val_tagged.into()], "");
+        if val_is_fresh_box && val_tagged.is_pointer_value() {
+            self.builder.call(self.rt.tagged_release, &[val_tagged.into()], "");
+        }
+    }
+
     /// Store `value` into an array slot: `lin_array_set(arr_ptr, idx_i64, tagged(value))`.
     /// `arr_ptr` must already be a RAW (unboxed) `LinArray*`.
     ///
@@ -960,11 +1006,15 @@ impl<'ctx> Codegen<'ctx> {
                     self.emit_object_set(obj, key_str, value, val_ty);
                 }
             }
-            // Typed index-signature map `{ String: T }` (ADR-055): O(1) hashed insert/overwrite.
-            // Pass the map's value type `T` so a flat-scalar `T` is stored UNBOXED (inline in the
-            // slot's TaggedVal, no heap box) and a narrower source value is widened to `T`.
-            Type::Map(elem) => {
-                if obj.is_pointer_value() && key.is_pointer_value() {
+            // Typed index-signature map `{ K: V }` (ADR-055 + numeric-key): O(1) hashed insert/overwrite.
+            // Pass the map's value type `V` so a flat-scalar `V` is stored UNBOXED (inline in the
+            // slot's TaggedVal, no heap box) and a narrower source value is widened to `V`.
+            Type::Map { key: map_key_ty, value: elem } => {
+                if map_key_ty.is_integer() {
+                    // Int-keyed map: coerce key to i64 and call lin_map_set_int.
+                    let i64_key = self.index_value_to_i64(key);
+                    self.emit_map_set_int(obj, i64_key.into(), value, val_ty, elem, val_repr);
+                } else if obj.is_pointer_value() && key.is_pointer_value() {
                     let key_str = resolve_obj_key(self, key);
                     self.emit_map_set(obj, key_str, value, val_ty, elem, val_repr);
                 }
@@ -1090,13 +1140,13 @@ impl<'ctx> Codegen<'ctx> {
         val_ty: &Type,
         obj_ty: &Type,
     ) {
-        // Find a Map(elem) variant in the union, if any.
+        // Find a Map{value:elem} variant in the union, if any.
         let map_elem: Option<Type> = match obj_ty {
             Type::Union(vs) => vs.iter().find_map(|v| match v {
-                Type::Map(e) => Some((**e).clone()),
+                Type::Map { value: e, .. } => Some((**e).clone()),
                 _ => None,
             }),
-            Type::Map(e) => Some((**e).clone()),
+            Type::Map { value: e, .. } => Some((**e).clone()),
             _ => None,
         };
         let Some(elem) = map_elem else {
@@ -1601,7 +1651,8 @@ impl<'ctx> Codegen<'ctx> {
             return true;
         }
         match ty {
-            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Map(t) => Self::ty_contains_sealed(t),
+            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) => Self::ty_contains_sealed(t),
+            Type::Map { value: t, .. } => Self::ty_contains_sealed(t),
             Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(Self::ty_contains_sealed),
             _ => false,
         }
@@ -2089,7 +2140,7 @@ impl<'ctx> Codegen<'ctx> {
                 && Self::is_union_type(val_ty)
                 && Self::sealed_fields(&fld_ty).is_none()
                 && Self::sealed_array_elem(&fld_ty).is_none()
-                && !matches!(fld_ty, Type::Map(_));
+                && !matches!(fld_ty, Type::Map { .. });
             let owned = (*already_owned || repr_change) && !coerce_borrowed;
             if Self::sealed_field_kind(&fld_ty).is_some() && !owned && stored.is_pointer_value() {
                 self.builder.call(self.rt.rc_retain, &[stored.into_pointer_value().into()], "sealed_fld_retain");

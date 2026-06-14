@@ -405,7 +405,7 @@ pub fn intrinsic_conventions(intr: &Intrinsic) -> Option<IntrinsicConv> {
 /// (`ArrayGet` ret `Borrow` for the plain get, fresh +1 for the `_tagged` variant), rather than being
 /// re-derived inline at the RC-insertion site.
 pub fn index_result_convention(obj_ty: &Type, key_ty: &Type) -> Convention {
-    if matches!(obj_ty, Type::Map(_)) {
+    if matches!(obj_ty, Type::Map { .. }) {
         return Borrow;
     }
     if matches!(obj_ty, Type::Array(_) | Type::FixedArray(_)) || key_ty.is_numeric() {
@@ -482,7 +482,7 @@ fn is_concrete_rc_ty(ty: &Type) -> bool {
             | Type::Array(_)
             | Type::FixedArray(_)
             | Type::Object { .. }
-            | Type::Map(_)
+            | Type::Map { .. }
             | Type::Iterator(_)
             | Type::Function { .. }
     )
@@ -797,7 +797,7 @@ fn needs_owning_conv(ty: &Type) -> bool {
             | Type::Array(_)
             | Type::FixedArray(_)
             | Type::Object { .. }
-            | Type::Map(_)
+            | Type::Map { .. }
             | Type::Iterator(_)
             | Type::Function { .. }
             | Type::Union(_)

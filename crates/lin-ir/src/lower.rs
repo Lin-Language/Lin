@@ -1338,7 +1338,7 @@ impl FuncBuilder {
 fn is_rc_type(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Map(_) | Type::Iterator(_) | Type::Function { .. }
+        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Map { .. } | Type::Iterator(_) | Type::Function { .. }
     )
     // NOTE (unboxed-sumtype Stage 2): a sum value is a refcounted `*SumNode`, but it is NOT added to
     // `is_rc_type` — Stage 1 deliberately keeps sum types OUT of the generic owning-read path
@@ -1478,7 +1478,7 @@ fn param_elem_is_boxed_repr(param_ty: &Type) -> bool {
             // Never = an empty array literal `[]` whose element type was not yet resolved;
             // it is physically a 0xFF tagged array and must be coerced when flowing into a
             // sealed-record array param (e.g. `initial: Transfer[] = []` in an emitter call).
-            Type::TypeVar(_) | Type::Union(_) | Type::Map(_) | Type::Never
+            Type::TypeVar(_) | Type::Union(_) | Type::Map { .. } | Type::Never
             | Type::Object { sealed: false, .. }),
         _ => false,
     }
@@ -1548,7 +1548,8 @@ fn to_contains_sealed_array(ty: &Type) -> bool {
             return true;
         }
         match ty {
-            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Map(t) => contains(t),
+            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) => contains(t),
+            Type::Map { value: t, .. } => contains(t),
             Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(contains),
             _ => false,
         }
@@ -1579,7 +1580,7 @@ fn is_sealed_field_ty(ty: &Type) -> bool {
         || matches!(ty, Type::Bool)
         || ty.is_string_ish()
         || matches!(ty, Type::Array(_) | Type::FixedArray(_))
-        || matches!(ty, Type::Map(_))
+        || matches!(ty, Type::Map { .. })
         || is_sealed_scalar_repr(ty)
 }
 
@@ -4366,7 +4367,7 @@ fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut Lower
             // `lin_object_set` will retain it, so we use Transfer semantics (unregister) rather
             // than Retain to avoid RC inflation.  The original val_temp stays owned and is
             // released at scope exit (via its existing entry in the owned-temps table).
-            let (val_temp, val_ty) = if let Type::Map(map_val_ty) = &obj_ty {
+            let (val_temp, val_ty) = if let Type::Map { value: map_val_ty, .. } = &obj_ty {
                 if anon_object_slot_repr_differs(&val_ty, map_val_ty) {
                     let narrow_ty = *map_val_ty.clone();
                     let proj = builder.alloc_temp(narrow_ty.clone());

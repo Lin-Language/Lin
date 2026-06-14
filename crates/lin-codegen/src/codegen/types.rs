@@ -33,7 +33,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::Object { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             // A typed index-signature map (`{ String: T }`, ADR-055) is a `LinMap*` — an opaque
             // pointer to the hashed container.
-            Type::Map(_) => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Map { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Union(_) => {
                 // Tagged union: { i8 tag, [8 x i8] payload } — 9 bytes total.
                 // We use an opaque pointer to a heap-allocated tagged value.
@@ -82,7 +82,7 @@ impl<'ctx> Codegen<'ctx> {
     /// releasing an owned box (e.g. a TAG_RECORD field-lookup result from `lin_record_get_field`).
     pub(crate) fn result_is_heap_pointer(ty: &Type) -> bool {
         matches!(ty, Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_)
-            | Type::Object { .. } | Type::Map(_) | Type::Function { .. }
+            | Type::Object { .. } | Type::Map { .. } | Type::Function { .. }
             | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry)
     }
 
@@ -125,7 +125,7 @@ impl<'ctx> Codegen<'ctx> {
                 | Type::Array(_)
                 | Type::FixedArray(_)
                 | Type::Object { .. }
-                | Type::Map(_)
+                | Type::Map { .. }
                 | Type::Iterator(_)
                 | Type::Function { .. }
         )
@@ -198,7 +198,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::Float32 | Type::Float64 => TAG_FLOAT64,
             Type::Str | Type::StrLit(_) => TAG_STR,
             Type::Object { .. } => TAG_OBJECT,
-            Type::Map(_) => TAG_MAP,
+            Type::Map { .. } => TAG_MAP,
             Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => TAG_ARRAY,
             Type::Function { .. } => TAG_FUNCTION,
             _ => TAG_NULL,
@@ -238,7 +238,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::Str | Type::StrLit(_) => Some(Self::KIND_STRING),
             Type::Array(_) | Type::FixedArray(_) => Some(Self::KIND_ARRAY),
             // A `{ String: T }` index-signature map is a `*LinMap` owned-pointer heap field.
-            Type::Map(_) => Some(Self::KIND_MAP),
+            Type::Map { .. } => Some(Self::KIND_MAP),
             // A nested sealed record (a field whose type is itself sealed-eligible). The recursion
             // bottoms out: a field's eligibility is decided by `sealed_fields` on that field type.
             Type::Object { .. } if Self::sealed_fields(ty).is_some() => Some(Self::KIND_SEALED),
@@ -282,7 +282,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::Float32 | Type::Float64 => Some(Self::NKIND_FLOAT64),
             Type::Str | Type::StrLit(_) => Some(Self::NKIND_STRING),
             Type::Array(_) | Type::FixedArray(_) => Some(Self::NKIND_ARRAY),
-            Type::Map(_) => Some(Self::NKIND_MAP),
+            Type::Map { .. } => Some(Self::NKIND_MAP),
             Type::Object { .. } if Self::sealed_fields(ty).is_some() => Some(Self::NKIND_SEALED),
             _ => None,
         }

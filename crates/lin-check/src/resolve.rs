@@ -104,7 +104,12 @@ fn resolve_type_inner(
             let key_ty = resolve_type_inner(key, env, visiting)?;
             let val_ty = resolve_type_inner(value, env, visiting)?;
             if key_ty == Type::Str {
-                Ok(Type::Map(Box::new(val_ty)))
+                Ok(Type::Map { key: Box::new(Type::Str), value: Box::new(val_ty) })
+            } else if key_ty.is_integer() {
+                // Integer-keyed map: `{ Int: T }`, `{ Int32: T }`, etc.
+                // Normalise to Int64 as the canonical key type (all integer values are stored as i64
+                // in the runtime Int-map slots).
+                Ok(Type::Map { key: Box::new(key_ty), value: Box::new(val_ty) })
             } else if let Some(literals) = closed_string_literal_set(&key_ty) {
                 let mut fields = IndexMap::new();
                 for k in literals {
@@ -113,8 +118,8 @@ fn resolve_type_inner(
                 Ok(Type::object(fields))
             } else {
                 Err(format!(
-                    "Index-signature key type must be String or a union of string literals, \
-                     but it resolves to {}",
+                    "Index-signature key type must be String, an integer type, or a union of string \
+                     literals, but it resolves to {}",
                     key_ty
                 ))
             }
@@ -284,7 +289,7 @@ fn expand_named_body(
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(expand_named_body(inner, env, visiting)?))),
         Type::Stream(inner) => Ok(Type::Stream(Box::new(expand_named_body(inner, env, visiting)?))),
         Type::Promise(inner) => Ok(Type::Promise(Box::new(expand_named_body(inner, env, visiting)?))),
-        Type::Map(v) => Ok(Type::Map(Box::new(expand_named_body(v, env, visiting)?))),
+        Type::Map { key, value } => Ok(Type::Map { key: Box::new(expand_named_body(key, env, visiting)?), value: Box::new(expand_named_body(value, env, visiting)?) }),
         other => Ok(other.clone()),
     }
 }
@@ -392,7 +397,7 @@ fn substitute(
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(substitute(inner, params, args, env, visiting)?))),
         Type::Stream(inner) => Ok(Type::Stream(Box::new(substitute(inner, params, args, env, visiting)?))),
         Type::Promise(inner) => Ok(Type::Promise(Box::new(substitute(inner, params, args, env, visiting)?))),
-        Type::Map(v) => Ok(Type::Map(Box::new(substitute(v, params, args, env, visiting)?))),
+        Type::Map { key, value } => Ok(Type::Map { key: Box::new(substitute(key, params, args, env, visiting)?), value: Box::new(substitute(value, params, args, env, visiting)?) }),
         _ => Ok(ty.clone()),
     }
 }

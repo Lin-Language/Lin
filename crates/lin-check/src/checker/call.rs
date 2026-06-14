@@ -56,7 +56,10 @@ fn expected_fn_params_fully_pinned(expected: &Type) -> bool {
 fn type_contains_never(ty: &Type) -> bool {
     match ty {
         Type::Never => true,
-        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Map(t) => {
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) => {
+            type_contains_never(t)
+        }
+        Type::Map { value: t, .. } => {
             type_contains_never(t)
         }
         Type::Union(ts) | Type::FixedArray(ts) => ts.iter().any(type_contains_never),
@@ -435,7 +438,7 @@ impl Checker {
                         // `check_object_against` Object branch defers for them anyway), and
                         // gated TypeVar-free for the same substitution reasons as arrays.
                         let object_lit_against_concrete_map = matches!(arg, Expr::Object(..))
-                            && matches!(param_ty, Type::Map(_))
+                            && matches!(param_ty, Type::Map { .. })
                             && !param_ty.contains_type_var();
                         // Array-of-TUPLE param (`[String, T][]`, i.e. `Array(FixedArray([...]))`)
                         // where a type parameter is nested inside the tuple. A 2+-element literal
@@ -1005,7 +1008,7 @@ impl Checker {
         if matches!(receiver, Expr::Array(..) | Expr::Object(..)) {
             if let Some(Type::Function { params, .. }) = self.env.effective_type(method) {
                 if let Some(p0) = params.first() {
-                    let p0_concrete_container = matches!(p0, Type::Array(_) | Type::FixedArray(_) | Type::Map(_))
+                    let p0_concrete_container = matches!(p0, Type::Array(_) | Type::FixedArray(_) | Type::Map { .. })
                         && !p0.contains_type_var();
                     if p0_concrete_container {
                         if let Ok(rechecked) = self.check_expr(receiver, p0) {
@@ -1062,7 +1065,7 @@ impl Checker {
                                 && matches!(param_ty, Type::Array(_) | Type::FixedArray(_))
                                 && !param_ty.contains_type_var();
                             let object_lit_against_concrete_map = matches!(arg, Expr::Object(..))
-                                && matches!(param_ty, Type::Map(_))
+                                && matches!(param_ty, Type::Map { .. })
                                 && !param_ty.contains_type_var();
                             let typed = if array_lit_against_concrete_array || object_lit_against_concrete_map {
                                 self.check_expr(arg, param_ty)?

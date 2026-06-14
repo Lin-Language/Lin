@@ -1406,15 +1406,16 @@ impl<'ctx> Codegen<'ctx> {
                             temp_map.insert(*dst, result);
                         }
                         Instruction::MakeObject { dst, fields, spreads, ty, stack } => {
-                            // Typed index-signature map `{ String: T }` (ADR-055): allocate a hashed
-                            // `LinMap` and set each literal field via `lin_map_set` (key = interned
-                            // LinString, value = boxed TaggedVal). The checker only produces a
-                            // `Type::Map` MakeObject for spread-free string-keyed literals (incl. the
-                            // common empty `{}`), so there are no spreads to merge here.
-                            if let Type::Map(elem_ty) = ty {
+                            // Typed index-signature map `{ K: V }` (ADR-055 + numeric-key): allocate
+                            // a hashed `LinMap` and set each literal field via `lin_map_set` (key =
+                            // interned LinString for String maps, value = boxed TaggedVal). The
+                            // checker only produces a `Type::Map` MakeObject for spread-free literals
+                            // (incl. the common empty `{}`), so there are no spreads to merge here.
+                            if let Type::Map { key: map_key_ty, value: elem_ty } = ty {
                                 let cap = i32_ty.const_int(fields.len().max(1) as u64, false);
+                                let key_kind_val = i32_ty.const_int(if map_key_ty.is_integer() { 1 } else { 0 }, false);
                                 let map_ptr = self.builder
-                                    .call(self.rt.map_alloc, &[cap.into()], "ir_map")
+                                    .call(self.rt.map_alloc, &[cap.into(), key_kind_val.into()], "ir_map")
                                     .try_as_basic_value().unwrap_basic().into_pointer_value();
                                 for (key, val_temp) in fields.iter() {
                                     if let Some(&val) = temp_map.get(val_temp) {
@@ -2527,9 +2528,10 @@ fn type_mentions_typevar(ty: &Type) -> bool {
         // The Json wildcard `TypeVar(u32::MAX)` is a concrete dynamic type, NOT a quantified
         // generic param — a function returning/taking Json is a real, callable function.
         Type::TypeVar(id) => *id != u32::MAX,
-        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Promise(t) | Type::Map(t) => {
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Promise(t) => {
             type_mentions_typevar(t)
         }
+        Type::Map { key, value } => type_mentions_typevar(key) || type_mentions_typevar(value),
         Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(type_mentions_typevar),
         Type::Function { params, ret, .. } => {
             params.iter().any(type_mentions_typevar) || type_mentions_typevar(ret)
