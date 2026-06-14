@@ -32,9 +32,9 @@ use std::sync::Mutex;
 
 use crate::array::{lin_array_length, LinArray};
 use crate::fs::{make_error_tagged, make_string};
-use crate::object::{lin_object_alloc, lin_object_set};
+use crate::map::{lin_map_alloc, lin_map_set};
 use crate::string::LinString;
-use crate::tagged::{alloc_tagged, lin_box_int32, lin_box_int64, TaggedVal, TAG_ARRAY, TAG_INT32, TAG_OBJECT, TAG_STR};
+use crate::tagged::{alloc_tagged, lin_box_int32, lin_box_int64, TaggedVal, TAG_ARRAY, TAG_INT32, TAG_MAP, TAG_STR};
 
 struct ProcEntry {
     child: Child,
@@ -106,20 +106,20 @@ unsafe fn read_string_array(arr: *const u8) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Build an `ExecResult` object `{ "status": Int32, "stdout": String, "stderr": String }`
-/// as an owned `TaggedVal*(Object)`. `lin_object_set` retains both the key and the value's
-/// inner string, so the local `+1` from each `make_string` is released afterward — the object
+/// Build an `ExecResult` map `{ "status": Int32, "stdout": String, "stderr": String }`
+/// as an owned `TaggedVal*(Map)`. `lin_map_set` retains both the key and the value's
+/// inner string, so the local `+1` from each `make_string` is released afterward — the map
 /// becomes the sole owner and freeing the returned box frees everything (no leak; see
 /// `fs::make_decode_error` for the same pattern, verified under ASan).
 unsafe fn make_exec_result(status: i32, stdout: &str, stderr: &str) -> *mut u8 {
     use crate::string::lin_string_release;
-    let obj = lin_object_alloc(3);
+    let map = lin_map_alloc(3);
 
     let status_key = make_string("status");
     let mut status_tv: TaggedVal = std::mem::zeroed();
     status_tv.tag = TAG_INT32;
     status_tv.payload = status as i64 as u64;
-    lin_object_set(obj, status_key, &status_tv); // retains status_key
+    lin_map_set(map, status_key, &status_tv);
     lin_string_release(status_key);
 
     let set_str = |key: &str, val: &str| {
@@ -128,14 +128,14 @@ unsafe fn make_exec_result(status: i32, stdout: &str, stderr: &str) -> *mut u8 {
         let mut tv: TaggedVal = std::mem::zeroed();
         tv.tag = TAG_STR;
         tv.payload = v as u64;
-        lin_object_set(obj, k, &tv); // retains both k and v
-        lin_string_release(k); // drop our local +1 (object owns its own ref)
+        lin_map_set(map, k, &tv);
+        lin_string_release(k);
         lin_string_release(v);
     };
     set_str("stdout", stdout);
     set_str("stderr", stderr);
 
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
 /// Run a fully-built `Command` to completion, capturing stdout+stderr; return an
