@@ -1,9 +1,10 @@
-//! Representation-inference pass — the single owner of the packed-vs-boxed decision (ADR-062).
+//! Representation-inference pass — the single owner of the packed-vs-boxed decision (ADR-069,
+//! which supersedes ADR-062).
 //!
 //! This computes, per function, a side table `Vec<Repr>` indexed by `Temp.0` giving the *physical
 //! representation* each temp carries at runtime — packed sealed struct / packed sealed array / boxed
 //! TaggedVal / unboxed flat scalar — stored on `LinFunction.repr`. Codegen reads `func.repr[t]` at
-//! the decide/assume sites instead of re-deriving from `Type`. See ADR-062 in `docs/DECISIONS.md`.
+//! the decide/assume sites instead of re-deriving from `Type`. See ADR-069 in `docs/DECISIONS.md`.
 //!
 //! # Consumed by codegen
 //!

@@ -665,7 +665,7 @@ pub struct LinFunction {
     /// Per-temp physical representation table, indexed by `Temp.0` (`repr[t.0]` is temp `t`'s repr).
     /// Empty until the representation-inference pass (`repr::run`) populates it; codegen reads it at
     /// every packed-vs-boxed DECIDE / ASSUME site instead of re-deriving from the static `Type`.
-    /// See ADR-062 (`docs/DECISIONS.md`).
+    /// See ADR-069 (`docs/DECISIONS.md`, which supersedes ADR-062).
     pub repr: Vec<crate::repr::Repr>,
     /// Coverage attribution origin. `Some(path)` for a CROSS-MODULE monomorphized specialization
     /// (`name$Int32`) whose body was cloned from another module's generic definition: its block
