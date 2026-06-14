@@ -352,7 +352,7 @@ impl Checker {
 
                     let field_ty = if let Type::Object { fields: ref obj_fields, .. } = ty {
                         obj_fields.get(&key).cloned().unwrap_or(Type::Null)
-                    } else if ty.is_json() {
+                    } else if ty.is_any_val() {
                         crate::resolve::json_type()
                     } else {
                         return Err(Diagnostic::error(
@@ -375,7 +375,7 @@ impl Checker {
                         *inner.clone()
                     } else if let Type::FixedArray(ref types) = ty {
                         types.get(i).cloned().unwrap_or(Type::Never)
-                    } else if ty.is_json() {
+                    } else if ty.is_any_val() {
                         // Dynamic JSON value — treat element type as Json
                         crate::resolve::json_type()
                     } else {

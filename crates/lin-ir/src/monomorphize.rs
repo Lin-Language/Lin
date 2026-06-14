@@ -3105,20 +3105,19 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
         if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod) {
             let lt = left.ty();
             let rt = right.ty();
-            let is_json = |t: &Type| matches!(t, Type::TypeVar(id) if *id == u32::MAX);
             if lt.is_numeric() && rt.is_numeric() {
                 if let Some(widened) = lin_check::widen::widen_numeric(&lt, &rt) {
                     *result_type = widened;
                 }
-            } else if lt.is_numeric() && is_json(&rt) {
-                // ADR-014 (reversed) §Json: a `Number` operand bound to the Json wildcard. The IR
+            } else if lt.is_numeric() && rt.is_any_val() {
+                // ADR-014 (reversed) §AnyVal: a `Number` operand bound to the AnyVal wildcard. The IR
                 // (`lower_expr` BinaryOp) unboxes the wildcard side to the CONCRETE operand's family
                 // and emits a native scalar op — so the result is that concrete numeric family, not
-                // the boxed `result_type` the checker recorded (the bounded var → Json). Mirror that
+                // the boxed `result_type` the checker recorded (the bounded var → AnyVal). Mirror that
                 // here so the slot type matches the value codegen produces (else `ret i32` vs a
-                // declared `ptr`/boxed slot — the `triple$Json` mismatch).
+                // declared `ptr`/boxed slot — the `triple$AnyVal` mismatch).
                 *result_type = lt;
-            } else if rt.is_numeric() && is_json(&lt) {
+            } else if rt.is_numeric() && lt.is_any_val() {
                 *result_type = rt;
             }
         }

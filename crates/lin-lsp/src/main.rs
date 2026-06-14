@@ -1602,8 +1602,8 @@ fn ast_exported_names(module: &lin_parse::ast::Module) -> HashSet<String> {
 
 // ── type-string display cleaning ──────────────────────────────────────────────
 
-/// Decimal text of `u32::MAX`, the `TypeVar` id the checker uses as the `Json` marker
-/// (`Type::is_json`). It Displays as `?T4294967295`, which we surface as `Json`.
+/// Decimal text of `u32::MAX`, the `TypeVar` id the checker uses as the `AnyVal` marker
+/// (`Type::is_any_val`). It Displays as `?T4294967295`, which we surface as `Json`.
 const JSON_TYPEVAR_DECIMAL: &str = "4294967295";
 
 /// Turn a rendered type string into a clean, user-facing one for display surfaces (completion

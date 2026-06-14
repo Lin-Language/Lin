@@ -1224,13 +1224,13 @@ impl Checker {
         // `if c then jsonFn(x) /*: ?T*/ else flag /*: Bool*/` became `Bool`, after which lowering
         // unboxed the Json branch's value AS a Bool (a null-deref when that value is `null`). The
         // value such a var actually holds at runtime is a boxed Json, so it behaves like the dynamic
-        // top type: treat it as `Json` for the merge decision (the existing `is_json_dynamic` arm
+        // top type: treat it as `Json` for the merge decision (the existing `is_any_val` arm
         // then yields `Json`, boxing both branches into the uniform Json representation).
         let is_unconstrained_inference_var = |t: &Type| matches!(t, Type::TypeVar(id)
             if *id < GENERIC_TV_BASE && *id != u32::MAX
                 && !self.solved_type_vars.contains_key(id));
-        let then_dynamic = is_json_dynamic(&then_ty) || is_unconstrained_inference_var(&then_ty);
-        let else_dynamic = is_json_dynamic(&else_ty) || is_unconstrained_inference_var(&else_ty);
+        let then_dynamic = is_any_val(&then_ty) || is_unconstrained_inference_var(&then_ty);
+        let else_dynamic = is_any_val(&else_ty) || is_unconstrained_inference_var(&else_ty);
         // Path-11: snapshot the branch lambda sets BEFORE the merge consumes the branch types, so a
         // function-typed `if` whose arms are distinct lambdas (`if c then f else g`) yields a 2-set
         // rather than aliasing onto whichever branch the structural collapse below happens to pick
@@ -1248,7 +1248,7 @@ impl Checker {
             // is redundant and would leak the internal `?T4294967295` sentinel into diagnostics,
             // so collapse to `Json` (the pre-change behaviour for this specific pairing).
             let other = if then_ty == Type::Null { &else_ty } else { &then_ty };
-            if is_json_dynamic(other) {
+            if is_any_val(other) {
                 other.clone()
             } else {
                 Type::flatten_union(vec![then_ty, else_ty])
@@ -1310,7 +1310,7 @@ impl Checker {
         // null-inclusive iff it has a `Null` member.
         let is_bare_null = left_ty == Type::Null;
         let union_has_null = matches!(&left_ty, Type::Union(vs) if vs.iter().any(|v| *v == Type::Null));
-        let left_is_json = is_json_dynamic(&left_ty);
+        let left_is_json = is_any_val(&left_ty);
         if !is_bare_null && !union_has_null && !left_is_json {
             return Err(Diagnostic::error(
                 left.span(),
@@ -1398,7 +1398,7 @@ impl Checker {
         // First try the bidirectional refinement path (object/string-literal/nested if/match).
         let typed = self.check_expr_branch_inner(body, expected)?;
         let ty = typed.ty();
-        if is_json_dynamic(&ty) || self.types_compatible(&ty, expected) {
+        if is_any_val(&ty) || self.types_compatible(&ty, expected) {
             Ok(typed)
         } else {
             Err(Diagnostic::error(
@@ -2035,9 +2035,9 @@ pub(crate) fn expected_pushes_scalar_width(ty: &Type) -> bool {
     )
 }
 
-/// True if `ty` is the dynamic/top `Json` type (`TypeVar(u32::MAX)`). A value of this type is
+/// True if `ty` is the `AnyVal` dynamic top type (`TypeVar(u32::MAX)`). A value of this type is
 /// accept-any in checked branch/arm position (see `check_branch_against`).
-pub(crate) fn is_json_dynamic(ty: &Type) -> bool {
+pub(crate) fn is_any_val(ty: &Type) -> bool {
     matches!(ty, Type::TypeVar(n) if *n == u32::MAX)
 }
 
