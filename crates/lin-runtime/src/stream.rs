@@ -2492,7 +2492,7 @@ unsafe fn make_meta_object(meta: &TarEntryMeta) -> *mut u8 {
     use crate::string::lin_string_release;
     use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TAG_INT64, TAG_BOOL, TaggedVal};
 
-    let map = lin_map_alloc(4);
+    let map = lin_map_alloc(4, 0);
 
     // name
     let k = crate::fs::make_string("name");
@@ -2758,7 +2758,7 @@ impl StreamSource for FilesSource {
         }
 
         // Build { name, data, size, typeflag, isDir } as LinMap.
-        let map = lin_map_alloc(8);
+        let map = lin_map_alloc(8, 0);
 
         let k = crate::fs::make_string("name");
         let v = crate::fs::make_string(&meta.name);
@@ -3333,7 +3333,7 @@ unsafe fn record_to_object(header: &[Vec<u8>], row: &[Vec<u8>]) -> *mut u8 {
     use crate::map::{lin_map_alloc, lin_map_set};
     use crate::string::lin_string_release;
     use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TaggedVal};
-    let map = lin_map_alloc(header.len().max(1) as u32);
+    let map = lin_map_alloc(header.len().max(1) as u32, 0);
     for (i, key_bytes) in header.iter().enumerate() {
         if i >= row.len() {
             break; // short row: omit the trailing keys

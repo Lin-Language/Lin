@@ -18,7 +18,7 @@ unsafe fn map_set_str(map: *mut crate::map::LinMap, key: &str, val: &str) {
 }
 
 unsafe fn make_response_object(status: u16, body: &str) -> *mut u8 {
-    let map = lin_map_alloc(4);
+    let map = lin_map_alloc(4, 0);
 
     // status field (Int32)
     let k = make_string("status");
@@ -29,7 +29,7 @@ unsafe fn make_response_object(status: u16, body: &str) -> *mut u8 {
     lin_string_release(k);
 
     // headers field (empty LinMap — typed as { String: String })
-    let headers_map = lin_map_alloc(1);
+    let headers_map = lin_map_alloc(1, 0);
     let k = make_string("headers");
     let mut tv: TaggedVal = std::mem::zeroed();
     tv.tag = TAG_MAP;

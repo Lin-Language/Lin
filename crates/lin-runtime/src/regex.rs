@@ -139,7 +139,7 @@ unsafe fn build_match(s: &str, re: &Regex, caps: &regex::Captures) -> *mut LinOb
     // named: { String: String } as LinMap (TAG_MAP) — only the groups that participated.
     // Safe to use TAG_MAP here because `named` is typed `AnyVal` in the Lin Match record,
     // so the consumer uses the full union tag-dispatch path (handles TAG_MAP correctly).
-    let named = lin_map_alloc(4);
+    let named = lin_map_alloc(4, 0);
     for name in re.capture_names().flatten() {
         if let Some(g) = caps.name(name) {
             let k = make_string(name);

@@ -53,17 +53,15 @@ unsafe fn clone_map(src: *const crate::map::LinMap) -> *mut crate::map::LinMap {
     if (*src).refcount >= IMMORTAL_RC {
         return src as *mut crate::map::LinMap;
     }
-    let dst = crate::map::lin_map_alloc((*src).len);
+    let dst = crate::map::lin_map_alloc((*src).len, (*src).key_kind);
     let cap = (*src).cap as usize;
     if cap > 0 && !(*src).slots.is_null() {
+        let is_int = (*src).key_kind == crate::map::KEY_KIND_INT;
         for i in 0..cap {
             let slot = (*src).slots.add(i);
-            if (*slot).key.is_null() {
-                continue;
+            if (*slot).hash == 0 {
+                continue; // empty slot
             }
-            // Deep-clone the key (a fresh +1 LinString) and the value payload (verbatim for scalars,
-            // a private deep copy for heap payloads).
-            let key = clone_string((*slot).key);
             let src_v = &(*slot).value;
             // Stage 6a: a TAG_RECORD value in a map must be transferred as TAG_OBJECT (materialize +
             // deep-clone), because transfer_payload returns a LinObject ptr with the original tag,
@@ -82,11 +80,19 @@ unsafe fn clone_map(src: *const crate::map::LinMap) -> *mut crate::map::LinMap {
                 let cloned_payload = transfer_payload(src_v.tag, src_v.payload);
                 TaggedVal { tag: src_v.tag, _pad: [0; 7], payload: cloned_payload }
             };
-            // lin_map_set retains the key (first insert) and retains the value payload; both are now
-            // owned by the map. Drop our construction references so each entry ends at the map's +1.
-            crate::map::lin_map_set(dst, key, &v);
-            crate::string::lin_string_release(key);
-            crate::object::release_tagged_payload_pub(&v);
+            // Insert into the destination map. For String maps, deep-clone the key; for Int maps
+            // the key is a scalar (no RC).
+            if is_int {
+                crate::map::lin_map_set_int(dst, (*slot).key as i64, &v);
+                crate::object::release_tagged_payload_pub(&v);
+            } else {
+                // Deep-clone the string key.
+                let key = clone_string((*slot).key as *mut crate::string::LinString);
+                // lin_map_set retains the key (first insert) and retains the value payload.
+                crate::map::lin_map_set(dst, key, &v);
+                crate::string::lin_string_release(key);
+                crate::object::release_tagged_payload_pub(&v);
+            }
         }
     }
     dst
@@ -570,7 +576,7 @@ mod tests {
         use crate::string::{lin_string_from_bytes, lin_string_release, lin_string_eq, LinString};
         use crate::tagged::{TaggedVal, TAG_STR, TAG_INT64};
         unsafe {
-            let src = lin_map_alloc(4);
+            let src = lin_map_alloc(4, 0);
             // key "name" -> string "hello" (a fresh, non-interned +1)
             let kname = lin_string_from_bytes(b"name".as_ptr(), 4);
             let sval = lin_string_from_bytes(b"hello".as_ptr(), 5);

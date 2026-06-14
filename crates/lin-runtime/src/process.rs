@@ -113,7 +113,7 @@ unsafe fn read_string_array(arr: *const u8) -> Option<Vec<String>> {
 /// `fs::make_decode_error` for the same pattern, verified under ASan).
 unsafe fn make_exec_result(status: i32, stdout: &str, stderr: &str) -> *mut u8 {
     use crate::string::lin_string_release;
-    let map = lin_map_alloc(3);
+    let map = lin_map_alloc(3, 0);
 
     let status_key = make_string("status");
     let mut status_tv: TaggedVal = std::mem::zeroed();

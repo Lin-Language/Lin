@@ -50,7 +50,7 @@ pub unsafe extern "C" fn lin_env_unset(name: *const LinString) {
 pub unsafe extern "C" fn lin_env_environ() -> *mut u8 {
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let cap = (vars.len().max(4)) as u32;
-    let map = lin_map_alloc(cap);
+    let map = lin_map_alloc(cap, 0);
     for (key, val) in &vars {
         let k = make_lin_string(key);
         let v = make_lin_string(val);
