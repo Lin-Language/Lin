@@ -1109,9 +1109,54 @@ fn format_float(f: f64) -> String {
 fn fmt_int_lit(n: i64, suffix: &Option<NumSuffix>, span: &Span) -> String {
     if let Some(spelled) = radix_spelling_at(span, n) {
         format!("{}{}", spelled, suffix_str(suffix))
+    } else if let Some(spelled) = big_unsigned_decimal_at(span, n) {
+        // A decimal literal above i64::MAX (e.g. `18446744073709551615` for UInt64) is stored as a
+        // negative i64 bit pattern; rendering `{n}` would flatten it to a misleading negative (the
+        // u64::MAX literal would print as `-1`). Recover the author's positive decimal spelling.
+        format!("{}{}", spelled, suffix_str(suffix))
     } else {
         format!("{}{}", n, suffix_str(suffix))
     }
+}
+
+/// If the source at `span` is a plain (non-radix, unsigned) decimal literal above `i64::MAX` whose
+/// u64 value reinterprets to the stored bit pattern `n`, return its digit spelling. Restricted to
+/// `n < 0` so in-range decimals stay on the normal `{n}` path (preserving their existing rendering,
+/// e.g. underscore stripping) and synthetic nodes don't match.
+fn big_unsigned_decimal_at(span: &Span, n: i64) -> Option<String> {
+    if n >= 0 {
+        return None;
+    }
+    SOURCE_CHARS.with(|src_c| {
+        let src = src_c.borrow();
+        if src.is_empty() {
+            return None;
+        }
+        let (s, e) = (span.start as usize, span.end as usize);
+        if e > src.len() || s >= e {
+            return None;
+        }
+        let text: String = src[s..e].iter().collect();
+        let body = text.trim();
+        // Must be a positive decimal — no leading `-`, no radix prefix.
+        if body.starts_with('-') {
+            return None;
+        }
+        let core = body.split(|c: char| c == 'i' || c == 'u').next().unwrap_or(body);
+        let lower = core.to_ascii_lowercase();
+        if lower.starts_with("0x") || lower.starts_with("0b") || lower.starts_with("0o") {
+            return None;
+        }
+        let cleaned = core.trim().replace('_', "");
+        if cleaned.is_empty() {
+            return None;
+        }
+        let parsed = cleaned.parse::<u64>().ok()?;
+        if parsed as i64 != n {
+            return None;
+        }
+        Some(cleaned)
+    })
 }
 
 /// If the source text at `span` is a radix-prefixed integer literal (`0x`/`0b`/`0o`, optional
@@ -2678,5 +2723,30 @@ mod tests {
             let out2 = format(&out);
             assert_eq!(out, out2, "formatter not idempotent for {src:?}");
         }
+    }
+
+    /// A decimal literal above i64::MAX (e.g. UInt64's max) is stored as a negative i64 bit
+    /// pattern. The formatter must re-emit the positive decimal spelling, not flatten u64::MAX to
+    /// the misleading `-1`. (Regression for std/number's MAX_UINT64 constant.)
+    #[test]
+    fn big_unsigned_decimal_keeps_spelling() {
+        // Spelling recovery reads the original source via span, so the formatter must be built
+        // source-aware (with_comments), as the real `lin fmt` path is — `new()` has no source.
+        let fmt_src = |src: &str| {
+            let tokens = Lexer::new(src, 0).tokenize();
+            let mut parser = Parser::new(tokens);
+            let module = parser.parse_module();
+            assert!(parser.diagnostics.is_empty(), "did not parse: {:?}", parser.diagnostics);
+            Formatter::with_comments(src, Vec::new()).format_module(&module)
+        };
+        let out = fmt_src("val MAX_UINT64: UInt64 = 18446744073709551615\n");
+        assert!(
+            out.contains("18446744073709551615"),
+            "u64::MAX literal must keep its decimal spelling, got {out:?}"
+        );
+        assert!(!out.contains("= -1"), "must not flatten to -1, got {out:?}");
+        assert_eq!(out, fmt_src(&out), "formatter not idempotent: {out:?}");
+        // A genuine negative literal must still render normally.
+        assert!(fmt_src("val x: Int64 = -1\n").contains("= -1"));
     }
 }
