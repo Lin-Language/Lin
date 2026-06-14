@@ -4,10 +4,10 @@
 //   { "k": Int32, "bestArrivals": { String: Int64 }, "kArrivals": { String: { String: Int64 } },
 //     "kConnections": { String: { String: Conn } } }
 // A connection (Conn) is either a Transfer (object with "origin") or a [trip, startIndex, endIndex]
-// tuple (the trip element stays Json — composite Json does not flow into the named Trip record).
+// tuple (the trip element stays AnyVal — composite AnyVal does not flow into the named Trip record).
 //
 // All three dictionaries are typed `{ String: T }` index-signature maps (ADR-082 / spec §5.1.1) —
-// hashed O(1) containers. `kConnections` was the LAST `Json` dictionary; it is now typed
+// hashed O(1) containers. `kConnections` was the LAST `AnyVal` dictionary; it is now typed
 // `{ String: { String: Conn } }` (the projection-aliasing UAF that blocked it is fixed on master,
 // see types.lin / NOTES.md). Round keys are stored as strings ("${k}") because Lin map keys are
 // strings — but the key is computed ONCE per round (addRound), not per access: the record
@@ -21,7 +21,7 @@ import { ScanResults, Conn } from "./types"
 
 val MAX = 9007199254740991i64
 
-export val createScanResults = (stops: Json, origins: Json): ScanResults =>
+export val createScanResults = (stops: AnyVal, origins: AnyVal): ScanResults =>
   var bestArrivals: { String: Int64 } = {}
   var kArrival0: { String: Int64 } = {}
   var kConnections: { String: { String: Conn } } = {}
@@ -59,36 +59,36 @@ export val addRound = (results: ScanResults): Null =>
   results["kArrivals"][key] = round
 
 // previousArrival/bestArrival read a typed `{ String: Int64 }` slot (so `m[k]` is `Int64 | Null`),
-// but they widen the result to `Json` so the arithmetic/comparison consumers in raptor.lin keep
-// their existing `!= null` guards + Json numeric ops unchanged (faithful skip-on-missing
+// but they widen the result to `AnyVal` so the arithmetic/comparison consumers in raptor.lin keep
+// their existing `!= null` guards + AnyVal numeric ops unchanged (faithful skip-on-missing
 // semantics; see scanTransfers). The O(1) hashed read already happened on the typed-map access.
 // previousArrival is the HOTTEST read in the scan: it reads the prevRound alias directly —
 // no "${k - 1}" interpolation, no rounds-map lookup.
-export val previousArrival = (results: ScanResults, stop: String): Json =>
+export val previousArrival = (results: ScanResults, stop: String): AnyVal =>
   results["prevRound"][stop]
 
-export val setTrip = (results: ScanResults, trip: Json, startIndex: Int32, endIndex: Int32, interchange: Int32): Null =>
+export val setTrip = (results: ScanResults, trip: AnyVal, startIndex: Int32, endIndex: Int32, interchange: Int32): Null =>
   val time = trip["stopTimes"][endIndex]["arrivalTime"] + interchange
   val stop = trip["stopTimes"][endIndex]["stop"]
   results["curRound"][stop] = time
   results["bestArrivals"][stop] = time
   results["kConnections"][stop][results["curKey"]] = [trip, startIndex, endIndex]
 
-export val setTransfer = (results: ScanResults, transfer: Json, time: Json): Null =>
+export val setTransfer = (results: ScanResults, transfer: AnyVal, time: AnyVal): Null =>
   val stop = transfer["destination"]
   results["curRound"][stop] = time
   results["bestArrivals"][stop] = time
   results["kConnections"][stop][results["curKey"]] = transfer
 
-export val bestArrival = (results: ScanResults, stop: String): Json =>
+export val bestArrival = (results: ScanResults, stop: String): AnyVal =>
   results["bestArrivals"][stop]
 
-export val getMarkedStops = (results: ScanResults): Json =>
+export val getMarkedStops = (results: ScanResults): AnyVal =>
   results["curRound"].keys()
 
 // finalize returns the typed ScanResults record itself (callers read its typed
 // kConnections/bestArrivals fields — see raptor.scan / query). It previously returned a
-// `[kConnections, bestArrivals]` `Json` array, but a heterogeneous typed-map array literal is
+// `[kConnections, bestArrivals]` `AnyVal` array, but a heterogeneous typed-map array literal is
 // not inferred as a tuple, and a named tuple-type alias is not indexable, so the record is the
 // clean typed carrier.
 export val finalize = (results: ScanResults): ScanResults =>

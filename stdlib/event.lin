@@ -1,7 +1,7 @@
 // std/event — typed event emitters, two layers, fully generic over the event payload type.
 //
 // Unlike a dynamically-typed emitter, an event here carries a value of a static type `T` — no
-// `Json`, no string-tagged `{ type, data }` envelope. Each emitter/bus is parameterised by its
+// `AnyVal`, no string-tagged `{ type, data }` envelope. Each emitter/bus is parameterised by its
 // payload type, so `emit`/`send` only accept a `T` and listeners receive a `T`. Distinct event
 // kinds are distinct types; use a tagged-union `T` if you want several shapes through one bus.
 //
@@ -61,7 +61,7 @@ type Msg<T> = { "kind": String, "value": T }
 // @example send(sink, 10)   // send(sink, 5); fire-and-forget
 // @example val total: Int32 | Error = drain(sink, 0)   // 15 (once the Error arm is handled)
 // @example stop(sink)
-export val emitter = <T, S>(reduce: (T, S) => S, initial: S, sample: T): Json =>
+export val emitter = <T, S>(reduce: (T, S) => S, initial: S, sample: T): AnyVal =>
   var state = initial
   worker(
     (m: Msg<T>): S =>
@@ -78,7 +78,7 @@ export val emitter = <T, S>(reduce: (T, S) => S, initial: S, sample: T): Json =>
 // producer can outpace a slow reducer and grow the queue.
 // @param e      an emitter handle from `emitter`.
 // @param value  the payload `T` to deliver (pins `T`).
-export val send = <T>(e: Json, value: T): Null =>
+export val send = <T>(e: AnyVal, value: T): Null =>
   message(e, { "kind": "event", "value": value })
 
 // Synchronous: enqueue `value` and block until the reducer has folded it. Gives natural backpressure.
@@ -86,7 +86,7 @@ export val send = <T>(e: Json, value: T): Null =>
 // @param value  the payload `T` to deliver.
 // @returns the resulting state `S`, or an `Error` injected at the worker boundary on a reducer
 //   fault. Annotate and handle the union accordingly.
-export val request = <T, S>(e: Json, value: T): S | Error =>
+export val request = <T, S>(e: AnyVal, value: T): S | Error =>
   workerRequest(e, { "kind": "event", "value": value })
 
 // Flush: block until the queue is fully processed and return the accumulated state. Because the
@@ -96,12 +96,12 @@ export val request = <T, S>(e: Json, value: T): S | Error =>
 // @param sample  a representative `T` that pins the envelope type (its `value` is ignored).
 // @returns the accumulated state `S`, or an `Error`. Annotate the result, e.g.
 //   `val s: Sum | Error = drain(e, 0)`.
-export val drain = <T, S>(e: Json, sample: T): S | Error =>
+export val drain = <T, S>(e: AnyVal, sample: T): S | Error =>
   workerRequest(e, { "kind": "drain", "value": sample })
 
 // Shut the emitter's worker down (drain in-flight, run the no-op onClose, join).
 // @param e  the emitter handle to stop. After `stop`, sending to the emitter is an error.
-export val stop = (e: Json): Null =>
+export val stop = (e: AnyVal): Null =>
   close(e)
 
 // ══ Layer 2 — synchronous in-process bus ══════════════════════════════════════════════════════

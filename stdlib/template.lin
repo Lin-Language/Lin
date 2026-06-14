@@ -14,8 +14,8 @@
 // empty string (not null, not an error). Only the file-based `render` can resolve layouts —
 // `renderWith` has no source directory, so it cannot follow `{% extends %}`/`{% include %}`.
 import foreign "lin-runtime"
-  val lin_template_render: (String, {  }) => Json
-  val lin_template_render_path: (String, {  }) => Json
+  val lin_template_render: (String, {  }) => AnyVal
+  val lin_template_render_path: (String, {  }) => AnyVal
 
 // Render an in-memory Jinja-style template string (minijinja-backed).
 // @param template  the template source. Because it is in-memory, `{% extends %}`/`{% include %}`

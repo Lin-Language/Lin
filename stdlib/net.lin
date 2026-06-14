@@ -16,19 +16,19 @@
 // For a higher-level lazy byte stream over a connection, see `tcpStream` (feeds std/stream
 // adapters).
 import foreign "lin-runtime"
-  val lin_udp_bind: (Int32) => Json
-  val lin_udp_recv: (Int32, UInt8[]) => Json
-  val lin_udp_recv_from: (Int32, UInt8[]) => Json
-  val lin_udp_send_to: (Int32, String, Int32, UInt8[]) => Json
-  val lin_udp_set_nonblocking: (Int32, Int32) => Json
-  val lin_udp_close: (Int32) => Json
-  val lin_tcp_listen: (Int32) => Json
-  val lin_tcp_accept: (Int32) => Json
-  val lin_tcp_connect: (String, Int32) => Json
-  val lin_tcp_recv: (Int32, UInt8[]) => Json
-  val lin_tcp_send: (Int32, UInt8[]) => Json
-  val lin_tcp_set_nonblocking: (Int32, Int32) => Json
-  val lin_tcp_close: (Int32) => Json
+  val lin_udp_bind: (Int32) => AnyVal
+  val lin_udp_recv: (Int32, UInt8[]) => AnyVal
+  val lin_udp_recv_from: (Int32, UInt8[]) => AnyVal
+  val lin_udp_send_to: (Int32, String, Int32, UInt8[]) => AnyVal
+  val lin_udp_set_nonblocking: (Int32, Int32) => AnyVal
+  val lin_udp_close: (Int32) => AnyVal
+  val lin_tcp_listen: (Int32) => AnyVal
+  val lin_tcp_accept: (Int32) => AnyVal
+  val lin_tcp_connect: (String, Int32) => AnyVal
+  val lin_tcp_recv: (Int32, UInt8[]) => AnyVal
+  val lin_tcp_send: (Int32, UInt8[]) => AnyVal
+  val lin_tcp_set_nonblocking: (Int32, Int32) => AnyVal
+  val lin_tcp_close: (Int32) => AnyVal
 
 // A received UDP datagram's metadata: byte count plus the sender's address and port.
 export type Datagram = { "len": Int32, "addr": String, "port": Int32 }

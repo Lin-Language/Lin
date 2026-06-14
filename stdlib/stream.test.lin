@@ -20,15 +20,15 @@ val quoteFields = (line: String): String =>
 // Module-level unwrap helpers: a multi-line `match` does not parse inside a parenthesised test
 // lambda (indentation is suppressed in parens), so the stream-terminal results (`X | Error`) are
 // unwrapped here. -1 / false / "err" stand in for the (not-expected) Error arm.
-val unwrapInt = (r: Json): Int32 =>
+val unwrapInt = (r: AnyVal): Int32 =>
   match r
     is Error => -1
     else => r
-val unwrapBool = (r: Json): Boolean =>
+val unwrapBool = (r: AnyVal): Boolean =>
   match r
     is Error => false
     else => r
-val unwrapStr = (r: Json): String =>
+val unwrapStr = (r: AnyVal): String =>
   match r
     is Error => "err"
     else => r

@@ -7,7 +7,7 @@ import { makeGraphResults, add, finalize, GraphResults, TreeNode } from "./graph
 import { Conn, Boarding } from "./types"
 
 // Deep equality over the typed `{ String: TreeNode[] }` graph (the typed-map rep lacks the
-// structural `toBe`/`toString` the `Json` rep had, so the result is checked with a typed walk).
+// structural `toBe`/`toString` the `AnyVal` rep had, so the result is checked with a typed walk).
 val nodeEq = (a: TreeNode | Null, b: TreeNode | Null): Boolean =>
   match a
     is Null =>

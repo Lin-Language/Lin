@@ -135,7 +135,7 @@ export val isFloat64 = (s: String): Boolean =>
   lin_is_float64(s)
 
 // Parse `s` to an Int32, narrowing to `null` on failure so callers can test with a plain
-// `== null` / `is Int32` instead of an untyped `Json` read.
+// `== null` / `is Int32` instead of an untyped `AnyVal` read.
 // @param s  the string to parse.
 // @returns the parsed Int32, or `null` if `s` is not a valid integer.
 // @example tryParseInt32("bad")   // null

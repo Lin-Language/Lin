@@ -3,7 +3,7 @@
 // Reads its configuration from the environment (config.lin → std/env), then runs a list
 // of named external commands (task.lin → std/process) through a concurrent scheduler
 // (scheduler.lin → std/async: parallel + a lock-guarded progress log), giving slow and
-// flaky steps a deadline and retries whose outcome is a Json-free Result (outcome.lin),
+// flaky steps a deadline and retries whose outcome is a AnyVal-free Result (outcome.lin),
 // and finally prints a rolled-up report (report.lin).
 //
 // Tune it from the shell, e.g.:

@@ -4,7 +4,7 @@ import { length } from "std/array"
 import { makeGraphResults, add, finalize } from "./graphResults"
 import { Conn } from "./types"
 
-val mergePath = (tree: Json, path: Json): Null =>
+val mergePath = (tree: AnyVal, path: AnyVal): Null =>
   var kConnections: { String: { String: Conn } } = {}
   range(1, length(path)).for(i =>
     val origin = path[i - 1]
@@ -14,7 +14,7 @@ val mergePath = (tree: Json, path: Json): Null =>
   )
   add(tree, kConnections)
 
-val build = (paths: Json): Json =>
+val build = (paths: AnyVal): AnyVal =>
   val tree = makeGraphResults()
   paths.for(p => mergePath(tree, p))
   finalize(tree)

@@ -23,12 +23,12 @@ val intOr = (x: Int32 | Null, d: Int32): Int32 =>
 val isStopBefore = (routeStopIndex: { String: { String: Int32 } }, routeId: String, stopA: String, stopB: String): Boolean =>
   intOr(routeStopIndex[routeId][stopA], 0) < intOr(routeStopIndex[routeId][stopB], 0)
 
-// Returns a `Json` object (routeId -> stopId). The queue is rebuilt every round per the
+// Returns a `AnyVal` object (routeId -> stopId). The queue is rebuilt every round per the
 // marked-stop set and is short-lived/small — it is NOT a perf hotspot, so it stays the
-// `Json` association-list rep (which also keeps its structural equality + `toString` working
+// `AnyVal` association-list rep (which also keeps its structural equality + `toString` working
 // for the unit tests; the typed `{ String: T }` map lacks cross-rep eq/display today).
-export val getQueue = (routesAtStop: { String: String[] }, routeStopIndex: { String: { String: Int32 } }, markedStops: Json): Json =>
-  var queue: Json = {}
+export val getQueue = (routesAtStop: { String: String[] }, routeStopIndex: { String: { String: Int32 } }, markedStops: AnyVal): AnyVal =>
+  var queue: AnyVal = {}
   markedStops.for(stop =>
     val routes = get(routesAtStop, stop, [])
     routes.for(routeId =>

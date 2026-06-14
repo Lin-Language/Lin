@@ -1,7 +1,7 @@
 // config.lin — the service's startup configuration: schema-driven defaults +
 // validation over a raw config object, returning a tagged result main.lin matches
 // on before it binds the port. A raw config is genuinely dynamic input, so it
-// arrives as Json and is resolved into the typed `Config` record here.
+// arrives as AnyVal and is resolved into the typed `Config` record here.
 import { keys } from "std/object"
 import { length, push } from "std/array"
 import { for } from "std/iter"
@@ -13,8 +13,8 @@ export type Config = { "host": String, "port": Int32, "debug": Boolean, "name": 
 
 // One schema entry: the expected type tag ("string" | "int" | "bool") and an
 // optional default. The default is heterogeneous (String, Int32 or Boolean) and
-// absent for required fields, so it stays dynamic (Json).
-export type SchemaEntry = { "type": String, "default": Json }
+// absent for required fields, so it stays dynamic (AnyVal).
+export type SchemaEntry = { "type": String, "default": AnyVal }
 
 // load() returns a tagged result the caller pattern-matches on. The discriminant
 // field is a String (string-literal singleton types are not supported), so
@@ -25,7 +25,7 @@ export type LoadResult = Success | Failure
 
 // The config schema. Each entry is { "type", "default" }; `name` is required so it
 // has no default and must be supplied by the caller.
-export val schema = (): Json =>
+export val schema = (): AnyVal =>
   {
     "host": { "type": "string", "default": "0.0.0.0" },
     "port": { "type": "int", "default": 3000 },
@@ -33,8 +33,8 @@ export val schema = (): Json =>
     "name": { "type": "string" }
   }
 
-// The runtime type tag of a Json value, as one of our schema type names.
-val typeName = (v: Json): String =>
+// The runtime type tag of a AnyVal value, as one of our schema type names.
+val typeName = (v: AnyVal): String =>
   match v
     is String => "string"
     is Int32 => "int"
@@ -44,7 +44,7 @@ val typeName = (v: Json): String =>
 // Fill any field absent from `cfg` with its schema default. Required fields (no
 // default) are left absent for `validate` to flag. Builds a fresh object so the
 // caller's input is not mutated.
-export val applyDefaults = (cfg: Json): Json =>
+export val applyDefaults = (cfg: AnyVal): AnyVal =>
   val sch = schema()
   var out: {  } = {}
   sch
@@ -59,7 +59,7 @@ export val applyDefaults = (cfg: Json): Json =>
 
 // Validate a (defaults-applied) config against the schema. Returns an array of
 // error message strings (empty array == valid).
-export val validate = (cfg: Json): String[] =>
+export val validate = (cfg: AnyVal): String[] =>
   val sch = schema()
   var errors: String[] = []
   sch
@@ -77,7 +77,7 @@ export val validate = (cfg: Json): String[] =>
 // Load a raw config object: apply defaults, validate, and return either
 // { "type": "success", "value": <complete Config> } or
 // { "type": "failure", "error": <joined messages> }.
-export val load = (raw: Json): LoadResult =>
+export val load = (raw: AnyVal): LoadResult =>
   val cfg = applyDefaults(raw)
   val errors = validate(cfg)
   if length(errors) == 0 then

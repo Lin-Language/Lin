@@ -6,7 +6,7 @@
 // thread; only the parsed, transferable `Transfer` crosses to the worker — so parsing and
 // collection overlap, and a large feed is processed in constant memory. The parse/emit/collect
 // logic lives in ./transfers (unit-tested in transfers.test.lin); this file is just the streaming
-// I/O around it. No `Json` payloads: the emitter is generic over the `Transfer` record type.
+// I/O around it. No `AnyVal` payloads: the emitter is generic over the `Transfer` record type.
 //
 // This is how RAPTOR's gtfsLoader would collect transfers.txt out of a GTFS feed. A real GTFS feed
 // is a ZIP (no zip reader in std yet) or a tar.gz; the only change for an archive is the SOURCE of

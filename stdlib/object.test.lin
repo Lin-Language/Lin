@@ -14,7 +14,7 @@ val s = suite("std/object", [
     ]
   ),
 
-  // `keys` over a plain `{}`/`Json` record preserves insertion order (TAG_OBJECT). Over a typed
+  // `keys` over a plain `{}`/`AnyVal` record preserves insertion order (TAG_OBJECT). Over a typed
   // `{ String: T }` map it is hash order — that distinction is covered in the typed-map section.
   test("keys order is insertion order", () =>
     val k = { "x": 1, "y": 2 }.keys()
@@ -413,7 +413,7 @@ val s = suite("std/object", [
 
   // The re-typed map-producing ops thread the element type through: `mapValues` over a
   // `{ String: Int32 }` returns a `{ String: W }` (here `W = Int32`) — a genuinely typed map whose
-  // values read back at the mapped type, not an opaque `Json`. The `: { String: Int32 }` annotation
+  // values read back at the mapped type, not an opaque `AnyVal`. The `: { String: Int32 }` annotation
   // on `doubled` only type-checks because the result really is that map type.
   test("typed map: mapValues yields a typed { String: W } result", () =>
     var src: { String: Int32 } = {}
@@ -576,8 +576,8 @@ val resultSuite = suite("std/object", [
   ),
 
   // ── predicate use in a filter callback ────────────────────────────────────
-  test("isOk filters successes out of a mixed Json array", () =>
-    val xs: Json = [
+  test("isOk filters successes out of a mixed AnyVal array", () =>
+    val xs: AnyVal = [
       parsePort("80"),
       parsePort(""),
       parsePort("443")
@@ -586,8 +586,8 @@ val resultSuite = suite("std/object", [
     [expect(oks.length()).toBe(2)]
   ),
 
-  test("isError filters failures out of a mixed Json array", () =>
-    val xs: Json = [
+  test("isError filters failures out of a mixed AnyVal array", () =>
+    val xs: AnyVal = [
       parsePort("80"),
       parsePort(""),
       parsePort("443")

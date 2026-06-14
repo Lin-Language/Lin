@@ -27,7 +27,7 @@ val countOf = (progress: Shared): Int32 =>
 
 // Narrow a single parallel result (the stdlib hands back a dynamic value) into the
 // precise TaskResult, accumulating with explicit push (the named-record-array idiom).
-val collect = (raw: Json[]): TaskResult[] =>
+val collect = (raw: AnyVal[]): TaskResult[] =>
   var out: TaskResult[] = []
   raw.for(x =>
     match x

@@ -28,7 +28,7 @@ val task = (i: Int32): Int32 =>
   i * 2 + 1
 
 // await yields T | Error (§24.2.2); recover a faulted task as 0 before summing.
-val recoverInt = (result: Json): Int32 =>
+val recoverInt = (result: AnyVal): Int32 =>
   match result
     is Int32 => result
     else => 0

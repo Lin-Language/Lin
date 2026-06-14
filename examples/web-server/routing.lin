@@ -128,7 +128,7 @@ export val dijkstra = (adj: { String: Neighbor[] }, source: String, allNodes: St
 
 // --- the public solve entry point -----------------------------------------
 // Read `graphPath`, run Dijkstra from `from`, and resolve the route to `to`.
-// The raw graph file is genuinely dynamic input, so it is read as Json and its
+// The raw graph file is genuinely dynamic input, so it is read as AnyVal and its
 // `edges`/`nodes` immediately fed into the typed `buildAdj`/`dijkstra` pipeline.
 export val solve = (graphPath: String, from: String, to: String): SolveResult =>
   val graphData = readJson(graphPath)

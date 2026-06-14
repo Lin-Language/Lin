@@ -126,11 +126,11 @@ val s = suite("std/process", [
 // in the documented closed set, is positive, is non-empty, names a real directory) rather than
 // exact machine values, so the suite passes on any host/CI runner regardless of platform.
 // platform() must be one of the documented closed set.
-val knownPlatform = (p: Json): Boolean =>
+val knownPlatform = (p: AnyVal): Boolean =>
   p == "linux" || p == "macos" || p == "windows" || p == "freebsd" || p == "openbsd" || p == "netbsd" || p == "unknown"
 
 // arch() must be one of the documented closed set.
-val knownArch = (a: Json): Boolean =>
+val knownArch = (a: AnyVal): Boolean =>
   a == "x86_64" || a == "aarch64" || a == "arm" || a == "x86" || a == "riscv64" || a == "wasm32" || a == "unknown"
 
 val osSuite = suite("std/process", [
@@ -171,7 +171,7 @@ val osSuite = suite("std/process", [
   ]),
 
   test("hostname is a non-empty string (or Error)", () => [
-    expect(hostname()).toSatisfy((h: Json) =>
+    expect(hostname()).toSatisfy((h: AnyVal) =>
       match h
         is Error => true
         else => length(h) > 0
@@ -179,7 +179,7 @@ val osSuite = suite("std/process", [
   ]),
 
   test("username resolves to a non-empty string (or Error)", () => [
-    expect(username()).toSatisfy((u: Json) =>
+    expect(username()).toSatisfy((u: AnyVal) =>
       match u
         is Error => true
         else => length(u) > 0
@@ -187,7 +187,7 @@ val osSuite = suite("std/process", [
   ]),
 
   test("homeDir resolves to a non-empty path (or Error)", () => [
-    expect(homeDir()).toSatisfy((h: Json) =>
+    expect(homeDir()).toSatisfy((h: AnyVal) =>
       match h
         is Error => true
         else => length(h) > 0
@@ -203,7 +203,7 @@ val osSuite = suite("std/process", [
   ]),
 
   test("uptime is a positive whole number of seconds (or Error)", () => [
-    expect(uptime()).toSatisfy((u: Json) =>
+    expect(uptime()).toSatisfy((u: AnyVal) =>
       match u
         is Error => true
         else => u >= 0
@@ -211,7 +211,7 @@ val osSuite = suite("std/process", [
   ]),
 
   test("loadAverage is a 3-element array on Unix, Error elsewhere", () => [
-    expect(loadAverage()).toSatisfy((la: Json) =>
+    expect(loadAverage()).toSatisfy((la: AnyVal) =>
       match la
         is Error => true
         else => la.length() == 3 && la[0] >= 0.0
@@ -219,7 +219,7 @@ val osSuite = suite("std/process", [
   ]),
 
   test("memInfo reports total > free >= 0 (or Error)", () => [
-    expect(memInfo()).toSatisfy((m: Json) =>
+    expect(memInfo()).toSatisfy((m: AnyVal) =>
       match m
         is Error => true
         else => m["total"] > 0 && m["free"] >= 0

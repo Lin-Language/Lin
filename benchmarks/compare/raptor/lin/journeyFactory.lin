@@ -8,16 +8,16 @@ import { length, push, slice, reverse } from "std/array"
 import { sortedRoundKeys } from "./roundKeys"
 import { Conn, Transfer } from "./types"
 
-val isTimetableLeg = (leg: Json): Boolean =>
+val isTimetableLeg = (leg: AnyVal): Boolean =>
   leg["stopTimes"] != null
 
 // Walk connections from finalDestination back to k=1, accumulating legs (in reverse), then reverse.
-val getJourneyLegs = (kConnections: { String: { String: Conn } }, k: String, finalDestination: String): Json =>
-  var legs: Json = []
+val getJourneyLegs = (kConnections: { String: { String: Conn } }, k: String, finalDestination: String): AnyVal =>
+  var legs: AnyVal = []
   buildLegs(kConnections, parseInt32(k), finalDestination, legs)
   reverse(legs)
 
-val buildLegs = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, legs: Json): Null =>
+val buildLegs = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, legs: AnyVal): Null =>
   if i <= 0 then
     null
   else
@@ -50,10 +50,10 @@ val buildLegs = (kConnections: { String: { String: Conn } }, i: Int32, destinati
             })
             buildLegs(kConnections, i - 1, origin, legs)
 
-val getDepartureTime = (legs: Json): Json =>
+val getDepartureTime = (legs: AnyVal): AnyVal =>
   depAt(legs, 0, 0)
 
-val depAt = (legs: Json, i: Int32, transferDuration: Int32): Json =>
+val depAt = (legs: AnyVal, i: Int32, transferDuration: Int32): AnyVal =>
   if i >= length(legs) then
     0
   else
@@ -63,10 +63,10 @@ val depAt = (legs: Json, i: Int32, transferDuration: Int32): Json =>
     else
       leg["stopTimes"][0]["departureTime"] - transferDuration
 
-val getArrivalTime = (legs: Json): Json =>
+val getArrivalTime = (legs: AnyVal): AnyVal =>
   arrAt(legs, length(legs) - 1, 0)
 
-val arrAt = (legs: Json, i: Int32, transferDuration: Int32): Json =>
+val arrAt = (legs: AnyVal, i: Int32, transferDuration: Int32): AnyVal =>
   if i < 0 then
     0
   else
@@ -77,8 +77,8 @@ val arrAt = (legs: Json, i: Int32, transferDuration: Int32): Json =>
       val sts = leg["stopTimes"]
       sts[length(sts) - 1]["arrivalTime"] + transferDuration
 
-export val getResults = (kConnections: { String: { String: Conn } }, destination: String): Json =>
-  var results: Json = []
+export val getResults = (kConnections: { String: { String: Conn } }, destination: String): AnyVal =>
+  var results: AnyVal = []
   // `kConnections[destination]` is `{ String: Conn } | Null`; callers only reach here for a
   // destination that has connections, so a Null map yields no rounds.
   val destMap = kConnections[destination]

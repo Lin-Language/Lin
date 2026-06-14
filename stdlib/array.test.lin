@@ -33,11 +33,11 @@ val s = suite("std/array", [
     ]
   ),
 
-  // Generic push of a genuinely-Json (dynamic) element into a CONCRETE flat-scalar array routes
+  // Generic push of a genuinely-AnyVal (dynamic) element into a CONCRETE flat-scalar array routes
   // through the dynamic path (lin_push_dyn coerces the boxed element into the flat slot), matching
   // the non-generic behaviour — no `zext ptr` codegen error.
-  test("push a Json element into a flat UInt8[]", () =>
-    val src: Json = [10, 20, 30]
+  test("push a AnyVal element into a flat UInt8[]", () =>
+    val src: AnyVal = [10, 20, 30]
     val buf: UInt8[] = []
     range(0, 3).for(i => buf.push(src[i]))
     [
@@ -1184,11 +1184,11 @@ val s = suite("std/array", [
     ]
   ),
 
-  // --- generic element typing flows through (Category 1 of the stdlib Json-typing audit) ---
+  // --- generic element typing flows through (Category 1 of the stdlib AnyVal-typing audit) ---
   // These lock in that the re-typed `<T>` collection ops PRESERVE the element type `T` rather than
-  // erasing to `Json`, so the result can be consumed by a `T`-typed context. `reverse`/`slice`/
+  // erasing to `AnyVal`, so the result can be consumed by a `T`-typed context. `reverse`/`slice`/
   // `unique` over String[] keep String elements; `String`-typed locals below would not type-check
-  // if the result were `Json`-erased.
+  // if the result were `AnyVal`-erased.
   test("reverse preserves the String element type through to a typed binding", () =>
     val names = ["alice", "bob", "carol"]
     val first: String = names.reverse()[0]
@@ -1414,7 +1414,7 @@ val s = suite("std/array", [
 
   // --- insertSorted: keeps order AND preserves element representation (the flat-array trap) ---
   test("insertSorted keeps order on a flat Int32[] and the result stays flat/correct", () =>
-    // Result is declared Int32[] — a flat (unboxed) array. If insertSorted built a tagged Json
+    // Result is declared Int32[] — a flat (unboxed) array. If insertSorted built a tagged AnyVal
     // array instead, the flat-typed reads below would reinterpret 16-byte slots as packed scalars
     // (garbage). toString over the flat array verifies the representation AND the order.
     val r: Int32[] = [1, 3, 5, 7].insertSorted(4, (a, b) => a - b)
@@ -1621,7 +1621,7 @@ val s = suite("std/array", [
   // These exercise the <T, K> signatures of sortBy / searchBy / dedupBy. ---
 
   // sortBy where the element type T (record) differs from the key type K (Int32 scalar): the
-  // flat-scalar key must round-trip through the boxed Json pair and sort numerically (not lexically).
+  // flat-scalar key must round-trip through the boxed AnyVal pair and sort numerically (not lexically).
   test("sortBy record elements by a flat Int32 key sorts numerically", () =>
     val people = [
       { "name": "Bob", "age": 30 },

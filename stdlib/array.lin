@@ -12,10 +12,10 @@
 // iter, iterOf) live in std/iter, where they dispatch on the receiver type (eager over
 // arrays/iterators, lazy over streams). Import those from std/iter, not std/array.
 import foreign "lin-runtime"
-  val lin_array_slice_dyn: (Json, Int32, Int32) => Json
-  val lin_array_append_dyn: (Json, Json) => Json
-  val lin_array_prepend_dyn: (Json, Json) => Json
-  val lin_object_get_or_insert_array: (Json, String) => Json
+  val lin_array_slice_dyn: (AnyVal, Int32, Int32) => AnyVal
+  val lin_array_append_dyn: (AnyVal, AnyVal) => AnyVal
+  val lin_array_prepend_dyn: (AnyVal, AnyVal) => AnyVal
+  val lin_object_get_or_insert_array: (AnyVal, String) => AnyVal
 
 // Iterable combinators moved to std/iter (Stage 1 of the std/iter unification). The array-shaped
 // functions below that need them internally (reverse/partition/zip/unique/chunk/sort/scan/groupBy/
@@ -35,7 +35,7 @@ export val push = <T>(arr: T[], item: T): Null =>
   lin_push(arr, item)
 
 // Copy the sub-range `[start, end)` into a new array, preserving the element type (a `UInt8[]`
-// yields a `UInt8[]`, an `Int32[]` an `Int32[]`, a `Json[]` a `Json[]`).
+// yields a `UInt8[]`, an `Int32[]` an `Int32[]`, a `AnyVal[]` a `AnyVal[]`).
 // @param arr    the source array.
 // @param start  start index (inclusive); negative counts from the end; clamped to `[0, length]`.
 // @param end    end index (exclusive); defaults to `length(arr)`; negative counts from the end; clamped to `[0, length]`.
@@ -50,12 +50,12 @@ export val slice = <T>(arr: T[], start: Int32, end: Int32 = length(arr)): T[] =>
   val e = if end < 0 then n + end else end
   lin_array_slice_dyn(arr, s, e)
 
-// Allocate an uninitialised length-`n` array (boxed/tagged `Json`, so untyped use needs no
+// Allocate an uninitialised length-`n` array (boxed/tagged `AnyVal`, so untyped use needs no
 // annotation). For a flat unboxed scalar array, use `arrayAllocateFilled` instead.
 // @param n  the length of the array to allocate.
-// @returns an uninitialised `Json` array of length `n`.
-export val arrayAllocate = (n: Int32): Json =>
-  // Stays `Json` rather than generic so call sites need no annotation for untyped use.
+// @returns an uninitialised `AnyVal` array of length `n`.
+export val arrayAllocate = (n: Int32): AnyVal =>
+  // Stays `AnyVal` rather than generic so call sites need no annotation for untyped use.
   lin_array_allocate(n)
 
 // Allocate a length-`n` array with every slot set to `fill`. The element type is inferred from
@@ -73,18 +73,18 @@ export val arrayAllocateFilled = <T>(n: Int32, fill: T): T[] =>
 // @example length([1, 2, 3])     // 3
 // @example length("hello")       // 5
 // @example length({ "a": 1 })    // 1
-export val length = (x: Json): Int32 =>
+export val length = (x: AnyVal): Int32 =>
   lin_length(x)
 
-// Non-generic Json wrappers over the lin_map/lin_filter/lin_reduce intrinsics, used internally by the
-// heterogeneous stdlib combinators (sortBy/minBy/maxBy/compact/sum/...) that operate on `Json[]`.
-val _mapJ = (arr: Json, f: Function): Json =>
+// Non-generic AnyVal wrappers over the lin_map/lin_filter/lin_reduce intrinsics, used internally by the
+// heterogeneous stdlib combinators (sortBy/minBy/maxBy/compact/sum/...) that operate on `AnyVal[]`.
+val _mapJ = (arr: AnyVal, f: Function): AnyVal =>
   lin_map(arr, f)
 
-val _filterJ = (arr: Json, f: Function): Json =>
+val _filterJ = (arr: AnyVal, f: Function): AnyVal =>
   lin_filter(arr, f)
 
-val _reduceJ = (arr: Json, init: Json, f: (Json, Json) => Json): Json =>
+val _reduceJ = (arr: AnyVal, init: AnyVal, f: (AnyVal, AnyVal) => AnyVal): AnyVal =>
   lin_reduce(arr, init, f)
 
 // Find the index of the first element equal to `target` (deep `==`), scanning left to right.
@@ -218,7 +218,7 @@ export val compact = <T>(arr: (T | Null)[]): T[] =>
 // be REAL `T[]` arrays with the SAME runtime representation as `arr` (flat unboxed for a scalar `T`,
 // tagged otherwise) — the generic `cmp` is monomorphized to read its args in `T`'s representation and
 // is called on `src[i]`/`src[j]`, so the buffer reads must yield that representation. Hence the buffers
-// are built with `arrayAllocateFilled(n, arr[0])`, NOT `arrayAllocate` (a tagged `Json` array, which a
+// are built with `arrayAllocateFilled(n, arr[0])`, NOT `arrayAllocate` (a tagged `AnyVal` array, which a
 // flat-typed read reinterprets as a packed scalar: a misaligned-pointer crash).
 //
 // Merge two already-sorted runs src[i..loB) and src[loB..hi) into dst[k..). On a tie (cmp <= 0, i.e.
@@ -281,19 +281,19 @@ export val sort = <T>(arr: T[], cmp: (T, T) => Int32): T[] =>
     )
     _mergePass(buf, work, n, 1, cmp)
 
-// Json-internal sort used by `sortBy` (and any heterogeneous helper that sorts `Json` pair
-// arrays). It does NOT route through the generic `sort`: passing a bare `Json` value to
-// `<T>(arr: T[], …)` leaves `T` unresolved at monomorphization (the bare-`Json`-to-generic
-// inference gap also documented in bench.lin). Pinning `T = Json` explicitly here (via the
-// `Json` signature, so the `arrayAllocateFilled` fill and the `_mergePass` element type are all
-// `Json` → a tagged buffer matching the tagged pair elements) keeps the merge sound.
-val _sortJ = (arr: Json, cmp: (Json, Json) => Int32): Json =>
+// AnyVal-internal sort used by `sortBy` (and any heterogeneous helper that sorts `AnyVal` pair
+// arrays). It does NOT route through the generic `sort`: passing a bare `AnyVal` value to
+// `<T>(arr: T[], …)` leaves `T` unresolved at monomorphization (the bare-`AnyVal`-to-generic
+// inference gap also documented in bench.lin). Pinning `T = AnyVal` explicitly here (via the
+// `AnyVal` signature, so the `arrayAllocateFilled` fill and the `_mergePass` element type are all
+// `AnyVal` → a tagged buffer matching the tagged pair elements) keeps the merge sound.
+val _sortJ = (arr: AnyVal, cmp: (AnyVal, AnyVal) => Int32): AnyVal =>
   val n = length(arr)
   if n <= 1 then
     concat(arr, [])
   else
-    val buf: Json = arrayAllocateFilled(n, arr[0])
-    val work: Json = arrayAllocateFilled(n, arr[0])
+    val buf: AnyVal = arrayAllocateFilled(n, arr[0])
+    val work: AnyVal = arrayAllocateFilled(n, arr[0])
     var i = 0
     arr.for(item =>
       set(buf, i, item)
@@ -303,14 +303,14 @@ val _sortJ = (arr: Json, cmp: (Json, Json) => Int32): Json =>
 
 // Build the heterogeneous `[key, item]` pair array for the keyed helpers (`sortBy`/`minBy`/
 // `maxBy`). Generic over `T` so `keyFn` is element-type-checked AND so `keyFn(item)`/the stored
-// `item` see `T`'s native representation. The pairs themselves are a `Json` array (a `[Json, T]`
-// literal infers a `Json` element), which the helpers then sort/reduce via the boxed-`Json` path.
-// It maps with the RAW `lin_map` builtin (NOT the `_mapJ` wrapper, whose `Function`/`Json`-typed
-// params would coerce the generic `keyFn`/`item` into the boxed-`Json` ABI — sound for object `T`
+// `item` see `T`'s native representation. The pairs themselves are a `AnyVal` array (a `[AnyVal, T]`
+// literal infers a `AnyVal` element), which the helpers then sort/reduce via the boxed-`AnyVal` path.
+// It maps with the RAW `lin_map` builtin (NOT the `_mapJ` wrapper, whose `Function`/`AnyVal`-typed
+// params would coerce the generic `keyFn`/`item` into the boxed-`AnyVal` ABI — sound for object `T`
 // but a misaligned read for a scalar `T`). Calling `lin_map` from this generic body keeps `arr`
 // at `T[]` and the lambda's `item` at `T`, so `keyFn(item)` is invoked on the `T` ABI; `lin_map`
-// boxes each result `[key, item]` pair into the returned tagged `Json` array itself.
-val _keyedPairs = <T, K>(arr: T[], keyFn: (T) => K): Json =>
+// boxes each result `[key, item]` pair into the returned tagged `AnyVal` array itself.
+val _keyedPairs = <T, K>(arr: T[], keyFn: (T) => K): AnyVal =>
   lin_map(arr, item => [keyFn(item), item])
 
 // Stably sort `arr` by a key extracted from each element, comparing keys with Lin's natural
@@ -320,9 +320,9 @@ val _keyedPairs = <T, K>(arr: T[], keyFn: (T) => K): Json =>
 // @returns a new `T[]` sorted ascending by key, ties in original order.
 // @example people.sortBy(p => p["name"])
 export val sortBy = <T, K>(arr: T[], keyFn: (T) => K): T[] =>
-  // The key `K` is checker-visible but only ever flows into the `[keyFn(item), item]` Json pair
-  // literal built by `_keyedPairs` (which BOXES it into the tagged Json array). The sort comparator
-  // below reads it back as the Json `a[0]`/`b[0]`, so the runtime comparison path is the boxed
+  // The key `K` is checker-visible but only ever flows into the `[keyFn(item), item]` AnyVal pair
+  // literal built by `_keyedPairs` (which BOXES it into the tagged AnyVal array). The sort comparator
+  // below reads it back as the AnyVal `a[0]`/`b[0]`, so the runtime comparison path is the boxed
   // `lin_tagged_cmp` regardless of `K`'s monomorphization — no flat-scalar-vs-tagged hazard here.
   val pairs = _keyedPairs(arr, keyFn)
   val sorted = _sortJ(pairs, (a, b) =>
@@ -331,8 +331,8 @@ export val sortBy = <T, K>(arr: T[], keyFn: (T) => K): T[] =>
   // Unpack the sorted `[key, item]` pairs back to a `T[]` in THIS generic body (each `pair[1]` is
   // the original element, restored to the `T` representation in the annotated `result`). Building
   // the result here rather than via `_mapJ(sorted, pair => pair[1])` keeps the returned array a
-  // real `T[]`: the `Json` `_mapJ` result, bound to the `T[]` return, read back element-by-element
-  // is the same erasure hazard that affects a `Json`-returning function consumed as a typed array.
+  // real `T[]`: the `AnyVal` `_mapJ` result, bound to the `T[]` return, read back element-by-element
+  // is the same erasure hazard that affects a `AnyVal`-returning function consumed as a typed array.
   val result: T[] = []
   sorted.for(pair => push(result, pair[1]))
   result
@@ -467,7 +467,7 @@ export val countInRange = <T>(arr: T[], lo: T, hi: T, compare: (T, T) => Int32):
 // @param arr  an array of numeric elements.
 // @returns the sum (`0` for an empty array).
 export val sum = <T>(arr: T[]): T =>
-  // Folds through the dynamic `_reduceJ` (Json accumulator) so a mixed/widening numeric fold stays
+  // Folds through the dynamic `_reduceJ` (AnyVal accumulator) so a mixed/widening numeric fold stays
   // correct (an `Int32`-literal init pinned to a generic `T` would mis-type a `Float64` sum), then
   // the `T` return coerces the result back to the element type. A bare untyped `[].sum()` cannot
   // infer `T` and is a compile error — annotate the array (`val xs: Int32[] = []`).
@@ -512,7 +512,7 @@ export val maxBy = <T>(arr: T[], keyFn: (T) => Number): T =>
   )[1]
 
 // Append `item` to the end of `arr`, returning a new array (does not mutate `arr`). A flat array
-// (e.g. `UInt8[]`) stays flat; a tagged `Json[]` stays tagged.
+// (e.g. `UInt8[]`) stays flat; a tagged `AnyVal[]` stays tagged.
 // @param arr   the source array; its element type pins `T` for element checking.
 // @param item  the element to append; must be assignable to `T` (`append(intArr, "s")` is a compile error).
 // @returns a new `T[]` with `item` appended.
@@ -620,12 +620,12 @@ export val findLastIndex = <T>(arr: T[], f: (T, Int32) => Boolean): Int32 =>
 // @returns a `T[][]` of the consecutive runs (`[]` for an empty input).
 export val dedupBy = <T, K>(arr: T[], f: (T) => K): T[][] =>
   val result: T[][] = []
-  // `prevKey` stays `Json` (not `K`): it must hold a `null` sentinel before the first element, which
+  // `prevKey` stays `AnyVal` (not `K`): it must hold a `null` sentinel before the first element, which
   // a bare `K` cannot. The first comparison is guarded by `have`, so the `null` is never compared.
-  // `prevKey != key` is then a Json-vs-`K` compare; codegen's order-symmetric tagged-equality arm
+  // `prevKey != key` is then a AnyVal-vs-`K` compare; codegen's order-symmetric tagged-equality arm
   // boxes the concrete `K` operand by its static type before `lin_tagged_eq`, so a flat-scalar `K`
   // is correctly boxed (no flat-vs-tagged read hazard).
-  var prevKey: Json = null
+  var prevKey: AnyVal = null
   var have = false
   arr.for(item =>
     val key = f(item)

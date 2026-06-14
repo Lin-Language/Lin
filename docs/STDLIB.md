@@ -27,7 +27,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/object`](#stdobject) | Object introspection functions, plus `T \| Error`/`T \| Null` ergonomics (formerly std/result) |
 | [`std/json`](#stdjson) | Type-directed JSON decode |
 | [`std/yaml`](#stdyaml) | YAML parse and serialise |
-| [`std/jq`](#stdjq) | Query Json values with jq filters |
+| [`std/jq`](#stdjq) | Query AnyVal values with jq filters |
 | [`std/csv`](#stdcsv) | RFC 4180 CSV parse/stringify (eager and streaming) |
 | [`std/io`](#stdio) | stdin/stdout and terminal input |
 | [`std/fs`](#stdfs) | Filesystem read and write, glob, temp files, symlinks |
@@ -76,7 +76,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`startsWith`](#startsWith) | `(String, String) -> Boolean` | Test whether string begins with prefix |
 | [`substring`](#substring) | `(String, Int32, Int32 = length(s)) -> String` | Extract a slice by codepoint indices |
 | [`toLower`](#toLower) | `(String) -> String` | Convert to lowercase |
-| [`toString`](#toString) | `(Json) -> String` | Convert any value to its string representation |
+| [`toString`](#toString) | `(AnyVal) -> String` | Convert any value to its string representation |
 | [`toUpper`](#toUpper) | `(String) -> String` | Convert to uppercase |
 | [`trim`](#trim) | `(String) -> String` | Remove leading and trailing whitespace |
 | [`trimEnd`](#trimEnd) | `(String) -> String` | Remove trailing whitespace only |
@@ -90,17 +90,17 @@ below show the array/iterator (eager) form; the per-function reference notes the
 
 | Function | Signature | Summary |
 | --- | --- | --- |
-| [`concat`](#concat-iter) | `(Json[], Json[]) -> Json[]` | Concatenate two iterables |
+| [`concat`](#concat-iter) | `(AnyVal[], AnyVal[]) -> AnyVal[]` | Concatenate two iterables |
 | [`drop`](#drop-iter) | `<T>(T[], Int32) -> T[]` | All elements after first n |
 | [`dropWhile`](#dropWhile-iter) | `<T>(T[], (T) -> Boolean) -> T[]` | Skip elements while predicate holds |
 | [`every`](#every-iter) | `<T>(T[], (T) -> Boolean) -> Boolean` | True if all elements match |
 | [`filter`](#filter-iter) | `<T>(T[], (T) -> Boolean) -> T[]` | Keep elements matching predicate |
 | [`find`](#find-iter) | `<T>(T[], (T) -> Boolean) -> T \| Null` | First matching element, or null |
-| [`flatMap`](#flatMap-iter) | `(Json[], (Json) -> Json[]) -> Json[]` | Map then flatten one level |
+| [`flatMap`](#flatMap-iter) | `(AnyVal[], (AnyVal) -> AnyVal[]) -> AnyVal[]` | Map then flatten one level |
 | [`flatten`](#flatten-iter) | `<T>(T[][]) -> T[]` | Flatten one level of nesting |
-| [`for`](#for-iter) | `(Iterable, (Json) -> Json) -> Null` | Iterate over array, iterator, or stream |
+| [`for`](#for-iter) | `(Iterable, (AnyVal) -> AnyVal) -> Null` | Iterate over array, iterator, or stream |
 | [`iter`](#iter) | `(() -> S, (S) -> Boolean, (S) -> S, (S) -> T) -> Iterator` | Build a custom iterator |
-| [`iterOf`](#iterOf) | `(Json[]) -> Iterator` | Iterator over an array (element type erased into the iterator) |
+| [`iterOf`](#iterOf) | `(AnyVal[]) -> Iterator` | Iterator over an array (element type erased into the iterator) |
 | [`map`](#map-iter) | `<T, U>(T[], (T) -> U) -> U[]` | Transform each element |
 | [`range`](#range) | `(Int32, Int32) -> Iterator` | Integer range `[start, end)`, step 1 |
 | [`rangeStep`](#rangeStep) | `(Int32, Int32, Int32) -> Iterator` | Integer range with an explicit (possibly negative) step |
@@ -119,15 +119,15 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | Function | Signature | Summary |
 | --- | --- | --- |
 | [`append`](#append) | `<T>(T[], T) -> T[]` | Non-mutating single-element append |
-| [`arrayAllocate`](#arrayAllocate) | `(Int32) -> Json[]` | Allocate an array of n nulls |
+| [`arrayAllocate`](#arrayAllocate) | `(Int32) -> AnyVal[]` | Allocate an array of n nulls |
 | [`arrayAllocateFilled`](#arrayAllocateFilled) | `<T>(Int32, T) -> T[]` | Allocate an array of n copies of a fill value |
 | [`at`](#at-array) | `<T, D>(T[], Int32, D = null) -> T \| D` | Element at index, or the default (`null` if omitted) when out of bounds; negative indices count from end |
 | [`chunk`](#chunk) | `<T>(T[], Int32) -> T[][]` | Split into n-sized sub-arrays |
-| [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
+| [`compact`](#compact) | `(AnyVal[]) -> AnyVal[]` | Remove null elements |
 | [`countBy`](#countBy) | `<T>(T[], (T) -> String) -> { String: Int32 }` | Frequency map by key function |
 | [`groupBy`](#groupBy) | `<T>(T[], (T) -> String) -> { String: T[] }` | Group into a typed map of arrays by key function |
 | [`indexOf`](#indexOf-array) | `<T>(T[], T, Int32 = 0) -> Int32` | First index of value at/after `fromIndex` (negatives count from end), or -1 |
-| [`length`](#length-array) | `(Json) -> Int32` | Length of array, string, or object |
+| [`length`](#length-array) | `(AnyVal) -> Int32` | Length of array, string, or object |
 | [`max`](#max-array) | `(Number[]) -> Number` | Maximum element |
 | [`maxBy`](#maxBy) | `<T>(T[], (T) -> Number) -> T` | Element with the largest key |
 | [`min`](#min-array) | `(Number[]) -> Number` | Minimum element |
@@ -205,32 +205,32 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 
 | Function | Signature | Summary |
 | --- | --- | --- |
-| [`entries`](#entries) | `(Json) -> [String, Json][]` | Array of `[key, value]` pairs (tag-aware: object or typed map) |
-| [`fromEntries`](#fromEntries) | `([String, Json][]) -> {}` | Build an object from key-value pairs |
+| [`entries`](#entries) | `(AnyVal) -> [String, AnyVal][]` | Array of `[key, value]` pairs (tag-aware: object or typed map) |
+| [`fromEntries`](#fromEntries) | `([String, AnyVal][]) -> {}` | Build an object from key-value pairs |
 | [`get`](#get) | `<T, D>({ String: T }, String, D = null) -> T \| D` | Value at key, or the default (`null` if omitted) when absent — the keyed convenience for the built-in `m[k] ?? default` (`??`, SPECIFICATION.md §8.3) |
-| [`isEmpty`](#isEmpty) | `(Json) -> Boolean` | True if object, array, or string is empty |
-| [`keys`](#keys) | `(Json) -> String[]` | Array of object keys (tag-aware: object or typed map) |
+| [`isEmpty`](#isEmpty) | `(AnyVal) -> Boolean` | True if object, array, or string is empty |
+| [`keys`](#keys) | `(AnyVal) -> String[]` | Array of object keys (tag-aware: object or typed map) |
 | [`mapValues`](#mapValues) | `<V,W>({ String: V }, (V) -> W) -> { String: W }` | Transform all values, keeping keys |
 | [`merge`](#merge) | `<T>({ String: T }, { String: T }) -> { String: T }` | Shallow-merge two typed maps (right wins on conflict) |
 | [`omit`](#omit) | `<T>({ String: T }, String[]) -> { String: T }` | Return typed map without specified keys |
 | [`pick`](#pick) | `<T>({ String: T }, String[]) -> { String: T }` | Return typed map with only specified keys |
-| [`values`](#values) | `(Json) -> Json[]` | Array of object values (tag-aware: object or typed map) |
+| [`values`](#values) | `(AnyVal) -> AnyVal[]` | Array of object values (tag-aware: object or typed map) |
 
 **std/yaml**
 
 | Function | Signature | Summary |
 | --- | --- | --- |
-| [`parse`](#parse-yaml) | `(String) -> Json \| Error` | Parse one YAML document |
-| [`parseAll`](#parseAll) | `(String) -> Json[] \| Error` | Parse a `---`-separated multi-document stream |
-| [`stringify`](#stringify-yaml) | `(Json) -> String` | Serialise a value to block-style YAML |
-| [`stringifyAll`](#stringifyAll) | `(Json[]) -> String` | Serialise values to a `---`-separated YAML stream |
+| [`parse`](#parse-yaml) | `(String) -> AnyVal \| Error` | Parse one YAML document |
+| [`parseAll`](#parseAll) | `(String) -> AnyVal[] \| Error` | Parse a `---`-separated multi-document stream |
+| [`stringify`](#stringify-yaml) | `(AnyVal) -> String` | Serialise a value to block-style YAML |
+| [`stringifyAll`](#stringifyAll) | `(AnyVal[]) -> String` | Serialise values to a `---`-separated YAML stream |
 
 **std/jq**
 
 | Function | Signature | Summary |
 | --- | --- | --- |
-| [`jq`](#jq) | `(Json, String) -> Json[] \| Error` | Run a jq filter, collecting all outputs |
-| [`jqFirst`](#jqFirst) | `(Json, String) -> Json \| Error` | Run a jq filter, returning the first output or `Null` |
+| [`jq`](#jq) | `(AnyVal, String) -> AnyVal[] \| Error` | Run a jq filter, collecting all outputs |
+| [`jqFirst`](#jqFirst) | `(AnyVal, String) -> AnyVal \| Error` | Run a jq filter, returning the first output or `Null` |
 
 **std/io**
 
@@ -239,8 +239,8 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`args`](#args) | `() -> String[]` | Command-line arguments (argv after the script name) |
 | [`exit`](#exit) | `(Int32) -> Null` | Terminate the process with an exit code |
 | [`lines`](#lines-io) | `() -> Iterator` | Iterator over stdin lines |
-| [`print`](#print) | `(Json) -> Null` | Write a value to stdout |
-| [`printErr`](#printErr) | `(Json) -> Null` | Write a value to stderr |
+| [`print`](#print) | `(AnyVal) -> Null` | Write a value to stdout |
+| [`printErr`](#printErr) | `(AnyVal) -> Null` | Write a value to stderr |
 | [`prompt`](#prompt) | `(String) -> String \| Null` | Print a message then read one line from stdin |
 | [`readAll`](#readAll) | `() -> String` | Read all of stdin as one string |
 | [`readLine`](#readLine) | `() -> String \| Null` | Read one line from stdin, or Null on EOF |
@@ -254,18 +254,18 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`exists`](#exists) | `(String) -> Boolean` | Test whether a file or directory exists |
 | [`isDir`](#isDir) | `(String) -> Boolean` | True if path is a directory |
 | [`isFile`](#isFile) | `(String) -> Boolean` | True if path is a regular file |
-| [`ls`](#ls) | `(String, Json) -> String[] \| Error` | List directory entry names; supports `{ recursive }` |
-| [`mkdir`](#mkdir) | `(String, Json) -> Null \| Error` | Create a directory; supports `{ parents }` option |
+| [`ls`](#ls) | `(String, AnyVal) -> String[] \| Error` | List directory entry names; supports `{ recursive }` |
+| [`mkdir`](#mkdir) | `(String, AnyVal) -> Null \| Error` | Create a directory; supports `{ parents }` option |
 | [`mv`](#mv) | `(String, String) -> Null \| Error` | Move or rename a file |
 | [`readFile`](#readFile) | `(String) -> String \| Error` | Read entire file as a string |
 | [`readFileBytes`](#readFileBytes) | `(String) -> UInt8[] \| Error` | Read file as a raw byte buffer |
-| [`readJson`](#readJson) | `(String) -> Json \| Error` | Read and parse file as JSON |
+| [`readJson`](#readJson) | `(String) -> AnyVal \| Error` | Read and parse file as JSON |
 | [`readLines`](#readLines) | `(String) -> String[] \| Error` | Read lines of a file into an array |
-| [`rm`](#rm) | `(String, Json) -> Null \| Error` | Remove a file or directory; supports `{ recursive }` |
+| [`rm`](#rm) | `(String, AnyVal) -> Null \| Error` | Remove a file or directory; supports `{ recursive }` |
 | [`stat`](#stat) | `(String) -> FileStat \| Error` | File metadata |
 | [`writeFile`](#writeFile) | `(String, String) -> Null \| Error` | Write string to file, replacing contents |
 | [`writeFileBytes`](#writeFileBytes) | `(String, UInt8[]) -> Null \| Error` | Write a raw byte buffer to file |
-| [`writeJson`](#writeJson) | `(String, Json, Json) -> Null \| Error` | Serialise value to pretty JSON; supports `{ compact }` option |
+| [`writeJson`](#writeJson) | `(String, AnyVal, AnyVal) -> Null \| Error` | Serialise value to pretty JSON; supports `{ compact }` option |
 | [`writeLines`](#writeLines) | `(String, String[]) -> Null \| Error` | Write an array of strings, one per line |
 
 **std/path**
@@ -288,18 +288,18 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | Function | Signature | Summary |
 | --- | --- | --- |
 | [`fetch`](#fetch) | `(String) -> HttpResponse \| Error` | GET a URL |
-| [`fetchJson`](#fetchJson) | `(String) -> Json \| Error` | GET a URL and parse the body as JSON |
+| [`fetchJson`](#fetchJson) | `(String) -> AnyVal \| Error` | GET a URL and parse the body as JSON |
 | [`fetchWith`](#fetchWith) | `(String, HttpOptions) -> HttpResponse \| Error` | Request with custom method, headers, body |
-| [`postJson`](#postJson) | `(String, Json) -> HttpResponse \| Error` | POST a JSON body to a URL |
+| [`postJson`](#postJson) | `(String, AnyVal) -> HttpResponse \| Error` | POST a JSON body to a URL |
 
 **std/http** — server
 
 | Function | Signature | Summary |
 | --- | --- | --- |
 | [`badRequest`](#badRequest) | `(String) -> HttpResponse` | Build a 400 response with a message |
-| [`json`](#json-helper) | `(Int32, Json) -> HttpResponse` | Build a JSON response |
+| [`json`](#json-helper) | `(Int32, AnyVal) -> HttpResponse` | Build a JSON response |
 | [`notFound`](#notFound) | `HttpResponse` | 404 response value |
-| [`parseBody`](#parseBody) | `(HttpRequest) -> Json \| Error` | Parse the request body as JSON |
+| [`parseBody`](#parseBody) | `(HttpRequest) -> AnyVal \| Error` | Parse the request body as JSON |
 | [`matchPath`](#matchPath) | `(String, String) -> { ...String } \| Null` | Match a path against a pattern, returning captured params |
 | [`redirect`](#redirect) | `(String) -> HttpResponse` | Build a 302 redirect response |
 | [`serve`](#serve) | `((HttpRequest) -> HttpResponse, Int32) -> Null` | Start a sequential HTTP server |
@@ -410,7 +410,7 @@ incrementally (constant memory) and threads decode errors in-band like every oth
 
 | Name | Signature | Summary |
 | --- | --- | --- |
-| [`expect`](#expect) | `(Json) -> Asserter` | Begin an assertion chain |
+| [`expect`](#expect) | `(AnyVal) -> Asserter` | Begin an assertion chain |
 | [`run`](#run-test) | `(Suite[]) -> Null` | Execute suites, print results, exit non-zero on failure |
 | [`suite`](#suite) | `(String, Test[]) -> Suite` | Group tests under a name |
 | [`test`](#test) | `(String, () -> Assertion[]) -> Test` | Declare a single test case |
@@ -785,7 +785,7 @@ toLower("CAFÉ")    // "café"
 ### toString
 
 ```txt
-val toString: (value: Json) -> String
+val toString: (value: AnyVal) -> String
 ```
 
 Converts any value to its string representation. Strings are returned as-is. Numbers, booleans, `null`, arrays, and objects are formatted as JSON.
@@ -993,7 +993,7 @@ val n = readStream("nums.txt")
 ### for (iter) {#for-iter}
 
 ```txt
-val for: (src: Json[] | Iterator | Stream, f: (Json[, i: Int32]) -> Json) -> Null | (Null | Error)
+val for: (src: AnyVal[] | Iterator | Stream, f: (AnyVal[, i: Int32]) -> AnyVal) -> Null | (Null | Error)
 ```
 
 Iterates over each element, calling `f` (its return value is discarded). `f` optionally receives the
@@ -1099,10 +1099,10 @@ eager `T[]`. **Stream** → lazy `Stream<T>`.
 ### flatMap (iter) {#flatMap-iter}
 
 ```txt
-val flatMap: (src: Json[] | Iterator | Stream, f: (Json[, i: Int32]) -> Json[]) -> Json[] | Stream
+val flatMap: (src: AnyVal[] | Iterator | Stream, f: (AnyVal[, i: Int32]) -> AnyVal[]) -> AnyVal[] | Stream
 ```
 
-Applies `f` to each element and concatenates the resulting arrays. **Array/Iterator** → eager `Json[]`.
+Applies `f` to each element and concatenates the resulting arrays. **Array/Iterator** → eager `AnyVal[]`.
 **Stream** → lazy stream that yields each inner element in turn.
 
 ```txt
@@ -1129,10 +1129,10 @@ flatten([[1, 2], [3, 4]])   // [1, 2, 3, 4]
 ### concat (iter) {#concat-iter}
 
 ```txt
-val concat: (a: Json[] | Iterator | Stream, b: Json[] | Iterator | Stream) -> Json[] | Stream
+val concat: (a: AnyVal[] | Iterator | Stream, b: AnyVal[] | Iterator | Stream) -> AnyVal[] | Stream
 ```
 
-Yields all of `a` followed by all of `b`. **Arrays/Iterators** → eager `Json[]`. **Streams** → lazy
+Yields all of `a` followed by all of `b`. **Arrays/Iterators** → eager `AnyVal[]`. **Streams** → lazy
 (both stream arguments are consumed/moved into the concatenated source).
 
 ```txt
@@ -1244,7 +1244,7 @@ fibs.for(n => print(toString(n)))
 ### iterOf
 
 ```txt
-val iterOf: (arr: Json[]) -> Iterator
+val iterOf: (arr: AnyVal[]) -> Iterator
 ```
 
 Returns an iterator that yields each element of `arr` in order. Produces a first-class iterator value
@@ -1279,7 +1279,7 @@ import { push, slice, sort, sum } from "std/array"
 val append: <T>(arr: T[], item: T) -> T[]
 ```
 
-Returns a new array with `item` added at the end. Does not modify `arr`. For in-place mutation, use `push`. Generic over the element type `T`, so the element type is enforced: `append(intArr, "s")` is a compile error. The result preserves the input's element representation: appending to a flat scalar array (e.g. `UInt8[]`, `Int32[]`) yields a flat array of the same type (a numeric literal item adopts the array's element width, so `b.append(3)` on a `UInt8[]` stays `UInt8[]`), so byte-level consumers still read packed bytes; a `Json[]` stays tagged.
+Returns a new array with `item` added at the end. Does not modify `arr`. For in-place mutation, use `push`. Generic over the element type `T`, so the element type is enforced: `append(intArr, "s")` is a compile error. The result preserves the input's element representation: appending to a flat scalar array (e.g. `UInt8[]`, `Int32[]`) yields a flat array of the same type (a numeric literal item adopts the array's element width, so `b.append(3)` on a `UInt8[]` stays `UInt8[]`), so byte-level consumers still read packed bytes; a `AnyVal[]` stays tagged.
 
 ```txt
 append([1, 2], 3)    // [1, 2, 3]
@@ -1292,7 +1292,7 @@ append(ss, "hello")  // ["hello"]
 ### arrayAllocate
 
 ```txt
-val arrayAllocate: (n: Int32) -> Json[]
+val arrayAllocate: (n: Int32) -> AnyVal[]
 ```
 
 Returns a new array of length `n` with every element initialised to `null`. Useful as a
@@ -1370,7 +1370,7 @@ chunk([], 2)                  // []
 ### compact
 
 ```txt
-val compact: (arr: Json[]) -> Json[]
+val compact: (arr: AnyVal[]) -> AnyVal[]
 ```
 
 Returns a new array with all `null` elements removed.
@@ -1441,7 +1441,7 @@ Returns the zero-based index of the first element deeply equal to `target` at or
 ### length (array) {#length-array}
 
 ```txt
-val length: (x: Json) -> Int32
+val length: (x: AnyVal) -> Int32
 ```
 
 Returns the length of an array, string, or object (number of keys).
@@ -1537,7 +1537,7 @@ val [evens, odds] = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)
 val prepend: <T>(arr: T[], item: T) -> T[]
 ```
 
-Returns a new array with `item` added at the beginning. Does not modify `arr`. Generic over `T` (same element-type enforcement as `append`). Like `append`, the result preserves the input's element representation (a flat `UInt8[]`/`Int32[]` stays flat; a `Json[]` stays tagged).
+Returns a new array with `item` added at the beginning. Does not modify `arr`. Generic over `T` (same element-type enforcement as `append`). Like `append`, the result preserves the input's element representation (a flat `UInt8[]`/`Int32[]` stays flat; a `AnyVal[]` stays tagged).
 
 ```txt
 prepend([2, 3], 1)    // [1, 2, 3]
@@ -1632,7 +1632,7 @@ set(buf, 1, "b")
 val slice: <T>(arr: T[], start: Int32, end: Int32 = length(arr)) -> T[]
 ```
 
-Returns a copy of the elements in the half-open range `[start, end)`. `end` is optional and defaults to the array length, so `slice(arr, start)` returns the elements from `start` to the end. Negative indices count from the end (`-1` is the last element's position): they are resolved by adding `length(arr)` to any negative value, then clamped to `[0, length(arr)]`. The element type is preserved: slicing a `UInt8[]` yields a `UInt8[]`, an `Int32[]` an `Int32[]`, and a `Json[]` a `Json[]`. Also re-exported from `std/bytes` (with both bounds explicit). There is no range-index syntax (`arr[a..b]`).
+Returns a copy of the elements in the half-open range `[start, end)`. `end` is optional and defaults to the array length, so `slice(arr, start)` returns the elements from `start` to the end. Negative indices count from the end (`-1` is the last element's position): they are resolved by adding `length(arr)` to any negative value, then clamped to `[0, length(arr)]`. The element type is preserved: slicing a `UInt8[]` yields a `UInt8[]`, an `Int32[]` an `Int32[]`, and a `AnyVal[]` a `AnyVal[]`. Also re-exported from `std/bytes` (with both bounds explicit). There is no range-index syntax (`arr[a..b]`).
 
 ```txt
 [10, 20, 30, 40, 50].slice(1, 4)   // [20, 30, 40]
@@ -2415,21 +2415,21 @@ import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, 
 > **Typed maps (`{ String: T }`).** Two groups of `std/object` ops relate to the typed
 > index-signature map (the dictionary type, backed by a hashed O(1) container):
 >
-> - **Tag-aware introspection** — `keys`, `values`, `entries`, `length`, and `isEmpty` keep a `Json`
->   parameter and work on both a plain `Json`/`{}` record and a typed map (the runtime dispatches on
+> - **Tag-aware introspection** — `keys`, `values`, `entries`, `length`, and `isEmpty` keep a `AnyVal`
+>   parameter and work on both a plain `AnyVal`/`{}` record and a typed map (the runtime dispatches on
 >   the value's tag). This is deliberate: they are the way to introspect *any* object, and a genuine
->   `Json` value must be able to flow in. Over a typed map their results are in **hash order**, not
+>   `AnyVal` value must be able to flow in. Over a typed map their results are in **hash order**, not
 >   insertion order; over a plain `{}` record they preserve insertion order.
 > - **Typed map producers** — `merge`, `pick`, `omit`, `mapValues` are generic over `{ String: T }`
 >   and *return* a typed map, so the element type flows through statically. They accept a typed map
->   (not a plain `Json` record — there is no implicit `Json -> { String: T }` coercion; pass
+>   (not a plain `AnyVal` record — there is no implicit `AnyVal -> { String: T }` coercion; pass
 >   a value annotated `{ String: T }`).
 >
 > A typed map also supports the built-in `m[k]` (yields `T | Null`) and `m[k] = v` directly. For a
 > *defaulted* read, `m[k] ?? default` uses the built-in null-coalescing operator `??`
 > (SPECIFICATION.md §8.3); for a keyed default [`get`](#get) is the convenience, returning a bare `T`
 > (the present value or the default), so the result needs no `null` guard.
-> `fromEntries` keeps a `Json` signature pending a compiler fix (a type parameter nested in a
+> `fromEntries` keeps a `AnyVal` signature pending a compiler fix (a type parameter nested in a
 > `[String, T][]` argument is not yet inferable).
 
 ---
@@ -2437,10 +2437,10 @@ import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, 
 ### entries
 
 ```txt
-val entries: (obj: Json) -> [String, Json][]
+val entries: (obj: AnyVal) -> [String, AnyVal][]
 ```
 
-Returns an array of `[key, value]` pairs. Tag-aware: works on a plain `{}`/`Json` record (insertion order) or a typed `{ String: T }` map (hash order).
+Returns an array of `[key, value]` pairs. Tag-aware: works on a plain `{}`/`AnyVal` record (insertion order) or a typed `{ String: T }` map (hash order).
 
 ```txt
 entries({ "a": 1, "b": 2 })   // [["a", 1], ["b", 2]]
@@ -2451,7 +2451,7 @@ entries({ "a": 1, "b": 2 })   // [["a", 1], ["b", 2]]
 ### fromEntries
 
 ```txt
-val fromEntries: (pairs: [String, Json][]) -> {}
+val fromEntries: (pairs: [String, AnyVal][]) -> {}
 ```
 
 Builds an object from an array of `[key, value]` pairs. This is the inverse of `entries`. If the same key appears more than once, the last value wins.
@@ -2476,7 +2476,7 @@ Defaulted read over a typed `{ String: T }` map: returns the value at `key`, or 
 - a same-typed default collapses the union: over a `{ String: Int32 }` map, `get(m, k, 0)` is `Int32 | Int32 = Int32`, a bare scalar usable in arithmetic;
 - a differently-typed default keeps both arms: `get(m, k, "n/a")` is `Int32 | String`.
 
-`m` must be a typed map (not a plain `Json` record — there is no implicit `Json -> { String: T }` coercion).
+`m` must be a typed map (not a plain `AnyVal` record — there is no implicit `AnyVal -> { String: T }` coercion).
 
 ```txt
 val counts: { String: Int32 } = { "a": 7 }
@@ -2492,7 +2492,7 @@ counts.get("z", "n/a")         // "n/a"   (independent default type -> Int32 | S
 ### isEmpty
 
 ```txt
-val isEmpty: (x: Json) -> Boolean
+val isEmpty: (x: AnyVal) -> Boolean
 ```
 
 Returns `true` if `x` is an empty object (`{}`), an empty array (`[]`), or an empty string (`""`).
@@ -2511,10 +2511,10 @@ isEmpty("hi")        // false
 ### keys
 
 ```txt
-val keys: (obj: Json) -> String[]
+val keys: (obj: AnyVal) -> String[]
 ```
 
-Returns an array of the object's keys. Tag-aware: works on a plain `{}`/`Json` record (insertion order) or a typed `{ String: T }` map (hash order).
+Returns an array of the object's keys. Tag-aware: works on a plain `{}`/`AnyVal` record (insertion order) or a typed `{ String: T }` map (hash order).
 
 ```txt
 keys({ "a": 1, "b": 2 })   // ["a", "b"]
@@ -2589,10 +2589,10 @@ m.pick(["a", "x"])   // { "a": 1 }
 ### values
 
 ```txt
-val values: (obj: Json) -> Json[]
+val values: (obj: AnyVal) -> AnyVal[]
 ```
 
-Returns an array of the object's values. Tag-aware: works on a plain `{}`/`Json` record (insertion order) or a typed `{ String: T }` map (hash order; the values are the map's `T` elements).
+Returns an array of the object's values. Tag-aware: works on a plain `{}`/`AnyVal` record (insertion order) or a typed `{ String: T }` map (hash order; the values are the map's `T` elements).
 
 ```txt
 values({ "a": 1, "b": 2 })   // [1, 2]
@@ -2613,10 +2613,10 @@ import { fromJson } from "std/json"
 ### fromJson
 
 ```txt
-val fromJson: (Type, value: Json) -> T | Error
+val fromJson: (Type, value: AnyVal) -> T | Error
 ```
 
-Type-directed decode: validates a `Json` value against the target type `T` and returns either
+Type-directed decode: validates a `AnyVal` value against the target type `T` and returns either
 the decoded value (typed as `T`) or an `Error`. Write it idiomatically as `T.fromJson(json)` or
 equivalently as `fromJson(T, json)`. `T` is a **type** (a type name or `type` alias), not a
 runtime value.
@@ -2668,13 +2668,13 @@ else
   overlapping object variants.
 - **Numbers** (target-driven): an **integer** target requires an integral, in-range number
   (`3.14` → error; out-of-range → error); a **float** target accepts any number; a
-  `Json`/unconstrained target accepts any number as-is.
+  `AnyVal`/unconstrained target accepts any number as-is.
 - Recursive types (e.g. `type Tree = { "value": Int32, "children": Tree[] }`) are supported.
 
 Array, fixed-array, and union targets must be named via a `type` alias (the receiver must be a
 bare type name): `type IntArr = Int32[]; IntArr.fromJson([1, 2, 3])`.
 
-A `Json` value cannot be assigned to a concrete structured object without decoding — `fromJson`
+A `AnyVal` value cannot be assigned to a concrete structured object without decoding — `fromJson`
 (or `is`/`has` narrowing) is the sound conversion.
 
 ### toJsonString
@@ -2699,7 +2699,7 @@ This is the primitive the test runner uses to build machine-readable records for
 ### toJson
 
 ```txt
-val toJson: (value: Json) -> String
+val toJson: (value: AnyVal) -> String
 ```
 
 Recursively serializes any Lin value to a strict, valid JSON string:
@@ -2737,7 +2737,7 @@ import { hash } from "std/hash"
 ### hash
 
 ```txt
-val hash: (x: Json) -> String
+val hash: (x: AnyVal) -> String
 ```
 
 Returns a canonical, type-tagged string key for any JSON value. The key is stable and matches Lin's structural equality: equal values produce equal keys, objects hash independently of key order, and arrays hash order-sensitively. Values of different types never collide — the key carries a type tag, so `hash(42)` (`"i:42"`) differs from `hash("42")` (`"s:42"`). Use it to deduplicate or index values by structural identity (e.g. as object keys in a manual set/map).
@@ -2811,7 +2811,7 @@ lines().for(line => print(line.trim()))
 ### print
 
 ```txt
-val print: (value: Json) -> Null
+val print: (value: AnyVal) -> Null
 ```
 
 Writes `value` to standard output followed by a newline. Strings are printed without quotes; other values are formatted as JSON.
@@ -2827,7 +2827,7 @@ print([1, 2, 3])     // [1, 2, 3]
 ### printErr
 
 ```txt
-val printErr: (value: Json) -> Null
+val printErr: (value: AnyVal) -> Null
 ```
 
 Writes `value` to standard error followed by a newline. Identical in behaviour to `print` but writes to stderr instead of stdout.
@@ -2895,17 +2895,17 @@ Import:
 import { parse, parseAll, stringify, stringifyAll } from "std/yaml"
 ```
 
-YAML maps to the same data model as JSON: a parsed document is an ordinary Json value (object, array, string, number, boolean, or `null`). Fallible functions return the canonical `Error` value (`{ "type": "error", "message": String }`) on a parse failure, detectable with `is Error`.
+YAML maps to the same data model as JSON: a parsed document is an ordinary AnyVal value (object, array, string, number, boolean, or `null`). Fallible functions return the canonical `Error` value (`{ "type": "error", "message": String }`) on a parse failure, detectable with `is Error`.
 
 ---
 
 ### parse <a name="parse-yaml"></a>
 
 ```txt
-val parse: (src: String) -> Json | Error
+val parse: (src: String) -> AnyVal | Error
 ```
 
-Parses a single YAML document into a Json value. Returns an `Error` value if `src` is not well-formed YAML.
+Parses a single YAML document into a AnyVal value. Returns an `Error` value if `src` is not well-formed YAML.
 
 ```txt
 val cfg = parse("name: web\nreplicas: 3\n")
@@ -2924,10 +2924,10 @@ readFile("deploy.yaml").parse().jq(".spec.containers[].image")
 ### parseAll
 
 ```txt
-val parseAll: (src: String) -> Json[] | Error
+val parseAll: (src: String) -> AnyVal[] | Error
 ```
 
-Parses a multi-document YAML stream — documents separated by a `---` line — into an array of Json values. Returns an `Error` value if any document is malformed.
+Parses a multi-document YAML stream — documents separated by a `---` line — into an array of AnyVal values. Returns an `Error` value if any document is malformed.
 
 ```txt
 val docs = parseAll("a: 1\n---\nb: 2\n")
@@ -2939,10 +2939,10 @@ print(docs.length())  // 2
 ### stringify <a name="stringify-yaml"></a>
 
 ```txt
-val stringify: (value: Json) -> String
+val stringify: (value: AnyVal) -> String
 ```
 
-Serialises a Json value to a block-style YAML document.
+Serialises a AnyVal value to a block-style YAML document.
 
 ```txt
 print(stringify({ "name": "web", "ports": [80, 443] }))
@@ -2957,10 +2957,10 @@ print(stringify({ "name": "web", "ports": [80, 443] }))
 ### stringifyAll
 
 ```txt
-val stringifyAll: (values: Json[]) -> String
+val stringifyAll: (values: AnyVal[]) -> String
 ```
 
-Serialises an array of Json values to a multi-document YAML stream, each document preceded by a `---` separator. The result round-trips through `parseAll`.
+Serialises an array of AnyVal values to a multi-document YAML stream, each document preceded by a `---` separator. The result round-trips through `parseAll`.
 
 ```txt
 print(stringifyAll([{ "a": 1 }, { "b": 2 }]))
@@ -2980,17 +2980,17 @@ Import:
 import { jq, jqFirst } from "std/jq"
 ```
 
-Runs [jq](https://jqlang.github.io/jq/) filter programs against a Json value, using a pure-Rust jq implementation. A filter can produce zero, one, or many output values; the full result set is returned as a Json array. Both compile errors (invalid filter syntax) and runtime errors return the canonical `Error` value, detectable with `is Error`.
+Runs [jq](https://jqlang.github.io/jq/) filter programs against a AnyVal value, using a pure-Rust jq implementation. A filter can produce zero, one, or many output values; the full result set is returned as a AnyVal array. Both compile errors (invalid filter syntax) and runtime errors return the canonical `Error` value, detectable with `is Error`.
 
 ---
 
 ### jq
 
 ```txt
-val jq: (input: Json, filter: String) -> Json[] | Error
+val jq: (input: AnyVal, filter: String) -> AnyVal[] | Error
 ```
 
-Runs `filter` against `input` and returns every output value as a Json array. Returns an `Error` value if the filter fails to compile or errors at runtime.
+Runs `filter` against `input` and returns every output value as a AnyVal array. Returns an `Error` value if the filter fails to compile or errors at runtime.
 
 ```txt
 val data = { "users": [{ "name": "Ada", "age": 36 }, { "name": "Bob", "age": 30 }] }
@@ -3011,7 +3011,7 @@ readFile("deploy.yaml").parse().jq(".spec.containers[].image")
 ### jqFirst
 
 ```txt
-val jqFirst: (input: Json, filter: String) -> Json | Error
+val jqFirst: (input: AnyVal, filter: String) -> AnyVal | Error
 ```
 
 Like [`jq`](#jq), but returns just the first output value instead of an array. Returns `Null` when the filter produces no output, and propagates an `Error` value unchanged.
@@ -3121,7 +3121,7 @@ isFile("missing")    // false
 ### ls
 
 ```txt
-val ls: (path: String, opts: Json) -> String[] | Error
+val ls: (path: String, opts: AnyVal) -> String[] | Error
 ```
 
 Returns an array of entry names in the directory at `path`. Pass `{ "recursive": true }` to walk subdirectories recursively (returns relative paths). Returns an `Error` if `path` does not exist or is not a directory.
@@ -3136,7 +3136,7 @@ val allFiles = ls("src", { "recursive": true })
 ### mkdir
 
 ```txt
-val mkdir: (path: String, opts: Json) -> Null | Error
+val mkdir: (path: String, opts: AnyVal) -> Null | Error
 ```
 
 Creates the directory at `path`. Pass `{ "parents": true }` to create all missing parent directories (equivalent to `mkdir -p`). Returns an `Error` if the path already exists (without `parents`) or if a parent is missing.
@@ -3197,7 +3197,7 @@ val bytes = readFileBytes("image.png")
 ### readJson
 
 ```txt
-val readJson: (path: String) -> Json | Error
+val readJson: (path: String) -> AnyVal | Error
 ```
 
 Reads and parses the file at `path` as JSON.
@@ -3225,7 +3225,7 @@ match readLines("data.csv")
 ### rm
 
 ```txt
-val rm: (path: String, opts: Json) -> Null | Error
+val rm: (path: String, opts: AnyVal) -> Null | Error
 ```
 
 Removes the file or directory at `path`. Pass `{ "recursive": true }` to remove a directory and all its contents. Without `recursive`, only files (not directories) can be removed.
@@ -3275,7 +3275,7 @@ Writes a `UInt8[]` byte buffer to the file at `path`. Returns `Null` on success,
 ### writeJson
 
 ```txt
-val writeJson: (path: String, value: Json, opts: Json) -> Null | Error
+val writeJson: (path: String, value: AnyVal, opts: AnyVal) -> Null | Error
 ```
 
 Serialises `value` to JSON and writes it to `path`. By default the output is pretty-printed. Pass `{ "compact": true }` to write compact single-line JSON.
@@ -3530,7 +3530,7 @@ match resp
 ### fetchJson
 
 ```txt
-val fetchJson: (url: String) -> Json | Error
+val fetchJson: (url: String) -> AnyVal | Error
 ```
 
 GET `url`, parse the body as JSON. Returns an `Error` if transport fails, the status is not 2xx, or the body is not valid JSON.
@@ -3564,7 +3564,7 @@ val resp = fetchWith("https://api.example.com/items", {
 ### postJson
 
 ```txt
-val postJson: (url: String, body: Json) -> HttpResponse | Error
+val postJson: (url: String, body: AnyVal) -> HttpResponse | Error
 ```
 
 POST `body` as JSON to `url` with `Content-Type: application/json`.
@@ -3595,7 +3595,7 @@ router.serve(3000)
 ### json (helper) {#json-helper}
 
 ```txt
-val json: (status: Int32, body: Json) -> HttpResponse
+val json: (status: Int32, body: AnyVal) -> HttpResponse
 ```
 
 Builds an `HttpResponse` with the JSON serialisation of `body` and `Content-Type: application/json`.
@@ -3686,7 +3686,7 @@ req["path"].matchPath("/users/:id")
 ### parseBody
 
 ```txt
-val parseBody: (req: HttpRequest) -> Json | Error
+val parseBody: (req: HttpRequest) -> AnyVal | Error
 ```
 
 Parses `req["body"]` as JSON.
@@ -4260,7 +4260,7 @@ One rule: drain or read the body before pulling the next `TarEntry` from the par
 ### untar
 
 ```txt
-val untar: (Stream<UInt8[]>, body: (TarHeader, Stream<UInt8[]>) -> Json) -> Null | Error
+val untar: (Stream<UInt8[]>, body: (TarHeader, Stream<UInt8[]>) -> AnyVal) -> Null | Error
 ```
 
 The terminal driver: drives the whole archive on the calling thread, calling `body(meta, data)`
@@ -4426,7 +4426,7 @@ You must handle the `Error` (e.g. with the `match` above) before using the value
 `Promise<T>`, and the type checker tracks the payload `T` through `race`/`timeout`/`retry`/
 `poolAsync`. Because a promise is its own type (not erased to a value), "you forgot to `await`"
 is caught — passing a `Promise<T>` where a `T` is expected is a type error. Like other opaque
-handles (`Shared<T>`, `Stream<T>`), a `Promise<T>` does not widen to `Json`. Error injection
+handles (`Shared<T>`, `Stream<T>`), a `Promise<T>` does not widen to `AnyVal`. Error injection
 happens at `await` (where the value materialises), not at `async`, because the other async
 primitives return live promise handles, not values.
 
@@ -4579,7 +4579,7 @@ gap (last-writer-wins); use `withLock` when the update must be atomic.
 
 > `Shared<T>` is **accessor-only**: `shared`/`get`/`set`/`withLock` are the only operations.
 > Passing a `Shared` value to anything else (e.g. `push(s, 7)`, indexing) is a compile-time type
-> error — the box never auto-unwraps to its inner type or to `Json`. The inner value
+> error — the box never auto-unwraps to its inner type or to `AnyVal`. The inner value
 > is reachable only via `get`/`withLock`, which copy it out. (This check is enforced by
 > `lin build`/`lin run`, which resolve imports; a bare `lin check` does not resolve imports and
 > so won't show it.)
@@ -4637,7 +4637,7 @@ close(w)
 
 ## std/event
 
-Typed event emitters in two layers, **fully generic over the event payload type** — no `Json`
+Typed event emitters in two layers, **fully generic over the event payload type** — no `AnyVal`
 envelope, no string-tagged `{ type, data }`. Each emitter/bus is parameterised by its payload type
 `T`, so `emit`/`send` accept a `T` and listeners receive a `T`. For several event shapes through
 one channel, make `T` a tagged union and `match` on it.
@@ -4659,7 +4659,7 @@ propagate its parameter back to a generic consumer. So **annotate the bus bindin
 `val b: Bus<Int32> = bus(firstListener)` — and every other call resolves `T` from that binding or a
 value argument. The async layer takes a representative `sample: T` argument on `emitter`/`drain`
 purely to pin `T` (a worker handler cannot otherwise recover it); the worker handle itself is the
-one opaque value (a `Worker`, erased to `Json` — that is the runtime handle, never your
+one opaque value (a `Worker`, erased to `AnyVal` — that is the runtime handle, never your
 payload).
 
 The module exports the types `Listener<T>` (`= (T) => Null`), `Bus<T>`, and `Sub`.
@@ -4681,7 +4681,7 @@ val emitter: <T, S>(reduce: (T, S) -> S, initial: S, sample: T) -> Emitter
 Spawns a subscriber worker that owns state `S` (seeded `initial`) and folds each delivered `T` into it
 via `reduce`, on the worker thread. `sample: T` is a representative payload that pins `T` for the
 internal transfer envelope; it is never delivered to `reduce`. The returned handle is opaque (a
-`Worker`, erased to `Json` — the runtime handle, never a payload).
+`Worker`, erased to `AnyVal` — the runtime handle, never a payload).
 
 ```txt
 val sink = emitter((x: Int32, sum: Int32) => sum + x, 0, 0)   // T=Int32, S=Int32
@@ -5079,7 +5079,7 @@ arithmetic
 ### expect
 
 ```txt
-val expect: (value: Json) -> Asserter
+val expect: (value: AnyVal) -> Asserter
 ```
 
 Wraps `value` in an `Asserter`. Call one assertion method to produce an `Assertion`.
@@ -5120,10 +5120,10 @@ Passes when `value` has shape `{ "type": "failure", "error": e }` and `e == mess
 
 ```txt
 val withFixture: (
-  setup: () -> Json,
-  teardown: (Json) -> Null,
+  setup: () -> AnyVal,
+  teardown: (AnyVal) -> Null,
   name: String,
-  body: (Json) -> Assertion[]
+  body: (AnyVal) -> Assertion[]
 ) -> Test
 ```
 
@@ -5185,7 +5185,7 @@ whole test program — for mocking sibling modules and stdlib wrappers:
 ```txt
 import { readFile } from "std/fs"
 
-replace readFile = (path: String): Json => "mock contents of ${path}"
+replace readFile = (path: String): AnyVal => "mock contents of ${path}"
 ```
 
 - **Replaced everywhere.** The override applies to every caller of that export —

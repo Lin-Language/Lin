@@ -1,4 +1,4 @@
-// outcome.lin — a generic, Json-free `Result<T, E>` tagged union and the combinators
+// outcome.lin — a generic, AnyVal-free `Result<T, E>` tagged union and the combinators
 // that make it composable. The task runner threads "this step produced a TaskResult"
 // (success) vs "this step could not be run — it timed out or gave up after N retries"
 // (failure) through these combinators, keeping a precise element type end-to-end.

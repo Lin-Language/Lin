@@ -8,13 +8,13 @@
 // TYPED `{ String: T }` index-signature maps via the `RaptorIndex` type below
 // (ADR-082 / spec §5.1.1) — routeStopIndex/routePath/routesAtStop/tripsByRoute became
 // hashed O(1) containers (the PREP-phase perf lever, see NOTES.md). The scan-state maps
-// (kArrivals, bestArrivals) AND kConnections — the LAST `Json` dictionary, now typed
+// (kArrivals, bestArrivals) AND kConnections — the LAST `AnyVal` dictionary, now typed
 // `{ String: { String: Conn } }` (the projection-aliasing UAF that blocked it is fixed on
 // master) — are typed via the `ScanResults` record. The createRaptor INPUT maps
 // (transfers/interchange), getQueue's return, and the loader's intermediate maps stay
-// `Json` — their consumers need structural-equality / `toString` the hashed map rep lacks,
-// or there is no `Json -> { String: T }` coercion at the loader boundary. See NOTES.md
-// "what's typed, what stays Json, and why" for the precise list.
+// `AnyVal` — their consumers need structural-equality / `toString` the hashed map rep lacks,
+// or there is no `AnyVal -> { String: T }` coercion at the loader boundary. See NOTES.md
+// "what's typed, what stays AnyVal, and why" for the precise list.
 //
 // USAGE STATUS (see NOTES.md "Typed records" section for the full map):
 //   ACTIVELY THREADED through code: Date (dateUtil/query/raptor), Service
@@ -22,9 +22,9 @@
 //   RaptorIndex (raptor/query/queueFactory/routeScanner/bench), Conn (the kConnections
 //   value, via ScanResults — scanResults/raptor/query/journeyFactory/graphResults/
 //   stringResults). Trip is referenced as the typed field of Service-carrying records but
-//   trips themselves stay `Json` (built from `Json`-map sources). The kConnections CONNECTION
+//   trips themselves stay `AnyVal` (built from `AnyVal`-map sources). The kConnections CONNECTION
 //   values now narrow via `match … is Transfer`; the Leg/TimetableLeg/Journey leg OBJECTS that
-//   journeyFactory BUILDS are still `Json` literals consumed via field-tests, so those types
+//   journeyFactory BUILDS are still `AnyVal` literals consumed via field-tests, so those types
 //   stay REFERENCE-ONLY for now (the intended shape of the built legs).
 //
 // A calendar date (UTC), modelling the reference's JS Date. month is 1-12,
@@ -36,8 +36,8 @@ export type StopTime = { "stop": String, "arrivalTime": Int32, "departureTime": 
 
 // GTFS calendar service ("runsOn") record. startDate/endDate are YYYYMMDD
 // integers. `days` ({ "<dow>": Bool }) and `dates` ({ "<date>": Bool }) are
-// dynamic-key index maps -> stay `Json` (a record FIELD may be typed `Json`).
-export type Service = { "startDate": Int32, "endDate": Int32, "days": Json, "dates": Json }
+// dynamic-key index maps -> stay `AnyVal` (a record FIELD may be typed `AnyVal`).
+export type Service = { "startDate": Int32, "endDate": Int32, "days": AnyVal, "dates": AnyVal }
 
 // GTFS trip. stopTimes is a typed StopTime[]; service is the typed Service.
 export type Trip = { "tripId": String, "serviceId": String, "stopTimes": StopTime[], "service": Service }
@@ -58,14 +58,14 @@ export type Leg = Transfer | TimetableLeg
 export type Journey = { "legs": Leg[], "departureTime": Int32, "arrivalTime": Int32 }
 
 // A scan connection: a timetable boarding `[trip, startIndex, endIndex]` (the trip element stays
-// `Json` — composite `Json` does not flow into the named `Trip` record, spec §5.1.1 / NOTES) or a
+// `AnyVal` — composite `AnyVal` does not flow into the named `Trip` record, spec §5.1.1 / NOTES) or a
 // footpath `Transfer`. This is the value type stored in the now-TYPED `kConnections` map (the
-// projection-aliasing UAF that previously forced `kConnections : Json` is fixed on master).
-export type Conn = [Json, Int32, Int32] | Transfer
+// projection-aliasing UAF that previously forced `kConnections : AnyVal` is fixed on master).
+export type Conn = [AnyVal, Int32, Int32] | Transfer
 
 // The per-scan ScanResults state (mirrors ScanResults). The arrival-time dictionaries it
 // threads are now typed `{ String: T }` index-signature maps (ADR-055 / spec §5.1.1) — a
-// hashed O(1) container in place of the O(n) association-list `Json` object — the scan/query
+// hashed O(1) container in place of the O(n) association-list `AnyVal` object — the scan/query
 // (GROUP/RANGE) perf lever:
 //   - bestArrivals  : StopID -> arrival time        { String: Int64 }
 //   - kArrivals      : roundStr -> (StopID -> time)  { String: { String: Int64 } }
@@ -80,7 +80,7 @@ export type Conn = [Json, Int32, Int32] | Transfer
 //                 the hottest read in the scan — consults, with NO per-access "${k - 1}"
 //                 interpolation + double map lookup).
 //
-// kConnections is the LAST `Json` dictionary to be typed. It was kept `Json` because a typed
+// kConnections is the LAST `AnyVal` dictionary to be typed. It was kept `AnyVal` because a typed
 // nested union-valued map triggered a use-after-free in the multi-day stitching
 // (`completeJourneys`/`prevConnections`) and the transfer-pattern walks
 // (graphResults/stringResults): a `match`-narrowed connection read off the map, `push`-ed into a
@@ -93,26 +93,26 @@ export type ScanResults = { "k": Int32, "curKey": String, "prevRound": { String:
 // The createRaptor index struct (mirrors RaptorAlgorithm's constructor fields).
 // The dynamic-key dictionaries that createRaptor BUILDS from scratch are now typed
 // `{ String: T }` index-signature maps (ADR-055 / spec §5.1.1) — a hashed O(1)
-// container, vs the O(n) association-list `Json` object the port used before this type
+// container, vs the O(n) association-list `AnyVal` object the port used before this type
 // existed. This is the headline PERFORMANCE lever for the index build (PREP phase),
 // where the routeId-keyed indexes (~16k distinct keys) were the O(16k)-scan-per-trip hot
 // path over 240k trips:
 //   - routeStopIndex : RouteID -> (StopID -> position)   nested typed map (Int32)
 //   - routePath      : RouteID -> StopID[]               String[] value
 //   - routesAtStop   : StopID  -> RouteID[]              String[] value
-//   - tripsByRoute   : RouteID -> Trip[]   (trips stay `Json`: read via boolean
-//                       field-test, not `is`-narrowable — value type is `Json[]`)
+//   - tripsByRoute   : RouteID -> Trip[]   (trips stay `AnyVal`: read via boolean
+//                       field-test, not `is`-narrowable — value type is `AnyVal[]`)
 //   - stops          : StopID[]  (keys(transfers))
 //
-// `transfers` and `interchange` ORIGINATE from the loader as `Json` maps (there is no
-// implicit `Json -> { String: T }` coercion, spec §5.1.1) and are SMALL per-origin maps
-// (<= ~3079 keys) — they stay `Json` to avoid a conversion pass with no perf payoff.
-export type RaptorIndex = { "routeStopIndex": { String: { String: Int32 } }, "routePath": { String: String[] }, "transfers": Json, "interchange": Json, "stops": String[], "routesAtStop": { String: String[] }, "tripsByRoute": { String: Json[] } }
+// `transfers` and `interchange` ORIGINATE from the loader as `AnyVal` maps (there is no
+// implicit `AnyVal -> { String: T }` coercion, spec §5.1.1) and are SMALL per-origin maps
+// (<= ~3079 keys) — they stay `AnyVal` to avoid a conversion pass with no perf payoff.
+export type RaptorIndex = { "routeStopIndex": { String: { String: Int32 } }, "routePath": { String: String[] }, "transfers": AnyVal, "interchange": AnyVal, "stops": String[], "routesAtStop": { String: String[] }, "tripsByRoute": { String: AnyVal[] } }
 
 // The RouteScanner state. `routeScanPosition` is a variable-key `routeId -> last-scanned-index`
 // memo dictionary, mutated across calls within one scan; it is typed `{ String: Int32 }` (ADR-082 /
 // spec §5.1.1) so the per-(route, round) `pos[routeId]` reads + write route to the hashed O(1)
-// `lin_map_get`/`lin_map_set` instead of the O(n) `Json` association-list scan (a remaining
-// query-phase `DICT_ON_JSON` site — see NOTES.md). The trip lists (`tripsByRoute`) keep `Json[]`
-// values (trips stay `Json`, as in RaptorIndex). `dateKey`/`dowKey` are interpolated once per scan.
-export type RouteScanner = { "tripsByRoute": { String: Json[] }, "date": Int32, "dateKey": String, "dowKey": String, "routeScanPosition": { String: Int32 } }
+// `lin_map_get`/`lin_map_set` instead of the O(n) `AnyVal` association-list scan (a remaining
+// query-phase `DICT_ON_JSON` site — see NOTES.md). The trip lists (`tripsByRoute`) keep `AnyVal[]`
+// values (trips stay `AnyVal`, as in RaptorIndex). `dateKey`/`dowKey` are interpolated once per scan.
+export type RouteScanner = { "tripsByRoute": { String: AnyVal[] }, "date": Int32, "dateKey": String, "dowKey": String, "routeScanPosition": { String: Int32 } }

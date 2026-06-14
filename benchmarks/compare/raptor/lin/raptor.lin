@@ -22,8 +22,8 @@ val OVERTAKING_ROUTE_SUFFIX = "overtakes"
 // `std/object.get` directly. This helper is RETAINED for the two reads `object.get` cannot
 // express:
 //   1. `interchange[stop]` (the map hoisted from `raptor["interchange"]` in scanRoutes) —
-//      `interchange` is a `Json` map (it ORIGINATES from the loader; RaptorIndex types it
-//      `Json`, and there is no implicit `Json -> { String: T }` coercion, §5.1.1), so
+//      `interchange` is a `AnyVal` map (it ORIGINATES from the loader; RaptorIndex types it
+//      `AnyVal`, and there is no implicit `AnyVal -> { String: T }` coercion, §5.1.1), so
 //      `get`'s `{ String: T }` first param does not accept it.
 //   2. `raptor["routeStopIndex"][routeId][stop]` — a NESTED double-index whose intermediate is a
 //      `{ String: Int32 } | Null`; `get` is single-level and does not apply to a nested read.
@@ -36,8 +36,8 @@ val intOr = (x: Int32 | Null, d: Int32): Int32 =>
 
 // getRouteId(trip, tripsByRoute): comma-joined "stop + pickUpBit + dropOffBit", with an
 // "overtakes" suffix when an earlier trip on the same routeId arrives later (contract #2).
-val getRouteId = (trip: Json, tripsByRoute: { String: Json[] }): String =>
-  var parts: Json = []
+val getRouteId = (trip: AnyVal, tripsByRoute: { String: AnyVal[] }): String =>
+  var parts: AnyVal = []
   trip["stopTimes"].for(s =>
     val pu = if s["pickUp"] then "1" else "0"
     val doff = if s["dropOff"] then "1" else "0"
@@ -55,18 +55,18 @@ val getRouteId = (trip: Json, tripsByRoute: { String: Json[] }): String =>
   )
   if overtakes then "${routeId}${OVERTAKING_ROUTE_SUFFIX}" else routeId
 
-export val createRaptor = (tripsIn: Json, transfers: Json, interchange: Json, date: Date | Null): RaptorIndex =>
+export val createRaptor = (tripsIn: AnyVal, transfers: AnyVal, interchange: AnyVal, date: Date | Null): RaptorIndex =>
   var routesAtStop: { String: String[] } = {}
-  var tripsByRoute: { String: Json[] } = {}
+  var tripsByRoute: { String: AnyVal[] } = {}
   var routeStopIndex: { String: { String: Int32 } } = {}
   var routePath: { String: String[] } = {}
-  var usefulTransfers: Json = {}
+  var usefulTransfers: AnyVal = {}
 
   // optional date pre-filter. `date` is `Date | Null`; a `match` (not a plain
   // `if date != null`) is required to narrow the named-record union to `Date`
   // before calling the date helpers — the if-expression form does not refine a
   // `T | Null` record union in Lin today (narrowing-friction note in NOTES.md).
-  var trips: Json = tripsIn
+  var trips: AnyVal = tripsIn
   match date
     is Null =>
       null
@@ -74,7 +74,7 @@ export val createRaptor = (tripsIn: Json, transfers: Json, interchange: Json, da
       val dateNumber = getDateNumber(date)
       val dateKey = "${dateNumber}"
       val dowKey = "${dayOfWeek(date)}"
-      var filtered: Json = []
+      var filtered: AnyVal = []
       tripsIn.for(trip =>
         if runsOn(trip["service"], dateNumber, dateKey, dowKey) then
           push(filtered, trip)
@@ -123,7 +123,7 @@ export val createRaptor = (tripsIn: Json, transfers: Json, interchange: Json, da
   }
 
 // Reverse iteration over the route path, building indexes (mirrors the for(i=len-1;i>=0)).
-val indexRoute = (path: String[], i: Int32, trip: Json, routeId: String, routeStopIndex: { String: { String: Int32 } }, usefulTransfers: Json, interchange: Json, routesAtStop: { String: String[] }, transfers: Json): Null =>
+val indexRoute = (path: String[], i: Int32, trip: AnyVal, routeId: String, routeStopIndex: { String: { String: Int32 } }, usefulTransfers: AnyVal, interchange: AnyVal, routesAtStop: { String: String[] }, transfers: AnyVal): Null =>
   if i < 0 then
     null
   else
@@ -150,7 +150,7 @@ val indexRoute = (path: String[], i: Int32, trip: Json, routeId: String, routeSt
     )
 
 // --- scan ---
-val scanRoutes = (raptor: RaptorIndex, results: ScanResults, routeScanner: RouteScanner, markedStops: Json): Null =>
+val scanRoutes = (raptor: RaptorIndex, results: ScanResults, routeScanner: RouteScanner, markedStops: AnyVal): Null =>
   val queue = getQueue(raptor["routesAtStop"], raptor["routeStopIndex"], markedStops)
   // hoist the interchange map ONCE per round — scanRouteAt was re-projecting it from the
   // index record on every stop of every route.
@@ -174,7 +174,7 @@ val scanRoutes = (raptor: RaptorIndex, results: ScanResults, routeScanner: Route
   )
 
 // Per-route forward scan from the boarding position, threading (trip, boardingPoint).
-val scanRoute = (raptor: RaptorIndex, results: ScanResults, routeScanner: RouteScanner, interchange: Json, routeId: String, startPi: Int32): Null =>
+val scanRoute = (raptor: RaptorIndex, results: ScanResults, routeScanner: RouteScanner, interchange: AnyVal, routeId: String, startPi: Int32): Null =>
   // The route key is always present (inserted by indexRoute), so the `[]` default is dead — but
   // `get` gives a clean single-level defaulted read over the `{ String: String[] }` routePath map.
   val routePath = get(raptor["routePath"], routeId, [])
@@ -194,7 +194,7 @@ val scanRoute = (raptor: RaptorIndex, results: ScanResults, routeScanner: RouteS
 // previousArrival is a PURE read, so it is deferred onto the branches that consume it
 // (trip == null, or the trip != null else-if) instead of being computed unconditionally —
 // the setTrip fast path of the hot inner loop never needs it.
-val scanRouteAt = (results: ScanResults, routeScanner: RouteScanner, routeId: String, routePath: Json, routePathLength: Int32, interchange: Json, pi: Int32, trip: Json, boardingPoint: Int32): Null =>
+val scanRouteAt = (results: ScanResults, routeScanner: RouteScanner, routeId: String, routePath: AnyVal, routePathLength: Int32, interchange: AnyVal, pi: Int32, trip: AnyVal, boardingPoint: Int32): Null =>
   if pi >= routePathLength then
     null
   else
@@ -296,7 +296,7 @@ val scanRouteAt = (results: ScanResults, routeScanner: RouteScanner, routeId: St
           boardingPoint
         )
 
-val scanTransfers = (raptor: RaptorIndex, results: ScanResults, markedStops: Json): Null =>
+val scanTransfers = (raptor: RaptorIndex, results: ScanResults, markedStops: AnyVal): Null =>
   markedStops.for(stopP =>
     // read the per-origin transfer list ONCE (it was projected twice: null test + use)
     val transferList = raptor["transfers"][stopP]
@@ -308,7 +308,7 @@ val scanTransfers = (raptor: RaptorIndex, results: ScanResults, markedStops: Jso
       // and every comparison against NaN is false -> the transfer is silently skipped.
       // Reproduce that skip-on-missing semantics explicitly (Lin would otherwise error on
       // `number + null` / `number < null`). The unit tests never hit this path. `interchange`
-      // stays `Json` (it originates from the loader; see RaptorIndex), so the Json `!= null`
+      // stays `AnyVal` (it originates from the loader; see RaptorIndex), so the AnyVal `!= null`
       // guard remains the faithful port here.
       val ic = raptor["interchange"][stopPi]
       val best = bestArrival(results, stopPi)
@@ -319,13 +319,13 @@ val scanTransfers = (raptor: RaptorIndex, results: ScanResults, markedStops: Jso
     )
   )
 
-export val scan = (raptor: RaptorIndex, origins: Json, date: Int32, dow: Int32): ScanResults =>
+export val scan = (raptor: RaptorIndex, origins: AnyVal, date: Int32, dow: Int32): ScanResults =>
   val routeScanner = createRouteScanner(raptor["tripsByRoute"], date, dow)
   val results = createScanResults(raptor["stops"], origins)
   scanRounds(raptor, results, routeScanner, keys(origins))
   finalize(results)
 
-val scanRounds = (raptor: RaptorIndex, results: ScanResults, routeScanner: RouteScanner, markedStops: Json): Null =>
+val scanRounds = (raptor: RaptorIndex, results: ScanResults, routeScanner: RouteScanner, markedStops: AnyVal): Null =>
   if length(markedStops) > 0 then
     addRound(results)
     scanRoutes(raptor, results, routeScanner, markedStops)

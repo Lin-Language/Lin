@@ -7,14 +7,14 @@
 // Reference: for each stop, for each route at that stop, keep the existing queue entry only if
 // it is strictly earlier than the new stop; otherwise replace with the new stop.
 //
-// The queue is the ONE irreducible `Json` in the scan: `scanRoutes` iterates `keys(queue)` and
+// The queue is the ONE irreducible `AnyVal` in the scan: `scanRoutes` iterates `keys(queue)` and
 // scans the routes IN THAT ORDER, and the per-round connection stored for a stop is the LAST
 // route's `setTrip` to win — so the queue's KEY ITERATION ORDER is load-bearing for the
-// within-round tie-break between equal-arrival trips. A `Json` object preserves INSERTION order
+// within-round tie-break between equal-arrival trips. A `AnyVal` object preserves INSERTION order
 // (the order marked stops/routes were enqueued, matching the reference); a typed `{ String: T }`
 // map iterates in HASH order, which silently changes which trip a journey boards (verified: it
 // flips RDG->IPS's first leg from trip 24305 to 24559 and breaks the cross-language digest). So
-// the queue stays `Json` to keep iteration deterministic and reference-faithful.
+// the queue stays `AnyVal` to keep iteration deterministic and reference-faithful.
 import { for } from "std/iter"
 import { get } from "std/object"
 
@@ -24,8 +24,8 @@ import { get } from "std/object"
 val isStopBefore = (routeStopIndex: { String: { String: Int32 } }, routeId: String, stopA: String, stopB: String): Boolean =>
   (routeStopIndex[routeId][stopA] ?? 0) < (routeStopIndex[routeId][stopB] ?? 0)
 
-export val getQueue = (routesAtStop: { String: String[] }, routeStopIndex: { String: { String: Int32 } }, markedStops: String[]): Json =>
-  var queue: Json = {}
+export val getQueue = (routesAtStop: { String: String[] }, routeStopIndex: { String: { String: Int32 } }, markedStops: String[]): AnyVal =>
+  var queue: AnyVal = {}
   markedStops.for(stop =>
     val routes = get(routesAtStop, stop, [])
     routes.for(routeId =>

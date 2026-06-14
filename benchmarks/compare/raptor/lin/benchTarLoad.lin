@@ -22,7 +22,7 @@ val TAR_GZ = "/home/linus/Work/linusnorton/lin-lang/benchmarks/compare/raptor/gt
 //   stSum2000       — sum of length(stopTimes) over the first 2000 trips
 //   firstDepSum     — sum of the first trip's stopTimes departureTimes
 //   transferTotal   — total transfer count summed across all origins
-val digest = (label: String, loaded: Json): Null =>
+val digest = (label: String, loaded: AnyVal): Null =>
   val trips = loaded["trips"]
   val nTrips = length(trips)
   val transfers = loaded["transfers"]

@@ -20,7 +20,7 @@ val intOr = (x: Int32 | Null, d: Int32): Int32 =>
     else =>
       d
 
-export val createRouteScanner = (tripsByRoute: { String: Json[] }, date: Int32, dow: Int32): RouteScanner =>
+export val createRouteScanner = (tripsByRoute: { String: AnyVal[] }, date: Int32, dow: Int32): RouteScanner =>
   // dateKey/dowKey are interpolated ONCE per scanner (= once per scan/day) and threaded
   // to every runsOn call in the hot backward scan — not rebuilt per trip.
   {
@@ -40,7 +40,7 @@ export val createRouteScanner = (tripsByRoute: { String: Json[] }, date: Int32, 
 // The reference memo condition `!lastFound || lastFound === trip` is true exactly when
 // (nothing found yet) OR (runsOn matched THIS iteration — the only way lastFound === trip),
 // so it is computed from the `ran` boolean directly; no trip identity comparison at all.
-val scanBack = (routeTrips: Json, pos: { String: Int32 }, routeId: String, stopIndex: Int32, time: Json, date: Int32, dateKey: String, dowKey: String, i: Int32, lastFound: Json): Json =>
+val scanBack = (routeTrips: AnyVal, pos: { String: Int32 }, routeId: String, stopIndex: Int32, time: AnyVal, date: Int32, dateKey: String, dowKey: String, i: Int32, lastFound: AnyVal): AnyVal =>
   if i < 0 then
     lastFound
   else
@@ -67,9 +67,9 @@ val scanBack = (routeTrips: Json, pos: { String: Int32 }, routeId: String, stopI
         newLastFound
       )
 
-export val getTrip = (scanner: RouteScanner, routeId: String, stopIndex: Int32, time: Json): Json =>
+export val getTrip = (scanner: RouteScanner, routeId: String, stopIndex: Int32, time: AnyVal): AnyVal =>
   val pos = scanner["routeScanPosition"]
-  val routeTrips: Json = scanner["tripsByRoute"][routeId]
+  val routeTrips: AnyVal = scanner["tripsByRoute"][routeId]
   val start = if pos[routeId] == null then
     length(routeTrips) - 1
   else

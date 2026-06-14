@@ -447,7 +447,7 @@ export val urlDecode = (s: String): String | Error =>
   val bytes = percentDecodeBytes(s)
   if bytes is Error then
     // The checker narrows the FALSE branch of `is Error` (giving `UInt8[]`) but not the TRUE
-    // branch to `Error` for a non-Json union scrutinee, so reconstruct a fresh Error here.
+    // branch to `Error` for a non-AnyVal union scrutinee, so reconstruct a fresh Error here.
     mkError(toString(bytes["message"]))
   else
     fromUtf8(bytes)

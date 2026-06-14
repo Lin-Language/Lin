@@ -9,10 +9,10 @@ import { Config } from "./config"
 // Router dispatch tests. `render` is mocked (ADR-046) so the / route is tested
 // without the on-disk view path; `solve` is mocked so the /route endpoint's
 // success and no-path branches are exercised deterministically without disk.
-replace render = (path: String, data: {  }): Json =>
+replace render = (path: String, data: {  }): AnyVal =>
   renderWith("<!DOCTYPE html><title>{{ title }}</title>", data)
 
-replace solve = (graphPath: String, from: String, to: String): Json =>
+replace solve = (graphPath: String, from: String, to: String): AnyVal =>
   if to == "Z" then
     { "type": "no-path" }
   else

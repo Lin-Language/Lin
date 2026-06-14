@@ -176,6 +176,10 @@ fn resolve_named_cycle(
         // raw handles and prevent accidental Int64↔Ptr confusion; this alias is the prototype shortcut.
         "Ptr" => Ok(Type::Int64),
         "String" => Ok(Type::Str),
+        // `AnyVal` is the dynamic top type (the former `Json` — reset §2.5, ADR-062 successor):
+        // a JSON-shaped value whose shape is not statically known. `Json` is retained as a
+        // deprecated alias so existing code keeps compiling; both resolve to the same wildcard.
+        "AnyVal" => Ok(json_type()),
         "Json" => Ok(json_type()),
         // `Error` is the conventional error value (spec §20, §24.2.2) and a structural object
         // alias (ADR-031): an object carrying a `type` discriminant and a `message`. Both the

@@ -89,7 +89,7 @@ val s = suite("sumtree", [
     [expect(acc.toString()).toBe("15")]
   ),
 
-  // unboxed-sumtype Stage 3 — a sum value crossing a CONTAINER boundary (a record/Json
+  // unboxed-sumtype Stage 3 — a sum value crossing a CONTAINER boundary (a record/AnyVal
   // field, a `{String:Expr}` map) materializes to a real boxed object on store and
   // projects back to a correct SumNode on read, so the round-tripped tree evaluates to
   // the same value. (Before the Stage-3 boundary fix these crashed: a SumNode pointer

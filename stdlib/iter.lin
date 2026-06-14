@@ -29,20 +29,20 @@
 // through a user-defined generic `Iterable` parameter stays array-shaped (eager) inside that
 // function.
 import foreign "lin-runtime"
-  val lin_array_concat_dyn: (Json, Json) => Json
+  val lin_array_concat_dyn: (AnyVal, AnyVal) => AnyVal
   val lin_stream_count: (Int32, Int32) => Stream
-  val lin_stream_repeat: (Json, Int32) => Stream
-  val lin_stream_cycle: (Json) => Stream
+  val lin_stream_repeat: (AnyVal, Int32) => Stream
+  val lin_stream_cycle: (AnyVal) => Stream
 // Maintainer note: the combinators here were relocated verbatim out of std/array (Stage 1 of the
 // std/iter unification); their eager Array/Iterator bodies are unchanged. std/iter is the
 // LOWER-LEVEL module: it must NOT import from std/array (that would form an array->iter->array import
 // cycle). The two array primitives these bodies need — `length` and `push` — are duplicated below as
 // PRIVATE helpers (byte-identical thin wrappers over the same lin_length/lin_push intrinsics
 // std/array wraps), so the moved bodies stay verbatim and std/iter stays self-contained.
-val length = (x: Json): Int32 =>
+val length = (x: AnyVal): Int32 =>
   lin_length(x)
 
-val push = (arr: Json, item: Json): Null =>
+val push = (arr: AnyVal, item: AnyVal): Null =>
   lin_push(arr, item)
 
 // Run `f` over every item of any iterable (the universal iteration driver). For side effects only.
@@ -50,11 +50,11 @@ val push = (arr: Json, item: Json): Null =>
 // @param f          callback `(item, index?) => …`; the trailing 0-based `Int32` index is optional.
 // @returns `null`.
 // @example [1, 2, 3].for(x => print(x))
-export val for = <T>(iterable: T[] | Iterator | Stream | Null, f: (T, Int32) => Json): Null =>
+export val for = <T>(iterable: T[] | Iterator | Stream | Null, f: (T, Int32) => AnyVal): Null =>
   // Generic over the element type `T` (matching `while`/`map`/`filter`): the callback receives the
-  // element typed, so `[1, 2, 3].for(x => …)` type-checks `x` as `Int32`. A `Json[]` source binds
-  // `T = Json` (the wildcard), so dynamic sources still drive directly. The callback RESULT stays
-  // `Json` — `for` is side-effecting and discards it, so the body may return anything. `Null` is
+  // element typed, so `[1, 2, 3].for(x => …)` type-checks `x` as `Int32`. A `AnyVal[]` source binds
+  // `T = AnyVal` (the wildcard), so dynamic sources still drive directly. The callback RESULT stays
+  // `AnyVal` — `for` is side-effecting and discards it, so the body may return anything. `Null` is
   // accepted (iterating a missing/`T[] | Null` source is a no-op — the loop bound is tag-checked to
   // 0 for a non-array), so `adj[k].for(…)` over a nullable map lookup needs no guard.
   lin_for(iterable, f)
@@ -91,7 +91,7 @@ export val range = (start: Int32, end: Int32) =>
 // @returns an iterator over the stepped range.
 // @example rangeStep(0, 10, 2).for(i => print(i))   // 0, 2, 4, 6, 8
 // @example rangeStep(5, 0, -1).map(i => i)           // [5, 4, 3, 2, 1]
-export val rangeStep = (start: Int32, end: Int32, step: Int32): Json =>
+export val rangeStep = (start: Int32, end: Int32, step: Int32): AnyVal =>
   if step > 0 then
     lin_iter(() => start, i => i < end, i => i + step, i => i)
   else if step < 0 then
@@ -103,7 +103,7 @@ export val rangeStep = (start: Int32, end: Int32, step: Int32): Json =>
 // @param arr  the backing array (its element type is recovered at the consuming combinator, not pinned here).
 // @returns an Iterator over `arr`'s elements.
 // @example val it = iterOf([10, 20, 30]); it.for(x => print(x))   // prints 10, 20, 30
-export val iterOf = (arr: Json) =>
+export val iterOf = (arr: AnyVal) =>
   lin_iter(() => 0, i => i < length(arr), i => i + 1, i => arr[i])
 
 // Build a custom Iterator from explicit state-machine closures.
@@ -113,18 +113,18 @@ export val iterOf = (arr: Json) =>
 // @param value    `(state) => item` projecting the current state to its yielded element.
 // @returns an Iterator driven by those closures.
 // @example iter(() => 0, s => s < 3, s => s + 1, s => s)   // yields 0, 1, 2
-export val iter = (init: Json, hasNext: Json, next: Json, value: Json) =>
+export val iter = (init: AnyVal, hasNext: AnyVal, next: AnyVal, value: AnyVal) =>
   lin_iter(init, hasNext, next, value)
 
 // Concatenate two iterables into one. Two flat arrays of the same type (e.g. `UInt8[]` ++ `UInt8[]`)
 // yield a flat array (so byte-level consumers read packed bytes); mixed/tagged element types yield a
-// `Json[]`. Over streams (`s.lines().concat(other.lines())`) the result is a lazy concatenated Stream.
+// `AnyVal[]`. Over streams (`s.lines().concat(other.lines())`) the result is a lazy concatenated Stream.
 // @param a  the first iterable (Array, Iterator, or Stream).
 // @param b  the second iterable, appended after `a`.
-// @returns the concatenation; flat when both inputs are the same flat type, tagged/`Json[]` otherwise.
+// @returns the concatenation; flat when both inputs are the same flat type, tagged/`AnyVal[]` otherwise.
 // @example concat([1, 2], [3, 4])   // [1, 2, 3, 4]
-export val concat = (a: Json, b: Json): Json =>
-  // Stays `Json` rather than generic because `concat` may mix element types across its two operands.
+export val concat = (a: AnyVal, b: AnyVal): AnyVal =>
+  // Stays `AnyVal` rather than generic because `concat` may mix element types across its two operands.
   lin_array_concat_dyn(a, b)
 
 // Apply `f` to every item, producing a new collection of the results.
@@ -309,7 +309,7 @@ export val sliding = <T>(src: T[] | Iterator | Stream, size: Int32): T[][] =>
   result
 
 // Private helper (std/iter self-contained): append `buf[base .. base+count]` into `window`.
-val rangeFill = (window: Json, buf: Json, base: Int32, count: Int32): Null =>
+val rangeFill = (window: AnyVal, buf: AnyVal, base: Int32, count: Int32): Null =>
   lin_range(0, count).for(i => push(window, buf[base + i]))
 
 // Pair each item with its successor: `[[src[0],src[1]], [src[1],src[2]], …]`.

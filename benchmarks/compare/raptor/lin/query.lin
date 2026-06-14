@@ -16,11 +16,11 @@ val ONE_DAY = 86400
 
 // getFoundStations: best arrival - 1 day (min 1) for every stop that has an arrival.
 // bestArrivals is the typed `{ String: Int64 }` scan-state map (it MUST stay typed here, not
-// widened to `Json`: a `Json m[k]` index uses the object path and would misread the TAG_MAP
+// widened to `AnyVal`: a `AnyVal m[k]` index uses the object path and would misread the TAG_MAP
 // rep). `bestArrivals[stop]` is therefore `Int64 | Null`; the `keys(kConnections[stop]) > 0`
 // guard means the stop always has an arrival, so the `!= null` guard narrows the read.
-val getFoundStations = (kConnections: { String: { String: Conn } }, bestArrivals: { String: Int64 }): Json =>
-  var origins: Json = {}
+val getFoundStations = (kConnections: { String: { String: Conn } }, bestArrivals: { String: Int64 }): AnyVal =>
+  var origins: AnyVal = {}
   kConnections
     .keys()
     .for(stop =>
@@ -33,8 +33,8 @@ val getFoundStations = (kConnections: { String: { String: Conn } }, bestArrivals
     )
   origins
 
-val mergeJourneys = (journeyA: Json, journeyB: Json): Json =>
-  var legs: Json = []
+val mergeJourneys = (journeyA: AnyVal, journeyB: AnyVal): AnyVal =>
+  var legs: AnyVal = []
   journeyA["legs"].for(l => push(legs, l))
   journeyB["legs"].for(l => push(legs, l))
   {
@@ -45,8 +45,8 @@ val mergeJourneys = (journeyA: Json, journeyB: Json): Json =>
 
 // completeJourneys: for every journey-so-far, find results to its origin in `connections`
 // and merge. (flatMap in the reference.)
-val completeJourneys = (resultsFactoryConnections: { String: { String: Conn } }, journeys: Json): Json =>
-  var out: Json = []
+val completeJourneys = (resultsFactoryConnections: { String: { String: Conn } }, journeys: AnyVal): AnyVal =>
+  var out: AnyVal = []
   journeys.for(journeyB =>
     val origin = journeyB["legs"][0]["origin"]
     getResults(resultsFactoryConnections, origin).for(journeyA =>
@@ -56,33 +56,33 @@ val completeJourneys = (resultsFactoryConnections: { String: { String: Conn } },
   out
 
 // getJourneysFromConnections: initial results for destinations + stitch previous days.
-val getJourneysFromConnections = (kConnections: { String: { String: Conn } }, prevConnections: { String: { String: Conn } }[], destinations: Json): Json =>
-  var initial: Json = []
+val getJourneysFromConnections = (kConnections: { String: { String: Conn } }, prevConnections: { String: { String: Conn } }[], destinations: AnyVal): AnyVal =>
+  var initial: AnyVal = []
   destinations.for(d =>
     val conns = kConnections[d]
     if conns != null && conns.keys().length() > 0 then
       getResults(kConnections, d).for(j => push(initial, j))
   )
   // reduce over reversed prevConnections
-  var journeys: Json = initial
+  var journeys: AnyVal = initial
   var idx = length(prevConnections) - 1
   reduceReversed(prevConnections, idx, journeys)
 
 // reduceReversed folds completeJourneys over prevConnections back-to-front. The fold function is
 // fixed (always completeJourneys), so it is called directly rather than threaded through a
 // `fn: Function` parameter — the indirection would be gratuitous.
-val reduceReversed = (prevConnections: { String: { String: Conn } }[], idx: Int32, journeys: Json): Json =>
+val reduceReversed = (prevConnections: { String: { String: Conn } }[], idx: Int32, journeys: AnyVal): AnyVal =>
   if idx < 0 then
     journeys
   else
     reduceReversed(prevConnections, idx - 1, completeJourneys(prevConnections[idx], journeys))
 
 // getJourneys: search up to maxSearchDays advancing the calendar each day.
-val getJourneys = (raptor: RaptorIndex, origins: Json, destinations: Json, date: Date, maxSearchDays: Int32): Json =>
+val getJourneys = (raptor: RaptorIndex, origins: AnyVal, destinations: AnyVal, date: Date, maxSearchDays: Int32): AnyVal =>
   var seed: { String: { String: Conn } }[] = []
   searchDay(raptor, origins, destinations, date, maxSearchDays, 0, seed)
 
-val searchDay = (raptor: RaptorIndex, origins: Json, destinations: Json, date: Date, maxSearchDays: Int32, i: Int32, connectionIndexes: { String: { String: Conn } }[]): Json =>
+val searchDay = (raptor: RaptorIndex, origins: AnyVal, destinations: AnyVal, date: Date, maxSearchDays: Int32, i: Int32, connectionIndexes: { String: { String: Conn } }[]): AnyVal =>
   if i >= maxSearchDays then
     []
   else
@@ -112,28 +112,28 @@ val searchDay = (raptor: RaptorIndex, origins: Json, destinations: Json, date: D
       )
 
 // Group-station plan: set the same departure time on every origin, search, apply filters.
-export val planGroup = (raptor: RaptorIndex, origins: Json, destinations: Json, date: Date, time: Int32, maxSearchDays: Int32, filters: Json): Json =>
-  var originTimes: Json = {}
+export val planGroup = (raptor: RaptorIndex, origins: AnyVal, destinations: AnyVal, date: Date, time: Int32, maxSearchDays: Int32, filters: AnyVal): AnyVal =>
+  var originTimes: AnyVal = {}
   origins.for(o => originTimes[o] = time)
   val results = getJourneys(raptor, originTimes, destinations, date, maxSearchDays)
   // apply each filter in turn
-  var rs: Json = results
+  var rs: AnyVal = results
   filters.for(filter => rs = filter(rs))
   rs
 
 // DepartAfterQuery.plan: single origin -> single destination, no filters.
-export val planDepartAfter = (raptor: RaptorIndex, origin: String, destination: String, date: Date, time: Int32, maxSearchDays: Int32): Json =>
+export val planDepartAfter = (raptor: RaptorIndex, origin: String, destination: String, date: Date, time: Int32, maxSearchDays: Int32): AnyVal =>
   planGroup(raptor, [origin], [destination], date, time, maxSearchDays, [])
 
 // RangeQuery.plan: profile query — repeated plans, advancing time past the earliest departure.
-export val planRange = (raptor: RaptorIndex, origin: String, destination: String, date: Date, maxSearchDays: Int32, filters: Json): Json =>
-  var results: Json = []
+export val planRange = (raptor: RaptorIndex, origin: String, destination: String, date: Date, maxSearchDays: Int32, filters: AnyVal): AnyVal =>
+  var results: AnyVal = []
   rangeStep(raptor, origin, destination, date, maxSearchDays, 1, ONE_DAY, results)
-  var rs: Json = results
+  var rs: AnyVal = results
   filters.for(filter => rs = filter(rs))
   rs
 
-val rangeStep = (raptor: RaptorIndex, origin: String, destination: String, date: Date, maxSearchDays: Int32, time: Int32, endTime: Int32, results: Json): Null =>
+val rangeStep = (raptor: RaptorIndex, origin: String, destination: String, date: Date, maxSearchDays: Int32, time: Int32, endTime: Int32, results: AnyVal): Null =>
   if time >= endTime then
     null
   else

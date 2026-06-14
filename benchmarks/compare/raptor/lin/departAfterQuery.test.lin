@@ -6,7 +6,7 @@ import { planDepartAfter } from "./query"
 import { parseDate } from "./dateUtil"
 
 // query.plan(origin, dest, dateStr, time) with optional maxSearchDays (default 3).
-val plan = (trips: Json, transfers: Json, interchange: Json, origin: String, dest: String, dateStr: String, time: Int32, maxDays: Int32): Json =>
+val plan = (trips: AnyVal, transfers: AnyVal, interchange: AnyVal, origin: String, dest: String, dateStr: String, time: Int32, maxDays: Int32): AnyVal =>
   val raptor = createRaptor(trips, transfers, interchange, null)
   val result = planDepartAfter(raptor, origin, dest, parseDate(dateStr), time, maxDays)
   setDefaultTrip(result)
@@ -14,7 +14,7 @@ val plan = (trips: Json, transfers: Json, interchange: Json, origin: String, des
 
 // Multi-day cases need to inspect result[0]; helpers keep the bodies out of expect(...)'s
 // parens (a multi-statement block is not a valid argument expression there).
-val firstArrival = (trips: Json, dateStr: String, time: Int32): Int32 =>
+val firstArrival = (trips: AnyVal, dateStr: String, time: Int32): Int32 =>
   val r = plan(trips, {}, {}, "A", "E", dateStr, time, 2)
   r[0]["arrivalTime"]
 
@@ -31,11 +31,11 @@ val nextDayTrips = [
   ])
 ]
 
-val overnightFirstLegs = (): Json =>
+val overnightFirstLegs = (): AnyVal =>
   val r = plan(nextDayTrips, {}, {}, "A", "E", "2018-10-16", 900, 2)
   r[0]["legs"]
 
-val incrementDayTrips = (): Json =>
+val incrementDayTrips = (): AnyVal =>
   val trip2 = t([
     st("D", null, 1000),
     st("B", 1035, 1035),
@@ -53,7 +53,7 @@ val incrementDayTrips = (): Json =>
 
 // The 4 calendar tests build a B->C trip with a custom service and search on a date that
 // includes/excludes it; the expected journey always uses the 1040->1110 alternative.
-val calendarTrips = (svc: Json): Json =>
+val calendarTrips = (svc: AnyVal): AnyVal =>
   val trip = t([
     st("B", null, 1030),
     st("C", 1100, null)
@@ -71,7 +71,7 @@ val calendarTrips = (svc: Json): Json =>
     ])
   ]
 
-val expectedChange = (): Json =>
+val expectedChange = (): AnyVal =>
   j([
     [
       st("A", null, 1000),

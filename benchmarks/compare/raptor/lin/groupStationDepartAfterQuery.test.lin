@@ -12,7 +12,7 @@ import { apply } from "./filter"
 import { parseDate } from "./dateUtil"
 
 // maxSearchDays = 1, filters = [apply] — mirrors `new GroupStationDepartAfterQuery(raptor, jf, 1, filters)`.
-val plan = (trips: Json, origins: Json, destinations: Json, dateStr: String, time: Int32): Json =>
+val plan = (trips: AnyVal, origins: AnyVal, destinations: AnyVal, dateStr: String, time: Int32): AnyVal =>
   val raptor = createRaptor(trips, {}, {}, null)
   val result = planGroup(raptor, origins, destinations, parseDate(dateStr), time, 1, [apply])
   setDefaultTrip(result)

@@ -22,10 +22,10 @@ import { Conn, Transfer } from "./types"
 // Walk the connections from finalDestination back to k=1, PREPENDING each origin, so the
 // returned path is in journey order (reference getPath uses unshift). State is threaded by
 // tail recursion (Lin's loop form).
-val getPath = (kConnections: { String: { String: Conn } }, k: String, finalDestination: String): Json =>
+val getPath = (kConnections: { String: { String: Conn } }, k: String, finalDestination: String): AnyVal =>
   walkPath(kConnections, parseInt32(k), finalDestination, [])
 
-val walkPath = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, path: Json): Json =>
+val walkPath = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, path: AnyVal): AnyVal =>
   if i <= 0 then
     path
   else
@@ -49,15 +49,15 @@ val walkPath = (kConnections: { String: { String: Conn } }, i: Int32, destinatio
               path
             )
 
-val stepPath = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, origin: String, path: Json): Json =>
+val stepPath = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, origin: String, path: AnyVal): AnyVal =>
   var next = [origin]
   path.for(p => push(next, p))
   walkPath(kConnections, i - 1, origin, next)
 
-export val makeStringResults = (): Json =>
+export val makeStringResults = (): AnyVal =>
   { "results": {  } }
 
-export val add = (sr: Json, kConnections: { String: { String: Conn } }): Null =>
+export val add = (sr: AnyVal, kConnections: { String: { String: Conn } }): Null =>
   val results = sr["results"]
   kConnections
     .keys()
@@ -82,5 +82,5 @@ export val add = (sr: Json, kConnections: { String: { String: Conn } }): Null =>
         )
     )
 
-export val finalize = (sr: Json): Json =>
+export val finalize = (sr: AnyVal): AnyVal =>
   sr["results"]

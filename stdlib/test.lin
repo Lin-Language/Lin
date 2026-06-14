@@ -29,25 +29,25 @@ import { toJsonString, toJson } from "std/json"
 import { startTimer, elapsed } from "std/time"
 
 // An Assertion is the result of a single matcher: a pass, or a fail carrying a message (and,
-// for comparison matchers, the raw expected/actual pair). Assertion VALUES flow as `Json`: a
+// for comparison matchers, the raw expected/actual pair). Assertion VALUES flow as `AnyVal`: a
 // failing assertion carries OPEN extra keys (`message`/`expected`/`actual`) that downstream
 // consumers (the reporter, the VSCode Test Explorer) read by name, so the value must NOT be
 // projected to a fixed field set. Under sealed-records (a named `type T = {…}` is a sealed,
 // fixed-layout record that DROPS extra fields on assignment), a concrete `Assertion = {type}`
-// return type would lossily project away those extra keys — so the helpers/matchers return `Json`.
+// return type would lossily project away those extra keys — so the helpers/matchers return `AnyVal`.
 // The "every test returns an ARRAY of assertions" guard is preserved at the array level: test
-// bodies are typed `() => Json[]` (an array is still required), and `docs/STDLIB.md` documents the
+// bodies are typed `() => AnyVal[]` (an array is still required), and `docs/STDLIB.md` documents the
 // `[ expect(...).toBe(...), … ]` form.
-val _pass = (): Json =>
+val _pass = (): AnyVal =>
   { "type": "pass" }
 
-val _fail = (message: String): Json =>
+val _fail = (message: String): AnyVal =>
   { "type": "fail", "message": message }
 
 // A failing assertion that ALSO carries the raw expected/actual pair, so consumers (the VSCode
-// Test Explorer) can render a structured diff without re-parsing the human message. Returns `Json`
+// Test Explorer) can render a structured diff without re-parsing the human message. Returns `AnyVal`
 // so the open extra keys survive (a sealed concrete return type would project them away).
-val _failCompare = (message: String, expected: Json, actual: Json): Json =>
+val _failCompare = (message: String, expected: AnyVal, actual: AnyVal): AnyVal =>
   {
     "type": "fail",
     "message": message,
@@ -55,7 +55,7 @@ val _failCompare = (message: String, expected: Json, actual: Json): Json =>
     "actual": actual
   }
 
-val _evalResult = (name: String, results: Json[], ms: Int64): Json =>
+val _evalResult = (name: String, results: AnyVal[], ms: Int64): AnyVal =>
   val failures = results.filter(a => a["type"] == "fail")
   if length(failures) == 0 then
     {
@@ -71,11 +71,11 @@ val _evalResult = (name: String, results: Json[], ms: Int64): Json =>
       "ms": ms
     }
 
-val _printFail = (r: Json): Null =>
+val _printFail = (r: AnyVal): Null =>
   print("  FAIL  ${r["name"]}")
   r["failures"].for(f => print("    ${f["message"]}"))
 
-val _printSuiteResults = (suiteResult: Json): Null =>
+val _printSuiteResults = (suiteResult: AnyVal): Null =>
   print(suiteResult["name"])
   suiteResult["results"].for(r =>
     if r["type"] == "pass" then
@@ -88,7 +88,7 @@ val _printSuiteResults = (suiteResult: Json): Null =>
 // @param value  the value under test.
 // @returns an asserter `{ "value": value }`; chain a matcher via dot-syntax, e.g.
 //   `expect(x).toBe(42)`.
-export val expect = (value: Json): Json =>
+export val expect = (value: AnyVal): AnyVal =>
   { "value": value }
 
 // Assert the asserter's value equals `expected` (structural `==`).
@@ -97,7 +97,7 @@ export val expect = (value: Json): Json =>
 // @returns a passing assertion, or a failing one carrying the expected/actual pair.
 // @example expect(1 + 2).toBe(3)
 // @example expect("hi".toUpper()).toBe("HI")
-export val toBe = (asserter: Json, expected: Json): Json =>
+export val toBe = (asserter: AnyVal, expected: AnyVal): AnyVal =>
   val value = asserter["value"]
   if value == expected then
     _pass()
@@ -111,7 +111,7 @@ export val toBe = (asserter: Json, expected: Json): Json =>
 // Assert the asserter's value is `null`.
 // @param asserter  the asserter from `expect`.
 // @returns a passing assertion, or a failing one carrying the actual value.
-export val toBeNull = (asserter: Json): Json =>
+export val toBeNull = (asserter: AnyVal): AnyVal =>
   val value = asserter["value"]
   if value == null then
     _pass()
@@ -120,9 +120,9 @@ export val toBeNull = (asserter: Json): Json =>
 
 // Assert the asserter's value satisfies a predicate.
 // @param asserter  the asserter from `expect`.
-// @param pred      a `(Json) => Boolean` predicate the value must satisfy.
+// @param pred      a `(AnyVal) => Boolean` predicate the value must satisfy.
 // @returns a passing assertion if `pred(value)` is true, otherwise a failing one.
-export val toSatisfy = (asserter: Json, pred: Function): Json =>
+export val toSatisfy = (asserter: AnyVal, pred: Function): AnyVal =>
   val value = asserter["value"]
   if pred(value) then
     _pass()
@@ -132,7 +132,7 @@ export val toSatisfy = (asserter: Json, pred: Function): Json =>
 // Assert the asserter's value is a success result (`{ "type": "success" }`).
 // @param asserter  the asserter from `expect`.
 // @returns a passing assertion if it is a success, otherwise a failing one.
-export val toSucceed = (asserter: Json): Json =>
+export val toSucceed = (asserter: AnyVal): AnyVal =>
   val value = asserter["value"]
   if value["type"] == "success" then
     _pass()
@@ -142,7 +142,7 @@ export val toSucceed = (asserter: Json): Json =>
 // Assert the asserter's value is a failure result (`{ "type": "failure" }`).
 // @param asserter  the asserter from `expect`.
 // @returns a passing assertion if it is a failure, otherwise a failing one.
-export val toFail = (asserter: Json): Json =>
+export val toFail = (asserter: AnyVal): AnyVal =>
   val value = asserter["value"]
   if value["type"] == "failure" then
     _pass()
@@ -154,7 +154,7 @@ export val toFail = (asserter: Json): Json =>
 // @param message   the expected failure error message.
 // @returns a passing assertion if it is a failure with that message, otherwise a failing one
 //   carrying the expected/actual pair.
-export val toFailWith = (asserter: Json, message: String): Json =>
+export val toFailWith = (asserter: AnyVal, message: String): AnyVal =>
   val value = asserter["value"]
   if value["type"] == "failure" && value["error"] == message then
     _pass()
@@ -183,7 +183,7 @@ val _isSelected = (name: String): Boolean =>
 // @returns a result record. When `--filter-test` (via LIN_TEST_ONLY) did not select this test, the
 //   body is not evaluated (no side effects, no fixture setup/teardown) and a `{ "type": "skip" }`
 //   sentinel is produced, which `report` counts as neither pass nor fail.
-export val test = (name: String, body: () => Json[]): Json =>
+export val test = (name: String, body: () => AnyVal[]): AnyVal =>
   if _isSelected(name) then
     val timer = startTimer()
     val results = body()
@@ -201,7 +201,7 @@ export val test = (name: String, body: () => Json[]): Json =>
 // @param name      the test name.
 // @param body      receives the fixture and returns an `Assertion[]`.
 // @returns the test result record (same as `test`).
-export val withFixture = (setup: () => Json, teardown: (Json) => Null, name: String, body: (Json) => Json[]): Json =>
+export val withFixture = (setup: () => AnyVal, teardown: (AnyVal) => Null, name: String, body: (AnyVal) => AnyVal[]): AnyVal =>
   test(name, () =>
     val fixture = setup()
     val results = body(fixture)
@@ -213,7 +213,7 @@ export val withFixture = (setup: () => Json, teardown: (Json) => Null, name: Str
 // @param name   the suite name.
 // @param tests  the array of test result records (from `test`/`withFixture`).
 // @returns a suite record `{ "name", "tests" }`.
-export val suite = (name: String, tests: Json[]): Json =>
+export val suite = (name: String, tests: AnyVal[]): AnyVal =>
   { "name": name, "tests": tests }
 
 // Machine-readable NDJSON emission, gated on the LIN_TEST_JSON env var (see `report`).
@@ -222,7 +222,7 @@ export val suite = (name: String, tests: Json[]): Json =>
 // same stdout stream. `toJsonString` already quotes+escapes its argument, so the name/message
 // are interpolated raw. Failure messages (which themselves contain `expected:…\nactual:…`
 // newlines) are joined with `\n` and handed to `toJsonString` for escaping.
-val _reportJsonResult = (r: Json): Null =>
+val _reportJsonResult = (r: AnyVal): Null =>
   if r["type"] == "skip" then
     null
   else if r["type"] == "pass" then
@@ -235,7 +235,7 @@ val _reportJsonResult = (r: Json): Null =>
     // Structured expected/actual is emitted ONLY when EXACTLY ONE failure carries a pair (the
     // common one-assertion-per-test case). With multiple failing assertions there is no single
     // pair to surface, so we omit the fields and let the joined `message` convey everything. The
-    // values are arbitrary Json (objects/arrays/quoted strings), so they MUST go through `toJson`
+    // values are arbitrary AnyVal (objects/arrays/quoted strings), so they MUST go through `toJson`
     // (the recursive serializer), never raw interpolation or the string-only `toJsonString`.
     val structured = r["failures"].filter(f => f["expected"] != null || f["actual"] != null)
     if length(structured) == 1 then
@@ -256,7 +256,7 @@ val _reportJsonResult = (r: Json): Null =>
 //   excluded from both pass and fail counts. When LIN_TEST_JSON is set, the human-readable lines
 //   are suppressed and one NDJSON record is emitted per test (for `lin test --reporter json`); the
 //   return value is identical in both modes.
-export val report = (s: Json): Int32 =>
+export val report = (s: AnyVal): Int32 =>
   val failed = s["tests"].filter(r => r["type"] == "fail")
   val skipped = s["tests"].filter(r => r["type"] == "skip")
   val passCount = length(s["tests"]) - length(failed) - length(skipped)
@@ -275,7 +275,7 @@ export val report = (s: Json): Int32 =>
 // Run a suite: print results and `exit(1)` if any test failed (the common case — a non-zero status
 // fails CI). For guaranteed post-run teardown even on failure, use `report` instead.
 // @param s  the suite from `suite`.
-export val run = (s: Json): Null =>
+export val run = (s: AnyVal): Null =>
   if report(s) > 0 then
     exit(1)
   else
