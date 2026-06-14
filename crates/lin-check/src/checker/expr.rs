@@ -69,14 +69,6 @@ fn place_path_of_expr(expr: &Expr) -> Option<PlacePath> {
     }
 }
 
-/// The root identifier a `PlacePath` is anchored at.
-fn place_path_root(path: &PlacePath) -> &str {
-    match path {
-        PlacePath::Root(n) => n,
-        PlacePath::Index(base, _) => place_path_root(base),
-    }
-}
-
 /// True if `name` appears anywhere in `path` — as the root or as an identifier key. Reassigning
 /// such an identifier invalidates the narrowing (the path may denote a different slot/value).
 fn place_path_mentions(path: &PlacePath, name: &str) -> bool {

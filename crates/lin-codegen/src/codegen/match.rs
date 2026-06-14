@@ -55,7 +55,6 @@ impl<'ctx> Codegen<'ctx> {
     /// materialized as a LinObject) OR TAG_RECORD (when boxed via `lin_box_record` in a union
     /// slot) — both are valid runtime representations of the same Lin type.
     fn compile_ir_is_type_single(&mut self, tag: inkwell::values::IntValue<'ctx>, ty: &Type) -> inkwell::values::IntValue<'ctx> {
-        let bool_ty = self.context.bool_type();
         let i8_ty = self.context.i8_type();
         // Stage 6a: a sealed record type can be TAG_OBJECT (materialized LinObject, the pre-6a
         // path) OR TAG_RECORD (wrapped sealed struct, the 6a path). Accept both.

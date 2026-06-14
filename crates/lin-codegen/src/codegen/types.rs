@@ -211,10 +211,6 @@ impl<'ctx> Codegen<'ctx> {
     /// field access via `lin_record_get_field`.
     pub(crate) const SEALED_HEADER: u64 = 24;
 
-    /// `elem_tag` for POINTER-BACKED sealed-record arrays (Stage 1 representation). Each slot is an
-    /// 8-byte sealed struct pointer. Kept in lockstep with `lin_runtime::array::SEALED_PTR_ARRAY_TAG`.
-    pub(crate) const SEALED_PTR_ARRAY_TAG: u8 = 0xFD;
-
     /// Immortal-refcount sentinel for STACK-allocated sealed records (sealed-records Stage 4). A
     /// record whose header rc is `>= IMMORTAL_RC` is inert to refcounting: `lin_rc_retain` and
     /// `lin_sealed_release` are no-ops on it (it lives on the stack and is never heap-freed). This
@@ -372,13 +368,6 @@ impl<'ctx> Codegen<'ctx> {
     // (`lin_runtime::array::SEALED_ARRAY_TAG`) inside `lin_sealed_array_alloc`; codegen never reads
     // it (all sealed-array ops dispatch on the STATIC element type via `sealed_array_elem`), so no
     // codegen-side constant is needed.
-
-    /// Per-element byte STRIDE of a sealed-record array: the struct payload WITHOUT the 16-byte
-    /// header (the array owns the elements, so no per-element header), padded to 8 so successive
-    /// elements stay 8-aligned. Equals `sealed_struct_size - SEALED_HEADER`.
-    pub(crate) fn sealed_array_stride(fields: &indexmap::IndexMap<String, Type>) -> u64 {
-        Self::sealed_struct_size(fields) - Self::SEALED_HEADER
-    }
 
     /// Does `box_value(v, ty)` produce a FRESH +1-owned heap value (which the boxing caller must
     /// later `tagged_release` to reclaim), as opposed to wrapping a BORROWED inner pointer in a box
@@ -864,28 +853,5 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Return the i8 constant for the runtime tag a value of `ty` is boxed under (used by
-    /// `is`-checks in match.rs). Delegates to `type_tag` so the two can never disagree — the
-    /// previous hand-copied table is what let Float32/Float64 drift to TAG_FLOAT32 (4) here
-    /// while box_value wrote TAG_FLOAT64 (5).
-    pub(crate) fn type_tag_const(&self, ty: &Type) -> inkwell::values::IntValue<'ctx> {
-        let i8_ty = self.context.i8_type();
-        // Types that are never boxed as a recognised scalar tag (Union/etc.) map to a sentinel
-        // 0xFF so a stray tag comparison never spuriously matches. `compile_ir_is_type` handles
-        // TypeVar (Json-erased ⇒ always true) and Union (match-any-member) BEFORE reaching here,
-        // so this fallback is only hit for genuinely-untaggable targets where "never match" is
-        // the safe answer.
-        let tag: u8 = match ty {
-            Type::Null | Type::Bool | Type::Int8 | Type::Int16 | Type::Int32
-            | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::Int64 | Type::UInt64
-            | Type::Float32 | Type::Float64 | Type::Str | Type::StrLit(_) | Type::Object { .. }
-            | Type::Map(_)
-            | Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) | Type::Function { .. } => {
-                Self::type_tag(ty)
-            }
-            _ => 0xFF,
-        };
-        i8_ty.const_int(tag as u64, false)
-    }
 
 }
