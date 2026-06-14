@@ -63,9 +63,16 @@ export val udpRecv = (fd: Int32, buf: UInt8[]): Int32 | Null | Error =>
 // @example val res = udpRecvFrom(sock, buf)   // res["len"] == 3, res["addr"] == "127.0.0.1"
 export val udpRecvFrom = (fd: Int32, buf: UInt8[]): Datagram | Null | Error =>
   val r = lin_udp_recv_from(fd, buf)
-  if r is Error then { "type": r["type"], "message": r["message"] }
-  else if r == null then null
-  else { "len": r["len"], "addr": r["addr"], "port": r["port"] }
+  if r is Error then
+    { "type": r["type"], "message": r["message"] }
+  else if r == null then
+    null
+  else
+    {
+      "len": r["len"],
+      "addr": r["addr"],
+      "port": r["port"]
+    }
 
 // Send the bytes in `buf` as a UDP datagram to `addr:port`.
 // @param fd    the socket descriptor from `udpBind`.
@@ -108,9 +115,16 @@ export val tcpListen = (port: Int32): Int32 | Error =>
 // @example tcpSend(client, slice(buf, 0, n))  // echo it back (slice from std/array)
 export val tcpAccept = (fd: Int32): TcpPeer | Null | Error =>
   val r = lin_tcp_accept(fd)
-  if r is Error then { "type": r["type"], "message": r["message"] }
-  else if r == null then null
-  else { "fd": r["fd"], "addr": r["addr"], "port": r["port"] }
+  if r is Error then
+    { "type": r["type"], "message": r["message"] }
+  else if r == null then
+    null
+  else
+    {
+      "fd": r["fd"],
+      "addr": r["addr"],
+      "port": r["port"]
+    }
 
 // Open a TCP connection to `host:port`.
 // @param host  the destination host/IP.

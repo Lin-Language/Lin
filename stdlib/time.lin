@@ -97,9 +97,17 @@ export type TimeComponents = { "year": Int32, "month": Int32, "day": Int32, "hou
 //   minute/second (0-59), millis (0-999), weekday (0=Sunday..6=Saturday), yearDay (1-366).
 export val components = (ts: Int64): TimeComponents =>
   val r = lin_time_components(ts)
-  { "year": r["year"], "month": r["month"], "day": r["day"], "hour": r["hour"],
-    "minute": r["minute"], "second": r["second"], "millis": r["millis"],
-    "weekday": r["weekday"], "yearDay": r["yearDay"] }
+  {
+    "year": r["year"],
+    "month": r["month"],
+    "day": r["day"],
+    "hour": r["hour"],
+    "minute": r["minute"],
+    "second": r["second"],
+    "millis": r["millis"],
+    "weekday": r["weekday"],
+    "yearDay": r["yearDay"]
+  }
 
 // Build a Unix-millisecond timestamp (UTC) from calendar fields. Out-of-range fields are rejected,
 // not normalised, so calendar typos surface as errors.

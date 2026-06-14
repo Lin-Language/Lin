@@ -35,8 +35,14 @@ export type HttpOptions = { "method": String, "headers": { String: String }, "bo
 // @example val result = fetch("https://example.com/ping")   // then result["status"]
 export val fetch = (url: String): HttpResponse | Error =>
   val r = lin_http_fetch(url)
-  if r is Error then { "type": r["type"], "message": r["message"] }
-  else { "status": r["status"], "headers": r["headers"], "body": r["body"] }
+  if r is Error then
+    { "type": r["type"], "message": r["message"] }
+  else
+    {
+      "status": r["status"],
+      "headers": r["headers"],
+      "body": r["body"]
+    }
 
 // Issue a request to `url` with a custom method/headers/body.
 // @param url  the URL to request.
@@ -45,8 +51,14 @@ export val fetch = (url: String): HttpResponse | Error =>
 // @example fetchWith("https://api.example.com/items", { "method": "DELETE", "headers": {}, "body": "" })
 export val fetchWith = (url: String, options: AnyVal): HttpResponse | Error =>
   val r = lin_http_fetch_with(url, options)
-  if r is Error then { "type": r["type"], "message": r["message"] }
-  else { "status": r["status"], "headers": r["headers"], "body": r["body"] }
+  if r is Error then
+    { "type": r["type"], "message": r["message"] }
+  else
+    {
+      "status": r["status"],
+      "headers": r["headers"],
+      "body": r["body"]
+    }
 
 // GET `url` and parse the response body as JSON.
 // @param url  the URL to fetch.
@@ -71,8 +83,14 @@ export val postJson = (url: String, body: AnyVal): HttpResponse | Error =>
     "headers": { "Content-Type": "application/json" },
     "body": lin_to_string(body)
   })
-  if r is Error then { "type": r["type"], "message": r["message"] }
-  else { "status": r["status"], "headers": r["headers"], "body": r["body"] }
+  if r is Error then
+    { "type": r["type"], "message": r["message"] }
+  else
+    {
+      "status": r["status"],
+      "headers": r["headers"],
+      "body": r["body"]
+    }
 
 // Build an `application/json` response with the given status and a JSON-serialised body.
 // @param status  the HTTP status code.
