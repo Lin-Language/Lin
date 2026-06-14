@@ -47,7 +47,7 @@ pub const TAG_SUMNODE: u8 = 21;
 /// heap handle wrapping a `num_bigint::BigInt`, in the `TAG_STREAM`/`TAG_SHARED` opaque-handle
 /// family. The payload is a `*const BigNumBox`; its RC dispatches through the tag-aware
 /// retain/release (the `TAG_BIGNUM` arm calls `lin_bignum_retain_box`/`lin_bignum_release_box`,
-/// the final drop freeing the boxed Rust value). The Lin surface aliases `BigInt = Json`, so the
+/// the final drop freeing the boxed Rust value). The Lin surface aliases `BigInt = AnyVal`, so the
 /// handle flows through the universal boxed-TaggedVal* representation like any opaque value.
 pub const TAG_BIGNUM: u8 = 22;
 /// Exact base-10 fixed-point decimal (`std/decimal`, `crate::decimal`). Same opaque-handle shape
