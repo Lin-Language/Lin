@@ -1854,6 +1854,29 @@ toUInt16(b[0]) << 8          // widen a byte for endian assembly
 
 ---
 
+### Integer limits
+
+The min/max value of each fixed-width integer type, exported as named constants.
+
+```txt
+val MAX_UINT8:  UInt8  = 255
+val MIN_INT8:   Int8   = -128
+val MAX_INT8:   Int8   = 127
+val MAX_UINT16: UInt16 = 65535
+val MIN_INT16:  Int16  = -32768
+val MAX_INT16:  Int16  = 32767
+val MAX_UINT32: UInt32 = 4294967295
+val MIN_INT32:  Int32  = -2147483648
+val MAX_INT32:  Int32  = 2147483647
+val MAX_UINT64: UInt64 = 18446744073709551615
+val MIN_INT64:  Int64  = -9223372036854775808
+val MAX_INT64:  Int64  = 9223372036854775807
+```
+
+There is no `MIN_UINT*` — all unsigned minimums are `0`.
+
+---
+
 ### tryParseFloat64
 
 ```txt

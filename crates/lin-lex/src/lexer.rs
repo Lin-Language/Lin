@@ -490,7 +490,10 @@ impl Lexer {
                 Ok(v) => v,
                 Err(_) => num_str.parse::<u64>().map(|u| u as i64).unwrap_or(0),
             };
-            let val = if negative { -val } else { val };
+            // wrapping_neg so -9223372036854775808 (i64::MIN) lexes correctly:
+            // its magnitude overflows i64, but the bit pattern is already i64::MIN
+            // and wrapping_neg(-i64::MIN) == i64::MIN.
+            let val = if negative { val.wrapping_neg() } else { val };
             Token::new(TokenKind::IntLit(val, suffix), span)
         }
     }
@@ -505,7 +508,7 @@ impl Lexer {
             self.pos += 1;
         }
         let val = i64::from_str_radix(&num_str, 16).unwrap_or(0);
-        let val = if negative { -val } else { val };
+        let val = if negative { val.wrapping_neg() } else { val };
         let suffix = self.lex_int_suffix();
         Token::new(TokenKind::IntLit(val, suffix), self.span(start, self.pos))
     }
@@ -549,7 +552,7 @@ impl Lexer {
             self.pos += 1;
         }
         let val = i64::from_str_radix(&num_str, 2).unwrap_or(0);
-        let val = if negative { -val } else { val };
+        let val = if negative { val.wrapping_neg() } else { val };
         let suffix = self.lex_int_suffix();
         Token::new(TokenKind::IntLit(val, suffix), self.span(start, self.pos))
     }
@@ -564,7 +567,7 @@ impl Lexer {
             self.pos += 1;
         }
         let val = i64::from_str_radix(&num_str, 8).unwrap_or(0);
-        let val = if negative { -val } else { val };
+        let val = if negative { val.wrapping_neg() } else { val };
         let suffix = self.lex_int_suffix();
         Token::new(TokenKind::IntLit(val, suffix), self.span(start, self.pos))
     }
@@ -863,5 +866,19 @@ val y = 2
             !toks.iter().any(|t| t.kind == TokenKind::QuestionQuestion),
             "a single `?` must not lex as `??`"
         );
+    }
+
+    #[test]
+    fn i64_min_literal_does_not_panic() {
+        // -9223372036854775808 is i64::MIN. Its magnitude (9223372036854775808) overflows i64,
+        // so the u64 fallback path stores the two's-complement bit pattern as i64::MIN.
+        // wrapping_neg(i64::MIN) == i64::MIN, which is the correct result. A plain `-val`
+        // here would panic in debug builds.
+        let toks = tokens("-9223372036854775808");
+        let lit = toks.iter().find(|t| matches!(t.kind, TokenKind::IntLit(_, _)));
+        assert!(lit.is_some(), "expected an IntLit token");
+        if let TokenKind::IntLit(v, _) = lit.unwrap().kind {
+            assert_eq!(v, i64::MIN, "i64::MIN literal must lex to i64::MIN");
+        }
     }
 }
