@@ -20,7 +20,7 @@ impl Checker {
         );
 
         // length: (String | Array<T> | Iterator<T> | Object) => Int32
-        // Uses TypeVar(u32::MAX) as the "any" Json type for the object case.
+        // Uses TypeVar(u32::MAX) as the AnyVal (dynamic top) type for the object case.
         self.define_intrinsic(
             "lin_length",
             Type::func(vec![Type::Union(vec![
@@ -56,13 +56,13 @@ impl Checker {
             Type::func(vec![Type::object(IndexMap::new())], Type::Array(Box::new(Type::Str))),
         );
 
-        // lin_object_set: (Object, String, Json) => Null — in-place object key mutation
+        // lin_object_set: (Object, String, AnyVal) => Null — in-place object key mutation
         self.define_intrinsic(
             "lin_object_set",
             Type::func(vec![Type::object(IndexMap::new()), Type::Str, Type::TypeVar(u32::MAX)], Type::Null),
         );
 
-        // for: (Iterable<T>, (T) => Json) => Null  — callback return type is ignored. A `Stream<T>`
+        // for: (Iterable<T>, (T) => AnyVal) => Null  — callback return type is ignored. A `Stream<T>`
         // is ALSO accepted as the iterable (streams brief §3): a stream `for` is driven by the
         // runtime (the IR lowerer branches on the Stream type → `lin_stream_for`), ends normally
         // at EOF, and a read Error becomes the for-expr's value. The declared result stays `Null`
@@ -184,7 +184,7 @@ impl Checker {
         self.define_intrinsic("lin_await", Type::func(
             vec![Type::Promise(Box::new(Type::TypeVar(9101)))],
             Type::Union(vec![Type::TypeVar(9101), crate::resolve::error_type()])));
-        // parallel: variadic — always returns a tagged array (TypeVar(u32::MAX) = Json/any).
+        // parallel: variadic — always returns a tagged array (TypeVar(u32::MAX) = AnyVal).
         // Using u32::MAX prevents zonking from resolving the element type to a flat scalar,
         // which would cause codegen to use a flat array representation for a tagged array.
         self.define_intrinsic("lin_parallel", Type::func(vec![Type::Array(Box::new(Type::func(vec![], Type::TypeVar(9102))))], Type::Array(Box::new(Type::TypeVar(u32::MAX)))));
@@ -210,7 +210,7 @@ impl Checker {
             ], Type::Promise(Box::new(Type::TypeVar(9121)))));
         // Shared<T> accessors (ADR-028 §2.3.1). The opaque Shared<T> type is modelled with a
         // The opaque `Shared<T>` type (ADR-029): the four accessors below are the ONLY operations.
-        // `Shared<T>` is invariant and never auto-unwraps to `T`/`Json`, so any other op on it
+        // `Shared<T>` is invariant and never auto-unwraps to `T`/`AnyVal`, so any other op on it
         // (push, indexing, …) is a compile-time type error. Each accessor shares a single TypeVar
         // `T` between its `Shared<T>` and the bare `T`, so inference links the two.
         //   shared:   <T>(T) => Shared<T>
@@ -260,10 +260,10 @@ impl Checker {
         self.define_intrinsic("lin_stream_close",
             Type::func(vec![Type::Stream(Box::new(Type::TypeVar(9161)))], Type::Null));
 
-        // Lazy adapters (Stage 4). Transform closures operate on BOXED items (Json-in/Json-out)
+        // Lazy adapters (Stage 4). Transform closures operate on BOXED items (AnyVal-in/AnyVal-out)
         // so the runtime can call them uniformly regardless of the concrete item type — stream
-        // items (UInt8[] chunks, String lines, …) are all JSON-compatible. Each adapter returns a
-        // fresh `Stream` (= Stream<Json>); the opaque Stream type confines ops to this API.
+        // items (UInt8[] chunks, String lines, …) are all AnyVal-compatible. Each adapter returns a
+        // fresh `Stream` (= Stream<AnyVal>); the opaque Stream type confines ops to this API.
         let any_stream = || Type::Stream(Box::new(Type::TypeVar(u32::MAX)));
         self.define_intrinsic("lin_stream_map", Type::func(vec![
                 any_stream(),
@@ -276,7 +276,7 @@ impl Checker {
         self.define_intrinsic("lin_stream_take",
             Type::func(vec![any_stream(), Type::Int32], any_stream()));
         // Net-new lazy adapters (Stage 3): drop(s, n); takeWhile/dropWhile(s, p); flatMap(s, f);
-        // flatten(s); concat(a, b) — all return a fresh Stream. Closures operate on boxed Json.
+        // flatten(s); concat(a, b) — all return a fresh Stream. Closures operate on boxed AnyVal.
         self.define_intrinsic("lin_stream_drop",
             Type::func(vec![any_stream(), Type::Int32], any_stream()));
         self.define_intrinsic("lin_stream_take_while", Type::func(vec![
@@ -308,7 +308,7 @@ impl Checker {
         // tar splitting (std/archive). `untar(s, body)` is a TERMINAL: it drives the whole archive on
         // the calling thread, calling `body(meta, data)` per entry where `meta` is an Object and
         // `data` is a `Stream<UInt8[]>` SUB-STREAM (a legal stream PARAMETER position per ADR-049).
-        // Returns `Null | Error`. The body's return is ignored, so it is typed `Json` (TypeVar(MAX)).
+        // Returns `Null | Error`. The body's return is ignored, so it is typed `AnyVal` (TypeVar(MAX)).
         // `manifest(s)`/`files(s)` are ADAPTERS returning a fresh `Stream` (of Objects). All three
         // CONSUME the parent stream (the affine move is type-based in the IR; the checker mirrors it
         // via `callee_routes_to_stream_op`'s std/archive arm).
@@ -410,15 +410,15 @@ impl Checker {
         // value_key: (any) => String — canonical type-tagged key for any value
         self.define_intrinsic("lin_value_key", Type::func(vec![Type::TypeVar(u32::MAX)], Type::Str));
 
-        // to_json: (Json) => String — recursive strict-JSON serializer for any value.
-        // The param is the Json marker (TypeVar(u32::MAX)) so any value flows in.
+        // to_json: (AnyVal) => String — recursive strict-JSON serializer for any value.
+        // The param is the AnyVal marker (TypeVar(u32::MAX)) so any value flows in.
         self.define_intrinsic("lin_to_json", Type::func(vec![Type::TypeVar(u32::MAX)], Type::Str));
 
-        // arrayAllocate(n) => Json[] — null-filled tagged array of length n
+        // arrayAllocate(n) => AnyVal[] — null-filled tagged array of length n
         self.define_intrinsic("lin_array_allocate", Type::func(vec![Type::Int32], Type::Array(Box::new(Type::TypeVar(u32::MAX)))));
 
         // arrayAllocateFilled(n, val) => T[] — flat scalar array of length n filled with val
-        // Uses TypeVar(u32::MAX) for val so any scalar can be passed; returns Json[] (TypeVar).
+        // Uses TypeVar(u32::MAX) for val so any scalar can be passed; returns AnyVal[] (TypeVar).
         self.define_intrinsic("lin_array_allocate_filled", Type::func(vec![Type::Int32, Type::TypeVar(u32::MAX)], Type::Array(Box::new(Type::TypeVar(u32::MAX)))));
     }
 }
