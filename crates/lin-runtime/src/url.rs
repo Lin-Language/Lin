@@ -13,9 +13,9 @@
 //! break the `build(parse(s)) == s` round-trip guarantee.
 
 use crate::fs::{make_error_tagged, make_string, resolve_lin_str};
-use crate::object::{lin_object_alloc, lin_object_set, LinObject};
+use crate::map::{lin_map_alloc, lin_map_set, LinMap};
 use crate::string::{lin_string_from_bytes, lin_string_release, LinString};
-use crate::tagged::{alloc_tagged, TaggedVal, TAG_INT32, TAG_OBJECT, TAG_STR};
+use crate::tagged::{alloc_tagged, TaggedVal, TAG_INT32, TAG_MAP, TAG_STR};
 
 /// The split result: each Option is None when the component was absent, Some(raw substring)
 /// when present (which may be the empty string, e.g. an empty query in `http://h/?`).
@@ -195,41 +195,41 @@ fn parse_port(s: &str) -> Result<i32, String> {
     s.parse::<i32>().map_err(|_| format!("port out of range: '{s}'"))
 }
 
-/// Set a String field on the object (retaining via lin_object_set, then dropping our local +1).
-unsafe fn set_str_field(obj: *mut LinObject, key: &str, val: &str) {
+/// Set a String field on the map (retaining via lin_map_set, then dropping our local +1).
+unsafe fn set_str_field(map: *mut LinMap, key: &str, val: &str) {
     let k = make_string(key);
     let v = make_string(val);
     let mut tv: TaggedVal = std::mem::zeroed();
     tv.tag = TAG_STR;
     tv.payload = v as u64;
-    lin_object_set(obj, k, &tv);
+    lin_map_set(map, k, &tv);
     lin_string_release(k);
     lin_string_release(v);
 }
 
 /// Set a field to a Null value (absent component).
-unsafe fn set_null_field(obj: *mut LinObject, key: &str) {
+unsafe fn set_null_field(map: *mut LinMap, key: &str) {
     let k = make_string(key);
     let tv: TaggedVal = std::mem::zeroed(); // tag 0 == TAG_NULL
-    lin_object_set(obj, k, &tv);
+    lin_map_set(map, k, &tv);
     lin_string_release(k);
 }
 
 /// Set an Int32 field.
-unsafe fn set_int_field(obj: *mut LinObject, key: &str, val: i32) {
+unsafe fn set_int_field(map: *mut LinMap, key: &str, val: i32) {
     let k = make_string(key);
     let mut tv: TaggedVal = std::mem::zeroed();
     tv.tag = TAG_INT32;
     tv.payload = val as i64 as u64;
-    lin_object_set(obj, k, &tv);
+    lin_map_set(map, k, &tv);
     lin_string_release(k);
 }
 
 /// Set a `String | Null` field from an Option.
-unsafe fn set_opt_str_field(obj: *mut LinObject, key: &str, val: &Option<String>) {
+unsafe fn set_opt_str_field(map: *mut LinMap, key: &str, val: &Option<String>) {
     match val {
-        Some(s) => set_str_field(obj, key, s),
-        None => set_null_field(obj, key),
+        Some(s) => set_str_field(map, key, s),
+        None => set_null_field(map, key),
     }
 }
 
@@ -250,20 +250,20 @@ pub unsafe extern "C" fn lin_url_parse(s: *const u8) -> *mut u8 {
         Err(e) => return make_error_tagged(&format!("invalid URL: {e}")),
     };
 
-    let obj = lin_object_alloc(8);
-    set_str_field(obj, "scheme", &parts.scheme);
-    set_opt_str_field(obj, "userinfo", &parts.userinfo);
+    let map = lin_map_alloc(8);
+    set_str_field(map, "scheme", &parts.scheme);
+    set_opt_str_field(map, "userinfo", &parts.userinfo);
     // host is always a String (possibly ""), but when there is no authority it must be "".
-    set_str_field(obj, "host", if parts.has_authority { &parts.host } else { "" });
+    set_str_field(map, "host", if parts.has_authority { &parts.host } else { "" });
     match parts.port {
-        Some(p) => set_int_field(obj, "port", p),
-        None => set_null_field(obj, "port"),
+        Some(p) => set_int_field(map, "port", p),
+        None => set_null_field(map, "port"),
     }
-    set_str_field(obj, "path", &parts.path);
-    set_opt_str_field(obj, "query", &parts.query);
-    set_opt_str_field(obj, "fragment", &parts.fragment);
+    set_str_field(map, "path", &parts.path);
+    set_opt_str_field(map, "query", &parts.query);
+    set_opt_str_field(map, "fragment", &parts.fragment);
 
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
 /// Resolve `ref` against `base` using RFC 3986 §5 reference resolution (the `url` crate's
