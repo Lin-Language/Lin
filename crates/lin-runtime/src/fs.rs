@@ -493,12 +493,8 @@ pub unsafe extern "C" fn lin_fs_write_file_bytes(path: *const u8, arr: *const u8
             let val = if tv_ptr.is_null() {
                 0u8
             } else {
-                let etag = (*tv_ptr).tag;
                 let payload = (*tv_ptr).payload;
-                let v = match etag {
-                    TAG_INT32 => payload as i32,
-                    _ => payload as i32,
-                };
+                let v = payload as i32;
                 // Free the box returned by lin_array_get_tagged. It may be an immutable cached
                 // small-int static (the flat-int arms route through the box cache), so use the
                 // cached-box-safe release rather than a raw dealloc.
