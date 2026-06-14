@@ -162,33 +162,45 @@ unsafe fn unwrap_stream(p: *const u8) -> *const StreamBox {
 /// exactly as a mid-pipeline read fault would. Returns `None` for a real stream or any non-error
 /// value (which the caller treats as an empty/EOF stream, the prior behaviour).
 unsafe fn stream_arg_error(s: *const u8) -> Option<String> {
-    use crate::object::LinObject;
     use crate::string::LinString;
     if s.is_null() {
         return None;
     }
     let tv = &*(s as *const TaggedVal);
-    if tv.tag != crate::tagged::TAG_OBJECT {
-        return None;
-    }
-    let obj = tv.payload as *const LinObject;
-    if obj.is_null() {
-        return None;
-    }
-    // Read `type`; only an `"error"`-tagged object is treated as an in-band fault.
-    let get = |key: &str| -> Option<String> {
-        let k = crate::fs::make_string(key);
-        let v = crate::object::lin_object_get(obj, k);
-        crate::string::lin_string_release(k);
-        if v.is_null() || (*v).tag != crate::tagged::TAG_STR {
-            return None;
+    match tv.tag {
+        crate::tagged::TAG_OBJECT => {
+            use crate::object::LinObject;
+            let obj = tv.payload as *const LinObject;
+            if obj.is_null() { return None; }
+            let get = |key: &str| -> Option<String> {
+                let k = crate::fs::make_string(key);
+                let v = crate::object::lin_object_get(obj, k);
+                crate::string::lin_string_release(k);
+                if v.is_null() || (*v).tag != crate::tagged::TAG_STR { return None; }
+                let sp = (*v).payload as *const LinString;
+                let slice = std::slice::from_raw_parts((*sp).data.as_ptr(), (*sp).len as usize);
+                std::str::from_utf8(slice).ok().map(|x| x.to_string())
+            };
+            match get("type") {
+                Some(ref t) if t == "error" => Some(get("message").unwrap_or_else(|| "stream error".to_string())),
+                _ => None,
+            }
         }
-        let sp = (*v).payload as *const LinString;
-        let slice = std::slice::from_raw_parts((*sp).data.as_ptr(), (*sp).len as usize);
-        std::str::from_utf8(slice).ok().map(|x| x.to_string())
-    };
-    match get("type") {
-        Some(ref t) if t == "error" => Some(get("message").unwrap_or_else(|| "stream error".to_string())),
+        crate::tagged::TAG_MAP => {
+            let map = tv.payload as *const crate::map::LinMap;
+            if map.is_null() { return None; }
+            let get_str = |key: &str| -> Option<String> {
+                let borrowed = crate::map::lin_map_get_bytes(map, key.as_ptr(), key.len() as u32);
+                if borrowed.is_null() || (*borrowed).tag != crate::tagged::TAG_STR { return None; }
+                let sp = (*borrowed).payload as *const LinString;
+                let slice = std::slice::from_raw_parts((*sp).data.as_ptr(), (*sp).len as usize);
+                std::str::from_utf8(slice).ok().map(|x| x.to_string())
+            };
+            match get_str("type") {
+                Some(ref t) if t == "error" => Some(get_str("message").unwrap_or_else(|| "stream error".to_string())),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -3708,8 +3720,8 @@ mod tests {
             let path_str = crate::string::lin_string_from_bytes(path.as_ptr(), path.len() as u32);
             let path_tagged = crate::tagged::alloc_tagged(crate::tagged::TAG_STR, path_str as u64);
             let r = lin_fs_open(path_tagged as *const u8);
-            // An open failure is an Error object, NOT a stream.
-            assert_eq!(crate::tagged::lin_get_tag(r), crate::tagged::TAG_OBJECT);
+            // An open failure is an Error map (TAG_MAP), NOT a stream.
+            assert_eq!(crate::tagged::lin_get_tag(r), crate::tagged::TAG_MAP);
             crate::tagged::lin_tagged_release(r);
             crate::tagged::lin_tagged_release(path_tagged);
         }
@@ -3856,7 +3868,7 @@ mod tests {
             let lines = lin_stream_lines(src as *const u8, 0);
             crate::tagged::lin_tagged_release(src);
             let r = lin_stream_collect(lines as *const u8);
-            assert_eq!(crate::tagged::lin_get_tag(r), crate::tagged::TAG_OBJECT, "error object");
+            assert_eq!(crate::tagged::lin_get_tag(r), crate::tagged::TAG_MAP, "error object");
             crate::tagged::lin_tagged_release(r);
             crate::tagged::lin_tagged_release(lines);
             assert_eq!(cc.load(Ordering::SeqCst), 1, "errored stream still closed once");

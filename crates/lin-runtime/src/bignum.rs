@@ -342,8 +342,8 @@ mod tests {
             let a = lin_bignum_from_int64(7);
             let z = lin_bignum_zero();
             let r = lin_bignum_div(a, z);
-            // An Error object is TAG_OBJECT, not TAG_BIGNUM.
-            assert_eq!(crate::tagged::lin_get_tag(r), crate::tagged::TAG_OBJECT);
+            // An Error is now TAG_MAP (not TAG_BIGNUM or old TAG_OBJECT).
+            assert_eq!(crate::tagged::lin_get_tag(r), crate::tagged::TAG_MAP);
             crate::tagged::lin_tagged_release(a);
             crate::tagged::lin_tagged_release(z);
             crate::tagged::lin_tagged_release(r);

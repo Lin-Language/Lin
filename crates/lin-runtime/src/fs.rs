@@ -1,18 +1,19 @@
-use crate::string::{LinString, lin_string_from_bytes};
-use crate::object::{LinObject, lin_object_alloc, lin_object_set};
+use crate::string::{LinString, lin_string_from_bytes, lin_string_release};
+
+use crate::map::{LinMap, lin_map_alloc, lin_map_set};
 use crate::array::{lin_array_alloc, LinArray, lin_array_length, lin_array_get_tagged,
                    lin_flat_array_alloc_u8, lin_flat_array_push_u8};
-use crate::tagged::{TaggedVal, TAG_STR, TAG_INT32, TAG_OBJECT, TAG_ARRAY, alloc_tagged, lin_unbox_ptr};
+use crate::tagged::{TaggedVal, TAG_STR, TAG_MAP, TAG_ARRAY, alloc_tagged, lin_unbox_ptr};
 
 pub unsafe fn make_string(s: &str) -> *mut LinString {
     lin_string_from_bytes(s.as_ptr(), s.len() as u32)
 }
 
 pub unsafe fn make_error_tagged(msg: &str) -> *mut u8 {
-    alloc_tagged(TAG_OBJECT, make_error_obj(msg) as u64)
+    make_error_map(msg)
 }
 
-/// C-callable wrapper: take a LinString* message, return TaggedVal*(Object error).
+/// C-callable wrapper: take a LinString* message, return TaggedVal*(Map error).
 #[no_mangle]
 pub unsafe extern "C" fn lin_make_error_tagged(msg: *const LinString) -> *mut u8 {
     let slice = std::slice::from_raw_parts((*msg).data.as_ptr(), (*msg).len as usize);
@@ -20,58 +21,32 @@ pub unsafe extern "C" fn lin_make_error_tagged(msg: *const LinString) -> *mut u8
     make_error_tagged(s)
 }
 
-unsafe fn make_error_obj(msg: &str) -> *mut LinObject {
-    use crate::string::lin_string_release;
-    let obj = lin_object_alloc(4);
-    let type_key = make_string("type");
-    let error_val = make_string("error");
-    let msg_key = make_string("message");
-    let msg_val = make_string(msg);
-    let mut tv: TaggedVal = std::mem::zeroed();
-    tv.tag = TAG_STR;
-    tv.payload = error_val as u64;
-    lin_object_set(obj, type_key, &tv); // inc_refs type_key, retains error_val
-    let mut tv2: TaggedVal = std::mem::zeroed();
-    tv2.tag = TAG_STR;
-    tv2.payload = msg_val as u64;
-    lin_object_set(obj, msg_key, &tv2); // inc_refs msg_key, retains msg_val
-    // lin_object_set takes its OWN reference to each key and value; release the local +1
-    // from each make_string so the object is the sole owner (freeing the returned error
-    // object then frees everything — no leak; verified under LeakSanitizer).
-    lin_string_release(type_key);
-    lin_string_release(error_val);
-    lin_string_release(msg_key);
-    lin_string_release(msg_val);
-    obj
+/// Build a `{ "type": "error", "message": <msg> }` LinMap box (TAG_MAP). Leg-2 canonical form
+/// so `is Error` (TAG_MAP + has "type"+"message") works via the Leg-1 infra without reconstruction.
+unsafe fn make_error_map(msg: &str) -> *mut u8 {
+    let map = map_set_str(map_set_str(lin_map_alloc(4), "type", "error"), "message", msg);
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
-/// Build a `fromJson` decode error as an owned `TaggedVal*(Object)` (ADR-031). Shape:
-/// `{ "type": "error", "message": <msg>, "path": <path> }`. The `type`/`message` fields keep
-/// the existing error convention; `path` is a JSONPath-ish location (e.g. `$.address.city`).
-/// Returned value is independently owned by the caller (release with `lin_tagged_release`).
-///
-/// Unlike the legacy `make_error_obj`, this builds the object leak-cleanly: `lin_object_set`
-/// retains the key and the value's inner payload, so the local +1 reference created here for
-/// each freshly-allocated key/value string is released afterwards. The net owner of every
-/// inner string is the object; releasing the returned box frees the object and, transitively,
-/// every string — no orphaned +1 references (verified under ASan).
+/// Build a `fromJson` decode error as an owned `TaggedVal*(Map)` (ADR-031). Shape:
+/// `{ "type": "error", "message": <msg>, "path": <path> }`. Returns TAG_MAP.
 pub unsafe fn make_decode_error(msg: &str, path: &str) -> *mut u8 {
-    use crate::string::lin_string_release;
-    let obj = lin_object_alloc(4);
-    let set_str = |obj: *mut LinObject, key: &str, val: &str| {
-        let k = make_string(key);
-        let v = make_string(val);
-        let mut tv: TaggedVal = std::mem::zeroed();
-        tv.tag = TAG_STR;
-        tv.payload = v as u64;
-        lin_object_set(obj, k, &tv); // retains both k and v
-        lin_string_release(k); // drop our local +1 (object now owns its own ref)
-        lin_string_release(v);
-    };
-    set_str(obj, "type", "error");
-    set_str(obj, "message", msg);
-    set_str(obj, "path", path);
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    let map = map_set_str(map_set_str(map_set_str(lin_map_alloc(4), "type", "error"), "message", msg), "path", path);
+    alloc_tagged(TAG_MAP, map as u64)
+}
+
+/// Set a string-valued field on a LinMap; returns the map. The local +1 on both key and value
+/// strings created by `make_string` is released after `lin_map_set` retains its own references.
+unsafe fn map_set_str(map: *mut LinMap, key: &str, val: &str) -> *mut LinMap {
+    let k = make_string(key);
+    let v = make_string(val);
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_STR;
+    tv.payload = v as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
+    lin_string_release(v);
+    map
 }
 
 /// Resolve a path that may be either a bare LinString* or a TaggedVal*(Str).
@@ -180,10 +155,34 @@ pub unsafe extern "C" fn lin_fs_is_dir(path: *const u8) -> u8 {
     std::path::Path::new(&path_str).is_dir() as u8
 }
 
-/// Build a FileStat object box from a std::fs::Metadata. `is_symlink` is supplied by the
-/// caller: a following `stat` reports `false` (it resolved the link and describes the target),
-/// while `lstat` (symlink_metadata) reports whether the path itself is a link. Returns an owned
-/// `TaggedVal*(Object)` with fields: size, modified, created, isFile, isDir, isSymlink, mode.
+/// Set an Int64 field on a LinMap; returns the map.
+unsafe fn map_set_int64(map: *mut LinMap, key: &str, val: i64) -> *mut LinMap {
+    let k = make_string(key);
+    let tv = TaggedVal { tag: crate::tagged::TAG_INT64, _pad: [0;7], payload: val as u64 };
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
+    map
+}
+
+/// Set an Int32 field on a LinMap; returns the map.
+unsafe fn map_set_int32(map: *mut LinMap, key: &str, val: i32) -> *mut LinMap {
+    let k = make_string(key);
+    let tv = TaggedVal { tag: crate::tagged::TAG_INT32, _pad: [0;7], payload: val as i64 as u64 };
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
+    map
+}
+
+/// Set a Bool field on a LinMap; returns the map.
+unsafe fn map_set_bool(map: *mut LinMap, key: &str, val: bool) -> *mut LinMap {
+    let k = make_string(key);
+    let tv = TaggedVal { tag: crate::tagged::TAG_BOOL, _pad: [0;7], payload: val as u64 };
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
+    map
+}
+
+/// Build a FileStat LinMap box from a std::fs::Metadata. Returns TAG_MAP.
 unsafe fn make_filestat(meta: &std::fs::Metadata, is_symlink: bool) -> *mut u8 {
     use std::time::UNIX_EPOCH;
     let modified = meta.modified().ok()
@@ -198,59 +197,20 @@ unsafe fn make_filestat(meta: &std::fs::Metadata, is_symlink: bool) -> *mut u8 {
     let is_file = meta.is_file();
     let is_dir = meta.is_dir();
 
-    let obj = lin_object_alloc(8);
-
-    let k_size = make_string("size");
-    let mut tv_size: TaggedVal = std::mem::zeroed();
-    tv_size.tag = crate::tagged::TAG_INT64;
-    tv_size.payload = size as u64;
-    lin_object_set(obj, k_size, &tv_size);
-
-    let k_modified = make_string("modified");
-    let mut tv_modified: TaggedVal = std::mem::zeroed();
-    tv_modified.tag = crate::tagged::TAG_INT64;
-    tv_modified.payload = modified as u64;
-    lin_object_set(obj, k_modified, &tv_modified);
-
-    let k_created = make_string("created");
-    let mut tv_created: TaggedVal = std::mem::zeroed();
-    tv_created.tag = crate::tagged::TAG_INT64;
-    tv_created.payload = created as u64;
-    lin_object_set(obj, k_created, &tv_created);
-
-    let k_is_file = make_string("isFile");
-    let mut tv_is_file: TaggedVal = std::mem::zeroed();
-    tv_is_file.tag = crate::tagged::TAG_BOOL;
-    tv_is_file.payload = is_file as u64;
-    lin_object_set(obj, k_is_file, &tv_is_file);
-
-    let k_is_dir = make_string("isDir");
-    let mut tv_is_dir: TaggedVal = std::mem::zeroed();
-    tv_is_dir.tag = crate::tagged::TAG_BOOL;
-    tv_is_dir.payload = is_dir as u64;
-    lin_object_set(obj, k_is_dir, &tv_is_dir);
-
-    let k_is_symlink = make_string("isSymlink");
-    let mut tv_is_symlink: TaggedVal = std::mem::zeroed();
-    tv_is_symlink.tag = crate::tagged::TAG_BOOL;
-    tv_is_symlink.payload = is_symlink as u64;
-    lin_object_set(obj, k_is_symlink, &tv_is_symlink);
-
     #[cfg(unix)]
-    let mode: i32 = {
-        use std::os::unix::fs::MetadataExt;
-        meta.mode() as i32
-    };
+    let mode: i32 = { use std::os::unix::fs::MetadataExt; meta.mode() as i32 };
     #[cfg(not(unix))]
     let mode: i32 = 0i32;
 
-    let k_mode = make_string("mode");
-    let mut tv_mode: TaggedVal = std::mem::zeroed();
-    tv_mode.tag = crate::tagged::TAG_INT32;
-    tv_mode.payload = mode as i64 as u64;
-    lin_object_set(obj, k_mode, &tv_mode);
-
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    let map = lin_map_alloc(8);
+    map_set_int64(map, "size", size);
+    map_set_int64(map, "modified", modified);
+    map_set_int64(map, "created", created);
+    map_set_bool(map, "isFile", is_file);
+    map_set_bool(map, "isDir", is_dir);
+    map_set_bool(map, "isSymlink", is_symlink);
+    map_set_int32(map, "mode", mode);
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
 /// Return file metadata as a tagged object, following symlinks (reports the target).

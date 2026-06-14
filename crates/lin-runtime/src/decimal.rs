@@ -399,7 +399,7 @@ mod tests {
             assert_eq!(str_of(q), "0.3333");
             let z = mk("0");
             let err = lin_decimal_div(a, z, 2, 1);
-            assert_eq!(crate::tagged::lin_get_tag(err), crate::tagged::TAG_OBJECT);
+            assert_eq!(crate::tagged::lin_get_tag(err), crate::tagged::TAG_MAP);
             for p in [a, b, q, z, err] { crate::tagged::lin_tagged_release(p); }
         }
     }

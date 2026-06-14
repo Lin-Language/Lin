@@ -128,12 +128,15 @@ export type FileStat = { "size": Int64, "modified": Int64, "created": Int64, "is
 // @returns a `FileStat`, or an Error if the path cannot be read.
 // @example stat("main.lin")["size"]   // file size in bytes
 export val stat = (path: String, opts: StatOpts | Null = null): FileStat | Error =>
-  if opts == null then
-    lin_fs_stat(path)
-  else if opts["follow"] == false then
-    lin_fs_lstat(path)
-  else
-    lin_fs_stat(path)
+  val r =
+    if opts == null then
+      lin_fs_stat(path)
+    else if opts["follow"] == false then
+      lin_fs_lstat(path)
+    else
+      lin_fs_stat(path)
+  if r is Error then { "type": r["type"], "message": r["message"] }
+  else { "size": r["size"], "modified": r["modified"], "created": r["created"], "isFile": r["isFile"], "isDir": r["isDir"], "isSymlink": r["isSymlink"], "mode": r["mode"] }
 
 // List the entries of a directory.
 // @param path  the directory to list.
@@ -301,7 +304,9 @@ export val isSymlink = (path: String): Boolean =>
 // @param path  the path to stat.
 // @returns a `FileStat`, or an Error if the path cannot be read.
 export val lstat = (path: String): FileStat | Error =>
-  lin_fs_lstat(path)
+  val r = lin_fs_lstat(path)
+  if r is Error then { "type": r["type"], "message": r["message"] }
+  else { "size": r["size"], "modified": r["modified"], "created": r["created"], "isFile": r["isFile"], "isDir": r["isDir"], "isSymlink": r["isSymlink"], "mode": r["mode"] }
 
 // Create `path` as an empty file if absent (no parent dirs created), else bump its mtime to now
 // without changing its contents.
