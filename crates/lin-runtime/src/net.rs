@@ -29,9 +29,10 @@ use std::os::fd::AsRawFd;
 use std::sync::Mutex;
 
 use crate::array::{lin_array_length, LinArray};
-use crate::fs::{make_error_tagged, resolve_lin_str};
-use crate::object::{lin_object_alloc, lin_object_set};
-use crate::tagged::{alloc_tagged, lin_box_int32, TaggedVal, TAG_ARRAY, TAG_INT32, TAG_STR};
+use crate::fs::{make_error_tagged, make_string, resolve_lin_str};
+use crate::map::{lin_map_alloc, lin_map_set};
+use crate::string::lin_string_release;
+use crate::tagged::{alloc_tagged, lin_box_int32, TaggedVal, TAG_ARRAY, TAG_INT32, TAG_MAP, TAG_STR};
 
 enum SocketKind {
     Udp(UdpSocket),
@@ -105,56 +106,42 @@ unsafe fn buf_parts(buf: *const u8) -> Option<(*mut u8, usize)> {
     Some((data, len))
 }
 
-/// Build a `{ "len": Int32, "addr": String, "port": Int32 }` Json object (TaggedVal*(Object)).
-unsafe fn make_len_addr_port(len: i32, addr: &str, port: i32) -> *mut u8 {
-    let obj = lin_object_alloc(4);
-
-    let len_key = crate::fs::make_string("len");
-    let mut len_tv: TaggedVal = std::mem::zeroed();
-    len_tv.tag = TAG_INT32;
-    len_tv.payload = len as i64 as u64;
-    lin_object_set(obj, len_key, &len_tv);
-
-    let addr_key = crate::fs::make_string("addr");
-    let addr_val = crate::fs::make_string(addr);
-    let mut addr_tv: TaggedVal = std::mem::zeroed();
-    addr_tv.tag = TAG_STR;
-    addr_tv.payload = addr_val as u64;
-    lin_object_set(obj, addr_key, &addr_tv);
-
-    let port_key = crate::fs::make_string("port");
-    let mut port_tv: TaggedVal = std::mem::zeroed();
-    port_tv.tag = TAG_INT32;
-    port_tv.payload = port as i64 as u64;
-    lin_object_set(obj, port_key, &port_tv);
-
-    alloc_tagged(crate::tagged::TAG_OBJECT, obj as u64)
+unsafe fn map_set_int32(map: *mut crate::map::LinMap, key: &str, val: i32) {
+    let k = make_string(key);
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_INT32;
+    tv.payload = val as i64 as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
 }
 
-/// Build a `{ "fd": Int32, "addr": String, "port": Int32 }` Json object (TaggedVal*(Object)).
+unsafe fn map_set_str(map: *mut crate::map::LinMap, key: &str, val: &str) {
+    let k = make_string(key);
+    let v = make_string(val);
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_STR;
+    tv.payload = v as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
+    lin_string_release(v);
+}
+
+/// Build a `{ "len": Int32, "addr": String, "port": Int32 }` LinMap box (TAG_MAP).
+unsafe fn make_len_addr_port(len: i32, addr: &str, port: i32) -> *mut u8 {
+    let map = lin_map_alloc(4);
+    map_set_int32(map, "len", len);
+    map_set_str(map, "addr", addr);
+    map_set_int32(map, "port", port);
+    alloc_tagged(TAG_MAP, map as u64)
+}
+
+/// Build a `{ "fd": Int32, "addr": String, "port": Int32 }` LinMap box (TAG_MAP).
 unsafe fn make_fd_addr_port(fd: i32, addr: &str, port: i32) -> *mut u8 {
-    let obj = lin_object_alloc(4);
-
-    let fd_key = crate::fs::make_string("fd");
-    let mut fd_tv: TaggedVal = std::mem::zeroed();
-    fd_tv.tag = TAG_INT32;
-    fd_tv.payload = fd as i64 as u64;
-    lin_object_set(obj, fd_key, &fd_tv);
-
-    let addr_key = crate::fs::make_string("addr");
-    let addr_val = crate::fs::make_string(addr);
-    let mut addr_tv: TaggedVal = std::mem::zeroed();
-    addr_tv.tag = TAG_STR;
-    addr_tv.payload = addr_val as u64;
-    lin_object_set(obj, addr_key, &addr_tv);
-
-    let port_key = crate::fs::make_string("port");
-    let mut port_tv: TaggedVal = std::mem::zeroed();
-    port_tv.tag = TAG_INT32;
-    port_tv.payload = port as i64 as u64;
-    lin_object_set(obj, port_key, &port_tv);
-
-    alloc_tagged(crate::tagged::TAG_OBJECT, obj as u64)
+    let map = lin_map_alloc(4);
+    map_set_int32(map, "fd", fd);
+    map_set_str(map, "addr", addr);
+    map_set_int32(map, "port", port);
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
 // ===========================================================================
