@@ -361,7 +361,7 @@ The following type names are resolvable in type-annotation position:
 String
 Boolean
 Null
-Json
+AnyVal
 Error
 Int8 Int16 Int32 Int64
 UInt8 UInt16 UInt32 UInt64
@@ -374,19 +374,21 @@ TarEntry
 
 plus any user-declared `type` alias (§5) and any `type` imported from another module (§22).
 
-`Json` represents arbitrary JSON data. It is the recursive union of every JSON-shaped value:
+`AnyVal` (formerly `Json`, renamed in the representation reset — ADR-069; `Json` is retained as a deprecated alias) is the **JSON-shaped dynamic top type**: arbitrary data whose shape is not statically known. It is the recursive union of every JSON-shaped value:
 
 ```txt
-type Json =
+type AnyVal =
   | String
   | Boolean
   | Null
   | <any numeric family>
-  | Json[]
-  | { ...Json }      // any object whose values are Json
+  | AnyVal[]
+  | { ...AnyVal }    // any object whose values are AnyVal
 ```
 
-The last form above is informal shorthand: a `Json`-valued object is any object whose fields are themselves `Json`. A *typed* index signature with a concrete value type does exist as real syntax — `{ String: T }` (§5.1.1).
+The last form above is informal shorthand: an `AnyVal`-valued object is any object whose fields are themselves `AnyVal`. A *typed* index signature with a concrete value type does exist as real syntax — `{ String: T }` (§5.1.1).
+
+`AnyVal` is **JSON-shaped and cannot smuggle an opaque handle**: `Stream<T>`, `Promise<T>`, `Shared<T>`, and `TarEntry` are rejected from widening into it (a live handle has RC/identity/serialization semantics a dynamic value type cannot honour). Code that must hold or forward an opaque or shape-agnostic value uses a **generic `<T>`** (a real type parameter *does* carry handles) or a **union** for a closed set — not `AnyVal`. There is intentionally no universal `Any` top type. (`Function`/`Iterator` currently still widen into `AnyVal`; tightening that is an open coherence question.)
 
 `Error` is a built-in structural alias for the conventional error value `{ "type": String, "message": String }` (§20). It composes in unions and is discriminated with `is Error`. As a structural alias it is **not** a sealed named record (§5.9.1): an `Error`-typed value may carry extra fields, and `is Error` permits them.
 
@@ -398,10 +400,10 @@ Several names that appear in prose and in conceptual signatures are **not** reso
 
 | Name | Status | Use instead |
 | --- | --- | --- |
-| `Number` | conceptual union over numeric families; not resolvable | `Json`, or a concrete family (`Int32`, `Float64`, …) |
-| `Iterable<T>` | conceptual ("arrays and iterators"); not resolvable | `Iterator<T>`, or `Json[]` for arrays |
-| `ThreadPool` | opaque runtime value, erased to `Json`; not a nominal type | annotate as `Json` (see §24.5) |
-| `Worker<Msg, Reply>` | opaque runtime value, erased to `Json`; not a nominal type | annotate as `Json` (see §24.6) |
+| `Number` | conceptual union over numeric families; not resolvable | `AnyVal`, or a concrete family (`Int32`, `Float64`, …) |
+| `Iterable<T>` | conceptual ("arrays and iterators"); not resolvable | `Iterator<T>`, or `AnyVal[]` for arrays |
+| `ThreadPool` | opaque runtime value, erased to `AnyVal`; not a nominal type | annotate as `AnyVal` (see §24.5) |
+| `Worker<Msg, Reply>` | opaque runtime value, erased to `AnyVal`; not a nominal type | annotate as `AnyVal` (see §24.6) |
 
 `Unknown` and `Never` are not built-in types.
 
@@ -655,27 +657,28 @@ guarantee that lets the compiler lay sealed records out as unboxed structs with
 constant-offset field access (see ADR-057); it does **not** change the structural
 compatibility above.
 
-Whether a given occurrence is *physically* in the packed (unboxed) form or the
-boxed (`LinObject`/`TaggedVal`) form is a flow-sensitive fact decided by the
-representation-inference pass (ADR-062), not by the type alone — the same `T` is
-packed when freshly constructed and boxed-wrapping-the-packed-buffer when read back
-from a map/object slot. This is transparent to programs: it affects only speed.
-A sealed record is laid out packed/contiguous when **every** field is itself
-packable: a scalar (numeric or `Boolean`, stored inline at its natural offset) or
-an eligible heap field — `String`, an array, a `{ String: T }` map, or a nested
-sealed record — each stored as an 8-byte owned pointer slot with a per-field
-retain/release. So a record with `String`/array/map fields is still packed: field
-access remains a constant-offset load (not an association-list lookup), and the only
-overhead over an all-scalar record is the owned-pointer refcounting. A record is
-kept boxed (fail-safe) only when some field is not packable — a `Json`/union field,
-a `Function`/`Iterator`/other opaque value, or an unsealed object. (Arrays *of*
-heap-field records — `Person[]` where `Person` has a `String` field — are a separate
-representation question and currently stay boxed; that is about the array element
-layout, not the record itself.) Either way the observable semantics in this section
-are identical.
+Representation is **type-determined**, not inferred (ADR-069, which supersedes the
+flow-sensitive representation-inference pass of ADR-062): a value whose static type
+is a sealed record `T` is **always** a flat packed struct — there is no boxed
+shadow and no per-occurrence packed-vs-boxed choice. Every field is at a constant
+offset: scalars (numeric/`Boolean`) inline at their natural offset, and heap fields
+— `String`, an array, a `{ String: T }` map, or a nested sealed record — each as an
+8-byte owned pointer slot with per-field retain/release. Field access is always a
+constant-offset load, never an association-list lookup; the only overhead over an
+all-scalar record is the owned-pointer refcounting. Arrays *of* records (`Person[]`)
+are pointer-backed (each element a shared sealed pointer), so `push` shares rather
+than copies. Records have **reference semantics** — `val b = a` makes `b` and `a`
+the same record, and mutation through a parameter is visible to all aliases.
+
+When a record value flows into a slot whose static type is the dynamic top type
+`AnyVal` or a union, it is not materialized into a string-keyed object — it is
+carried as a runtime-tagged sealed pointer (`TAG_RECORD`; `T | Null` over a record
+is a nullable sealed pointer, `A | B` a tag + sealed payload), and `match … is T`
+narrows it back to the typed pointer, so member reads stay constant-offset. This is
+transparent to programs: it affects only speed.
 
 The two are reconciled by a **non-mutating projection** at the boundary: when a
-wider value (one with extra fields, or a `Json` value) flows into a slot of named
+wider value (one with extra fields, or an `AnyVal` value) flows into a slot of named
 type `T` — a parameter, a `val`/`var` with a `T` annotation, a return typed `T`,
 or an element of a `T[]` — it is **copied** into a fresh sealed value containing
 only `T`'s fields. Extra fields are dropped **from the copy**; the original value
@@ -697,7 +700,7 @@ fields, dropping unknown keys.
 used as an *open carrier* that smuggles extra fields through to a later consumer:
 once a value is typed as a named record, its extra fields are gone. Code that must
 preserve arbitrary extra keys (a heterogeneous bag, a pass-through envelope) should
-type the value `Json`, not a named record type.
+type the value `AnyVal`, not a named record type.
 
 ---
 
