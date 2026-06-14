@@ -110,19 +110,9 @@ pub struct LinWorker {
     on_close_cls: *mut u8,
 }
 
-/// Build an `Error` object `{ "type": "error", "message": <msg> }` as a boxed `TaggedVal*`.
-/// Mirrors `http::make_error_object`. Runs on the awaiting thread.
+/// Build an `Error` map `{ "type": "error", "message": <msg> }` as a TAG_MAP TaggedVal*.
 unsafe fn make_error_tagged(msg: &str) -> *mut u8 {
-    use crate::object::{lin_object_alloc, lin_object_set};
-    use crate::string::lin_string_from_bytes;
-    use crate::tagged::{alloc_tagged, TaggedVal, TAG_OBJECT, TAG_STR};
-    let obj = lin_object_alloc(2);
-    let mk = |s: &str| lin_string_from_bytes(s.as_ptr(), s.len() as u32);
-    let type_tv = TaggedVal { tag: TAG_STR, _pad: [0; 7], payload: mk("error") as u64 };
-    lin_object_set(obj, mk("type"), &type_tv);
-    let msg_tv = TaggedVal { tag: TAG_STR, _pad: [0; 7], payload: mk(msg) as u64 };
-    lin_object_set(obj, mk("message"), &msg_tv);
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    crate::fs::make_error_tagged(msg)
 }
 
 /// Box a raw `*mut LinPromise` into a `TaggedVal*(TAG_PROMISE)` so it round-trips through
@@ -458,35 +448,43 @@ pub unsafe extern "C" fn lin_retry(thunk: *mut u8, n: i32) -> *mut LinPromise {
     lin_make_promise(last)
 }
 
-/// True if `v` is an Error-shaped object `{ "type": "error", ... }` (the runtime's fault/Error
-/// representation). Used by `retry` to decide success vs. failure.
+/// True if `v` is an Error-shaped value `{ "type": "error", ... }` (TAG_MAP or TAG_OBJECT).
+/// Used by `retry` to decide success vs. failure.
 unsafe fn is_error_value(v: *mut u8) -> bool {
-    use crate::object::{lin_object_get, LinObject, tagged_as_object};
-    use crate::string::lin_string_from_bytes;
-    use crate::tagged::{TaggedVal, TAG_STR};
-    if v.is_null() {
-        return false;
-    }
-    let tv = v as *const TaggedVal;
-    let (obj, owned) = match tagged_as_object(tv) {
-        Some(pair) => pair,
-        None => return false,
+    use crate::tagged::{TaggedVal, TAG_MAP, TAG_STR};
+    if v.is_null() { return false; }
+    let tv = &*(v as *const TaggedVal);
+    let got_type: Option<*const TaggedVal> = match tv.tag {
+        TAG_MAP => {
+            let map = tv.payload as *const crate::map::LinMap;
+            if map.is_null() { return false; }
+            let g = crate::map::lin_map_get_bytes(map, b"type".as_ptr(), 4);
+            if g.is_null() { None } else { Some(g) }
+        }
+        _ => {
+            use crate::object::{lin_object_get, tagged_as_object};
+            use crate::string::lin_string_from_bytes;
+            let (obj, owned) = match tagged_as_object(tv as *const TaggedVal) {
+                Some(pair) => pair,
+                None => return false,
+            };
+            let key = lin_string_from_bytes("type".as_ptr(), 4);
+            let got = lin_object_get(obj, key);
+            crate::string::lin_string_release(key);
+            if owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
+            if got.is_null() { return false; }
+            Some(got)
+        }
     };
-    let key = lin_string_from_bytes("type".as_ptr(), 4);
-    let got = lin_object_get(obj, key);
-    crate::string::lin_string_release(key);
-    if owned { crate::object::lin_object_release(obj as *mut LinObject); }
-    if got.is_null() {
-        return false;
+    match got_type {
+        None => false,
+        Some(got) => {
+            if (*got).tag != TAG_STR { return false; }
+            let s = (*got).payload as *const crate::string::LinString;
+            if s.is_null() { return false; }
+            (*s).as_str() == "error"
+        }
     }
-    if (*got).tag != TAG_STR {
-        return false;
-    }
-    let s = (*got).payload as *const crate::string::LinString;
-    if s.is_null() {
-        return false;
-    }
-    (*s).as_str() == "error"
 }
 
 /// Run all tasks in `tasks` (a tagged `LinArray*`) concurrently on OS threads, then join them
