@@ -1,5 +1,5 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { parseInt32, parseFloat64, toInt32, toFloat64, toFloat32, isInt32, isFloat64, tryParseInt32, tryParseFloat64 } from "std/number"
+import { parseInt32, parseFloat64, toInt32, toFloat64, toFloat32, isInt32, isFloat64, tryParseInt32, tryParseFloat64, MAX_UINT8, MIN_INT8, MAX_INT8, MAX_UINT32, MIN_INT32, MAX_INT32, MAX_UINT64, MIN_INT64, MAX_INT64 } from "std/number"
 import { f32ToBe } from "std/bytes"
 import { length } from "std/array"
 import { toString } from "std/string"
@@ -101,6 +101,43 @@ val s = suite("std/number", [
   test("a small u8-suffixed literal types as UInt8", () => [
     // toString works regardless of width; the point is it compiles and keeps its value.
     expect(toString(200u8)).toBe("200")
+  ]),
+
+  // --- integer-limit constants (std/number) ---
+  test("MAX_UINT8 is 255", () => [
+    expect(toString(MAX_UINT8)).toBe("255")
+  ]),
+
+  test("MIN_INT8 is -128", () => [
+    expect(toString(MIN_INT8)).toBe("-128")
+  ]),
+
+  test("MAX_INT8 is 127", () => [
+    expect(toString(MAX_INT8)).toBe("127")
+  ]),
+
+  test("MAX_UINT32 is 4294967295", () => [
+    expect(toString(MAX_UINT32)).toBe("4294967295")
+  ]),
+
+  test("MIN_INT32 is -2147483648", () => [
+    expect(toString(MIN_INT32)).toBe("-2147483648")
+  ]),
+
+  test("MAX_INT32 is 2147483647", () => [
+    expect(toString(MAX_INT32)).toBe("2147483647")
+  ]),
+
+  test("MAX_UINT64 is 18446744073709551615", () => [
+    expect(toString(MAX_UINT64)).toBe("18446744073709551615")
+  ]),
+
+  test("MIN_INT64 is -9223372036854775808 (lexer-fix regression)", () => [
+    expect(toString(MIN_INT64)).toBe("-9223372036854775808")
+  ]),
+
+  test("MAX_INT64 is 9223372036854775807", () => [
+    expect(toString(MAX_INT64)).toBe("9223372036854775807")
   ])
 ])
 
