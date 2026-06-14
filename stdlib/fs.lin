@@ -2,44 +2,44 @@
 //
 // All operations are synchronous and blocking. Fallible calls return their value or an Error shape
 // (`{ "type": "error", "message": ... }`) that you narrow with `is Error`; the predicates exists,
-// isFile, isDir, and isSymlink are total and return a plain Boolean. The `opts` Json argument on
+// isFile, isDir, and isSymlink are total and return a plain Boolean. The `opts` AnyVal argument on
 // ls, mkdir, rm, and writeJson selects a variant via keys such as `{ recursive }`, `{ parents }`,
 // or `{ compact }`. For incremental reads, openRead returns a lazy byte stream.
 //
 //   import { readFile, writeFile, readJson, ls, mkdir, exists, isFile, isDir } from "std/fs"
 import foreign "lin-runtime"
-  val lin_fs_read_file: (String) => Json
-  val lin_fs_write_file: (String, String) => Json
-  val lin_fs_append_file: (String, String) => Json
-  val lin_fs_read_lines: (String) => Json
-  val lin_fs_read_json: (String) => Json
-  val lin_fs_write_json: (String, Json) => Json
-  val lin_fs_write_json_compact: (String, Json) => Json
+  val lin_fs_read_file: (String) => AnyVal
+  val lin_fs_write_file: (String, String) => AnyVal
+  val lin_fs_append_file: (String, String) => AnyVal
+  val lin_fs_read_lines: (String) => AnyVal
+  val lin_fs_read_json: (String) => AnyVal
+  val lin_fs_write_json: (String, AnyVal) => AnyVal
+  val lin_fs_write_json_compact: (String, AnyVal) => AnyVal
   val lin_fs_exists: (String) => Boolean
   val lin_fs_is_file: (String) => Boolean
   val lin_fs_is_dir: (String) => Boolean
-  val lin_fs_stat: (String) => Json
-  val lin_fs_list_dir: (String) => Json
-  val lin_fs_list_dir_all: (String) => Json
-  val lin_fs_mkdir: (String) => Json
-  val lin_fs_mkdir_all: (String) => Json
-  val lin_fs_delete_file: (String) => Json
-  val lin_fs_rename: (String, String) => Json
-  val lin_fs_cp: (String, String) => Json
-  val lin_fs_rm: (String, Int32) => Json
-  val lin_fs_read_file_bytes: (String) => Json
-  val lin_fs_write_file_bytes: (String, UInt8[]) => Json
-  val lin_fs_write_lines: (String, String[]) => Json
-  val lin_fs_glob: (String) => Json
-  val lin_fs_temp_file: (String, String) => Json
-  val lin_fs_temp_dir: () => Json
-  val lin_fs_chmod: (String, Int32) => Json
-  val lin_fs_symlink: (String, String) => Json
-  val lin_fs_readlink: (String) => Json
+  val lin_fs_stat: (String) => AnyVal
+  val lin_fs_list_dir: (String) => AnyVal
+  val lin_fs_list_dir_all: (String) => AnyVal
+  val lin_fs_mkdir: (String) => AnyVal
+  val lin_fs_mkdir_all: (String) => AnyVal
+  val lin_fs_delete_file: (String) => AnyVal
+  val lin_fs_rename: (String, String) => AnyVal
+  val lin_fs_cp: (String, String) => AnyVal
+  val lin_fs_rm: (String, Int32) => AnyVal
+  val lin_fs_read_file_bytes: (String) => AnyVal
+  val lin_fs_write_file_bytes: (String, UInt8[]) => AnyVal
+  val lin_fs_write_lines: (String, String[]) => AnyVal
+  val lin_fs_glob: (String) => AnyVal
+  val lin_fs_temp_file: (String, String) => AnyVal
+  val lin_fs_temp_dir: () => AnyVal
+  val lin_fs_chmod: (String, Int32) => AnyVal
+  val lin_fs_symlink: (String, String) => AnyVal
+  val lin_fs_readlink: (String) => AnyVal
   val lin_fs_is_symlink: (String) => Boolean
-  val lin_fs_lstat: (String) => Json
-  val lin_fs_touch: (String) => Json
-  val lin_fs_realpath: (String) => Json
+  val lin_fs_lstat: (String) => AnyVal
+  val lin_fs_touch: (String) => AnyVal
+  val lin_fs_realpath: (String) => AnyVal
 
 // Option records for the filesystem operations. Every field is optional — an omitted key reads as
 // `Null` (the same as not passing it), so `{}` and a partial literal like `{ "recursive": true }`
@@ -80,18 +80,18 @@ export val readLines = (path: String): String[] | Error =>
 
 // Read a file and parse its contents as JSON.
 // @param path  the file to read.
-// @returns the parsed Json value, or an Error if the file cannot be read or is not valid JSON.
+// @returns the parsed AnyVal value, or an Error if the file cannot be read or is not valid JSON.
 // @example val data = readJson("config.json")   // then data["version"], or Error on failure
-export val readJson = (path: String): Json | Error =>
+export val readJson = (path: String): AnyVal | Error =>
   lin_fs_read_json(path)
 
 // Serialise `value` to JSON and write it to `path`, truncating any existing file.
 // @param path  the file to write.
-// @param value  the Json value to serialise.
+// @param value  the AnyVal value to serialise.
 // @param opts  accepts `{ compact }`; when true, output is minified rather than pretty-printed.
 // @returns Null on success, or an Error if the write fails.
 // @example writeJson("config.json", { "version": 2 }, { "compact": true })
-export val writeJson = (path: String, value: Json, opts: WriteJsonOpts | Null): Null | Error =>
+export val writeJson = (path: String, value: AnyVal, opts: WriteJsonOpts | Null): Null | Error =>
   if opts == null then
     lin_fs_write_json(path, value)
   else if opts["compact"] == true then
@@ -322,7 +322,7 @@ export val realpath = (path: String): String | Error =>
 // @param path  the file to open.
 // @returns a `Stream<UInt8[]>`, or an Error if the file cannot be opened.
 export val openRead = (path: String) =>
-  // The opaque `Stream` annotation (= `Stream<Json>`) on the pull params below is the
+  // The opaque `Stream` annotation (= `Stream<AnyVal>`) on the pull params below is the
   // erased view; the concrete element type is inferred from the `lin_fs_open` intrinsic.
   lin_fs_open(path)
 

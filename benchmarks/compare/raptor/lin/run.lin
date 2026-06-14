@@ -30,7 +30,7 @@ val fmt = (s: Int32): String =>
   "${pad2(hh)}:${pad2(mm)}:${pad2(ss)}"
 
 // Sort by departureTime asc, then arrivalTime asc.
-val sortJourneys = (journeys: Json): Json =>
+val sortJourneys = (journeys: AnyVal): AnyVal =>
   sort(journeys, (a, b) =>
     if a["departureTime"] != b["departureTime"] then
       a["departureTime"] - b["departureTime"]

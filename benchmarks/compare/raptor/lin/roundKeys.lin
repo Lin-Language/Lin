@@ -10,9 +10,9 @@ import { keys } from "std/object"
 import { parseInt32 } from "std/number"
 import { push, sort } from "std/array"
 
-export val sortedRoundKeys = (m: Json): Json =>
-  var nums: Json = []
+export val sortedRoundKeys = (m: AnyVal): AnyVal =>
+  var nums: AnyVal = []
   keys(m).for(k => push(nums, parseInt32(k)))
-  var result: Json = []
+  var result: AnyVal = []
   sort(nums, (a, b) => a - b).for(n => push(result, "${n}"))
   result

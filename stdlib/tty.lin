@@ -9,8 +9,8 @@
 //
 //   import { rawMode, readKey } from "std/tty"
 import foreign "lin-runtime"
-  val lin_tty_raw_mode: (Int32) => Json
-  val lin_tty_read_key: () => Json
+  val lin_tty_raw_mode: (Int32) => AnyVal
+  val lin_tty_read_key: () => AnyVal
 
 // Enable or disable terminal raw mode on stdin.
 // @param on  `true` to enable raw mode, `false` to restore cooked mode.

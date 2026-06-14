@@ -25,7 +25,7 @@
 // from gtfsLoader.lin — the hot row path still indexes `row[i]` directly (no per-row
 // object-get per column).
 //
-// Returns { "trips": Json, "transfers": Json, "interchange": Json, "dropped": Int32 }.
+// Returns { "trips": AnyVal, "transfers": AnyVal, "interchange": AnyVal, "dropped": Int32 }.
 import { for, filter } from "std/iter"
 import { split } from "std/string"
 import { parseInt32 } from "std/number"
@@ -63,8 +63,8 @@ val makeTransfer = (origin: String, destination: String, duration: Int32, startT
     "endTime": endTime
   }
 
-val indexOfColumns = (header: Json): Json =>
-  var idx: Json = {}
+val indexOfColumns = (header: AnyVal): AnyVal =>
+  var idx: AnyVal = {}
   var i = 0
   header.for(name =>
     idx[name] = i
@@ -74,10 +74,10 @@ val indexOfColumns = (header: Json): Json =>
 
 // Binary search a list of { "key": String, ... } sorted ascending by "key".
 // Returns the matching record or null.
-val bsearch = (list: Json, key: String): Json =>
+val bsearch = (list: AnyVal, key: String): AnyVal =>
   bsearchAt(list, key, 0, length(list) - 1)
 
-val bsearchAt = (list: Json, key: String, lo: Int32, hi: Int32): Json =>
+val bsearchAt = (list: AnyVal, key: String, lo: Int32, hi: Int32): AnyVal =>
   if lo > hi then
     null
   else
@@ -91,7 +91,7 @@ val bsearchAt = (list: Json, key: String, lo: Int32, hi: Int32): Json =>
       bsearchAt(list, key, lo, mid - 1)
 
 // Sort an array of { "key": String, ... } ascending by "key" for binary search.
-val sortByKey = (list: Json): Json =>
+val sortByKey = (list: AnyVal): AnyVal =>
   sort(list, (a, b) =>
     if a["key"] < b["key"] then -1 else if a["key"] > b["key"] then 1 else 0
   )
@@ -99,11 +99,11 @@ val sortByKey = (list: Json): Json =>
 // --- calendar_dates.txt -> datesSorted [{ key: service_id, dates }] (sorted) ---
 // Rows are contiguous by service_id; group by detecting changes, exactly as in
 // gtfsLoader.lin. The header latch replaces forEachRow's two-pass header read.
-val loadCalendarDates = (s: Stream<UInt8[]>): Json =>
-  var datesList: Json = []
+val loadCalendarDates = (s: Stream<UInt8[]>): AnyVal =>
+  var datesList: AnyVal = []
   var curDatesSvc = ""
   var datesStarted = false
-  var curDates: Json = {}
+  var curDates: AnyVal = {}
   var iServiceId = 0 - 1
   var iDate = 0 - 1
   var iException = 0 - 1
@@ -134,8 +134,8 @@ val loadCalendarDates = (s: Stream<UInt8[]>): Json =>
   sortByKey(datesList)
 
 // --- calendar.txt -> servicesSorted [{ key: service_id, service }] (sorted) ---
-val loadCalendar = (s: Stream<UInt8[]>, datesSorted: Json): Json =>
-  var serviceList: Json = []
+val loadCalendar = (s: Stream<UInt8[]>, datesSorted: AnyVal): AnyVal =>
+  var serviceList: AnyVal = []
   var iServiceId = 0 - 1
   var iSunday = 0 - 1
   var iMonday = 0 - 1
@@ -185,11 +185,11 @@ val loadCalendar = (s: Stream<UInt8[]>, datesSorted: Json): Json =>
 
 // --- stop_times.txt -> stopTimesGroups [{ tripId, stopTimes }] in file (block) order ---
 // 2.37M rows: streamed so peak transient heap is one line, not the whole 93 MB member.
-val loadStopTimes = (s: Stream<UInt8[]>, cachedTime: (String) => Int32): Json =>
-  var stopTimesGroups: Json = []
+val loadStopTimes = (s: Stream<UInt8[]>, cachedTime: (String) => Int32): AnyVal =>
+  var stopTimesGroups: AnyVal = []
   var curTrip = ""
   var tripStarted = false
-  var curStopTimes: Json = []
+  var curStopTimes: AnyVal = []
   var iTripId = 0 - 1
   var iPickupType = 0 - 1
   var iDropOffType = 0 - 1
@@ -236,7 +236,7 @@ val loadStopTimes = (s: Stream<UInt8[]>, cachedTime: (String) => Int32): Json =>
 // --- transfers.txt -> interchange + transfers (small maps, mutated in place) ---
 // Returns the stream-driver result (Null | Error); callers invoke for effect and discard
 // it, exactly as gtfsLoader.lin's forEachRow callers do.
-val loadTransfers = (s: Stream<UInt8[]>, transfers: Json, interchange: Json): Json =>
+val loadTransfers = (s: Stream<UInt8[]>, transfers: AnyVal, interchange: AnyVal): AnyVal =>
   var iFromStop = 0 - 1
   var iToStop = 0 - 1
   var iMinTransferTime = 0 - 1
@@ -264,7 +264,7 @@ val loadTransfers = (s: Stream<UInt8[]>, transfers: Json, interchange: Json): Js
     )
 
 // --- links.txt -> transfers (footpaths; date/day columns ignored) ---
-val loadLinks = (s: Stream<UInt8[]>, transfers: Json, cachedTime: (String) => Int32): Json =>
+val loadLinks = (s: Stream<UInt8[]>, transfers: AnyVal, cachedTime: (String) => Int32): AnyVal =>
   var iFromStop = 0 - 1
   var iToStop = 0 - 1
   var iDuration = 0 - 1
@@ -299,8 +299,8 @@ val loadLinks = (s: Stream<UInt8[]>, transfers: Json, cachedTime: (String) => In
 
 // --- trips.txt -> resolved trips (positional merge-join with stopTimesGroups; service via
 //     binary search). Drop trips whose serviceId has no calendar row. ---
-val loadTrips = (s: Stream<UInt8[]>, stopTimesGroups: Json, servicesSorted: Json): Json =>
-  var resolvedTrips: Json = []
+val loadTrips = (s: Stream<UInt8[]>, stopTimesGroups: AnyVal, servicesSorted: AnyVal): AnyVal =>
+  var resolvedTrips: AnyVal = []
   var dropped = 0
   var g = 0
   val numGroups = length(stopTimesGroups)
@@ -337,7 +337,7 @@ val loadTrips = (s: Stream<UInt8[]>, stopTimesGroups: Json, servicesSorted: Json
     )
   { "trips": resolvedTrips, "dropped": dropped }
 
-export val loadGTFSTar = (tarGzPath: String): Json =>
+export val loadGTFSTar = (tarGzPath: String): AnyVal =>
   // Time-parse cache, exactly as in loadGTFS (local to the load; ~4.8M calls with
   // heavily repeated strings).
   var timeCache: { String: Int32 } = {}
@@ -353,12 +353,12 @@ export val loadGTFSTar = (tarGzPath: String): Json =>
 
   // Cross-file state, filled in tar entry order. Each wanted entry's body is drained
   // inside its dispatch arm; unwanted entries never call body() (auto-skipped).
-  var datesSorted: Json = []
-  var servicesSorted: Json = []
-  var stopTimesGroups: Json = []
-  var transfers: Json = {}
-  var interchange: Json = {}
-  var resolvedTrips: Json = []
+  var datesSorted: AnyVal = []
+  var servicesSorted: AnyVal = []
+  var stopTimesGroups: AnyVal = []
+  var transfers: AnyVal = {}
+  var interchange: AnyVal = {}
+  var resolvedTrips: AnyVal = []
   var dropped = 0
   readStream(tarGzPath)
     .gunzip()

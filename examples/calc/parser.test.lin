@@ -6,7 +6,7 @@
 import { expect, toBe, toSucceed, toFail, test, suite, run } from "std/test"
 import { parse, Token } from "./parser"
 
-// Token builders — typed so the fixture arrays are Token[] (a Json[] literal
+// Token builders — typed so the fixture arrays are Token[] (a AnyVal[] literal
 // would not coerce). lparen/rparen carry an empty text (structurally a Token).
 val num = (t: String): Token => { "kind": "num", "text": t }
 val op = (t: String): Token => { "kind": "op", "text": t }

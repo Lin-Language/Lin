@@ -7,8 +7,8 @@ import { length } from "std/array"
 // wrong-typed fields), and load() (the tagged Success/Failure result main.lin
 // matches on before binding the port).
 // Pull the resolved config out of a successful load, typed as Config so the
-// assertions are against named-type fields rather than raw Json.
-val loaded = (raw: Json): Config =>
+// assertions are against named-type fields rather than raw AnyVal.
+val loaded = (raw: AnyVal): Config =>
   match load(raw)
     has { "type": "success", value } => value
     else =>

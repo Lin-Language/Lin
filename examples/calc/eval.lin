@@ -14,14 +14,14 @@ type Evaluated = EvalSuccess | Failure
 val fail = (msg: String): Failure =>
   { "type": "failure", "error": msg }
 
-val isFailure = (x: Json): Boolean =>
+val isFailure = (x: AnyVal): Boolean =>
   x["type"] == "failure"
 
 // Evaluate one AST node to either a number wrapped in success, or a failure.
 // `node` walks a recursive AST union ({kind:"num",value} | {kind:"binop",...})
-// indexed by per-variant fields after a `kind` test, so it stays dynamic Json;
+// indexed by per-variant fields after a `kind` test, so it stays dynamic AnyVal;
 // likewise the recursive sub-results are read via `["value"]` after isFailure.
-val evalNode = (node: Json): Json =>
+val evalNode = (node: AnyVal): AnyVal =>
   if node["kind"] == "num" then
     { "type": "success", "value": node["value"] }
   else
@@ -48,7 +48,7 @@ val evalNode = (node: Json): Json =>
           { "type": "success", "value": a / b }
 
 // Public entry: an AST result (success/failure from the parser) -> evaluated result.
-export val evalAst = (parsed: Json): Evaluated =>
+export val evalAst = (parsed: AnyVal): Evaluated =>
   if isFailure(parsed) then
     parsed
   else

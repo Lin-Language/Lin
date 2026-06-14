@@ -85,7 +85,7 @@ val trimAsciiWs = (s: String): String =>
 // — `pos` points just past the closing quote, `ok` is false on EOF inside the quote. Tail-recursive
 // (TCO'd to a byte loop), so it allocates ZERO throwaway arrays — unlike `range(0,n).while`, which
 // materialised a length-n Int32 array on EVERY field, making `parse` O(N²) in allocation.
-val scanQuotedSpans = (s: String, n: Int32, i: Int32, segStart: Int32, parts: String[]): Json =>
+val scanQuotedSpans = (s: String, n: Int32, i: Int32, segStart: Int32, parts: String[]): AnyVal =>
   val b = byteAt(s, i)
   if b == -1 then
     // EOF inside a quoted field -> unterminated quote.
@@ -113,7 +113,7 @@ val scanQuotedSpans = (s: String, n: Int32, i: Int32, segStart: Int32, parts: St
 // stray-quote error. Returns a cursor { "pos": Int32, "ok": Boolean }. Tail-recursive (TCO'd to a
 // byte loop) — zero throwaway arrays (the old `range(0,n+1).while` allocated a length-n array per
 // field).
-val scanUnquoted = (s: String, n: Int32, i: Int32, delim: Int32): Json =>
+val scanUnquoted = (s: String, n: Int32, i: Int32, delim: Int32): AnyVal =>
   val b = byteAt(s, i)
   if b == -1 || b == delim || b == CR || b == LF then
     {
@@ -128,7 +128,7 @@ val scanUnquoted = (s: String, n: Int32, i: Int32, delim: Int32): Json =>
   else
     scanUnquoted(s, n, i + 1, delim)
 
-val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean): Json =>
+val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean): AnyVal =>
   val first = byteAt(s, start)
   if first == QUOTE then
     // Quoted field: accumulate spans between escaped quotes and join them, so the common
@@ -160,7 +160,7 @@ val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean)
 // cursor { "pos": Int32, "ok": Boolean } once the record terminator (delimiter run ends at CR / LF /
 // CRLF / EOF) is reached. Tail-recursive (TCO'd) — one field per step, no throwaway arrays (the old
 // `range(0,n+1).while` allocated a length-n Int32 array per record).
-val scanRecordFields = (s: String, n: Int32, pos: Int32, delim: Int32, trim: Boolean, fields: String[]): Json =>
+val scanRecordFields = (s: String, n: Int32, pos: Int32, delim: Int32, trim: Boolean, fields: String[]): AnyVal =>
   val cur = scanField(s, n, pos, delim, trim)
   if cur["ok"] != true then
     {
@@ -192,7 +192,7 @@ val scanRecordFields = (s: String, n: Int32, pos: Int32, delim: Int32, trim: Boo
         "ok": true
       }
 
-val scanRecord = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean): Json =>
+val scanRecord = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean): AnyVal =>
   val fields: String[] = []
   val res = scanRecordFields(s, n, start, delim, trim, fields)
   {
@@ -202,9 +202,9 @@ val scanRecord = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean
   }
 
 // ── eager parse ──────────────────────────────────────────────────────────────
-// Recursively scan records from byte `pos`, ACCUMULATING into `rows` (a `Json[]` threaded as a
+// Recursively scan records from byte `pos`, ACCUMULATING into `rows` (a `AnyVal[]` threaded as a
 // PARAMETER, not a closure-captured local). Returns ONE consistent shape — a cursor
-//   { "rows": Json[], "pos": Int32, "ok": Boolean }
+//   { "rows": AnyVal[], "pos": Int32, "ok": Boolean }
 // — never a bare array on one branch and an Error object on another. A malformed field sets `ok`
 // false; the NON-recursive `parse` wrapper turns that into the canonical Error.
 //
@@ -215,7 +215,7 @@ val scanRecord = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean
 // the recursion (errors via the `ok` flag, the Error built in the outer wrapper) sidesteps the TCO
 // owned-param release bug (a tail-recursive fn returning an owned array PARAM on one branch and an
 // OBJECT on another corrupts its output; also being fixed separately).
-val scanRows = (rows: Json[], s: String, n: Int32, pos: Int32, delim: Int32, trim: Boolean): Json =>
+val scanRows = (rows: AnyVal[], s: String, n: Int32, pos: Int32, delim: Int32, trim: Boolean): AnyVal =>
   if pos >= n then
     {
       "rows": rows,
@@ -254,12 +254,12 @@ export val parse = (s: String, opts: CsvOptions = {  }): String[][] | Error =>
     val n = lengthBytes(s)
     val delim = optDelimByte(opts)
     val trim = optTrim(opts)
-    // The accumulator is `Json[]`, NOT `String[][]`: each row is read out of `scanRecord`'s
-    // returned object as a `Json` field, and pushing a `Json` element grows a `Json[]` via the
-    // dynamic push path. (A `Json`-typed element pushed into a statically-`String[][]` array is
+    // The accumulator is `AnyVal[]`, NOT `String[][]`: each row is read out of `scanRecord`'s
+    // returned object as a `AnyVal` field, and pushing a `AnyVal` element grows a `AnyVal[]` via the
+    // dynamic push path. (A `AnyVal`-typed element pushed into a statically-`String[][]` array is
     // silently dropped by the monomorphized typed-element push.) The `String[][]` element shape is
     // recovered on return.
-    val rows: Json[] = []
+    val rows: AnyVal[] = []
     val result = scanRows(rows, s, n, 0, delim, trim)
     if result["ok"] != true then
       {
@@ -272,7 +272,7 @@ export val parse = (s: String, opts: CsvOptions = {  }): String[][] | Error =>
 // ── header records ────────────────────────────────────────────────────────────
 // Build a { String: String } record from a header row + a data row, last-wins on duplicate
 // headers, lenient on ragged rows (short -> omit trailing keys; extra fields dropped).
-val rowToRecord = (header: Json, row: Json): { String: String } =>
+val rowToRecord = (header: AnyVal, row: AnyVal): { String: String } =>
   val hlen = length(header)
   val rlen = length(row)
   var rec: { String: String } = {}
@@ -284,9 +284,9 @@ val rowToRecord = (header: Json, row: Json): { String: String } =>
 // Recursively map data rows `parsed[i..]` to records, threading the `records` accumulator as a
 // PARAMETER (same captured-array workaround as `scanRows`: a top-level `.for()` capturing `records`
 // AND calling `rowToRecord` — which runs its own `.for()` — loses pushes). `parsed`/`header` are
-// kept `Json` here so `parsed[i]` flows into `rowToRecord`'s `String[]` param without a typed
+// kept `AnyVal` here so `parsed[i]` flows into `rowToRecord`'s `String[]` param without a typed
 // re-index crash.
-val mapRecords = (records: { String: String }[], parsed: Json, header: Json, i: Int32, total: Int32): Null =>
+val mapRecords = (records: { String: String }[], parsed: AnyVal, header: AnyVal, i: Int32, total: Int32): Null =>
   if i >= total then
     null
   else
@@ -354,7 +354,7 @@ val delimString = (opts: CsvOptions): String =>
 // FRESH arrays) rather than a `.for()` that pushes into a captured accumulator — the latter is lost
 // when the surrounding row-loop is itself a captured `.for()` (the captured-array bug worked around
 // elsewhere via recursion; here map/join avoids it without recursion).
-val renderRow = (row: Json, delim: Int32, sep: String): String =>
+val renderRow = (row: AnyVal, delim: Int32, sep: String): String =>
   val cells: String[] = row.map(field => renderField(field, delim))
   join(cells, sep)
 
@@ -375,12 +375,12 @@ export val stringify = (rows: String[][], opts: CsvOptions = {  }): String =>
 // Collect the union of all record keys in the order `keys()` reports them per record. DEVIATION
 // from the proposal: the proposal specifies FIRST-SEEN (insertion) column order, relying on typed
 // `{ String: String }` maps preserving insertion order — but in the current runtime a typed map is
-// a hash map whose `keys()` is in HASH order, not insertion order (a plain `Json` object literal
+// a hash map whose `keys()` is in HASH order, not insertion order (a plain `AnyVal` object literal
 // DOES preserve insertion order, but the public signature is `{ String: String }[]`). So the column
 // order is deterministic but follows the map's key-iteration order. The union-of-keys property,
 // missing-column-as-empty-field, and parse∘stringify round-trip all still hold. Recursive (threads
 // `header`/`seen` as parameters) to avoid the captured-accumulator bug in a nested `.for()`.
-val collectKeys = (records: Json, header: String[], seen: { String: Boolean }, i: Int32, total: Int32): Null =>
+val collectKeys = (records: AnyVal, header: String[], seen: { String: Boolean }, i: Int32, total: Int32): Null =>
   if i >= total then
     null
   else
@@ -388,7 +388,7 @@ val collectKeys = (records: Json, header: String[], seen: { String: Boolean }, i
     addNewKeys(ks, header, seen, 0, length(ks))
     collectKeys(records, header, seen, i + 1, total)
 
-val addNewKeys = (ks: Json, header: String[], seen: { String: Boolean }, j: Int32, kn: Int32): Null =>
+val addNewKeys = (ks: AnyVal, header: String[], seen: { String: Boolean }, j: Int32, kn: Int32): Null =>
   if j >= kn then
     null
   else
@@ -400,7 +400,7 @@ val addNewKeys = (ks: Json, header: String[], seen: { String: Boolean }, j: Int3
 
 // Build the positional row for one record over the resolved `header` (missing key -> ""). Returns a
 // fresh `String[]` via `map` (no captured push).
-val recordRow = (rec: Json, header: String[]): String[] =>
+val recordRow = (rec: AnyVal, header: String[]): String[] =>
   header.map(k =>
     val v = rec[k]
     if v == null then "" else "${v}"
@@ -408,7 +408,7 @@ val recordRow = (rec: Json, header: String[]): String[] =>
 
 // Append each record's positional row to `rows` (threaded as a parameter; recursion avoids the
 // captured-accumulator bug).
-val appendRecordRows = (records: Json, header: String[], rows: Json[], i: Int32, total: Int32): Null =>
+val appendRecordRows = (records: AnyVal, header: String[], rows: AnyVal[], i: Int32, total: Int32): Null =>
   if i >= total then
     null
   else
@@ -431,7 +431,7 @@ export val stringifyRecords = (records: { String: String }[], opts: CsvOptions =
     val seen: { String: Boolean } = {}
     collectKeys(records, header, seen, 0, total)
     // Positional rows: header first, then one row per record (missing key -> empty field).
-    val rows: Json[] = []
+    val rows: AnyVal[] = []
     push(rows, header)
     appendRecordRows(records, header, rows, 0, total)
     stringify(rows, opts)

@@ -7,7 +7,7 @@ import { sleep } from "std/time"
 // await now yields `T | Error` (§32.2.2); this recovers the numeric value (Error -> 0) so the
 // happy-path pool test can sum results. Defined at module level because a multi-line `match`
 // does not parse inside a parenthesised test lambda (indentation is suppressed in parens).
-val unwrapInt = (r: Json): Int32 =>
+val unwrapInt = (r: AnyVal): Int32 =>
   match r
     is Error => 0
     else => r

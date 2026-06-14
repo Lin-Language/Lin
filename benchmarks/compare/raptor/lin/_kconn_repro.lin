@@ -23,7 +23,7 @@ import { keys } from "std/object"
 import { length, push } from "std/array"
 
 val main = () =>
-  var results: Json = {}
+  var results: AnyVal = {}
 
   results["C"] = []
   val bC = results["C"]

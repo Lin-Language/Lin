@@ -13,7 +13,7 @@ import { sleep } from "std/time"
 // path. `exec` is mocked (ADR-046) so the run is deterministic and hermetic: no real
 // subprocesses, no dependence on host binaries or platform exit codes, and the
 // "command could not launch" case (an Error return) is reproduced exactly.
-replace exec = (command: String, args: String[]): Json =>
+replace exec = (command: String, args: String[]): AnyVal =>
   if command == "printf" then
     {
       "status": 0,

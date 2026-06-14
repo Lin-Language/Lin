@@ -1,10 +1,10 @@
 // Benchmark: typed index-signature map `{ String: T }` (ADR-055) insert + lookup of N distinct
-// keys. With the hashed `LinMap` backing this is O(N); with the old assoc-list `Json` object
+// keys. With the hashed `LinMap` backing this is O(N); with the old assoc-list `AnyVal` object
 // (`lin_object_*`, linear scan) the same workload is O(N^2). Build the map by inserting N distinct
 // keys, then look every key back up and fold the values into a checksum.
 //
-// Compare against `benchmarks/object_access.lin` (which measures the O(n) `{}`/Json record path):
-// scaling N here stays ~linear, whereas an N-key `Json` map degrades quadratically.
+// Compare against `benchmarks/object_access.lin` (which measures the O(n) `{}`/AnyVal record path):
+// scaling N here stays ~linear, whereas an N-key `AnyVal` map degrades quadratically.
 import { print } from "std/io"
 import { toString } from "std/string"
 import { for, range } from "std/iter"

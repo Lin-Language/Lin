@@ -5,10 +5,10 @@ import { toString, contains } from "std/string"
 // Spy cells for the withFixture lifecycle test below.
 var fxSetups = 0
 var fxTeardowns = 0
-val fxSetup = (): Json =>
+val fxSetup = (): AnyVal =>
   fxSetups = fxSetups + 1
   { "conn": 7 }
-val fxTeardown = (fixture: Json): Null =>
+val fxTeardown = (fixture: AnyVal): Null =>
   fxTeardowns = fxTeardowns + 1
   null
 
@@ -69,7 +69,7 @@ val s = suite("std/test", [
   ),
 
   test("toBe failure message contains expected and actual", () =>
-    val r: Json = expect(1).toBe(2)
+    val r: AnyVal = expect(1).toBe(2)
     [
       expect(r["type"]).toBe("fail"),
       expect(r["message"].contains("expected")).toBe(true),
@@ -78,7 +78,7 @@ val s = suite("std/test", [
   ),
 
   test("toBe failure carries structured expected and actual", () =>
-    val r: Json = expect(2).toBe(3)
+    val r: AnyVal = expect(2).toBe(3)
     [
       expect(r["expected"]).toBe(3),
       expect(r["actual"]).toBe(2)
@@ -86,7 +86,7 @@ val s = suite("std/test", [
   ),
 
   test("toSatisfy failure carries no structured pair", () =>
-    val r: Json = expect(1).toSatisfy(x => x > 10)
+    val r: AnyVal = expect(1).toSatisfy(x => x > 10)
     [
       expect(r["expected"]).toBeNull(),
       expect(r["actual"]).toBeNull()

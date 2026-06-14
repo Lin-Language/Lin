@@ -6,7 +6,7 @@
 // The PQ is two parallel pre-allocated arrays (node, dist) with a manual length
 // counter, so removal is an O(1) swap-remove — mirroring Rust's `Vec<(usize,i64)>`
 // + `swap_remove` — and the min-scan never reallocates.
-// (The earlier version reused the examples/dijkstra string-keyed Json maps, whose
+// (The earlier version reused the examples/dijkstra string-keyed AnyVal maps, whose
 // field lookup is an O(n) linear scan, and rebuilt the PQ array on every pop via
 // slice() — together an O(V*E*V) handicap. Switching to integer-indexed arrays
 // cut this benchmark ~5x. The remaining gap to Rust/Go is Lin's boxed-scalar

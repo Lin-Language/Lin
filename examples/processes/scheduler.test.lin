@@ -16,7 +16,7 @@ import { length } from "std/array"
 // `flakyCalls` is module-level state the "flaky" branch counts up across attempts.
 var flakyCalls = 0
 
-replace exec = (command: String, args: String[]): Json =>
+replace exec = (command: String, args: String[]): AnyVal =>
   if command == "ok" then
     {
       "status": 0,

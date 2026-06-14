@@ -11,12 +11,12 @@
 //   import { fetch, fetchJson, fetchWith, postJson } from "std/http"
 //   import { serve, json, text, redirect, notFound, badRequest, matchPath, parseBody } from "std/http"
 import foreign "lin-runtime"
-  val lin_http_fetch: (String) => Json
-  val lin_url_parse: (String) => Json
+  val lin_http_fetch: (String) => AnyVal
+  val lin_url_parse: (String) => AnyVal
   val lin_url_join: (String, String) => String
-  val lin_http_fetch_with: (String, Json) => Json
-  val lin_parse_json: (String) => Json
-  val lin_server_path_match: (String, String) => Json
+  val lin_http_fetch_with: (String, AnyVal) => AnyVal
+  val lin_parse_json: (String) => AnyVal
+  val lin_server_path_match: (String, String) => AnyVal
 
 // An incoming HTTP request passed to a `serve` handler: method, path, raw query string,
 // header map, and the raw request body.
@@ -41,7 +41,7 @@ export val fetch = (url: String): HttpResponse | Error =>
 // @param options  an `HttpOptions`-shaped record (method, headers, body).
 // @returns an `HttpResponse`, or an `Error` if the request fails.
 // @example fetchWith("https://api.example.com/items", { "method": "DELETE", "headers": {}, "body": "" })
-export val fetchWith = (url: String, options: Json): HttpResponse | Error =>
+export val fetchWith = (url: String, options: AnyVal): HttpResponse | Error =>
   lin_http_fetch_with(url, options)
 
 // GET `url` and parse the response body as JSON.
@@ -49,7 +49,7 @@ export val fetchWith = (url: String, options: Json): HttpResponse | Error =>
 // @returns the parsed JSON value, or an `Error` if the request fails (the error is passed through
 //          unparsed).
 // @example val users = fetchJson("https://api.example.com/users")   // then users.for(u => ...)
-export val fetchJson = (url: String): Json | Error =>
+export val fetchJson = (url: String): AnyVal | Error =>
   val response = lin_http_fetch(url)
   if response["type"] == "error" then
     response
@@ -61,7 +61,7 @@ export val fetchJson = (url: String): Json | Error =>
 // @param body  any JSON-serialisable value; sent as the JSON request body.
 // @returns an `HttpResponse`, or an `Error` if the request fails.
 // @example postJson("https://api.example.com/users", { "name": "Alice" })
-export val postJson = (url: String, body: Json): HttpResponse | Error =>
+export val postJson = (url: String, body: AnyVal): HttpResponse | Error =>
   lin_http_fetch_with(url, {
     "method": "POST",
     "headers": { "Content-Type": "application/json" },
@@ -72,7 +72,7 @@ export val postJson = (url: String, body: Json): HttpResponse | Error =>
 // @param status  the HTTP status code.
 // @param data  any JSON-serialisable value; becomes the response body.
 // @returns the `HttpResponse`.
-export val json = (status: Int32, data: Json): HttpResponse =>
+export val json = (status: Int32, data: AnyVal): HttpResponse =>
   {
     "status": status,
     "headers": { "Content-Type": "application/json" },
@@ -120,7 +120,7 @@ export val badRequest = (message: String): HttpResponse =>
 // Parse a request's body as JSON.
 // @param req  the `HttpRequest` (its `body` field is parsed).
 // @returns the parsed JSON value, or an `Error` if the body is not valid JSON.
-export val parseBody = (req: Json): Json | Error =>
+export val parseBody = (req: AnyVal): AnyVal | Error =>
   lin_parse_json(req["body"])
 
 // Match a request path against a route pattern (e.g. `/users/:id`), extracting path params.
@@ -128,7 +128,7 @@ export val parseBody = (req: Json): Json | Error =>
 // @param pattern  the route pattern with `:name` capture segments.
 // @returns a map of captured params if the path matches, or a non-match result otherwise.
 // @example matchPath("/users/42", "/users/:id")   // { "id": "42" }
-export val matchPath = (path: String, pattern: String): Json =>
+export val matchPath = (path: String, pattern: String): AnyVal =>
   lin_server_path_match(pattern, path)
 
 // Start a blocking HTTP server on `port`, dispatching each request to `handler`.
@@ -136,7 +136,7 @@ export val matchPath = (path: String, pattern: String): Json =>
 // @param port  the TCP port to listen on.
 // @returns never returns under normal operation (runs the accept loop).
 // @example handler.serve(3000)   // handler = req => match req["path"] is "/ping" => text(200, "pong") else => notFound
-export val serve = (handler: Json, port: Int32): Null =>
+export val serve = (handler: AnyVal, port: Int32): Null =>
   lin_serve(handler, port)
 
 // ===== URL parsing/building (folded in from the former std/url module) =====

@@ -1,4 +1,4 @@
-// ASan stress program for the lazy Json hash side-index (RAPTOR #4b).
+// ASan stress program for the lazy AnyVal hash side-index (RAPTOR #4b).
 // Builds a large dictionary by repeated `obj[k] = v` (the lin_object_set path), overwrites a
 // subset, looks up every key, and reads keys() back — exercising build / grow / overwrite /
 // release on objects well past the index threshold. Prints a digest so a wrong/stale slot
@@ -12,7 +12,7 @@ import { toString } from "std/string"
 val N = 2000
 
 // Build a dictionary keyed by stringified index -> index*7.
-var dict: Json = {}
+var dict: AnyVal = {}
 range(0, N).for(i =>
   dict[toString(i)] = i * 7
 )

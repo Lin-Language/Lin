@@ -8,20 +8,20 @@ import { expect, toBe, toSucceed, toFailWith, test, suite, run } from "std/test"
 import { evalAst } from "./eval"
 
 // AST + result builders. evalAst takes the parser's tagged result
-// ({ "type": "success", "value": <ast> } | failure) as dynamic Json, so the
-// fixtures are Json builders mirroring the parser's node/result shapes.
-val numNode = (v: Int32): Json => { "kind": "num", "value": v }
-val binop = (o: String, l: Json, r: Json): Json => {
+// ({ "type": "success", "value": <ast> } | failure) as dynamic AnyVal, so the
+// fixtures are AnyVal builders mirroring the parser's node/result shapes.
+val numNode = (v: Int32): AnyVal => { "kind": "num", "value": v }
+val binop = (o: String, l: AnyVal, r: AnyVal): AnyVal => {
   "kind": "binop",
   "op": o,
   "left": l,
   "right": r
 }
-val ok = (ast: Json): Json => { "type": "success", "value": ast }
-val parseFail = (msg: String): Json => { "type": "failure", "error": msg }
+val ok = (ast: AnyVal): AnyVal => { "type": "success", "value": ast }
+val parseFail = (msg: String): AnyVal => { "type": "failure", "error": msg }
 
 // Convenience: the Int32 of a successful eval (sentinel on failure).
-val valueOf = (parsed: Json): Int32 =>
+val valueOf = (parsed: AnyVal): Int32 =>
   match evalAst(parsed)
     has { "type": "success", value } => value
     else => -999999

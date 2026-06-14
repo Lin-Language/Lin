@@ -9,7 +9,7 @@ import { createRaptor } from "./raptor"
 import { planRange } from "./query"
 import { parseDate } from "./dateUtil"
 
-val plan = (trips: Json, origin: String, dest: String, dateStr: String): Json =>
+val plan = (trips: AnyVal, origin: String, dest: String, dateStr: String): AnyVal =>
   val raptor = createRaptor(trips, {}, {}, null)
   val result = planRange(raptor, origin, dest, parseDate(dateStr), 3, [])
   setDefaultTrip(result)

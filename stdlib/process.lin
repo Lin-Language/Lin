@@ -10,26 +10,26 @@
 //
 //   import { exec, shell, cwd, chdir, spawn, wait, kill } from "std/process"
 import foreign "lin-runtime"
-  val lin_process_exec: (String, String[]) => Json
-  val lin_os_hostname: () => Json
+  val lin_process_exec: (String, String[]) => AnyVal
+  val lin_os_hostname: () => AnyVal
   val lin_os_platform: () => String
   val lin_os_arch: () => String
   val lin_os_cpu_count: () => Int32
   val lin_os_pid: () => Int32
   val lin_os_ppid: () => Int32
-  val lin_os_username: () => Json
-  val lin_os_home_dir: () => Json
+  val lin_os_username: () => AnyVal
+  val lin_os_home_dir: () => AnyVal
   val lin_os_temp_dir: () => String
-  val lin_os_uptime: () => Json
-  val lin_os_load_average: () => Json
-  val lin_os_mem_info: () => Json
-  val lin_process_shell: (String) => Json
+  val lin_os_uptime: () => AnyVal
+  val lin_os_load_average: () => AnyVal
+  val lin_os_mem_info: () => AnyVal
+  val lin_process_shell: (String) => AnyVal
   val lin_process_cwd: () => String
-  val lin_process_chdir: (String) => Json
-  val lin_process_spawn: (String, String[]) => Json
-  val lin_process_read_stdout: (Int64, UInt8[]) => Json
-  val lin_process_kill: (Int64) => Json
-  val lin_process_wait: (Int64) => Json
+  val lin_process_chdir: (String) => AnyVal
+  val lin_process_spawn: (String, String[]) => AnyVal
+  val lin_process_read_stdout: (Int64, UInt8[]) => AnyVal
+  val lin_process_kill: (Int64) => AnyVal
+  val lin_process_wait: (Int64) => AnyVal
 
 // The captured result of a finished process: its exit status and full output.
 export type ExecResult = { "status": Int32, "stdout": String, "stderr": String }

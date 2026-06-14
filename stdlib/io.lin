@@ -6,7 +6,7 @@
 //
 //   import { print, readLine, args, exit } from "std/io"
 import foreign "lin-runtime"
-  val lin_io_read_line: () => Json
+  val lin_io_read_line: () => AnyVal
   val lin_io_read_all: () => String
   val lin_io_lines: () => String[]
   val lin_io_print_err: (String) => Null
@@ -32,12 +32,12 @@ export val lines = (): String[] =>
 // @example print("hello")     // hello
 // @example print([1, 2, 3])   // [1, 2, 3]
 // @example print({ "a": 1 })  // {"a":1}
-export val print = (x: Json): Null =>
+export val print = (x: AnyVal): Null =>
   lin_print(x)
 
 // Print a value to standard error, followed by a newline.
 // @param x  the value to print (stringified).
-export val printErr = (x: Json): Null =>
+export val printErr = (x: AnyVal): Null =>
   lin_io_print_err(lin_to_string(x))
 
 // The process command-line arguments.

@@ -11,13 +11,13 @@ import { base64Encode, base64Decode, base64UrlEncode, base64UrlDecode, base64Enc
 // multibyte UTF-8 through urlEncode/urlDecode and the query codec.
 // --- assertion helpers -----------------------------------------------------
 // True if a decode result is the Error value.
-val isErr = (r: Json): Boolean =>
+val isErr = (r: AnyVal): Boolean =>
   match r
     is Error => true
     else => false
 
 // Render a UInt8[] | Error as a comma-joined byte list (or "ERR") for a stable toBe compare.
-val bytesStr = (r: Json): String =>
+val bytesStr = (r: AnyVal): String =>
   match r
     is Error => "ERR"
     else =>
@@ -32,7 +32,7 @@ val joinBytes = (r: UInt8[], n: Int32, i: Int32, acc: String): String =>
     joinBytes(r, n, i + 1, "${acc},${r[i]}")
 
 // Unwrap a String | Error to the string, or "ERR" on the error arm.
-val str = (r: Json): String =>
+val str = (r: AnyVal): String =>
   match r
     is Error => "ERR"
     else => r
@@ -249,7 +249,7 @@ val s = suite("std/encoding", [
 
 // Unwrap a UInt8[] | Error to the bytes (empty UInt8[] on the error arm — only used in
 // tests that already assert success, so the error arm is unreachable there).
-val unwrapBytes = (r: Json): UInt8[] =>
+val unwrapBytes = (r: AnyVal): UInt8[] =>
   match r
     is Error =>
       val empty: UInt8[] = []

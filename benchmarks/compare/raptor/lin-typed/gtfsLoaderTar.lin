@@ -344,13 +344,13 @@ val loadTrips = (s: Stream<UInt8[]>, stopTimesGroups: StopTimeGroup[], servicesS
         val serviceId = row[iServiceId]
         // positional join: groups are in identical trip_id order, 1:1 with trips here.
         val matched = g < numGroups && stopTimesGroups[g]["tripId"] == tripId
-        // Keep the conditional stopTimes as a BARE `Json` binding, then flow it directly into the
+        // Keep the conditional stopTimes as a BARE `AnyVal` binding, then flow it directly into the
         // typed `Trip.stopTimes : StopTime[]` field below. Binding it as `val sts: StopTime[]` first
         // instead materializes a STANDALONE packed StopTime[] that is then RE-packed into the Trip —
         // that double-materialization of a conditional value corrupts the packed layout (a misaligned
         // String read / repr-oracle disagreement, a codegen constraint; see gtfsLoader.lin). This is
-        // the one irreducible `Json` in the trip-resolution loop; the trip packs once, at construction.
-        val stsJson: Json = if matched then stopTimesGroups[g]["stopTimes"] else []
+        // the one irreducible `AnyVal` in the trip-resolution loop; the trip packs once, at construction.
+        val stsJson: AnyVal = if matched then stopTimesGroups[g]["stopTimes"] else []
         if matched then g = g + 1
         // serviceId may have no calendar row -> drop the trip; otherwise read the typed Service.
         val svcRec = bsearch(servicesSorted, serviceId)

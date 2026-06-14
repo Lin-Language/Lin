@@ -61,7 +61,7 @@ val sampleGraph = {
 
 // readJson dispatches on the path: a known file yields the graph, anything else an
 // error object (the "file missing / bad JSON" case solve must surface).
-replace readJson = (path: String): Json =>
+replace readJson = (path: String): AnyVal =>
   if path == "graph.json" then
     sampleGraph
   else

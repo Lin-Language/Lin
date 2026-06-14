@@ -1,4 +1,4 @@
-// Benchmark: large-record structural equality (`==` over Json objects).
+// Benchmark: large-record structural equality (`==` over AnyVal objects).
 //
 // Models change-detection / membership over parsed config-style records: a reference
 // config with many fields is compared against a stream of incoming records, counting how

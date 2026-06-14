@@ -12,7 +12,7 @@ import { Config } from "./config"
 // -> dijkstra -> reconstructPath); only the boundaries are mocked: `render` (so /
 // doesn't depend on the on-disk view path) and `readJson` (so the graph is fed
 // in-memory instead of from disk).
-replace render = (path: String, data: {  }): Json =>
+replace render = (path: String, data: {  }): AnyVal =>
   renderWith("<!DOCTYPE html><title>{{ title }}</title><h1>{{ heading }}</h1>", data)
 
 val graph = {
@@ -62,7 +62,7 @@ val graph = {
   ]
 }
 
-replace readJson = (path: String): Json => graph
+replace readJson = (path: String): AnyVal => graph
 
 val config: Config = {
   "host": "0.0.0.0",

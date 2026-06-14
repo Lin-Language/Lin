@@ -5,7 +5,7 @@ import { Bus, bus, on, once, off, emit, listenerCount, emitter, send, request, d
 
 // Handlers can't return into the assertions, so they append to a module-level log; tests assert on
 // the log. A fresh log per test via `reset`.
-var log: Json = []
+var log: AnyVal = []
 val reset = (): Null =>
   log = []
 val record = (s: String): Null =>
@@ -109,7 +109,7 @@ val s = suite("std/event", [
   ),
 
   test("emitter built by a factory that RETURNS it keeps its var state (spec §24.6.4)", () =>
-    val mkSink = (): Json =>
+    val mkSink = (): AnyVal =>
       emitter((x: Int32, n: Int32): Int32 => n + 1, 0, 0)
     val sink = mkSink()
     send(sink, 0)

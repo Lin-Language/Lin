@@ -18,7 +18,7 @@ import { parseInt32 } from "std/number"
 
 // A lexer token (mirrors lexer.lin's Token — type aliases aren't cross-module).
 // Exported so unit tests can construct token-array fixtures typed as Token[]
-// (a Json[] literal won't coerce to Token[]).
+// (a AnyVal[] literal won't coerce to Token[]).
 export type Token = { "kind": String, "text": String }
 
 // AST nodes (recursive). `kind` is the discriminant: "num" | "binop".
@@ -36,12 +36,12 @@ type Parsed = ParseSuccess | Failure
 // `{ "node": <Ast>, "pos": <Int32> }` or a Failure. The checker can't index a
 // union by a field that only one variant has, and these steps are read via
 // `["node"]`/`["pos"]` after an `isFailure` guard rather than pattern-matched,
-// so the step value stays dynamic `Json` here (the genuinely-dynamic case the
+// so the step value stays dynamic `AnyVal` here (the genuinely-dynamic case the
 // guide allows). The typed boundaries are the Token[] input and Parsed output.
 val fail = (msg: String): Failure =>
   { "type": "failure", "error": msg }
 
-val isFailure = (x: Json): Boolean =>
+val isFailure = (x: AnyVal): Boolean =>
   x["type"] == "failure"
 
 // Token kind at `pos`, or "eof" past the end. `&&`/short-circuit keeps the OOB
@@ -53,7 +53,7 @@ val kindAt = (tokens: Token[], pos: Int32): String =>
     tokens[pos]["kind"]
 
 // factor = number | '(' expr ')'
-val parseFactor = (tokens: Token[], pos: Int32): Json =>
+val parseFactor = (tokens: Token[], pos: Int32): AnyVal =>
   val k = kindAt(tokens, pos)
   if k == "num" then
     {
@@ -72,7 +72,7 @@ val parseFactor = (tokens: Token[], pos: Int32): Json =>
     fail("expected number or '(' at token ${pos}")
 
 // term = factor (('*' | '/') factor)*  — left-associative fold over the * / run.
-val parseTermLoop = (tokens: Token[], left: Ast, pos: Int32): Json =>
+val parseTermLoop = (tokens: Token[], left: Ast, pos: Int32): AnyVal =>
   val k = kindAt(tokens, pos)
   if k != "op" then
     { "node": left, "pos": pos }
@@ -93,7 +93,7 @@ val parseTermLoop = (tokens: Token[], left: Ast, pos: Int32): Json =>
         }
         parseTermLoop(tokens, node, right["pos"])
 
-val parseTerm = (tokens: Token[], pos: Int32): Json =>
+val parseTerm = (tokens: Token[], pos: Int32): AnyVal =>
   val first = parseFactor(tokens, pos)
   if isFailure(first) then
     first
@@ -101,7 +101,7 @@ val parseTerm = (tokens: Token[], pos: Int32): Json =>
     parseTermLoop(tokens, first["node"], first["pos"])
 
 // expr = term (('+' | '-') term)*  — left-associative fold over the + - run.
-val parseExprLoop = (tokens: Token[], left: Ast, pos: Int32): Json =>
+val parseExprLoop = (tokens: Token[], left: Ast, pos: Int32): AnyVal =>
   val k = kindAt(tokens, pos)
   if k != "op" then
     { "node": left, "pos": pos }
@@ -122,7 +122,7 @@ val parseExprLoop = (tokens: Token[], left: Ast, pos: Int32): Json =>
         }
         parseExprLoop(tokens, node, right["pos"])
 
-val parseExpr = (tokens: Token[], pos: Int32): Json =>
+val parseExpr = (tokens: Token[], pos: Int32): AnyVal =>
   val first = parseTerm(tokens, pos)
   if isFailure(first) then
     first

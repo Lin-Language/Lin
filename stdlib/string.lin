@@ -30,7 +30,7 @@ import foreign "lin-runtime"
   val lin_string_starts_with: (String, String) => Boolean
   val lin_string_ends_with: (String, String) => Boolean
   val lin_string_is_blank: (String) => Boolean
-  val lin_string_from_utf8: (UInt8[]) => Json
+  val lin_string_from_utf8: (UInt8[]) => AnyVal
 
 // Remove whitespace from both ends of `s`.
 // @param s  the string to trim.
@@ -299,5 +299,5 @@ export val fromUtf8 = (bytes: UInt8[]): String | Error =>
 // @example toString(42)        // "42"
 // @example toString(true)      // "true"
 // @example toString([1, 2])    // "[1, 2]"
-export val toString = (x: Json): String =>
+export val toString = (x: AnyVal): String =>
   lin_to_string(x)

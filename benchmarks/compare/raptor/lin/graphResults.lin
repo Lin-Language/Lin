@@ -17,10 +17,10 @@ import { Conn, Transfer } from "./types"
 
 // path = [finalDestination, origin1, origin2, ...] built by appending each origin
 // while walking k back to 1 (reference getPath uses push, so this order is correct).
-val getPath = (kConnections: { String: { String: Conn } }, k: String, finalDestination: String): Json =>
+val getPath = (kConnections: { String: { String: Conn } }, k: String, finalDestination: String): AnyVal =>
   walk(kConnections, parseInt32(k), finalDestination, [finalDestination])
 
-val walk = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, path: Json): Json =>
+val walk = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, path: AnyVal): AnyVal =>
   if i <= 0 then
     path
   else
@@ -43,10 +43,10 @@ val walk = (kConnections: { String: { String: Conn } }, i: Int32, destination: S
             walk(kConnections, i - 1, origin, path)
 
 // isSame(path, node): does node's parent chain spell out path[0], path[1], ...?
-val isSame = (path: Json, node: Json): Boolean =>
+val isSame = (path: AnyVal, node: AnyVal): Boolean =>
   isSameAt(path, node, 0)
 
-val isSameAt = (path: Json, node: Json, i: Int32): Boolean =>
+val isSameAt = (path: AnyVal, node: AnyVal, i: Int32): Boolean =>
   if node == null then
     true
   else if node["label"] != path[i] then
@@ -55,12 +55,12 @@ val isSameAt = (path: Json, node: Json, i: Int32): Boolean =>
     isSameAt(path, node["parent"], i + 1)
 
 // mergePath([head, ...tail]) returning the (possibly new) node for head.
-val mergePathInto = (results: Json, path: Json): Json =>
+val mergePathInto = (results: AnyVal, path: AnyVal): AnyVal =>
   val head = path[0]
   val tail = slice(path, 1, length(path))
   if results[head] == null then results[head] = []
   val bucket = results[head]
-  var found: Json = null
+  var found: AnyVal = null
   bucket.for(n =>
     if found == null && isSame(tail, n["parent"]) then found = n
   )
@@ -73,10 +73,10 @@ val mergePathInto = (results: Json, path: Json): Json =>
     push(bucket, node)
     node
 
-export val makeGraphResults = (): Json =>
+export val makeGraphResults = (): AnyVal =>
   { "results": {  } }
 
-export val add = (gr: Json, kConnections: { String: { String: Conn } }): Null =>
+export val add = (gr: AnyVal, kConnections: { String: { String: Conn } }): Null =>
   val results = gr["results"]
   kConnections
     .keys()
@@ -88,5 +88,5 @@ export val add = (gr: Json, kConnections: { String: { String: Conn } }): Null =>
         )
     )
 
-export val finalize = (gr: Json): Json =>
+export val finalize = (gr: AnyVal): AnyVal =>
   gr["results"]

@@ -11,18 +11,18 @@ import { toLower } from "std/string"
 import { hexEncode, hexDecode, utf8Bytes } from "std/encoding"
 
 import foreign "lin-runtime"
-  val lin_crypto_sha256: (UInt8[]) => Json
-  val lin_crypto_sha512: (UInt8[]) => Json
-  val lin_crypto_sha1: (UInt8[]) => Json
-  val lin_crypto_md5: (UInt8[]) => Json
-  val lin_crypto_hmac_sha256: (UInt8[], UInt8[]) => Json
-  val lin_crypto_random_bytes: (Int32) => Json
+  val lin_crypto_sha256: (UInt8[]) => AnyVal
+  val lin_crypto_sha512: (UInt8[]) => AnyVal
+  val lin_crypto_sha1: (UInt8[]) => AnyVal
+  val lin_crypto_md5: (UInt8[]) => AnyVal
+  val lin_crypto_hmac_sha256: (UInt8[], UInt8[]) => AnyVal
+  val lin_crypto_random_bytes: (Int32) => AnyVal
   val lin_crypto_uuid_v4: () => String
   val lin_crypto_uuid_v7: () => String
   val lin_crypto_ct_eq: (UInt8[], UInt8[]) => Boolean
-  val lin_crypto_hasher_new: (String) => Json
+  val lin_crypto_hasher_new: (String) => AnyVal
   val lin_crypto_hasher_update: (Int64, UInt8[]) => Int64
-  val lin_crypto_hasher_digest: (Int64) => Json
+  val lin_crypto_hasher_digest: (Int64) => AnyVal
 
 // An opaque incremental-hash handle: an Int64 id the runtime interprets, not subscriptable. Created
 // by newHasher, fed by update, finalised by digest/digestHex.

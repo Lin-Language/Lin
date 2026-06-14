@@ -11,20 +11,20 @@
 // from `compile`. Everything downstream of a successfully compiled `Regex` is total: it returns
 // Null, a Boolean, or an array, and never an Error.
 
-export type Regex = Json
+export type Regex = AnyVal
 
 // A single match. `groups` is the array of positional capture groups: participating groups are
 // `String`, and non-participating positional holes are `Null`, so `m["groups"][1]` indexes it
 // directly. `named` is an object of named capture groups; an absent named group reads as `Null`.
-export type Match = { "text": String, "start": Int32, "end": Int32, "groups": Json, "named": Json }
+export type Match = { "text": String, "start": Int32, "end": Int32, "groups": AnyVal, "named": AnyVal }
 
 import foreign "lin-runtime"
-  val lin_regex_compile: (String) => Json
-  val lin_regex_is_match: (Json, String) => Boolean
-  val lin_regex_find: (Json, String) => Json
-  val lin_regex_find_all: (Json, String) => Json
-  val lin_regex_replace: (Json, String, String, Boolean) => String
-  val lin_regex_split: (Json, String) => Json
+  val lin_regex_compile: (String) => AnyVal
+  val lin_regex_is_match: (AnyVal, String) => Boolean
+  val lin_regex_find: (AnyVal, String) => AnyVal
+  val lin_regex_find_all: (AnyVal, String) => AnyVal
+  val lin_regex_replace: (AnyVal, String, String, Boolean) => String
+  val lin_regex_split: (AnyVal, String) => AnyVal
 // Compile a pattern into a reusable Regex handle. This is the only fault case in the module.
 // @param pattern  the RE2 source pattern.
 // @returns the compiled Regex, or an Error (detect with `is Error`) if the pattern is not valid

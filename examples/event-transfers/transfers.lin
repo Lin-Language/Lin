@@ -1,7 +1,7 @@
 // transfers — the parse + emit + index logic for the event-transfers example, factored out of
 // main.lin so it is unit-testable without touching the filesystem. Fully generic / typed: a
 // `Transfer` is a record, and the emitter folds `Transfer` values into a typed `Transfer[]` state
-// (no `Json` payloads).
+// (no `AnyVal` payloads).
 import { for } from "std/iter"
 import { split } from "std/string"
 import { parseInt32 } from "std/number"
@@ -28,8 +28,8 @@ val SAMPLE: Transfer = {
 }
 
 // Build a fresh transfer-collector emitter: a worker that folds each emitted `Transfer` into a
-// `Transfer[]` state. (The handle is opaque — `Json` per §24.1 — but the payload is fully typed.)
-export val transferSink = (): Json =>
+// `Transfer[]` state. (The handle is opaque — `AnyVal` per §24.1 — but the payload is fully typed.)
+export val transferSink = (): AnyVal =>
   emitter(
     (t: Transfer, acc: Transfer[]): Transfer[] =>
       push(acc, t)
@@ -40,7 +40,7 @@ export val transferSink = (): Json =>
 
 // Parse one transfers.txt data row (`from,to,type,min_transfer_time`) and, if it is a real footpath
 // (from != to), emit it to the sink. Returns whether a transfer was emitted.
-export val emitRow = (sink: Json, line: String): Boolean =>
+export val emitRow = (sink: AnyVal, line: String): Boolean =>
   val f = split(line, ",")
   val origin = f[0]
   val dest = f[1]

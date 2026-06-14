@@ -539,11 +539,11 @@ impl fmt::Display for Type {
             Type::Stream(inner) => write!(f, "Stream<{}>", inner),
             Type::Promise(inner) => write!(f, "Promise<{}>", inner),
             Type::TarEntry => write!(f, "TarEntry"),
-            // `TypeVar(u32::MAX)` is the dynamic `Json` marker — render it as `Json`, not a raw id.
-            // Other ids are unresolved generic/inference variables; they render as `?T<id>` so the
-            // LSP's `clean_type_string` can assign distinct positional names (`T`/`U`/…) while
-            // deduping repeats of the same var.
-            Type::TypeVar(id) if *id == u32::MAX => write!(f, "Json"),
+            // `TypeVar(u32::MAX)` is the dynamic `AnyVal` marker — render it as `AnyVal` (the former
+            // `Json`; reset §2.5), not a raw id. Other ids are unresolved generic/inference variables;
+            // they render as `?T<id>` so the LSP's `clean_type_string` can assign distinct positional
+            // names (`T`/`U`/…) while deduping repeats of the same var.
+            Type::TypeVar(id) if *id == u32::MAX => write!(f, "AnyVal"),
             Type::TypeVar(id) => write!(f, "?T{}", id),
             Type::Never => write!(f, "Never"),
             Type::Named(name) => write!(f, "{}", name),

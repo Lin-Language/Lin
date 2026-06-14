@@ -17,7 +17,7 @@ val tarPath = "stdlib/fixtures/sample.tar"
 val gzPath = "stdlib/fixtures/sample.tar.gz"
 
 // `readText` returns `String | Error`; unwrap the success arm for the assertion.
-val unwrapStr = (r: Json): String =>
+val unwrapStr = (r: AnyVal): String =>
   match r
     is Error => "err"
     else => r
@@ -25,7 +25,7 @@ val unwrapStr = (r: Json): String =>
 val s = suite("std/archive", [
   // (a) manifest() lists the expected entry names (body skipped, meta-only).
   test("manifest lists entry names", () =>
-    val names: Json[] = []
+    val names: AnyVal[] = []
     readStream(tarPath)
       .manifest()
       .for(m =>
@@ -41,7 +41,7 @@ val s = suite("std/archive", [
 
   // manifest over a gzipped archive (tar.gz = gunzip composed with the splitter).
   test("manifest works over a tar.gz via gunzip", () =>
-    val sizes: Json[] = []
+    val sizes: AnyVal[] = []
     readStream(gzPath)
       .gunzip()
       .manifest()

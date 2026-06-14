@@ -1,7 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { Result, ok, err, isOk, andThen, mapOk, unwrapOr } from "./outcome"
 
-// Unit tests for the generic, Json-free Result combinators in isolation. Every receiver
+// Unit tests for the generic, AnyVal-free Result combinators in isolation. Every receiver
 // is annotated `Result<Int32, String>` so each call's type parameters are determined.
 val dbl = (n: Int32): Int32 => n * 2
 

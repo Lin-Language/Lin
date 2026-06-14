@@ -9,26 +9,26 @@ import { for } from "std/iter"
 import { length, push, sort } from "std/array"
 
 // earliestArrival(a, b): b arrives before or at the same time as a.
-val earliestArrival = (a: Json, b: Json): Boolean =>
+val earliestArrival = (a: AnyVal, b: AnyVal): Boolean =>
   b["arrivalTime"] <= a["arrivalTime"]
 
 // leastChanges(a, b): b has the same or fewer changes than a.
-val leastChanges = (a: Json, b: Json): Boolean =>
+val leastChanges = (a: AnyVal, b: AnyVal): Boolean =>
   length(b["legs"]) <= length(a["legs"])
 
-val dominates = (a: Json, b: Json): Boolean =>
+val dominates = (a: AnyVal, b: AnyVal): Boolean =>
   earliestArrival(a, b) && leastChanges(a, b)
 
-val cmp = (a: Json, b: Json): Int32 =>
+val cmp = (a: AnyVal, b: AnyVal): Int32 =>
   if a["departureTime"] != b["departureTime"] then
     a["departureTime"] - b["departureTime"]
   else
     b["arrivalTime"] - a["arrivalTime"]
 
-export val apply = (journeys: Json): Json =>
+export val apply = (journeys: AnyVal): AnyVal =>
   val sorted = sort(journeys, cmp)
   val n = length(sorted)
-  var result: Json = []
+  var result: AnyVal = []
   var i = 0
   sorted.for(a =>
     // keep `a` unless some later journey (index > i) dominates it

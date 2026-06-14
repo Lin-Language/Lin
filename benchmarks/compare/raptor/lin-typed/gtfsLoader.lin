@@ -1,7 +1,7 @@
 // gtfs/GTFSLoader — read the plain-CSV GTFS feed and return the shapes createRaptor expects.
 //
 // Mirrors node/src/gtfs/GTFSLoader.js (the golden reference) in RESULT, but uses array-based
-// joins instead of large object maps: Lin's Json objects are association lists with O(n) key
+// joins instead of large object maps: Lin's AnyVal objects are association lists with O(n) key
 // lookup (crates/lin-runtime/src/object.rs), so a 240k-key object map would make loading O(n^2).
 // We avoid that by exploiting the feed's ordering rather than keying everything by id:
 //   - stop_times.txt rows for a trip_id are CONTIGUOUS -> group by detecting trip_id changes.
@@ -294,9 +294,9 @@ export val loadGTFS = (dataDir: String): GTFSData =>
   //     binary search). Drop trips whose serviceId has no calendar row. ---
   // The accumulator is a typed `Trip[]` — each element is a fully typed `Trip` (built below) and the
   // array carries the typed element representation end-to-end into createRaptor's `tripsIn: Trip[]`.
-  // (HISTORICAL: this used to be `Json` because building a `Trip` whose `stopTimes : StopTime[]` field
-  // is fed a `Json` array value — then capturing the `Trip[]` accumulator in this `forEachRow` stream
-  // callback — produced a use-after-free: codegen's `sealed_construct` stored the unboxed Json-array
+  // (HISTORICAL: this used to be `AnyVal` because building a `Trip` whose `stopTimes : StopTime[]` field
+  // is fed a `AnyVal` array value — then capturing the `Trip[]` accumulator in this `forEachRow` stream
+  // callback — produced a use-after-free: codegen's `sealed_construct` stored the unboxed AnyVal-array
   // pointer into the field BORROWED (no retain) while wrongly accounting it as owned, so when the
   // source box was released the field dangled. Fixed in `lin-codegen/src/codegen/data.rs` —
   // `sealed_construct` now retains a heap field whose coerce is a borrowing union→concrete unbox.)
@@ -314,21 +314,21 @@ export val loadGTFS = (dataDir: String): GTFSData =>
       // Bind the matched group into a `val` and advance `g` only on a match — clean and
       // cursor-independent, no mutable temp needed.
       val matched = g < numGroups && stopTimesGroups[g]["tripId"] == tripId
-      // Keep the conditional stopTimes as a BARE `Json` binding, then flow it directly into the
-      // typed `Trip.stopTimes : StopTime[]` field below. The Json binding is a Json index/literal
+      // Keep the conditional stopTimes as a BARE `AnyVal` binding, then flow it directly into the
+      // typed `Trip.stopTimes : StopTime[]` field below. The AnyVal binding is a AnyVal index/literal
       // union (a fresh inference var), so it coerces into the typed field at the literal site and
       // the trip packs once, at construction. Binding it as `val sts: StopTime[]` first instead
       // materializes a STANDALONE packed StopTime[] that is then RE-packed into the Trip — that
-      // double-materialization of an `if (Json index) else []` value corrupts the packed layout
+      // double-materialization of an `if (AnyVal index) else []` value corrupts the packed layout
       // (a misaligned String read / repr-oracle disagreement). The `service` is bound typed (a
       // direct value, no conditional) and is unaffected.
-      // Keep the conditional stopTimes as a BARE `Json` binding, then flow it directly into the
+      // Keep the conditional stopTimes as a BARE `AnyVal` binding, then flow it directly into the
       // typed `Trip.stopTimes : StopTime[]` field below. Binding it as `val sts: StopTime[]` first
       // instead materializes a STANDALONE packed StopTime[] that is then RE-packed into the Trip —
       // that double-materialization of a conditional value corrupts the packed layout (a misaligned
       // String read / repr-oracle disagreement, a codegen constraint). This is the one irreducible
-      // `Json` in the trip-resolution loop; the trip packs once, at construction.
-      val stsJson: Json = if matched then stopTimesGroups[g]["stopTimes"] else []
+      // `AnyVal` in the trip-resolution loop; the trip packs once, at construction.
+      val stsJson: AnyVal = if matched then stopTimesGroups[g]["stopTimes"] else []
       if matched then g = g + 1
       // serviceId may have no calendar row -> drop the trip; otherwise read the typed Service.
       val svcRec = bsearch(servicesSorted, serviceId)

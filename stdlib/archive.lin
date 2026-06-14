@@ -54,7 +54,7 @@ export type TarFile = { "name": String, "data": UInt8[], "size": Int64, "typefla
 // @param body  `body(meta, data)`, called per entry, where `meta` is the entry's `TarHeader` and
 //   `data` is a byte stream over the entry's body (valid only inside the callback). Its return is ignored.
 // @returns `Null` on success, or an `Error` if an entry body faulted or a read failed.
-export val untar = (s: Stream<UInt8[]>, body: (TarHeader, Stream<UInt8[]>) => Json): Json =>
+export val untar = (s: Stream<UInt8[]>, body: (TarHeader, Stream<UInt8[]>) => AnyVal): AnyVal =>
   lin_stream_untar(s, body)
 
 // Stream each entry's metadata, skipping bodies — a fast, body-free listing.

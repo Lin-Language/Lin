@@ -21,10 +21,10 @@ import foreign "lin-runtime"
   val lin_time_elapsed: (Int64) => Int64
   val lin_time_to_iso: (Int64) => String
   val lin_time_format: (Int64, String) => String
-  val lin_time_from_iso: (String) => Json
-  val lin_time_parse: (String, String) => Json
-  val lin_time_components: (Int64) => Json
-  val lin_time_from_components: (Int64, Int64, Int64, Int64, Int64, Int64, Int64) => Json
+  val lin_time_from_iso: (String) => AnyVal
+  val lin_time_parse: (String, String) => AnyVal
+  val lin_time_components: (Int64) => AnyVal
+  val lin_time_from_components: (Int64, Int64, Int64, Int64, Int64, Int64, Int64) => AnyVal
 
 // The current wall-clock time as a Unix timestamp in milliseconds (UTC).
 // @example now()   // e.g. 1716825600000
@@ -100,10 +100,10 @@ export val components = (ts: Int64): TimeComponents =>
 
 // Build a Unix-millisecond timestamp (UTC) from calendar fields. Out-of-range fields are rejected,
 // not normalised, so calendar typos surface as errors.
-// @param c  a Json object; only year/month/day/hour/minute/second/millis are read. `weekday`/
+// @param c  a AnyVal object; only year/month/day/hour/minute/second/millis are read. `weekday`/
 //   `yearDay` are ignored on input, so the full record from `components` is accepted unchanged.
 // @returns the timestamp in Unix milliseconds, or an Error if any read field is out of range.
-export val fromComponents = (c: Json): Int64 | Error =>
+export val fromComponents = (c: AnyVal): Int64 | Error =>
   lin_time_from_components(
     c["year"],
     c["month"],

@@ -10,25 +10,25 @@ import { reduce } from "std/iter"
 // A `T | Error` result cannot be `match`ed inside a parenthesised test lambda (multi-line match is
 // suppressed in parens), so unwrap to a stable comparable shape at module scope. `parse`/`stringify`
 // are the surface; these turn the result into a `.toString()`-comparable form or an "ERR" marker.
-val rowsStr = (r: Json): String =>
+val rowsStr = (r: AnyVal): String =>
   match r
     is Error => "ERR"
     else => r.toString()
 
-val errMsg = (r: Json): String =>
+val errMsg = (r: AnyVal): String =>
   match r
     is Error => "${r["message"]}"
     else => "NO-ERR"
 
 // A header record's field, or "MISSING" if the row is an Error / the key is absent.
-val recField = (r: Json, i: Int32, key: String): String =>
+val recField = (r: AnyVal, i: Int32, key: String): String =>
   match r
     is Error => "ERR"
     else =>
       val v = r[i][key]
       if v == null then "MISSING" else "${v}"
 
-val recCount = (r: Json): Int32 =>
+val recCount = (r: AnyVal): Int32 =>
   match r
     is Error => 0 - 1
     else => length(r)

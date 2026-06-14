@@ -34,14 +34,14 @@ export val await = <T>(p: Promise<T>): T | Error =>
   lin_await(p)
 
 // Run a list of thunks concurrently and collect their results in order.
-// @param tasks  an array of zero-argument thunks (`(() => T)[]`, passed as `Json`).
-// @returns a `Json[]` of the results, one per task, in input order.
+// @param tasks  an array of zero-argument thunks (`(() => T)[]`, passed as `AnyVal`).
+// @returns a `AnyVal[]` of the results, one per task, in input order.
 // @example val [a, b, c] = parallel([() => fetchUsers(), () => fetchPosts(), () => fetchComments()])
-export val parallel = (tasks: Json): Json[] =>
+export val parallel = (tasks: AnyVal): AnyVal[] =>
   lin_parallel(tasks)
 
 // Return a promise that resolves to the first of `promises` to settle.
-// @param promises  an array of `Promise` handles (passed as `Json`).
+// @param promises  an array of `Promise` handles (passed as `AnyVal`).
 // @returns an opaque `Promise` handle for the first settled result; resolve with `await`.
 // @example val fastest = await(race([async(() => fetchFrom("a")), async(() => fetchFrom("b"))]))
 export val race = <T>(promises: Promise<T>[]): Promise<T> =>
@@ -56,7 +56,7 @@ export val timeout = <T>(p: Promise<T>, ms: Int32): Promise<T> =>
   lin_timeout(p, ms)
 
 // Retry a faulting thunk up to `times` attempts.
-// @param f      a zero-argument thunk `() => T` (passed as `Json`).
+// @param f      a zero-argument thunk `() => T` (passed as `AnyVal`).
 // @param times  the maximum number of attempts.
 // @returns an opaque `Promise` handle; awaiting it yields the first success, or the last `Error`.
 // @example val data = await(retry(() => unstableFetch(), 3))
@@ -66,18 +66,18 @@ export val retry = <T>(f: () => T, times: Int32): Promise<T> =>
 // Create a fixed-size pool of worker threads.
 // @param size  the number of worker threads in the pool.
 // @returns an opaque pool handle for `poolAsync`.
-export val threadPool = (size: Int32): Json =>
+export val threadPool = (size: Int32): AnyVal =>
   lin_thread_pool(size)
 
 // Submit thunk `f` to a thread pool for execution. A pool bounds concurrency: at most `n` thunks
 // run at once, and excess work queues until a worker frees up. Designed for the dot-call form
 // `pool.poolAsync(thunk)`.
 // @param pool  a pool handle from `threadPool`.
-// @param f     a zero-argument thunk `() => T` (passed as `Json`).
+// @param f     a zero-argument thunk `() => T` (passed as `AnyVal`).
 // @returns an opaque `Promise` handle for the result; resolve with `await`.
 // @example val pool = threadPool(8)
 // @example val result = await(pool.poolAsync(() => heavyWork()))
-export val poolAsync = <T>(pool: Json, f: () => T): Promise<T> =>
+export val poolAsync = <T>(pool: AnyVal, f: () => T): Promise<T> =>
   lin_pool_async(pool, f)
 
 // Spawn a long-lived worker thread that owns thread-confined state.
@@ -89,25 +89,25 @@ export val poolAsync = <T>(pool: Json, f: () => T): Promise<T> =>
 // @example val reply = request(w, "hello")   // "echo: hello"
 // @example message(w, "fire-and-forget")
 // @example close(w)
-export val worker = (handler: Json, onClose: Json): Json =>
+export val worker = (handler: AnyVal, onClose: AnyVal): AnyVal =>
   lin_worker(handler, onClose)
 
 // Send `msg` to a worker and block until it replies. This is synchronous and gives backpressure.
 // @param w    a worker handle from `worker`.
 // @param msg  the message payload.
 // @returns the worker's reply (or an `Error` injected at the worker boundary on a handler fault).
-export val request = (w: Json, msg: Json): Json =>
+export val request = (w: AnyVal, msg: AnyVal): AnyVal =>
   lin_request(w, msg)
 
 // Send `msg` to a worker, fire-and-forget: enqueue it and return immediately, with no reply.
 // @param w    a worker handle from `worker`.
 // @param msg  the message payload.
-export val message = (w: Json, msg: Json): Null =>
+export val message = (w: AnyVal, msg: AnyVal): Null =>
   lin_message(w, msg)
 
 // Shut a worker down (drain in-flight work, run its `onClose`, join the thread).
 // @param w  the worker handle to close.
-export val close = (w: Json): Null =>
+export val close = (w: AnyVal): Null =>
   lin_close(w)
 
 // Box a value into opt-in shared mutable state.

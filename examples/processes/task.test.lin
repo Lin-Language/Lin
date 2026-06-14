@@ -13,7 +13,7 @@ import { length } from "std/array"
 // so the runAll check below asserts the DELTA across its own call, not an absolute.)
 var execCount = 0
 
-replace exec = (command: String, args: String[]): Json =>
+replace exec = (command: String, args: String[]): AnyVal =>
   execCount = execCount + 1
   if command == "ok" then
     {

@@ -4,7 +4,7 @@
 // times to retry a flaky step, and whether it is running under CI (which usually means
 // "be strict / non-interactive"). `getEnv` returns `String | Null`, so every read is
 // narrowed: an unset or non-numeric var falls back to a documented default rather than
-// failing. The result is a precise Config record — no Json anywhere.
+// failing. The result is a precise Config record — no AnyVal anywhere.
 import { getEnv } from "std/env"
 import { isInt32, parseInt32 } from "std/number"
 

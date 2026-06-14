@@ -2,10 +2,10 @@
 //
 //   import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, isEmpty } from "std/object"
 //
-// `keys`/`values`/`entries` are tag-aware — they work on both a plain `{}`/`Json` record and a typed
+// `keys`/`values`/`entries` are tag-aware — they work on both a plain `{}`/`AnyVal` record and a typed
 // index-signature map `{ String: T }`. `merge`/`pick`/`omit`/`mapValues` are generic over
 // `{ String: T }` and return a typed map; pass them a value annotated `{ String: T }` (there is no
-// implicit `Json -> { String: T }` coercion). Over a typed map, key order is hash order, not insertion
+// implicit `AnyVal -> { String: T }` coercion). Over a typed map, key order is hash order, not insertion
 // order. `get` is the idiomatic defaulted read (`m[k] ?? default`) — a bare `m[k]` already yields
 // `T | Null`, so the helper folds in a fallback whose type `D` is independent of the value type `T`.
 //
@@ -14,38 +14,38 @@
 // `Result`/`Option` wrapper type: a fallible call returns `T | Error`, an absence-y call returns
 // `T | Null`, and the success value is the value with no unwrap ceremony on the happy path.
 import foreign "lin-runtime"
-  val lin_keys_any: (Json) => String[]
-  val lin_values_any: (Json) => Json[]
-  val lin_entries_any: (Json) => Json[]
+  val lin_keys_any: (AnyVal) => String[]
+  val lin_values_any: (AnyVal) => AnyVal[]
+  val lin_entries_any: (AnyVal) => AnyVal[]
 
 import { push, length } from "std/array"
 import { for, some } from "std/iter"
 
 // `keys`/`values`/`entries` are tag-aware at runtime, so one function serves both a record
 // (`{}`/`{ String: T }`, insertion order) and an index-signature map (hash order). The parameter is
-// the union `{ String: Json } | {}` — accepting a record literal, a typed map, or a `Json` value
+// the union `{ String: AnyVal } | {}` — accepting a record literal, a typed map, or a `AnyVal` value
 // (any of which may carry an object), while REJECTING a non-object argument (`keys(1)`, `keys("s")`,
-// `keys([…])` are compile errors). A `Json` holding a non-object yields an empty result at runtime.
+// `keys([…])` are compile errors). A `AnyVal` holding a non-object yields an empty result at runtime.
 //
 // Return the keys of an object or map.
-// @param obj  a record, an index-signature map, or a `Json` object.
+// @param obj  a record, an index-signature map, or a `AnyVal` object.
 // @returns a `String[]` of the keys (insertion order for a record, hash order for a map).
 // @example keys({ "a": 1, "b": 2 })   // ["a", "b"]
-export val keys = (obj: { String: Json } | {  }): String[] =>
+export val keys = (obj: { String: AnyVal } | {  }): String[] =>
   lin_keys_any(obj)
 
 // Return the values of an object or map.
-// @param obj  a record, an index-signature map, or a `Json` object.
-// @returns a `Json[]` of the values, in key order.
+// @param obj  a record, an index-signature map, or a `AnyVal` object.
+// @returns a `AnyVal[]` of the values, in key order.
 // @example values({ "a": 1, "b": 2 })   // [1, 2]
-export val values = (obj: { String: Json } | {  }): Json[] =>
+export val values = (obj: { String: AnyVal } | {  }): AnyVal[] =>
   lin_values_any(obj)
 
 // Return the key/value pairs of an object or map.
-// @param obj  a record, an index-signature map, or a `Json` object.
-// @returns a `Json[]` of `[key, value]` pairs, in key order.
+// @param obj  a record, an index-signature map, or a `AnyVal` object.
+// @returns a `AnyVal[]` of `[key, value]` pairs, in key order.
 // @example entries({ "a": 1, "b": 2 })   // [["a", 1], ["b", 2]]
-export val entries = (obj: { String: Json } | {  }): Json[] =>
+export val entries = (obj: { String: AnyVal } | {  }): AnyVal[] =>
   lin_entries_any(obj)
 
 // Build an object from a list of `[key, value]` pairs (the inverse of `entries`). Later pairs with
@@ -144,7 +144,7 @@ export val get = <T, D>(m: { String: T }, key: String, default: D = null): T | D
 // @example isEmpty({})        // true
 // @example isEmpty([])        // true
 // @example isEmpty({ "a": 1 })   // false
-export val isEmpty = (x: Json): Boolean =>
+export val isEmpty = (x: AnyVal): Boolean =>
   length(x) == 0
 
 // Result/Option ergonomics for the two fallible-value conventions: `T | Error` and `T | Null`.
@@ -167,26 +167,26 @@ export val error = (message: String): Error =>
 // in `if`/`&&` positions and combinator callbacks (e.g. `xs.filter`).
 // Note: this does not narrow the union — after `if isError(x)` the compiler still sees `x : T | Error`.
 // Use the built-in `is Error` test to unlock the success arm's fields; this is for filtering/counting/branching.
-// @param x  any value (typed `Json`, the supertype any union flows into).
+// @param x  any value (typed `AnyVal`, the supertype any union flows into).
 // @returns `true` iff `x` is the canonical Error.
-export val isError = (x: Json): Boolean =>
+export val isError = (x: AnyVal): Boolean =>
   match x
     is Error => true
     else => false
 
 // Test whether `x` is not the canonical Error — the negation of `isError`. A `Null` `x` is "ok"
 // here (it is not an Error); use `isNull` to test absence.
-// @param x  any value (typed `Json`).
+// @param x  any value (typed `AnyVal`).
 // @returns `true` unless `x` is the canonical Error.
-export val isOk = (x: Json): Boolean =>
+export val isOk = (x: AnyVal): Boolean =>
   match x
     is Error => false
     else => true
 
 // Test whether `x` is the `Null` value (the absence arm of a `T | Null`).
-// @param x  any value (typed `Json`).
+// @param x  any value (typed `AnyVal`).
 // @returns `true` iff `x` is `null`.
-export val isNull = (x: Json): Boolean =>
+export val isNull = (x: AnyVal): Boolean =>
   match x
     is Null => true
     else => false
@@ -195,10 +195,10 @@ export val isNull = (x: Json): Boolean =>
 // success value is returned when `x` is neither an `Error` nor `Null`, otherwise `default`.
 // @example val port: Int32 = parsePort(input).unwrapOr(8080)    // T | Error -> T
 // @example val name: String = config["name"].unwrapOr("anon")   // T | Null  -> T
-// @param x        any value (typed `Json`, so any `T | Error` / `T | Null` union flows in).
+// @param x        any value (typed `AnyVal`, so any `T | Error` / `T | Null` union flows in).
 // @param default  the fallback returned for the `Error`/`Null` arms; pins `D`.
-// @returns the success value, or `default`, typed `Json | D` (the static success type is recovered via `D`, as in `at`/`get`).
-export val unwrapOr = <D>(x: Json, default: D): Json | D =>
+// @returns the success value, or `default`, typed `AnyVal | D` (the static success type is recovered via `D`, as in `at`/`get`).
+export val unwrapOr = <D>(x: AnyVal, default: D): AnyVal | D =>
   match x
     is Error => default
     is Null => default

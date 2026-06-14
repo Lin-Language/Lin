@@ -12384,7 +12384,7 @@ val j: Json = { "name": "Bob", "age": 30 }
 val p: Person = j
 "#);
     assert!(
-        err.contains("Person") || err.contains("4294967295") || err.to_lowercase().contains("json"),
+        err.contains("Person") || err.contains("4294967295") || (err.to_lowercase().contains("json") || err.to_lowercase().contains("anyval")),
         "expected a Json->Person type error, got:\n{}",
         err
     );
@@ -12402,7 +12402,7 @@ type Person = { "name": String, "age": Int32 }
 val p: Person = readJson("p.json")
 "#);
     assert!(
-        err.contains("Person") || err.contains("4294967295") || err.to_lowercase().contains("json"),
+        err.contains("Person") || err.contains("4294967295") || (err.to_lowercase().contains("json") || err.to_lowercase().contains("anyval")),
         "expected a Json call-result -> Person type error, got:\n{}",
         err
     );
@@ -12418,7 +12418,7 @@ val getJson = (): Json => { "name": "Bob", "age": 30 }
 val p: Person = getJson()
 "#);
     assert!(
-        err.contains("Person") || err.contains("4294967295") || err.to_lowercase().contains("json"),
+        err.contains("Person") || err.contains("4294967295") || (err.to_lowercase().contains("json") || err.to_lowercase().contains("anyval")),
         "expected a local Json call-result -> Person type error, got:\n{}",
         err
     );
@@ -12433,7 +12433,7 @@ val j: Json = { "name": "Bob", "age": 30 }
 val r = greet(j)
 "#);
     assert!(
-        err.contains("Person") || err.contains("4294967295") || err.to_lowercase().contains("json"),
+        err.contains("Person") || err.contains("4294967295") || (err.to_lowercase().contains("json") || err.to_lowercase().contains("anyval")),
         "expected a Json-arg type error, got:\n{}",
         err
     );
