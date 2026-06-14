@@ -19,9 +19,10 @@
 
 use crate::array::{lin_array_alloc, lin_array_push_tagged};
 use crate::fs::{make_error_tagged, make_string, resolve_lin_str};
+use crate::map::{lin_map_alloc, lin_map_set, lin_map_release};
 use crate::object::{lin_object_alloc, lin_object_set, LinObject};
 use crate::string::{lin_string_release, LinString};
-use crate::tagged::{alloc_tagged, TaggedVal, TAG_ARRAY, TAG_INT32, TAG_NULL, TAG_OBJECT, TAG_STR};
+use crate::tagged::{alloc_tagged, TaggedVal, TAG_ARRAY, TAG_INT32, TAG_MAP, TAG_NULL, TAG_OBJECT, TAG_STR};
 
 use regex::Regex;
 
@@ -62,16 +63,22 @@ fn byte_to_cp(s: &str, byte_off: usize) -> i32 {
     s[..byte_off].chars().count() as i32
 }
 
-/// Build a `Match` record as a +1-owned `*mut LinObject` from a `regex::Captures`.
+/// Build a `Match` object as a +1-owned `*mut LinObject` from a `regex::Captures`.
 /// Shape (per the proposal):
-///   { text:String, start:Int32, end:Int32, groups:(String|Null)[], named:Object }
+///   { text:String, start:Int32, end:Int32, groups:(String|Null)[], named:AnyVal }
 /// `groups[0]` is the whole match; a non-participating positional group is a genuine `Null`
-/// hole. `named` is a plain object (TAG_OBJECT) carrying only the named groups that matched —
-/// an absent named group reads back as `Null` via ordinary object indexing.
+/// hole. `named` is a LinMap (TAG_MAP) carrying only the named groups that matched —
+/// an absent named group reads back as `Null` via ordinary map indexing. `named` is stored
+/// as AnyVal in the Match type so the consumer uses the union tag-dispatch path (TAG_MAP-safe).
 ///
 /// Returns the bare object pointer (NOT a tagged wrapper): `find` boxes it once with
 /// `alloc_tagged`, while `find_all` pushes it via a stack `TaggedVal` (transfer semantics),
 /// so neither path leaks a 16-byte wrapper shell.
+///
+/// NOTE: the outer Match is TAG_OBJECT (not TAG_MAP) because the Lin `Match` type is a
+/// named record with statically-known fields, and the compiled accessor for a narrowed
+/// `m: Match` parameter calls `lin_object_get` directly (no tag dispatch). Only the `named`
+/// sub-value is typed `AnyVal` at the Lin level and therefore safely upgraded to TAG_MAP.
 unsafe fn build_match(s: &str, re: &Regex, caps: &regex::Captures) -> *mut LinObject {
     let whole = caps.get(0).expect("captures always have group 0");
     let obj = lin_object_alloc(8);
@@ -129,25 +136,27 @@ unsafe fn build_match(s: &str, re: &Regex, caps: &regex::Captures) -> *mut LinOb
     // lin_object_set retains the array payload; drop our local +1 from lin_array_alloc.
     crate::array::lin_array_release(groups);
 
-    // named: { String: String } — only the groups that participated.
-    let named = lin_object_alloc(4);
+    // named: { String: String } as LinMap (TAG_MAP) — only the groups that participated.
+    // Safe to use TAG_MAP here because `named` is typed `AnyVal` in the Lin Match record,
+    // so the consumer uses the full union tag-dispatch path (handles TAG_MAP correctly).
+    let named = lin_map_alloc(4);
     for name in re.capture_names().flatten() {
         if let Some(g) = caps.name(name) {
             let k = make_string(name);
             let tv = tagged_str(g.as_str());
-            lin_object_set(named, k, &tv);
+            lin_map_set(named, k, &tv);
             lin_string_release(k);
             lin_string_release(tv.payload as *mut LinString);
         }
     }
     let k_named = make_string("named");
     let mut tv_named: TaggedVal = std::mem::zeroed();
-    tv_named.tag = TAG_OBJECT;
+    tv_named.tag = TAG_MAP;
     tv_named.payload = named as u64;
     lin_object_set(obj, k_named, &tv_named);
     lin_string_release(k_named);
-    // lin_object_set retains the named object; drop our local +1 from lin_object_alloc.
-    crate::object::lin_object_release(named);
+    // lin_object_set retains the named map; drop our local +1 from lin_map_alloc.
+    lin_map_release(named);
 
     obj
 }
@@ -295,7 +304,7 @@ mod tests {
         p as *const TaggedVal
     }
 
-    unsafe fn obj_str(obj: *const crate::object::LinObject, key: &str) -> String {
+    unsafe fn obj_str(obj: *const LinObject, key: &str) -> String {
         let k = make_string(key);
         let tv = lin_object_get(obj, k);
         lin_string_release(k);
@@ -306,7 +315,7 @@ mod tests {
         std::str::from_utf8(slice).unwrap().to_owned()
     }
 
-    unsafe fn obj_i32(obj: *const crate::object::LinObject, key: &str) -> i32 {
+    unsafe fn obj_i32(obj: *const LinObject, key: &str) -> i32 {
         let k = make_string(key);
         let tv = lin_object_get(obj, k);
         lin_string_release(k);
@@ -339,7 +348,7 @@ mod tests {
 
             let m = lin_regex_find(h, lin_str("  hello world"));
             assert_eq!((*tv(m)).tag, TAG_OBJECT);
-            let obj = (*tv(m)).payload as *const crate::object::LinObject;
+            let obj = (*tv(m)).payload as *const LinObject;
             assert_eq!(obj_str(obj, "text"), "hello");
             assert_eq!(obj_i32(obj, "start"), 2);
             assert_eq!(obj_i32(obj, "end"), 7);
@@ -353,7 +362,7 @@ mod tests {
             let h = lin_regex_compile(lin_str("café"));
             // "a café here": 'café' starts at codepoint 2 (bytes 2), ends at codepoint 6.
             let m = lin_regex_find(h, lin_str("a café here"));
-            let obj = (*tv(m)).payload as *const crate::object::LinObject;
+            let obj = (*tv(m)).payload as *const LinObject;
             assert_eq!(obj_str(obj, "text"), "café");
             assert_eq!(obj_i32(obj, "start"), 2);
             assert_eq!(obj_i32(obj, "end"), 6);
@@ -362,7 +371,7 @@ mod tests {
             // An emoji before the match shifts codepoint vs byte offsets apart.
             let h2 = lin_regex_compile(lin_str("end"));
             let m2 = lin_regex_find(h2, lin_str("🎉 the end"));
-            let obj2 = (*tv(m2)).payload as *const crate::object::LinObject;
+            let obj2 = (*tv(m2)).payload as *const LinObject;
             // "🎉 the " = codepoints: 🎉(1) space(2) t(3)h(4)e(5) space(6) -> "end" at cp 6.
             assert_eq!(obj_i32(obj2, "start"), 6);
             assert_eq!(obj_i32(obj2, "end"), 9);
