@@ -35,10 +35,22 @@ print(scores[42] ?? "null")
 
 // --- Use as a sparse frequency accumulator ---
 var freq: { Int32: Int32 } = {}
-val data = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5]
+val data = [
+  3,
+  1,
+  4,
+  1,
+  5,
+  9,
+  2,
+  6,
+  5,
+  3,
+  5
+]
 range(0, length(data)).for(i =>
-    val v = data[i]
-    freq[v] = (freq[v] ?? 0) + 1
+  val v = data[i]
+  freq[v] = (freq[v] ?? 0) + 1
 )
 
 print(toString(freq[5] ?? 0))
