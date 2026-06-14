@@ -87,7 +87,7 @@ impl Checker {
                 // Phase 4.5b: an INTERMEDIATE `val result = lin_array_allocate(n)` inside a
                 // combinator whose declared return is `Array(elem)`. `infer_function` set
                 // `array_alloc_elem_hint = Some((result, elem))` for exactly this binding. Check
-                // the fresh allocation against `Array(elem)` so its Json-wildcard element type is
+                // the fresh allocation against `Array(elem)` so its AnyVal-wildcard element type is
                 // refined to the declared element (the generic param `U`). Monomorphization then
                 // pins `Array(U)` to a concrete `Array(Int32)` and codegen emits a flat allocation
                 // matching the flat reader. Gated to the allocation intrinsic (see the helper).
