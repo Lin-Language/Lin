@@ -1912,60 +1912,6 @@ impl<'ctx> Codegen<'ctx> {
             .try_as_basic_value().unwrap_basic()
     }
 
-    /// Emit (and cache) a per-sealed-type element materializer thunk `(payload_ptr) -> *LinObject`:
-    /// reads each field from the HEADER-LESS element payload (struct offset minus `SEALED_HEADER`),
-    /// boxes it, and `object_set_fresh`'s it under the interned key — producing a fresh +1 boxed
-    /// object. Mirrors `sealed_materialize_to_object` but the source is a payload pointer, not a
-    /// standalone struct. Scalar-only (Stage 3): no per-field RC to balance (the boxed scalar shell
-    /// is reclaimed by object_set_fresh's retain + a tagged_release).
-    fn sealed_array_elem_materializer(&mut self, fields: &indexmap::IndexMap<String, Type>) -> inkwell::values::FunctionValue<'ctx> {
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let i64_ty = self.context.i64_type();
-        let i32_ty = self.context.i32_type();
-        // Cache key by the field layout (offsets + types reflected via stride + names).
-        let key = format!("__sealedarrmat_{}_{}",
-            Self::sealed_array_stride(fields),
-            fields.iter().map(|(k, t)| format!("{}_{:?}", k, Self::type_tag(t))).collect::<Vec<_>>().join("_"));
-        if let Some(f) = self.module.get_function(&key) {
-            return f;
-        }
-        // Save the current insertion point; the thunk is a separate function.
-        let saved_block = self.builder.get_insert_block();
-        let fn_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
-        let func = self.module.add_function(&key, fn_ty, None);
-        let entry = self.context.append_basic_block(func, "entry");
-        self.builder.position_at_end(entry);
-        let payload = func.get_nth_param(0).unwrap().into_pointer_value();
-        let new_obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(fields.len() as u64, false).into()], "smat_obj")
-            .try_as_basic_value().unwrap_basic().into_pointer_value();
-        for (k, fty) in fields.iter() {
-            let (off, _) = Self::sealed_field_layout(fields, k);
-            let payload_off = off - Self::SEALED_HEADER;
-            let llvm_fld = self.llvm_type(fty);
-            let p = unsafe { self.builder.gep(self.context.i8_type(), payload, &[i64_ty.const_int(payload_off, false)], "smat_fld_p") };
-            let loaded = self.builder.load(llvm_fld, p, "smat_fld");
-            // SCALAR-ONLY: this materializer is reached only via `sealed_array_to_tagged`, whose
-            // `fields` come from `sealed_array_elem` — the scalar-only packed-array gate
-            // (`is_sealed_array_field_packable` = scalar||Bool). So `sealed_field_kind(fty)` is always
-            // `None` here (no heap field can reach a packed 0xFE array); `box_value` boxes the scalar in
-            // a cache-safe shell. The former `is_heap` arms (fresh-owned / borrowed-shell release) were
-            // for the retired heap-field-array direction and never emitted — removed (the live twin
-            // `sealed_materialize_to_object` keeps the heap arms for nested heap RECORD fields).
-            let boxed = self.box_value(loaded, fty);
-            let key_str = self.compile_string_lit(k).into_pointer_value();
-            self.builder.call(self.rt.object_set_fresh, &[new_obj.into(), key_str.into(), boxed.into()], "");
-            if boxed.is_pointer_value() {
-                // Scalar field: reclaim the cache-safe box shell (no inner heap).
-                self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
-            }
-        }
-        self.builder.build_return(Some(&new_obj)).unwrap();
-        if let Some(b) = saved_block {
-            self.builder.position_at_end(b);
-        }
-        func
-    }
-
     /// Load element `idx` of a pointer-backed sealed-record array as an owned (+1) sealed struct
     /// pointer. For Stage 1 pointer-backed arrays (0xFD), `arr[i]` loads the 8-byte struct pointer
     /// from the data buffer and retains it (+1 rc). The caller receives an independent +1 ownership
