@@ -4,20 +4,73 @@
 //! catastrophic for dictionary-shaped ones — see ADR-055 / spec §5.1.1).
 //!
 //! Backing representation: a single open-addressing (linear-probing) hash table. Each occupied
-//! slot stores `(key: *mut LinString, value: TaggedVal)`. Values are boxed inside the 16-byte
-//! `TaggedVal` exactly like `LinObject` entries, so the refcount discipline (retain on store,
-//! release on overwrite/free) is byte-for-byte the proven `object.rs` discipline — only the
-//! *lookup* changes from a linear scan to a hash probe. (Unboxing scalar values is a documented
-//! follow-up; boxed-but-hashed already delivers the O(1) headline win safely.)
+//! slot stores `(hash: u64, key: *mut LinString, value: TaggedVal)`. The stored hash acts as a
+//! cheap first-comparison filter in `find_slot`: when the probe's hash doesn't match the lookup
+//! key's hash, `key_eq` (which dereferences the key pointer — a cache miss) is skipped entirely.
+//! Empty slots are identified by `key == null`; their `hash` field is ignored. The hash is
+//! FNV-1a over the key bytes; a collision in the lower/upper bits is handled gracefully because
+//! `key_eq` is the authoritative check and is always called on a hash match.
+//!
+//! Values are boxed inside the 16-byte `TaggedVal` exactly like `LinObject` entries, so the
+//! refcount discipline (retain on store, release on overwrite/free) is byte-for-byte the proven
+//! `object.rs` discipline — only the *lookup* changes from a linear scan to a hash probe.
 //!
 //! A distinct container (rather than retrofitting a hash side-index onto `LinObject`) deliberately
 //! sidesteps the inline `MakeObject` codegen ABI constraint (`LinObject` entries GEP'd at
 //! `entries@16`, 24-byte stride). `LinMap` is opaque to codegen — every access goes through these
 //! FFI functions.
+//!
+//! ## LIN_MAP_PROFILE (env-gated, zero overhead when unset)
+//! When `LIN_MAP_PROFILE=1`, atomic counters track:
+//!   MAP_GETS      — total lin_map_get calls
+//!   HASH_SKIPS    — probe steps skipped by hash mismatch (no key_eq call)
+//!   KEY_EQ_CALLS  — probe steps where key_eq was called (hash matched or slot empty)
+//!   KEY_EQ_MISS   — key_eq called + returned false (key content mismatch on hash collision)
+//! These are printed to stderr at process exit.
 
 use std::alloc::{alloc, dealloc, Layout};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::string::{LinString, lin_string_inc_ref, lin_string_release, IMMORTAL_RC};
 use crate::tagged::{TaggedVal, TAG_NULL};
+
+// ── Profiling counters (env-gated, zero cost when disabled) ─────────────────────────────────
+static MAP_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+static MAP_GETS: AtomicU64 = AtomicU64::new(0);
+static MAP_HASH_SKIPS: AtomicU64 = AtomicU64::new(0);
+static MAP_KEY_EQ_CALLS: AtomicU64 = AtomicU64::new(0);
+static MAP_KEY_EQ_MISS: AtomicU64 = AtomicU64::new(0);
+
+fn ensure_map_profile_init() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if std::env::var("LIN_MAP_PROFILE").as_deref() == Ok("1") {
+            MAP_PROFILE_ENABLED.store(true, Ordering::Relaxed);
+            unsafe { libc::atexit(map_profile_atexit); }
+        }
+    });
+}
+
+extern "C" fn map_profile_atexit() {
+    lin_map_profile_print();
+}
+
+#[no_mangle]
+pub extern "C" fn lin_map_profile_print() {
+    if MAP_PROFILE_ENABLED.load(Ordering::Relaxed) {
+        let gets = MAP_GETS.load(Ordering::Relaxed);
+        let skips = MAP_HASH_SKIPS.load(Ordering::Relaxed);
+        let eq_calls = MAP_KEY_EQ_CALLS.load(Ordering::Relaxed);
+        let eq_miss = MAP_KEY_EQ_MISS.load(Ordering::Relaxed);
+        let total_probes = skips + eq_calls;
+        let probes_per_get = if gets > 0 { total_probes as f64 / gets as f64 } else { 0.0 };
+        eprintln!(
+            "MAP_PROFILE: gets={gets} total_probe_steps={total_probes} probes/get={probes_per_get:.2} \
+             hash_skips={skips} ({:.1}%) key_eq_calls={eq_calls} key_eq_miss={eq_miss}",
+            if total_probes > 0 { skips as f64 / total_probes as f64 * 100.0 } else { 0.0 },
+        );
+    }
+}
 
 /// A hashed String-keyed map. `slots` points at `cap` `Slot`s (cap is always a power of two).
 #[repr(C)]
@@ -29,8 +82,16 @@ pub struct LinMap {
     pub slots: *mut Slot,
 }
 
+/// Each slot stores the full 64-bit FNV hash inline so probe steps can skip `key_eq`
+/// (a pointer dereference — cache miss) whenever hashes differ.
+/// Empty slot: `key == null` (hash is ignored for empty slots, left as zero).
 #[repr(C)]
 pub struct Slot {
+    /// FNV-1a hash of the key's bytes. Zero means empty when `key` is also null (unambiguous
+    /// because we check `key.is_null()` first). For an occupied slot this is the precomputed hash,
+    /// so a probe step reads this u64 (hot — same cache line as the slot itself) before deciding
+    /// whether to dereference `key` for `key_eq`.
+    pub hash: u64,
     /// null = empty slot. (No tombstones: this map has no delete operation.)
     pub key: *mut LinString,
     pub value: TaggedVal,
@@ -57,15 +118,15 @@ unsafe fn slots_layout(cap: u32) -> Layout {
     )
 }
 
-/// Allocate a zeroed slot table of `cap` slots (every slot empty: key = null).
+/// Allocate a zeroed slot table of `cap` slots (every slot empty: key = null, hash = 0).
 unsafe fn alloc_slots(cap: u32) -> *mut Slot {
     let buf = alloc(slots_layout(cap)) as *mut Slot;
-    // Zero the whole buffer: key = null (empty), value = {tag 0, payload 0}.
     std::ptr::write_bytes(buf as *mut u8, 0, slots_layout(cap).size());
     buf
 }
 
 /// FNV-1a hash over the key bytes.
+#[inline]
 unsafe fn hash_key(key: *const LinString) -> u64 {
     if key.is_null() {
         return 0;
@@ -81,6 +142,7 @@ unsafe fn hash_key(key: *const LinString) -> u64 {
     h
 }
 
+#[inline]
 unsafe fn key_eq(a: *const LinString, b: *const LinString) -> bool {
     if a == b {
         return true;
@@ -108,23 +170,59 @@ pub unsafe extern "C" fn lin_map_alloc(_hint: u32) -> *mut LinMap {
     ptr
 }
 
-/// Probe for `key`, returning the index of the matching slot or, if absent, the first empty slot
-/// where it would be inserted. Requires cap > 0 and at least one empty slot (load factor < 1).
-unsafe fn find_slot(map: *const LinMap, key: *const LinString) -> usize {
+/// Probe for `key` with precomputed `khash`, returning the index of the matching slot or, if
+/// absent, the first empty slot where it would be inserted. Requires cap > 0 and at least one
+/// empty slot (load factor < 1).
+///
+/// Probe step logic (inner-loop fast path):
+///   1. Read `slot.key` (always a hot load — same cache line as `slot.hash` in a 32-byte slot).
+///   2. If `key == null` → empty slot: return (insertion point or miss).
+///   3. If `slot.hash != khash` → different key by hash: skip `key_eq` entirely (saves the
+///      dereference of the stored key pointer, a probable cache miss for a scattered map).
+///   4. `key_eq` only on hash match: the full byte compare, which may deref both key pointers.
+#[inline]
+unsafe fn find_slot(map: *const LinMap, key: *const LinString, khash: u64) -> usize {
     let cap = (*map).cap as usize;
     let mask = cap - 1;
-    let mut idx = (hash_key(key) as usize) & mask;
-    // Bound the probe to `cap` steps. `lin_map_set` keeps the load factor < 1 (`over_load`), so a
-    // well-formed map always has an empty slot and this terminates on the null-key check well
-    // before the bound. The bound is DEFENSIVE: a wrong-tag pointer reaching here (e.g. a LinObject
-    // misread as a LinMap before the codegen tag-dispatch was added) would otherwise spin forever
-    // on a table with no null slot. Returning the last probed index degrades to a miss/overwrite
-    // rather than an infinite loop — a contained failure, not a hang.
+    let mut idx = (khash as usize) & mask;
+    // Bound: defensive against a degenerate full table (same as before).
     for _ in 0..cap {
         let slot = (*map).slots.add(idx);
-        if (*slot).key.is_null() || key_eq((*slot).key, key) {
+        let slot_key = (*slot).key;
+        if slot_key.is_null() {
+            return idx; // empty → insertion point or miss
+        }
+        if (*slot).hash == khash && key_eq(slot_key, key) {
+            return idx; // found
+        }
+        idx = (idx + 1) & mask;
+    }
+    idx
+}
+
+/// Instrumented variant of find_slot — identical logic but bumps the profiling counters.
+#[cold]
+unsafe fn find_slot_profiled(map: *const LinMap, key: *const LinString, khash: u64) -> usize {
+    let cap = (*map).cap as usize;
+    let mask = cap - 1;
+    let mut idx = (khash as usize) & mask;
+    for _ in 0..cap {
+        let slot = (*map).slots.add(idx);
+        let slot_key = (*slot).key;
+        if slot_key.is_null() {
+            MAP_KEY_EQ_CALLS.fetch_add(1, Ordering::Relaxed); // null check counts as key_eq work
             return idx;
         }
+        if (*slot).hash != khash {
+            MAP_HASH_SKIPS.fetch_add(1, Ordering::Relaxed);
+            idx = (idx + 1) & mask;
+            continue;
+        }
+        MAP_KEY_EQ_CALLS.fetch_add(1, Ordering::Relaxed);
+        if key_eq(slot_key, key) {
+            return idx;
+        }
+        MAP_KEY_EQ_MISS.fetch_add(1, Ordering::Relaxed);
         idx = (idx + 1) & mask;
     }
     idx
@@ -145,10 +243,12 @@ unsafe fn grow(map: *mut LinMap) {
         if (*src).key.is_null() {
             continue;
         }
-        let mut idx = (hash_key((*src).key) as usize) & mask;
+        // Re-use the stored hash — no need to recompute FNV on grow.
+        let mut idx = ((*src).hash as usize) & mask;
         loop {
             let dst = new_slots.add(idx);
             if (*dst).key.is_null() {
+                (*dst).hash = (*src).hash;
                 (*dst).key = (*src).key;
                 std::ptr::copy_nonoverlapping(&(*src).value, &mut (*dst).value, 1);
                 break;
@@ -171,10 +271,12 @@ pub unsafe extern "C" fn lin_map_set(map: *mut LinMap, key: *mut LinString, val:
     if (*map).cap == 0 || over_load((*map).len + 1, (*map).cap) {
         grow(map);
     }
-    let idx = find_slot(map, key);
+    let khash = hash_key(key);
+    let idx = find_slot(map, key, khash);
     let slot = (*map).slots.add(idx);
     if (*slot).key.is_null() {
-        // Fresh insert.
+        // Fresh insert: store hash + key + value.
+        (*slot).hash = khash;
         lin_string_inc_ref(key);
         (*slot).key = key;
         std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
@@ -194,7 +296,14 @@ pub unsafe extern "C" fn lin_map_get(map: *const LinMap, key: *const LinString) 
     if map.is_null() || (*map).cap == 0 || (*map).len == 0 {
         return std::ptr::null();
     }
-    let idx = find_slot(map, key);
+    let khash = hash_key(key);
+    let idx = if MAP_PROFILE_ENABLED.load(Ordering::Relaxed) {
+        ensure_map_profile_init();
+        MAP_GETS.fetch_add(1, Ordering::Relaxed);
+        find_slot_profiled(map, key, khash)
+    } else {
+        find_slot(map, key, khash)
+    };
     let slot = (*map).slots.add(idx);
     if (*slot).key.is_null() {
         std::ptr::null()
