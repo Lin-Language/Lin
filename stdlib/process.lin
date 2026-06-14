@@ -185,5 +185,7 @@ export val loadAverage = (): Float64[] | Error =>
 //   semantics vary across operating systems — a rough capacity gauge, not exact.
 export val memInfo = (): MemInfo | Error =>
   val r = lin_os_mem_info()
-  if r is Error then { "type": r["type"], "message": r["message"] }
-  else { "total": r["total"], "free": r["free"] }
+  if r is Error then
+    { "type": r["type"], "message": r["message"] }
+  else
+    { "total": r["total"], "free": r["free"] }

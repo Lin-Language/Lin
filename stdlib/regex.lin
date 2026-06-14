@@ -32,8 +32,10 @@ import foreign "lin-runtime"
 //          backreference or lookaround construct.
 export val compile = (pattern: String): Regex | Error =>
   val r = lin_regex_compile(pattern)
-  if r is Error then { "type": r["type"], "message": r["message"] }
-  else r
+  if r is Error then
+    { "type": r["type"], "message": r["message"] }
+  else
+    r
 
 // Test whether `re` matches anywhere within `s`. Cheapest operation; allocates no Match.
 // @param re  the compiled pattern.
@@ -87,5 +89,7 @@ export val split = (re: Regex, s: String): String[] =>
 // @returns true if `pattern` matches `s`, or the compile Error if `pattern` is invalid.
 export val matches = (pattern: String, s: String): Boolean | Error =>
   val re = compile(pattern)
-  if re is Error then re
-  else isMatch(re, s)
+  if re is Error then
+    re
+  else
+    isMatch(re, s)
