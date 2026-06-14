@@ -1,8 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use crate::string::{LinString, lin_string_from_bytes, lin_string_release};
 use crate::fs::{make_string, make_error_tagged, resolve_lin_str};
-use crate::object::{lin_object_alloc, lin_object_set, LinObject};
-use crate::tagged::{lin_box_int64, TaggedVal, TAG_INT32, TAG_OBJECT, alloc_tagged};
+use crate::map::{lin_map_alloc, lin_map_set};
+use crate::tagged::{lin_box_int64, TaggedVal, TAG_INT32, TAG_MAP, alloc_tagged};
 
 /// Current Unix timestamp in milliseconds.
 #[no_mangle]
@@ -432,22 +432,19 @@ pub unsafe extern "C" fn lin_time_parse(s: *const u8, pattern: *const u8) -> *mu
 // ---------------------------------------------------------------------------
 
 /// Set an Int32 field (key -> value) on an object, balancing the key reference.
-/// Int32 is a scalar held inline in the TaggedVal payload (no value RC), so only
-/// the freshly-made key string needs releasing after `lin_object_set` retains it.
-unsafe fn set_int32(obj: *mut LinObject, key: &str, val: i32) {
+unsafe fn map_set_int32(map: *mut crate::map::LinMap, key: &str, val: i32) {
     let k = make_string(key);
     let mut tv: TaggedVal = std::mem::zeroed();
     tv.tag = TAG_INT32;
     tv.payload = val as i64 as u64;
-    lin_object_set(obj, k, &tv); // retains k, copies the scalar tv
-    lin_string_release(k); // drop our local +1; object owns its own key ref
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
 }
 
-/// components: (ts_ms: Int64) => Json (object). Decompose a Unix-millisecond
-/// instant into its UTC calendar fields. Never fails: every Int64 is a valid
-/// instant. Uses floor division so negative (pre-1970) timestamps decompose
-/// correctly. month 1-12, day 1-31, hour 0-23, minute/second 0-59, millis 0-999,
-/// weekday 0=Sunday..6=Saturday, yearDay 1-366.
+/// components: (ts_ms: Int64) => AnyVal. Decompose a Unix-millisecond instant into UTC calendar
+/// fields. Never fails: every Int64 is a valid instant. Uses floor division so negative
+/// (pre-1970) timestamps decompose correctly. month 1-12, day 1-31, hour 0-23,
+/// minute/second 0-59, millis 0-999, weekday 0=Sunday..6=Saturday, yearDay 1-366.
 #[no_mangle]
 pub unsafe extern "C" fn lin_time_components(ms: i64) -> *mut u8 {
     let days = div_floor(ms, 86_400_000);
@@ -462,17 +459,17 @@ pub unsafe extern "C" fn lin_time_components(ms: i64) -> *mut u8 {
     let weekday = weekday_from_days(days);
     let year_day = days - days_from_civil(year, 1, 1) + 1;
 
-    let obj = lin_object_alloc(9);
-    set_int32(obj, "year", year as i32);
-    set_int32(obj, "month", month as i32);
-    set_int32(obj, "day", day as i32);
-    set_int32(obj, "hour", hour as i32);
-    set_int32(obj, "minute", minute as i32);
-    set_int32(obj, "second", second as i32);
-    set_int32(obj, "millis", millis as i32);
-    set_int32(obj, "weekday", weekday as i32);
-    set_int32(obj, "yearDay", year_day as i32);
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    let map = lin_map_alloc(9);
+    map_set_int32(map, "year", year as i32);
+    map_set_int32(map, "month", month as i32);
+    map_set_int32(map, "day", day as i32);
+    map_set_int32(map, "hour", hour as i32);
+    map_set_int32(map, "minute", minute as i32);
+    map_set_int32(map, "second", second as i32);
+    map_set_int32(map, "millis", millis as i32);
+    map_set_int32(map, "weekday", weekday as i32);
+    map_set_int32(map, "yearDay", year_day as i32);
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
 /// from_components: (year, month, day, hour, minute, second, millis: Int32)
