@@ -275,7 +275,7 @@ pub unsafe extern "C" fn lin_os_mem_info() -> *mut u8 {
     if total == 0 {
         return make_error_tagged("memInfo: cannot read system memory");
     }
-    let map = lin_map_alloc(4);
+    let map = lin_map_alloc(4, 0);
     map_set_int64(map, "total", total as i64);
     map_set_int64(map, "free", free as i64);
     alloc_tagged(TAG_MAP, map as u64)

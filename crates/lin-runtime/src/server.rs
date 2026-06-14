@@ -31,7 +31,7 @@ pub unsafe extern "C" fn lin_server_path_match(
         return std::ptr::null_mut();
     }
 
-    let map = lin_map_alloc(4);
+    let map = lin_map_alloc(4, 0);
     for (pp, tp) in pat_parts.iter().zip(path_parts.iter()) {
         if let Some(param_name) = pp.strip_prefix(':') {
             let key = make_string(param_name);
@@ -169,7 +169,7 @@ fn read_request(stream: &mut TcpStream) -> Option<(Vec<u8>, usize)> {
 /// Build an HttpRequest map `{ method, path, query, headers, body }` as an owned
 /// `TaggedVal*(Map)`. Mirrors the `{ status, headers, body }` construction in `http.rs`.
 unsafe fn build_request_object(req: &ParsedRequest) -> *mut u8 {
-    let map = lin_map_alloc(5);
+    let map = lin_map_alloc(5, 0);
 
     let set_str = |m: *mut LinMap, key: &str, val: &str| {
         let k = make_string(key);
@@ -187,7 +187,7 @@ unsafe fn build_request_object(req: &ParsedRequest) -> *mut u8 {
     set_str(map, "query", &req.query);
 
     // headers: nested map of String -> String
-    let headers_map = lin_map_alloc(req.headers.len().max(1) as u32);
+    let headers_map = lin_map_alloc(req.headers.len().max(1) as u32, 0);
     for (name, value) in &req.headers {
         set_str(headers_map, name, value);
     }

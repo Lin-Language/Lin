@@ -459,7 +459,7 @@ pub unsafe extern "C" fn lin_time_components(ms: i64) -> *mut u8 {
     let weekday = weekday_from_days(days);
     let year_day = days - days_from_civil(year, 1, 1) + 1;
 
-    let map = lin_map_alloc(9);
+    let map = lin_map_alloc(9, 0);
     map_set_int32(map, "year", year as i32);
     map_set_int32(map, "month", month as i32);
     map_set_int32(map, "day", day as i32);

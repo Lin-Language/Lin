@@ -128,7 +128,7 @@ unsafe fn map_set_str(map: *mut crate::map::LinMap, key: &str, val: &str) {
 
 /// Build a `{ "len": Int32, "addr": String, "port": Int32 }` LinMap box (TAG_MAP).
 unsafe fn make_len_addr_port(len: i32, addr: &str, port: i32) -> *mut u8 {
-    let map = lin_map_alloc(4);
+    let map = lin_map_alloc(4, 0);
     map_set_int32(map, "len", len);
     map_set_str(map, "addr", addr);
     map_set_int32(map, "port", port);
@@ -137,7 +137,7 @@ unsafe fn make_len_addr_port(len: i32, addr: &str, port: i32) -> *mut u8 {
 
 /// Build a `{ "fd": Int32, "addr": String, "port": Int32 }` LinMap box (TAG_MAP).
 unsafe fn make_fd_addr_port(fd: i32, addr: &str, port: i32) -> *mut u8 {
-    let map = lin_map_alloc(4);
+    let map = lin_map_alloc(4, 0);
     map_set_int32(map, "fd", fd);
     map_set_str(map, "addr", addr);
     map_set_int32(map, "port", port);

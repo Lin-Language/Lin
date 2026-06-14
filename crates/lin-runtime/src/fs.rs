@@ -24,14 +24,14 @@ pub unsafe extern "C" fn lin_make_error_tagged(msg: *const LinString) -> *mut u8
 /// Build a `{ "type": "error", "message": <msg> }` LinMap box (TAG_MAP). Leg-2 canonical form
 /// so `is Error` (TAG_MAP + has "type"+"message") works via the Leg-1 infra without reconstruction.
 unsafe fn make_error_map(msg: &str) -> *mut u8 {
-    let map = map_set_str(map_set_str(lin_map_alloc(4), "type", "error"), "message", msg);
+    let map = map_set_str(map_set_str(lin_map_alloc(4, 0), "type", "error"), "message", msg);
     alloc_tagged(TAG_MAP, map as u64)
 }
 
 /// Build a `fromJson` decode error as an owned `TaggedVal*(Map)` (ADR-031). Shape:
 /// `{ "type": "error", "message": <msg>, "path": <path> }`. Returns TAG_MAP.
 pub unsafe fn make_decode_error(msg: &str, path: &str) -> *mut u8 {
-    let map = map_set_str(map_set_str(map_set_str(lin_map_alloc(4), "type", "error"), "message", msg), "path", path);
+    let map = map_set_str(map_set_str(map_set_str(lin_map_alloc(4, 0), "type", "error"), "message", msg), "path", path);
     alloc_tagged(TAG_MAP, map as u64)
 }
 
@@ -202,7 +202,7 @@ unsafe fn make_filestat(meta: &std::fs::Metadata, is_symlink: bool) -> *mut u8 {
     #[cfg(not(unix))]
     let mode: i32 = 0i32;
 
-    let map = lin_map_alloc(8);
+    let map = lin_map_alloc(8, 0);
     map_set_int64(map, "size", size);
     map_set_int64(map, "modified", modified);
     map_set_int64(map, "created", created);

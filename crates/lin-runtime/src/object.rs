@@ -467,11 +467,15 @@ pub unsafe extern "C" fn lin_union_force_to_object(tv: *const u8) -> *mut LinObj
             let len = (*map).len;
             let obj = lin_object_alloc(len.max(2));
             let cap = (*map).cap as usize;
-            for i in 0..cap {
-                let slot = (*map).slots.add(i);
-                if (*slot).key.is_null() { continue; }
-                // lin_object_set retains the key and the value's payload; key RC stays balanced.
-                lin_object_set(obj, (*slot).key, &(*slot).value);
+            // Only String-keyed maps can be converted to LinObject (Int keys have no string repr here).
+            if (*map).key_kind == crate::map::KEY_KIND_STRING {
+                for i in 0..cap {
+                    let slot = (*map).slots.add(i);
+                    if (*slot).hash == 0 { continue; } // empty slot
+                    let key_ptr = (*slot).key as *mut crate::string::LinString;
+                    // lin_object_set retains the key and the value's payload; key RC stays balanced.
+                    lin_object_set(obj, key_ptr, &(*slot).value);
+                }
             }
             obj
         }
@@ -1511,7 +1515,7 @@ mod tests {
         unsafe {
             use crate::array::{lin_array_length, lin_array_get_tagged};
             use crate::map::{lin_map_alloc, lin_map_get, lin_map_release};
-            let map = lin_map_alloc(2); // the `var result: { String: T[] } = {}`
+            let map = lin_map_alloc(2, 0); // the `var result: { String: T[] } = {}`
             let map_box = alloc_tagged(TAG_MAP, map as u64); // map crosses as a boxed value
             let even = crate::string::lin_string_from_bytes("even".as_ptr(), 4);
             let odd = crate::string::lin_string_from_bytes("odd".as_ptr(), 3);

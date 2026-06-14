@@ -250,7 +250,7 @@ pub unsafe extern "C" fn lin_url_parse(s: *const u8) -> *mut u8 {
         Err(e) => return make_error_tagged(&format!("invalid URL: {e}")),
     };
 
-    let map = lin_map_alloc(8);
+    let map = lin_map_alloc(8, 0);
     set_str_field(map, "scheme", &parts.scheme);
     set_opt_str_field(map, "userinfo", &parts.userinfo);
     // host is always a String (possibly ""), but when there is no authority it must be "".
