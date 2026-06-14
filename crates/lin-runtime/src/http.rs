@@ -1,56 +1,50 @@
 /// HTTP fetch intrinsics for compiled Lin programs.
 use crate::fs::{make_string, resolve_lin_str};
-use crate::tagged::{TAG_INT32, TAG_STR, TAG_OBJECT, alloc_tagged};
-use crate::object::{lin_object_alloc, lin_object_set, tagged_as_object};
+use crate::map::{lin_map_alloc, lin_map_set};
+use crate::string::lin_string_release;
+use crate::tagged::{TAG_INT32, TAG_STR, TAG_MAP, alloc_tagged};
+use crate::object::tagged_as_object;
 use crate::tagged::TaggedVal;
 
+unsafe fn map_set_str(map: *mut crate::map::LinMap, key: &str, val: &str) {
+    let k = make_string(key);
+    let v = make_string(val);
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_STR;
+    tv.payload = v as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
+    lin_string_release(v);
+}
+
 unsafe fn make_response_object(status: u16, body: &str) -> *mut u8 {
-    let obj = lin_object_alloc(4);
+    let map = lin_map_alloc(4);
 
     // status field (Int32)
-    let status_key = make_string("status");
-    let mut status_tv: TaggedVal = std::mem::zeroed();
-    status_tv.tag = TAG_INT32;
-    status_tv.payload = status as i32 as i64 as u64;
-    lin_object_set(obj, status_key, &status_tv);
+    let k = make_string("status");
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_INT32;
+    tv.payload = status as i32 as i64 as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
 
-    // headers field (empty object)
-    let headers_obj = lin_object_alloc(1);
-    let headers_key = make_string("headers");
-    let mut headers_tv: TaggedVal = std::mem::zeroed();
-    headers_tv.tag = TAG_OBJECT;
-    headers_tv.payload = headers_obj as u64;
-    lin_object_set(obj, headers_key, &headers_tv);
+    // headers field (empty LinMap — typed as { String: String })
+    let headers_map = lin_map_alloc(1);
+    let k = make_string("headers");
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_MAP;
+    tv.payload = headers_map as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
 
     // body field (Str)
-    let body_str = make_string(body);
-    let body_key = make_string("body");
-    let mut body_tv: TaggedVal = std::mem::zeroed();
-    body_tv.tag = TAG_STR;
-    body_tv.payload = body_str as u64;
-    lin_object_set(obj, body_key, &body_tv);
+    map_set_str(map, "body", body);
 
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
 unsafe fn make_error_object(msg: &str) -> *mut u8 {
-    let obj = lin_object_alloc(2);
-
-    let type_key = make_string("type");
-    let type_val = make_string("error");
-    let mut type_tv: TaggedVal = std::mem::zeroed();
-    type_tv.tag = TAG_STR;
-    type_tv.payload = type_val as u64;
-    lin_object_set(obj, type_key, &type_tv);
-
-    let msg_key = make_string("message");
-    let msg_val = make_string(msg);
-    let mut msg_tv: TaggedVal = std::mem::zeroed();
-    msg_tv.tag = TAG_STR;
-    msg_tv.payload = msg_val as u64;
-    lin_object_set(obj, msg_key, &msg_tv);
-
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    crate::fs::make_error_tagged(msg)
 }
 
 /// HTTP GET fetch. url is a LinString* or TaggedVal*(Str).
