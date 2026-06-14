@@ -1,19 +1,21 @@
 # Project: Actually Improve Performance — the representation reset
 
-**Status:** IN PROGRESS on the `reset/main` project branch (§6 branch policy).
-- **Stage 0 — DONE, on master** (test pins `test_reset_pin_*`, scan sentinel, baselines appendix; plus
-  the bare-record-map-value crash fix `650c07d5` it uncovered).
-- **Stage 1 — DONE, on `reset/main`**: D5 share-on-push via 0xFD pointer-backed record arrays
-  (all-scalar class); D3a anonymous-param monomorphisation (share-on-pass); D3b non-param slot
-  project-copy. Side wins on master: the monomorphisation inner-closure LLVM symbol-collision fix
-  (`b5ccb64b` — cured the long-standing cross-module generic worker-transfer crash). Stage-1 ledger:
-  typed RAPTOR −4.7% vs baseline (digest exact), `records` ≡ master, scan sentinel ~1.9× (the §5.6
-  lever remains available); suites green. The repr.rs boxed-arm removal was re-sequenced into Stage 2.
-- **Stage 2 — IN PROGRESS**: leg 2a (heap-field record arrays → 0xFD) hit the documented
-  `{String: T[]}` map-value seam; direction decided: the `??` coalesce join PRESERVES Packed for
-  sealed arrays (hot path stays 0xFD-native) + generic LinArray runtime fns gain tag-dispatching
-  0xFD arms via the named descriptor (sound safety net, 0xFE precedent). A record-taint/forced-Boxed
-  pass was rejected (re-introduces the flow-sensitive reconciliation this project deletes).
+**Status:** ARCHITECTURE COMPLETE — merging `reset/main` → `master` (2026-06-14). See **§0.1 As-built
+status** for the full picture; the one-line version: the reset delivered the target architecture and is
+at **~parity** on RAPTOR wall-clock, and the decisive profile (§0.1) proves the real perf lever is the
+**call/value axis — a separate project**, not representation. Stages landed on `reset/main`:
+- **Stage 0–4 + 6a — DONE/MERGED** (`reset/main` @ `f37a938d`): packed sealed records as the sole
+  record representation (0xFD pointer-backed arrays), `T|Null` = `Layout::NullableRecord` (nullable
+  sealed pointer, no materialize), `A|B` = tag+payload, `TAG_RECORD`/`AnyVal` runtime-tagged dispatch
+  (no flow-sensitive repr oracle — the path-9 trap is gone), `repr.rs` collapsed to a **pure layout
+  calculator**, RC repointed (Stage 4 — RC already elided on the final repr), and Stage-6a dead-code
+  deletion (−135 lines; the D8 "typed-record boxed shadow" was found to have **never been implemented**,
+  so there was nothing to delete there). Plus a map `get` hash-filter (`Slot` 24→32B, skip `key_eq` on
+  hash mismatch) for a modest **~1.5%**.
+- **Stage 6b — NOT STARTED**: the `.lin` `Json→AnyVal` migration + the remaining `LinObject` runtime
+  deletion (object.rs string storage + ~15 cold `TAG_OBJECT` producers, still load-bearing). Wide,
+  mechanical, parallelizable; carries the http-500-class consumer-breakage risk.
+- **Closing — IN PROGRESS**: this doc + spec/ADR to as-built; honest re-measure (this file's §0.1).
 **Author:** drafted with Claude, 2026-06-12, from the post-RAPTOR performance retrospective.
 **Prerequisite read:** `docs/PERFORMANCE.md` (§2 typed-vs-Json RAPTOR), `docs/DECISIONS.md`
 (ADR-057 sealed records, ADR-062 representation inference, ADR-064 SumNode), `docs/SPECIFICATION.md`
@@ -38,6 +40,61 @@ exist. The typed-vs-Go gap then closes as a *consequence* of drawing three clean
 hashmaps, and a dynamic value type — rather than as a perpetual fight.
 
 ---
+
+## 0.1 As-built status and honest verdict (2026-06-14)
+
+The architecture in this document was **built and merged** to `reset/main` (Stages 0–4 + 6a). What it
+delivered, and what it did *not*:
+
+**Delivered (the architecture):** records are flat packed sealed structs with constant-offset access
+where statically typed; reference semantics preserved; `T|Null` is a nullable sealed pointer
+(`Layout::NullableRecord`) and `A|B` a tag+payload — `match` narrows to a typed pointer, no
+per-access materialize; the dynamic value is `TAG_RECORD`/`AnyVal`, **runtime-tagged** (modelled on
+`SumNode`, ADR-064) rather than reconciled by a flow-sensitive repr oracle — so the entire "path-9"
+problem space (ADR-062's occurrence-by-occurrence struct clawback) is **deleted**, and `repr.rs` is now
+a pure layout calculator. The compiler got *smaller* (−135 lines in the 6a cleanup alone; more once 6b
+removes `LinObject`). Stage 3 (record unions) — the leg that defeated three prior attempts — is solved.
+
+**NOT delivered (a wall-clock speedup):** typed RAPTOR is at **~parity** with the pre-reset baseline,
+not faster. The reason is a *measurement*, not a guess. A cycle profile (rdtsc bucket counters in
+`lin-runtime`, branch `reset/profile-e`) breaks typed-RAPTOR runtime down as:
+
+| bucket | share |
+|---|---|
+| `lin_map_get` (string-keyed) | 9.47% |
+| field lookups (`record_get_field` / `object_get`) | 3.73% |
+| `tagged_eq` | 0.80% |
+| alloc | 0.52% |
+| box/unbox | 0.45% |
+| array pointer-chase | 0.20% |
+| **`tagged_arith`** | **0.00%** (all arithmetic native/inline — typing fully worked) |
+| **everything else (~85%)** | **inline compiled code: the call/value axis — closure + loop dispatch, control flow** |
+
+So representation touches **≤ ~4%** of RAPTOR (the record-shaped reads), and the one contained
+runtime lever — `map_get` at 9.5% — is **cache-warm** in RAPTOR's small hot maps, which is why the
+hash-filter optimization measured only ~1.5%, not 9%. **The dominant cost (~85%) is the call/value
+axis**, which the representation reset does not touch. This also retires §5.6 (inline-array layout):
+the pointer-chase it targets is 0.20%.
+
+**Verdict:** ship the reset on **architecture + simplification** merits — a correct, smaller,
+path-9-free compiler with Go-style packed value layouts — *not* on a RAPTOR speedup. The next real
+performance project is the **call/value axis** (§1.1's "calls" adventure: closure/loop dispatch, the
+box/unbox boundary around calls, string slice-copies, small-object alloc), tracked separately from
+this reset.
+
+**Scoped next steps (in order):**
+1. **Stage 6b — `.lin` migration + `LinObject` deletion** (mechanical, parallelizable, one agent per
+   module). Rename `Json`→`AnyVal` across `stdlib/`/`examples/`/`benchmarks/`/`docs/`; retype the
+   genuinely-dynamic sites to `AnyVal` and the known-shape ones to records/maps; then delete the
+   runtime `LinObject` string-keyed storage and migrate the ~15 cold `TAG_OBJECT` producers
+   (fs/http/env/async error objects) to records/maps. **Risk:** a consumer reading an old
+   `TAG_OBJECT` breaks (the http-500 class that bit 6a leg-2) — gate each module on digest-exact +
+   `test_serve_real_http` + the fs/http suites; do it with oversight, not blind overnight.
+2. **Closing** — finish spec/ADR to as-built: `SPECIFICATION.md` §5.9 (records = flat packed
+   reference structs), a new ADR superseding ADR-062 (representation is type-determined via
+   `TAG_RECORD`/`NullableRecord`, no flow-sensitive inference), the five userland-visible changes
+   (§7.2), and this honest re-measure.
+3. **Separate project — the call/value axis** (the actual Go-gap lever; not part of this reset).
 
 ## 0.5 Working design decisions (D1–D8 — the direction to implement against)
 
