@@ -1,6 +1,6 @@
-use crate::string::{LinString, lin_string_from_bytes};
-use crate::object::{lin_object_alloc, lin_object_set};
-use crate::tagged::{TaggedVal, TAG_STR, alloc_tagged};
+use crate::string::{LinString, lin_string_from_bytes, lin_string_release};
+use crate::map::{lin_map_alloc, lin_map_set};
+use crate::tagged::{TaggedVal, TAG_STR, TAG_MAP, alloc_tagged};
 
 unsafe fn make_lin_string(s: &str) -> *mut LinString {
     lin_string_from_bytes(s.as_ptr(), s.len() as u32)
@@ -45,20 +45,21 @@ pub unsafe extern "C" fn lin_env_unset(name: *const LinString) {
     }
 }
 
-/// Return all environment variables as a TaggedVal*(Object) (key→string value).
+/// Return all environment variables as a TaggedVal*(LinMap) (key→string value, { String: String }).
 #[no_mangle]
 pub unsafe extern "C" fn lin_env_environ() -> *mut u8 {
-    use crate::tagged::{TAG_OBJECT, alloc_tagged};
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let cap = (vars.len().max(4)) as u32;
-    let obj = lin_object_alloc(cap);
+    let map = lin_map_alloc(cap);
     for (key, val) in &vars {
         let k = make_lin_string(key);
         let v = make_lin_string(val);
         let mut tv: TaggedVal = std::mem::zeroed();
         tv.tag = TAG_STR;
         tv.payload = v as u64;
-        lin_object_set(obj, k, &tv);
+        lin_map_set(map, k, &tv);
+        lin_string_release(k);
+        lin_string_release(v);
     }
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    alloc_tagged(TAG_MAP, map as u64)
 }
