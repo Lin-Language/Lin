@@ -332,10 +332,10 @@ mod tests {
             assert_ne!((*tv(h)).payload, 0);
 
             let bad = lin_regex_compile(lin_str("(unbalanced"));
-            assert_eq!((*tv(bad)).tag, TAG_OBJECT);
+            assert_eq!((*tv(bad)).tag, TAG_MAP);
             // backreferences rejected
             let br = lin_regex_compile(lin_str(r"(\w+)\1"));
-            assert_eq!((*tv(br)).tag, TAG_OBJECT);
+            assert_eq!((*tv(br)).tag, TAG_MAP);
         }
     }
 
