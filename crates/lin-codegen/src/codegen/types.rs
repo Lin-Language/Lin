@@ -605,9 +605,7 @@ impl<'ctx> Codegen<'ctx> {
         None
     }
 
-    /// `Some(())` shorthand: is `ty` a Stage-1-eligible unboxed sum type? (Foundation helper —
-    /// consumed once the repr seed + call ABI are wired; see `repr::type_seed`.)
-    #[allow(dead_code)]
+    /// `Some(())` shorthand: is `ty` a Stage-1-eligible unboxed sum type?
     pub(crate) fn is_sum_type(ty: &Type) -> bool {
         Self::sum_type_discriminant(ty).is_some()
     }

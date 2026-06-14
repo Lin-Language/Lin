@@ -960,13 +960,6 @@ impl FuncBuilder {
         dst
     }
 
-    #[allow(dead_code)]
-    fn copy_temp(&mut self, src: Temp, ty: Type) -> Temp {
-        let dst = self.alloc_temp(ty);
-        self.emit(Instruction::Copy { dst, src });
-        dst
-    }
-
     /// Push a new ownership scope frame.
     fn push_scope(&mut self) {
         self.scope_owned.push(Vec::new());
