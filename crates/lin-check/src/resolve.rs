@@ -179,8 +179,8 @@ fn resolve_named_cycle(
         // `AnyVal` is the dynamic top type (the former `Json` — reset §2.5, ADR-062 successor):
         // a JSON-shaped value whose shape is not statically known. `Json` is retained as a
         // deprecated alias so existing code keeps compiling; both resolve to the same wildcard.
-        "AnyVal" => Ok(json_type()),
-        "Json" => Ok(json_type()),
+        "AnyVal" => Ok(any_val_type()),
+        "Json" => Ok(any_val_type()),
         // `Error` is the conventional error value (spec §20, §24.2.2) and a structural object
         // alias (ADR-031): an object carrying a `type` discriminant and a `message`. Both the
         // async runtime (on a caught thunk fault) and `fromJson` produce this shape — the
@@ -195,10 +195,10 @@ fn resolve_named_cycle(
             Type::TypeVar(u32::MAX),
         )),
         // Iterator without type argument: use Json wildcard element type
-        "Iterator" => Ok(Type::Iterator(Box::new(json_type()))),
+        "Iterator" => Ok(Type::Iterator(Box::new(any_val_type()))),
         // Shared without a type argument: Shared<Json>. The opaque shared-mutable-state box
         // (ADR-029); only the shared/get/set/withLock accessors operate on it.
-        "Shared" => Ok(Type::Shared(Box::new(json_type()))),
+        "Shared" => Ok(Type::Shared(Box::new(any_val_type()))),
         // Stream without a type argument: Stream<Json>. The opaque pull-source (streams brief).
         // NOTE: the brief's locked decision was "not spellable in source"; we relaxed that to
         // EXACTLY the Shared precedent (a bare `Stream` annotation) so the trusted stdlib's thin
@@ -206,10 +206,10 @@ fn resolve_named_cycle(
         // an UNANNOTATED single param as an arg-position bare lambda, which is invalid at a
         // `val =` RHS. Opacity is unchanged: `compat.rs` still forbids any non-stream op on a
         // `Stream`, so naming it buys a user nothing but the type itself.
-        "Stream" => Ok(Type::Stream(Box::new(json_type()))),
+        "Stream" => Ok(Type::Stream(Box::new(any_val_type()))),
         // Promise without a type argument: Promise<Json>. The opaque async-result handle; the only
         // operation is `await` (which yields `T | Error`). Same opacity as Shared/Stream.
-        "Promise" => Ok(Type::Promise(Box::new(json_type()))),
+        "Promise" => Ok(Type::Promise(Box::new(any_val_type()))),
         // TarEntry — opaque, generation-stamped archive entry handle. Not generic.
         "TarEntry" => Ok(Type::TarEntry),
         _ => {
@@ -409,10 +409,9 @@ pub fn error_type() -> Type {
     Type::object(fields)
 }
 
-pub fn json_type() -> Type {
-    // Json is the open dynamic type: any JSON-compatible value.
-    // We use TypeVar(u32::MAX) as a special "any" marker that is_compatible always accepts.
-    // This allows object literals, arrays, strings, numbers, bools, null to all satisfy Json.
+pub fn any_val_type() -> Type {
+    // AnyVal (formerly Json) is the dynamic top type: any value is compatible.
+    // TypeVar(u32::MAX) is the special marker that is_compatible always accepts.
     Type::TypeVar(u32::MAX)
 }
 
