@@ -14427,6 +14427,62 @@ val m: { Bad: Int32 } = {}
 }
 
 #[test]
+fn test_int_map_basic_operations() {
+    // Smoke test for { Int32: String } maps: insert, read hit, read miss, overwrite.
+    let output = run(r#"import { print } from "std/io"
+
+var m: { Int32: String } = {}
+m[0] = "zero"
+m[-1] = "neg"
+m[42] = "forty-two"
+m[1000000] = "million"
+print(m[0] ?? "null")
+print(m[-1] ?? "null")
+print(m[42] ?? "null")
+print(m[1000000] ?? "null")
+print(m[7] ?? "null")
+m[42] = "overwritten"
+print(m[42] ?? "null")
+"#);
+    assert_eq!(output, vec![
+        "zero",
+        "neg",
+        "forty-two",
+        "million",
+        "null",
+        "overwritten",
+    ]);
+}
+
+#[test]
+fn test_int_map_key_zero_stores_correctly() {
+    // Key 0 is the tricky case: the occupancy rule is hash==0 (not key==0), so key 0 must
+    // be stored using fmix64(0) != 0 as the hash. Verifies it survives a round-trip.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+var m: { Int32: Int32 } = {}
+m[0] = 99
+print(toString(m[0] ?? -1))
+print(toString(m[1] ?? -1))
+"#);
+    assert_eq!(output, vec!["99", "-1"]);
+}
+
+#[test]
+fn test_int_map_wrong_key_type_rejected() {
+    // Using a String key on an Int-keyed map must be a type error.
+    let err = run_expect_err(r#"import { print } from "std/io"
+var m: { Int32: String } = {}
+m["hello"] = "world"
+"#);
+    assert!(
+        err.contains("keyed by") || err.contains("Int32") || err.contains("String"),
+        "expected Int-map string-key type error, got: {err}"
+    );
+}
+
+#[test]
 fn test_check_accepts_valid_imported_symbol_program() {
     let (ok, output) = check_source(
         r#"import { trim } from "std/string"
