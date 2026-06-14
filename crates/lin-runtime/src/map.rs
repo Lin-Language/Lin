@@ -329,6 +329,47 @@ pub unsafe extern "C" fn lin_map_get(map: *const LinMap, key: *const LinString) 
     }
 }
 
+/// Lookup by raw UTF-8 key bytes — the map analogue of `lin_object_get_bytes`. Avoids
+/// allocating a temporary `LinString` for cold consumers (e.g. the fromJson validator).
+/// Returns a borrowed `*const TaggedVal` into the map slot, or null if absent.
+pub(crate) unsafe fn lin_map_get_bytes(
+    map: *const LinMap,
+    key_ptr: *const u8,
+    key_len: u32,
+) -> *const TaggedVal {
+    if map.is_null() || (*map).cap == 0 || (*map).len == 0 {
+        return std::ptr::null();
+    }
+    let bytes = std::slice::from_raw_parts(key_ptr, key_len as usize);
+    // FNV-1a over the raw bytes — same algorithm as hash_key.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let cap = (*map).cap as usize;
+    let mask = cap - 1;
+    let mut idx = (h as usize) & mask;
+    for _ in 0..cap {
+        let slot = (*map).slots.add(idx);
+        let slot_key = (*slot).key;
+        if slot_key.is_null() {
+            return std::ptr::null();
+        }
+        if (*slot).hash == h {
+            let kl = (*slot_key).len as usize;
+            if kl == bytes.len() {
+                let kb = std::slice::from_raw_parts((*slot_key).data.as_ptr(), kl);
+                if kb == bytes {
+                    return &(*slot).value;
+                }
+            }
+        }
+        idx = (idx + 1) & mask;
+    }
+    std::ptr::null()
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_has(map: *const LinMap, key: *const LinString) -> u8 {
     if lin_map_get(map, key).is_null() {

@@ -276,6 +276,15 @@ pub unsafe extern "C" fn lin_union_get_field(tv: *const u8, key: *const crate::s
             let borrowed = crate::object::lin_object_get(obj, key);
             crate::object::lin_tagged_clone(borrowed as *const u8)
         }
+        TAG_MAP => {
+            let map = payload as *const crate::map::LinMap;
+            if map.is_null() {
+                return std::ptr::null_mut();
+            }
+            // lin_map_get returns a BORROWED interior pointer; clone it into an OWNED box.
+            let borrowed = crate::map::lin_map_get(map, key);
+            crate::object::lin_tagged_clone(borrowed as *const u8)
+        }
         TAG_RECORD => {
             let sealed = payload as *const u8;
             if sealed.is_null() {
