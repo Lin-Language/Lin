@@ -1,5 +1,6 @@
-use crate::object::{lin_object_alloc, lin_object_set, LinObject, tagged_as_object};
-use crate::tagged::{TaggedVal, TAG_STR, TAG_OBJECT, TAG_INT32, alloc_tagged};
+use crate::map::{lin_map_alloc, lin_map_set, LinMap};
+use crate::object::{LinObject, tagged_as_object};
+use crate::tagged::{TaggedVal, TAG_STR, TAG_MAP, TAG_INT32, alloc_tagged};
 use crate::fs::{make_string, resolve_lin_str, make_error_tagged};
 use crate::string::{LinString, lin_string_release};
 use std::io::{Read, Write};
@@ -30,7 +31,7 @@ pub unsafe extern "C" fn lin_server_path_match(
         return std::ptr::null_mut();
     }
 
-    let obj = lin_object_alloc(4);
+    let map = lin_map_alloc(4);
     for (pp, tp) in pat_parts.iter().zip(path_parts.iter()) {
         if let Some(param_name) = pp.strip_prefix(':') {
             let key = make_string(param_name);
@@ -38,15 +39,16 @@ pub unsafe extern "C" fn lin_server_path_match(
             let mut tv: TaggedVal = std::mem::zeroed();
             tv.tag = TAG_STR;
             tv.payload = val_str as u64;
-            lin_object_set(obj, key, &tv);
-            // Note: lin_object_set takes ownership of key pointer; do NOT release key.
+            lin_map_set(map, key, &tv);
+            lin_string_release(key);
+            lin_string_release(val_str);
         } else if *pp != *tp {
-            crate::object::lin_object_release(obj);
+            crate::map::lin_map_release(map);
             return std::ptr::null_mut();
         }
     }
 
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -164,38 +166,43 @@ fn read_request(stream: &mut TcpStream) -> Option<(Vec<u8>, usize)> {
     Some((buf, header_end))
 }
 
-/// Build an HttpRequest object `{ method, path, query, headers, body }` as an owned
-/// `TaggedVal*(Object)`. Mirrors the `{ status, headers, body }` construction in `http.rs`.
+/// Build an HttpRequest map `{ method, path, query, headers, body }` as an owned
+/// `TaggedVal*(Map)`. Mirrors the `{ status, headers, body }` construction in `http.rs`.
 unsafe fn build_request_object(req: &ParsedRequest) -> *mut u8 {
-    let obj = lin_object_alloc(5);
+    let map = lin_map_alloc(5);
 
-    let set_str = |obj: *mut LinObject, key: &str, val: &str| {
+    let set_str = |m: *mut LinMap, key: &str, val: &str| {
         let k = make_string(key);
         let v = make_string(val);
         let mut tv: TaggedVal = std::mem::zeroed();
         tv.tag = TAG_STR;
         tv.payload = v as u64;
-        lin_object_set(obj, k, &tv);
+        lin_map_set(m, k, &tv);
+        lin_string_release(k);
+        lin_string_release(v);
     };
 
-    set_str(obj, "method", &req.method);
-    set_str(obj, "path", &req.path);
-    set_str(obj, "query", &req.query);
+    set_str(map, "method", &req.method);
+    set_str(map, "path", &req.path);
+    set_str(map, "query", &req.query);
 
-    // headers: nested object of String -> String
-    let headers_obj = lin_object_alloc(req.headers.len().max(1) as u32);
+    // headers: nested map of String -> String
+    let headers_map = lin_map_alloc(req.headers.len().max(1) as u32);
     for (name, value) in &req.headers {
-        set_str(headers_obj, name, value);
+        set_str(headers_map, name, value);
     }
     let headers_key = make_string("headers");
     let mut headers_tv: TaggedVal = std::mem::zeroed();
-    headers_tv.tag = TAG_OBJECT;
-    headers_tv.payload = headers_obj as u64;
-    lin_object_set(obj, headers_key, &headers_tv);
+    headers_tv.tag = TAG_MAP;
+    headers_tv.payload = headers_map as u64;
+    lin_map_set(map, headers_key, &headers_tv);
+    lin_string_release(headers_key);
+    // lin_map_set retains headers_map; drop our local +1
+    crate::map::lin_map_release(headers_map);
 
-    set_str(obj, "body", &req.body);
+    set_str(map, "body", &req.body);
 
-    alloc_tagged(TAG_OBJECT, obj as u64)
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
 /// Read a String field from an object payload by key, if present and TAG_STR.
