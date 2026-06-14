@@ -29,26 +29,44 @@
 //! These are printed to stderr at process exit.
 
 use std::alloc::{alloc, dealloc, Layout};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::string::{LinString, lin_string_inc_ref, lin_string_release, IMMORTAL_RC};
 use crate::tagged::{TaggedVal, TAG_NULL};
 
 // ── Profiling counters (env-gated, zero cost when disabled) ─────────────────────────────────
-static MAP_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+// State: 0 = uninit, 1 = disabled, 2 = enabled.
+// Use SeqCst on the state transitions to prevent the compiler from reordering the init check
+// with subsequent counter increments. On the steady-state fast path (state == 1 = disabled)
+// the single SeqCst load adds ~1 cycle — invisible against 316M map_get calls.
+use std::sync::atomic::AtomicU8;
+static MAP_PROFILE_STATE: AtomicU8 = AtomicU8::new(0);
 static MAP_GETS: AtomicU64 = AtomicU64::new(0);
 static MAP_HASH_SKIPS: AtomicU64 = AtomicU64::new(0);
 static MAP_KEY_EQ_CALLS: AtomicU64 = AtomicU64::new(0);
 static MAP_KEY_EQ_MISS: AtomicU64 = AtomicU64::new(0);
 
-fn ensure_map_profile_init() {
+/// Initialize the profiling state on the very first map operation.
+/// After the first call this is a no-op (state != 0). Uses SeqCst to ensure visibility.
+#[cold]
+fn init_map_profile_state() -> u8 {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        if std::env::var("LIN_MAP_PROFILE").as_deref() == Ok("1") {
-            MAP_PROFILE_ENABLED.store(true, Ordering::Relaxed);
+        let enabled = std::env::var("LIN_MAP_PROFILE").as_deref() == Ok("1");
+        let new_state: u8 = if enabled { 2 } else { 1 };
+        MAP_PROFILE_STATE.store(new_state, Ordering::SeqCst);
+        if enabled {
             unsafe { libc::atexit(map_profile_atexit); }
         }
     });
+    MAP_PROFILE_STATE.load(Ordering::SeqCst)
+}
+
+/// Return the profiling state: 0=uninit (first call), 1=disabled, 2=enabled.
+#[inline(always)]
+fn map_profile_state() -> u8 {
+    let s = MAP_PROFILE_STATE.load(Ordering::Relaxed);
+    if s == 0 { init_map_profile_state() } else { s }
 }
 
 extern "C" fn map_profile_atexit() {
@@ -57,7 +75,7 @@ extern "C" fn map_profile_atexit() {
 
 #[no_mangle]
 pub extern "C" fn lin_map_profile_print() {
-    if MAP_PROFILE_ENABLED.load(Ordering::Relaxed) {
+    if MAP_PROFILE_STATE.load(Ordering::Relaxed) == 2 {
         let gets = MAP_GETS.load(Ordering::Relaxed);
         let skips = MAP_HASH_SKIPS.load(Ordering::Relaxed);
         let eq_calls = MAP_KEY_EQ_CALLS.load(Ordering::Relaxed);
@@ -297,8 +315,7 @@ pub unsafe extern "C" fn lin_map_get(map: *const LinMap, key: *const LinString) 
         return std::ptr::null();
     }
     let khash = hash_key(key);
-    let idx = if MAP_PROFILE_ENABLED.load(Ordering::Relaxed) {
-        ensure_map_profile_init();
+    let idx = if map_profile_state() == 2 {
         MAP_GETS.fetch_add(1, Ordering::Relaxed);
         find_slot_profiled(map, key, khash)
     } else {
