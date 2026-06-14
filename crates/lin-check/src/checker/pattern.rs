@@ -353,7 +353,7 @@ impl Checker {
                     let field_ty = if let Type::Object { fields: ref obj_fields, .. } = ty {
                         obj_fields.get(&key).cloned().unwrap_or(Type::Null)
                     } else if ty.is_any_val() {
-                        crate::resolve::json_type()
+                        crate::resolve::any_val_type()
                     } else {
                         return Err(Diagnostic::error(
                             *span,
@@ -365,7 +365,7 @@ impl Checker {
                 }
                 if let Some(rest_name) = rest {
                     // rest collects remaining fields as a Json object
-                    self.env.define(rest_name.clone(), crate::resolve::json_type(), mutable);
+                    self.env.define(rest_name.clone(), crate::resolve::any_val_type(), mutable);
                 }
                 Ok(self.env.next_slot() - 1)
             }
@@ -377,7 +377,7 @@ impl Checker {
                         types.get(i).cloned().unwrap_or(Type::Never)
                     } else if ty.is_any_val() {
                         // Dynamic JSON value — treat element type as Json
-                        crate::resolve::json_type()
+                        crate::resolve::any_val_type()
                     } else {
                         return Err(Diagnostic::error(
                             *span,
@@ -390,7 +390,7 @@ impl Checker {
                     let rest_ty = if let Type::Array(inner) = ty {
                         Type::Array(inner.clone())
                     } else {
-                        Type::Array(Box::new(crate::resolve::json_type()))
+                        Type::Array(Box::new(crate::resolve::any_val_type()))
                     };
                     self.env.define(rest_name.clone(), rest_ty, mutable);
                 }

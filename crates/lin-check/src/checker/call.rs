@@ -3,7 +3,7 @@ use lin_parse::ast::Expr;
 
 use super::Checker;
 use super::helpers::{apply_type_subs, first_mutable_capture, first_non_transferable_capture, integer_range, is_definitely_non_transferable};
-use crate::resolve::{error_type, json_type};
+use crate::resolve::{error_type, any_val_type};
 use crate::typed_ir::*;
 use crate::types::Type;
 
@@ -150,7 +150,7 @@ impl Checker {
             Err(e) => return Some(Err(e)),
         };
         let value_ty = typed_value.ty();
-        if !self.types_compatible(&value_ty, &json_type()) {
+        if !self.types_compatible(&value_ty, &any_val_type()) {
             return Some(Err(Diagnostic::error(
                 value_arg.span(),
                 format!(
