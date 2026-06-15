@@ -151,7 +151,7 @@ so it flows through. At each call site the concrete family flows in from the arg
 existing single-module **monomorphization** (`crates/lin-ir/src/monomorphize.rs`) materializes a
 specialized copy (`isEven$Int32`, `isEven$Float64`) compiled to native unboxed ops. A genuinely
 non-numeric argument (`String`/`Bool`/`Object`/array) is rejected at the call site with
-"expected a numeric type (Number)". A dynamic `Json` value IS accepted (see **§Json** below).
+"expected a numeric type (Number)". A dynamic `AnyVal` value IS accepted (see **§AnyVal** below).
 
 **Rationale**: We measured the boxed-union representation at ~3.6× slower than concrete `Int32`
 (every op a tagged `lin_tagged_arith` over heap-boxed operands). The bounded-generic model is the
@@ -209,32 +209,32 @@ type (so the spec signature and the call site agree). Before this fix the result
 while codegen emitted a `double` → the `lin_box_int32(double)` / `ret double`-vs-`i32` ABI crash;
 the earlier reject in `checker/call.rs` was a workaround that is now removed.
 
-**§Json: a `Json` value is ACCEPTED at a `Number` parameter** (direct OR projected), consistent with
-the existing `Json → Int32` scalar coercion gap (ADR-032). It monomorphizes the bounded var to the
-default **`Int32`** family and unboxes **unchecked** — a `Json` holding a non-integer number unboxes
+**§AnyVal: an `AnyVal` value is ACCEPTED at a `Number` parameter** (direct OR projected), consistent with
+the existing `AnyVal → Int32` scalar coercion gap (ADR-032). It monomorphizes the bounded var to the
+default **`Int32`** family and unboxes **unchecked** — an `AnyVal` holding a non-integer number unboxes
 as garbage, exactly the same accepted, documented unsoundness as `val n: Int32 = jsonValue` today.
 The safe path for validated extraction is `Int32.fromJson(v)` (ADR-031), which range-checks and
-returns `T | Error`. This replaces an earlier inconsistency: a DIRECT `Json` argument
-(`val x: Json = 42`, the bare `TypeVar(u32::MAX)` marker) was REJECTED while a `Json` PROJECTION
+returns `T | Error`. This replaces an earlier inconsistency: a DIRECT `AnyVal` argument
+(`val x: AnyVal = 42`, the bare `TypeVar(u32::MAX)` marker) was REJECTED while an `AnyVal` PROJECTION
 (`config["count"]`, a fresh inference var) slipped past the call-site bound guard and ran — so the
 same value produced a compile error or a result depending only on whether it was indexed. Both now
 compile and produce the SAME answer. Mechanically: (1) `arg_satisfies_numeric_bound`
-(`checker/call.rs`) accepts ANY `TypeVar`, including the `u32::MAX` Json wildcard (it previously
-excluded it); (2) the `Number` var unifies against the Json arg's wildcard type and
-`lin-ir::monomorphize` binds it to the wildcard, minting a `$Json`-named spec whose param is a boxed
-`ptr` unboxed as `Int32`; (3) for a `Number`-RETURNING body over a Json operand (`x * 3`), the
+(`checker/call.rs`) accepts ANY `TypeVar`, including the `u32::MAX` AnyVal wildcard (it previously
+excluded it); (2) the `Number` var unifies against the AnyVal arg's wildcard type and
+`lin-ir::monomorphize` binds it to the wildcard, minting a `$AnyVal`-named spec whose param is a boxed
+`ptr` unboxed as `Int32`; (3) for a `Number`-RETURNING body over a AnyVal operand (`x * 3`), the
 arithmetic op's result and the spec/return type are re-derived to the concrete unboxed family
 (`Int32`) — mirroring the IR's unbox-to-concrete-operand behaviour — so the spec signature
-(`define i32 triple$Json`) matches the native scalar it returns instead of a stale boxed `ptr` (the
-historical `triple$Json` codegen crash), and the call site re-coerces (boxes) the scalar back to the
-`Json` the surrounding context expects.
+(`define i32 triple$AnyVal`) matches the native scalar it returns instead of a stale boxed `ptr` (the
+historical `triple$AnyVal` codegen crash), and the call site re-coerces (boxes) the scalar back to the
+`AnyVal` the surrounding context expects.
 
 **Consequence / limitations** (first cut):
-- **Validated dynamic numerics use `fromJson`.** A `Json` value passed to a `Number` parameter is
-  accepted (§Json above) but decoded as `Int32` with an unchecked unbox; for a range-checked decode
-  to a specific family use `Int32.fromJson(v)` etc. We do NOT promote a `Json` `Number` argument to a
+- **Validated dynamic numerics use `fromJson`.** A `AnyVal` value passed to a `Number` parameter is
+  accepted (§AnyVal above) but decoded as `Int32` with an unchecked unbox; for a range-checked decode
+  to a specific family use `Int32.fromJson(v)` etc. We do NOT promote an `AnyVal` `Number` argument to a
   boxed slow path — it specializes to the concrete `Int32` family like every other argument.
-- `Number` is no longer part of the structural definition of `Json` (it never resolved to a union).
+- `Number` is no longer part of the structural definition of `AnyVal` (it never resolved to a union).
 - **Nested `Number` works** for `Number[]` and combinator callbacks over it (see the implementation
   note above) — `(xs: Number[]) => xs.map((v: Number) => v*2)` specializes and runs natively.
 - A `Number` in a **higher-order function-typed parameter** (`(f: (Number) => Number, x: Number)`)
@@ -358,15 +358,15 @@ Implementation:
 
 **Rationale**: Synthesizing adapters as `TypedExpr::Function` and lowering them through the normal function path means RC, coercion, and earlier-parameter/chained default references (`(a, b = a + 1, c = b + 1)`) all work for free — defaults are just ordinary expressions evaluated in a scope where the preceding parameters are bound. Filling defaults in the defining module (rather than serializing default *expressions* into `.sig` files for callers to inline) keeps signatures small and makes cross-module defaults work by symbol reference. The trailing-comma marker resolves the currying/default-fill ambiguity at the exact site where intent lives, with zero new tokens. Putting `required` in `Type::Function` but excluding it from compatibility means default-ness never blocks an assignment or argument match — a `(Int32, Int32) => Int32` value is interchangeable whether or not its second parameter had a default.
 
-**Consequence**: Existing code that relied on bare under-application to curry (e.g. `add(10)`) must add a trailing comma (`add(10,)`); within this repo only one example needed migration. The closure ABI change (32→40 bytes) touches every closure allocation site and `lin_closure_release`; all are updated together. A self-recursive *default-fill* tail call cannot use the TCO fast path (it targets a different-arity adapter), so it lowers as an ordinary call. Implementing the indirect path surfaced and fixed a pre-existing bug in the boxed-ABI wrapper: it inferred the Lin return type from the LLVM return kind and treated every pointer return as already-boxed Json, so a function value returning a raw `String`/`Array`/`Object` crashed the indirect caller (which unboxes); the wrapper now takes the real Lin return type and boxes correctly.
+**Consequence**: Existing code that relied on bare under-application to curry (e.g. `add(10)`) must add a trailing comma (`add(10,)`); within this repo only one example needed migration. The closure ABI change (32→40 bytes) touches every closure allocation site and `lin_closure_release`; all are updated together. A self-recursive *default-fill* tail call cannot use the TCO fast path (it targets a different-arity adapter), so it lowers as an ordinary call. Implementing the indirect path surfaced and fixed a pre-existing bug in the boxed-ABI wrapper: it inferred the Lin return type from the LLVM return kind and treated every pointer return as already-boxed AnyVal, so a function value returning a raw `String`/`Array`/`Object` crashed the indirect caller (which unboxes); the wrapper now takes the real Lin return type and boxes correctly.
 
 ## ADR-027: All call paths must coerce arguments to parameter types
 
-**Decision**: Every call-lowering path in `lower_call` (`lin-ir/src/lower.rs`) coerces each argument to the callee's declared parameter type via `lower_call_arg` (which boxes a concrete value to `Json`/`TaggedVal*` when the parameter is union/Json) and retains heap arguments via `retain_call_arg`. This includes the fallback **indirect-call path** — a call through a closure *value* (`val f = ...; f(x)`, a closure passed as a parameter, or any non-statically-resolved callee) — which previously lowered its arguments with a bare `lower_expr` and no coercion.
+**Decision**: Every call-lowering path in `lower_call` (`lin-ir/src/lower.rs`) coerces each argument to the callee's declared parameter type via `lower_call_arg` (which boxes a concrete value to `AnyVal`/`TaggedVal*` when the parameter is union/AnyVal) and retains heap arguments via `retain_call_arg`. This includes the fallback **indirect-call path** — a call through a closure *value* (`val f = ...; f(x)`, a closure passed as a parameter, or any non-statically-resolved callee) — which previously lowered its arguments with a bare `lower_expr` and no coercion.
 
-**Rationale**: Lin's uniform closure ABI passes `Json` parameters as boxed `TaggedVal*`. The named-function and imported-function paths already box concrete arguments (an `Array`, `Object`, or scalar) to match a `Json` parameter; the indirect path is just another way to reach the same ABI and must follow the same rule. The callee's parameter types are read from the callee expression's `Type::Function` signature, identically to the other paths.
+**Rationale**: Lin's uniform closure ABI passes `AnyVal` parameters as boxed `TaggedVal*`. The named-function and imported-function paths already box concrete arguments (an `Array`, `Object`, or scalar) to match an `AnyVal` parameter; the indirect path is just another way to reach the same ABI and must follow the same rule. The callee's parameter types are read from the callee expression's `Type::Function` signature, identically to the other paths.
 
-**Consequence**: Fixes silent data corruption — before this, an `Array` (or any heap value) passed to a `Json`-typed closure parameter reached the callee as a raw `LinArray*` instead of a boxed `TaggedVal*`. The callee read its tag/payload from garbage, so the value behaved as a different (or empty) object and *mutations through it were lost* (e.g. `push` into an accumulator passed to a stored closure left the original array empty). This is the argument-side analog of the return-side boxing bug noted in ADR-026; together they make the first-class-function/closure path representation-correct for all heap types. Regression: `test_array_passed_to_closure_value_mutates` in `crates/lin/tests/integration.rs`.
+**Consequence**: Fixes silent data corruption — before this, an `Array` (or any heap value) passed to an `AnyVal`-typed closure parameter reached the callee as a raw `LinArray*` instead of a boxed `TaggedVal*`. The callee read its tag/payload from garbage, so the value behaved as a different (or empty) object and *mutations through it were lost* (e.g. `push` into an accumulator passed to a stored closure left the original array empty). This is the argument-side analog of the return-side boxing bug noted in ADR-026; together they make the first-class-function/closure path representation-correct for all heap types. Regression: `test_array_passed_to_closure_value_mutates` in `crates/lin/tests/integration.rs`.
 
 ## ADR-028: Async concurrency — copy-by-default RC, catchable faults at the thread boundary
 
@@ -388,7 +388,7 @@ Implementation:
 
 **Rationale**: This delivers the load-bearing guarantee — real, race-free shared *mutable* state without taxing the single-threaded hot path (only the box's refcount is atomic; only `Shared` operations take a lock). Copy-in/copy-out at every boundary means no live reference into the inner graph escapes the lock, so the inner non-atomic RC is sound. Validated under ASan and a multi-threaded `#[test]` (8 threads × concurrent get/set) plus a Lin-level concurrent-`withLock`-push test (no lost updates).
 
-**Consequence**: The compile-time **accessor-only enforcement** (rejecting `push(s, 7)`, indexing, auto-unwrap on a `Shared<T>` as a type error) is **now wired** (follow-up landed): a dedicated `Type::Shared(Box<Type>)` variant is threaded through the checker, IR, and codegen. `shared`/`get`/`set`/`withLock` are typed against it (`shared: <T>(T) => Shared<T>`, `get: <T>(Shared<T>) => T`, `set: <T>(Shared<T>, T) => Null`, `withLock: <T,R>(Shared<T>, (T)=>R) => R`); the stdlib wrappers annotate `Shared` (resolvable by name, like `Iterator`); and compat makes `Shared<T>` **invariant** — compatible only with another `Shared<U>` (inner types recursed) and explicitly NOT widening to `Json`/`TypeVar`, so it can't silently flow into a `Json` parameter and lose the guard. Any non-accessor op on a `Shared` value is therefore a type error (`Argument 1 has type Shared<…>, expected …`). At runtime it is still a boxed `TaggedVal*(TAG_SHARED)` (`is_union_type` / `is_union_ty` include it; RC dispatches through the tag-aware path; `capture_kind` → `CAP_TAGGED` so the transfer copy path shares it by atomic bump — the nesting rule). NOTE: `lin check` does not resolve imports, so this enforcement is visible under `lin build`/`lin run` (which do); a bare `lin check` still sees imported names as `Json`. Remaining caveats unchanged: `withLock` mutates in place, so a scalar accumulator (`n => n + 1`) does not persist (use a one-element array or `get`/`set`); `set` collides by name with `std/array`'s `set` when both are imported (alias one); `Shared<T>` makes reference cycles reachable and Lin has no cycle collector (ADR-024); `withLock` reintroduces deadlock potential (no reentrancy, keep critical sections short).
+**Consequence**: The compile-time **accessor-only enforcement** (rejecting `push(s, 7)`, indexing, auto-unwrap on a `Shared<T>` as a type error) is **now wired** (follow-up landed): a dedicated `Type::Shared(Box<Type>)` variant is threaded through the checker, IR, and codegen. `shared`/`get`/`set`/`withLock` are typed against it (`shared: <T>(T) => Shared<T>`, `get: <T>(Shared<T>) => T`, `set: <T>(Shared<T>, T) => Null`, `withLock: <T,R>(Shared<T>, (T)=>R) => R`); the stdlib wrappers annotate `Shared` (resolvable by name, like `Iterator`); and compat makes `Shared<T>` **invariant** — compatible only with another `Shared<U>` (inner types recursed) and explicitly NOT widening to `AnyVal`/`TypeVar`, so it can't silently flow into an `AnyVal` parameter and lose the guard. Any non-accessor op on a `Shared` value is therefore a type error (`Argument 1 has type Shared<…>, expected …`). At runtime it is still a boxed `TaggedVal*(TAG_SHARED)` (`is_union_type` / `is_union_ty` include it; RC dispatches through the tag-aware path; `capture_kind` → `CAP_TAGGED` so the transfer copy path shares it by atomic bump — the nesting rule). NOTE: `lin check` does not resolve imports, so this enforcement is visible under `lin build`/`lin run` (which do); a bare `lin check` still sees imported names as `AnyVal`. Remaining caveats unchanged: `withLock` mutates in place, so a scalar accumulator (`n => n + 1`) does not persist (use a one-element array or `get`/`set`); `set` collides by name with `std/array`'s `set` when both are imported (alias one); `Shared<T>` makes reference cycles reachable and Lin has no cycle collector (ADR-024); `withLock` reintroduces deadlock potential (no reentrancy, keep critical sections short).
 
 ## ADR-030: `Frozen<T>` — opt-in shared read-only state via deep immortal seal (coercion deferred)
 
@@ -408,31 +408,31 @@ Implementation:
 
 **Absorbs a duplicate two-unary-operator record**, which restated the same rule and spec-text updates; both are now this one.
 
-## ADR-032: `Json` is a covariant sink — closing the Json→concrete cast hole
+## ADR-032: `AnyVal` is a covariant sink — closing the AnyVal→concrete cast hole
 
-**Decision**: `Json` (modelled as `Type::TypeVar(u32::MAX)`, see `types.rs::is_json`) is made a **covariant sink**: anything is assignable *into* `Json` (concrete `T → Json` stays allowed, so `writeJson(value: Json)` and the pervasive "store anything as Json" patterns keep working), but a `Json` *value* is **not** assignable *out* to a fully-concrete **structured object** target — one that (after unfolding `Named` types) is an `Object` with at least one required, non-nullable field. So `val p: Person = readJson(...)` (where `Person = {name: String, age: Int32}`) is now a type error; the value must be decoded via `fromJson` (ADR-033) or narrowed via `is`/`has`. The fix splits the old blanket `(_, TypeVar(_)) | (TypeVar(_), _) => true` arm in `compat.rs` into: (1) `(_, TypeVar(MAX)) => true` (sink), (2) `(TypeVar(MAX), target) => lenient_json || !requires_structured_decode(target)`, (3) the existing permissive arm for all *other* (non-MAX) TypeVars — genuine inference vars, the `9000+` generic slots, intrinsic vars — so inference is unchanged. `requires_structured_decode` deliberately treats only required-field objects as the hazard: `Json` flowing into scalars (`Int32`/`Int64`), buffers (`UInt8[]`), opaque handles, open objects (`{}`), arrays, functions, iterators, or anything still containing a TypeVar stays permissive — those are the language's handle/buffer/polymorphic-return patterns, which have no `fromJson` remedy and predate this change.
+**Decision**: `AnyVal` (modelled as `Type::TypeVar(u32::MAX)`, see `types.rs::is_json`) is made a **covariant sink**: anything is assignable *into* `AnyVal` (concrete `T → AnyVal` stays allowed, so `writeJson(value: AnyVal)` and the pervasive "store anything as AnyVal" patterns keep working), but an `AnyVal` *value* is **not** assignable *out* to a fully-concrete **structured object** target — one that (after unfolding `Named` types) is an `Object` with at least one required, non-nullable field. So `val p: Person = readJson(...)` (where `Person = {name: String, age: Int32}`) is now a type error; the value must be decoded via `fromJson` (ADR-033) or narrowed via `is`/`has`. The fix splits the old blanket `(_, TypeVar(_)) | (TypeVar(_), _) => true` arm in `compat.rs` into: (1) `(_, TypeVar(MAX)) => true` (sink), (2) `(TypeVar(MAX), target) => lenient_json || !requires_structured_decode(target)`, (3) the existing permissive arm for all *other* (non-MAX) TypeVars — genuine inference vars, the `9000+` generic slots, intrinsic vars — so inference is unchanged. `requires_structured_decode` deliberately treats only required-field objects as the hazard: `AnyVal` flowing into scalars (`Int32`/`Int64`), buffers (`UInt8[]`), opaque handles, open objects (`{}`), arrays, functions, iterators, or anything still containing a TypeVar stays permissive — those are the language's handle/buffer/polymorphic-return patterns, which have no `fromJson` remedy and predate this change.
 
-**Rationale**: The old rule made `Json` bidirectionally compatible with *everything*, so a value read from a `Json` source could be silently bound to a richly-typed annotation with **zero validation** — the annotation was a lie. Drawing the line at required-field objects catches the real "I claimed this JSON is a `Person`" hazard (the one a decoder can fix) while not breaking the thousands of existing scalar/handle/buffer flows. The leniency is scoped: a per-`Checker` `lenient_json` flag is set **only** for the trusted embedded stdlib (whose wrappers forward `Json` handles into concrete intrinsic/foreign params by design, e.g. `lin_parse_json`, `pathMatch`); user modules and user-defined imported modules always check strictly. After this change the only sound `Json → T` conversions are (a) `fromJson` (validated decode) and (b) `is`/`has` narrowing (a separate `checker/pattern.rs` path that branches on `ty.is_json()` directly and is backed by runtime tag checks, so it stays sound and is unaffected).
+**Rationale**: The old rule made `AnyVal` bidirectionally compatible with *everything*, so a value read from an `AnyVal` source could be silently bound to a richly-typed annotation with **zero validation** — the annotation was a lie. Drawing the line at required-field objects catches the real "I claimed this JSON is a `Person`" hazard (the one a decoder can fix) while not breaking the thousands of existing scalar/handle/buffer flows. The leniency is scoped: a per-`Checker` `lenient_json` flag is set **only** for the trusted embedded stdlib (whose wrappers forward `AnyVal` handles into concrete intrinsic/foreign params by design, e.g. `lin_parse_json`, `pathMatch`); user modules and user-defined imported modules always check strictly. After this change the only sound `AnyVal → T` conversions are (a) `fromJson` (validated decode) and (b) `is`/`has` narrowing (a separate `checker/pattern.rs` path that branches on `ty.is_json()` directly and is backed by runtime tag checks, so it stays sound and is unaffected).
 
-**Consequence**: The predicted blast-radius migration sites (`pathMatch`'s `String` params, `lin_parse_json`'s `String` param) did **not** in fact break: their targets are scalars, not required-field objects, so the narrower `requires_structured_decode` rule leaves them permissive — no stdlib widening was needed. The whole stdlib, example suite, and test suite compile unchanged. The scalar/handle escape hatch is a deliberate soundness gap (`Json → Int32` is still unchecked) accepted to avoid a disruptive migration; tightening it later (e.g. a `fromJson` for scalars) is additive. `lin build` of `val p: Person = readJson(...)` (and the direct `val p: Person = jsonReturningCall()` form) now surfaces `Expected type {...}, got ?T4294967295`; the remedy is `Person.fromJson(...)`. (Note: `lin check` of a *single* file leaves imported functions' return types as fresh inference vars rather than `Json`, so the gate cannot fire there for an imported call — the full `lin build` pipeline, which resolves import signatures, is the authority. A bug where a zero-param or all-`Json`-param `Json`-returning function was misclassified as the opaque `Function` annotation — and its `Json` return freshened into a permissive inference var, slipping the gate — was fixed in `infer_call` by requiring the opaque shortcut to have a *non-empty* all-`TypeVar(MAX)` param list.)
+**Consequence**: The predicted blast-radius migration sites (`pathMatch`'s `String` params, `lin_parse_json`'s `String` param) did **not** in fact break: their targets are scalars, not required-field objects, so the narrower `requires_structured_decode` rule leaves them permissive — no stdlib widening was needed. The whole stdlib, example suite, and test suite compile unchanged. The scalar/handle escape hatch is a deliberate soundness gap (`AnyVal → Int32` is still unchecked) accepted to avoid a disruptive migration; tightening it later (e.g. a `fromJson` for scalars) is additive. `lin build` of `val p: Person = readJson(...)` (and the direct `val p: Person = jsonReturningCall()` form) now surfaces `Expected type {...}, got ?T4294967295`; the remedy is `Person.fromJson(...)`. (Note: `lin check` of a *single* file leaves imported functions' return types as fresh inference vars rather than `AnyVal`, so the gate cannot fire there for an imported call — the full `lin build` pipeline, which resolves import signatures, is the authority. A bug where a zero-param or all-`AnyVal`-param `AnyVal`-returning function was misclassified as the opaque `Function` annotation — and its `AnyVal` return freshened into a permissive inference var, slipping the gate — was fixed in `infer_call` by requiring the opaque shortcut to have a *non-empty* all-`TypeVar(MAX)` param list.)
 
-**Scope decision — total vs structured (empirically locked)**: a *total* gate (rejecting ANY `Json → concrete T`, including scalars and arrays) was implemented and run against the full suite. It broke (a) the stdlib's pervasive **polymorphic-return idiom** — `slice`/`concat`/`accept`/`wait`/etc. return `Json` and are routinely assigned to concrete `val`s (`val sub: UInt8[] = slice(bytes, 1, 4)`, `val code: Int64 = wait(pid)`, socket `accept(): Int32`) — and (b) **`is`-narrowing into a concrete branch** (`if j is String then j else ""`, whose narrowed value is still statically `Json`). Empirically: `test_is_narrowing_still_works`, `test_slice_preserves_element_type`, `test_net_tcp_loopback_echo`, `test_net_udp_loopback_roundtrip`, `test_proc_spawn_read_wait`, `test_proc_wait_exit_code` all failed under the total gate. These patterns have **no `fromJson` remedy** and forcing one is hostile, so the total scope was rejected and the gate is **scoped to required-field structured objects** — the genuine "unchecked object decode" hazard. This matches the structured-object-only conclusion anticipated in the plan.
+**Scope decision — total vs structured (empirically locked)**: a *total* gate (rejecting ANY `AnyVal → concrete T`, including scalars and arrays) was implemented and run against the full suite. It broke (a) the stdlib's pervasive **polymorphic-return idiom** — `slice`/`concat`/`accept`/`wait`/etc. return `AnyVal` and are routinely assigned to concrete `val`s (`val sub: UInt8[] = slice(bytes, 1, 4)`, `val code: Int64 = wait(pid)`, socket `accept(): Int32`) — and (b) **`is`-narrowing into a concrete branch** (`if j is String then j else ""`, whose narrowed value is still statically `AnyVal`). Empirically: `test_is_narrowing_still_works`, `test_slice_preserves_element_type`, `test_net_tcp_loopback_echo`, `test_net_udp_loopback_roundtrip`, `test_proc_spawn_read_wait`, `test_proc_wait_exit_code` all failed under the total gate. These patterns have **no `fromJson` remedy** and forcing one is hostile, so the total scope was rejected and the gate is **scoped to required-field structured objects** — the genuine "unchecked object decode" hazard. This matches the structured-object-only conclusion anticipated in the plan.
 
 ## ADR-033: `fromJson` — type-directed JSON decode (descriptor-driven runtime interpreter)
 
-**Decision**: `T.fromJson(json)` (and the equivalent `fromJson(T, json)`) is a **checker special form** that validates a `Json` value against the target type `T` and yields `T | Error`. It is recognised by the surface name `fromJson` at the call site (intercepted in both `infer_call` and `infer_dot_call` *before* arg0/receiver is inferred as a value, since arg0 is a *type*, not a runtime value — so unlike `print`/`for` no `lin_*` wrapper can express it). `std/json` exports a `fromJson` stub purely so the import resolves and `lin check` sees the name; the stub body is never used for real call sites. Validation is implemented as a single generic runtime interpreter `lin_from_json(value, descriptor)` driven by a compact, position-relative byte **descriptor** emitted per call site by codegen (`DescEncoder`), so emitted code is O(1) per site and recursion/cycles are finite back-edges (memoised by named type). The interpreter walks value+descriptor in lockstep, returns the input **cloned** (`lin_tagged_clone`, +1 independently owned) on success or a fresh `Error` on the first structural mismatch, building a JSONPath-ish `path` (e.g. `$.address.city`) during the walk. `Error` is a structural object alias `{ "type": "error", "message": String }` (resolved by `resolve_named_cycle`, not a new `Type` variant — cf. ADR-029), and the runtime error value also carries a `"path"` field, which width subtyping permits.
+**Decision**: `T.fromJson(json)` (and the equivalent `fromJson(T, json)`) is a **checker special form** that validates an `AnyVal` value against the target type `T` and yields `T | Error`. It is recognised by the surface name `fromJson` at the call site (intercepted in both `infer_call` and `infer_dot_call` *before* arg0/receiver is inferred as a value, since arg0 is a *type*, not a runtime value — so unlike `print`/`for` no `lin_*` wrapper can express it). `std/json` exports a `fromJson` stub purely so the import resolves and `lin check` sees the name; the stub body is never used for real call sites. Validation is implemented as a single generic runtime interpreter `lin_from_json(value, descriptor)` driven by a compact, position-relative byte **descriptor** emitted per call site by codegen (`DescEncoder`), so emitted code is O(1) per site and recursion/cycles are finite back-edges (memoised by named type). The interpreter walks value+descriptor in lockstep, returns the input **cloned** (`lin_tagged_clone`, +1 independently owned) on success or a fresh `Error` on the first structural mismatch, building a JSONPath-ish `path` (e.g. `$.address.city`) during the walk. `Error` is a structural object alias `{ "type": "error", "message": String }` (resolved by `resolve_named_cycle`, not a new `Type` variant — cf. ADR-029), and the runtime error value also carries a `"path"` field, which width subtyping permits.
 
 This ADR records three load-bearing semantic choices and their trade-offs:
 
 - **(a) Union variant selection is FIRST-MATCH-WINS.** A `KIND_UNION` node tries each variant in declaration order and accepts the first that validates. **Trade-off**: for overlapping, non-discriminated object variants the most-permissive / first-listed variant *shadows* more-specific ones — e.g. with `{ "k": String } | { "k": String, "w": Int32 }`, an input that has both `k` and `w` matches the first variant. The *runtime data is fully preserved* (the same value is returned, no fields are dropped), but the *static type* the program reasons about is the matched variant, which may be the wider one. **Recommendation**: give union variants a discriminant field (e.g. a literal `"type"` tag) so exactly one variant matches; list more-specific variants first when overlap is unavoidable. First-match-wins was chosen for v1 because it is predictable, order-explicit, and matches the spec's first-error policy spirit; a "best/most-specific match" rule would be ambiguous and costly.
 
-- **(b) Number policy is target-type-driven.** An **integer** target requires the JSON number to be integral and within the target's width/signedness range (a float like `3.14` is rejected; an integral float like `5000000000.0` against `Int32` is rejected as out of range). A **float** target (`Float32`/`Float64`) accepts any JSON number. An **unconstrained** target (`Json`/a `TypeVar`, encoded as `KIND_JSON`) accepts any number as-is with no narrowing — number-range validation is intentionally skipped there by design. (Note: a bare suffixless integer *literal* in Lin source is typed `Int32` and truncated by the lexer per spec §21 *before* it can reach `fromJson`, so genuine out-of-range integers arriving from real JSON parsing are the cases the range check guards.)
+- **(b) Number policy is target-type-driven.** An **integer** target requires the JSON number to be integral and within the target's width/signedness range (a float like `3.14` is rejected; an integral float like `5000000000.0` against `Int32` is rejected as out of range). A **float** target (`Float32`/`Float64`) accepts any JSON number. An **unconstrained** target (`AnyVal`/a `TypeVar`, encoded as `KIND_JSON`) accepts any number as-is with no narrowing — number-range validation is intentionally skipped there by design. (Note: a bare suffixless integer *literal* in Lin source is typed `Int32` and truncated by the lexer per spec §21 *before* it can reach `fromJson`, so genuine out-of-range integers arriving from real JSON parsing are the cases the range check guards.)
 
 - **(c) `Error` is a structural object alias, but `is Error` IS made to discriminate.** `Error` is `{ "type": String, "message": String }` (open, resolved by `resolve_named_cycle`; the runtime value also carries `"path"`). A *bare* tag check would match any object, so to make the agreed idiom `match result | is Error => .. | is Person => ..` work, **`is Error` is desugared in the checker (`check_pattern`, `Pattern::TypeName == "Error"`) into the value-constrained object pattern `{ "type": "error", "message": _ }`.** This reuses the existing object-pattern lowering (`lower_object_pattern_test`) which checks field presence AND `scrut["type"] == "error"` at runtime — exactly what distinguishes a decode failure (always `"type": "error"`) from a decoded value (any other shape). Standalone `Expr::Is` was routed through the same object-pattern path (its old `IsType` lowering mapped an object pattern to `Type::Never`/tag `0xFF`, which never matched). Exhaustiveness was taught to count this desugared pattern as covering the `Error` union variant. Chosen over adding a dedicated `Type::StrLit` literal-type (which would touch ~20 exhaustive `Type` matches across codegen/boxing/representation — too invasive, cf. ADR-029) and over a new `Type` variant. **Former residual trade-off, now RESOLVED by ADR-036:** when this ADR was written, the standalone expression form `result is Person` compiled to a bare `TAG_OBJECT` check, so it *also* matched the Error object and the `is Error` arm had to come first or a decode failure would route into the `Person` arm and fault on `result["name"]`. ADR-036 makes `is <ObjectType>` check the target's required fields (and types) in **both** the match-arm and expression paths, so `is Person` no longer matches an Error object and the arm order is no longer load-bearing. The `result["type"] == "error"` discriminant still works and remains valid for code that prefers it.
 
 **Rationale**: A descriptor + one generic interpreter (validator strategy C) beats inlining per-site LLVM (code bloat, recursion needs emitted helpers) and per-type generated functions (still heavy IR, forward-decl cycle handling): it keeps generated code tiny, reuses the existing tag/unbox runtime primitives, makes recursion trivial (table indices), and makes the walker ordinary, unit-testable Rust. Returning a **clone** rather than the same retained pointer (a deviation from the original plan note) keeps ownership symmetric: the `fromJson` result is registered `+1 owned` in lin-ir, and the input value temp is independently owned and released by normal liveness — returning the *same* pointer would alias two owners and double-free. Verified under AddressSanitizer: no use-after-free / double-free; the decode-`Error` builder (`make_decode_error`) releases its locally-created key/value strings after `lin_object_set` retains them, so error values are leak-clean (only the program-lifetime interned string-literal cache leaks, as elsewhere).
 
-**Consequence**: The input `Json` is **borrowed** (never consumed); the result is unconditionally a fresh `+1`-owned value (clone on success, fresh `Error` on failure); the descriptor is a static const global (never freed). Array/fixed-array/object/union targets can only be named via a `type` alias or built-in name because the special form requires arg0 to be a bare identifier (`Int32[].fromJson(...)` does not parse; use `type IntArr = Int32[]`). A user who shadows `fromJson` with a *local* binding defers to the normal call path; a global user `fromJson` called with a real type-name arg0 would still be intercepted (an accepted, low-risk corner). `Iterator`/`Function`/`Never`/`TypeVar` target fields encode as `KIND_JSON` (accept-any), since they are not JSON-shaped and have no meaningful structural check.
+**Consequence**: The input `AnyVal` is **borrowed** (never consumed); the result is unconditionally a fresh `+1`-owned value (clone on success, fresh `Error` on failure); the descriptor is a static const global (never freed). Array/fixed-array/object/union targets can only be named via a `type` alias or built-in name because the special form requires arg0 to be a bare identifier (`Int32[].fromJson(...)` does not parse; use `type IntArr = Int32[]`). A user who shadows `fromJson` with a *local* binding defers to the normal call path; a global user `fromJson` called with a real type-name arg0 would still be intercepted (an accepted, low-risk corner). `Iterator`/`Function`/`Never`/`TypeVar` target fields encode as `KIND_JSON` (accept-any), since they are not JSON-shaped and have no meaningful structural check.
 
 **Absorbs the discriminant-literal decode fix.** A `Type::StrLit(s)` target field encodes as a dedicated descriptor node `KIND_STRLIT = 10` carrying `{ u16 lit_len, lit_bytes }`, and the runtime interpreter (`lin_from_json`, `lin-runtime/src/decode.rs`) validates the JSON value is a string **and** equals that exact literal (e.g. `expected "alpha" at $.kind, got "beta"`). This replaces the original v1 `KIND_STRING` placeholder, which accepted any string in a discriminant slot and let first-match-wins (a) silently mis-decode a wrong-tagged union (e.g. `Result.fromJson({ "type": "bogus", … })` succeeded). With `KIND_STRLIT`, each union variant's discriminant literal is checked during the probe, so `{ "type": "failure", … }` fails the `"success"` variant and correctly falls through. A plain `Type::Str` field still encodes as `KIND_STRING` (any string), so ordinary string decoding is unchanged; encoder (`codegen/intrinsics.rs`) and decoder are kept in sync.
 
@@ -475,8 +475,8 @@ example runs and discriminates both branches cleanly under ASan too.
 2. `(StrLit, Str) => true` — a literal widens to the open `String` type.
 3. `(Str, StrLit) => false` — load-bearing rejection: an arbitrary string is not statically known
    to equal the singleton, so `val t: Tag = someString` is an error.
-4. The `Json`-sink arms are unchanged; an object with a (non-null) `StrLit` field is already treated
-   as "structured" by `requires_structured_decode`, so a `Json` value still cannot be silently
+4. The `AnyVal`-sink arms are unchanged; an object with a (non-null) `StrLit` field is already treated
+   as "structured" by `requires_structured_decode`, so an `AnyVal` value still cannot be silently
    bound to a literal-discriminated object — it must go through `fromJson` or `is`/`has` narrowing.
 
 **Bidirectional refinement (`checker/expr.rs`)**: a bare string-literal *value* still infers to
@@ -500,9 +500,9 @@ discriminant tag, so the union's first-match-wins probe discriminates variants b
 through to the `"failure"` variant). Superseded the original v1 `KIND_STRING` placeholder.
 
 **Limitations / scope (deliberate, v1)**:
-- **`Json → StrLit` stays permissive (unchecked) in user code.** A `Json` value IS assignable to a
+- **`AnyVal → StrLit` stays permissive (unchecked) in user code.** A `AnyVal` value IS assignable to a
   `StrLit` target (`requires_structured_decode(StrLit)` is false — a literal is scalar-like), exactly
-  as `Json → Int32` is unchecked (ADR-032 scalar gap). `fromJson` is the validated path. Tightening
+  as `AnyVal → Int32` is unchecked (ADR-032 scalar gap). `fromJson` is the validated path. Tightening
   this would diverge from the scalar-gap policy, so it is left consistent by design.
 - **Exhaustiveness (Step F) was NOT implemented.** Recognising a literal-discriminated `has`/`is`
   arm as covering a specific union variant is *not* done. This is safe: the existing exhaustiveness
@@ -595,7 +595,7 @@ consistent, sound semantics wanted.
   val, target, named_defs }` (payload mirrors `FromJson`). The two former `is <ObjectType>` sites —
   the standalone `TypedExpr::Is` arm and `lower_match_pattern`'s
   `Is(TypeCheckDeep(..))` — now emit `MatchesSchema` instead of `HasPattern`. `val` is the
-  already-boxed-to-Json scrutinee, exactly as the `HasPattern` path boxed it (`box_to_json`);
+  already-boxed-to-AnyVal scrutinee, exactly as the `HasPattern` path boxed it (`box_to_json`);
   liveness treats it as `(uses val, defs dst)`.
 - **Codegen** (`codegen/match.rs`, `mod.rs`): `MatchesSchema` reuses `emit_from_json_descriptor`
   (promoted to `pub(crate)`) to emit the same static descriptor global the `FromJson` path builds,
@@ -726,11 +726,11 @@ the `std/array` combinators) works identically; the representation is an impleme
 **Rationale**: Byte/scalar buffers are the substrate for binary protocols, `std/bytes`, and socket
 I/O (`recv` fills a caller-owned `UInt8[]`). Boxing each byte as a tagged value would cost ~16× the
 memory and defeat the point. Because the element type is statically known, codegen selects the flat
-representation with no runtime tag dispatch. Mixed/`Json`/object arrays keep the boxed tagged
+representation with no runtime tag dispatch. Mixed/`AnyVal`/object arrays keep the boxed tagged
 representation; only statically-scalar element types go flat.
 
 **Consequence**: Codegen and the runtime must convert between flat and tagged forms at boundaries where
-a flat array meets a `Json`/dynamic context (`lin_flat_to_tagged_*`, used e.g. by `toString` and
+a flat array meets an `AnyVal`/dynamic context (`lin_flat_to_tagged_*`, used e.g. by `toString` and
 dynamic length). The flat/boxed distinction is why `concat`/`slice` are flat-representation-aware:
 slicing/concatenating a `UInt8[]` yields a `UInt8[]` whose elements read correctly, not a boxed array
 of zeros. `is_flat_scalar` (codegen) is the single predicate deciding the representation and must stay
@@ -738,7 +738,7 @@ consistent with the runtime's family set.
 
 ## ADR-041: Closures OWN their captures (retain on capture, release on free)
 
-**Decision**: A closure's environment now OWNS one reference per heap/union capture — the same ownership rule arrays and objects already follow for stored elements. At `MakeClosure` the lowerer takes ownership of each capturing value (concrete rc → `Retain` in place; union/`Json` → `CloneBox` so the env holds its own `TaggedVal*`); `lin_closure_release` releases them when the closure is freed. Mutably-captured `var` bindings are unchanged: they store the heap **cell pointer** (shared by reference, ADR-012) and keep their existing borrow-only / `FreeCell` / escaping-cell lifecycle — the env does not own the cell. Scalars need no ownership.
+**Decision**: A closure's environment now OWNS one reference per heap/union capture — the same ownership rule arrays and objects already follow for stored elements. At `MakeClosure` the lowerer takes ownership of each capturing value (concrete rc → `Retain` in place; union/`AnyVal` → `CloneBox` so the env holds its own `TaggedVal*`); `lin_closure_release` releases them when the closure is freed. Mutably-captured `var` bindings are unchanged: they store the heap **cell pointer** (shared by reference, ADR-012) and keep their existing borrow-only / `FreeCell` / escaping-cell lifecycle — the env does not own the cell. Scalars need no ownership.
 
 To let the runtime release captures, every closure carries a **capture descriptor** at closure offset 40 (`{ u32 count, u8 kinds[count] }`, a static read-only global): one `CaptureRelease` byte per capture (None / Str / Array / Object / Closure / Tagged). The closure struct grew from 40 to 48 bytes (`CLOSURE_SIZE`); `alloc_closure`/`store_capture_descriptor` centralise the layout, and `lin_closure_release` frees 48 and walks the descriptor (mirroring the recursive element release in `lin_array_release`/`lin_object_release`). Partial-application closures keep borrow semantics with a null capture descriptor. The async thread-transfer path (ADR-027) reads the same descriptor (passed explicitly from the closure, no longer stored at env offset 0) and reuses its codes.
 
@@ -775,7 +775,7 @@ still-live borrowed array → retain; copy from a fresh temp being freed → mov
 The analogous move-without-retain residual leaks in the `for`/`map` element-shell path (`lower.rs`)
 are a distinct, pre-existing issue.
 
-`std/array`'s `append`/`prepend`/`groupBy` follow the same discipline, backed by RC-self-contained runtime intrinsics rather than pure-Lin loops: `lin_array_append_dyn`/`lin_array_prepend_dyn` (`array.rs`) and `lin_object_get_or_insert_array` (`object.rs`), all ordinary `import foreign "lin-runtime"` symbols (ADR-008). `append`/`prepend` **preserve the input's element representation** (ADR-040) — a flat scalar source yields a flat result (coercing the item via `lin_push_dyn` + bulk `concat_into`), a tagged/`Json[]` source yields a tagged result — fixing a latent bug where the old Lin loop allocated a *tagged* array and silently boxed flat bytes. They are hand-rolled (not composed on `concat_dyn`) because `concat_dyn`'s tagged path copies element pointers *without* retaining; the intrinsics instead copy through `lin_push_dyn` (which retains) and retain the item, so the result owns its own +1 per heap element and releases independently. `get_or_insert` does a single hash lookup, retaining the interior group array (or allocating+inserting it) and returning an owned box that `push` mutates in place — making `groupBy` one lookup+push per item.
+`std/array`'s `append`/`prepend`/`groupBy` follow the same discipline, backed by RC-self-contained runtime intrinsics rather than pure-Lin loops: `lin_array_append_dyn`/`lin_array_prepend_dyn` (`array.rs`) and `lin_object_get_or_insert_array` (`object.rs`), all ordinary `import foreign "lin-runtime"` symbols (ADR-008). `append`/`prepend` **preserve the input's element representation** (ADR-040) — a flat scalar source yields a flat result (coercing the item via `lin_push_dyn` + bulk `concat_into`), a tagged/`AnyVal[]` source yields a tagged result — fixing a latent bug where the old Lin loop allocated a *tagged* array and silently boxed flat bytes. They are hand-rolled (not composed on `concat_dyn`) because `concat_dyn`'s tagged path copies element pointers *without* retaining; the intrinsics instead copy through `lin_push_dyn` (which retains) and retain the item, so the result owns its own +1 per heap element and releases independently. `get_or_insert` does a single hash lookup, retaining the interior group array (or allocating+inserting it) and returning an owned box that `push` mutates in place — making `groupBy` one lookup+push per item.
 
 ## ADR-042: Numeric literal suffixes honoured; large bare literals widen, never truncate
 
@@ -795,11 +795,11 @@ are a distinct, pre-existing issue.
 
 Re-homing (`rehome_imported_body`) rewrites the cloned body's slots: every body-local slot (params, inner `val`/`var`, destructure targets) is remapped to a fresh importer slot (so it can't collide with the importer's own slots or another specialization), and every FREE reference to the origin module's scope is rewritten into an importer-side construct the importer's lowering already resolves — a sibling function/val → a synthesised `TypedStmt::Import` (a `Named` call to `{origin_key}_{name}`), an intrinsic → a merged intrinsic slot, a **thin intrinsic wrapper** (`for = (it,f) => lin_for(it,f)`) → the intrinsic itself (inlined, preserving the polymorphic builtin's concrete-element dispatch), a foreign binding → a `ForeignImport`. An import-of-import resolves to the SOURCE module's symbol, never the intermediate's. Imported modules also monomorphize their OWN sibling generic calls during `lower_import_module` (`monomorphize_import`), keeping ALL generic originals so external importers that don't specialize still resolve the boxed `{module_key}_{name}` symbol.
 
-Two supporting fixes: (1) `subst_expr` now substitutes the declared-type field of statements inside a block (`subst_stmt_types`) — a `var acc: U` in a generic body otherwise kept `ty: TypeVar(U)`, producing a boxed-union cell while the substituted closure that captures it read the concrete type (a misaligned-pointer crash). (2) the checker's `infer_function_with_hints` now surfaces a lambda's CONCRETE body type when the expected return is a quantified generic param (id ≥ 9001), so a higher-order generic call (`mymap(arr, x => x*2)` with `f: (T) => U`) can bind `U` from the lambda body; the bare-TypeVar boxing convention is retained for the Json/`Function` polymorphic-slot case.
+Two supporting fixes: (1) `subst_expr` now substitutes the declared-type field of statements inside a block (`subst_stmt_types`) — a `var acc: U` in a generic body otherwise kept `ty: TypeVar(U)`, producing a boxed-union cell while the substituted closure that captures it read the concrete type (a misaligned-pointer crash). (2) the checker's `infer_function_with_hints` now surfaces a lambda's CONCRETE body type when the expected return is a quantified generic param (id ≥ 9001), so a higher-order generic call (`mymap(arr, x => x*2)` with `f: (T) => U`) can bind `U` from the lambda body; the bare-TypeVar boxing convention is retained for the AnyVal/`Function` polymorphic-slot case.
 
 **Rationale**: The importer has the full `TypedModule` for every import (not just the signature), so it can see imported generic BODIES — the only place with both the body and the concrete call types. Specializing there avoids touching the imported module's compilation/caching and avoids cross-contamination (each importer derives its own specializations from the cached generic body; the `.lin-cache` stores the TypedModule with the generic body intact, keyed by source hash regardless of how importers instantiate). The no-op invariant is preserved: `module_uses_generic` gates the whole pass, so a module that neither defines nor imports a param-generic function lowers byte-for-byte as before (verified: `benchmarks/array_pipeline.lin` IR is byte-identical to baseline).
 
-**Consequence**: User-defined cross-module generics — including higher-order ones with the `map` shape (`<T,U>(arr: T[], f: (T) => U)`) — specialize to native, unboxed code in the importer (e.g. `id$Int32` is `define i32 @"id$Int32"(i32)`). Verified end-to-end (output + IR proof + ASan, no UAF/leak) and across the cache (two importers using one imported generic at different element types each get correct specializations). **Converting stdlib `map`/`filter`/`reduce` to generic was attempted and DEFERRED at the time**: the specialized bodies are themselves nearly box-free, but (a) the result of a `[]`-plus-`push` build is a *tagged* array while a static `U[]` result type makes consumers read via the *flat* ABI — a representation mismatch — and (b) the per-element boxing at the `lin_for` callback boundary remains (the closure ABI passes a `TaggedVal*`), so the static box count rose and ~20 of the diverse stdlib/example uses regressed. The full flat/zero-box pipeline needed closure-callback ABI specialization — which later landed in ADR-044. stdlib `array.lin` was therefore left `Json`-typed here; the cross-module infrastructure is in place for when that lands.
+**Consequence**: User-defined cross-module generics — including higher-order ones with the `map` shape (`<T,U>(arr: T[], f: (T) => U)`) — specialize to native, unboxed code in the importer (e.g. `id$Int32` is `define i32 @"id$Int32"(i32)`). Verified end-to-end (output + IR proof + ASan, no UAF/leak) and across the cache (two importers using one imported generic at different element types each get correct specializations). **Converting stdlib `map`/`filter`/`reduce` to generic was attempted and DEFERRED at the time**: the specialized bodies are themselves nearly box-free, but (a) the result of a `[]`-plus-`push` build is a *tagged* array while a static `U[]` result type makes consumers read via the *flat* ABI — a representation mismatch — and (b) the per-element boxing at the `lin_for` callback boundary remains (the closure ABI passes a `TaggedVal*`), so the static box count rose and ~20 of the diverse stdlib/example uses regressed. The full flat/zero-box pipeline needed closure-callback ABI specialization — which later landed in ADR-044. stdlib `array.lin` was therefore left `AnyVal`-typed here; the cross-module infrastructure is in place for when that lands.
 
 ## ADR-044: Generic `map`/`filter`/`reduce` + a capture-less-lambda inliner — the zero-per-element-box array pipeline (10x at -O2)
 
@@ -839,7 +839,7 @@ wrapper `ptr(ptr env, ptr boxedArg…) -> ptr boxedRet`, so a combinator calling
    `Function`, its body is spliced directly into the loop — param bound to the flat element temp,
    body lowered inline — with NO closure alloc and NO per-element box/unbox/indirect call. `reduce`
    additionally carries a CONCRETE-SCALAR accumulator UNBOXED through the loop phi (gated on a scalar
-   `result_type`; a union/heap accumulator keeps the boxed Json-phi path). RC: unboxed scalar
+   `result_type`; a union/heap accumulator keeps the boxed AnyVal-phi path). RC: unboxed scalar
    elements/results carry no refcount, so there is no per-iteration box to release.
 
 **The two regressions and how they were solved (correctness-first).**
@@ -853,10 +853,10 @@ wrapper `ptr(ptr env, ptr boxedArg…) -> ptr boxedRet`, so a combinator calling
     commit 286cfd2; no helper indirection is needed. The earlier draft of this note claimed inline
     `match` was impossible under ADR-003/014 indentation suppression — that no longer holds.)
   - **R2 (`sortBy`/`minBy`/`maxBy`/`compact`/`sum`/…):** these stdlib combinators call `map`/`reduce`/
-    `filter` internally over `Json[]`; a SIBLING call to the now-generic combinator specialized at
-    `$Json` cross-module, where the combinator's owned-array result and the surrounding generic body's
+    `filter` internally over `AnyVal[]`; a SIBLING call to the now-generic combinator specialized at
+    `$AnyVal` cross-module, where the combinator's owned-array result and the surrounding generic body's
     RC accounting disagreed — a double-release of the intermediate array (capacity-overflow crash).
-    SOLVED by keeping those internal callers on non-generic Json helpers (`_mapJ`/`_filterJ`/
+    SOLVED by keeping those internal callers on non-generic AnyVal helpers (`_mapJ`/`_filterJ`/
     `_reduceJ`, thin wrappers over the same intrinsics). The generic exports still give the zero-box
     fast path at the user's monomorphic call site.
 
@@ -864,12 +864,12 @@ wrapper `ptr(ptr env, ptr boxedArg…) -> ptr boxedRet`, so a combinator calling
   - **Cross-module generic specialization for IMPORTED modules** (`lower_import_module_with_imports`,
     `monomorphize_import_with_imports`): a module that imports a generic AND is itself imported (e.g.
     `examples/report` calling `std/array.reduce`) previously did not specialize its cross-module
-    generic calls — they fell to the boxed type-erased original (returns `Json`), crashing a concrete
+    generic calls — they fell to the boxed type-erased original (returns `AnyVal`), crashing a concrete
     scalar use site (`ret i32` vs `ptr`). The import path now monomorphizes with the program's imports
     map, exactly like the top-level importer.
   - **`repoint_call_native` re-coercion**: when a native specialization returns a CONCRETE scalar but
     the checker left the Call's `result_type` as the boxed/erased generic return (the `U` TypeVar
-    surfaced as `Json`, e.g. `total = s` with `total: Json`), the Call is wrapped in a `Coerce {
+    surfaced as `AnyVal`, e.g. `total = s` with `total: AnyVal`), the Call is wrapped in a `Coerce {
     concrete → original }` so the boxed/unboxed handoff is explicit. Without it the consumer emits
     `store i32`/`ret i32` against a `ptr` slot (a hard codegen type mismatch).
 
@@ -883,9 +883,9 @@ per-element malloc/indirect-call the way it elides cheaper boxing, so eliminatin
 itself is what unlocks the win.
 
 **Correctness + safety.** stdlib+examples 59/59; integration 357/0 (isolated). map/filter/reduce
-verified over `Int32[]` (flat), `String[]`/`Float64[]` (tagged/flat), `Json[]` (heterogeneous);
+verified over `Int32[]` (flat), `String[]`/`Float64[]` (tagged/flat), `AnyVal[]` (heterogeneous);
 capturing lambda → closure path (correct); stored-fn-value callback → closure path (correct); chained
-pipeline; non-scalar (array/string) reduce accumulator → boxed Json-phi path (correct). ASan-clean over
+pipeline; non-scalar (array/string) reduce accumulator → boxed AnyVal-phi path (correct). ASan-clean over
 the full stdlib+examples leg + flat/tagged/capturing/mixed/sortBy/churn fixtures. No-op invariant: a
 non-combinator program's MAIN module IR is BYTE-IDENTICAL to base (only `std/array` differs).
 
@@ -906,24 +906,24 @@ is untouched and the object-array inline win is RETAINED. Verified: stdlib+examp
 357/0; ASan-clean across every example-project test + a `filter`-over-`Object[]` fixture.
 
 **Consequences.** The zero-per-element-box array pipeline ships at a verified ~10x `-O2` speedup.
-Generic `map`/`filter`/`reduce` + capture-less-lambda inlining is the mechanism; the internal Json
+Generic `map`/`filter`/`reduce` + capture-less-lambda inlining is the mechanism; the internal AnyVal
 helpers and the union-narrowing example rewrite keep every heterogeneous/union call site correct; the
 import-path monomorphization + native-return re-coercion are general fixes for cross-module generic
 calls. Capturing lambdas and stored-fn callbacks keep the (correct, boxed) closure path.
 
 **Absorbs the three staging steps of this saga** — now folded in as the shipped final state:
 
-- **(staging step 1) Flow-typing refinement pins generic combinator element types so alloc-builder bodies emit FLAT arrays.** A generic combinator returns `U[]`, but the only fully-controlled allocation intrinsic, `lin_array_allocate`, infers to the Json-wildcard `Array(TypeVar(MAX))`; monomorphization's `subst` rewrites `U` but never the MAX wildcard, so the allocation stayed TAGGED while a `U=Int32` consumer read it FLAT (garbage). The checker now refines the wildcard element of a fresh `lin_array_allocate` to the function's declared-return element — both for a direct `=> lin_array_allocate(n)` body and for the realistic intermediate-binding shape `val result = lin_array_allocate(n); …; result` — so `subst` pins `Array(Int32)` and `is_flat_scalar` emits a flat allocation matching the flat reader. STRICTLY gated to `lin_array_allocate` (every other `Json[]`-returning call stays tagged); a user annotation on the binding wins. The write uses the representation-aware `lin_array_set`, so producer/writer/reader all agree.
-- **(staging step 2) A `Json` argument binds a generic `T[]` param to the Json wildcard, and the import path erases leftover inference TypeVars to Json.** `collect_type_subs` (lin-check) and `collect_subs` (lin-ir) gained `(Array(pt), TypeVar(MAX))`/`(Iterator(pt), TypeVar(MAX))` arms so a `Json` array argument binds `T=Json` (a representation-consistent TAGGED `$Json` monomorph) while an `Int32[]` argument still binds `T=Int32` (FLAT `$Int32`). And `monomorphize_inner` runs every binding through `erase_nonconcrete_typevars`: a leftover/unsolved INFERENCE TypeVar (id `< GENERIC_TV_BASE`) is rewritten to `TypeVar(MAX)` before keying a specialization, so the import path can never emit a `$T<id>` garbage monomorph (which had read/allocated at a bogus element type → capacity overflow / heap corruption). A QUANTIFIED generic id is left untouched so a genuinely-unconstrained param still gets the clean "cannot infer a concrete type" diagnostic.
+- **(staging step 1) Flow-typing refinement pins generic combinator element types so alloc-builder bodies emit FLAT arrays.** A generic combinator returns `U[]`, but the only fully-controlled allocation intrinsic, `lin_array_allocate`, infers to the AnyVal-wildcard `Array(TypeVar(MAX))`; monomorphization's `subst` rewrites `U` but never the MAX wildcard, so the allocation stayed TAGGED while a `U=Int32` consumer read it FLAT (garbage). The checker now refines the wildcard element of a fresh `lin_array_allocate` to the function's declared-return element — both for a direct `=> lin_array_allocate(n)` body and for the realistic intermediate-binding shape `val result = lin_array_allocate(n); …; result` — so `subst` pins `Array(Int32)` and `is_flat_scalar` emits a flat allocation matching the flat reader. STRICTLY gated to `lin_array_allocate` (every other `AnyVal[]`-returning call stays tagged); a user annotation on the binding wins. The write uses the representation-aware `lin_array_set`, so producer/writer/reader all agree.
+- **(staging step 2) A `AnyVal` argument binds a generic `T[]` param to the AnyVal wildcard, and the import path erases leftover inference TypeVars to AnyVal.** `collect_type_subs` (lin-check) and `collect_subs` (lin-ir) gained `(Array(pt), TypeVar(MAX))`/`(Iterator(pt), TypeVar(MAX))` arms so an `AnyVal` array argument binds `T=AnyVal` (a representation-consistent TAGGED `$AnyVal` monomorph) while an `Int32[]` argument still binds `T=Int32` (FLAT `$Int32`). And `monomorphize_inner` runs every binding through `erase_nonconcrete_typevars`: a leftover/unsolved INFERENCE TypeVar (id `< GENERIC_TV_BASE`) is rewritten to `TypeVar(MAX)` before keying a specialization, so the import path can never emit a `$T<id>` garbage monomorph (which had read/allocated at a bogus element type → capacity overflow / heap corruption). A QUANTIFIED generic id is left untouched so a genuinely-unconstrained param still gets the clean "cannot infer a concrete type" diagnostic.
 - **(staging step 3) Route `map`/`filter`/`reduce` through the materializing `lin_*` intrinsics with representation-safe element reads.** Before the inliner landed, the three combinators were first switched from hand-written `for`/`push` loops to thin wrappers over `lin_map`/`lin_filter`/`lin_reduce`, whose lowering allocates a flat output for a flat-scalar result and reads flat only from a PROVABLY-FLAT producer (`is_provably_flat_producer` — a `range`/`map`/`filter`/flat-alloc call or a non-empty scalar array literal); otherwise it reads via the runtime-`elem_tag`-aware `lin_array_get_tagged`, keeping `[]`+push arrays (which allocate TAGGED even when typed `Int32[]`) sound. This step also routes a push into a statically-flat array through `lin_push_dyn`, and fixed three latent bugs the routing exposed: a curried callback at full arity returning a function was wrongly treated as under-application (now disambiguated by arg-count vs declared arity); `emit_index_loop`'s phi back-edge hard-coded the body block (now patched to the block that actually jumps back, needed for filter's keep/skip split); and `collect_type_subs` gained `Array`↔`Iterator` cross-unification so a generic `T[]` param applied to `range(0,n)` binds `T=Int32`. At `-O2` this intermediate step was perf-NEUTRAL on its own (LLVM already elided the cheaper boxing); the real win came only once the closure call itself was eliminated by the inliner above.
 
-**Also absorbs the earlier direct-index-accessor genericization (Phase 6).** A first, conservative pass had already genericized only the **direct-index accessors** — `at: <T>(arr: T[], index: Int32): T`, `set: <T>(arr: T[], idx: Int32, item: T): Null`, `indexOf: <T>(arr: T[], target: T): Int32` — because they read/write a single element through the already-element-type-aware bracket-index path (`arr[i]` / `arr[i] = item`) without allocating or routing the element through an opaque `for`/closure callback, so flat and tagged inputs both stay representation-consistent (no perf delta, pure type-safety). Every *allocating/builder/dyn-fn/numeric/iterator* combinator was deliberately left `Json` at that point precisely because of the boxed-closure-ABI representation mismatch this ADR's inliner later removed — so `map`/`filter`/`reduce` are now generic-and-unboxed, while the numeric reductions (`sum`/`min`/`maxBy`/…) stay `Json` pending a `<T: Numeric>` constraint and the iterable ops live in `std/iter` (ADR-051). The one behavioural note from that pass survives: `at`/`set`/`indexOf` no longer accept a non-array `Json` (e.g. `range(0,10).at(5)` reports `expected Int32[]`); wrap an iterator in an array first.
+**Also absorbs the earlier direct-index-accessor genericization (Phase 6).** A first, conservative pass had already genericized only the **direct-index accessors** — `at: <T>(arr: T[], index: Int32): T`, `set: <T>(arr: T[], idx: Int32, item: T): Null`, `indexOf: <T>(arr: T[], target: T): Int32` — because they read/write a single element through the already-element-type-aware bracket-index path (`arr[i]` / `arr[i] = item`) without allocating or routing the element through an opaque `for`/closure callback, so flat and tagged inputs both stay representation-consistent (no perf delta, pure type-safety). Every *allocating/builder/dyn-fn/numeric/iterator* combinator was deliberately left `AnyVal` at that point precisely because of the boxed-closure-ABI representation mismatch this ADR's inliner later removed — so `map`/`filter`/`reduce` are now generic-and-unboxed, while the numeric reductions (`sum`/`min`/`maxBy`/…) stay `AnyVal` pending a `<T: Numeric>` constraint and the iterable ops live in `std/iter` (ADR-051). The one behavioural note from that pass survives: `at`/`set`/`indexOf` no longer accept a non-array `AnyVal` (e.g. `range(0,10).at(5)` reports `expected Int32[]`); wrap an iterator in an array first.
 
 ## ADR-045: `Error` built-in type + `is Error`; `await` enforces Error handling via `T | Error`; first-class `Promise<T>`
 
 > **Update (first-class `Promise<T>`).** The "no nominal Promise type" decision below was later
 > reversed: `Type::Promise<T>` is now a first-class opaque handle type, modelled exactly like
-> `Shared<T>`/`Stream<T>` (a boxed `TaggedVal*(TAG_PROMISE)` that does not widen to `Json`). The
+> `Shared<T>`/`Stream<T>` (a boxed `TaggedVal*(TAG_PROMISE)` that does not widen to `AnyVal`). The
 > change is purely in `lin-check` (variant + compat/zonk/resolve/collect-subs arms), threaded
 > through `lin-ir` monomorphize/lower and `lin-codegen` (representation, RC, tagged-array element
 > push) the same way `Stream<T>` already is — **no runtime change** (TAG_PROMISE + box/unbox/await
@@ -948,7 +948,7 @@ with no new runtime support. (The deeper `is <ObjectType>` validation that super
 field-presence check is ADR-036; nested-promise auto-flatten — `await` recursing through a
 `TAG_PROMISE` result — is implemented in the runtime per §24.2.3.) The other half of §24.2.2 —
 forcing callers to handle an uninspected `Error` — was originally deferred (the whole async surface
-was `Json`-typed, with no parametric `Promise<T>`), and **shipped at `await`, not `async`**, as
+was `AnyVal`-typed, with no parametric `Promise<T>`), and **shipped at `await`, not `async`**, as
 recorded below.
 
 **Decision.** `await` is typed as a generic `<T>(p: T): T | Error` in `stdlib/async.lin`. It is the
@@ -971,8 +971,8 @@ crashed codegen (`Found PointerValue … but expected the IntValue variant` in `
 `async`/`poolAsync`/`race`/`timeout`/`retry` all return a **live `LinPromise*` handle**, not a resolved
 value — the value only materialises at `await`. A union type forces a boxed-`TaggedVal*` representation
 and scalar boxing; applying it to a promise pointer makes codegen try to box the promise *as* its inner
-scalar, which is a representation mismatch. So every promise-*producing* wrapper keeps its opaque `Json`
-typing (a `LinPromise*` is just an opaque pointer, same as `Json`), and only the promise-*consuming*
+scalar, which is a representation mismatch. So every promise-*producing* wrapper keeps its opaque `AnyVal`
+typing (a `LinPromise*` is just an opaque pointer, same as `AnyVal`), and only the promise-*consuming*
 `await` — whose runtime result genuinely is a boxed value — carries the `T | Error` union. This still
 satisfies §24.2.2 (you cannot use an awaited result without handling the `Error`), which is the rule the
 spec actually cares about; it just attaches the union one call later than the prose suggests.
@@ -982,16 +982,16 @@ type compat/resolve/zonk/monomorphize, every async intrinsic signature, and code
 risky change for the §24.2.2 guarantee alone. The generic-union approach reuses what already exists.
 
 **Known limitation (honest).** Because there is no nominal `Promise<T>` and a promise handle is erased
-to `Json`, this enforces *"you must handle the Error after awaiting"* but does **not** catch *"you forgot
+to `AnyVal`, this enforces *"you must handle the Error after awaiting"* but does **not** catch *"you forgot
 to await"* — i.e. using a promise as if it were the value. A real `Type::Promise<T>` would catch the
 latter (a promise wouldn't be assignable to its inner type), but at the cost above. This is not a
-regression: the previous all-`Json` typing didn't catch the forgotten-await case either. Deferred.
+regression: the previous all-`AnyVal` typing didn't catch the forgotten-await case either. Deferred.
 
 **Narrowing footnote.** Match narrowing does not strip the structural `Error` member from an
 `?T | Error` union whose `T` is an unsolved type variable (the awaited value, since the promise is
-`Json`). So `match await(…) is Error => … else => result` leaves `result` typed as the full union in
-the `else` arm rather than `?T`. Routing the awaited value through a `Json`-typed boundary (a tiny
-`(r: Json): Int32 => match r is Error => … else => r` helper) sidesteps this and coerces cleanly; the
+`AnyVal`). So `match await(…) is Error => … else => result` leaves `result` typed as the full union in
+the `else` arm rather than `?T`. Routing the awaited value through an `AnyVal`-typed boundary (a tiny
+`(r: AnyVal): Int32 => match r is Error => … else => r` helper) sidesteps this and coerces cleanly; the
 concurrency examples and async tests use that helper for happy-path arithmetic. Improving union
 narrowing over unsolved type variables is a separate, pre-existing checker concern.
 
@@ -1072,9 +1072,9 @@ test-only + intrinsic/unused diagnostics).
 - **Type drift** is caught by an explicit `types_compatible` check after `check_expr` — the
   function-hint path treats expected param types as hints, so an annotation could otherwise override
   them silently.
-- **`withFixture` is `Json`-typed**, not generic: `(() => Json, (Json) => Null, String, (Json) =>
+- **`withFixture` is `AnyVal`-typed**, not generic: `(() => AnyVal, (AnyVal) => Null, String, (AnyVal) =>
   Assertion[]) => Test`. A generic stdlib export taking function params + returning a concrete type
-  hit a monomorphization edge (resolved as a `__val` wrapper, link error); the `Json` fixture type
+  hit a monomorphization edge (resolved as a `__val` wrapper, link error); the `AnyVal` fixture type
   sidesteps it and is sufficient for a test helper.
 - **`run` now delegates to `report`**, the non-exiting variant (`(Suite) => Int32`) added for
   guaranteed afterAll teardown — `run(s) = if report(s) > 0 then exit(1) else null`.
@@ -1142,18 +1142,18 @@ synthesises a stack `TaggedVal(TAG_OBJECT)` for the bare-pointer case before cal
 `tagged_to_json` (which only reads tag+payload — it neither frees nor owns the input).
 
 **Error handling (option a)**: the FFI return type changed from `*mut LinString` to a
-tagged value `*mut u8` (`Json`), matching the established `readFile`/`lin_fs_read_json`
-convention (declared `=> Json` in the `import foreign "lin-runtime"` block, documented
+tagged value `*mut u8` (`AnyVal`), matching the established `readFile`/`lin_fs_read_json`
+convention (declared `=> AnyVal` in the `import foreign "lin-runtime"` block, documented
 conceptually as `String | Error`). Success boxes the rendered string into a
 `TAG_STR` tagged value; a template **syntax error or render failure** returns
 `make_error_tagged(...)` → `{ "type": "error", "message": ... }`, discriminated with
-`is Error` exactly like other fallible stdlib operations. Typing the wrappers as `Json`
+`is Error` exactly like other fallible stdlib operations. Typing the wrappers as `AnyVal`
 (rather than a literal `String | Error` annotation) is what keeps callers that use the
 result directly as a string working unchanged — `out.contains(...)` in the web-server
-tests and `writeFile(path, rendered)` in the docs-site builder both rely on the `Json`
+tests and `writeFile(path, rendered)` in the docs-site builder both rely on the `AnyVal`
 wildcard, and a hard `String | Error` annotation would reject those (`Error` has no
 `.contains`; `writeFile` wants a `String`). This mirrors how the docs already describe
-`readFile` as `String | Error` while its signature is `Json`.
+`readFile` as `String | Error` while its signature is `AnyVal`.
 
 **Ownership**: `lin_string_from_bytes` returns an OWNED (+1) string; that owned
 reference transfers into the `TAG_STR` tagged box, and the standard owned-release
@@ -1260,7 +1260,7 @@ to reason about aliasing through a container or through a mutable cell that two 
 (ADR-012). The restriction is enforced in the checker (a `Stream`-typed object/array literal element or
 `var` initializer is a type error) and is **relaxable later** (container-linearity / region tracking)
 without changing the surface API. It mirrors the deliberately-narrow scope choices of ADR-029 (`Shared`
-is invariant, never widens to `Json`) and ADR-032 (the structured-decode gate).
+is invariant, never widens to `AnyVal`) and ADR-032 (the structured-decode gate).
 
 **`CAP_MOVE` in the closure-env ABI.** Capture kinds live in two mirrored places that previously stopped
 at `CAP_TAGGED=5` (`crates/lin-runtime/src/transfer.rs`'s `CAP_*` family and `lin-ir/src/ir.rs`'s
@@ -1399,7 +1399,7 @@ three of:
    `(module, export)` dispatch fact.
 
 The std/iter wrappers spell their iterable param as the union `T[] | Iterator | Stream` (so a `Stream`
-is accepted without the opaque type leaking into a bare `Json` param) and **drop their return
+is accepted without the opaque type leaking into a bare `AnyVal` param) and **drop their return
 annotations** so the checker-computed receiver-dependent type flows through. The "definitely a stream"
 predicate (`is_definitely_stream`) accepts a bare `Stream<…>` or a `Stream<…> | Error` (a source
 intrinsic's result), but NOT a mixed `Array | Iterator | Stream` union — a union with a live array
@@ -1542,8 +1542,8 @@ hinting, an explicit `Int32` annotation is allowed, and any other annotation is 
   surplus index temp (`inline_lambda_body` binds by the lambda's own param count, and the dead
   narrowing temp is DCE'd).
 - **Tier B — derived combinators** are pure-Lin wrappers that call `f(item, idx)` with a threaded
-  counter. They re-type their callback param to the indexed form and operate on **`Json` elements**
-  (matching their original `arr: Json` shape — keeping the boxed monomorphization unchanged).
+  counter. They re-type their callback param to the indexed form and operate on **`AnyVal` elements**
+  (matching their original `arr: AnyVal` shape — keeping the boxed monomorphization unchanged).
 
 **In-place adapter (not a thunk).** When a user passes a SHORTER callback, the checker PADS the typed
 lambda with synthetic unused trailing `Int32` parameters (`infer_function_with_hints`), so the compiled
@@ -1556,8 +1556,8 @@ list to the closure's declared arity, so a 1-param closure value reaching there 
 
 **No runtime/ABI change.** `lin-runtime` is untouched; the stream combinators keep their 1-arg ABI.
 
-**Inference note.** A `for`-style callback whose expected element param is the `Json` wildcard
-(`TypeVar(MAX)`) binds the param DIRECTLY to `Json` rather than to a fresh inference var. Minting a
+**Inference note.** A `for`-style callback whose expected element param is the `AnyVal` wildcard
+(`TypeVar(MAX)`) binds the param DIRECTLY to `AnyVal` rather than to a fresh inference var. Minting a
 fresh var there left an ambiguous element (a `[]`+push array) unsolved and defaulted to the wrong
 scalar (surfaced as an `i8` element — a real regression caught by the pool stress test). This matches
 the prior opaque-`Function` behaviour; a non-MAX generic `T` (map/filter's element) still mints a fresh
@@ -1649,8 +1649,8 @@ Surface and checker rules:
 - An empty `{}` literal infers `{ String: T }` from its annotated context (binding target / return
   type), else stays a fixed record. A non-empty string-keyed literal checked against a `{ String: T }`
   context produces a `LinMap` whose values are each checked against `T`.
-- No implicit `Json → { String: T }` coercion: a `Map` target is a *structured decode* in user code
-  (`compat::requires_structured_decode`), so a raw `Json` must go through `fromJson`/narrowing,
+- No implicit `AnyVal → { String: T }` coercion: a `Map` target is a *structured decode* in user code
+  (`compat::requires_structured_decode`), so a raw `AnyVal` must go through `fromJson`/narrowing,
   exactly like a structured record (parity with §6.3 / ADR-045). The trusted stdlib stays lenient.
 - A `Map` is its OWN type — not structurally compatible with a fixed `Object` in either direction
   (`compat.rs`), covariant in `T` (`Map<U>` → `Map<T>` when `U` compat `T`).
@@ -1735,35 +1735,35 @@ runtime container is untouched — the change is entirely in **codegen**:
   representation-independent**, not introduced by unboxing.
 
 **Relationship to `hashed-json-object.md` / ADR-056 (#4b).** #4b *did* land independently as
-**ADR-056** (a lazy O(1) hash side-index on large generic `Json` objects). The two are
+**ADR-056** (a lazy O(1) hash side-index on large generic `AnyVal` objects). The two are
 **complementary, not redundant**, and operate at different layers: ADR-056 makes the *untyped* `{}`
-/ `Json` dictionary O(1) at runtime with zero surface-language change, while this ADR adds a *typed*
+/ `AnyVal` dictionary O(1) at runtime with zero surface-language change, while this ADR adds a *typed*
 `{ String: T }` surface form (fidelity + a value type that flows through the stdlib) backed by its
 own `LinMap`. Code that wants a typed dictionary uses `{ String: T }` and gets O(1) by construction
-and an unboxed scalar payload; code that stays on dynamic `Json` still gets O(1) lookup from ADR-056.
+and an unboxed scalar payload; code that stays on dynamic `AnyVal` still gets O(1) lookup from ADR-056.
 The earlier draft of this ADR (written before ADR-056 merged) claimed to *supersede* #4b on the
 assumption it would be left unimplemented — that is no longer accurate: both shipped and coexist.
 
 **Stdlib.** `std/object`'s `keys`/`values`/`entries` are made **tag-aware** (new runtime bridges
 `lin_keys_any`/`lin_values_any`/`lin_entries_any` dispatch on the boxed value's tag — TAG_OBJECT →
-`LinObject`, TAG_MAP → `LinMap`), so the SAME functions work over both a `Json`/`{}` record and a
+`LinObject`, TAG_MAP → `LinMap`), so the SAME functions work over both an `AnyVal`/`{}` record and a
 typed map. `length`/`isEmpty` likewise handle TAG_MAP (`lin_map_length`, `lin_length_dyn`). The
-constructor cluster (`fromEntries`/`merge`/`pick`/`omit`/`mapValues`) stays on the `Json`/`LinObject`
+constructor cluster (`fromEntries`/`merge`/`pick`/`omit`/`mapValues`) stays on the `AnyVal`/`LinObject`
 representation (a map and a record are different runtime containers; silently re-routing them would
-change behaviour) — they remain `Json`-typed and unchanged.
+change behaviour) — they remain `AnyVal`-typed and unchanged.
 
 **Performance (microbenchmark `benchmarks/map_index_signature.lin`, insert+lookup of N distinct
 keys, debug-built compiler / O2 output):**
 
-| N | `{ String: T }` (LinMap) | `Json` object (assoc-list) | speedup |
+| N | `{ String: T }` (LinMap) | `AnyVal` object (assoc-list) | speedup |
 |------:|------:|------:|------:|
 | 10000 | 18 ms | 1824 ms | ~101x |
 | 20000 | 35 ms | 5664 ms | ~162x |
 | 40000 | 76 ms | 26920 ms | ~354x |
 | 80000 | 308 ms | 151969 ms | ~493x |
 
-The map roughly doubles as N doubles (linear); the `Json` object roughly quadruples (quadratic). At
-N=200000 the `Json` version exceeds 120 s while the map finishes in ~0.4 s.
+The map roughly doubles as N doubles (linear); the `AnyVal` object roughly quadruples (quadratic). At
+N=200000 the `AnyVal` version exceeds 120 s while the map finishes in ~0.4 s.
 
 **Flat-scalar unboxing — measured delta.** A value-churn microbenchmark
 (`benchmarks/map_flat_scalar.lin`: an `{ String: Int64 }` map, 64-key set × 100k rounds of overwrite
@@ -1795,9 +1795,9 @@ insertion-order. A `var`-local map that goes out of scope inside a recursive fun
 at scope exit (a **pre-existing**, representation-independent IR-lowering gap — reproduces on the
 boxed String-valued path too; unrelated to unboxing).
 
-## ADR-056: Large `Json` objects get a lazy O(1) hash side-index (RAPTOR #4b)
+## ADR-056: Large `AnyVal` objects get a lazy O(1) hash side-index (RAPTOR #4b)
 
-**Decision**: `Json` objects keep their association-list `entries` buffer as the source of truth, but
+**Decision**: `AnyVal` objects keep their association-list `entries` buffer as the source of truth, but
 gain an **optional, lazily-built open-addressing hash side-index** for O(1)-average key lookup once an
 object grows past a threshold (`HASH_INDEX_THRESHOLD = 16` entries). The change lives entirely in
 `crates/lin-runtime/src/object.rs`; no codegen change was required.
@@ -1852,7 +1852,7 @@ simplified back to plain `{}` maps — a follow-up, not part of this change.
 values are laid out as an **unboxed, constant-offset struct** instead of the
 uniform boxed, refcounted, string-keyed `LinObject`. Crucially, this changes
 **representation only** — type **compatibility stays structural**. A wider or
-`Json` value is still assignable where `T` is expected (§5.9 width subtyping is
+`AnyVal` value is still assignable where `T` is expected (§5.9 width subtyping is
 unchanged); at that boundary it is **projected** by a *non-mutating copy* into a
 fresh sealed value holding exactly `T`'s fields. The source is untouched and
 keeps any extra fields in its own scope.
@@ -1873,7 +1873,7 @@ projection-copy) and release (on drop, nested recursing). `rc` at offset 0 means
 the existing `lin_rc_retain`/RC machinery works unchanged. Field read is a
 constant-offset load; construction stores fields by offset with no string keys.
 Operations that need the universal JSON shape (`==` cross-representation,
-`toString`, `keys`, spread, dynamic `obj[k]`, `Json` boundary, thread-transfer)
+`toString`, `keys`, spread, dynamic `obj[k]`, `AnyVal` boundary, thread-transfer)
 **materialize** the struct into a boxed `LinObject` at that edge — correct, and
 the slow path is only the rare ops, not field access.
 
@@ -1891,8 +1891,8 @@ reuse, box elimination — all in `docs/`/memory) established the cost is the
 representation, not the allocator. Sealed layout removes the call, the lookup,
 and the box in one move. Measured: **~83×** faster field access on an
 access-bound scalar-record loop, **~5.9×** on a mixed String-field record,
-**~87×** on a scalar-record array versus a boxed `Json[]`, and **~5.7×** on the
-`records` cross-language benchmark versus the same code typed `:Json`.
+**~87×** on a scalar-record array versus a boxed `AnyVal[]`, and **~5.7×** on the
+`records` cross-language benchmark versus the same code typed `:AnyVal`.
 
 A `Type::Object` carries a `sealed: bool` (set when a named record type resolves;
 `false` for anonymous literals, inferred shapes, and the `Error` alias). The flag
@@ -1904,7 +1904,7 @@ compatibility are exactly as before.
 - **Sealing by shape (any all-scalar object, named or anonymous)** — rejected: it
   would seal pervasive anonymous `{x,y}` literals and force conversions at most
   boundaries. Gating on the *named* `sealed` marker keeps the fast layout where a
-  programmer named a precise shape, and keeps anonymous/`Json` flow boxed.
+  programmer named a precise shape, and keeps anonymous/`AnyVal` flow boxed.
 - **Opt-in `sealed`/`exact` keyword** — rejected in favour of "all named record
   types are sealed", which needs no new syntax and matches the intuition that
   naming a type names an exact shape.
@@ -1940,10 +1940,10 @@ illustration of the one user-visible semantic change. `std/test`'s
 carrier** — a failing assertion stuffed extra keys (`message`/`expected`/
 `actual`) that the reporter reads by name. Under sealed semantics a named-typed
 value drops extra fields on the projection copy, so the assertion helpers/matchers
-now return `Json` (values keep their extra keys; the array-of-assertions test-body
+now return `AnyVal` (values keep their extra keys; the array-of-assertions test-body
 guard is preserved at the array level). **The idiom that sealed records break:** a
 named record type used as a deliberately-extensible bag of extra fields. Code that
-needs open extra-field carry-through must type the value `Json`, not a named
+needs open extra-field carry-through must type the value `AnyVal`, not a named
 record. This is the §5.9.1 lossy-projection rule (see SPECIFICATION). Implemented
 across Stages 0.5 (inert `sealed` marker through resolution), 1 (scalar records),
 2 (heap-field records), and 3 (scalar-record arrays); arrays of heap-field records
@@ -1958,7 +1958,7 @@ over `stdlib/`+`examples/`.
 **Context**: A context-free empty literal inferred a degenerate element type — `[]` →
 `Array(Never)`, `{}` → an empty record `{ }`. This silently misbehaved: the type carried no
 usable element information, so it forced array-building primitives (`std/array.push`/`append`/
-`prepend`/`compact`) to keep an opaque `(Json, …)` signature, which in turn meant the element
+`prepend`/`compact`) to keep an opaque `(AnyVal, …)` signature, which in turn meant the element
 type was never checked — `push(intArr, "a string")` type-checked and would corrupt at runtime.
 
 **Decision**: An empty collection literal (`[]` or `{}`) with **neither contextual type evidence
@@ -1984,8 +1984,8 @@ accumulator the natural follow-up is `push = <T>(arr: T[], item: T): Null` (and 
 "str")` hole. That generic form does NOT compile correctly today: the monomorphized body
 `push$<T>` calls the `lin_push` intrinsic with its `item: T` param, and the intrinsic mishandles a
 BOXED element arriving across that param boundary for several element representations —
-- a borrowed `Json` element (e.g. `push(acc, m["k"])` over a stream `.for`) **double-frees** (the
-  codegen `Array(Json)` path routes to `lin_array_push_tagged`, which CONSUMES the box without an
+- a borrowed `AnyVal` element (e.g. `push(acc, m["k"])` over a stream `.for`) **double-frees** (the
+  codegen `Array(AnyVal)` path routes to `lin_array_push_tagged`, which CONSUMES the box without an
   inner retain, contradicting the IR's `transfer_into_container` retain-semantics assumption); and
 - a concrete heap-object element (e.g. `push(pqEntries, e)` over a `{ … }[]`) is stored as a raw
   object pointer though it is actually a `TaggedVal*` box → an `index_probe` crash on read.
@@ -1995,16 +1995,16 @@ requirement does not remove. Making `push`/`append`/`prepend` generic is gated o
 representation contract (ASan-verified RC work). `append`/`prepend` carry an additional independent
 blocker: a literal item (`b.append(3)` on a `UInt8[]`) defaults to `Int32` and splits the static
 `T` from the flat runtime representation (a call-site literal-width inference gap). `compact` keeps
-`Json` because its natural `<T>((T | Null)[]): T[]` is still unparseable (postfix `[]` on a
-parenthesized union). `arrayAllocate` stays `(Int32): Json` (a return-only `T` would force an
+`AnyVal` because its natural `<T>((T | Null)[]): T[]` is still unparseable (postfix `[]` on a
+parenthesized union). `arrayAllocate` stays `(Int32): AnyVal` (a return-only `T` would force an
 annotation at every call site). So Phase 2 remains future work; `push`/`append`/`prepend` keep
-their `(Json, …)` signatures for now.
+their `(AnyVal, …)` signatures for now.
 
 **Consequence**: The newly-erroring evidence-free empty literals across the repo were annotated
 (`stdlib/string.lin`, `stdlib/array.lin`, `stdlib/iter.lin`, `stdlib/object.lin`, plus
 `*.test.lin` and several `examples/`/`benchmarks/`/`docs-site/builder/` accumulators). The
 `std/test`-style dynamic record accumulator pattern (`var o = {}; o[k] = v`) annotates as `: {}`
-(the empty-record type, preserving the growable `LinObject` backing) — NOT `Json`, which has a
+(the empty-record type, preserving the growable `LinObject` backing) — NOT `AnyVal`, which has a
 pre-existing escaping-object bug, and NOT `{ String: T }`, which switches to the hashed `LinMap`
 backing and changes `toString`/`keys` behavior.
 
@@ -2017,8 +2017,8 @@ annotation requirement.)
 exposed codegen/RC gaps. On current master several relevant fixes had landed (null-complement
 narrowing, empty-array-arg flat-scalar element adoption, is-pattern TypeVar substitution in
 monomorphization). Re-establishing the gaps on master under AddressSanitizer found that the two RC
-gaps ADR-058 named (borrowed-`Json` double-free; concrete-object `index_probe` crash) **no longer
-reproduce** — the borrowed-`Json` push is RC-balanced, and the concrete-object push reads back
+gaps ADR-058 named (borrowed-`AnyVal` double-free; concrete-object `index_probe` crash) **no longer
+reproduce** — the borrowed-`AnyVal` push is RC-balanced, and the concrete-object push reads back
 correctly — and the `append(UInt8[], 3)` literal-width gap is closed at the *empty-array-arg* level.
 But making the signatures generic surfaced four NEW representation gaps, now fixed:
 
@@ -2038,22 +2038,22 @@ But making the signatures generic surfaced four NEW representation gaps, now fix
    `push_sealed_elem_into_tagged`, mirroring `push_into_sealed_array`).
 3. **Nested generic push in a cross-module generic** (`mymap<T,U>`'s `push(result: U[], …)`
    monomorphized to `mymap$Int32_Int32` heap-buffer-overflowed): the re-homed `push` (an
-   import-of-import thin intrinsic wrapper) was re-homed to the boxed `std_array_push` `$Json`
+   import-of-import thin intrinsic wrapper) was re-homed to the boxed `std_array_push` `$AnyVal`
    specialization instead of inlined to the `lin_push` intrinsic. Fixed in `lin-ir`
    (`monomorphize.rs`, `classify_origin_slot`'s `Import` arm): an import-of-import whose source
    defines a thin intrinsic wrapper is INLINED to the intrinsic, so `lin_push`'s runtime
    element-tag dispatch keeps the flat representation.
-4. **Dynamic (`Json`) element into a concrete-scalar array** (`push(buf: UInt8[], src[i]: Json)` →
-   `zext ptr` codegen error): a genuinely-`Json` (or leftover inference-var) item flowing into a
-   bare-`TypeVar` param a container arg pinned to a concrete type is REBOUND to the `Json` wildcard,
-   so the call monomorphizes at `$Json` (→ `lin_push_dyn`, which converts the boxed element into the
+4. **Dynamic (`AnyVal`) element into a concrete-scalar array** (`push(buf: UInt8[], src[i]: AnyVal)` →
+   `zext ptr` codegen error): a genuinely-`AnyVal` (or leftover inference-var) item flowing into a
+   bare-`TypeVar` param a container arg pinned to a concrete type is REBOUND to the `AnyVal` wildcard,
+   so the call monomorphizes at `$AnyVal` (→ `lin_push_dyn`, which converts the boxed element into the
    array's runtime slot — the non-generic `push` behaviour). Fixed in both `lin-check`
    (`infer_call`/`infer_dot_call`) and `lin-ir` (`monomorphize.rs`), since the monomorphizer
    re-derives subs independently.
 
 **Decision**: `push = <T>(arr: T[], item: T): Null`, `append`/`prepend` = `<T>(arr: T[], item: T):
 T[]`. The element type is now CHECKED — `push(intArr, "str")` / `append(intArr, "s")` are compile
-errors, closing the soundness hole. `compact` stays `(Json): Json` (its natural
+errors, closing the soundness hole. `compact` stays `(AnyVal): AnyVal` (its natural
 `<T>((T | Null)[]): T[]` is still unparseable — postfix `[]` on a parenthesized union). The
 empty-literal annotation requirement (ADR-058) is a HARD PREREQUISITE: without it an unannotated
 `val acc = []` is `Never[]` and generic push mis-stores elements as `null`; with it the accumulator
@@ -2061,15 +2061,15 @@ pins `T`. This branch therefore carries ADR-058's checker change and annotations
 **must land at or after Phase 1**.
 
 **Verification**: RC balance verified under AddressSanitizer (runtime built with
-`-Zsanitizer=address`, linked via clang `-fsanitize=address`). The borrowed-`Json`, closure-`Json`,
+`-Zsanitizer=address`, linked via clang `-fsanitize=address`). The borrowed-`AnyVal`, closure-`AnyVal`,
 concrete-object, and cross-module-generic push churn loops (5000 iters) are clean of
 use-after-free / double-free / heap-overflow. A pre-existing, change-independent leak in the
-sealed-record-array push path remains on master (same magnitude with the old `Json` `push`); it is
+sealed-record-array push path remains on master (same magnitude with the old `AnyVal` `push`); it is
 out of scope here.
 
 **Consequence**: No repo-wide call-site sweep was needed beyond ADR-058's annotations — the four
 fixes make every existing `push`/`append`/`prepend` call site (incl. `examples/codec`,
-`examples/raspberry-controller`, the `decode`/`appendBytes` `Json`-element patterns, and the
+`examples/raspberry-controller`, the `decode`/`appendBytes` `AnyVal`-element patterns, and the
 cross-module `mymap`) compile and run correctly. Regression tests in
 `crates/lin/tests/integration.rs` and `stdlib/array.test.lin`.
 
@@ -2088,7 +2088,7 @@ so user code could call them directly (`examples/dijkstra` was found doing exact
 flag is the OR of two things, set by the compile pipeline: `is_stdlib` (the trusted-stdlib signal
 already threaded per module, the same source as `lenient_json`) and the `LIN_ALLOW_INTRINSICS`
 test-only escape-hatch env var. A dedicated flag rather than reusing `lenient_json` keeps the two
-meanings distinct (`lenient_json` is specifically about Json→concrete coercion).
+meanings distinct (`lenient_json` is specifically about AnyVal→concrete coercion).
 
 **Choke point**: every bare-name reference — call targets `lin_foo(...)` (via `infer_call` →
 `infer_expr`) and intrinsic-as-value uses — flows through `Checker::infer_ident`. After the binding
@@ -2215,7 +2215,7 @@ instead of re-deriving from `Type`.
   byte-for-byte the current packed codegen — so the constant-offset typed loads / contiguous pushes /
   packed `sealed_eq` of a static loop kernel (the ~87x speedups) are preserved by construction. The
   pass only acts at boundaries: container stores (keep-packed), genuinely-dynamic consumers
-  (toString/keys/spread/Json/FFI/equality → materialize once), union membership (box), and
+  (toString/keys/spread/AnyVal/FFI/equality → materialize once), union membership (box), and
   cross-representation call args.
 - **Soundness gates**: a debug-only `verify(func)` walks every instruction and asserts the repr each
   opcode REQUIRES of each operand equals `func.repr[operand]` — a silent mismatch becomes a
@@ -2289,7 +2289,7 @@ boundary → nested-record gate → TCO param leak → `Trip|Null` union boxing 
 materialize-per-access), and each is a materialize-or-leak seam — "fix-for-a-fix all the way down."
 The full record + mechanism is in `docs/PERFORMANCE.md` §5 (path-9). **Do not re-attempt heap-field
 end-to-end packing for perf.** The orthogonal win that *did* pay (typing RAPTOR's dictionaries off
-`Json` → O(1) `LinMap`, ~5.6× PREP) shipped separately (ADR-055). The all-scalar sealed-record packing
+`AnyVal` → O(1) `LinMap`, ~5.6× PREP) shipped separately (ADR-055). The all-scalar sealed-record packing
 (ADR-057) is unaffected and remains Lin's headline strength. The design below is retained as the
 record of what was tried and why it was closed, **not as a roadmap.**
 
@@ -2298,8 +2298,8 @@ arrays" for its own sake. It is to let real typed-record-heavy programs — the 
 the yardstick — keep their hot-path values (`Trip`, `StopTime`, `tripsByRoute: {String: Trip[]}`,
 `trip["stopTimes"][pi]["arrivalTime"]`) in the *packed* representation end-to-end, so field access is
 a constant-offset load and LLVM can optimise across it. Profiling (ADR-062 / [[project_raptor_perf_frontier]])
-measured the gap: a packed typed-record field read is ~70x a `Json` `lin_object_get`, AND the packed
-value is transparent to LLVM (hoist/fold/SROA/dead-elim) whereas `Json` is a total optimisation
+measured the gap: a packed typed-record field read is ~70x an `AnyVal` `lin_object_get`, AND the packed
+value is transparent to LLVM (hoist/fold/SROA/dead-elim) whereas `AnyVal` is a total optimisation
 barrier. **Success metric: RAPTOR GROUP/RANGE wall-clock moves materially toward Go/Node (~16s query
 vs Lin's ~390s), with the cross-language digest gate (`group=26203913 range=773022892 journeys=139`)
 byte-identical.** Stage 3b is the enabling representational work; the conversion of the RAPTOR port to
@@ -2339,7 +2339,7 @@ genuinely this representation-consistency question, not RC discipline.
    inference, which would be a large new analysis with its own soundness surface and would pessimise
    any record that touches a map anywhere); (i) composes with the existing `WrapsPacked`/`BoxKeepPacked`
    machinery the lattice already has; (i) degrades gracefully (a boxed read just pays one materialise,
-   exactly as a `Json` read does today — never a crash). (ii) is reserved as a fallback only if (i)
+   exactly as an `AnyVal` read does today — never a crash). (ii) is reserved as a fallback only if (i)
    proves to have an unfixable hot-path cost.
 2. **The gate stays a SINGLE source of truth, and Stage 3b lands by DIALING THE GATE, not by adding
    implementation special-cases.** Consolidate the 4 lockstep mirrors
@@ -2398,7 +2398,7 @@ separate patch.
 **Status**: Accepted (Stages 0–4 implemented + measured; merged to master). Stage 5 (arena/FBIP node
 reuse) deferred as low-value for this workload.
 
-**Problem.** A recursive tagged union typed as `Json` (the interpreter/parser/compiler workload class —
+**Problem.** A recursive tagged union typed as `AnyVal` (the interpreter/parser/compiler workload class —
 `type Ast = Num | BinOp`) compiles to boxed string-keyed `LinObject`s reached by non-inlined
 `lin_object_get` per field, with `lin_matches_schema` dispatch. Measured ~77× Rust on the `interp`
 benchmark. Neither sealed records (monomorphic, one field-map) nor the shipped union-discrimination
@@ -2416,7 +2416,7 @@ variant fields). Recursive children are `KIND_SUMNODE` owned pointer slots with 
 **The hard part — keep-packed through boxed containers, and how the store/read asymmetry was solved.**
 For a `SumNode` to stay unboxed inside a boxed record field or `{String:_}` map value (essential: the
 `interp` parser cursor `{node, pos}` else round-trips boxed↔packed every parse step and the unboxed-eval
-win is *swamped* — measured 0.768 s, a regression vs the 0.526 s `Json` baseline), the store and the read
+win is *swamped* — measured 0.768 s, a regression vs the 0.526 s `AnyVal` baseline), the store and the read
 must agree on representation. They CAN'T agree statically: the store sees the value's sum-union type, the
 read sees the field's declared type which the checker leaves as a partially-expanded `Named`/`Union`. The
 resolution is a **distinct runtime tag `TAG_SUMNODE`** that makes the slot self-describing — the read
@@ -2427,7 +2427,7 @@ misread the SumNode's offset-4 size as a `LinObject` length — the type-confusi
 genuinely-dynamic consumers (`toString`/`==`/json/spread/worker-transfer) MATERIALIZE to a real
 `LinObject` via a per-type materializer fn-ptr stored at the `SumDesc` head, so a kept-packed pointer
 never escapes its representation domain (a cross-thread one would be a UAF). **Result: `interp` 0.437 s,
-1.20× faster than the `Json` baseline and 1.76× faster than the materializing port; `evalNode` fully
+1.20× faster than the `AnyVal` baseline and 1.76× faster than the materializing port; `evalNode` fully
 unboxed.** With the AST unboxed the next floor is tokenizer strings / `Token[]` alloc / closure ABI, not
 the AST — so Stage 5 (FBIP node reuse) is deferred as low-value until profiling says node alloc/RC
 dominates.
@@ -2546,7 +2546,7 @@ failures). The result type is `(T | Error) | D`. This is the single most importa
 is regression-tested (`test_coalesce_error_passes_through`).
 
 **Never-null left is a compile error.** The left type must be able to be `Null` (bare `Null`, a union
-containing `Null`, or `Json`). A left that is never null (`5 ?? 1`) makes the default dead code, so it
+containing `Null`, or `AnyVal`). A left that is never null (`5 ?? 1`) makes the default dead code, so it
 is a spanned diagnostic rather than silently accepted. The result type strips `Null` from the left and
 unions the right's type `D`, collapsing to the bare stripped type when `D` is assignable to it —
 identical to `if x != null then x else d` and to `object.get`'s documented collapse (reuses the
@@ -2586,7 +2586,7 @@ field reads, where the runtime's ~17 dynamic consumers (`toString`/`eq`/`toJson`
 dispatch on `TAG_SUMNODE`. The gate originally admitted only **scalar/Bool** non-discriminant fields:
 a variant carrying a `String`/`Array`/nested-sealed field fell back to the boxed `LinObject` path,
 where every match-narrow field read costs a `lin_object_get` key-lookup **plus** a `sealed_alloc`
-re-materialization. This is the same boxed/Json decay the PERFORMANCE.md §2 RAPTOR penalty traces to:
+re-materialization. This is the same boxed/AnyVal decay the PERFORMANCE.md §2 RAPTOR penalty traces to:
 a typed record that *looks* like JSON should not be *represented* as JSON.
 
 **Decision (landed)**: Widen the SumNode gate to admit **heap-field** variants. A discriminated union

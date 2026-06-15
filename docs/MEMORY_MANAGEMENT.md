@@ -20,7 +20,7 @@ Scalars (`Int32`, `Int64`, `Float32`, `Float64`, `Bool`, `Null`) are stored unbo
 
 ### Tagged union (`TaggedVal`)
 
-Union-typed (`Json`, unresolved `TypeVar`) values are heap-boxed as `TaggedVal { tag:u8, _pad:[u8;7], payload:u64 }`. The payload is either an inline scalar or a pointer to one of the types above. `lin_tagged_release` decrements the inner pointer's refcount then frees the 16-byte box.
+Union-typed (`AnyVal`, unresolved `TypeVar`) values are heap-boxed as `TaggedVal { tag:u8, _pad:[u8;7], payload:u64 }`. The payload is either an inline scalar or a pointer to one of the types above. `lin_tagged_release` decrements the inner pointer's refcount then frees the 16-byte box.
 
 ---
 

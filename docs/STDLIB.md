@@ -1332,7 +1332,7 @@ import { push, slice, sort, sum } from "std/array"
 val append: <T>(arr: T[], item: T) -> T[]
 ```
 
-Returns a new array with `item` added at the end. Does not modify `arr`. For in-place mutation, use `push`. Generic over the element type `T`, so the element type is enforced: `append(intArr, "s")` is a compile error. The result preserves the input's element representation: appending to a flat scalar array (e.g. `UInt8[]`, `Int32[]`) yields a flat array of the same type (a numeric literal item adopts the array's element width, so `b.append(3)` on a `UInt8[]` stays `UInt8[]`), so byte-level consumers still read packed bytes; a `AnyVal[]` stays tagged.
+Returns a new array with `item` added at the end. Does not modify `arr`. For in-place mutation, use `push`. Generic over the element type `T`, so the element type is enforced: `append(intArr, "s")` is a compile error. The result preserves the input's element representation: appending to a flat scalar array (e.g. `UInt8[]`, `Int32[]`) yields a flat array of the same type (a numeric literal item adopts the array's element width, so `b.append(3)` on a `UInt8[]` stays `UInt8[]`), so byte-level consumers still read packed bytes; an `AnyVal[]` stays tagged.
 
 ```txt
 append([1, 2], 3)    // [1, 2, 3]
@@ -1590,7 +1590,7 @@ val [evens, odds] = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)
 val prepend: <T>(arr: T[], item: T) -> T[]
 ```
 
-Returns a new array with `item` added at the beginning. Does not modify `arr`. Generic over `T` (same element-type enforcement as `append`). Like `append`, the result preserves the input's element representation (a flat `UInt8[]`/`Int32[]` stays flat; a `AnyVal[]` stays tagged).
+Returns a new array with `item` added at the beginning. Does not modify `arr`. Generic over `T` (same element-type enforcement as `append`). Like `append`, the result preserves the input's element representation (a flat `UInt8[]`/`Int32[]` stays flat; an `AnyVal[]` stays tagged).
 
 ```txt
 prepend([2, 3], 1)    // [1, 2, 3]
@@ -1685,7 +1685,7 @@ set(buf, 1, "b")
 val slice: <T>(arr: T[], start: Int32, end: Int32 = length(arr)) -> T[]
 ```
 
-Returns a copy of the elements in the half-open range `[start, end)`. `end` is optional and defaults to the array length, so `slice(arr, start)` returns the elements from `start` to the end. Negative indices count from the end (`-1` is the last element's position): they are resolved by adding `length(arr)` to any negative value, then clamped to `[0, length(arr)]`. The element type is preserved: slicing a `UInt8[]` yields a `UInt8[]`, an `Int32[]` an `Int32[]`, and a `AnyVal[]` a `AnyVal[]`. Also re-exported from `std/bytes` (with both bounds explicit). There is no range-index syntax (`arr[a..b]`).
+Returns a copy of the elements in the half-open range `[start, end)`. `end` is optional and defaults to the array length, so `slice(arr, start)` returns the elements from `start` to the end. Negative indices count from the end (`-1` is the last element's position): they are resolved by adding `length(arr)` to any negative value, then clamped to `[0, length(arr)]`. The element type is preserved: slicing a `UInt8[]` yields a `UInt8[]`, an `Int32[]` an `Int32[]`, and an `AnyVal[]` an `AnyVal[]`. Also re-exported from `std/bytes` (with both bounds explicit). There is no range-index syntax (`arr[a..b]`).
 
 ```txt
 [10, 20, 30, 40, 50].slice(1, 4)   // [20, 30, 40]
@@ -2496,7 +2496,7 @@ import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, 
 > **Typed maps (`{ String: T }`).** Two groups of `std/object` ops relate to the typed
 > index-signature map (the dictionary type, backed by a hashed O(1) container):
 >
-> - **Tag-aware introspection** — `keys`, `values`, `entries`, `length`, and `isEmpty` keep a `AnyVal`
+> - **Tag-aware introspection** — `keys`, `values`, `entries`, `length`, and `isEmpty` keep an `AnyVal`
 >   parameter and work on both a plain `AnyVal`/`{}` record and a typed map (the runtime dispatches on
 >   the value's tag). This is deliberate: they are the way to introspect *any* object, and a genuine
 >   `AnyVal` value must be able to flow in. Over a typed map their results are in **hash order**, not
@@ -2510,7 +2510,7 @@ import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, 
 > *defaulted* read, `m[k] ?? default` uses the built-in null-coalescing operator `??`
 > (SPECIFICATION.md §8.3); for a keyed default [`get`](#get) is the convenience, returning a bare `T`
 > (the present value or the default), so the result needs no `null` guard.
-> `fromEntries` keeps a `AnyVal` signature pending a compiler fix (a type parameter nested in a
+> `fromEntries` keeps an `AnyVal` signature pending a compiler fix (a type parameter nested in a
 > `[String, T][]` argument is not yet inferable).
 
 ---
@@ -2697,7 +2697,7 @@ import { fromJson } from "std/json"
 val fromJson: (Type, value: AnyVal) -> T | Error
 ```
 
-Type-directed decode: validates a `AnyVal` value against the target type `T` and returns either
+Type-directed decode: validates an `AnyVal` value against the target type `T` and returns either
 the decoded value (typed as `T`) or an `Error`. Write it idiomatically as `T.fromJson(json)` or
 equivalently as `fromJson(T, json)`. `T` is a **type** (a type name or `type` alias), not a
 runtime value.
