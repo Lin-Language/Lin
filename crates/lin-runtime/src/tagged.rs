@@ -511,7 +511,7 @@ pub unsafe extern "C-unwind" fn lin_tagged_arith(a: *const u8, b: *const u8, op:
             0 => "+", 1 => "-", 2 => "*", 3 => "/", 4 => "%", _ => "arithmetic",
         };
         crate::fault::runtime_fault(&format!(
-            "Runtime error: cannot apply operator '{}' to dynamic Json operands of kind {} and {} \
+            "Runtime error: cannot apply operator '{}' to dynamic AnyVal operands of kind {} and {} \
              (a missing object key reads as Null — guard with `is`/`!= null` or `has` before arithmetic)",
             op_name, describe(at), describe(bt),
         ));
