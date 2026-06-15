@@ -1335,21 +1335,25 @@ impl FuncBuilder {
     }
 }
 
+// DIVERGENCE from `ir::is_concrete_rc_ty` (rc_elide / ownership_verify): NullableRecord
+// (`T|Null` where T is a sealed record) is intentionally absent here. The lowerer handles
+// NullableRecord ownership via `is_nullable_sealed_record` / `needs_owning` guards that fire
+// BEFORE any `is_rc_type` call site is reached (the `narrowed_from_nullable` branches).
+// Adding NullableRecord here would double-retain nullable-record reads → double-free.
+// Sum types are also excluded: a SumNode IS refcounted but ownership is tracked via
+// construction-site `register_owned` + the runtime KIND_SUMNODE drop walk, not here.
 fn is_rc_type(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Map { .. } | Type::Iterator(_) | Type::Function { .. }
+        Type::Str
+            | Type::StrLit(_)
+            | Type::Array(_)
+            | Type::FixedArray(_)
+            | Type::Object { .. }
+            | Type::Map { .. }
+            | Type::Iterator(_)
+            | Type::Function { .. }
     )
-    // NOTE (unboxed-sumtype Stage 2): a sum value is a refcounted `*SumNode`, but it is NOT added to
-    // `is_rc_type` — Stage 1 deliberately keeps sum types OUT of the generic owning-read path
-    // (`own_for_read` / read-retain). A sum local is owned by its CONSTRUCTION site
-    // (`try_lower_sum_literal` → `register_owned`, released at scope exit via the SumNode branch of
-    // `emit_release_repr`); every other read (match scrutinee, recursive child) is a BORROW. Adding
-    // sum to `is_rc_type` would make the match scrutinee read retain the param AND the call-arg read
-    // retain again — extra references whose scope-exit releases do not always balance under nested
-    // recursion, leaking the tree (under-release → reuse-corruption). The recursive-CHILD ownership
-    // (the node owns +1 of each child) is handled explicitly at the SumNode construction transfer
-    // (`transfer_into_container`) + the runtime KIND_SUMNODE drop walk, NOT via this predicate.
 }
 
 /// The CHILD SUM TYPE of a recursive-child field read (unboxed-sumtype Stage 2), or `None`.
