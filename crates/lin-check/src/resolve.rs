@@ -110,6 +110,16 @@ fn resolve_type_inner(
                 // Normalise to Int64 as the canonical key type (all integer values are stored as i64
                 // in the runtime Int-map slots).
                 Ok(Type::Map { key: Box::new(key_ty), value: Box::new(val_ty) })
+            } else if let Some(int_keys) = closed_int_literal_set(&key_ty) {
+                // A closed union of integer literals (e.g. `0 | 1 | 2 | 3 | 4 | 5 | 6`): expand to
+                // a fixed record keyed by the integer string representations, mirroring the
+                // string-literal-union expansion. Index access is total (no `| Null`) when the key
+                // type is the same literal union, exactly like `{ "mon"|"tue"|…: V }`.
+                let mut fields = IndexMap::new();
+                for k in int_keys {
+                    fields.insert(k.to_string(), val_ty.clone());
+                }
+                Ok(Type::object(fields))
             } else if let Some(literals) = closed_string_literal_set(&key_ty) {
                 let mut fields = IndexMap::new();
                 for k in literals {
@@ -131,6 +141,26 @@ fn resolve_type_inner(
         }
         TypeExpr::StringLit(s, _span) => Ok(Type::StrLit(s.clone())),
         TypeExpr::IntLit(n, _span) => Ok(Type::IntLit(*n)),
+    }
+}
+
+/// If `ty` is a single `IntLit` or a `Union` whose every member is an `IntLit`, return the integer
+/// values (order-preserving). Otherwise `None`. Used by the index-signature arm to expand
+/// `{ <int-literal-union>: V }` into a fixed record with integer-string keys.
+fn closed_int_literal_set(ty: &Type) -> Option<Vec<i64>> {
+    match ty {
+        Type::IntLit(n) => Some(vec![*n]),
+        Type::Union(variants) if !variants.is_empty() => {
+            let mut keys = Vec::with_capacity(variants.len());
+            for v in variants {
+                match v {
+                    Type::IntLit(n) => keys.push(*n),
+                    _ => return None,
+                }
+            }
+            Some(keys)
+        }
+        _ => None,
     }
 }
 

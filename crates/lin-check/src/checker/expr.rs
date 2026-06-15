@@ -652,6 +652,12 @@ impl Checker {
                     // Empty schema (e.g. `var result = {}`): object may be populated dynamically,
                     // so any key access must be a runtime lookup → TypeVar.
                     self.env.fresh_type_var()
+                } else if let TypedExpr::IntLit(ref n, _, _) = typed_key {
+                    // Integer literal key on a fixed record: look up the string representation.
+                    // This handles `obj[0]` / `obj[dow]` where the record was expanded from a
+                    // `{ <int-literal-union>: V }` index-signature.
+                    let key_str = n.to_string();
+                    fields.get(&key_str).cloned().unwrap_or(Type::Null)
                 } else if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
                     if !fields.contains_key(key_str) {
                         // Key not in the known object type — emit a warning with a "did you mean" hint.
@@ -768,13 +774,95 @@ impl Checker {
             // logic by recursing on the resolved type. If it bottoms out at a still-`Named` (true
             // cycle with no indexable layer) or a non-indexable type, fall through to the existing
             // "Cannot index" error — i.e. fail conservatively, never invent a result type.
-            Type::Named(_) => {
+            Type::Named(name) => {
                 if let Some(resolved) = self.resolve_named_body(&obj_ty) {
                     return self.infer_index_into(typed_obj, typed_key, &resolved, span);
                 }
-                return Err(Diagnostic::error(span, format!("Cannot index into type {}", obj_ty)));
+                // resolve_named_body returned None: either the decl has generic params (can't
+                // be instantiated without type args) or it is a forward-declaration placeholder
+                // (the body is `Named(name)` — set by forward_declare_types before check_stmt
+                // fills in the real body). Either way we cannot statically index into this type.
+                let key_ty = typed_key.ty();
+                // Try to surface the expanded body. Prefer the already-resolved env entry;
+                // fall back to the raw AST body recorded during forward_declare_types so
+                // we can show the source-level shape even for types declared after this usage.
+                let expanded: Option<String> = self.env.lookup_type(name).and_then(|decl| {
+                    if matches!(&decl.body, Type::Named(n) if n == name) {
+                        // Forward-declaration self-cycle — env body not yet resolved.
+                        // Use the raw AST body instead.
+                        self.raw_type_decls.get(name)
+                            .map(|raw| lin_parse::fmt_type(raw))
+                    } else if decl.params.is_empty() {
+                        Some(format!("{}", decl.body))
+                    } else {
+                        None // generic — no single expansion
+                    }
+                });
+                let is_generic = self.env.lookup_type(name)
+                    .is_some_and(|decl| !decl.params.is_empty());
+                let key_is_string_or_unknown =
+                    key_ty.is_string_ish() || matches!(key_ty, Type::TypeVar(_));
+                // Pick a headline that reflects the actual kind of type.
+                let is_fwd_index_sig = self.raw_type_decls.get(name)
+                    .is_some_and(|raw| matches!(raw, lin_parse::ast::TypeExpr::IndexSig(..)));
+                let headline = if is_fwd_index_sig {
+                    format!("`{}` is not yet resolved at this point", name)
+                } else {
+                    format!("`{}` is a fixed-shape record and cannot be indexed dynamically", name)
+                };
+                let mut diag = Diagnostic::error(span, headline);
+                if is_generic {
+                    diag = diag.with_help(format!(
+                        "`{}` is a generic type — provide type arguments to index into it", name
+                    ));
+                } else {
+                    let raw_is_index_sig = self.raw_type_decls.get(name)
+                        .is_some_and(|raw| matches!(raw, lin_parse::ast::TypeExpr::IndexSig(..)));
+                    let help = if raw_is_index_sig {
+                        // The type IS declared as a map (`{ KeyType: ValueType }`) but the
+                        // forward-declaration self-cycle prevented resolution. Tell the user
+                        // the type and that moving it earlier will fix the error.
+                        match &expanded {
+                            Some(body) => format!(
+                                "`{}` = {} — move this type declaration above its first use",
+                                name, body
+                            ),
+                            None => format!(
+                                "`{}` is declared as a map but not yet resolved — move the type declaration above its first use",
+                                name
+                            ),
+                        }
+                    } else {
+                        // The type is a fixed-shape record. If key is string-like, suggest
+                        // switching to a map declaration.
+                        match (&expanded, key_is_string_or_unknown) {
+                            (Some(body), true) => format!(
+                                "`{}` = {} — to index dynamically, change to a map: `{{ String: <ValueType> }}`",
+                                name, body
+                            ),
+                            (Some(body), false) => format!("`{}` = {}", name, body),
+                            (None, true) => "to index dynamically, change the type to a map: `{ String: <ValueType> }`".to_string(),
+                            (None, false) => String::new(),
+                        }
+                    };
+                    if !help.is_empty() {
+                        diag = diag.with_help(help);
+                    }
+                }
+                return Err(diag);
             }
-            _ => return Err(Diagnostic::error(span, format!("Cannot index into type {}", obj_ty))),
+            _ => {
+                let key_ty = typed_key.ty();
+                let key_label = if matches!(key_ty, Type::TypeVar(_)) {
+                    "a dynamically-typed key".to_string()
+                } else {
+                    format!("a key of type `{}`", key_ty)
+                };
+                return Err(Diagnostic::error(
+                    span,
+                    format!("cannot index into `{}` with {}", obj_ty, key_label),
+                ));
+            }
         };
         Ok(TypedExpr::Index { object: Box::new(typed_obj), key: Box::new(typed_key), result_type, span })
     }
@@ -867,6 +955,16 @@ impl Checker {
                 );
             }
         }
+        // Closed integer-literal union key (e.g. `DayOfWeek = 0|1|…|6`) on a record expanded from
+        // `{ DayOfWeek: V }`: all keys are known to be present, so access is total (no `| Null`).
+        if let Some(int_keys) = self.closed_int_literal_keys(key_ty) {
+            let str_keys: Vec<String> = int_keys.iter().map(|n| n.to_string()).collect();
+            if str_keys.iter().all(|k| fields.contains_key(k)) {
+                return Type::flatten_union(
+                    str_keys.iter().map(|k| fields[k].clone()).collect(),
+                );
+            }
+        }
         // Conservative fallback: any field value, plus the safe-bracket `Null` (§6.1). Routed
         // through `flatten_union` so duplicate value types collapse (`Boolean | Boolean | Null`
         // → `Boolean | Null`) — duplicates were what surfaced the un-collapsed `Boolean × 7`.
@@ -879,7 +977,7 @@ impl Checker {
     /// can recurse after resolving the alias. Re-runs `infer_index` on an already-typed object and
     /// key against an explicitly-provided object type (`obj_ty`). This is only entered from the
     /// `Named` arm with a freshly-resolved concrete body, so a `Named` arriving here again is a
-    /// genuine cycle and yields the "Cannot index" error.
+    /// genuine cycle and yields the "cannot index into" error.
     fn infer_index_into(
         &mut self,
         typed_obj: TypedExpr,
@@ -990,7 +1088,16 @@ impl Checker {
                 Type::flatten_union(vec![inner, Type::Null])
             }
             other => {
-                return Err(Diagnostic::error(span, format!("Cannot index into type {}", other)))
+                let key_ty = typed_key.ty();
+                let key_label = if matches!(key_ty, Type::TypeVar(_)) {
+                    "a dynamically-typed key".to_string()
+                } else {
+                    format!("a key of type `{}`", key_ty)
+                };
+                return Err(Diagnostic::error(
+                    span,
+                    format!("cannot index into `{}` with {}", other, key_label),
+                ));
             }
         };
         Ok(TypedExpr::Index { object: Box::new(typed_obj), key: Box::new(typed_key), result_type, span })
@@ -1631,6 +1738,9 @@ impl Checker {
 
     pub(crate) fn infer_block(&mut self, stmts: &[Stmt], final_expr: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
         self.env.push_scope();
+        // Forward-declare any function-literal `val` bindings in this block so they can refer
+        // to each other regardless of definition order (hoisting, mirrors module-level ADR-012).
+        self.forward_declare_functions_in(stmts);
         let mut typed_stmts = Vec::new();
         let block_tail = self.in_tail_position;
         self.in_tail_position = false;
@@ -1794,6 +1904,38 @@ impl Checker {
                 Ok(None)
             }
             Type::Object { fields: expected_fields, sealed } => {
+                // Integer-literal-keyed object literal against a fixed record whose keys are all
+                // decimal digit strings (produced by expanding `{ DayOfWeek: Boolean }` where
+                // `DayOfWeek = 0|1|...|6`). Treat each integer key as its decimal string form and
+                // check each value against the corresponding expected field type.
+                let all_int_keys = !fields.is_empty()
+                    && fields.iter().all(|f| matches!(f, ObjectField::Pair(k, _) if extract_int_key(k).is_some()));
+                let expected_all_digit_keys = !expected_fields.is_empty()
+                    && expected_fields.keys().all(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_digit()));
+                if all_int_keys && expected_all_digit_keys {
+                    let mut typed_fields = Vec::new();
+                    for field in fields {
+                        if let ObjectField::Pair(key_expr, val_expr) = field {
+                            let n = extract_int_key(key_expr).unwrap();
+                            let key_str = n.to_string();
+                            let expected_val_ty = expected_fields.get(&key_str)
+                                .cloned()
+                                .unwrap_or_else(|| self.env.fresh_type_var());
+                            let typed_val = self.check_expr(val_expr, &expected_val_ty)?;
+                            typed_fields.push((key_str, typed_val));
+                        }
+                    }
+                    let ty = Type::Object {
+                        fields: expected_fields.clone(),
+                        sealed: *sealed,
+                    };
+                    return Ok(Some(TypedExpr::MakeObject {
+                        fields: typed_fields,
+                        spreads: Vec::new(),
+                        ty,
+                        span,
+                    }));
+                }
                 // Take over with directed field-by-field checking when it would actually change
                 // the outcome — otherwise stay on the existing undirected inference path so plain
                 // structural objects are unaffected. Cases that need directing:

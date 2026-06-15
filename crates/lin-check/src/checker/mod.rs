@@ -125,6 +125,10 @@ pub struct Checker {
     /// same value — the narrowing only tightens the type, never widens. Any assignment to `obj`
     /// (or `key`) within the branch invalidates the matching entries (`clear_index_narrowings_for`).
     pub(crate) index_narrowings: Vec<crate::checker::expr::IndexNarrow>,
+    /// Raw AST type bodies for every top-level `type` declaration in the current module,
+    /// keyed by name. Populated during `forward_declare_types` so error messages can show
+    /// the source-level shape of a Named type even before `check_stmt` has resolved it.
+    pub(crate) raw_type_decls: std::collections::HashMap<String, lin_parse::ast::TypeExpr>,
 }
 
 impl Default for Checker {
@@ -166,6 +170,7 @@ impl Checker {
             param_def_span_types: Vec::new(),
             next_lambda_id: 1,
             index_narrowings: Vec::new(),
+            raw_type_decls: std::collections::HashMap::new(),
         }
     }
 
@@ -194,7 +199,16 @@ impl Checker {
         self.forward_declare_functions(module);
 
         let mut stmts = Vec::new();
-        for stmt in &module.statements {
+        // Hoist all type declarations to the front so that types defined anywhere in the
+        // module are resolved before any function body is checked. This mirrors how
+        // forward_declare_functions hoists val bindings: a type used before its textual
+        // declaration should not be an error. TypeDecl statements produce no runtime code,
+        // so reordering them is always safe.
+        let (type_decls, other_stmts): (Vec<_>, Vec<_>) = module
+            .statements
+            .iter()
+            .partition(|s| matches!(s, Stmt::TypeDecl { .. }));
+        for stmt in type_decls.into_iter().chain(other_stmts) {
             match self.check_stmt(stmt) {
                 Ok(typed_stmt) => stmts.push(typed_stmt),
                 Err(diag) => self.diagnostics.push(diag),
@@ -354,9 +368,9 @@ impl Checker {
     /// is resolved, the occurrence of `Tree` in the body will be already in the env.
     fn forward_declare_types(&mut self, module: &Module) {
         for stmt in &module.statements {
-            if let Stmt::TypeDecl { name, params, .. } = stmt {
+            if let Stmt::TypeDecl { name, params, body, .. } = stmt {
                 // Register a placeholder body of Named(name) for now; the real body
-                // will be resolved and replaced when check_stmt processes TypeDecl.
+                // will be resolved when check_stmt processes TypeDecl.
                 // Using Named(name) as the placeholder means self-references in the body
                 // will be detected by the cycle guard in resolve.rs and left as Named(name).
                 self.env.define_type(
@@ -364,14 +378,19 @@ impl Checker {
                     params.clone(),
                     Type::Named(name.clone()),
                 );
+                // Store the raw AST body so error messages can show the source-level shape
+                // of this type before check_stmt has had a chance to resolve it.
+                self.raw_type_decls.insert(name.clone(), body.clone());
             }
         }
     }
 
-    /// Forward-declare top-level `val name = (...) => ...` functions so that
+    /// Forward-declare `val name = (...) => ...` functions in `stmts` so that
     /// they can call each other (mutual recursion, ADR-012 equivalent).
-    fn forward_declare_functions(&mut self, module: &Module) {
-        for stmt in &module.statements {
+    /// Called for module-level statements and for every block body, enabling
+    /// hoisting of inner function literals within a closure or function body.
+    pub(crate) fn forward_declare_functions_in(&mut self, stmts: &[lin_parse::ast::Stmt]) {
+        for stmt in stmts {
             if let Stmt::Val { pattern, value, .. } = stmt {
                 if let Expr::Function { type_params, params, return_type, .. } = value {
                     let name = match pattern {
@@ -379,11 +398,6 @@ impl Checker {
                         _ => None,
                     };
                     if let Some(name) = name {
-                        // Generic function: allocate one quantified TypeVar (≥9000) per type
-                        // param and resolve the signature in a scratch env binding each param to
-                        // that TypeVar. The SAME id assignment is recorded in `generic_fn_params`
-                        // and reused by `infer_function`, so the forward-declared signature (driving
-                        // call-site inference) and the lowered body's param types are consistent.
                         let (env_for_resolve, param_assign) = if type_params.is_empty() {
                             (self.env.clone(), Vec::new())
                         } else {
@@ -400,13 +414,6 @@ impl Checker {
                         if !param_assign.is_empty() {
                             self.generic_fn_params.insert(name.clone(), param_assign);
                         }
-
-                        // Resolve param/return annotations with `Number` support (ADR-014,
-                        // reversed): each `Number` becomes a fresh numerically-constrained generic
-                        // TypeVar recorded in `numeric_tvs`. The forward-declared signature drives
-                        // call-site inference + the numeric-bound check, so the ids minted here are
-                        // the ones a call site binds and validates (the body mints its own, used by
-                        // monomorphization — both are ≥9001 generics, neither is globally solved).
                         let mut param_types: Vec<Type> = Vec::with_capacity(params.len());
                         for p in params {
                             let ty = match &p.type_ann {
@@ -417,10 +424,6 @@ impl Checker {
                             };
                             param_types.push(ty);
                         }
-                        // A bare `Number` RETURN is treated as un-annotated in the signature (the
-                        // body determines it — see `infer_function`). Using a fresh inference var
-                        // here keeps the forward signature from minting an un-inferrable bound var;
-                        // the slot's type is replaced by the body-inferred signature after checking.
                         let ret_type = match return_type {
                             Some(t) if !Self::is_bare_number(t) => self
                                 .resolve_type_with_number_in(t, &env_for_resolve)
@@ -440,5 +443,11 @@ impl Checker {
                 }
             }
         }
+    }
+
+    /// Forward-declare top-level `val name = (...) => ...` functions so that
+    /// they can call each other (mutual recursion, ADR-012 equivalent).
+    fn forward_declare_functions(&mut self, module: &Module) {
+        self.forward_declare_functions_in(&module.statements);
     }
 }
