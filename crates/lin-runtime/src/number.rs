@@ -187,3 +187,92 @@ pub unsafe extern "C" fn lin_is_float64(s: *const LinString) -> bool {
     let st = (*s).as_str();
     st.trim().parse::<f64>().is_ok()
 }
+
+// -------------------------------------------------------------------------
+// Unsigned-integer parse functions.
+// -------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn lin_parse_uint8(s: *const LinString) -> u8 {
+    unsafe { (*s).as_str().trim().parse::<u8>().unwrap_or(0) }
+}
+
+#[no_mangle]
+pub extern "C" fn lin_parse_uint16(s: *const LinString) -> u16 {
+    unsafe { (*s).as_str().trim().parse::<u16>().unwrap_or(0) }
+}
+
+#[no_mangle]
+pub extern "C" fn lin_parse_uint32(s: *const LinString) -> u32 {
+    unsafe { (*s).as_str().trim().parse::<u32>().unwrap_or(0) }
+}
+
+#[no_mangle]
+pub extern "C" fn lin_parse_uint64(s: *const LinString) -> u64 {
+    unsafe { (*s).as_str().trim().parse::<u64>().unwrap_or(0) }
+}
+
+#[no_mangle]
+pub extern "C" fn lin_parse_int64(s: *const LinString) -> i64 {
+    unsafe { (*s).as_str().trim().parse::<i64>().unwrap_or(0) }
+}
+
+#[no_mangle]
+pub extern "C" fn lin_parse_float32(s: *const LinString) -> f32 {
+    unsafe { (*s).as_str().trim().parse::<f32>().unwrap_or(0.0) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_try_parse_uint8(s: *const LinString) -> *mut u8 {
+    let st = (*s).as_str();
+    match st.trim().parse::<u8>() {
+        Ok(n) => crate::tagged::lin_box_int32(n as i32),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_try_parse_uint16(s: *const LinString) -> *mut u8 {
+    let st = (*s).as_str();
+    match st.trim().parse::<u16>() {
+        Ok(n) => crate::tagged::lin_box_int32(n as i32),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_try_parse_uint32(s: *const LinString) -> *mut u8 {
+    let st = (*s).as_str();
+    match st.trim().parse::<u32>() {
+        // UInt32 values that fit in i32 range use the int32 box; larger values use int64.
+        Ok(n) => crate::tagged::lin_box_int64(n as i64),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_try_parse_uint64(s: *const LinString) -> *mut u8 {
+    let st = (*s).as_str();
+    match st.trim().parse::<u64>() {
+        Ok(n) => crate::tagged::lin_box_uint64(n),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_try_parse_int64(s: *const LinString) -> *mut u8 {
+    let st = (*s).as_str();
+    match st.trim().parse::<i64>() {
+        Ok(n) => crate::tagged::lin_box_int64(n),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_try_parse_float32(s: *const LinString) -> *mut u8 {
+    let st = (*s).as_str();
+    match st.trim().parse::<f32>() {
+        Ok(f) => crate::tagged::lin_box_float64(f as f64),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
