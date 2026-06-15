@@ -1343,109 +1343,13 @@ impl Checker {
         self.consumed_streams.extend(consumed_then);
         let then_ty = typed_then.ty();
         let else_ty = typed_else.ty();
-        // A branch typed `Null` (or a TypeVar that is structurally compatible with everything,
-        // incl. Null) must NOT collapse the merged type onto the OTHER branch via
-        // `types_compatible`. The old collapse silently dropped the value-producing branch: e.g.
-        // `if cond then arr[i] else null` (where `arr[i]` is a generic `T` or a `Json` element)
-        // computed `result_type = Null`, so lowering built an if-merge phi/return typed `Null`
-        // and the value branch was replaced by `null` at runtime (`at` returning null on a valid
-        // index). When exactly one branch is `Null` and the other is not, form the union so both
-        // branches survive (and survive monomorphization substitution of any generic `T`).
-        // Two DISTINCT quantified-generic type parameters (e.g. `T` and `D` in
-        // `<T, D>(…): T | D`, ids ≥ 9000 and ≠ the Json wildcard) must NOT be collapsed onto each
-        // other by the `types_compatible` arms below. An unconstrained TypeVar unifies with
-        // anything, so `types_compatible(T, D)` is vacuously true and would pick ONE of them —
-        // silently dropping the other arm's type. For an `if … then arr[i] /*: T*/ else default
-        // /*: D*/` body that erases the union to a single param, so after monomorphization the two
-        // arms (a flat-scalar element vs a boxed default) disagree on representation and codegen
-        // emits a malformed phi. Keep them as an honest `T | D` union so both arms survive
-        // substitution and each gets boxed into the union representation. Same-id (`T | T`) still
-        // collapses via the normal path; a generic-vs-concrete pairing also keeps its existing
-        // behaviour (only BOTH being distinct quantified params triggers this).
-        // Quantified-generic TypeVar ids are minted ≥ 9001 (`Checker::next_generic_tv`), above the
-        // intrinsic-slot range; the Json wildcard is `u32::MAX`. A bound type PARAMETER therefore
-        // lives in `[GENERIC_TV_BASE, u32::MAX)`.
-        const GENERIC_TV_BASE: u32 = 9000;
-        let distinct_generic_params = matches!(
-            (&then_ty, &else_ty),
-            (Type::TypeVar(a), Type::TypeVar(b))
-                if a != b
-                    && *a >= GENERIC_TV_BASE && *a != u32::MAX
-                    && *b >= GENERIC_TV_BASE && *b != u32::MAX
-        );
-        // An EMPTY-array branch (`[]`, typed `Array(Never)` — the bottom array type) must not WIN
-        // the merge over a non-empty-array other branch. `types_compatible` treats `Never[]` as
-        // assignable to/from anything, so the collapse below would otherwise pick `Never[]` as the
-        // result and discard the real branch — e.g. `if cond then jsonValue else []` (a fresh
-        // inference-var `then`) became `Never[]`, after which iterating it lowered the element at a
-        // bogus scalar repr (the `for`-over-`if…else []` codegen ABI clash). The non-empty branch
-        // carries the real element type, so it dominates; two empty arrays keep `Never[]`.
-        let then_empty_arr = matches!(&then_ty, Type::Array(e) if matches!(**e, Type::Never));
-        let else_empty_arr = matches!(&else_ty, Type::Array(e) if matches!(**e, Type::Never));
-        // An UNCONSTRAINED inference TypeVar branch (a plain inference var, id below the
-        // quantified-generic base and not the Json wildcard, that nothing ever SOLVED) must NOT
-        // collapse the merge onto the OTHER concrete branch. The classic source is calling a value
-        // typed `(Json) => Json` (or the opaque `Function` annotation): the call-site freshens its
-        // return into an inference var that is never unified against anything, so it stays unsolved
-        // through the whole check (zonking leaves it dangling). Such a var is `types_compatible`
-        // with EVERY concrete type (an unconstrained var unifies with anything), so the
-        // `else_ty`/`then_ty` collapse below would silently pick the concrete branch — e.g.
-        // `if c then jsonFn(x) /*: ?T*/ else flag /*: Bool*/` became `Bool`, after which lowering
-        // unboxed the Json branch's value AS a Bool (a null-deref when that value is `null`). The
-        // value such a var actually holds at runtime is a boxed Json, so it behaves like the dynamic
-        // top type: treat it as `Json` for the merge decision (the existing `is_any_val` arm
-        // then yields `Json`, boxing both branches into the uniform Json representation).
-        let is_unconstrained_inference_var = |t: &Type| matches!(t, Type::TypeVar(id)
-            if *id < GENERIC_TV_BASE && *id != u32::MAX
-                && !self.solved_type_vars.contains_key(id));
-        let then_dynamic = is_any_val(&then_ty) || is_unconstrained_inference_var(&then_ty);
-        let else_dynamic = is_any_val(&else_ty) || is_unconstrained_inference_var(&else_ty);
-        // Path-11: snapshot the branch lambda sets BEFORE the merge consumes the branch types, so a
-        // function-typed `if` whose arms are distinct lambdas (`if c then f else g`) yields a 2-set
-        // rather than aliasing onto whichever branch the structural collapse below happens to pick
-        // (PartialEq ignores `lset`, so the collapse would otherwise silently drop one inhabitant).
+        // Path-11: snapshot branch lambda sets BEFORE the merge so a function-typed `if` whose arms
+        // are distinct lambdas (`if c then f else g`) yields a 2-set rather than aliasing onto
+        // whichever branch the structural collapse picks (PartialEq ignores `lset`).
         let then_lset = top_level_lambda_set(&then_ty);
         let else_lset = top_level_lambda_set(&else_ty);
-        let result_type = if then_empty_arr != else_empty_arr {
-            if then_empty_arr { else_ty } else { then_ty }
-        } else if distinct_generic_params {
-            Type::flatten_union(vec![then_ty, else_ty])
-        } else if (then_ty == Type::Null) != (else_ty == Type::Null) {
-            // Exactly one branch is the literal Null type. Keep both as a union so the
-            // value-producing branch survives — UNLESS the other branch is `Json` (the dynamic
-            // top type, `TypeVar(u32::MAX)`), which already subsumes `Null`: there `Json | Null`
-            // is redundant and would leak the internal `?T4294967295` sentinel into diagnostics,
-            // so collapse to `Json` (the pre-change behaviour for this specific pairing).
-            let other = if then_ty == Type::Null { &else_ty } else { &then_ty };
-            if is_any_val(other) {
-                other.clone()
-            } else {
-                Type::flatten_union(vec![then_ty, else_ty])
-            }
-        } else if then_dynamic != else_dynamic {
-            // Exactly one branch is the dynamic top type — the `Json` wildcard (`TypeVar(u32::MAX)`)
-            // OR an unconstrained inference var (an opaque/Json function-call result, see above) —
-            // and the other is a CONCRETE type (e.g. `if c then mkErr() /*: Json*/ else rows
-            // /*: String[][]*/`, or `if c then jsonFn(x) /*: ?T*/ else flag /*: Bool*/`). A dynamic
-            // type unifies with everything, so the `types_compatible` collapse below would otherwise
-            // pick the CONCRETE branch's type as the result — discarding the dynamic branch's
-            // representation. At runtime the dynamic branch yields a boxed Json value, but the
-            // if-expression's static type would say (e.g.) `String[][]`/`Bool`, so lowering boxes
-            // BOTH branches as the concrete representation and the dynamic branch's value is
-            // mis-tagged → a wrong-tagged box that crashes/corrupts on read (a Bool unbox of a Json
-            // `null` null-derefs). `Json` is the top type and genuinely subsumes the concrete
-            // branch, so the result IS `Json` — both branches box into the uniform Json
-            // representation, consistent with how each is produced.
-            Type::TypeVar(u32::MAX)
-        } else if self.types_compatible(&then_ty, &else_ty) {
-            else_ty
-        } else if self.types_compatible(&else_ty, &then_ty) {
-            then_ty
-        } else {
-            Type::flatten_union(vec![then_ty, else_ty])
-        };
-        // Path-11: if the merged result is itself a function type, stamp it with the JOIN of the
-        // branch sets (inert metadata; the union/collapse above used PartialEq, which ignores it).
+        let result_type = self.join_branch_types(then_ty, else_ty);
+        // Path-11: stamp the result with the join of the branch lambda sets (inert metadata).
         let result_type = with_joined_lambda_set(result_type, &then_lset, &else_lset);
         Ok(TypedExpr::If {
             cond: Box::new(typed_cond),
@@ -1454,6 +1358,91 @@ impl Checker {
             result_type,
             span,
         })
+    }
+
+    /// Resolve the static type of an `if`/`else` expression given the independently-inferred types
+    /// of its two branches. This is a lattice join over Lin's type structure; the arms below encode
+    /// a fixed precedence — earlier arms override later ones. The ordering is load-bearing:
+    ///
+    /// 1. **Empty-array wins**: `Never[]` (the bottom array `[]`) yields to any non-empty-array
+    ///    branch; `types_compatible` otherwise picks `Never[]` and discards the real element type.
+    /// 2. **Distinct generic params**: two different quantified `TypeVar`s (`T9001 × D9002`) must
+    ///    form a union — `types_compatible` collapses them to one and breaks monomorphization.
+    /// 3. **Exactly-one-Null**: keep the union so the value-producing branch survives
+    ///    monomorphization; `Json | Null` collapses to `Json` (redundant, leaks the sentinel id).
+    /// 4. **Dynamic top type**: one `AnyVal`/unconstrained-inference-var branch means the result
+    ///    IS `AnyVal` — `types_compatible` would otherwise pick the concrete branch, giving the
+    ///    `AnyVal` value a wrong static tag at the phi merge → crash/corruption on unbox.
+    /// 5. **`types_compatible` collapse**: standard structural subtype check (then⊆else, or vice
+    ///    versa); picks the more general side.
+    /// 6. **Fallback union**: neither is a subtype of the other → honest union.
+    ///
+    /// Lambda-set stamping (`Path-11`) is applied by the caller AFTER this function so it can
+    /// snapshot the branch sets before they are consumed by the merge.
+    pub(crate) fn join_branch_types(&self, then_ty: Type, else_ty: Type) -> Type {
+        // TypeVar ids ≥ 9001 are quantified generic params; the Json wildcard is u32::MAX.
+        const GENERIC_TV_BASE: u32 = 9000;
+
+        // Arm 1 — empty-array branch: `Array(Never)` (bottom array `[]`) must not win.
+        // `types_compatible` treats `Never[]` as assignable to/from anything, so the collapse in
+        // arm 5 would otherwise pick `Never[]` and discard the real element type.
+        let then_empty_arr = matches!(&then_ty, Type::Array(e) if matches!(**e, Type::Never));
+        let else_empty_arr = matches!(&else_ty, Type::Array(e) if matches!(**e, Type::Never));
+        if then_empty_arr != else_empty_arr {
+            return if then_empty_arr { else_ty } else { then_ty };
+        }
+
+        // Arm 2 — distinct quantified generic params: `T × D` (both ids in [GENERIC_TV_BASE,
+        // u32::MAX), different ids). `types_compatible` unifies an unconstrained TypeVar with
+        // anything, so arm 5 would collapse them to one — breaking monomorphization.
+        let distinct_generic_params = matches!(
+            (&then_ty, &else_ty),
+            (Type::TypeVar(a), Type::TypeVar(b))
+                if a != b
+                    && *a >= GENERIC_TV_BASE && *a != u32::MAX
+                    && *b >= GENERIC_TV_BASE && *b != u32::MAX
+        );
+        if distinct_generic_params {
+            return Type::flatten_union(vec![then_ty, else_ty]);
+        }
+
+        // Arm 3 — exactly one branch is `Null`: form a union so the value-producing branch
+        // survives. Exception: `Json | Null` collapses to `Json` (Json subsumes Null; keeping the
+        // union would leak the `?T4294967295` sentinel into diagnostics).
+        if (then_ty == Type::Null) != (else_ty == Type::Null) {
+            let other = if then_ty == Type::Null { &else_ty } else { &then_ty };
+            return if is_any_val(other) {
+                other.clone()
+            } else {
+                Type::flatten_union(vec![then_ty, else_ty])
+            };
+        }
+
+        // An unsolved inference TypeVar (id < GENERIC_TV_BASE, not the Json wildcard, not in
+        // `solved_type_vars`) behaves like `AnyVal` for the merge: it holds a boxed Json value at
+        // runtime. Treating it as concrete would give it the wrong static tag at the phi merge.
+        let is_unconstrained_var = |t: &Type| matches!(t, Type::TypeVar(id)
+            if *id < GENERIC_TV_BASE && *id != u32::MAX
+                && !self.solved_type_vars.contains_key(id));
+        let then_dynamic = is_any_val(&then_ty) || is_unconstrained_var(&then_ty);
+        let else_dynamic = is_any_val(&else_ty) || is_unconstrained_var(&else_ty);
+
+        // Arm 4 — exactly one dynamic branch: result is `AnyVal`. `types_compatible` would pick
+        // the concrete branch's type, boxing the dynamic branch value at the wrong tag → crash.
+        if then_dynamic != else_dynamic {
+            return Type::TypeVar(u32::MAX);
+        }
+
+        // Arm 5 — structural subtype collapse: standard path.
+        if self.types_compatible(&then_ty, &else_ty) {
+            return else_ty;
+        }
+        if self.types_compatible(&else_ty, &then_ty) {
+            return then_ty;
+        }
+
+        // Arm 6 — fallback: neither is a subtype of the other.
+        Type::flatten_union(vec![then_ty, else_ty])
     }
 
     /// Null-coalescing `left ?? right` (ADR-065). Semantically `if left != null then left else
@@ -2547,7 +2536,7 @@ fn extract_int_key(expr: &Expr) -> Option<i64> {
     match expr {
         Expr::IntLit(v, _, _) => Some(*v),
         Expr::BinaryOp { op: BinOp::Sub, left, right, .. } => {
-            // Parser lowers `-N` as `0 - N`; both sides must be integer literals.
+            // Parser lowers `-N` as `0 - N`; both sides must be literal integers.
             if let (Expr::IntLit(0, None, _), Expr::IntLit(v, _, _)) = (left.as_ref(), right.as_ref()) {
                 Some(-v)
             } else {
@@ -2555,5 +2544,95 @@ fn extract_int_key(expr: &Expr) -> Option<i64> {
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checker::Checker;
+
+    fn join(then_ty: Type, else_ty: Type) -> Type {
+        Checker::new().join_branch_types(then_ty, else_ty)
+    }
+
+    /// Arm 3: exactly one `Null` branch forms a union with the value-producing branch.
+    #[test]
+    fn null_and_concrete_forms_union() {
+        let result = join(Type::Null, Type::Bool);
+        assert_eq!(result, Type::Union(vec![Type::Null, Type::Bool]));
+
+        let result = join(Type::Bool, Type::Null);
+        assert_eq!(result, Type::Union(vec![Type::Bool, Type::Null]));
+    }
+
+    /// Arm 3 exception: `Null × AnyVal` collapses to `AnyVal` (Json subsumes Null).
+    #[test]
+    fn null_and_anyval_collapses_to_anyval() {
+        let any_val = Type::TypeVar(u32::MAX);
+        assert_eq!(join(Type::Null, any_val.clone()), any_val.clone());
+        assert_eq!(join(any_val.clone(), Type::Null), any_val);
+    }
+
+    /// Arm 1: `Never[]` (empty-array bottom) yields to a non-empty-array branch.
+    #[test]
+    fn empty_array_branch_yields_to_real_array() {
+        let never_arr = Type::Array(Box::new(Type::Never));
+        let string_arr = Type::Array(Box::new(Type::Str));
+        // then=Never[], else=String[] → String[]
+        assert_eq!(join(never_arr.clone(), string_arr.clone()), string_arr.clone());
+        // then=String[], else=Never[] → String[]
+        assert_eq!(join(string_arr.clone(), never_arr.clone()), string_arr);
+        // both Never[] → Never[] (unchanged)
+        assert_eq!(join(never_arr.clone(), never_arr.clone()), never_arr);
+    }
+
+    /// Arm 2: two DISTINCT quantified generic params form a union, not a collapse.
+    #[test]
+    fn distinct_generic_params_form_union() {
+        let t = Type::TypeVar(9001);
+        let d = Type::TypeVar(9002);
+        let result = join(t.clone(), d.clone());
+        assert_eq!(result, Type::Union(vec![t, d]));
+    }
+
+    /// Arm 2 does NOT fire for the same generic param on both sides (T | T → T).
+    #[test]
+    fn same_generic_param_collapses() {
+        let t = Type::TypeVar(9001);
+        // types_compatible is permissive on non-MAX TypeVars → arm 5 picks else_ty = t
+        let result = join(t.clone(), t.clone());
+        assert_eq!(result, t);
+    }
+
+    /// Arm 4: `AnyVal` (TypeVar(u32::MAX)) × concrete → result is `AnyVal`.
+    #[test]
+    fn anyval_and_concrete_yields_anyval() {
+        let any_val = Type::TypeVar(u32::MAX);
+        assert_eq!(join(any_val.clone(), Type::Bool), any_val.clone());
+        assert_eq!(join(Type::Int32, any_val.clone()), any_val.clone());
+    }
+
+    /// Arm 4: unsolved inference TypeVar (id < 9000, not u32::MAX, not solved) × concrete → AnyVal.
+    #[test]
+    fn unsolved_inference_var_and_concrete_yields_anyval() {
+        // A fresh Checker has an empty solved_type_vars map, so TypeVar(42) is unsolved.
+        let unsolved = Type::TypeVar(42);
+        let result = join(unsolved, Type::Bool);
+        assert_eq!(result, Type::TypeVar(u32::MAX));
+    }
+
+    /// Arm 5: standard subtype collapse — Bool ⊆ Bool → Bool.
+    #[test]
+    fn compatible_types_collapse() {
+        assert_eq!(join(Type::Bool, Type::Bool), Type::Bool);
+        assert_eq!(join(Type::Int32, Type::Int32), Type::Int32);
+    }
+
+    /// Arm 6: unrelated concrete types form a union.
+    #[test]
+    fn unrelated_types_form_union() {
+        let result = join(Type::Bool, Type::Str);
+        assert_eq!(result, Type::Union(vec![Type::Bool, Type::Str]));
     }
 }
