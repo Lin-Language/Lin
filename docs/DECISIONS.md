@@ -2753,3 +2753,121 @@ string-keyed `lin_object_get`, an LLVM optimisation barrier) but the mechanism n
   unsound (RC/identity/serialization); generics + unions cover the real cases. See §2.5 / the compat guards.
 - **A tracing GC to absorb the alloc traffic.** Measured CLOSED-NEGATIVE earlier (no workload is
   alloc-bound; the cost is work-per-alloc on the call/value axis), independent of this ADR.
+
+## ADR-070: Object-literal arguments are checked against concrete record parameters
+
+**Status**: Accepted.
+
+**Context**: Surfaced while writing `std/datetime` (whose records carry non-default integer-typed
+fields). In `infer_call` (`crates/lin-check/src/checker/call.rs`), an object literal passed *directly*
+as a call argument was routed through expected-type-directed `check_expr` only when the parameter was
+a `Type::Map` — a structural `Type::Object` record parameter fell through to bottom-up `infer_expr`.
+So a field-value literal never adopted its expected field type: `readY({ "y": -44 })` against
+`(r: { "y": Int64 })` typed `-44` as the `Int32` default (spec §21), which codegen then
+**zero-extended** into the i64 field slot — `-44` read back as `2^32 − 44`. Binding the literal to a
+typed `val` first was correct (it went through the directed path), so only the direct-argument case
+was affected.
+
+**Decision**: Extend the call-argument routing condition to include concrete (TypeVar-free)
+`Type::Object` parameters: `matches!(param_ty, Type::Map { .. } | Type::Object { .. })`. The
+`check_object_against` Object arm already self-gates — it directs only when it changes the outcome
+(discriminant literals, sealed records, field widening) and otherwise returns `None` to fall back to
+inference — so this is safe for plain structural records and only fixes the missing
+expected-field-type push-down.
+
+**Consequences**: Negative (and any non-Int32-default) integer literals in direct object-literal
+arguments now adopt their declared field width. Regression guard:
+`test_fmt_negative_int64_field_in_direct_object_arg` in `crates/lin/tests/integration.rs`.
+
+## ADR-071: The formatter parenthesises greedy-tailed binary operands
+
+**Status**: Accepted.
+
+**Context**: Surfaced while writing `std/datetime`, whose civil-date math uses `(if … else …) / N`.
+`fmt_binop_operand` (`crates/lin-parse/src/formatter.rs`) only wrapped `BinaryOp` and `Coalesce`
+operands. An `if`/`match`/bare-lambda/block operand fell through unwrapped, but these parse their
+trailing branch by consuming a full expression, so as a binary operand they bind looser than the
+operator. `(if c then y else z) / 400` re-emitted as `if c then y else z / 400`, which reparses
+`z / 400` into the `else` — a silently different value. The formatter's contract is to never change
+program meaning, so this is a soundness bug, not a style nit.
+
+**Decision**: In `fmt_binop_operand`, unconditionally parenthesise an
+`Expr::If`/`Match`/`Function`/`Block` operand. Always-wrapping is the only locally-sound rule: the
+operand carries no "is there anything to my right" context at that point, and both sides are unsafe
+(left as above; right when the whole binary expression is itself followed by more, e.g.
+`(x * if c then a else b) + 1` would swallow `b + 1`). It is idempotent.
+
+**Consequences**: One committed benchmark (`object_equality.lin`) re-canonicalised to add the
+now-required parens around `matches + (if … else …)` — value-identical, just explicit. The formatter
+corpus run-equivalence gate (`crates/lin/tests/integration.rs`) stays green; regression guard:
+`test_fmt_parenthesizes_if_as_binary_operand`.
+
+## ADR-072: Mixed-integer-width arithmetic widens to the result type
+
+**Status**: Accepted.
+
+**Context**: Surfaced while writing `std/datetime`. In `compile_binary_op_values`
+(`crates/lin-codegen/src/codegen/arith.rs`), when two integer operands had different widths the
+narrower was extended to the *wider operand's* width. But the checker's mixed-signedness widening rule
+(`widen.rs`) takes the RESULT past both operands — `Int32 + UInt8`, and even `Int32 + UInt32` (both
+32-bit), yield `Int64`, because neither operand's type can represent every value of the other. The op
+then ran at the operand width and produced an `add i32` feeding an `i64` box/return slot — an LLVM
+type mismatch that failed the build (and would miscompile if it slipped through). `lin check` passed
+(the checker's result type was correct); only codegen was wrong.
+
+**Decision**: In the integer-width reconciliation, compute the target width as
+`max(lhs_width, rhs_width, result_width)` — folding the result width in **only for arithmetic**
+(`Add`/`Sub`/`Mul`/`Div`/`Mod`); comparisons (Bool result), bitwise, and shift keep the operand width
+as before. Build the target LLVM int type from the *width* (`8/16/32/64 → iN_type()`), NOT from a
+`Type` — an operand's LLVM value width can transiently exceed its static type's width, and deriving
+the target type from a `Type` made the recursive dispatch fail to converge (an observed stack overflow
+compiling the chained shift/or in `std/bytes` `u32FromBe`). Building from the width guarantees both
+extended operands land at exactly the target width, so the recursion terminates. Sign- vs zero-extend
+still follows each *source* operand's signedness (an unsigned UInt32 4e9 widens to 4e9, not negative).
+
+**Consequences**: Mixed-width integer arithmetic compiles and computes at the checker's result width.
+Regression guard: `test_mixed_integer_width_arithmetic_widens_to_result` in
+`crates/lin/tests/integration.rs`. Full workspace + stdlib/examples suites stay green.
+
+**Record-field types — resolved as: keep `Int64`** (see ADR-073). `weekday` returns the
+numeric-literal-union `Weekday = 0 | … | 6` (the `match` narrows the wide intermediate to the small
+type, which lowers to i32). The `Date`/`Time` record *fields* stay `Int64` rather than `UInt8`/`UInt16`,
+because reading a narrow field back into the civil-date math silently overflows (§21: a suffixless
+literal adopts the narrow operand's width, so `153 * month` runs at `UInt8` width). The explicit
+`narrowTo*` family (ADR-073) is the boundary tool for storing a wide result into a narrow field, not a
+licence to make hot-path numeric fields narrow.
+
+## ADR-073: `narrowTo*` — explicit `Int64 → fixed-width` narrowing casts
+
+**Status**: Accepted.
+
+**Context**: `std/number`'s `to*` integer-narrowing family (`toUInt8`/`toInt8`/…/`toUInt64`) takes
+`UInt64`, so only an already-*unsigned* (or masked) value reaches it (§21). A value **computed in
+`Int64`** — the result of arithmetic, or anything signed — cannot: `Int64 → UInt64` is not an implicit
+coercion (it could wrap a negative; the rule in `compat.rs::is_numeric_compatible` is deliberate). And
+`toInt32` takes a `Float64`, so there was no integer→`Int32` narrowing at all. Surfaced by `std/datetime`,
+whose civil-date math is all `Int64` but whose natural field types are small.
+
+**Decision**: Add a parallel `narrowTo*` family taking a signed `Int64`:
+`narrowToUInt8`/`narrowToInt8`/`narrowToUInt16`/`narrowToInt16`/`narrowToUInt32`/`narrowToInt32`/
+`narrowToUInt64`. Each truncates to the named width with two's-complement (`as`-cast) semantics —
+identical low-bits behaviour to the `to*` family, the only difference being the accepted input type.
+Backed by seven trivial `lin_narrow_*` runtime symbols (`crates/lin-runtime/src/number.rs`) declared
+as FFI in `stdlib/number.lin` — no codegen/RuntimeFns change, exactly like the `to*` family. The
+implicit-coercion rule is left untouched (signed→unsigned stays non-implicit); this is purely an
+*explicit* escape hatch.
+
+**Decision (datetime fields): keep `Int64`.** With the narrowing path available, `std/datetime` could
+have moved its record fields to `UInt8`/`UInt16`/`Int32`. It deliberately does NOT: reading a narrow
+field back into the civil-date arithmetic silently overflows, because per §21 a suffixless integer
+literal adopts the *narrow operand's* width — `153 * month` with `month: UInt8` computes at `UInt8`
+width (`153 * 2 = 306 → 50`). Right-sizing the fields would force an explicit `val m: Int64 = …` widen
+at every field read in `toEpochDay`/`fromEpochDay`/`addMonths`/…, where a single missed widen is a
+silent wrong answer. The hot-path numeric fields therefore stay `Int64`; `narrowTo*` is used only where
+a value genuinely crosses into a narrow type (and `weekday`'s `Weekday` return is narrowed via `match`,
+which sidesteps the issue entirely). A future change to §21's literal-in-narrow-arithmetic rule could
+revisit this.
+
+**Consequences**: A computed `Int64` can now be stored into any fixed-width integer. Regression guards
+in `stdlib/number.test.lin` (in-range, out-of-range-truncation, negative-`Int32`, signed→unsigned
+reinterpret). Spec §21 and STDLIB.md document the family and the read-back-overflow caution.
