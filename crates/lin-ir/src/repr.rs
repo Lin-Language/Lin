@@ -231,157 +231,28 @@ fn join(a: &Repr, b: &Repr) -> Repr {
 }
 
 // ---------------------------------------------------------------------------
-// Predicate mirrors — the SINGLE place the new pass reads a Type, used for both seeding and the
-// oracle. These mirror the codegen predicates EXACTLY (cited inline). Keeping them here means the
-// oracle compares the analysis against the same logic the seeds use, so a disagreement is a real
-// divergence between the dataflow result and the per-site type decision, not a transcription bug.
+// Predicate delegates — all gate predicates are defined once in `lin_check::types::Type`
+// and called from here. This removes the hand-copied "Kept byte-identical" mirrors.
 // ---------------------------------------------------------------------------
 
-/// Mirror of `Codegen::is_sealed_scalar_field` (types.rs:166).
-fn is_sealed_scalar_field(ty: &Type) -> bool {
-    ty.is_flat_scalar() || matches!(ty, Type::Bool)
-}
-
-/// Mirror of `Codegen::sealed_field_kind(..).is_some()` (types.rs:177): an eligible HEAP field of a
-/// sealed record (String / Array / Map / nested-sealed).
-fn is_sealed_heap_field(ty: &Type) -> bool {
-    match ty {
-        Type::Str | Type::StrLit(_) => true,
-        Type::Array(_) | Type::FixedArray(_) => true,
-        Type::Map { .. } => true,
-        Type::Object { .. } => sealed_fields(ty).is_some(),
-        _ => false,
-    }
-}
-
-/// Mirror of `Codegen::is_sealed_field` (types.rs:194).
-fn is_sealed_field(ty: &Type) -> bool {
-    is_sealed_scalar_field(ty) || is_sealed_heap_field(ty)
-}
-
-/// Mirror of `Codegen::sealed_fields` (types.rs:210): `Some(fields)` iff `ty` is a sealed record
-/// whose fields are ALL scalars or eligible heap fields. This is the PackedStruct gate.
+/// THE sealed-record gate. Delegates to the canonical `Type::sealed_fields`.
 pub(crate) fn sealed_fields(ty: &Type) -> Option<&IndexMap<String, Type>> {
-    match ty {
-        Type::Object { fields, sealed: true }
-            if !fields.is_empty() && fields.values().all(is_sealed_field) =>
-        {
-            Some(fields)
-        }
-        _ => None,
-    }
+    Type::sealed_fields(ty)
 }
 
-/// Mirror of `Codegen::sum_type_discriminant` (types.rs) — the SINGLE Stage-1 sum-type gate. Returns
-/// the discriminant key iff `ty` is a `Type::Union` of 2+ object variants sharing a distinct StrLit
-/// discriminant whose every OTHER field is an unboxed scalar (NON-RECURSIVE, SCALAR-ONLY). Any
-/// violation → `None` → the value stays a boxed union (fail-safe). Kept byte-identical to codegen.
+/// THE Stage-1 sum-type gate discriminant. Delegates to `Type::sum_type_discriminant`.
 pub fn sum_type_discriminant_of(ty: &Type) -> Option<String> {
-    sum_type_discriminant(ty)
+    Type::sum_type_discriminant(ty)
 }
 
-/// Mirror of `Codegen::sum_recursive_self_name` (unboxed-sumtype Stage 2). The UNIQUE recursive
-/// self-reference name of a candidate sum union, or `None` if it has no recursive child or >1
-/// distinct self-name (mutual recursion — out of scope → boxed fail-safe). Kept byte-identical.
+/// The UNIQUE recursive self-reference name of a sum union. Delegates to `Type::sum_recursive_self_name`.
 pub fn sum_recursive_self_name(ty: &Type) -> Option<String> {
-    let variants = match ty {
-        Type::Union(vs) => vs,
-        _ => return None,
-    };
-    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for v in variants {
-        if let Type::Object { fields, .. } = v {
-            for fty in fields.values() {
-                if let Type::Named(n) = fty {
-                    names.insert(n.clone());
-                }
-            }
-        }
-    }
-    if names.len() == 1 {
-        names.into_iter().next()
-    } else {
-        None
-    }
+    Type::sum_recursive_self_name(ty)
 }
 
-/// Mirror of `Codegen::is_sum_recursive_child` (Stage 2): a `Type::Named(self_name)` recursive child.
-fn is_sum_recursive_child(fty: &Type, self_name: &str) -> bool {
-    matches!(fty, Type::Named(n) if n == self_name)
-}
-
-fn sum_type_discriminant(ty: &Type) -> Option<String> {
-    let variants = match ty {
-        Type::Union(vs) => vs,
-        _ => return None,
-    };
-    if variants.len() < 2 {
-        return None;
-    }
-    // Stage 2: the unique recursive self-name (if any). A `Named(self_name)` field is a legal
-    // recursive child (`*SumNode` slot); any other Named/heap/union field → boxed (fail-safe).
-    let self_name = sum_recursive_self_name(ty);
-    let mut recs: Vec<&IndexMap<String, Type>> = Vec::with_capacity(variants.len());
-    for v in variants {
-        match v {
-            Type::Object { fields, .. } if !fields.is_empty() => recs.push(fields),
-            _ => return None,
-        }
-    }
-    let first = recs[0];
-    'keys: for (key, kty) in first.iter() {
-        if !matches!(kty, Type::StrLit(_)) {
-            continue;
-        }
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for rec in &recs {
-            match rec.get(key) {
-                Some(Type::StrLit(s)) => {
-                    if !seen.insert(s.clone()) {
-                        continue 'keys;
-                    }
-                }
-                _ => continue 'keys,
-            }
-        }
-        for rec in &recs {
-            for (fk, fty) in rec.iter() {
-                if fk == key {
-                    continue;
-                }
-                if matches!(fty, Type::StrLit(_)) {
-                    return None;
-                }
-                let is_recursive_child = self_name
-                    .as_deref()
-                    .is_some_and(|n| is_sum_recursive_child(fty, n));
-                // Heap-field SumNode Stage 3: admit String/Array/nested-sealed fields in addition to
-                // flat scalars and recursive children. The runtime drop walk (release_heap_fields) +
-                // codegen descriptor (sumnode_descriptor) handle heap-field release; the
-                // materializer (get_or_build_sumnode_materializer) boxes them for dynamic boundaries.
-                if !is_sealed_field(fty) && !is_recursive_child {
-                    return None;
-                }
-            }
-        }
-        return Some(key.clone());
-    }
-    None
-}
-
-/// True iff `ty` is a Stage-1-eligible unboxed sum type. Public so the lowerer (`lower.rs`) can
-/// gate its sum-type boundary insertions on the IDENTICAL gate the repr pass + codegen use (the
-/// single source of truth is `sum_type_discriminant`).
-pub fn sum_type_eligible(ty: &Type) -> bool {
-    sum_type_discriminant(ty).is_some()
-}
-
-/// The FULL field map (including the discriminant + any recursive children) of the variant of sum
-/// type `ty` whose discriminant value is `disc`. Public so the lowerer can push a nested literal into
-/// the correct child-sum slot (NESTED-LITERAL DISCRIMINANT PUSHDOWN, design §6 gap 1). `None` when
-/// `ty` is not a sum type or no variant carries `disc`.
+/// The FULL field map of the variant with discriminant `disc`. Public for the lowerer.
 pub fn sumnode_variant_by_disc(ty: &Type, disc: &str) -> Option<IndexMap<String, Type>> {
-    let key = sum_type_discriminant(ty)?;
+    let key = Type::sum_type_discriminant(ty)?;
     let variants = match ty {
         Type::Union(vs) => vs,
         _ => return None,
@@ -398,48 +269,19 @@ pub fn sumnode_variant_by_disc(ty: &Type, disc: &str) -> Option<IndexMap<String,
     None
 }
 
-/// Stage 3 NullableRecord gate: `Some(fields)` iff `ty` is `T | Null` (or `Null | T`) where `T` is a
-/// sealed record eligible via `sealed_fields()`. The physical representation is a single nullable
-/// pointer — `*sealed_T` or null. Two-member unions only (exactly one non-Null member).
+/// True iff `ty` is a Stage-1-eligible unboxed sum type. Delegates to `Type::sum_type_eligible`.
+pub fn sum_type_eligible(ty: &Type) -> bool {
+    Type::sum_type_eligible(ty)
+}
+
+/// Stage-3 NullableRecord gate. Delegates to `Type::nullable_sealed_record`.
 pub fn nullable_sealed_record(ty: &Type) -> Option<&IndexMap<String, Type>> {
-    let variants = match ty {
-        Type::Union(vs) => vs,
-        _ => return None,
-    };
-    let mut record: Option<&IndexMap<String, Type>> = None;
-    for v in variants {
-        if matches!(v, Type::Null) {
-            continue;
-        }
-        match sealed_fields(v) {
-            Some(f) if record.is_none() => record = Some(f),
-            _ => return None, // non-sealed variant or second sealed variant → boxed
-        }
-    }
-    record
+    Type::nullable_sealed_record(ty)
 }
 
-/// Delegates to the SINGLE source of truth `Type::is_sealed_array_field_packable` (ADR-063 gate
-/// consolidation), in lockstep with `Codegen::sealed_array_elem_field_packable`, lower.rs
-/// `is_sealed_array_elem_field_packable`, and `monomorphize::field_packed_scalar`.
-fn sealed_array_elem_field_packable(ty: &Type) -> bool {
-    ty.is_sealed_array_field_packable()
-}
-
-/// Mirror of `Codegen::sealed_array_elem` (types.rs:287): `Some(elem_fields)` iff `ty` is
-/// `Array(elem)` whose element is a sealed record with ALL packable (scalar) fields. The
-/// PackedSealedArray gate.
+/// THE sealed-record-ARRAY gate. Delegates to `Type::sealed_array_elem`.
 fn sealed_array_elem(ty: &Type) -> Option<&IndexMap<String, Type>> {
-    let elem = match ty {
-        Type::Array(e) => e.as_ref(),
-        _ => return None,
-    };
-    let fields = sealed_fields(elem)?;
-    if fields.values().all(sealed_array_elem_field_packable) {
-        Some(fields)
-    } else {
-        None
-    }
+    Type::sealed_array_elem(ty)
 }
 
 /// The repr a value of static `Type` `ty` is READ as by every assume site that dispatches purely on

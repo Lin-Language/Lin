@@ -1430,41 +1430,17 @@ fn is_nullable_record_param(ty: &Type) -> bool {
     has_named_non_null
 }
 
+/// True when `ty` is a sealed record (the PackedStruct gate). Delegates to
+/// `crate::repr::sealed_fields` which calls the canonical `Type::sealed_fields`.
 fn is_sealed_scalar_repr(ty: &Type) -> bool {
-    matches!(ty, Type::Object { fields, sealed: true }
-        if !fields.is_empty() && fields.values().all(is_sealed_field_ty))
+    crate::repr::sealed_fields(ty).is_some()
 }
 
-/// True when `ty` is `Array(elem)` whose element is a sealed record laid out as a contiguous,
-/// unboxed, header-less element buffer — sealed-records Stage 3a (all-scalar fields) AND Stage 3b
-/// (packable HEAP fields: String / Array / nested-sealed). MUST mirror
-/// `Codegen::sealed_array_elem` / `sealed_array_elem_field_packable` EXACTLY: the two decide,
-/// independently, when the packed-element representation applies, so any disagreement makes the
-/// lowerer's Coerce/ownership insertion and codegen's representation diverge (a UAF / mis-read).
-/// Heap-field elements get per-element-per-field RC across construct/read/index-set/drop/transfer
-/// (runtime: `release_sealed_array_elems` / `retain_sealed_payload_fields` / `lin_sealed_array_set`).
-/// The function name is kept for call-site stability across the generalized gate.
+/// True when `ty` is `Array(elem)` whose element is a packed-sealed record (the PackedSealedArray
+/// gate). Delegates to the canonical `Type::sealed_array_elem` via `crate::repr`.
+/// The function name is kept for call-site stability.
 fn is_sealed_scalar_array(ty: &Type) -> bool {
-    match ty {
-        // A field is packable into the contiguous element buffer iff scalar/Bool OR a STRING heap
-        // field. Array / nested-sealed element fields are NOT yet enabled (kept boxed) — see the
-        // gate note in `Codegen::sealed_array_elem_field_packable`. MUST mirror it EXACTLY.
-        Type::Array(elem) => match elem.as_ref() {
-            Type::Object { fields, sealed: true } => {
-                !fields.is_empty() && fields.values().all(is_sealed_array_elem_field_packable)
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-/// Element-field eligibility — delegates to the SINGLE source of truth
-/// `Type::is_sealed_array_field_packable` (ADR-063 gate consolidation). The codegen gate
-/// (`Codegen::sealed_array_elem_field_packable`), `monomorphize::field_packed_scalar`, and
-/// `repr::sealed_array_elem_field_packable` all defer to the same predicate, so they cannot drift.
-fn is_sealed_array_elem_field_packable(ty: &Type) -> bool {
-    ty.is_sealed_array_field_packable()
+    Type::sealed_array_elem(ty).is_some()
 }
 
 /// True when `param_ty` is an array whose element is a BOXED runtime representation — a generic
@@ -1571,17 +1547,10 @@ fn nested_sealed_repr_change(from: &Type, to: &Type) -> bool {
     to_contains_sealed_array(to) && inner_from.as_ref() != inner_to.as_ref()
 }
 
-/// A field type permitted in a sealed record: a scalar (numeric or Bool) OR an eligible heap field
-/// (String/Array/Map/nested-sealed). Mirrors `Codegen::is_sealed_field`. A nested-sealed field
-/// recurses into `is_sealed_scalar_repr`; a self-recursive type survives resolution as `Type::Named`
-/// (not an inlined `Object`), so the recursion terminates and a cyclic record stays boxed (fail-safe).
+/// True when `ty` is a permissible field of a sealed record. Delegates to the canonical
+/// `Type::is_sealed_field` (defined in `lin_check::types`).
 fn is_sealed_field_ty(ty: &Type) -> bool {
-    ty.is_flat_scalar()
-        || matches!(ty, Type::Bool)
-        || ty.is_string_ish()
-        || matches!(ty, Type::Array(_) | Type::FixedArray(_))
-        || matches!(ty, Type::Map { .. })
-        || is_sealed_scalar_repr(ty)
+    ty.is_sealed_field()
 }
 
 /// A type that participates in the OWNING reference model for var cells / module globals:
