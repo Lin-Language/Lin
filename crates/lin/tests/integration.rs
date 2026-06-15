@@ -4687,6 +4687,55 @@ print(countdown(50000))
 }
 
 #[test]
+fn test_non_tail_self_call_in_discriminated_match_arm() {
+    // Regression: a `val` whose RHS is a self-recursive call, inside a `match` arm body
+    // that is checked bidirectionally against a string-literal-discriminated union, used to
+    // be mis-marked a TAIL call. TCO then replaced the call with a loop back-edge, leaving
+    // its result temp undefined while the (live) inner `match` still read it — a codegen
+    // "undefined lhs temp" crash. The call is NOT in tail position (its value is consumed),
+    // so it must be a plain call. A recursive tree evaluator exercises exactly this shape.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type Num = { "kind": "num", "value": Int32 }
+type Bin = { "kind": "bin", "op": String, "left": Expr, "right": Expr }
+type Expr = Num | Bin
+
+type Failure = { "type": "failure", "error": String }
+type EvalSuccess = { "type": "success", "value": Int32 }
+type Evaluated = EvalSuccess | Failure
+
+val fail = (msg: String): Failure => { "type": "failure", "error": msg }
+
+val apply = (op: String, a: Int32, b: Int32): Evaluated =>
+  if op == "+" then { "type": "success", "value": a + b }
+  else if op == "*" then { "type": "success", "value": a * b }
+  else if b == 0 then fail("division by zero")
+  else { "type": "success", "value": a / b }
+
+val evalNode = (node: Expr): Evaluated =>
+  match node
+    is Num => { "type": "success", "value": node["value"] }
+    is Bin =>
+      val left = evalNode(node["left"])
+      match left
+        is EvalSuccess =>
+          val right = evalNode(node["right"])
+          match right
+            is EvalSuccess => apply(node["op"], left["value"], right["value"])
+            else => right
+        else => left
+
+val tree: Expr = { "kind": "bin", "op": "*", "left": { "kind": "bin", "op": "+", "left": { "kind": "num", "value": 2 }, "right": { "kind": "num", "value": 3 } }, "right": { "kind": "num", "value": 4 } }
+
+match evalNode(tree)
+  has { "type": "success", value } => print("= ${toString(value)}")
+  else => print("error")
+"#);
+    assert_eq!(output, vec!["= 20"]);
+}
+
+#[test]
 fn test_continuation_lines_and() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
