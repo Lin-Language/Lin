@@ -1,7 +1,7 @@
 # Events
 
 [`std/event`](/stdlib/event) provides typed event emitters in two layers. Both are **generic over
-the event payload type** `T` — there is no `Json` envelope and no string-tagged `{ type, data }`
+the event payload type** `T` — there is no `AnyVal` envelope and no string-tagged `{ type, data }`
 shape: `emit`/`send` take a `T`, and listeners receive a `T`. If you need several event shapes
 through one channel, make `T` a tagged union and `match` on it.
 
@@ -104,7 +104,7 @@ boundary and surfaces here as a value, rather than aborting the program — hand
 `match … is Error`. The `sample` argument on `emitter`/`drain` exists only to pin the payload type
 for inference; it is never folded.
 
-> The emitter handle itself is an opaque `Worker` value (typed `Json` — that is the runtime handle,
+> The emitter handle itself is an opaque `Worker` value (typed `AnyVal` — that is the runtime handle,
 > never your payload). Everything you emit and fold stays fully typed.
 
 ## Putting it together: stream in, process, emit

@@ -62,7 +62,7 @@ val result = fetch("https://example.com/ping")   // then result["status"]
 #### `fetchWith`
 
 ```lin
-val fetchWith = (url: String, options: Json): HttpResponse | Error
+val fetchWith = (url: String, options: AnyVal): HttpResponse | Error
 ```
 
 Issue a request to `url` with a custom method/headers/body.
@@ -79,7 +79,7 @@ fetchWith("https://api.example.com/items", { "method": "DELETE", "headers": {}, 
 #### `fetchJson`
 
 ```lin
-val fetchJson = (url: String): Json | Error
+val fetchJson = (url: String): AnyVal | Error
 ```
 
 GET `url` and parse the response body as JSON.
@@ -96,7 +96,7 @@ val users = fetchJson("https://api.example.com/users")   // then users.for(u => 
 #### `postJson`
 
 ```lin
-val postJson = (url: String, body: Json): HttpResponse | Error
+val postJson = (url: String, body: AnyVal): HttpResponse | Error
 ```
 
 POST `body` to `url` as `application/json`.
@@ -113,7 +113,7 @@ postJson("https://api.example.com/users", { "name": "Alice" })
 #### `json`
 
 ```lin
-val json = (status: Int32, data: Json): HttpResponse
+val json = (status: Int32, data: AnyVal): HttpResponse
 ```
 
 Build an `application/json` response with the given status and a JSON-serialised body.
@@ -163,7 +163,7 @@ Build a 400 Bad Request response carrying `message` as the body.
 #### `parseBody`
 
 ```lin
-val parseBody = (req: Json): Json | Error
+val parseBody = (req: AnyVal): AnyVal | Error
 ```
 
 Parse a request's body as JSON.
@@ -173,7 +173,7 @@ Parse a request's body as JSON.
 #### `matchPath`
 
 ```lin
-val matchPath = (path: String, pattern: String): Json
+val matchPath = (path: String, pattern: String): AnyVal
 ```
 
 Match a request path against a route pattern (e.g. `/users/:id`), extracting path params.
@@ -190,7 +190,7 @@ matchPath("/users/42", "/users/:id")   // { "id": "42" }
 #### `serve`
 
 ```lin
-val serve = (handler: Json, port: Int32): Null
+val serve = (handler: AnyVal, port: Int32): Null
 ```
 
 Start a blocking HTTP server on `port`, dispatching each request to `handler`.

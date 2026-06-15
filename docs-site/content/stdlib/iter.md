@@ -38,7 +38,7 @@ function.
 #### `for`
 
 ```lin
-val for = <T>(iterable: T[] | Iterator | Stream | Null, f: (T, Int32) => Json): Null
+val for = <T>(iterable: T[] | Iterator | Stream | Null, f: (T, Int32) => AnyVal): Null
 ```
 
 Run `f` over every item of any iterable (the universal iteration driver). For side effects only.
@@ -96,7 +96,7 @@ range(1, 6).map(i => i * i)        // [1, 4, 9, 16, 25]
 #### `rangeStep`
 
 ```lin
-val rangeStep = (start: Int32, end: Int32, step: Int32): Json
+val rangeStep = (start: Int32, end: Int32, step: Int32): AnyVal
 ```
 
 Build an integer sequence from `start` toward `end` (exclusive) advancing by `step`.
@@ -120,7 +120,7 @@ rangeStep(5, 0, -1).map(i => i)           // [5, 4, 3, 2, 1]
 #### `iterOf`
 
 ```lin
-val iterOf = (arr: Json)
+val iterOf = (arr: AnyVal)
 ```
 
 Build an opaque Iterator that yields the elements of `arr` in order.
@@ -136,7 +136,7 @@ val it = iterOf([10, 20, 30]); it.for(x => print(x))   // prints 10, 20, 30
 #### `iter`
 
 ```lin
-val iter = (init: Json, hasNext: Json, next: Json, value: Json)
+val iter = (init: AnyVal, hasNext: AnyVal, next: AnyVal, value: AnyVal)
 ```
 
 Build a custom Iterator from explicit state-machine closures.
@@ -155,15 +155,15 @@ iter(() => 0, s => s < 3, s => s + 1, s => s)   // yields 0, 1, 2
 #### `concat`
 
 ```lin
-val concat = (a: Json, b: Json): Json
+val concat = (a: AnyVal, b: AnyVal): AnyVal
 ```
 
 Concatenate two iterables into one. Two flat arrays of the same type (e.g. `UInt8[]` ++ `UInt8[]`)
 yield a flat array (so byte-level consumers read packed bytes); mixed/tagged element types yield a
-`Json[]`. Over streams (`s.lines().concat(other.lines())`) the result is a lazy concatenated Stream.
+`AnyVal[]`. Over streams (`s.lines().concat(other.lines())`) the result is a lazy concatenated Stream.
 - **`a`** — the first iterable (Array, Iterator, or Stream).
 - **`b`** — the second iterable, appended after `a`.
-- **Returns** the concatenation; flat when both inputs are the same flat type, tagged/`Json[]` otherwise.
+- **Returns** the concatenation; flat when both inputs are the same flat type, tagged/`AnyVal[]` otherwise.
 
 **Example:**
 

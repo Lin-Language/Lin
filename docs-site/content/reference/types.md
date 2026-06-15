@@ -34,22 +34,22 @@ type Number =
   | Float32 | Float64
 ```
 
-## `Json`
+## `AnyVal`
 
-`Json` is the recursive union of all JSON-compatible values:
+`AnyVal` is the recursive union of all JSON-compatible values:
 
 ```lin
-type Json =
+type AnyVal =
   | String | Boolean | Null | Number
-  | Json[]
-  | { ...Json }   // any object whose values are Json
+  | AnyVal[]
+  | { ...AnyVal }   // any object whose values are AnyVal
 ```
 
-Use `Json` when the shape of data is not statically known.
+Use `AnyVal` when the shape of data is not statically known.
 
-### `Json` is a covariant sink
+### `AnyVal` is a covariant sink
 
-Any value assigns **into** `Json` — `val j: Json = anyValue` is always allowed. But `Json` does **not** implicitly assign **out** to a concrete object type with required fields. To go from an untrusted `Json` value to a concrete type you must either:
+Any value assigns **into** `AnyVal` — `val j: AnyVal = anyValue` is always allowed. But `AnyVal` does **not** implicitly assign **out** to a concrete object type with required fields. To go from an untrusted `AnyVal` value to a concrete type you must either:
 
 - validate via `fromJson` (from `std/json`), which decodes and type-checks recursively, returning `T | Error`; or
 - narrow with an `is`/`has` pattern in a `match`.
@@ -98,7 +98,7 @@ Object types are structural. A value with additional fields is compatible with a
 
 ### Sealed named records
 
-A **named** record type — `type Person = { … }` — is **sealed**: a value whose static type is `Person` holds *exactly* `Person`'s fields, no more. This is a representation guarantee that lets the compiler lay sealed records out as unboxed structs with constant-offset field access, so a typed record is dramatically faster than the equivalent dynamic `Json` object.
+A **named** record type — `type Person = { … }` — is **sealed**: a value whose static type is `Person` holds *exactly* `Person`'s fields, no more. This is a representation guarantee that lets the compiler lay sealed records out as unboxed structs with constant-offset field access, so a typed record is dramatically faster than the equivalent dynamic `AnyVal` object.
 
 Sealing does **not** weaken structural compatibility. When a wider value (one with extra fields) flows into a `Person`-typed slot — a parameter, an annotated `val`/`var`, a typed return, or a `Person[]` element — it is **copied** into a fresh value containing only `Person`'s fields. The extra fields are dropped *from the copy*; the original value is untouched in its own scope.
 
@@ -111,7 +111,7 @@ val p: Person = wide                         // projects to a fresh { "name": "A
 wide["age"]                                  // still 99 — `wide` is unchanged
 ```
 
-The practical consequence: a named record type can't be used as an open carrier that smuggles extra fields through to a later consumer — once a value is typed as a named record, its extra fields are gone. If you need to preserve arbitrary extra keys, type the value `Json`, not a named record.
+The practical consequence: a named record type can't be used as an open carrier that smuggles extra fields through to a later consumer — once a value is typed as a named record, its extra fields are gone. If you need to preserve arbitrary extra keys, type the value `AnyVal`, not a named record.
 
 `Person.fromJson(json)` projects the same way: it validates and keeps exactly `Person`'s fields, dropping unknown keys.
 
@@ -131,8 +131,8 @@ val n = counts["apple"]      // Int32 | Null  (a missing key reads as Null)
 - `m[k]` yields `T | Null` (a missing key is `Null`). For a defaulted read, use `object.get(m, k, default)` from `std/object`.
 - `m[k] = v` accepts any string key `k` and requires `v : T`.
 - `keys(m) : String[]`, `values(m) : T[]`, and `entries(m)` are available via `std/object`.
-- A hashmap is backed at runtime by a hashed container giving **O(1) average** lookup/insert — unlike a dynamic `Json` object, whose small association-list layout is O(n) per access. Reach for `{ String: T }` whenever you have a genuinely large or open-keyed dictionary.
-- There is no implicit `Json → { String: T }` coercion — decode a `Json` value through `fromJson` or narrow it, exactly as for any other concrete type.
+- A hashmap is backed at runtime by a hashed container giving **O(1) average** lookup/insert — unlike a dynamic `AnyVal` object, whose small association-list layout is O(n) per access. Reach for `{ String: T }` whenever you have a genuinely large or open-keyed dictionary.
+- There is no implicit `AnyVal → { String: T }` coercion — decode a `AnyVal` value through `fromJson` or narrow it, exactly as for any other concrete type.
 
 **Aliased keys.** The key may be written as the literal `String`, or as **any type alias that resolves to `String`**. This lets a domain alias document intent at the call site:
 
@@ -209,10 +209,10 @@ val pair = <A, B>(a: A, b: B): { "first": A, "second": B } =>
 
 Generic types are **covariant** in producer positions (return type, array element, container content) and **contravariant** in consumer positions (function arguments):
 
-- `Person[]` is assignable to `Json[]`.
-- `Iterator<Person>` is assignable to `Iterator<Json>`.
-- A function returning `Person` is assignable to one returning `Json`.
-- `(Json) => Int32` is assignable to `(Person) => Int32` (a consumer of `Json` accepts a `Person`).
+- `Person[]` is assignable to `AnyVal[]`.
+- `Iterator<Person>` is assignable to `Iterator<AnyVal>`.
+- A function returning `Person` is assignable to one returning `AnyVal`.
+- `(AnyVal) => Int32` is assignable to `(Person) => Int32` (a consumer of `AnyVal` accepts a `Person`).
 
 ## Type-expression precedence
 
