@@ -1,0 +1,16 @@
+import { print } from "std/io"
+
+type DaysOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6
+
+val dayName = (d: DaysOfWeek): String =>
+  match d
+    is 0 => "Sunday"
+    is 1 => "Monday"
+    is 2 => "Tuesday"
+    is 3 => "Wednesday"
+    is 4 => "Thursday"
+    is 5 => "Friday"
+    is 6 => "Saturday"
+
+val today: DaysOfWeek = 3
+print(dayName(today))
