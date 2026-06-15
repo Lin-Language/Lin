@@ -840,6 +840,48 @@ pub unsafe extern "C" fn lin_union_force_to_map(tv: *const u8) -> *mut LinMap {
     dynamic_to_map(tv as *const TaggedVal)
 }
 
+/// Cluster D: moved from object.rs. Get or insert a `LinArray` at `key` inside a boxed object.
+/// After Phase 3, all dynamic objects are TAG_MAP (LinMap*). TAG_OBJECT path removed.
+/// Used by the stdlib `groupBy` implementation (stdlib/array.lin `lin_object_get_or_insert_array`).
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_get_or_insert_array(obj: *const u8, key: *const u8) -> *mut u8 {
+    use crate::tagged::{TaggedVal, TAG_ARRAY, TAG_MAP, TAG_STR, alloc_tagged};
+    use crate::string::LinString;
+    if obj.is_null() {
+        return alloc_tagged(TAG_ARRAY, crate::array::lin_array_alloc(4) as u64);
+    }
+    // After Phase 3: dynamic objects are always TAG_MAP.
+    if *obj == TAG_MAP {
+        let lin_map = (*(obj as *const TaggedVal)).payload as *mut LinMap;
+        let key_str = if !key.is_null() && *key == TAG_STR {
+            (*(key as *const TaggedVal)).payload as *const LinString
+        } else {
+            key as *const LinString
+        };
+        let existing = lin_map_get(lin_map, key_str);
+        if !existing.is_null() && (*existing).tag == TAG_ARRAY {
+            let arr = (*existing).payload as *mut crate::array::LinArray;
+            if !arr.is_null() && (*arr).refcount < crate::string::IMMORTAL_RC {
+                (*arr).refcount += 1;
+            }
+            return alloc_tagged(TAG_ARRAY, arr as u64);
+        }
+        // Absent (or present-but-not-an-array): create a fresh array and insert it.
+        let arr = crate::array::lin_array_alloc(4); // rc = 1
+        let val = TaggedVal { tag: TAG_ARRAY, _pad: [0; 7], payload: arr as u64 };
+        lin_map_set(lin_map, key_str as *mut LinString, &val);
+        // `lin_map_set` retains the inner (arr rc → 2). Drop our construction +1 (rc → 1),
+        // then bump once for the returned box's +1 (rc → 2).
+        crate::array::lin_array_release(arr);
+        if (*arr).refcount < crate::string::IMMORTAL_RC {
+            (*arr).refcount += 1;
+        }
+        return alloc_tagged(TAG_ARRAY, arr as u64);
+    }
+    // Not a map — return a fresh empty array (TAG_OBJECT producers removed, Cluster D).
+    alloc_tagged(TAG_ARRAY, crate::array::lin_array_alloc(4) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -19,7 +19,6 @@ pub mod math;
 pub mod memory;
 pub mod net;
 pub mod number;
-pub mod object;
 pub mod path;
 pub mod shared;
 pub mod process;

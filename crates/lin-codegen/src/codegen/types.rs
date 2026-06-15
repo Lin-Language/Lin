@@ -199,7 +199,11 @@ impl<'ctx> Codegen<'ctx> {
             // Both float widths box as f64 bits (see doc above).
             Type::Float32 | Type::Float64 => TAG_FLOAT64,
             Type::Str | Type::StrLit(_) => TAG_STR,
-            Type::Object { .. } => TAG_OBJECT,
+            // After Phase 3: non-sealed open objects are TAG_MAP (LinMap); sealed objects are
+            // packed structs (TAG_RECORD in union slots). type_tag returns TAG_MAP for both since
+            // sealed records boxed into union slots use TAG_RECORD (handled by sealed arm in
+            // compile_ir_is_type_single), and open objects are always TAG_MAP.
+            Type::Object { .. } => TAG_MAP,
             Type::Map { .. } => TAG_MAP,
             Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => TAG_ARRAY,
             Type::Function { .. } => TAG_FUNCTION,
@@ -207,17 +211,12 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Like `type_tag` but returns `TAG_MAP` for a genuinely-open (non-sealed) `Type::Object` and
-    /// `TAG_OBJECT` for sealed records. Use at sites that produce a concrete open-object value (the
-    /// `MakeObject` open literal, materializer outputs) which are `LinMap*` after Stage 6b Phase 2.
-    /// Sealed `Type::Object` values are packed structs whose tag is managed separately; leave them
-    /// with TAG_OBJECT so the existing sealed-record paths are unaffected.
+    /// Like `type_tag` but historically returned `TAG_MAP` for non-sealed and `TAG_OBJECT` for
+    /// sealed `Type::Object`. After Cluster D (TAG_OBJECT producers removed), `type_tag` already
+    /// returns `TAG_MAP` for all `Type::Object` variants, so this is now identical to `type_tag`.
+    /// Kept as a separate entry point for call-site clarity (indicates the site produces a
+    /// concrete value, not a boxed union tag check).
     pub(crate) fn type_tag_open(ty: &Type) -> u8 {
-        if let Type::Object { .. } = ty {
-            if Self::sealed_fields(ty).is_none() {
-                return TAG_MAP;
-            }
-        }
         Self::type_tag(ty)
     }
 
