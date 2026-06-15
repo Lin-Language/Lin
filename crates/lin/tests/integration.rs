@@ -4400,7 +4400,7 @@ val run = (): Null =>
 run()
 "#);
     assert!(
-        err.contains("Cannot index into type Int32"),
+        err.contains("cannot index into `Int32`"),
         "case A should error: callback param `a` must be Int32, got: {}",
         err
     );
@@ -4428,7 +4428,7 @@ import { toString } from "std/string"
 print(toString([1, 2, 3].map(x => x["k"])))
 "#);
     assert!(
-        err.contains("Cannot index into type Int32"),
+        err.contains("cannot index into `Int32`"),
         "map callback param `x` must be Int32, got: {}",
         err
     );
@@ -19070,6 +19070,52 @@ print("${step(2000, 0)}")
     // even sum = 2+4+...+2000 = 1001000 ; odd count = 1000 → odd v contributes 1000*100=100000
     // bump total = 2000. Total = 1001000 + 100000 + 2000 = 1103000.
     assert_eq!(output, vec!["1103000"]);
+}
+
+#[test]
+fn test_coalesce_empty_literal_refines_to_stripped_type() {
+    // `m[k] ?? {}` where m's value type is itself a map/record should refine `{}` to that value
+    // type, not produce a `ValueType | {}` union. Regression for the case where `infer_coalesce`
+    // inferred the right operand with no expected type.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+// Nested map: { String: { UInt32: Boolean } } — the exact pattern from the original bug.
+// dates[key] is { UInt32: Boolean } | Null; `?? {}` must refine to { UInt32: Boolean }.
+var dates: { String: { UInt32: Boolean } } = {}
+dates["svc1"][1u32] = true
+val entry: { UInt32: Boolean } = dates["missing"] ?? {}
+print(toString(entry[1u32] ?? false))
+
+// { String: Int32[] } — empty-array default refines to Int32[].
+var lists: { String: Int32[] } = {}
+val xs: Int32[] = lists["k"] ?? []
+print(toString(length(xs)))
+"#);
+    assert_eq!(output, vec!["false", "0"]);
+}
+
+#[test]
+fn test_coalesce_mismatched_default_still_unions() {
+    // When the RHS default is genuinely a different type, `??` still produces a union result
+    // (the documented `stripped | D` behaviour is preserved — no regression).
+    let output = run(r#"import { print } from "std/io"
+
+var m: { String: Int32 } = {}
+m["x"] = 7
+val r = m["x"] ?? "fallback"
+val s = m["missing"] ?? "fallback"
+match r
+  is String => print("string: ${r}")
+  is Int32 => print("int: ${r}")
+  else => print("other")
+match s
+  is String => print("string: ${s}")
+  is Int32 => print("int: ${s}")
+  else => print("other")
+"#);
+    assert_eq!(output, vec!["int: 7", "string: fallback"]);
 }
 
 #[test]
