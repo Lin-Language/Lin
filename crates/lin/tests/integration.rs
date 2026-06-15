@@ -14537,6 +14537,63 @@ m["hello"] = "world"
     );
 }
 
+// ── Integer-keyed map LITERALS (§5.1.1) ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_int_map_literal_basic() {
+    // Basic int-map literal: { 1: "one", 2: "two", 42: "forty-two" }
+    let output = run(r#"import { print } from "std/io"
+
+val m: { Int32: String } = { 1: "one", 2: "two", 42: "forty-two" }
+print(m[1] ?? "?")
+print(m[2] ?? "?")
+print(m[42] ?? "?")
+print(m[99] ?? "?")
+"#);
+    assert_eq!(output, vec!["one", "two", "forty-two", "?"]);
+}
+
+#[test]
+fn test_int_map_literal_negative_keys() {
+    // Negative integer literal keys in an int-map literal.
+    let output = run(r#"import { print } from "std/io"
+
+val m: { Int32: String } = { -1: "minus-one", 0: "zero", -99: "neg-ninety-nine" }
+print(m[0] ?? "?")
+print(m[-1] ?? "?")
+print(m[-99] ?? "?")
+print(m[1] ?? "?")
+"#);
+    assert_eq!(output, vec!["zero", "minus-one", "neg-ninety-nine", "?"]);
+}
+
+#[test]
+fn test_int_map_literal_inferred_type() {
+    // Without annotation: infers { Int32: String } from the int literal keys.
+    let output = run(r#"import { print } from "std/io"
+
+val n = { 0: "false", 1: "true" }
+print(n[0] ?? "?")
+print(n[1] ?? "?")
+print(n[2] ?? "?")
+"#);
+    assert_eq!(output, vec!["false", "true", "?"]);
+}
+
+#[test]
+fn test_int_map_literal_mixed_keys_rejected() {
+    // Mixing integer and string keys in the same literal is a type error.
+    let err = run_expect_err(r#"import { print } from "std/io"
+
+val m = { 1: "a", "b": "c" }
+print(m[1] ?? "?")
+"#);
+    assert!(
+        err.contains("mixed") || err.contains("integer") || err.contains("string"),
+        "expected mixed-key type error, got: {err}"
+    );
+}
+
 #[test]
 fn test_check_accepts_valid_imported_symbol_program() {
     let (ok, output) = check_source(
