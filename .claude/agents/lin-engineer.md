@@ -258,39 +258,36 @@ val squares = range(1, 4).map(n => n * n)     // [1, 4, 9]
 - Async: `val p = async(() => work())` then `await(p)`, typed `(p: T) => T | Error` — faults surface as `Error`, not crashes. You must `await` before using the value. `async` thunks must not capture `var` and must not return a `Function` or `Iterator` (compile errors). `worker(handler, init)` confines `var` state to one thread; `request(w, msg)` / `close(w)` drive it.
 
 ### Types
-- **Avoid `Json`. It is an escape hatch, not a default.** Reach for it ONLY when a value's shape is genuinely dynamic and unknowable at compile time — parsing arbitrary external JSON, a recursive AST indexed by per-variant fields, untyped wire data. The rest of the time — which is almost always — use a **named record type, a generic, or a union**. `Json` defeats the type checker (no field checking, no arithmetic without narrowing/decoding), defeats width-subtyping, and is a real performance cliff: field access on `Json` is an optimisation barrier the backend can't hoist or fold, where typed records get inlined to a constant slot load. If you find yourself writing `(x: Json)` and then `x["field"]`, stop and write the record type instead.
-
-If you need a hashmap, define one as `{ String: SomeType }`. 
-
-- Structural and width-subtyped: an object with extra fields satisfies a narrower object type. Prefer naming your shapes: `type Record = { "name": String, "score": Int32 }` and typing functions `(r: Record): ...`, not `(r: Json)`.
+- Avoid `AnyVal`. use a **named record type, a generic, or a map**. If you need a hashmap, define one as `{ String: SomeType }`. 
+- Structural and width-subtyped: an object with extra fields satisfies a narrower object type. Prefer naming your shapes: `type Record = { "name": String, "score": Int32 }` and typing functions `(r: Record): ...`.
 - Unions `A | B | C`; narrow with `is`/`has`.
 - Typed maps use an index signature: `{ String: Int32 }`, missing key → `Null`. Arrays are `T[]`; fixed tuples are positional `[T1, T2]`.
 - `Number` is a zero-cost numerically-bounded generic, not a union.
 - Sealed/exact named records exist for unboxed layout (ADR-057, spec §5.9.1) — check the spec before relying on their precise semantics.
+- Maps can have a String or Int-Type key and the keys can be aliased.
+- You can use String or Int union types, e.g. `type DaysOfWeek = "Monday" | "Tuesday" | "Wednesday"` or `0 | 1 | 2`
 
-#### Use generics instead of `Json` for shape-agnostic code
+#### Use generics
 
-When a function works over *any* element type — containers, wrappers, pipelines — make it **generic** with a type parameter `<T>` rather than smearing everything to `Json`. Generics are monomorphised (zero-cost) and keep the element type precise end-to-end:
+When a function works over *any* element type — containers, wrappers, pipelines — make it **generic** with a type parameter `<T>`. Generics are monomorphised (zero-cost) and keep the element type precise end-to-end:
 
 ```lin
-// A generic, type-safe "first or fallback" — works for any T, no Json anywhere.
+// A generic, type-safe "first or fallback" — works for any T
 val firstOr = <T>(xs: T[], fallback: T): T =>
   if length(xs) == 0 then fallback else xs[0]
 
 val n: Int32 = firstOr([3, 4, 5], 0)          // T = Int32
 val s: String = firstOr(["a", "b"], "?")       // T = String
 
-// A generic wrapper type carries its payload type, instead of { "value": Json }.
+// A generic wrapper type carries its payload type
 type Box<T> = { "value": T }
 
 val unwrap = <T>(b: Box<T>): T => b["value"]
 ```
 
-Compare with the anti-pattern `val firstOr = (xs: Json, fallback: Json): Json => ...`, which loses the element type, forbids arithmetic on the result without narrowing, and is slower.
-
 #### Intersection types with `&` — composing record shapes
 
-Use `&` to build a record type that has **all** the fields of its parts, instead of retyping a wide shape as `Json`. This is the idiom for "X, plus some extra fields" (ADR-061):
+Use `&` to build a record type that has **all** the fields of its parts. This is the idiom for "X, plus some extra fields" (ADR-061):
 
 ```lin
 type Entity = { "id": String, "createdAt": Int32 }

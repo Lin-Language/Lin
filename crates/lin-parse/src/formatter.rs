@@ -1266,7 +1266,7 @@ fn indent_first(s: &str, ind: &str) -> String {
 
 // ── type expressions ──────────────────────────────────────────────────────────
 
-fn fmt_type(ty: &TypeExpr) -> String {
+pub fn fmt_type(ty: &TypeExpr) -> String {
     match ty {
         TypeExpr::Named(name, _) => name.clone(),
         TypeExpr::Generic(name, params, _) => {

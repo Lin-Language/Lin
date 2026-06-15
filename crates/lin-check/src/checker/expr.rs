@@ -774,13 +774,95 @@ impl Checker {
             // logic by recursing on the resolved type. If it bottoms out at a still-`Named` (true
             // cycle with no indexable layer) or a non-indexable type, fall through to the existing
             // "Cannot index" error — i.e. fail conservatively, never invent a result type.
-            Type::Named(_) => {
+            Type::Named(name) => {
                 if let Some(resolved) = self.resolve_named_body(&obj_ty) {
                     return self.infer_index_into(typed_obj, typed_key, &resolved, span);
                 }
-                return Err(Diagnostic::error(span, format!("Cannot index into type {}", obj_ty)));
+                // resolve_named_body returned None: either the decl has generic params (can't
+                // be instantiated without type args) or it is a forward-declaration placeholder
+                // (the body is `Named(name)` — set by forward_declare_types before check_stmt
+                // fills in the real body). Either way we cannot statically index into this type.
+                let key_ty = typed_key.ty();
+                // Try to surface the expanded body. Prefer the already-resolved env entry;
+                // fall back to the raw AST body recorded during forward_declare_types so
+                // we can show the source-level shape even for types declared after this usage.
+                let expanded: Option<String> = self.env.lookup_type(name).and_then(|decl| {
+                    if matches!(&decl.body, Type::Named(n) if n == name) {
+                        // Forward-declaration self-cycle — env body not yet resolved.
+                        // Use the raw AST body instead.
+                        self.raw_type_decls.get(name)
+                            .map(|raw| lin_parse::fmt_type(raw))
+                    } else if decl.params.is_empty() {
+                        Some(format!("{}", decl.body))
+                    } else {
+                        None // generic — no single expansion
+                    }
+                });
+                let is_generic = self.env.lookup_type(name)
+                    .is_some_and(|decl| !decl.params.is_empty());
+                let key_is_string_or_unknown =
+                    key_ty.is_string_ish() || matches!(key_ty, Type::TypeVar(_));
+                // Pick a headline that reflects the actual kind of type.
+                let is_fwd_index_sig = self.raw_type_decls.get(name)
+                    .is_some_and(|raw| matches!(raw, lin_parse::ast::TypeExpr::IndexSig(..)));
+                let headline = if is_fwd_index_sig {
+                    format!("`{}` is not yet resolved at this point", name)
+                } else {
+                    format!("`{}` is a fixed-shape record and cannot be indexed dynamically", name)
+                };
+                let mut diag = Diagnostic::error(span, headline);
+                if is_generic {
+                    diag = diag.with_help(format!(
+                        "`{}` is a generic type — provide type arguments to index into it", name
+                    ));
+                } else {
+                    let raw_is_index_sig = self.raw_type_decls.get(name)
+                        .is_some_and(|raw| matches!(raw, lin_parse::ast::TypeExpr::IndexSig(..)));
+                    let help = if raw_is_index_sig {
+                        // The type IS declared as a map (`{ KeyType: ValueType }`) but the
+                        // forward-declaration self-cycle prevented resolution. Tell the user
+                        // the type and that moving it earlier will fix the error.
+                        match &expanded {
+                            Some(body) => format!(
+                                "`{}` = {} — move this type declaration above its first use",
+                                name, body
+                            ),
+                            None => format!(
+                                "`{}` is declared as a map but not yet resolved — move the type declaration above its first use",
+                                name
+                            ),
+                        }
+                    } else {
+                        // The type is a fixed-shape record. If key is string-like, suggest
+                        // switching to a map declaration.
+                        match (&expanded, key_is_string_or_unknown) {
+                            (Some(body), true) => format!(
+                                "`{}` = {} — to index dynamically, change to a map: `{{ String: <ValueType> }}`",
+                                name, body
+                            ),
+                            (Some(body), false) => format!("`{}` = {}", name, body),
+                            (None, true) => "to index dynamically, change the type to a map: `{ String: <ValueType> }`".to_string(),
+                            (None, false) => String::new(),
+                        }
+                    };
+                    if !help.is_empty() {
+                        diag = diag.with_help(help);
+                    }
+                }
+                return Err(diag);
             }
-            _ => return Err(Diagnostic::error(span, format!("Cannot index into type {}", obj_ty))),
+            _ => {
+                let key_ty = typed_key.ty();
+                let key_label = if matches!(key_ty, Type::TypeVar(_)) {
+                    "a dynamically-typed key".to_string()
+                } else {
+                    format!("a key of type `{}`", key_ty)
+                };
+                return Err(Diagnostic::error(
+                    span,
+                    format!("cannot index into `{}` with {}", obj_ty, key_label),
+                ));
+            }
         };
         Ok(TypedExpr::Index { object: Box::new(typed_obj), key: Box::new(typed_key), result_type, span })
     }
@@ -895,7 +977,7 @@ impl Checker {
     /// can recurse after resolving the alias. Re-runs `infer_index` on an already-typed object and
     /// key against an explicitly-provided object type (`obj_ty`). This is only entered from the
     /// `Named` arm with a freshly-resolved concrete body, so a `Named` arriving here again is a
-    /// genuine cycle and yields the "Cannot index" error.
+    /// genuine cycle and yields the "cannot index into" error.
     fn infer_index_into(
         &mut self,
         typed_obj: TypedExpr,
@@ -1006,7 +1088,16 @@ impl Checker {
                 Type::flatten_union(vec![inner, Type::Null])
             }
             other => {
-                return Err(Diagnostic::error(span, format!("Cannot index into type {}", other)))
+                let key_ty = typed_key.ty();
+                let key_label = if matches!(key_ty, Type::TypeVar(_)) {
+                    "a dynamically-typed key".to_string()
+                } else {
+                    format!("a key of type `{}`", key_ty)
+                };
+                return Err(Diagnostic::error(
+                    span,
+                    format!("cannot index into `{}` with {}", other, key_label),
+                ));
             }
         };
         Ok(TypedExpr::Index { object: Box::new(typed_obj), key: Box::new(typed_key), result_type, span })
