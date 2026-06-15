@@ -4687,6 +4687,55 @@ print(countdown(50000))
 }
 
 #[test]
+fn test_non_tail_self_call_in_discriminated_match_arm() {
+    // Regression: a `val` whose RHS is a self-recursive call, inside a `match` arm body
+    // that is checked bidirectionally against a string-literal-discriminated union, used to
+    // be mis-marked a TAIL call. TCO then replaced the call with a loop back-edge, leaving
+    // its result temp undefined while the (live) inner `match` still read it — a codegen
+    // "undefined lhs temp" crash. The call is NOT in tail position (its value is consumed),
+    // so it must be a plain call. A recursive tree evaluator exercises exactly this shape.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type Num = { "kind": "num", "value": Int32 }
+type Bin = { "kind": "bin", "op": String, "left": Expr, "right": Expr }
+type Expr = Num | Bin
+
+type Failure = { "type": "failure", "error": String }
+type EvalSuccess = { "type": "success", "value": Int32 }
+type Evaluated = EvalSuccess | Failure
+
+val fail = (msg: String): Failure => { "type": "failure", "error": msg }
+
+val apply = (op: String, a: Int32, b: Int32): Evaluated =>
+  if op == "+" then { "type": "success", "value": a + b }
+  else if op == "*" then { "type": "success", "value": a * b }
+  else if b == 0 then fail("division by zero")
+  else { "type": "success", "value": a / b }
+
+val evalNode = (node: Expr): Evaluated =>
+  match node
+    is Num => { "type": "success", "value": node["value"] }
+    is Bin =>
+      val left = evalNode(node["left"])
+      match left
+        is EvalSuccess =>
+          val right = evalNode(node["right"])
+          match right
+            is EvalSuccess => apply(node["op"], left["value"], right["value"])
+            else => right
+        else => left
+
+val tree: Expr = { "kind": "bin", "op": "*", "left": { "kind": "bin", "op": "+", "left": { "kind": "num", "value": 2 }, "right": { "kind": "num", "value": 3 } }, "right": { "kind": "num", "value": 4 } }
+
+match evalNode(tree)
+  has { "type": "success", value } => print("= ${toString(value)}")
+  else => print("error")
+"#);
+    assert_eq!(output, vec!["= 20"]);
+}
+
+#[test]
 fn test_continuation_lines_and() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -19031,6 +19080,52 @@ print("${step(2000, 0)}")
     // even sum = 2+4+...+2000 = 1001000 ; odd count = 1000 → odd v contributes 1000*100=100000
     // bump total = 2000. Total = 1001000 + 100000 + 2000 = 1103000.
     assert_eq!(output, vec!["1103000"]);
+}
+
+#[test]
+fn test_coalesce_empty_literal_refines_to_stripped_type() {
+    // `m[k] ?? {}` where m's value type is itself a map/record should refine `{}` to that value
+    // type, not produce a `ValueType | {}` union. Regression for the case where `infer_coalesce`
+    // inferred the right operand with no expected type.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+// Nested map: { String: { UInt32: Boolean } } — the exact pattern from the original bug.
+// dates[key] is { UInt32: Boolean } | Null; `?? {}` must refine to { UInt32: Boolean }.
+var dates: { String: { UInt32: Boolean } } = {}
+dates["svc1"][1u32] = true
+val entry: { UInt32: Boolean } = dates["missing"] ?? {}
+print(toString(entry[1u32] ?? false))
+
+// { String: Int32[] } — empty-array default refines to Int32[].
+var lists: { String: Int32[] } = {}
+val xs: Int32[] = lists["k"] ?? []
+print(toString(length(xs)))
+"#);
+    assert_eq!(output, vec!["false", "0"]);
+}
+
+#[test]
+fn test_coalesce_mismatched_default_still_unions() {
+    // When the RHS default is genuinely a different type, `??` still produces a union result
+    // (the documented `stripped | D` behaviour is preserved — no regression).
+    let output = run(r#"import { print } from "std/io"
+
+var m: { String: Int32 } = {}
+m["x"] = 7
+val r = m["x"] ?? "fallback"
+val s = m["missing"] ?? "fallback"
+match r
+  is String => print("string: ${r}")
+  is Int32 => print("int: ${r}")
+  else => print("other")
+match s
+  is String => print("string: ${s}")
+  is Int32 => print("int: ${s}")
+  else => print("other")
+"#);
+    assert_eq!(output, vec!["int: 7", "string: fallback"]);
 }
 
 #[test]

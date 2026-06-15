@@ -354,9 +354,17 @@ impl Checker {
         {
             self.env.push_scope();
             let mut typed_stmts = Vec::new();
+            // A block's non-final statements are NOT in tail position; only its final expression
+            // is. Clear the flag while checking the statements (mirroring `infer_block`) so a
+            // self-recursive call in a `val` RHS isn't mis-marked a tail call — that produced a
+            // bogus `TailCall` whose result temp is then read by the (live) tail expression,
+            // yielding an undefined-SSA-temp crash in codegen. Restore for the final expression.
+            let block_tail = self.in_tail_position;
+            self.in_tail_position = false;
             for stmt in stmts {
                 typed_stmts.push(self.check_stmt(stmt)?);
             }
+            self.in_tail_position = block_tail;
             let typed_final = self.check_expr(final_expr, expected)?;
             let block_ty = typed_final.ty();
             self.env.pop_scope();
@@ -1494,8 +1502,34 @@ impl Checker {
             left_ty.without_null().unwrap_or(Type::Never)
         };
 
-        let typed_right = self.infer_expr(right)?;
-        let right_ty = typed_right.ty();
+        // When the stripped left type is a concrete pushable type (not Never, not Json), try to
+        // check the right operand against it so that a bare literal default (`?? {}`, `?? []`)
+        // refines to the stripped type rather than inferring as an unrelated `{}` / `[]`.
+        // We fall back to plain inference if the directed check fails (genuine different-shaped
+        // default → documented `stripped | D` union result).
+        //
+        // Diagnostic-leak guard: check_expr_branch_inner only returns Err via Diagnostic return
+        // (no self.diagnostics.push before Err for Object/Array arms), but snapshot defensively.
+        let (typed_right, right_ty) = if !left_is_json && stripped != Type::Never {
+            let diag_len_before = self.diagnostics.len();
+            match self.check_expr_branch_inner(right, &stripped) {
+                Ok(typed) => {
+                    let ty = typed.ty();
+                    (typed, ty)
+                }
+                Err(_) => {
+                    // Discard stray diagnostics pushed before the error (defensive).
+                    self.diagnostics.truncate(diag_len_before);
+                    let typed = self.infer_expr(right)?;
+                    let ty = typed.ty();
+                    (typed, ty)
+                }
+            }
+        } else {
+            let typed = self.infer_expr(right)?;
+            let ty = typed.ty();
+            (typed, ty)
+        };
 
         // Result type = stripped | D, collapsed to `stripped` when D is assignable to it. A bare
         // `Null` left collapses to `right`'s type (its stripped half is `Never`). For a `Json` left
