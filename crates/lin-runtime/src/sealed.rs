@@ -481,10 +481,12 @@ pub unsafe fn materialize_sealed_elem_boxed(payload: *const u8, named_desc: *con
 ///   NamedDesc row does not carry. Unreachable while the packing gate
 ///   (`Type::is_sealed_array_field_packable`) admits scalars + Bool only; the gate-widening work
 ///   must extend this before admitting nested records.
-pub unsafe fn pack_named_payload_from_object(
+/// Shared implementation: pack one field per descriptor entry using a caller-supplied lookup
+/// function `get_tv(key) -> *const TaggedVal` (borrowed interior pointer or null).
+unsafe fn pack_named_payload_impl(
     slot: *mut u8,
-    obj: *const crate::object::LinObject,
     named_desc: *const u8,
+    get_tv: impl Fn(*const crate::string::LinString) -> *const crate::tagged::TaggedVal,
 ) {
     use crate::tagged::{
         TAG_NULL, TAG_INT32, TAG_INT64, TAG_UINT64, TAG_FLOAT32, TAG_FLOAT64, TAG_BOOL,
@@ -502,8 +504,7 @@ pub unsafe fn pack_named_payload_from_object(
         cur = next;
         let dst = slot.add(offset as usize - SEALED_HEADER);
         let key = crate::string::lin_string_from_bytes(name.as_ptr(), name.len() as u32);
-        // Borrowed interior pointer (null if the key is absent).
-        let tv = crate::object::lin_object_get(obj, key);
+        let tv = get_tv(key);
         crate::string::lin_string_release(key);
         let (tag, payload) = if tv.is_null() { (TAG_NULL, 0u64) } else { ((*tv).tag, (*tv).payload) };
         match nkind {
@@ -572,6 +573,28 @@ pub unsafe fn pack_named_payload_from_object(
             }
         }
     }
+}
+
+/// Pack sealed-record payload from a `LinObject` (TAG_OBJECT) source.
+pub unsafe fn pack_named_payload_from_object(
+    slot: *mut u8,
+    obj: *const crate::object::LinObject,
+    named_desc: *const u8,
+) {
+    pack_named_payload_impl(slot, named_desc, |key| {
+        crate::object::lin_object_get(obj, key)
+    });
+}
+
+/// Pack sealed-record payload from a `LinMap` (TAG_MAP) source — Phase 2 open objects.
+pub unsafe fn pack_named_payload_from_map(
+    slot: *mut u8,
+    map: *const crate::map::LinMap,
+    named_desc: *const u8,
+) {
+    pack_named_payload_impl(slot, named_desc, |key| {
+        crate::map::lin_map_get(map, key)
+    });
 }
 
 /// Compute the total struct size (header + payload) from a named descriptor, for dynamic alloc
@@ -661,6 +684,19 @@ pub unsafe fn alloc_sealed_struct_from_object(
     let size = struct_size_from_named_desc(named_desc);
     let sptr = lin_sealed_alloc(size, heap_desc, named_desc);
     pack_named_payload_from_object(sptr.add(SEALED_HEADER), obj, named_desc);
+    sptr
+}
+
+/// Allocate a fresh sealed struct from a `LinMap` (Phase 2 open objects) using the named
+/// descriptor. For the dynamic push/set path when the source is a TAG_MAP.
+pub unsafe fn alloc_sealed_struct_from_map(
+    map: *const crate::map::LinMap,
+    named_desc: *const u8,
+    heap_desc: *const u8,
+) -> *mut u8 {
+    let size = struct_size_from_named_desc(named_desc);
+    let sptr = lin_sealed_alloc(size, heap_desc, named_desc);
+    pack_named_payload_from_map(sptr.add(SEALED_HEADER), map, named_desc);
     sptr
 }
 

@@ -893,7 +893,7 @@ pub unsafe extern "C" fn lin_object_keys(obj: *const LinObject) -> *mut crate::a
 /// a union/Json slot and is represented as TAG_RECORD.
 #[no_mangle]
 pub unsafe extern "C" fn lin_tagged_keys(tv: *const u8) -> *mut crate::array::LinArray {
-    use crate::tagged::{TAG_OBJECT, TAG_RECORD, TaggedVal, lin_unbox_ptr};
+    use crate::tagged::{TAG_OBJECT, TAG_RECORD, TAG_MAP, TaggedVal, lin_unbox_ptr};
     if tv.is_null() {
         return crate::array::lin_array_alloc(0);
     }
@@ -902,6 +902,10 @@ pub unsafe extern "C" fn lin_tagged_keys(tv: *const u8) -> *mut crate::array::Li
         TAG_OBJECT => {
             let obj = lin_unbox_ptr(tv) as *const LinObject;
             lin_object_keys(obj)
+        }
+        // Phase 2: non-sealed open objects are now backed by LinMap (TAG_MAP).
+        TAG_MAP => {
+            crate::map::lin_map_keys(src.payload as *const crate::map::LinMap)
         }
         TAG_RECORD => {
             let sealed = src.payload as *mut u8;
@@ -1195,14 +1199,13 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
     }
     if at == crate::tagged::TAG_SUMNODE {
         // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: both sides are kept-packed `*SumNode`s (a
-        // record field comparison). Materialize each to a real LinObject and compare structurally
-        // (order-independent), releasing the transient materializations. (`at == bt` holds here.)
-        let ao = crate::sumnode::lin_sumnode_materialize(ap as *mut u8);
-        let bo = crate::sumnode::lin_sumnode_materialize(bp as *mut u8);
-        let eq = !ao.is_null() && !bo.is_null()
-            && lin_object_eq(ao as *const LinObject, bo as *const LinObject) != 0;
-        if !ao.is_null() { lin_object_release(ao as *mut LinObject); }
-        if !bo.is_null() { lin_object_release(bo as *mut LinObject); }
+        // record field comparison). Phase 2: materializer returns LinMap*. Compare via lin_map_eq.
+        let am = crate::sumnode::lin_sumnode_materialize(ap as *mut u8);
+        let bm = crate::sumnode::lin_sumnode_materialize(bp as *mut u8);
+        let eq = !am.is_null() && !bm.is_null()
+            && crate::map::lin_map_eq(am as *const crate::map::LinMap, bm as *const crate::map::LinMap) != 0;
+        if !am.is_null() { crate::map::lin_map_release(am as *mut crate::map::LinMap); }
+        if !bm.is_null() { crate::map::lin_map_release(bm as *mut crate::map::LinMap); }
         return eq;
     }
     // Stage 6a: TAG_RECORD vs TAG_RECORD (or TAG_RECORD vs TAG_OBJECT) comparison in a record

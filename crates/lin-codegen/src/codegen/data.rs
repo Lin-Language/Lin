@@ -191,8 +191,8 @@ impl<'ctx> Codegen<'ctx> {
         // index-get) expects. This is the generic `push$Object` / `set` into a `Field[]` case.
         if let Type::Object { .. } = val_ty {
             if let Some(fields) = Self::sealed_fields(val_ty).cloned() {
-                let obj = self.sealed_materialize_to_object(val, &fields);
-                let tag = i8_ty.const_int(Self::type_tag(val_ty) as u64, false);
+                let obj = self.sealed_materialize_to_map(val, &fields);
+                let tag = i8_ty.const_int(Self::type_tag_open(val_ty) as u64, false);
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
                 let cell = self.entry_alloca(ptr_ty, "arr_cell");
                 self.builder.store(cell, obj);
@@ -210,7 +210,8 @@ impl<'ctx> Codegen<'ctx> {
             Type::TypeVar(_) | Type::Union(_) | Type::Promise(_) | Type::Shared(_) | Type::Stream(_) | Type::TarEntry =>
                 self.push_tagged_val(arr, val, val_ty),
             _ => {
-                let tag_val = Self::type_tag(val_ty);
+                // Phase 2: use type_tag_open so non-sealed open objects get TAG_MAP, not TAG_OBJECT.
+                let tag_val = Self::type_tag_open(val_ty);
                 let tag = i8_ty.const_int(tag_val as u64, false);
                 // lin_array_push copies a full 8 bytes from the cell into the payload, so the
                 // cell must hold 8 defined bytes. Pointers are stored as the raw 8-byte pointer;
@@ -282,21 +283,21 @@ impl<'ctx> Codegen<'ctx> {
         if let Some(sum_ty) = obj_repr.sumnode_sum_ty() {
             let sum_ty = sum_ty.clone();
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-            // Runtime key: materialize the whole node to a boxed LinObject once, then object_get.
+            // Runtime key: materialize the whole node to a fresh LinMap* once, then map_get.
             let obj_box = self.sumnode_materialize_to_object(obj, &sum_ty, llvm_fn).into_pointer_value();
             let key_raw = if Self::is_union_type(key_ty) && key.is_pointer_value() {
                 self.builder.call(self.rt.unbox_ptr, &[key.into()], "sumnode_idx_kstr").try_as_basic_value().unwrap_basic()
             } else {
                 key
             };
-            let got = self.builder.call(self.rt.object_get, &[obj_box.into(), key_raw.into()], "sumnode_idx_get").try_as_basic_value().unwrap_basic();
+            let got = self.builder.call(self.rt.map_get, &[obj_box.into(), key_raw.into()], "sumnode_idx_get").try_as_basic_value().unwrap_basic();
             let cloned = if got.is_pointer_value() {
                 let clone_fn = self.get_or_declare_fn("lin_tagged_clone", ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(clone_fn, &[got.into()], "sumnode_idx_clone").try_as_basic_value().unwrap_basic()
             } else {
                 got
             };
-            self.builder.call(self.rt.object_release, &[obj_box.into()], "");
+            self.builder.call(self.rt.map_release, &[obj_box.into()], "");
             return cloned;
         }
         // When the object is statically Json/union, `obj` is a TaggedVal* wrapping the
@@ -335,14 +336,23 @@ impl<'ctx> Codegen<'ctx> {
             let arr_res = self.builder.call(get_tagged_fn, &[container.into(), idx.into()], "ir_idx_aget").try_as_basic_value().unwrap_basic();
             let int_exit = self.builder.get_insert_block().unwrap();
             self.builder.unconditional_branch(mrg);
-            // string key → object get, guarded by an object-tag check on the container source.
+            // string key → object/map get: dispatch on the container's tag (TAG_MAP or TAG_OBJECT).
             self.builder.position_at_end(str_b);
             let key_raw = self.builder.call(self.rt.unbox_ptr, &[key.into()], "ir_idxk_str").try_as_basic_value().unwrap_basic();
             let obj_tag = self.builder.call(self.rt.get_tag, &[obj.into()], "ir_idx_otag").try_as_basic_value().unwrap_basic().into_int_value();
+            let is_map = self.builder.int_compare(IntPredicate::EQ, obj_tag, i8t.const_int(TAG_MAP as u64, false), "ir_idx_ismap");
             let is_obj = self.builder.int_compare(IntPredicate::EQ, obj_tag, i8t.const_int(TAG_OBJECT as u64, false), "ir_idx_isobj");
+            let mget_b = self.context.append_basic_block(llvm_fn, "ir_idx_mget");
             let oget_b = self.context.append_basic_block(llvm_fn, "ir_idx_oget");
+            let chk_obj = self.context.append_basic_block(llvm_fn, "ir_idx_chkobj");
             let onull_b = self.context.append_basic_block(llvm_fn, "ir_idx_onull");
             let omrg = self.context.append_basic_block(llvm_fn, "ir_idx_omrg");
+            self.builder.conditional_branch(is_map, mget_b, chk_obj);
+            self.builder.position_at_end(mget_b);
+            let mget = self.builder.call(self.rt.map_get, &[container.into(), key_raw.into()], "ir_idx_msget").try_as_basic_value().unwrap_basic();
+            let mget_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(omrg);
+            self.builder.position_at_end(chk_obj);
             self.builder.conditional_branch(is_obj, oget_b, onull_b);
             self.builder.position_at_end(oget_b);
             let oget = self.builder.call(self.rt.object_get, &[container.into(), key_raw.into()], "ir_idx_osget").try_as_basic_value().unwrap_basic();
@@ -352,7 +362,7 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.unconditional_branch(omrg);
             self.builder.position_at_end(omrg);
             let ophi = self.builder.phi(ptr_ty, "ir_idx_ophi");
-            ophi.add_incoming(&[(&oget, oget_exit), (&ptr_ty.const_null(), onull_b)]);
+            ophi.add_incoming(&[(&mget, mget_exit), (&oget, oget_exit), (&ptr_ty.const_null(), onull_b)]);
             let str_res = ophi.as_basic_value();
             let str_exit = self.builder.get_insert_block().unwrap();
             self.builder.unconditional_branch(mrg);
@@ -541,18 +551,19 @@ impl<'ctx> Codegen<'ctx> {
         // STAGE 3: a sealed record indexed by a non-literal key — packed-struct ASSUME from repr.
         if let Some(fields) = obj_repr.packed_struct_fields().cloned() {
             if obj.is_pointer_value() {
-                let mat = self.sealed_materialize_to_object(obj, &fields).into_pointer_value();
+                // Stage 6b Phase 2: materialize sealed record to a fresh LinMap* then map_get.
+                let mat = self.sealed_materialize_to_map(obj, &fields).into_pointer_value();
                 let key_raw = if Self::is_union_type(key_ty) && key.is_pointer_value() {
                     self.builder.call(self.rt.unbox_ptr, &[key.into()], "sealed_dynk_unbox").try_as_basic_value().unwrap_basic()
                 } else {
                     key
                 };
-                let entry = self.builder.call(self.rt.object_get, &[mat.into(), key_raw.into()], "sealed_dynk_get").try_as_basic_value().unwrap_basic();
+                let entry = self.builder.call(self.rt.map_get, &[mat.into(), key_raw.into()], "sealed_dynk_get").try_as_basic_value().unwrap_basic();
                 // `entry` is a borrowed interior `*TaggedVal` (or null) into `mat`; clone it into an
                 // independent owned box, then free `mat` (the clone keeps the inner alive).
                 let clone_fn = self.get_or_declare_fn("lin_tagged_clone", ptr_ty.fn_type(&[ptr_ty.into()], false));
                 let owned = self.builder.call(clone_fn, &[entry.into()], "sealed_dynk_clone").try_as_basic_value().unwrap_basic();
-                self.builder.call(self.rt.object_release, &[mat.into()], "");
+                self.builder.call(self.rt.map_release, &[mat.into()], "");
                 // `owned` is a +1 box; the IR lowering's projection CloneBox (union result) clones it
                 // again into the binding's owned box — balanced. Match the surrounding repr.
                 return if Self::is_union_type(result_ty) { owned } else { self.unbox_tagged_val_to_type(owned, result_ty) };
@@ -680,7 +691,8 @@ impl<'ctx> Codegen<'ctx> {
             final_phi.add_incoming(&[(&inner_unboxed, inner_mrg_exit), (&rec_unboxed, rec_exit)]);
             return final_phi.as_basic_value();
         }
-        let tagged = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "ir_oget").try_as_basic_value().unwrap_basic();
+        // Stage 6b Phase 2: concrete open-object container is now a LinMap*; use map_get.
+        let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_oget").try_as_basic_value().unwrap_basic();
         self.unbox_tagged_val_to_type(tagged, result_ty)
     }
 
@@ -952,8 +964,8 @@ impl<'ctx> Codegen<'ctx> {
         // `lin_object`); the boxed-array set is the index-set analogue of the boxed-array push fix.
         if let Type::Object { .. } = val_ty {
             if let Some(fields) = Self::sealed_fields(val_ty).cloned() {
-                let obj = self.sealed_materialize_to_object(value, &fields);
-                let tag = i8_ty.const_int(Self::type_tag(val_ty) as u64, false);
+                let obj = self.sealed_materialize_to_map(value, &fields);
+                let tag = i8_ty.const_int(Self::type_tag_open(val_ty) as u64, false);
                 let cell = self.builder.alloca(self.context.struct_type(
                     &[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false), "set_tv");
                 let tag_ptr = self.builder.struct_gep(
@@ -1000,6 +1012,17 @@ impl<'ctx> Codegen<'ctx> {
             }
         };
         match obj_ty {
+            // Stage 6b Phase 2: concrete open objects are LinMap* — use map_set. Named types
+            // and sealed records come through here too but are handled below; unsealed Object
+            // is the only case reaching this with a raw LinMap*.
+            Type::Object { sealed: false, .. } => {
+                if obj.is_pointer_value() && key.is_pointer_value() {
+                    let key_str = resolve_obj_key(self, key);
+                    // Use emit_map_set with a boxed-opaque repr; the concrete open object holds
+                    // any-typed tagged values like a Json map.
+                    self.emit_map_set(obj, key_str, value, val_ty, &Type::TypeVar(u32::MAX), &lin_ir::repr::Repr::boxed_opaque());
+                }
+            }
             Type::Object { .. } | Type::Named(_) => {
                 if obj.is_pointer_value() && key.is_pointer_value() {
                     let key_str = resolve_obj_key(self, key);
@@ -1141,18 +1164,25 @@ impl<'ctx> Codegen<'ctx> {
         obj_ty: &Type,
     ) {
         // Find a Map{value:elem} variant in the union, if any.
+        // For TypeVar (Json), ALWAYS emit a tag-dispatch because the container may be a LinMap
+        // (TAG_MAP, from Phase 2 concrete open-object flip) or a LinObject (TAG_OBJECT).
+        let is_json_dynamic = matches!(obj_ty, Type::TypeVar(_));
         let map_elem: Option<Type> = match obj_ty {
             Type::Union(vs) => vs.iter().find_map(|v| match v {
                 Type::Map { value: e, .. } => Some((**e).clone()),
                 _ => None,
             }),
             Type::Map { value: e, .. } => Some((**e).clone()),
+            // For TypeVar (Json), use a dynamic-fallback elem type so the dispatch is emitted.
+            Type::TypeVar(_) => Some(Type::TypeVar(u32::MAX)),
             _ => None,
         };
         let Some(elem) = map_elem else {
             self.emit_object_set(container, key_str, value, val_ty);
             return;
         };
+        // For pure JSON (TypeVar), use the value's type as-is (opaque boxed).
+        let elem = if is_json_dynamic { val_ty.clone() } else { elem };
         let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         let i8t = self.context.i8_type();
         let tag = self.builder.call(self.rt.get_tag, &[boxed_obj.into()], "set_objtag").try_as_basic_value().unwrap_basic().into_int_value();
@@ -1626,12 +1656,39 @@ impl<'ctx> Codegen<'ctx> {
         // Borrowed element box (interior `*TaggedVal`); no fresh allocation, no release.
         let elem_box = self.builder.call(self.rt.array_get, &[arr_raw.into(), idx_i64.into()], "bafg_elem")
             .try_as_basic_value().unwrap_basic();
-        // Unbox the element box to the raw `LinObject*`, then a single `object_get` for the field.
-        let obj = self.builder.call(self.rt.unbox_ptr, &[elem_box.into()], "bafg_obj")
+        // Phase 2: array elements may be TAG_MAP (codegen-produced open objects, Phase 2) or
+        // TAG_OBJECT (runtime/legacy producers, Track B not yet done). Tag-dispatch to handle both.
+        let inner_obj = self.builder.call(self.rt.unbox_ptr, &[elem_box.into()], "bafg_obj")
             .try_as_basic_value().unwrap_basic();
         let key_str = self.compile_string_lit(field).into_pointer_value();
-        let tagged = self.builder.call(self.rt.object_get, &[obj.into(), key_str.into()], "bafg_get")
+        let i8_ty = self.context.i8_type();
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let elem_tag = self.builder.call(self.rt.get_tag, &[elem_box.into()], "bafg_tag")
+            .try_as_basic_value().unwrap_basic().into_int_value();
+        let is_map_tag = self.builder.int_compare(
+            inkwell::IntPredicate::EQ, elem_tag,
+            i8_ty.const_int(lin_common::tags::TAG_MAP as u64, false), "bafg_is_map");
+        let map_bb = self.context.append_basic_block(llvm_fn, "bafg_map");
+        let obj_bb = self.context.append_basic_block(llvm_fn, "bafg_obj");
+        let merge_bb = self.context.append_basic_block(llvm_fn, "bafg_merge");
+        self.builder.conditional_branch(is_map_tag, map_bb, obj_bb);
+        // TAG_MAP branch: use map_get
+        self.builder.position_at_end(map_bb);
+        let map_tagged = self.builder.call(self.rt.map_get, &[inner_obj.into(), key_str.into()], "bafg_mget")
             .try_as_basic_value().unwrap_basic();
+        let map_pred = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(merge_bb);
+        // TAG_OBJECT branch: use object_get (legacy runtime producers)
+        self.builder.position_at_end(obj_bb);
+        let obj_tagged = self.builder.call(self.rt.object_get, &[inner_obj.into(), key_str.into()], "bafg_oget")
+            .try_as_basic_value().unwrap_basic();
+        let obj_pred = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(merge_bb);
+        // merge
+        self.builder.position_at_end(merge_bb);
+        let tagged_phi = self.builder.phi(ptr_ty, "bafg_phi");
+        tagged_phi.add_incoming(&[(&map_tagged, map_pred), (&obj_tagged, obj_pred)]);
+        let tagged = tagged_phi.as_basic_value();
         // Coerce the (borrowed interior) field value to the field's declared type. The lowerer
         // registers `dst` owned and retains for an RC result, so this borrowed read is balanced.
         self.unbox_tagged_val_to_type(tagged, result_ty)
@@ -2181,19 +2238,22 @@ impl<'ctx> Codegen<'ctx> {
     /// RC contract per field: `lin_object_set_fresh` RETAINS the value's inner payload (the object
     /// takes a +1). For a SCALAR field there is no inner heap, so the fresh box's shell would leak —
     /// `lin_tagged_release` reclaims it (no-op on the absent inner). For a HEAP field the loaded
-    /// pointer is BORROWED (the struct still owns its original +1); after `object_set_fresh` retains
-    /// the inner (object +1), only the box SHELL is freed (`lin_tagged_free_box`) — NOT
-    /// `lin_tagged_release`, which would also drop the inner and leave the object holding a pointer
+    /// pointer is BORROWED (the struct still owns its original +1); after `map_set` retains
+    /// the inner (map +1), only the box SHELL is freed (`lin_tagged_free_box`) — NOT
+    /// `lin_tagged_release`, which would also drop the inner and leave the map holding a pointer
     /// it never accounted for (a use-after-free once the struct releases). The struct keeps its
-    /// reference; the materialized object owns an independent +1. Both balanced.
-    pub(crate) fn sealed_materialize_to_object(
+    /// reference; the materialized map owns an independent +1. Both balanced.
+    /// Stage 6b Phase 2: builds a `LinMap*` (was `LinObject*`).
+    pub(crate) fn sealed_materialize_to_map(
         &mut self,
         obj: BasicValueEnum<'ctx>,
         fields: &indexmap::IndexMap<String, Type>,
     ) -> BasicValueEnum<'ctx> {
         let i32_ty = self.context.i32_type();
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let new_obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(fields.len() as u64, false).into()], "sealed_mat")
+        let new_map = self.builder.call(self.rt.map_alloc,
+            &[i32_ty.const_int(fields.len() as u64, false).into(), i32_ty.const_zero().into()],
+            "sealed_mat")
             .try_as_basic_value().unwrap_basic().into_pointer_value();
         let keys: Vec<String> = fields.keys().cloned().collect();
         let free_box_shell = self.get_or_declare_fn("lin_tagged_free_box", self.context.void_type().fn_type(&[ptr_ty.into()], false));
@@ -2203,24 +2263,24 @@ impl<'ctx> Codegen<'ctx> {
             let v = self.sealed_field_get(obj, k, fields, &fld_ty);
             // box_value(heap) wraps the BORROWED pointer (no retain); box_value(scalar) wraps the
             // scalar (cached/heap box). For a nested sealed field, box_value materializes it to its
-            // own boxed LinObject (a fresh +1), which object_set_fresh then retains — handled below.
+            // own boxed LinMap (a fresh +1), which map_set then retains — handled below.
             let boxed = self.box_value(v, &fld_ty);
             let key_str = self.compile_string_lit(k).into_pointer_value();
-            self.builder.call(self.rt.object_set_fresh, &[new_obj.into(), key_str.into(), boxed.into()], "");
+            self.builder.call(self.rt.map_set, &[new_map.into(), key_str.into(), boxed.into()], "");
             if boxed.is_pointer_value() {
                 if is_heap && Self::box_value_yields_fresh_owned(&fld_ty) {
                     // box_value produced a FRESH +1 value (a nested SEALED record materialized to a
-                    // boxed LinObject, OR a sealed-record ARRAY materialized to a fresh tagged
-                    // `Object[]` via `sealed_array_to_tagged`). object_set_fresh retained it (+2 on
+                    // boxed LinMap, OR a sealed-record ARRAY materialized to a fresh tagged
+                    // `Object[]` via `sealed_array_to_tagged`). map_set retained it (+2 on
                     // the fresh inner); full tagged_release drops the construction +1 back to the
-                    // object's owned +1 AND frees the box shell. Using `free_box_shell` here would
+                    // map's owned +1 AND frees the box shell. Using `free_box_shell` here would
                     // leak the entire materialized inner (its header + nested elements) — the
                     // record-with-record-array-field leak (the RAPTOR `Trip { stopTimes: StopTime[] }`
                     // shape) every build/push/index-set/map dropped ~176 B/element.
                     self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
                 } else if is_heap {
                     // A plain String / plain (non-sealed-elem) Array field's box wraps a BORROWED
-                    // inner pointer (the struct still owns its original +1) that object_set_fresh
+                    // inner pointer (the struct still owns its original +1) that map_set
                     // retained — free ONLY the shell so the borrowed inner is not dropped.
                     self.builder.call(free_box_shell, &[boxed.into()], "");
                 } else {
@@ -2229,7 +2289,7 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
         }
-        new_obj.into()
+        new_map.into()
     }
 
     /// Project a source value (`src`, statically `src_ty`) into a FRESH sealed scalar record of
@@ -2257,18 +2317,13 @@ impl<'ctx> Codegen<'ctx> {
             }).collect();
             return self.sealed_construct(target_fields, &vals);
         }
-        // Source is a boxed object / Json. For union/Json sources, use `lin_union_force_to_object`
-        // to get an OWNED +1 LinObject* that works for BOTH TAG_OBJECT and TAG_RECORD (Stage 6a).
-        // A TAG_OBJECT source is retained (uniform ownership); a TAG_RECORD sealed struct is
-        // materialized to a fresh +1 LinObject. The caller releases the container after the loop.
-        // For a non-union raw LinObject* source, no wrap needed — use `src` directly (borrowed).
+        // Source is a boxed object / Json. For union/Json sources, use `lin_union_force_to_map`
+        // to get an OWNED +1 LinMap* that works for TAG_MAP, TAG_OBJECT, and TAG_RECORD (Stage 6b).
+        // The caller releases the container after the loop.
+        // For a non-union raw LinMap* source (e.g. a concrete open-object), use `src` directly (borrowed).
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let (container, owned_container) = if Self::is_union_type(src_ty) {
-            let force_fn = self.get_or_declare_fn(
-                "lin_union_force_to_object",
-                ptr_ty.fn_type(&[ptr_ty.into()], false),
-            );
-            let c = self.builder.call(force_fn, &[src.into()], "sealed_proj_cont").try_as_basic_value().unwrap_basic();
+            let c = self.builder.call(self.rt.map_force, &[src.into()], "sealed_proj_cont").try_as_basic_value().unwrap_basic();
             (c, true)
         } else {
             (src, false)
@@ -2278,13 +2333,13 @@ impl<'ctx> Codegen<'ctx> {
         for k in &target_keys {
             let fty = target_fields.get(k).cloned().unwrap_or(Type::Null);
             let key_str = self.compile_string_lit(k).into_pointer_value();
-            // lin_object_get returns an INTERIOR pointer to the entry's TaggedVal (borrowed); unbox
+            // lin_map_get returns an INTERIOR pointer to the entry's TaggedVal (borrowed); unbox
             // it to the field value. For a scalar nothing is owned. For a String/Array the unbox
-            // yields the BORROWED inner heap pointer (owned by the source object entry) → the struct
+            // yields the BORROWED inner heap pointer (owned by the source map entry) → the struct
             // must retain it (`already_owned = false`). For a NESTED SEALED field the unbox RECURSES
             // into `sealed_project_from`, producing a FRESH +1 sealed struct → transfer ownership
             // (`already_owned = true`, no extra retain).
-            let tagged = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "sealed_proj_get").try_as_basic_value().unwrap_basic();
+            let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "sealed_proj_get").try_as_basic_value().unwrap_basic();
             // A PACKED-SEALED-ARRAY field (`StopTime[]` inside `Trip`): the Json source holds this as a
             // boxed/tagged `Object[]`, but the target packed slot expects a contiguous packed `T[]`
             // (0xFE) buffer — storing the boxed array verbatim would make the later materialize read
@@ -2307,49 +2362,50 @@ impl<'ctx> Codegen<'ctx> {
             vals.push((k.clone(), v, fty, owned));
         }
         let result = self.sealed_construct(target_fields, &vals);
-        // Release the forced LinObject* when it was materialized from a union box.
+        // Release the forced LinMap* when it was materialised from a union box.
         if owned_container && container.is_pointer_value() {
-            self.builder.call(self.rt.object_release, &[container.into()], "");
+            self.builder.call(self.rt.map_release, &[container.into()], "");
         }
         result
     }
 
-    /// Project a WIDER boxed `LinObject*` into a FRESH boxed `LinObject*` with exactly
-    /// `target_fields`. D3b: the boxed→boxed-narrower slot boundary (anon-struct widening severs
-    /// sharing). Non-mutating: `src` is untouched (its owner releases it); extra fields are
-    /// ignored; the result is a fresh +1 independent owned `LinObject*`.
+    /// Project a WIDER `LinMap*` into a FRESH `LinMap*` with exactly `target_fields`.
+    /// D3b: the boxed→boxed-narrower slot boundary (anon-struct widening severs sharing).
+    /// Non-mutating: `src` is untouched (its owner releases it); extra fields are
+    /// ignored; the result is a fresh +1 independent owned `LinMap*`.
     ///
     /// RC contract per field:
-    /// - `lin_object_get` returns a BORROWED interior `TaggedVal*` pointer (do NOT release).
-    /// - `lin_object_set_fresh` copies the 16-byte `TaggedVal` and RETAINS the inner payload (+1).
-    /// - No extra per-field cleanup is needed; `set_fresh` handles retention.
+    /// - `lin_map_get` returns a BORROWED interior `TaggedVal*` pointer (do NOT release).
+    /// - `lin_map_set` copies the 16-byte `TaggedVal` and RETAINS the inner payload (+1).
+    /// - No extra per-field cleanup is needed; `map_set` handles retention.
+    /// Stage 6b Phase 2: was `boxed_object_project` building a `LinObject*`.
     pub(crate) fn boxed_object_project(
         &mut self,
         src: BasicValueEnum<'ctx>,
         target_fields: &indexmap::IndexMap<String, Type>,
     ) -> BasicValueEnum<'ctx> {
         let i32_ty = self.context.i32_type();
-        let new_obj = self.builder.call(
-            self.rt.object_alloc,
-            &[i32_ty.const_int(target_fields.len() as u64, false).into()],
-            "anon_proj_obj",
+        let new_map = self.builder.call(
+            self.rt.map_alloc,
+            &[i32_ty.const_int(target_fields.len() as u64, false).into(), i32_ty.const_zero().into()],
+            "anon_proj_map",
         ).try_as_basic_value().unwrap_basic().into_pointer_value();
         for k in target_fields.keys() {
             let key_str = self.compile_string_lit(k).into_pointer_value();
-            // Borrow the entry from the source object (interior ptr, never release).
+            // Borrow the entry from the source map (interior ptr, never release).
             let entry = self.builder.call(
-                self.rt.object_get,
+                self.rt.map_get,
                 &[src.into(), key_str.into()],
                 "anon_proj_get",
             ).try_as_basic_value().unwrap_basic();
-            // object_set_fresh copies the TaggedVal and retains the inner.
+            // map_set copies the TaggedVal and retains the inner.
             self.builder.call(
-                self.rt.object_set_fresh,
-                &[new_obj.into(), key_str.into(), entry.into()],
+                self.rt.map_set,
+                &[new_map.into(), key_str.into(), entry.into()],
                 "",
             );
         }
-        new_obj.into()
+        new_map.into()
     }
 
     /// Field-wise equality of two sealed scalar records of the SAME type (`fields`). Loads each
@@ -2605,16 +2661,13 @@ impl<'ctx> Codegen<'ctx> {
         if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
     }
 
-    /// Materialize a `SumNode` into a fresh boxed `LinObject` (the universal Json representation) for
+    /// Materialize a `SumNode` into a fresh `LinMap*` (Phase 2: open-object/TAG_MAP backing) for
     /// a dynamic edge (toString / Json-serialize / keys / spread / `==` vs a non-sum value / FFI /
-    /// transfer). Reads the inline tag to pick the variant, then sets the discriminant StrLit + each
-    /// scalar payload field under its interned string key. Returns a +1 `LinObject*`. Scalar-only
-    /// (Stage 1): every boxed value is a scalar box whose shell `lin_tagged_release` reclaims after
-    /// `object_set_fresh` (no borrowed inner to keep, mirroring `sealed_materialize_to_object`).
+    /// transfer). Returns a +1 `LinMap*`. `sum_ty` is the static sum type.
     ///
     /// Emits a per-variant switch (each variant materialises its own concrete shape), merging the
-    /// resulting `LinObject*` at a phi. `sum_ty` is the static sum type.
-    pub(crate) fn sumnode_materialize_to_object(
+    /// resulting `LinMap*` at a phi.
+    pub(crate) fn sumnode_materialize_to_map(
         &mut self,
         node: BasicValueEnum<'ctx>,
         sum_ty: &Type,
@@ -2632,13 +2685,24 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap_basic()
     }
 
+    /// Backwards-compat alias.
+    #[allow(dead_code)]
+    pub(crate) fn sumnode_materialize_to_object(
+        &mut self,
+        node: BasicValueEnum<'ctx>,
+        sum_ty: &Type,
+        llvm_fn: inkwell::values::FunctionValue<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        self.sumnode_materialize_to_map(node, sum_ty, llvm_fn)
+    }
+
     /// Build (and memoize) the per-sum-type materializer `lin_summat_<key>(node: ptr) -> ptr`: it
-    /// reads the node's inline tag, switches to the matching variant, and builds a fresh boxed
-    /// `LinObject` with the discriminant StrLit + each payload field. A SCALAR field is boxed
-    /// directly; a RECURSIVE CHILD (`*SumNode`) is materialized by a RECURSIVE CALL to this same
-    /// function (so the whole tree serialises). Returns a +1 `LinObject*`. Children are BORROWED
-    /// (read by const offset, never released here); the per-field box shells are reclaimed after
-    /// `object_set_fresh` retains. Memoized by the sum type's shape so it is emitted once.
+    /// reads the node's inline tag, switches to the matching variant, and builds a fresh `LinMap`
+    /// with the discriminant StrLit + each payload field. A SCALAR field is boxed directly; a
+    /// RECURSIVE CHILD (`*SumNode`) is materialized by a RECURSIVE CALL to this same function
+    /// (so the whole tree serialises). Returns a +1 `LinMap*`. Children are BORROWED (read by
+    /// const offset, never released here); the per-field box shells are reclaimed after `map_set`
+    /// retains. Memoized by the sum type's shape so it is emitted once.
     fn get_or_build_sumnode_materializer(&mut self, sum_ty: &Type) -> inkwell::values::FunctionValue<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i32_ty = self.context.i32_type();
@@ -2689,20 +2753,20 @@ impl<'ctx> Codegen<'ctx> {
             .collect();
         self.builder.switch(tag, default_bb, &cases);
         let mut incoming: Vec<(inkwell::values::PointerValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
-        // Default arm: defensive empty object (the tag is always valid).
+        // Default arm: defensive empty map (the tag is always valid).
         self.builder.position_at_end(default_bb);
-        let def_obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(0, false).into()], "sumnode_mat_def").try_as_basic_value().unwrap_basic().into_pointer_value();
+        let def_obj = self.builder.call(self.rt.map_alloc, &[i32_ty.const_int(0, false).into(), i32_ty.const_zero().into()], "sumnode_mat_def").try_as_basic_value().unwrap_basic().into_pointer_value();
         let def_pred = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_bb);
         incoming.push((def_obj, def_pred));
         for (idx, (_tagv, payload, disc_val)) in variant_bodies.iter().enumerate() {
             self.builder.position_at_end(blocks[idx]);
             let nfields = (payload.len() + 1) as u64;
-            let obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(nfields, false).into()], "sumnode_mat_obj").try_as_basic_value().unwrap_basic().into_pointer_value();
+            let obj = self.builder.call(self.rt.map_alloc, &[i32_ty.const_int(nfields, false).into(), i32_ty.const_zero().into()], "sumnode_mat_obj").try_as_basic_value().unwrap_basic().into_pointer_value();
             let dk = self.compile_string_lit(&disc_key).into_pointer_value();
             let dv_raw = self.compile_string_lit(disc_val);
             let dv_box = self.box_value(dv_raw, &Type::Str);
-            self.builder.call(self.rt.object_set_fresh, &[obj.into(), dk.into(), dv_box.into()], "");
+            self.builder.call(self.rt.map_set, &[obj.into(), dk.into(), dv_box.into()], "");
             if dv_box.is_pointer_value() {
                 self.builder.call(free_box_shell, &[dv_box.into()], "");
             }
@@ -2713,12 +2777,12 @@ impl<'ctx> Codegen<'ctx> {
                     .is_some_and(|n| Self::is_sum_recursive_child(fty, n));
                 if is_recursive {
                     // Recursive child: read the borrowed `*SumNode`, materialize it via a SELF-CALL,
-                    // box as TAG_OBJECT. Child is borrowed — not released; the materialized object is
-                    // a fresh +1 that `object_set_fresh` retains, so we release our copy after.
+                    // box as TAG_MAP. Child is borrowed — not released; the materialized map is
+                    // a fresh +1 that `map_set` retains, so we release our copy after.
                     let child = self.sumnode_recursive_child_get(node, k, sum_ty);
                     let child_obj = self.builder.call(func, &[child.into()], "sumnode_mat_child").try_as_basic_value().unwrap_basic();
                     let boxed = self.box_value(child_obj, &Self::sumnode_first_variant_obj_ty(sum_ty));
-                    self.builder.call(self.rt.object_set_fresh, &[obj.into(), key_str.into(), boxed.into()], "");
+                    self.builder.call(self.rt.map_set, &[obj.into(), key_str.into(), boxed.into()], "");
                     if boxed.is_pointer_value() {
                         self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
                     }
@@ -2726,13 +2790,13 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 // Heap-field SumNode Stage 3: a heap field (String/Array/nested-sealed) is stored
                 // as an owned interior pointer in the node. Read it directly (BORROWED — the node
-                // still owns it), box it, set it in the object (object_set_fresh retains), then
-                // release our fresh-box shell. The node remains the owner; the object takes its own
-                // reference via object_set_fresh's retain.
+                // still owns it), box it, set it in the map (map_set retains), then
+                // release our fresh-box shell. The node remains the owner; the map takes its own
+                // reference via map_set's retain.
                 if Self::sealed_field_kind(fty).is_some() && !Self::is_sum_scalar_field(fty) {
                     let v = self.sumnode_field_get(node, k, payload, fty);
                     let boxed = self.box_value(v, fty);
-                    self.builder.call(self.rt.object_set_fresh, &[obj.into(), key_str.into(), boxed.into()], "");
+                    self.builder.call(self.rt.map_set, &[obj.into(), key_str.into(), boxed.into()], "");
                     if boxed.is_pointer_value() {
                         self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
                     }
@@ -2740,7 +2804,7 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 let v = self.sumnode_field_get(node, k, payload, fty);
                 let boxed = self.box_value(v, fty);
-                self.builder.call(self.rt.object_set_fresh, &[obj.into(), key_str.into(), boxed.into()], "");
+                self.builder.call(self.rt.map_set, &[obj.into(), key_str.into(), boxed.into()], "");
                 if boxed.is_pointer_value() {
                     self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
                 }
@@ -2892,7 +2956,8 @@ impl<'ctx> Codegen<'ctx> {
         let container: BasicValueEnum<'ctx> = func.get_nth_param(0).unwrap();
         // Read the discriminant string value (boxed) for the switch.
         let dk = self.compile_string_lit(&disc_key).into_pointer_value();
-        let disc_box = self.builder.call(self.rt.object_get, &[container.into(), dk.into()], "sumnode_pfb_disc").try_as_basic_value().unwrap_basic();
+        // Phase 2: container is now LinMap* (materializer returns LinMap*). Use map_get.
+        let disc_box = self.builder.call(self.rt.map_get, &[container.into(), dk.into()], "sumnode_pfb_disc").try_as_basic_value().unwrap_basic();
         let mut variant_info: Vec<(String, indexmap::IndexMap<String, Type>)> = Vec::new();
         for v in &variants {
             if let Type::Object { fields, .. } = v {
@@ -2931,7 +2996,8 @@ impl<'ctx> Codegen<'ctx> {
                 v.push((disc_key.clone(), self.compile_string_lit(disc_val), Type::StrLit(disc_val.clone())));
                 for (k, fty) in payload.iter() {
                     let key_str = self.compile_string_lit(k).into_pointer_value();
-                    let tagged = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "sumnode_pfb_get").try_as_basic_value().unwrap_basic();
+                    // Phase 2: container is LinMap*. Use map_get.
+                    let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "sumnode_pfb_get").try_as_basic_value().unwrap_basic();
                     // A RECURSIVE CHILD field (typed `Named(self)`) is projected into a fresh `*SumNode`
                     // of the SAME sum type via a SELF-CALL on the child's boxed object; `sumnode_construct`
                     // stores it as the owned recursive child pointer. A scalar field is unboxed.
@@ -3036,14 +3102,15 @@ impl<'ctx> Codegen<'ctx> {
             return ptr_ty.const_null().into();
         }
         if obj.is_pointer_value() {
-            // A Json/union object arrives as a boxed TaggedVal*; unbox to the raw LinObject*.
+            // A Json/union object arrives as a boxed TaggedVal*; unbox to the raw LinMap*.
             let container = if Self::is_union_type(obj_ty) {
                 self.builder.call(self.rt.unbox_ptr, &[obj.into()], "ir_fget_unbox").try_as_basic_value().unwrap_basic()
             } else {
                 obj
             };
             let key_str = self.compile_string_lit(field).into_pointer_value();
-            let tagged = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "ir_fget").try_as_basic_value().unwrap_basic();
+            // Phase 2: concrete open-object container is now a LinMap*; use map_get.
+            let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_fget_m").try_as_basic_value().unwrap_basic();
             // No string_release: `compile_string_lit` returns an interned, immortal
             // LinString (refcount == IMMORTAL_RC), so the release is a runtime no-op
             // — but still an emitted call, hit on every typed field read. Drop it.
@@ -3091,14 +3158,14 @@ impl<'ctx> Codegen<'ctx> {
         let pass_bb = self.context.append_basic_block(llvm_fn, "fgb_sum_pass");
         let merge_bb = self.context.append_basic_block(llvm_fn, "fgb_sum_merge");
         self.builder.conditional_branch(is_kp, kp_bb, pass_bb);
-        // KEEP-PACKED: unwrap the raw *SumNode (borrowed), materialize to a boxed LinObject, box it.
+        // KEEP-PACKED: unwrap the raw *SumNode (borrowed), materialize to a fresh LinMap*, box it.
         self.builder.position_at_end(kp_bb);
         let node = self.builder.call(self.rt.unbox_ptr, &[tagged.into()], "fgb_kp_node").try_as_basic_value().unwrap_basic();
         let obj = self.sumnode_materialize_to_object(node, sum_ty, llvm_fn);
-        let kp_box = self.builder.call(self.rt.box_object, &[obj.into()], "fgb_kp_box").try_as_basic_value().unwrap_basic();
+        let kp_box = self.builder.call(self.rt.box_map, &[obj.into()], "fgb_kp_box").try_as_basic_value().unwrap_basic();
         let kp_pred = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_bb);
-        // OTHER tag (materialized TAG_OBJECT box / null): pass through unchanged.
+        // OTHER tag (materialized TAG_MAP box / null): pass through unchanged.
         self.builder.position_at_end(pass_bb);
         self.builder.unconditional_branch(merge_bb);
         self.builder.position_at_end(merge_bb);

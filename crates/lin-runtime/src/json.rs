@@ -2,7 +2,7 @@
 use crate::string::LinString;
 use crate::object::tagged_as_object;
 use crate::array::{LinArray, lin_array_alloc};
-use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_OBJECT, TAG_ARRAY, alloc_tagged};
+use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_OBJECT, TAG_ARRAY, TAG_MAP, alloc_tagged};
 use crate::fs::{make_string, make_error_tagged, resolve_lin_str};
 use crate::sealed::{
     SEALED_HEADER,
@@ -419,6 +419,27 @@ pub unsafe fn tagged_to_json(tv: *const u8) -> serde_json::Value {
                 map.insert(key_str, tagged_to_json(val_tv));
             }
             serde_json::Value::Object(map)
+        }
+        TAG_MAP => {
+            // Phase 2: non-sealed open objects are now backed by LinMap (TAG_MAP).
+            let map = payload as *const crate::map::LinMap;
+            if map.is_null() { return serde_json::Value::Object(serde_json::Map::new()); }
+            let cap = (*map).cap as usize;
+            let mut smap = serde_json::Map::new();
+            for i in 0..cap {
+                let slot = (*map).slots.add(i);
+                if (*slot).hash == 0 { continue; }
+                let key_ptr = (*slot).key as *const crate::string::LinString;
+                let key_str = if key_ptr.is_null() {
+                    String::new()
+                } else {
+                    let slice = std::slice::from_raw_parts((*key_ptr).data.as_ptr(), (*key_ptr).len as usize);
+                    std::str::from_utf8_unchecked(slice).to_owned()
+                };
+                let val_ptr = &(*slot).value as *const TaggedVal as *const u8;
+                smap.insert(key_str, tagged_to_json(val_ptr));
+            }
+            serde_json::Value::Object(smap)
         }
         crate::tagged::TAG_RECORD => {
             // Stage 6a: sealed-struct pointer in a dynamic slot. Materialize to a LinObject

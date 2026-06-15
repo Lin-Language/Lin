@@ -72,6 +72,7 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub box_float64: FunctionValue<'ctx>,
     pub box_str: FunctionValue<'ctx>,
     pub box_object: FunctionValue<'ctx>,
+    pub box_map: FunctionValue<'ctx>,
     pub box_array: FunctionValue<'ctx>,
     pub box_sumnode: FunctionValue<'ctx>,
     /// Stage 6a: `lin_box_record(sealed_ptr: ptr) -> ptr` — wraps a typed sealed-struct pointer into
@@ -117,6 +118,11 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub map_set: FunctionValue<'ctx>,
     pub map_get: FunctionValue<'ctx>,
     pub map_release: FunctionValue<'ctx>,
+    /// `lin_union_force_to_map(tv: ptr) -> *LinMap` — normalise a union/Json boxed source to a
+    /// fresh owned +1 `LinMap` (handles TAG_MAP/TAG_OBJECT/TAG_RECORD/TAG_SUMNODE). Caller releases.
+    pub map_force: FunctionValue<'ctx>,
+    /// `lin_map_eq(a: ptr, b: ptr) -> i8` — structural, order-independent equality for two maps.
+    pub map_eq: FunctionValue<'ctx>,
     /// Int-keyed map entry points (key_kind = 1).
     pub map_get_int: FunctionValue<'ctx>,
     pub map_set_int: FunctionValue<'ctx>,
@@ -220,6 +226,7 @@ impl<'ctx> RuntimeFns<'ctx> {
         let box_float64 = module.add_function("lin_box_float64", ptr_type.fn_type(&[context.f64_type().into()], false), None);
         let box_str = module.add_function("lin_box_str", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_object = module.add_function("lin_box_object", ptr_type.fn_type(&[ptr_type.into()], false), None);
+        let box_map = module.add_function("lin_box_map", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_array = module.add_function("lin_box_array", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_sumnode = module.add_function("lin_box_sumnode", ptr_type.fn_type(&[ptr_type.into()], false), None);
         // Stage 6a: lin_box_record(sealed_ptr: ptr) -> ptr (TaggedVal* with TAG_RECORD tag)
@@ -261,6 +268,8 @@ impl<'ctx> RuntimeFns<'ctx> {
         let map_set = module.add_function("lin_map_set", void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false), None);
         let map_get = module.add_function("lin_map_get", ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false), None);
         let map_release = module.add_function("lin_map_release", void_type.fn_type(&[ptr_type.into()], false), None);
+        let map_force = module.add_function("lin_union_force_to_map", ptr_type.fn_type(&[ptr_type.into()], false), None);
+        let map_eq = module.add_function("lin_map_eq", i8_type.fn_type(&[ptr_type.into(), ptr_type.into()], false), None);
         // Int-keyed map entry points: get(map, i64)->ptr, set(map, i64, val_ptr)->void
         let map_get_int = module.add_function("lin_map_get_int", ptr_type.fn_type(&[ptr_type.into(), i64_type.into()], false), None);
         let map_set_int = module.add_function("lin_map_set_int", void_type.fn_type(&[ptr_type.into(), i64_type.into(), ptr_type.into()], false), None);
@@ -288,6 +297,7 @@ impl<'ctx> RuntimeFns<'ctx> {
             box_float64,
             box_str,
             box_object,
+            box_map,
             box_array,
             box_sumnode,
             box_record,
@@ -319,6 +329,8 @@ impl<'ctx> RuntimeFns<'ctx> {
             map_set,
             map_get,
             map_release,
+            map_force,
+            map_eq,
             map_get_int,
             map_set_int,
         }

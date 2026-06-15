@@ -149,11 +149,19 @@ impl<'ctx> Codegen<'ctx> {
                     ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(f, &[val.into()], "atos").try_as_basic_value().unwrap_basic()
             }
-            Type::Object { .. } => {
+            Type::Object { .. } if Self::sealed_scalar_fields(ty).is_some() => {
+                // Sealed record: still LinObject*-backed; use lin_object_to_string.
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
                 let f = self.get_or_declare_fn("lin_object_to_string",
                     ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(f, &[val.into()], "otos").try_as_basic_value().unwrap_basic()
+            }
+            Type::Object { .. } => {
+                // Non-sealed open object: now backed by LinMap* (Phase 2 flip).
+                let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                let f = self.get_or_declare_fn("lin_map_to_string",
+                    ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(f, &[val.into()], "mtos").try_as_basic_value().unwrap_basic()
             }
             _ => {
                 // For unknown complex types, fall back to runtime tagged dispatch.
@@ -863,7 +871,7 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn("lin_stream_tar_entries", ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into()], "ir_tar_entries").try_as_basic_value().unwrap_basic()
             }
-            // header(entry) → lin_tar_header(entry) → boxed Object (TarHeader). TarEntry may
+            // header(entry) → lin_tar_header(entry) → raw LinMap* (TarHeader, Phase 2 flip). TarEntry may
             // arrive boxed (is_union_type returns true for TarEntry); unbox to the raw *TarEntryBox.
             Intrinsic::TarHeader => {
                 let e = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
@@ -996,8 +1004,8 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn("lin_stream_cycle", ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(fnv, &[arr.into()], "ir_stream_cycle").try_as_basic_value().unwrap_basic()
             }
-            // lin_object_set(obj, key, val) => Null. Unbox obj→LinObject*, key→LinString*,
-            // box val→TaggedVal*, then call the runtime. Mirrors the AST handler.
+            // object_set_dyn(obj, key, val) => Null. Phase 2: open objects are LinMap*.
+            // Unbox obj→LinMap*, key→LinString*, box val→TaggedVal*, then call lin_map_set.
             Intrinsic::ObjectSetDyn => {
                 if args.len() >= 3 {
                     let obj_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
@@ -1005,7 +1013,14 @@ impl<'ctx> Codegen<'ctx> {
                     let val_ty = arg_tys.get(2).cloned().unwrap_or(Type::Null);
                     let obj_ptr = self.ir_as_raw_ptr(args[0], &obj_ty);
                     let key_ptr = self.ir_as_raw_ptr(args[1], &key_ty);
-                    self.emit_object_set(obj_ptr, key_ptr, args[2], &val_ty);
+                    let val_is_fresh_box = !Self::is_union_type(&val_ty);
+                    let val_tagged = if val_is_fresh_box {
+                        self.box_value(args[2], &val_ty)
+                    } else { args[2] };
+                    self.builder.call(self.rt.map_set, &[obj_ptr.into(), key_ptr.into(), val_tagged.into()], "");
+                    if val_is_fresh_box && val_tagged.is_pointer_value() {
+                        self.builder.call(self.rt.tagged_release, &[val_tagged.into()], "");
+                    }
                 }
                 ptr_ty.const_null().into()
             }

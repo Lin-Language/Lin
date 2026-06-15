@@ -137,14 +137,15 @@ impl<'ctx> Codegen<'ctx> {
                 .unwrap_basic()
                 .into_int_value()
         } else if matches!(ty, Type::Object { .. }) {
-            // Structural object equality via runtime (order-independent).
+            // Structural object equality via runtime (order-independent). Phase 2: open objects
+            // are LinMap* (TAG_MAP) so use lin_map_eq.
             let eq_i8 = self.builder
-                .build_call(self.rt.object_eq, &[lv.into(), rv.into()], "oeq")
+                .build_call(self.rt.map_eq, &[lv.into(), rv.into()], "meq")
                 .unwrap()
                 .try_as_basic_value()
                 .unwrap_basic()
                 .into_int_value();
-            self.builder.int_truncate(eq_i8, self.context.bool_type(), "oeq_b")
+            self.builder.int_truncate(eq_i8, self.context.bool_type(), "meq_b")
         } else if Self::sealed_array_elem(ty).is_some() {
             // Sealed-record array equality (Stage 3): materialize both to the tagged Object[] view
             // and compare structurally (deep, order-independent per element). Fail-safe; equality is
@@ -399,12 +400,12 @@ impl<'ctx> Codegen<'ctx> {
                 let ptr_t = self.context.ptr_type(AddressSpace::default());
                 let (lboxed, l_materialized) = if l_sealed {
                     let f = Self::sealed_scalar_fields(lty).unwrap().clone();
-                    let obj = self.sealed_materialize_to_object(lv, &f);
+                    let obj = self.sealed_materialize_to_map(lv, &f);
                     (self.box_value(obj, &Type::object(f)), true)
                 } else { (self.box_value(lv, lty), false) };
                 let (rboxed, r_materialized) = if r_sealed {
                     let f = Self::sealed_scalar_fields(rty).unwrap().clone();
-                    let obj = self.sealed_materialize_to_object(rv, &f);
+                    let obj = self.sealed_materialize_to_map(rv, &f);
                     (self.box_value(obj, &Type::object(f)), true)
                 } else { (self.box_value(rv, rty), false) };
                 let i8_ty = self.context.i8_type();
