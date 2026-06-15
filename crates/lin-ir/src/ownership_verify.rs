@@ -469,23 +469,9 @@ fn is_union_owning_ty(ty: &Type) -> bool {
     )
 }
 
-/// Concrete refcounted heap value types (the `Retain` owning set). Mirrors `lower::is_rc_type`.
-/// Stage 3: NullableRecord unions are included here — they are raw nullable `*sealed_T` pointers
-/// whose RC (at offset 0 of the sealed struct) is managed via `lin_rc_retain`/`lin_sealed_release`,
-/// exactly like a sealed struct (`Type::Object{sealed:true}`). `lin_rc_retain` already null-guards.
+// Delegates to the shared `ir::is_concrete_rc_ty`; the alias keeps call-site names stable.
 fn is_concrete_rc_ty(ty: &Type) -> bool {
-    if crate::repr::nullable_sealed_record(ty).is_some() { return true; }
-    matches!(
-        ty,
-        Type::Str
-            | Type::StrLit(_)
-            | Type::Array(_)
-            | Type::FixedArray(_)
-            | Type::Object { .. }
-            | Type::Map { .. }
-            | Type::Iterator(_)
-            | Type::Function { .. }
-    )
+    crate::ir::is_concrete_rc_ty(ty)
 }
 
 /// Whether the box/unbox `Coerce` emitted across the union boundary produces a `dst` that ALIASES the
