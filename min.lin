@@ -1,0 +1,18 @@
+import { print } from "std/io"
+import { toString } from "std/string"
+type Num = { "kind": "num", "value": Int32 }
+type Bin = { "kind": "bin", "left": Expr, "right": Expr }
+type Expr = Num | Bin
+type A = { "tag": "a", "value": Int32 }
+type B = { "tag": "b", "value": Int32 }
+type Ev = A | B
+val evalNode = (node: Expr): Ev =>
+  match node
+    is Num => { "tag": "a", "value": node["value"] }
+    is Bin =>
+      val left = evalNode(node["left"])
+      match left
+        is A => { "tag": "a", "value": left["value"] + 1 }
+        else => left
+val one: Expr = { "kind": "num", "value": 5 }
+print(toString(evalNode(one)["value"]))

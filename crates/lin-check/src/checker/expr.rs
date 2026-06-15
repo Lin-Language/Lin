@@ -354,9 +354,17 @@ impl Checker {
         {
             self.env.push_scope();
             let mut typed_stmts = Vec::new();
+            // A block's non-final statements are NOT in tail position; only its final expression
+            // is. Clear the flag while checking the statements (mirroring `infer_block`) so a
+            // self-recursive call in a `val` RHS isn't mis-marked a tail call — that produced a
+            // bogus `TailCall` whose result temp is then read by the (live) tail expression,
+            // yielding an undefined-SSA-temp crash in codegen. Restore for the final expression.
+            let block_tail = self.in_tail_position;
+            self.in_tail_position = false;
             for stmt in stmts {
                 typed_stmts.push(self.check_stmt(stmt)?);
             }
+            self.in_tail_position = block_tail;
             let typed_final = self.check_expr(final_expr, expected)?;
             let block_ty = typed_final.ty();
             self.env.pop_scope();
