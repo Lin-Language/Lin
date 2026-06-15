@@ -1813,6 +1813,38 @@ impl Checker {
                 Ok(None)
             }
             Type::Object { fields: expected_fields, sealed } => {
+                // Integer-literal-keyed object literal against a fixed record whose keys are all
+                // decimal digit strings (produced by expanding `{ DayOfWeek: Boolean }` where
+                // `DayOfWeek = 0|1|...|6`). Treat each integer key as its decimal string form and
+                // check each value against the corresponding expected field type.
+                let all_int_keys = !fields.is_empty()
+                    && fields.iter().all(|f| matches!(f, ObjectField::Pair(k, _) if extract_int_key(k).is_some()));
+                let expected_all_digit_keys = !expected_fields.is_empty()
+                    && expected_fields.keys().all(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_digit()));
+                if all_int_keys && expected_all_digit_keys {
+                    let mut typed_fields = Vec::new();
+                    for field in fields {
+                        if let ObjectField::Pair(key_expr, val_expr) = field {
+                            let n = extract_int_key(key_expr).unwrap();
+                            let key_str = n.to_string();
+                            let expected_val_ty = expected_fields.get(&key_str)
+                                .cloned()
+                                .unwrap_or_else(|| self.env.fresh_type_var());
+                            let typed_val = self.check_expr(val_expr, &expected_val_ty)?;
+                            typed_fields.push((key_str, typed_val));
+                        }
+                    }
+                    let ty = Type::Object {
+                        fields: expected_fields.clone(),
+                        sealed: *sealed,
+                    };
+                    return Ok(Some(TypedExpr::MakeObject {
+                        fields: typed_fields,
+                        spreads: Vec::new(),
+                        ty,
+                        span,
+                    }));
+                }
                 // Take over with directed field-by-field checking when it would actually change
                 // the outcome — otherwise stay on the existing undirected inference path so plain
                 // structural objects are unaffected. Cases that need directing:
