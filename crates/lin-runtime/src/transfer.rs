@@ -68,14 +68,15 @@ unsafe fn clone_map(src: *const crate::map::LinMap) -> *mut crate::map::LinMap {
             // which would create a TAG_RECORD-wrapping-LinObject box (wrong release semantics).
             // Mirror clone_object's TAG_RECORD arm exactly.
             let v = if src_v.tag == crate::tagged::TAG_RECORD {
+                // Phase 3: sealed-struct → materialize to LinMap, deep-clone, transfer as TAG_MAP.
                 let sealed = src_v.payload as *const u8;
                 let named_desc = if sealed.is_null() { std::ptr::null() } else {
                     *((sealed.add(16)) as *const *const u8)
                 };
-                let obj = crate::sealed::materialize_sealed_struct_pub(src_v.payload as *mut u8, named_desc);
-                let cloned = clone_object(obj as *const LinObject);
-                if !obj.is_null() { crate::object::lin_object_release(obj); }
-                TaggedVal { tag: crate::tagged::TAG_OBJECT, _pad: [0; 7], payload: cloned as u64 }
+                let map = crate::sealed::materialize_sealed_to_map_pub(src_v.payload as *mut u8, named_desc);
+                let cloned = clone_map(map as *const crate::map::LinMap);
+                if !map.is_null() { crate::map::lin_map_release(map); }
+                TaggedVal { tag: crate::tagged::TAG_MAP, _pad: [0; 7], payload: cloned as u64 }
             } else {
                 let cloned_payload = transfer_payload(src_v.tag, src_v.payload);
                 TaggedVal { tag: src_v.tag, _pad: [0; 7], payload: cloned_payload }
@@ -273,14 +274,15 @@ pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
         // clone_object's TAG_RECORD arm. transfer_payload would return a LinObject ptr under the
         // original TAG_RECORD tag, giving wrong release semantics.
         if (*se).tag == crate::tagged::TAG_RECORD {
+            // Phase 3: sealed-struct → materialize to LinMap, deep-clone, transfer as TAG_MAP.
             let sealed = (*se).payload as *const u8;
             let named_desc = if sealed.is_null() { std::ptr::null() } else {
-                *((sealed.add(8)) as *const *const u8)
+                *((sealed.add(16)) as *const *const u8)
             };
-            let obj = crate::sealed::materialize_sealed_struct_pub((*se).payload as *mut u8, named_desc);
-            let cloned = clone_object(obj as *const LinObject);
-            if !obj.is_null() { crate::object::lin_object_release(obj); }
-            (*de).tag = crate::tagged::TAG_OBJECT;
+            let map = crate::sealed::materialize_sealed_to_map_pub((*se).payload as *mut u8, named_desc);
+            let cloned = clone_map(map as *const crate::map::LinMap);
+            if !map.is_null() { crate::map::lin_map_release(map); }
+            (*de).tag = crate::tagged::TAG_MAP;
             (*de).payload = cloned as u64;
         } else {
             (*de).tag = (*se).tag;
@@ -313,15 +315,15 @@ unsafe fn clone_object(src: *const LinObject) -> *mut LinObject {
             let obj = crate::sumnode::lin_sumnode_materialize((*se).value.payload as *mut u8);
             TaggedVal { tag: crate::tagged::TAG_OBJECT, _pad: [0; 7], payload: obj as u64 }
         } else if (*se).value.tag == crate::tagged::TAG_RECORD {
-            // Stage 6a: a sealed-struct pointer in a dynamic slot MUST NOT cross the thread boundary
-            // by raw pointer (share-nothing). MATERIALIZE it to a real LinObject (deep, self-contained
-            // copy) and transfer as TAG_OBJECT. Mirrors the TAG_SUMNODE arm exactly.
+            // Phase 3: sealed-struct → materialize to LinMap, deep-clone, transfer as TAG_MAP.
             let sealed = (*se).value.payload as *const u8;
             let named_desc = if sealed.is_null() { std::ptr::null() } else {
-                *((sealed.add(8)) as *const *const u8)
+                *((sealed.add(16)) as *const *const u8)
             };
-            let obj = crate::sealed::materialize_sealed_struct_pub((*se).value.payload as *mut u8, named_desc);
-            TaggedVal { tag: crate::tagged::TAG_OBJECT, _pad: [0; 7], payload: obj as u64 }
+            let map = crate::sealed::materialize_sealed_to_map_pub((*se).value.payload as *mut u8, named_desc);
+            let cloned = clone_map(map as *const crate::map::LinMap);
+            if !map.is_null() { crate::map::lin_map_release(map); }
+            TaggedVal { tag: crate::tagged::TAG_MAP, _pad: [0; 7], payload: cloned as u64 }
         } else {
             let mut v = TaggedVal { tag: (*se).value.tag, _pad: [0; 7], payload: 0 };
             v.payload = transfer_payload((*se).value.tag, (*se).value.payload);
@@ -374,21 +376,17 @@ pub unsafe extern "C" fn lin_transfer_clone(p: *const u8) -> *mut u8 {
         return std::ptr::null_mut();
     }
     let src = &*(p as *const TaggedVal);
-    // Stage 6a: a TAG_RECORD box wraps a sealed-struct pointer. We CANNOT call transfer_payload
-    // and reuse src.tag here because `alloc_tagged(TAG_RECORD, linobj_ptr)` would be wrong
-    // (TAG_RECORD release calls lin_sealed_release_self, not lin_object_release). Instead,
-    // materialize + deep-clone to a LinObject and box it as TAG_OBJECT (same as clone_object does
-    // for record-typed fields). The result is observationally identical — TAG_OBJECT with the same
-    // fields — because TAG_RECORD only exists for performance; its logical type is still a record.
+    // Phase 3: TAG_RECORD → materialize to LinMap, deep-clone the map, box as TAG_MAP.
+    // (TAG_RECORD release calls lin_sealed_release_self; we cannot forward the raw ptr.)
     if src.tag == crate::tagged::TAG_RECORD {
         let sealed = src.payload as *const u8;
         let named_desc = if sealed.is_null() { std::ptr::null() } else {
-            *((sealed.add(8)) as *const *const u8)
+            *((sealed.add(16)) as *const *const u8)
         };
-        let obj = crate::sealed::materialize_sealed_struct_pub(src.payload as *mut u8, named_desc);
-        let cloned = clone_object(obj as *const LinObject);
-        if !obj.is_null() { crate::object::lin_object_release(obj); }
-        return crate::tagged::alloc_tagged(crate::tagged::TAG_OBJECT, cloned as u64);
+        let map = crate::sealed::materialize_sealed_to_map_pub(src.payload as *mut u8, named_desc);
+        let cloned = clone_map(map as *const crate::map::LinMap);
+        if !map.is_null() { crate::map::lin_map_release(map); }
+        return crate::tagged::alloc_tagged(crate::tagged::TAG_MAP, cloned as u64);
     }
     let payload = transfer_payload(src.tag, src.payload);
     crate::tagged::alloc_tagged(src.tag, payload)

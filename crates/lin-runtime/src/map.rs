@@ -643,10 +643,10 @@ pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArr
             let sealed = tv.payload as *mut u8;
             if sealed.is_null() { return crate::array::lin_array_alloc(0); }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let mat = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
+            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
             if mat.is_null() { return crate::array::lin_array_alloc(0); }
-            let arr = crate::object::lin_object_keys(mat as *const crate::object::LinObject);
-            crate::object::lin_object_release(mat);
+            let arr = lin_map_keys(mat as *const LinMap);
+            lin_map_release(mat);
             arr
         }
         _ => crate::array::lin_array_alloc(0),
@@ -666,10 +666,10 @@ pub unsafe extern "C" fn lin_values_any(p: *const u8) -> *mut crate::array::LinA
             let sealed = tv.payload as *mut u8;
             if sealed.is_null() { return crate::array::lin_array_alloc(0); }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let mat = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
+            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
             if mat.is_null() { return crate::array::lin_array_alloc(0); }
-            let arr = crate::object::lin_object_values(mat as *const crate::object::LinObject);
-            crate::object::lin_object_release(mat);
+            let arr = lin_map_values(mat as *const LinMap);
+            lin_map_release(mat);
             arr
         }
         _ => crate::array::lin_array_alloc(0),
@@ -689,10 +689,10 @@ pub unsafe extern "C" fn lin_entries_any(p: *const u8) -> *mut crate::array::Lin
             let sealed = tv.payload as *mut u8;
             if sealed.is_null() { return crate::array::lin_array_alloc(0); }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let mat = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
+            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
             if mat.is_null() { return crate::array::lin_array_alloc(0); }
-            let arr = crate::object::lin_object_entries(mat as *const crate::object::LinObject);
-            crate::object::lin_object_release(mat);
+            let arr = lin_map_entries(mat as *const LinMap);
+            lin_map_release(mat);
             arr
         }
         _ => crate::array::lin_array_alloc(0),
@@ -842,10 +842,8 @@ pub(crate) unsafe fn dynamic_to_map(tv: *const TaggedVal) -> *mut LinMap {
             let sealed = (*tv).payload as *mut u8;
             if sealed.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let obj = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
-            if obj.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
-            let m = lin_object_to_map(obj as *const crate::object::LinObject);
-            crate::object::lin_object_release(obj);
+            let m = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+            if m.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
             m
         }
         t if t == crate::tagged::TAG_SUMNODE => {

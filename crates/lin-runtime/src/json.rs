@@ -606,18 +606,18 @@ mod fromjson_record_tests {
             let tv_ptr = json_to_tagged(&v);
 
             // Get field "p" — lin_record_get_field for NKIND_SEALED materialises the nested
-            // struct to a LinObject tagged TAG_OBJECT.
+            // struct to a LinMap tagged TAG_MAP (Phase 3: all sealed materializations are LinMap).
             let p_box = record_get(tv_ptr, "p");
             assert!(!p_box.is_null(), "nested field 'p' must be accessible");
             let p_tag = (*(p_box as *const TaggedVal)).tag;
-            assert_eq!(p_tag, TAG_OBJECT, "nested sealed field must materialise to TAG_OBJECT");
+            assert_eq!(p_tag, crate::tagged::TAG_MAP, "nested sealed field must materialise to TAG_MAP");
 
-            // Access ["q"] from the nested materialised object.
-            let obj = (*(p_box as *const TaggedVal)).payload as *const crate::object::LinObject;
+            // Access ["q"] from the nested materialised map.
+            let map = (*(p_box as *const TaggedVal)).payload as *const crate::map::LinMap;
             let k = crate::string::lin_string_from_bytes(b"q".as_ptr(), 1);
-            let q_tv = crate::object::lin_object_get(obj, k);
+            let q_tv = crate::map::lin_map_get(map, k);
             assert!(!q_tv.is_null());
-            assert_eq!((*q_tv).tag, TAG_INT32);
+            assert_eq!((*q_tv).tag, crate::tagged::TAG_INT32);
             assert_eq!((*q_tv).payload as i32, 2);
             crate::string::lin_string_release(k);
 

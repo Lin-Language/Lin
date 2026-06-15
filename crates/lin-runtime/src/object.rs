@@ -480,16 +480,18 @@ pub unsafe extern "C" fn lin_union_force_to_object(tv: *const u8) -> *mut LinObj
             obj
         }
         TAG_RECORD => {
+            // Phase 3: sealed records now materialize as LinMap. lin_union_force_to_object is still
+            // called from the codegen obj_b branch — but after Phase 3 no TAG_OBJECT sources remain,
+            // so this arm is effectively dead (sealed→map, map handled by TAG_MAP arm above).
+            // Keep it alive so it stays compilable during the transition; it will be removed in Phase 4.
             let sealed = src.payload as *mut u8;
             if sealed.is_null() {
                 return std::ptr::null_mut();
             }
-            // Read the named descriptor from the sealed struct header at offset 16 (Stage 6a).
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            // materialize_sealed_struct_pub: takes the struct base (WITH 24-byte header) + named
-            // descriptor; materializes header-relative offsets field-by-field into a fresh +1
-            // LinObject. Retains all heap fields into the object; the sealed struct keeps its own
-            // references untouched.
+            // Materialize to a LinObject via the old path (the codegen obj_b branch reads the result
+            // via lin_object_get; this path is only reached for actual TAG_OBJECT or TAG_RECORD
+            // sources that aren't TAG_MAP, which can't happen after Phase 3 for sealed records).
             crate::sealed::materialize_sealed_struct_pub(sealed, named_desc)
         }
         _ => std::ptr::null_mut(),
@@ -912,11 +914,10 @@ pub unsafe extern "C" fn lin_tagged_keys(tv: *const u8) -> *mut crate::array::Li
             if sealed.is_null() {
                 return crate::array::lin_array_alloc(0);
             }
-            // Read named_desc from sealed struct header offset 16 (SEALED_HEADER=24, Stage 6a).
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let mat = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
-            let arr = lin_object_keys(mat as *const LinObject);
-            lin_object_release(mat);
+            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+            let arr = crate::map::lin_map_keys(mat as *const crate::map::LinMap);
+            crate::map::lin_map_release(mat);
             arr
         }
         _ => crate::array::lin_array_alloc(0),
@@ -1033,20 +1034,31 @@ pub unsafe fn tagged_as_object(tv: *const TaggedVal) -> Option<(*const LinObject
 /// (e.g. `is Error` on a map-backed error value must work without reconstruction).
 #[no_mangle]
 pub unsafe extern "C" fn lin_value_has_field(tagged: *const u8, key: *const LinString) -> u8 {
-    use crate::tagged::{TaggedVal, TAG_MAP};
+    use crate::tagged::{TaggedVal, TAG_MAP, TAG_RECORD};
     if tagged.is_null() { return 0; }
     let tv = tagged as *const TaggedVal;
-    if (*tv).tag == TAG_MAP {
-        let map = (*tv).payload as *const crate::map::LinMap;
-        return if map.is_null() { 0 } else { crate::map::lin_map_has(map, key) };
-    }
-    match tagged_as_object(tv) {
-        Some((obj, owned)) => {
-            let result = lin_object_has(obj, key);
-            if owned { lin_object_release(obj as *mut LinObject); }
+    match (*tv).tag {
+        TAG_MAP => {
+            let map = (*tv).payload as *const crate::map::LinMap;
+            if map.is_null() { 0 } else { crate::map::lin_map_has(map, key) }
+        }
+        TAG_RECORD => {
+            let sealed = (*tv).payload as *mut u8;
+            if sealed.is_null() { return 0; }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+            let result = if mat.is_null() { 0 } else { crate::map::lin_map_has(mat, key) };
+            crate::map::lin_map_release(mat);
             result
         }
-        None => 0,
+        _ => match tagged_as_object(tv) {
+            Some((obj, owned)) => {
+                let result = lin_object_has(obj, key);
+                if owned { lin_object_release(obj as *mut LinObject); }
+                result
+            }
+            None => 0,
+        }
     }
 }
 
@@ -1208,32 +1220,35 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
         if !bm.is_null() { crate::map::lin_map_release(bm as *mut crate::map::LinMap); }
         return eq;
     }
-    // Stage 6a: TAG_RECORD vs TAG_RECORD (or TAG_RECORD vs TAG_OBJECT) comparison in a record
-    // field slot (object-level equality). Materialize the TAG_RECORD side to a LinObject and compare.
-    // Note: `at == bt` holds here since we're inside tagged_val_eq after a type check at this tag.
-    // But this function is also called from lin_object_eq positional/indexed path, so handle the
-    // cross-type case defensively via the top-level lin_tagged_eq which dispatches TAG_RECORD.
+    // Phase 3: TAG_RECORD vs TAG_RECORD (or TAG_RECORD vs TAG_OBJECT/TAG_MAP) comparison.
+    // Materialize both sides to LinMap and compare structurally.
     if at == crate::tagged::TAG_RECORD {
+        use crate::tagged::{TAG_RECORD, TAG_OBJECT, TAG_MAP};
         let sealed = ap as *const u8;
         if sealed.is_null() { return false; }
         let named_desc = *((sealed.add(16)) as *const *const u8);
-        let ao = crate::sealed::materialize_sealed_struct_pub(ap as *mut u8, named_desc);
-        let bo_obj = if bt == crate::tagged::TAG_RECORD {
+        let am = crate::sealed::materialize_sealed_to_map_pub(ap as *mut u8, named_desc);
+        let bm = if bt == TAG_RECORD {
             let bsealed = bp as *const u8;
-            if bsealed.is_null() { if !ao.is_null() { lin_object_release(ao); } return false; }
+            if bsealed.is_null() {
+                crate::map::lin_map_release(am);
+                return false;
+            }
             let bnamed_desc = *((bsealed.add(16)) as *const *const u8);
-            crate::sealed::materialize_sealed_struct_pub(bp as *mut u8, bnamed_desc)
-        } else if bt == crate::tagged::TAG_OBJECT {
-            bp as *mut LinObject
+            crate::sealed::materialize_sealed_to_map_pub(bp as *mut u8, bnamed_desc)
+        } else if bt == TAG_MAP {
+            crate::map::lin_map_retain(bp as *mut crate::map::LinMap);
+            bp as *mut crate::map::LinMap
+        } else if bt == TAG_OBJECT {
+            crate::map::lin_object_to_map(bp as *const LinObject)
         } else {
-            if !ao.is_null() { lin_object_release(ao); }
+            crate::map::lin_map_release(am);
             return false;
         };
-        let b_was_materialized = bt == crate::tagged::TAG_RECORD;
-        let eq = !ao.is_null() && !bo_obj.is_null()
-            && lin_object_eq(ao as *const LinObject, bo_obj as *const LinObject) != 0;
-        if !ao.is_null() { lin_object_release(ao); }
-        if b_was_materialized && !bo_obj.is_null() { lin_object_release(bo_obj); }
+        let eq = !am.is_null() && !bm.is_null()
+            && crate::map::lin_map_eq(am as *const crate::map::LinMap, bm as *const crate::map::LinMap) != 0;
+        crate::map::lin_map_release(am);
+        crate::map::lin_map_release(bm);
         return eq;
     }
     // For other types (closures, iterators): pointer equality.

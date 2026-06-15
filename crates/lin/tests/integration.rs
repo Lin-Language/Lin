@@ -16049,7 +16049,8 @@ val plain = { "x": 7, "name": "ada" }
 print("${j == plain}")
 print("${plain == j}")
 "#);
-    assert_eq!(out, vec!["7", "ada", r#"{"x": 7, "name": "ada"}"#, "true", "true", "true"]);
+    // Phase 3: sealed records materialize to LinMap; map serialization uses alphabetical key order.
+    assert_eq!(out, vec!["7", "ada", r#"{"name": "ada", "x": 7}"#, "true", "true", "true"]);
 }
 
 #[test]
@@ -16065,7 +16066,8 @@ val j: Json = p
 print(toString(j))
 print("${j["lo"]} ${j["hi"]}")
 "#);
-    assert_eq!(out, vec![r#"{"lo": 7, "hi": 42}"#, "7 42"]);
+    // Phase 3: sealed records materialize to LinMap; map serialization uses alphabetical key order.
+    assert_eq!(out, vec![r#"{"hi": 42, "lo": 7}"#, "7 42"]);
 }
 
 #[test]
@@ -17292,12 +17294,13 @@ print("${ps[0]["name"]} ${ps[0]["age"]}")
 print("${ps[1]["name"]} ${ps[1]["age"]}")
 print(toString(ps))
 "#);
+    // Phase 3: sealed records materialize to LinMap; map serialization uses alphabetical key order.
     assert_eq!(
         out,
         vec![
             "ann 30",
             "bob 41",
-            r#"[{"name": "ann", "age": 30}, {"name": "bob", "age": 41}]"#
+            r#"[{"age": 30, "name": "ann"}, {"age": 41, "name": "bob"}]"#
         ]
     );
 }
@@ -17397,11 +17400,12 @@ push(ps, { "name": "cat", "age": 7 })
 print("${length(ps)} ${ps[0]["name"]} ${ps[2]["age"]}")
 print(toString(ps))
 "#);
+    // Phase 3: sealed records materialize to LinMap; map serialization uses alphabetical key order.
     assert_eq!(
         out,
         vec![
             "3 ann 7",
-            r#"[{"name": "ann", "age": 30}, {"name": "bob", "age": 41}, {"name": "cat", "age": 7}]"#
+            r#"[{"age": 30, "name": "ann"}, {"age": 41, "name": "bob"}, {"age": 7, "name": "cat"}]"#
         ]
     );
 }
@@ -20290,8 +20294,9 @@ print(toString(ps))
 val ps2: Person[] = [{ "name": "ann", "age": 30 }, { "name": "bob", "age": 41 }]
 print(toString(ps == ps2))
 "#);
+    // Phase 3: sealed records materialize to LinMap; map serialization uses alphabetical key order.
     assert_eq!(out, vec![
-        r#"[{"name": "ann", "age": 30}, {"name": "bob", "age": 41}]"#,
+        r#"[{"age": 30, "name": "ann"}, {"age": 41, "name": "bob"}]"#,
         "true",
     ]);
 }

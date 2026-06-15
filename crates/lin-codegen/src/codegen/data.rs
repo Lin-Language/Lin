@@ -2348,56 +2348,18 @@ impl<'ctx> Codegen<'ctx> {
             return self.sealed_construct(target_fields, &vals);
         }
         // Source is a boxed object / Json.
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let target_keys: Vec<String> = target_fields.keys().cloned().collect();
         let mut vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> = Vec::with_capacity(target_keys.len());
 
-        // UNION/Json source: branch ONCE on the runtime tag and read each field via the MATCHING
-        // O(1) force + DIRECT getter — no per-field tag-dispatch, no whole-source copy:
-        //   - TAG_MAP  → `lin_union_force_to_map`  (O(1) retain) + `lin_map_get`    (RANGE's hot case)
-        //   - else     → `lin_union_force_to_object`(O(1) retain for an object; materialise a record)
-        //                 + `lin_object_get`                                        (PREP's hot case)
-        // The bug this fixes: the Stage-6b code forced EVERYTHING to a map, so a TAG_OBJECT source was
-        // O(n)-COPIED per projection (42.5M copies in RAPTOR PREP) — `force_to_object` only RETAINS an
-        // object. Per-field RC is the proven borrowed-interior model (see `emit_sealed_proj_loop`); the
-        // forced container is released after the loop (its +1 balances `sealed_construct`'s field
-        // retains), exactly as the original `force_to_map` code did.
         if Self::is_union_type(src_ty) {
-            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-            let i8t = self.context.i8_type();
-            let tag = self.builder.call(self.rt.get_tag, &[src.into()], "sproj_tag")
-                .try_as_basic_value().unwrap_basic().into_int_value();
-            let is_map = self.builder.int_compare(
-                IntPredicate::EQ, tag, i8t.const_int(TAG_MAP as u64, false), "sproj_is_map");
-            let map_b = self.context.append_basic_block(llvm_fn, "sproj_map");
-            let obj_b = self.context.append_basic_block(llvm_fn, "sproj_obj");
-            let merge_b = self.context.append_basic_block(llvm_fn, "sproj_merge");
-            self.builder.conditional_branch(is_map, map_b, obj_b);
-
-            // TAG_MAP: force_to_map is an O(1) retain; read fields via the direct map_get.
-            self.builder.position_at_end(map_b);
+            // All union sources (TAG_MAP / TAG_RECORD / TAG_OBJECT) are normalised to a LinMap*
+            // by lin_union_force_to_map: TAG_MAP → O(1) retain; TAG_RECORD → materialise; TAG_OBJECT → copy.
+            // Phase 3: TAG_RECORD materialises to TAG_MAP, so the old TAG_OBJECT branch is gone.
             let cmap = self.builder.call(self.rt.map_force, &[src.into()], "sproj_cmap")
                 .try_as_basic_value().unwrap_basic();
-            let rmap = self.emit_sealed_proj_loop(cmap, self.rt.map_get, target_fields);
+            let result = self.emit_sealed_proj_loop(cmap, self.rt.map_get, target_fields);
             self.builder.call(self.rt.map_release, &[cmap.into()], "");
-            let map_exit = self.builder.get_insert_block().unwrap();
-            self.builder.unconditional_branch(merge_b);
-
-            // TAG_OBJECT (O(1) retain) / TAG_RECORD (materialise): read fields via the direct object_get.
-            self.builder.position_at_end(obj_b);
-            let force_obj = self.get_or_declare_fn(
-                "lin_union_force_to_object", ptr_ty.fn_type(&[ptr_ty.into()], false));
-            let cobj = self.builder.call(force_obj, &[src.into()], "sproj_cobj")
-                .try_as_basic_value().unwrap_basic();
-            let robj = self.emit_sealed_proj_loop(cobj, self.rt.object_get, target_fields);
-            self.builder.call(self.rt.object_release, &[cobj.into()], "");
-            let obj_exit = self.builder.get_insert_block().unwrap();
-            self.builder.unconditional_branch(merge_b);
-
-            self.builder.position_at_end(merge_b);
-            let phi = self.builder.phi(rmap.get_type(), "sproj_phi");
-            phi.add_incoming(&[(&rmap, map_exit), (&robj, obj_exit)]);
-            return phi.as_basic_value();
+            return result;
         }
 
         // Non-union source: a concrete raw `LinMap*`. Borrowed per-field reads, no copy, no release.

@@ -13,7 +13,7 @@
 
 use std::fmt::Write as _;
 
-use crate::object::{lin_object_get_bytes, lin_tagged_clone, LinObject};
+use crate::object::{lin_tagged_clone, LinObject};
 use crate::array::{lin_array_length, LinArray};
 use crate::fs::make_decode_error;
 use crate::tagged::{
@@ -262,26 +262,30 @@ unsafe fn validate(
             // Materialize the sealed struct to a transient LinObject so the field-walk logic below
             // can use `lin_object_get_bytes` uniformly. The materialized object is owned (+1) and
             // released after the walk. A TAG_OBJECT passes through unchanged (no alloc).
-            let (obj, mat_owned) = if tag == TAG_OBJECT {
-                (lin_unbox_ptr(value) as *const LinObject, false)
+            // Normalize any object-shaped value to a LinMap for uniform field lookup.
+            let (map, map_owned) = if tag == TAG_MAP {
+                let m = (*(value as *const TaggedVal)).payload as *const crate::map::LinMap;
+                (m, false)
+            } else if tag == TAG_OBJECT {
+                let obj = lin_unbox_ptr(value) as *const LinObject;
+                let m = crate::map::lin_object_to_map(obj);
+                (m as *const crate::map::LinMap, !m.is_null())
             } else if tag == TAG_RECORD {
                 let sealed = (*(value as *const TaggedVal)).payload as *mut u8;
                 if sealed.is_null() {
                     return Err(format!("expected an object at {}", path));
                 }
-                // Read named_desc from sealed struct header offset 16 (Stage 6a SEALED_HEADER=24).
                 let named_desc = *((sealed.add(16)) as *const *const u8);
-                let mat = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
-                if mat.is_null() {
+                let m = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+                if m.is_null() {
                     return Err(format!("expected an object at {}", path));
                 }
-                (mat as *const LinObject, true)
+                (m as *const crate::map::LinMap, true)
             } else {
                 return Err(format!("expected an object at {}", path));
             };
             let nfields = desc.u32_at(node + 1) as usize;
-            // Walk the variable-length field rows. On error, preserve the path (don't truncate)
-            // so the caller sees the full JSONPath to the mismatch — the original behaviour.
+            // Walk the variable-length field rows.
             let mut cur = node + 5;
             let result = (|| -> Result<(), String> {
                 for _ in 0..nfields {
@@ -292,15 +296,14 @@ unsafe fn validate(
                     cur += 2 + klen + 1 + 4;
 
                     // Look up by raw key bytes — no temp LinString malloc/free per field.
-                    let field = if obj.is_null() {
+                    let field = if map.is_null() {
                         std::ptr::null()
                     } else {
-                        lin_object_get_bytes(obj, key.as_ptr(), key.len() as u32)
+                        crate::map::lin_map_get_bytes(map, key.as_ptr(), key.len() as u32)
                     };
 
                     let field_present = !field.is_null() && (*(field as *const TaggedVal)).tag != TAG_NULL;
                     if !field_present {
-                        // Missing (or explicit null) field: allowed iff the target field is nullable.
                         if nullable {
                             continue;
                         }
@@ -310,8 +313,6 @@ unsafe fn validate(
                     path.push('.');
                     path.push_str(key);
                     let r = validate(field as *const u8, desc, val_off, path);
-                    // On SUCCESS: truncate path back. On ERROR: leave path extended so the
-                    // caller sees the full JSONPath to the failure (mirrors original behaviour).
                     if r.is_ok() {
                         path.truncate(base_len);
                     }
@@ -319,9 +320,8 @@ unsafe fn validate(
                 }
                 Ok(())
             })();
-            // Release the materialized object if we allocated one for TAG_RECORD.
-            if mat_owned {
-                crate::object::lin_object_release(obj as *mut LinObject);
+            if map_owned {
+                crate::map::lin_map_release(map as *mut crate::map::LinMap);
             }
             result
         }
