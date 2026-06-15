@@ -1,0 +1,108 @@
+import { Service, ServiceDays } from "./service"
+import { DateIndex, DateNumber } from "./date"
+
+// 
+// StopID e.g. NRW
+// 
+export type StopId = String
+
+// 
+// Time in seconds since mIdnight (note this may be greater than 24 hours).
+// 
+export type Time = UInt32
+
+// 
+// Duration in seconds
+// 
+export type Duration = UInt16
+
+// 
+// GTFS stop time
+// 
+export type StopTime = {
+  "stop": StopId,
+  "arrivalTime": Time,
+  "departureTime": Time,
+  "pickUp": Boolean,
+  "dropOff": Boolean
+}
+
+// 
+// Leg of a journey
+// 
+export type Leg = {
+  "origin": StopId,
+  "destination": StopId
+}
+
+// 
+// Leg with a defined departure and arrival time
+// 
+export type TimetableLeg = Leg & {
+  "stopTimes": StopTime[],
+  "trip": Trip
+}
+
+// 
+// Leg with a duration instead of departure and arrival time
+// 
+export type Transfer = Leg & {
+  "duration": Duration,
+  "startTime": Time,
+  "endTime": Time
+}
+
+// 
+// GTFS trip_id
+// 
+export type TripId = String
+
+// 
+// GTFS service_id, used to determine the trip's calendar
+// 
+export type ServiceId = String
+
+// 
+// GTFS trip
+// 
+export type Trip = {
+  "tripId": TripId,
+  "stopTimes": StopTime[],
+  "serviceId": ServiceId,
+  "service": Service
+}
+
+// 
+// GTFS calendar
+// 
+export type Calendar = {
+  "serviceId": ServiceId,
+  "startDate": DateNumber,
+  "endDate": DateNumber,
+  "days": ServiceDays,
+  "exclude": DateIndex,
+  "include": DateIndex
+}
+
+// 
+// Calendars indexed by service Id
+// 
+export type CalendarIndex = { ServiceId: Calendar }
+
+// 
+// GTFS stop
+// 
+export type Stop = {
+  "id": StopId,
+  "code": String,
+  "name": String,
+  "description": String,
+  "latitude": Float32,
+  "longitude": Float32,
+  "timezone": String
+}
+
+// 
+// Stops indexed by Id
+// 
+export type StopIndex = { StopId: Stop }

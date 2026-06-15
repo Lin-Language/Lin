@@ -1,0 +1,16 @@
+
+// 
+// Date stored as a number, e.g 20181225
+// 
+export type DateNumber = UInt32
+
+// 
+// Index of dates, used to access exclude/include dates in O(1) time
+// e.g. 20260601: true
+// 
+export type DateIndex = { DateNumber: Boolean }
+
+// 
+// Sunday = 0, Monday = 1... don't blame me, blame JavaScript .getDay
+// 
+export type DayOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6
