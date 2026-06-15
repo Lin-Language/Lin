@@ -2687,9 +2687,10 @@ the calling thread (documented in the `body` stdlib doc comment).
 
 **Status**: Accepted (landed incrementally on `master` over the 2026-06-12…14 reset; Stages 0–4 + 6a +
 the Stage-6b `Json`→`AnyVal` rename + the genuine-dynamic-object → `LinMap` conversion are merged).
-Full design + staged plan: `docs/project-actually-improve-performance.md` (see its §0.1 for the as-built
-status and the honest measurement). Supersedes **ADR-062** and folds in **ADR-063/064/067** (SumNode,
-the `T|Null` repr frontier) as the now-unified representation model.
+Full as-built status, the staged design, and the honest re-measure are distilled in
+`docs/PERFORMANCE.md` §5.6 (the representation reset — path-9 resolution). Supersedes **ADR-062** and
+folds in **ADR-063/064/067** (SumNode, the `T|Null` repr frontier) as the now-unified representation
+model.
 
 **Context.** ADR-062 made a record's representation a *flow-sensitive dataflow fact* (packed where
 provably safe, boxed `LinObject` otherwise), reconciled occurrence-by-occurrence by a `repr.rs`
