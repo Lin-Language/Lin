@@ -125,6 +125,10 @@ pub struct Checker {
     /// same value — the narrowing only tightens the type, never widens. Any assignment to `obj`
     /// (or `key`) within the branch invalidates the matching entries (`clear_index_narrowings_for`).
     pub(crate) index_narrowings: Vec<crate::checker::expr::IndexNarrow>,
+    /// Raw AST type bodies for every top-level `type` declaration in the current module,
+    /// keyed by name. Populated during `forward_declare_types` so error messages can show
+    /// the source-level shape of a Named type even before `check_stmt` has resolved it.
+    pub(crate) raw_type_decls: std::collections::HashMap<String, lin_parse::ast::TypeExpr>,
 }
 
 impl Default for Checker {
@@ -166,6 +170,7 @@ impl Checker {
             param_def_span_types: Vec::new(),
             next_lambda_id: 1,
             index_narrowings: Vec::new(),
+            raw_type_decls: std::collections::HashMap::new(),
         }
     }
 
@@ -194,7 +199,16 @@ impl Checker {
         self.forward_declare_functions(module);
 
         let mut stmts = Vec::new();
-        for stmt in &module.statements {
+        // Hoist all type declarations to the front so that types defined anywhere in the
+        // module are resolved before any function body is checked. This mirrors how
+        // forward_declare_functions hoists val bindings: a type used before its textual
+        // declaration should not be an error. TypeDecl statements produce no runtime code,
+        // so reordering them is always safe.
+        let (type_decls, other_stmts): (Vec<_>, Vec<_>) = module
+            .statements
+            .iter()
+            .partition(|s| matches!(s, Stmt::TypeDecl { .. }));
+        for stmt in type_decls.into_iter().chain(other_stmts) {
             match self.check_stmt(stmt) {
                 Ok(typed_stmt) => stmts.push(typed_stmt),
                 Err(diag) => self.diagnostics.push(diag),
@@ -354,9 +368,9 @@ impl Checker {
     /// is resolved, the occurrence of `Tree` in the body will be already in the env.
     fn forward_declare_types(&mut self, module: &Module) {
         for stmt in &module.statements {
-            if let Stmt::TypeDecl { name, params, .. } = stmt {
+            if let Stmt::TypeDecl { name, params, body, .. } = stmt {
                 // Register a placeholder body of Named(name) for now; the real body
-                // will be resolved and replaced when check_stmt processes TypeDecl.
+                // will be resolved when check_stmt processes TypeDecl.
                 // Using Named(name) as the placeholder means self-references in the body
                 // will be detected by the cycle guard in resolve.rs and left as Named(name).
                 self.env.define_type(
@@ -364,6 +378,9 @@ impl Checker {
                     params.clone(),
                     Type::Named(name.clone()),
                 );
+                // Store the raw AST body so error messages can show the source-level shape
+                // of this type before check_stmt has had a chance to resolve it.
+                self.raw_type_decls.insert(name.clone(), body.clone());
             }
         }
     }

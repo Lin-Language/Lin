@@ -4400,7 +4400,7 @@ val run = (): Null =>
 run()
 "#);
     assert!(
-        err.contains("Cannot index into type Int32"),
+        err.contains("cannot index into `Int32`"),
         "case A should error: callback param `a` must be Int32, got: {}",
         err
     );
@@ -4428,7 +4428,7 @@ import { toString } from "std/string"
 print(toString([1, 2, 3].map(x => x["k"])))
 "#);
     assert!(
-        err.contains("Cannot index into type Int32"),
+        err.contains("cannot index into `Int32`"),
         "map callback param `x` must be Int32, got: {}",
         err
     );
