@@ -86,8 +86,6 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub unbox_float64: FunctionValue<'ctx>,
     pub unbox_bool: FunctionValue<'ctx>,
     pub unbox_ptr: FunctionValue<'ctx>,
-    pub object_set: FunctionValue<'ctx>,
-    pub object_get: FunctionValue<'ctx>,
     pub tagged_to_string: FunctionValue<'ctx>,
     pub rc_retain: FunctionValue<'ctx>,
     pub string_release: FunctionValue<'ctx>,
@@ -235,10 +233,6 @@ impl<'ctx> RuntimeFns<'ctx> {
         let unbox_ptr = module.add_function("lin_unbox_ptr", ptr_type.fn_type(&[ptr_type.into()], false), None);
         // lin_tagged_to_string(tagged: ptr) -> ptr (LinString*)
         let tagged_to_string = module.add_function("lin_tagged_to_string", string_ptr_type.fn_type(&[ptr_type.into()], false), None);
-        // lin_object_set(obj: ptr, key: ptr, val: ptr) -> void (still used for TAG_OBJECT dynamic dispatch)
-        let object_set = module.add_function("lin_object_set", void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false), None);
-        // lin_object_get(obj: ptr, key: ptr) -> ptr (points to TaggedVal, or null)
-        let object_get = module.add_function("lin_object_get", ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false), None);
         // Retain / release: adjust refcount, free if zero.
         let rc_retain = module.add_function("lin_rc_retain", void_type.fn_type(&[ptr_type.into()], false), None);
         let string_release = module.add_function("lin_string_release", void_type.fn_type(&[ptr_type.into()], false), None);
@@ -295,8 +289,6 @@ impl<'ctx> RuntimeFns<'ctx> {
             unbox_float64,
             unbox_bool,
             unbox_ptr,
-            object_set,
-            object_get,
             tagged_to_string,
             rc_retain,
             string_release,

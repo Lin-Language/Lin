@@ -5,7 +5,7 @@ use inkwell::{AddressSpace, IntPredicate};
 use lin_check::types::Type;
 use lin_ir::ir as lir;
 use super::Codegen;
-use lin_common::tags::{TAG_NULL, TAG_OBJECT, TAG_RECORD, TAG_MAP};
+use lin_common::tags::{TAG_NULL, TAG_RECORD, TAG_MAP};
 
 impl<'ctx> Codegen<'ctx> {
     pub(crate) fn compile_ir_is_type(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> inkwell::values::IntValue<'ctx> {
@@ -56,19 +56,16 @@ impl<'ctx> Codegen<'ctx> {
     /// slot) — both are valid runtime representations of the same Lin type.
     fn compile_ir_is_type_single(&mut self, tag: inkwell::values::IntValue<'ctx>, ty: &Type) -> inkwell::values::IntValue<'ctx> {
         let i8_ty = self.context.i8_type();
-        // Stage 6a / Phase 3: a sealed record in a dynamic slot can be TAG_OBJECT (legacy
-        // materialized LinObject), TAG_RECORD (wrapped sealed struct), OR TAG_MAP (Phase-3
-        // materialized via `materialize_sealed_to_map`, e.g. read out of a dynamic array/field).
-        // Accept all three — otherwise `v is SomeRecord` is false for a record read as TAG_MAP.
+        // Cluster D / Phase 3: a sealed record in a dynamic slot can be TAG_RECORD (wrapped
+        // sealed struct) OR TAG_MAP (Phase-3 materialized via `materialize_sealed_to_map`,
+        // e.g. read out of a dynamic array/field). TAG_OBJECT removed (no producers).
+        // Accept both — otherwise `v is SomeRecord` is false for a record read as TAG_MAP.
         if Self::sealed_fields(ty).is_some() {
-            let eq_obj = self.builder.int_compare(
-                IntPredicate::EQ, tag, i8_ty.const_int(TAG_OBJECT as u64, false), "ir_is_obj");
             let eq_rec = self.builder.int_compare(
                 IntPredicate::EQ, tag, i8_ty.const_int(TAG_RECORD as u64, false), "ir_is_rec");
             let eq_map = self.builder.int_compare(
                 IntPredicate::EQ, tag, i8_ty.const_int(TAG_MAP as u64, false), "ir_is_map");
-            let or1 = self.builder.or(eq_obj, eq_rec, "ir_is_or1");
-            return self.builder.or(or1, eq_map, "ir_is_seal");
+            return self.builder.or(eq_rec, eq_map, "ir_is_seal");
         }
         let expected = i8_ty.const_int(Self::type_tag(ty) as u64, false);
         self.builder.int_compare(IntPredicate::EQ, tag, expected, "ir_is")

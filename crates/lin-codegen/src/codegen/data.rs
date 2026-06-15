@@ -1,7 +1,7 @@
 use super::builder_ext::BuilderExt;
 use inkwell::types::BasicType;
 use inkwell::values::BasicValueEnum;
-use lin_common::tags::{TAG_INT32, TAG_INT64, TAG_OBJECT, TAG_MAP, TAG_RECORD};
+use lin_common::tags::{TAG_INT32, TAG_INT64, TAG_MAP, TAG_RECORD};
 use inkwell::{AddressSpace, IntPredicate};
 
 use lin_check::types::Type;
@@ -184,11 +184,10 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn tagged_array_push_value(&mut self, arr: BasicValueEnum<'ctx>, val: BasicValueEnum<'ctx>, val_ty: &Type) {
         let i8_ty = self.context.i8_type();
         // A SEALED-repr record element (`{tag:Int32, bytes:Int32[]}` etc.) flowing into a TAGGED
-        // array is a packed struct pointer, NOT a boxed LinObject. Storing it raw under TAG_OBJECT
-        // makes the runtime read the struct as a LinObject header → a misaligned-pointer deref of a
-        // scalar field (`0x5`) on read-back. Materialize it to a fresh boxed LinObject first, then
-        // store that pointer under TAG_OBJECT — the representation the tagged slot (and toString /
-        // index-get) expects. This is the generic `push$Object` / `set` into a `Field[]` case.
+        // array is a packed struct pointer, NOT a boxed LinMap. Storing it raw would type-confuse
+        // read-back. Materialize it to a fresh LinMap first, then store that pointer under TAG_MAP —
+        // the representation the tagged slot (and toString / index-get) expects (Cluster D: was
+        // TAG_OBJECT / LinObject, now TAG_MAP / LinMap). Generic `push$Object` / `set` into `Field[]`.
         if let Type::Object { .. } = val_ty {
             if let Some(fields) = Self::sealed_fields(val_ty).cloned() {
                 let obj = self.sealed_materialize_to_map(val, &fields);
@@ -336,33 +335,24 @@ impl<'ctx> Codegen<'ctx> {
             let arr_res = self.builder.call(get_tagged_fn, &[container.into(), idx.into()], "ir_idx_aget").try_as_basic_value().unwrap_basic();
             let int_exit = self.builder.get_insert_block().unwrap();
             self.builder.unconditional_branch(mrg);
-            // string key → object/map get: dispatch on the container's tag (TAG_MAP or TAG_OBJECT).
+            // string key → map get: dispatch on the container's tag (TAG_MAP only; TAG_OBJECT is dead).
             self.builder.position_at_end(str_b);
             let key_raw = self.builder.call(self.rt.unbox_ptr, &[key.into()], "ir_idxk_str").try_as_basic_value().unwrap_basic();
             let obj_tag = self.builder.call(self.rt.get_tag, &[obj.into()], "ir_idx_otag").try_as_basic_value().unwrap_basic().into_int_value();
             let is_map = self.builder.int_compare(IntPredicate::EQ, obj_tag, i8t.const_int(TAG_MAP as u64, false), "ir_idx_ismap");
-            let is_obj = self.builder.int_compare(IntPredicate::EQ, obj_tag, i8t.const_int(TAG_OBJECT as u64, false), "ir_idx_isobj");
             let mget_b = self.context.append_basic_block(llvm_fn, "ir_idx_mget");
-            let oget_b = self.context.append_basic_block(llvm_fn, "ir_idx_oget");
-            let chk_obj = self.context.append_basic_block(llvm_fn, "ir_idx_chkobj");
             let onull_b = self.context.append_basic_block(llvm_fn, "ir_idx_onull");
             let omrg = self.context.append_basic_block(llvm_fn, "ir_idx_omrg");
-            self.builder.conditional_branch(is_map, mget_b, chk_obj);
+            self.builder.conditional_branch(is_map, mget_b, onull_b);
             self.builder.position_at_end(mget_b);
             let mget = self.builder.call(self.rt.map_get, &[container.into(), key_raw.into()], "ir_idx_msget").try_as_basic_value().unwrap_basic();
             let mget_exit = self.builder.get_insert_block().unwrap();
-            self.builder.unconditional_branch(omrg);
-            self.builder.position_at_end(chk_obj);
-            self.builder.conditional_branch(is_obj, oget_b, onull_b);
-            self.builder.position_at_end(oget_b);
-            let oget = self.builder.call(self.rt.object_get, &[container.into(), key_raw.into()], "ir_idx_osget").try_as_basic_value().unwrap_basic();
-            let oget_exit = self.builder.get_insert_block().unwrap();
             self.builder.unconditional_branch(omrg);
             self.builder.position_at_end(onull_b);
             self.builder.unconditional_branch(omrg);
             self.builder.position_at_end(omrg);
             let ophi = self.builder.phi(ptr_ty, "ir_idx_ophi");
-            ophi.add_incoming(&[(&mget, mget_exit), (&oget, oget_exit), (&ptr_ty.const_null(), onull_b)]);
+            ophi.add_incoming(&[(&mget, mget_exit), (&ptr_ty.const_null(), onull_b)]);
             let str_res = ophi.as_basic_value();
             let str_exit = self.builder.get_insert_block().unwrap();
             self.builder.unconditional_branch(mrg);
@@ -588,12 +578,11 @@ impl<'ctx> Codegen<'ctx> {
             // `outer[a][b]`, where `outer[a]` is `{ String: T } | Null` and is NOT spellable as
             // an `is`-pattern to narrow, ADR-055 §5.1.1) runs through this union path. Its runtime
             // value is a TAG_MAP, so dispatch on the tag: TAG_MAP → `lin_map_get` (O(1) hashed),
-            // TAG_OBJECT → `lin_object_get` (the Json association-list path),
             // TAG_RECORD → `lin_record_get_field` (descriptor-driven field read, Stage 6a),
-            // otherwise Null.
+            // otherwise Null. (TAG_OBJECT arm removed in Cluster D: no producers remain.)
             //
             // OWNERSHIP CONTRACT:
-            //   map_get / object_get return a BORROWED `*const TaggedVal` (interior pointer into
+            //   map_get returns a BORROWED `*const TaggedVal` (interior pointer into
             //   the container); `unbox_tagged_val_to_type` reads it without retaining.
             //   lin_record_get_field returns an OWNED `+1 *mut TaggedVal` (a heap-allocated box
             //   that owns a retain on heap-typed fields). To normalise ownership, the TAG_RECORD
@@ -602,9 +591,8 @@ impl<'ctx> Codegen<'ctx> {
             //
             //   Control-flow structure (two-level merge):
             //   entry → is_map? → map_b → inner_mrg
-            //         → is_obj? → obj_ok → inner_mrg
             //         → is_rec? → rec_b → (unbox, release) → final_mrg
-            //         → no → final_mrg (null result)
+            //         → no → inner_mrg (null result)
             //   inner_mrg → (unbox) → final_mrg
             //   final_mrg holds the final unboxed value of the target result type.
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
@@ -612,38 +600,28 @@ impl<'ctx> Codegen<'ctx> {
             let i8t = self.context.i8_type();
             let is_map = self.builder.int_compare(
                 IntPredicate::EQ, obj_tag, i8t.const_int(TAG_MAP as u64, false), "ir_idx_is_map");
-            let is_obj = self.builder.int_compare(
-                IntPredicate::EQ, obj_tag, i8t.const_int(TAG_OBJECT as u64, false), "ir_idx_is_obj");
             let is_record = self.builder.int_compare(
                 IntPredicate::EQ, obj_tag, i8t.const_int(TAG_RECORD as u64, false), "ir_idx_is_rec");
             let map_b = self.context.append_basic_block(llvm_fn, "ir_idx_map");
-            let chk_obj = self.context.append_basic_block(llvm_fn, "ir_idx_chk_obj");
-            let ok = self.context.append_basic_block(llvm_fn, "ir_idx_obj_ok");
             let chk_rec = self.context.append_basic_block(llvm_fn, "ir_idx_chk_rec");
             let rec_b = self.context.append_basic_block(llvm_fn, "ir_idx_rec");
             let no = self.context.append_basic_block(llvm_fn, "ir_idx_obj_no");
-            let inner_mrg = self.context.append_basic_block(llvm_fn, "ir_idx_inner_mrg"); // map/obj/null
+            let inner_mrg = self.context.append_basic_block(llvm_fn, "ir_idx_inner_mrg"); // map/null
             let final_mrg = self.context.append_basic_block(llvm_fn, "ir_idx_final_mrg"); // all paths
-            self.builder.conditional_branch(is_map, map_b, chk_obj);
+            self.builder.conditional_branch(is_map, map_b, chk_rec);
             self.builder.position_at_end(map_b);
             let map_entry = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget_u").try_as_basic_value().unwrap_basic();
             let map_exit = self.builder.get_insert_block().unwrap();
-            self.builder.unconditional_branch(inner_mrg);
-            self.builder.position_at_end(chk_obj);
-            self.builder.conditional_branch(is_obj, ok, chk_rec);
-            self.builder.position_at_end(ok);
-            let entry = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "ir_oget").try_as_basic_value().unwrap_basic();
-            let ok_exit = self.builder.get_insert_block().unwrap();
             self.builder.unconditional_branch(inner_mrg);
             self.builder.position_at_end(chk_rec);
             self.builder.conditional_branch(is_record, rec_b, no);
             self.builder.position_at_end(no);
             let null_res = ptr_ty.const_null();
             self.builder.unconditional_branch(inner_mrg);
-            // inner_mrg: collect borrowed TaggedVal* from map/obj/null paths, unbox, branch to final.
+            // inner_mrg: collect borrowed TaggedVal* from map/null paths, unbox, branch to final.
             self.builder.position_at_end(inner_mrg);
             let inner_phi = self.builder.phi(ptr_ty, "ir_idx_inner_phi");
-            inner_phi.add_incoming(&[(&map_entry, map_exit), (&entry, ok_exit), (&null_res, no)]);
+            inner_phi.add_incoming(&[(&map_entry, map_exit), (&null_res, no)]);
             let inner_result_ptr = inner_phi.as_basic_value();
             let inner_unboxed = self.unbox_tagged_val_to_type(inner_result_ptr, result_ty);
             // inner_unboxed may be a pointer or a scalar. For the phi we need a uniform type; we use
@@ -694,29 +672,6 @@ impl<'ctx> Codegen<'ctx> {
         // Stage 6b Phase 2: concrete open-object container is now a LinMap*; use map_get.
         let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_oget").try_as_basic_value().unwrap_basic();
         self.unbox_tagged_val_to_type(tagged, result_ty)
-    }
-
-    /// Store `value` into an object: `lin_object_set(obj_ptr, key_ptr, box(value))`.
-    /// `obj_ptr`/`key_ptr` must already be RAW (unboxed) `LinObject*`/`LinString*`.
-    ///
-    /// A concrete value is heap-boxed; a union value (already a `TaggedVal*` under the
-    /// uniform ABI) is passed straight through. `lin_object_set` copies the 16-byte
-    /// TaggedVal and RETAINS its inner payload, so for a fresh box we release it afterwards
-    /// (undoing the box's own +0, freeing the shell) — net codegen effect on the inner is
-    /// zero; the slot's single reference is supplied by the IR `transfer_into_container`
-    /// emitted in `IndexSet`/`ObjectSetDyn` lowering. Shared by `compile_ir_index_set` and
-    /// `Intrinsic::ObjectSetDyn` so the two paths can never drift (the historical RC-bug
-    /// source).
-    pub(crate) fn emit_object_set(&mut self, obj_ptr: BasicValueEnum<'ctx>, key_ptr: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type) {
-        let val_is_fresh_box = !Self::is_union_type(val_ty);
-        let val_tagged = if val_is_fresh_box {
-            self.box_value(value, val_ty)
-        } else { value };
-        self.builder.call(self.rt.object_set,
-            &[obj_ptr.into(), key_ptr.into(), val_tagged.into()], "");
-        if val_is_fresh_box && val_tagged.is_pointer_value() {
-            self.builder.call(self.rt.tagged_release, &[val_tagged.into()], "");
-        }
     }
 
     /// Store `value` into a typed index-signature map (`lin_map_set`, ADR-055).
@@ -1023,10 +978,14 @@ impl<'ctx> Codegen<'ctx> {
                     self.emit_map_set(obj, key_str, value, val_ty, &Type::TypeVar(u32::MAX), &lin_ir::repr::Repr::boxed_opaque());
                 }
             }
+            // Cluster D: sealed Object / Named dynamic-key write — route through lin_map_set.
+            // Sealed records with a dynamic (non-literal) key are a rare fallthrough path;
+            // the lowerer redirects all compile-time-literal keys to FieldSet before this.
+            // After Phase 3 there are no TAG_OBJECT producers, so lin_object_set is dead.
             Type::Object { .. } | Type::Named(_) => {
                 if obj.is_pointer_value() && key.is_pointer_value() {
                     let key_str = resolve_obj_key(self, key);
-                    self.emit_object_set(obj, key_str, value, val_ty);
+                    self.emit_map_set(obj, key_str, value, val_ty, &Type::TypeVar(u32::MAX), &lin_ir::repr::Repr::boxed_opaque());
                 }
             }
             // Typed index-signature map `{ K: V }` (ADR-055 + numeric-key): O(1) hashed insert/overwrite.
@@ -1178,7 +1137,8 @@ impl<'ctx> Codegen<'ctx> {
             _ => None,
         };
         let Some(elem) = map_elem else {
-            self.emit_object_set(container, key_str, value, val_ty);
+            // No Map variant and not Json-dynamic: route through lin_map_set (TAG_OBJECT removed).
+            self.emit_map_set(container, key_str, value, val_ty, &Type::TypeVar(u32::MAX), &lin_ir::repr::Repr::boxed_opaque());
             return;
         };
         // For pure JSON (TypeVar), use the value's type as-is (opaque boxed).
@@ -1196,8 +1156,9 @@ impl<'ctx> Codegen<'ctx> {
         // there is no packed buffer to keep-pack — pass the fail-safe boxed repr.
         self.emit_map_set(container, key_str, value, val_ty, &elem, &lin_ir::repr::Repr::boxed_opaque());
         self.builder.unconditional_branch(mrg);
+        // Non-TAG_MAP fallback: TAG_OBJECT producers removed in Cluster D; route through map_set.
         self.builder.position_at_end(obj_b);
-        self.emit_object_set(container, key_str, value, val_ty);
+        self.emit_map_set(container, key_str, value, val_ty, &elem, &lin_ir::repr::Repr::boxed_opaque());
         self.builder.unconditional_branch(mrg);
         self.builder.position_at_end(mrg);
     }
@@ -1669,25 +1630,24 @@ impl<'ctx> Codegen<'ctx> {
             inkwell::IntPredicate::EQ, elem_tag,
             i8_ty.const_int(lin_common::tags::TAG_MAP as u64, false), "bafg_is_map");
         let map_bb = self.context.append_basic_block(llvm_fn, "bafg_map");
-        let obj_bb = self.context.append_basic_block(llvm_fn, "bafg_obj");
+        let no_bb = self.context.append_basic_block(llvm_fn, "bafg_no");
         let merge_bb = self.context.append_basic_block(llvm_fn, "bafg_merge");
-        self.builder.conditional_branch(is_map_tag, map_bb, obj_bb);
+        self.builder.conditional_branch(is_map_tag, map_bb, no_bb);
         // TAG_MAP branch: use map_get
         self.builder.position_at_end(map_bb);
         let map_tagged = self.builder.call(self.rt.map_get, &[inner_obj.into(), key_str.into()], "bafg_mget")
             .try_as_basic_value().unwrap_basic();
         let map_pred = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_bb);
-        // TAG_OBJECT branch: use object_get (legacy runtime producers)
-        self.builder.position_at_end(obj_bb);
-        let obj_tagged = self.builder.call(self.rt.object_get, &[inner_obj.into(), key_str.into()], "bafg_oget")
-            .try_as_basic_value().unwrap_basic();
-        let obj_pred = self.builder.get_insert_block().unwrap();
+        // Non-map fallback: null (TAG_OBJECT producers removed in Cluster D).
+        self.builder.position_at_end(no_bb);
+        let no_tagged: BasicValueEnum<'ctx> = ptr_ty.const_null().into();
+        let no_pred = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_bb);
         // merge
         self.builder.position_at_end(merge_bb);
         let tagged_phi = self.builder.phi(ptr_ty, "bafg_phi");
-        tagged_phi.add_incoming(&[(&map_tagged, map_pred), (&obj_tagged, obj_pred)]);
+        tagged_phi.add_incoming(&[(&map_tagged, map_pred), (&no_tagged, no_pred)]);
         let tagged = tagged_phi.as_basic_value();
         // Coerce the (borrowed interior) field value to the field's declared type. The lowerer
         // registers `dst` owned and retains for an RC result, so this borrowed read is balanced.

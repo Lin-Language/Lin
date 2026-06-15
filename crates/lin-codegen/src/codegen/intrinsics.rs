@@ -239,10 +239,18 @@ impl<'ctx> Codegen<'ctx> {
                             i64_ty.fn_type(&[ptr_ty.into()], false));
                         self.builder.call(len_fn, &[arg.into()], "ir_alen").try_as_basic_value().unwrap_basic()
                     }
+                    // Cluster D: object length dispatch. Sealed records are packed structs
+                    // with a statically-known field count; return it as a compile-time constant.
+                    // Non-sealed open objects are LinMap* — call lin_map_length.
+                    // Named types are treated as unsealed open objects (LinMap* at runtime).
+                    ty @ Type::Object { .. } if Self::sealed_fields(ty).is_some() => {
+                        let n_fields = Self::sealed_fields(ty).map(|f| f.len()).unwrap_or(0);
+                        i64_ty.const_int(n_fields as u64, false).into()
+                    }
                     Type::Object { .. } | Type::Named(_) => {
-                        let obj_len_fn = self.get_or_declare_fn("lin_object_length",
+                        let map_len_fn = self.get_or_declare_fn("lin_map_length",
                             i64_ty.fn_type(&[ptr_ty.into()], false));
-                        self.builder.call(obj_len_fn, &[arg.into()], "ir_olen").try_as_basic_value().unwrap_basic()
+                        self.builder.call(map_len_fn, &[arg.into()], "ir_olen").try_as_basic_value().unwrap_basic()
                     }
                     // Typed index-signature map `{ K: V }` (ADR-055 + numeric-key): entry count.
                     Type::Map { .. } => {
@@ -1049,10 +1057,10 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 ptr_ty.const_null().into()
             }
-            // lin_keys(obj) => String[]. Unbox to LinObject*, call lin_object_keys.
-            // Stage 6a: when the argument is a union/Json type, it may be TAG_RECORD (sealed
-            // struct by pointer). Use lin_tagged_keys which dispatches on the tag and handles
-            // both TAG_OBJECT and TAG_RECORD (materializing the sealed struct for the latter).
+            // lin_keys(obj) => String[]. Cluster D: TAG_OBJECT / lin_object_keys removed.
+            // Dispatch: union/Json → lin_tagged_keys (handles TAG_MAP, TAG_RECORD, TAG_MAP);
+            // sealed concrete Object → box as TAG_RECORD + lin_tagged_keys (materialized path);
+            // non-sealed concrete Object / Named / Map → lin_map_keys directly on the LinMap*.
             Intrinsic::Keys => {
                 if let Some(&obj_v) = args.first() {
                     let arg_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
@@ -1066,11 +1074,19 @@ impl<'ctx> Codegen<'ctx> {
                         let f = self.get_or_declare_fn("lin_tagged_keys",
                             ptr_ty.fn_type(&[ptr_ty.into()], false));
                         self.builder.call(f, &[tagged_v.into()], "ir_tagged_keys").try_as_basic_value().unwrap_basic()
-                    } else {
-                        let obj_ptr = self.ir_as_raw_ptr(obj_v, &arg_ty);
-                        let f = self.get_or_declare_fn("lin_object_keys",
+                    } else if matches!(&arg_ty, Type::Object { .. }) && Self::sealed_fields(&arg_ty).is_some() {
+                        // Sealed concrete record: box as TAG_RECORD, then use lin_tagged_keys
+                        // (which materialises it to a LinMap and returns the keys).
+                        let boxed = self.box_value(obj_v, &arg_ty);
+                        let f = self.get_or_declare_fn("lin_tagged_keys",
                             ptr_ty.fn_type(&[ptr_ty.into()], false));
-                        self.builder.call(f, &[obj_ptr.into()], "ir_keys").try_as_basic_value().unwrap_basic()
+                        self.builder.call(f, &[boxed.into()], "ir_tagged_keys_s").try_as_basic_value().unwrap_basic()
+                    } else {
+                        // Non-sealed open object (LinMap*) or Named type — call lin_map_keys.
+                        let obj_ptr = self.ir_as_raw_ptr(obj_v, &arg_ty);
+                        let f = self.get_or_declare_fn("lin_map_keys",
+                            ptr_ty.fn_type(&[ptr_ty.into()], false));
+                        self.builder.call(f, &[obj_ptr.into()], "ir_mkeys").try_as_basic_value().unwrap_basic()
                     }
                 } else { ptr_ty.const_null().into() }
             }

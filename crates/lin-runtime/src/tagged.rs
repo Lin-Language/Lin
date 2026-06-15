@@ -775,6 +775,77 @@ pub unsafe extern "C" fn lin_tagged_clone(p: *const u8) -> *mut u8 {
     alloc_tagged(src.tag, src.payload)
 }
 
+// ── Cluster D: dispatch helpers moved from object.rs ─────────────────────────────────────────────
+// TAG_OBJECT arm removed from all: no producers remain after Phase 3.
+
+/// Return a `String[]` of the keys of a boxed object/map/record value.
+/// Dispatches on the runtime tag: TAG_MAP → `lin_map_keys` (O(1)), TAG_RECORD → materialize to
+/// LinMap then return its keys, else return an empty array. TAG_OBJECT removed (Cluster D).
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_keys(tv: *const u8) -> *mut crate::array::LinArray {
+    if tv.is_null() {
+        return crate::array::lin_array_alloc(0);
+    }
+    let src = &*(tv as *const TaggedVal);
+    match src.tag {
+        TAG_MAP => {
+            crate::map::lin_map_keys(src.payload as *const crate::map::LinMap)
+        }
+        TAG_RECORD => {
+            let sealed = src.payload as *mut u8;
+            if sealed.is_null() {
+                return crate::array::lin_array_alloc(0);
+            }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+            let arr = crate::map::lin_map_keys(mat as *const crate::map::LinMap);
+            crate::map::lin_map_release(mat);
+            arr
+        }
+        _ => crate::array::lin_array_alloc(0),
+    }
+}
+
+/// Check if a boxed value (TaggedVal*) has a given string key. Returns 0/1.
+/// Dispatches: TAG_MAP → `lin_map_has`, TAG_RECORD → materialize + check, else 0.
+/// TAG_OBJECT removed (Cluster D).
+#[no_mangle]
+pub unsafe extern "C" fn lin_value_has_field(tagged: *const u8, key: *const crate::string::LinString) -> u8 {
+    if tagged.is_null() { return 0; }
+    let tv = tagged as *const TaggedVal;
+    match (*tv).tag {
+        TAG_MAP => {
+            let map = (*tv).payload as *const crate::map::LinMap;
+            if map.is_null() { 0 } else { crate::map::lin_map_has(map, key) }
+        }
+        TAG_RECORD => {
+            let sealed = (*tv).payload as *mut u8;
+            if sealed.is_null() { return 0; }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+            let result = if mat.is_null() { 0 } else { crate::map::lin_map_has(mat, key) };
+            crate::map::lin_map_release(mat);
+            result
+        }
+        _ => 0,
+    }
+}
+
+/// Check if a boxed value (TaggedVal*) is an array of length `n` (exact) or `>= n` when
+/// `at_least != 0`. Returns 0 for null/non-array values. Branchless helper for the IR
+/// array-pattern lowering.
+#[no_mangle]
+pub unsafe extern "C" fn lin_value_array_len_check(tagged: *const u8, n: u64, at_least: u8) -> u8 {
+    if tagged.is_null() { return 0; }
+    let tv = &*(tagged as *const TaggedVal);
+    if tv.tag != TAG_ARRAY { return 0; }
+    let arr = tv.payload as *const crate::array::LinArray;
+    if arr.is_null() { return 0; }
+    let len = (*arr).len as u64;
+    let ok = if at_least != 0 { len >= n } else { len == n };
+    ok as u8
+}
+
 #[cfg(test)]
 mod cache_tests {
     use super::*;
