@@ -197,7 +197,7 @@ val tryParseInt32 = (s: String): Int32 | Null
 ```
 
 Parse `s` to an Int32, narrowing to `null` on failure so callers can test with a plain
-`== null` / `is Int32` instead of an untyped `Json` read.
+`== null` / `is Int32` instead of an untyped `AnyVal` read.
 - **`s`** — the string to parse.
 - **Returns** the parsed Int32, or `null` if `s` is not a valid integer.
 

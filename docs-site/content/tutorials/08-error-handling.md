@@ -21,7 +21,7 @@ A function that might fail:
 ```lin
 import { isInt32, parseInt32 } from "std/number"
 
-val parseAge = (s: String): Json =>
+val parseAge = (s: String): AnyVal =>
   if isInt32(s) then
     val n = parseInt32(s)
     if n >= 0 && n <= 150 then { "type": "success", "value": n }
@@ -66,7 +66,7 @@ Chain results by matching each step. Use `is Error` to detect a stdlib failure a
 ```lin
 import { readFile, readJson } from "std/fs"
 
-val loadConfig = (path: String): Json =>
+val loadConfig = (path: String): AnyVal =>
   val fileResult = readFile(path)
   match fileResult
     is Error =>
@@ -82,7 +82,7 @@ val loadConfig = (path: String): Json =>
 
 ## Standard library errors
 
-The standard library (`std/fs`, `std/http`, etc.) returns `Json | Error` or `T | Error`, where `Error` is the built-in `{ "type": String, "message": String }` type. Match with `is Error` to handle failures:
+The standard library (`std/fs`, `std/http`, etc.) returns `AnyVal | Error` or `T | Error`, where `Error` is the built-in `{ "type": String, "message": String }` type. Match with `is Error` to handle failures:
 
 ```lin
 import { readFile } from "std/fs"
@@ -96,7 +96,7 @@ match src
 
 ## Decoding untrusted JSON with `fromJson`
 
-When you have a `Json` value of unknown shape — from a file, an HTTP response, or stdin — the recommended way to get a concrete, validated type is `fromJson` from `std/json`. It performs type-directed, recursive decoding and returns `T | Error`:
+When you have a `AnyVal` value of unknown shape — from a file, an HTTP response, or stdin — the recommended way to get a concrete, validated type is `fromJson` from `std/json`. It performs type-directed, recursive decoding and returns `T | Error`:
 
 ```lin
 import { fromJson } from "std/json"

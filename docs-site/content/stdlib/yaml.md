@@ -2,8 +2,8 @@
 
 std/yaml — parse and serialise YAML.
 
-YAML maps onto the same data model as JSON, so a parsed document is an ordinary `Json` value
-(object, array, string, number, boolean, or null). Because YAML decodes to plain `Json`, it
+YAML maps onto the same data model as JSON, so a parsed document is an ordinary `AnyVal` value
+(object, array, string, number, boolean, or null). Because YAML decodes to plain `AnyVal`, it
 composes directly with std/json's `fromJson` and with std/jq filters — a "yq" query is just a
 `parse` followed by `jq`. Fallible functions return the canonical `Error` value
 `{ "type": "error", "message": String }`, detectable with `is Error`.
@@ -22,22 +22,22 @@ round-trips through the parsed value, not the original text).
 #### `parse`
 
 ```lin
-val parse = (src: String): Json | Error
+val parse = (src: String): AnyVal | Error
 ```
 
-Parse a single YAML document into a Json value.
+Parse a single YAML document into a AnyVal value.
 - **`src`** — the YAML source text.
 - **Returns** the parsed value, or an `Error` if `src` is not valid YAML.
 
 #### `parseAll`
 
 ```lin
-val parseAll = (src: String): Json | Error
+val parseAll = (src: String): AnyVal | Error
 ```
 
 Parse a multi-document YAML stream (`---`-separated) into an array of values.
 - **`src`** — the YAML source text.
-- **Returns** a `Json[]` of the parsed documents, or an `Error` if `src` is not valid YAML.
+- **Returns** a `AnyVal[]` of the parsed documents, or an `Error` if `src` is not valid YAML.
 
 **Example:**
 
@@ -48,17 +48,17 @@ parseAll("a: 1\n---\nb: 2\n").length()  // 2
 #### `stringify`
 
 ```lin
-val stringify = (value: Json): String
+val stringify = (value: AnyVal): String
 ```
 
-Serialize a Json value to a single YAML document.
+Serialize a AnyVal value to a single YAML document.
 - **`value`** — the value to serialize.
 - **Returns** the YAML text.
 
 #### `stringifyAll`
 
 ```lin
-val stringifyAll = (values: Json[]): String
+val stringifyAll = (values: AnyVal[]): String
 ```
 
 Serialize an array of values to a multi-document (`---`-separated) YAML stream.
