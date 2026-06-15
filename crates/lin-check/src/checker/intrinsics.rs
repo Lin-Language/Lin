@@ -178,7 +178,7 @@ impl Checker {
                 Type::Array(Box::new(Type::func(vec![], async_t.clone()))),
             ])], Type::Promise(Box::new(async_t.clone()))));
         // await: <T>(Promise<T>) => T | Error. Resolves the handle to its payload, or the fault
-        // arm (ADR-070). The result type is the `T | Error` UNION — not bare `T` — so the value
+        // arm (ADR-045). The result type is the `T | Error` UNION — not bare `T` — so the value
         // stays tagged at runtime: a faulted await returns an Error object, and unboxing the result
         // as a raw `T` (e.g. i32) would corrupt it. 9101 links the Promise<T> payload to the result.
         self.define_intrinsic("lin_await", Type::func(
