@@ -3,7 +3,7 @@
 std/event — typed event emitters, two layers, fully generic over the event payload type.
 
 Unlike a dynamically-typed emitter, an event here carries a value of a static type `T` — no
-`Json`, no string-tagged `{ type, data }` envelope. Each emitter/bus is parameterised by its
+`AnyVal`, no string-tagged `{ type, data }` envelope. Each emitter/bus is parameterised by its
 payload type, so `emit`/`send` only accept a `T` and listeners receive a `T`. Distinct event
 kinds are distinct types; use a tagged-union `T` if you want several shapes through one bus.
 
@@ -53,7 +53,7 @@ A listener over a payload of type `T`.
 #### `emitter`
 
 ```lin
-val emitter = <T, S>(reduce: (T, S) => S, initial: S, sample: T): Json
+val emitter = <T, S>(reduce: (T, S) => S, initial: S, sample: T): AnyVal
 ```
 
 Spawn a subscriber worker that owns state `S` and folds each delivered `T` into it. `reduce` runs
@@ -93,7 +93,7 @@ stop(sink)
 #### `send`
 
 ```lin
-val send = <T>(e: Json, value: T): Null
+val send = <T>(e: AnyVal, value: T): Null
 ```
 
 Fire-and-forget: enqueue `value` and return immediately. There is no backpressure, so a fast
@@ -104,7 +104,7 @@ producer can outpace a slow reducer and grow the queue.
 #### `request`
 
 ```lin
-val request = <T, S>(e: Json, value: T): S | Error
+val request = <T, S>(e: AnyVal, value: T): S | Error
 ```
 
 Synchronous: enqueue `value` and block until the reducer has folded it. Gives natural backpressure.
@@ -116,7 +116,7 @@ Synchronous: enqueue `value` and block until the reducer has folded it. Gives na
 #### `drain`
 
 ```lin
-val drain = <T, S>(e: Json, sample: T): S | Error
+val drain = <T, S>(e: AnyVal, sample: T): S | Error
 ```
 
 Flush: block until the queue is fully processed and return the accumulated state. Because the
@@ -130,7 +130,7 @@ returned state reflects them all.
 #### `stop`
 
 ```lin
-val stop = (e: Json): Null
+val stop = (e: AnyVal): Null
 ```
 
 Shut the emitter's worker down (drain in-flight, run the no-op onClose, join).

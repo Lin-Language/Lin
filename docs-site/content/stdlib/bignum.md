@@ -18,7 +18,7 @@ across a thread boundary, so bignum math runs on the main thread.
 #### `BigInt`
 
 ```lin
-type BigInt = Json
+type BigInt = AnyVal
 ```
 
 

@@ -105,10 +105,103 @@ impl LinString {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Small-string freelist
+//
+// Most strings produced at runtime are short (interp benchmark: 620K allocs,
+// avg len 1.1 bytes; dijkstra: 137K short strings). Recycling small blocks
+// avoids the malloc/free round-trip and the allocator's per-block metadata.
+//
+// Design:
+//   * SIZE_CLASSES: a small fixed set of rounded allocation sizes covering
+//     total block sizes up to MAX_SMALL_SIZE (32 bytes → len ≤ 24).
+//   * Each class owns one `Mutex<Vec<*mut u8>>` of free raw blocks, capped at
+//     POOL_CAP entries to bound resident memory.
+//   * lin_string_alloc: if the needed block size fits a class, pop from the
+//     pool (or alloc_zeroed on empty), then initialise header fields.
+//   * lin_string_free:  if block size fits a class AND pool not full, push
+//     the raw pointer back (the block is fully owned: refcount hit 0 before
+//     lin_string_release called us). Otherwise dealloc.
+//
+// SAFETY: `*mut u8` raw pointers are wrapped in the `RawPtr` newtype to
+// satisfy `Send` / `Sync`.  Sound because the pointers are unaliased heap
+// blocks that we own exclusively at the time of push/pop; the Mutex ensures
+// no two threads access the pool concurrently.
+// ---------------------------------------------------------------------------
+
+/// LinString header size in bytes (refcount:u32 + len:u32).
+const HEADER_SIZE: usize = std::mem::size_of::<LinString>();
+/// Alignment requirement for LinString allocations (u32 = 4 bytes).
+const HEADER_ALIGN: usize = std::mem::align_of::<u32>();
+
+/// Maximum total block size (header + data) served from the freelist.
+const MAX_SMALL_SIZE: usize = 32;
+
+/// Rounded allocation sizes for size classes (all multiples of HEADER_ALIGN).
+const SIZE_CLASSES: [usize; 4] = [8, 12, 20, 32];
+
+/// Maximum free blocks to retain per size class.
+const POOL_CAP: usize = 512;
+
+struct RawPtr(*mut u8);
+// SAFETY: these are unaliased, exclusively-owned heap blocks.
+unsafe impl Send for RawPtr {}
+unsafe impl Sync for RawPtr {}
+
+struct StringPool {
+    classes: [Mutex<Vec<RawPtr>>; 4],
+}
+
+static STRING_POOL: OnceLock<StringPool> = OnceLock::new();
+
+fn string_pool() -> &'static StringPool {
+    STRING_POOL.get_or_init(|| StringPool {
+        classes: [
+            Mutex::new(Vec::new()),
+            Mutex::new(Vec::new()),
+            Mutex::new(Vec::new()),
+            Mutex::new(Vec::new()),
+        ],
+    })
+}
+
+/// Return the index into SIZE_CLASSES for a block of `size` bytes, or None if too large.
+#[inline]
+fn size_class(size: usize) -> Option<usize> {
+    if size > MAX_SMALL_SIZE {
+        return None;
+    }
+    for (i, &cls) in SIZE_CLASSES.iter().enumerate() {
+        if size <= cls {
+            return Some(i);
+        }
+    }
+    None
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_alloc(len: u32) -> *mut LinString {
-    let size = std::mem::size_of::<LinString>() + len as usize;
-    let layout = Layout::from_size_align_unchecked(size, std::mem::align_of::<u32>());
+    let size = HEADER_SIZE + len as usize;
+    if let Some(ci) = size_class(size) {
+        let cls_size = SIZE_CLASSES[ci];
+        let pool = string_pool();
+        let block = {
+            let mut guard = pool.classes[ci].lock().unwrap();
+            guard.pop().map(|p| p.0)
+        };
+        let ptr = if let Some(raw) = block {
+            // Reused block: zero-fill so stale data from previous use is gone.
+            std::ptr::write_bytes(raw, 0, cls_size);
+            raw as *mut LinString
+        } else {
+            let layout = Layout::from_size_align_unchecked(cls_size, HEADER_ALIGN);
+            alloc_zeroed(layout) as *mut LinString
+        };
+        (*ptr).refcount = 1;
+        (*ptr).len = len;
+        return ptr;
+    }
+    let layout = Layout::from_size_align_unchecked(size, HEADER_ALIGN);
     let ptr = alloc_zeroed(layout) as *mut LinString;
     (*ptr).refcount = 1;
     (*ptr).len = len;
@@ -117,8 +210,21 @@ pub unsafe extern "C" fn lin_string_alloc(len: u32) -> *mut LinString {
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_free(s: *mut LinString) {
-    let size = std::mem::size_of::<LinString>() + (*s).len as usize;
-    let layout = Layout::from_size_align_unchecked(size, std::mem::align_of::<u32>());
+    let size = HEADER_SIZE + (*s).len as usize;
+    if let Some(ci) = size_class(size) {
+        let pool = string_pool();
+        let mut guard = pool.classes[ci].lock().unwrap();
+        if guard.len() < POOL_CAP {
+            guard.push(RawPtr(s as *mut u8));
+            return;
+        }
+        // Pool full — fall through to dealloc.
+        drop(guard);
+        let layout = Layout::from_size_align_unchecked(SIZE_CLASSES[ci], HEADER_ALIGN);
+        dealloc(s as *mut u8, layout);
+        return;
+    }
+    let layout = Layout::from_size_align_unchecked(size, HEADER_ALIGN);
     dealloc(s as *mut u8, layout);
 }
 
@@ -315,7 +421,7 @@ pub unsafe extern "C" fn lin_string_cmp(a: *const LinString, b: *const LinString
 // Lazily built on first use via `OnceLock` (a `LinString` is a heap allocation, so it can't be
 // a compile-time `static` like the plain-data box cache). The raw pointers are wrapped in a
 // `Send`/`Sync` newtype: sound precisely because the targets are immortal + immutable.
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 struct IntStrCache(Vec<*mut LinString>);
 // SAFETY: every pointer targets an immortal, immutable LinString (refcount = IMMORTAL_RC);
 // nothing ever writes through them or frees them, so sharing across threads cannot race.
@@ -1179,10 +1285,12 @@ unsafe fn push_json_map(out: &mut String, map: *const crate::map::LinMap) {
             if i > 0 { out.push(','); }
             let raw = *(*map).order.add(i);
             let val_ptr: *const TaggedVal = if is_int {
-                let mut buf = String::new();
-                use std::fmt::Write;
-                let _ = write!(buf, "{}", raw as i64);
-                push_json_escaped(out, &buf);
+                // Integer keys never need JSON escaping — write the digits directly
+                // into `out` wrapped in quotes, avoiding a per-entry heap allocation.
+                use std::fmt::Write as _;
+                out.push('"');
+                let _ = write!(out, "{}", raw as i64);
+                out.push('"');
                 crate::map::lin_map_get_int(map, raw as i64)
             } else {
                 let key_ptr = raw as *const crate::string::LinString;

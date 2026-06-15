@@ -1,6 +1,6 @@
 # std/jq
 
-std/jq — query `Json` values with jq filter programs, backed by a pure-Rust jq engine.
+std/jq — query `AnyVal` values with jq filter programs, backed by a pure-Rust jq engine.
 
 A filter is a stream: it can produce zero, one, or many output values. `jq` returns the full
 result set as an array; `jqFirst` returns just the first (or null). Both compile errors
@@ -22,13 +22,13 @@ and logic, and the standard builtins (`select`, `map`, `keys`, `has`, `length`, 
 #### `jq`
 
 ```lin
-val jq = (input: Json, filter: String): Json | Error
+val jq = (input: AnyVal, filter: String): AnyVal | Error
 ```
 
-Run a jq filter over a Json value and collect all results.
-- **`input`** — the Json value to query.
+Run a jq filter over a AnyVal value and collect all results.
+- **`input`** — the AnyVal value to query.
 - **`filter`** — the jq filter expression.
-- **Returns** a `Json[]` of the filter's outputs, or an `Error` object if the filter is invalid or
+- **Returns** a `AnyVal[]` of the filter's outputs, or an `Error` object if the filter is invalid or
   fails to evaluate.
 
 **Example:**
@@ -46,11 +46,11 @@ jq({ "xs": [1, 2, 3] }, ".xs | add")                      // [6]
 #### `jqFirst`
 
 ```lin
-val jqFirst = (input: Json, filter: String): Json | Error
+val jqFirst = (input: AnyVal, filter: String): AnyVal | Error
 ```
 
 Run a jq filter and return only its first result.
-- **`input`** — the Json value to query.
+- **`input`** — the AnyVal value to query.
 - **`filter`** — the jq filter expression.
 - **Returns** the first output value, `null` if the filter produced none, or the `Error` object if the
   query failed.

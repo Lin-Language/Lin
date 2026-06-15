@@ -25,7 +25,7 @@ lock-free read-only state any thread can share without copying.
 #### `async`
 
 ```lin
-val async = (f: Json): Json
+val async = (f: AnyVal): AnyVal
 ```
 
 `async` runs thunk `f` concurrently and returns an opaque `Promise<T>` handle; resolve it with
@@ -52,12 +52,12 @@ Resolve a promise to its value.
 #### `parallel`
 
 ```lin
-val parallel = (tasks: Json): Json[]
+val parallel = (tasks: AnyVal): AnyVal[]
 ```
 
 Run a list of thunks concurrently and collect their results in order.
-- **`tasks`** — an array of zero-argument thunks (`(() => T)[]`, passed as `Json`).
-- **Returns** a `Json[]` of the results, one per task, in input order.
+- **`tasks`** — an array of zero-argument thunks (`(() => T)[]`, passed as `AnyVal`).
+- **Returns** a `AnyVal[]` of the results, one per task, in input order.
 
 **Example:**
 
@@ -68,11 +68,11 @@ val [a, b, c] = parallel([() => fetchUsers(), () => fetchPosts(), () => fetchCom
 #### `race`
 
 ```lin
-val race = (promises: Json): Json
+val race = (promises: AnyVal): AnyVal
 ```
 
 Return a promise that resolves to the first of `promises` to settle.
-- **`promises`** — an array of `Promise` handles (passed as `Json`).
+- **`promises`** — an array of `Promise` handles (passed as `AnyVal`).
 - **Returns** an opaque `Promise` handle for the first settled result; resolve with `await`.
 
 **Example:**
@@ -84,7 +84,7 @@ val fastest = await(race([async(() => fetchFrom("a")), async(() => fetchFrom("b"
 #### `timeout`
 
 ```lin
-val timeout = (p: Json, ms: Int32): Json
+val timeout = (p: AnyVal, ms: Int32): AnyVal
 ```
 
 Return a promise that fails with a timeout `Error` if `p` does not settle within `ms`.
@@ -101,11 +101,11 @@ match await(timeout(longOp, 5000)) is Null => print("timed out") is Error => pri
 #### `retry`
 
 ```lin
-val retry = (f: Json, times: Int32): Json
+val retry = (f: AnyVal, times: Int32): AnyVal
 ```
 
 Retry a faulting thunk up to `times` attempts.
-- **`f`** — a zero-argument thunk `() => T` (passed as `Json`).
+- **`f`** — a zero-argument thunk `() => T` (passed as `AnyVal`).
 - **`times`** — the maximum number of attempts.
 - **Returns** an opaque `Promise` handle; awaiting it yields the first success, or the last `Error`.
 
@@ -118,7 +118,7 @@ val data = await(retry(() => unstableFetch(), 3))
 #### `threadPool`
 
 ```lin
-val threadPool = (size: Int32): Json
+val threadPool = (size: Int32): AnyVal
 ```
 
 Create a fixed-size pool of worker threads.
@@ -128,14 +128,14 @@ Create a fixed-size pool of worker threads.
 #### `poolAsync`
 
 ```lin
-val poolAsync = (pool: Json, f: Json): Json
+val poolAsync = (pool: AnyVal, f: AnyVal): AnyVal
 ```
 
 Submit thunk `f` to a thread pool for execution. A pool bounds concurrency: at most `n` thunks
 run at once, and excess work queues until a worker frees up. Designed for the dot-call form
 `pool.poolAsync(thunk)`.
 - **`pool`** — a pool handle from `threadPool`.
-- **`f`** — a zero-argument thunk `() => T` (passed as `Json`).
+- **`f`** — a zero-argument thunk `() => T` (passed as `AnyVal`).
 - **Returns** an opaque `Promise` handle for the result; resolve with `await`.
 
 **Example:**
@@ -153,7 +153,7 @@ val result = await(pool.poolAsync(() => heavyWork()))
 #### `worker`
 
 ```lin
-val worker = (handler: Json, onClose: Json): Json
+val worker = (handler: AnyVal, onClose: AnyVal): AnyVal
 ```
 
 Spawn a long-lived worker thread that owns thread-confined state.
@@ -189,7 +189,7 @@ close(w)
 #### `request`
 
 ```lin
-val request = (w: Json, msg: Json): Json
+val request = (w: AnyVal, msg: AnyVal): AnyVal
 ```
 
 Send `msg` to a worker and block until it replies. This is synchronous and gives backpressure.
@@ -200,7 +200,7 @@ Send `msg` to a worker and block until it replies. This is synchronous and gives
 #### `message`
 
 ```lin
-val message = (w: Json, msg: Json): Null
+val message = (w: AnyVal, msg: AnyVal): Null
 ```
 
 Send `msg` to a worker, fire-and-forget: enqueue it and return immediately, with no reply.
@@ -210,7 +210,7 @@ Send `msg` to a worker, fire-and-forget: enqueue it and return immediately, with
 #### `close`
 
 ```lin
-val close = (w: Json): Null
+val close = (w: AnyVal): Null
 ```
 
 Shut a worker down (drain in-flight work, run its `onClose`, join the thread).
@@ -219,7 +219,7 @@ Shut a worker down (drain in-flight work, run its `onClose`, join the thread).
 #### `shared`
 
 ```lin
-val shared = (v: Json): Shared
+val shared = (v: AnyVal): Shared
 ```
 
 Box a value into opt-in shared mutable state.
@@ -231,7 +231,7 @@ Box a value into opt-in shared mutable state.
 #### `get`
 
 ```lin
-val get = (s: Shared): Json
+val get = (s: Shared): AnyVal
 ```
 
 Snapshot the current value out of a `Shared` cell under the lock.
@@ -241,7 +241,7 @@ Snapshot the current value out of a `Shared` cell under the lock.
 #### `set`
 
 ```lin
-val set = (s: Shared, v: Json): Null
+val set = (s: Shared, v: AnyVal): Null
 ```
 
 Copy a new value into a `Shared` cell under the write lock.
@@ -251,7 +251,7 @@ Copy a new value into a `Shared` cell under the write lock.
 #### `withLock`
 
 ```lin
-val withLock = (s: Shared, f: Function): Json
+val withLock = (s: Shared, f: Function): AnyVal
 ```
 
 Mutate a `Shared` cell in place under the write lock.
@@ -280,7 +280,7 @@ val current = get(counter)     // snapshot copy; set(counter, 100) replaces it
 #### `frozen`
 
 ```lin
-val frozen = (v: Json): Json
+val frozen = (v: AnyVal): AnyVal
 ```
 
 Deep-freeze a transferable graph into opt-in shared read-only state.

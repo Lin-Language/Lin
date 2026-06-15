@@ -12,13 +12,14 @@
 //! This is the interned-string immortality trick generalized from one string to a whole graph.
 //! Cost: a frozen graph is **never freed** — `frozen` is for load-once, program-lifetime data.
 
-use crate::tagged::{TaggedVal, TAG_STR, TAG_ARRAY, TAG_MAP};
+use crate::tagged::{TaggedVal, TAG_STR, TAG_ARRAY, TAG_MAP, TAG_RECORD, TAG_SUMNODE};
 use crate::string::{LinString, IMMORTAL_RC};
 use crate::array::{LinArray, LinArrayElem};
 use crate::map::LinMap;
 
-/// Recursively seal a `LinString` immortal (idempotent).
-unsafe fn freeze_string(s: *mut LinString) {
+/// Recursively seal a `LinString` immortal (idempotent). `pub(crate)` so the sum-node freeze walk
+/// (`sumnode::lin_sumnode_freeze`) can seal a variant's string fields with the same primitive.
+pub(crate) unsafe fn freeze_string(s: *mut LinString) {
     if !s.is_null() {
         (*s).refcount = IMMORTAL_RC;
     }
@@ -26,7 +27,7 @@ unsafe fn freeze_string(s: *mut LinString) {
 
 /// Recursively seal a `LinArray` and all its (tagged) elements immortal. Flat scalar arrays have
 /// no nested pointers, so only the header is sealed.
-unsafe fn freeze_array(arr: *mut LinArray) {
+pub(crate) unsafe fn freeze_array(arr: *mut LinArray) {
     if arr.is_null() || (*arr).refcount >= IMMORTAL_RC {
         return; // null or already frozen (also breaks any accidental sharing/cycle)
     }
@@ -41,7 +42,7 @@ unsafe fn freeze_array(arr: *mut LinArray) {
 }
 
 /// Recursively seal a `LinMap` (string-keyed open object, TAG_MAP) immortal.
-unsafe fn freeze_map(map: *mut LinMap) {
+pub(crate) unsafe fn freeze_map(map: *mut LinMap) {
     if map.is_null() || (*map).refcount >= IMMORTAL_RC {
         return;
     }
@@ -66,7 +67,53 @@ unsafe fn freeze_payload(tag: u8, payload: u64) {
         TAG_STR => freeze_string(payload as *mut LinString),
         TAG_ARRAY => freeze_array(payload as *mut LinArray),
         TAG_MAP => freeze_map(payload as *mut LinMap),
-        _ => {} // scalars (TAG_OBJECT has no producers after Phase 3)
+        // A packed record / sum node boxed into a dynamic (AnyVal/union) slot — e.g. produced by
+        // lin_box_record / lin_box_sumnode on the sealed→AnyVal coerce path — must ALSO be sealed,
+        // else a frozen graph holding one leaves that node MORTAL: shared read-only across threads
+        // under non-atomic RC, a stray release frees it → cross-thread UAF (the exact thing frozen()
+        // exists to prevent). Recurse into its heap fields via the type's descriptor.
+        TAG_RECORD => freeze_sealed(payload as *mut u8),
+        TAG_SUMNODE => crate::sumnode::lin_sumnode_freeze(payload as *mut u8),
+        _ => {} // scalars; opaque atomic handles (Shared/BigInt/Decimal) are already immortal-safe
+    }
+}
+
+/// Recursively seal a packed sealed-record struct (TAG_RECORD) immortal: saturate its own offset-0
+/// refcount and freeze every heap field per the descriptor at header offset 8. Mirrors
+/// `sealed::release_heap_fields`' descriptor walk but immortal-seals instead of releasing.
+/// (Kept here, not in sealed.rs, so the freeze walk and the drop walk don't share a file during the
+/// reset; the planned TagClass walker unification — docs/TODO.md B2 — will merge these.)
+pub(crate) unsafe fn freeze_sealed(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    let rc = ptr as *mut u32;
+    if *rc >= IMMORTAL_RC {
+        return; // already frozen — also breaks any accidental sharing/cycle
+    }
+    *rc = IMMORTAL_RC;
+    // heap_desc @ offset 8; NULL for a scalar-only record.
+    let desc = *((ptr.add(8)) as *const *const u8);
+    if desc.is_null() {
+        return;
+    }
+    let count = *(desc as *const u32);
+    let entries = desc.add(4); // each entry = { u32 offset, u32 kind }
+    for i in 0..count as usize {
+        let ent = entries.add(i * 8);
+        let offset = *(ent as *const u32) as usize;
+        let kind = *((ent.add(4)) as *const u32);
+        let payload = *(ptr.add(offset) as *const *mut u8);
+        if payload.is_null() {
+            continue;
+        }
+        match kind {
+            crate::sealed::KIND_STRING => freeze_string(payload as *mut LinString),
+            crate::sealed::KIND_ARRAY => freeze_array(payload as *mut LinArray),
+            crate::sealed::KIND_SEALED => freeze_sealed(payload),
+            crate::sealed::KIND_MAP => freeze_map(payload as *mut LinMap),
+            _ => {}
+        }
     }
 }
 

@@ -82,19 +82,19 @@ val dirName = (filePath: String): String =>
   )
   join(dirParts)
 
-// Check if a Json value is a stdlib Error value
-val isError = (v: Json): Boolean =>
+// Check if a AnyVal value is a stdlib Error value
+val isError = (v: AnyVal): Boolean =>
   v != null && v["type"] == "error"
 
 // Get file content string from readFile result (returns "" on error)
-val fileContent = (v: Json): String =>
+val fileContent = (v: AnyVal): String =>
   if isError(v) then
     ""
   else
     v
 
 // Get error message from an Error value
-val errorMsg = (v: Json): String =>
+val errorMsg = (v: AnyVal): String =>
   if v == null then
     "unknown error"
   else if v["message"] == null then
@@ -103,7 +103,7 @@ val errorMsg = (v: Json): String =>
     v["message"]
 
 // Process a single markdown file, returning Null
-val processFile = (filePath: String, navEntries: Json): Null =>
+val processFile = (filePath: String, navEntries: AnyVal): Null =>
   val sourceJson = readFile(filePath)
   if isError(sourceJson) then
     print("Error reading ${filePath}: ${errorMsg(sourceJson)}")

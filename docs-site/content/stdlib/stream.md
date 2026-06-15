@@ -193,7 +193,7 @@ Release the stream's underlying resource explicitly.
 #### `promise`
 
 ```lin
-val promise = (s: Stream): Json
+val promise = (s: Stream): AnyVal
 ```
 
 Terminal: drive the pipeline on a worker thread for real concurrency and fault isolation. The

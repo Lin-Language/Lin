@@ -106,15 +106,15 @@ val describe = (p: Person): String =>
 
 The type checker enforces that the object has the required fields.
 
-## Working with `Json`
+## Working with `AnyVal`
 
-When you don't know the shape in advance — e.g., data from a file or HTTP request — use the `Json` type:
+When you don't know the shape in advance — e.g., data from a file or HTTP request — use the `AnyVal` type:
 
 ```lin
 import { readJson } from "std/fs"
 import { print } from "std/io"
 
-val result = readJson("config.json")   // Json | Error
+val result = readJson("config.json")   // AnyVal | Error
 match result
   is Error => print("error: ${result["message"]}")
   else =>
@@ -122,6 +122,6 @@ match result
     print(config["version"])
 ```
 
-`Json` allows accessing any key without type errors. The result of a bracket access on `Json` is also `Json`.
+`AnyVal` allows accessing any key without type errors. The result of a bracket access on `AnyVal` is also `AnyVal`.
 
-Note that `Json` is a *covariant sink*: any value assigns into a `Json`, but a `Json` value does not implicitly assign out to a concrete object type with required fields. To convert untrusted `Json` into a typed value, validate it with `fromJson` (from `std/json`) or narrow it with `is`/`has`.
+Note that `AnyVal` is a *covariant sink*: any value assigns into a `AnyVal`, but a `AnyVal` value does not implicitly assign out to a concrete object type with required fields. To convert untrusted `AnyVal` into a typed value, validate it with `fromJson` (from `std/json`) or narrow it with `is`/`has`.

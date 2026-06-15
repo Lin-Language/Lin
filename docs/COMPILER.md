@@ -278,7 +278,7 @@ Each `LinFunction` is walked block-by-block. A `temp_map: HashMap<Temp, BasicVal
 | `Str` | `ptr` (to heap-allocated `LinString`) |
 | `Array(T)` | `ptr` (to heap-allocated `LinArray`) |
 | `Object(...)` | `ptr` (to heap-allocated `LinObject`) |
-| `Union(...)` / `TypeVar` (Json/any) | `ptr` (to heap-allocated `TaggedVal`) |
+| `Union(...)` / `TypeVar` (AnyVal/any) | `ptr` (to heap-allocated `TaggedVal`) |
 | `Function { ... }` | `ptr` (to `{ fn_ptr, env_ptr }` closure pair) |
 | `Null` | `i8` (constant `0`) |
 
