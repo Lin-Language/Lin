@@ -441,6 +441,27 @@ key type for the dynamic map form. `{ String: T }` reads "any number of string k
 to `T`". It is a distinct type from a fixed-field record `{ "f": T, … }`: a value is *either* a
 fixed record *or* an index-signature map, never both.
 
+**Numeric (integer) keys — `{ Int: T }`.** The key type may instead be an **integer family** (`Int8`…
+`Int64`, `UInt8`…`UInt64`, or the `Int` alias), giving a hashmap keyed by an integer rather than a
+string:
+
+```txt
+val seen: { Int32: Boolean } = {}
+seen[42] = true
+seen[1_000_000] = true        // sparse keys — no dense array allocated
+val hit = seen[42]            // type: Boolean | Null
+val miss = seen[7]            // → Null
+```
+
+Integer keys are stored as a raw `i64` inline in the hash slot (no per-key allocation, no pointer
+chase), so an integer map is **faster and smaller** than a string map; key `0`, negatives, and large
+sparse keys all work. Keys normalize to `i64` and compare by integer value (so an `Int32` index into
+a `{ Int64: T }` map is accepted, mirroring numeric `==`). **`Float` keys are rejected** (equality is
+a footgun), as are union/`AnyVal`/`Function`/handle key types. A map has exactly one key kind — you
+cannot mix string and integer keys in one map. Sealed-record and array key types are a planned
+extension (see `docs/proposals/numeric-key-maps.md`); for *dense* `0..N` indices prefer an array, not
+a map.
+
 **Literal-union key — sugar for a fixed record.** When the key identifier instead resolves to a
 **closed union of string literals** (or a single string-literal type), the `{ K: V }` form is
 **sugar** for the fixed record with one field per literal, all of value type `V`:
@@ -463,10 +484,11 @@ Because the meaning of `{ K: V }` depends on what `K` resolves to — `String` �
 string-literal union ⇒ fixed record — these two have different runtime representations; changing a
 key alias from one to the other changes the type. See ADR-055.
 
-- `m[k]` requires `k : String` and yields `T | Null` (a missing key is `Null`, consistent with the
-  §6.1 safe-bracket rule). A non-String key (e.g. a numeric value) is a compile-time error
-  (`a `{ String: T }` is keyed by String, but the key is `…``) — the read and write key rules are
-  symmetric. For the *defaulted* read, `m[k] ?? default` uses the built-in null-coalescing operator
+- `m[k]` requires `k` to match the map's **key type** (`String` for a `{ String: T }` map, the
+  integer family for a `{ Int: T }` map) and yields `T | Null` (a missing key is `Null`, consistent
+  with the §6.1 safe-bracket rule). A key of the wrong kind — a numeric key into a `{ String: T }`
+  map, or a string key into a `{ Int: T }` map — is a compile-time error; the read and write key
+  rules are symmetric. For the *defaulted* read, `m[k] ?? default` uses the built-in null-coalescing operator
   `??` (§8.3); for a keyed default the dot-applicable `object.get(m, k, default)` (`std/object`)
   remains the convenience. Both give the default an independent type `D`, so the result is `T | D`
   (and `T | Null` when the default is omitted); a same-typed default collapses `T | D` to a bare `T`.
