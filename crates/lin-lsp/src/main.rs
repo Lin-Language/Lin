@@ -1276,14 +1276,22 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
     pre_resolve_imports(&module, &effective_base, &mut imported, &mut visiting);
 
     let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
+    let mut import_type_decls: HashMap<(String, String), (Vec<String>, Type)> = HashMap::new();
     for (path, imp_module) in &imported {
         for (name, ty) in extract_exports(imp_module) {
             import_type_map.insert((path.clone(), name), ty);
+        }
+        // Imported `type` declarations live on `exported_types`, NOT in the val-export map
+        // above. They must be registered into `import_type_decls` or imported type aliases
+        // used in annotations resolve as "Unknown type" (mirrors lin-compile's import path).
+        for (name, decl) in &imp_module.exported_types {
+            import_type_decls.insert((path.clone(), name.clone()), decl.clone());
         }
     }
 
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
+    checker.import_type_decls = import_type_decls;
 
     let typed = match checker.check_module(&module) {
         Ok(typed) => Some(typed),
@@ -1505,14 +1513,22 @@ fn pre_resolve_imports(
             pre_resolve_imports(&ast_mod, &child_base, cache, visiting);
 
             let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
+            let mut import_type_decls: HashMap<(String, String), (Vec<String>, Type)> =
+                HashMap::new();
             for (dep_path, dep_module) in cache.iter() {
                 for (name, ty) in extract_exports(dep_module) {
                     import_type_map.insert((dep_path.clone(), name), ty);
+                }
+                // Register imported `type` declarations so transitively-imported types
+                // (a local module importing types from another local module) also resolve.
+                for (name, decl) in &dep_module.exported_types {
+                    import_type_decls.insert((dep_path.clone(), name.clone()), decl.clone());
                 }
             }
 
             let mut checker = Checker::new();
             checker.import_types = import_type_map;
+            checker.import_type_decls = import_type_decls;
             // Trusted stdlib modules legitimately reference `lin_*` intrinsics (ADR-060); allow
             // them here so resolving an imported `std/...` dependency doesn't spuriously error.
             let is_stdlib = stdlib_source(path.as_str()).is_some();
@@ -1528,14 +1544,12 @@ fn pre_resolve_imports(
 /// Export name→type map for an imported module, used to enrich completion detail / signature for
 /// imported symbols.
 ///
-/// LIMITATION (FIX 5, intentionally not implemented): only `val` exports are surfaced. `var` and
-/// `type` exports are NOT, because they cannot be recovered from the typed IR here: `TypedStmt::Var`
-/// carries only a `slot` (no `name`), and `type` declarations are ERASED entirely (there is no
-/// `TypedStmt::TypeDecl`). So adding arms for them is not the trivial, obviously-correct change the
-/// task scoped FIX 5 to — surfacing them would require either a name on `TypedStmt::Var` or reading
-/// the surface AST and re-deriving types, neither of which is low-risk. The user-visible effect is
-/// minor: completion of an IMPORTED `var`/`type` shows no inferred-type detail (the name still
-/// completes via the cross-file index; hover/goto on the export site itself are unaffected).
+/// This surfaces only `val` exports (for completion detail). Imported `type` declarations are
+/// handled separately and DO resolve in annotations: callers read them from
+/// `TypedModule.exported_types` into `Checker::import_type_decls` (see `analyse` /
+/// `pre_resolve_imports`), mirroring lin-compile's import path. `var` exports are still not
+/// surfaced here — `TypedStmt::Var` carries only a `slot` (no `name`) — but that only costs
+/// inferred-type detail in completion; the name still completes via the cross-file index.
 fn extract_exports(module: &TypedModule) -> Vec<(String, Type)> {
     module
         .statements
@@ -7376,6 +7390,67 @@ export val thingCount = 7
         pre_resolve_imports(&entry, &dir, &mut cache, &mut visiting);
 
         assert!(cache.contains_key("leaf"), "acyclic import should resolve: {:?}", cache.keys().collect::<Vec<_>>());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An imported `type` used in a type annotation must NOT produce a false-positive
+    /// "Unknown type" diagnostic. The checker resolves imported type aliases via
+    /// `import_type_decls`, sourced from each imported module's `exported_types`; `analyse`
+    /// must populate that map (the val-export map alone does not carry type decls).
+    #[test]
+    fn imported_type_used_in_annotation_is_not_unknown() {
+        let dir = std::env::temp_dir().join(format!("lin_lsp_imptype_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("gtfs.lin"),
+            "export type Trip = { id: String }\n",
+        )
+        .unwrap();
+
+        let main_src = "import { Trip } from \"./gtfs\"\nval trips: Trip[] = []\n";
+        let analysis = analyse(main_src, Some(&dir));
+
+        let unknown: Vec<_> = analysis
+            .diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Unknown type"))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "imported type `Trip` used in annotation must resolve, got: {:?}",
+            unknown.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Transitively-imported types resolve too: module `b` imports a type from `c` and
+    /// re-exports it; `pre_resolve_imports` must register `c`'s `exported_types` while
+    /// checking `b`, or `b` itself fails to resolve the type and never lands in the cache.
+    #[test]
+    fn transitively_imported_type_resolves_through_pre_resolve() {
+        let dir = std::env::temp_dir().join(format!("lin_lsp_transtype_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("c.lin"), "export type Id = String\n").unwrap();
+        std::fs::write(
+            dir.join("b.lin"),
+            "import { Id } from \"c\"\nexport val makeId = (x: Id) => x\n",
+        )
+        .unwrap();
+
+        let entry = parse("import { makeId } from \"b\"\n");
+        let mut cache: HashMap<String, TypedModule> = HashMap::new();
+        let mut visiting: HashSet<String> = HashSet::new();
+        pre_resolve_imports(&entry, &dir, &mut cache, &mut visiting);
+
+        // `b` checked successfully only if its `Id` annotation resolved (otherwise the
+        // checker errors and `b` is never inserted into the cache).
+        assert!(
+            cache.contains_key("b"),
+            "module `b` using a transitively-imported type must check: {:?}",
+            cache.keys().collect::<Vec<_>>()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
