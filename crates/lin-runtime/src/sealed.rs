@@ -300,16 +300,13 @@ pub unsafe extern "C" fn lin_sealed_release_self(ptr: *mut u8) {
 // codes below — they cover SCALARS too (unlike the heap-only `KIND_*`), and their boxing matches
 // `Codegen::type_tag` / `box_value` exactly (UInt8/16/32 → INT64-positive; Float32 → FLOAT64).
 
-/// Named-descriptor field kinds. MUST stay in lockstep with `Codegen::sealed_named_field_kind`.
-pub const NKIND_INT32: u32 = 1; // Int8/Int16/Int32 → lin_box_int32
-pub const NKIND_INT64: u32 = 2; // Int64, UInt8/UInt16/UInt32 (zero-extended positive) → lin_box_int64
-pub const NKIND_UINT64: u32 = 3; // UInt64 → lin_box_uint64
-pub const NKIND_FLOAT64: u32 = 4; // Float32/Float64 → lin_box_float64
-pub const NKIND_BOOL: u32 = 5; // Bool → lin_box_bool
-pub const NKIND_STRING: u32 = 6; // *LinString heap field → retain + lin_box_str
-pub const NKIND_ARRAY: u32 = 7; // *LinArray heap field → retain + lin_box_array
-pub const NKIND_SEALED: u32 = 8; // *sealed-struct heap field → recurse via nested NamedDesc
-pub const NKIND_MAP: u32 = 9; // *LinMap heap field → retain + lin_box_map
+/// Named-descriptor field kinds — re-exported from `lin_common::tags` (the single source of truth).
+/// Both the runtime and codegen reference `lin_common::tags::NKIND_*` directly; these re-exports
+/// keep existing call-sites in this file working without qualification changes.
+pub use lin_common::tags::{
+    NKIND_INT32, NKIND_INT64, NKIND_UINT64, NKIND_FLOAT64, NKIND_BOOL,
+    NKIND_STRING, NKIND_ARRAY, NKIND_SEALED, NKIND_MAP,
+};
 
 /// Read a NamedField row at byte offset `cur` in the blob. Returns the parsed fields and the offset
 /// just past the row (so the caller can walk to the next field).
@@ -616,13 +613,7 @@ unsafe fn struct_size_from_named_desc(named_desc: *const u8) -> usize {
     for _ in 0..field_count {
         let (offset, nkind, _nested, _name, next) = read_named_field(named_desc, cur);
         cur = next;
-        let field_size: usize = match nkind {
-            NKIND_INT32 => 4,
-            NKIND_INT64 | NKIND_UINT64 | NKIND_FLOAT64 => 8,
-            NKIND_BOOL => 1,
-            // heap fields and anything else: pointer = 8 bytes
-            _ => 8,
-        };
+        let field_size: usize = lin_common::tags::nkind_size_align(nkind).0 as usize;
         let end = offset as usize + field_size;
         if end > max_end { max_end = end; }
     }
@@ -711,6 +702,13 @@ pub unsafe fn alloc_sealed_struct_from_map(
 ) -> *mut u8 {
     let size = struct_size_from_named_desc(named_desc);
     let sptr = lin_sealed_alloc(size, heap_desc, named_desc);
+    // Verify that our dynamically-reconstructed size matches what lin_sealed_alloc stored in the
+    // header (offset 4). A mismatch means nkind_size_align diverged from codegen's sealed_slot_size.
+    debug_assert_eq!(
+        *((sptr.add(4)) as *const u32) as usize,
+        size,
+        "sealed alloc size mismatch: nkind_size_align reconstruction ({size}) != header stored size"
+    );
     pack_named_payload_from_map(sptr.add(SEALED_HEADER), map, named_desc);
     sptr
 }

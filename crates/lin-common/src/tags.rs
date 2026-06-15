@@ -70,3 +70,35 @@ pub const TAG_TAR_ENTRY: u8 = 24;
 /// read fields via the named descriptor exactly as `TAG_SUMNODE` does via `lin_sumnode_materialize`.
 /// A `TAG_RECORD` and a `TAG_OBJECT` with identical fields compare EQUAL (`lin_tagged_eq`).
 pub const TAG_RECORD: u8 = 25;
+
+// ── Named-descriptor field kind codes (NKIND_*) ───────────────────────────────────────────────────
+// Shared by `lin-runtime` (sealed.rs) and `lin-codegen` (types.rs). Both crates MUST reference
+// these constants and call `nkind_size_align` for field-size derivation — never re-derive locally.
+pub const NKIND_INT32: u32 = 1; // Int8/Int16/Int32 → 4 bytes
+pub const NKIND_INT64: u32 = 2; // Int64, UInt8/UInt16/UInt32 (zero-extended) → 8 bytes
+pub const NKIND_UINT64: u32 = 3; // UInt64 → 8 bytes
+pub const NKIND_FLOAT64: u32 = 4; // Float32/Float64 → 8 bytes
+pub const NKIND_BOOL: u32 = 5; // Bool → 1 byte
+pub const NKIND_STRING: u32 = 6; // *LinString heap field → 8-byte pointer
+pub const NKIND_ARRAY: u32 = 7; // *LinArray heap field → 8-byte pointer
+pub const NKIND_SEALED: u32 = 8; // *sealed-struct heap field → 8-byte pointer
+pub const NKIND_MAP: u32 = 9; // *LinMap heap field → 8-byte pointer
+
+/// Returns `(byte_size, alignment)` for a named-descriptor field kind code.
+/// This is the SINGLE SOURCE OF TRUTH for the nkind → layout mapping shared by the
+/// runtime (`lin_runtime::sealed`) and the codegen (`lin_codegen::codegen::types`).
+/// Heap-pointer field kinds (String/Array/Sealed/Map) all occupy an 8-byte pointer slot.
+/// Scalar kinds use their natural width (which equals their natural alignment for all cases here).
+/// Returns `(8, 8)` for any unknown code as a safe fail-open (pointer-sized slot).
+#[inline]
+pub const fn nkind_size_align(nkind: u32) -> (u32, u32) {
+    match nkind {
+        NKIND_INT32  => (4, 4),
+        NKIND_INT64  => (8, 8),
+        NKIND_UINT64 => (8, 8),
+        NKIND_FLOAT64 => (8, 8),
+        NKIND_BOOL   => (1, 1),
+        // All heap-pointer kinds: String, Array, Sealed, Map — and any future additions.
+        _ => (8, 8),
+    }
+}
