@@ -762,26 +762,29 @@ unsafe fn push_display_array(out: &mut String, arr: *const crate::array::LinArra
 /// Serialize a LinMap (string-keyed open object) to JSON.
 unsafe fn push_display_map(out: &mut String, map: *const crate::map::LinMap) {
     if map.is_null() { out.push_str("{}"); return; }
-    let cap = (*map).cap as usize;
-    // Collect occupied slots as (key, value) pairs then sort by key for deterministic output.
-    let mut pairs: Vec<(&str, *const TaggedVal)> = Vec::new();
-    for i in 0..cap {
-        let slot = (*map).slots.add(i);
-        if (*slot).hash == 0 {
-            continue;
-        }
-        let key_ptr = (*slot).key as *const crate::string::LinString;
-        let key_str = if key_ptr.is_null() { "" } else { (*key_ptr).as_str() };
-        pairs.push((key_str, &(*slot).value as *const TaggedVal));
-    }
-    pairs.sort_unstable_by_key(|(k, _)| *k);
+    // Iterate the map's INSERTION-ORDER array so a record (which is now map-backed) serialises in
+    // field-declaration order, matching the legacy LinObject behaviour. (Was: collect slots + sort
+    // alphabetically — a Phase-3 key-order regression for records.)
+    let len = (*map).len as usize;
+    let is_int = (*map).key_kind == crate::map::KEY_KIND_INT;
     out.push('{');
-    for (i, (key_str, val_ptr)) in pairs.iter().enumerate() {
-        if i > 0 { out.push_str(", "); }
-        out.push('"');
-        out.push_str(key_str);
-        out.push_str("\": ");
-        push_display_value(out, *val_ptr);
+    if !(*map).order.is_null() {
+        for i in 0..len {
+            if i > 0 { out.push_str(", "); }
+            out.push('"');
+            let raw = *(*map).order.add(i);
+            let val_ptr: *const TaggedVal = if is_int {
+                use std::fmt::Write;
+                let _ = write!(out, "{}", raw as i64);
+                crate::map::lin_map_get_int(map, raw as i64)
+            } else {
+                let key_ptr = raw as *const crate::string::LinString;
+                if !key_ptr.is_null() { out.push_str((*key_ptr).as_str()); }
+                crate::map::lin_map_get(map, key_ptr)
+            };
+            out.push_str("\": ");
+            push_display_value(out, val_ptr);
+        }
     }
     out.push('}');
 }
@@ -1251,29 +1254,36 @@ unsafe fn push_json_object(out: &mut String, obj: *const crate::object::LinObjec
     out.push('}');
 }
 
-/// Emit a `LinMap` as strict JSON (alphabetically sorted keys; keys+string values are escaped).
+/// Emit a `LinMap` as strict JSON in INSERTION order (so a map-backed record serialises in
+/// field-declaration order; keys+string values are escaped).
 /// Phase 2: `lin_sumnode_materialize` now returns a `*LinMap`, so the json-serializer needs this.
 unsafe fn push_json_map(out: &mut String, map: *const crate::map::LinMap) {
     if map.is_null() {
         out.push_str("{}");
         return;
     }
-    let cap = (*map).cap as usize;
-    let mut pairs: Vec<(&str, *const TaggedVal)> = Vec::new();
-    for i in 0..cap {
-        let slot = (*map).slots.add(i);
-        if (*slot).hash == 0 { continue; }
-        let key_ptr = (*slot).key as *const crate::string::LinString;
-        let key_str = if key_ptr.is_null() { "" } else { (*key_ptr).as_str() };
-        pairs.push((key_str, &(*slot).value as *const TaggedVal));
-    }
-    pairs.sort_unstable_by_key(|(k, _)| *k);
+    let len = (*map).len as usize;
+    let is_int = (*map).key_kind == crate::map::KEY_KIND_INT;
     out.push('{');
-    for (i, (key_str, val_ptr)) in pairs.iter().enumerate() {
-        if i > 0 { out.push(','); }
-        push_json_escaped(out, key_str);
-        out.push(':');
-        push_json_value(out, *val_ptr);
+    if !(*map).order.is_null() {
+        for i in 0..len {
+            if i > 0 { out.push(','); }
+            let raw = *(*map).order.add(i);
+            let val_ptr: *const TaggedVal = if is_int {
+                let mut buf = String::new();
+                use std::fmt::Write;
+                let _ = write!(buf, "{}", raw as i64);
+                push_json_escaped(out, &buf);
+                crate::map::lin_map_get_int(map, raw as i64)
+            } else {
+                let key_ptr = raw as *const crate::string::LinString;
+                let key_str = if key_ptr.is_null() { "" } else { (*key_ptr).as_str() };
+                push_json_escaped(out, key_str);
+                crate::map::lin_map_get(map, key_ptr)
+            };
+            out.push(':');
+            push_json_value(out, val_ptr);
+        }
     }
     out.push('}');
 }

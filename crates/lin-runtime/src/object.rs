@@ -1007,7 +1007,7 @@ pub unsafe extern "C" fn lin_object_has(obj: *const LinObject, key: *const LinSt
 /// TAG_RECORD in a dynamic slot (Stage 6a). Hot paths (lin_tagged_index etc.) use their
 /// own descriptor-driven fast path; do NOT use this there.
 pub unsafe fn tagged_as_object(tv: *const TaggedVal) -> Option<(*const LinObject, bool)> {
-    use crate::tagged::{TAG_OBJECT, TAG_RECORD};
+    use crate::tagged::{TAG_OBJECT, TAG_RECORD, TAG_MAP};
     if tv.is_null() { return None; }
     match (*tv).tag {
         TAG_OBJECT => {
@@ -1022,6 +1022,29 @@ pub unsafe fn tagged_as_object(tv: *const TaggedVal) -> Option<(*const LinObject
             let mat = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
             if mat.is_null() { return None; }
             Some((mat as *const LinObject, true))
+        }
+        // Phase 3: dynamic objects + materialized records are now `LinMap` (TAG_MAP). Callers that
+        // still read fields out of a `LinObject` (lin_array_set's sealed pack, server/http response
+        // serialisation) get a TRANSIENT +1 LinObject built from the map (released by the caller via
+        // the `owned=true` flag). Iterates the map's insertion-order array so field order is
+        // preserved. (Phase 4/5 migrates these consumers to read the map directly, retiring this arm.)
+        TAG_MAP => {
+            let map = (*tv).payload as *const crate::map::LinMap;
+            if map.is_null() { return None; }
+            let len = (*map).len as usize;
+            let obj = lin_object_alloc(len as u32);
+            if !(*map).order.is_null() {
+                for i in 0..len {
+                    let key = *(*map).order.add(i) as *mut LinString;
+                    if key.is_null() { continue; }
+                    let val = crate::map::lin_map_get(map, key);
+                    let null_tv = TaggedVal { tag: crate::tagged::TAG_NULL, _pad: [0; 7], payload: 0 };
+                    let val_ref = if val.is_null() { &null_tv } else { &*val };
+                    // lin_object_set retains the value's inner (+1); the map keeps its own ref.
+                    lin_object_set(obj, key, val_ref);
+                }
+            }
+            Some((obj as *const LinObject, true))
         }
         _ => None,
     }

@@ -46,6 +46,34 @@ unsafe fn clone_string(s: *const LinString) -> *mut LinString {
 /// inserted key + value payload, so we DROP our construction references afterwards (release the
 /// cloned key; release the cloned value payload via a temporary box) to leave exactly the map's own
 /// +1 per entry. Frozen/immortal maps are shared read-only (zero-copy), mirroring clone_array.
+/// Deep-clone ONE tagged value for cross-thread transfer, returning a fully independent
+/// `(tag, payload)` that shares NO pointer with `src` (the transfer invariant, ADR-028).
+/// Phase 3: a `TAG_RECORD` (packed sealed struct) or `TAG_OBJECT` (legacy LinObject) transfers as
+/// a fresh `TAG_MAP` (dynamic objects are map-backed); every other tag keeps its tag with a
+/// deep-cloned payload via `transfer_payload` (scalars verbatim; string/array/map deep-copy;
+/// Shared/TarEntry retained). Used by `clone_map`, `clone_array`, and the CAP_OBJECT env clone so
+/// they share one correct implementation — previously the CAP_OBJECT path used bare
+/// `transfer_payload`, which aliased a nested object/record field across the thread boundary (UAF).
+unsafe fn transfer_clone_value(src: &TaggedVal) -> TaggedVal {
+    use crate::tagged::{TAG_MAP, TAG_OBJECT, TAG_RECORD};
+    if src.tag == TAG_RECORD {
+        let sealed = src.payload as *const u8;
+        let named_desc = if sealed.is_null() { std::ptr::null() } else {
+            *((sealed.add(16)) as *const *const u8)
+        };
+        let map = crate::sealed::materialize_sealed_to_map_pub(src.payload as *mut u8, named_desc);
+        let cloned = clone_map(map as *const crate::map::LinMap);
+        if !map.is_null() { crate::map::lin_map_release(map); }
+        TaggedVal { tag: TAG_MAP, _pad: [0; 7], payload: cloned as u64 }
+    } else if src.tag == TAG_OBJECT {
+        let cloned = clone_object_as_map(src.payload as *const LinObject);
+        TaggedVal { tag: TAG_MAP, _pad: [0; 7], payload: cloned as u64 }
+    } else {
+        let payload = transfer_payload(src.tag, src.payload);
+        TaggedVal { tag: src.tag, _pad: [0; 7], payload }
+    }
+}
+
 unsafe fn clone_map(src: *const crate::map::LinMap) -> *mut crate::map::LinMap {
     if src.is_null() {
         return std::ptr::null_mut();
@@ -62,24 +90,7 @@ unsafe fn clone_map(src: *const crate::map::LinMap) -> *mut crate::map::LinMap {
             if (*slot).hash == 0 {
                 continue; // empty slot
             }
-            let src_v = &(*slot).value;
-            // TAG_RECORD and TAG_OBJECT both transfer as TAG_MAP (Phase 3).
-            let v = if src_v.tag == crate::tagged::TAG_RECORD {
-                let sealed = src_v.payload as *const u8;
-                let named_desc = if sealed.is_null() { std::ptr::null() } else {
-                    *((sealed.add(16)) as *const *const u8)
-                };
-                let map = crate::sealed::materialize_sealed_to_map_pub(src_v.payload as *mut u8, named_desc);
-                let cloned = clone_map(map as *const crate::map::LinMap);
-                if !map.is_null() { crate::map::lin_map_release(map); }
-                TaggedVal { tag: crate::tagged::TAG_MAP, _pad: [0; 7], payload: cloned as u64 }
-            } else if src_v.tag == crate::tagged::TAG_OBJECT {
-                let cloned = clone_object_as_map(src_v.payload as *const LinObject);
-                TaggedVal { tag: crate::tagged::TAG_MAP, _pad: [0; 7], payload: cloned as u64 }
-            } else {
-                let cloned_payload = transfer_payload(src_v.tag, src_v.payload);
-                TaggedVal { tag: src_v.tag, _pad: [0; 7], payload: cloned_payload }
-            };
+            let v = transfer_clone_value(&(*slot).value);
             // Insert into the destination map. For String maps, deep-clone the key; for Int maps
             // the key is a scalar (no RC).
             if is_int {
@@ -269,25 +280,10 @@ pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
     for i in 0..len as usize {
         let se = (*src).data.add(i);
         let de = (*dst).data.add(i);
-        // TAG_RECORD and TAG_OBJECT both transfer as TAG_MAP (Phase 3).
-        if (*se).tag == crate::tagged::TAG_RECORD {
-            let sealed = (*se).payload as *const u8;
-            let named_desc = if sealed.is_null() { std::ptr::null() } else {
-                *((sealed.add(16)) as *const *const u8)
-            };
-            let map = crate::sealed::materialize_sealed_to_map_pub((*se).payload as *mut u8, named_desc);
-            let cloned = clone_map(map as *const crate::map::LinMap);
-            if !map.is_null() { crate::map::lin_map_release(map); }
-            (*de).tag = crate::tagged::TAG_MAP;
-            (*de).payload = cloned as u64;
-        } else if (*se).tag == crate::tagged::TAG_OBJECT {
-            let cloned = clone_object_as_map((*se).payload as *const LinObject);
-            (*de).tag = crate::tagged::TAG_MAP;
-            (*de).payload = cloned as u64;
-        } else {
-            (*de).tag = (*se).tag;
-            (*de).payload = transfer_payload((*se).tag, (*se).payload);
-        }
+        let src_tv = TaggedVal { tag: (*se).tag, _pad: [0; 7], payload: (*se).payload };
+        let cloned = transfer_clone_value(&src_tv);
+        (*de).tag = cloned.tag;
+        (*de).payload = cloned.payload;
     }
     (*dst).len = len;
     dst
@@ -503,11 +499,10 @@ pub unsafe fn transfer_clone_env(env_ptr: *const u8, desc: *const u8) -> *mut u8
                     for j in 0..len as usize {
                         let se = (*src_obj).entries.add(j);
                         let key = clone_string((*se).key);
-                        let v: TaggedVal = {
-                            let mut v = TaggedVal { tag: (*se).value.tag, _pad: [0; 7], payload: 0 };
-                            v.payload = transfer_payload((*se).value.tag, (*se).value.payload);
-                            v
-                        };
+                        // Deep-clone the field value — `transfer_clone_value` handles a nested
+                        // object/record (→ TAG_MAP) instead of aliasing it across the thread
+                        // boundary (the prior bare `transfer_payload` was a cross-thread UAF).
+                        let v = transfer_clone_value(&(*se).value);
                         crate::object::object_push_owned(dst, key, v);
                     }
                     dst as u64
