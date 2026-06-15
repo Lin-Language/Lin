@@ -2577,6 +2577,61 @@ print(if back["Mon"] then "ok" else "no")
     assert_eq!(output, vec!["ok"]);
 }
 
+// ── Integer-literal union types ─────────────────────────────────────────────────────────────────
+
+/// `type DaysOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6` — basic round-trip: assign a member value,
+/// pass to a function, match exhaustively, get the right result.
+#[test]
+fn test_int_lit_type_member_ok() {
+    let output = run(r#"import { print } from "std/io"
+
+type DaysOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6
+
+val dayName = (d: DaysOfWeek): String =>
+  match d
+    is 0 => "Sunday"
+    is 1 => "Monday"
+    is 2 => "Tuesday"
+    is 3 => "Wednesday"
+    is 4 => "Thursday"
+    is 5 => "Friday"
+    is 6 => "Saturday"
+
+val today: DaysOfWeek = 3
+print(dayName(today))
+"#);
+    assert_eq!(output, vec!["Wednesday"]);
+}
+
+/// Assigning a value outside the declared integer-literal union is a compile-time type error.
+#[test]
+fn test_int_lit_type_out_of_range_is_type_error() {
+    let err = run_expect_err(r#"type DaysOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6
+val bad: DaysOfWeek = 9
+"#);
+    // The error should mention the expected union and the bad literal.
+    assert!(
+        err.contains("Expected type") && err.contains("9"),
+        "expected out-of-range type error, got: {err}"
+    );
+}
+
+/// A non-exhaustive match on an integer-literal union emits a compile-time error listing
+/// the uncovered cases.
+#[test]
+fn test_int_lit_type_non_exhaustive_match_is_error() {
+    let err = run_expect_err(r#"type DaysOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6
+val dayName = (d: DaysOfWeek): String =>
+  match d
+    is 0 => "Sunday"
+    is 1 => "Monday"
+"#);
+    assert!(
+        err.contains("non-exhaustive") && err.contains("2"),
+        "expected non-exhaustive match error, got: {err}"
+    );
+}
+
 #[test]
 fn test_index_sig_string_key_still_map_and_bad_key_errors() {
     // The `{ String: V }` map form is UNCHANGED: arbitrary string keys, read yields `V | Null`.
