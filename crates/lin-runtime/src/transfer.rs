@@ -309,7 +309,7 @@ pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
 /// directly (materialise to LinMap, deep-clone, emit TAG_MAP) to avoid the tag-mismatch problem of
 /// returning a LinMap ptr under the original tag.
 unsafe fn transfer_payload(tag: u8, payload: u64) -> u64 {
-    use crate::tagged::{TAG_SHARED, TAG_MAP, TAG_TAR_ENTRY};
+    use crate::tagged::{TAG_SHARED, TAG_MAP, TAG_TAR_ENTRY, TAG_BIGNUM, TAG_DECIMAL};
     match tag {
         TAG_STR => clone_string(payload as *const LinString) as u64,
         TAG_ARRAY => clone_array(payload as *const LinArray) as u64,
@@ -318,6 +318,22 @@ unsafe fn transfer_payload(tag: u8, payload: u64) -> u64 {
             // Nesting/boundary rule (ADR-028 §2.3.1): a Shared box embedded in a transferred
             // value is NOT deep-copied through — bump its atomic refcount and SHARE the box.
             crate::shared::lin_shared_retain_box(payload as *const u8);
+            payload
+        }
+        // BigInt / Decimal are opaque, IMMUTABLE, ATOMICALLY-refcounted heap handles (same shape as
+        // Shared). They surface to the checker as `AnyVal` (`export type BigInt = AnyVal`), so the
+        // async capture/return gate cannot reject them by type — they CAN reach this boundary inside
+        // a transferred graph. Previously they fell through to `_ => payload`, aliasing the box across
+        // the thread with NO refcount bump → freed when one side released while the other still held
+        // it (cross-thread double-free). Retain the box (atomic +1) and share it, exactly like
+        // TAG_SHARED: immutable + atomic RC makes sharing sound; the worker's release goes through the
+        // matching `lin_bignum_release_box` / `lin_decimal_release_box` arm.
+        TAG_BIGNUM => {
+            crate::bignum::lin_bignum_retain_box(payload as *const u8);
+            payload
+        }
+        TAG_DECIMAL => {
+            crate::decimal::lin_decimal_retain_box(payload as *const u8);
             payload
         }
         // Scalars: copy verbatim. (TAG_FUNCTION is not transferable data — the checker
