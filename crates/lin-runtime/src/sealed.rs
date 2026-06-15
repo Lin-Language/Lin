@@ -46,6 +46,12 @@
 //!     descriptor (share-nothing); release frees them via the same descriptor walk.
 
 use std::alloc::{alloc, dealloc, Layout};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+// One heap descriptor is built per distinct sealed type. Named-desc pointers are stable (static
+// codegen globals), so the pointer value is a sound key.
+static HEAP_DESC_MEMO: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
 /// Header size in bytes: `u32 refcount` + `u32 size` + `u64 heap_desc_ptr` + `u64 named_desc_ptr`.
 /// Field payload begins at offset 24. Kept in lockstep with `Codegen::SEALED_HEADER`.
@@ -369,7 +375,11 @@ unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *cons
         let (offset, nkind, nested, name, next) = read_named_field(named_desc, cur);
         cur = next;
         let slot = payload.add(offset as usize - SEALED_HEADER);
-        let key = crate::string::lin_string_from_bytes(name.as_ptr(), name.len() as u32);
+        // Intern the field-name string once per type (static descriptor bytes → stable ptr+len).
+        // lin_string_literal returns an immortal LinString (IMMORTAL_RC); lin_map_set's retain
+        // and lin_map_release's release are both no-ops on immortal strings, so no alloc/free
+        // per materialize call.
+        let key = crate::string::lin_string_literal(name.as_ptr(), name.len() as u32);
         match nkind {
             NKIND_INT32 => {
                 let v = *(slot as *const i32);
@@ -429,7 +439,8 @@ unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *cons
             }
             _ => {}
         }
-        crate::string::lin_string_release(key);
+        // Immortal strings don't need release, but calling lin_string_release on them is a safe
+        // no-op (IMMORTAL_RC guard returns early). Omitting the call removes the branch.
     }
     map
 }
@@ -507,9 +518,9 @@ unsafe fn pack_named_payload_impl(
         let (offset, nkind, _nested, name, next) = read_named_field(named_desc, cur);
         cur = next;
         let dst = slot.add(offset as usize - SEALED_HEADER);
-        let key = crate::string::lin_string_from_bytes(name.as_ptr(), name.len() as u32);
+        // Intern the field-name string once per type (same rationale as materialize_named_payload_to_map).
+        let key = crate::string::lin_string_literal(name.as_ptr(), name.len() as u32);
         let tv = get_tv(key);
-        crate::string::lin_string_release(key);
         let (tag, payload) = if tv.is_null() { (TAG_NULL, 0u64) } else { ((*tv).tag, (*tv).payload) };
         match nkind {
             NKIND_INT32 => {
@@ -621,13 +632,22 @@ unsafe fn struct_size_from_named_desc(named_desc: *const u8) -> usize {
 
 /// Build a heap-only field descriptor from a named descriptor, for the dynamic alloc path on
 /// 0xFD pointer-backed arrays (Stage 2a: heap fields like String/Array/Map). The returned
-/// pointer is valid for the lifetime of the process (leaked once per distinct named_desc, which
-/// is bounded by the number of distinct sealed record types). Returns NULL if there are no heap
-/// fields (scalar-only type → no descriptor needed). The allocation is intentionally leaked (one
-/// per type, not per element) because the heap descriptor must survive all structs of that type.
+/// pointer is valid for the lifetime of the process (allocated once per distinct named_desc
+/// type, memoised in HEAP_DESC_MEMO keyed on the stable static named_desc pointer). Returns
+/// NULL if there are no heap fields (scalar-only type → no descriptor needed).
 pub unsafe fn build_heap_desc_from_named_desc(named_desc: *const u8) -> *const u8 {
     if named_desc.is_null() {
         return std::ptr::null();
+    }
+    let key = named_desc as usize;
+    // Fast path: check the memo under lock before doing any work.
+    {
+        let guard = HEAP_DESC_MEMO.lock().unwrap();
+        if let Some(ref map) = *guard {
+            if let Some(&cached) = map.get(&key) {
+                return cached as *const u8;
+            }
+        }
     }
     let field_count = u32::from_le_bytes([
         *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
@@ -648,21 +668,37 @@ pub unsafe fn build_heap_desc_from_named_desc(named_desc: *const u8) -> *const u
         };
         heap_fields.push((offset, kind));
     }
-    if heap_fields.is_empty() {
-        return std::ptr::null();
+    let result_ptr: *const u8 = if heap_fields.is_empty() {
+        std::ptr::null()
+    } else {
+        // Build the heap descriptor blob: [ u32 count | { u32 offset, u32 kind } * count ]
+        let byte_len = 4 + heap_fields.len() * 8;
+        let layout = std::alloc::Layout::from_size_align_unchecked(byte_len, 4);
+        let ptr = std::alloc::alloc(layout);
+        if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
+        *(ptr as *mut u32) = heap_fields.len() as u32;
+        for (i, (off, kind)) in heap_fields.iter().enumerate() {
+            let ent = ptr.add(4 + i * 8) as *mut u32;
+            *ent = *off;
+            *ent.add(1) = *kind;
+        }
+        ptr as *const u8
+    };
+    // Store in the memo (initialising the map on first use).
+    let mut guard = HEAP_DESC_MEMO.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    // Another thread may have raced and inserted while we built; prefer the winner's allocation
+    // to avoid a double-free: if already present, free the blob we just built and return theirs.
+    if let Some(&existing) = map.get(&key) {
+        if !result_ptr.is_null() {
+            let byte_len = 4 + heap_fields.len() * 8;
+            let layout = std::alloc::Layout::from_size_align_unchecked(byte_len, 4);
+            std::alloc::dealloc(result_ptr as *mut u8, layout);
+        }
+        return existing as *const u8;
     }
-    // Build the heap descriptor blob: [ u32 count | { u32 offset, u32 kind } * count ]
-    let byte_len = 4 + heap_fields.len() * 8;
-    let layout = std::alloc::Layout::from_size_align_unchecked(byte_len, 4);
-    let ptr = std::alloc::alloc(layout);
-    if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
-    *(ptr as *mut u32) = heap_fields.len() as u32;
-    for (i, (off, kind)) in heap_fields.iter().enumerate() {
-        let ent = ptr.add(4 + i * 8) as *mut u32;
-        *ent = *off;
-        *ent.add(1) = *kind;
-    }
-    ptr as *const u8
+    map.insert(key, result_ptr as usize);
+    result_ptr
 }
 
 
