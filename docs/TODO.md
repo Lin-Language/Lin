@@ -146,6 +146,32 @@ spine (B1/B3/B4/B8) is serial + conductor-driven.
 
 ---
 
+## WAVE M — investigate high memory usage (typed RAPTOR ~25 GB vs Node 2–4 GB)  [NEW, high priority]
+
+The typed RAPTOR bench peaks at ~25–28 GB RSS in its RANGE phase; Node does the equivalent in 2–4 GB —
+a 6–12× gap. This is a real competitiveness problem, separate from the correctness/perf work above.
+
+Known data (prior measurement, [[project_gc_retired_not_alloc_bound]]): the run churns ~1.8 B allocations
+but **< 1.3 GB is ever live**. So RSS ≫ live-set by ~20×. That points away from a true unbounded leak and
+toward **allocator retention / fragmentation** (glibc malloc keeps freed small blocks in per-thread arenas
+and rarely `madvise`s them back), but a real retention bug (RC holding per-query result graphs across the
+RANGE loop) is NOT yet ruled out.
+
+Investigation steps (in order — cheap discriminators first):
+- [ ] **Measure live-set vs RSS over time**: sample `/proc/self/statm` (RSS) alongside a periodic
+  `malloc_trim(0)` / `mallinfo2` to see how much is reclaimable arena vs genuinely live. If `malloc_trim`
+  collapses RSS → it's arena retention, not a leak.
+- [ ] **Swap the allocator**: link `mimalloc`/`jemalloc` (or set `MALLOC_ARENA_MAX=1`,
+  `glibc.malloc.trim_threshold`) and re-measure RSS. A large drop confirms allocator fragmentation and may
+  itself be the fix (a one-line dependency).
+- [ ] **Check for a true retention leak**: does RSS grow *monotonically* across the 5 RANGE queries, or
+  plateau? Monotonic growth that survives `malloc_trim` = a real leak (a per-query result graph or
+  materialized record array not reclaimed) — then bisect with the LIN_ALLOC_STATS counters + ASan leak mode.
+- [ ] **Peak working set**: if a phase genuinely needs 25 GB live (e.g. PREP materializing all StopTimes),
+  that's an algorithmic materialization problem (the de-materialization lever in
+  [[project_raptor_dematerialization_measured]]), not allocator.
+Deliverable: root-cause (arena vs leak vs working-set) + the cheapest fix that closes most of the gap.
+
 ## Sequencing
 
 ```
