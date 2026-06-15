@@ -150,11 +150,23 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(f, &[val.into()], "atos").try_as_basic_value().unwrap_basic()
             }
             Type::Object { .. } if Self::sealed_scalar_fields(ty).is_some() => {
-                // Sealed record: still LinObject*-backed; use lin_object_to_string.
+                // Sealed record (TAG_RECORD packed struct): box it first then use lin_tagged_to_string.
+                // lin_object_to_string is retired (Phase 3: sealed records are packed structs, not
+                // LinObjects). Box with lin_box_record (retains → rc+1), call lin_tagged_to_string,
+                // then release the box with lin_tagged_release.
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
-                let f = self.get_or_declare_fn("lin_object_to_string",
+                let box_fn = self.get_or_declare_fn("lin_box_record",
                     ptr_ty.fn_type(&[ptr_ty.into()], false));
-                self.builder.call(f, &[val.into()], "otos").try_as_basic_value().unwrap_basic()
+                let tagged = self.builder.call(box_fn, &[val.into()], "stos_box")
+                    .try_as_basic_value().unwrap_basic();
+                let str_fn = self.get_or_declare_fn("lin_tagged_to_string",
+                    ptr_ty.fn_type(&[ptr_ty.into()], false));
+                let s = self.builder.call(str_fn, &[tagged.into()], "stos")
+                    .try_as_basic_value().unwrap_basic();
+                let rel_fn = self.get_or_declare_fn("lin_tagged_release",
+                    self.context.void_type().fn_type(&[ptr_ty.into()], false));
+                self.builder.call(rel_fn, &[tagged.into()], "");
+                s
             }
             Type::Object { .. } => {
                 // Non-sealed open object: now backed by LinMap* (Phase 2 flip).

@@ -396,28 +396,7 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
     }
 }
 
-/// Public wrapper for retain_tagged_payload, used by array.rs when pushing tagged values.
-pub unsafe fn retain_tagged_payload_pub(tv: &TaggedVal) {
-    retain_tagged_payload(tv);
-}
-
-/// Public wrapper for release_tagged_payload, used by map.rs (the typed-map container reuses the
-/// exact object value RC discipline; see ADR-055).
-pub unsafe fn release_tagged_payload_pub(tv: &TaggedVal) {
-    release_tagged_payload(tv);
-}
-
-/// Retain the heap payload of a boxed TaggedVal* (tag-aware). The codegen `Retain`
-/// instruction can't use `lin_rc_retain` on a TaggedVal* — offset 0 is the tag byte, not a
-/// refcount, so that would corrupt the tag. This reads the tag and bumps the inner value's
-/// refcount, the mirror of the tag-aware `lin_tagged_release`. Null-safe.
-#[no_mangle]
-pub unsafe extern "C" fn lin_tagged_retain(p: *const u8) {
-    if p.is_null() {
-        return;
-    }
-    retain_tagged_payload(&*(p as *const TaggedVal));
-}
+// retain_tagged_payload_pub, release_tagged_payload_pub, lin_tagged_retain moved to tagged.rs (Cluster D).
 
 /// Clone a boxed TaggedVal*: allocate a FRESH TaggedVal box copying the tag+payload and
 /// retain the inner heap payload (if any). Returns an independently-owned box that can be
@@ -489,33 +468,22 @@ pub unsafe extern "C" fn lin_union_force_to_object(tv: *const u8) -> *mut LinObj
                 return std::ptr::null_mut();
             }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            // Materialize to a LinObject via the old path (the codegen obj_b branch reads the result
-            // via lin_object_get; this path is only reached for actual TAG_OBJECT or TAG_RECORD
-            // sources that aren't TAG_MAP, which can't happen after Phase 3 for sealed records).
-            crate::sealed::materialize_sealed_struct_pub(sealed, named_desc)
+            // Materialize to LinMap first, then convert to LinObject (compatibility bridge).
+            // Phase 3: TAG_RECORD no longer reaches this via normal code paths (TAG_OBJECT is dead,
+            // TAG_MAP goes through the arm above). This arm is kept for compilation only.
+            let map = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+            if map.is_null() { return std::ptr::null_mut(); }
+            // Re-enter with a synthetic TAG_MAP tagged value to reuse the map→obj conversion above.
+            let tv2 = crate::tagged::TaggedVal { tag: crate::tagged::TAG_MAP, _pad: [0; 7], payload: map as u64 };
+            let obj = lin_union_force_to_object(&tv2 as *const crate::tagged::TaggedVal as *const u8);
+            crate::map::lin_map_release(map);
+            obj
         }
         _ => std::ptr::null_mut(),
     }
 }
 
-/// keeps store/read/release-old/teardown perfectly symmetric (mirroring the concrete-rc
-/// retain/release pairs) and never frees a box owned by someone else.
-///
-/// Null-safe (null Json → null box). Cached scalar boxes (small ints, bools) are returned
-/// as-is: they are immutable statics, carry no heap payload, and `lin_tagged_release`
-/// no-ops on them, so an alias is safe and avoids a needless allocation.
-#[no_mangle]
-pub unsafe extern "C" fn lin_tagged_clone(p: *const u8) -> *mut u8 {
-    if p.is_null() {
-        return std::ptr::null_mut();
-    }
-    if crate::tagged::is_cached_box_pub(p) {
-        return p as *mut u8;
-    }
-    let src = &*(p as *const TaggedVal);
-    retain_tagged_payload(src);
-    crate::tagged::alloc_tagged(src.tag, src.payload)
-}
+// lin_tagged_clone moved to tagged.rs (Cluster D).
 
 /// Set a field. Key must be a LinString*. Value is a TaggedVal* (pointer to tagged payload).
 /// Copies the 16-byte TaggedVal struct and retains the inner value (the object owns a reference).
@@ -1019,9 +987,23 @@ pub unsafe fn tagged_as_object(tv: *const TaggedVal) -> Option<(*const LinObject
             let sealed = (*tv).payload as *mut u8;
             if sealed.is_null() { return None; }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let mat = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
-            if mat.is_null() { return None; }
-            Some((mat as *const LinObject, true))
+            // Phase 3: materialize to LinMap, then convert map to LinObject (compatibility bridge).
+            let map = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+            if map.is_null() { return None; }
+            let len = (*map).len as usize;
+            let obj = lin_object_alloc(len as u32);
+            if !(*map).order.is_null() {
+                for i in 0..len {
+                    let key = *(*map).order.add(i) as *mut LinString;
+                    if key.is_null() { continue; }
+                    let val = crate::map::lin_map_get(map, key);
+                    let null_tv = TaggedVal { tag: crate::tagged::TAG_NULL, _pad: [0; 7], payload: 0 };
+                    let val_ref = if val.is_null() { &null_tv } else { &*val };
+                    lin_object_set(obj, key, val_ref);
+                }
+            }
+            crate::map::lin_map_release(map);
+            Some((obj as *const LinObject, true))
         }
         // Phase 3: dynamic objects + materialized records are now `LinMap` (TAG_MAP). Callers that
         // still read fields out of a `LinObject` (lin_array_set's sealed pack, server/http response
@@ -1246,7 +1228,7 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
     // Phase 3: TAG_RECORD vs TAG_RECORD (or TAG_RECORD vs TAG_OBJECT/TAG_MAP) comparison.
     // Materialize both sides to LinMap and compare structurally.
     if at == crate::tagged::TAG_RECORD {
-        use crate::tagged::{TAG_RECORD, TAG_OBJECT, TAG_MAP};
+        use crate::tagged::{TAG_RECORD, TAG_MAP};
         let sealed = ap as *const u8;
         if sealed.is_null() { return false; }
         let named_desc = *((sealed.add(16)) as *const *const u8);
@@ -1262,8 +1244,6 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
         } else if bt == TAG_MAP {
             crate::map::lin_map_retain(bp as *mut crate::map::LinMap);
             bp as *mut crate::map::LinMap
-        } else if bt == TAG_OBJECT {
-            crate::map::lin_object_to_map(bp as *const LinObject)
         } else {
             crate::map::lin_map_release(am);
             return false;

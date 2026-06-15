@@ -326,7 +326,7 @@ unsafe fn read_named_field(base: *const u8, cur: usize) -> (u32, u32, *const u8,
 /// its own +1. `nested` is the nested NamedDesc for `NKIND_SEALED` (else ignored). Returns a fresh
 /// heap `TaggedVal*` the caller owns (and must `lin_tagged_release`).
 unsafe fn box_named_heap_field(p: *mut u8, nkind: u32, nested: *const u8) -> *mut u8 {
-    use crate::tagged::{TAG_OBJECT, lin_box_str, lin_box_array, lin_box_map, alloc_tagged};
+    use crate::tagged::{TAG_MAP, lin_box_str, lin_box_array, lin_box_map, alloc_tagged};
     match nkind {
         NKIND_STRING => {
             crate::memory::lin_rc_retain(p as *mut u32);
@@ -342,87 +342,17 @@ unsafe fn box_named_heap_field(p: *mut u8, nkind: u32, nested: *const u8) -> *mu
         }
         NKIND_SEALED => {
             // A nested sealed record stored as a STANDALONE struct (with header). Recurse to a fresh
-            // boxed LinObject so the materialized view is uniform Json. Its heap fields are retained
-            // by the recursive materialize; the parent's pointer keeps its own +1, untouched.
-            let nested_obj = materialize_sealed_struct(p, nested);
-            alloc_tagged(TAG_OBJECT, nested_obj as u64)
+            // LinMap so the materialized view is uniformly map-backed (Phase 3: no TAG_OBJECT).
+            // Its heap fields are retained by the recursive materialize; the parent's pointer
+            // keeps its own +1, untouched.
+            let nested_map = materialize_sealed_struct_to_map(p, nested);
+            alloc_tagged(TAG_MAP, nested_map as u64)
         }
         // A scalar kind should never reach here.
         _ => crate::tagged::lin_box_null(),
     }
 }
 
-/// Materialize a HEADER-LESS packed element payload `payload` (the `data + idx*stride` interior
-/// pointer) into a fresh +1-owned keyed `LinObject` via the NAMED descriptor `named_desc`. Each
-/// scalar field is boxed by value; each heap field is RETAINED and boxed (the returned object owns a
-/// +1, the packed buffer keeps its own). Returns NULL if `named_desc` is NULL (defensive — a 0xFE
-/// array always carries one once codegen emits it).
-unsafe fn materialize_named_payload(payload: *const u8, named_desc: *const u8) -> *mut crate::object::LinObject {
-    use crate::tagged::{
-        TaggedVal, TAG_INT32, TAG_INT64, TAG_UINT64, TAG_FLOAT64, TAG_BOOL,
-    };
-    if named_desc.is_null() {
-        return std::ptr::null_mut();
-    }
-    let field_count = u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)]) as usize;
-    let obj = crate::object::lin_object_alloc(field_count as u32);
-    let mut cur = 4usize;
-    for _ in 0..field_count {
-        let (offset, nkind, nested, name, next) = read_named_field(named_desc, cur);
-        cur = next;
-        let slot = payload.add(offset as usize - SEALED_HEADER);
-        let key = crate::string::lin_string_from_bytes(name.as_ptr(), name.len() as u32);
-        // Build the field's TaggedVal. For SCALAR kinds we read the raw value and stack-build a
-        // TaggedVal (lin_object_set_fresh copies it by value, no inner RC). For HEAP kinds we box a
-        // fresh +1-retained view, then free our temporary box AFTER set_fresh (which took its own +1).
-        match nkind {
-            NKIND_INT32 => {
-                let v = *(slot as *const i32);
-                let tv = TaggedVal { tag: TAG_INT32, _pad: [0; 7], payload: v as i64 as u64 };
-                crate::object::lin_object_set_fresh(obj, key, &tv);
-            }
-            NKIND_INT64 => {
-                let v = *(slot as *const i64);
-                let tv = TaggedVal { tag: TAG_INT64, _pad: [0; 7], payload: v as u64 };
-                crate::object::lin_object_set_fresh(obj, key, &tv);
-            }
-            NKIND_UINT64 => {
-                let v = *(slot as *const u64);
-                let tv = TaggedVal { tag: TAG_UINT64, _pad: [0; 7], payload: v };
-                crate::object::lin_object_set_fresh(obj, key, &tv);
-            }
-            NKIND_FLOAT64 => {
-                let v = *(slot as *const f64);
-                let tv = TaggedVal { tag: TAG_FLOAT64, _pad: [0; 7], payload: v.to_bits() };
-                crate::object::lin_object_set_fresh(obj, key, &tv);
-            }
-            NKIND_BOOL => {
-                let v = *(slot as *const u8);
-                let tv = TaggedVal { tag: TAG_BOOL, _pad: [0; 7], payload: (v != 0) as u64 };
-                crate::object::lin_object_set_fresh(obj, key, &tv);
-            }
-            NKIND_STRING | NKIND_ARRAY | NKIND_SEALED | NKIND_MAP => {
-                // Heap field: the slot holds an 8-byte owned pointer.
-                let p = *(slot as *const *mut u8);
-                if p.is_null() {
-                    use crate::tagged::TAG_NULL;
-                    let tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
-                    crate::object::lin_object_set_fresh(obj, key, &tv);
-                } else {
-                    let boxed = box_named_heap_field(p, nkind, nested);
-                    // set_fresh retains the inner payload (+1 for the object). `boxed` is our fresh
-                    // construction +1; release it to drop construction back to the object's owned +1
-                    // AND free the box shell.
-                    crate::object::lin_object_set_fresh(obj, key, boxed as *const TaggedVal);
-                    crate::tagged::lin_tagged_release(boxed);
-                }
-            }
-            _ => {}
-        }
-        crate::string::lin_string_release(key);
-    }
-    obj
-}
 
 /// Materialize a HEADER-LESS payload into a fresh +1-owned `LinMap` (String-keyed).
 /// Mirrors `materialize_named_payload` but builds a LinMap instead of a LinObject.
@@ -516,22 +446,6 @@ pub unsafe fn materialize_sealed_to_map_pub(ptr: *mut u8, named_desc: *const u8)
     materialize_sealed_struct_to_map(ptr as *const u8, named_desc)
 }
 
-/// Materialize a STANDALONE sealed struct `ptr` (header + payload) into a fresh boxed LinObject via
-/// its NAMED descriptor — used for a nested `NKIND_SEALED` field. The struct's payload begins at
-/// `SEALED_HEADER`; the named descriptor stores struct-relative offsets, so we pass the struct base
-/// adjusted: `materialize_named_payload` expects a header-LESS payload and rebases by
-/// `-SEALED_HEADER`, so we hand it `ptr + SEALED_HEADER`.
-unsafe fn materialize_sealed_struct(ptr: *const u8, named_desc: *const u8) -> *mut crate::object::LinObject {
-    materialize_named_payload(ptr.add(SEALED_HEADER), named_desc)
-}
-
-/// Public wrapper around `materialize_sealed_struct` for use by the pointer-backed array path in
-/// `lin_array_get_tagged`. Takes the struct base pointer (WITH 16-byte header) + named descriptor;
-/// returns a fresh +1-owned `LinObject` for the caller to box and return. Non-null assumption: the
-/// caller checks for null before calling.
-pub unsafe fn materialize_sealed_struct_pub(ptr: *mut u8, named_desc: *const u8) -> *mut crate::object::LinObject {
-    materialize_sealed_struct(ptr as *const u8, named_desc)
-}
 
 /// Materialize element `idx`'s packed payload of a 0xFE sealed-record array into a FRESH +1-owned
 /// keyed `LinMap`, wrapped in a fresh `TaggedVal*` tagged `TAG_MAP`. The caller OWNS the returned
@@ -665,16 +579,6 @@ unsafe fn pack_named_payload_impl(
     }
 }
 
-/// Pack sealed-record payload from a `LinObject` (TAG_OBJECT) source.
-pub unsafe fn pack_named_payload_from_object(
-    slot: *mut u8,
-    obj: *const crate::object::LinObject,
-    named_desc: *const u8,
-) {
-    pack_named_payload_impl(slot, named_desc, |key| {
-        crate::object::lin_object_get(obj, key)
-    });
-}
 
 /// Pack sealed-record payload from a `LinMap` (TAG_MAP) source — Phase 2 open objects.
 pub unsafe fn pack_named_payload_from_map(
@@ -761,21 +665,6 @@ pub unsafe fn build_heap_desc_from_named_desc(named_desc: *const u8) -> *const u
     ptr as *const u8
 }
 
-/// Allocate a fresh sealed struct from a `LinObject` using the named descriptor (for field
-/// names/offsets/kinds) and an optional heap-only descriptor (for RC on drop). For the dynamic
-/// push/set path on a 0xFD pointer-backed array. Returns a +1-owned struct pointer.
-/// `heap_desc` may be NULL for scalar-only records; pass `(*arr).elem_desc` for 0xFD arrays so
-/// that String/Array/Map heap fields are properly released on drop.
-pub unsafe fn alloc_sealed_struct_from_object(
-    obj: *const crate::object::LinObject,
-    named_desc: *const u8,
-    heap_desc: *const u8,
-) -> *mut u8 {
-    let size = struct_size_from_named_desc(named_desc);
-    let sptr = lin_sealed_alloc(size, heap_desc, named_desc);
-    pack_named_payload_from_object(sptr.add(SEALED_HEADER), obj, named_desc);
-    sptr
-}
 
 /// Allocate a fresh sealed struct from a `LinMap` (Phase 2 open objects) using the named
 /// descriptor. For the dynamic push/set path when the source is a TAG_MAP.
@@ -805,8 +694,8 @@ pub unsafe fn alloc_sealed_struct_from_map(
 ///    no inner heap payload → release is a no-op on the inner (just frees the box shell).
 ///  - String/Array/Map: the slot holds an owned pointer; we RETAIN it before boxing (the struct keeps
 ///    its own +1; the caller's +1 release is balanced by this retain). Mirrors `box_named_heap_field`.
-///  - Sealed (nested struct): recurse materialize to a LinObject, box as TAG_OBJECT. Same contract
-///    as `box_named_heap_field(NKIND_SEALED)`.
+///  - Sealed (nested struct): recurse materialize to a LinMap, box as TAG_MAP. Same contract
+///    as `box_named_heap_field(NKIND_SEALED)`. (Phase 3: TAG_OBJECT has no producers.)
 #[no_mangle]
 pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const crate::string::LinString) -> *mut u8 {
     use crate::tagged::{TAG_INT32, TAG_INT64, TAG_UINT64, TAG_FLOAT64, TAG_BOOL, TAG_MAP, alloc_tagged};
@@ -895,7 +784,7 @@ mod named_desc_tests {
     //! correct keyed object that is RC-balanced (run under ASan to judge UAF/leak).
 
     use super::*;
-    use crate::tagged::{TAG_MAP, TAG_OBJECT, TAG_INT32, TAG_STR};
+    use crate::tagged::{TAG_MAP, TAG_INT32, TAG_STR};
 
     /// Build a NamedDesc byte blob matching `Codegen::sealed_named_descriptor`:
     /// `[u32 count | { u32 offset, u32 nkind, u64 nested_ptr, u16 name_len, name_bytes } * count]`.
@@ -1016,22 +905,23 @@ mod named_desc_tests {
         }
     }
 
-    // ----- WRITE direction: `pack_named_payload_from_object` through the dynamic/tagged sinks -----
-    // (the inverse of the materialize tests above; guards the map-value-fetch/push corruption fix —
-    // before it, lin_array_push blind-wrote 16-byte TaggedVal slots into the stride-sized packed
-    // buffer (heap overflow at the 3rd element) and lin_push_dyn silently dropped the element.)
+    // ----- WRITE direction: `pack_named_payload_from_map` through the dynamic/tagged sinks -----
+    // (Phase 3: TAG_OBJECT producers are gone; tests use LinMap instead. Guards the map-value-fetch/
+    // push corruption fix — before it, lin_array_push blind-wrote 16-byte TaggedVal slots into the
+    // stride-sized packed buffer (heap overflow at the 3rd element) and lin_push_dyn silently dropped
+    // the element.)
 
-    /// Build a fresh keyed LinObject `{ x: Int32(xv), y: Int32(yv) }` (rc = 1).
-    unsafe fn make_obj_xy(xv: i32, yv: i32) -> *mut crate::object::LinObject {
+    /// Build a fresh LinMap `{ x: Int32(xv), y: Int32(yv) }` (rc = 1).
+    unsafe fn make_map_xy(xv: i32, yv: i32) -> *mut crate::map::LinMap {
         use crate::tagged::TaggedVal;
-        let obj = crate::object::lin_object_alloc(2);
+        let map = crate::map::lin_map_alloc(2, crate::map::KEY_KIND_STRING);
         for (name, v) in [("x", xv), ("y", yv)] {
             let key = crate::string::lin_string_from_bytes(name.as_ptr(), name.len() as u32);
             let tv = TaggedVal { tag: TAG_INT32, _pad: [0; 7], payload: v as i64 as u64 };
-            crate::object::lin_object_set_fresh(obj, key, &tv);
+            crate::map::lin_map_set(map, key, &tv);
             crate::string::lin_string_release(key);
         }
-        obj
+        map
     }
 
     // Scalar record P { x: Int32, y: Int32 } pushed through BOTH dynamic write sinks, crossing the
@@ -1043,35 +933,33 @@ mod named_desc_tests {
         unsafe {
             use crate::tagged::TaggedVal;
             // Struct-relative offsets (24-byte SEALED_HEADER): x@payload0 → 24, y@payload4 → 28.
-            // Stale-offset fix (were 16/20 from the old 16-byte header).
             let named = build_named_desc(&[
                 ("x", 24, NKIND_INT32, std::ptr::null()),
                 ("y", 28, NKIND_INT32, std::ptr::null()),
             ]);
             let arr = crate::array::lin_sealed_array_alloc(4, 8, std::ptr::null(), named.as_ptr());
-            // 5 pushes via lin_push_dyn (RETAINING contract: the caller keeps its object ref).
+            // 5 pushes via lin_push_dyn (RETAINING contract: the caller keeps its map ref).
             for i in 0..5i32 {
-                let obj = make_obj_xy(i, i * 10);
-                let tv = TaggedVal { tag: TAG_OBJECT, _pad: [0; 7], payload: obj as u64 };
+                let map = make_map_xy(i, i * 10);
+                let tv = TaggedVal { tag: TAG_MAP, _pad: [0; 7], payload: map as u64 };
                 crate::array::lin_push_dyn(arr, &tv);
-                assert_eq!((*obj).refcount, 1, "lin_push_dyn must not consume the caller's ref");
-                crate::object::lin_object_release(obj);
+                assert_eq!((*map).refcount, 1, "lin_push_dyn must not consume the caller's ref");
+                crate::map::lin_map_release(map);
             }
             assert_eq!((*arr).len, 5);
             // Packed bytes are real field values at the element stride (not TaggedVal slots).
             let p = crate::array::lin_sealed_array_elem_ptr(arr, 4);
             assert_eq!(*(p as *const i32), 4);
             assert_eq!(*(p.add(4) as *const i32), 40);
-            // lin_array_push (MOVE contract: consumes one transferred object ref).
-            let obj = make_obj_xy(7, 8);
-            crate::memory::lin_rc_retain(obj as *mut u32); // the codegen-transferred +1 (rc -> 2)
-            let cell: *mut crate::object::LinObject = obj;
-            crate::array::lin_array_push(arr, &cell as *const _ as *const u8, TAG_OBJECT);
-            assert_eq!((*obj).refcount, 1, "lin_array_push must consume exactly the transferred ref");
-            crate::object::lin_object_release(obj);
+            // lin_array_push (MOVE contract: consumes one transferred map ref).
+            let map = make_map_xy(7, 8);
+            crate::memory::lin_rc_retain(map as *mut u32); // the codegen-transferred +1 (rc -> 2)
+            let cell: *mut crate::map::LinMap = map;
+            crate::array::lin_array_push(arr, &cell as *const _ as *const u8, TAG_MAP);
+            assert_eq!((*map).refcount, 1, "lin_array_push must consume exactly the transferred ref");
+            crate::map::lin_map_release(map);
             // Roundtrip element 5 through the materializing boxed reader.
             let tv = crate::array::lin_array_get_tagged(arr, 5);
-            // Phase 3: materialized sealed records are TAG_MAP, not TAG_OBJECT.
             assert_eq!((*tv).tag, TAG_MAP);
             let mat = (*tv).payload as *const crate::map::LinMap;
             let kx = crate::string::lin_string_from_bytes(b"x".as_ptr(), 1);
@@ -1085,15 +973,14 @@ mod named_desc_tests {
     }
 
     // Heap-field record R { name: String, n: Int32 }: the pack retains the String into the slot
-    // (the source object keeps its own ref), and the materialize/drop chain releases it exactly
+    // (the source map keeps its own ref), and the materialize/drop chain releases it exactly
     // once each — RC-balanced end to end (ASan judges leak/double-free).
     #[test]
     fn dynamic_push_packs_heap_field_rc_balanced() {
         unsafe {
             use crate::tagged::TaggedVal;
             // Offsets are struct-relative (include the 24-byte SEALED_HEADER): name@payload0 → 24,
-            // n@payload8 → 32. Stale-offset fix: these read 16/24 from the OLD 16-byte header and were
-            // missed when SEALED_HEADER grew 16→24 for the TAG_RECORD named-desc slot.
+            // n@payload8 → 32.
             let named = build_named_desc(&[
                 ("name", 24, NKIND_STRING, std::ptr::null()),
                 ("n", 32, NKIND_INT32, std::ptr::null()),
@@ -1103,30 +990,29 @@ mod named_desc_tests {
             heap_desc.extend_from_slice(&24u32.to_le_bytes());
             heap_desc.extend_from_slice(&KIND_STRING.to_le_bytes());
             let arr = crate::array::lin_sealed_array_alloc(4, 16, heap_desc.as_ptr(), named.as_ptr());
-            // Source object { name: "hello", n: 42 } — it owns its own +1 on the string.
+            // Source map { name: "hello", n: 42 } — it owns its own +1 on the string.
             let s = crate::string::lin_string_from_bytes(b"hello".as_ptr(), 5);
-            let obj = crate::object::lin_object_alloc(2);
+            let map = crate::map::lin_map_alloc(2, crate::map::KEY_KIND_STRING);
             let kname = crate::string::lin_string_from_bytes(b"name".as_ptr(), 4);
             let tv_name = TaggedVal { tag: TAG_STR, _pad: [0; 7], payload: s as u64 };
-            crate::object::lin_object_set_fresh(obj, kname, &tv_name); // retains: s rc -> 2
+            crate::map::lin_map_set(map, kname, &tv_name); // retains: s rc -> 2
             crate::string::lin_string_release(kname);
             let kn = crate::string::lin_string_from_bytes(b"n".as_ptr(), 1);
             let tv_n = TaggedVal { tag: TAG_INT32, _pad: [0; 7], payload: 42u64 };
-            crate::object::lin_object_set_fresh(obj, kn, &tv_n);
+            crate::map::lin_map_set(map, kn, &tv_n);
             crate::string::lin_string_release(kn);
-            crate::string::lin_string_release(s); // drop our construction ref: obj is sole owner (rc 1)
+            crate::string::lin_string_release(s); // drop our construction ref: map is sole owner (rc 1)
             assert_eq!((*s).refcount, 1);
 
-            let tv = TaggedVal { tag: TAG_OBJECT, _pad: [0; 7], payload: obj as u64 };
+            let tv = TaggedVal { tag: TAG_MAP, _pad: [0; 7], payload: map as u64 };
             crate::array::lin_push_dyn(arr, &tv); // pack retains the string into the slot (rc -> 2)
             assert_eq!((*s).refcount, 2, "the packed slot must take its OWN string ref");
-            crate::object::lin_object_release(obj); // source object drops its ref (rc -> 1, array owns)
+            crate::map::lin_map_release(map); // source map drops its ref (rc -> 1, array owns)
             assert_eq!((*s).refcount, 1);
 
             // Materialize-on-read takes another independent +1.
             let out = crate::array::lin_array_get_tagged(arr, 0);
             assert_eq!((*s).refcount, 2);
-            // Phase 3: materialized sealed records are TAG_MAP, not TAG_OBJECT.
             assert_eq!((*out).tag, TAG_MAP);
             let mat = (*out).payload as *const crate::map::LinMap;
             let k = crate::string::lin_string_from_bytes(b"name".as_ptr(), 4);

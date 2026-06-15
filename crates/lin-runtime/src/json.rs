@@ -1,7 +1,7 @@
 /// JSON parsing and serialization for Lin runtime.
 use crate::string::LinString;
 use crate::array::{LinArray, lin_array_alloc};
-use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_OBJECT, TAG_ARRAY, TAG_MAP, alloc_tagged};
+use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_ARRAY, TAG_MAP, alloc_tagged};
 use crate::fs::{make_string, make_error_tagged, resolve_lin_str};
 use crate::sealed::{
     SEALED_HEADER,
@@ -404,20 +404,6 @@ pub unsafe fn tagged_to_json(tv: *const u8) -> serde_json::Value {
                 vec.push(tagged_to_json(elem as *const u8));
             }
             serde_json::Value::Array(vec)
-        }
-        TAG_OBJECT => {
-            let obj = payload as *const crate::object::LinObject;
-            let len = (*obj).len as usize;
-            let mut map = serde_json::Map::new();
-            for i in 0..len {
-                let entry = (*obj).entries.add(i);
-                let key_s = (*entry).key;
-                let slice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
-                let key_str = std::str::from_utf8_unchecked(slice).to_owned();
-                let val_tv = &(*entry).value as *const TaggedVal as *const u8;
-                map.insert(key_str, tagged_to_json(val_tv));
-            }
-            serde_json::Value::Object(map)
         }
         TAG_MAP => {
             // Phase 2: non-sealed open objects are now backed by LinMap (TAG_MAP).

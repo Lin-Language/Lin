@@ -13,14 +13,13 @@
 
 use std::fmt::Write as _;
 
-use crate::object::{lin_tagged_clone, LinObject};
 use crate::array::{lin_array_length, LinArray};
 use crate::fs::make_decode_error;
 use crate::tagged::{
-    TaggedVal, tagged_as_f64, lin_unbox_ptr,
+    TaggedVal, tagged_as_f64, lin_unbox_ptr, lin_tagged_clone,
     TAG_NULL, TAG_BOOL, TAG_INT8, TAG_INT16, TAG_INT32, TAG_INT64,
     TAG_UINT8, TAG_UINT16, TAG_UINT32, TAG_UINT64, TAG_FLOAT32, TAG_FLOAT64,
-    TAG_STR, TAG_OBJECT, TAG_ARRAY, TAG_RECORD, TAG_MAP,
+    TAG_STR, TAG_ARRAY, TAG_RECORD, TAG_MAP,
 };
 
 // Descriptor opcodes — keep in sync with DescEncoder in lin-codegen.
@@ -223,10 +222,8 @@ unsafe fn validate(
             Ok(())
         }
         KIND_OBJECT => {
-            // Accept TAG_OBJECT, TAG_RECORD (sealed struct, Stage 6a), and TAG_MAP (map-backed
-            // structural types such as error objects returned as LinMap).
-            // For TAG_MAP: field lookup goes through lin_map_get_bytes (same byte-based lookup,
-            // no temp LinString alloc). For TAG_OBJECT/TAG_RECORD: use the existing LinObject path.
+            // Accept TAG_RECORD (sealed struct, Stage 6a) and TAG_MAP (map-backed structural types).
+            // Field lookup goes through lin_map_get_bytes for TAG_MAP (no temp LinString alloc).
             if tag == TAG_MAP {
                 let map = (*(value as *const TaggedVal)).payload as *const crate::map::LinMap;
                 let nfields = desc.u32_at(node + 1) as usize;
@@ -258,18 +255,10 @@ unsafe fn validate(
                     Ok(())
                 })();
             }
-            // Stage 6a: accept TAG_RECORD (sealed struct by pointer) in addition to TAG_OBJECT.
-            // Materialize the sealed struct to a transient LinObject so the field-walk logic below
-            // can use `lin_object_get_bytes` uniformly. The materialized object is owned (+1) and
-            // released after the walk. A TAG_OBJECT passes through unchanged (no alloc).
             // Normalize any object-shaped value to a LinMap for uniform field lookup.
             let (map, map_owned) = if tag == TAG_MAP {
                 let m = (*(value as *const TaggedVal)).payload as *const crate::map::LinMap;
                 (m, false)
-            } else if tag == TAG_OBJECT {
-                let obj = lin_unbox_ptr(value) as *const LinObject;
-                let m = crate::map::lin_object_to_map(obj);
-                (m as *const crate::map::LinMap, !m.is_null())
             } else if tag == TAG_RECORD {
                 let sealed = (*(value as *const TaggedVal)).payload as *mut u8;
                 if sealed.is_null() {

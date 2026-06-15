@@ -71,7 +71,6 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub box_uint64: FunctionValue<'ctx>,
     pub box_float64: FunctionValue<'ctx>,
     pub box_str: FunctionValue<'ctx>,
-    pub box_object: FunctionValue<'ctx>,
     pub box_map: FunctionValue<'ctx>,
     pub box_array: FunctionValue<'ctx>,
     pub box_sumnode: FunctionValue<'ctx>,
@@ -87,16 +86,12 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub unbox_float64: FunctionValue<'ctx>,
     pub unbox_bool: FunctionValue<'ctx>,
     pub unbox_ptr: FunctionValue<'ctx>,
-    pub object_alloc: FunctionValue<'ctx>,
     pub object_set: FunctionValue<'ctx>,
-    pub object_set_fresh: FunctionValue<'ctx>,
     pub object_get: FunctionValue<'ctx>,
-    pub object_eq: FunctionValue<'ctx>,
     pub tagged_to_string: FunctionValue<'ctx>,
     pub rc_retain: FunctionValue<'ctx>,
     pub string_release: FunctionValue<'ctx>,
     pub array_release: FunctionValue<'ctx>,
-    pub object_release: FunctionValue<'ctx>,
     pub closure_release: FunctionValue<'ctx>,
     pub tagged_release: FunctionValue<'ctx>,
     /// Sealed-record (sealed-records Stages 1–2): `lin_sealed_alloc(size: i64, heap_desc: ptr, named_desc: ptr) -> ptr`
@@ -225,7 +220,6 @@ impl<'ctx> RuntimeFns<'ctx> {
         let box_uint64 = module.add_function("lin_box_uint64", ptr_type.fn_type(&[i64_type.into()], false), None);
         let box_float64 = module.add_function("lin_box_float64", ptr_type.fn_type(&[context.f64_type().into()], false), None);
         let box_str = module.add_function("lin_box_str", ptr_type.fn_type(&[ptr_type.into()], false), None);
-        let box_object = module.add_function("lin_box_object", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_map = module.add_function("lin_box_map", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_array = module.add_function("lin_box_array", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_sumnode = module.add_function("lin_box_sumnode", ptr_type.fn_type(&[ptr_type.into()], false), None);
@@ -241,21 +235,14 @@ impl<'ctx> RuntimeFns<'ctx> {
         let unbox_ptr = module.add_function("lin_unbox_ptr", ptr_type.fn_type(&[ptr_type.into()], false), None);
         // lin_tagged_to_string(tagged: ptr) -> ptr (LinString*)
         let tagged_to_string = module.add_function("lin_tagged_to_string", string_ptr_type.fn_type(&[ptr_type.into()], false), None);
-        // lin_object_alloc(initial_cap: i32) -> ptr
-        let object_alloc = module.add_function("lin_object_alloc", ptr_type.fn_type(&[i32_type.into()], false), None);
-        // lin_object_set(obj: ptr, key: ptr, val: ptr) -> void
+        // lin_object_set(obj: ptr, key: ptr, val: ptr) -> void (still used for TAG_OBJECT dynamic dispatch)
         let object_set = module.add_function("lin_object_set", void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false), None);
-        // lin_object_set_fresh(obj: ptr, key: ptr, val: ptr) -> void — no-dup-check literal append
-        let object_set_fresh = module.add_function("lin_object_set_fresh", void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false), None);
         // lin_object_get(obj: ptr, key: ptr) -> ptr (points to TaggedVal, or null)
         let object_get = module.add_function("lin_object_get", ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false), None);
-        // lin_object_eq(a: ptr, b: ptr) -> i8
-        let object_eq = module.add_function("lin_object_eq", i8_type.fn_type(&[ptr_type.into(), ptr_type.into()], false), None);
         // Retain / release: adjust refcount, free if zero.
         let rc_retain = module.add_function("lin_rc_retain", void_type.fn_type(&[ptr_type.into()], false), None);
         let string_release = module.add_function("lin_string_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let array_release = module.add_function("lin_array_release", void_type.fn_type(&[ptr_type.into()], false), None);
-        let object_release = module.add_function("lin_object_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let closure_release = module.add_function("lin_closure_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let tagged_release = module.add_function("lin_tagged_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let sealed_alloc = module.add_function("lin_sealed_alloc", ptr_type.fn_type(&[i64_type.into(), ptr_type.into(), ptr_type.into()], false), None);
@@ -296,7 +283,6 @@ impl<'ctx> RuntimeFns<'ctx> {
             box_uint64,
             box_float64,
             box_str,
-            box_object,
             box_map,
             box_array,
             box_sumnode,
@@ -309,16 +295,12 @@ impl<'ctx> RuntimeFns<'ctx> {
             unbox_float64,
             unbox_bool,
             unbox_ptr,
-            object_alloc,
             object_set,
-            object_set_fresh,
             object_get,
-            object_eq,
             tagged_to_string,
             rc_retain,
             string_release,
             array_release,
-            object_release,
             closure_release,
             tagged_release,
             sealed_alloc,

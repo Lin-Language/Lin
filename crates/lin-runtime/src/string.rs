@@ -1,7 +1,7 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_FLOAT32, TAG_ARRAY, TAG_OBJECT, TAG_MAP};
+use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_FLOAT32, TAG_ARRAY, TAG_MAP};
 
 /// Runtime string representation: reference-counted, UTF-8.
 /// Layout: refcount (u32) | len (u32) | data ([u8; len])
@@ -684,12 +684,6 @@ unsafe fn push_display_value(out: &mut String, tagged: *const TaggedVal) {
         push_display_array(out, arr);
         return;
     }
-    if tag == TAG_OBJECT {
-        let obj = payload as *const crate::object::LinObject;
-        if obj.is_null() { out.push_str("{}"); return; }
-        push_display_object(out, obj);
-        return;
-    }
     if tag == TAG_MAP {
         let map = payload as *const crate::map::LinMap;
         if map.is_null() { out.push_str("{}"); return; }
@@ -789,29 +783,6 @@ unsafe fn push_display_map(out: &mut String, map: *const crate::map::LinMap) {
     out.push('}');
 }
 
-unsafe fn object_to_json_string(obj: *const crate::object::LinObject) -> String {
-    let mut out = String::new();
-    push_display_object(&mut out, obj);
-    out
-}
-
-unsafe fn push_display_object(out: &mut String, obj: *const crate::object::LinObject) {
-    let len = (*obj).len as usize;
-    out.push('{');
-    for i in 0..len {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        let entry = (*obj).entries.add(i);
-        let key = (*entry).key;
-        out.push('"');
-        if key.is_null() { out.push_str("null"); } else { out.push_str((*key).as_str()); }
-        out.push_str("\": ");
-        push_display_value(out, &(*entry).value as *const TaggedVal);
-    }
-    out.push('}');
-}
-
 /// Convert a LinArray* to its JSON string representation.
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_to_string(arr: *const crate::array::LinArray) -> *mut LinString {
@@ -819,16 +790,6 @@ pub unsafe extern "C" fn lin_array_to_string(arr: *const crate::array::LinArray)
         return lin_string_from_bytes(b"null".as_ptr(), 4);
     }
     let s = array_to_json_string(arr);
-    lin_string_from_bytes(s.as_ptr(), s.len() as u32)
-}
-
-/// Convert a LinObject* to its JSON string representation.
-#[no_mangle]
-pub unsafe extern "C" fn lin_object_to_string(obj: *const crate::object::LinObject) -> *mut LinString {
-    if obj.is_null() {
-        return lin_string_from_bytes(b"null".as_ptr(), 4);
-    }
-    let s = object_to_json_string(obj);
     lin_string_from_bytes(s.as_ptr(), s.len() as u32)
 }
 
@@ -916,25 +877,6 @@ unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
                 parts.push(part);
             }
             format!("a:[{}]", parts.join(","))
-        }
-        TAG_OBJECT => {
-            let obj = payload as *const crate::object::LinObject;
-            if obj.is_null() { return "o:{}".to_string(); }
-            let len = (*obj).len as usize;
-            let mut pairs: Vec<(String, String)> = Vec::with_capacity(len);
-            for i in 0..len {
-                let entry = (*obj).entries.add(i);
-                let key_str = if (*entry).key.is_null() {
-                    String::new()
-                } else {
-                    (*(*entry).key).as_str().to_string()
-                };
-                let val_str = tagged_to_key_string(&(*entry).value as *const TaggedVal);
-                pairs.push((key_str, val_str));
-            }
-            pairs.sort_by(|a, b| a.0.cmp(&b.0));
-            let inner: Vec<String> = pairs.into_iter().map(|(k, v)| format!("{}:{}", k, v)).collect();
-            format!("o:{{{}}}", inner.join(","))
         }
         TAG_MAP => {
             let map = payload as *const crate::map::LinMap;
@@ -1063,9 +1005,6 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
     } else if tag == TAG_ARRAY {
         let arr = payload as *const crate::array::LinArray;
         lin_array_to_string(arr)
-    } else if tag == TAG_OBJECT {
-        let obj = payload as *const crate::object::LinObject;
-        lin_object_to_string(obj)
     } else if tag == TAG_MAP {
         let map = payload as *const crate::map::LinMap;
         lin_map_to_string(map)
@@ -1140,12 +1079,7 @@ unsafe fn push_json_value(out: &mut String, tagged: *const TaggedVal) {
             let arr = payload as *const crate::array::LinArray;
             push_json_array(out, arr);
         }
-        TAG_OBJECT => {
-            let obj = payload as *const crate::object::LinObject;
-            push_json_object(out, obj);
-        }
         TAG_MAP => {
-            // Phase 2: non-sealed open objects are now backed by LinMap.
             let map = payload as *const crate::map::LinMap;
             push_json_map(out, map);
         }
@@ -1228,31 +1162,6 @@ unsafe fn push_json_array(out: &mut String, arr: *const crate::array::LinArray) 
     out.push(']');
 }
 
-unsafe fn push_json_object(out: &mut String, obj: *const crate::object::LinObject) {
-    if obj.is_null() {
-        out.push_str("{}");
-        return;
-    }
-    let len = (*obj).len as usize;
-    out.push('{');
-    for i in 0..len {
-        if i > 0 {
-            out.push(',');
-        }
-        let entry = (*obj).entries.add(i);
-        let key = (*entry).key;
-        // Keys are escaped+quoted exactly like string values (the lossy stringifier above
-        // leaves them unescaped — strict JSON requires escaping).
-        if key.is_null() {
-            out.push_str("\"\"");
-        } else {
-            push_json_escaped(out, (*key).as_str());
-        }
-        out.push(':');
-        push_json_value(out, &(*entry).value as *const TaggedVal);
-    }
-    out.push('}');
-}
 
 /// Emit a `LinMap` as strict JSON in INSERTION order (so a map-backed record serialises in
 /// field-declaration order; keys+string values are escaped).
