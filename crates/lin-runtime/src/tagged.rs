@@ -373,38 +373,18 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
         crate::map::lin_map_release(bm);
         return eq;
     }
-    // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` (TAG_SUMNODE) or a Stage-6a
-    // sealed-record pointer (TAG_RECORD) escaped into a dynamic equality. Materialize either operand to
-    // a real LinObject and compare as objects (order-independent structural equality). Transient
-    // materializations released after. TAG_RECORD and TAG_OBJECT with equal fields compare EQUAL (§5.7).
-    if at == TAG_SUMNODE || bt == TAG_SUMNODE || at == TAG_RECORD || bt == TAG_RECORD {
-        let mat = |tv: *const TaggedVal, t: u8| -> (*mut u8, bool) {
-            if t == TAG_SUMNODE {
-                (crate::sumnode::lin_sumnode_materialize((*tv).payload as *mut u8), true)
-            } else if t == TAG_RECORD {
-                // Materialize a sealed struct to a LinObject via its named descriptor (offset 16).
-                let sealed = (*tv).payload as *const u8;
-                if sealed.is_null() {
-                    return (std::ptr::null_mut(), false);
-                }
-                let named_desc = *((sealed.add(16)) as *const *const u8);
-                let obj = crate::sealed::materialize_sealed_struct_pub(sealed as *mut u8, named_desc);
-                (obj as *mut u8, !obj.is_null())
-            } else {
-                ((*tv).payload as *mut u8, false)
-            }
-        };
-        let (ao, a_owned) = mat(av, at);
-        let (bo, b_owned) = mat(bv, bt);
-        let is_obj_a = at == TAG_SUMNODE || at == TAG_OBJECT || at == TAG_RECORD;
-        let is_obj_b = bt == TAG_SUMNODE || bt == TAG_OBJECT || bt == TAG_RECORD;
-        let eq = if is_obj_a && is_obj_b {
-            crate::object::lin_object_eq(ao as *const crate::object::LinObject, bo as *const crate::object::LinObject)
-        } else {
-            0
-        };
-        if a_owned { crate::object::lin_object_release(ao as *mut crate::object::LinObject); }
-        if b_owned { crate::object::lin_object_release(bo as *mut crate::object::LinObject); }
+    // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` (TAG_SUMNODE) or a
+    // sealed-record pointer (TAG_RECORD) or TAG_OBJECT escaped into a dynamic equality. Normalize
+    // both operands to LinMap and compare structurally (order-independent). Transient maps released.
+    if at == TAG_SUMNODE || bt == TAG_SUMNODE || at == TAG_RECORD || bt == TAG_RECORD || at == TAG_OBJECT || bt == TAG_OBJECT {
+        let a_dynobj = at == TAG_MAP || at == TAG_OBJECT || at == TAG_RECORD || at == TAG_SUMNODE;
+        let b_dynobj = bt == TAG_MAP || bt == TAG_OBJECT || bt == TAG_RECORD || bt == TAG_SUMNODE;
+        if !a_dynobj || !b_dynobj { return 0; }
+        let am = crate::map::dynamic_to_map(av);
+        let bm = crate::map::dynamic_to_map(bv);
+        let eq = crate::map::lin_map_eq(am, bm);
+        crate::map::lin_map_release(am);
+        crate::map::lin_map_release(bm);
         return eq;
     }
     let ap = (*av).payload;

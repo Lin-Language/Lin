@@ -459,20 +459,20 @@ pub unsafe extern "C" fn lin_sealed_ptr_array_to_tagged(arr: *const LinArray) ->
     let named_desc = (*arr).elem_named_desc;
     for i in 0..len {
         let sptr = *(((*arr).data as *const *mut u8).add(i as usize));
-        let obj = if sptr.is_null() {
+        let map = if sptr.is_null() {
             std::ptr::null_mut()
         } else {
-            crate::sealed::materialize_sealed_struct_pub(sptr, named_desc) as *mut u8
+            crate::sealed::materialize_sealed_to_map_pub(sptr, named_desc)
         };
         let slot = (*out).data.add(i as usize);
-        if obj.is_null() {
+        if map.is_null() {
             (*slot).tag = TAG_NULL;
             (*slot)._pad = [0; 7];
             (*slot).payload = 0;
         } else {
-            (*slot).tag = TAG_OBJECT;
+            (*slot).tag = TAG_MAP;
             (*slot)._pad = [0; 7];
-            (*slot).payload = obj as u64;
+            (*slot).payload = map as u64;
         }
     }
     (*out).len = len;
@@ -1177,10 +1177,9 @@ pub unsafe extern "C-unwind" fn lin_array_get_tagged(arr: *const LinArray, idx: 
             // payload of `elem_stride` bytes — NOT a TaggedVal. The default arm below would misread
             // its first 16 bytes as a `{tag, payload}` box (a scalar misread; a heap-field deref
             // crash). Instead MATERIALIZE a fresh keyed `LinObject` view from the packed element via
-            // the NAMED full-field descriptor, box it TAG_OBJECT, and return it as the caller's owned
-            // +1 (matching the get_tagged contract: the caller frees it). Heap fields are RETAINED
-            // into the materialized object; the packed buffer keeps its own reference. We allocated
-            // `tv` above as a scratch box; free it and return the materializer's box instead.
+            // the NAMED full-field descriptor, materialize to a LinMap, box as TAG_MAP, and return
+            // it as the caller's owned +1 (matching the get_tagged contract). Heap fields are
+            // RETAINED into the materialized map; the packed buffer keeps its own reference.
             dealloc(tv as *mut u8, tv_layout);
             let payload = ((*arr).data as *const u8).add((idx as u64 * (*arr).elem_stride) as usize);
             return crate::sealed::materialize_sealed_elem_boxed(payload, (*arr).elem_named_desc);
@@ -1196,11 +1195,10 @@ pub unsafe extern "C-unwind" fn lin_array_get_tagged(arr: *const LinArray, idx: 
             if sptr.is_null() {
                 return crate::tagged::lin_box_null() as *mut TaggedVal;
             }
-            // `materialize_sealed_struct` takes the struct base pointer (with header) + named_desc
-            // and returns a fresh +1 LinObject. Wrap it in a TAG_OBJECT box for the caller.
-            use crate::tagged::{TAG_OBJECT, alloc_tagged};
-            let obj = crate::sealed::materialize_sealed_struct_pub(sptr, (*arr).elem_named_desc);
-            return alloc_tagged(TAG_OBJECT, obj as u64) as *mut TaggedVal;
+            // Materialize the sealed struct to a fresh +1 LinMap. Wrap in a TAG_MAP box for the caller.
+            use crate::tagged::{TAG_MAP, alloc_tagged};
+            let map = crate::sealed::materialize_sealed_to_map_pub(sptr, (*arr).elem_named_desc);
+            return alloc_tagged(TAG_MAP, map as u64) as *mut TaggedVal;
         }
         _ => {
             // Tagged array: elem is already a LinArrayElem (16 bytes) = TaggedVal layout.

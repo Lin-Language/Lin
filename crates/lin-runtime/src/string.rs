@@ -707,16 +707,14 @@ unsafe fn push_display_value(out: &mut String, tagged: *const TaggedVal) {
         return;
     }
     if tag == crate::tagged::TAG_RECORD {
-        // Stage 6a: a sealed-struct pointer in a dynamic slot. Materialize to a LinObject via the
-        // named descriptor (offset 16) and serialize, then release the transient.
         let sealed = payload as *const u8;
         let named_desc = if sealed.is_null() { std::ptr::null() } else {
             *((sealed.add(16)) as *const *const u8)
         };
-        let obj = crate::sealed::materialize_sealed_struct_pub(payload as *mut u8, named_desc);
-        if obj.is_null() { out.push_str("{}"); return; }
-        push_display_object(out, obj as *const crate::object::LinObject);
-        crate::object::lin_object_release(obj as *mut crate::object::LinObject);
+        let map = crate::sealed::materialize_sealed_to_map_pub(payload as *mut u8, named_desc);
+        if map.is_null() { out.push_str("{}"); return; }
+        push_display_map(out, map as *const crate::map::LinMap);
+        crate::map::lin_map_release(map);
         return;
     }
     out.push_str("[object]");
@@ -763,6 +761,7 @@ unsafe fn push_display_array(out: &mut String, arr: *const crate::array::LinArra
 
 /// Serialize a LinMap (string-keyed open object) to JSON.
 unsafe fn push_display_map(out: &mut String, map: *const crate::map::LinMap) {
+    if map.is_null() { out.push_str("{}"); return; }
     let cap = (*map).cap as usize;
     // Collect occupied slots as (key, value) pairs then sort by key for deterministic output.
     let mut pairs: Vec<(&str, *const TaggedVal)> = Vec::new();
@@ -1079,18 +1078,16 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
         crate::map::lin_map_release(map as *mut crate::map::LinMap);
         s
     } else if tag == crate::tagged::TAG_RECORD {
-        // Stage 6a: a sealed-struct pointer in a dynamic slot. Materialize to a LinObject via the
-        // named descriptor (offset 16), stringify, then release the transient object.
         let sealed = payload as *const u8;
         let named_desc = if sealed.is_null() { std::ptr::null() } else {
             *((sealed.add(16)) as *const *const u8)
         };
-        let obj = crate::sealed::materialize_sealed_struct_pub(payload as *mut u8, named_desc);
-        if obj.is_null() {
+        let map = crate::sealed::materialize_sealed_to_map_pub(payload as *mut u8, named_desc);
+        if map.is_null() {
             return lin_string_from_bytes(b"{}".as_ptr(), 2);
         }
-        let s = lin_object_to_string(obj as *const crate::object::LinObject);
-        crate::object::lin_object_release(obj as *mut crate::object::LinObject);
+        let s = lin_map_to_string(map as *const crate::map::LinMap);
+        crate::map::lin_map_release(map);
         s
     } else if tag == crate::tagged::TAG_BIGNUM {
         // Opaque BigInt handle: render its exact base-10 form (so accidental interpolation shows
@@ -1161,18 +1158,16 @@ unsafe fn push_json_value(out: &mut String, tagged: *const TaggedVal) {
             }
         }
         crate::tagged::TAG_RECORD => {
-            // Stage 6a: sealed-struct pointer in a dynamic slot. Materialize to a LinObject via the
-            // named descriptor (offset 16), serialize as a JSON object, release the transient.
             let sealed = payload as *const u8;
             let named_desc = if sealed.is_null() { std::ptr::null() } else {
                 *((sealed.add(16)) as *const *const u8)
             };
-            let obj = crate::sealed::materialize_sealed_struct_pub(payload as *mut u8, named_desc);
-            if obj.is_null() {
+            let map = crate::sealed::materialize_sealed_to_map_pub(payload as *mut u8, named_desc);
+            if map.is_null() {
                 out.push_str("{}");
             } else {
-                push_json_object(out, obj as *const crate::object::LinObject);
-                crate::object::lin_object_release(obj as *mut crate::object::LinObject);
+                push_json_map(out, map as *const crate::map::LinMap);
+                crate::map::lin_map_release(map);
             }
         }
         // Functions/iterators and any unknown tag are not JSON values → null.
