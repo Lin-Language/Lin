@@ -935,7 +935,7 @@ val s = suite("std/array", [
   ),
 
   test("groupBy preserves order within each group across many items", () =>
-    // One lookup + in-place push per item (lin_object_get_or_insert_array): items must
+    // One lookup + in-place push per item (lin_map_get_or_insert_array): items must
     // accumulate in encounter order within each bucket.
     val result = [1, 2, 3, 4, 5, 6].groupBy(x => if x % 2 == 0 then "even" else "odd")
     [

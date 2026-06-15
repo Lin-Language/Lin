@@ -345,7 +345,7 @@ unsafe fn box_named_heap_field(p: *mut u8, nkind: u32, nested: *const u8) -> *mu
         }
         NKIND_SEALED => {
             // A nested sealed record stored as a STANDALONE struct (with header). Recurse to a fresh
-            // LinMap so the materialized view is uniformly map-backed (Phase 3: no TAG_OBJECT).
+            // LinMap so the materialized view is uniformly map-backed (TAG_MAP).
             // Its heap fields are retained by the recursive materialize; the parent's pointer
             // keeps its own +1, untouched.
             let nested_map = materialize_sealed_struct_to_map(p, nested);
@@ -729,7 +729,7 @@ pub unsafe fn alloc_sealed_struct_from_map(
 ///  - String/Array/Map: the slot holds an owned pointer; we RETAIN it before boxing (the struct keeps
 ///    its own +1; the caller's +1 release is balanced by this retain). Mirrors `box_named_heap_field`.
 ///  - Sealed (nested struct): recurse materialize to a LinMap, box as TAG_MAP. Same contract
-///    as `box_named_heap_field(NKIND_SEALED)`. (Phase 3: TAG_OBJECT has no producers.)
+///    as `box_named_heap_field(NKIND_SEALED)`.
 #[no_mangle]
 pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const crate::string::LinString) -> *mut u8 {
     use crate::tagged::{TAG_INT32, TAG_INT64, TAG_UINT64, TAG_FLOAT64, TAG_BOOL, TAG_MAP, alloc_tagged};
@@ -857,7 +857,7 @@ mod named_desc_tests {
             // Read element 1 via the DYNAMIC boxed reader (the new 0xFE branch).
             let tv = crate::array::lin_array_get_tagged(arr, 1);
             assert!(!tv.is_null());
-            // Phase 3: materialized sealed records are now TAG_MAP, not TAG_OBJECT.
+            // Materialized sealed records are TAG_MAP.
             assert_eq!((*tv).tag, TAG_MAP);
             let map = (*tv).payload as *const crate::map::LinMap;
             let kx = crate::string::lin_string_from_bytes(b"x".as_ptr(), 1);
@@ -912,7 +912,7 @@ mod named_desc_tests {
             // DYNAMIC boxed read: materialize the element. The materialized map must take its OWN
             // +1 on the string (rc -> 2) so the packed buffer's reference is independent.
             let tv = crate::array::lin_array_get_tagged(arr, 0);
-            // Phase 3: materialized sealed records are TAG_MAP, not TAG_OBJECT.
+            // Materialized sealed records are TAG_MAP.
             assert_eq!((*tv).tag, TAG_MAP);
             assert_eq!((*s).refcount, 2); // array + materialized map
             let map = (*tv).payload as *const crate::map::LinMap;
@@ -940,10 +940,9 @@ mod named_desc_tests {
     }
 
     // ----- WRITE direction: `pack_named_payload_from_map` through the dynamic/tagged sinks -----
-    // (Phase 3: TAG_OBJECT producers are gone; tests use LinMap instead. Guards the map-value-fetch/
-    // push corruption fix — before it, lin_array_push blind-wrote 16-byte TaggedVal slots into the
-    // stride-sized packed buffer (heap overflow at the 3rd element) and lin_push_dyn silently dropped
-    // the element.)
+    // Guards the map-value-fetch/push corruption fix — before it, lin_array_push blind-wrote
+    // 16-byte TaggedVal slots into the stride-sized packed buffer (heap overflow at the 3rd
+    // element) and lin_push_dyn silently dropped the element.
 
     /// Build a fresh LinMap `{ x: Int32(xv), y: Int32(yv) }` (rc = 1).
     unsafe fn make_map_xy(xv: i32, yv: i32) -> *mut crate::map::LinMap {

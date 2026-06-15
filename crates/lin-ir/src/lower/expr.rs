@@ -602,9 +602,9 @@ pub fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut L
             // This is the GENERAL (boxed) MakeObject path — a sealed scalar-record TARGET is
             // constructed directly as a packed struct elsewhere (`try_lower_sealed_literal`), so
             // here `ty` is always a boxed object/Json. A field VALUE that is itself a sealed scalar
-            // record is a packed struct, NOT a LinObject; storing it raw under TAG_OBJECT makes the
-            // object's serialize/release walk it as object entries → heap corruption. MATERIALIZE
-            // each sealed field value to a boxed LinObject (sealed→Json Coerce) first.
+            // record is a packed struct, NOT a LinMap; storing it raw under TAG_RECORD makes the
+            // object's serialize/release walk it as map entries → heap corruption. MATERIALIZE
+            // each sealed field value to a boxed LinMap (sealed→Json Coerce) first.
             let lowered_fields: Vec<(String, Temp)> = fields
                 .iter()
                 .map(|(k, v)| {
@@ -678,11 +678,11 @@ pub fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut L
                 // are NOT sealed-scalar-arrays (gated) and fall to the boxed branch below.
                 Type::Array(inner) if is_sealed_scalar_array(ty) => *inner.clone(),
                 // Arrays of HEAP-FIELD sealed records stay BOXED (Stage 3b deferred): store each
-                // element as a boxed `LinObject` (the universal Json element representation). Lower
+                // element as a boxed `LinMap` (the universal Json element representation). Lower
                 // the element type to the UNSEALED object form so `coerce_to_slot_type` inserts a
-                // sealed→Json MATERIALIZATION per element (the sealed struct is NOT a LinObject —
-                // pushing it raw under TAG_OBJECT makes the array's release/serialize walk it as
-                // object entries → heap corruption).
+                // sealed→Json MATERIALIZATION per element (the sealed struct is NOT a LinMap —
+                // pushing it raw under TAG_RECORD makes the array's release/serialize walk it as
+                // map entries → heap corruption).
                 Type::Array(inner) if is_sealed_scalar_repr(inner) => match inner.as_ref() {
                     Type::Object { fields, .. } => Type::object(fields.clone()),
                     _ => unreachable!(),
@@ -1178,8 +1178,8 @@ pub fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut L
             let raw = lower_expr(expr, builder, ctx);
             // HasPattern inspects an object via a boxed TaggedVal*; box a concrete object.
             // Heap-field SumNode Stage 3: if the union is SumNode-eligible, the physical value
-            // is a `*SumNode` (TAG_SUMNODE). HasPattern needs a boxed TAG_OBJECT. Coerce to
-            // Json first so codegen materializes the SumNode → boxed LinObject at this boundary.
+            // is a `*SumNode` (TAG_SUMNODE). HasPattern needs a boxed TAG_MAP. Coerce to
+            // Json first so codegen materializes the SumNode → boxed LinMap at this boundary.
             let val_temp = if crate::repr::sum_type_eligible(&val_ty) {
                 let json = Type::TypeVar(u32::MAX);
                 let dst_coerce = builder.alloc_temp(json.clone());

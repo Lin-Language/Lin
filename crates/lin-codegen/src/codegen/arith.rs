@@ -408,7 +408,7 @@ impl<'ctx> Codegen<'ctx> {
         }
         // Sealed scalar-record equality (sealed-records Stage 1). MUST come before the boxed-union
         // arms below: a sealed Object is not `is_union_type`, but boxing it via `box_value`
-        // (Type::Object → box_object) would treat its packed-struct ptr as a LinObject and corrupt.
+        // (Type::Object → box_map) would treat its packed-struct ptr as a LinMap and corrupt.
         // Order-independent per spec §3.4 (a sealed value == a same-shape boxed Json/object).
         if matches!(op, BinOp::Eq | BinOp::NotEq) {
             let l_sealed = Self::sealed_scalar_fields(lty).is_some();
@@ -428,7 +428,7 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 // Mixed (sealed vs Json/unsealed, or two different sealed shapes): box BOTH sides
                 // to a TaggedVal* and use the order-independent tagged equality. A MATERIALIZED
-                // (sealed) side wraps a FRESH +1 LinObject owned by the box — reclaim it fully
+                // (sealed) side wraps a FRESH +1 LinMap owned by the box — reclaim it fully
                 // afterwards (shell + inner). A NON-materialized (unsealed/Json) side wraps a
                 // BORROWED value — its owner (the enclosing scope) frees it, so reclaim only the
                 // 16-byte box SHELL here, never the inner (the historical UAF, ASan-caught).

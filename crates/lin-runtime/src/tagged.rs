@@ -254,8 +254,8 @@ pub unsafe extern "C" fn lin_box_record(p: *mut u8) -> *mut u8 {
 }
 
 /// Stage 6a: read one field from a union-typed TaggedVal box by name, returning an OWNED +1
-/// `TaggedVal*` (null = field missing or null source). Handles both TAG_OBJECT and TAG_RECORD:
-///   - TAG_OBJECT → `lin_object_get` (borrowed interior) → `lin_tagged_clone` → owned +1.
+/// `TaggedVal*` (null = field missing or null source). Handles TAG_MAP and TAG_RECORD:
+///   - TAG_MAP → `lin_map_get` (borrowed interior) → `lin_tagged_clone` → owned +1.
 ///   - TAG_RECORD → `lin_record_get_field` (already owned +1).
 ///   - anything else (null, scalar, array, …) → null.
 ///
@@ -678,7 +678,7 @@ pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
 }
 
 /// Retain the heap-allocated payload of a TaggedVal (increment refcount). Used when copying a
-/// TaggedVal into an object/array slot so the new owner has a reference. Moved from object.rs
+/// TaggedVal into a map/array slot so the new owner has a reference. Moved from object.rs
 /// in Cluster D: TAG_OBJECT arm dropped (no producers after Phase 3).
 pub(crate) unsafe fn retain_tagged_payload(tv: &TaggedVal) {
     let payload = tv.payload;
@@ -723,7 +723,7 @@ pub(crate) unsafe fn retain_tagged_payload(tv: &TaggedVal) {
         TAG_TAR_ENTRY => {
             crate::stream::lin_tar_entry_retain_box(payload as *const u8);
         }
-        _ => {} // scalars and dead TAG_OBJECT: no heap payload to retain
+        _ => {} // scalars (and retired TAG_OBJECT = 7): no heap payload to retain
     }
 }
 
@@ -751,7 +751,7 @@ pub unsafe fn release_tagged_payload_pub(tv: &TaggedVal) {
         TAG_BIGNUM => crate::bignum::lin_bignum_release_box(payload as *const u8),
         TAG_DECIMAL => crate::decimal::lin_decimal_release_box(payload as *const u8),
         TAG_TAR_ENTRY => crate::stream::lin_tar_entry_release_box(payload as *const u8),
-        _ => {} // scalars and dead TAG_OBJECT: no heap payload
+        _ => {} // scalars (and retired TAG_OBJECT = 7): no heap payload
     }
 }
 
@@ -781,11 +781,11 @@ pub unsafe extern "C" fn lin_tagged_clone(p: *const u8) -> *mut u8 {
 }
 
 // ── Cluster D: dispatch helpers moved from object.rs ─────────────────────────────────────────────
-// TAG_OBJECT arm removed from all: no producers remain after Phase 3.
+// TAG_OBJECT (= 7) has no producers after Phase 3; all arms below dispatch TAG_MAP/TAG_RECORD.
 
 /// Return a `String[]` of the keys of a boxed object/map/record value.
 /// Dispatches on the runtime tag: TAG_MAP → `lin_map_keys` (O(1)), TAG_RECORD → materialize to
-/// LinMap then return its keys, else return an empty array. TAG_OBJECT removed (Cluster D).
+/// LinMap then return its keys, else return an empty array.
 #[no_mangle]
 pub unsafe extern "C" fn lin_tagged_keys(tv: *const u8) -> *mut crate::array::LinArray {
     if tv.is_null() {
@@ -813,7 +813,6 @@ pub unsafe extern "C" fn lin_tagged_keys(tv: *const u8) -> *mut crate::array::Li
 
 /// Check if a boxed value (TaggedVal*) has a given string key. Returns 0/1.
 /// Dispatches: TAG_MAP → `lin_map_has`, TAG_RECORD → materialize + check, else 0.
-/// TAG_OBJECT removed (Cluster D).
 #[no_mangle]
 pub unsafe extern "C" fn lin_value_has_field(tagged: *const u8, key: *const crate::string::LinString) -> u8 {
     if tagged.is_null() { return 0; }

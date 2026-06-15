@@ -101,7 +101,7 @@ impl<'ctx> Codegen<'ctx> {
             let arr_res = self.builder.call(get_tagged_fn, &[container.into(), idx.into()], "ir_idx_aget").try_as_basic_value().unwrap_basic();
             let int_exit = self.builder.get_insert_block().unwrap();
             self.builder.unconditional_branch(mrg);
-            // string key → map get: dispatch on the container's tag (TAG_MAP only; TAG_OBJECT is dead).
+            // string key → map get: dispatch on the container's tag (TAG_MAP only; no other producers).
             self.builder.position_at_end(str_b);
             let key_raw = self.builder.call(self.rt.unbox_ptr, &[key.into()], "ir_idxk_str").try_as_basic_value().unwrap_basic();
             let obj_tag = self.builder.call(self.rt.get_tag, &[obj.into()], "ir_idx_otag").try_as_basic_value().unwrap_basic().into_int_value();
@@ -192,8 +192,8 @@ impl<'ctx> Codegen<'ctx> {
                 return self.sealed_project_from(tagged, &Type::TypeVar(u32::MAX), &fields);
             }
             // Stage 3 NullableRecord: `T | Null` result where T is a sealed record. The slot holds
-            // a MATERIALIZED TAG_OBJECT (see `emit_map_set` — bare records materialize before store).
-            // `lin_map_get` returns a borrowed TaggedVal*(TAG_OBJECT) for a hit, or null for a miss.
+            // a MATERIALIZED TAG_MAP (see `emit_map_set` — bare records materialize before store).
+            // `lin_map_get` returns a borrowed TaggedVal*(TAG_MAP) for a hit, or null for a miss.
             // Project the hit into a fresh +1 sealed struct; return null ptr for a miss.
             // NullableRecord repr = raw `*T` (non-null) or null — no TaggedVal wrapper.
             if let Some(fields) = Self::nullable_sealed_record_type(result_ty) {
@@ -226,7 +226,7 @@ impl<'ctx> Codegen<'ctx> {
             // at runtime. `lin_map_get` returns null for a missing key.
             let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
             // UNBOXED SUM TYPE: a `{ String: Expr }` map value is stored MATERIALIZED as a boxed
-            // `LinObject` (TAG_OBJECT — see `emit_map_set`); the read-back returns the borrowed box for
+            // `LinMap` (TAG_MAP — see `emit_map_set`); the read-back returns the borrowed box for
             // the `Expr | Null` union result, which the consumer's `box_value`/match boundary handles.
             // (Keep-packed-by-pointer for the Map value slot is DEFERRED: the IR lowering wraps a
             // union-typed Index result in a `CloneBox` that assumes a `TaggedVal*`, so returning a raw
@@ -296,14 +296,14 @@ impl<'ctx> Codegen<'ctx> {
         }
         // Sealed record indexed by a NON-LITERAL key (`p[k]`). A sealed record is a packed,
         // header-prefixed struct with NO runtime key table, so a dynamic key can't resolve a slot
-        // by offset; reading it as a `LinObject` (the generic object path below) misinterprets the
+        // by offset; reading it as a `LinMap` (the generic object path below) misinterprets the
         // packed bytes and crashes the runtime. The literal-key case is fused upstream (IR
         // lowering → constant-offset FieldGet / Null const); only a runtime key reaches here.
-        // Materialize the sealed record to a boxed `LinObject` (its EXACTLY-declared fields — extras
-        // already stripped) and do the normal dynamic `lin_object_get`, which returns the matching
+        // Materialize the sealed record to a fresh `LinMap` (its EXACTLY-declared fields — extras
+        // already stripped) and do the normal dynamic `lin_map_get`, which returns the matching
         // value or Null for an absent key (safe-access §6.1). Clone the (borrowed, interior) result
-        // into a fresh owned box and release the temporary object before returning, so nothing
-        // dangles once the materialized object is freed.
+        // into a fresh owned box and release the temporary map before returning, so nothing
+        // dangles once the materialized map is freed.
         // STAGE 3: a sealed record indexed by a non-literal key — packed-struct ASSUME from repr.
         if let Some(fields) = obj_repr.packed_struct_fields().cloned() {
             if obj.is_pointer_value() {
@@ -326,7 +326,7 @@ impl<'ctx> Codegen<'ctx> {
             }
             return ptr_ty.const_null().into();
         }
-        // Object key access. lin_object_get expects a raw *LinString key; unbox a boxed key.
+        // Object key access. lin_map_get expects a raw *LinString key; unbox a boxed key.
         let key_str = if key_ty.is_string_ish() {
             key
         } else if Self::is_union_type(key_ty) && key.is_pointer_value() {
@@ -336,8 +336,8 @@ impl<'ctx> Codegen<'ctx> {
         };
         // When the object is statically Json/union, its runtime value may NOT be an object
         // (e.g. `results["type"]` where results is actually an array). Guard the lookup with
-        // a tag check — TAG_OBJECT(7) → look up the key; otherwise return Null. Without this,
-        // lin_object_get would read a LinArray*/scalar as a LinObject* and crash. Mirrors the
+        // a tag check — dispatch on TAG_MAP/TAG_RECORD; otherwise return Null. Without this,
+        // lin_map_get would read a LinArray*/scalar as a LinMap* and crash. Mirrors the
         // AST compile_index string-key-on-Json path.
         if Self::is_union_type(obj_ty) {
             // A `{ String: T } | Null` index (e.g. the inner read of a NESTED typed map
@@ -345,7 +345,7 @@ impl<'ctx> Codegen<'ctx> {
             // an `is`-pattern to narrow, ADR-055 §5.1.1) runs through this union path. Its runtime
             // value is a TAG_MAP, so dispatch on the tag: TAG_MAP → `lin_map_get` (O(1) hashed),
             // TAG_RECORD → `lin_record_get_field` (descriptor-driven field read, Stage 6a),
-            // otherwise Null. (TAG_OBJECT arm removed in Cluster D: no producers remain.)
+            // otherwise Null.
             //
             // OWNERSHIP CONTRACT:
             //   map_get returns a BORROWED `*const TaggedVal` (interior pointer into
@@ -463,7 +463,7 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn emit_map_set(&mut self, map_ptr: BasicValueEnum<'ctx>, key_ptr: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type, elem_ty: &Type, val_repr: &lin_ir::repr::Repr) {
         // KEEP-PACKED: when the value is a PACKED sealed array / sealed record (proven by the pass:
         // `val_repr` is `Packed(L)`), store it into the map slot by WRAPPING the still-packed pointer
-        // in a 16-byte TaggedVal (`compile_ir_box_keep_packed`, TAG_ARRAY / TAG_OBJECT) — O(1), NO
+        // in a 16-byte TaggedVal (`compile_ir_box_keep_packed`, TAG_ARRAY / TAG_RECORD) — O(1), NO
         // `sealed_array_to_tagged` materialize (the O(n) copy that crashed on read-back). `lin_map_set`
         // copies the 16 bytes inline and retains the inner; the shell is freed after. The read-back
         // (`compile_ir_index` Map arm) unboxes it as a packed pointer (`compile_ir_unbox_keep_packed`)
@@ -472,14 +472,14 @@ impl<'ctx> Codegen<'ctx> {
         // (Driven by these helper calls directly; the matching IR opcodes were never emitted and were
         // removed.)
         // UNBOXED SUM TYPE: a SumNode value stored into a `{ String: Expr }` map is MATERIALIZED to a
-        // boxed `LinObject` (TAG_OBJECT) — the universal Json representation the map slot and the boxed
-        // `Expr | Null` read-back expect. The materialized object is +1 owned; `lin_map_set` retains
+        // boxed `LinMap` (TAG_MAP) — the universal Json representation the map slot and the boxed
+        // `Expr | Null` read-back expect. The materialized map is +1 owned; `lin_map_set` retains
         // the inner into the slot, so we release the transient box after.
         //
         // KEEP-PACKED-BY-POINTER for the Map value slot is DEFERRED (the TAG_SUMNODE runtime substrate
         // + codegen helpers are in place for it): the IR LOWERING `CloneBox`es the union-typed `m[k]`
-        // result and the consumer's match-discriminator reads the boxed value via `object_get` / `is`
-        // (`compile_ir_index` union arm) assuming a `LinObject` — a keep-packed `TAG_SUMNODE` slot read
+        // result and the consumer's match-discriminator reads the boxed value via `map_get` / `is`
+        // (`compile_ir_index` union arm) assuming a `LinMap` — a keep-packed `TAG_SUMNODE` slot read
         // by that borrowed-interior discriminator path is a type-confusion deref. Enabling it needs the
         // lowering/repr STEP-4 (suppress the project Coerce + teach the discriminator to materialize a
         // TAG_SUMNODE scrutinee), out of this change's scope.
@@ -500,12 +500,12 @@ impl<'ctx> Codegen<'ctx> {
             let packed_arr = val_repr.packed_sealed_array_layout().is_some();
             // ARRAYS ONLY. A packed sealed ARRAY is a real `LinArray` (elem_tag 0xFE) — every
             // dynamic consumer tag-dispatches on it, so wrapping the still-packed pointer is sound.
-            // A bare packed sealed RECORD is NOT a `LinObject`: wrapping it in TAG_OBJECT type-
+            // A bare packed sealed RECORD is NOT a `LinMap`: wrapping it in TAG_RECORD type-
             // confuses every boxed read-back (`m[k]` is `T | Null`, a union — the general read path
-            // hands the payload to `lin_object_get`, which reads sealed bytes as a LinObject header:
+            // hands the payload to `lin_map_get`, which reads sealed bytes as a LinMap header:
             // the index-cap underflow crash / silent corruption). Bare records fall through to the
             // GENERAL path below: `box_value` MATERIALIZES the sealed struct to a fresh boxed
-            // `LinObject` (`sealed_materialize_to_object`), the slot owns the fresh box, and the
+            // `LinMap` (`sealed_materialize_to_map`), the slot owns the fresh box, and the
             // source struct stays owned by its scope — the IndexSet lowering's
             // `set_sealed_elem_into_tagged` carve-out already skips `transfer_into_container` for
             // exactly this materialize contract (same as the sealed-elem-into-tagged-array store).
@@ -584,14 +584,14 @@ impl<'ctx> Codegen<'ctx> {
 
     /// `object[key] = value` for the IR path. Mirrors the AST `compile_index_set`:
     /// dispatch on the object's static type; for Json/union objects, dispatch at
-    /// runtime on the key's tag (int key ⇒ array set, string key ⇒ object set),
-    /// unboxing the boxed container first. Stores go through the shared `emit_object_set`/
+    /// runtime on the key's tag (int key ⇒ array set, string key ⇒ map set),
+    /// unboxing the boxed container first. Stores go through the shared `emit_map_set`/
     /// `emit_array_set` helpers so the boxing/retain/release sequence is IDENTICAL to the
-    /// `lin_object_set`/`lin_array_set` intrinsics; the matching IR-level ownership transfer
+    /// `lin_map_set`/`lin_array_set` intrinsics; the matching IR-level ownership transfer
     /// is emitted in `IndexSet` lowering (`lin-ir`).
     pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, val_ty: &Type, val_repr: &lin_ir::repr::Repr) {
         // Resolve an object key to a raw `LinString*`. A string key that is a callback param
-        // arrives boxed (a `TaggedVal*`); unbox it, or `lin_object_set` reads the box as a
+        // arrives boxed (a `TaggedVal*`); unbox it, or `lin_map_set` reads the box as a
         // LinString and corrupts the key.
         let resolve_obj_key = |this: &mut Self, k: BasicValueEnum<'ctx>| -> BasicValueEnum<'ctx> {
             if Self::is_union_type(key_ty) && k.is_pointer_value() {
@@ -615,7 +615,7 @@ impl<'ctx> Codegen<'ctx> {
             // Cluster D: sealed Object / Named dynamic-key write — route through lin_map_set.
             // Sealed records with a dynamic (non-literal) key are a rare fallthrough path;
             // the lowerer redirects all compile-time-literal keys to FieldSet before this.
-            // After Phase 3 there are no TAG_OBJECT producers, so lin_object_set is dead.
+            // All dynamic objects are TAG_MAP (LinMap*); route dynamic-key writes through lin_map_set.
             Type::Object { .. } | Type::Named(_) => {
                 if obj.is_pointer_value() && key.is_pointer_value() {
                     let key_str = resolve_obj_key(self, key);
@@ -738,15 +738,14 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// String-keyed store into a union/`T|Null` container that may hold EITHER a Json object
-    /// (TAG_OBJECT) OR a typed index-signature map (TAG_MAP). This is the write analogue of the
-    /// tag-dispatched read in `compile_ir_index`: a NESTED typed map's inner write
-    /// (`outer[a][b] = v`, where `outer[a]` is `{ String: T } | Null` — not `is`-narrowable,
-    /// ADR-055 §5.1.1) reaches here with `obj_ty` a union containing a `Map(elem)` variant.
-    /// When such a variant is present, dispatch on the runtime tag: TAG_MAP → `emit_map_set`
-    /// (O(1) hashed insert), otherwise `emit_object_set`. Both helpers RETAIN the inner payload,
-    /// so the ownership contract is identical on either branch. With no Map variant this is a
-    /// plain `emit_object_set` (no extra branch emitted).
+    /// String-keyed store into a union/`T|Null` container that may hold a Json object/map (TAG_MAP)
+    /// or sealed record (TAG_RECORD). This is the write analogue of the tag-dispatched read in
+    /// `compile_ir_index`: a NESTED typed map's inner write (`outer[a][b] = v`, where `outer[a]`
+    /// is `{ String: T } | Null` — not `is`-narrowable, ADR-055 §5.1.1) reaches here with `obj_ty`
+    /// a union containing a `Map(elem)` variant. When such a variant is present, dispatch on the
+    /// runtime tag: TAG_MAP → `emit_map_set` (O(1) hashed insert). Both branches RETAIN the inner
+    /// payload, so the ownership contract is identical on either branch. With no Map variant this is
+    /// a plain `emit_map_set` (no extra branch emitted).
     pub(crate) fn emit_obj_or_map_set(
         &mut self,
         boxed_obj: BasicValueEnum<'ctx>,
@@ -758,7 +757,7 @@ impl<'ctx> Codegen<'ctx> {
     ) {
         // Find a Map{value:elem} variant in the union, if any.
         // For TypeVar (Json), ALWAYS emit a tag-dispatch because the container may be a LinMap
-        // (TAG_MAP, from Phase 2 concrete open-object flip) or a LinObject (TAG_OBJECT).
+        // (TAG_MAP) or a sealed record (TAG_RECORD).
         let is_json_dynamic = matches!(obj_ty, Type::TypeVar(_));
         let map_elem: Option<Type> = match obj_ty {
             Type::Union(vs) => vs.iter().find_map(|v| match v {
@@ -771,7 +770,7 @@ impl<'ctx> Codegen<'ctx> {
             _ => None,
         };
         let Some(elem) = map_elem else {
-            // No Map variant and not Json-dynamic: route through lin_map_set (TAG_OBJECT removed).
+            // No Map variant and not Json-dynamic: route through lin_map_set.
             self.emit_map_set(container, key_str, value, val_ty, &Type::TypeVar(u32::MAX), &lin_ir::repr::Repr::boxed_opaque());
             return;
         };
@@ -790,7 +789,7 @@ impl<'ctx> Codegen<'ctx> {
         // there is no packed buffer to keep-pack — pass the fail-safe boxed repr.
         self.emit_map_set(container, key_str, value, val_ty, &elem, &lin_ir::repr::Repr::boxed_opaque());
         self.builder.unconditional_branch(mrg);
-        // Non-TAG_MAP fallback: TAG_OBJECT producers removed in Cluster D; route through map_set.
+        // Non-TAG_MAP fallback (e.g. TAG_RECORD): route through map_set for uniformity.
         self.builder.position_at_end(obj_b);
         self.emit_map_set(container, key_str, value, val_ty, &elem, &lin_ir::repr::Repr::boxed_opaque());
         self.builder.unconditional_branch(mrg);
@@ -810,7 +809,7 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Load `field` from a sealed record at its constant byte offset — THE win: a single typed load,
-    /// no `lin_object_get` call / hash lookup / unbox. `obj` is the struct ptr. For a HEAP field the
+    /// no `lin_map_get` call / hash lookup / unbox. `obj` is the struct ptr. For a HEAP field the
     /// loaded value is the BORROWED heap pointer (the struct owns it); the IR `FieldGet`/`Index`
     /// lowering emits the owning `Retain` separately (same contract as a boxed-object field read).
     pub(crate) fn sealed_field_get(
@@ -840,7 +839,7 @@ impl<'ctx> Codegen<'ctx> {
     /// wider source to the field's width); for a HEAP field (String / Array / nested sealed) the old
     /// pointer is released and the new one retained, so the struct keeps exactly one +1 reference and
     /// the source value stays owned by its caller (released at scope exit) — the same retain semantics
-    /// as a boxed `lin_object_set`.
+    /// as a boxed `lin_map_set`.
     pub(crate) fn compile_ir_field_set(
         &mut self,
         obj: BasicValueEnum<'ctx>,
@@ -975,10 +974,10 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// `arr[index][field]` for a BOXED `Object[]` whose element is a sealed/typed record stored as a
-    /// heap `LinObject` (the boxed `Token[]` representation — a record with heap fields, NOT a packed
+    /// heap `LinMap` (the boxed `Token[]` representation — a record with heap fields, NOT a packed
     /// sealed-scalar array). Reads the BORROWED element box via `lin_array_get` (a `*TaggedVal*`
-    /// interior pointer — no fresh box alloc, no element release), unboxes to the raw `LinObject`,
-    /// does the SINGLE `lin_object_get` for `field`, then unboxes/coerces to `result_ty`. The
+    /// interior pointer — no fresh box alloc, no element release), unboxes to the raw `LinMap*`,
+    /// does the SINGLE `lin_map_get` for `field`, then unboxes/coerces to `result_ty`. The
     /// returned value is BORROWED interior storage; the lowerer's `BoxedArrayFieldGet` registers `dst`
     /// owned and emits the `Retain` for an RC `result_ty`, matching the materialize-then-read path
     /// this replaces. This skips the generic `arr[i]` sealed PROJECTION (alloc + read every field +
@@ -1014,8 +1013,8 @@ impl<'ctx> Codegen<'ctx> {
         // Borrowed element box (interior `*TaggedVal`); no fresh allocation, no release.
         let elem_box = self.builder.call(self.rt.array_get, &[arr_raw.into(), idx_i64.into()], "bafg_elem")
             .try_as_basic_value().unwrap_basic();
-        // Phase 2: array elements may be TAG_MAP (codegen-produced open objects, Phase 2) or
-        // TAG_OBJECT (runtime/legacy producers, Track B not yet done). Tag-dispatch to handle both.
+        // Array elements of object type are TAG_MAP. Tag-dispatch to distinguish TAG_MAP from
+        // other tags (null, scalars) and return Null for non-map elements.
         let inner_obj = self.builder.call(self.rt.unbox_ptr, &[elem_box.into()], "bafg_obj")
             .try_as_basic_value().unwrap_basic();
         let key_str = self.compile_string_lit(field).into_pointer_value();
@@ -1036,7 +1035,7 @@ impl<'ctx> Codegen<'ctx> {
             .try_as_basic_value().unwrap_basic();
         let map_pred = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_bb);
-        // Non-map fallback: null (TAG_OBJECT producers removed in Cluster D).
+        // Non-map fallback: return null.
         self.builder.position_at_end(no_bb);
         let no_tagged: BasicValueEnum<'ctx> = ptr_ty.const_null().into();
         let no_pred = self.builder.get_insert_block().unwrap();
@@ -1106,7 +1105,7 @@ impl<'ctx> Codegen<'ctx> {
             // A sealed record has EXACTLY its declared fields. A field NOT in the shape is
             // statically absent — `sealed_field_layout` would assert on it (compiler panic). Follow
             // the safe-access rule (§6.1: missing object key → Null), mirroring the boxed
-            // `lin_object_get` missing-key → Null path: produce the Null result for `result_ty`.
+            // `lin_map_get` missing-key → Null path: produce the Null result for `result_ty`.
             // (The IR lowerer already routes a statically-absent literal key to a Null const; this is
             // the codegen-side safety net for any other FieldGet that reaches here, e.g. destructure.)
             if !fields.contains_key(field) {
@@ -1134,9 +1133,9 @@ impl<'ctx> Codegen<'ctx> {
             // KEEP-PACKED-THROUGH-RECORD-FIELDS read-back: when the field's declared result type is a
             // sum type, the slot MAY hold a keep-packed `TaggedVal(TAG_SUMNODE)` (the BoxKeepSumnode
             // store — the interp cursor `{node,pos}["node"]` zero-copy path) OR a MATERIALIZED
-            // `TAG_OBJECT` (the cross-thread / boundary / fallback path). Dispatch on the RUNTIME TAG so
+            // `TAG_MAP` (the cross-thread / boundary / fallback path). Dispatch on the RUNTIME TAG so
             // both are correct WITHOUT a static store/read agreement: TAG_SUMNODE → unwrap the still-
-            // packed `*SumNode` (+retain), zero copy; otherwise → project the boxed object into a fresh
+            // packed `*SumNode` (+retain), zero copy; otherwise → project the boxed LinMap into a fresh
             // node (the historical path). This runtime-tag dispatch is what makes the optimization sound
             // (no asymmetric keep-packed/materialize decision). A `sum | Null` read is handled the same
             // — a null payload tags as TAG_NULL → the project/unwrap both yield a null node.
@@ -1147,7 +1146,7 @@ impl<'ctx> Codegen<'ctx> {
     /// Keep-packed read-back of a sum field into UNION/Json (type-erased) position: the result must
     /// remain a BOXED `TaggedVal*` for the union ABI and be correct for every dynamic consumer
     /// (toString/eq/json). If the slot holds a keep-packed `TAG_SUMNODE`, MATERIALIZE the still-packed
-    /// `*SumNode` to a real boxed `LinObject` (TAG_OBJECT) so the type-erased consumers see an object,
+    /// `*SumNode` to a real boxed `LinMap` (TAG_MAP) so the type-erased consumers see an object,
     /// not a SumNode they cannot interpret. If it already holds a materialized box (or a null), pass it
     /// through unchanged. Tag-dispatched (sound: zero static asymmetry). The boundary counterpart of
     /// `sumnode_project_from_boxed`'s keep-packed fast path (which targets sum-CONSUMING position and

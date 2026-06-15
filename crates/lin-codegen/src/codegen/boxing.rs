@@ -146,16 +146,16 @@ impl<'ctx> Codegen<'ctx> {
                     .try_as_basic_value().unwrap_basic()
             }
             // UNBOXED SUM TYPE (unboxed-sumtype Stage 3): a Stage-eligible sum type's value is
-            // physically a `*SumNode`, NOT a `LinObject`. `box_value` is the GENERICALLY-DYNAMIC
-            // boxing entry (toString / `==` / match-discriminator `object_get` / spread / closure
-            // arg / a `sum|Null` param) — those consumers read the boxed value as a LinObject, so the
-            // node MUST be MATERIALIZED to a real boxed `LinObject` here (boxing the raw `*SumNode` as
-            // TAG_OBJECT was a latent type-confusion bug: the consumer's `object_get`/release walked a
-            // SumNode header as a LinObject → garbage discriminant / crash). The keep-packed
-            // container-store boundary (Map value slot) does NOT route through `box_value`; it stores a
-            // TAG_SUMNODE node directly so only the genuinely-dynamic consumers pay the materialize.
+            // physically a `*SumNode`, NOT a `LinMap`. `box_value` is the GENERICALLY-DYNAMIC
+            // boxing entry (toString / `==` / match-discriminator `map_get` / spread / closure
+            // arg / a `sum|Null` param) — those consumers read the boxed value as a LinMap, so the
+            // node MUST be MATERIALIZED to a real boxed `LinMap` here (Phase 2: sumnode materializes
+            // to LinMap* — box as TAG_MAP; formerly TAG_OBJECT, which was a latent type-confusion bug:
+            // the consumer walked a SumNode header as a LinObject → garbage discriminant / crash).
+            // The keep-packed container-store boundary (Map value slot) does NOT route through
+            // `box_value`; it stores a TAG_SUMNODE node directly so only the genuinely-dynamic
+            // consumers pay the materialize.
             // Handle BEFORE the generic Union arm (a sum type IS a `Type::Union`).
-            // Stage 6b Phase 2: sumnode materializes to LinMap* — box as TAG_MAP.
             Type::Union(_) if Self::is_sum_type(val_ty) && val.is_pointer_value() => {
                 let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 let map = self.sumnode_materialize_to_object(val, val_ty, llvm_fn);
@@ -474,9 +474,9 @@ impl<'ctx> Codegen<'ctx> {
     /// (keep-packed-through-record-fields). Wraps the still-packed node by-pointer in a 16-byte
     /// `TaggedVal(TAG_SUMNODE)` — O(1), no `lin_summat` materialize. The DISTINCT tag is what makes
     /// this sound: the slot's release routes to `lin_sumnode_release_self` (the node's own size), not
-    /// `lin_object_release`. Borrows the inner (shell is +1); the slot's owning reference comes from
+    /// `lin_map_release`. Borrows the inner (shell is +1); the slot's owning reference comes from
     /// the IR `transfer_into_container`. The read-back twin is `compile_ir_unbox_keep_sumnode`, which
-    /// tag-checks before unwrapping — so a slot that was instead MATERIALIZED (TAG_OBJECT, the
+    /// tag-checks before unwrapping — so a slot that was instead MATERIALIZED (TAG_MAP, the
     /// fallback / cross-thread / boundary path) reads back correctly too (runtime-tag dispatch removes
     /// the store/read static asymmetry entirely).
     pub(crate) fn compile_ir_box_keep_sumnode(&mut self, val: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
@@ -537,13 +537,13 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.unbox_ptr, &[ptr.into()], "ir_ustr").try_as_basic_value().unwrap_basic()
             }
             // Unboxing a boxed Json/object into a SEALED scalar record target = a PROJECTION:
-            // the boxed value is a TaggedVal* (or raw LinObject*); project it into a fresh sealed
+            // the boxed value is a TaggedVal* (or raw LinMap*); project it into a fresh sealed
             // struct. Routed through the central projection helper so the source representation is
-            // handled correctly (it unboxes a union box to the raw LinObject internally).
+            // handled correctly (it unboxes a union box to the raw LinMap internally).
             Type::Object { .. } if Self::sealed_scalar_fields(ty).is_some() => {
                 let fields = Self::sealed_scalar_fields(ty).unwrap().clone();
                 // The incoming `tagged` is a boxed value (Json). Use the union-typed projection
-                // path: sealed_project_from unboxes a union source to the raw LinObject itself.
+                // path: sealed_project_from unboxes a union source to the raw LinMap itself.
                 self.sealed_project_from(tagged, &Type::TypeVar(u32::MAX), &fields)
             }
             // Typed index-signature map (`{ String: T }`, ADR-055): a `m[k]` whose value type is
@@ -556,9 +556,9 @@ impl<'ctx> Codegen<'ctx> {
             }
             // KEEP-PACKED-THROUGH-RECORD-FIELDS read into UNION/Json position: a `sum | Null` result
             // (the safe-access `cur["node"] : Expr | Null` shape) stays a BOXED union value. If the slot
-            // holds a keep-packed `TAG_SUMNODE`, MATERIALIZE it to a real TAG_OBJECT box so the dynamic
-            // consumers (toString/eq/json, or a later `is`-narrowing match's `object_get`) see a real
-            // object — NOT a SumNode pointer they cannot interpret. A non-keep-packed box / null passes
+            // holds a keep-packed `TAG_SUMNODE`, MATERIALIZE it to a real TAG_MAP box so the dynamic
+            // consumers (toString/eq/json, or a later `is`-narrowing match's `map_get`) see a real
+            // LinMap — NOT a SumNode pointer they cannot interpret. A non-keep-packed box / null passes
             // through. (A subsequent narrow into a sum PARAM re-projects the materialized box → correct.)
             // This keeps the keep-packed STORE win while making EVERY read boundary correct + sound.
             Type::Union(_) if Self::sum_member_of_nullable_union(ty).is_some() => {
@@ -568,14 +568,14 @@ impl<'ctx> Codegen<'ctx> {
             // UNBOXED SUM TYPE (unboxed-sumtype Stage 3): unboxing a boxed Json/object into a sum-typed
             // target is a PROJECTION back into a fresh `*SumNode` — the consumer (a SumNode param / a
             // `match` over the packed scrutinee / a recursive eval) requires the packed repr the type
-            // implies, NOT the boxed LinObject. Without this arm the sum union fell to `_ => tagged`,
+            // implies, NOT the boxed LinMap. Without this arm the sum union fell to `_ => tagged`,
             // returning the boxed value where a SumNode was expected → garbage tag read. Reads the
-            // discriminant + scalar/recursive-child fields from the boxed object (recursing for
+            // discriminant + scalar/recursive-child fields from the boxed map (recursing for
             // children). This is the read-back twin of the `box_value` sum-materialize boundary above.
             _ if Self::is_sum_type(ty) => {
                 // KEEP-PACKED-THROUGH-RECORD-FIELDS read-back: `sumnode_project_from_boxed` tag-dispatches
                 // on the boxed value — a keep-packed `TAG_SUMNODE` (cursor zero-copy store) is unwrapped
-                // to the still-packed `*SumNode` (+retain, zero copy); a materialized `TAG_OBJECT` is
+                // to the still-packed `*SumNode` (+retain, zero copy); a materialized `TAG_MAP` is
                 // projected into a fresh node. Sound with NO static store/read agreement. (`ty` is a
                 // union here, so the tag probe is on a genuine box.)
                 let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();

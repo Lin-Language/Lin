@@ -477,8 +477,8 @@ pub unsafe extern "C" fn lin_sealed_ptr_array_to_tagged(arr: *const LinArray) ->
 }
 
 /// Materialize a sealed-record array into a TAGGED `LinArray` (Json `Object[]`): each inline element
-/// becomes a boxed `LinMap` via the per-type codegen materializer. Phase 3 removed TAG_OBJECT
-/// producers; the `mat` thunk now returns a fresh +1 `*mut LinMap`.
+/// becomes a boxed `LinMap` via the per-type codegen materializer. The `mat` thunk returns a fresh
+/// +1 `*mut LinMap`, tagged TAG_MAP.
 #[no_mangle]
 pub unsafe extern "C" fn lin_sealed_array_to_tagged(
     arr: *const LinArray,
@@ -514,7 +514,7 @@ pub unsafe extern "C" fn lin_array_push(arr: *mut LinArray, elem_ptr: *const u8,
     // object reference; packing retains the heap fields into the slot, then the object is released
     // (net: field ownership moves into the slot, the shell is freed).
     if (*arr).elem_tag == SEALED_ARRAY_TAG {
-        // Accept TAG_MAP only (TAG_OBJECT is a dead legacy tag with no producers after Phase 3).
+        // Only TAG_MAP values can be pushed into a sealed record array.
         if tag != crate::tagged::TAG_MAP {
             crate::fault::runtime_fault(
                 "Runtime error: cannot push a non-record value into a sealed record array",
@@ -531,7 +531,7 @@ pub unsafe extern "C" fn lin_array_push(arr: *mut LinArray, elem_ptr: *const u8,
         return;
     }
     if (*arr).elem_tag == SEALED_PTR_ARRAY_TAG {
-        // Accept TAG_MAP only (TAG_OBJECT is a dead legacy tag with no producers after Phase 3).
+        // Only TAG_MAP values can be pushed into a sealed-ptr record array.
         if tag != crate::tagged::TAG_MAP {
             crate::fault::runtime_fault(
                 "Runtime error: cannot push a non-record value into a sealed-ptr record array",
@@ -539,7 +539,7 @@ pub unsafe extern "C" fn lin_array_push(arr: *mut LinArray, elem_ptr: *const u8,
         }
         let named = (*arr).elem_named_desc;
         let heap_desc = (*arr).elem_desc;
-        // tag == TAG_MAP (guaranteed by the check above; TAG_OBJECT has no producers after Phase 3).
+        // tag == TAG_MAP (checked above).
         let map = *(elem_ptr as *const *mut crate::map::LinMap);
         if map.is_null() {
             crate::fault::runtime_fault("Runtime error: cannot push null into a sealed-ptr record array");
@@ -957,7 +957,7 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
             return; // non-record value — silent no-op (spec §6.1)
         }
     } else if elem_tag == SEALED_PTR_ARRAY_TAG {
-        // Pointer-backed (0xFD): the `tagged` is a TAG_OBJECT wrapping a LinObject* (materialized
+        // Pointer-backed (0xFD): the `tagged` is a TAG_MAP wrapping a LinMap* (materialized
         // by `lin_array_get_tagged`). Project it into a fresh sealed struct and store that.
         // Contract: lin_array_set does NOT consume `tagged` — the caller retains it and will
         // release it separately. We borrow `obj` from tagged, pack into a new sealed struct,

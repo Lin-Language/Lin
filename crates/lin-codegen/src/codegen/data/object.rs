@@ -428,14 +428,14 @@ impl<'ctx> Codegen<'ctx> {
         from != to
     }
 
-    /// Materialize a sealed record into a fresh boxed `LinObject` (TAG_OBJECT semantics): the
-    /// universal Json representation. Used at the sealed→Json/unsealed boundary so all the existing
-    /// dynamic object machinery (toString/keys/print/dynamic-index/eq-vs-Json) operates unchanged on
-    /// a normal LinObject. Returns the raw `LinObject*` (+1 owned). Each field is loaded by offset,
-    /// boxed, and `lin_object_set_fresh`'d under its interned string key.
+    /// Materialize a sealed record into a fresh `LinMap` (TAG_MAP): the universal Json
+    /// representation. Used at the sealed→Json/unsealed boundary so all the existing dynamic object
+    /// machinery (toString/keys/print/dynamic-index/eq-vs-Json) operates on a normal LinMap.
+    /// Returns the raw `LinMap*` (+1 owned). Each field is loaded by offset, boxed, and
+    /// `lin_map_set`'d under its interned string key.
     ///
-    /// RC contract per field: `lin_object_set_fresh` RETAINS the value's inner payload (the object
-    /// takes a +1). For a SCALAR field there is no inner heap, so the fresh box's shell would leak —
+    /// RC contract per field: `lin_map_set` RETAINS the value's inner payload (the map takes a +1).
+    /// For a SCALAR field there is no inner heap, so the fresh box's shell would leak —
     /// `lin_tagged_release` reclaims it (no-op on the absent inner). For a HEAP field the loaded
     /// pointer is BORROWED (the struct still owns its original +1); after `map_set` retains
     /// the inner (map +1), only the box SHELL is freed (`lin_tagged_free_box`) — NOT
@@ -551,9 +551,8 @@ impl<'ctx> Codegen<'ctx> {
         let mut vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> = Vec::with_capacity(target_keys.len());
 
         if Self::is_union_type(src_ty) {
-            // All union sources (TAG_MAP / TAG_RECORD / TAG_OBJECT) are normalised to a LinMap*
-            // by lin_union_force_to_map: TAG_MAP → O(1) retain; TAG_RECORD → materialise; TAG_OBJECT → copy.
-            // Phase 3: TAG_RECORD materialises to TAG_MAP, so the old TAG_OBJECT branch is gone.
+            // All union sources (TAG_MAP / TAG_RECORD / TAG_SUMNODE) are normalised to a LinMap*
+            // by lin_union_force_to_map: TAG_MAP → O(1) retain; TAG_RECORD/TAG_SUMNODE → materialise.
             let cmap = self.builder.call(self.rt.map_force, &[src.into()], "sproj_cmap")
                 .try_as_basic_value().unwrap_basic();
             let result = self.emit_sealed_proj_loop(cmap, self.rt.map_get, target_fields);
@@ -1090,13 +1089,13 @@ impl<'ctx> Codegen<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         // KEEP-PACKED-THROUGH-RECORD-FIELDS fast path: when `src` is a BOXED union/Json value (so it
         // is a `TaggedVal*`), its payload MAY be a keep-packed `*SumNode` (TAG_SUMNODE — the cursor
-        // zero-copy store) rather than a materialized `LinObject` (TAG_OBJECT). Tag-dispatch: a
-        // TAG_SUMNODE box's payload IS already the projected node, so just unwrap it + retain (zero
-        // copy); any other tag → unbox to the LinObject and run the per-type projector (rebuild). This
-        // centralizes the keep-packed read-back so EVERY caller (the arg/slot Coerce, `unbox_tagged_
-        // val_to_type`, Index) gets it. Only when `src_ty` is a union is `src` a box we may probe; a
-        // non-union `src` is a raw `LinObject*` (e.g. a match-narrowed, already-unboxed scrutinee) whose
-        // first bytes are NOT a tag — never probe it, project directly. The runtime-tag dispatch is the
+        // zero-copy store) or a materialized `LinMap` (TAG_MAP). Tag-dispatch: a TAG_SUMNODE box's
+        // payload IS already the projected node, so just unwrap it + retain (zero copy); TAG_MAP →
+        // unbox to the LinMap and run the per-type projector (rebuild). This centralizes the
+        // keep-packed read-back so EVERY caller (the arg/slot Coerce, `unbox_tagged_val_to_type`,
+        // Index) gets it. Only when `src_ty` is a union is `src` a box we may probe; a non-union
+        // `src` is a raw `LinMap*` (e.g. a match-narrowed, already-unboxed scrutinee) whose first
+        // bytes are NOT a tag — never probe it, project directly. The runtime-tag dispatch is the
         // soundness mechanism: no static store/read agreement is required.
         if Self::is_union_type(src_ty) && src.is_pointer_value() {
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
@@ -1116,7 +1115,7 @@ impl<'ctx> Codegen<'ctx> {
             }
             let kp_pred = self.builder.get_insert_block().unwrap();
             self.builder.unconditional_branch(merge_bb);
-            // MATERIALIZED (TAG_OBJECT) box: unbox to the LinObject and run the projector.
+            // MATERIALIZED (TAG_MAP) box: unbox to the LinMap and run the projector.
             self.builder.position_at_end(proj_bb);
             let container = self.builder.call(self.rt.unbox_ptr, &[src.into()], "sumnode_pfb_unbox").try_as_basic_value().unwrap_basic();
             let func = self.get_or_build_sumnode_projector(sum_ty);
@@ -1215,7 +1214,7 @@ impl<'ctx> Codegen<'ctx> {
                         .as_deref()
                         .is_some_and(|n| Self::is_sum_recursive_child(fty, n));
                     let val = if is_recursive {
-                        // The child slot in the boxed object is a nested boxed LinObject (TAG_OBJECT).
+                        // The child slot in the boxed object is a nested boxed LinMap (TAG_MAP).
                         let child_obj = self.builder.call(self.rt.unbox_ptr, &[tagged.into()], "sumnode_pfb_child_unbox").try_as_basic_value().unwrap_basic();
                         self.builder.call(func, &[child_obj.into()], "sumnode_pfb_child").try_as_basic_value().unwrap_basic()
                     } else {

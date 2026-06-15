@@ -499,7 +499,7 @@ pub fn lower_call(
     // Fix: emit the Call with `ret_ty = TypeVar(MAX)` (the ACTUAL closure return type so the
     // repr pass seeds it `Boxed`), then emit a `Coerce { from: TypeVar(MAX), to: SumNode }`.
     // Codegen compiles that Coerce to `sumnode_project_from_boxed` (the pfb tag-dispatch):
-    // TAG_SUMNODE → unwrap+retain; TAG_OBJECT → project a fresh node. The intermediate box is
+    // TAG_SUMNODE → unwrap+retain; TAG_MAP → project a fresh node. The intermediate box is
     // registered owned (closure SumNode returns ARE +1 — materialization always allocates a
     // fresh box) so scope-exit releases it; the Coerce result (fresh +1 SumNode) is the
     // value consumed downstream.
