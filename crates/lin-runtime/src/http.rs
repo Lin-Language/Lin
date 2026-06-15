@@ -3,7 +3,6 @@ use crate::fs::{make_string, resolve_lin_str};
 use crate::map::{lin_map_alloc, lin_map_set};
 use crate::string::lin_string_release;
 use crate::tagged::{TAG_INT32, TAG_STR, TAG_MAP, alloc_tagged};
-use crate::object::tagged_as_object;
 use crate::tagged::TaggedVal;
 
 unsafe fn map_set_str(map: *mut crate::map::LinMap, key: &str, val: &str) {
@@ -80,66 +79,38 @@ pub unsafe extern "C" fn lin_http_fetch_with(url: *const u8, opts: *const u8) ->
         None => return make_error_object("invalid URL"),
     };
 
-    // Normalize opts to a LinObject* (handles both TAG_OBJECT and TAG_RECORD).
-    let tv = if opts.is_null() { std::ptr::null() } else { opts as *const TaggedVal };
-    let (opts_obj, opts_owned) = match tagged_as_object(tv) {
-        Some(pair) => (pair.0, pair.1),
-        None => (std::ptr::null(), false),
+    // Read opts fields from LinMap (Phase 3: all open objects are TAG_MAP).
+    let opts_map: *const crate::map::LinMap = if opts.is_null() {
+        std::ptr::null()
+    } else {
+        let tv = opts as *const TaggedVal;
+        if (*tv).tag == TAG_MAP { (*tv).payload as *const crate::map::LinMap } else { std::ptr::null() }
     };
 
-    let method = if opts_obj.is_null() {
+    let method = if opts_map.is_null() {
         "GET".to_string()
     } else {
-        let obj = opts_obj;
-        let method_key = "method";
-        let mut found = "GET".to_string();
-        let len = (*obj).len as usize;
-        for i in 0..len {
-            let entry = (*obj).entries.add(i);
-            let key_s = (*entry).key;
-            let slice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
-            if let Ok(k) = std::str::from_utf8(slice) {
-                if k == method_key {
-                    let val_tv = &(*entry).value;
-                    if val_tv.tag == TAG_STR {
-                        let vs = val_tv.payload as *const crate::string::LinString;
-                        let vs_slice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
-                        if let Ok(s) = std::str::from_utf8(vs_slice) {
-                            found = s.to_uppercase();
-                        }
-                    }
-                    break;
-                }
-            }
+        let tv = crate::map::lin_map_get_bytes(opts_map, b"method".as_ptr(), 6);
+        if tv.is_null() || (*tv).tag != TAG_STR {
+            "GET".to_string()
+        } else {
+            let vs = (*tv).payload as *const crate::string::LinString;
+            let vs_slice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
+            std::str::from_utf8(vs_slice).unwrap_or("GET").to_uppercase()
         }
-        found
     };
 
-    let body_str: Option<String> = if opts_obj.is_null() {
+    let body_str: Option<String> = if opts_map.is_null() {
         None
     } else {
-        let obj = opts_obj;
-        let len = (*obj).len as usize;
-        let mut found = None;
-        for i in 0..len {
-            let entry = (*obj).entries.add(i);
-            let key_s = (*entry).key;
-            let slice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
-            if let Ok(k) = std::str::from_utf8(slice) {
-                if k == "body" {
-                    let val_tv = &(*entry).value;
-                    if val_tv.tag == TAG_STR {
-                        let vs = val_tv.payload as *const crate::string::LinString;
-                        let vs_slice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
-                        if let Ok(s) = std::str::from_utf8(vs_slice) {
-                            found = Some(s.to_string());
-                        }
-                    }
-                    break;
-                }
-            }
+        let tv = crate::map::lin_map_get_bytes(opts_map, b"body".as_ptr(), 4);
+        if tv.is_null() || (*tv).tag != TAG_STR {
+            None
+        } else {
+            let vs = (*tv).payload as *const crate::string::LinString;
+            let vs_slice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
+            std::str::from_utf8(vs_slice).ok().map(|s| s.to_string())
         }
-        found
     };
 
     let req = ureq::request(&method, &url_str);
@@ -148,8 +119,6 @@ pub unsafe extern "C" fn lin_http_fetch_with(url: *const u8, opts: *const u8) ->
     } else {
         req.call()
     };
-
-    if opts_owned { crate::object::lin_object_release(opts_obj as *mut crate::object::LinObject); }
 
     match result {
         Ok(resp) => {

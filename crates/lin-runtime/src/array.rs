@@ -724,15 +724,17 @@ pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::
             let map = (*tagged).payload as *const crate::map::LinMap;
             crate::sealed::pack_named_payload_from_map(slot, map, named);
             // lin_push_dyn has RETAINING semantics: caller keeps the box; map is NOT consumed.
+        } else if (*tagged).tag == crate::tagged::TAG_RECORD {
+            let sealed = (*tagged).payload as *mut u8;
+            if sealed.is_null() { crate::fault::runtime_fault("Runtime error: cannot push null record into sealed array"); }
+            let named_desc_ptr = *((sealed.add(16)) as *const *const u8);
+            let lmap = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc_ptr);
+            crate::sealed::pack_named_payload_from_map(slot, lmap, named);
+            crate::map::lin_map_release(lmap);
         } else {
-            let (obj, mat_owned) = match crate::object::tagged_as_object(tagged) {
-                Some(pair) => pair,
-                None => crate::fault::runtime_fault(
-                    "Runtime error: cannot push a non-record value into a sealed record array",
-                ),
-            };
-            crate::sealed::pack_named_payload_from_object(slot, obj, named);
-            if mat_owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
+            crate::fault::runtime_fault(
+                "Runtime error: cannot push a non-record value into a sealed record array",
+            );
         }
         return;
     }
@@ -756,17 +758,19 @@ pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::
             lin_sealed_ptr_array_push(arr, sptr); // retains: sptr rc goes 1→2
             crate::sealed::lin_sealed_release_self(sptr); // release our alloc ref: rc goes 2→1
             // map is not released — caller keeps its box (retaining semantics).
-        } else {
-            let (obj, mat_owned) = match crate::object::tagged_as_object(tagged) {
-                Some(pair) => pair,
-                None => crate::fault::runtime_fault(
-                    "Runtime error: cannot push a non-record value into a sealed-ptr record array",
-                ),
-            };
-            let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
+        } else if (*tagged).tag == crate::tagged::TAG_RECORD {
+            let sealed = (*tagged).payload as *mut u8;
+            if sealed.is_null() { crate::fault::runtime_fault("Runtime error: cannot push null record into sealed-ptr array"); }
+            let named_desc_ptr = *((sealed.add(16)) as *const *const u8);
+            let lmap = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc_ptr);
+            let sptr = crate::sealed::alloc_sealed_struct_from_map(lmap, named, heap_desc);
             lin_sealed_ptr_array_push(arr, sptr); // retains: sptr rc goes 1→2
             crate::sealed::lin_sealed_release_self(sptr); // release our alloc ref: rc goes 2→1
-            if mat_owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
+            crate::map::lin_map_release(lmap);
+        } else {
+            crate::fault::runtime_fault(
+                "Runtime error: cannot push a non-record value into a sealed-ptr record array",
+            );
         }
         return;
     }
@@ -980,23 +984,26 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
         if tagged.is_null() {
             return;
         }
-        // Accept TAG_OBJECT or TAG_RECORD (Stage 6a). Materialize TAG_RECORD to a transient
-        // LinObject so pack_named_payload_from_object can walk fields uniformly.
-        let (obj, mat_owned) = match crate::object::tagged_as_object(tagged) {
-            Some(pair) => pair,
-            None => return, // non-record value — silent no-op (spec §6.1)
-        };
+        // Dispatch on tag: TAG_MAP (direct) or TAG_RECORD (materialize to map first).
         let stride = (*arr).elem_stride;
         let slot = ((*arr).data as *mut u8).add((actual as u64 * stride) as usize);
         crate::sealed::release_payload_fields_pub(slot, (*arr).elem_desc);
-        crate::sealed::pack_named_payload_from_object(slot, obj, (*arr).elem_named_desc);
-        // For TAG_OBJECT the caller owns it and will release it separately (set contract: no consume).
-        // For TAG_RECORD the transient materialization is owned here — release it.
-        if mat_owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
-        // The original TAG_OBJECT case released `obj` here, meaning `lin_array_set` CONSUMED the
-        // `tagged` argument's inner. That was the pre-existing contract (move semantics for SEALED).
-        // Preserve it for TAG_OBJECT by matching the original release:
-        if !mat_owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
+        if (*tagged).tag == crate::tagged::TAG_MAP {
+            let map = (*tagged).payload as *const crate::map::LinMap;
+            crate::sealed::pack_named_payload_from_map(slot, map, (*arr).elem_named_desc);
+            // TAG_MAP: retaining semantics — caller keeps the box, no consume.
+        } else if (*tagged).tag == crate::tagged::TAG_RECORD {
+            let sealed = (*tagged).payload as *mut u8;
+            if !sealed.is_null() {
+                let named_desc_ptr = *((sealed.add(16)) as *const *const u8);
+                let lmap = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc_ptr);
+                crate::sealed::pack_named_payload_from_map(slot, lmap, (*arr).elem_named_desc);
+                crate::map::lin_map_release(lmap);
+            }
+            // TAG_RECORD: retaining semantics — caller keeps the box, no consume.
+        } else {
+            return; // non-record value — silent no-op (spec §6.1)
+        }
     } else if elem_tag == SEALED_PTR_ARRAY_TAG {
         // Pointer-backed (0xFD): the `tagged` is a TAG_OBJECT wrapping a LinObject* (materialized
         // by `lin_array_get_tagged`). Project it into a fresh sealed struct and store that.
@@ -1006,24 +1013,29 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
         if tagged.is_null() {
             return;
         }
-        let (obj_raw, mat_owned) = match crate::object::tagged_as_object(tagged) {
-            Some(pair) => pair,
-            None => return,
-        };
-        if obj_raw.is_null() {
-            if mat_owned { crate::object::lin_object_release(obj_raw as *mut crate::object::LinObject); }
-            return;
-        }
         let named = (*arr).elem_named_desc;
         let heap_desc = (*arr).elem_desc;
-        let new_sptr = crate::sealed::alloc_sealed_struct_from_object(obj_raw, named, heap_desc);
+        let new_sptr = if (*tagged).tag == crate::tagged::TAG_MAP {
+            let map = (*tagged).payload as *const crate::map::LinMap;
+            if map.is_null() { return; }
+            crate::sealed::alloc_sealed_struct_from_map(map, named, heap_desc)
+        } else if (*tagged).tag == crate::tagged::TAG_RECORD {
+            let sealed = (*tagged).payload as *mut u8;
+            if sealed.is_null() { return; }
+            let named_desc_ptr = *((sealed.add(16)) as *const *const u8);
+            let lmap = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc_ptr);
+            let sptr = crate::sealed::alloc_sealed_struct_from_map(lmap, named, heap_desc);
+            crate::map::lin_map_release(lmap);
+            sptr
+        } else {
+            return;
+        };
         let slot = ((*arr).data as *mut *mut u8).add(actual as usize);
         let old = *slot;
         if !old.is_null() {
             crate::sealed::lin_sealed_release_self(old);
         }
         *slot = new_sptr; // transfer alloc rc=1 to slot
-        if mat_owned { crate::object::lin_object_release(obj_raw as *mut crate::object::LinObject); }
     } else {
         let tag = if tagged.is_null() { TAG_NULL } else { (*tagged).tag };
         let payload = if tagged.is_null() { 0u64 } else { (*tagged).payload };

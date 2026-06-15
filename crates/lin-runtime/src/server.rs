@@ -1,5 +1,4 @@
-use crate::map::{lin_map_alloc, lin_map_set, LinMap};
-use crate::object::{LinObject, tagged_as_object};
+use crate::map::{lin_map_alloc, lin_map_set, lin_map_get_bytes, LinMap};
 use crate::tagged::{TaggedVal, TAG_STR, TAG_MAP, TAG_INT32, alloc_tagged};
 use crate::fs::{make_string, resolve_lin_str, make_error_tagged};
 use crate::string::{LinString, lin_string_release};
@@ -205,11 +204,9 @@ unsafe fn build_request_object(req: &ParsedRequest) -> *mut u8 {
     alloc_tagged(TAG_MAP, map as u64)
 }
 
-/// Read a String field from an object payload by key, if present and TAG_STR.
-unsafe fn obj_get_string(obj: *const LinObject, key: &str) -> Option<String> {
-    let k = make_string(key);
-    let tv = crate::object::lin_object_get(obj, k);
-    lin_string_release(k);
+/// Read a String field from a LinMap by key bytes, if present and TAG_STR.
+unsafe fn map_get_string(map: *const LinMap, key: &str) -> Option<String> {
+    let tv = lin_map_get_bytes(map, key.as_ptr(), key.len() as u32);
     if tv.is_null() || (*tv).tag != TAG_STR {
         return None;
     }
@@ -218,19 +215,38 @@ unsafe fn obj_get_string(obj: *const LinObject, key: &str) -> Option<String> {
     std::str::from_utf8(slice).ok().map(|x| x.to_string())
 }
 
-/// Read an Int32 field from an object payload by key, if present and TAG_INT32.
-unsafe fn obj_get_i32(obj: *const LinObject, key: &str) -> Option<i32> {
-    let k = make_string(key);
-    let tv = crate::object::lin_object_get(obj, k);
-    lin_string_release(k);
+/// Read an Int32 field from a LinMap by key bytes, if present and TAG_INT32.
+unsafe fn map_get_i32(map: *const LinMap, key: &str) -> Option<i32> {
+    let tv = lin_map_get_bytes(map, key.as_ptr(), key.len() as u32);
     if tv.is_null() || (*tv).tag != TAG_INT32 {
         return None;
     }
     Some((*tv).payload as i32)
 }
 
-/// Serialize a Lin HttpResponse object (a `TaggedVal*(Object)`) into an HTTP/1.1
-/// wire response. Reads `status` (Int32, default 200), `headers` (Object), and
+/// Extract the LinMap from a TaggedVal that may be TAG_MAP or TAG_RECORD (sealed struct).
+/// Returns (map ptr, owned: bool) where owned=true means caller must call lin_map_release.
+unsafe fn response_to_map(tv: *const TaggedVal) -> Option<(*const LinMap, bool)> {
+    use crate::tagged::TAG_RECORD;
+    if tv.is_null() { return None; }
+    match (*tv).tag {
+        TAG_MAP => {
+            let map = (*tv).payload as *const LinMap;
+            if map.is_null() { None } else { Some((map, false)) }
+        }
+        TAG_RECORD => {
+            let sealed = (*tv).payload as *mut u8;
+            if sealed.is_null() { return None; }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let map = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+            if map.is_null() { None } else { Some((map as *const LinMap, true)) }
+        }
+        _ => None,
+    }
+}
+
+/// Serialize a Lin HttpResponse object (a `TaggedVal*(TAG_MAP or TAG_RECORD)`) into an HTTP/1.1
+/// wire response. Reads `status` (Int32, default 200), `headers` (TAG_MAP), and
 /// `body` (Str). An error-shaped object (`{ "type": "error", ... }`) or a
 /// missing/ill-typed value yields a 500.
 unsafe fn serialize_response(resp: *const u8) -> Vec<u8> {
@@ -238,54 +254,62 @@ unsafe fn serialize_response(resp: *const u8) -> Vec<u8> {
         return wire_response(500, &[], "Internal Server Error");
     }
     let tv = resp as *const TaggedVal;
-    let (obj, resp_owned) = match tagged_as_object(tv) {
+    let (map, map_owned) = match response_to_map(tv) {
         Some(pair) => pair,
         None => return wire_response(500, &[], "Internal Server Error"),
     };
 
     // Error-shaped result → 500.
-    if let Some(t) = obj_get_string(obj, "type") {
+    if let Some(t) = map_get_string(map, "type") {
         if t == "error" {
-            let msg = obj_get_string(obj, "message").unwrap_or_else(|| "error".to_string());
-            if resp_owned { crate::object::lin_object_release(obj as *mut LinObject); }
+            let msg = map_get_string(map, "message").unwrap_or_else(|| "error".to_string());
+            if map_owned { crate::map::lin_map_release(map as *mut LinMap); }
             return wire_response(500, &[], &msg);
         }
     }
 
-    let status = obj_get_i32(obj, "status").unwrap_or(200);
-    let body = obj_get_string(obj, "body").unwrap_or_default();
+    let status = map_get_i32(map, "status").unwrap_or(200);
+    let body = map_get_string(map, "body").unwrap_or_default();
 
-    // headers nested object → Vec<(name, value)>
+    // headers nested map → Vec<(name, value)>
     let mut headers: Vec<(String, String)> = Vec::new();
-    let hkey = make_string("headers");
-    let htv = crate::object::lin_object_get(obj, hkey);
-    lin_string_release(hkey);
-    if !htv.is_null() {
-        let htv_typed = htv as *const TaggedVal;
-        if let Some((hobj, hobj_owned)) = tagged_as_object(htv_typed) {
-            let len = (*hobj).len as usize;
+    let htv = lin_map_get_bytes(map, b"headers".as_ptr(), 7);
+    // headers may be TAG_MAP (open) or TAG_RECORD (sealed, e.g. { String: String } typed map).
+    let hmap_opt = if htv.is_null() {
+        None
+    } else if (*htv).tag == TAG_MAP {
+        let hm = (*htv).payload as *const LinMap;
+        if hm.is_null() { None } else { Some((hm, false)) }
+    } else {
+        response_to_map(htv)
+    };
+    if let Some((hmap, hmap_owned)) = hmap_opt {
+        if !(*hmap).order.is_null() {
+            let len = (*hmap).len as usize;
             for i in 0..len {
-                let entry = (*hobj).entries.add(i);
-                let key_s = (*entry).key;
+                let key_bits = *(*hmap).order.add(i);
+                let key_s = key_bits as *const LinString;
+                if key_s.is_null() { continue; }
                 let kslice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
                 let name = match std::str::from_utf8(kslice) {
                     Ok(s) => s.to_string(),
                     Err(_) => continue,
                 };
-                let vtv = &(*entry).value;
-                if vtv.tag == TAG_STR {
-                    let vs = vtv.payload as *const LinString;
+                let vtv = crate::map::lin_map_get(hmap, key_s);
+                if vtv.is_null() { continue; }
+                if (*vtv).tag == TAG_STR {
+                    let vs = (*vtv).payload as *const LinString;
                     let vslice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
                     if let Ok(v) = std::str::from_utf8(vslice) {
                         headers.push((name, v.to_string()));
                     }
                 }
             }
-            if hobj_owned { crate::object::lin_object_release(hobj as *mut LinObject); }
         }
+        if hmap_owned { crate::map::lin_map_release(hmap as *mut LinMap); }
     }
 
-    if resp_owned { crate::object::lin_object_release(obj as *mut LinObject); }
+    if map_owned { crate::map::lin_map_release(map as *mut LinMap); }
     wire_response(status, &headers, &body)
 }
 
