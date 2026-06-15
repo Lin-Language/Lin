@@ -1,0 +1,3 @@
+import { StopId } from "../gtfs/gtfs"
+
+export type StopTimes = { StopId: UInt32 }
