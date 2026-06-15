@@ -401,8 +401,8 @@ impl<'ctx> Codegen<'ctx> {
 
     /// KEEP-PACKED box (repr pass Stage 4): wrap a still-packed `LinArray*` (elem_tag 0xFE) / packed
     /// sealed struct* into a 16-byte `TaggedVal` WITHOUT materializing. O(1), borrows the inner. A
-    /// sealed ARRAY uses `lin_box_array` (TAG_ARRAY) and a sealed RECORD uses `lin_box_object`
-    /// (TAG_OBJECT) — both store the payload pointer verbatim; the runtime dispatches release/free on
+    /// sealed ARRAY uses `lin_box_array` (TAG_ARRAY) and a sealed RECORD uses `lin_box_record`
+    /// (TAG_RECORD) — both store the payload pointer verbatim; the runtime dispatches release/free on
     /// the header (`elem_tag` for arrays, the sealed offset-4 size for structs). The box shell is a
     /// fresh +1; the inner's owning reference is supplied by the surrounding container transfer.
     pub(crate) fn compile_ir_box_keep_packed(&mut self, val: BasicValueEnum<'ctx>, arr: bool) -> BasicValueEnum<'ctx> {

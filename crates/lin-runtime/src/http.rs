@@ -2,7 +2,7 @@
 use crate::fs::{make_string, resolve_lin_str};
 use crate::map::{lin_map_alloc, lin_map_set};
 use crate::string::lin_string_release;
-use crate::tagged::{TAG_INT32, TAG_STR, TAG_MAP, alloc_tagged};
+use crate::tagged::{TAG_INT32, TAG_STR, TAG_MAP, TAG_RECORD, alloc_tagged};
 use crate::tagged::TaggedVal;
 
 unsafe fn map_set_str(map: *mut crate::map::LinMap, key: &str, val: &str) {
@@ -79,12 +79,28 @@ pub unsafe extern "C" fn lin_http_fetch_with(url: *const u8, opts: *const u8) ->
         None => return make_error_object("invalid URL"),
     };
 
-    // Read opts fields from LinMap (Phase 3: all open objects are TAG_MAP).
-    let opts_map: *const crate::map::LinMap = if opts.is_null() {
-        std::ptr::null()
+    // Read opts fields from the options object. Phase 3: an open object is TAG_MAP; a typed
+    // (sealed) options record is TAG_RECORD and must be materialised to a LinMap first, otherwise
+    // method/body would be silently dropped. `opts_map_owned` = we allocated the map and must
+    // release it before returning.
+    let (opts_map, opts_map_owned): (*const crate::map::LinMap, bool) = if opts.is_null() {
+        (std::ptr::null(), false)
     } else {
         let tv = opts as *const TaggedVal;
-        if (*tv).tag == TAG_MAP { (*tv).payload as *const crate::map::LinMap } else { std::ptr::null() }
+        match (*tv).tag {
+            TAG_MAP => ((*tv).payload as *const crate::map::LinMap, false),
+            TAG_RECORD => {
+                let sealed = (*tv).payload as *mut u8;
+                if sealed.is_null() {
+                    (std::ptr::null(), false)
+                } else {
+                    let named_desc = *((sealed.add(16)) as *const *const u8);
+                    let map = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+                    (map as *const crate::map::LinMap, !map.is_null())
+                }
+            }
+            _ => (std::ptr::null(), false),
+        }
     };
 
     let method = if opts_map.is_null() {
@@ -112,6 +128,11 @@ pub unsafe extern "C" fn lin_http_fetch_with(url: *const u8, opts: *const u8) ->
             std::str::from_utf8(vs_slice).ok().map(|s| s.to_string())
         }
     };
+
+    // All fields read out; release the materialised options map if we own it.
+    if opts_map_owned {
+        crate::map::lin_map_release(opts_map as *mut crate::map::LinMap);
+    }
 
     let req = ureq::request(&method, &url_str);
     let result = if let Some(b) = body_str {

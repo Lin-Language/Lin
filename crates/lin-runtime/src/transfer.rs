@@ -47,14 +47,14 @@ unsafe fn clone_string(s: *const LinString) -> *mut LinString {
 /// +1 per entry. Frozen/immortal maps are shared read-only (zero-copy), mirroring clone_array.
 /// Deep-clone ONE tagged value for cross-thread transfer, returning a fully independent
 /// `(tag, payload)` that shares NO pointer with `src` (the transfer invariant, ADR-028).
-/// Phase 3: a `TAG_RECORD` (packed sealed struct) or `TAG_OBJECT` (legacy LinObject) transfers as
-/// a fresh `TAG_MAP` (dynamic objects are map-backed); every other tag keeps its tag with a
+/// Phase 3: a `TAG_RECORD` (packed sealed struct) or `TAG_SUMNODE` (kept-packed sum node) transfers
+/// as a fresh `TAG_MAP` (dynamic objects are map-backed); every other tag keeps its tag with a
 /// deep-cloned payload via `transfer_payload` (scalars verbatim; string/array/map deep-copy;
 /// Shared/TarEntry retained). Used by `clone_map`, `clone_array`, and the CAP_OBJECT env clone so
 /// they share one correct implementation — previously the CAP_OBJECT path used bare
 /// `transfer_payload`, which aliased a nested object/record field across the thread boundary (UAF).
 unsafe fn transfer_clone_value(src: &TaggedVal) -> TaggedVal {
-    use crate::tagged::{TAG_MAP, TAG_RECORD};
+    use crate::tagged::{TAG_MAP, TAG_RECORD, TAG_SUMNODE};
     if src.tag == TAG_RECORD {
         let sealed = src.payload as *const u8;
         let named_desc = if sealed.is_null() { std::ptr::null() } else {
@@ -63,6 +63,14 @@ unsafe fn transfer_clone_value(src: &TaggedVal) -> TaggedVal {
         let map = crate::sealed::materialize_sealed_to_map_pub(src.payload as *mut u8, named_desc);
         let cloned = clone_map(map as *const crate::map::LinMap);
         if !map.is_null() { crate::map::lin_map_release(map); }
+        TaggedVal { tag: TAG_MAP, _pad: [0; 7], payload: cloned as u64 }
+    } else if src.tag == TAG_SUMNODE {
+        // KEEP-PACKED-THROUGH-RECORD-FIELDS thread-transfer: a kept-packed `*SumNode` value MUST
+        // NOT cross the thread boundary by pointer (it would alias → cross-thread double-free).
+        // Materialise it to a fresh +1 LinMap, deep-clone that, and transfer as a uniform TAG_MAP.
+        let map = crate::sumnode::lin_sumnode_materialize(src.payload as *mut u8);
+        let cloned = clone_map(map as *const crate::map::LinMap);
+        if !map.is_null() { crate::map::lin_map_release(map as *mut crate::map::LinMap); }
         TaggedVal { tag: TAG_MAP, _pad: [0; 7], payload: cloned as u64 }
     } else {
         let payload = transfer_payload(src.tag, src.payload);
@@ -78,23 +86,32 @@ unsafe fn clone_map(src: *const crate::map::LinMap) -> *mut crate::map::LinMap {
         return src as *mut crate::map::LinMap;
     }
     let dst = crate::map::lin_map_alloc((*src).len, (*src).key_kind);
-    let cap = (*src).cap as usize;
-    if cap > 0 && !(*src).slots.is_null() {
+    let len = (*src).len as usize;
+    // Iterate the source's INSERTION-ORDER key list (not raw hash slots) so the clone preserves
+    // declaration order (option A: insertion order everywhere). Inserting in this sequence rebuilds
+    // the destination's own order array identically.
+    if len > 0 && !(*src).order.is_null() {
         let is_int = (*src).key_kind == crate::map::KEY_KIND_INT;
-        for i in 0..cap {
-            let slot = (*src).slots.add(i);
-            if (*slot).hash == 0 {
-                continue; // empty slot
+        for i in 0..len {
+            let key_bits = *(*src).order.add(i);
+            // Fetch the value slot for this ordered key.
+            let vsrc: *const TaggedVal = if is_int {
+                crate::map::lin_map_get_int(src, key_bits as i64)
+            } else {
+                crate::map::lin_map_get(src, key_bits as *const crate::string::LinString)
+            };
+            if vsrc.is_null() {
+                continue; // key vanished — defensive, should not happen
             }
-            let v = transfer_clone_value(&(*slot).value);
+            let v = transfer_clone_value(&*vsrc);
             // Insert into the destination map. For String maps, deep-clone the key; for Int maps
             // the key is a scalar (no RC).
             if is_int {
-                crate::map::lin_map_set_int(dst, (*slot).key as i64, &v);
+                crate::map::lin_map_set_int(dst, key_bits as i64, &v);
                 crate::tagged::release_tagged_payload_pub(&v);
             } else {
                 // Deep-clone the string key.
-                let key = clone_string((*slot).key as *mut crate::string::LinString);
+                let key = clone_string(key_bits as *mut crate::string::LinString);
                 // lin_map_set retains the key (first insert) and retains the value payload.
                 crate::map::lin_map_set(dst, key, &v);
                 crate::string::lin_string_release(key);
@@ -288,9 +305,9 @@ pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
 
 /// Transfer one tagged payload (the 8-byte field) by kind: scalars copy verbatim; heap
 /// pointers are deep-copied.
-/// NOTE: TAG_RECORD and TAG_OBJECT are NOT handled here. All call sites that may encounter those
-/// tags handle them directly (TAG_RECORD → materialize to LinMap; TAG_OBJECT → clone_object_as_map)
-/// to avoid the tag-mismatch problem of returning a LinMap ptr under the original tag.
+/// NOTE: TAG_RECORD and TAG_SUMNODE are NOT handled here — `transfer_clone_value` handles them
+/// directly (materialise to LinMap, deep-clone, emit TAG_MAP) to avoid the tag-mismatch problem of
+/// returning a LinMap ptr under the original tag.
 unsafe fn transfer_payload(tag: u8, payload: u64) -> u64 {
     use crate::tagged::{TAG_SHARED, TAG_MAP, TAG_TAR_ENTRY};
     match tag {
@@ -325,20 +342,10 @@ pub unsafe extern "C" fn lin_transfer_clone(p: *const u8) -> *mut u8 {
         return std::ptr::null_mut();
     }
     let src = &*(p as *const TaggedVal);
-    // Phase 3: TAG_RECORD → materialise to LinMap, deep-clone, box as TAG_MAP.
-    // (TAG_OBJECT has no producers after Phase 3.)
-    if src.tag == crate::tagged::TAG_RECORD {
-        let sealed = src.payload as *const u8;
-        let named_desc = if sealed.is_null() { std::ptr::null() } else {
-            *((sealed.add(16)) as *const *const u8)
-        };
-        let map = crate::sealed::materialize_sealed_to_map_pub(src.payload as *mut u8, named_desc);
-        let cloned = clone_map(map as *const crate::map::LinMap);
-        if !map.is_null() { crate::map::lin_map_release(map); }
-        return crate::tagged::alloc_tagged(crate::tagged::TAG_MAP, cloned as u64);
-    }
-    let payload = transfer_payload(src.tag, src.payload);
-    crate::tagged::alloc_tagged(src.tag, payload)
+    // Deep-clone the value graph. transfer_clone_value handles the record/sum-node → LinMap
+    // materialisation (Phase 3 dynamic-object unification) and deep-copies every other tag.
+    let cloned = transfer_clone_value(src);
+    crate::tagged::alloc_tagged(cloned.tag, cloned.payload)
 }
 
 // -------------------------------------------------------------------------
