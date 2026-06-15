@@ -1,0 +1,16 @@
+
+import { split } from "std/string"
+import { parseUInt32 } from "std/number"
+
+export val createTimeParser = () => 
+  val timeCache: { String: UInt32 } = {}
+
+  (time: String): UInt32 => 
+    if (timeCache[time] == null) then
+      val [hh, mm, ss] = time.split(":")
+      timeCache[time] = parseUInt32(hh) * 60 * 60 + parseUInt32(mm) * 60 + parseUInt32(ss)
+    else 
+      timeCache[time]
+  
+
+

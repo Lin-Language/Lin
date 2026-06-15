@@ -1,0 +1,33 @@
+
+export type GroupStationDepartAfterQuery {
+  "raptor": RaptorAlgorithm,
+  "resultsFactory": ResultsFactory,
+  "maxSearchDays": UInt8,
+  "filters": JourneyFilter[]
+}
+
+export val createGroupStationDepartAfterQuery = (
+  raptor: RaptorAlgorithm, 
+  resultsFactory: ResultsFactory, 
+  maxSearchDays: UInt8 = 3,
+  filters: JourneyFilter[] = []
+) => {
+  "raptor": raptor,
+  "resultsFactory": resultsFactory,
+  "maxSearchDays": maxSearchDays
+  "filters": filters
+}
+
+
+// 
+// Plan a journey between the origin and destination set of stops on the given date and time
+// 
+export val plan = (GroupStationDepartAfterQuery: query, origins: StopID[], destinations: StopID[], date: Date, time: Time): Journey[] =>
+  // set the departure time for each origin
+  const originTimes = origins.reduce(keyValue(origin => [origin, time]), {});
+
+  // get results for every destination and flatten into a single array
+  const results = this.getJourneys(originTimes, destinations, date);
+
+  // apply each filter to the results
+  return this.filters.reduce((rs, filter) => filter.apply(rs), results);
