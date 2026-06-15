@@ -54,17 +54,17 @@ pub const KIND_SUMNODE: u32 = 4;
 /// `Codegen::sumnode_descriptor` (which emits `{ ptr matfn, [N x i32] table }`).
 pub const SUMDESC_TABLE_OFFSET: usize = 8;
 
-/// The materializer function pointer signature: `*SumNode -> *LinObject` (the per-type
+/// The materializer function pointer signature: `*SumNode -> *LinMap` (the per-type
 /// `lin_summat_<key>` codegen emits). Used to materialize a kept-packed `TAG_SUMNODE` slot that
 /// escaped a record field into the type-erased dynamic domain (toString/eq/json).
 type SumMatFn = unsafe extern "C" fn(*mut u8) -> *mut u8;
 
-/// Materialize an unboxed `*SumNode` to a real boxed `LinObject` (the universal Json representation),
-/// via the per-type materializer fn-ptr stored at the head of the node's SumDesc. Returns a +1
-/// `LinObject*` (NOT a TaggedVal box — the caller boxes it as TAG_OBJECT). Null/desc-less safe
-/// (returns null — a scalar-only sum type still carries a descriptor under this scheme, so the
-/// desc is non-null for every keep-packed-eligible node). Used by the runtime dynamic-boundary
-/// walkers (`lin_tagged_to_string` / `push_json_value` / `lin_tagged_eq`) for a TAG_SUMNODE payload.
+/// Materialize an unboxed `*SumNode` to a fresh +1 `LinMap*`, via the per-type materializer
+/// fn-ptr stored at the head of the node's SumDesc. Returns a `*mut LinMap` cast as `*mut u8`.
+/// Null/desc-less safe (returns null — a scalar-only sum type still carries a descriptor under
+/// this scheme, so the desc is non-null for every keep-packed-eligible node). Used by the runtime
+/// dynamic-boundary walkers (`lin_tagged_to_string` / `push_json_value` / `lin_tagged_eq`) for a
+/// TAG_SUMNODE payload.
 #[no_mangle]
 pub unsafe extern "C" fn lin_sumnode_materialize(node: *mut u8) -> *mut u8 {
     if node.is_null() {
