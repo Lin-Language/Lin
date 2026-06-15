@@ -1,5 +1,5 @@
 use crate::string::{LinString, lin_string_from_bytes};
-use crate::tagged::{TaggedVal, TAG_OBJECT, TAG_STR, TAG_ARRAY, TAG_NULL, TAG_RECORD, alloc_tagged};
+use crate::tagged::{TaggedVal, TAG_MAP, TAG_OBJECT, TAG_STR, TAG_ARRAY, TAG_NULL, TAG_RECORD, alloc_tagged};
 use crate::fs::{make_error_tagged, resolve_lin_str};
 
 /// Bridge a Lin data value to a `serde_json::Value` for use as a minijinja render
@@ -13,12 +13,14 @@ unsafe fn data_to_context(data: *const u8) -> serde_json::Value {
         return serde_json::Value::Object(serde_json::Map::new());
     }
     let tag = *data;
-    if tag == TAG_OBJECT || tag == TAG_STR || tag == TAG_ARRAY || tag == TAG_NULL || tag == TAG_RECORD {
-        // Already a TaggedVal* (TAG_RECORD handled by tagged_to_json Stage 6a path).
+    if tag == TAG_OBJECT || tag == TAG_MAP || tag == TAG_STR || tag == TAG_ARRAY || tag == TAG_NULL || tag == TAG_RECORD {
+        // Already a TaggedVal* (TAG_MAP = Phase 2 open objects; TAG_RECORD = Stage 6a sealed path).
         crate::json::tagged_to_json(data)
     } else {
-        // Bare LinObject*: wrap it so tagged_to_json sees a TAG_OBJECT.
-        let tv = TaggedVal { tag: TAG_OBJECT, _pad: [0; 7], payload: data as u64 };
+        // Bare LinMap* (Phase 2: open objects are LinMap*): wrap it so tagged_to_json sees TAG_MAP.
+        // Prior to Phase 2 this path was bare LinObject*, but after Phase 2 bare object pointers
+        // are always LinMap*, so TAG_MAP is the correct tag here.
+        let tv = TaggedVal { tag: TAG_MAP, _pad: [0; 7], payload: data as u64 };
         crate::json::tagged_to_json(&tv as *const TaggedVal as *const u8)
     }
 }

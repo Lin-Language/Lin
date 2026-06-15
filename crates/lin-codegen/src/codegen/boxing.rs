@@ -93,30 +93,27 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.box_str, &[val.into()], "boxstr")
                     .try_as_basic_value().unwrap_basic()
             }
-            // A SEALED SCALAR RECORD is a packed struct, NOT a LinObject — box_object would
-            // treat its ptr as a LinObject header and corrupt. Materialize to a fresh boxed
-            // LinObject first, then box that as TAG_OBJECT. (This is the same conversion the
-            // Coerce(sealed → Json) boundary performs; it is the safety net for any path that
-            // boxes a sealed value directly, e.g. heterogeneous array elements or closure args.)
+            // A SEALED SCALAR RECORD is a packed struct, NOT a LinMap/LinObject — box_map would
+            // treat its ptr as a LinMap header and corrupt. Materialize to a fresh LinMap first,
+            // then box that as TAG_MAP. (This is the same conversion the Coerce(sealed → Json)
+            // boundary performs; it is the safety net for any path that boxes a sealed value
+            // directly, e.g. heterogeneous array elements or closure args.)
             // NOTE (Stage 6a): the sealed→Json Coerce path in compile_ir_coerce emits lin_box_record
-            // DIRECTLY (bypassing this materialize path) when the target is a union/Json slot. This
-            // fallback retains the TAG_OBJECT materialize for all OTHER boxing contexts that still
-            // need a LinObject (map slots read back via sealed_project_from, closure args, etc.).
+            // DIRECTLY (bypassing this materialize path) when the target is a union/Json slot.
             Type::Object { .. } if Self::sealed_scalar_fields(val_ty).is_some() => {
                 let fields = Self::sealed_scalar_fields(val_ty).unwrap().clone();
-                let obj = self.sealed_materialize_to_object(val, &fields);
-                self.builder.call(self.rt.box_object, &[obj.into()], "boxsealed")
+                let obj = self.sealed_materialize_to_map(val, &fields);
+                self.builder.call(self.rt.box_map, &[obj.into()], "boxsealed_map")
                     .try_as_basic_value().unwrap_basic()
             }
+            // Phase 2: non-sealed open objects are now LinMap* — box with TAG_MAP.
             Type::Object { .. } => {
-                self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
+                self.builder.call(self.rt.box_map, &[val.into()], "boxmap_obj")
                     .try_as_basic_value().unwrap_basic()
             }
             // Typed index-signature map (`{ K: V }`, ADR-055 + numeric-key): box the LinMap* as TAG_MAP.
             Type::Map { .. } => {
-                let box_map_fn = self.get_or_declare_fn("lin_box_map",
-                    self.context.ptr_type(AddressSpace::default()).fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false));
-                self.builder.call(box_map_fn, &[val.into()], "boxmap")
+                self.builder.call(self.rt.box_map, &[val.into()], "boxmap")
                     .try_as_basic_value().unwrap_basic()
             }
             // A SEALED-RECORD ARRAY (0xFD pointer-backed or 0xFE inline-packed) is boxed as a
@@ -157,16 +154,17 @@ impl<'ctx> Codegen<'ctx> {
             // container-store boundary (Map value slot) does NOT route through `box_value`; it stores a
             // TAG_SUMNODE node directly so only the genuinely-dynamic consumers pay the materialize.
             // Handle BEFORE the generic Union arm (a sum type IS a `Type::Union`).
+            // Stage 6b Phase 2: sumnode materializes to LinMap* — box as TAG_MAP.
             Type::Union(_) if Self::is_sum_type(val_ty) && val.is_pointer_value() => {
                 let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-                let obj = self.sumnode_materialize_to_object(val, val_ty, llvm_fn);
-                self.builder.call(self.rt.box_object, &[obj.into()], "boxsumobj")
+                let map = self.sumnode_materialize_to_object(val, val_ty, llvm_fn);
+                self.builder.call(self.rt.box_map, &[map.into()], "boxsummap")
                     .try_as_basic_value().unwrap_basic()
             }
             // A `sum | Null` value (e.g. a `{ String: Expr }` map read): physically EITHER a `*SumNode`
-            // or a null pointer. Materialize the node to a boxed LinObject when non-null, else box
+            // or a null pointer. Materialize the node to a boxed LinMap when non-null, else box
             // Null. Without this the generic Union arm (below) returned the raw `*SumNode` verbatim
-            // (a non-`all_objects` union), so a downstream `object_get`/match read it as a LinObject →
+            // (a non-`all_objects` union), so a downstream `map_get`/match read it as a LinMap →
             // garbage discriminant ("non-exhaustive match"). Runtime-branch on null.
             Type::Union(_) if Self::sum_member_of_nullable_union(val_ty).is_some() && val.is_pointer_value() => {
                 let sum_ty = Self::sum_member_of_nullable_union(val_ty).unwrap();
@@ -183,8 +181,8 @@ impl<'ctx> Codegen<'ctx> {
                 let null_pred = self.builder.get_insert_block().unwrap();
                 self.builder.unconditional_branch(merge_bb);
                 self.builder.position_at_end(node_bb);
-                let obj = self.sumnode_materialize_to_object(val, &sum_ty, llvm_fn);
-                let node_box = self.builder.call(self.rt.box_object, &[obj.into()], "sumnode_box").try_as_basic_value().unwrap_basic();
+                let map = self.sumnode_materialize_to_object(val, &sum_ty, llvm_fn);
+                let node_box = self.builder.call(self.rt.box_map, &[map.into()], "sumnode_mapbox").try_as_basic_value().unwrap_basic();
                 let node_pred = self.builder.get_insert_block().unwrap();
                 self.builder.unconditional_branch(merge_bb);
                 self.builder.position_at_end(merge_bb);
@@ -196,10 +194,10 @@ impl<'ctx> Codegen<'ctx> {
             // If it's already a tagged pointer, return as-is.
             Type::Union(variants) => {
                 if val.is_pointer_value() {
-                    // If all variants are Object types, this is a LinObject*.
+                    // If all variants are Object types, they are now LinMap* (Phase 2).
                     let all_objects = variants.iter().all(|v| matches!(v, Type::Object { .. }));
                     if all_objects {
-                        self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
+                        self.builder.call(self.rt.box_map, &[val.into()], "boxobj_map")
                             .try_as_basic_value().unwrap_basic()
                     } else {
                         // Already tagged (or unknown) — return as-is.
@@ -365,7 +363,8 @@ impl<'ctx> Codegen<'ctx> {
         // map_flat_scalar segfault). Mirrors the home-alloca hoist in mod.rs.
         let alloca = self.entry_block_alloca(tagged_ty, "tv");
 
-        let tag = Self::type_tag(val_ty);
+        // Use type_tag_open so a concrete open-object payload (LinMap*) is tagged TAG_MAP.
+        let tag = Self::type_tag_open(val_ty);
         let tag_val = i8_ty.const_int(tag as u64, false);
         let tag_ptr = self.builder.struct_gep(tagged_ty, alloca, 0, "tv_tag");
         self.builder.store(tag_ptr, tag_val);
@@ -414,7 +413,8 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.call(self.rt.box_array, &[val.into()], "kp_boxarr")
                 .try_as_basic_value().unwrap_basic()
         } else {
-            self.builder.call(self.rt.box_object, &[val.into()], "kp_boxobj")
+            // Phase 2: non-array keep-packed values are LinMap* (TAG_MAP).
+            self.builder.call(self.rt.box_map, &[val.into()], "kp_boxmap")
                 .try_as_basic_value().unwrap_basic()
         }
     }

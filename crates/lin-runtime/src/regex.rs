@@ -20,9 +20,8 @@
 use crate::array::{lin_array_alloc, lin_array_push_tagged};
 use crate::fs::{make_error_tagged, make_string, resolve_lin_str};
 use crate::map::{lin_map_alloc, lin_map_set, lin_map_release};
-use crate::object::{lin_object_alloc, lin_object_set, LinObject};
 use crate::string::{lin_string_release, LinString};
-use crate::tagged::{alloc_tagged, TaggedVal, TAG_ARRAY, TAG_INT32, TAG_MAP, TAG_NULL, TAG_OBJECT, TAG_STR};
+use crate::tagged::{alloc_tagged, TaggedVal, TAG_ARRAY, TAG_INT32, TAG_MAP, TAG_NULL, TAG_STR};
 
 use regex::Regex;
 
@@ -75,18 +74,16 @@ fn byte_to_cp(s: &str, byte_off: usize) -> i32 {
 /// `alloc_tagged`, while `find_all` pushes it via a stack `TaggedVal` (transfer semantics),
 /// so neither path leaks a 16-byte wrapper shell.
 ///
-/// NOTE: the outer Match is TAG_OBJECT (not TAG_MAP) because the Lin `Match` type is a
-/// named record with statically-known fields, and the compiled accessor for a narrowed
-/// `m: Match` parameter calls `lin_object_get` directly (no tag dispatch). Only the `named`
-/// sub-value is typed `AnyVal` at the Lin level and therefore safely upgraded to TAG_MAP.
-unsafe fn build_match(s: &str, re: &Regex, caps: &regex::Captures) -> *mut LinObject {
+/// Phase 2: `Match` is an unsealed open type (has AnyVal fields), so it is now backed by
+/// LinMap (TAG_MAP). Returns a +1-owned `*mut LinMap`.
+unsafe fn build_match(s: &str, re: &Regex, caps: &regex::Captures) -> *mut crate::map::LinMap {
     let whole = caps.get(0).expect("captures always have group 0");
-    let obj = lin_object_alloc(8);
+    let obj = lin_map_alloc(5, 0); // 5 fields: text, start, end, groups, named
 
     // text
     let k_text = make_string("text");
     let tv_text = tagged_str(whole.as_str());
-    lin_object_set(obj, k_text, &tv_text);
+    lin_map_set(obj, k_text, &tv_text);
     lin_string_release(k_text);
     lin_string_release(tv_text.payload as *mut LinString);
 
@@ -98,14 +95,14 @@ unsafe fn build_match(s: &str, re: &Regex, caps: &regex::Captures) -> *mut LinOb
     let mut tv_start: TaggedVal = std::mem::zeroed();
     tv_start.tag = TAG_INT32;
     tv_start.payload = start_cp as i64 as u64;
-    lin_object_set(obj, k_start, &tv_start);
+    lin_map_set(obj, k_start, &tv_start);
     lin_string_release(k_start);
 
     let k_end = make_string("end");
     let mut tv_end: TaggedVal = std::mem::zeroed();
     tv_end.tag = TAG_INT32;
     tv_end.payload = end_cp as i64 as u64;
-    lin_object_set(obj, k_end, &tv_end);
+    lin_map_set(obj, k_end, &tv_end);
     lin_string_release(k_end);
 
     // groups: (String | Null)[], one entry per capture group (index 0 = whole match).
@@ -131,14 +128,12 @@ unsafe fn build_match(s: &str, re: &Regex, caps: &regex::Captures) -> *mut LinOb
     let mut tv_groups: TaggedVal = std::mem::zeroed();
     tv_groups.tag = TAG_ARRAY;
     tv_groups.payload = groups as u64;
-    lin_object_set(obj, k_groups, &tv_groups);
+    lin_map_set(obj, k_groups, &tv_groups);
     lin_string_release(k_groups);
-    // lin_object_set retains the array payload; drop our local +1 from lin_array_alloc.
+    // lin_map_set retains the array payload; drop our local +1 from lin_array_alloc.
     crate::array::lin_array_release(groups);
 
     // named: { String: String } as LinMap (TAG_MAP) — only the groups that participated.
-    // Safe to use TAG_MAP here because `named` is typed `AnyVal` in the Lin Match record,
-    // so the consumer uses the full union tag-dispatch path (handles TAG_MAP correctly).
     let named = lin_map_alloc(4, 0);
     for name in re.capture_names().flatten() {
         if let Some(g) = caps.name(name) {
@@ -153,9 +148,9 @@ unsafe fn build_match(s: &str, re: &Regex, caps: &regex::Captures) -> *mut LinOb
     let mut tv_named: TaggedVal = std::mem::zeroed();
     tv_named.tag = TAG_MAP;
     tv_named.payload = named as u64;
-    lin_object_set(obj, k_named, &tv_named);
+    lin_map_set(obj, k_named, &tv_named);
     lin_string_release(k_named);
-    // lin_object_set retains the named map; drop our local +1 from lin_map_alloc.
+    // lin_map_set retains the named map; drop our local +1 from lin_map_alloc.
     lin_map_release(named);
 
     obj
@@ -209,7 +204,8 @@ pub unsafe extern "C" fn lin_regex_find(handle: *const u8, s: *const u8) -> *mut
         None => return std::ptr::null_mut(),
     };
     match re.captures(&hay) {
-        Some(caps) => alloc_tagged(TAG_OBJECT, build_match(&hay, re, &caps) as u64),
+        // Phase 2: Match is unsealed (has AnyVal fields) → LinMap (TAG_MAP).
+        Some(caps) => alloc_tagged(TAG_MAP, build_match(&hay, re, &caps) as u64),
         None => std::ptr::null_mut(),
     }
 }
@@ -231,9 +227,10 @@ pub unsafe extern "C" fn lin_regex_find_all(handle: *const u8, s: *const u8) -> 
         // lin_array_push_tagged copies the 16 bytes inline and TRANSFERS ownership of the
         // object into the array slot (no retain, no wrapper to free) — the array_release at
         // end of life will release the object.
+        // Phase 2: Match is unsealed (has AnyVal fields) → LinMap (TAG_MAP).
         let obj = build_match(&hay, re, &caps);
         let mut tv: TaggedVal = std::mem::zeroed();
-        tv.tag = TAG_OBJECT;
+        tv.tag = TAG_MAP;
         tv.payload = obj as u64;
         lin_array_push_tagged(arr, &tv as *const TaggedVal as *const u8);
     }
@@ -289,7 +286,6 @@ pub unsafe extern "C" fn lin_regex_split(handle: *const u8, s: *const u8) -> *mu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::lin_object_get;
     use crate::string::lin_string_from_bytes;
     use crate::tagged::{lin_tagged_release, TAG_INT32};
 
@@ -304,9 +300,10 @@ mod tests {
         p as *const TaggedVal
     }
 
-    unsafe fn obj_str(obj: *const LinObject, key: &str) -> String {
+    // Phase 2: Match is a LinMap (TAG_MAP). Test helpers use lin_map_get.
+    unsafe fn map_str(map: *const crate::map::LinMap, key: &str) -> String {
         let k = make_string(key);
-        let tv = lin_object_get(obj, k);
+        let tv = crate::map::lin_map_get(map, k);
         lin_string_release(k);
         assert!(!tv.is_null(), "field {key} missing");
         assert_eq!((*tv).tag, TAG_STR, "field {key} not a string");
@@ -315,14 +312,15 @@ mod tests {
         std::str::from_utf8(slice).unwrap().to_owned()
     }
 
-    unsafe fn obj_i32(obj: *const LinObject, key: &str) -> i32 {
+    unsafe fn map_i32(map: *const crate::map::LinMap, key: &str) -> i32 {
         let k = make_string(key);
-        let tv = lin_object_get(obj, k);
+        let tv = crate::map::lin_map_get(map, k);
         lin_string_release(k);
         assert!(!tv.is_null(), "field {key} missing");
         assert_eq!((*tv).tag, TAG_INT32);
         (*tv).payload as i32
     }
+
 
     #[test]
     fn compile_ok_and_bad() {
@@ -346,12 +344,13 @@ mod tests {
             assert_eq!(lin_regex_is_match(h, lin_str("  hello world")), 1);
             assert_eq!(lin_regex_is_match(h, lin_str("123")), 0);
 
+            // Phase 2: Match is a LinMap (TAG_MAP).
             let m = lin_regex_find(h, lin_str("  hello world"));
-            assert_eq!((*tv(m)).tag, TAG_OBJECT);
-            let obj = (*tv(m)).payload as *const LinObject;
-            assert_eq!(obj_str(obj, "text"), "hello");
-            assert_eq!(obj_i32(obj, "start"), 2);
-            assert_eq!(obj_i32(obj, "end"), 7);
+            assert_eq!((*tv(m)).tag, TAG_MAP);
+            let map = (*tv(m)).payload as *const crate::map::LinMap;
+            assert_eq!(map_str(map, "text"), "hello");
+            assert_eq!(map_i32(map, "start"), 2);
+            assert_eq!(map_i32(map, "end"), 7);
             lin_tagged_release(m);
         }
     }
@@ -361,20 +360,21 @@ mod tests {
         unsafe {
             let h = lin_regex_compile(lin_str("café"));
             // "a café here": 'café' starts at codepoint 2 (bytes 2), ends at codepoint 6.
+            // Phase 2: Match is a LinMap (TAG_MAP).
             let m = lin_regex_find(h, lin_str("a café here"));
-            let obj = (*tv(m)).payload as *const LinObject;
-            assert_eq!(obj_str(obj, "text"), "café");
-            assert_eq!(obj_i32(obj, "start"), 2);
-            assert_eq!(obj_i32(obj, "end"), 6);
+            let map = (*tv(m)).payload as *const crate::map::LinMap;
+            assert_eq!(map_str(map, "text"), "café");
+            assert_eq!(map_i32(map, "start"), 2);
+            assert_eq!(map_i32(map, "end"), 6);
             lin_tagged_release(m);
 
             // An emoji before the match shifts codepoint vs byte offsets apart.
             let h2 = lin_regex_compile(lin_str("end"));
             let m2 = lin_regex_find(h2, lin_str("🎉 the end"));
-            let obj2 = (*tv(m2)).payload as *const LinObject;
+            let map2 = (*tv(m2)).payload as *const crate::map::LinMap;
             // "🎉 the " = codepoints: 🎉(1) space(2) t(3)h(4)e(5) space(6) -> "end" at cp 6.
-            assert_eq!(obj_i32(obj2, "start"), 6);
-            assert_eq!(obj_i32(obj2, "end"), 9);
+            assert_eq!(map_i32(map2, "start"), 6);
+            assert_eq!(map_i32(map2, "end"), 9);
             lin_tagged_release(m2);
         }
     }

@@ -5602,8 +5602,10 @@ print(toString(obj))
 val arr = [1, "two", true, null]
 print(toString(arr))
 "#);
+    // Phase 2: non-sealed objects are backed by LinMap (hash map). toString serializes keys
+    // in alphabetical order for deterministic output (insertion order is not preserved).
     assert_eq!(output, vec![
-        r#"{"name": "Bob", "age": 25}"#,
+        r#"{"age": 25, "name": "Bob"}"#,
         r#"[1, "two", true, null]"#,
     ]);
 }
@@ -11096,8 +11098,8 @@ print(toString(length(strs)))
 fn test_group_by_even_odd_and_empty() {
     // groupBy now returns a typed index-signature map `{ String: T[] }` (ADR-055): ONE hash lookup
     // per item (lin_object_get_or_insert_array, tag-aware over LinMap) + push. Grouping by even/odd
-    // splits correctly. The map itself stringifies as `[object]` (TAG_MAP has no structural
-    // toString yet — an ADR-055 follow-up); the per-key array values print normally.
+    // splits correctly. The map itself stringifies as `{}` (TAG_MAP now has structural toString);
+    // the per-key array values print normally.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { groupBy } from "std/array"
@@ -11114,7 +11116,7 @@ print(toString(ge))          // [object] (empty map)
 val one = groupBy([7, 9, 11], x => "all")
 print(toString(one["all"]))  // [7, 9, 11]
 "#);
-    assert_eq!(out, vec!["[2, 4]", "[1, 3, 5]", "[object]", "[7, 9, 11]"]);
+    assert_eq!(out, vec!["[2, 4]", "[1, 3, 5]", "{}", "[7, 9, 11]"]);
 }
 
 #[test]
@@ -11960,7 +11962,8 @@ val top = (): Json =>
   else { "type": "success", "value": r["node"] }
 print(toString(top()))
 "#);
-    assert_eq!(out, vec![r#"{"type": "failure", "error": "eof"}"#]);
+    // Phase 2: open objects use LinMap (hash-ordered keys → alphabetical in toString).
+    assert_eq!(out, vec![r#"{"error": "eof", "type": "failure"}"#]);
 
     // Both branches are union (`r` and another call result `mk()`): the merge stays boxed and
     // must clone the borrowed `r` so the scope-release of `r` does not dangle the result.
@@ -11973,7 +11976,8 @@ val pick = (i: Int32): Json =>
 print(toString(pick(5)))
 print(toString(pick(0)))
 "#);
-    assert_eq!(out, vec![r#"{"type": "failure", "k": "v"}"#, r#"{"type": "failure", "k": "v"}"#]);
+    // Phase 2: open objects use LinMap (hash-ordered → sorted alphabetical in toString). k < t.
+    assert_eq!(out, vec![r#"{"k": "v", "type": "failure"}"#, r#"{"k": "v", "type": "failure"}"#]);
 
     // Multi-level propagation: `mid` returns `r` (from `deep`) on failure, `top` returns `r`
     // (from `mid`) on failure — the owned union local is forwarded through two `if`-branches.
@@ -11994,7 +11998,8 @@ val top = (arr: Json): Json =>
   else { "type": "success", "value": r["node"] }
 print(toString(top([1, 2])))
 "#);
-    assert_eq!(out, vec![r#"{"type": "failure", "error": "eof"}"#]);
+    // Phase 2: open objects use LinMap (hash-ordered keys → alphabetical in toString).
+    assert_eq!(out, vec![r#"{"error": "eof", "type": "failure"}"#]);
 
     // Returned-in-a-loop with the result discarded: a per-call leak (the if-branch clone
     // re-cloned by the function return) would surface here under the ASan CI leg; functionally
@@ -16072,7 +16077,8 @@ print(toString(wrap))
         out,
         vec![
             r#"[{"x": 1, "y": 2}, {"x": 1, "y": 2}, {"x": 1, "y": 2}]"#,
-            r#"{"pt": {"x": 1, "y": 2}, "n": 9}"#
+            // Phase 2: open (Json) objects use LinMap (hash-ordered → alphabetical).
+            r#"{"n": 9, "pt": {"x": 1, "y": 2}}"#
         ]
     );
 }
@@ -16646,7 +16652,8 @@ print("${err}")
         out,
         vec![
             r#"[["a"]]"#.to_string(),
-            r#"{"type": "error", "message": "unterminated"}"#.to_string(),
+            // Phase 2: open objects use LinMap (hash-ordered keys → alphabetical in toString).
+            r#"{"message": "unterminated", "type": "error"}"#.to_string(),
         ]
     );
 }
@@ -16671,7 +16678,8 @@ print("${pick([["a"]], 0)}")
     assert_eq!(
         out,
         vec![
-            r#"{"type": "error", "message": "x"}"#.to_string(),
+            // Phase 2: open objects use LinMap (hash-ordered keys → alphabetical in toString).
+            r#"{"message": "x", "type": "error"}"#.to_string(),
             r#"[["a"]]"#.to_string(),
         ]
     );
@@ -18372,9 +18380,10 @@ main()
 "#
     );
     let out = run(&src);
+    // Phase 2: open (BinOp has Expr union fields → unsealed → LinMap → alphabetical toString).
     assert_eq!(
         out,
-        vec![r#"{"kind": "op", "op": 0, "left": {"kind": "num", "value": 3}, "right": {"kind": "num", "value": 4}}"#]
+        vec![r#"{"kind": "op", "left": {"kind": "num", "value": 3}, "op": 0, "right": {"kind": "num", "value": 4}}"#]
     );
 }
 
@@ -18448,9 +18457,10 @@ main()
 "#
     );
     let out = run(&src);
+    // Phase 2: open objects (BinOp has Expr union fields → unsealed → LinMap → alphabetical keys).
     assert_eq!(
         out,
-        vec![r#"{"kind": "op", "op": 0, "left": {"kind": "num", "value": 3}, "right": {"kind": "num", "value": 4}}"#]
+        vec![r#"{"kind": "op", "left": {"kind": "num", "value": 3}, "op": 0, "right": {"kind": "num", "value": 4}}"#]
     );
 }
 

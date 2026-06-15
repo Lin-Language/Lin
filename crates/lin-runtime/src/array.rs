@@ -519,47 +519,62 @@ pub unsafe extern "C" fn lin_array_push(arr: *mut LinArray, elem_ptr: *const u8,
     // object reference; packing retains the heap fields into the slot, then the object is released
     // (net: field ownership moves into the slot, the shell is freed).
     if (*arr).elem_tag == SEALED_ARRAY_TAG {
-        if tag != crate::tagged::TAG_OBJECT {
+        // Phase 2: also accept TAG_MAP (open objects now backed by LinMap).
+        if tag != crate::tagged::TAG_OBJECT && tag != crate::tagged::TAG_MAP {
             crate::fault::runtime_fault(
                 "Runtime error: cannot push a non-record value into a sealed record array",
             );
         }
-        let obj = *(elem_ptr as *const *mut crate::object::LinObject);
-        if obj.is_null() {
-            crate::fault::runtime_fault(
-                "Runtime error: cannot push null into a sealed record array",
-            );
-        }
         let named = (*arr).elem_named_desc;
         let slot = lin_sealed_array_push_slot(arr);
-        crate::sealed::pack_named_payload_from_object(slot, obj, named);
-        crate::object::lin_object_release(obj);
+        if tag == crate::tagged::TAG_MAP {
+            let map = *(elem_ptr as *const *mut crate::map::LinMap);
+            if map.is_null() {
+                crate::fault::runtime_fault("Runtime error: cannot push null into a sealed record array");
+            }
+            crate::sealed::pack_named_payload_from_map(slot, map, named);
+            crate::map::lin_map_release(map);
+        } else {
+            let obj = *(elem_ptr as *const *mut crate::object::LinObject);
+            if obj.is_null() {
+                crate::fault::runtime_fault("Runtime error: cannot push null into a sealed record array");
+            }
+            crate::sealed::pack_named_payload_from_object(slot, obj, named);
+            crate::object::lin_object_release(obj);
+        }
         return;
     }
     if (*arr).elem_tag == SEALED_PTR_ARRAY_TAG {
         // MOVE semantics (caller transfers its +1 ref to the destination).
-        // elem_ptr holds a *mut LinObject (TAG_OBJECT) — the monomorphized `push$<T>` path and the
-        // `tagged_array_push_value` codegen path both arrive here with a `*mut *mut LinObject` cell
-        // (arr_cell containing the LinObject pointer).  Convert the LinObject to a fresh sealed
-        // struct, store it (ownership transferred to slot), and release the caller's LinObject ref.
-        if tag != crate::tagged::TAG_OBJECT {
+        // elem_ptr holds a *mut LinObject (TAG_OBJECT) or *mut LinMap (TAG_MAP, Phase 2) —
+        // both arrive here with an arr_cell containing the pointer.
+        // Phase 2: also accept TAG_MAP (open objects now backed by LinMap).
+        if tag != crate::tagged::TAG_OBJECT && tag != crate::tagged::TAG_MAP {
             crate::fault::runtime_fault(
                 "Runtime error: cannot push a non-record value into a sealed-ptr record array",
             );
         }
-        // elem_ptr is an arr_cell: a pointer to a *mut LinObject.
-        let obj = *(elem_ptr as *const *mut crate::object::LinObject);
-        if obj.is_null() {
-            crate::fault::runtime_fault(
-                "Runtime error: cannot push null into a sealed-ptr record array",
-            );
-        }
         let named = (*arr).elem_named_desc;
         let heap_desc = (*arr).elem_desc;
-        // Allocate a sealed struct from the LinObject (rc=1 on the new struct).
-        let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
-        // Release the transferred LinObject ref (the struct slot owns the data now).
-        crate::object::lin_object_release(obj);
+        let sptr = if tag == crate::tagged::TAG_MAP {
+            let map = *(elem_ptr as *const *mut crate::map::LinMap);
+            if map.is_null() {
+                crate::fault::runtime_fault("Runtime error: cannot push null into a sealed-ptr record array");
+            }
+            let s = crate::sealed::alloc_sealed_struct_from_map(map, named, heap_desc);
+            crate::map::lin_map_release(map);
+            s
+        } else {
+            // elem_ptr is an arr_cell: a pointer to a *mut LinObject.
+            let obj = *(elem_ptr as *const *mut crate::object::LinObject);
+            if obj.is_null() {
+                crate::fault::runtime_fault("Runtime error: cannot push null into a sealed-ptr record array");
+            }
+            let s = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
+            // Release the transferred LinObject ref (the struct slot owns the data now).
+            crate::object::lin_object_release(obj);
+            s
+        };
         // Store sptr into the slot (no extra retain — we transfer the alloc rc=1 to the slot).
         let len = (*arr).len;
         let cap = (*arr).cap;
@@ -601,38 +616,53 @@ pub unsafe extern "C" fn lin_array_push_tagged(arr: *mut LinArray, tagged: *cons
     // fields are packed (retained) into the slot; the caller must still not release the box.
     if (*arr).elem_tag == SEALED_ARRAY_TAG {
         let tv = tagged as *const crate::tagged::TaggedVal;
-        if tv.is_null() || (*tv).tag != crate::tagged::TAG_OBJECT {
+        if tv.is_null() || ((*tv).tag != crate::tagged::TAG_OBJECT && (*tv).tag != crate::tagged::TAG_MAP) {
             crate::fault::runtime_fault(
                 "Runtime error: cannot push a non-record value into a sealed record array",
             );
         }
-        let obj = (*tv).payload as *mut crate::object::LinObject;
         let named = (*arr).elem_named_desc;
         let slot = lin_sealed_array_push_slot(arr);
-        crate::sealed::pack_named_payload_from_object(slot, obj, named);
-        crate::object::lin_object_release(obj);
+        if (*tv).tag == crate::tagged::TAG_MAP {
+            let map = (*tv).payload as *mut crate::map::LinMap;
+            crate::sealed::pack_named_payload_from_map(slot, map, named);
+            crate::map::lin_map_release(map);
+        } else {
+            let obj = (*tv).payload as *mut crate::object::LinObject;
+            crate::sealed::pack_named_payload_from_object(slot, obj, named);
+            crate::object::lin_object_release(obj);
+        }
         return;
     }
     if (*arr).elem_tag == SEALED_PTR_ARRAY_TAG {
-        // MOVE semantics: the TaggedVal holds a LinObject (TAG_OBJECT) whose ownership is being
-        // transferred. Convert to a fresh sealed struct, store (transfer alloc rc=1 to slot), and
-        // release the LinObject.
+        // MOVE semantics: the TaggedVal holds a LinObject (TAG_OBJECT) or LinMap (TAG_MAP, Phase 2)
+        // whose ownership is being transferred. Convert to a fresh sealed struct, store (transfer
+        // alloc rc=1 to slot), and release the source.
         let tv = tagged as *const crate::tagged::TaggedVal;
-        if tv.is_null() || (*tv).tag != crate::tagged::TAG_OBJECT {
+        if tv.is_null() || ((*tv).tag != crate::tagged::TAG_OBJECT && (*tv).tag != crate::tagged::TAG_MAP) {
             crate::fault::runtime_fault(
                 "Runtime error: cannot push a non-record value into a sealed-ptr record array",
             );
         }
-        let obj = (*tv).payload as *mut crate::object::LinObject;
-        if obj.is_null() {
-            crate::fault::runtime_fault(
-                "Runtime error: cannot push null into a sealed-ptr record array",
-            );
-        }
         let named = (*arr).elem_named_desc;
         let heap_desc = (*arr).elem_desc;
-        let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
-        crate::object::lin_object_release(obj);
+        let sptr = if (*tv).tag == crate::tagged::TAG_MAP {
+            let map = (*tv).payload as *mut crate::map::LinMap;
+            if map.is_null() {
+                crate::fault::runtime_fault("Runtime error: cannot push null into a sealed-ptr record array");
+            }
+            let s = crate::sealed::alloc_sealed_struct_from_map(map, named, heap_desc);
+            crate::map::lin_map_release(map);
+            s
+        } else {
+            let obj = (*tv).payload as *mut crate::object::LinObject;
+            if obj.is_null() {
+                crate::fault::runtime_fault("Runtime error: cannot push null into a sealed-ptr record array");
+            }
+            let s = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
+            crate::object::lin_object_release(obj);
+            s
+        };
         let len = (*arr).len;
         let cap = (*arr).cap;
         if len == cap {
@@ -687,41 +717,57 @@ pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::
                 "Runtime error: cannot push a non-record value into a sealed record array",
             );
         }
-        let (obj, mat_owned) = match crate::object::tagged_as_object(tagged) {
-            Some(pair) => pair,
-            None => crate::fault::runtime_fault(
-                "Runtime error: cannot push a non-record value into a sealed record array",
-            ),
-        };
         let named = (*arr).elem_named_desc;
         let slot = lin_sealed_array_push_slot(arr);
-        crate::sealed::pack_named_payload_from_object(slot, obj, named);
-        if mat_owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
+        // Phase 2: also accept TAG_MAP (open objects now backed by LinMap).
+        if (*tagged).tag == crate::tagged::TAG_MAP {
+            let map = (*tagged).payload as *const crate::map::LinMap;
+            crate::sealed::pack_named_payload_from_map(slot, map, named);
+            // lin_push_dyn has RETAINING semantics: caller keeps the box; map is NOT consumed.
+        } else {
+            let (obj, mat_owned) = match crate::object::tagged_as_object(tagged) {
+                Some(pair) => pair,
+                None => crate::fault::runtime_fault(
+                    "Runtime error: cannot push a non-record value into a sealed record array",
+                ),
+            };
+            crate::sealed::pack_named_payload_from_object(slot, obj, named);
+            if mat_owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
+        }
         return;
     }
     if elem_tag == SEALED_PTR_ARRAY_TAG {
-        // Pointer-backed sealed-record array: allocate a fresh sealed struct from the boxed object,
+        // Pointer-backed sealed-record array: allocate a fresh sealed struct from the boxed value,
         // then push the pointer. `lin_sealed_ptr_array_push` retains (+1), and the alloc starts at
         // rc=1; we pass ownership to the array by calling push WITHOUT the extra retain then releasing
         // our alloc ref — or equivalently: alloc (rc=1), push (retains→rc=2), release alloc ref (rc=1).
-        // `lin_push_dyn` has RETAINING semantics: the caller keeps its object; obj is NOT consumed.
+        // `lin_push_dyn` has RETAINING semantics: the caller keeps its box; source is NOT consumed.
         if tagged.is_null() {
             crate::fault::runtime_fault(
                 "Runtime error: cannot push a non-record value into a sealed-ptr record array",
             );
         }
-        let (obj, mat_owned) = match crate::object::tagged_as_object(tagged) {
-            Some(pair) => pair,
-            None => crate::fault::runtime_fault(
-                "Runtime error: cannot push a non-record value into a sealed-ptr record array",
-            ),
-        };
         let named = (*arr).elem_named_desc;
         let heap_desc = (*arr).elem_desc;
-        let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
-        lin_sealed_ptr_array_push(arr, sptr); // retains: sptr rc goes 1→2
-        crate::sealed::lin_sealed_release_self(sptr); // release our alloc ref: rc goes 2→1
-        if mat_owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
+        // Phase 2: also accept TAG_MAP (open objects now backed by LinMap).
+        if (*tagged).tag == crate::tagged::TAG_MAP {
+            let map = (*tagged).payload as *const crate::map::LinMap;
+            let sptr = crate::sealed::alloc_sealed_struct_from_map(map, named, heap_desc);
+            lin_sealed_ptr_array_push(arr, sptr); // retains: sptr rc goes 1→2
+            crate::sealed::lin_sealed_release_self(sptr); // release our alloc ref: rc goes 2→1
+            // map is not released — caller keeps its box (retaining semantics).
+        } else {
+            let (obj, mat_owned) = match crate::object::tagged_as_object(tagged) {
+                Some(pair) => pair,
+                None => crate::fault::runtime_fault(
+                    "Runtime error: cannot push a non-record value into a sealed-ptr record array",
+                ),
+            };
+            let sptr = crate::sealed::alloc_sealed_struct_from_object(obj, named, heap_desc);
+            lin_sealed_ptr_array_push(arr, sptr); // retains: sptr rc goes 1→2
+            crate::sealed::lin_sealed_release_self(sptr); // release our alloc ref: rc goes 2→1
+            if mat_owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
+        }
         return;
     }
     if elem_tag == 0xFF {

@@ -191,7 +191,8 @@ impl<'ctx> Codegen<'ctx> {
                 let fields = Self::sealed_scalar_fields(ty).unwrap().clone();
                 self.emit_sealed_release(val, &fields);
             }
-            Type::Object { .. } => { self.builder.call(self.rt.object_release, &[ptr.into()], ""); }
+            // Non-sealed open objects are now LinMap* (TAG_MAP) — use map_release.
+            Type::Object { .. } => { self.builder.call(self.rt.map_release, &[ptr.into()], ""); }
             // Typed index-signature map (`{ K: V }`, ADR-055 + numeric-key): the hashed LinMap container.
             Type::Map { .. } => { self.builder.call(self.rt.map_release, &[ptr.into()], ""); }
             Type::Function { .. } => { self.builder.call(self.rt.closure_release, &[ptr.into()], ""); }

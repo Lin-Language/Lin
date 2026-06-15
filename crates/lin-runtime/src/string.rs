@@ -1,7 +1,7 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_FLOAT32, TAG_ARRAY, TAG_OBJECT};
+use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_FLOAT32, TAG_ARRAY, TAG_OBJECT, TAG_MAP};
 
 /// Runtime string representation: reference-counted, UTF-8.
 /// Layout: refcount (u32) | len (u32) | data ([u8; len])
@@ -690,14 +690,20 @@ unsafe fn push_display_value(out: &mut String, tagged: *const TaggedVal) {
         push_display_object(out, obj);
         return;
     }
+    if tag == TAG_MAP {
+        let map = payload as *const crate::map::LinMap;
+        if map.is_null() { out.push_str("{}"); return; }
+        push_display_map(out, map);
+        return;
+    }
     if tag == crate::tagged::TAG_SUMNODE {
         // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` field reached the
-        // (lossy display) object stringifier — materialize it to a real LinObject and serialize, then
-        // release the transient. This makes `toString(record_with_sum_field)` correct (NOT `[object]`).
-        let obj = crate::sumnode::lin_sumnode_materialize(payload as *mut u8);
-        if obj.is_null() { out.push_str("[object]"); return; }
-        push_display_object(out, obj as *const crate::object::LinObject);
-        crate::object::lin_object_release(obj as *mut crate::object::LinObject);
+        // (lossy display) stringifier — materialize to a real LinMap (Phase 2: open objects are
+        // LinMap-backed) and serialize, then release the transient.
+        let map = crate::sumnode::lin_sumnode_materialize(payload as *mut u8);
+        if map.is_null() { out.push_str("[object]"); return; }
+        push_display_map(out, map as *const crate::map::LinMap);
+        crate::map::lin_map_release(map as *mut crate::map::LinMap);
         return;
     }
     if tag == crate::tagged::TAG_RECORD {
@@ -755,6 +761,32 @@ unsafe fn push_display_array(out: &mut String, arr: *const crate::array::LinArra
     out.push(']');
 }
 
+/// Serialize a LinMap (string-keyed open object) to JSON.
+unsafe fn push_display_map(out: &mut String, map: *const crate::map::LinMap) {
+    let cap = (*map).cap as usize;
+    // Collect occupied slots as (key, value) pairs then sort by key for deterministic output.
+    let mut pairs: Vec<(&str, *const TaggedVal)> = Vec::new();
+    for i in 0..cap {
+        let slot = (*map).slots.add(i);
+        if (*slot).hash == 0 {
+            continue;
+        }
+        let key_ptr = (*slot).key as *const crate::string::LinString;
+        let key_str = if key_ptr.is_null() { "" } else { (*key_ptr).as_str() };
+        pairs.push((key_str, &(*slot).value as *const TaggedVal));
+    }
+    pairs.sort_unstable_by_key(|(k, _)| *k);
+    out.push('{');
+    for (i, (key_str, val_ptr)) in pairs.iter().enumerate() {
+        if i > 0 { out.push_str(", "); }
+        out.push('"');
+        out.push_str(key_str);
+        out.push_str("\": ");
+        push_display_value(out, *val_ptr);
+    }
+    out.push('}');
+}
+
 unsafe fn object_to_json_string(obj: *const crate::object::LinObject) -> String {
     let mut out = String::new();
     push_display_object(&mut out, obj);
@@ -796,6 +828,17 @@ pub unsafe extern "C" fn lin_object_to_string(obj: *const crate::object::LinObje
     }
     let s = object_to_json_string(obj);
     lin_string_from_bytes(s.as_ptr(), s.len() as u32)
+}
+
+/// Convert a LinMap* (open object / TAG_MAP) to its JSON string representation.
+#[no_mangle]
+pub unsafe extern "C" fn lin_map_to_string(map: *const crate::map::LinMap) -> *mut LinString {
+    if map.is_null() {
+        return lin_string_from_bytes(b"null".as_ptr(), 4);
+    }
+    let mut out = String::new();
+    push_display_map(&mut out, map);
+    lin_string_from_bytes(out.as_ptr(), out.len() as u32)
 }
 
 /// Produce a canonical, type-tagged key string for any value, suitable for use as an object key.
@@ -885,6 +928,27 @@ unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
                     (*(*entry).key).as_str().to_string()
                 };
                 let val_str = tagged_to_key_string(&(*entry).value as *const TaggedVal);
+                pairs.push((key_str, val_str));
+            }
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            let inner: Vec<String> = pairs.into_iter().map(|(k, v)| format!("{}:{}", k, v)).collect();
+            format!("o:{{{}}}", inner.join(","))
+        }
+        TAG_MAP => {
+            let map = payload as *const crate::map::LinMap;
+            if map.is_null() { return "o:{}".to_string(); }
+            let cap = (*map).cap as usize;
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            for i in 0..cap {
+                let slot = (*map).slots.add(i);
+                if (*slot).hash == 0 { continue; }
+                let key_ptr = (*slot).key as *const crate::string::LinString;
+                let key_str = if key_ptr.is_null() {
+                    String::new()
+                } else {
+                    (*key_ptr).as_str().to_string()
+                };
+                let val_str = tagged_to_key_string(&(*slot).value as *const TaggedVal);
                 pairs.push((key_str, val_str));
             }
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1000,16 +1064,19 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
     } else if tag == TAG_OBJECT {
         let obj = payload as *const crate::object::LinObject;
         lin_object_to_string(obj)
+    } else if tag == TAG_MAP {
+        let map = payload as *const crate::map::LinMap;
+        lin_map_to_string(map)
     } else if tag == crate::tagged::TAG_SUMNODE {
         // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` that escaped a record
-        // field into the type-erased dynamic domain. Materialize it to a real LinObject (via the
-        // per-type materializer in its descriptor), stringify, and release the transient object.
-        let obj = crate::sumnode::lin_sumnode_materialize(payload as *mut u8);
-        if obj.is_null() {
+        // field into the type-erased dynamic domain. Materialize to a LinMap (Phase 2: open objects
+        // are LinMap-backed), stringify, and release the transient.
+        let map = crate::sumnode::lin_sumnode_materialize(payload as *mut u8);
+        if map.is_null() {
             return lin_string_from_bytes(b"[object]".as_ptr(), 8);
         }
-        let s = lin_object_to_string(obj as *const crate::object::LinObject);
-        crate::object::lin_object_release(obj as *mut crate::object::LinObject);
+        let s = lin_map_to_string(map as *const crate::map::LinMap);
+        crate::map::lin_map_release(map as *mut crate::map::LinMap);
         s
     } else if tag == crate::tagged::TAG_RECORD {
         // Stage 6a: a sealed-struct pointer in a dynamic slot. Materialize to a LinObject via the
@@ -1077,15 +1144,20 @@ unsafe fn push_json_value(out: &mut String, tagged: *const TaggedVal) {
             let obj = payload as *const crate::object::LinObject;
             push_json_object(out, obj);
         }
+        TAG_MAP => {
+            // Phase 2: non-sealed open objects are now backed by LinMap.
+            let map = payload as *const crate::map::LinMap;
+            push_json_map(out, map);
+        }
         crate::tagged::TAG_SUMNODE => {
             // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: materialize the kept-packed `*SumNode` to a
-            // real LinObject, serialize, release the transient object.
-            let obj = crate::sumnode::lin_sumnode_materialize(payload as *mut u8);
-            if obj.is_null() {
+            // LinMap (Phase 2: open objects are LinMap-backed), serialize, release the transient.
+            let map = crate::sumnode::lin_sumnode_materialize(payload as *mut u8);
+            if map.is_null() {
                 out.push_str("null");
             } else {
-                push_json_object(out, obj as *const crate::object::LinObject);
-                crate::object::lin_object_release(obj as *mut crate::object::LinObject);
+                push_json_map(out, map as *const crate::map::LinMap);
+                crate::map::lin_map_release(map as *mut crate::map::LinMap);
             }
         }
         crate::tagged::TAG_RECORD => {
@@ -1180,6 +1252,33 @@ unsafe fn push_json_object(out: &mut String, obj: *const crate::object::LinObjec
         }
         out.push(':');
         push_json_value(out, &(*entry).value as *const TaggedVal);
+    }
+    out.push('}');
+}
+
+/// Emit a `LinMap` as strict JSON (alphabetically sorted keys; keys+string values are escaped).
+/// Phase 2: `lin_sumnode_materialize` now returns a `*LinMap`, so the json-serializer needs this.
+unsafe fn push_json_map(out: &mut String, map: *const crate::map::LinMap) {
+    if map.is_null() {
+        out.push_str("{}");
+        return;
+    }
+    let cap = (*map).cap as usize;
+    let mut pairs: Vec<(&str, *const TaggedVal)> = Vec::new();
+    for i in 0..cap {
+        let slot = (*map).slots.add(i);
+        if (*slot).hash == 0 { continue; }
+        let key_ptr = (*slot).key as *const crate::string::LinString;
+        let key_str = if key_ptr.is_null() { "" } else { (*key_ptr).as_str() };
+        pairs.push((key_str, &(*slot).value as *const TaggedVal));
+    }
+    pairs.sort_unstable_by_key(|(k, _)| *k);
+    out.push('{');
+    for (i, (key_str, val_ptr)) in pairs.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        push_json_escaped(out, key_str);
+        out.push(':');
+        push_json_value(out, *val_ptr);
     }
     out.push('}');
 }

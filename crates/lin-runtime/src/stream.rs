@@ -2435,56 +2435,56 @@ fn padded_len(size: usize) -> usize {
 ///   `{ name: String, size: Int64, typeflag: String, isDir: Boolean }`.
 /// Returned value is independently owned (release with `lin_tagged_release`). Leak-clean: each
 /// `lin_object_set` retains its own key/value, so the local +1 from each `make_string` is released.
-/// Build a `TarHeader` object and return the raw `LinObject*` (not wrapped in `alloc_tagged`).
-/// Used by `lin_tar_header` — the stdlib wrapper's codegen calls `lin_object_get` directly on
-/// the return value, so we must return an unboxed `LinObject*`.
+/// Build a `TarHeader` map and return the raw `LinMap*` (not wrapped in `alloc_tagged`).
+/// Used by `lin_tar_header` — the stdlib wrapper's codegen calls `lin_map_get` directly on
+/// the return value (Phase 2: non-sealed objects are now backed by LinMap).
 unsafe fn make_meta_object_unboxed(meta: &TarEntryMeta) -> *mut u8 {
-    use crate::object::{lin_object_alloc, lin_object_set};
+    use crate::map::{lin_map_alloc, lin_map_set};
     use crate::string::lin_string_release;
     use crate::tagged::{TAG_STR, TAG_INT64, TAG_BOOL, TaggedVal};
 
-    let obj = lin_object_alloc(4);
+    let map = lin_map_alloc(4, 0);
 
     // name
-    let k_name = crate::fs::make_string("name");
-    let v_name = crate::fs::make_string(&meta.name);
-    let mut tv_name: TaggedVal = std::mem::zeroed();
-    tv_name.tag = TAG_STR;
-    tv_name.payload = v_name as u64;
-    lin_object_set(obj, k_name, &tv_name);
-    lin_string_release(k_name);
-    lin_string_release(v_name);
+    let k = crate::fs::make_string("name");
+    let v = crate::fs::make_string(&meta.name);
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_STR;
+    tv.payload = v as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
+    lin_string_release(v);
 
     // size (Int64)
-    let k_size = crate::fs::make_string("size");
-    let mut tv_size: TaggedVal = std::mem::zeroed();
-    tv_size.tag = TAG_INT64;
-    tv_size.payload = meta.size as u64;
-    lin_object_set(obj, k_size, &tv_size);
-    lin_string_release(k_size);
+    let k = crate::fs::make_string("size");
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_INT64;
+    tv.payload = meta.size as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
 
     // typeflag
     let tf = if meta.typeflag == 0 { '0' } else { meta.typeflag as char };
     let tf_str = tf.to_string();
-    let k_tf = crate::fs::make_string("typeflag");
-    let v_tf = crate::fs::make_string(&tf_str);
-    let mut tv_tf: TaggedVal = std::mem::zeroed();
-    tv_tf.tag = TAG_STR;
-    tv_tf.payload = v_tf as u64;
-    lin_object_set(obj, k_tf, &tv_tf);
-    lin_string_release(k_tf);
-    lin_string_release(v_tf);
+    let k = crate::fs::make_string("typeflag");
+    let v = crate::fs::make_string(&tf_str);
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_STR;
+    tv.payload = v as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
+    lin_string_release(v);
 
     // isDir
     let is_dir = meta.typeflag == b'5';
-    let k_dir = crate::fs::make_string("isDir");
-    let mut tv_dir: TaggedVal = std::mem::zeroed();
-    tv_dir.tag = TAG_BOOL;
-    tv_dir.payload = is_dir as u64;
-    lin_object_set(obj, k_dir, &tv_dir);
-    lin_string_release(k_dir);
+    let k = crate::fs::make_string("isDir");
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_BOOL;
+    tv.payload = is_dir as u64;
+    lin_map_set(map, k, &tv);
+    lin_string_release(k);
 
-    obj as *mut u8
+    map as *mut u8
 }
 
 unsafe fn make_meta_object(meta: &TarEntryMeta) -> *mut u8 {
@@ -3074,15 +3074,15 @@ pub unsafe extern "C" fn lin_stream_tar_entries(s: *const u8) -> *mut u8 {
 pub unsafe extern "C" fn lin_tar_header(e: *const u8) -> *mut u8 {
     use crate::tagged::TAG_TAR_ENTRY;
     if e.is_null() {
-        // Return a minimal empty object rather than an error-tagged value, since the caller
-        // will immediately call lin_object_get on the result (not unbox it as TaggedVal).
-        let obj = crate::object::lin_object_alloc(0);
-        return obj as *mut u8;
+        // Return a minimal empty map rather than an error-tagged value, since the caller
+        // will immediately call lin_map_get on the result (Phase 2: non-sealed objects = LinMap).
+        let map = crate::map::lin_map_alloc(0, 0);
+        return map as *mut u8;
     }
     let tv = &*(e as *const crate::tagged::TaggedVal);
     if tv.tag != TAG_TAR_ENTRY {
-        let obj = crate::object::lin_object_alloc(0);
-        return obj as *mut u8;
+        let map = crate::map::lin_map_alloc(0, 0);
+        return map as *mut u8;
     }
     let entry = tv.payload as *const TarEntryBox;
     let meta = TarEntryMeta {
@@ -4513,29 +4513,32 @@ mod tests {
         (bytes, err_msg)
     }
 
-    /// Read the `name` field from a `lin_tar_header` result object.
-    /// `lin_tar_header` returns a raw `LinObject*`, NOT a tagged box — use directly.
+    /// Read the `name` field from a `lin_tar_header` result map.
+    /// `lin_tar_header` returns a raw `LinMap*` (Phase 2: non-sealed objects are LinMap), NOT a tagged box — use directly.
     unsafe fn header_name(h: *mut u8) -> String {
-        let obj = h as *const crate::object::LinObject;
+        let map = h as *const crate::map::LinMap;
         let k = crate::fs::make_string("name");
-        let v = crate::object::lin_object_get(obj, k);
+        let v = crate::map::lin_map_get(map, k);
         crate::string::lin_string_release(k);
+        if v.is_null() { return String::new(); }
+        // v is a *const TaggedVal (TAG_STR, LinString*); resolve_lin_str accepts TaggedVal*.
         crate::fs::resolve_lin_str(v as *const u8).unwrap_or_default()
     }
 
-    /// Read the `size` field from a `lin_tar_header` result object as i64.
-    /// `lin_tar_header` returns a raw `LinObject*`, NOT a tagged box — use directly.
+    /// Read the `size` field from a `lin_tar_header` result map as i64.
+    /// `lin_tar_header` returns a raw `LinMap*` (Phase 2: non-sealed objects are LinMap), NOT a tagged box — use directly.
     unsafe fn header_size(h: *mut u8) -> i64 {
-        let obj = h as *const crate::object::LinObject;
+        let map = h as *const crate::map::LinMap;
         let k = crate::fs::make_string("size");
-        let v = crate::object::lin_object_get(obj, k);
+        let v = crate::map::lin_map_get(map, k);
         crate::string::lin_string_release(k);
+        if v.is_null() { return 0; }
         (*v).payload as i64
     }
 
-    /// Release a `lin_tar_header` result (a raw `LinObject*`, not a TaggedVal box).
+    /// Release a `lin_tar_header` result (a raw `LinMap*`, not a TaggedVal box).
     unsafe fn release_header(h: *mut u8) {
-        crate::object::lin_object_release(h as *mut crate::object::LinObject);
+        crate::map::lin_map_release(h as *mut crate::map::LinMap);
     }
 
     // (a) entries() yields all handles with correct headers.

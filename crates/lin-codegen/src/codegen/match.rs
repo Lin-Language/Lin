@@ -272,7 +272,7 @@ impl<'ctx> Codegen<'ctx> {
             if Self::sealed_scalar_fields(from_ty).is_some() {
                 if let Some(sf) = Self::sealed_scalar_fields(from_ty) {
                     let sf = sf.clone();
-                    let obj = self.sealed_materialize_to_object(val, &sf);
+                    let obj = self.sealed_materialize_to_map(val, &sf);
                     let boxed = self.box_value(obj, &Type::object(sf));
                     let node = self.sumnode_project_from_boxed(boxed, &Type::TypeVar(u32::MAX), to_ty, llvm_fn);
                     // Release the transient boxed materialization (its inner object + shell).
@@ -391,7 +391,7 @@ impl<'ctx> Codegen<'ctx> {
                 // Runtime consumers (lin_tagged_eq/to_string/push_json_value/transfer/field-access)
                 // all have TAG_RECORD arms that dispatch correctly via the named_desc at header offset 16.
                 // This is the ONE flow the BRIEF targets: `val j: Json = p` → O(1) wrap, no copy.
-                // Pre-6a was: sealed_materialize_to_object + box_value → TAG_OBJECT (O(n) copy).
+                // Pre-6a was: sealed_materialize_to_map + box_value → TAG_OBJECT (O(n) copy).
                 if matches!(to_ty, Type::TypeVar(_)) && val.is_pointer_value() {
                     return self.builder.call(self.rt.box_record, &[val.into()], "boxrec")
                         .try_as_basic_value().unwrap_basic();
@@ -400,11 +400,11 @@ impl<'ctx> Codegen<'ctx> {
                     // sealed → multi-variant union (if-merge, named union type): materialize to
                     // LinObject for TAG_OBJECT. TAG_RECORD would be unboxed by lin_unbox_ptr on
                     // the phi result, returning a sealed ptr instead of LinObject* → crash.
-                    let obj = self.sealed_materialize_to_object(val, &sf);
+                    let obj = self.sealed_materialize_to_map(val, &sf);
                     return self.box_value(obj, &Type::object(sf));
                 }
                 // sealed → unsealed object (non-union target): materialize to LinObject.
-                let obj = self.sealed_materialize_to_object(val, &sf);
+                let obj = self.sealed_materialize_to_map(val, &sf);
                 return obj;
             }
         }

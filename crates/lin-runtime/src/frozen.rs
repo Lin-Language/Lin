@@ -12,10 +12,11 @@
 //! This is the interned-string immortality trick generalized from one string to a whole graph.
 //! Cost: a frozen graph is **never freed** — `frozen` is for load-once, program-lifetime data.
 
-use crate::tagged::{TaggedVal, TAG_STR, TAG_ARRAY, TAG_OBJECT};
+use crate::tagged::{TaggedVal, TAG_STR, TAG_ARRAY, TAG_OBJECT, TAG_MAP};
 use crate::string::{LinString, IMMORTAL_RC};
 use crate::array::{LinArray, LinArrayElem};
 use crate::object::LinObject;
+use crate::map::LinMap;
 
 /// Recursively seal a `LinString` immortal (idempotent).
 unsafe fn freeze_string(s: *mut LinString) {
@@ -37,6 +38,26 @@ unsafe fn freeze_array(arr: *mut LinArray) {
             let elem = (*arr).data.add(i) as *mut LinArrayElem;
             freeze_payload((*elem).tag, (*elem).payload);
         }
+    }
+}
+
+/// Recursively seal a `LinMap` (string-keyed open object, TAG_MAP) immortal.
+unsafe fn freeze_map(map: *mut LinMap) {
+    if map.is_null() || (*map).refcount >= IMMORTAL_RC {
+        return;
+    }
+    (*map).refcount = IMMORTAL_RC;
+    let cap = (*map).cap as usize;
+    for i in 0..cap {
+        let slot = (*map).slots.add(i);
+        if (*slot).hash == 0 {
+            continue;
+        }
+        // Freeze the string key.
+        let key_ptr = (*slot).key as *mut crate::string::LinString;
+        freeze_string(key_ptr);
+        // Freeze the value payload.
+        freeze_payload((*slot).value.tag, (*slot).value.payload);
     }
 }
 
@@ -67,6 +88,7 @@ unsafe fn freeze_payload(tag: u8, payload: u64) {
         TAG_STR => freeze_string(payload as *mut LinString),
         TAG_ARRAY => freeze_array(payload as *mut LinArray),
         TAG_OBJECT => freeze_object(payload as *mut LinObject),
+        TAG_MAP => freeze_map(payload as *mut LinMap),
         _ => {} // scalars: nothing to seal
     }
 }

@@ -142,8 +142,9 @@ val s = suite("sumtree", [
     val tree: Expr = binOp(0, num(3), num(4))
     val cursor = { "node": tree, "pos": 0 }
     [
+      // Phase 2: open objects use LinMap (hash-ordered keys → alphabetical in toString).
       expect(cursor["node"].toString()).toBe(
-        "{\"kind\": \"op\", \"op\": 0, \"left\": {\"kind\": \"num\", \"value\": 3}, \"right\": {\"kind\": \"num\", \"value\": 4}}"
+        "{\"kind\": \"op\", \"left\": {\"kind\": \"num\", \"value\": 3}, \"op\": 0, \"right\": {\"kind\": \"num\", \"value\": 4}}"
       )
     ]
   ),

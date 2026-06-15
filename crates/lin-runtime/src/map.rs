@@ -462,23 +462,33 @@ pub unsafe extern "C" fn lin_map_keys(map: *const LinMap) -> *mut crate::array::
     if !map.is_null() {
         let cap = (*map).cap as usize;
         let is_int = (*map).key_kind == KEY_KIND_INT;
-        let mut out = 0usize;
-        for i in 0..cap {
-            let slot = (*map).slots.add(i);
-            if (*slot).hash == 0 {
-                continue;
+        if is_int {
+            // Int keys: collect and sort numerically for deterministic ordering.
+            let mut keys: Vec<u64> = Vec::with_capacity(len as usize);
+            for i in 0..cap {
+                let slot = (*map).slots.add(i);
+                if (*slot).hash == 0 { continue; }
+                keys.push((*slot).key);
             }
-            let dst = (*arr).data.add(out);
-            if is_int {
+            keys.sort_unstable_by_key(|&k| k as i64);
+            for (out, &key) in keys.iter().enumerate() {
+                let dst = (*arr).data.add(out);
                 (*dst).tag = crate::tagged::TAG_INT64;
-                (*dst).payload = (*slot).key; // raw i64 bits
-            } else {
+                (*dst).payload = key;
+            }
+        } else {
+            // String keys: bucket iteration order (insertion-stable hash scan).
+            let mut out = 0usize;
+            for i in 0..cap {
+                let slot = (*map).slots.add(i);
+                if (*slot).hash == 0 { continue; }
+                let dst = (*arr).data.add(out);
                 let key_ptr = (*slot).key as *mut LinString;
                 lin_string_inc_ref(key_ptr);
                 (*dst).tag = crate::tagged::TAG_STR;
                 (*dst).payload = (*slot).key;
+                out += 1;
             }
-            out += 1;
         }
     }
     (*arr).len = len as u64;
@@ -807,6 +817,13 @@ pub(crate) unsafe fn dynamic_to_map(tv: *const TaggedVal) -> *mut LinMap {
         }
         _ => lin_map_alloc(0, KEY_KIND_STRING),
     }
+}
+
+/// Public C entry point for `dynamic_to_map`. Used by codegen's `sealed_project_from` to
+/// normalise a union/Json boxed source into a fresh owned `LinMap` (+1). Caller releases.
+#[no_mangle]
+pub unsafe extern "C" fn lin_union_force_to_map(tv: *const u8) -> *mut LinMap {
+    dynamic_to_map(tv as *const TaggedVal)
 }
 
 #[cfg(test)]

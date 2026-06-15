@@ -1553,12 +1553,14 @@ impl<'ctx> Codegen<'ctx> {
                                 fields.len() + 4
                             };
                             let cap = i32_ty.const_int(cap_hint as u64, false);
-                            let obj_ptr = self.builder.call(self.rt.object_alloc, &[cap.into()], "ir_obj").try_as_basic_value().unwrap_basic().into_pointer_value();
+                            // Phase 2: open (non-sealed) objects use LinMap* (TAG_MAP) as the
+                            // backing store. KEY_KIND_STRING = 0.
+                            let i32_zero = i32_ty.const_int(0, false);
+                            let obj_ptr = self.builder.call(self.rt.map_alloc, &[cap.into(), i32_zero.into()], "ir_map").try_as_basic_value().unwrap_basic().into_pointer_value();
                             // Apply spreads. A spread source typed Json/union arrives boxed
-                            // (a TaggedVal*) — unbox to the raw LinObject* before merging, or
-                            // lin_object_merge reads the box as an object and crashes.
+                            // (a TaggedVal*) — unbox to the raw LinMap* before merging.
                             if !spreads.is_empty() {
-                                let merge_fn = self.get_or_declare_fn("lin_object_merge",
+                                let merge_fn = self.get_or_declare_fn("lin_map_merge",
                                     void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                                 for s in spreads {
                                     if let Some(&sv) = temp_map.get(s) {
@@ -1572,15 +1574,10 @@ impl<'ctx> Codegen<'ctx> {
                                     }
                                 }
                             }
-                            // For a no-spread literal the keys appended are statically
-                            // known-distinct, so we can use the no-dup-check fast append
-                            // (`lin_object_set_fresh`). But object-literal semantics are
-                            // last-wins for a repeated key (`{"x":1,"x":2}["x"] == 2`), and the
-                            // checker does NOT reject duplicate literal keys — so we must first
-                            // de-duplicate, keeping the LAST occurrence of each key. (When spreads
-                            // are present a literal field can collide with a spread-provided key,
-                            // which we cannot detect statically, so that case keeps the
-                            // dup-checking `lin_object_set`.)
+                            // Phase 2: all fields go through lin_map_set via build_tagged_val_alloca.
+                            // The inline GEP path is dropped (it was LinObject-layout-specific).
+                            // De-duplicate: for a no-spread literal keep only the LAST occurrence of
+                            // each key (last-wins semantics). With spreads use lin_map_set always.
                             let use_fresh = spreads.is_empty();
                             let last_idx: std::collections::HashMap<&String, usize> = if use_fresh {
                                 let mut m = std::collections::HashMap::new();
@@ -1592,106 +1589,6 @@ impl<'ctx> Codegen<'ctx> {
                                 std::collections::HashMap::new()
                             };
 
-                            // ── PHASES 1+2: inline object literal construction ────────────
-                            // When the literal has no spreads and EVERY materialised field has a
-                            // known concrete representation, emit the LinObject entry stores INLINE
-                            // instead of calling lin_object_set_fresh per field. This removes one
-                            // non-inlined runtime call per field — the ~46% construction half of
-                            // per-object cost (see perf profiling: inlining the per-field CALL is the
-                            // lever, the allocator is only ~3-4%).
-                            //
-                            // Eligible field types and their RC handling, mirroring the runtime's
-                            // lin_object_set_fresh → retain_tagged_payload EXACTLY:
-                            //   • scalars (Int/Float/Bool/Null): no heap payload → no retain (Phase 1)
-                            //   • Str/StrLit/Array/FixedArray/Object: heap payload retained via the
-                            //     offset-0 refcount with the immortal guard — which is PRECISELY what
-                            //     lin_rc_retain does — so we emit one lin_rc_retain on the stored
-                            //     pointer, the object takes ownership of a +1 reference (Phase 2).
-                            // EXCLUDED (fall back to the runtime set_fresh path, identical behaviour):
-                            //   • Function: retain_tagged_payload is a NO-OP for TAG_FUNCTION (it is
-                            //     asymmetric with release); replicating that inline is error-prone, so
-                            //     any Function field disqualifies the whole object.
-                            //   • union/TypeVar/Named/Shared/Stream: already a boxed TaggedVal* with
-                            //     its own tag/retain semantics; not a plain (tag,payload) pair here.
-                            //
-                            // lin_object_alloc(N) gives cap==N, len==0, entries → inline buffer; we
-                            // write each entry's key/tag/payload directly and set len at the end.
-                            // cap==N (the field count for a no-spread literal) guarantees no grow, so
-                            // the inline entries buffer never moves.
-                            fn inline_field_kind(t: &Type) -> Option<bool> {
-                                // Some(needs_retain) if eligible for the inline path; None otherwise.
-                                match t {
-                                    Type::Null | Type::Bool
-                                    | Type::Int8 | Type::Int16 | Type::Int32
-                                    | Type::UInt8 | Type::UInt16 | Type::UInt32
-                                    | Type::Int64 | Type::UInt64
-                                    | Type::Float32 | Type::Float64 => Some(false),
-                                    Type::Str | Type::StrLit(_)
-                                    | Type::Array(_) | Type::FixedArray(_)
-                                    | Type::Object { .. } => Some(true),
-                                    _ => None,
-                                }
-                            }
-                            let inline_eligible = use_fresh && fields.iter().enumerate().all(|(idx, (key, vt))| {
-                                // Only the surviving (last-wins) fields are materialised.
-                                last_idx.get(key) != Some(&idx) || {
-                                    let t = func.temp_types.get(vt).cloned().unwrap_or(Type::Null);
-                                    inline_field_kind(&t).is_some()
-                                }
-                            });
-                            if inline_eligible {
-                                let i8_ty = self.context.i8_type();
-                                // entries = *(ptr*)(obj + 16)
-                                let entries_pp = unsafe {
-                                    self.builder.gep(i8_ty, obj_ptr, &[i64_ty.const_int(16, false)], "obj_entries_pp")
-                                };
-                                let entries = self.builder.load(ptr_ty, entries_pp, "obj_entries").into_pointer_value();
-                                // LinObjectEntry stride = 24 bytes: key@0, value.tag@8, value.payload@16.
-                                let mut slot: u64 = 0;
-                                for (idx, (key, val_temp)) in fields.iter().enumerate() {
-                                    if last_idx.get(key) != Some(&idx) { continue; }
-                                    if let Some(&val) = temp_map.get(val_temp) {
-                                        let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
-                                        let needs_retain = inline_field_kind(&val_ty) == Some(true);
-                                        let key_str = self.compile_string_lit(key).into_pointer_value();
-                                        let base = slot * 24;
-                                        // key@base
-                                        let key_p = unsafe {
-                                            self.builder.gep(i8_ty, entries, &[i64_ty.const_int(base, false)], "ent_key_p")
-                                        };
-                                        self.builder.store(key_p, key_str);
-                                        // tag@base+8
-                                        let tag_p = unsafe {
-                                            self.builder.gep(i8_ty, entries, &[i64_ty.const_int(base + 8, false)], "ent_tag_p")
-                                        };
-                                        self.builder.store(tag_p, i8_ty.const_int(Self::type_tag(&val_ty) as u64, false));
-                                        // payload@base+16
-                                        let payload = self.tagged_payload_i64(&val, &val_ty);
-                                        let pay_p = unsafe {
-                                            self.builder.gep(i8_ty, entries, &[i64_ty.const_int(base + 16, false)], "ent_pay_p")
-                                        };
-                                        self.builder.store(pay_p, payload);
-                                        // The object now owns a reference to a heap payload — retain it,
-                                        // mirroring retain_tagged_payload. lin_rc_retain bumps the
-                                        // offset-0 refcount and no-ops on immortal (interned literal /
-                                        // frozen) values, exactly matching the runtime for Str/Array/
-                                        // Object. The matching release happens in lin_object_release.
-                                        if needs_retain && val.is_pointer_value() {
-                                            self.builder.call(self.rt.rc_retain, &[val.into_pointer_value().into()], "");
-                                        }
-                                    }
-                                    slot += 1;
-                                }
-                                // len = slot  (*(u32*)(obj + 4))
-                                let len_p = unsafe {
-                                    self.builder.gep(i8_ty, obj_ptr, &[i64_ty.const_int(4, false)], "obj_len_p")
-                                };
-                                self.builder.store(len_p, i32_ty.const_int(slot, false));
-                                let _ = ty;
-                                temp_map.insert(*dst, obj_ptr.into());
-                                continue;
-                            }
-
                             for (idx, (key, val_temp)) in fields.iter().enumerate() {
                                 // Skip earlier duplicates in the no-spread fast path so only the
                                 // last write for a key is materialised (last-wins).
@@ -1701,70 +1598,20 @@ impl<'ctx> Codegen<'ctx> {
                                 if let Some(&val) = temp_map.get(val_temp) {
                                     let key_str = self.compile_string_lit(key).into_pointer_value();
                                     let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
-                                    // UNBOXED SUM TYPE (unboxed-sumtype Stage 3): a sum-typed field
-                                    // value is physically a `*SumNode`, NOT a boxed TaggedVal*. The
-                                    // generic union branch below would store the raw SumNode pointer as
-                                    // if it were already a box → the read-back `object_get` reads a
-                                    // SumNode header as a LinObject → garbage / crash.
-                                    //
-                                    // MATERIALIZE it to a real boxed LinObject — the safe, always-sound
-                                    // boundary for a record field (which may flow to toString / match /
-                                    // spread, and whose READ-back type partially expands the recursive
-                                    // children, so a keep-packed `TAG_SUMNODE` store could not be matched
-                                    // by a type-driven read decision — see the deferral note below).
-                                    // `box_value` heap-boxes the materialized object as TAG_OBJECT (and
-                                    // handles the `sum|Null` null case); the freshly materialized object
-                                    // is +1, `object_set_fresh` retains it into the slot, release the
-                                    // transient box after.
-                                    //
-                                    // KEEP-PACKED-BY-POINTER for a record/Json field slot is DEFERRED:
-                                    // the field's READ-back type and the stored VALUE's type are
-                                    // structurally different (the record field type expands the recursive
-                                    // sum children one level to `Union`, while the value carries them as
-                                    // `Named` — so `is_sum_type`/`sum_type_eligible` disagree between the
-                                    // store and the read). A keep-packed decision must therefore be
-                                    // REPR-driven (the repr pass carries a consistent label), which needs
-                                    // the lowering/repr STEP-4 — out of this change's scope. The
-                                    // TAG_SUMNODE runtime substrate + codegen helpers are in place.
+                                    // UNBOXED SUM TYPE: a sum-typed field value is a `*SumNode`.
+                                    // Wrap still-packed by-pointer in a TAG_SUMNODE box (O(1)).
                                     if Self::is_sum_type(&val_ty)
                                         || Self::sum_member_of_nullable_union(&val_ty).is_some()
                                     {
-                                        // KEEP-PACKED-THROUGH-RECORD-FIELDS store: a sum-typed field
-                                        // value is physically a `*SumNode`. Instead of materializing it
-                                        // to a boxed LinObject (`lin_summat` + `lin_box_object` — the
-                                        // O(n)-tree round-trip the interp cursor `{node,pos}` paid every
-                                        // parse step), wrap the still-packed node by-pointer in a
-                                        // `TaggedVal(TAG_SUMNODE)` (BoxKeepSumnode, O(1), zero copy). The
-                                        // DISTINCT tag is the soundness mechanism: the slot's release
-                                        // routes to `lin_sumnode_release_self`, retain to the offset-0 RC
-                                        // bump, and toString/eq/json/transfer MATERIALIZE on demand (the
-                                        // runtime walkers' TAG_SUMNODE arms). The read-back
-                                        // (`compile_ir_field_get_sumnode_readback`) tag-dispatches, so a
-                                        // slot stored EITHER keep-packed OR materialized reads correctly
-                                        // — no static store/read asymmetry. Ownership matches the
-                                        // materialize path: the IR `transfer_into_container` supplies the
-                                        // slot's owning +1; `object_set*` retains the inner; the shell
-                                        // release here undoes that duplicate, net-zero on the node.
-                                        // A null value (the `sum | Null` null case) tags as TAG_NULL.
                                         let keep_packed = val.is_pointer_value();
                                         let stored = if keep_packed {
                                             self.compile_ir_box_keep_sumnode(val)
                                         } else {
                                             self.box_value(val, &val_ty)
                                         };
-                                        let set_fn = if use_fresh { self.rt.object_set_fresh } else { self.rt.object_set };
-                                        self.builder.call(set_fn, &[obj_ptr.into(), key_str.into(), stored.into()], "");
+                                        self.builder.call(self.rt.map_set, &[obj_ptr.into(), key_str.into(), stored.into()], "");
                                         if stored.is_pointer_value() {
                                             if keep_packed {
-                                                // KEEP-PACKED: `object_set*` already retained the inner
-                                                // `*SumNode` into the slot (its OWN +1, independent of
-                                                // the source local). The source local keeps its own
-                                                // reference and is released at scope exit. So free ONLY
-                                                // the box SHELL here (lin_tagged_free_box) — a full
-                                                // `tagged_release` would `lin_sumnode_release_self` the
-                                                // shared node, dropping the slot's reference and freeing
-                                                // a node the cursor still points to (UAF). Mirrors the
-                                                // materializer's `free_box_shell` after a `set_fresh`.
                                                 let free_shell = self.get_or_declare_fn(
                                                     "lin_tagged_free_box",
                                                     self.context.void_type().fn_type(&[ptr_ty.into()], false),
@@ -1776,25 +1623,17 @@ impl<'ctx> Codegen<'ctx> {
                                         }
                                         continue;
                                     }
-                                    // A union/Json-typed field value is ALREADY a boxed TaggedVal*
-                                    // — pass it straight to lin_object_set. Re-wrapping it via
-                                    // build_tagged_val_alloca would store the pointer under a
-                                    // TAG_NULL tag (type_tag(TypeVar)=0), so later reads see null.
+                                    // All other fields: build a stack TaggedVal and call lin_map_set.
+                                    // A union/Json-typed value is already a boxed TaggedVal* — pass
+                                    // it directly. A concrete value is wrapped in a stack TaggedVal.
                                     let tagged = if Self::is_union_type(&val_ty) && val.is_pointer_value() {
                                         val.into_pointer_value()
                                     } else {
                                         self.build_tagged_val_alloca(&val, &val_ty)
                                     };
-                                    let set_fn = if use_fresh { self.rt.object_set_fresh } else { self.rt.object_set };
-                                    self.builder.call(set_fn, &[obj_ptr.into(), key_str.into(), tagged.into()], "");
-                                    // No string_release: `compile_string_lit` returns an INTERNED,
-                                    // immortal LinString (refcount == IMMORTAL_RC), so both the
-                                    // `inc_ref` inside object_set* and a release here are runtime
-                                    // no-ops — but the release is still an emitted call, hit once
-                                    // per field per object construction. Object-heavy code builds
-                                    // millions of objects, so dropping the dead call is a real win.
-                                    // SOUND: the key is never freed (immortal), and object_set*'s
-                                    // own inc_ref is also a no-op on it, so RC stays balanced.
+                                    self.builder.call(self.rt.map_set, &[obj_ptr.into(), key_str.into(), tagged.into()], "");
+                                    // lin_map_set copies the TaggedVal and retains the inner; the
+                                    // stack alloca is reclaimed automatically — no release needed.
                                 }
                             }
                             let _ = ty;
@@ -1993,13 +1832,15 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::ObjectRest { dst, src, src_ty, exclude } => {
                             if let Some(&src_v) = temp_map.get(src) {
-                                // Unbox a boxed Json object to the raw LinObject*.
+                                // Unbox a boxed Json/union object to the raw LinMap*.
                                 let src_obj = if Self::is_union_type(src_ty) && src_v.is_pointer_value() {
                                     self.builder.call(self.rt.unbox_ptr, &[src_v.into()], "orest_unbox").try_as_basic_value().unwrap_basic()
                                 } else { src_v };
-                                let rest_obj = self.builder.call(self.rt.object_alloc,
-                                    &[i32_ty.const_int(4, false).into()], "orest").try_as_basic_value().unwrap_basic().into_pointer_value();
-                                let exclude_fn = self.get_or_declare_fn("lin_object_copy_except",
+                                // Phase 2: open objects are LinMap* now.
+                                let i32_zero_rest = i32_ty.const_int(0, false);
+                                let rest_obj = self.builder.call(self.rt.map_alloc,
+                                    &[i32_ty.const_int(4, false).into(), i32_zero_rest.into()], "orest_map").try_as_basic_value().unwrap_basic().into_pointer_value();
+                                let exclude_fn = self.get_or_declare_fn("lin_map_copy_except",
                                     void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into(), i32_ty.into()], false));
                                 let n_exc = exclude.len() as u32;
                                 let arr_ty = ptr_ty.array_type(n_exc.max(1));
@@ -2013,7 +1854,7 @@ impl<'ctx> Codegen<'ctx> {
                                 let keys_ptr = self.builder.pointer_cast(keys_arr, ptr_ty, "orest_kps");
                                 self.builder.call(exclude_fn,
                                     &[rest_obj.into(), src_obj.into(), keys_ptr.into(), i32_ty.const_int(n_exc as u64, false).into()], "");
-                                let boxed = self.builder.call(self.rt.box_object, &[rest_obj.into()], "orest_boxed").try_as_basic_value().unwrap_basic();
+                                let boxed = self.builder.call(self.rt.box_map, &[rest_obj.into()], "orest_boxed_map").try_as_basic_value().unwrap_basic();
                                 temp_map.insert(*dst, boxed);
                             }
                         }
@@ -2201,18 +2042,21 @@ impl<'ctx> Codegen<'ctx> {
                                         "sumtag_eq",
                                     )
                                 } else {
-                                    // Defensive fallback: materialize + boxed disc-string compare.
+                                    // Defensive fallback: materialize to LinMap* + map_get disc-string compare.
                                     let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-                                    let obj = self.sumnode_materialize_to_object(v, sum_ty, llvm_fn);
-                                    let boxed = self.box_value(obj, &Self::sumnode_first_variant_obj_ty(sum_ty));
+                                    let map = self.sumnode_materialize_to_map(v, sum_ty, llvm_fn);
                                     let disc_key = Self::sum_type_discriminant(sum_ty).unwrap_or_default();
                                     let kp = self.compile_string_lit(&disc_key).into_pointer_value();
-                                    let got = self.builder.call(self.rt.object_get, &[boxed.into(), kp.into()], "").try_as_basic_value().unwrap_basic();
+                                    // Phase 2: map is a raw LinMap* — map_get directly.
+                                    let got = self.builder.call(self.rt.map_get, &[map.into(), kp.into()], "sumtag_mget").try_as_basic_value().unwrap_basic();
                                     let litr = self.compile_string_lit(disc_value);
                                     let lit = self.box_value(litr, &Type::Str);
                                     let eqfn = self.get_or_declare_fn("lin_tagged_eq", self.context.i8_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                                     let e = self.builder.call(eqfn, &[got.into(), lit.into()], "").try_as_basic_value().unwrap_basic().into_int_value();
-                                    self.builder.int_truncate_or_bit_cast(e, self.context.bool_type(), "")
+                                    let result_i1 = self.builder.int_truncate_or_bit_cast(e, self.context.bool_type(), "");
+                                    // Release the transient LinMap* (Phase 2: was box+tagged_release).
+                                    self.builder.call(self.rt.map_release, &[map.into()], "");
+                                    result_i1
                                 };
                                 temp_map.insert(*dst, result.into());
                             }
