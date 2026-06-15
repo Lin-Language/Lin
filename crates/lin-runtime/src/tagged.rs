@@ -201,11 +201,6 @@ pub unsafe extern "C" fn lin_box_str(p: *mut u8) -> *mut u8 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_box_object(p: *mut u8) -> *mut u8 {
-    alloc_tagged(TAG_OBJECT, p as u64)
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn lin_box_array(p: *mut u8) -> *mut u8 {
     alloc_tagged(TAG_ARRAY, p as u64)
 }
