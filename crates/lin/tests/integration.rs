@@ -19024,6 +19024,52 @@ print("${step(2000, 0)}")
 }
 
 #[test]
+fn test_coalesce_empty_literal_refines_to_stripped_type() {
+    // `m[k] ?? {}` where m's value type is itself a map/record should refine `{}` to that value
+    // type, not produce a `ValueType | {}` union. Regression for the case where `infer_coalesce`
+    // inferred the right operand with no expected type.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+// Nested map: { String: { UInt32: Boolean } } — the exact pattern from the original bug.
+// dates[key] is { UInt32: Boolean } | Null; `?? {}` must refine to { UInt32: Boolean }.
+var dates: { String: { UInt32: Boolean } } = {}
+dates["svc1"][1u32] = true
+val entry: { UInt32: Boolean } = dates["missing"] ?? {}
+print(toString(entry[1u32] ?? false))
+
+// { String: Int32[] } — empty-array default refines to Int32[].
+var lists: { String: Int32[] } = {}
+val xs: Int32[] = lists["k"] ?? []
+print(toString(length(xs)))
+"#);
+    assert_eq!(output, vec!["false", "0"]);
+}
+
+#[test]
+fn test_coalesce_mismatched_default_still_unions() {
+    // When the RHS default is genuinely a different type, `??` still produces a union result
+    // (the documented `stripped | D` behaviour is preserved — no regression).
+    let output = run(r#"import { print } from "std/io"
+
+var m: { String: Int32 } = {}
+m["x"] = 7
+val r = m["x"] ?? "fallback"
+val s = m["missing"] ?? "fallback"
+match r
+  is String => print("string: ${r}")
+  is Int32 => print("int: ${r}")
+  else => print("other")
+match s
+  is String => print("string: ${s}")
+  is Int32 => print("int: ${s}")
+  else => print("other")
+"#);
+    assert_eq!(output, vec!["int: 7", "string: fallback"]);
+}
+
+#[test]
 fn test_fmt_roundtrips_coalesce() {
     // The formatter must print `??` back faithfully, and keep parens around a parenthesised
     // logical RHS / right-nested `??` (ADR-065). Idempotent.
