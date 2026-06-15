@@ -357,6 +357,22 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
     let bt = if bv.is_null() { TAG_NULL } else { (*bv).tag };
     if at == TAG_NULL && bt == TAG_NULL { return 1; }
     if at == TAG_NULL || bt == TAG_NULL { return 0; }
+    // Dynamic-object equality during the LinObject→LinMap migration (Stage 6b): if EITHER side is a
+    // map and both sides are dynamic-object-shaped, normalize both to a `LinMap` and compare
+    // structurally (order-independent). Covers map==map AND the mixed case map==object /
+    // map==record / map==sumnode — a producer migrated to emit TAG_MAP compared against one that
+    // still emits a TAG_OBJECT (or a kept-packed record/sumnode). Without this, map==map would fall
+    // to raw pointer identity below and map==object would return 0.
+    let a_dynobj = at == TAG_MAP || at == TAG_OBJECT || at == TAG_RECORD || at == TAG_SUMNODE;
+    let b_dynobj = bt == TAG_MAP || bt == TAG_OBJECT || bt == TAG_RECORD || bt == TAG_SUMNODE;
+    if (at == TAG_MAP || bt == TAG_MAP) && a_dynobj && b_dynobj {
+        let am = crate::map::dynamic_to_map(av);
+        let bm = crate::map::dynamic_to_map(bv);
+        let eq = crate::map::lin_map_eq(am, bm);
+        crate::map::lin_map_release(am);
+        crate::map::lin_map_release(bm);
+        return eq;
+    }
     // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` (TAG_SUMNODE) or a Stage-6a
     // sealed-record pointer (TAG_RECORD) escaped into a dynamic equality. Materialize either operand to
     // a real LinObject and compare as objects (order-independent structural equality). Transient

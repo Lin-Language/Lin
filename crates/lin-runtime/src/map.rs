@@ -700,6 +700,115 @@ pub unsafe extern "C" fn lin_object_to_map(obj: *const crate::object::LinObject)
     map
 }
 
+// ── object.rs-parity ops (LinObject → LinMap migration, Stage 6b deletion) ─────────────────
+//
+// These mirror the corresponding `lin_object_*` functions so the dynamic-object representation
+// can move from `LinObject` onto `LinMap`. Structural equality is order-independent (§5.7);
+// merge/copy_except back object spread / rest.
+
+/// Structural, order-independent equality of two maps (mirrors `lin_object_eq`). Maps of
+/// different key kinds (String vs Int) are never equal. Values compared via `lin_tagged_eq`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_map_eq(a: *const LinMap, b: *const LinMap) -> u8 {
+    if a == b { return 1; }
+    if a.is_null() || b.is_null() { return 0; }
+    if (*a).key_kind != (*b).key_kind { return 0; }
+    if (*a).len != (*b).len { return 0; }
+    let cap = (*a).cap as usize;
+    let is_int = (*a).key_kind == KEY_KIND_INT;
+    for i in 0..cap {
+        let slot = (*a).slots.add(i);
+        if (*slot).hash == 0 { continue; }
+        let bval = if is_int {
+            lin_map_get_int(b, (*slot).key as i64)
+        } else {
+            lin_map_get(b, (*slot).key as *const LinString)
+        };
+        if bval.is_null() { return 0; } // key absent in b → unequal
+        let av = &(*slot).value as *const TaggedVal as *const u8;
+        if crate::tagged::lin_tagged_eq(av, bval as *const u8) == 0 {
+            return 0;
+        }
+    }
+    1
+}
+
+/// Merge `src` into `dst` (mirrors `lin_object_merge` — object spread). Both maps must share a
+/// key kind; a null `src` contributes nothing. Each value is retained by `lin_map_set`.
+#[no_mangle]
+pub unsafe extern "C-unwind" fn lin_map_merge(dst: *mut LinMap, src: *const LinMap) {
+    if src.is_null() || dst.is_null() { return; }
+    let cap = (*src).cap as usize;
+    let is_int = (*src).key_kind == KEY_KIND_INT;
+    for i in 0..cap {
+        let slot = (*src).slots.add(i);
+        if (*slot).hash == 0 { continue; }
+        if is_int {
+            lin_map_set_int(dst, (*slot).key as i64, &(*slot).value);
+        } else {
+            lin_map_set(dst, (*slot).key as *mut LinString, &(*slot).value);
+        }
+    }
+}
+
+/// Copy every entry of `src` into `dst` except those whose key is in `excluded` (mirrors
+/// `lin_object_copy_except` — object rest pattern). String-keyed only (rest is string-keyed).
+#[no_mangle]
+pub unsafe extern "C" fn lin_map_copy_except(
+    dst: *mut LinMap,
+    src: *const LinMap,
+    excluded: *const *const LinString,
+    n_excluded: u32,
+) {
+    if src.is_null() || dst.is_null() { return; }
+    let cap = (*src).cap as usize;
+    'outer: for i in 0..cap {
+        let slot = (*src).slots.add(i);
+        if (*slot).hash == 0 { continue; }
+        let key = (*slot).key as *const LinString;
+        for j in 0..n_excluded {
+            if string_key_eq(key, *excluded.add(j as usize)) {
+                continue 'outer;
+            }
+        }
+        lin_map_set(dst, key as *mut LinString, &(*slot).value);
+    }
+}
+
+/// Normalize ANY dynamic-object representation (Map/Object/Record/SumNode boxed in a TaggedVal)
+/// to a fresh owned `LinMap` (+1). Used by the equality path during the LinObject→LinMap
+/// migration so a value produced as a map compares structurally-equal to one still produced as
+/// a LinObject (or a kept-packed record/sumnode). Caller releases the result.
+pub(crate) unsafe fn dynamic_to_map(tv: *const TaggedVal) -> *mut LinMap {
+    if tv.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
+    match (*tv).tag {
+        TAG_MAP => {
+            let m = (*tv).payload as *mut LinMap;
+            lin_map_retain(m);
+            m
+        }
+        TAG_OBJECT => lin_object_to_map((*tv).payload as *const crate::object::LinObject),
+        TAG_RECORD => {
+            let sealed = (*tv).payload as *mut u8;
+            if sealed.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let obj = crate::sealed::materialize_sealed_struct_pub(sealed, named_desc);
+            if obj.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
+            let m = lin_object_to_map(obj as *const crate::object::LinObject);
+            crate::object::lin_object_release(obj);
+            m
+        }
+        t if t == crate::tagged::TAG_SUMNODE => {
+            let obj = crate::sumnode::lin_sumnode_materialize((*tv).payload as *mut u8);
+            if obj.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
+            let m = lin_object_to_map(obj as *const crate::object::LinObject);
+            crate::object::lin_object_release(obj as *mut crate::object::LinObject);
+            m
+        }
+        _ => lin_map_alloc(0, KEY_KIND_STRING),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,6 +980,100 @@ mod tests {
             crate::array::lin_array_release(vals);
             crate::array::lin_array_release(ents);
             lin_map_release(m);
+        }
+    }
+
+    #[test]
+    fn map_eq_structural_order_independent() {
+        unsafe {
+            // a and b have the same content, inserted in DIFFERENT order.
+            let a = lin_map_alloc(0, KEY_KIND_STRING);
+            let b = lin_map_alloc(0, KEY_KIND_STRING);
+            for i in 0..30i32 {
+                let k = str_key(&format!("k{i}"));
+                let v = int_val(i);
+                lin_map_set(a, k, &v);
+                lin_string_release(k);
+            }
+            for i in (0..30i32).rev() {
+                let k = str_key(&format!("k{i}"));
+                let v = int_val(i);
+                lin_map_set(b, k, &v);
+                lin_string_release(k);
+            }
+            assert_eq!(lin_map_eq(a, b), 1, "same content diff order should be equal");
+            // Mutate one value in b → unequal.
+            let k = str_key("k7");
+            let v = int_val(999);
+            lin_map_set(b, k, &v);
+            lin_string_release(k);
+            assert_eq!(lin_map_eq(a, b), 0, "differing value should be unequal");
+            lin_map_release(a);
+            lin_map_release(b);
+        }
+    }
+
+    #[test]
+    fn map_eq_len_and_keykind() {
+        unsafe {
+            let a = lin_map_alloc(0, KEY_KIND_STRING);
+            let b = lin_map_alloc(0, KEY_KIND_STRING);
+            let k = str_key("x");
+            let v = int_val(1);
+            lin_map_set(a, k, &v);
+            lin_string_release(k);
+            assert_eq!(lin_map_eq(a, b), 0, "different lengths unequal");
+            // Different key kind never equal.
+            let c = lin_map_alloc(0, KEY_KIND_INT);
+            assert_eq!(lin_map_eq(a, c), 0, "string vs int map unequal");
+            lin_map_release(a);
+            lin_map_release(b);
+            lin_map_release(c);
+        }
+    }
+
+    #[test]
+    fn map_merge_overwrites() {
+        unsafe {
+            let dst = lin_map_alloc(0, KEY_KIND_STRING);
+            let src = lin_map_alloc(0, KEY_KIND_STRING);
+            let ka = str_key("a"); let va = int_val(1); lin_map_set(dst, ka, &va); lin_string_release(ka);
+            let kb = str_key("b"); let vb = int_val(2); lin_map_set(dst, kb, &vb); lin_string_release(kb);
+            // src overwrites b, adds c.
+            let kb2 = str_key("b"); let vb2 = int_val(20); lin_map_set(src, kb2, &vb2); lin_string_release(kb2);
+            let kc = str_key("c"); let vc = int_val(3); lin_map_set(src, kc, &vc); lin_string_release(kc);
+            lin_map_merge(dst, src);
+            assert_eq!(lin_map_length(dst), 3);
+            let kb3 = str_key("b");
+            assert_eq!((*lin_map_get(dst, kb3)).payload as u32 as i32, 20, "b overwritten");
+            lin_string_release(kb3);
+            let kc2 = str_key("c");
+            assert_eq!((*lin_map_get(dst, kc2)).payload as u32 as i32, 3, "c added");
+            lin_string_release(kc2);
+            lin_map_release(dst);
+            lin_map_release(src);
+        }
+    }
+
+    #[test]
+    fn map_copy_except_excludes() {
+        unsafe {
+            let src = lin_map_alloc(0, KEY_KIND_STRING);
+            for n in ["a", "b", "c", "d"] {
+                let k = str_key(n); let v = int_val(1); lin_map_set(src, k, &v); lin_string_release(k);
+            }
+            let dst = lin_map_alloc(0, KEY_KIND_STRING);
+            let ex_b = str_key("b");
+            let ex_d = str_key("d");
+            let excluded: [*const LinString; 2] = [ex_b as *const LinString, ex_d as *const LinString];
+            lin_map_copy_except(dst, src, excluded.as_ptr(), 2);
+            assert_eq!(lin_map_length(dst), 2, "b and d excluded");
+            let ka = str_key("a"); assert!(!lin_map_get(dst, ka).is_null()); lin_string_release(ka);
+            let kb = str_key("b"); assert!(lin_map_get(dst, kb).is_null(), "b excluded"); lin_string_release(kb);
+            lin_string_release(ex_b);
+            lin_string_release(ex_d);
+            lin_map_release(src);
+            lin_map_release(dst);
         }
     }
 }
