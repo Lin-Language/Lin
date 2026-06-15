@@ -513,7 +513,7 @@ not a patch.
 - **Transfer/copy fns**: `lin_transfer_clone(TaggedVal) -> TaggedVal` that deep-
   copies a transferable graph (and a parallel one for closure envs). Must reject
   / never-receive non-transferable tags (checker guarantees the static cases;
-  runtime guards the dynamic `Json` case per spec §24.2).
+  runtime guards the dynamic `AnyVal` case per spec §24.2).
 
 ### 2.7 `print` ordering (§24.7)
 

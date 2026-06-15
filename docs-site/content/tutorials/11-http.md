@@ -15,7 +15,7 @@ print("status: ${res["status"]}")
 print(res["body"])
 ```
 
-When the body is JSON, `fetchJson` fetches and parses it in one step, handing back a plain `Json` value you read and match like any other:
+When the body is JSON, `fetchJson` fetches and parses it in one step, handing back a plain `AnyVal` value you read and match like any other:
 
 ```lin
 import { print } from "std/io"
@@ -44,7 +44,7 @@ A request is `{ "method", "path", "query", "headers", "body" }`. The natural way
 ```lin
 import { serve, json, text } from "std/http"
 
-val handler = (req: Json): Json =>
+val handler = (req: AnyVal): AnyVal =>
   match req
     has { "method": "GET", "path": "/" }       => text(200, "Welcome to Lin")
     has { "method": "GET", "path": "/health" } => json(200, { "ok": true })
@@ -62,7 +62,7 @@ The `json` and `text` helpers build response records with the right `Content-Typ
 ```lin
 import { json, matchPath } from "std/http"
 
-val handler = (req: Json): Json =>
+val handler = (req: AnyVal): AnyVal =>
   val params = matchPath(req["path"], "/users/:id")
   if params == null then json(404, { "error": "not found" })
   else json(200, { "id": params["id"] })
@@ -75,7 +75,7 @@ val handler = (req: Json): Json =>
 ```lin
 import { json, parseBody } from "std/http"
 
-val createUser = (req: Json): Json =>
+val createUser = (req: AnyVal): AnyVal =>
   val body = parseBody(req)
   if body["name"] == null then json(400, { "error": "name required" })
   else json(201, { "created": body["name"] })
@@ -102,7 +102,7 @@ Holes may use dotted paths (`{{ user.name }}`) to reach into nested objects. A m
 import { text } from "std/http"
 import { render } from "std/template"
 
-val page = (req: Json): Json =>
+val page = (req: AnyVal): AnyVal =>
   val html = render("views/home.jinja", { "title": "Home", "year": 2026 })
   match html
     is { "type": "error", "message": _ } => text(500, "template error")

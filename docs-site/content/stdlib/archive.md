@@ -48,7 +48,7 @@ A tar entry together with its fully buffered body (`data`).
 #### `untar`
 
 ```lin
-val untar = (s: Stream<UInt8[]>, body: (TarHeader, Stream<UInt8[]>) => Json): Json
+val untar = (s: Stream<UInt8[]>, body: (TarHeader, Stream<UInt8[]>) => AnyVal): AnyVal
 ```
 
 Drive the whole tar archive on the calling thread in constant memory, calling `body` once per entry.

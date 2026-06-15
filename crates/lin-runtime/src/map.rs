@@ -25,7 +25,7 @@
 //!   KEY_EQ_MISS   — key_eq called + returned false (key content mismatch on hash collision)
 //! These are printed to stderr at process exit.
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc, alloc_zeroed, dealloc, Layout};
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::string::{LinString, lin_string_inc_ref, lin_string_release, IMMORTAL_RC};
 use crate::tagged::{TaggedVal, TAG_NULL};
@@ -122,7 +122,7 @@ pub struct Slot {
 const INITIAL_CAP: u32 = 8;
 #[inline]
 fn over_load(len: u32, cap: u32) -> bool {
-    (len as u64) * 8 >= (cap as u64) * 7
+    (len as u64) * 10 >= (cap as u64) * 7
 }
 
 unsafe fn map_header_layout() -> Layout {
@@ -141,9 +141,7 @@ unsafe fn slots_layout(cap: u32) -> Layout {
 
 /// Allocate a zeroed slot table of `cap` slots (every slot empty: hash = 0).
 unsafe fn alloc_slots(cap: u32) -> *mut Slot {
-    let buf = alloc(slots_layout(cap)) as *mut Slot;
-    std::ptr::write_bytes(buf as *mut u8, 0, slots_layout(cap).size());
-    buf
+    alloc_zeroed(slots_layout(cap)) as *mut Slot
 }
 
 unsafe fn order_layout(cap: u32) -> Layout {
@@ -175,6 +173,17 @@ unsafe fn order_push(map: *mut LinMap, key: u64) {
 
 // ── Hash functions ───────────────────────────────────────────────────────────────────────────
 
+/// FNV-1a hash over a raw byte slice. Returns nonzero (maps 0 → 1).
+#[inline]
+fn fnv1a_bytes(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    if h == 0 { 1 } else { h }
+}
+
 /// FNV-1a hash over the key bytes (String kind).
 /// Returns a nonzero value (maps 0 → 1 to avoid the empty-slot sentinel).
 #[inline]
@@ -185,13 +194,7 @@ unsafe fn hash_string_key(key: *const LinString) -> u64 {
     let len = (*key).len as usize;
     let data = (*key).data.as_ptr();
     let bytes = std::slice::from_raw_parts(data, len);
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    // Ensure nonzero (FNV can produce 0 for pathological inputs).
-    if h == 0 { 1 } else { h }
+    fnv1a_bytes(bytes)
 }
 
 /// Murmurhash3 finalizer (fmix64) for Int keys.
@@ -332,19 +335,19 @@ unsafe fn grow(map: *mut LinMap) {
 // ── Public API ───────────────────────────────────────────────────────────────────────────────
 
 /// Allocate a new `LinMap` with the given `key_kind` (KEY_KIND_STRING or KEY_KIND_INT).
-/// `hint` is the expected initial capacity (ignored: always starts at INITIAL_CAP).
+/// `hint` is the expected initial capacity; the table is sized to the next power-of-two
+/// >= max(hint, INITIAL_CAP) so that maps built with a known count avoid an early grow.
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_alloc(hint: u32, key_kind: u32) -> *mut LinMap {
-    let _ = hint;
+    let cap = hint.next_power_of_two().max(INITIAL_CAP);
     let ptr = alloc(map_header_layout()) as *mut LinMap;
     (*ptr).refcount = 1;
     (*ptr).len = 0;
-    (*ptr).cap = INITIAL_CAP;
+    (*ptr).cap = cap;
     (*ptr).key_kind = key_kind;
-    (*ptr).slots = alloc_slots(INITIAL_CAP);
-    let order_cap = INITIAL_CAP;
-    (*ptr).order = alloc_order(order_cap);
-    (*ptr).cap_order = order_cap;
+    (*ptr).slots = alloc_slots(cap);
+    (*ptr).order = alloc_order(cap);
+    (*ptr).cap_order = cap;
     (*ptr)._pad = 0;
     ptr
 }
@@ -446,6 +449,7 @@ pub unsafe extern "C" fn lin_map_get_int(map: *const LinMap, key: i64) -> *const
 
 /// Lookup by raw UTF-8 key bytes — the map analogue of `lin_object_get_bytes`. Avoids
 /// allocating a temporary `LinString` for cold consumers (e.g. the fromJson validator).
+/// Uses the same FNV-1a hash and probe structure as `find_slot_string` to stay in lockstep.
 pub(crate) unsafe fn lin_map_get_bytes(
     map: *const LinMap,
     key_ptr: *const u8,
@@ -455,13 +459,7 @@ pub(crate) unsafe fn lin_map_get_bytes(
         return std::ptr::null();
     }
     let bytes = std::slice::from_raw_parts(key_ptr, key_len as usize);
-    // FNV-1a over the raw bytes — same algorithm as hash_string_key.
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    if h == 0 { h = 1; }
+    let h = fnv1a_bytes(bytes);
     let cap = (*map).cap as usize;
     let mask = cap - 1;
     let mut idx = (h as usize) & mask;
@@ -520,62 +518,70 @@ pub unsafe extern "C" fn lin_map_keys(map: *const LinMap) -> *mut crate::array::
     arr
 }
 
-/// Return a `LinArray*` of all values (each a TaggedVal copied + payload-retained).
+/// Return a `LinArray*` of all values in insertion order (matches `lin_map_keys` order).
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_values(map: *const LinMap) -> *mut crate::array::LinArray {
     let len = if map.is_null() { 0 } else { (*map).len };
     let arr = crate::array::lin_array_alloc(len as u64);
-    if !map.is_null() {
-        let cap = (*map).cap as usize;
-        let mut out = 0usize;
-        for i in 0..cap {
-            let slot = (*map).slots.add(i);
-            if (*slot).hash == 0 {
-                continue;
+    if !map.is_null() && len > 0 && !(*map).order.is_null() {
+        let is_int = (*map).key_kind == KEY_KIND_INT;
+        for i in 0..len as usize {
+            let key = *(*map).order.add(i);
+            let src = if is_int {
+                lin_map_get_int(map, key as i64)
+            } else {
+                lin_map_get(map, key as *const LinString)
+            };
+            let dst = (*arr).data.add(i) as *mut TaggedVal;
+            if src.is_null() {
+                (*dst).tag = TAG_NULL;
+                (*dst).payload = 0;
+            } else {
+                std::ptr::copy_nonoverlapping(src, dst, 1);
+                crate::tagged::retain_tagged_payload_pub(&*src);
             }
-            let src = &(*slot).value;
-            let dst = (*arr).data.add(out) as *mut TaggedVal;
-            std::ptr::copy_nonoverlapping(src as *const TaggedVal, dst, 1);
-            crate::tagged::retain_tagged_payload_pub(src);
-            out += 1;
         }
     }
     (*arr).len = len as u64;
     arr
 }
 
-/// Return a `LinArray*` of `[key, value]` pair arrays (hash order).
+/// Return a `LinArray*` of `[key, value]` pair arrays in insertion order (matches `lin_map_keys`).
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_entries(map: *const LinMap) -> *mut crate::array::LinArray {
     let len = if map.is_null() { 0 } else { (*map).len };
     let out = crate::array::lin_array_alloc(len as u64);
-    if !map.is_null() {
-        let cap = (*map).cap as usize;
+    if !map.is_null() && len > 0 && !(*map).order.is_null() {
         let is_int = (*map).key_kind == KEY_KIND_INT;
-        let mut o = 0usize;
-        for i in 0..cap {
-            let slot = (*map).slots.add(i);
-            if (*slot).hash == 0 {
-                continue;
-            }
+        for i in 0..len as usize {
+            let key = *(*map).order.add(i);
             let pair = crate::array::lin_array_alloc(2);
             if is_int {
                 (*(*pair).data.add(0)).tag = crate::tagged::TAG_INT64;
-                (*(*pair).data.add(0)).payload = (*slot).key;
+                (*(*pair).data.add(0)).payload = key;
             } else {
-                let key_ptr = (*slot).key as *mut LinString;
+                let key_ptr = key as *mut LinString;
                 lin_string_inc_ref(key_ptr);
                 (*(*pair).data.add(0)).tag = crate::tagged::TAG_STR;
-                (*(*pair).data.add(0)).payload = (*slot).key;
+                (*(*pair).data.add(0)).payload = key;
             }
-            let src = &(*slot).value;
-            std::ptr::copy_nonoverlapping(src as *const TaggedVal, (*pair).data.add(1) as *mut TaggedVal, 1);
-            crate::tagged::retain_tagged_payload_pub(src);
+            let src = if is_int {
+                lin_map_get_int(map, key as i64)
+            } else {
+                lin_map_get(map, key as *const LinString)
+            };
+            let val_dst = (*pair).data.add(1) as *mut TaggedVal;
+            if src.is_null() {
+                (*val_dst).tag = TAG_NULL;
+                (*val_dst).payload = 0;
+            } else {
+                std::ptr::copy_nonoverlapping(src, val_dst, 1);
+                crate::tagged::retain_tagged_payload_pub(&*src);
+            }
             (*pair).len = 2;
-            let dst = (*out).data.add(o);
+            let dst = (*out).data.add(i);
             (*dst).tag = crate::tagged::TAG_ARRAY;
             (*dst).payload = pair as u64;
-            o += 1;
         }
     }
     (*out).len = len as u64;

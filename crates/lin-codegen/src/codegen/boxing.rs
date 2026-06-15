@@ -44,6 +44,7 @@ impl<'ctx> Codegen<'ctx> {
     /// For concrete types, allocates and fills a TaggedVal with the appropriate tag.
     /// For TypeVar, dispatches on the actual LLVM type (int/float/pointer) to pick the right box call.
     pub(crate) fn box_value(&mut self, val: BasicValueEnum<'ctx>, val_ty: &Type) -> BasicValueEnum<'ctx> {
+        #[allow(unreachable_patterns)] // _ arm is a future-proof guard; currently exhaustive
         let ptr = match val_ty {
             Type::Null => self.builder.call(self.rt.box_null, &[], "boxnull")
                 .try_as_basic_value().unwrap_basic(),
@@ -233,7 +234,20 @@ impl<'ctx> Codegen<'ctx> {
                     val
                 }
             }
-            _ => val,
+            // Opaque handle types whose runtime value is already a boxed TaggedVal* — pass through
+            // unchanged. is_union_type() returns true for all of these, so call sites that guard
+            // with is_union_type() never reach here; the pass-through is the safety net for any
+            // site that doesn't guard.
+            Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
+            | Type::Named(_) | Type::Never => val,
+            // Any Type variant that reaches here was not expected to be boxed. In a release build
+            // the old fall-through behaviour is preserved (return val unchanged) so existing
+            // behaviour is not regressed; in debug/test builds this fires as a panic so the corpus
+            // gate catches the unhandled case immediately rather than silently miscompiling.
+            _ => {
+                debug_assert!(false, "box_value: unhandled type {val_ty:?} — add an explicit arm");
+                val
+            }
         };
         ptr
     }
@@ -241,6 +255,7 @@ impl<'ctx> Codegen<'ctx> {
     /// Unbox a tagged union pointer to the concrete type `target_ty`.
     pub(crate) fn unbox_value(&mut self, ptr: BasicValueEnum<'ctx>, target_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_val = ptr.into_pointer_value();
+        #[allow(unreachable_patterns)] // _ arm is a future-proof guard; currently exhaustive
         match target_ty {
             Type::Null => self.context.ptr_type(AddressSpace::default()).const_null().into(),
             Type::Bool => {
@@ -299,9 +314,23 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "uptr")
                     .try_as_basic_value().unwrap_basic()
             }
-            // Already tagged — return as-is
+            // Already tagged — return as-is.
             Type::Union(_) | Type::TypeVar(_) => ptr,
-            _ => ptr,
+            // Opaque handle types: their runtime value IS the tagged box pointer.
+            Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
+            | Type::Named(_) | Type::Never
+            // Iterator<T> is boxed as TAG_ARRAY (lin_iter returns a LinArray*); unboxing to the
+            // raw pointer is the same as Array — handled identically by the unbox_ptr call above,
+            // but Iterator was not listed in that explicit arm. Pass through; the pointer IS the
+            // value the caller needs (it's already unboxed at the IR level for Iterator results).
+            | Type::Iterator(_) => ptr,
+            // Any Type variant that reaches here was not expected to be unboxed via this entry
+            // point. Preserve old fall-through in release builds; panic in debug/test so the
+            // corpus gate catches the gap immediately.
+            _ => {
+                debug_assert!(false, "unbox_value: unhandled type {target_ty:?} — add an explicit arm");
+                ptr
+            }
         }
     }
 
@@ -472,6 +501,7 @@ impl<'ctx> Codegen<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         if !tagged.is_pointer_value() { return tagged; }
         let ptr = tagged.into_pointer_value();
+        #[allow(unreachable_patterns)] // _ arm is a future-proof guard; currently exhaustive
         match ty {
             Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => {
                 // Boxed as TAG_INT32 (sign-extended at box time). Read i32 and truncate to the
@@ -552,7 +582,25 @@ impl<'ctx> Codegen<'ctx> {
                 self.sumnode_project_from_boxed(tagged, ty, ty, llvm_fn)
             }
             Type::Null => ptr_ty.const_null().into(),
-            _ => tagged, // pass through for union/unknown
+            // Already-tagged values: the caller has a boxed TaggedVal* and the target type is
+            // itself tagged — return the box unchanged. Includes generic unions, TypeVar (unknown
+            // concrete type at compile time), opaque handle types (Shared/Stream/Promise/TarEntry
+            // whose runtime rep IS a tagged box), Named aliases, and Never (unreachable in
+            // practice).
+            Type::Union(_) | Type::TypeVar(_)
+            | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
+            | Type::Named(_) | Type::Never => tagged,
+            // Iterator<T> values materialise as a LinArray* (TAG_ARRAY) at the IR boundary;
+            // unboxing to the raw pointer falls through here when Iterator is the stated target
+            // type. Pass through unchanged — the pointer IS the value.
+            Type::Iterator(_) => tagged,
+            // Any Type variant that reaches here was not expected to be unboxed via this entry
+            // point. Preserve old fall-through in release builds; panic in debug/test so the
+            // corpus gate catches the gap immediately.
+            _ => {
+                debug_assert!(false, "unbox_tagged_val_to_type: unhandled type {ty:?} — add an explicit arm");
+                tagged
+            }
         }
     }
 

@@ -59,7 +59,7 @@ Arms are checked top-to-bottom. For literal values (`is "Dave"`), only that exac
 `has` checks that an object contains at least certain fields, allowing extra fields. It does **not** check the types of those fields:
 
 ```lin
-val greet = (person: Json): String =>
+val greet = (person: AnyVal): String =>
   match person
     has { "name": "Alice" }  => "Hello, Alice!"
     has { name, age }        =>
@@ -99,7 +99,7 @@ match input
 Represent errors and results as tagged objects — then match on the tag:
 
 ```lin
-val divide = (a: Float64, b: Float64): Json =>
+val divide = (a: Float64, b: Float64): AnyVal =>
   if b == 0.0 then { "type": "failure", "error": "division by zero" }
   else { "type": "success", "value": a / b }
 
@@ -127,7 +127,7 @@ val process = (input: String | Int32 | Null): String =>
 Match arms can contain blocks with local bindings:
 
 ```lin
-val summarise = (result: Json): String =>
+val summarise = (result: AnyVal): String =>
   match result
     has { "type": "success", value } =>
       val rounded = value

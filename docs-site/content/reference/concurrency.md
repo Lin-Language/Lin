@@ -48,7 +48,7 @@ val n: Int32 = await(p)   // compile error: Int32 | Error is not assignable to I
 
 To await several computations at once, use [`parallel`](#parallelthunks) (collect a whole array of results) or `await` each `Promise<T>` handle in turn.
 
-> The `T | Error` union is attached at `await` rather than at `async` (the promise handle in flight is opaque; only `await` materialises a result that can fault). `Promise<T>` is a first-class opaque type that does not widen to `Json`, so the checker enforces "handle the `Error`" **and** catches "forgot to `await`" (passing a `Promise<T>` where its resolved value is expected is a type error). See ADR-045.
+> The `T | Error` union is attached at `await` rather than at `async` (the promise handle in flight is opaque; only `await` materialises a result that can fault). `Promise<T>` is a first-class opaque type that does not widen to `AnyVal`, so the checker enforces "handle the `Error`" **and** catches "forgot to `await`" (passing a `Promise<T>` where its resolved value is expected is a type error). See ADR-045.
 
 ## `parallel(thunks)`
 

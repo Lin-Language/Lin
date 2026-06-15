@@ -176,6 +176,63 @@ unsafe fn release_heap_fields(ptr: *mut u8) {
     }
 }
 
+/// Immortal-seal a `*SumNode` and (recursively) every heap field of its current variant — the
+/// sum-node arm of `frozen()`. Mirrors `release_heap_fields`' variant-indexed descriptor walk but
+/// saturates the refcount instead of decrementing, and seals each heap field via the shared
+/// `frozen::freeze_*` primitives. Needed because a kept-packed sum node can be boxed into a dynamic
+/// (AnyVal/union) slot (`lin_box_sumnode`); when such a graph is `frozen()`, the node must be sealed
+/// too or it stays mortal and is freeable while shared read-only across threads (cross-thread UAF).
+/// Idempotent (inert once IMMORTAL_RC). Null-safe.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sumnode_freeze(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    let rc = ptr as *mut u32;
+    if *rc >= crate::string::IMMORTAL_RC {
+        return; // already frozen — also breaks any accidental sharing/cycle
+    }
+    *rc = crate::string::IMMORTAL_RC;
+    let desc = desc_of(ptr);
+    if desc.is_null() {
+        return; // scalar-only sum type: no heap fields to seal
+    }
+    let table = desc.add(SUMDESC_TABLE_OFFSET);
+    let variant_count = *(table as *const u32);
+    let tag = tag_of(ptr);
+    if tag >= variant_count {
+        return;
+    }
+    // Skip to this variant's VariantDesc (variable-length blocks, exactly as release_heap_fields).
+    let mut cur = table.add(4);
+    for _ in 0..tag {
+        let hc = *(cur as *const u32) as usize;
+        cur = cur.add(4 + hc * 8);
+    }
+    let heap_count = *(cur as *const u32) as usize;
+    let entries = cur.add(4);
+    for i in 0..heap_count {
+        let ent = entries.add(i * 8);
+        let offset = *(ent as *const u32) as usize;
+        let kind = *((ent.add(4)) as *const u32);
+        let payload = *(ptr.add(offset) as *const *mut u8);
+        if payload.is_null() {
+            continue;
+        }
+        match kind {
+            crate::sealed::KIND_STRING => {
+                crate::frozen::freeze_string(payload as *mut crate::string::LinString)
+            }
+            crate::sealed::KIND_ARRAY => {
+                crate::frozen::freeze_array(payload as *mut crate::array::LinArray)
+            }
+            crate::sealed::KIND_SEALED => crate::frozen::freeze_sealed(payload),
+            KIND_SUMNODE => lin_sumnode_freeze(payload), // recursive child
+            _ => {}
+        }
+    }
+}
+
 /// Release a `SumNode`: decrement its refcount and, on reaching zero, release each heap field of the
 /// node's variant (per the descriptor) THEN free the allocation. `size` is the same total byte size
 /// passed to `lin_sumnode_alloc` (codegen knows it statically per sum type). Null- and

@@ -166,12 +166,12 @@ val components = (ts: Int64): TimeComponents
 #### `fromComponents`
 
 ```lin
-val fromComponents = (c: Json): Int64 | Error
+val fromComponents = (c: AnyVal): Int64 | Error
 ```
 
 Build a Unix-millisecond timestamp (UTC) from calendar fields. Out-of-range fields are rejected,
 not normalised, so calendar typos surface as errors.
-- **`c`** — a Json object; only year/month/day/hour/minute/second/millis are read. `weekday`/
+- **`c`** — a AnyVal object; only year/month/day/hour/minute/second/millis are read. `weekday`/
   `yearDay` are ignored on input, so the full record from `components` is accepted unchanged.
 - **Returns** the timestamp in Unix milliseconds, or an Error if any read field is out of range.
 
