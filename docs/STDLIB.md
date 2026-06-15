@@ -164,6 +164,13 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`toUInt32`](#narrowing-casts) | `(UInt64) -> UInt32` | Truncate to a 32-bit unsigned int |
 | [`toInt64`](#narrowing-casts) | `(UInt64) -> Int64` | Reinterpret to a 64-bit signed int |
 | [`toUInt64`](#narrowing-casts) | `(UInt64) -> UInt64` | Identity / reinterpret to 64-bit unsigned int |
+| [`narrowToUInt8`](#narrowing-casts) | `(Int64) -> UInt8` | Truncate a signed Int64 to an 8-bit unsigned byte |
+| [`narrowToInt8`](#narrowing-casts) | `(Int64) -> Int8` | Truncate a signed Int64 to an 8-bit signed byte |
+| [`narrowToUInt16`](#narrowing-casts) | `(Int64) -> UInt16` | Truncate a signed Int64 to a 16-bit unsigned int |
+| [`narrowToInt16`](#narrowing-casts) | `(Int64) -> Int16` | Truncate a signed Int64 to a 16-bit signed int |
+| [`narrowToUInt32`](#narrowing-casts) | `(Int64) -> UInt32` | Truncate a signed Int64 to a 32-bit unsigned int |
+| [`narrowToInt32`](#narrowing-casts) | `(Int64) -> Int32` | Truncate a signed Int64 to a 32-bit signed int |
+| [`narrowToUInt64`](#narrowing-casts) | `(Int64) -> UInt64` | Reinterpret a signed Int64 as 64-bit unsigned |
 | [`tryParseFloat64`](#tryParseFloat64) | `(String) -> Float64 \| Null` | Parse Float64, returning Null on failure |
 | [`tryParseInt32`](#tryParseInt32) | `(String) -> Int32 \| Null` | Parse Int32, returning Null on failure |
 
@@ -449,7 +456,7 @@ incrementally (constant memory) and threads decode errors in-band like every oth
 | [`timeOf`](#timeOf) | `(DateTime) -> Time` | The time part of a `DateTime` |
 | [`atTime`](#atTime) | `(Date, Time) -> DateTime` | Combine a `Date` and a `Time` |
 | [`atStartOfDay`](#atStartOfDay) | `(Date) -> DateTime` | The `DateTime` at midnight on a `Date` |
-| [`weekday`](#weekday) | `(Date) -> Int64` | Day of week, 0=Sunday..6=Saturday |
+| [`weekday`](#weekday) | `(Date) -> Weekday` | Day of week, 0=Sunday..6=Saturday |
 | [`dayOfYear`](#dayOfYear) | `(Date) -> Int64` | Day of year, 1-366 |
 | [`addDays`](#addDays) | `(Date, Int64) -> Date` | Shift a `Date` by whole days |
 | [`addMonths`](#addMonths) | `(Date, Int64) -> Date` | Shift by months, clamping the month end |
@@ -1890,6 +1897,34 @@ toUInt8(0x1234)              // 0x34  (52)
 toUInt8((v >> 24) & 0xFF)    // top byte of a UInt32 v
 toUInt16(b[0]) << 8          // widen a byte for endian assembly
 ```
+
+The `to*` family takes `UInt64`, so it reaches only *unsigned* (or masked) inputs. A value
+**computed in `Int64`** cannot reach them — `Int64 → UInt64` is not an implicit coercion (it could
+wrap a negative). The parallel `narrowTo*` family takes a signed `Int64` and covers that case:
+
+```txt
+val narrowToUInt8:  (v: Int64) -> UInt8
+val narrowToInt8:   (v: Int64) -> Int8
+val narrowToUInt16: (v: Int64) -> UInt16
+val narrowToInt16:  (v: Int64) -> Int16
+val narrowToUInt32: (v: Int64) -> UInt32
+val narrowToInt32:  (v: Int64) -> Int32     // the integer→Int32 cast toInt32 (Float64-input) lacks
+val narrowToUInt64: (v: Int64) -> UInt64    // signed→unsigned reinterpret
+```
+
+Same two's-complement truncation; the only difference is the accepted input. Use them to store a
+wide computed result into a narrow field. Truncation never fails — an out-of-range value keeps its
+low bits — so narrow only values you know fit.
+
+```txt
+narrowToUInt8(300)           // 44   (300 & 0xFF)
+narrowToInt32(0 - 44)        // -44  (computed negative into an Int32 field)
+```
+
+> Reading a narrow field *back* into wide arithmetic does not auto-widen: `153 * month` with
+> `month: UInt8` computes at `UInt8` width and silently overflows (a suffixless literal adopts the
+> narrow operand's width, §21). Widen the read first (`val m: Int64 = d["month"]`), or keep hot-path
+> numeric fields at `Int64` and narrow only at the storage boundary.
 
 ---
 
@@ -5483,10 +5518,14 @@ The value types:
 | `DateTime` | `Date & Time` | A day + time — Temporal.PlainDateTime |
 | `Duration` | `{ millis }` | An exact elapsed span (always milliseconds) |
 | `Period` | `{ years, months, days }` | A calendar span (months are not fixed-length) |
+| `Weekday` | `0 \| 1 \| … \| 6` | Day of week, 0=Sunday..6=Saturday — a numeric literal union |
 
 `DateTime` is the record intersection `Date & Time` (see ADR-061), so by structural width-subtyping
 every `DateTime` is *also* a `Date` and a `Time` — you can pass one straight to any `Date`/`Time`
-function. All fields are `Int64` and `year` may be negative (astronomical numbering; no year-0 gap).
+function. The record fields are `Int64` and `year` may be negative (astronomical numbering; no
+year-0 gap). `weekday` returns the `Weekday` literal union (0=Sunday..6=Saturday), with named
+constants `Sun`..`Sat`, so a `match` over it is exhaustively checked and only the seven valid values
+type-check.
 
 Construction (`date`/`time`/`dateTime`) validates and returns `T | Error` (the canonical
 `{ "type": "error", … }`, matched with `is Error`). The calendar shifts never fail: out-of-range
@@ -5502,7 +5541,7 @@ match dateTime(2024, 1, 15, 10, 30, 0)
 
 toIso(fromTimestamp(0))                // "1970-01-01T00:00:00.000"
 toIsoDate(addMonths(d, 1))             // clamps to the month end
-weekday({ "year": 1970, "month": 1, "day": 1 })   // 4 (Thursday)
+weekday({ "year": 1970, "month": 1, "day": 1 })   // Thu (== 4)
 toMillis(plus(hours(2), minutes(30)))  // 9000000
 ```
 

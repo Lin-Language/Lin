@@ -4,6 +4,7 @@ import { date, time, dateTime, isLeapYear, daysInMonth } from "std/datetime"
 import { toEpochDay, fromEpochDay, toTimestamp, fromTimestamp } from "std/datetime"
 import { dateOf, timeOf, atTime, atStartOfDay } from "std/datetime"
 import { weekday, dayOfYear, addDays, addMonths, addYears, addPeriod, period } from "std/datetime"
+import { Weekday, Sun, Mon, Tue, Wed, Thu, Fri, Sat } from "std/datetime"
 import { millis, seconds, minutes, hours, days, plus, minus, scale } from "std/datetime"
 import { toMillis, toSeconds, toMinutes, toHours, toDays, between, plusDuration, minusDuration } from "std/datetime"
 import { compareDate, compare, isBefore, isAfter } from "std/datetime"
@@ -257,6 +258,28 @@ val s = suite("std/datetime", [
     expect(weekday({ "year": 2024, "month": 1, "day": 15 })).toBe(1), // Monday
     expect(weekday({ "year": 2024, "month": 1, "day": 14 })).toBe(0) // Sunday
   ]),
+
+  test("weekday returns the named Weekday constants", () => [
+    expect(weekday({ "year": 1970, "month": 1, "day": 1 }) == Thu).toBe(true),
+    expect(weekday({ "year": 2024, "month": 1, "day": 14 }) == Sun).toBe(true),
+    expect(weekday({ "year": 2024, "month": 1, "day": 20 }) == Sat).toBe(true)
+  ]),
+
+  test("a Weekday is exhaustively matchable", () =>
+    val name = (w: Weekday): String =>
+      match w
+        is 0 => "Sun"
+        is 1 => "Mon"
+        is 2 => "Tue"
+        is 3 => "Wed"
+        is 4 => "Thu"
+        is 5 => "Fri"
+        is 6 => "Sat"
+    [
+      expect(name(weekday({ "year": 1970, "month": 1, "day": 1 }))).toBe("Thu"),
+      expect(name(Mon)).toBe("Mon")
+    ]
+  ),
 
   test("dayOfYear counts from 1, leap-aware", () => [
     expect(dayOfYear({ "year": 2024, "month": 1, "day": 1 })).toBe(1),

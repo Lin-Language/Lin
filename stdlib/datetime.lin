@@ -7,6 +7,7 @@
 //   DateTime  = Date & Time                                  — a day + time     (Temporal.PlainDateTime)
 //   Duration  = { millis }                                   — an exact elapsed span (always milliseconds)
 //   Period    = { years, months, days }                      — a calendar span (months are not fixed-length)
+//   Weekday   = 0 | 1 | … | 6                                — day of week (0=Sunday), with Sun..Sat constants
 //
 // Because `DateTime` is the record intersection `Date & Time` (ADR-061), every `DateTime` is *also*
 // a `Date` and a `Time` by structural width-subtyping — you can pass one straight to any `Date`/`Time`
@@ -42,6 +43,20 @@ export type Duration = { "millis": Int64 }
 // A calendar span in human units. Unlike `Duration` these are not fixed-length (a month varies), so a
 // `Period` is only meaningful when added to a specific `Date` via `addPeriod`.
 export type Period = { "years": Int64, "months": Int64, "days": Int64 }
+// The day of the week as a numeric literal union: 0=Sunday .. 6=Saturday. Returned by `weekday`,
+// so a `match` over it is exhaustively checked and only the seven valid values type-check. The
+// `Sun`..`Sat` constants below name each value.
+export type Weekday = 0 | 1 | 2 | 3 | 4 | 5 | 6
+
+// Named `Weekday` constants — use these rather than bare integers for readable `match` arms and
+// comparisons (`weekday(d) == Sat`).
+export val Sun: Weekday = 0
+export val Mon: Weekday = 1
+export val Tue: Weekday = 2
+export val Wed: Weekday = 3
+export val Thu: Weekday = 4
+export val Fri: Weekday = 5
+export val Sat: Weekday = 6
 
 // Milliseconds in one UTC day — the unit there is no DST to perturb.
 val MS_PER_DAY: Int64 = 86400000
@@ -229,9 +244,20 @@ export val now = (): DateTime => fromTimestamp(wallClockNow())
 export val today = (): Date => dateOf(now())
 
 // ── Computed fields ──────────────────────────────────────────────────────────────────
-// The day of the week, 0=Sunday .. 6=Saturday (matching std/time).
-// @example weekday({ "year": 1970, "month": 1, "day": 1 })  // 4 (Thursday)
-export val weekday = (d: Date): Int64 => floorMod(toEpochDay(d) + 4, 7)
+// The day of the week as a `Weekday` (0=Sunday .. 6=Saturday). The civil-date math runs in `Int64`;
+// the `match` narrows the in-range result `0..6` to the literal union so callers get an exhaustive
+// type. The `else` is unreachable (`floorMod(_, 7)` is always 0-6) and returns `Sat` only to satisfy
+// totality.
+// @example weekday({ "year": 1970, "month": 1, "day": 1 })  // 4 (Thu)
+export val weekday = (d: Date): Weekday =>
+  match floorMod(toEpochDay(d) + 4, 7)
+    is 0 => Sun
+    is 1 => Mon
+    is 2 => Tue
+    is 3 => Wed
+    is 4 => Thu
+    is 5 => Fri
+    else => Sat
 
 // The day of the year, 1-366 (Jan 1 = 1).
 export val dayOfYear = (d: Date): Int64 =>
