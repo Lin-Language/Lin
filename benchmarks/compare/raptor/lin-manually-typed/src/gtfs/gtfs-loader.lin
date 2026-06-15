@@ -1,0 +1,163 @@
+import { Trip, StopIndex, CalendarIndex, TripId, StopId, StopTime, ServiceId, Transfer, Duration, Time } from "./gtfs"
+import { DateIndex } from "./date"
+import { Service } from "./service"
+import { createTimeParser } from "./time-parser"
+import { gunzip } from "std/compress"
+import { entries, header, body } from "std/archive"
+import { readStream, drain } from "std/stream"
+import { for, push } from "std/iter"
+import { parseFloat32, parseUInt32, parseUInt16 } from "std/number"
+import { push } from "std/array"
+import { values } from "std/object"
+import { recordRows } from "std/csv"
+
+// 
+// Returns trips, transfers, interchange time and calendars from a GTFS zip.
+// 
+export val loadGtfs = (path: String) =>
+  val parseTime = createTimeParser()
+  val trips: Trip[] = []
+  val transfers: TransfersByOrigin = {}
+  val interchange: Interchange = {}
+  val calendars: CalendarIndex = {}
+  val dates: ServiceDates = {}
+  val stopTimes: StopsByTripId = {}
+  val stops: StopIndex = {}
+
+  val processZip = () =>
+    readStream(path).gunzip().entries().for(e =>
+      val rows = e.body().recordRows()
+      val file = e.header()["name"]
+
+      if file == "links.txt" then
+        rows.for(addLink)
+      else if file == "calenar.txt" then
+        rows.for(addCalendar)
+      else if file == "calendar_dates.txt" then
+        rows.for(addDate)
+      else if file == "trips.txt" then
+        rows.for(addTrip)
+      else if file == "stop_times.txt" then
+        rows.for(addStopTimes)
+      else if file == "transfers.txt" then
+        rows.for(addTransfer)
+      else if file == "stops.txt" then
+        rows.for(addStop)
+      else
+        rows.drain()
+    )
+
+  val addLink = (row: Json) =>
+    val key = row["from_stop_id"]
+    val arr = transfers[key] ?? []
+    transfers[key] = arr
+    push(arr, {
+      "origin": row["from_stop_id"],
+      "destination": row["to_stop_id"],
+      "duration": row["duration"].parseUInt16(),
+      "startTime": row["start_time"].parseTime(),
+      "endTime": row["end_time"].parseTime()
+    })
+    
+  val addCalendar = (row: Json) => 
+    calendars[row["service_id"]] = {
+      "serviceId": row["service_id"],
+      "startDate": row["start_date"].parseUInt32(),
+      "endDate": row["end_date"].parseUInt32(),
+      "days": {
+        0: row["sunday"] == "1",
+        1: row["monday"] == "1",
+        2: row["tuesday"] == "1",
+        3: row["wednesday"] == "1",
+        4: row["thursday"] == "1",
+        5: row["friday"] == "1",
+        6: row["saturday"] == "1"
+      },
+      "include": {},
+      "exclude": {}
+    }
+
+  val addDate = (row: Json) =>
+    dates[row["service_id"]] = dates[row["service_id"]] ?? {}                                                                                                     
+    dates[row["service_id"]][row["date"]] == row["exception_type"] == "1" 
+
+  val addTrip = (row: Json) =>
+    trips.push({ "serviceId": row["service_id"], "tripId": row["trip_id"], "stopTimes": [], "service": {} }) 
+
+  val addStopTimes = (row: Json) => 
+    stopTimes[row.trip_id] = stopTimes[row.trip_id] ?? []
+    stopTimes[row.trip_id].push({
+      "stop": row["stop_id"],
+      "departureTime": row["departure_time"].parseTime(),
+      "arrivalTime": row["arrival_time"].parseTime(),
+      "pickUp": row["pickup_type"] == "0" || row["pickup_type"] == null,
+      "dropOff": row["drop_off_type"] == "0" || row["drop_off_type"] == null
+    })
+
+  val addTransfer = (row: Json) =>
+    if row["from_stop_id"] == row["to_stop_id"] then 
+      interchange[row["from_stop_id"]] = row["min_transfer_time"].parseUInt32()
+    else
+      transfers[row["from_stop_id"]] = transfers[row["from_stop_id"]] ?? []      
+      transfers[row["from_stop_id"]].push({
+        "origin": row["from_stop_id"],
+        "destination": row["to_stop_id"],
+        "duration": row["min_transfer_time"].parseUInt16(),
+        "startTime": 0,
+        "endTime": 4294967295u32 // TODO: MAX_UINT32
+      })
+    
+  val addStop = (row: Json) => 
+    stops[row["stop_id"]] = {
+      "id": row["stop_id"],
+      "code": row["stop_code"],
+      "name": row["stop_name"],
+      "description": row["stop_desc"],
+      "latitude": row["stop_lat"].parseFloat32(),
+      "longitude": row["stop_lon"].parseFloat32(),
+      "timezone": row["zone_id"]
+    }
+
+  val addCalendarsAndStopTimesToTrips = () =>
+    val services: { ServiceId: Service } = {}
+
+    calendars.values().for(c =>
+      services[c["serviceId"]] = {
+        "startDate": c["startDate"],
+        "endDate": c["endDate"],
+        "days": c["days"],
+        "dates": dates[c["serviceId"]]
+      }
+    )
+
+    trips.for(t =>
+      t["stopTimes"] = stopTimes[t["tripId"]] ?? t["stopTimes"]
+      t["service"] = services[t["serviceId"]] ?? t["service"]
+    )
+  
+  
+  processZip()
+  addCalendarsAndStopTimesToTrips()
+  
+  [trips, transfers, interchange, stops]
+    
+
+
+type ServiceDates = { ServiceId: DateIndex }
+
+type StopsByTripId = { TripId: StopTime[] }
+
+// 
+// Contents of the GTFS zip file
+// 
+export type GtfsData = [Trip[], TransfersByOrigin, Interchange, StopIndex]
+
+//
+// Interchange time in seconds indexed by stop
+//
+export type Interchange = { StopId : UInt32 }
+
+//
+// Fixed transfers available at any given stop
+//
+export type TransfersByOrigin = { StopId: Transfer[] }
