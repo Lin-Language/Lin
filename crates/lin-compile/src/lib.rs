@@ -44,13 +44,16 @@ pub enum CompileError {
     /// cycle as a human-readable path chain (e.g. `a -> b -> a`).
     ImportCycle(String),
     /// An `import` referred to a module file that does not exist. Carries the import path as
-    /// written, the absolute path we tried to read, an optional did-you-mean suggestion, and
-    /// whether the import looked like a stdlib (`std/...`) import.
+    /// written, the absolute path we tried to read, an optional did-you-mean suggestion, whether
+    /// the import looked like a stdlib (`std/...`) import, the span of the import statement, and
+    /// the file that contained it (for diagnostic rendering).
     ModuleNotFound {
         import_path: String,
         tried: PathBuf,
         suggestion: Option<String>,
         std_like: bool,
+        span: lin_common::Span,
+        importing_file: String,
     },
     /// The entry source file passed on the command line does not exist.
     SourceFileNotFound(PathBuf),
@@ -76,6 +79,7 @@ impl std::fmt::Display for CompileError {
                 tried,
                 suggestion,
                 std_like,
+                ..
             } => {
                 write!(
                     f,
@@ -586,6 +590,16 @@ fn load_signature(key: &str, base_dir: &Path) -> Option<ModuleSignature> {
     ModuleSignature::from_bytes(payload)
 }
 
+/// Stamp every diagnostic in `diags` with a source file path, so renderers can load the right
+/// source text. Called when type errors originate in an imported module rather than the entry file.
+fn tag_diagnostics(diags: Vec<lin_common::Diagnostic>, file: Option<&str>) -> Vec<lin_common::Diagnostic> {
+    if let Some(f) = file {
+        diags.into_iter().map(|d| d.with_file(f)).collect()
+    } else {
+        diags
+    }
+}
+
 /// Lex and parse a Lin source string into an AST module.
 /// Returns Err with parse diagnostics if any parse errors occurred.
 fn parse_source(source: &str) -> Result<Module, Vec<lin_common::Diagnostic>> {
@@ -847,11 +861,12 @@ struct ImportGraph {
 fn build_import_graph(
     ast_module: &Module,
     base_dir: &Path,
+    current_file: &str,
     graph: &mut ImportGraph,
 ) -> Result<Vec<String>, CompileError> {
     let mut deps = Vec::new();
     for stmt in &ast_module.statements {
-        let Stmt::Import { path, .. } = stmt else { continue };
+        let Stmt::Import { path, span, .. } = stmt else { continue };
         let identity = module_identity(path, base_dir);
         deps.push(identity.clone());
 
@@ -886,6 +901,8 @@ fn build_import_graph(
                             tried: file_path.clone(),
                             suggestion,
                             std_like,
+                            span: *span,
+                            importing_file: current_file.to_string(),
                         }
                     } else {
                         CompileError::Io(e)
@@ -904,13 +921,14 @@ fn build_import_graph(
             ast: ast.clone(),
             src_text,
             base_dir: imported_base.clone(),
-            abs_path,
+            abs_path: abs_path.clone(),
             is_stdlib,
             deps: Vec::new(),
         });
         graph.order.push(identity.clone());
 
-        let child_deps = build_import_graph(&ast, &imported_base, graph)?;
+        let child_file = abs_path.as_deref().unwrap_or("<stdlib>");
+        let child_deps = build_import_graph(&ast, &imported_base, child_file, graph)?;
         if let Some(m) = graph.modules.get_mut(&identity) {
             m.deps = child_deps;
         }
@@ -1077,7 +1095,7 @@ fn pre_resolve_imports_from_ast(
     import_sources: &mut HashMap<String, (String, String)>,
 ) -> Result<(), CompileError> {
     let mut graph = ImportGraph { modules: HashMap::new(), order: Vec::new() };
-    build_import_graph(ast_module, base_dir, &mut graph)?;
+    build_import_graph(ast_module, base_dir, &_entry_path.display().to_string(), &mut graph)?;
     let sccs = tarjan_sccs(&graph);
 
     // identity -> content_hash of that module's resolved `ModuleSignature`. Populated as each SCC
@@ -1145,7 +1163,7 @@ fn resolve_singleton(
     }
 
     let (typed, _warnings) = check_module_with_imports(&m.ast, cache, m.is_stdlib)
-        .map_err(CompileError::TypeCheck)?;
+        .map_err(|diags| CompileError::TypeCheck(tag_diagnostics(diags, m.abs_path.as_deref())))?;
     let sig = ModuleSignature::from_module(&typed);
     save_cache(&key, &typed, &m.base_dir);
     save_signature(&key, &sig, &m.base_dir);
@@ -1251,7 +1269,7 @@ fn check_scc(
     let mut provisional: HashMap<(String, String), Type> = HashMap::new();
     for m in &members {
         let (typed, _w) = check_module_with_imports(&m.ast, cache, m.is_stdlib)
-            .map_err(CompileError::TypeCheck)?;
+            .map_err(|diags| CompileError::TypeCheck(tag_diagnostics(diags, m.abs_path.as_deref())))?;
         let sig = ModuleSignature::from_module(&typed);
         for (name, ty) in sig.exports {
             // Seed under every path string this member is reached by, so a peer importing it by
@@ -1313,7 +1331,7 @@ fn check_scc(
     // import-type map, so cross-module references resolve to concrete types.
     for (identity, m) in scc.iter().zip(members.iter()) {
         let (typed, _w) = check_module_with_seeded_imports(&m.ast, cache, &provisional, m.is_stdlib)
-            .map_err(CompileError::TypeCheck)?;
+            .map_err(|diags| CompileError::TypeCheck(tag_diagnostics(diags, m.abs_path.as_deref())))?;
         let sig = ModuleSignature::from_module(&typed);
         // Cyclic members are always freshly checked (their type depends on peers), so their `.typed`
         // is never read back from the cache. We still persist the signature — under the same

@@ -55,7 +55,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.box_bool, &[i8v.into()], "boxbool")
                     .try_as_basic_value().unwrap_basic()
             }
-            Type::Int8 | Type::Int16 | Type::Int32 => {
+            Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => {
                 let i32v = self.builder.int_s_extend_or_bit_cast(val.into_int_value(), self.context.i32_type(), "toi32");
                 self.builder.call(self.rt.box_int32, &[i32v.into()], "boxi32")
                     .try_as_basic_value().unwrap_basic()
@@ -251,7 +251,7 @@ impl<'ctx> Codegen<'ctx> {
                 // Convert i8 to i1
                 self.builder.int_truncate(v.into_int_value(), self.context.bool_type(), "utobool").into()
             }
-            Type::Int8 | Type::Int16 | Type::Int32 => {
+            Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => {
                 let v = self.builder.call(self.rt.unbox_int32, &[ptr_val.into()], "ui32")
                     .try_as_basic_value().unwrap_basic();
                 let ity = self.llvm_type(target_ty).into_int_type();
@@ -320,7 +320,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.int_z_extend(val.into_int_value(), i64_ty, "bext")
                 } else { i64_ty.const_zero() }
             }
-            Type::Int8 | Type::Int16 | Type::Int32 | Type::UInt8 | Type::UInt16 | Type::UInt32 => {
+            Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) | Type::UInt8 | Type::UInt16 | Type::UInt32 => {
                 if val.is_int_value() {
                     self.builder.int_z_extend_or_bit_cast(val.into_int_value(), i64_ty, "iext")
                 } else { i64_ty.const_zero() }
@@ -473,12 +473,13 @@ impl<'ctx> Codegen<'ctx> {
         if !tagged.is_pointer_value() { return tagged; }
         let ptr = tagged.into_pointer_value();
         match ty {
-            Type::Int8 | Type::Int16 | Type::Int32 => {
+            Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => {
                 // Boxed as TAG_INT32 (sign-extended at box time). Read i32 and truncate to the
                 // target width (a no-op bitcast for Int32). Without the Int8/Int16 arms these fell
                 // through to `_ => tagged`, leaking the raw box pointer where a narrow scalar was
                 // expected — the gate-divergence inline path's `for(x => push(buf, x))` over a
                 // `UInt8[]`/`Int8[]` with a Json-typed lambda param (codegen signature mismatch).
+                // IntLit(_) is Int32 at runtime; unbox the same way.
                 let v = self.builder.call(self.rt.unbox_int32, &[ptr.into()], "ir_i32").try_as_basic_value().unwrap_basic().into_int_value();
                 let ity = self.llvm_type(ty).into_int_type();
                 self.builder.int_truncate_or_bit_cast(v, ity, "ir_inarrow").into()

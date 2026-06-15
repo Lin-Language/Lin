@@ -1407,10 +1407,11 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::MakeObject { dst, fields, spreads, ty, stack } => {
                             // Typed index-signature map `{ K: V }` (ADR-055 + numeric-key): allocate
-                            // a hashed `LinMap` and set each literal field via `lin_map_set` (key =
-                            // interned LinString for String maps, value = boxed TaggedVal). The
-                            // checker only produces a `Type::Map` MakeObject for spread-free literals
-                            // (incl. the common empty `{}`), so there are no spreads to merge here.
+                            // a hashed `LinMap` and set each literal field. For String-keyed maps the
+                            // key is an interned LinString; for Int-keyed maps the key is a raw i64
+                            // constant (encoded as the decimal string representation in the IR field
+                            // name, parsed back here). The checker only produces a `Type::Map`
+                            // MakeObject for spread-free literals (incl. the common empty `{}`).
                             if let Type::Map { key: map_key_ty, value: elem_ty } = ty {
                                 let cap = i32_ty.const_int(fields.len().max(1) as u64, false);
                                 let key_kind_val = i32_ty.const_int(if map_key_ty.is_integer() { 1 } else { 0 }, false);
@@ -1419,7 +1420,6 @@ impl<'ctx> Codegen<'ctx> {
                                     .try_as_basic_value().unwrap_basic().into_pointer_value();
                                 for (key, val_temp) in fields.iter() {
                                     if let Some(&val) = temp_map.get(val_temp) {
-                                        let key_str = self.compile_string_lit(key).into_pointer_value();
                                         let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
                                         // Flat-scalar `T` (ADR-055 follow-up): store the scalar UNBOXED
                                         // via a stack TaggedVal carrying `T`'s tag/payload, widening a
@@ -1442,7 +1442,16 @@ impl<'ctx> Codegen<'ctx> {
                                             // own +1 (released at scope exit). UNCHANGED RC behaviour.
                                             self.build_tagged_val_alloca(&val, &val_ty)
                                         };
-                                        self.builder.call(self.rt.map_set, &[map_ptr.into(), key_str.into(), tagged.into()], "");
+                                        if map_key_ty.is_integer() {
+                                            // Key was stored as its decimal string representation in
+                                            // the IR; parse it back to an i64 constant for map_set_int.
+                                            let key_i64: i64 = key.parse().expect("int-map IR key must be a decimal i64");
+                                            let key_val = i64_ty.const_int(key_i64 as u64, true);
+                                            self.builder.call(self.rt.map_set_int, &[map_ptr.into(), key_val.into(), tagged.into()], "");
+                                        } else {
+                                            let key_str = self.compile_string_lit(key).into_pointer_value();
+                                            self.builder.call(self.rt.map_set, &[map_ptr.into(), key_str.into(), tagged.into()], "");
+                                        }
                                     }
                                 }
                                 temp_map.insert(*dst, map_ptr.into());

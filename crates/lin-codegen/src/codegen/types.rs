@@ -22,6 +22,8 @@ impl<'ctx> Codegen<'ctx> {
             Type::Float32 => self.context.f32_type().into(),
             Type::Float64 => self.context.f64_type().into(),
             Type::Str | Type::StrLit(_) => self.string_ptr_type.into(),
+            // IntLit is Int32 at runtime — no boxing, same LLVM integer type.
+            Type::IntLit(_) => self.context.i32_type().into(),
             Type::Null => {
                 // Null is represented as a pointer (null ptr), same as Union/TypeVar.
                 // This ensures Null-typed vars can hold tagged values assigned later.
@@ -187,7 +189,7 @@ impl<'ctx> Codegen<'ctx> {
         match ty {
             Type::Null => TAG_NULL,
             Type::Bool => TAG_BOOL,
-            Type::Int8 | Type::Int16 | Type::Int32 => TAG_INT32,
+            Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => TAG_INT32,
             // UInt8/16/32 are zero-extended and boxed as TAG_INT64 (always-positive i64) so
             // a u32 >= 2^31 reads back correctly. Must match box_value / build_tagged_val_alloca.
             Type::UInt8 | Type::UInt16 | Type::UInt32 => TAG_INT64,
@@ -220,10 +222,10 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) const SEALED_IMMORTAL_RC: u32 = 0x8000_0000;
 
     /// True when `ty` is an unboxed scalar field of a sealed record: a fixed-width numeric (mirrors
-    /// `is_flat_scalar`) OR `Bool`. Scalar fields are stored inline at their natural-aligned offset
-    /// and need NO per-field RC.
+    /// `is_flat_scalar`) OR `Bool` OR `IntLit` (which is Int32 at runtime). Scalar fields are stored
+    /// inline at their natural-aligned offset and need NO per-field RC.
     pub(crate) fn is_sealed_scalar_field(ty: &Type) -> bool {
-        Self::is_flat_scalar(ty) || matches!(ty, Type::Bool)
+        Self::is_flat_scalar(ty) || matches!(ty, Type::Bool | Type::IntLit(_))
     }
 
     /// The descriptor kind code for a HEAP field of a sealed record, or `None` if `ty` is not an
@@ -276,7 +278,7 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn sealed_named_field_kind(ty: &Type) -> Option<u32> {
         match ty {
             Type::Bool => Some(Self::NKIND_BOOL),
-            Type::Int8 | Type::Int16 | Type::Int32 => Some(Self::NKIND_INT32),
+            Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => Some(Self::NKIND_INT32),
             Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::Int64 => Some(Self::NKIND_INT64),
             Type::UInt64 => Some(Self::NKIND_UINT64),
             Type::Float32 | Type::Float64 => Some(Self::NKIND_FLOAT64),

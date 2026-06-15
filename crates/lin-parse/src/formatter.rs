@@ -1316,6 +1316,7 @@ fn fmt_type(ty: &TypeExpr) -> String {
         }
         TypeExpr::IndexSig(key, value, _) => format!("{{ {}: {} }}", fmt_type(key), fmt_type(value)),
         TypeExpr::StringLit(s, _) => format!("\"{}\"", s),
+        TypeExpr::IntLit(n, _) => format!("{}", n),
     }
 }
 

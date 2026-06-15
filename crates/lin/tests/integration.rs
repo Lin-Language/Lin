@@ -2577,6 +2577,61 @@ print(if back["Mon"] then "ok" else "no")
     assert_eq!(output, vec!["ok"]);
 }
 
+// ── Integer-literal union types ─────────────────────────────────────────────────────────────────
+
+/// `type DaysOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6` — basic round-trip: assign a member value,
+/// pass to a function, match exhaustively, get the right result.
+#[test]
+fn test_int_lit_type_member_ok() {
+    let output = run(r#"import { print } from "std/io"
+
+type DaysOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6
+
+val dayName = (d: DaysOfWeek): String =>
+  match d
+    is 0 => "Sunday"
+    is 1 => "Monday"
+    is 2 => "Tuesday"
+    is 3 => "Wednesday"
+    is 4 => "Thursday"
+    is 5 => "Friday"
+    is 6 => "Saturday"
+
+val today: DaysOfWeek = 3
+print(dayName(today))
+"#);
+    assert_eq!(output, vec!["Wednesday"]);
+}
+
+/// Assigning a value outside the declared integer-literal union is a compile-time type error.
+#[test]
+fn test_int_lit_type_out_of_range_is_type_error() {
+    let err = run_expect_err(r#"type DaysOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6
+val bad: DaysOfWeek = 9
+"#);
+    // The error should mention the expected union and the bad literal.
+    assert!(
+        err.contains("Expected type") && err.contains("9"),
+        "expected out-of-range type error, got: {err}"
+    );
+}
+
+/// A non-exhaustive match on an integer-literal union emits a compile-time error listing
+/// the uncovered cases.
+#[test]
+fn test_int_lit_type_non_exhaustive_match_is_error() {
+    let err = run_expect_err(r#"type DaysOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6
+val dayName = (d: DaysOfWeek): String =>
+  match d
+    is 0 => "Sunday"
+    is 1 => "Monday"
+"#);
+    assert!(
+        err.contains("non-exhaustive") && err.contains("2"),
+        "expected non-exhaustive match error, got: {err}"
+    );
+}
+
 #[test]
 fn test_index_sig_string_key_still_map_and_bad_key_errors() {
     // The `{ String: V }` map form is UNCHANGED: arbitrary string keys, read yields `V | Null`.
@@ -14555,6 +14610,63 @@ m["hello"] = "world"
     assert!(
         err.contains("keyed by") || err.contains("Int32") || err.contains("String"),
         "expected Int-map string-key type error, got: {err}"
+    );
+}
+
+// ── Integer-keyed map LITERALS (§5.1.1) ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_int_map_literal_basic() {
+    // Basic int-map literal: { 1: "one", 2: "two", 42: "forty-two" }
+    let output = run(r#"import { print } from "std/io"
+
+val m: { Int32: String } = { 1: "one", 2: "two", 42: "forty-two" }
+print(m[1] ?? "?")
+print(m[2] ?? "?")
+print(m[42] ?? "?")
+print(m[99] ?? "?")
+"#);
+    assert_eq!(output, vec!["one", "two", "forty-two", "?"]);
+}
+
+#[test]
+fn test_int_map_literal_negative_keys() {
+    // Negative integer literal keys in an int-map literal.
+    let output = run(r#"import { print } from "std/io"
+
+val m: { Int32: String } = { -1: "minus-one", 0: "zero", -99: "neg-ninety-nine" }
+print(m[0] ?? "?")
+print(m[-1] ?? "?")
+print(m[-99] ?? "?")
+print(m[1] ?? "?")
+"#);
+    assert_eq!(output, vec!["zero", "minus-one", "neg-ninety-nine", "?"]);
+}
+
+#[test]
+fn test_int_map_literal_inferred_type() {
+    // Without annotation: infers { Int32: String } from the int literal keys.
+    let output = run(r#"import { print } from "std/io"
+
+val n = { 0: "false", 1: "true" }
+print(n[0] ?? "?")
+print(n[1] ?? "?")
+print(n[2] ?? "?")
+"#);
+    assert_eq!(output, vec!["false", "true", "?"]);
+}
+
+#[test]
+fn test_int_map_literal_mixed_keys_rejected() {
+    // Mixing integer and string keys in the same literal is a type error.
+    let err = run_expect_err(r#"import { print } from "std/io"
+
+val m = { 1: "a", "b": "c" }
+print(m[1] ?? "?")
+"#);
+    assert!(
+        err.contains("mixed") || err.contains("integer") || err.contains("string"),
+        "expected mixed-key type error, got: {err}"
     );
 }
 

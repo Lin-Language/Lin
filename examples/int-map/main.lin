@@ -5,7 +5,34 @@ import { length } from "std/array"
 
 // Demonstrate {Int32: T} numeric-key hashmaps.
 
-// --- Basic insert + lookup ---
+// --- Literal form (§5.1.1) ---
+// Bare integer literal keys unambiguously denote an int-keyed map literal.
+val lookup: { Int32: String } = {
+  1: "one",
+  2: "two",
+  42: "forty-two"
+}
+print(lookup[1] ?? "?")
+print(lookup[2] ?? "?")
+print(lookup[42] ?? "?")
+print(lookup[99] ?? "?")
+
+// Negative keys are allowed.
+val signs: { Int32: String } = {
+  -1: "negative",
+  0: "zero",
+  1: "positive"
+}
+print(signs[-1] ?? "?")
+print(signs[0] ?? "?")
+print(signs[1] ?? "?")
+
+// Type is inferred from integer keys without an annotation.
+val flags = { 0: false, 1: true }
+print(toString(flags[0] ?? false))
+print(toString(flags[1] ?? false))
+
+// --- Index-assign form (pre-existing) ---
 var scores: { Int32: String } = {}
 scores[1] = "one"
 scores[2] = "two"
