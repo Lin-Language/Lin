@@ -2298,6 +2298,36 @@ impl<'ctx> Codegen<'ctx> {
     /// is read by whatever representation it has:
     ///   - another sealed scalar record → field copy by offset;
     ///   - a boxed `LinObject` / Json TaggedVal → `lin_object_get` per target field, unbox, store.
+    /// Emit the sealed-projection field loop reading from a raw `container` (`LinObject*` or
+    /// `LinMap*`) via `getter` (`lin_object_get` / `lin_map_get`, both `(container, key) -> BORROWED
+    /// TaggedVal*`). Per-field RC is the borrowed-interior model (`already_owned=false` ⇒
+    /// `sealed_construct` retains heap fields); returns the fresh +1 sealed struct. The CALLER owns
+    /// `container` and releases it after (the borrowed reads are consumed by `sealed_construct` first).
+    fn emit_sealed_proj_loop(
+        &mut self,
+        container: BasicValueEnum<'ctx>,
+        getter: inkwell::values::FunctionValue<'ctx>,
+        target_fields: &indexmap::IndexMap<String, Type>,
+    ) -> BasicValueEnum<'ctx> {
+        let mut vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> =
+            Vec::with_capacity(target_fields.len());
+        for (k, fty0) in target_fields.iter() {
+            let fty = fty0.clone();
+            let key_str = self.compile_string_lit(k).into_pointer_value();
+            let tagged = self.builder.call(getter, &[container.into(), key_str.into()], "sealed_proj_get")
+                .try_as_basic_value().unwrap_basic();
+            if Self::sealed_array_elem(&fty).is_some() {
+                let packed = self.sealed_array_project_owned(tagged, &Type::TypeVar(u32::MAX), &fty);
+                vals.push((k.clone(), packed, fty, true));
+                continue;
+            }
+            let v = self.unbox_tagged_val_to_type(tagged, &fty);
+            let owned = matches!(fty, Type::Object { .. }) && Self::sealed_fields(&fty).is_some();
+            vals.push((k.clone(), v, fty, owned));
+        }
+        self.sealed_construct(target_fields, &vals)
+    }
+
     pub(crate) fn sealed_project_from(
         &mut self,
         src: BasicValueEnum<'ctx>,
@@ -2317,42 +2347,66 @@ impl<'ctx> Codegen<'ctx> {
             }).collect();
             return self.sealed_construct(target_fields, &vals);
         }
-        // Source is a boxed object / Json. For union/Json sources, use `lin_union_force_to_map`
-        // to get an OWNED +1 LinMap* that works for TAG_MAP, TAG_OBJECT, and TAG_RECORD (Stage 6b).
-        // The caller releases the container after the loop.
-        // For a non-union raw LinMap* source (e.g. a concrete open-object), use `src` directly (borrowed).
+        // Source is a boxed object / Json.
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let (container, owned_container) = if Self::is_union_type(src_ty) {
-            let c = self.builder.call(self.rt.map_force, &[src.into()], "sealed_proj_cont").try_as_basic_value().unwrap_basic();
-            (c, true)
-        } else {
-            (src, false)
-        };
         let target_keys: Vec<String> = target_fields.keys().cloned().collect();
         let mut vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> = Vec::with_capacity(target_keys.len());
+
+        // UNION/Json source: branch ONCE on the runtime tag and read each field via the MATCHING
+        // O(1) force + DIRECT getter — no per-field tag-dispatch, no whole-source copy:
+        //   - TAG_MAP  → `lin_union_force_to_map`  (O(1) retain) + `lin_map_get`    (RANGE's hot case)
+        //   - else     → `lin_union_force_to_object`(O(1) retain for an object; materialise a record)
+        //                 + `lin_object_get`                                        (PREP's hot case)
+        // The bug this fixes: the Stage-6b code forced EVERYTHING to a map, so a TAG_OBJECT source was
+        // O(n)-COPIED per projection (42.5M copies in RAPTOR PREP) — `force_to_object` only RETAINS an
+        // object. Per-field RC is the proven borrowed-interior model (see `emit_sealed_proj_loop`); the
+        // forced container is released after the loop (its +1 balances `sealed_construct`'s field
+        // retains), exactly as the original `force_to_map` code did.
+        if Self::is_union_type(src_ty) {
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let i8t = self.context.i8_type();
+            let tag = self.builder.call(self.rt.get_tag, &[src.into()], "sproj_tag")
+                .try_as_basic_value().unwrap_basic().into_int_value();
+            let is_map = self.builder.int_compare(
+                IntPredicate::EQ, tag, i8t.const_int(TAG_MAP as u64, false), "sproj_is_map");
+            let map_b = self.context.append_basic_block(llvm_fn, "sproj_map");
+            let obj_b = self.context.append_basic_block(llvm_fn, "sproj_obj");
+            let merge_b = self.context.append_basic_block(llvm_fn, "sproj_merge");
+            self.builder.conditional_branch(is_map, map_b, obj_b);
+
+            // TAG_MAP: force_to_map is an O(1) retain; read fields via the direct map_get.
+            self.builder.position_at_end(map_b);
+            let cmap = self.builder.call(self.rt.map_force, &[src.into()], "sproj_cmap")
+                .try_as_basic_value().unwrap_basic();
+            let rmap = self.emit_sealed_proj_loop(cmap, self.rt.map_get, target_fields);
+            self.builder.call(self.rt.map_release, &[cmap.into()], "");
+            let map_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_b);
+
+            // TAG_OBJECT (O(1) retain) / TAG_RECORD (materialise): read fields via the direct object_get.
+            self.builder.position_at_end(obj_b);
+            let force_obj = self.get_or_declare_fn(
+                "lin_union_force_to_object", ptr_ty.fn_type(&[ptr_ty.into()], false));
+            let cobj = self.builder.call(force_obj, &[src.into()], "sproj_cobj")
+                .try_as_basic_value().unwrap_basic();
+            let robj = self.emit_sealed_proj_loop(cobj, self.rt.object_get, target_fields);
+            self.builder.call(self.rt.object_release, &[cobj.into()], "");
+            let obj_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_b);
+
+            self.builder.position_at_end(merge_b);
+            let phi = self.builder.phi(rmap.get_type(), "sproj_phi");
+            phi.add_incoming(&[(&rmap, map_exit), (&robj, obj_exit)]);
+            return phi.as_basic_value();
+        }
+
+        // Non-union source: a concrete raw `LinMap*`. Borrowed per-field reads, no copy, no release.
+        let container = src;
         for k in &target_keys {
             let fty = target_fields.get(k).cloned().unwrap_or(Type::Null);
             let key_str = self.compile_string_lit(k).into_pointer_value();
-            // lin_map_get returns an INTERIOR pointer to the entry's TaggedVal (borrowed); unbox
-            // it to the field value. For a scalar nothing is owned. For a String/Array the unbox
-            // yields the BORROWED inner heap pointer (owned by the source map entry) → the struct
-            // must retain it (`already_owned = false`). For a NESTED SEALED field the unbox RECURSES
-            // into `sealed_project_from`, producing a FRESH +1 sealed struct → transfer ownership
-            // (`already_owned = true`, no extra retain).
             let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "sealed_proj_get").try_as_basic_value().unwrap_basic();
-            // A PACKED-SEALED-ARRAY field (`StopTime[]` inside `Trip`): the Json source holds this as a
-            // boxed/tagged `Object[]`, but the target packed slot expects a contiguous packed `T[]`
-            // (0xFE) buffer — storing the boxed array verbatim would make the later materialize read
-            // the boxed `Object[]`'s element pointers as inline packed bytes (a misaligned heap-field
-            // deref). PROJECT the boxed array into a fresh +1 packed buffer (this rebuilds element-wise
-            // for a genuinely-boxed source, and clones-by-pointer for an already-packed one), then
-            // transfer that fresh +1 into the struct slot (`already_owned = true`). Mirrors the nested
-            // SEALED-RECORD field below (also a fresh +1 projection).
             if Self::sealed_array_elem(&fty).is_some() {
-                // Pass the boxed TaggedVal* with a union src_ty so `sealed_array_project_owned` unboxes
-                // it to the raw `LinArray*` internally. `_owned` ALWAYS yields a fresh +1 (retains a
-                // keep-packed alias, rebuilds a boxed `Object[]`), which the struct stores verbatim and
-                // releases on drop (`already_owned = true`).
                 let packed = self.sealed_array_project_owned(tagged, &Type::TypeVar(u32::MAX), &fty);
                 vals.push((k.clone(), packed, fty, true));
                 continue;
@@ -2361,12 +2415,7 @@ impl<'ctx> Codegen<'ctx> {
             let owned = matches!(fty, Type::Object { .. }) && Self::sealed_fields(&fty).is_some();
             vals.push((k.clone(), v, fty, owned));
         }
-        let result = self.sealed_construct(target_fields, &vals);
-        // Release the forced LinMap* when it was materialised from a union box.
-        if owned_container && container.is_pointer_value() {
-            self.builder.call(self.rt.map_release, &[container.into()], "");
-        }
-        result
+        self.sealed_construct(target_fields, &vals)
     }
 
     /// Project a WIDER `LinMap*` into a FRESH `LinMap*` with exactly `target_fields`.
