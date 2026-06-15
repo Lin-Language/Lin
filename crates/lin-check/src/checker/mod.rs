@@ -368,10 +368,12 @@ impl Checker {
         }
     }
 
-    /// Forward-declare top-level `val name = (...) => ...` functions so that
+    /// Forward-declare `val name = (...) => ...` functions in `stmts` so that
     /// they can call each other (mutual recursion, ADR-012 equivalent).
-    fn forward_declare_functions(&mut self, module: &Module) {
-        for stmt in &module.statements {
+    /// Called for module-level statements and for every block body, enabling
+    /// hoisting of inner function literals within a closure or function body.
+    pub(crate) fn forward_declare_functions_in(&mut self, stmts: &[lin_parse::ast::Stmt]) {
+        for stmt in stmts {
             if let Stmt::Val { pattern, value, .. } = stmt {
                 if let Expr::Function { type_params, params, return_type, .. } = value {
                     let name = match pattern {
@@ -379,11 +381,6 @@ impl Checker {
                         _ => None,
                     };
                     if let Some(name) = name {
-                        // Generic function: allocate one quantified TypeVar (≥9000) per type
-                        // param and resolve the signature in a scratch env binding each param to
-                        // that TypeVar. The SAME id assignment is recorded in `generic_fn_params`
-                        // and reused by `infer_function`, so the forward-declared signature (driving
-                        // call-site inference) and the lowered body's param types are consistent.
                         let (env_for_resolve, param_assign) = if type_params.is_empty() {
                             (self.env.clone(), Vec::new())
                         } else {
@@ -400,13 +397,6 @@ impl Checker {
                         if !param_assign.is_empty() {
                             self.generic_fn_params.insert(name.clone(), param_assign);
                         }
-
-                        // Resolve param/return annotations with `Number` support (ADR-014,
-                        // reversed): each `Number` becomes a fresh numerically-constrained generic
-                        // TypeVar recorded in `numeric_tvs`. The forward-declared signature drives
-                        // call-site inference + the numeric-bound check, so the ids minted here are
-                        // the ones a call site binds and validates (the body mints its own, used by
-                        // monomorphization — both are ≥9001 generics, neither is globally solved).
                         let mut param_types: Vec<Type> = Vec::with_capacity(params.len());
                         for p in params {
                             let ty = match &p.type_ann {
@@ -417,10 +407,6 @@ impl Checker {
                             };
                             param_types.push(ty);
                         }
-                        // A bare `Number` RETURN is treated as un-annotated in the signature (the
-                        // body determines it — see `infer_function`). Using a fresh inference var
-                        // here keeps the forward signature from minting an un-inferrable bound var;
-                        // the slot's type is replaced by the body-inferred signature after checking.
                         let ret_type = match return_type {
                             Some(t) if !Self::is_bare_number(t) => self
                                 .resolve_type_with_number_in(t, &env_for_resolve)
@@ -440,5 +426,11 @@ impl Checker {
                 }
             }
         }
+    }
+
+    /// Forward-declare top-level `val name = (...) => ...` functions so that
+    /// they can call each other (mutual recursion, ADR-012 equivalent).
+    fn forward_declare_functions(&mut self, module: &Module) {
+        self.forward_declare_functions_in(&module.statements);
     }
 }
