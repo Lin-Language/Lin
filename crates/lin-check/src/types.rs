@@ -84,6 +84,11 @@ pub enum Type {
     /// the literal only constrains type-checking (compat, bidirectional refinement,
     /// exhaustiveness). See ADR-035.
     StrLit(String),
+    /// A singleton integer-literal type, e.g. `3` or `-1` in type position. At runtime an
+    /// `IntLit` value is represented identically to an `Int32` (plain integer, no boxing, no RC);
+    /// the literal only constrains type-checking (compat, bidirectional refinement,
+    /// exhaustiveness). Mirrors `StrLit` for the integer domain.
+    IntLit(i64),
     Array(Box<Type>),
     FixedArray(Vec<Type>),
     /// A structural object type. `sealed` is an INERT representation marker (Stage 0.5 of the
@@ -188,6 +193,7 @@ impl PartialEq for Type {
             | (Str, Str)
             | (Never, Never) => true,
             (StrLit(a), StrLit(b)) => a == b,
+            (IntLit(a), IntLit(b)) => a == b,
             (Array(a), Array(b)) => a == b,
             (FixedArray(a), FixedArray(b)) => a == b,
             // Ignore `sealed`: structural identity is the field map only.
@@ -351,6 +357,13 @@ impl Type {
         matches!(self, Type::Str | Type::StrLit(_))
     }
 
+    /// True for any integer width AND for any integer-literal singleton (`IntLit`). An `IntLit`
+    /// is represented identically to `Int32` at runtime; this predicate is the integer analogue
+    /// of `is_string_ish` — use it wherever runtime integer representation is what matters.
+    pub fn is_int_ish(&self) -> bool {
+        self.is_integer() || matches!(self, Type::IntLit(_))
+    }
+
     pub fn is_signed(&self) -> bool {
         matches!(
             self,
@@ -483,6 +496,7 @@ impl fmt::Display for Type {
             Type::Float64 => write!(f, "Float64"),
             Type::Str => write!(f, "String"),
             Type::StrLit(s) => write!(f, "\"{}\"", s),
+            Type::IntLit(n) => write!(f, "{}", n),
             Type::Array(inner) => write!(f, "{}[]", inner),
             Type::FixedArray(types) => {
                 write!(f, "[")?;
