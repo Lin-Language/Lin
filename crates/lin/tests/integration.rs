@@ -5654,7 +5654,7 @@ print(toString(arr))
     // Phase 2: non-sealed objects are backed by LinMap (hash map). toString serializes keys
     // in alphabetical order for deterministic output (insertion order is not preserved).
     assert_eq!(output, vec![
-        r#"{"age": 25, "name": "Bob"}"#,
+        r#"{"name": "Bob", "age": 25}"#,
         r#"[1, "two", true, null]"#,
     ]);
 }
@@ -12088,7 +12088,7 @@ val top = (): Json =>
 print(toString(top()))
 "#);
     // Phase 2: open objects use LinMap (hash-ordered keys → alphabetical in toString).
-    assert_eq!(out, vec![r#"{"error": "eof", "type": "failure"}"#]);
+    assert_eq!(out, vec![r#"{"type": "failure", "error": "eof"}"#]);
 
     // Both branches are union (`r` and another call result `mk()`): the merge stays boxed and
     // must clone the borrowed `r` so the scope-release of `r` does not dangle the result.
@@ -12102,7 +12102,7 @@ print(toString(pick(5)))
 print(toString(pick(0)))
 "#);
     // Phase 2: open objects use LinMap (hash-ordered → sorted alphabetical in toString). k < t.
-    assert_eq!(out, vec![r#"{"k": "v", "type": "failure"}"#, r#"{"k": "v", "type": "failure"}"#]);
+    assert_eq!(out, vec![r#"{"type": "failure", "k": "v"}"#, r#"{"type": "failure", "k": "v"}"#]);
 
     // Multi-level propagation: `mid` returns `r` (from `deep`) on failure, `top` returns `r`
     // (from `mid`) on failure — the owned union local is forwarded through two `if`-branches.
@@ -12124,7 +12124,7 @@ val top = (arr: Json): Json =>
 print(toString(top([1, 2])))
 "#);
     // Phase 2: open objects use LinMap (hash-ordered keys → alphabetical in toString).
-    assert_eq!(out, vec![r#"{"error": "eof", "type": "failure"}"#]);
+    assert_eq!(out, vec![r#"{"type": "failure", "error": "eof"}"#]);
 
     // Returned-in-a-loop with the result discarded: a per-call leak (the if-branch clone
     // re-cloned by the function return) would surface here under the ASan CI leg; functionally
@@ -16049,8 +16049,7 @@ val plain = { "x": 7, "name": "ada" }
 print("${j == plain}")
 print("${plain == j}")
 "#);
-    // Phase 3: sealed records materialize to LinMap; map serialization uses alphabetical key order.
-    assert_eq!(out, vec!["7", "ada", r#"{"name": "ada", "x": 7}"#, "true", "true", "true"]);
+    assert_eq!(out, vec!["7", "ada", r#"{"x": 7, "name": "ada"}"#, "true", "true", "true"]);
 }
 
 #[test]
@@ -16066,8 +16065,7 @@ val j: Json = p
 print(toString(j))
 print("${j["lo"]} ${j["hi"]}")
 "#);
-    // Phase 3: sealed records materialize to LinMap; map serialization uses alphabetical key order.
-    assert_eq!(out, vec![r#"{"hi": 42, "lo": 7}"#, "7 42"]);
+    assert_eq!(out, vec![r#"{"lo": 7, "hi": 42}"#, "7 42"]);
 }
 
 #[test]
@@ -16205,7 +16203,7 @@ print(toString(wrap))
         vec![
             r#"[{"x": 1, "y": 2}, {"x": 1, "y": 2}, {"x": 1, "y": 2}]"#,
             // Phase 2: open (Json) objects use LinMap (hash-ordered → alphabetical).
-            r#"{"n": 9, "pt": {"x": 1, "y": 2}}"#
+            r#"{"pt": {"x": 1, "y": 2}, "n": 9}"#
         ]
     );
 }
@@ -16780,7 +16778,7 @@ print("${err}")
         vec![
             r#"[["a"]]"#.to_string(),
             // Phase 2: open objects use LinMap (hash-ordered keys → alphabetical in toString).
-            r#"{"message": "unterminated", "type": "error"}"#.to_string(),
+            r#"{"type": "error", "message": "unterminated"}"#.to_string(),
         ]
     );
 }
@@ -16806,7 +16804,7 @@ print("${pick([["a"]], 0)}")
         out,
         vec![
             // Phase 2: open objects use LinMap (hash-ordered keys → alphabetical in toString).
-            r#"{"message": "x", "type": "error"}"#.to_string(),
+            r#"{"type": "error", "message": "x"}"#.to_string(),
             r#"[["a"]]"#.to_string(),
         ]
     );
@@ -17294,13 +17292,12 @@ print("${ps[0]["name"]} ${ps[0]["age"]}")
 print("${ps[1]["name"]} ${ps[1]["age"]}")
 print(toString(ps))
 "#);
-    // Phase 3: sealed records materialize to LinMap; map serialization uses alphabetical key order.
     assert_eq!(
         out,
         vec![
             "ann 30",
             "bob 41",
-            r#"[{"age": 30, "name": "ann"}, {"age": 41, "name": "bob"}]"#
+            r#"[{"name": "ann", "age": 30}, {"name": "bob", "age": 41}]"#
         ]
     );
 }
@@ -17400,12 +17397,11 @@ push(ps, { "name": "cat", "age": 7 })
 print("${length(ps)} ${ps[0]["name"]} ${ps[2]["age"]}")
 print(toString(ps))
 "#);
-    // Phase 3: sealed records materialize to LinMap; map serialization uses alphabetical key order.
     assert_eq!(
         out,
         vec![
             "3 ann 7",
-            r#"[{"age": 30, "name": "ann"}, {"age": 41, "name": "bob"}, {"age": 7, "name": "cat"}]"#
+            r#"[{"name": "ann", "age": 30}, {"name": "bob", "age": 41}, {"name": "cat", "age": 7}]"#
         ]
     );
 }
@@ -18512,7 +18508,7 @@ main()
     // Phase 2: open (BinOp has Expr union fields → unsealed → LinMap → alphabetical toString).
     assert_eq!(
         out,
-        vec![r#"{"kind": "op", "left": {"kind": "num", "value": 3}, "op": 0, "right": {"kind": "num", "value": 4}}"#]
+        vec![r#"{"kind": "op", "op": 0, "left": {"kind": "num", "value": 3}, "right": {"kind": "num", "value": 4}}"#]
     );
 }
 
@@ -18589,7 +18585,7 @@ main()
     // Phase 2: open objects (BinOp has Expr union fields → unsealed → LinMap → alphabetical keys).
     assert_eq!(
         out,
-        vec![r#"{"kind": "op", "left": {"kind": "num", "value": 3}, "op": 0, "right": {"kind": "num", "value": 4}}"#]
+        vec![r#"{"kind": "op", "op": 0, "left": {"kind": "num", "value": 3}, "right": {"kind": "num", "value": 4}}"#]
     );
 }
 
@@ -20294,9 +20290,8 @@ print(toString(ps))
 val ps2: Person[] = [{ "name": "ann", "age": 30 }, { "name": "bob", "age": 41 }]
 print(toString(ps == ps2))
 "#);
-    // Phase 3: sealed records materialize to LinMap; map serialization uses alphabetical key order.
     assert_eq!(out, vec![
-        r#"[{"age": 30, "name": "ann"}, {"age": 41, "name": "bob"}]"#,
+        r#"[{"name": "ann", "age": 30}, {"name": "bob", "age": 41}]"#,
         "true",
     ]);
 }
