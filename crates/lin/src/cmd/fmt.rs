@@ -8,11 +8,16 @@ pub struct FmtArgs {
     /// Check mode: exit 1 if any file would be reformatted, without writing
     #[arg(long)]
     pub check: bool,
+    /// Glob patterns to exclude (comma-separated or repeated), e.g. `**/wip/**`.
+    /// Matched against each candidate file path; excludes work-in-progress trees
+    /// from CI's fmt gate without removing them from the repo.
+    #[arg(long, value_delimiter = ',')]
+    pub exclude: Vec<String>,
 }
 
 pub fn run(args: &FmtArgs) {
-    // Collect all .lin files to process.
-    let files = collect_files(&args.files);
+    // Collect all .lin files to process, dropping any that match an --exclude glob.
+    let files = collect_files(&args.files, &args.exclude);
 
     if files.is_empty() {
         eprintln!("lin fmt: no .lin files found");
@@ -86,20 +91,32 @@ pub fn format_source(source: &str) -> Result<String, String> {
 
 /// Collect .lin files from the given paths. If a path is a directory, glob
 /// `**/*.lin` under it, skipping `.lin-cache/`. If no paths are given, glob
-/// `**/*.lin` in the current directory (skipping `.lin-cache/`).
-fn collect_files(input: &[PathBuf]) -> Vec<PathBuf> {
-    if input.is_empty() {
-        return glob_lin_files(&PathBuf::from("."));
-    }
+/// `**/*.lin` in the current directory (skipping `.lin-cache/`). Any file whose
+/// path matches one of `exclude` (glob patterns) is dropped — this applies to
+/// both globbed directory contents and explicitly-listed files.
+fn collect_files(input: &[PathBuf], exclude: &[String]) -> Vec<PathBuf> {
+    let patterns: Vec<glob::Pattern> = exclude
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
+    let excluded = |path: &PathBuf| {
+        let s = path.to_string_lossy();
+        patterns.iter().any(|pat| pat.matches(&s))
+    };
 
     let mut result = Vec::new();
-    for p in input {
-        if p.is_dir() {
-            result.extend(glob_lin_files(p));
-        } else {
-            result.push(p.clone());
+    if input.is_empty() {
+        result.extend(glob_lin_files(&PathBuf::from(".")));
+    } else {
+        for p in input {
+            if p.is_dir() {
+                result.extend(glob_lin_files(p));
+            } else {
+                result.push(p.clone());
+            }
         }
     }
+    result.retain(|p| !excluded(p));
     result
 }
 
@@ -119,4 +136,36 @@ fn glob_lin_files(base: &PathBuf) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclude_glob_drops_matching_files() {
+        // Explicitly-listed files (non-existent paths are treated as files, not dirs)
+        // are filtered by the exclude globs just like globbed directory contents.
+        let inputs = vec![
+            PathBuf::from("benchmarks/compare/raptor/lin-manually-typed/src/query/q.lin"),
+            PathBuf::from("benchmarks/compare/raptor/lin/src/main.lin"),
+            PathBuf::from("examples/calc/main.lin"),
+        ];
+        let kept = collect_files(&inputs, &["**/lin-manually-typed/**".to_string()]);
+        assert_eq!(
+            kept,
+            vec![
+                PathBuf::from("benchmarks/compare/raptor/lin/src/main.lin"),
+                PathBuf::from("examples/calc/main.lin"),
+            ],
+            "the lin-manually-typed WIP tree must be excluded; everything else kept"
+        );
+    }
+
+    #[test]
+    fn no_exclude_keeps_everything() {
+        let inputs = vec![PathBuf::from("examples/calc/main.lin")];
+        let kept = collect_files(&inputs, &[]);
+        assert_eq!(kept, inputs);
+    }
 }
