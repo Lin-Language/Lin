@@ -260,7 +260,7 @@ RAPTOR is *`Json`-read-bound* — and the cost is always *work per operation*
 | Path | Tried | Measured | Verdict | WHY |
 |------|-------|----------|---------|-----|
 | **7 — tracing GC** | Replace RC with generational tracing GC to make allocation cheap | `LIN_NO_RC` ceiling (entire allocator+RC as no-ops): **0.48 s vs 0.408 s = NO speedup**; RAPTOR ~1.0× all phases despite textbook GC-bait retention (32.9 GB allocated, 0.039 retention, 96% dying young) | **CLOSED-NEGATIVE** | A GC can't recover a cost that deleting the *entire* heap+RC subsystem doesn't recover — the cost is work-per-allocation (reads + calls), which GC doesn't touch. **No workload is alloc-bound.** Revisit only for correctness (RC-UAF), never perf. |
-| **9 — end-to-end packed records** | Pack heap-field records all the way (loader→map→read) so RAPTOR's 630 M linear scans become const-offset loads | Three independent agents built digest-correct end-to-end typed RAPTOR: PREP 7.7 s→27.2 s (**3.5× slower**), GROUP 19.9 s→36.2 s (**1.82×**), RANGE 59.4 s→105.3 s (**1.77×**) | **CLOSED-NEGATIVE** | The cost is **representation-boundary materialization, not field reads.** Functional code threads records through many generic boundaries; each is a materialize-or-leak seam (worker boundary → nested-record gate → TCO param leak → `Trip\|Null` union boxing → map-value materialize-per-access). Each packing fix repaired a bug a prior packing fix introduced — "fix-for-a-fix all the way down." |
+| **9 — end-to-end packed records** | Pack heap-field records all the way (loader→map→read) so RAPTOR's 630 M linear scans become const-offset loads | Three independent agents built digest-correct end-to-end typed RAPTOR: PREP 7.7 s→27.2 s (**3.5× slower**), GROUP 19.9 s→36.2 s (**1.82×**), RANGE 59.4 s→105.3 s (**1.77×**) | **CLOSED-NEGATIVE as a flow-sensitive oracle → re-approached and RESOLVED by the representation reset (§5.6)** | The cost is **representation-boundary materialization, not field reads.** Each packing fix repaired a bug a prior packing fix introduced — "fix-for-a-fix all the way down" — *because* it tried to reconcile packed-vs-boxed at compile time. The **reset (§5.6)** deletes that reconciliation: representation is type-determined (a record is *always* packed; the dynamic case is runtime-tagged `TAG_RECORD`/`AnyVal`). That landed the architecture — but the honest re-measure (§5.6) shows it lands at **parity**, because representation is ≤4% of RAPTOR; the real lever is the call/value axis. |
 | **5 — value records** | Make fixed-key records inline values (no header/shell RC), claimed semantics-preserving | Falsifying test on master: `val b=a; a["state"]=99; b["state"]` → **99** | **CLOSED-NEGATIVE (premise falsified)** | Records are observably-mutable **reference** types; value semantics is a *breaking* change, not a free representation swap. Cost diagnosis was right; the "non-breaking" framing was wrong. The live form is Path 1 (packed *representation*, not value *semantics*). |
 | **2 — inline caches / hidden classes** | Shape ids + per-site inline cache for `Json` field offset resolution | **99.56% cache hit rate** (656.6 M/659.5 M); but RAPTOR GROUP −3.3%, RANGE +3.8% slower, interp +2.5% slower — **net wash-to-loss** | **CLOSED-NEGATIVE (built, sound, gated off)** | The IC mechanism works perfectly, but it optimizes the *cheapest* part. The real per-read cost is the wrapper (key-intern + unbox + tag-dispatch + owning clone), not offset resolution. The cheap corollary is to use `{String:T}` → `lin_map_get` instead. |
 | **8 Tier-1 — bitcode runtime** | Compile runtime to bitcode + `alwaysinline` so box/unbox can cancel | Spike: **<2%** (interp −0.6%, object_access −1.8%); box/unbox pairs do **not** cancel | **Dead-end alone** | The *consumer* (indirect closure call / `lin_tagged_arith` / `lin_object_get`) stays opaque, so the box never meets its unbox. Inline the consumer (Tier 2/3) first; Tier 1 last. Reversed the path-8 sequencing. |
@@ -284,6 +284,63 @@ RAPTOR is *`Json`-read-bound* — and the cost is always *work per operation*
 | **stdlib algorithmic wins (this session)** | csv scanners/trim tail-recursive (was `range().while`); `buildQuery` `string.join` not O(n²) `joinAmp`; `array.chunk` inner copy via `slice`; `object.pick` bind-once; `lin_object_eq` O(n·m)→hash-index | csv ~60× on large input; object-eq ~2.0× on 24-key records | Big-O fixes beat micro-tuning; the csv O(N²)→O(N) is the largest single win this session. |
 | **loop-emitter unification (this session, cleanup)** | `emit_combinator_loop`: one counted-loop scaffold for index + packed views; `lower_while` re-expressed through it | for/map/filter/fusion byte-identical | Not a perf win itself — removes ~95% duplication so future loop work lands once. |
 | **ownership-as-a-fact verifier (this session)** | `Convention{Borrow,Own,Inout}` on `LinFunction` + `LIN_OWNERSHIP_SHADOW` report-only RC-balance verifier; first per-site heuristic consumed (Index-result lifetime) | zero behaviour change; shadow CLEAN | Foundation for sound RC elision and path-10's borrowed-reads; ships as inert metadata first. |
+
+### 5.6 The representation reset — path-9 re-approached and resolved (2026-06)
+
+Path-9 (above) closed *negative* because it tried to recover struct speed for dynamic-context records
+with a **flow-sensitive, compile-time packed-vs-boxed oracle** (`repr.rs`, ADR-062) — every generic
+boundary became a materialize-or-leak seam, and each packing fix repaired a bug a prior packing fix
+introduced. The **representation reset** re-approached the same goal from the opposite side and is the
+project that finally closed it — not by a better oracle, but by **deleting the oracle**.
+
+**The thesis.** A *record* and a *JSON object* had been welded into one boxed, refcounted,
+**string-keyed** representation (`LinObject`), so field access was an association-list lookup and an LLVM
+optimization barrier even when the field set was statically known. The fix draws three clean lines:
+
+- **Records are flat packed sealed structs** with constant-offset field access — and keep **reference
+  semantics** (`val b = a` shares; mutation through a parameter is visible). Representation is now
+  **type-determined**, not inferred: a record is *always* a packed struct; there is no boxed shadow.
+- **The dynamic value is `AnyVal`** (née `Json`) — a **JSON-shaped** tagged union (`Null | Bool | Int* |
+  Float* | String | AnyVal[] | {String:AnyVal} | <record>`) that is **runtime-tagged** (`TAG_RECORD`
+  carries a sealed pointer + descriptor, modelled on `SumNode`/ADR-064) rather than reconciled by a
+  compile-time oracle. It deliberately **cannot hold an opaque handle** (`Function`/`Iterator`/`Stream`/
+  `Shared`/`Promise`/`TarEntry`); handle-carrying code stays statically typed. There is intentionally
+  no true `Any` top type — generics `<T>` and unions cover the parametric cases.
+- **Dynamic string-keyed data is a real `LinMap` hashmap** (`{String:T}`), O(1) — not a string-keyed
+  object. Genuinely-dynamic runtime objects (HTTP/URL/env/error) now build `LinMap`; known-shape
+  results reconstruct typed records.
+
+**What landed (on `master`):** Stages 0–4 + 6a + the 6b runtime-producer migration. `T | Null` over a
+record is a **nullable sealed pointer** (`Layout::NullableRecord`, no per-access materialize); `A | B`
+is a tag + sealed payload; `match … is T` narrows to a typed pointer. `repr.rs` collapsed to a **pure
+layout calculator**; the entire "path-9" problem space is deleted. **ADR-069 supersedes ADR-062.** The
+compiler got *smaller*. Also shipped on this foundation: numeric **`{Int:T}` map keys** (raw-`i64`
+inline keys — faster *and* smaller than string keys; SPECIFICATION.md §5.1.1).
+
+**The honest verdict (measured, not asserted).** Typed RAPTOR is at **~parity** with the pre-reset
+baseline — *not* faster. A cycle profile (rdtsc bucket counters) explains why:
+
+| bucket | share |
+|---|---|
+| `lin_map_get` (string-keyed) | 9.5% |
+| field lookups (`record_get_field`/`object_get`) | 3.7% |
+| `tagged_eq` / alloc / box-unbox / ptr-chase | ~2% combined |
+| **`tagged_arith`** | **0.0%** (typed arithmetic fully inlines) |
+| **everything else (~85%)** | **the call/value axis — closure + loop dispatch, control flow** |
+
+Representation touches **≤ ~4%** of RAPTOR, so the reset is an **architecture + simplification win at
+parity**, *not* a RAPTOR speedup — and that is the correct, honest outcome. It retires `§5.6`-style
+inline-array layout (the pointer-chase it targets is 0.2%) and the older "inherent PREP copy" framing
+(§2.4): under pointer-backed reference arrays the regroup shares a pointer.
+
+**Therefore the real Go-gap lever is the call/value axis** — confirmed by direct interp profiling: ~82%
+of the `interp` benchmark is **object allocation + RC at call/value boundaries** (per-frame `Cursor`/
+`Token` allocs, ~1000 retain/release sites), not representation, dispatch, or strings (a measured
+"string slice-copy" worry proved false at 0.01%). The tractable levers there are **alloc elimination**
+(stack-alloc non-escaping frames, multi-value returns) and **RC elision on hot borrows** — a separate
+project from the reset, and the one that actually narrows the 80–113× interp gap to Go/Rust. (A
+sealed-struct version of the `Cursor` was tried and *regressed* 9%: un-boxing is not the same as not
+allocating — the alloc count is what matters.)
 
 ---
 

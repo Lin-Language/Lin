@@ -459,8 +459,9 @@ sparse keys all work. Keys normalize to `i64` and compare by integer value (so a
 a `{ Int64: T }` map is accepted, mirroring numeric `==`). **`Float` keys are rejected** (equality is
 a footgun), as are union/`AnyVal`/`Function`/handle key types. A map has exactly one key kind — you
 cannot mix string and integer keys in one map. Sealed-record and array key types are a planned
-extension (see `docs/proposals/numeric-key-maps.md`); for *dense* `0..N` indices prefer an array, not
-a map.
+extension (a *structural* key kind: hash + compare the key's fields/elements — cheap to add once the
+key-kind dispatch exists, O(fields) per access, paid only by struct-keyed maps); for *dense* `0..N`
+indices prefer an array, not a map.
 
 **Literal-union key — sugar for a fixed record.** When the key identifier instead resolves to a
 **closed union of string literals** (or a single string-literal type), the `{ K: V }` form is
