@@ -47,7 +47,8 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/env`](#stdenv) | Environment variables |
 | [`std/template`](#stdtemplate) | String template rendering |
 | [`std/test`](#stdtest) | Test framework |
-| [`std/time`](#stdtime) | Timestamps, timing, and calendar arithmetic |
+| [`std/time`](#stdtime) | Instants, timing, and timestamp formatting (Unix milliseconds) |
+| [`std/datetime`](#stddatetime) | Immutable calendar types: Date, Time, DateTime, Duration, Period |
 
 ### Functions by module
 
@@ -428,6 +429,44 @@ incrementally (constant memory) and threads decode errors in-band like every oth
 | [`sleepMicros`](#sleepMicros) | `(Int64) -> Null` | Block for n microseconds |
 | [`startTimer`](#startTimer) | `() -> Timer` | Start a high-resolution elapsed timer |
 | [`toIso`](#toIso) | `(Int64) -> String` | Format a timestamp as ISO 8601 |
+
+**std/datetime**
+
+| Function | Signature | Summary |
+| --- | --- | --- |
+| [`date`](#date) | `(Int64, Int64, Int64) -> Date \| Error` | Build a validated calendar `Date` |
+| [`time`](#time) | `(Int64, Int64, Int64, Int64) -> Time \| Error` | Build a validated wall-clock `Time` |
+| [`dateTime`](#dateTime) | `(Int64, …) -> DateTime \| Error` | Build a validated `DateTime` |
+| [`isLeapYear`](#isLeapYear) | `(Int64) -> Boolean` | Whether a year is a Gregorian leap year |
+| [`daysInMonth`](#daysInMonth) | `(Int64, Int64) -> Int64` | Days in a (year, month), leap-aware |
+| [`toEpochDay`](#toEpochDay) | `(Date) -> Int64` | Days since 1970-01-01 |
+| [`fromEpochDay`](#fromEpochDay) | `(Int64) -> Date` | `Date` from a day count since the epoch |
+| [`toTimestamp`](#toTimestamp) | `(DateTime) -> Int64` | Unix-millisecond timestamp for a `DateTime` |
+| [`fromTimestamp`](#fromTimestamp) | `(Int64) -> DateTime` | `DateTime` for a Unix-millisecond timestamp |
+| [`now`](#now-datetime) | `() -> DateTime` | Current UTC `DateTime` (impure) |
+| [`today`](#today) | `() -> Date` | Today's UTC `Date` (impure) |
+| [`dateOf`](#dateOf) | `(DateTime) -> Date` | The date part of a `DateTime` |
+| [`timeOf`](#timeOf) | `(DateTime) -> Time` | The time part of a `DateTime` |
+| [`atTime`](#atTime) | `(Date, Time) -> DateTime` | Combine a `Date` and a `Time` |
+| [`atStartOfDay`](#atStartOfDay) | `(Date) -> DateTime` | The `DateTime` at midnight on a `Date` |
+| [`weekday`](#weekday) | `(Date) -> Int64` | Day of week, 0=Sunday..6=Saturday |
+| [`dayOfYear`](#dayOfYear) | `(Date) -> Int64` | Day of year, 1-366 |
+| [`addDays`](#addDays) | `(Date, Int64) -> Date` | Shift a `Date` by whole days |
+| [`addMonths`](#addMonths) | `(Date, Int64) -> Date` | Shift by months, clamping the month end |
+| [`addYears`](#addYears) | `(Date, Int64) -> Date` | Shift by years, clamping Feb 29 |
+| [`addPeriod`](#addPeriod) | `(Date, Period) -> Date` | Shift by a calendar `Period` |
+| [`period`](#period) | `(Int64, Int64, Int64) -> Period` | Build a calendar `Period` |
+| [`millis`](#millis-datetime)/[`seconds`](#seconds-datetime)/[`minutes`](#minutes-datetime)/[`hours`](#hours-datetime)/[`days`](#days-datetime) | `(Int64) -> Duration` | Build a `Duration` from a unit count |
+| [`plus`](#plus-datetime)/[`minus`](#minus-datetime) | `(Duration, Duration) -> Duration` | Add / subtract durations |
+| [`scale`](#scale-datetime) | `(Duration, Int64) -> Duration` | Scale a duration by a factor |
+| [`toMillis`](#toMillis)/[`toSeconds`](#toSeconds-datetime)/[`toMinutes`](#toMinutes-datetime)/[`toHours`](#toHours)/[`toDays`](#toDays) | `(Duration) -> Int64` | Whole units in a duration |
+| [`between`](#between) | `(DateTime, DateTime) -> Duration` | Signed exact span from a to b |
+| [`plusDuration`](#plusDuration)/[`minusDuration`](#minusDuration) | `(DateTime, Duration) -> DateTime` | Shift an instant by a duration |
+| [`compareDate`](#compareDate) | `(Date, Date) -> Int64` | Three-way compare of dates |
+| [`compare`](#compare-datetime) | `(DateTime, DateTime) -> Int64` | Three-way compare of instants |
+| [`isBefore`](#isBefore)/[`isAfter`](#isAfter) | `(DateTime, DateTime) -> Boolean` | Order two instants |
+| [`toIsoDate`](#toIsoDate)/[`toIsoTime`](#toIsoTime)/[`toIso`](#toIso-datetime) | `(…) -> String` | Render ISO 8601 strings |
+| [`parseIsoDate`](#parseIsoDate)/[`parseIsoTime`](#parseIsoTime)/[`parseIso`](#parseIso) | `(String) -> … \| Error` | Parse ISO 8601 strings |
 
 ---
 
@@ -5422,3 +5461,52 @@ Formats the Unix millisecond timestamp `ts` as an ISO 8601 string in UTC.
 toIso(0)       // "1970-01-01T00:00:00.000Z"
 toIso(now())   // e.g. "2025-05-27T14:32:07.123Z"
 ```
+
+---
+
+## std/datetime
+
+An immutable, structural calendar library (proleptic Gregorian, UTC). Inspired by `java.time` and
+TC39 Temporal, but built entirely from Lin records — there is no opaque runtime type. All operations
+are pure except `now`/`today`, which read the wall clock.
+
+```txt
+import { date, dateTime, now, addDays, addMonths, toIso, parseIso } from "std/datetime"
+```
+
+The value types:
+
+| Type | Shape | Role |
+| --- | --- | --- |
+| `Date` | `{ year, month, day }` (all `Int64`) | A calendar day — Temporal.PlainDate |
+| `Time` | `{ hour, minute, second, millis }` | A wall-clock time — Temporal.PlainTime |
+| `DateTime` | `Date & Time` | A day + time — Temporal.PlainDateTime |
+| `Duration` | `{ millis }` | An exact elapsed span (always milliseconds) |
+| `Period` | `{ years, months, days }` | A calendar span (months are not fixed-length) |
+
+`DateTime` is the record intersection `Date & Time` (see ADR-061), so by structural width-subtyping
+every `DateTime` is *also* a `Date` and a `Time` — you can pass one straight to any `Date`/`Time`
+function. All fields are `Int64` and `year` may be negative (astronomical numbering; no year-0 gap).
+
+Construction (`date`/`time`/`dateTime`) validates and returns `T | Error` (the canonical
+`{ "type": "error", … }`, matched with `is Error`). The calendar shifts never fail: out-of-range
+days clamp to the month end (Jan 31 + 1mo → Feb 28/29). This is fixed-offset UTC arithmetic; full
+IANA timezone support (DST, historical offsets) is out of scope. Bridge to/from `std/time`
+timestamps with `toTimestamp`/`fromTimestamp`.
+
+```txt
+val d = date(2024, 2, 29)              // ok (leap day); date(2023,2,29) is an Error
+match dateTime(2024, 1, 15, 10, 30, 0)
+  is Error => …
+  else => dt                           // a DateTime, usable as a Date or a Time
+
+toIso(fromTimestamp(0))                // "1970-01-01T00:00:00.000"
+toIsoDate(addMonths(d, 1))             // clamps to the month end
+weekday({ "year": 1970, "month": 1, "day": 1 })   // 4 (Thursday)
+toMillis(plus(hours(2), minutes(30)))  // 9000000
+```
+
+See the source `stdlib/datetime.lin` for the full per-function documentation; every export carries a
+doc comment with parameters and examples.
+
+---

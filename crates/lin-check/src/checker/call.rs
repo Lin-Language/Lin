@@ -433,12 +433,23 @@ impl Checker {
                         // an empty `Object` (no fields to fix a value type), which then fails to
                         // match the concrete `Map(T)` param. Route object literals through
                         // expected-type-directed checking so `{}` (and string-keyed literals)
-                        // adopt the param's `Map(T)` representation. Restricted to `Type::Map`
-                        // so structural-`Object` params stay on the inference path (the
-                        // `check_object_against` Object branch defers for them anyway), and
-                        // gated TypeVar-free for the same substitution reasons as arrays.
-                        let object_lit_against_concrete_map = matches!(arg, Expr::Object(..))
-                            && matches!(param_ty, Type::Map { .. })
+                        // adopt the param's `Map(T)` representation.
+                        //
+                        // A `Type::Object` record param needs the same routing: a field-value
+                        // literal must be checked against its expected field type, not inferred
+                        // bottom-up. Without this, a negative integer literal in a `{ "y": -44 }`
+                        // argument defaults to Int32 (spec §21) instead of adopting the field's
+                        // declared Int64, and is then zero-extended (not sign-extended) into the
+                        // i64 field slot at codegen — `{ "y": -44 }` read back as 2^32-44. (Binding
+                        // the literal to a typed `val` first goes through the directed `check_expr`
+                        // path and is correct; the direct-argument path was the only gap.)
+                        // `check_object_against`'s Object arm self-gates — it directs only when it
+                        // changes the outcome (discriminants, sealed records, field widening) and
+                        // otherwise returns None to fall back to inference — so this is safe for
+                        // plain structural records too. Gated TypeVar-free for the same
+                        // substitution reasons as arrays/maps.
+                        let object_lit_against_concrete_record = matches!(arg, Expr::Object(..))
+                            && matches!(param_ty, Type::Map { .. } | Type::Object { .. })
                             && !param_ty.contains_type_var();
                         // Array-of-TUPLE param (`[String, T][]`, i.e. `Array(FixedArray([...]))`)
                         // where a type parameter is nested inside the tuple. A 2+-element literal
@@ -453,7 +464,7 @@ impl Checker {
                             && matches!(param_ty, Type::Array(inner)
                                 if matches!(**inner, Type::FixedArray(_)));
                         let typed = if array_lit_against_concrete_array
-                            || object_lit_against_concrete_map
+                            || object_lit_against_concrete_record
                             || array_lit_against_tuple_array
                         {
                             self.check_expr(arg, param_ty)?
