@@ -47,16 +47,13 @@
 //! Reference: Reinking et al., "Perceus: Garbage Free Reference Counting with
 //! Reuse", PLDI 2021.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use lin_check::types::Type;
 
 use crate::ir::*;
 use crate::liveness::Liveness;
 
-/// Maximum number of blocks to visit during BFS when searching cross-block
-/// for a paired Release. Keeps compile-time cost bounded.
-const BFS_BLOCK_LIMIT: usize = 8;
 
 /// Run the RC elision pass on all functions in a module, mutating in place.
 pub fn elide_rc(module: &mut LinModule) {
@@ -152,6 +149,7 @@ fn elide_rc_fn(func: &mut LinFunction) {
                 func,
                 &block_index,
                 &to_remove,
+                &postdom,
             ) {
                 let release_block_id = func.blocks[release_block_idx].id;
                 let retain_block_id = func.blocks[block_idx].id;
@@ -268,80 +266,69 @@ fn temp_survives_to_block_end(temp: Temp, retain_idx: usize, instrs: &[Instructi
     true
 }
 
-/// BFS across CFG successors to find the paired Release for `temp` that was
-/// Retained in `origin_block_idx`. Visits at most `BFS_BLOCK_LIMIT` blocks.
+/// Walk down the post-dominator chain from the retain's block to find the
+/// paired Release for `temp`.
 ///
-/// Returns `Some((block_idx, instr_idx))` of the Release if found on a path
-/// with:
-///   - No intermediate blocks (between origin and the release block) that
-///     contain interference (call/alloc/Release-of-temp).
-///   - The release block's prefix up to the Release is also clean.
+/// The key insight: `PostDom` already tells us which blocks post-dominate the
+/// retain's block.  Walking the *immediate post-dominator* chain (the unique
+/// path of idom nodes from `origin` upward through the post-dominator tree)
+/// visits only blocks guaranteed to be on EVERY path from the retain.  This
+/// is strictly safer than BFS (which could follow a branch that only reaches
+/// the Release on some paths) and removes the arbitrary `BFS_BLOCK_LIMIT` cap.
 ///
-/// All intermediate blocks must pass `block_is_clean_for` (no interference and
-/// temp is not defined or released in them) for the path to be eligible.
+/// For each block on the chain:
+///   - If it contains an unclaimed Release of `temp`, that is the candidate.
+///   - If it contains interference (call/alloc/escape) or redefines `temp`,
+///     we stop walking (path is tainted).
+///   - Otherwise keep walking to the next immediate post-dominator.
+///
+/// We only accept the pair when the release block post-dominates the retain
+/// block — guaranteed by construction here since every block on the idom chain
+/// post-dominates the origin.
 fn find_paired_release_cross_block(
     temp: Temp,
     origin_block_idx: usize,
     func: &LinFunction,
     block_index: &HashMap<BlockId, usize>,
     claimed: &HashSet<(usize, usize)>,
+    postdom: &PostDom,
 ) -> Option<(usize, usize)> {
-    let origin_block = &func.blocks[origin_block_idx];
+    let origin_id = func.blocks[origin_block_idx].id;
 
-    // BFS queue: (block_id, must_be_clean_entirely)
-    // For blocks between origin and release, all instructions must be clean.
-    // For the release block, we only require the prefix up to the Release.
+    // Walk the immediate post-dominator chain.  We build it by following
+    // `idom` at each step, stopping when we revisit a node (cycle guard) or
+    // reach a node that no longer post-dominates the origin.
+    let mut current_id = origin_id;
     let mut visited: HashSet<BlockId> = HashSet::new();
-    visited.insert(origin_block.id);
+    visited.insert(origin_id);
 
-    let mut queue: VecDeque<BlockId> = VecDeque::new();
-    for succ in terminator_successors(&origin_block.terminator) {
-        if !visited.contains(&succ) {
-            queue.push_back(succ);
-            visited.insert(succ);
-        }
-    }
-
-    let mut blocks_visited = 0usize;
-
-    while let Some(bid) = queue.pop_front() {
-        blocks_visited += 1;
-        if blocks_visited > BFS_BLOCK_LIMIT {
+    loop {
+        let Some(next_id) = postdom.idom(current_id) else { break };
+        // Cycle guard (idom of the exit node may point to itself).
+        if visited.contains(&next_id) {
             break;
         }
+        visited.insert(next_id);
 
-        let Some(&idx) = block_index.get(&bid) else { continue };
+        // Every block on the idom chain post-dominates the origin by definition —
+        // no need to re-check `post_dominates`.
+        let Some(&idx) = block_index.get(&next_id) else { break };
         let block = &func.blocks[idx];
 
-        // Check whether this block contains an UNCLAIMED Release (one not already paired with
-        // an earlier Retain). Skipping claimed Releases keeps elision one-to-one across blocks,
-        // matching the same-block rule.
+        // Does this block contain the Release?
         if let Some(release_pos) =
             find_release_at_block_start(temp, block, |i| claimed.contains(&(idx, i)))
         {
-            // Found the Release. Check that the prefix of this block (before the
-            // Release) is clean (using the sentinel usize::MAX to mean "from 0").
             return Some((idx, release_pos));
         }
 
-        // This block must be entirely clean for the path to remain eligible.
-        if !block_is_clean_for(temp, block) {
-            // Path through this block is tainted — do not continue BFS through it.
-            continue;
+        // If the block is tainted (interference or temp redefined) we cannot
+        // skip over it; stop the walk.
+        if !block_is_clean_for(temp, block) || !block_temp_survives(temp, block) {
+            break;
         }
 
-        // Temp must survive the whole block (not redefined, not released).
-        if !block_temp_survives(temp, block) {
-            continue;
-        }
-
-        // Enqueue successors.
-        for succ in terminator_successors(&block.terminator) {
-            if !visited.contains(&succ) {
-                visited.insert(succ);
-                queue.push_back(succ);
-            }
-        }
+        current_id = next_id;
     }
 
     None
@@ -479,6 +466,9 @@ fn terminator_uses_temp(term: &Terminator, temp: Temp) -> bool {
 struct PostDom {
     /// `post_dom[b]` = the set of blocks that post-dominate `b` (including `b`).
     post_dom: HashMap<BlockId, HashSet<BlockId>>,
+    /// `idom_map[b]` = the immediate post-dominator of `b` (the closest strict
+    /// post-dominator).  Absent for exit blocks (no strict post-dominator).
+    idom_map: HashMap<BlockId, BlockId>,
 }
 
 impl PostDom {
@@ -534,7 +524,23 @@ impl PostDom {
             }
         }
 
-        PostDom { post_dom }
+        // Derive the immediate post-dominator for each block.
+        // idom(b) = the strict post-dominator of b with the LARGEST post-dom set
+        // (i.e. the one closest to b in the post-dom tree, since nodes further from
+        // the exit have larger post-dom sets).
+        let mut idom_map: HashMap<BlockId, BlockId> = HashMap::new();
+        for b in &func.blocks {
+            let best = post_dom[&b.id]
+                .iter()
+                .filter(|&&p| p != b.id)
+                .max_by_key(|&&p| post_dom.get(&p).map(|s| s.len()).unwrap_or(0))
+                .copied();
+            if let Some(p) = best {
+                idom_map.insert(b.id, p);
+            }
+        }
+
+        PostDom { post_dom, idom_map }
     }
 
     /// True if `p` post-dominates `b` (every path from `b` to an exit goes
@@ -542,6 +548,11 @@ impl PostDom {
     /// returns false — we never elide on the basis of unreachable info.
     fn post_dominates(&self, p: BlockId, b: BlockId) -> bool {
         self.post_dom.get(&b).map(|set| set.contains(&p)).unwrap_or(false)
+    }
+
+    /// Returns the immediate post-dominator of `b`, or `None` for exit blocks.
+    fn idom(&self, b: BlockId) -> Option<BlockId> {
+        self.idom_map.get(&b).copied()
     }
 }
 
@@ -1090,5 +1101,135 @@ mod tests {
         elide_rc(&mut module);
         let (retains, releases) = count_rc(&module.functions[0], Temp(0));
         assert_eq!((retains, releases), (0, 0), "clean post-dominating pair should elide");
+    }
+
+    /// Build an N-block linear chain:
+    ///   block 0 → instrs0, Jump(1)
+    ///   block 1 → [],       Jump(2)
+    ///   ...
+    ///   block N-1 → instrsN, Return
+    fn make_linear_chain_fn(
+        id: FuncId,
+        instrs_first: Vec<Instruction>,
+        depth: usize,
+        instrs_last: Vec<Instruction>,
+    ) -> LinFunction {
+        let mut blocks = Vec::new();
+        let total = depth + 2; // first + `depth` intermediates + last
+        for i in 0..total {
+            let instructions = if i == 0 {
+                instrs_first.clone()
+            } else if i == total - 1 {
+                instrs_last.clone()
+            } else {
+                vec![]
+            };
+            let terminator = if i + 1 < total {
+                Terminator::Jump(BlockId((i + 1) as u32))
+            } else {
+                Terminator::Return(None)
+            };
+            blocks.push(BasicBlock {
+                id: BlockId(i as u32),
+                label: None,
+                instructions,
+                terminator,
+                span: None,
+                instr_spans: Vec::new(),
+            });
+        }
+        let mut temp_types = std::collections::HashMap::new();
+        temp_types.insert(Temp(0), Type::Str);
+        LinFunction {
+            id,
+            name: None,
+            params: vec![],
+            is_closure: false,
+            ret_ty: Type::Null,
+            param_conventions: Vec::new(),
+            ret_convention: Convention::Own,
+            blocks,
+            temp_types,
+            temp_count: 1,
+            intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
+            coverage_origin: None,
+        }
+    }
+
+    /// Retain in block 0, Release in block 11 (10 clean intermediate blocks).
+    /// Old BFS_BLOCK_LIMIT=8 would stop before reaching the Release; the
+    /// post-dominator chain walk finds it because the chain post-dominates.
+    #[test]
+    fn deep_idom_chain_elides_beyond_old_bfs_limit() {
+        let instrs_first = vec![Instruction::Retain { val: Temp(0), ty: Type::Str }];
+        let instrs_last = vec![Instruction::Release { val: Temp(0), ty: Type::Str }];
+        // 10 intermediate clean blocks → release is 11 idom hops away
+        let func = make_linear_chain_fn(FuncId(0), instrs_first, 10, instrs_last);
+        let mut module = make_module(func);
+        elide_rc(&mut module);
+        let (retains, releases) = count_rc(&module.functions[0], Temp(0));
+        assert_eq!(
+            (retains, releases),
+            (0, 0),
+            "deep idom chain (>8 blocks) should still elide"
+        );
+    }
+
+    /// Retain in block 0, interference in block 5 (a call), Release in block 11.
+    /// The idom chain walk stops at the interference block; both must be kept.
+    #[test]
+    fn deep_idom_chain_stops_at_interference() {
+        // Build a 12-block chain manually: Retain at 0, Call at block 5, Release at 11.
+        let total = 12usize;
+        let mut blocks = Vec::new();
+        for i in 0..total {
+            let instructions = match i {
+                0 => vec![Instruction::Retain { val: Temp(0), ty: Type::Str }],
+                5 => vec![Instruction::Call {
+                    dst: Temp(0), // reuse slot (won't matter, path is blocked)
+                    callee: CallTarget::Named("side_effect".into()),
+                    args: vec![],
+                    ret_ty: Type::Null,
+                }],
+                11 => vec![Instruction::Release { val: Temp(0), ty: Type::Str }],
+                _ => vec![],
+            };
+            let terminator = if i + 1 < total {
+                Terminator::Jump(BlockId((i + 1) as u32))
+            } else {
+                Terminator::Return(None)
+            };
+            blocks.push(BasicBlock {
+                id: BlockId(i as u32),
+                label: None,
+                instructions,
+                terminator,
+                span: None,
+                instr_spans: Vec::new(),
+            });
+        }
+        let mut temp_types = std::collections::HashMap::new();
+        temp_types.insert(Temp(0), Type::Str);
+        let func = LinFunction {
+            id: FuncId(0),
+            name: None,
+            params: vec![],
+            is_closure: false,
+            ret_ty: Type::Null,
+            param_conventions: Vec::new(),
+            ret_convention: Convention::Own,
+            blocks,
+            temp_types,
+            temp_count: 1,
+            intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
+            coverage_origin: None,
+        };
+        let mut module = make_module(func);
+        elide_rc(&mut module);
+        let (retains, releases) = count_rc(&module.functions[0], Temp(0));
+        assert_eq!(retains, 1, "Retain must be kept (interference in intermediate block)");
+        assert_eq!(releases, 1, "Release must be kept (interference in intermediate block)");
     }
 }
