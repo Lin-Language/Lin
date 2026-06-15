@@ -1,3 +1,4 @@
+import { StopId } from "../gtfs/gtfs"
 
 export type GroupStationDepartAfterQuery {
   "raptor": RaptorAlgorithm,
@@ -22,12 +23,38 @@ export val createGroupStationDepartAfterQuery = (
 // 
 // Plan a journey between the origin and destination set of stops on the given date and time
 // 
-export val plan = (GroupStationDepartAfterQuery: query, origins: StopID[], destinations: StopID[], date: Date, time: Time): Journey[] =>
+export val plan = (query: GroupStationDepartAfterQuery, origins: StopId[], destinations: StopId[], date: Date, time: Time): Journey[] =>
   // set the departure time for each origin
-  const originTimes = origins.reduce(keyValue(origin => [origin, time]), {});
+  const originTimes = origins.map(origin => [origin, time]).fromEntries()
 
   // get results for every destination and flatten into a single array
-  const results = this.getJourneys(originTimes, destinations, date);
+  const results = query.getJourneys(originTimes, destinations, date);
 
   // apply each filter to the results
   return this.filters.reduce((rs, filter) => filter.apply(rs), results);
+
+// 
+// Find journeys using the raptor object, if no results are found then increment the day and keep
+// searching until results have been found or the maximum number of days has been reached
+//   
+val getJourneys = (query: GroupStationDepartAfterQuery, originTimes: StopTimes, destinations: StopId[], startDate: Date) =>
+  val connectionIndexes: ConnectionIndex[] = []
+  var origins = originTimes
+
+  val searchDay = (i: UInt8) =>
+    val date = date.addDays(i)
+    val dateNumber = date.getDateNumber()
+    val dayOfWeek = date.getDayOfWeek()
+    val [kConnections, bestArrivals] = this.raptor.scan(origins, dateNumber, dayOfWeek)
+    
+    results = this.getJourneysFromConnections(kConnections, connectionIndexes, destinations)
+
+    if results.length() > 0 || query["maxSearchDays"] == i then
+      results
+    else    
+      // reset the origin departure times, and increment the day by one
+      origins = this.getFoundStations(kConnections, bestArrivals);
+      connectionIndexes.push(kConnections)
+      searchDay(i + 1)
+
+  searchDay(0)
