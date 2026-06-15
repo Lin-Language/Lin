@@ -270,20 +270,19 @@ impl<'ctx> Codegen<'ctx> {
     /// two are in DISJOINT descriptor namespaces — see the runtime const's doc comment.)
     pub(crate) const KIND_MAP: u32 = 4;
 
-    /// NAMED full-field descriptor kind codes (ADR-063 Stage 3b mechanism (i)). Unlike the heap-only
-    /// `KIND_*`, these cover SCALARS too, since the named descriptor lists EVERY field for the boxed
-    /// materialize-on-read path. MUST stay in lockstep with `lin_runtime::sealed::NKIND_*`. The boxing
-    /// each code implies matches `type_tag` / `box_value` exactly (so a materialized field reads back
-    /// identically to a directly-boxed value).
-    pub(crate) const NKIND_INT32: u32 = 1; // Int8/Int16/Int32
-    pub(crate) const NKIND_INT64: u32 = 2; // Int64, UInt8/UInt16/UInt32 (zero-extended positive)
-    pub(crate) const NKIND_UINT64: u32 = 3; // UInt64
-    pub(crate) const NKIND_FLOAT64: u32 = 4; // Float32/Float64
-    pub(crate) const NKIND_BOOL: u32 = 5; // Bool
-    pub(crate) const NKIND_STRING: u32 = 6; // String/StrLit
-    pub(crate) const NKIND_ARRAY: u32 = 7; // Array/FixedArray
-    pub(crate) const NKIND_SEALED: u32 = 8; // nested sealed record
-    pub(crate) const NKIND_MAP: u32 = 9; // { String: T } index-signature map (*LinMap)
+    /// NAMED full-field descriptor kind codes — canonical definitions live in `lin_common::tags`.
+    /// Re-exported here as associated constants for call-site clarity. The boxing each code implies
+    /// matches `type_tag` / `box_value` exactly (so a materialized field reads back identically to a
+    /// directly-boxed value).
+    pub(crate) const NKIND_INT32: u32 = lin_common::tags::NKIND_INT32;
+    pub(crate) const NKIND_INT64: u32 = lin_common::tags::NKIND_INT64;
+    pub(crate) const NKIND_UINT64: u32 = lin_common::tags::NKIND_UINT64;
+    pub(crate) const NKIND_FLOAT64: u32 = lin_common::tags::NKIND_FLOAT64;
+    pub(crate) const NKIND_BOOL: u32 = lin_common::tags::NKIND_BOOL;
+    pub(crate) const NKIND_STRING: u32 = lin_common::tags::NKIND_STRING;
+    pub(crate) const NKIND_ARRAY: u32 = lin_common::tags::NKIND_ARRAY;
+    pub(crate) const NKIND_SEALED: u32 = lin_common::tags::NKIND_SEALED;
+    pub(crate) const NKIND_MAP: u32 = lin_common::tags::NKIND_MAP;
 
     /// The NAMED-descriptor kind for `ty` (a sealed-record field). Covers every permissible sealed
     /// field — scalar OR heap. Returns `None` only for a type that is not a valid sealed field (which
