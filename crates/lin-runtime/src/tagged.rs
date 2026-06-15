@@ -229,14 +229,24 @@ pub unsafe extern "C" fn lin_box_sumnode(p: *mut u8) -> *mut u8 {
 
 /// Box a `*sealed-struct` by-pointer as a TaggedVal(TAG_RECORD) — Stage 6a dynamic-slot widening.
 /// The sealed struct carries its own descriptor at offset 8 (`[u32 rc | u32 size | u64 desc_ptr | ...]`),
-/// so no separate descriptor argument is needed. The struct is BORROWED here (the shell is the only
-/// fresh +1 added by this function); the slot's owning reference is retained by the struct itself
-/// (the RC at offset 0). The distinct TAG_RECORD tag routes the slot's release to
-/// `lin_sealed_release_self` (reads the size from offset 4), NOT `lin_object_release` (which would
-/// misinterpret the sealed header). RC contract mirrors `lin_box_sumnode` exactly.
+/// so no separate descriptor argument is needed. The distinct TAG_RECORD tag routes the slot's release
+/// to `lin_sealed_release_self` (reads the size from offset 4), NOT `lin_object_release` (which would
+/// misinterpret the sealed header).
+///
+/// RC contract — this RETAINS (+1), and that is DELIBERATELY DIFFERENT from `lin_box_sumnode` (which
+/// does NOT retain). The two boxers are used in different ownership contexts:
+///   * `lin_box_record` is called only on the COERCE/escape paths (`val j: AnyVal = rec`, NullableRecord
+///     coercion — codegen `match.rs`), where the SOURCE struct stays a live owner in its own scope and
+///     the box is an ADDITIONAL independent owner → it must take its own +1.
+///   * `lin_box_sumnode` is called only on the keep-packed MOVE-into-a-container path
+///     (`compile_ir_box_keep_sumnode`), where the IR's `transfer_into_container` MOVES the single +1
+///     into the slot and suppresses the source release → the box must NOT add a second +1.
+/// (The keep-packed record-into-container MOVE goes through `lin_box_map`/`lin_box_array`, not this
+/// function — see `compile_ir_box_keep_packed` — so `lin_box_record` never participates in a move.)
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_record(p: *mut u8) -> *mut u8 {
-    // Retain the sealed struct: the new TaggedVal shell is an additional owner (+1).
+    // Retain the sealed struct: the new TaggedVal shell is an additional owner (+1). See the contract
+    // note above for why this differs from lin_box_sumnode.
     if !p.is_null() {
         crate::memory::lin_rc_retain(p as *mut u32);
     }
