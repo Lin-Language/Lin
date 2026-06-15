@@ -38,8 +38,11 @@ pub fn check_exhaustiveness(
     }
 
     match scrutinee_ty {
-        Type::Union(variants) => check_union_exhaustiveness(variants, arms, span),
+        Type::Union(variants) => check_union_exhaustiveness(scrutinee_ty, variants, arms, span),
         Type::Bool => check_bool_exhaustiveness(arms, span),
+        // A single `IntLit(n)` type matched without `else` is trivially exhaustive when the sole
+        // literal arm covers it — treat it as a one-variant union.
+        Type::IntLit(_) => check_union_exhaustiveness(scrutinee_ty, &[scrutinee_ty.clone()], arms, span),
         _ => {
             // For non-union types, only warn if there are pattern arms that could miss.
             // We cannot prove completeness without an else arm or full type coverage.
@@ -61,12 +64,71 @@ pub fn check_exhaustiveness(
     }
 }
 
-/// Check that every variant in the union is covered by an `Is(TypeCheck)` arm.
-fn check_union_exhaustiveness(
+/// Check exhaustiveness of a match on a closed union of integer-literal types. Arms use
+/// `Is(Literal(IntLit(n, ...)))` (not `Is(TypeCheck(IntLit(n), ...))`). An arm covers the
+/// `IntLit(n)` variant iff it is a `Literal(IntLit(n, _, _))`.
+fn check_int_lit_union_exhaustiveness(
     variants: &[Type],
     arms: &[TypedMatchArm],
     span: Span,
 ) -> Vec<Diagnostic> {
+    // Collect all integer values explicitly covered by literal arms.
+    let covered: Vec<i64> = arms.iter().filter_map(|a| {
+        match &a.pattern {
+            TypedMatchPattern::Is(TypedPattern::Literal(lit)) => {
+                if let crate::typed_ir::TypedExpr::IntLit(n, _, _) = lit.as_ref() {
+                    Some(*n)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }).collect();
+
+    let missing: Vec<&Type> = variants.iter().filter(|v| {
+        if let Type::IntLit(n) = v {
+            !covered.contains(n)
+        } else {
+            true
+        }
+    }).collect();
+
+    if missing.is_empty() {
+        return Vec::new();
+    }
+
+    let witness = missing.iter().map(|t| format!("{}", t)).collect::<Vec<_>>().join(" | ");
+
+    vec![Diagnostic::error(
+        span,
+        format!(
+            "non-exhaustive match: the following types are not covered: {}. Add an arm for {} or an `else` arm.",
+            witness, missing[0]
+        ),
+    ).with_help(format!(
+        "Add `is {} => ...` or a catch-all `else => ...` arm.",
+        missing[0]
+    ))]
+}
+
+/// Check that every variant in the union is covered by an `Is(TypeCheck)` arm.
+fn check_union_exhaustiveness(
+    scrutinee_ty: &Type,
+    variants: &[Type],
+    arms: &[TypedMatchArm],
+    span: Span,
+) -> Vec<Diagnostic> {
+    // For a closed int-literal union — a union whose every member is an `IntLit` — match arms use
+    // `Is(Literal(IntLit(n, IntLit(n), _)))` rather than `Is(TypeCheck(IntLit(n), _))`. Detect this
+    // case and delegate to the int-literal exhaustiveness helper.
+    let all_int_lits = matches!(scrutinee_ty, Type::IntLit(_))
+        || (matches!(scrutinee_ty, Type::Union(_))
+            && variants.iter().all(|v| matches!(v, Type::IntLit(_))));
+    if all_int_lits {
+        return check_int_lit_union_exhaustiveness(variants, arms, span);
+    }
+
     // Collect all types that are explicitly covered by `is T` arms.
     let covered: Vec<&Type> = arms.iter().filter_map(|a| {
         // `TypeCheckDeep` (ADR-035, `is <ObjectType>`) covers its variant exactly like `TypeCheck`.

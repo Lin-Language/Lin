@@ -4470,6 +4470,37 @@ fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut FuncBuil
             return lower_callback_arg(cb_ret, name.as_deref(), params, body, ret_type, captures, builder, ctx);
         }
     }
+    // Sealed record literal → sealed record param: construct the packed struct DIRECTLY (each
+    // field stored by offset) without the build-boxed-LinObject-then-project round-trip that the
+    // generic `lower_expr` + `lower_coerce_arg` path pays (lin_object_alloc + N sets + N
+    // lin_object_get). Fires when the param is a sealed scalar record and the argument is an
+    // object literal with no spreads and at least the target fields — the standard
+    // `try_lower_sealed_literal` preconditions. The `Named`-param analogue lives in
+    // `try_lower_sealed_literal_into_named` (called from `lower_call_arg_tracked` above).
+    //
+    // GATED to records whose fields are ALL scalar or String: no Array / nested-record fields.
+    // `try_lower_sealed_literal` calls plain `lower_expr` for each field, which produces
+    // unsealed/boxed representations for array literals and nested object literals. When a sealed
+    // struct field is an array (e.g. `stopTimes: StopTime[]`), the field value from `lower_expr`
+    // is a boxed `Object[]`, but the sealed slot expects a packed `StopTime[]`. Storing verbatim
+    // corrupts the struct (the codegen's `sealed_repr_differs` returns false for Array→Array,
+    // so no coerce fires). The Coerce path (lower_expr + lower_coerce_arg) handles this correctly
+    // via `sealed_project_from_boxed` / `sealed_array_project_from` inside codegen. Restrict to
+    // scalar+String records where the field representation is already correct from `lower_expr`.
+    if let Some(pt) = param_ty {
+        if is_sealed_scalar_repr(pt) {
+            let all_scalar_or_string = match pt {
+                Type::Object { fields, .. } =>
+                    fields.values().all(|f| f.is_flat_scalar() || f.is_string_ish() || matches!(f, Type::Bool)),
+                _ => false,
+            };
+            if all_scalar_or_string {
+                if let Some(t) = try_lower_sealed_literal(a, pt, builder, ctx) {
+                    return t;
+                }
+            }
+        }
+    }
     let t = lower_expr(a, builder, ctx);
     let coerced = lower_coerce_arg(t, &a.ty(), param_ty, builder);
     move_streamish_arg(&a.ty(), coerced, builder);

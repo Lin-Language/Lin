@@ -286,15 +286,19 @@ fn compile_test(src: &PathBuf, coverage: bool, json: bool) -> Result<PathBuf, St
     match compile(&opts) {
         Ok(()) => Ok(bin),
         Err(CompileError::TypeCheck(diagnostics)) => {
-            let source = fs::read_to_string(src).unwrap_or_default();
-            let path = src.display().to_string();
+            let entry_path = src.display().to_string();
+            let entry_source = fs::read_to_string(src).unwrap_or_default();
             if !json {
                 eprintln!("FAIL (compile) {}", src.display());
                 for diag in &diagnostics {
-                    diag.render(&path, &source);
+                    let (path, source) = match &diag.file {
+                        Some(f) => (f.as_str(), fs::read_to_string(f).unwrap_or_default()),
+                        None => (entry_path.as_str(), entry_source.clone()),
+                    };
+                    diag.render(path, &source);
                 }
             }
-            let mut msg = format!("type check failed in {}", path);
+            let mut msg = format!("type check failed in {}", entry_path);
             for diag in &diagnostics {
                 msg.push('\n');
                 msg.push_str(&diag.message);

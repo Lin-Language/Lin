@@ -208,6 +208,24 @@ impl Parser {
                 let s = if let TokenKind::StringLit(s) = self.advance_kind() { s } else { String::new() };
                 TypeExpr::StringLit(s, span)
             }
+            TokenKind::IntLit(_, _) => {
+                // A non-negative integer-literal singleton type, e.g. `0` or `42`.
+                let span = self.current_span();
+                let n = if let TokenKind::IntLit(n, _) = self.advance_kind() { n } else { 0 };
+                TypeExpr::IntLit(n, span)
+            }
+            TokenKind::Minus => {
+                // A negative integer-literal singleton type, e.g. `-1` in type position.
+                let span = self.current_span();
+                self.advance(); // consume `-`
+                if let TokenKind::IntLit(_n, _) = self.peek_kind() {
+                    let n = if let TokenKind::IntLit(n, _) = self.advance_kind() { n } else { 0 };
+                    TypeExpr::IntLit(-n, span)
+                } else {
+                    // Not a negative literal — unknown type, advance past what we consumed.
+                    TypeExpr::Named("Unknown".to_string(), span)
+                }
+            }
             _ => {
                 let span = self.current_span();
                 self.advance();

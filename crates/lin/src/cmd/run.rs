@@ -45,10 +45,33 @@ pub fn run(args: &RunArgs) {
     match compile(&opts) {
         Ok(()) => {}
         Err(CompileError::TypeCheck(diagnostics)) => {
-            let source = fs::read_to_string(&args.file).unwrap_or_default();
+            let entry_source = fs::read_to_string(&args.file).unwrap_or_default();
             for diag in &diagnostics {
-                diag.render(&path, &source);
+                let (p, source) = match &diag.file {
+                    Some(f) => (f.as_str(), fs::read_to_string(f).unwrap_or_default()),
+                    None => (path.as_str(), entry_source.clone()),
+                };
+                diag.render(p, &source);
             }
+            let _ = fs::remove_file(&bin);
+            process::exit(1);
+        }
+        Err(CompileError::ModuleNotFound { import_path, tried, suggestion, std_like, span, importing_file }) => {
+            use lin_common::Diagnostic;
+            let source = fs::read_to_string(&importing_file).unwrap_or_default();
+            let mut diag = Diagnostic::error(span, format!("module not found: \"{}\"", import_path));
+            diag.notes.push((span, format!("tried to read: {}", tried.display())));
+            let mut help_parts: Vec<String> = Vec::new();
+            if std_like {
+                help_parts.push(format!("\"{}\" is not a built-in stdlib module", import_path));
+            }
+            if let Some(s) = suggestion {
+                help_parts.push(format!("did you mean \"{}\"?", s));
+            }
+            if !help_parts.is_empty() {
+                diag.help = Some(help_parts.join("\n"));
+            }
+            diag.render(&importing_file, &source);
             let _ = fs::remove_file(&bin);
             process::exit(1);
         }

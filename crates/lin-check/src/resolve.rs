@@ -130,6 +130,7 @@ fn resolve_type_inner(
             Ok(Type::flatten_union(resolved?))
         }
         TypeExpr::StringLit(s, _span) => Ok(Type::StrLit(s.clone())),
+        TypeExpr::IntLit(n, _span) => Ok(Type::IntLit(*n)),
     }
 }
 
