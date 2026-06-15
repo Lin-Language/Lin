@@ -13,7 +13,7 @@ val navHref = (base: String, path: String): String =>
   if path == "/" then "${base}/index.html" else "${base}${path}.html"
 
 // Render nav entries for one section
-val renderSectionEntries = (sectionEntries: Json, currentPath: String, base: String): String =>
+val renderSectionEntries = (sectionEntries: AnyVal, currentPath: String, base: String): String =>
   var html = ""
   sectionEntries.for(entry =>
     val path = entry["path"]
@@ -26,16 +26,16 @@ val renderSectionEntries = (sectionEntries: Json, currentPath: String, base: Str
   html
 
 // Render one section block
-val renderSection = (section: String, sectionEntries: Json, currentPath: String, base: String): String =>
+val renderSection = (section: String, sectionEntries: AnyVal, currentPath: String, base: String): String =>
   val entriesHtml = renderSectionEntries(sectionEntries, currentPath, base)
   if section != "" then
     "<div class=\"nav-section\">\n<h3 class=\"nav-section-title\">${section}</h3>\n${entriesHtml}</div>\n"
   else
     entriesHtml
 
-export val buildNav = (entries: Json, currentPath: String, base: String): String =>
+export val buildNav = (entries: AnyVal, currentPath: String, base: String): String =>
   // Collect unique section names in order
-  var sections: Json[] = []
+  var sections: AnyVal[] = []
   var seenStr = "|"
   entries.for(entry =>
     val section = entry["section"]

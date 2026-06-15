@@ -14,7 +14,7 @@ val stdlibDir = "stdlib"
 val outDir = "docs-site/content/stdlib"
 
 // True if a value is the stdlib Error shape.
-val isErr = (v: Json): Boolean =>
+val isErr = (v: AnyVal): Boolean =>
   v != null && v["type"] == "error"
 
 // Strip the leading "// " (or "//") from a comment line, returning the bare text.

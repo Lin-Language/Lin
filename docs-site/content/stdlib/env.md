@@ -45,8 +45,8 @@ Remove an environment variable from this process.
 #### `environ`
 
 ```lin
-val environ = (): Json
+val environ = (): AnyVal
 ```
 
 Snapshot all environment variables.
-- **Returns** a Json object mapping each variable name to its String value.
+- **Returns** a AnyVal object mapping each variable name to its String value.
