@@ -652,6 +652,12 @@ impl Checker {
                     // Empty schema (e.g. `var result = {}`): object may be populated dynamically,
                     // so any key access must be a runtime lookup → TypeVar.
                     self.env.fresh_type_var()
+                } else if let TypedExpr::IntLit(ref n, _, _) = typed_key {
+                    // Integer literal key on a fixed record: look up the string representation.
+                    // This handles `obj[0]` / `obj[dow]` where the record was expanded from a
+                    // `{ <int-literal-union>: V }` index-signature.
+                    let key_str = n.to_string();
+                    fields.get(&key_str).cloned().unwrap_or(Type::Null)
                 } else if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
                     if !fields.contains_key(key_str) {
                         // Key not in the known object type — emit a warning with a "did you mean" hint.
@@ -864,6 +870,16 @@ impl Checker {
             if keys.iter().all(|k| fields.contains_key(k)) {
                 return Type::flatten_union(
                     keys.iter().map(|k| fields[k].clone()).collect(),
+                );
+            }
+        }
+        // Closed integer-literal union key (e.g. `DayOfWeek = 0|1|…|6`) on a record expanded from
+        // `{ DayOfWeek: V }`: all keys are known to be present, so access is total (no `| Null`).
+        if let Some(int_keys) = self.closed_int_literal_keys(key_ty) {
+            let str_keys: Vec<String> = int_keys.iter().map(|n| n.to_string()).collect();
+            if str_keys.iter().all(|k| fields.contains_key(k)) {
+                return Type::flatten_union(
+                    str_keys.iter().map(|k| fields[k].clone()).collect(),
                 );
             }
         }
