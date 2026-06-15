@@ -10,3 +10,6 @@ benchmarks/results/
 docs-site/output/
 /docs-builder
 tmp/
+*.local.json
+*.local.md
+
