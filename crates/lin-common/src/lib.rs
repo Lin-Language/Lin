@@ -90,6 +90,10 @@ pub struct Diagnostic {
     pub notes: Vec<(Span, String)>,
     /// Optional suggestion text shown below the error.
     pub help: Option<String>,
+    /// Absolute path of the source file this diagnostic belongs to. `None` means "the entry file
+    /// passed on the command line". Set by the compile pipeline when an error originates in an
+    /// imported module rather than the main source.
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,11 +104,11 @@ pub enum Severity {
 
 impl Diagnostic {
     pub fn error(span: Span, message: impl Into<String>) -> Self {
-        Self { span, message: message.into(), severity: Severity::Error, notes: Vec::new(), help: None }
+        Self { span, message: message.into(), severity: Severity::Error, notes: Vec::new(), help: None, file: None }
     }
 
     pub fn warning(span: Span, message: impl Into<String>) -> Self {
-        Self { span, message: message.into(), severity: Severity::Warning, notes: Vec::new(), help: None }
+        Self { span, message: message.into(), severity: Severity::Warning, notes: Vec::new(), help: None, file: None }
     }
 
     pub fn with_note(mut self, span: Span, message: impl Into<String>) -> Self {
@@ -114,6 +118,11 @@ impl Diagnostic {
 
     pub fn with_help(mut self, message: impl Into<String>) -> Self {
         self.help = Some(message.into());
+        self
+    }
+
+    pub fn with_file(mut self, path: impl Into<String>) -> Self {
+        self.file = Some(path.into());
         self
     }
 

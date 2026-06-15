@@ -58,10 +58,14 @@ pub fn run(args: &BuildArgs) {
             }
         }
         Err(CompileError::TypeCheck(diagnostics)) => {
-            let source = fs::read_to_string(&args.file).unwrap_or_default();
-            let path = args.file.display().to_string();
+            let entry_path = args.file.display().to_string();
+            let entry_source = fs::read_to_string(&args.file).unwrap_or_default();
             for diag in &diagnostics {
-                diag.render(&path, &source);
+                let (path, source) = match &diag.file {
+                    Some(f) => (f.as_str(), fs::read_to_string(f).unwrap_or_default()),
+                    None => (entry_path.as_str(), entry_source.clone()),
+                };
+                diag.render(path, &source);
             }
             process::exit(1);
         }
