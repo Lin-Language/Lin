@@ -590,6 +590,16 @@ fn load_signature(key: &str, base_dir: &Path) -> Option<ModuleSignature> {
     ModuleSignature::from_bytes(payload)
 }
 
+/// Stamp every diagnostic in `diags` with a source file path, so renderers can load the right
+/// source text. Called when type errors originate in an imported module rather than the entry file.
+fn tag_diagnostics(diags: Vec<lin_common::Diagnostic>, file: Option<&str>) -> Vec<lin_common::Diagnostic> {
+    if let Some(f) = file {
+        diags.into_iter().map(|d| d.with_file(f)).collect()
+    } else {
+        diags
+    }
+}
+
 /// Lex and parse a Lin source string into an AST module.
 /// Returns Err with parse diagnostics if any parse errors occurred.
 fn parse_source(source: &str) -> Result<Module, Vec<lin_common::Diagnostic>> {
@@ -1152,7 +1162,7 @@ fn resolve_singleton(
     }
 
     let (typed, _warnings) = check_module_with_imports(&m.ast, cache, m.is_stdlib)
-        .map_err(CompileError::TypeCheck)?;
+        .map_err(|diags| CompileError::TypeCheck(tag_diagnostics(diags, m.abs_path.as_deref())))?;
     let sig = ModuleSignature::from_module(&typed);
     save_cache(&key, &typed, &m.base_dir);
     save_signature(&key, &sig, &m.base_dir);
@@ -1258,7 +1268,7 @@ fn check_scc(
     let mut provisional: HashMap<(String, String), Type> = HashMap::new();
     for m in &members {
         let (typed, _w) = check_module_with_imports(&m.ast, cache, m.is_stdlib)
-            .map_err(CompileError::TypeCheck)?;
+            .map_err(|diags| CompileError::TypeCheck(tag_diagnostics(diags, m.abs_path.as_deref())))?;
         let sig = ModuleSignature::from_module(&typed);
         for (name, ty) in sig.exports {
             // Seed under every path string this member is reached by, so a peer importing it by
@@ -1320,7 +1330,7 @@ fn check_scc(
     // import-type map, so cross-module references resolve to concrete types.
     for (identity, m) in scc.iter().zip(members.iter()) {
         let (typed, _w) = check_module_with_seeded_imports(&m.ast, cache, &provisional, m.is_stdlib)
-            .map_err(CompileError::TypeCheck)?;
+            .map_err(|diags| CompileError::TypeCheck(tag_diagnostics(diags, m.abs_path.as_deref())))?;
         let sig = ModuleSignature::from_module(&typed);
         // Cyclic members are always freshly checked (their type depends on peers), so their `.typed`
         // is never read back from the cache. We still persist the signature — under the same

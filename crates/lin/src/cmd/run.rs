@@ -45,9 +45,13 @@ pub fn run(args: &RunArgs) {
     match compile(&opts) {
         Ok(()) => {}
         Err(CompileError::TypeCheck(diagnostics)) => {
-            let source = fs::read_to_string(&args.file).unwrap_or_default();
+            let entry_source = fs::read_to_string(&args.file).unwrap_or_default();
             for diag in &diagnostics {
-                diag.render(&path, &source);
+                let (p, source) = match &diag.file {
+                    Some(f) => (f.as_str(), fs::read_to_string(f).unwrap_or_default()),
+                    None => (path.as_str(), entry_source.clone()),
+                };
+                diag.render(p, &source);
             }
             let _ = fs::remove_file(&bin);
             process::exit(1);
