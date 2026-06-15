@@ -44,13 +44,16 @@ pub enum CompileError {
     /// cycle as a human-readable path chain (e.g. `a -> b -> a`).
     ImportCycle(String),
     /// An `import` referred to a module file that does not exist. Carries the import path as
-    /// written, the absolute path we tried to read, an optional did-you-mean suggestion, and
-    /// whether the import looked like a stdlib (`std/...`) import.
+    /// written, the absolute path we tried to read, an optional did-you-mean suggestion, whether
+    /// the import looked like a stdlib (`std/...`) import, the span of the import statement, and
+    /// the file that contained it (for diagnostic rendering).
     ModuleNotFound {
         import_path: String,
         tried: PathBuf,
         suggestion: Option<String>,
         std_like: bool,
+        span: lin_common::Span,
+        importing_file: String,
     },
     /// The entry source file passed on the command line does not exist.
     SourceFileNotFound(PathBuf),
@@ -76,6 +79,7 @@ impl std::fmt::Display for CompileError {
                 tried,
                 suggestion,
                 std_like,
+                ..
             } => {
                 write!(
                     f,
@@ -846,11 +850,12 @@ struct ImportGraph {
 fn build_import_graph(
     ast_module: &Module,
     base_dir: &Path,
+    current_file: &str,
     graph: &mut ImportGraph,
 ) -> Result<Vec<String>, CompileError> {
     let mut deps = Vec::new();
     for stmt in &ast_module.statements {
-        let Stmt::Import { path, .. } = stmt else { continue };
+        let Stmt::Import { path, span, .. } = stmt else { continue };
         let identity = module_identity(path, base_dir);
         deps.push(identity.clone());
 
@@ -885,6 +890,8 @@ fn build_import_graph(
                             tried: file_path.clone(),
                             suggestion,
                             std_like,
+                            span: *span,
+                            importing_file: current_file.to_string(),
                         }
                     } else {
                         CompileError::Io(e)
@@ -903,13 +910,14 @@ fn build_import_graph(
             ast: ast.clone(),
             src_text,
             base_dir: imported_base.clone(),
-            abs_path,
+            abs_path: abs_path.clone(),
             is_stdlib,
             deps: Vec::new(),
         });
         graph.order.push(identity.clone());
 
-        let child_deps = build_import_graph(&ast, &imported_base, graph)?;
+        let child_file = abs_path.as_deref().unwrap_or("<stdlib>");
+        let child_deps = build_import_graph(&ast, &imported_base, child_file, graph)?;
         if let Some(m) = graph.modules.get_mut(&identity) {
             m.deps = child_deps;
         }
@@ -1076,7 +1084,7 @@ fn pre_resolve_imports_from_ast(
     import_sources: &mut HashMap<String, (String, String)>,
 ) -> Result<(), CompileError> {
     let mut graph = ImportGraph { modules: HashMap::new(), order: Vec::new() };
-    build_import_graph(ast_module, base_dir, &mut graph)?;
+    build_import_graph(ast_module, base_dir, &_entry_path.display().to_string(), &mut graph)?;
     let sccs = tarjan_sccs(&graph);
 
     // identity -> content_hash of that module's resolved `ModuleSignature`. Populated as each SCC

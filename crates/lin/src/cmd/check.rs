@@ -46,6 +46,24 @@ pub fn run(args: &CheckArgs) {
             }
             process::exit(1);
         }
+        Err(CompileError::ModuleNotFound { import_path, tried, suggestion, std_like, span, importing_file }) => {
+            use lin_common::Diagnostic;
+            let source = fs::read_to_string(&importing_file).unwrap_or_default();
+            let mut diag = Diagnostic::error(span, format!("module not found: \"{}\"", import_path));
+            diag.notes.push((span, format!("tried to read: {}", tried.display())));
+            let mut help_parts: Vec<String> = Vec::new();
+            if std_like {
+                help_parts.push(format!("\"{}\" is not a built-in stdlib module", import_path));
+            }
+            if let Some(s) = suggestion {
+                help_parts.push(format!("did you mean \"{}\"?", s));
+            }
+            if !help_parts.is_empty() {
+                diag.help = Some(help_parts.join("\n"));
+            }
+            diag.render(&importing_file, &source);
+            process::exit(1);
+        }
         Err(e) => {
             eprintln!("Check failed: {}", e);
             process::exit(1);
