@@ -847,11 +847,10 @@ pub(crate) unsafe fn dynamic_to_map(tv: *const TaggedVal) -> *mut LinMap {
             m
         }
         t if t == crate::tagged::TAG_SUMNODE => {
-            let obj = crate::sumnode::lin_sumnode_materialize((*tv).payload as *mut u8);
-            if obj.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
-            let m = lin_object_to_map(obj as *const crate::object::LinObject);
-            crate::object::lin_object_release(obj as *mut crate::object::LinObject);
-            m
+            // lin_sumnode_materialize now returns a *LinMap directly (Phase 3/Cluster B).
+            let m = crate::sumnode::lin_sumnode_materialize((*tv).payload as *mut u8);
+            if m.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
+            m as *mut LinMap
         }
         _ => lin_map_alloc(0, KEY_KIND_STRING),
     }

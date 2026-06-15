@@ -305,13 +305,11 @@ unsafe fn clone_object_as_map(src: *const LinObject) -> *mut crate::map::LinMap 
         let key = clone_string((*se).key);
         let v: TaggedVal = if (*se).value.tag == crate::tagged::TAG_SUMNODE {
             // KEEP-PACKED-THROUGH-RECORD-FIELDS thread-transfer: a kept-packed *SumNode field
-            // MUST NOT cross the thread boundary by pointer. Materialise to LinObject, then
-            // convert to LinMap so the worker sees a uniform TAG_MAP.
-            let obj = crate::sumnode::lin_sumnode_materialize((*se).value.payload as *mut u8);
-            let map = crate::map::lin_object_to_map(obj as *const LinObject);
-            let cloned = clone_map(map);
-            crate::map::lin_map_release(map);
-            if !obj.is_null() { crate::object::lin_object_release(obj as *mut LinObject); }
+            // MUST NOT cross the thread boundary by pointer. lin_sumnode_materialize now returns
+            // a *LinMap directly (Phase 3/Cluster B), so no LinObject intermediate is needed.
+            let map = crate::sumnode::lin_sumnode_materialize((*se).value.payload as *mut u8);
+            let cloned = if map.is_null() { crate::map::lin_map_alloc(0, crate::map::KEY_KIND_STRING) } else { clone_map(map as *const crate::map::LinMap) };
+            if !map.is_null() { crate::map::lin_map_release(map as *mut crate::map::LinMap); }
             TaggedVal { tag: crate::tagged::TAG_MAP, _pad: [0; 7], payload: cloned as u64 }
         } else if (*se).value.tag == crate::tagged::TAG_RECORD {
             // Sealed-struct → materialise to LinMap, deep-clone, transfer as TAG_MAP.
