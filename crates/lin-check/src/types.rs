@@ -477,6 +477,169 @@ impl Type {
             Type::Union(flat)
         }
     }
+
+    // ── Packed-repr gate predicates (ADR-063 / ADR-069) ────────────────────────
+    //
+    // These are the SINGLE source of truth for the packed-vs-boxed decision. Every
+    // crate that decides whether a value is packed (lin-ir, lin-codegen) calls these
+    // instead of maintaining a local transcription. Downstream callers:
+    //   - `lin_codegen::codegen::types::Codegen` methods delegate to these.
+    //   - `lin_ir::repr` free-functions delegate to these.
+    //   - `lin_ir::lower` predicates delegate via `lin_ir::repr`.
+    //   - `lin_ir::monomorphize` and `lin_ir::escape` already call
+    //     `Type::is_sealed_array_field_packable` (which lives here).
+
+    /// True when `ty` is an unboxed scalar field of a sealed record: a fixed-width numeric,
+    /// `Bool`, or `IntLit` (Int32 at runtime). Stored inline; no per-field RC.
+    pub fn is_sealed_scalar_field(&self) -> bool {
+        self.is_flat_scalar() || matches!(self, Type::Bool | Type::IntLit(_))
+    }
+
+    /// True when `ty` is an eligible HEAP field of a sealed record (String/StrLit, Array/FixedArray,
+    /// Map, or a nested sealed record). Stored as an 8-byte owned pointer slot.
+    pub fn is_sealed_heap_field(&self) -> bool {
+        self.is_string_ish()
+            || matches!(self, Type::Array(_) | Type::FixedArray(_))
+            || matches!(self, Type::Map { .. })
+            || (matches!(self, Type::Object { .. }) && Type::sealed_fields(self).is_some())
+    }
+
+    /// True when `ty` is a permissible field of a sealed record: scalar or eligible heap field.
+    pub fn is_sealed_field(&self) -> bool {
+        self.is_sealed_scalar_field() || self.is_sealed_heap_field()
+    }
+
+    /// THE sealed-record gate. `Some(fields)` iff `ty` is a `Type::Object { sealed: true }` whose
+    /// fields are all sealed-eligible. FAIL SAFE: `None` → boxed path.
+    pub fn sealed_fields(ty: &Type) -> Option<&IndexMap<String, Type>> {
+        match ty {
+            Type::Object { fields, sealed: true }
+                if !fields.is_empty() && fields.values().all(|f| f.is_sealed_field()) =>
+            {
+                Some(fields)
+            }
+            _ => None,
+        }
+    }
+
+    /// THE sealed-record-ARRAY gate. `Some(elem_fields)` iff `ty` is `Array(elem)` whose element
+    /// is a sealed record with all fields packable. FAIL SAFE: `None` → boxed/flat array path.
+    pub fn sealed_array_elem(ty: &Type) -> Option<&IndexMap<String, Type>> {
+        let elem = match ty {
+            Type::Array(e) => e.as_ref(),
+            _ => return None,
+        };
+        let fields = Type::sealed_fields(elem)?;
+        if fields.values().all(|f| f.is_sealed_array_field_packable()) {
+            Some(fields)
+        } else {
+            None
+        }
+    }
+
+    /// The UNIQUE recursive self-reference name of a candidate sum union (`None` if absent or
+    /// ambiguous — mutual recursion → boxed, fail-safe).
+    pub fn sum_recursive_self_name(ty: &Type) -> Option<String> {
+        let variants = match ty {
+            Type::Union(vs) => vs,
+            _ => return None,
+        };
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for v in variants {
+            if let Type::Object { fields, .. } = v {
+                for fty in fields.values() {
+                    if let Type::Named(n) = fty {
+                        names.insert(n.clone());
+                    }
+                }
+            }
+        }
+        if names.len() == 1 { names.into_iter().next() } else { None }
+    }
+
+    /// THE Stage-1 sum-type gate. Returns the discriminant key iff `ty` is a `Type::Union` of 2+
+    /// variants sharing a distinct `StrLit` discriminant and all other fields are sealed-eligible
+    /// or a recursive self-child. Any violation → `None` → boxed union (fail-safe).
+    pub fn sum_type_discriminant(ty: &Type) -> Option<String> {
+        let variants = match ty {
+            Type::Union(vs) => vs,
+            _ => return None,
+        };
+        if variants.len() < 2 {
+            return None;
+        }
+        let self_name = Type::sum_recursive_self_name(ty);
+        let mut recs: Vec<&IndexMap<String, Type>> = Vec::with_capacity(variants.len());
+        for v in variants {
+            match v {
+                Type::Object { fields, .. } if !fields.is_empty() => recs.push(fields),
+                _ => return None,
+            }
+        }
+        let first = recs[0];
+        'keys: for (key, kty) in first.iter() {
+            if !matches!(kty, Type::StrLit(_)) {
+                continue;
+            }
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for rec in &recs {
+                match rec.get(key) {
+                    Some(Type::StrLit(s)) => {
+                        if !seen.insert(s.clone()) {
+                            continue 'keys;
+                        }
+                    }
+                    _ => continue 'keys,
+                }
+            }
+            for rec in &recs {
+                for (fk, fty) in rec.iter() {
+                    if fk == key {
+                        continue;
+                    }
+                    if matches!(fty, Type::StrLit(_)) {
+                        return None;
+                    }
+                    let is_recursive_child = self_name
+                        .as_deref()
+                        .is_some_and(|n| matches!(fty, Type::Named(name) if name == n));
+                    if !fty.is_sealed_field() && !is_recursive_child {
+                        return None;
+                    }
+                }
+            }
+            return Some(key.clone());
+        }
+        None
+    }
+
+    /// True when `ty` is a Stage-1-eligible unboxed sum type.
+    pub fn sum_type_eligible(ty: &Type) -> bool {
+        Type::sum_type_discriminant(ty).is_some()
+    }
+
+    /// Stage-3 NullableRecord gate: `Some(fields)` iff `ty` is `T | Null` where `T` is a sealed
+    /// record. Excludes sum types (those use the SumNode path). FAIL SAFE: `None` → boxed.
+    pub fn nullable_sealed_record(ty: &Type) -> Option<&IndexMap<String, Type>> {
+        let variants = match ty {
+            Type::Union(vs) => vs,
+            _ => return None,
+        };
+        if Type::sum_type_eligible(ty) {
+            return None;
+        }
+        let mut record: Option<&IndexMap<String, Type>> = None;
+        for v in variants {
+            if matches!(v, Type::Null) {
+                continue;
+            }
+            match Type::sealed_fields(v) {
+                Some(f) if record.is_none() => record = Some(f),
+                _ => return None,
+            }
+        }
+        record
+    }
 }
 
 impl fmt::Display for Type {
