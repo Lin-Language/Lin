@@ -368,4 +368,7 @@ pub enum TypeExpr {
     TaggedUnion(Vec<TypeExpr>, Span),
     /// A string-literal singleton type, e.g. `"success"` in type position.
     StringLit(String, Span),
+    /// An integer-literal singleton type, e.g. `0` or `3` in type position.
+    /// Negative literals (e.g. `-1`) are also representable.
+    IntLit(i64, Span),
 }

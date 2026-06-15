@@ -117,6 +117,30 @@ impl Checker {
                 check_int_literal_fits(*v, expected, *span)?;
                 return Ok(TypedExpr::IntLit(*v, expected.clone(), *span));
             }
+            // Integer-literal singleton refinement (mirrors ADR-034 for StrLit). A bare integer
+            // literal narrows to `IntLit(n)` when the expected type is exactly `IntLit(n)` with the
+            // same value, or when it is a closed union of `IntLit` values containing `n`.
+            //
+            // When the expected type is a single IntLit:
+            if let Type::IntLit(t) = expected {
+                if v == t {
+                    return Ok(TypedExpr::IntLit(*v, Type::IntLit(*t), *span));
+                }
+                return Err(Diagnostic::error(
+                    *span,
+                    format!("Expected literal type {}, got {}", t, v),
+                ));
+            }
+            // When the expected type is a closed union of IntLit values:
+            if let Some(members) = self.closed_int_literal_keys(expected) {
+                if members.iter().any(|m| *m == *v) {
+                    return Ok(TypedExpr::IntLit(*v, Type::IntLit(*v), *span));
+                }
+                return Err(Diagnostic::error(
+                    *span,
+                    format!("Expected type {}, got {}", expected, v),
+                ));
+            }
         }
 
         // Float literal against an expected `Float32`. A suffixless float literal infers to
@@ -800,6 +824,27 @@ impl Checker {
                 for v in &variants {
                     match self.resolve_named_body(v)? {
                         Type::StrLit(s) => keys.push(s),
+                        _ => return None,
+                    }
+                }
+                Some(keys)
+            }
+            _ => None,
+        }
+    }
+
+    /// If `ty` denotes a CLOSED set of integer-literal values — a single `IntLit` or a union whose
+    /// every member is an `IntLit` (after peeling `Named` aliases) — return those values.
+    /// Otherwise return `None`. Mirrors `closed_string_literal_keys` for the integer domain.
+    pub(crate) fn closed_int_literal_keys(&self, ty: &Type) -> Option<Vec<i64>> {
+        let resolved = self.resolve_named_body(ty)?;
+        match resolved {
+            Type::IntLit(n) => Some(vec![n]),
+            Type::Union(variants) => {
+                let mut keys = Vec::with_capacity(variants.len());
+                for v in &variants {
+                    match self.resolve_named_body(v)? {
+                        Type::IntLit(n) => keys.push(n),
                         _ => return None,
                     }
                 }

@@ -177,6 +177,16 @@ pub fn is_compatible_env(
         (Type::StrLit(_), Type::Str) => true,
         (Type::Str, Type::StrLit(_)) => false,
 
+        // Singleton integer-literal types. An `IntLit(n)` is an `Int32` at runtime; the rules
+        // mirror `StrLit`:
+        //  1. two literals are compatible iff equal.
+        //  2. a literal widens to any integer family type (Int32 is the canonical default).
+        //  3. a bare integer type is NOT assignable to a specific literal — an arbitrary Int32
+        //     is not statically known to equal the singleton value.
+        (Type::IntLit(a), Type::IntLit(b)) => a == b,
+        (Type::IntLit(_), t) if t.is_integer() => true,
+        (t, Type::IntLit(_)) if t.is_integer() => false,
+
         // Numeric widening: narrower assignable to wider
         (a, b) if a.is_numeric() && b.is_numeric() => is_numeric_compatible(a, b),
 

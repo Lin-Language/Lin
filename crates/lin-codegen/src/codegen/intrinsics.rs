@@ -1479,6 +1479,8 @@ impl<'a> DescEncoder<'a> {
             Type::Int8 => { self.put_u8(KIND_INT); self.put_u8(1); self.put_u8(1); }
             Type::Int16 => { self.put_u8(KIND_INT); self.put_u8(2); self.put_u8(1); }
             Type::Int32 => { self.put_u8(KIND_INT); self.put_u8(4); self.put_u8(1); }
+            // IntLit(_) is Int32 at runtime — fromJson validates a signed 32-bit integer value.
+            Type::IntLit(_) => { self.put_u8(KIND_INT); self.put_u8(4); self.put_u8(1); }
             Type::Int64 => { self.put_u8(KIND_INT); self.put_u8(8); self.put_u8(1); }
             Type::UInt8 => { self.put_u8(KIND_INT); self.put_u8(1); self.put_u8(0); }
             Type::UInt16 => { self.put_u8(KIND_INT); self.put_u8(2); self.put_u8(0); }
