@@ -10,6 +10,12 @@
 //   import { parseInt32, parseFloat64, toInt32, toFloat64, isInt32, isFloat64 } from "std/number"
 import foreign "lin-runtime"
   val lin_parse_int32: (String) => Int32
+  val lin_parse_int64: (String) => Int64
+  val lin_parse_uint8: (String) => UInt8
+  val lin_parse_uint16: (String) => UInt16
+  val lin_parse_uint32: (String) => UInt32
+  val lin_parse_uint64: (String) => UInt64
+  val lin_parse_float32: (String) => Float32
   val lin_parse_float64: (String) => Float64
   val lin_to_int32: (Float64) => Int32
   val lin_to_float64: (Int32) => Float64
@@ -17,6 +23,12 @@ import foreign "lin-runtime"
   val lin_is_int32: (String) => Boolean
   val lin_is_float64: (String) => Boolean
   val lin_try_parse_int32: (String) => Int32 | Null
+  val lin_try_parse_int64: (String) => Int64 | Null
+  val lin_try_parse_uint8: (String) => UInt8 | Null
+  val lin_try_parse_uint16: (String) => UInt16 | Null
+  val lin_try_parse_uint32: (String) => UInt32 | Null
+  val lin_try_parse_uint64: (String) => UInt64 | Null
+  val lin_try_parse_float32: (String) => Float32 | Null
   val lin_try_parse_float64: (String) => Float64 | Null
   val lin_to_uint8: (UInt64) => UInt8
   val lin_to_int8: (UInt64) => Int8
@@ -47,6 +59,48 @@ export val MAX_INT64: Int64 = 9223372036854775807
 // @example parseInt32("42")   // 42
 export val parseInt32 = (s: String): Int32 =>
   lin_parse_int32(s)
+
+// Parse `s` as a base-10 Int64.
+// @param s  the string to parse.
+// @returns the parsed integer. Runtime error if unparseable or out of Int64 range.
+// @example parseInt64("9000000000")   // 9000000000
+export val parseInt64 = (s: String): Int64 =>
+  lin_parse_int64(s)
+
+// Parse `s` as a base-10 UInt8.
+// @param s  the string to parse.
+// @returns the parsed integer. Runtime error if unparseable or out of UInt8 range.
+// @example parseUInt8("255")   // 255
+export val parseUInt8 = (s: String): UInt8 =>
+  lin_parse_uint8(s)
+
+// Parse `s` as a base-10 UInt16.
+// @param s  the string to parse.
+// @returns the parsed integer. Runtime error if unparseable or out of UInt16 range.
+// @example parseUInt16("65535")   // 65535
+export val parseUInt16 = (s: String): UInt16 =>
+  lin_parse_uint16(s)
+
+// Parse `s` as a base-10 UInt32.
+// @param s  the string to parse.
+// @returns the parsed integer. Runtime error if unparseable or out of UInt32 range.
+// @example parseUInt32("4000000000")   // 4000000000
+export val parseUInt32 = (s: String): UInt32 =>
+  lin_parse_uint32(s)
+
+// Parse `s` as a base-10 UInt64.
+// @param s  the string to parse.
+// @returns the parsed integer. Runtime error if unparseable or out of UInt64 range.
+// @example parseUInt64("18446744073709551615")   // 18446744073709551615
+export val parseUInt64 = (s: String): UInt64 =>
+  lin_parse_uint64(s)
+
+// Parse `s` as a Float32.
+// @param s  the string to parse.
+// @returns the parsed floating-point value.
+// @example parseFloat32("3.14")   // 3.14
+export val parseFloat32 = (s: String): Float32 =>
+  lin_parse_float32(s)
 
 // Parse `s` as a Float64.
 // @param s  the string to parse.
@@ -141,6 +195,30 @@ export val isFloat64 = (s: String): Boolean =>
 // @example tryParseInt32("bad")   // null
 export val tryParseInt32 = (s: String): Int32 | Null =>
   lin_try_parse_int32(s)
+
+// @returns the parsed Int64, or `null` if `s` is not a valid integer.
+export val tryParseInt64 = (s: String): Int64 | Null =>
+  lin_try_parse_int64(s)
+
+// @returns the parsed UInt8, or `null` if `s` is not a valid UInt8.
+export val tryParseUInt8 = (s: String): UInt8 | Null =>
+  lin_try_parse_uint8(s)
+
+// @returns the parsed UInt16, or `null` if `s` is not a valid UInt16.
+export val tryParseUInt16 = (s: String): UInt16 | Null =>
+  lin_try_parse_uint16(s)
+
+// @returns the parsed UInt32, or `null` if `s` is not a valid UInt32.
+export val tryParseUInt32 = (s: String): UInt32 | Null =>
+  lin_try_parse_uint32(s)
+
+// @returns the parsed UInt64, or `null` if `s` is not a valid UInt64.
+export val tryParseUInt64 = (s: String): UInt64 | Null =>
+  lin_try_parse_uint64(s)
+
+// @returns the parsed Float32, or `null` if `s` is not a valid float.
+export val tryParseFloat32 = (s: String): Float32 | Null =>
+  lin_try_parse_float32(s)
 
 // Parse `s` to a Float64, narrowing to `null` on failure.
 // @param s  the string to parse.

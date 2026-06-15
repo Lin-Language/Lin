@@ -1,5 +1,5 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { parseInt32, parseFloat64, toInt32, toFloat64, toFloat32, isInt32, isFloat64, tryParseInt32, tryParseFloat64, MAX_UINT8, MIN_INT8, MAX_INT8, MAX_UINT32, MIN_INT32, MAX_INT32, MAX_UINT64, MIN_INT64, MAX_INT64 } from "std/number"
+import { parseInt32, parseInt64, parseUInt8, parseUInt16, parseUInt32, parseUInt64, parseFloat32, parseFloat64, toInt32, toFloat64, toFloat32, isInt32, isFloat64, tryParseInt32, tryParseInt64, tryParseUInt8, tryParseUInt16, tryParseUInt32, tryParseUInt64, tryParseFloat32, tryParseFloat64, MAX_UINT8, MIN_INT8, MAX_INT8, MAX_UINT32, MIN_INT32, MAX_INT32, MAX_UINT64, MIN_INT64, MAX_INT64 } from "std/number"
 import { f32ToBe } from "std/bytes"
 import { length } from "std/array"
 import { toString } from "std/string"
@@ -9,8 +9,49 @@ val s = suite("std/number", [
     expect("42".parseInt32()).toBe(42)
   ]),
 
+  test("parseInt64 parses large integer string", () => [
+    expect("9000000000".parseInt64()).toBe(9000000000)
+  ]),
+
+  test("parseUInt8 parses uint8 string", () => [
+    expect("255".parseUInt8()).toBe(255)
+  ]),
+
+  test("parseUInt16 parses uint16 string", () => [
+    expect("65535".parseUInt16()).toBe(65535)
+  ]),
+
+  test("parseUInt32 parses uint32 string", () => [
+    expect("4000000000".parseUInt32()).toBe(4000000000)
+  ]),
+
+  test("parseUInt64 parses uint64 string", () => [
+    expect("9000000000000000000".parseUInt64()).toBe(9000000000000000000)
+  ]),
+
+  test("parseFloat32 parses float32 string", () => [
+    expect("3.14".parseFloat32() > 3.13).toBe(true),
+    expect("3.14".parseFloat32() < 3.15).toBe(true)
+  ]),
+
   test("parseFloat64 parses float string", () => [
     expect("3.14".parseFloat64()).toBe(3.14)
+  ]),
+
+  test("tryParseUInt32 returns null on bad input", () => [
+    expect("bad".tryParseUInt32()).toBe(null)
+  ]),
+
+  test("tryParseUInt32 returns value on good input", () => [
+    expect("4000000000".tryParseUInt32()).toBe(4000000000)
+  ]),
+
+  test("tryParseInt64 returns null on bad input", () => [
+    expect("bad".tryParseInt64()).toBe(null)
+  ]),
+
+  test("tryParseFloat32 returns null on bad input", () => [
+    expect("bad".tryParseFloat32()).toBe(null)
   ]),
 
   test("toInt32 truncates float", () => [
