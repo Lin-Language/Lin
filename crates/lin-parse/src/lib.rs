@@ -3,7 +3,7 @@ pub mod formatter;
 pub mod parser;
 
 pub use ast::*;
-pub use formatter::Formatter;
+pub use formatter::{fmt_type, Formatter};
 pub use parser::*;
 
 use lin_common::Diagnostic;
