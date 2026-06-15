@@ -1144,6 +1144,19 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
     let bp = (*b).payload;
     if at == TAG_NULL && bt == TAG_NULL { return true; }
     if at == TAG_NULL || bt == TAG_NULL { return false; }
+    // LinObject→LinMap migration (Stage 6b): a dynamic-object FIELD VALUE may now be TAG_MAP (a
+    // nested object materialized as a map, stored in a not-yet-migrated LinObject). Normalize any
+    // map-involved dynamic-object pair to LinMap and compare structurally (mirrors lin_tagged_eq).
+    let a_dynobj = at == TAG_MAP || at == TAG_OBJECT || at == TAG_RECORD || at == TAG_SUMNODE;
+    let b_dynobj = bt == TAG_MAP || bt == TAG_OBJECT || bt == TAG_RECORD || bt == TAG_SUMNODE;
+    if (at == TAG_MAP || bt == TAG_MAP) && a_dynobj && b_dynobj {
+        let am = crate::map::dynamic_to_map(a);
+        let bm = crate::map::dynamic_to_map(b);
+        let eq = crate::map::lin_map_eq(am, bm) != 0;
+        crate::map::lin_map_release(am);
+        crate::map::lin_map_release(bm);
+        return eq;
+    }
     // Cross-numeric: widen to f64 so Int32(1) == Int64(1).
     let at_is_num = (at >= TAG_INT32 && at <= TAG_FLOAT64) || at == crate::tagged::TAG_UINT64;
     let bt_is_num = (bt >= TAG_INT32 && bt <= TAG_FLOAT64) || bt == crate::tagged::TAG_UINT64;
