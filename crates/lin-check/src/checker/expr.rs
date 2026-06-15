@@ -1648,6 +1648,26 @@ impl Checker {
     }
 
     pub(crate) fn infer_object(&mut self, fields: &[ObjectField], span: Span) -> Result<TypedExpr, Diagnostic> {
+        // Detect whether this is an integer-keyed map literal (§5.1.1).
+        // A bare integer literal key (`1:`, `-1:`, `42:`) unambiguously signals `{ Int: T }`.
+        // Negative literals arrive as BinaryOp(0 - v) from the parser's Minus prefix rule.
+        let first_int_key = fields.iter().find_map(|f| {
+            if let ObjectField::Pair(k, _) = f { extract_int_key(k) } else { None }
+        });
+        let first_str_key = fields.iter().any(|f| {
+            matches!(f, ObjectField::Pair(Expr::StringLit(..), _))
+        });
+        if first_int_key.is_some() {
+            // All keys must be integer literals — mixing string and int keys is a type error.
+            if first_str_key {
+                return Err(Diagnostic::error(
+                    span,
+                    "mixed key types in object literal: cannot mix integer keys and string keys \
+                     (use all integer keys for `{ Int: T }` or all string keys for `{ String: T }`)",
+                ));
+            }
+            return self.infer_int_map_literal(fields, span);
+        }
         let mut typed_fields = Vec::new();
         let mut spreads = Vec::new();
         let mut obj_type = IndexMap::new();
@@ -1687,6 +1707,54 @@ impl Checker {
         self.in_tail_position = saved_tail;
         // Object literal → anonymous structural type → UNSEALED.
         Ok(TypedExpr::MakeObject { fields: typed_fields, spreads, ty: Type::object(obj_type), span })
+    }
+
+    /// Infer an integer-keyed map literal `{ 1: v, -1: w, 42: x }`.
+    /// Keys are stored as their decimal string representation in `TypedExpr::MakeObject.fields`
+    /// so the existing IR/codegen machinery is reused; codegen dispatches to `lin_map_set_int`
+    /// when the map type has an integer key (it already allocates with KEY_KIND_INT).
+    fn infer_int_map_literal(&mut self, fields: &[ObjectField], span: Span) -> Result<TypedExpr, Diagnostic> {
+        let saved_tail = self.in_tail_position;
+        self.in_tail_position = false;
+        let mut typed_fields: Vec<(String, TypedExpr)> = Vec::new();
+        let mut value_types: Vec<Type> = Vec::new();
+        for field in fields {
+            match field {
+                ObjectField::Pair(key_expr, val_expr) => {
+                    let key_int = extract_int_key(key_expr).ok_or_else(|| {
+                        Diagnostic::error(
+                            key_expr.span(),
+                            "integer-keyed map literals must use integer literal keys",
+                        )
+                    })?;
+                    let typed_val = self.infer_expr(val_expr)?;
+                    let val_ty = typed_val.ty();
+                    if type_is_streamish(&val_ty) {
+                        return Err(Diagnostic::error(
+                            val_expr.span(),
+                            "a Stream cannot be stored in a map value — keep it in a `val` binding",
+                        ));
+                    }
+                    value_types.push(val_ty);
+                    typed_fields.push((key_int.to_string(), typed_val));
+                }
+                ObjectField::Spread(_) => {
+                    return Err(Diagnostic::error(
+                        span,
+                        "spread syntax is not supported in integer-keyed map literals",
+                    ));
+                }
+            }
+        }
+        self.in_tail_position = saved_tail;
+        let value_ty = unify_types(&value_types);
+        let key_ty = Type::Int32;
+        Ok(TypedExpr::MakeObject {
+            fields: typed_fields,
+            spreads: Vec::new(),
+            ty: Type::Map { key: Box::new(key_ty), value: Box::new(value_ty) },
+            span,
+        })
     }
 
     /// Bidirectional refinement for an object literal against an expected type (ADR-034).
@@ -1771,21 +1839,32 @@ impl Checker {
             // typed `Map{K,V}` and lowered into a `LinMap`. The empty `{}` literal is the common
             // case (`var m: { String: T } = {}`), which produces an empty hashed map of the right
             // type — this is how `{}` infers a map from its assignment-target / return-type context.
-            // For Int-keyed maps, only empty `{}` literals are accepted here (no int-literal-keyed
-            // object syntax yet); non-empty int-map literals fall through to inference.
             Type::Map { key: map_key_ty, value: val_ty } => {
                 let mut typed_fields = Vec::new();
-                for field in fields {
-                    if let ObjectField::Pair(Expr::StringLit(key, _), val_expr) = field {
-                        // Only allow string-literal keys for String-keyed maps.
-                        if map_key_ty.is_integer() {
+                if map_key_ty.is_integer() {
+                    // Integer-keyed map: each key must be an integer literal.
+                    for field in fields {
+                        match field {
+                            ObjectField::Pair(key_expr, val_expr) => {
+                                let key_int = match extract_int_key(key_expr) {
+                                    Some(k) => k,
+                                    None => return Ok(None),
+                                };
+                                let typed_val = self.check_expr(val_expr, val_ty)?;
+                                typed_fields.push((key_int.to_string(), typed_val));
+                            }
+                            ObjectField::Spread(_) => return Ok(None),
+                        }
+                    }
+                } else {
+                    for field in fields {
+                        if let ObjectField::Pair(Expr::StringLit(key, _), val_expr) = field {
+                            let typed_val = self.check_expr(val_expr, val_ty)?;
+                            typed_fields.push((key.clone(), typed_val));
+                        } else {
+                            // A non-literal key or a dynamic field shape — defer to ordinary inference.
                             return Ok(None);
                         }
-                        let typed_val = self.check_expr(val_expr, val_ty)?;
-                        typed_fields.push((key.clone(), typed_val));
-                    } else {
-                        // A non-literal key or a dynamic field shape — defer to ordinary inference.
-                        return Ok(None);
                     }
                 }
                 Ok(Some(TypedExpr::MakeObject {
@@ -2282,5 +2361,23 @@ pub(crate) fn type_mentions_generic_tv(ty: &Type) -> bool {
             params.iter().any(type_mentions_generic_tv) || type_mentions_generic_tv(ret)
         }
         _ => false,
+    }
+}
+
+/// Extract a compile-time i64 from an integer-literal key expression.
+/// Accepts bare `IntLit(v)` and the parser's negation encoding `BinaryOp(0 - v)` so that
+/// `{ -1: … }` is recognised as key `-1` (§5.1.1 disambiguation rule).
+fn extract_int_key(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::IntLit(v, _, _) => Some(*v),
+        Expr::BinaryOp { op: BinOp::Sub, left, right, .. } => {
+            // Parser lowers `-N` as `0 - N`; both sides must be integer literals.
+            if let (Expr::IntLit(0, None, _), Expr::IntLit(v, _, _)) = (left.as_ref(), right.as_ref()) {
+                Some(-v)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
