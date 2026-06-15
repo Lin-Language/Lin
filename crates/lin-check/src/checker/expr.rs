@@ -1647,6 +1647,9 @@ impl Checker {
 
     pub(crate) fn infer_block(&mut self, stmts: &[Stmt], final_expr: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
         self.env.push_scope();
+        // Forward-declare any function-literal `val` bindings in this block so they can refer
+        // to each other regardless of definition order (hoisting, mirrors module-level ADR-012).
+        self.forward_declare_functions_in(stmts);
         let mut typed_stmts = Vec::new();
         let block_tail = self.in_tail_position;
         self.in_tail_position = false;
