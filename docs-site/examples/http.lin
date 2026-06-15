@@ -10,7 +10,7 @@ print("name: ${user["name"]}")
 
 // Server: a handler maps a request to a response. Pattern-match on the request's
 // method and path shape — bind path/body fields inline, with an else for 404.
-val handler = (req: Json): Json =>
+val handler = (req: AnyVal): AnyVal =>
   match req
     has { "method": "GET", "path": "/" }        => text(200, "Lin web server")
     has { "method": "GET", "path": "/health" }  => json(200, { "ok": true })

@@ -42,7 +42,7 @@ Read all of standard input as lines.
 #### `print`
 
 ```lin
-val print = (x: Json): Null
+val print = (x: AnyVal): Null
 ```
 
 Print a value to standard output, followed by a newline.
@@ -69,7 +69,7 @@ print({ "a": 1 })  // {"a":1}
 #### `printErr`
 
 ```lin
-val printErr = (x: Json): Null
+val printErr = (x: AnyVal): Null
 ```
 
 Print a value to standard error, followed by a newline.

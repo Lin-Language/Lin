@@ -49,7 +49,7 @@ Only a restricted set of types may appear in `import foreign` signatures:
 | `Null` (return only) | `void` |
 | `String` | `LinString` struct (see below) |
 
-`Json`, object types, array types, `Iterator`, and `Function` are not permitted in foreign signatures.
+`AnyVal`, object types, array types, `Iterator`, and `Function` are not permitted in foreign signatures.
 
 ## String passing convention
 
@@ -92,7 +92,7 @@ The path `"lin-runtime"` is reserved for stdlib files that declare their depende
 
 ```lin
 import foreign "lin-runtime"
-  val lin_fs_read_file: (String) => Json
+  val lin_fs_read_file: (String) => AnyVal
 ```
 
 User code cannot use this path meaningfully — the runtime is always linked automatically.
