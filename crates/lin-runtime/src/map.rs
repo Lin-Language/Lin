@@ -86,13 +86,21 @@ pub extern "C" fn lin_map_profile_print() {
 
 /// A hashed map. `slots` points at `cap` `Slot`s (cap is always a power of two).
 /// `key_kind` selects the key type: KEY_KIND_STRING (0) or KEY_KIND_INT (1).
+/// `order` is a heap-allocated `*mut u64` array of length `len` tracking insertion order:
+/// each entry is a raw key (pointer for String maps, i64 bits for Int maps) in the order
+/// the key was FIRST inserted. This lets `lin_map_keys` return keys in insertion order,
+/// matching `lin_object_keys` behavior. The order array is grown by doubling (cap_order
+/// tracks its allocation size; always >= len).
 #[repr(C)]
 pub struct LinMap {
     pub refcount: u32,
     pub len: u32,       // number of occupied slots
     pub cap: u32,       // table size (power of two), 0 = no table allocated yet
-    pub key_kind: u32,  // KEY_KIND_STRING or KEY_KIND_INT (replaces old _pad)
+    pub key_kind: u32,  // KEY_KIND_STRING (0) or KEY_KIND_INT (1)
     pub slots: *mut Slot,
+    pub order: *mut u64, // insertion-order key list, length = len, capacity = cap_order
+    pub cap_order: u32,  // allocated capacity of `order` array
+    pub _pad: u32,       // padding for 8-byte alignment
 }
 
 /// Each slot stores the full 64-bit hash inline so probe steps can skip `key_eq`
@@ -136,6 +144,33 @@ unsafe fn alloc_slots(cap: u32) -> *mut Slot {
     let buf = alloc(slots_layout(cap)) as *mut Slot;
     std::ptr::write_bytes(buf as *mut u8, 0, slots_layout(cap).size());
     buf
+}
+
+unsafe fn order_layout(cap: u32) -> Layout {
+    Layout::from_size_align_unchecked(
+        std::mem::size_of::<u64>() * cap as usize,
+        std::mem::align_of::<u64>(),
+    )
+}
+
+/// Allocate an uninitialised order array of `cap` u64 slots.
+unsafe fn alloc_order(cap: u32) -> *mut u64 {
+    alloc(order_layout(cap)) as *mut u64
+}
+
+/// Append `key` to the order list, growing if necessary.
+unsafe fn order_push(map: *mut LinMap, key: u64) {
+    let len = (*map).len; // called before len is incremented
+    if len >= (*map).cap_order {
+        let old_cap = (*map).cap_order;
+        let new_cap = if old_cap == 0 { INITIAL_CAP } else { old_cap * 2 };
+        let new_order = alloc_order(new_cap) as *mut u64;
+        std::ptr::copy_nonoverlapping((*map).order, new_order, len as usize);
+        dealloc((*map).order as *mut u8, order_layout(old_cap));
+        (*map).order = new_order;
+        (*map).cap_order = new_cap;
+    }
+    *(*map).order.add(len as usize) = key;
 }
 
 // ── Hash functions ───────────────────────────────────────────────────────────────────────────
@@ -307,6 +342,10 @@ pub unsafe extern "C" fn lin_map_alloc(hint: u32, key_kind: u32) -> *mut LinMap 
     (*ptr).cap = INITIAL_CAP;
     (*ptr).key_kind = key_kind;
     (*ptr).slots = alloc_slots(INITIAL_CAP);
+    let order_cap = INITIAL_CAP;
+    (*ptr).order = alloc_order(order_cap);
+    (*ptr).cap_order = order_cap;
+    (*ptr)._pad = 0;
     ptr
 }
 
@@ -323,7 +362,8 @@ pub unsafe extern "C" fn lin_map_set(map: *mut LinMap, key: *mut LinString, val:
     let idx = find_slot_string(map, key, khash);
     let slot = (*map).slots.add(idx);
     if (*slot).hash == 0 {
-        // Fresh insert.
+        // Fresh insert — record insertion order before incrementing len.
+        order_push(map, key as u64);
         (*slot).hash = khash;
         lin_string_inc_ref(key);
         (*slot).key = key as u64;
@@ -331,7 +371,7 @@ pub unsafe extern "C" fn lin_map_set(map: *mut LinMap, key: *mut LinString, val:
         crate::object::retain_tagged_payload_pub(val_ref);
         (*map).len += 1;
     } else {
-        // Overwrite.
+        // Overwrite — order unchanged (key already present).
         crate::object::release_tagged_payload_pub(&(*slot).value);
         std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
         crate::object::retain_tagged_payload_pub(val_ref);
@@ -372,14 +412,15 @@ pub unsafe extern "C" fn lin_map_set_int(map: *mut LinMap, key: i64, val: *const
     let idx = find_slot_int(map, key_bits, khash);
     let slot = (*map).slots.add(idx);
     if (*slot).hash == 0 {
-        // Fresh insert: no key RC (scalar).
+        // Fresh insert: no key RC (scalar) — record insertion order.
+        order_push(map, key_bits);
         (*slot).hash = khash;
         (*slot).key = key_bits;
         std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
         crate::object::retain_tagged_payload_pub(val_ref);
         (*map).len += 1;
     } else {
-        // Overwrite.
+        // Overwrite — order unchanged.
         crate::object::release_tagged_payload_pub(&(*slot).value);
         std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
         crate::object::retain_tagged_payload_pub(val_ref);
@@ -459,35 +500,19 @@ pub unsafe extern "C" fn lin_map_length(map: *const LinMap) -> i64 {
 pub unsafe extern "C" fn lin_map_keys(map: *const LinMap) -> *mut crate::array::LinArray {
     let len = if map.is_null() { 0 } else { (*map).len };
     let arr = crate::array::lin_array_alloc(len as u64);
-    if !map.is_null() {
-        let cap = (*map).cap as usize;
+    if !map.is_null() && len > 0 && !(*map).order.is_null() {
         let is_int = (*map).key_kind == KEY_KIND_INT;
-        if is_int {
-            // Int keys: collect and sort numerically for deterministic ordering.
-            let mut keys: Vec<u64> = Vec::with_capacity(len as usize);
-            for i in 0..cap {
-                let slot = (*map).slots.add(i);
-                if (*slot).hash == 0 { continue; }
-                keys.push((*slot).key);
-            }
-            keys.sort_unstable_by_key(|&k| k as i64);
-            for (out, &key) in keys.iter().enumerate() {
-                let dst = (*arr).data.add(out);
+        for i in 0..len as usize {
+            let key = *(*map).order.add(i);
+            let dst = (*arr).data.add(i);
+            if is_int {
                 (*dst).tag = crate::tagged::TAG_INT64;
                 (*dst).payload = key;
-            }
-        } else {
-            // String keys: bucket iteration order (insertion-stable hash scan).
-            let mut out = 0usize;
-            for i in 0..cap {
-                let slot = (*map).slots.add(i);
-                if (*slot).hash == 0 { continue; }
-                let dst = (*arr).data.add(out);
-                let key_ptr = (*slot).key as *mut LinString;
+            } else {
+                let key_ptr = key as *mut LinString;
                 lin_string_inc_ref(key_ptr);
                 (*dst).tag = crate::tagged::TAG_STR;
-                (*dst).payload = (*slot).key;
-                out += 1;
+                (*dst).payload = key;
             }
         }
     }
@@ -586,6 +611,10 @@ pub unsafe extern "C" fn lin_map_release(map: *mut LinMap) {
             crate::object::release_tagged_payload_pub(&(*slot).value);
         }
         dealloc((*map).slots as *mut u8, slots_layout(cap));
+    }
+    let cap_order = (*map).cap_order;
+    if cap_order > 0 && !(*map).order.is_null() {
+        dealloc((*map).order as *mut u8, order_layout(cap_order));
     }
     dealloc(map as *mut u8, map_header_layout());
 }
@@ -745,24 +774,33 @@ pub unsafe extern "C" fn lin_map_eq(a: *const LinMap, b: *const LinMap) -> u8 {
 
 /// Merge `src` into `dst` (mirrors `lin_object_merge` — object spread). Both maps must share a
 /// key kind; a null `src` contributes nothing. Each value is retained by `lin_map_set`.
+/// Iterates in insertion order to preserve key ordering semantics.
 #[no_mangle]
 pub unsafe extern "C-unwind" fn lin_map_merge(dst: *mut LinMap, src: *const LinMap) {
     if src.is_null() || dst.is_null() { return; }
-    let cap = (*src).cap as usize;
+    let len = (*src).len as usize;
     let is_int = (*src).key_kind == KEY_KIND_INT;
-    for i in 0..cap {
-        let slot = (*src).slots.add(i);
-        if (*slot).hash == 0 { continue; }
+    if (*src).order.is_null() || len == 0 { return; }
+    for i in 0..len {
+        let key = *(*src).order.add(i);
+        // Look up the value by key to pass to lin_map_set.
         if is_int {
-            lin_map_set_int(dst, (*slot).key as i64, &(*slot).value);
+            let val = lin_map_get_int(src, key as i64);
+            let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
+            let val_ref = if val.is_null() { &null_tv } else { &*val };
+            lin_map_set_int(dst, key as i64, val_ref);
         } else {
-            lin_map_set(dst, (*slot).key as *mut LinString, &(*slot).value);
+            let val = lin_map_get(src, key as *const LinString);
+            let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
+            let val_ref = if val.is_null() { &null_tv } else { &*val };
+            lin_map_set(dst, key as *mut LinString, val_ref);
         }
     }
 }
 
 /// Copy every entry of `src` into `dst` except those whose key is in `excluded` (mirrors
 /// `lin_object_copy_except` — object rest pattern). String-keyed only (rest is string-keyed).
+/// Iterates in insertion order to preserve key ordering semantics.
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_copy_except(
     dst: *mut LinMap,
@@ -771,17 +809,19 @@ pub unsafe extern "C" fn lin_map_copy_except(
     n_excluded: u32,
 ) {
     if src.is_null() || dst.is_null() { return; }
-    let cap = (*src).cap as usize;
-    'outer: for i in 0..cap {
-        let slot = (*src).slots.add(i);
-        if (*slot).hash == 0 { continue; }
-        let key = (*slot).key as *const LinString;
+    let len = (*src).len as usize;
+    if (*src).order.is_null() || len == 0 { return; }
+    'outer: for i in 0..len {
+        let key = *(*src).order.add(i) as *const LinString;
         for j in 0..n_excluded {
             if string_key_eq(key, *excluded.add(j as usize)) {
                 continue 'outer;
             }
         }
-        lin_map_set(dst, key as *mut LinString, &(*slot).value);
+        let val = lin_map_get(src, key);
+        let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
+        let val_ref = if val.is_null() { &null_tv } else { &*val };
+        lin_map_set(dst, key as *mut LinString, val_ref);
     }
 }
 
