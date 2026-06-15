@@ -172,6 +172,40 @@ Investigation steps (in order — cheap discriminators first):
   [[project_raptor_dematerialization_measured]]), not allocator.
 Deliverable: root-cause (arena vs leak vs working-set) + the cheapest fix that closes most of the gap.
 
+## WAVE M — ROOT CAUSE FOUND (2026-06-15): allocation amplification, not allocator
+
+Measured the typed RAPTOR peak with a counting global allocator (`memprofile.rs`, branch
+experiment/mem-profile — NOT merged, it's a probe):
+
+- **Allocator ruled out**: peak RSS is ~25GB under glibc-default, ~25GB under `MALLOC_ARENA_MAX=1`, and
+  ~23GB under **mimalloc** — all equal. mimalloc returns freed memory aggressively, so this is genuinely
+  live, not fragmentation. (mimalloc as global allocator works as a one-liner in lin-runtime and shaved
+  ~10% — worth shipping later regardless, but it is NOT the fix.)
+- **Root cause = allocation COUNT**: at peak the program holds **265 MILLION live allocations / 21.4 GB**.
+  Live-count by size class: ≤16B=38M (TaggedVal boxes), ≤48B=89M + ≤64B=85M (sealed StopTime/Trip
+  records, ~10GB), ≤256B=51.7M (larger records/arrays, ~6-13GB).
+- **Amplification ≈ 100×**: the dataset is ~2.37M stop_times + 240K trips + 3K stops ≈ 2.6M logical
+  records, yet there are 265M live allocations — ~100 heap objects per logical record. Node holds the
+  same data in 2-4GB because V8 stores object arrays contiguously with inline fields and small-int
+  values; Lin allocates a separate heap object per record AND per field/value, with no columnar storage.
+
+This is the dominant remaining gap and an ARCHITECTURAL project (call it Wave R — representation
+efficiency), bigger than the Wave B cleanups. Candidate levers, roughly highest-ROI first:
+- [ ] **Attribute the 265M precisely**: split the counter by allocation KIND (string/array/map/sealed/
+  box) and by phase (LOAD vs PREP vs RANGE) to see whether LOAD intermediates (parsed CSV rows / Json)
+  are retained into PREP (a reclaimable retention) vs the typed records themselves (representation).
+- [ ] **Intern repeated strings**: stop_id/route_id/trip_id repeat across millions of stop_times; if each
+  record holds its own LinString copy, interning collapses millions of duplicates to thousands.
+- [ ] **Columnar / flat scalar storage for record arrays**: a `StopTime[]` of all-scalar (Int) fields
+  could be a flat struct-of-arrays (one allocation for N records) instead of N boxed records — the
+  0xFE packed-array path already exists; widen it so a big record array is one buffer, not N objects.
+- [ ] **Stop boxing scalar values in dynamic containers** (the ≤16B 38M boxes) — immediate/tagged
+  small-int values (the path-10 8-byte-immediate spike) avoid a heap box per dynamic scalar.
+- [ ] **Avoid PREP record-copy doubling** (memory note: "value-array regroup copies records") — regroup
+  by index/reference instead of copying record values.
+Deliverable already achieved: root cause (allocation amplification ~100×) + allocator ruled out. Next is
+the per-kind/per-phase attribution to pick the highest-ROI lever.
+
 ## Sequencing
 
 ```
