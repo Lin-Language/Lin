@@ -7404,7 +7404,7 @@ export val thingCount = 7
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("gtfs.lin"),
-            "export type Trip = { id: String }\n",
+            "export type Trip = { \"id\": String }\n",
         )
         .unwrap();
 
