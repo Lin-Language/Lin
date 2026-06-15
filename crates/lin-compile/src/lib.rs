@@ -728,6 +728,7 @@ const STDLIB_MODULES: &[(&str, &str)] = &[
     ("std/env",      include_str!("../../../stdlib/env.lin")),
     ("std/test",     include_str!("../../../stdlib/test.lin")),
     ("std/time",     include_str!("../../../stdlib/time.lin")),
+    ("std/datetime", include_str!("../../../stdlib/datetime.lin")),
     ("std/path",     include_str!("../../../stdlib/path.lin")),
     ("std/math",     include_str!("../../../stdlib/math.lin")),
     ("std/bytes",    include_str!("../../../stdlib/bytes.lin")),

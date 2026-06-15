@@ -899,6 +899,17 @@ fn fmt_binop_operand(operand: &Expr, parent: &BinOp, is_right: bool, render: imp
         // `(m["x"] ?? 0) + 1` reparses as `m["x"] ?? (0 + 1)` if the parens are dropped. This is
         // unconditional, independent of whether the source happened to have parens.
         Expr::Coalesce { .. } => return format!("({})", s),
+        // A GREEDY-TAILED primary — `if`/`match`/bare-lambda/block — parses its trailing branch
+        // (then/else, arm body, `=>` body) by consuming a full expression, so as a binary operand
+        // it MUST be parenthesised to preserve the parse. Both sides need it: a left operand
+        // `(if c then x else y) / 400` reparses as `if c then x else (y / 400)`, and a right
+        // operand is unsafe whenever the whole binary expression is itself followed by more —
+        // `(x * if c then a else b) + 1` reparses with `b + 1` swallowed into the `else`. Always
+        // wrapping is the only locally-sound rule (the operand carries no "is anything to my right"
+        // context here), and it is idempotent.
+        Expr::If { .. } | Expr::Match { .. } | Expr::Function { .. } | Expr::Block(..) => {
+            return format!("({})", s)
+        }
         _ => {}
     }
     s
@@ -1255,7 +1266,7 @@ fn indent_first(s: &str, ind: &str) -> String {
 
 // ── type expressions ──────────────────────────────────────────────────────────
 
-fn fmt_type(ty: &TypeExpr) -> String {
+pub fn fmt_type(ty: &TypeExpr) -> String {
     match ty {
         TypeExpr::Named(name, _) => name.clone(),
         TypeExpr::Generic(name, params, _) => {

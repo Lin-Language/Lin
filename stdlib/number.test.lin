@@ -1,5 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { parseInt32, parseFloat64, toInt32, toFloat64, toFloat32, isInt32, isFloat64, tryParseInt32, tryParseFloat64, MAX_UINT8, MIN_INT8, MAX_INT8, MAX_UINT32, MIN_INT32, MAX_INT32, MAX_UINT64, MIN_INT64, MAX_INT64 } from "std/number"
+import { parseInt32, parseInt64, parseUInt8, parseUInt16, parseUInt32, parseUInt64, parseFloat32, parseFloat64, toInt32, toFloat64, toFloat32, isInt32, isFloat64, tryParseInt32, tryParseInt64, tryParseUInt8, tryParseUInt16, tryParseUInt32, tryParseUInt64, tryParseFloat32, tryParseFloat64, MAX_UINT8, MIN_INT8, MAX_INT8, MAX_UINT32, MIN_INT32, MAX_INT32, MAX_UINT64, MIN_INT64, MAX_INT64 } from "std/number"
+import { narrowToUInt8, narrowToInt8, narrowToUInt16, narrowToInt16, narrowToUInt32, narrowToInt32, narrowToUInt64 } from "std/number"
 import { f32ToBe } from "std/bytes"
 import { length } from "std/array"
 import { toString } from "std/string"
@@ -9,8 +10,49 @@ val s = suite("std/number", [
     expect("42".parseInt32()).toBe(42)
   ]),
 
+  test("parseInt64 parses large integer string", () => [
+    expect("9000000000".parseInt64()).toBe(9000000000)
+  ]),
+
+  test("parseUInt8 parses uint8 string", () => [
+    expect("255".parseUInt8()).toBe(255)
+  ]),
+
+  test("parseUInt16 parses uint16 string", () => [
+    expect("65535".parseUInt16()).toBe(65535)
+  ]),
+
+  test("parseUInt32 parses uint32 string", () => [
+    expect("4000000000".parseUInt32()).toBe(4000000000)
+  ]),
+
+  test("parseUInt64 parses uint64 string", () => [
+    expect("9000000000000000000".parseUInt64()).toBe(9000000000000000000)
+  ]),
+
+  test("parseFloat32 parses float32 string", () => [
+    expect("3.14".parseFloat32() > 3.13).toBe(true),
+    expect("3.14".parseFloat32() < 3.15).toBe(true)
+  ]),
+
   test("parseFloat64 parses float string", () => [
     expect("3.14".parseFloat64()).toBe(3.14)
+  ]),
+
+  test("tryParseUInt32 returns null on bad input", () => [
+    expect("bad".tryParseUInt32()).toBe(null)
+  ]),
+
+  test("tryParseUInt32 returns value on good input", () => [
+    expect("4000000000".tryParseUInt32()).toBe(4000000000)
+  ]),
+
+  test("tryParseInt64 returns null on bad input", () => [
+    expect("bad".tryParseInt64()).toBe(null)
+  ]),
+
+  test("tryParseFloat32 returns null on bad input", () => [
+    expect("bad".tryParseFloat32()).toBe(null)
   ]),
 
   test("toInt32 truncates float", () => [
@@ -138,6 +180,36 @@ val s = suite("std/number", [
 
   test("MAX_INT64 is 9223372036854775807", () => [
     expect(toString(MAX_INT64)).toBe("9223372036854775807")
+  ]),
+
+  // ── narrowTo* : Int64 -> fixed-width truncating casts ─────────────────────
+  // The complement of the toUInt8/… family: these take a SIGNED Int64 (the widest signed integer,
+  // into which any computed integer widens), so a value computed in Int64 can be narrowed to a small
+  // field — the path the toUInt8 family (UInt64 input) cannot provide, since Int64 -> UInt64 is not
+  // an implicit coercion.
+  test("narrowTo* truncate an in-range Int64 unchanged", () => [
+    expect(toString(narrowToUInt8(200))).toBe("200"),
+    expect(toString(narrowToInt8(-5))).toBe("-5"),
+    expect(toString(narrowToUInt16(1000))).toBe("1000"),
+    expect(toString(narrowToInt16(-1000))).toBe("-1000"),
+    expect(toString(narrowToUInt32(70000))).toBe("70000"),
+    expect(toString(narrowToInt32(-70000))).toBe("-70000")
+  ]),
+
+  test("narrowTo* truncate an out-of-range Int64 to its low bits", () => [
+    expect(toString(narrowToUInt8(300))).toBe("44"), // 300 & 0xFF
+    expect(toString(narrowToUInt8(256))).toBe("0"),
+    expect(toString(narrowToUInt16(70000))).toBe("4464"), // 70000 & 0xFFFF
+    expect(toString(narrowToInt8(255))).toBe("-1") // two's-complement reinterpret
+  ]),
+
+  test("narrowToInt32 narrows a negative Int64 (the toInt32-from-int gap)", () => [
+    expect(toString(narrowToInt32(0 - 44))).toBe("-44"),
+    expect(toString(narrowToInt32(2024))).toBe("2024")
+  ]),
+
+  test("narrowToUInt64 reinterprets a negative Int64 (signed->unsigned bridge)", () => [
+    expect(toString(narrowToUInt64(0 - 1))).toBe("18446744073709551615")
   ])
 ])
 

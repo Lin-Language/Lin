@@ -1416,6 +1416,7 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/async"    => Some(include_str!("../../../stdlib/async.lin")),
         "std/test"     => Some(include_str!("../../../stdlib/test.lin")),
         "std/time"     => Some(include_str!("../../../stdlib/time.lin")),
+        "std/datetime" => Some(include_str!("../../../stdlib/datetime.lin")),
         "std/path"     => Some(include_str!("../../../stdlib/path.lin")),
         "std/math"     => Some(include_str!("../../../stdlib/math.lin")),
         "std/env"      => Some(include_str!("../../../stdlib/env.lin")),
@@ -6384,7 +6385,7 @@ fn seed_stdlib_index(index: &mut WorkspaceIndex) {
 const STDLIB_MODULE_IDS: &[&str] = &[
     "std/io", "std/json", "std/string", "std/number", "std/array", "std/iter",
     "std/object", "std/fs", "std/ffi", "std/http", "std/template", "std/async",
-    "std/test", "std/time", "std/path", "std/math", "std/env",
+    "std/test", "std/time", "std/datetime", "std/path", "std/math", "std/env",
     "std/bytes", "std/regex", "std/crypto", "std/csv", "std/encoding", "std/random", "std/bignum", "std/decimal", "std/net", "std/process", "std/tty", "std/signal", "std/yaml",
     "std/jq", "std/stream", "std/compress", "std/archive", "std/event",
 ];

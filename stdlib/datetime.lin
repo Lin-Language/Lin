@@ -1,0 +1,597 @@
+// std/datetime — an immutable, structural calendar library (proleptic Gregorian, UTC).
+//
+// Inspired by java.time and TC39 Temporal, but built entirely from Lin records:
+//
+//   Date      = { year, month, day }                         — a calendar day  (Temporal.PlainDate)
+//   Time      = { hour, minute, second, millis }             — a wall-clock time (Temporal.PlainTime)
+//   DateTime  = Date & Time                                  — a day + time     (Temporal.PlainDateTime)
+//   Duration  = { millis }                                   — an exact elapsed span (always milliseconds)
+//   Period    = { years, months, days }                      — a calendar span (months are not fixed-length)
+//   Weekday   = 0 | 1 | … | 6                                — day of week (0=Sunday), with Sun..Sat constants
+//   OffsetDateTime = DateTime & { offsetMinutes }            — a DateTime at a fixed UTC offset (java.time OffsetDateTime)
+//
+// Because `DateTime` is the record intersection `Date & Time` (ADR-061), every `DateTime` is *also*
+// a `Date` and a `Time` by structural width-subtyping — you can pass one straight to any `Date`/`Time`
+// function, which reads only the fields it needs. (Likewise an `OffsetDateTime` is structurally a
+// `DateTime`.) All fields are `Int64`, so arithmetic composes without casts; `year` may be negative
+// (proleptic Gregorian, no year 0 gap — astronomical numbering).
+//
+// All values are immutable: every "mutating" operation returns a fresh record. Construction validates
+// its fields and returns `T | Error` (the canonical `{ "type":"error", ... }`, matched with `is Error`);
+// the calendar shifts (`addDays`/`addMonths`/`addYears`/`addPeriod`) never fail — out-of-range days are
+// clamped to the month end (Jan 31 + 1mo -> Feb 28/29). `now`/`today`/`nowAt` are the only impure
+// functions (they read the wall clock via std/time); everything else is pure.
+//
+// The core is UTC. `OffsetDateTime` + `withOffset`/`atOffset`/`toOffset`/`toInstant` add support for a
+// FIXED UTC offset (e.g. +05:30 year-round) — enough to read and render local civil time at a constant
+// offset, and to parse/emit ISO `±HH:MM`. This is NOT a named timezone: there is no DST and no
+// historical-offset handling. Full IANA timezone support (DST, `America/New_York`) is out of scope.
+//
+//   import { date, dateTime, now, today, addDays, addMonths, toIso, parseIso } from "std/datetime"
+//   import { OffsetDateTime, withOffset, atOffset, toInstant, nowAt, toIsoOffsetDateTime } from "std/datetime"
+import { toString, padStart, split, substring, indexOf } from "std/string"
+import { length } from "std/array"
+import { tryParseInt32 } from "std/number"
+import { error } from "std/object"
+import { now as wallClockNow } from "std/time"
+
+// ── Types ──────────────────────────────────────────────────────────────────────
+// A calendar day with no time-of-day. `month` is 1-12, `day` is 1-31. (Temporal.PlainDate.)
+export type Date = { "year": Int64, "month": Int64, "day": Int64 }
+// A wall-clock time with no date. `hour` 0-23, `minute`/`second` 0-59, `millis` 0-999. (Temporal.PlainTime.)
+export type Time = { "hour": Int64, "minute": Int64, "second": Int64, "millis": Int64 }
+// A day together with a time-of-day — the intersection of `Date` and `Time`, so a `DateTime` is usable
+// anywhere a `Date` or a `Time` is expected. (Temporal.PlainDateTime.)
+export type DateTime = Date & Time
+// An exact elapsed span, held as a whole number of milliseconds. Composes by addition and scaling.
+export type Duration = { "millis": Int64 }
+// A calendar span in human units. Unlike `Duration` these are not fixed-length (a month varies), so a
+// `Period` is only meaningful when added to a specific `Date` via `addPeriod`.
+export type Period = { "years": Int64, "months": Int64, "days": Int64 }
+// A `DateTime` tagged with a fixed UTC offset in minutes (`offsetMinutes`, e.g. 330 for +05:30, -300
+// for -05:00). The `DateTime` fields are the LOCAL wall-clock at that offset; the instant they denote
+// is `wall - offset` (see `toInstant`). Because it is the intersection `DateTime & { offsetMinutes }`,
+// an `OffsetDateTime` is structurally also a `DateTime`/`Date`/`Time` — pass it to any of their
+// functions and the local wall-clock fields are read. This is a FIXED offset (java.time
+// `OffsetDateTime`, Temporal offset string), NOT a named zone: it has no DST, so +05:00 means +05:00
+// year-round. Full IANA timezone support is out of scope. (Temporal.OffsetDateTime / `java.time.OffsetDateTime`.)
+export type OffsetDateTime = DateTime & { "offsetMinutes": Int64 }
+// The day of the week as a numeric literal union: 0=Sunday .. 6=Saturday. Returned by `weekday`,
+// so a `match` over it is exhaustively checked and only the seven valid values type-check. The
+// `Sun`..`Sat` constants below name each value.
+export type Weekday = 0 | 1 | 2 | 3 | 4 | 5 | 6
+
+// Named `Weekday` constants — use these rather than bare integers for readable `match` arms and
+// comparisons (`weekday(d) == Sat`).
+export val Sun: Weekday = 0
+export val Mon: Weekday = 1
+export val Tue: Weekday = 2
+export val Wed: Weekday = 3
+export val Thu: Weekday = 4
+export val Fri: Weekday = 5
+export val Sat: Weekday = 6
+
+// Milliseconds in one UTC day — the unit there is no DST to perturb.
+val MS_PER_DAY: Int64 = 86400000
+
+// ── Internal integer helpers ─────────────────────────────────────────────────────
+// Lin's `/` and `%` truncate toward zero; the calendar math needs floored division.
+val floorDiv = (a: Int64, b: Int64): Int64 =>
+  val q = a / b
+  if a % b != 0 && (a < 0) != (b < 0) then q - 1 else q
+
+val floorMod = (a: Int64, b: Int64): Int64 =>
+  val r = a % b
+  if r != 0 && (r < 0) != (b < 0) then r + b else r
+
+// ── Leap years and month lengths ──────────────────────────────────────────────────
+// Whether `year` is a Gregorian leap year (divisible by 4, except centuries not divisible by 400).
+// @example isLeapYear(2000)  // true     isLeapYear(1900)  // false
+export val isLeapYear = (year: Int64): Boolean =>
+  (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+
+// The number of days in a given (year, month). `month` is 1-12; Feb is leap-aware.
+// @example daysInMonth(2024, 2)  // 29
+export val daysInMonth = (year: Int64, month: Int64): Int64 =>
+  if month == 2 then
+    if isLeapYear(year) then 29 else 28
+  else if month == 4 || month == 6 || month == 9 || month == 11 then
+    30
+  else
+    31
+
+// ── Civil <-> epoch-day (Howard Hinnant's algorithm) ───────────────────────────────
+// These convert between a (year, month, day) triple and a count of days since the Unix epoch
+// (1970-01-01 = day 0). They are exact for the whole Int64 range and assume truncating division,
+// which Lin provides. http://howardhinnant.github.io/date_algorithms.html
+// The number of days from 1970-01-01 to the given civil date (negative before the epoch).
+export val toEpochDay = (d: Date): Int64 =>
+  val y = if d["month"] <= 2 then d["year"] - 1 else d["year"]
+  val era = (if y >= 0 then y else y - 399) / 400
+  val yoe = y - era * 400
+  val mp = if d["month"] > 2 then d["month"] - 3 else d["month"] + 9
+  val doy = (153 * mp + 2) / 5 + d["day"] - 1
+  val doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+  era * 146097 + doe - 719468
+
+// The civil `Date` for a count of days since 1970-01-01 (the inverse of `toEpochDay`).
+export val fromEpochDay = (epochDay: Int64): Date =>
+  val z = epochDay + 719468
+  val era = (if z >= 0 then z else z - 146096) / 146097
+  val doe = z - era * 146097
+  val yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  val y = yoe + era * 400
+  val doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+  val mp = (5 * doy + 2) / 153
+  val day = doy - (153 * mp + 2) / 5 + 1
+  val month = if mp < 10 then mp + 3 else mp - 9
+  {
+    "year": if month <= 2 then y + 1 else y,
+    "month": month,
+    "day": day
+  }
+
+// ── Construction (validating) ──────────────────────────────────────────────────────
+// Build a validated `Date`. Rejects out-of-range fields rather than normalising them, so typos
+// surface as errors. `year` is unconstrained (proleptic Gregorian, may be negative).
+// @returns the `Date`, or an `Error` if `month` is not 1-12 or `day` not in range for the month.
+// @example date(2024, 2, 29)  // ok (leap day)     date(2023, 2, 29)  // Error
+export val date = (year: Int64, month: Int64, day: Int64): Date | Error =>
+  if month < 1 || month > 12 then
+    error("month out of range (1-12): ${toString(month)}")
+  else if day < 1 || day > daysInMonth(year, month) then
+    error(
+      "day out of range for ${toString(year)}-${toString(month)}: ${toString(day)}"
+    )
+  else
+    {
+      "year": year,
+      "month": month,
+      "day": day
+    }
+
+// Build a validated `Time`. Trailing fields default to zero, so `time(10, 30)` is 10:30:00.000.
+// @returns the `Time`, or an `Error` if any field is out of range.
+export val time = (hour: Int64, minute: Int64 = 0, second: Int64 = 0, millis: Int64 = 0): Time | Error =>
+  if hour < 0 || hour > 23 then
+    error("hour out of range (0-23): ${toString(hour)}")
+  else if minute < 0 || minute > 59 then
+    error("minute out of range (0-59): ${toString(minute)}")
+  else if second < 0 || second > 59 then
+    error("second out of range (0-59): ${toString(second)}")
+  else if millis < 0 || millis > 999 then
+    error("millis out of range (0-999): ${toString(millis)}")
+  else
+    {
+      "hour": hour,
+      "minute": minute,
+      "second": second,
+      "millis": millis
+    }
+
+// Build a validated `DateTime` from all fields at once. Trailing time fields default to zero.
+// @returns the `DateTime`, or the first `Error` from validating the date or the time.
+export val dateTime = (year: Int64, month: Int64, day: Int64, hour: Int64 = 0, minute: Int64 = 0, second: Int64 = 0, millis: Int64 = 0): DateTime | Error =>
+  val d = date(year, month, day)
+  match d
+    is Error => error("${d["message"]}")
+    else =>
+      val t = time(hour, minute, second, millis)
+      match t
+        is Error => error("${t["message"]}")
+        else =>
+          {
+            "year": year,
+            "month": month,
+            "day": day,
+            "hour": hour,
+            "minute": minute,
+            "second": second,
+            "millis": millis
+          }
+
+// ── Moving between Date / Time / DateTime ────────────────────────────────────────────
+// The date portion of a `DateTime` (drops the time-of-day).
+export val dateOf = (dt: DateTime): Date =>
+  {
+    "year": dt["year"],
+    "month": dt["month"],
+    "day": dt["day"]
+  }
+
+// The time portion of a `DateTime` (drops the calendar date).
+export val timeOf = (dt: DateTime): Time =>
+  {
+    "hour": dt["hour"],
+    "minute": dt["minute"],
+    "second": dt["second"],
+    "millis": dt["millis"]
+  }
+
+// Combine a `Date` and a `Time` into a `DateTime`.
+export val atTime = (d: Date, t: Time): DateTime =>
+  {
+    "year": d["year"],
+    "month": d["month"],
+    "day": d["day"],
+    "hour": t["hour"],
+    "minute": t["minute"],
+    "second": t["second"],
+    "millis": t["millis"]
+  }
+
+// The `DateTime` at midnight (00:00:00.000) on the given `Date`.
+export val atStartOfDay = (d: Date): DateTime =>
+  {
+    "year": d["year"],
+    "month": d["month"],
+    "day": d["day"],
+    "hour": 0,
+    "minute": 0,
+    "second": 0,
+    "millis": 0
+  }
+
+// ── Unix-millisecond bridge ──────────────────────────────────────────────────────────
+// The Unix-millisecond timestamp (UTC) for a `DateTime` — the same canonical value std/time uses,
+// so the two libraries interoperate freely.
+export val toTimestamp = (dt: DateTime): Int64 =>
+  toEpochDay(dateOf(dt)) * MS_PER_DAY + dt["hour"] * 3600000 + dt["minute"] * 60000 + dt["second"] * 1000 + dt["millis"]
+
+// The `DateTime` (UTC) for a Unix-millisecond timestamp — the inverse of `toTimestamp`. Never fails:
+// every Int64 is a valid instant (negative is pre-1970).
+export val fromTimestamp = (ts: Int64): DateTime =>
+  val epochDay = floorDiv(ts, MS_PER_DAY)
+  val rem = ts - epochDay * MS_PER_DAY
+  atTime(fromEpochDay(epochDay), {
+    "hour": rem / 3600000,
+    "minute": (rem / 60000) % 60,
+    "second": (rem / 1000) % 60,
+    "millis": rem % 1000
+  })
+
+// The current wall-clock instant as a UTC `DateTime`. Impure (reads the system clock via std/time).
+export val now = (): DateTime => fromTimestamp(wallClockNow())
+
+// Today's date in UTC. Impure (reads the system clock).
+export val today = (): Date => dateOf(now())
+
+// ── Fixed UTC offset (OffsetDateTime) ─────────────────────────────────────────────────
+// A fixed-offset layer over the UTC core: an `OffsetDateTime` carries local wall-clock fields plus a
+// constant `offsetMinutes`. There is NO DST — the offset is the same all year — so this models
+// java.time `OffsetDateTime`, not a named zone. Convert to/from the canonical UTC instant with
+// `toInstant`/`atOffset`; `now`/`today` above (and `fromTimestamp`) remain the UTC entry points.
+// Milliseconds in one minute — the offset unit.
+val MS_PER_MIN: Int64 = 60000
+
+// Tag a local `DateTime` with a fixed UTC offset, producing an `OffsetDateTime`. The fields are taken
+// as the LOCAL wall-clock at `offsetMinutes`; the instant is computed as `wall - offset` by `toInstant`.
+// @param offsetMinutes  the offset east of UTC in minutes (e.g. 330 for +05:30, -300 for -05:00).
+// @example dt.withOffset(330)  // tag a DateTime as +05:30 local
+export val withOffset = (dt: DateTime, offsetMinutes: Int64): OffsetDateTime =>
+  { ...dt, "offsetMinutes": offsetMinutes }
+
+// The fixed offset (minutes east of UTC) of an `OffsetDateTime`.
+export val offsetOf = (odt: OffsetDateTime): Int64 => odt["offsetMinutes"]
+
+// The UTC Unix-millisecond instant an `OffsetDateTime` denotes. Subtracts the offset from the local
+// wall-clock: 10:30 at +05:30 is the same instant as 05:00 UTC.
+export val toInstant = (odt: OffsetDateTime): Int64 =>
+  toTimestamp(odt) - odt["offsetMinutes"] * MS_PER_MIN
+
+// The `OffsetDateTime` a fixed-offset observer reads for a UTC instant. The local wall-clock is
+// `instant + offset`, tagged with the offset — the inverse of `toInstant`. Never fails.
+// @param ts  the UTC Unix-millisecond instant.
+// @param offsetMinutes  the observer's offset east of UTC, in minutes.
+// @example atOffset(0, -300)  // 1969-12-31T19:00 -05:00 (the epoch seen from UTC-5)
+export val atOffset = (ts: Int64, offsetMinutes: Int64): OffsetDateTime =>
+  withOffset(fromTimestamp(ts + offsetMinutes * MS_PER_MIN), offsetMinutes)
+
+// Re-express an `OffsetDateTime` at a different fixed offset, preserving the instant (the local
+// wall-clock shifts so it denotes the same moment). `withOffset` REPLACES the offset keeping the
+// wall-clock; this keeps the instant and recomputes the wall-clock.
+// @example toOffset(atOffset(0, 0), -300)  // same instant, now read as -05:00
+export val toOffset = (odt: OffsetDateTime, offsetMinutes: Int64): OffsetDateTime =>
+  atOffset(toInstant(odt), offsetMinutes)
+
+// The local wall-clock `DateTime` at UTC for an `OffsetDateTime` (drops the offset, shifting to the
+// UTC instant). Equivalent to `fromTimestamp(toInstant(odt))`.
+export val toUtc = (odt: OffsetDateTime): DateTime => fromTimestamp(toInstant(odt))
+
+// The current wall-clock as an `OffsetDateTime` at a fixed offset. Impure (reads the system clock).
+// @param offsetMinutes  the offset east of UTC, in minutes.
+export val nowAt = (offsetMinutes: Int64): OffsetDateTime => atOffset(wallClockNow(), offsetMinutes)
+
+// ── Computed fields ──────────────────────────────────────────────────────────────────
+// The day of the week as a `Weekday` (0=Sunday .. 6=Saturday). The civil-date math runs in `Int64`;
+// the `match` narrows the in-range result `0..6` to the literal union so callers get an exhaustive
+// type. The `else` is unreachable (`floorMod(_, 7)` is always 0-6) and returns `Sat` only to satisfy
+// totality.
+// @example weekday({ "year": 1970, "month": 1, "day": 1 })  // 4 (Thu)
+export val weekday = (d: Date): Weekday =>
+  match floorMod(toEpochDay(d) + 4, 7)
+    is 0 => Sun
+    is 1 => Mon
+    is 2 => Tue
+    is 3 => Wed
+    is 4 => Thu
+    is 5 => Fri
+    else => Sat
+
+// The day of the year, 1-366 (Jan 1 = 1).
+export val dayOfYear = (d: Date): Int64 =>
+  toEpochDay(d) - toEpochDay({
+    "year": d["year"],
+    "month": 1,
+    "day": 1
+  }) + 1
+
+// ── Calendar arithmetic (never fails; clamps month-end) ──────────────────────────────
+// Shift a `Date` by `n` whole days (`n` may be negative). Exact day arithmetic, no clamping needed.
+export val addDays = (d: Date, n: Int64): Date => fromEpochDay(toEpochDay(d) + n)
+
+// Shift a `Date` by `n` whole calendar months, clamping `day` to the last valid day of the target
+// month (e.g. Jan 31 + 1mo -> Feb 28/29). `n` may be negative.
+export val addMonths = (d: Date, n: Int64): Date =>
+  val total = d["year"] * 12 + (d["month"] - 1) + n
+  val ny = floorDiv(total, 12)
+  val nm = floorMod(total, 12) + 1
+  val dim = daysInMonth(ny, nm)
+  {
+    "year": ny,
+    "month": nm,
+    "day": if d["day"] > dim then dim else d["day"]
+  }
+
+// Shift a `Date` by `n` whole calendar years, with the same month-end clamping as `addMonths`
+// (Feb 29 + 1yr in a non-leap year -> Feb 28). Defined as `addMonths(d, n * 12)`.
+export val addYears = (d: Date, n: Int64): Date => addMonths(d, n * 12)
+
+// Shift a `Date` by a `Period`: years and months first (with month-end clamping), then exact days.
+export val addPeriod = (d: Date, p: Period): Date =>
+  addDays(addMonths(d, p["years"] * 12 + p["months"]), p["days"])
+
+// ── Duration ───────────────────────────────────────────────────────────────────────
+// Construct a `Duration` from a unit count (`n` may be negative). They scale a single unit, so
+// `hours(2)` plus `minutes(30)` (via `plus`) is a 2½-hour span.
+export val millis = (n: Int64): Duration => { "millis": n }
+// `n` seconds as a `Duration`.
+export val seconds = (n: Int64): Duration => { "millis": n * 1000 }
+// `n` minutes as a `Duration`.
+export val minutes = (n: Int64): Duration => { "millis": n * 60000 }
+// `n` hours as a `Duration`.
+export val hours = (n: Int64): Duration => { "millis": n * 3600000 }
+// `n` days (fixed 24h each) as a `Duration`.
+export val days = (n: Int64): Duration => { "millis": n * MS_PER_DAY }
+
+// The sum of two durations.
+export val plus = (a: Duration, b: Duration): Duration => { "millis": a["millis"] + b["millis"] }
+// The difference of two durations (`a - b`).
+export val minus = (a: Duration, b: Duration): Duration => { "millis": a["millis"] - b["millis"] }
+// A duration scaled by an integer factor.
+export val scale = (a: Duration, factor: Int64): Duration => { "millis": a["millis"] * factor }
+
+// The whole milliseconds in a duration.
+export val toMillis = (d: Duration): Int64 => d["millis"]
+// The whole seconds in a duration (truncated toward zero).
+export val toSeconds = (d: Duration): Int64 => d["millis"] / 1000
+// The whole minutes in a duration (truncated toward zero).
+export val toMinutes = (d: Duration): Int64 => d["millis"] / 60000
+// The whole hours in a duration (truncated toward zero).
+export val toHours = (d: Duration): Int64 => d["millis"] / 3600000
+// The whole days in a duration (truncated toward zero).
+export val toDays = (d: Duration): Int64 => d["millis"] / MS_PER_DAY
+
+// The signed exact `Duration` from `a` to `b` (`b - a` as milliseconds).
+export val between = (a: DateTime, b: DateTime): Duration => { "millis": toTimestamp(b) - toTimestamp(a) }
+
+// Shift a `DateTime` by an exact `Duration` (`d` may be negative). Pure millisecond arithmetic.
+export val plusDuration = (dt: DateTime, d: Duration): DateTime => fromTimestamp(toTimestamp(dt) + d["millis"])
+// Shift a `DateTime` backward by an exact `Duration`.
+export val minusDuration = (dt: DateTime, d: Duration): DateTime => fromTimestamp(toTimestamp(dt) - d["millis"])
+
+// ── Period ───────────────────────────────────────────────────────────────────────
+// Construct a calendar `Period`. Trailing fields default to zero, so `period(1)` is one year.
+export val period = (years: Int64, months: Int64 = 0, days: Int64 = 0): Period =>
+  {
+    "years": years,
+    "months": months,
+    "days": days
+  }
+
+// ── Comparison ───────────────────────────────────────────────────────────────────
+// Three-way compare of two `Date`s by calendar order: -1 if `a < b`, 0 if equal, 1 if `a > b`.
+export val compareDate = (a: Date, b: Date): Int64 =>
+  val da = toEpochDay(a)
+  val db = toEpochDay(b)
+  if da < db then -1 else if da > db then 1 else 0
+
+// Three-way compare of two `DateTime`s by instant: -1 if `a < b`, 0 if equal, 1 if `a > b`.
+export val compare = (a: DateTime, b: DateTime): Int64 =>
+  val ta = toTimestamp(a)
+  val tb = toTimestamp(b)
+  if ta < tb then -1 else if ta > tb then 1 else 0
+
+// Whether `a` is strictly before `b` (by instant).
+export val isBefore = (a: DateTime, b: DateTime): Boolean => toTimestamp(a) < toTimestamp(b)
+// Whether `a` is strictly after `b` (by instant).
+export val isAfter = (a: DateTime, b: DateTime): Boolean => toTimestamp(a) > toTimestamp(b)
+
+// ── ISO 8601 formatting ─────────────────────────────────────────────────────────────
+// Zero-pad a non-negative number to `width`; render a negative number as "-" + padded magnitude.
+val pad = (n: Int64, width: Int32): String =>
+  if n < 0 then
+    "-${padStart(toString(0 - n), width, "0")}"
+  else
+    padStart(toString(n), width, "0")
+
+// The ISO 8601 calendar-date string for a `Date`, e.g. "2024-01-15".
+export val toIsoDate = (d: Date): String =>
+  "${pad(d["year"], 4)}-${pad(d["month"], 2)}-${pad(d["day"], 2)}"
+
+// The ISO 8601 time string for a `Time`, e.g. "10:30:00.500" (always with milliseconds).
+export val toIsoTime = (t: Time): String =>
+  "${pad(t["hour"], 2)}:${pad(t["minute"], 2)}:${pad(t["second"], 2)}.${pad(t["millis"], 3)}"
+
+// The ISO 8601 date-time string for a `DateTime`, e.g. "2024-01-15T10:30:00.500".
+export val toIso = (dt: DateTime): String => "${toIsoDate(dateOf(dt))}T${toIsoTime(timeOf(dt))}"
+
+// The ISO 8601 offset suffix for `offsetMinutes`: "Z" for zero, otherwise "+HH:MM" / "-HH:MM".
+// @example toIsoOffset(330)  // "+05:30"     toIsoOffset(0)  // "Z"     toIsoOffset(-300)  // "-05:00"
+export val toIsoOffset = (offsetMinutes: Int64): String =>
+  if offsetMinutes == 0 then
+    "Z"
+  else
+    val sign = if offsetMinutes < 0 then "-" else "+"
+    val mag = if offsetMinutes < 0 then 0 - offsetMinutes else offsetMinutes
+    "${sign}${pad(mag / 60, 2)}:${pad(mag % 60, 2)}"
+
+// The ISO 8601 date-time string for an `OffsetDateTime`, e.g. "2024-01-15T10:30:00.500+05:30" (the
+// local wall-clock followed by the offset suffix). Use `toIso` for the bare wall-clock without offset.
+export val toIsoOffsetDateTime = (odt: OffsetDateTime): String =>
+  "${toIso(odt)}${toIsoOffset(odt["offsetMinutes"])}"
+
+// ── ISO 8601 parsing ────────────────────────────────────────────────────────────────
+// Parse one decimal field, narrowing a bad component to a `null` the caller turns into an Error.
+// Returns Int32 (auto-widens to the Int64 fields at the `date`/`time` call sites); keeping it Int32
+// preserves the runtime union tag so the caller's `is Int32` discriminant matches.
+val field = (s: String): Int32 | Null =>
+  val n = tryParseInt32(s)
+  match n
+    is Int32 => n
+    else => null
+
+// Parse an ISO 8601 calendar date "YYYY-MM-DD" (years 0000-9999) into a validated `Date`.
+// @returns the `Date`, or an `Error` if the string is malformed or the date is invalid.
+export val parseIsoDate = (s: String): Date | Error =>
+  val parts = split(s, "-")
+  if parts.length() != 3 then
+    error("expected ISO date YYYY-MM-DD, got: ${s}")
+  else
+    val y = field(parts[0])
+    val m = field(parts[1])
+    val d = field(parts[2])
+    match y
+      is Int32 =>
+        match m
+          is Int32 =>
+            match d
+              is Int32 => date(y, m, d)
+              else => error("invalid day in ISO date: ${s}")
+          else => error("invalid month in ISO date: ${s}")
+      else => error("invalid year in ISO date: ${s}")
+
+// Parse an ISO 8601 time "HH:MM:SS" or "HH:MM:SS.sss" into a validated `Time`.
+// @returns the `Time`, or an `Error` if the string is malformed or the time is invalid.
+export val parseIsoTime = (s: String): Time | Error =>
+  val dot = indexOf(s, ".")
+  val msPart = if dot < 0 then "0" else substring(s, dot + 1)
+  val hms = if dot < 0 then s else substring(s, 0, dot)
+  val parts = split(hms, ":")
+  if parts.length() != 3 then
+    error("expected ISO time HH:MM:SS, got: ${s}")
+  else
+    val h = field(parts[0])
+    val mi = field(parts[1])
+    val se = field(parts[2])
+    val ms = field(msPart)
+    match h
+      is Int32 =>
+        match mi
+          is Int32 =>
+            match se
+              is Int32 =>
+                match ms
+                  is Int32 => time(h, mi, se, ms)
+                  else => error("invalid milliseconds in ISO time: ${s}")
+              else => error("invalid seconds in ISO time: ${s}")
+          else => error("invalid minutes in ISO time: ${s}")
+      else => error("invalid hours in ISO time: ${s}")
+
+// Parse an ISO 8601 date-time "YYYY-MM-DDTHH:MM:SS(.sss)?" (a trailing "Z" is accepted and ignored,
+// since these values are always UTC) into a validated `DateTime`.
+// @returns the `DateTime`, or an `Error` if either half is malformed or out of range.
+export val parseIso = (s: String): DateTime | Error =>
+  val t = indexOf(s, "T")
+  if t < 0 then
+    error("expected ISO date-time with 'T' separator, got: ${s}")
+  else
+    val datePart = substring(s, 0, t)
+    val rest = substring(s, t + 1)
+    val z = indexOf(rest, "Z")
+    val timePart = if z < 0 then rest else substring(rest, 0, z)
+    val d = parseIsoDate(datePart)
+    match d
+      is Error => error("${d["message"]}")
+      else =>
+        val tm = parseIsoTime(timePart)
+        match tm
+          is Error => error("${tm["message"]}")
+          else => atTime(d, tm)
+
+// Parse an ISO 8601 offset suffix ("Z", "+HH:MM", or "-HH:MM") to minutes east of UTC. "Z" is 0.
+// @returns the offset in minutes, or an `Error` if malformed or out of the ±18:00 range.
+export val parseIsoOffset = (s: String): Int64 | Error =>
+  if s == "Z" then
+    0
+  else
+    val sign = substring(s, 0, 1)
+    if sign != "+" && sign != "-" then
+      error("expected ISO offset Z or ±HH:MM, got: ${s}")
+    else
+      val body = substring(s, 1)
+      val parts = split(body, ":")
+      if parts.length() != 2 then
+        error("expected ISO offset ±HH:MM, got: ${s}")
+      else
+        val h = field(parts[0])
+        val mi = field(parts[1])
+        match h
+          is Int32 =>
+            match mi
+              is Int32 =>
+                if h < 0 || h > 18 || mi < 0 || mi > 59 then
+                  error("ISO offset out of range: ${s}")
+                else
+                  val mag: Int64 = h * 60 + mi
+                  if sign == "-" then 0 - mag else mag
+              else => error("invalid offset minutes: ${s}")
+          else => error("invalid offset hours: ${s}")
+
+// Parse an ISO 8601 date-time WITH an offset, "YYYY-MM-DDThh:mm:ss(.sss)?(Z|±HH:MM)", into an
+// `OffsetDateTime`. The wall-clock fields and the offset are taken as written (the local time at that
+// offset); use `toInstant` for the UTC instant. A missing offset is an error — use `parseIso` for the
+// offset-less form.
+// @returns the `OffsetDateTime`, or an `Error` if any part is malformed, out of range, or the offset
+//   is absent.
+export val parseIsoOffsetDateTime = (s: String): OffsetDateTime | Error =>
+  val t = indexOf(s, "T")
+  if t < 0 then
+    error("expected ISO date-time with 'T' separator, got: ${s}")
+  else
+    // The offset starts at the trailing 'Z', or the first '+'/'-' AFTER the time (skip the date's
+    // '-' separators by searching only the post-'T' region).
+    val rest = substring(s, t + 1)
+    val zPos = indexOf(rest, "Z")
+    val plusPos = indexOf(rest, "+")
+    // A '-' in the time region marks a negative offset; it cannot appear inside HH:MM:SS.sss.
+    val minusPos = indexOf(rest, "-")
+    val cut = if zPos >= 0 then
+      zPos
+    else if plusPos >= 0 then
+      plusPos
+    else
+      minusPos
+    if cut < 0 then
+      error("expected a trailing offset (Z or ±HH:MM) in: ${s}")
+    else
+      val dtPart = substring(s, 0, t + 1 + cut)
+      val offPart = substring(rest, cut)
+      val dt = parseIso(dtPart)
+      match dt
+        is Error => error("${dt["message"]}")
+        else =>
+          val off = parseIsoOffset(offPart)
+          match off
+            is Error => error("${off["message"]}")
+            else => withOffset(dt, off)

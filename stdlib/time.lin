@@ -1,18 +1,15 @@
-// std/time — timestamps, timing, formatting, and UTC calendar arithmetic.
+// std/time — instants, timing, and timestamp formatting (Unix milliseconds, UTC).
 //
 // The canonical value is a Unix timestamp in milliseconds (UTC), held as an Int64. `now` reads the
 // wall clock; for measuring durations prefer `startTimer`/`elapsed`, which use a monotonic clock
 // unaffected by wall-clock adjustments. toIso/fromIso convert to and from ISO 8601; format/parse use
-// strftime-style patterns. The calendar layer (components / fromComponents, the single-field
-// extractors, and the addDays/addMonths/diff family) is pure UTC arithmetic over the same Int64 —
-// durations are likewise just milliseconds (seconds/minutes/hours/days), so they compose with +/-.
-// Full IANA timezone support (DST, historical offsets) is out of scope; componentsAt/formatAt take a
-// fixed UTC offset.
+// strftime-style patterns.
+//
+// For calendar work — `Date`/`DateTime` records, field extraction, day/month/year arithmetic,
+// durations and ISO parsing — use `std/datetime`, which models the calendar as immutable records and
+// bridges back to these timestamps with `toTimestamp`/`fromTimestamp`.
 //
 //   import { now, sleep, toIso, fromIso, format, parse, startTimer, elapsed } from "std/time"
-import { toString, join } from "std/string"
-import { push } from "std/array"
-
 import foreign "lin-runtime"
   val lin_time_now: () => Int64
   val lin_time_sleep: (Int64) => Null
@@ -23,8 +20,6 @@ import foreign "lin-runtime"
   val lin_time_format: (Int64, String) => String
   val lin_time_from_iso: (String) => AnyVal
   val lin_time_parse: (String, String) => AnyVal
-  val lin_time_components: (Int64) => AnyVal
-  val lin_time_from_components: (Int64, Int64, Int64, Int64, Int64, Int64, Int64) => AnyVal
 
 // The current wall-clock time as a Unix timestamp in milliseconds (UTC).
 // @example now()   // e.g. 1716825600000
@@ -77,219 +72,3 @@ export val fromIso = (s: String): Int64 | Error =>
 // @example parse("2024-01-15", "%Y-%m-%d")   // 1705276800000
 export val parse = (s: String, pattern: String): Int64 | Error =>
   lin_time_parse(s, pattern)
-
-// ===========================================================================
-// Calendar layer (additive). The canonical value stays the Unix-millisecond
-// Int64; these are pure UTC transforms over it. Field ranges: month 1-12,
-// weekday 0=Sunday..6=Saturday, day 1-31, hour 0-23, minute/second 0-59,
-// millis 0-999, yearDay 1-366. Full IANA timezone support (DST, historical
-// offsets) is out of scope — see componentsAt/formatAt for fixed offsets.
-// ===========================================================================
-// Break a Unix-millisecond timestamp into its UTC calendar fields. Never fails — every Int64 is a
-// valid instant; pre-1970 (negative `ts`) and far-future years use the proleptic Gregorian
-// calendar, so `year` may be negative.
-// The fixed calendar-fields record returned by `components`/`componentsAt`: stable integer fields,
-// every one always present. `weekday` is 0=Sunday..6=Saturday; `yearDay` is 1-366.
-export type TimeComponents = { "year": Int32, "month": Int32, "day": Int32, "hour": Int32, "minute": Int32, "second": Int32, "millis": Int32, "weekday": Int32, "yearDay": Int32 }
-
-// @param ts  the timestamp in Unix milliseconds.
-// @returns a `TimeComponents` record: year, month (1-12), day (1-31), hour (0-23),
-//   minute/second (0-59), millis (0-999), weekday (0=Sunday..6=Saturday), yearDay (1-366).
-export val components = (ts: Int64): TimeComponents =>
-  val r = lin_time_components(ts)
-  {
-    "year": r["year"],
-    "month": r["month"],
-    "day": r["day"],
-    "hour": r["hour"],
-    "minute": r["minute"],
-    "second": r["second"],
-    "millis": r["millis"],
-    "weekday": r["weekday"],
-    "yearDay": r["yearDay"]
-  }
-
-// Build a Unix-millisecond timestamp (UTC) from calendar fields. Out-of-range fields are rejected,
-// not normalised, so calendar typos surface as errors.
-// @param c  a AnyVal object; only year/month/day/hour/minute/second/millis are read. `weekday`/
-//   `yearDay` are ignored on input, so the full record from `components` is accepted unchanged.
-// @returns the timestamp in Unix milliseconds, or an Error if any read field is out of range.
-export val fromComponents = (c: AnyVal): Int64 | Error =>
-  lin_time_from_components(
-    c["year"],
-    c["month"],
-    c["day"],
-    c["hour"],
-    c["minute"],
-    c["second"],
-    c["millis"]
-  )
-
-// Single-field UTC extractors. Each is `components(ts).<field>`; prefer `components` when you need
-// several fields at once (it decomposes only once). In all of them `ts` is a Unix-millisecond timestamp.
-// The UTC year (may be negative for pre-1 BCE instants).
-export val year = (ts: Int64): Int32 => components(ts)["year"]
-
-// The UTC month, 1-12.
-export val month = (ts: Int64): Int32 => components(ts)["month"]
-
-// The UTC day of the month, 1-31.
-export val day = (ts: Int64): Int32 => components(ts)["day"]
-
-// The UTC hour, 0-23.
-export val hour = (ts: Int64): Int32 => components(ts)["hour"]
-
-// The UTC minute, 0-59.
-export val minute = (ts: Int64): Int32 => components(ts)["minute"]
-
-// The UTC second, 0-59.
-export val second = (ts: Int64): Int32 => components(ts)["second"]
-
-// The UTC day of the week, 0=Sunday..6=Saturday.
-export val weekday = (ts: Int64): Int32 => components(ts)["weekday"]
-
-// The UTC day of the year, 1-366.
-export val dayOfYear = (ts: Int64): Int32 => components(ts)["yearDay"]
-
-// Add `n` whole days to a timestamp by a fixed exact-millisecond offset.
-// @param ts  the timestamp in Unix milliseconds.
-// @param n  the number of days to add (may be negative to subtract).
-// @returns the shifted timestamp. Never fails (a UTC day is always 86_400_000 ms — no DST).
-export val addDays = (ts: Int64, n: Int64): Int64 => ts + n * 86400000
-
-// Add `n` whole hours to a timestamp.
-// @param ts  the timestamp in Unix milliseconds.
-// @param n  the number of hours to add (may be negative). @returns the shifted timestamp.
-export val addHours = (ts: Int64, n: Int64): Int64 => ts + n * 3600000
-
-// Add `n` whole minutes to a timestamp.
-// @param ts  the timestamp in Unix milliseconds.
-// @param n  the number of minutes to add (may be negative). @returns the shifted timestamp.
-export val addMinutes = (ts: Int64, n: Int64): Int64 => ts + n * 60000
-
-// Add `n` whole seconds to a timestamp.
-// @param ts  the timestamp in Unix milliseconds.
-// @param n  the number of seconds to add (may be negative). @returns the shifted timestamp.
-export val addSeconds = (ts: Int64, n: Int64): Int64 => ts + n * 1000
-
-// Leap-year-aware days in a (year, month). month is 1-12.
-val daysInMonth = (y: Int64, m: Int64): Int64 =>
-  if m == 2 then
-    if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 then 29 else 28
-  else if m == 4 || m == 6 || m == 9 || m == 11 then
-    30
-  else
-    31
-
-// Add `n` whole calendar months, preserving the time-of-day fields and clamping `day` to the last
-// valid day of the target month (e.g. Jan 31 + 1mo -> Feb 28/29).
-// @param ts  the timestamp in Unix milliseconds.
-// @param n  the number of months to add (may be negative).
-// @returns the shifted timestamp. Never fails — clamping replaces what would be an invalid date.
-export val addMonths = (ts: Int64, n: Int64): Int64 =>
-  val c = components(ts)
-  val cy: Int64 = c["year"]
-  val cm: Int64 = c["month"]
-  // 0-based month index from year 0, advanced by n, then floor-split back over 12.
-  val total = cy * 12 + (cm - 1) + n
-  var ny = total / 12
-  var nm = total % 12
-  // Floor-correct the truncating `/` and `%` for negative `total`.
-  if nm < 0 then
-    nm = nm + 12
-    ny = ny - 1
-  val targetMonth = nm + 1
-  val dim = daysInMonth(ny, targetMonth)
-  val cd: Int64 = c["day"]
-  val clampedDay = if cd > dim then dim else cd
-  val built = lin_time_from_components(ny, targetMonth, clampedDay, c["hour"], c["minute"], c["second"], c["millis"])
-  // Pre-clamped, so this cannot fail; the match keeps the signature non-fallible.
-  match built
-    is Error => ts
-    else => built
-
-// Add `n` whole calendar years, with the same month-end clamping as addMonths (Feb 29 + N years
-// landing on a non-leap year clamps to Feb 28). Defined as addMonths(ts, n*12).
-// @param ts  the timestamp in Unix milliseconds.
-// @param n  the number of years to add (may be negative).
-// @returns the shifted timestamp. Never fails.
-export val addYears = (ts: Int64, n: Int64): Int64 => addMonths(ts, n * 12)
-
-// The signed millisecond difference between two timestamps (exactly `b - a`).
-// @param a  the earlier timestamp.
-// @param b  the later timestamp.
-// @returns `b - a` in milliseconds; positive when `b` is later.
-export val diff = (a: Int64, b: Int64): Int64 => b - a
-
-// Floor division by a positive divisor (for the day-index split below).
-val floorDiv = (a: Int64, b: Int64): Int64 =>
-  val q = a / b
-  if a % b != 0 && a < 0 then q - 1 else q
-
-// The signed number of whole UTC calendar days between two timestamps. Counts date boundaries
-// crossed (the difference of the two civil day indices), not elapsed 24h spans.
-// @param a  the earlier timestamp.
-// @param b  the later timestamp.
-// @returns the signed count of day boundaries from `a` to `b`.
-export val diffDays = (a: Int64, b: Int64): Int64 =>
-  floorDiv(b, 86400000) - floorDiv(a, 86400000)
-
-// Duration constructors. A duration in std/time is just an Int64 of milliseconds (the same
-// representation as `elapsed`/`sleep`), so these scale a unit count and compose with `+`/`-`.
-// Each takes a unit count `n` (may be negative) and returns the equivalent milliseconds.
-// `n` seconds as milliseconds.
-export val seconds = (n: Int64): Int64 => n * 1000
-
-// `n` minutes as milliseconds.
-export val minutes = (n: Int64): Int64 => n * 60000
-
-// `n` hours as milliseconds.
-export val hours = (n: Int64): Int64 => n * 3600000
-
-// `n` days as milliseconds.
-export val days = (n: Int64): Int64 => n * 86400000
-
-// Render a millisecond duration as a compact human string using the largest non-zero units
-// (`d h m s ms`). Display only — there is no matching parser.
-// @param ms  the duration in milliseconds (may be negative).
-// @returns the formatted string: zero units are dropped, a fully zero duration is "0ms", and a
-//   negative duration is prefixed with "-".
-export val formatDuration = (ms: Int64): String =>
-  if ms == 0 then
-    "0ms"
-  else
-    val sign = if ms < 0 then "-" else ""
-    var rem = if ms < 0 then 0 - ms else ms
-    val d = rem / 86400000
-    rem = rem % 86400000
-    val h = rem / 3600000
-    rem = rem % 3600000
-    val m = rem / 60000
-    rem = rem % 60000
-    val s = rem / 1000
-    val millis = rem % 1000
-    var parts: String[] = []
-    if d != 0 then push(parts, "${toString(d)}d")
-    if h != 0 then push(parts, "${toString(h)}h")
-    if m != 0 then push(parts, "${toString(m)}m")
-    if s != 0 then push(parts, "${toString(s)}s")
-    if millis != 0 then push(parts, "${toString(millis)}ms")
-    "${sign}${join(parts, " ")}"
-
-// Like `components`, but for a fixed UTC offset: `offsetMinutes` is added to the instant before
-// decomposition, so the returned fields are the local wall-clock an observer at that constant
-// offset would read (the instant itself is unchanged). Full IANA tz (DST, historical offsets) is
-// out of scope.
-// @param ts  the timestamp in Unix milliseconds.
-// @param offsetMinutes  the UTC offset in minutes (e.g. -300 for UTC-5, 330 for UTC+5:30).
-// @returns the `TimeComponents` record for that local time (same shape as `components`).
-export val componentsAt = (ts: Int64, offsetMinutes: Int32): TimeComponents =>
-  components(ts + minutes(offsetMinutes))
-
-// Like `format`, but renders the local wall-clock at a fixed UTC offset (see componentsAt).
-// @param ts  the timestamp in Unix milliseconds.
-// @param pattern  a strftime-style format string.
-// @param offsetMinutes  the UTC offset in minutes (e.g. 330 for UTC+5:30).
-// @returns the formatted local-time string.
-export val formatAt = (ts: Int64, pattern: String, offsetMinutes: Int32): String =>
-  format(ts + minutes(offsetMinutes), pattern)
