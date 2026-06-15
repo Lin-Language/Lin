@@ -368,13 +368,13 @@ pub unsafe extern "C" fn lin_map_set(map: *mut LinMap, key: *mut LinString, val:
         lin_string_inc_ref(key);
         (*slot).key = key as u64;
         std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
-        crate::object::retain_tagged_payload_pub(val_ref);
+        crate::tagged::retain_tagged_payload_pub(val_ref);
         (*map).len += 1;
     } else {
         // Overwrite — order unchanged (key already present).
-        crate::object::release_tagged_payload_pub(&(*slot).value);
+        crate::tagged::release_tagged_payload_pub(&(*slot).value);
         std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
-        crate::object::retain_tagged_payload_pub(val_ref);
+        crate::tagged::retain_tagged_payload_pub(val_ref);
     }
 }
 
@@ -417,13 +417,13 @@ pub unsafe extern "C" fn lin_map_set_int(map: *mut LinMap, key: i64, val: *const
         (*slot).hash = khash;
         (*slot).key = key_bits;
         std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
-        crate::object::retain_tagged_payload_pub(val_ref);
+        crate::tagged::retain_tagged_payload_pub(val_ref);
         (*map).len += 1;
     } else {
         // Overwrite — order unchanged.
-        crate::object::release_tagged_payload_pub(&(*slot).value);
+        crate::tagged::release_tagged_payload_pub(&(*slot).value);
         std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
-        crate::object::retain_tagged_payload_pub(val_ref);
+        crate::tagged::retain_tagged_payload_pub(val_ref);
     }
 }
 
@@ -536,7 +536,7 @@ pub unsafe extern "C" fn lin_map_values(map: *const LinMap) -> *mut crate::array
             let src = &(*slot).value;
             let dst = (*arr).data.add(out) as *mut TaggedVal;
             std::ptr::copy_nonoverlapping(src as *const TaggedVal, dst, 1);
-            crate::object::retain_tagged_payload_pub(src);
+            crate::tagged::retain_tagged_payload_pub(src);
             out += 1;
         }
     }
@@ -570,7 +570,7 @@ pub unsafe extern "C" fn lin_map_entries(map: *const LinMap) -> *mut crate::arra
             }
             let src = &(*slot).value;
             std::ptr::copy_nonoverlapping(src as *const TaggedVal, (*pair).data.add(1) as *mut TaggedVal, 1);
-            crate::object::retain_tagged_payload_pub(src);
+            crate::tagged::retain_tagged_payload_pub(src);
             (*pair).len = 2;
             let dst = (*out).data.add(o);
             (*dst).tag = crate::tagged::TAG_ARRAY;
@@ -608,7 +608,7 @@ pub unsafe extern "C" fn lin_map_release(map: *mut LinMap) {
                 lin_string_release((*slot).key as *mut LinString);
             }
             // Int keys are scalar — no release needed.
-            crate::object::release_tagged_payload_pub(&(*slot).value);
+            crate::tagged::release_tagged_payload_pub(&(*slot).value);
         }
         dealloc((*map).slots as *mut u8, slots_layout(cap));
     }
@@ -628,7 +628,7 @@ pub unsafe extern "C" fn lin_map_retain(map: *mut LinMap) {
 
 // ── Tag-aware bridges: keys/values/entries over a BOXED value (`TaggedVal*`) ──────────────
 
-use crate::tagged::{TAG_OBJECT, TAG_MAP, TAG_RECORD};
+use crate::tagged::{TAG_MAP, TAG_RECORD};
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArray {
@@ -637,7 +637,6 @@ pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArr
     }
     let tv = &*(p as *const TaggedVal);
     match tv.tag {
-        TAG_OBJECT => crate::object::lin_object_keys(tv.payload as *const crate::object::LinObject),
         TAG_MAP => lin_map_keys(tv.payload as *const LinMap),
         TAG_RECORD => {
             let sealed = tv.payload as *mut u8;
@@ -660,7 +659,6 @@ pub unsafe extern "C" fn lin_values_any(p: *const u8) -> *mut crate::array::LinA
     }
     let tv = &*(p as *const TaggedVal);
     match tv.tag {
-        TAG_OBJECT => crate::object::lin_object_values(tv.payload as *const crate::object::LinObject),
         TAG_MAP => lin_map_values(tv.payload as *const LinMap),
         TAG_RECORD => {
             let sealed = tv.payload as *mut u8;
@@ -683,7 +681,6 @@ pub unsafe extern "C" fn lin_entries_any(p: *const u8) -> *mut crate::array::Lin
     }
     let tv = &*(p as *const TaggedVal);
     match tv.tag {
-        TAG_OBJECT => crate::object::lin_object_entries(tv.payload as *const crate::object::LinObject),
         TAG_MAP => lin_map_entries(tv.payload as *const LinMap),
         TAG_RECORD => {
             let sealed = tv.payload as *mut u8;
@@ -716,27 +713,8 @@ pub unsafe extern "C" fn lin_to_map(p: *const u8) -> *mut LinMap {
             }
             m
         }
-        crate::tagged::TAG_OBJECT => lin_object_to_map(tv.payload as *const crate::object::LinObject),
         _ => lin_map_alloc(0, KEY_KIND_STRING),
     }
-}
-
-/// Build a fresh `LinMap` (rc = 1) from a `LinObject`'s entries (String-keyed).
-#[no_mangle]
-pub unsafe extern "C" fn lin_object_to_map(obj: *const crate::object::LinObject) -> *mut LinMap {
-    let map = lin_map_alloc(0, KEY_KIND_STRING);
-    if obj.is_null() {
-        return map;
-    }
-    let len = (*obj).len;
-    for i in 0..len {
-        let entry = (*obj).entries.add(i as usize);
-        let key = (*entry).key;
-        if !key.is_null() {
-            lin_map_set(map, key, &(*entry).value as *const TaggedVal);
-        }
-    }
-    map
 }
 
 // ── object.rs-parity ops (LinObject → LinMap migration, Stage 6b deletion) ─────────────────
@@ -837,7 +815,6 @@ pub(crate) unsafe fn dynamic_to_map(tv: *const TaggedVal) -> *mut LinMap {
             lin_map_retain(m);
             m
         }
-        TAG_OBJECT => lin_object_to_map((*tv).payload as *const crate::object::LinObject),
         TAG_RECORD => {
             let sealed = (*tv).payload as *mut u8;
             if sealed.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }

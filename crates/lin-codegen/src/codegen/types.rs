@@ -180,14 +180,7 @@ impl<'ctx> Codegen<'ctx> {
     /// the tag field and matched by `is`-checks. This must EXACTLY mirror `box_value` /
     /// `tagged_payload_i64` so the runtime reads the payload back the same way it was written.
     ///
-    /// Like `type_tag` but for GENUINELY OPEN (non-sealed) objects — returns TAG_MAP.
-    /// A sealed Object (`sealed_scalar_fields(..).is_some()` OR `packed_struct_fields()` non-None)
-    /// must NOT use this — it stays TAG_RECORD / TAG_OBJECT as before.
-    pub(crate) fn type_tag_open_object() -> u8 {
-        lin_common::tags::TAG_MAP
-    }
-
-    /// Floats: both Float32 and Float64 box as TAG_FLOAT64 with an f64-bits payload (codegen
+/// Floats: both Float32 and Float64 box as TAG_FLOAT64 with an f64-bits payload (codegen
     /// fpext's a Float32 to f64 before boxing), so TAG_FLOAT32 (a flat-array elem_tag only)
     /// must NEVER be emitted for a boxed scalar — doing so made the runtime read an f64-bits
     /// payload as `f32::from_bits(payload as u32)` → garbage, and made `x is Float64` compare

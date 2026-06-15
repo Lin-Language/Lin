@@ -12,10 +12,9 @@
 //! This is the interned-string immortality trick generalized from one string to a whole graph.
 //! Cost: a frozen graph is **never freed** — `frozen` is for load-once, program-lifetime data.
 
-use crate::tagged::{TaggedVal, TAG_STR, TAG_ARRAY, TAG_OBJECT, TAG_MAP};
+use crate::tagged::{TaggedVal, TAG_STR, TAG_ARRAY, TAG_MAP};
 use crate::string::{LinString, IMMORTAL_RC};
 use crate::array::{LinArray, LinArrayElem};
-use crate::object::LinObject;
 use crate::map::LinMap;
 
 /// Recursively seal a `LinString` immortal (idempotent).
@@ -61,35 +60,13 @@ unsafe fn freeze_map(map: *mut LinMap) {
     }
 }
 
-/// Recursively seal a `LinObject` (its values; keys are strings) immortal.
-unsafe fn freeze_object(obj: *mut LinObject) {
-    if obj.is_null() || (*obj).refcount >= IMMORTAL_RC {
-        return;
-    }
-    (*obj).refcount = IMMORTAL_RC;
-    // Build the O(1) hash side-index NOW, while we are still single-threaded. A frozen object is
-    // designed for lock-free concurrent reads (ADR-043), but the index is normally built LAZILY on
-    // first lookup, which would be a data race across threads. By building it at freeze time, every
-    // subsequent `get`/`has`/`eq` on this (large) frozen object probes a clean, immutable index
-    // lock-free, and the immortal-RC guard in `ensure_index` ensures it is never rebuilt or freed.
-    // No-op for small objects (< HASH_INDEX_THRESHOLD), which keep the read-only linear scan.
-    crate::object::build_index_for_freeze(obj);
-    let len = (*obj).len as usize;
-    for i in 0..len {
-        let entry = (*obj).entries.add(i);
-        freeze_string((*entry).key);
-        freeze_payload((*entry).value.tag, (*entry).value.payload);
-    }
-}
-
 /// Seal one tagged payload by kind.
 unsafe fn freeze_payload(tag: u8, payload: u64) {
     match tag {
         TAG_STR => freeze_string(payload as *mut LinString),
         TAG_ARRAY => freeze_array(payload as *mut LinArray),
-        TAG_OBJECT => freeze_object(payload as *mut LinObject),
         TAG_MAP => freeze_map(payload as *mut LinMap),
-        _ => {} // scalars: nothing to seal
+        _ => {} // scalars (TAG_OBJECT has no producers after Phase 3)
     }
 }
 
