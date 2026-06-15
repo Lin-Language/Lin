@@ -2754,6 +2754,27 @@ string-keyed `lin_object_get`, an LLVM optimisation barrier) but the mechanism n
 - **A tracing GC to absorb the alloc traffic.** Measured CLOSED-NEGATIVE earlier (no workload is
   alloc-bound; the cost is work-per-alloc on the call/value axis), independent of this ADR.
 
+**As-built (2026-06).** The reset landed its core goals (TAG_OBJECT deleted, records always packed,
+no materialization on union boundaries), but two pieces of the stated end-state have not yet been
+reached and should not be treated as already done:
+
+1. **The repr lattice still runs.** `repr::analyze` (`lin-ir/src/repr.rs`) is still a full union-find
+   carry-class + seed + lattice-`join` dataflow pass with a fixpoint fold and a debug oracle check.
+   The stated "repr.rs is a pure layout calculator" is aspirational: SumNode, NullableRecord, and
+   TailCall-coerce cases still require the flow-sensitive join to resolve their representation.
+   Collapsing this to a pure `type → Layout` function requires either resolving those edge cases or
+   explicitly accepting them as permanent flow-sensitive exceptions.
+
+2. **The sealed-eligibility gate is duplicated 4–5 times.** The predicate that decides whether a
+   record is packed (`sealed_fields` / `is_sealed_scalar_repr` / `field_packed_scalar`) exists
+   hand-copied in `codegen/types.rs`, `repr.rs`, `lower.rs`, `monomorphize.rs`, and `escape.rs`,
+   maintained by `// Kept byte-identical` comments. This is the "decided in N places" fragility the
+   reset was meant to end.
+
+Both are tracked as consolidation debt in `docs/TODO.md` Wave B. Do not trust the "single owner /
+no flow-sensitive choice" prose above as a description of the current code — read `repr.rs` and the
+gate predicates directly.
+
 ## ADR-070: Object-literal arguments are checked against concrete record parameters
 
 **Status**: Accepted.
