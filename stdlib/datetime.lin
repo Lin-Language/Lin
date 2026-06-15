@@ -8,22 +8,27 @@
 //   Duration  = { millis }                                   — an exact elapsed span (always milliseconds)
 //   Period    = { years, months, days }                      — a calendar span (months are not fixed-length)
 //   Weekday   = 0 | 1 | … | 6                                — day of week (0=Sunday), with Sun..Sat constants
+//   OffsetDateTime = DateTime & { offsetMinutes }            — a DateTime at a fixed UTC offset (java.time OffsetDateTime)
 //
 // Because `DateTime` is the record intersection `Date & Time` (ADR-061), every `DateTime` is *also*
 // a `Date` and a `Time` by structural width-subtyping — you can pass one straight to any `Date`/`Time`
-// function, which reads only the fields it needs. All fields are `Int64`, so arithmetic composes
-// without casts; `year` may be negative (proleptic Gregorian, no year 0 gap — astronomical numbering).
+// function, which reads only the fields it needs. (Likewise an `OffsetDateTime` is structurally a
+// `DateTime`.) All fields are `Int64`, so arithmetic composes without casts; `year` may be negative
+// (proleptic Gregorian, no year 0 gap — astronomical numbering).
 //
 // All values are immutable: every "mutating" operation returns a fresh record. Construction validates
 // its fields and returns `T | Error` (the canonical `{ "type":"error", ... }`, matched with `is Error`);
 // the calendar shifts (`addDays`/`addMonths`/`addYears`/`addPeriod`) never fail — out-of-range days are
-// clamped to the month end (Jan 31 + 1mo -> Feb 28/29). `now`/`today` are the only impure functions
-// (they read the wall clock via std/time); everything else is pure.
+// clamped to the month end (Jan 31 + 1mo -> Feb 28/29). `now`/`today`/`nowAt` are the only impure
+// functions (they read the wall clock via std/time); everything else is pure.
 //
-// This is fixed-offset UTC arithmetic. Full IANA timezone support (DST, historical offsets) is out of
-// scope — pair with std/time's fixed-offset helpers if you need a constant non-UTC offset.
+// The core is UTC. `OffsetDateTime` + `withOffset`/`atOffset`/`toOffset`/`toInstant` add support for a
+// FIXED UTC offset (e.g. +05:30 year-round) — enough to read and render local civil time at a constant
+// offset, and to parse/emit ISO `±HH:MM`. This is NOT a named timezone: there is no DST and no
+// historical-offset handling. Full IANA timezone support (DST, `America/New_York`) is out of scope.
 //
 //   import { date, dateTime, now, today, addDays, addMonths, toIso, parseIso } from "std/datetime"
+//   import { OffsetDateTime, withOffset, atOffset, toInstant, nowAt, toIsoOffsetDateTime } from "std/datetime"
 import { toString, padStart, split, substring, indexOf } from "std/string"
 import { length } from "std/array"
 import { tryParseInt32 } from "std/number"
@@ -43,6 +48,14 @@ export type Duration = { "millis": Int64 }
 // A calendar span in human units. Unlike `Duration` these are not fixed-length (a month varies), so a
 // `Period` is only meaningful when added to a specific `Date` via `addPeriod`.
 export type Period = { "years": Int64, "months": Int64, "days": Int64 }
+// A `DateTime` tagged with a fixed UTC offset in minutes (`offsetMinutes`, e.g. 330 for +05:30, -300
+// for -05:00). The `DateTime` fields are the LOCAL wall-clock at that offset; the instant they denote
+// is `wall - offset` (see `toInstant`). Because it is the intersection `DateTime & { offsetMinutes }`,
+// an `OffsetDateTime` is structurally also a `DateTime`/`Date`/`Time` — pass it to any of their
+// functions and the local wall-clock fields are read. This is a FIXED offset (java.time
+// `OffsetDateTime`, Temporal offset string), NOT a named zone: it has no DST, so +05:00 means +05:00
+// year-round. Full IANA timezone support is out of scope. (Temporal.OffsetDateTime / `java.time.OffsetDateTime`.)
+export type OffsetDateTime = DateTime & { "offsetMinutes": Int64 }
 // The day of the week as a numeric literal union: 0=Sunday .. 6=Saturday. Returned by `weekday`,
 // so a `match` over it is exhaustively checked and only the seven valid values type-check. The
 // `Sun`..`Sat` constants below name each value.
@@ -243,6 +256,52 @@ export val now = (): DateTime => fromTimestamp(wallClockNow())
 // Today's date in UTC. Impure (reads the system clock).
 export val today = (): Date => dateOf(now())
 
+// ── Fixed UTC offset (OffsetDateTime) ─────────────────────────────────────────────────
+// A fixed-offset layer over the UTC core: an `OffsetDateTime` carries local wall-clock fields plus a
+// constant `offsetMinutes`. There is NO DST — the offset is the same all year — so this models
+// java.time `OffsetDateTime`, not a named zone. Convert to/from the canonical UTC instant with
+// `toInstant`/`atOffset`; `now`/`today` above (and `fromTimestamp`) remain the UTC entry points.
+// Milliseconds in one minute — the offset unit.
+val MS_PER_MIN: Int64 = 60000
+
+// Tag a local `DateTime` with a fixed UTC offset, producing an `OffsetDateTime`. The fields are taken
+// as the LOCAL wall-clock at `offsetMinutes`; the instant is computed as `wall - offset` by `toInstant`.
+// @param offsetMinutes  the offset east of UTC in minutes (e.g. 330 for +05:30, -300 for -05:00).
+// @example dt.withOffset(330)  // tag a DateTime as +05:30 local
+export val withOffset = (dt: DateTime, offsetMinutes: Int64): OffsetDateTime =>
+  { ...dt, "offsetMinutes": offsetMinutes }
+
+// The fixed offset (minutes east of UTC) of an `OffsetDateTime`.
+export val offsetOf = (odt: OffsetDateTime): Int64 => odt["offsetMinutes"]
+
+// The UTC Unix-millisecond instant an `OffsetDateTime` denotes. Subtracts the offset from the local
+// wall-clock: 10:30 at +05:30 is the same instant as 05:00 UTC.
+export val toInstant = (odt: OffsetDateTime): Int64 =>
+  toTimestamp(odt) - odt["offsetMinutes"] * MS_PER_MIN
+
+// The `OffsetDateTime` a fixed-offset observer reads for a UTC instant. The local wall-clock is
+// `instant + offset`, tagged with the offset — the inverse of `toInstant`. Never fails.
+// @param ts  the UTC Unix-millisecond instant.
+// @param offsetMinutes  the observer's offset east of UTC, in minutes.
+// @example atOffset(0, -300)  // 1969-12-31T19:00 -05:00 (the epoch seen from UTC-5)
+export val atOffset = (ts: Int64, offsetMinutes: Int64): OffsetDateTime =>
+  withOffset(fromTimestamp(ts + offsetMinutes * MS_PER_MIN), offsetMinutes)
+
+// Re-express an `OffsetDateTime` at a different fixed offset, preserving the instant (the local
+// wall-clock shifts so it denotes the same moment). `withOffset` REPLACES the offset keeping the
+// wall-clock; this keeps the instant and recomputes the wall-clock.
+// @example toOffset(atOffset(0, 0), -300)  // same instant, now read as -05:00
+export val toOffset = (odt: OffsetDateTime, offsetMinutes: Int64): OffsetDateTime =>
+  atOffset(toInstant(odt), offsetMinutes)
+
+// The local wall-clock `DateTime` at UTC for an `OffsetDateTime` (drops the offset, shifting to the
+// UTC instant). Equivalent to `fromTimestamp(toInstant(odt))`.
+export val toUtc = (odt: OffsetDateTime): DateTime => fromTimestamp(toInstant(odt))
+
+// The current wall-clock as an `OffsetDateTime` at a fixed offset. Impure (reads the system clock).
+// @param offsetMinutes  the offset east of UTC, in minutes.
+export val nowAt = (offsetMinutes: Int64): OffsetDateTime => atOffset(wallClockNow(), offsetMinutes)
+
 // ── Computed fields ──────────────────────────────────────────────────────────────────
 // The day of the week as a `Weekday` (0=Sunday .. 6=Saturday). The civil-date math runs in `Int64`;
 // the `match` narrows the in-range result `0..6` to the literal union so callers get an exhaustive
@@ -377,6 +436,21 @@ export val toIsoTime = (t: Time): String =>
 // The ISO 8601 date-time string for a `DateTime`, e.g. "2024-01-15T10:30:00.500".
 export val toIso = (dt: DateTime): String => "${toIsoDate(dateOf(dt))}T${toIsoTime(timeOf(dt))}"
 
+// The ISO 8601 offset suffix for `offsetMinutes`: "Z" for zero, otherwise "+HH:MM" / "-HH:MM".
+// @example toIsoOffset(330)  // "+05:30"     toIsoOffset(0)  // "Z"     toIsoOffset(-300)  // "-05:00"
+export val toIsoOffset = (offsetMinutes: Int64): String =>
+  if offsetMinutes == 0 then
+    "Z"
+  else
+    val sign = if offsetMinutes < 0 then "-" else "+"
+    val mag = if offsetMinutes < 0 then 0 - offsetMinutes else offsetMinutes
+    "${sign}${pad(mag / 60, 2)}:${pad(mag % 60, 2)}"
+
+// The ISO 8601 date-time string for an `OffsetDateTime`, e.g. "2024-01-15T10:30:00.500+05:30" (the
+// local wall-clock followed by the offset suffix). Use `toIso` for the bare wall-clock without offset.
+export val toIsoOffsetDateTime = (odt: OffsetDateTime): String =>
+  "${toIso(odt)}${toIsoOffset(odt["offsetMinutes"])}"
+
 // ── ISO 8601 parsing ────────────────────────────────────────────────────────────────
 // Parse one decimal field, narrowing a bad component to a `null` the caller turns into an Error.
 // Returns Int32 (auto-widens to the Int64 fields at the `date`/`time` call sites); keeping it Int32
@@ -454,3 +528,70 @@ export val parseIso = (s: String): DateTime | Error =>
         match tm
           is Error => error("${tm["message"]}")
           else => atTime(d, tm)
+
+// Parse an ISO 8601 offset suffix ("Z", "+HH:MM", or "-HH:MM") to minutes east of UTC. "Z" is 0.
+// @returns the offset in minutes, or an `Error` if malformed or out of the ±18:00 range.
+export val parseIsoOffset = (s: String): Int64 | Error =>
+  if s == "Z" then
+    0
+  else
+    val sign = substring(s, 0, 1)
+    if sign != "+" && sign != "-" then
+      error("expected ISO offset Z or ±HH:MM, got: ${s}")
+    else
+      val body = substring(s, 1)
+      val parts = split(body, ":")
+      if parts.length() != 2 then
+        error("expected ISO offset ±HH:MM, got: ${s}")
+      else
+        val h = field(parts[0])
+        val mi = field(parts[1])
+        match h
+          is Int32 =>
+            match mi
+              is Int32 =>
+                if h < 0 || h > 18 || mi < 0 || mi > 59 then
+                  error("ISO offset out of range: ${s}")
+                else
+                  val mag: Int64 = h * 60 + mi
+                  if sign == "-" then 0 - mag else mag
+              else => error("invalid offset minutes: ${s}")
+          else => error("invalid offset hours: ${s}")
+
+// Parse an ISO 8601 date-time WITH an offset, "YYYY-MM-DDThh:mm:ss(.sss)?(Z|±HH:MM)", into an
+// `OffsetDateTime`. The wall-clock fields and the offset are taken as written (the local time at that
+// offset); use `toInstant` for the UTC instant. A missing offset is an error — use `parseIso` for the
+// offset-less form.
+// @returns the `OffsetDateTime`, or an `Error` if any part is malformed, out of range, or the offset
+//   is absent.
+export val parseIsoOffsetDateTime = (s: String): OffsetDateTime | Error =>
+  val t = indexOf(s, "T")
+  if t < 0 then
+    error("expected ISO date-time with 'T' separator, got: ${s}")
+  else
+    // The offset starts at the trailing 'Z', or the first '+'/'-' AFTER the time (skip the date's
+    // '-' separators by searching only the post-'T' region).
+    val rest = substring(s, t + 1)
+    val zPos = indexOf(rest, "Z")
+    val plusPos = indexOf(rest, "+")
+    // A '-' in the time region marks a negative offset; it cannot appear inside HH:MM:SS.sss.
+    val minusPos = indexOf(rest, "-")
+    val cut = if zPos >= 0 then
+      zPos
+    else if plusPos >= 0 then
+      plusPos
+    else
+      minusPos
+    if cut < 0 then
+      error("expected a trailing offset (Z or ±HH:MM) in: ${s}")
+    else
+      val dtPart = substring(s, 0, t + 1 + cut)
+      val offPart = substring(rest, cut)
+      val dt = parseIso(dtPart)
+      match dt
+        is Error => error("${dt["message"]}")
+        else =>
+          val off = parseIsoOffset(offPart)
+          match off
+            is Error => error("${off["message"]}")
+            else => withOffset(dt, off)

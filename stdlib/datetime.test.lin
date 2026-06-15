@@ -9,6 +9,8 @@ import { millis, seconds, minutes, hours, days, plus, minus, scale } from "std/d
 import { toMillis, toSeconds, toMinutes, toHours, toDays, between, plusDuration, minusDuration } from "std/datetime"
 import { compareDate, compare, isBefore, isAfter } from "std/datetime"
 import { toIsoDate, toIsoTime, toIso, parseIsoDate, parseIsoTime, parseIso } from "std/datetime"
+import { OffsetDateTime, withOffset, offsetOf, toInstant, atOffset, toOffset, toUtc } from "std/datetime"
+import { toIsoOffset, toIsoOffsetDateTime, parseIsoOffset, parseIsoOffsetDateTime } from "std/datetime"
 
 // Helpers: unwrap a `T | Error` in tests, substituting a sentinel on Error so a failed construction
 // produces a visibly-wrong value rather than a type error.
@@ -44,6 +46,21 @@ val unwrapDt = (r: DateTime | Error): DateTime =>
         "minute": 0,
         "second": 0,
         "millis": 0
+      }
+    else => r
+
+val unwrapOdt = (r: OffsetDateTime | Error): OffsetDateTime =>
+  match r
+    is Error =>
+      {
+        "year": 0,
+        "month": 0,
+        "day": 0,
+        "hour": 0,
+        "minute": 0,
+        "second": 0,
+        "millis": 0,
+        "offsetMinutes": 0
       }
     else => r
 
@@ -455,6 +472,122 @@ val s = suite("std/datetime", [
     val dt = fromTimestamp(KNOWN)
     [
       expect(toTimestamp(unwrapDt(parseIso(toIso(dt))))).toBe(KNOWN)
+    ]
+  ),
+
+  // ── OffsetDateTime: fixed UTC offset ──────────────────────────────────────
+  test("withOffset tags local fields; toInstant subtracts the offset", () =>
+    // 2024-01-15T10:30 local at +05:30 is the instant 2024-01-15T05:00:00Z = 1705294800000.
+    val odt = withOffset(unwrapDt(dateTime(2024, 1, 15, 10, 30, 0)), 330)
+    [
+      expect(offsetOf(odt)).toBe(330),
+      expect(odt["hour"]).toBe(10), // local wall-clock unchanged
+      expect(toInstant(odt)).toBe(1705294800000)
+    ]
+  ),
+
+  test("an OffsetDateTime is structurally a DateTime/Date/Time", () =>
+    val odt = withOffset(unwrapDt(dateTime(2024, 1, 15, 10, 30, 45)), -300)
+    [
+      // pass straight to Date- and Time- and DateTime-typed functions
+      expect(toIsoDate(odt)).toBe("2024-01-15"),
+      expect(toIsoTime(odt)).toBe("10:30:45.000"),
+      expect(weekday(odt)).toBe(1) // Monday — reads the local date fields
+    ]
+  ),
+
+  test("atOffset is the inverse of toInstant", () =>
+    val odt = withOffset(unwrapDt(dateTime(2024, 1, 15, 10, 30, 0)), 330)
+    val back = atOffset(toInstant(odt), 330)
+    [
+      expect(toInstant(back)).toBe(toInstant(odt)),
+      expect(back["hour"]).toBe(10),
+      expect(back["minute"]).toBe(30),
+      expect(offsetOf(back)).toBe(330)
+    ]
+  ),
+
+  test("atOffset of the epoch at -05:00 reads the previous evening", () =>
+    val odt = atOffset(0, -300) // 1969-12-31T19:00 -05:00
+    [
+      expect(odt["year"]).toBe(1969),
+      expect(odt["month"]).toBe(12),
+      expect(odt["day"]).toBe(31),
+      expect(odt["hour"]).toBe(19),
+      expect(toInstant(odt)).toBe(0)
+    ]
+  ),
+
+  test("toOffset preserves the instant and shifts the wall-clock", () =>
+    val odt = withOffset(unwrapDt(dateTime(2024, 1, 15, 10, 30, 0)), 330) // 05:00Z
+    val ny = toOffset(odt, -300) // same instant at -05:00 = 2024-01-15T00:00
+    [
+      expect(toInstant(ny)).toBe(toInstant(odt)),
+      expect(ny["day"]).toBe(15),
+      expect(ny["hour"]).toBe(0),
+      expect(ny["minute"]).toBe(0),
+      expect(offsetOf(ny)).toBe(-300)
+    ]
+  ),
+
+  test("toUtc shifts an OffsetDateTime to the UTC wall-clock", () =>
+    val odt = withOffset(unwrapDt(dateTime(2024, 1, 15, 10, 30, 0)), 330)
+    val u = toUtc(odt)
+    [
+      expect(u["hour"]).toBe(5),
+      expect(u["minute"]).toBe(0)
+    ]
+  ),
+
+  test("toIsoOffset renders Z / +HH:MM / -HH:MM", () => [
+    expect(toIsoOffset(0)).toBe("Z"),
+    expect(toIsoOffset(330)).toBe("+05:30"),
+    expect(toIsoOffset(-300)).toBe("-05:00"),
+    expect(toIsoOffset(-510)).toBe("-08:30")
+  ]),
+
+  test("toIsoOffsetDateTime appends the offset suffix", () =>
+    val odt = withOffset(unwrapDt(dateTime(2024, 1, 15, 10, 30, 0)), 330)
+    [
+      expect(toIsoOffsetDateTime(odt)).toBe("2024-01-15T10:30:00.000+05:30"),
+      expect(toIsoOffsetDateTime(atOffset(KNOWN, 0))).toBe("2024-01-15T10:30:00.000Z")
+    ]
+  ),
+
+  test("parseIsoOffset parses Z and signed offsets", () => [
+    expect(parseIsoOffset("Z")).toBe(0),
+    expect(parseIsoOffset("+05:30")).toBe(330),
+    expect(parseIsoOffset("-05:00")).toBe(-300),
+    expect(parseIsoOffset("+18:00")).toBe(1080),
+    expect(parseIsoOffset("19:00") is Error).toBe(true), // missing sign
+    expect(parseIsoOffset("+19:00") is Error).toBe(true) // hours out of range
+  ]),
+
+  test("parseIsoOffsetDateTime reads wall-clock + offset (Z, +, -)", () =>
+    val a = unwrapOdt(parseIsoOffsetDateTime("2024-01-15T10:30:00.000+05:30"))
+    val b = unwrapOdt(parseIsoOffsetDateTime("2024-01-15T00:00:00.000-05:00"))
+    val z = unwrapOdt(parseIsoOffsetDateTime("2024-01-15T05:00:00.000Z"))
+    [
+      // all three name the SAME instant (05:00Z)
+      expect(toInstant(a)).toBe(1705294800000),
+      expect(toInstant(b)).toBe(1705294800000),
+      expect(toInstant(z)).toBe(1705294800000),
+      expect(offsetOf(a)).toBe(330),
+      expect(offsetOf(b)).toBe(-300),
+      expect(a["hour"]).toBe(10) // local fields preserved as written
+    ]
+  ),
+
+  test("parseIsoOffsetDateTime requires an offset and rejects malformed input", () => [
+    expect(parseIsoOffsetDateTime("2024-01-15T10:30:00.000") is Error).toBe(true), // no offset
+    expect(parseIsoOffsetDateTime("2024-01-15 10:30:00Z") is Error).toBe(true) // no 'T'
+  ]),
+
+  test("toIsoOffsetDateTime round-trips parseIsoOffsetDateTime", () =>
+    val s = "2024-07-01T23:45:06.250-08:30"
+    val odt = unwrapOdt(parseIsoOffsetDateTime(s))
+    [
+      expect(toIsoOffsetDateTime(odt)).toBe(s)
     ]
   )
 ])
