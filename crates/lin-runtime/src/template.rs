@@ -4,8 +4,8 @@ use crate::fs::{make_error_tagged, resolve_lin_str};
 
 /// Bridge a Lin data value to a `serde_json::Value` for use as a minijinja render
 /// context. `tagged_to_json` expects a `TaggedVal*`; the foreign `{}` arg may instead
-/// arrive as a bare `LinObject*` (the param does not force boxing in every code path),
-/// so detect the tag and synthesise a stack `TaggedVal(TAG_OBJECT)` for a raw object
+/// arrive as a bare `LinMap*` (the param does not force boxing in every code path),
+/// so detect the tag and synthesise a stack `TaggedVal(TAG_MAP)` for a raw map
 /// pointer. `tagged_to_json` only reads tag+payload — it neither frees nor takes
 /// ownership, so the synthesised stack value is safe.
 unsafe fn data_to_context(data: *const u8) -> serde_json::Value {
@@ -52,7 +52,7 @@ unsafe fn ok_string(out: &str) -> *mut u8 {
 /// rendered string on success, or an `Error` object `{type:error,message}` on a
 /// render/parse failure (faithful to Lin's `is Error` convention — see ADR-048).
 ///
-/// `data` may be a raw `LinObject*` or a `TaggedVal*(TAG_OBJECT)`; both are
+/// `data` may be a raw `LinMap*` or a `TaggedVal*(TAG_MAP)`; both are
 /// accepted and bridged to a `serde_json::Value::Object` via `tagged_to_json`.
 #[no_mangle]
 pub unsafe extern "C" fn lin_template_render(

@@ -846,11 +846,11 @@ pub unsafe extern "C" fn lin_union_force_to_map(tv: *const u8) -> *mut LinMap {
     dynamic_to_map(tv as *const TaggedVal)
 }
 
-/// Cluster D: moved from object.rs. Get or insert a `LinArray` at `key` inside a boxed object.
-/// After Phase 3, all dynamic objects are TAG_MAP (LinMap*). TAG_OBJECT path removed.
-/// Used by the stdlib `groupBy` implementation (stdlib/array.lin `lin_object_get_or_insert_array`).
+/// Cluster D: moved from object.rs. Get or insert a `LinArray` at `key` inside a LinMap.
+/// All dynamic objects are TAG_MAP (LinMap*) — no TAG_OBJECT producers remain after Phase 3.
+/// Used by the stdlib `groupBy` implementation.
 #[no_mangle]
-pub unsafe extern "C" fn lin_object_get_or_insert_array(obj: *const u8, key: *const u8) -> *mut u8 {
+pub unsafe extern "C" fn lin_map_get_or_insert_array(obj: *const u8, key: *const u8) -> *mut u8 {
     use crate::tagged::{TaggedVal, TAG_ARRAY, TAG_MAP, TAG_STR, alloc_tagged};
     use crate::string::LinString;
     if obj.is_null() {
@@ -884,7 +884,7 @@ pub unsafe extern "C" fn lin_object_get_or_insert_array(obj: *const u8, key: *co
         }
         return alloc_tagged(TAG_ARRAY, arr as u64);
     }
-    // Not a map — return a fresh empty array (TAG_OBJECT producers removed, Cluster D).
+    // Not a map — return a fresh empty array.
     alloc_tagged(TAG_ARRAY, crate::array::lin_array_alloc(4) as u64)
 }
 

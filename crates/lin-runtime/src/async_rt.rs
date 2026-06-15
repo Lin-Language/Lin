@@ -448,7 +448,7 @@ pub unsafe extern "C" fn lin_retry(thunk: *mut u8, n: i32) -> *mut LinPromise {
     lin_make_promise(last)
 }
 
-/// True if `v` is an Error-shaped value `{ "type": "error", ... }` (TAG_MAP or TAG_OBJECT).
+/// True if `v` is an Error-shaped value `{ "type": "error", ... }` (TAG_MAP).
 /// Used by `retry` to decide success vs. failure.
 unsafe fn is_error_value(v: *mut u8) -> bool {
     use crate::tagged::{TaggedVal, TAG_MAP, TAG_STR};

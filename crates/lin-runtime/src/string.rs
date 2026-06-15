@@ -1309,7 +1309,7 @@ unsafe fn push_json_map(out: &mut String, map: *const crate::map::LinMap) {
 /// `byteAt` turns a `String` into bytes one at a time; this turns the byte buffer back into a
 /// `String`, validating that the bytes are well-formed UTF-8. Returns a boxed `TaggedVal*`:
 ///   * success → `TAG_STR` box wrapping a fresh +1 `LinString`
-///   * invalid UTF-8 → `TAG_OBJECT` box wrapping the standard `{type:"error",message}` shape
+///   * invalid UTF-8 → `TAG_MAP` box wrapping the standard `{type:"error",message}` shape
 /// This is why the foreign declaration is `=> Json` (a boxed tagged value, re-annotated to
 /// `String | Error` in the `std/string.fromUtf8` wrapper): a bare `=> UInt8[]`/`=> String`
 /// foreign return cannot carry the Error arm. `arr` may be a raw `LinArray*` or a

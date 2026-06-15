@@ -21,16 +21,16 @@ use inkwell::AddressSpace;
 // declaration or call below changes based on it. The convention summary, grounded in the runtime
 // semantics in `lin-runtime/src/`:
 //
-//   lin_object_get(borrow obj, borrow key)        -> borrow   (interior pointer; caller must clone
+//   lin_map_get(borrow map, borrow key)           -> borrow   (interior pointer; caller must clone
 //                                                              before it escapes — see own_for_read)
-//   lin_object_set(inout obj, own key, own val)   -> own/void (obj mutated in place; key+val stored)
-//   lin_object_has / lin_object_eq / lin_string_eq(borrow, borrow) -> scalar
+//   lin_map_set(inout map, own key, own val)       -> own/void (map mutated in place; key+val stored)
+//   lin_map_has / lin_map_eq / lin_string_eq(borrow, borrow) -> scalar
 //   lin_array_get(borrow arr, own i)              -> borrow   (borrowed element; the `_tagged`
 //                                                              variant returns a fresh +1 instead)
 //   lin_push / lin_array_push(inout arr, own v)   -> void     (canonical (inout, own))
 //   lin_*_length / lin_string_length(borrow)      -> scalar
 //   lin_string_concat(borrow, borrow)             -> own      (fresh string; inputs copied)
-//   lin_array_alloc / lin_object_alloc / lin_map_alloc(own cap) -> own (fresh +1)
+//   lin_array_alloc / lin_map_alloc(own cap)      -> own (fresh +1)
 //   lin_keys(borrow obj)                          -> own      (fresh String[])
 //   lin_print(borrow s)                           -> void     (reads only — today's lowering
 //                                                              over-owns this; a Wave-2 win)
@@ -112,7 +112,7 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub map_get: FunctionValue<'ctx>,
     pub map_release: FunctionValue<'ctx>,
     /// `lin_union_force_to_map(tv: ptr) -> *LinMap` — normalise a union/Json boxed source to a
-    /// fresh owned +1 `LinMap` (handles TAG_MAP/TAG_OBJECT/TAG_RECORD/TAG_SUMNODE). Caller releases.
+    /// fresh owned +1 `LinMap` (handles TAG_MAP/TAG_RECORD/TAG_SUMNODE). Caller releases.
     pub map_force: FunctionValue<'ctx>,
     /// `lin_map_eq(a: ptr, b: ptr) -> i8` — structural, order-independent equality for two maps.
     pub map_eq: FunctionValue<'ctx>,

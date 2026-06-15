@@ -832,10 +832,10 @@ pub fn lower_object_pattern_test(
     ctx: &mut LowerCtx,
 ) -> PatternTest {
     // Heap-field SumNode Stage 3: `HasPattern` (→ `lin_value_has_field`) checks the tag byte at
-    // offset 0 of the pointer, expecting TAG_OBJECT. A raw `*SumNode` has its RC field at offset 0
+    // offset 0 of the pointer, expecting a TaggedVal. A raw `*SumNode` has its RC field at offset 0
     // (not a tag byte), so `lin_value_has_field` misidentifies it and returns false for every field.
     // When the scrutinee is a SumNode-eligible union, coerce it to Json (materialize to a boxed
-    // `LinObject`) first, so `HasPattern` and the discriminant `Index` value-constraints see a
+    // `LinMap`, TAG_MAP) first, so `HasPattern` and the discriminant `Index` value-constraints see a
     // valid tagged object. The materialized pointer is registered as owned and released at scope end.
     let json_ty = Type::TypeVar(u32::MAX);
     builder.push_scope();

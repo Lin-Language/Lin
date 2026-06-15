@@ -20,6 +20,7 @@ pub const TAG_INT64: u8 = 3;
 pub const TAG_FLOAT32: u8 = 4;
 pub const TAG_FLOAT64: u8 = 5;
 pub const TAG_STR: u8 = 6;
+/// RETIRED — no producers; reserved tag value 7. Kept so defensive match arms compile.
 pub const TAG_OBJECT: u8 = 7;
 pub const TAG_ARRAY: u8 = 8;
 pub const TAG_FUNCTION: u8 = 9;
@@ -37,11 +38,11 @@ pub const TAG_STREAM: u8 = 19;
 pub const TAG_MAP: u8 = 20;
 /// KEEP-PACKED unboxed sum node (`*SumNode`, `crate::sumnode`) wrapped by-pointer in a 16-byte
 /// `TaggedVal` so an unboxed sum value can live in a BOXED record/object FIELD slot WITHOUT
-/// materializing to a `LinObject` (the keep-packed-through-record-fields optimization, ADR-062
+/// materializing to a `LinMap` (the keep-packed-through-record-fields optimization, ADR-062
 /// Stage 4 follow-up). A SumNode has the SEALED header shape (`[rc|size|desc|tag|pad|payload]`), NOT
-/// the `LinObject` shape, so the slot MUST carry this distinct tag — dispatching its release/retain
+/// the `LinMap` shape, so the slot MUST carry this distinct tag — dispatching its release/retain
 /// to `lin_sumnode_*` and its display/equality/serialization/transfer to a MATERIALIZE-on-demand
-/// boundary. A `TAG_OBJECT` here would type-confuse `lin_object_release` (offset-4 size read as len).
+/// boundary. Using TAG_MAP here would type-confuse `lin_map_release` (offset-4 reads size, not rc).
 pub const TAG_SUMNODE: u8 = 21;
 /// Arbitrary-precision integer (`std/bignum`, `crate::bignum`). An opaque, immutable, refcounted
 /// heap handle wrapping a `num_bigint::BigInt`, in the `TAG_STREAM`/`TAG_SHARED` opaque-handle
@@ -65,10 +66,10 @@ pub const TAG_TAR_ENTRY: u8 = 24;
 /// a `*sealed-struct` (same shape as a `lin_sealed_alloc` allocation: `[u32 rc | u32 size |
 /// u64 desc_ptr | payload...]`). The descriptor pointer is recoverable from the struct at offset 8
 /// (`SealedDesc`), which also provides field names+kinds for display/equality/field-access. This
-/// avoids materialising a `LinObject` on widening (O(1) wrap vs O(n) copy). All dynamic consumers
+/// avoids materialising a `LinMap` on widening (O(1) wrap vs O(n) copy). All dynamic consumers
 /// (`lin_tagged_eq` / `lin_tagged_to_string` / `push_json_value` / worker transfer / field-access)
 /// read fields via the named descriptor exactly as `TAG_SUMNODE` does via `lin_sumnode_materialize`.
-/// A `TAG_RECORD` and a `TAG_OBJECT` with identical fields compare EQUAL (`lin_tagged_eq`).
+/// A `TAG_RECORD` and a `TAG_MAP` with identical fields compare EQUAL (`lin_tagged_eq`).
 pub const TAG_RECORD: u8 = 25;
 
 // ── Named-descriptor field kind codes (NKIND_*) ───────────────────────────────────────────────────

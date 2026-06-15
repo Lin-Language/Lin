@@ -183,8 +183,8 @@ impl<'ctx> DebugInfoState<'ctx> {
     }
 
     /// Map a Lin `Type` to the `DIType` to attach to a local of that type. Pointer-shaped Lin
-    /// values use a pointer-to-named-runtime-struct so the Phase 2 lldb formatters apply
-    /// (`TaggedVal`/`LinArray`/`LinString`/`LinObject`); scalars use a primitive base type and
+    /// values use a pointer-to-named-runtime-struct so the lldb formatters apply
+    /// (`TaggedVal`/`LinArray`/`LinString`/`LinMap`); scalars use a primitive base type and
     /// render as their raw logical value.
     fn ditype_for(&mut self, context: &'ctx inkwell::context::Context, ty: &Type) -> DIType<'ctx> {
         match ty {

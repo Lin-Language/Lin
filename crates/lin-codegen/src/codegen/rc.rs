@@ -168,7 +168,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(cont_bb);
                 return;
             }
-            // A boxed slot (Opaque): the box is a TaggedVal/LinObject whose release is the
+            // A boxed slot (Opaque): the box is a TaggedVal/LinMap whose release is the
             // tag-dispatched one. Fall through to the type-based dispatch which already picks the right
             // boxed releaser for the static type (object/array/tagged/map/closure/stream).
             Repr::Boxed(_) | Repr::FlatScalar(_) | Repr::Unknown | Repr::Bottom => {}
@@ -184,9 +184,9 @@ impl<'ctx> Codegen<'ctx> {
         match ty {
             Type::Str | Type::StrLit(_) => { self.builder.call(self.rt.string_release, &[ptr.into()], ""); }
             Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => { self.builder.call(self.rt.array_release, &[ptr.into()], ""); }
-            // A sealed scalar record uses the packed-struct layout, NOT a LinObject — route its
+            // A sealed scalar record uses the packed-struct layout, NOT a LinMap — route its
             // release to lin_sealed_release (decrement rc, free on zero; no per-field release).
-            // Passing it to lin_object_release would walk garbage entries. Gate FIRST.
+            // Passing it to lin_map_release would walk garbage entries. Gate FIRST.
             Type::Object { .. } if Self::sealed_scalar_fields(ty).is_some() => {
                 let fields = Self::sealed_scalar_fields(ty).unwrap().clone();
                 self.emit_sealed_release(val, &fields);

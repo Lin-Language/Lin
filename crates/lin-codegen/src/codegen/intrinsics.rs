@@ -291,7 +291,7 @@ impl<'ctx> Codegen<'ctx> {
                     // owned — `lower.rs` `push_into_sealed_array` skips the ownership transfer — and
                     // is released at scope exit, balancing the retain. WITHOUT this, a sealed-array
                     // `push` fell through to `tagged_array_push_value`, which materialized a BOXED
-                    // LinObject and tagged-pushed it (TAG_OBJECT) into the packed-scalar buffer → a
+                    // LinMap and tagged-pushed it (TAG_MAP) into the packed-scalar buffer → a
                     // pointer-sized tagged element written into a scalar-stride slot → heap-buffer
                     // overflow (`realloc(): invalid next size`; ASan: heap-buffer-overflow in
                     // lin_array_push). Stage-3 tests dodged this by using array LITERALS only. Scalar
@@ -1057,8 +1057,8 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 ptr_ty.const_null().into()
             }
-            // lin_keys(obj) => String[]. Cluster D: TAG_OBJECT / lin_object_keys removed.
-            // Dispatch: union/Json → lin_tagged_keys (handles TAG_MAP, TAG_RECORD, TAG_MAP);
+            // lin_keys(obj) => String[].
+            // Dispatch: union/Json → lin_tagged_keys (handles TAG_MAP, TAG_RECORD, TAG_SUMNODE);
             // sealed concrete Object → box as TAG_RECORD + lin_tagged_keys (materialized path);
             // non-sealed concrete Object / Named / Map → lin_map_keys directly on the LinMap*.
             Intrinsic::Keys => {
@@ -1173,7 +1173,7 @@ impl<'ctx> Codegen<'ctx> {
                 // Allocate a 0xFD array and push the fill N times (retaining per push). This mirrors
                 // the array-literal path for sealed elements (lin_sealed_ptr_array_alloc + push).
                 // Without this special case, the `else` branch below creates a 0xFF tagged array and
-                // stores TAG_OBJECT struct-pointer TaggedVals — but later ops (IndexSet, field reads)
+                // stores TAG_RECORD struct-pointer TaggedVals — but later ops (IndexSet, field reads)
                 // assume 0xFD repr → wrong element layout → crash at runtime.
                 if let Some(fill_fields) = arg_reprs.get(1).and_then(|r| r.packed_struct_fields()) {
                     let fill_fields = fill_fields.clone();

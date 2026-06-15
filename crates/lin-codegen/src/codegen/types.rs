@@ -30,8 +30,8 @@ impl<'ctx> Codegen<'ctx> {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
             Type::Array(_) | Type::FixedArray(_) => self.array_ptr_type.into(),
-            // Stage 0.5: codegen IGNORES the `sealed` marker — every object, sealed or not, is the
-            // boxed string-keyed `LinObject` pointer, exactly as before. Stage 1 will branch here.
+            // Every object type, sealed or not, is an opaque pointer — sealed records are packed
+            // structs, unsealed objects are `LinMap*`; both are pointer-sized at the LLVM level.
             Type::Object { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             // A typed index-signature map (`{ String: T }`, ADR-055) is a `LinMap*` — an opaque
             // pointer to the hashed container.
@@ -79,7 +79,7 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Stage 6a: Returns true if `ty` represents a value whose tagged-box payload is a HEAP POINTER
-    /// (LinString*, LinArray*, LinObject*, LinMap*) — as opposed to a scalar (Int, Float, Bool,
+    /// (LinString*, LinArray*, sealed-struct*, LinMap*) — as opposed to a scalar (Int, Float, Bool,
     /// Null) whose payload is an integer or zero. Used to decide whether to retain the inner before
     /// releasing an owned box (e.g. a TAG_RECORD field-lookup result from `lin_record_get_field`).
     pub(crate) fn result_is_heap_pointer(ty: &Type) -> bool {
@@ -371,7 +371,7 @@ impl<'ctx> Codegen<'ctx> {
     /// shell (which the caller frees with `lin_tagged_free_box`, leaving the borrowed inner alone)?
     ///
     /// `box_value` MATERIALIZES — i.e. allocates a fresh +1 — only for nested SEALED records
-    /// (`Type::Object` with sealed fields) → fresh boxed `LinObject` (`sealed_materialize_to_object`).
+    /// (`Type::Object` with sealed fields) → fresh boxed `LinMap` (`sealed_materialize_to_map`).
     ///
     /// For sealed-record ARRAYS (Stage-2a: 0xFD pointer-backed), `box_value` calls `lin_box_array`
     /// which wraps the raw `LinArray*` pointer directly (BORROWED, no retain and no fresh
@@ -491,8 +491,8 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// The (unsealed) object Type of the FIRST variant of a sum type — used purely to give
-    /// `box_value` a TAG_OBJECT box tag when boxing a materialized SumNode for a dynamic edge. Any
-    /// variant's object type yields the same box tag (TAG_OBJECT); the first is a convenient
+    /// `box_value` a TAG_MAP box tag when boxing a materialized SumNode for a dynamic edge. Any
+    /// variant's object type yields the same box tag (TAG_MAP); the first is a convenient
     /// representative. `ty` must be a sum type.
     pub(crate) fn sumnode_first_variant_obj_ty(ty: &Type) -> Type {
         let fields = match ty {

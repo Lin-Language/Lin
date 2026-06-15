@@ -51,8 +51,8 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Test a single concrete type `ty` against an already-extracted tag integer. Returns an i1.
-    /// Handles the Stage-6a dual-tag case: sealed Object types can appear as TAG_OBJECT (when
-    /// materialized as a LinObject) OR TAG_RECORD (when boxed via `lin_box_record` in a union
+    /// Handles the Stage-6a dual-tag case: sealed Object types can appear as TAG_MAP (when
+    /// materialized as a LinMap) OR TAG_RECORD (when boxed via `lin_box_record` in a union
     /// slot) — both are valid runtime representations of the same Lin type.
     fn compile_ir_is_type_single(&mut self, tag: inkwell::values::IntValue<'ctx>, ty: &Type) -> inkwell::values::IntValue<'ctx> {
         let i8_ty = self.context.i8_type();
@@ -133,7 +133,7 @@ impl<'ctx> Codegen<'ctx> {
     /// `TaggedVal` → UAF). Three directions:
     ///   - sum → SAME sum type: a no-op carry (same SumNode pointer).
     ///   - sum → a concrete VARIANT record (the `match`-arm narrowing): project to a sealed struct.
-    ///   - sum → Json / union / generic / anything else: materialize the node to a boxed `LinObject`,
+    ///   - sum → Json / union / generic / anything else: materialize the node to a boxed `LinMap`,
     ///     then box to a union/Json `TaggedVal` if the target is union/Json.
     /// All other coercions (numeric, sealed-record, array, boxed sources) delegate to the existing
     /// type-driven `compile_ir_coerce`.
@@ -254,8 +254,8 @@ impl<'ctx> Codegen<'ctx> {
                 let tf = target_fields.clone();
                 return self.sumnode_project_to_sealed(val, &sum_ty, &tf);
             }
-            // sum → Json / union / generic / unsealed object: materialize to a boxed LinObject, then
-            // box as TAG_OBJECT if the target is a union/Json wildcard.
+            // sum → Json / union / generic / unsealed object: materialize to a boxed LinMap, then
+            // box as TAG_MAP if the target is a union/Json wildcard.
             let obj = self.sumnode_materialize_to_object(val, &sum_ty, llvm_fn);
             if Self::is_union_type(to_ty) || matches!(to_ty, Type::TypeVar(_)) {
                 return self.box_value(obj, &Self::sumnode_first_variant_obj_ty(&sum_ty));
@@ -286,7 +286,7 @@ impl<'ctx> Codegen<'ctx> {
             }
             // KEEP-PACKED-THROUGH-RECORD-FIELDS read-back is centralized in `sumnode_project_from_boxed`:
             // for a BOXED union/Json source it tag-dispatches (TAG_SUMNODE → unwrap the kept-packed
-            // `*SumNode` zero-copy; TAG_OBJECT → project a fresh node), and for a raw `LinObject*` (a
+            // `*SumNode` zero-copy; TAG_MAP → project a fresh node), and for a raw `LinMap*` (a
             // match-narrowed, already-unboxed scrutinee — `src_ty` not a union) it projects directly.
             // So this single call is correct for BOTH the cursor read (`parsed["node"]` boxed, the
             // interp keep-packed fast path) AND the match-arm narrowing alike — with no static asymmetry.
@@ -381,11 +381,11 @@ impl<'ctx> Codegen<'ctx> {
                 // Stage 6a: DIRECT O(1) wrap as TAG_RECORD for the sealed→Json/AnyVal Coerce.
                 // Only applied when the target is EXACTLY the JSON/AnyVal type (TypeVar(u32::MAX)
                 // or TypeVar in general), NOT for multi-variant Union types (which are synthetic
-                // merge unions for if-branches and expect TAG_OBJECT from lin_unbox_ptr).
+                // merge unions for if-branches and expect TAG_MAP from lin_unbox_ptr).
                 //
                 // The restriction is necessary because: multi-variant unions created by if-merge
                 // phi nodes are immediately unboxed via `lin_unbox_ptr` + `Coerce(union → Object)`,
-                // and `lin_unbox_ptr` for TAG_RECORD returns the sealed struct ptr (not LinObject*)
+                // and `lin_unbox_ptr` for TAG_RECORD returns the sealed struct ptr (not LinMap*)
                 // → crashes. Only genuine Json/AnyVal slots are fully TAG_RECORD-aware via tag dispatch.
                 //
                 // `lin_box_record` retains the sealed struct (bumps its RC at offset 0) and
@@ -393,19 +393,19 @@ impl<'ctx> Codegen<'ctx> {
                 // Runtime consumers (lin_tagged_eq/to_string/push_json_value/transfer/field-access)
                 // all have TAG_RECORD arms that dispatch correctly via the named_desc at header offset 16.
                 // This is the ONE flow the BRIEF targets: `val j: Json = p` → O(1) wrap, no copy.
-                // Pre-6a was: sealed_materialize_to_map + box_value → TAG_OBJECT (O(n) copy).
+                // Pre-6a was: sealed_materialize_to_map + box_value → TAG_MAP (O(n) copy).
                 if matches!(to_ty, Type::TypeVar(_)) && val.is_pointer_value() {
                     return self.builder.call(self.rt.box_record, &[val.into()], "boxrec")
                         .try_as_basic_value().unwrap_basic();
                 }
                 if Self::is_union_type(to_ty) {
                     // sealed → multi-variant union (if-merge, named union type): materialize to
-                    // LinObject for TAG_OBJECT. TAG_RECORD would be unboxed by lin_unbox_ptr on
-                    // the phi result, returning a sealed ptr instead of LinObject* → crash.
+                    // LinMap for TAG_MAP. TAG_RECORD would be unboxed by lin_unbox_ptr on
+                    // the phi result, returning a sealed ptr instead of LinMap* → crash.
                     let obj = self.sealed_materialize_to_map(val, &sf);
                     return self.box_value(obj, &Type::object(sf));
                 }
-                // sealed → unsealed object (non-union target): materialize to LinObject.
+                // sealed → unsealed object (non-union target): materialize to LinMap.
                 let obj = self.sealed_materialize_to_map(val, &sf);
                 return obj;
             }
@@ -429,7 +429,7 @@ impl<'ctx> Codegen<'ctx> {
         }
         // ── Sealed-record ARRAY boundaries (sealed-records Stage 3) ───────────────────────
         // A `MyType[]` is a contiguous unboxed buffer (elem_tag 0xFE); a Json/Object[] is a tagged
-        // array of boxed LinObjects. Crossing between them is a per-element PROJECTION /
+        // array of boxed LinMaps. Crossing between them is a per-element PROJECTION /
         // MATERIALIZATION, not a pointer reinterpret. Handle BEFORE the generic union arms.
         let to_sealed_arr = Self::sealed_array_elem(to_ty).is_some();
         let from_sealed_arr = Self::sealed_array_elem(from_ty).is_some();
@@ -478,21 +478,20 @@ impl<'ctx> Codegen<'ctx> {
         }
         // Json/Object → typed map `{ String: T }` (ADR-055). A value reaching a map-typed context
         // through the Json supertype — an empty object literal `{}`, a `Json` field read, a `Json`
-        // parameter — is physically a `LinObject` (TAG_OBJECT), but the map accessors require a
-        // `LinMap`. Reinterpreting the pointer corrupts the heap (the `lin_map_get`/`_set` crash:
-        // `find_slot` probes a LinObject's bytes as a hash table → infinite-loop / invalid free).
-        // MATERIALIZE a real map from the object's entries instead. Skip when the source is already
-        // a map (`from_ty` is `Type::Map`): that is a verbatim pointer pass-through. The source may
-        // arrive boxed (union/Json TaggedVal*) — unbox to the raw `LinObject*` first. The fresh map
-        // is +1 owned (matching the `register_owned` the lowerer applies to a Coerce result).
+        // parameter — may be a TAG_MAP (LinMap*) or TAG_RECORD (packed sealed struct). The map
+        // accessors require a real `LinMap`. MATERIALIZE via `lin_to_map` which handles both.
+        // Skip when the source is already a map (`from_ty` is `Type::Map`): that is a verbatim
+        // pointer pass-through. The source may arrive boxed (union/Json TaggedVal*) — unbox to the
+        // raw pointer first. The fresh map is +1 owned (matching the `register_owned` the lowerer
+        // applies to a Coerce result).
         if matches!(to_ty, Type::Map { .. }) && !matches!(from_ty, Type::Map { .. }) && val.is_pointer_value() {
             // The runtime value may be EITHER a real `LinMap` (a `{ String: T }` value flowing
-            // through the Json supertype — e.g. a nested map read as `T|Null`) or a `LinObject` (an
-            // empty object literal, a Json object field). The two have incompatible layouts and the
-            // raw pointer carries no tag, so dispatch on the BOXED value's tag at runtime via
-            // `lin_to_map`: TAG_MAP → retain + return as-is (preserve identity, no copy); TAG_OBJECT
-            // → materialize a fresh `LinMap`. A union source is already a boxed `TaggedVal*`; box a
-            // concrete object source first so `lin_to_map` always has a tag to read.
+            // through the Json supertype — e.g. a nested map read as `T|Null`) or a TAG_RECORD
+            // (a sealed struct). The two have incompatible layouts and the raw pointer carries no tag,
+            // so dispatch on the BOXED value's tag at runtime via `lin_to_map`: TAG_MAP → retain +
+            // return as-is (preserve identity, no copy); TAG_RECORD → materialize a fresh `LinMap`.
+            // A union source is already a boxed `TaggedVal*`; box a concrete object source first
+            // so `lin_to_map` always has a tag to read.
             let boxed = if Self::is_union_type(from_ty) {
                 val
             } else {
@@ -510,8 +509,8 @@ impl<'ctx> Codegen<'ctx> {
             return m;
         }
         // D3b: Unsealed Object widening into a NARROWER unsealed Object slot. Both are physically
-        // LinObject*; the source has extra or different fields the slot does not. Project-copy into
-        // a fresh LinObject with exactly to_ty's fields, severing sharing.
+        // LinMap*; the source has extra or different fields the slot does not. Project-copy into
+        // a fresh LinMap with exactly to_ty's fields, severing sharing.
         if let (Type::Object { sealed: false, fields: to_fields }, Type::Object { sealed: false, .. }) = (to_ty, from_ty) {
             let tf = to_fields.clone();
             return self.boxed_object_project(val, &tf);

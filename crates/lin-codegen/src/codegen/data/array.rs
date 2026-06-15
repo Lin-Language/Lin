@@ -184,8 +184,8 @@ impl<'ctx> Codegen<'ctx> {
         // A SEALED-repr record element (`{tag:Int32, bytes:Int32[]}` etc.) flowing into a TAGGED
         // array is a packed struct pointer, NOT a boxed LinMap. Storing it raw would type-confuse
         // read-back. Materialize it to a fresh LinMap first, then store that pointer under TAG_MAP —
-        // the representation the tagged slot (and toString / index-get) expects (Cluster D: was
-        // TAG_OBJECT / LinObject, now TAG_MAP / LinMap). Generic `push$Object` / `set` into `Field[]`.
+        // the representation the tagged slot (and toString / index-get) expects.
+        // Generic `push$Object` / `set` into `Field[]`.
         if let Type::Object { .. } = val_ty {
             if let Some(fields) = Self::sealed_fields(val_ty).cloned() {
                 let obj = self.sealed_materialize_to_map(val, &fields);
@@ -207,7 +207,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::TypeVar(_) | Type::Union(_) | Type::Promise(_) | Type::Shared(_) | Type::Stream(_) | Type::TarEntry =>
                 self.push_tagged_val(arr, val, val_ty),
             _ => {
-                // Phase 2: use type_tag_open so non-sealed open objects get TAG_MAP, not TAG_OBJECT.
+                // type_tag_open: all object types now resolve to TAG_MAP (no TAG_OBJECT producers).
                 let tag_val = Self::type_tag_open(val_ty);
                 let tag = i8_ty.const_int(tag_val as u64, false);
                 // lin_array_push copies a full 8 bytes from the cell into the payload, so the
@@ -328,17 +328,17 @@ impl<'ctx> Codegen<'ctx> {
         let i8_ty = self.context.i8_type();
         let void_ty = self.context.void_type();
         // A SEALED-repr record value (`{id:String, dep:Int32, …}`) being set into a TAGGED `Object[]`
-        // is a PACKED struct pointer, NOT a boxed LinObject. `build_tagged_val_alloca` would tag it
-        // TAG_OBJECT with the raw struct pointer as payload — the runtime then reads the packed bytes
-        // as a LinObject header on read-back (heap-buffer-overflow / misaligned deref). Materialize it
-        // to a fresh boxed LinObject first (its heap fields retained into the new object), then store
-        // that pointer under TAG_OBJECT — the SAME representation `tagged_array_push_value` stores for
-        // the `push$Object` case. The materialized object is a fresh +1 whose reference moves into the
+        // is a PACKED struct pointer, NOT a boxed LinMap. `build_tagged_val_alloca` would tag it
+        // TAG_RECORD with the raw struct pointer as payload — the runtime then reads the packed bytes
+        // as a LinMap header on read-back (heap-buffer-overflow / misaligned deref). Materialize it
+        // to a fresh LinMap first (heap fields retained into the new map), then store that pointer
+        // under TAG_MAP — the SAME representation `tagged_array_push_value` stores for the
+        // `push$Object` case. The materialized map is a fresh +1 whose reference moves into the
         // array slot (`lin_array_set` raw-copies the 16-byte TaggedVal without an inner retain for a
         // tagged array), so it is NOT released here; the source struct keeps its own ownership (the IR
         // `ArraySetDyn` transfer leaves it owned, released at scope exit, dropping its heap fields).
-        // Without this, `set(boxedSealedArr, i, {…})` crashed (ASan heap-buffer-overflow in
-        // `lin_object`); the boxed-array set is the index-set analogue of the boxed-array push fix.
+        // Without this, `set(boxedSealedArr, i, {…})` crashed (ASan heap-buffer-overflow); the
+        // boxed-array set is the index-set analogue of the boxed-array push fix.
         if let Type::Object { .. } = val_ty {
             if let Some(fields) = Self::sealed_fields(val_ty).cloned() {
                 let obj = self.sealed_materialize_to_map(value, &fields);

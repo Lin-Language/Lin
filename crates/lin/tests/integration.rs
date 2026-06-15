@@ -11222,7 +11222,7 @@ print(toString(length(strs)))
 #[test]
 fn test_group_by_even_odd_and_empty() {
     // groupBy now returns a typed index-signature map `{ String: T[] }` (ADR-055): ONE hash lookup
-    // per item (lin_object_get_or_insert_array, tag-aware over LinMap) + push. Grouping by even/odd
+    // per item (lin_map_get_or_insert_array, tag-aware over LinMap) + push. Grouping by even/odd
     // splits correctly. The map itself stringifies as `{}` (TAG_MAP now has structural toString);
     // the per-key array values print normally.
     let out = run(r#"import { print } from "std/io"
