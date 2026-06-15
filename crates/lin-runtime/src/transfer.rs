@@ -485,25 +485,14 @@ pub unsafe fn transfer_clone_env(env_ptr: *const u8, desc: *const u8) -> *mut u8
             CAP_CLOSURE => clone_closure(src_word as *const u8) as u64,
             CAP_STR => clone_string(src_word as *const LinString) as u64,
             CAP_ARRAY => clone_array(src_word as *const LinArray) as u64,
-            // CAP_OBJECT: env slot holds a raw LinObject*; clone it as LinObject (release_env_copy
-            // calls lin_object_release on this slot). Phase 4 will migrate this to LinMap.
+            // CAP_OBJECT: env slot holds a raw *mut LinMap (Phase 3: open objects are LinMap-backed).
+            // Deep-clone the map so the worker owns a private copy.
             CAP_OBJECT => {
-                let src_obj = src_word as *const LinObject;
-                if src_obj.is_null() {
+                let src_map = src_word as *const crate::map::LinMap;
+                if src_map.is_null() {
                     0u64
                 } else {
-                    let len = (*src_obj).len;
-                    let dst = crate::object::lin_object_alloc(len.max(4));
-                    for j in 0..len as usize {
-                        let se = (*src_obj).entries.add(j);
-                        let key = clone_string((*se).key);
-                        // Deep-clone the field value — `transfer_clone_value` handles a nested
-                        // object/record (→ TAG_MAP) instead of aliasing it across the thread
-                        // boundary (the prior bare `transfer_payload` was a cross-thread UAF).
-                        let v = transfer_clone_value(&(*se).value);
-                        crate::object::object_push_owned(dst, key, v);
-                    }
-                    dst as u64
+                    clone_map(src_map) as u64
                 }
             },
             CAP_TAGGED => lin_transfer_clone(src_word as *const u8) as u64,
@@ -536,7 +525,8 @@ pub unsafe fn release_env_copy(env_ptr: *mut u8, desc: *const u8, env_size: u64)
             match *kinds.add(i) {
                 CAP_STR => crate::string::lin_string_release(word as *mut LinString),
                 CAP_ARRAY => crate::array::lin_array_release(word as *mut LinArray),
-                CAP_OBJECT => crate::object::lin_object_release(word as *mut LinObject),
+                // CAP_OBJECT: after Phase 3, open objects are LinMap-backed.
+                CAP_OBJECT => crate::map::lin_map_release(word as *mut crate::map::LinMap),
                 CAP_CLOSURE => crate::memory::lin_closure_release(word as *mut u8),
                 CAP_TAGGED => crate::tagged::lin_tagged_release(word as *mut u8),
                 CAP_SEALED => crate::sealed::lin_sealed_release_self(word as *mut u8),
