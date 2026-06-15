@@ -474,6 +474,13 @@ incrementally (constant memory) and threads decode errors in-band like every oth
 | [`isBefore`](#isBefore)/[`isAfter`](#isAfter) | `(DateTime, DateTime) -> Boolean` | Order two instants |
 | [`toIsoDate`](#toIsoDate)/[`toIsoTime`](#toIsoTime)/[`toIso`](#toIso-datetime) | `(…) -> String` | Render ISO 8601 strings |
 | [`parseIsoDate`](#parseIsoDate)/[`parseIsoTime`](#parseIsoTime)/[`parseIso`](#parseIso) | `(String) -> … \| Error` | Parse ISO 8601 strings |
+| [`withOffset`](#stddatetime) | `(DateTime, Int64) -> OffsetDateTime` | Tag local fields with a fixed UTC offset |
+| [`atOffset`](#stddatetime) | `(Int64, Int64) -> OffsetDateTime` | The OffsetDateTime an observer at an offset reads for an instant |
+| [`toInstant`](#stddatetime) | `(OffsetDateTime) -> Int64` | UTC instant (subtracts the offset) |
+| [`toOffset`](#stddatetime) | `(OffsetDateTime, Int64) -> OffsetDateTime` | Re-express at a different offset, same instant |
+| [`offsetOf`](#stddatetime)/[`toUtc`](#stddatetime)/[`nowAt`](#stddatetime) | `(…) -> …` | Offset accessor / shift to UTC / now at an offset |
+| [`toIsoOffset`](#stddatetime)/[`toIsoOffsetDateTime`](#stddatetime) | `(…) -> String` | Render `±HH:MM`/`Z` and offset-tagged ISO |
+| [`parseIsoOffset`](#stddatetime)/[`parseIsoOffsetDateTime`](#stddatetime) | `(String) -> … \| Error` | Parse offset suffix / offset-tagged ISO |
 
 ---
 
@@ -5519,19 +5526,27 @@ The value types:
 | `Duration` | `{ millis }` | An exact elapsed span (always milliseconds) |
 | `Period` | `{ years, months, days }` | A calendar span (months are not fixed-length) |
 | `Weekday` | `0 \| 1 \| … \| 6` | Day of week, 0=Sunday..6=Saturday — a numeric literal union |
+| `OffsetDateTime` | `DateTime & { offsetMinutes }` | A DateTime at a fixed UTC offset — java.time OffsetDateTime |
 
 `DateTime` is the record intersection `Date & Time` (see ADR-061), so by structural width-subtyping
 every `DateTime` is *also* a `Date` and a `Time` — you can pass one straight to any `Date`/`Time`
-function. The record fields are `Int64` and `year` may be negative (astronomical numbering; no
-year-0 gap). `weekday` returns the `Weekday` literal union (0=Sunday..6=Saturday), with named
-constants `Sun`..`Sat`, so a `match` over it is exhaustively checked and only the seven valid values
-type-check.
+function (and an `OffsetDateTime` is likewise structurally a `DateTime`). The record fields are
+`Int64` and `year` may be negative (astronomical numbering; no year-0 gap). `weekday` returns the
+`Weekday` literal union (0=Sunday..6=Saturday), with named constants `Sun`..`Sat`, so a `match` over
+it is exhaustively checked and only the seven valid values type-check.
 
 Construction (`date`/`time`/`dateTime`) validates and returns `T | Error` (the canonical
 `{ "type": "error", … }`, matched with `is Error`). The calendar shifts never fail: out-of-range
-days clamp to the month end (Jan 31 + 1mo → Feb 28/29). This is fixed-offset UTC arithmetic; full
-IANA timezone support (DST, historical offsets) is out of scope. Bridge to/from `std/time`
-timestamps with `toTimestamp`/`fromTimestamp`.
+days clamp to the month end (Jan 31 + 1mo → Feb 28/29). Bridge to/from `std/time` timestamps with
+`toTimestamp`/`fromTimestamp`.
+
+**Fixed UTC offset.** The core is UTC; `OffsetDateTime` adds a fixed offset (e.g. `+05:30`
+year-round). Its `DateTime` fields are the *local* wall-clock at `offsetMinutes`; the instant is
+`wall − offset`. `withOffset` tags a local `DateTime`; `atOffset(instant, off)` is what an observer
+at that offset reads; `toInstant` returns the UTC instant; `toOffset` re-expresses at another offset
+preserving the instant; `nowAt` reads the clock at an offset. `toIsoOffsetDateTime`/`parseIsoOffsetDateTime`
+round-trip the `±HH:MM`/`Z` form. This is **not** a named zone — there is no DST, and full IANA
+timezone support (`America/New_York`, historical offsets) is out of scope.
 
 ```txt
 val d = date(2024, 2, 29)              // ok (leap day); date(2023,2,29) is an Error
@@ -5543,6 +5558,10 @@ toIso(fromTimestamp(0))                // "1970-01-01T00:00:00.000"
 toIsoDate(addMonths(d, 1))             // clamps to the month end
 weekday({ "year": 1970, "month": 1, "day": 1 })   // Thu (== 4)
 toMillis(plus(hours(2), minutes(30)))  // 9000000
+
+withOffset(dt, 330).toInstant()        // UTC instant for 10:30 local at +05:30 → 05:00Z
+toOffset(atOffset(0, 0), -300)         // the epoch re-expressed at -05:00
+toIsoOffsetDateTime(atOffset(KNOWN, 330))   // "…T16:00:00.000+05:30"
 ```
 
 See the source `stdlib/datetime.lin` for the full per-function documentation; every export carries a
