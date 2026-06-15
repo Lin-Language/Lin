@@ -422,22 +422,24 @@ pub unsafe fn tagged_to_json(tv: *const u8) -> serde_json::Value {
         }
         TAG_MAP => {
             // Phase 2: non-sealed open objects are now backed by LinMap (TAG_MAP).
+            // Iterate in insertion order so toJson preserves key order.
             let map = payload as *const crate::map::LinMap;
             if map.is_null() { return serde_json::Value::Object(serde_json::Map::new()); }
-            let cap = (*map).cap as usize;
+            let len = (*map).len as usize;
             let mut smap = serde_json::Map::new();
-            for i in 0..cap {
-                let slot = (*map).slots.add(i);
-                if (*slot).hash == 0 { continue; }
-                let key_ptr = (*slot).key as *const crate::string::LinString;
-                let key_str = if key_ptr.is_null() {
-                    String::new()
-                } else {
-                    let slice = std::slice::from_raw_parts((*key_ptr).data.as_ptr(), (*key_ptr).len as usize);
-                    std::str::from_utf8_unchecked(slice).to_owned()
-                };
-                let val_ptr = &(*slot).value as *const TaggedVal as *const u8;
-                smap.insert(key_str, tagged_to_json(val_ptr));
+            if !(*map).order.is_null() {
+                for i in 0..len {
+                    let key_ptr = *(*map).order.add(i) as *const crate::string::LinString;
+                    let key_str = if key_ptr.is_null() {
+                        String::new()
+                    } else {
+                        let slice = std::slice::from_raw_parts((*key_ptr).data.as_ptr(), (*key_ptr).len as usize);
+                        std::str::from_utf8_unchecked(slice).to_owned()
+                    };
+                    let val = crate::map::lin_map_get(map, key_ptr);
+                    let val_ptr = if val.is_null() { std::ptr::null() } else { val as *const u8 };
+                    smap.insert(key_str, tagged_to_json(val_ptr));
+                }
             }
             serde_json::Value::Object(smap)
         }
