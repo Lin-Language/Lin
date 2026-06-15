@@ -8955,6 +8955,82 @@ fn test_fmt_preserves_grouping_parens() {
 }
 
 #[test]
+fn test_fmt_parenthesizes_if_as_binary_operand() {
+    // A greedy-tailed primary (`if`/`match`/bare lambda) used as a binary operand MUST keep
+    // parentheses: its trailing branch is parsed by consuming a full expression, so dropping the
+    // parens re-associates the operator into the branch. `(if c then y else z) / 400` reparses as
+    // `if c then y else (z / 400)` — a different value. Regression guard for the formatter soundness
+    // bug where `fmt_binop_operand` only wrapped `BinaryOp`/`Coalesce` operands.
+    assert_eq!(
+        fmt("val x = (if c then a else b) / 400\n").trim(),
+        "val x = (if c then a else b) / 400"
+    );
+    // Right operand too (left-associative `+` would otherwise swallow a following term).
+    assert_eq!(
+        fmt("val x = n + (if c then a else b)\n").trim(),
+        "val x = n + (if c then a else b)"
+    );
+    // Idempotent — re-formatting the output must not strip the parens it just added.
+    let once = fmt("val x = (if c then a else b) / 400\n");
+    assert_eq!(fmt(&once), once, "formatter not idempotent on if-operand parens");
+    // End-to-end: the value must be the grouped one. (-44 // 400 with truncating division is 0;
+    // the buggy reparse `-(399/400)` would give a different result.)
+    let out = run(
+        "import { print } from \"std/io\"\nimport { toString } from \"std/string\"\n\
+         val y: Int64 = 0 - 44\nval era = (if y >= 0 then y else y - 399) / 400\nprint(toString(era))\n",
+    );
+    assert_eq!(out, vec!["-1"], "(if y>=0 then y else y-399)/400 with y=-44 must be -1");
+}
+
+#[test]
+fn test_fmt_negative_int64_field_in_direct_object_arg() {
+    // A negative integer literal in an object literal passed DIRECTLY as an argument to a function
+    // with an `Int64`-field record parameter must adopt the field's Int64 type (not default to
+    // Int32 and get zero-extended to 2^32-n). Regression guard for the checker fix routing object
+    // literals against concrete `Type::Object` params through expected-type-directed checking.
+    let out = run(
+        "import { print } from \"std/io\"\nimport { toString } from \"std/string\"\n\
+         type R = { \"y\": Int64 }\nval readY = (r: R): Int64 => r[\"y\"]\n\
+         print(toString(readY({ \"y\": 0 - 44 })))\nprint(toString(readY({ \"y\": -44 })))\n",
+    );
+    assert_eq!(out, vec!["-44", "-44"], "negative Int64 field in a direct object arg must not zero-extend");
+}
+
+#[test]
+fn test_mixed_integer_width_arithmetic_widens_to_result() {
+    // Arithmetic between two DIFFERENT integer widths must widen both operands AND the op to the
+    // result width the checker assigned. Under mixed-signedness widening `Int32 + UInt8` (and even
+    // `Int32 + UInt32`, both 32-bit) yields Int64, so the add must run at i64 — otherwise codegen
+    // emits `add i32` into an i64 box/return slot (LLVM type mismatch / miscompile). Regression
+    // guard for the operand-width-reconciliation fix in compile_binary_op_values.
+    let out = run(
+        "import { print } from \"std/io\"\nimport { toString } from \"std/string\"\n\
+         type D = { \"a\": Int32, \"b\": UInt8 }\nval f = (d: D): Int64 => d[\"a\"] * 12 + d[\"b\"]\n\
+         print(toString(f({ \"a\": 2024, \"b\": 3 })))\n",
+    );
+    assert_eq!(out, vec!["24291"], "Int32*12 + UInt8 must compute at the Int64 result width");
+
+    // Mixed-sign same-width: Int32 + UInt32 -> Int64. Unsigned operand must zero-extend (stay
+    // positive), not sign-extend into a negative.
+    let out = run(
+        "import { print } from \"std/io\"\nimport { toString } from \"std/string\"\n\
+         type D = { \"a\": Int32, \"b\": UInt32 }\nval f = (d: D): Int64 => d[\"a\"] + d[\"b\"]\n\
+         print(toString(f({ \"a\": 1, \"b\": 4000000000 })))\n",
+    );
+    assert_eq!(out, vec!["4000000001"], "Int32 + UInt32 must widen to i64 and zero-extend the unsigned operand");
+
+    // A UInt8 read mixed with an Int32 literal in a chained bitwise/shift expression (the
+    // std/bytes u32FromBe shape) must still compile — the fix must not infinitely recurse when an
+    // operand's LLVM value width differs from its static type width.
+    let out = run(
+        "import { print } from \"std/io\"\nimport { toString } from \"std/string\"\n\
+         import { u32FromBe } from \"std/bytes\"\n\
+         val bytes: UInt8[] = [255, 255, 255, 255]\nprint(toString(u32FromBe(bytes, 0)))\n",
+    );
+    assert_eq!(out, vec!["4294967295"], "chained shift/or over UInt8 reads must compile and be correct");
+}
+
+#[test]
 fn test_fmt_implicit_else_null_omitted() {
     // A statement-position `if` with an IMPLICIT null else drops the `else null`; an
     // author-written `else null` is kept (it may signal intent).

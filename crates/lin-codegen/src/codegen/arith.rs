@@ -346,18 +346,53 @@ impl<'ctx> Codegen<'ctx> {
                 return self.compile_binary_op_values(lf, rf, op, wide_ty, wide_ty, result_ty);
             }
         }
-        // Mismatched integer widths (e.g. Int64 `n` vs an Int32 literal `0`): sign-extend
-        // the narrower operand to the wider so the ICmp/arith operands agree.
+        // Reconcile integer operand widths before the op. Both operands must share a width;
+        // we extend the narrower(s) up to a common TARGET width, choosing sign- vs zero-extend
+        // per each SOURCE operand's signedness (so an unsigned UInt8 250 widens to 250, not -6).
+        //
+        // The target is usually just the wider operand — EXCEPT for ARITHMETIC, where the checker
+        // can widen the RESULT type past BOTH operands. Under the mixed-signedness widening rule,
+        // neither operand's type can represent every value of the other, so e.g. `Int32 + UInt8`
+        // and even `Int32 + UInt32` (both 32-bit) yield `Int64`. The op and its result slot must
+        // then be at that result width — otherwise we emit `add i32 …` straight into an `i64`
+        // box/return slot (an LLVM type mismatch / miscompile). So for arithmetic, fold the result
+        // type's width into the target. Comparisons (Bool result), bitwise, and shift keep their
+        // result at the operand width, so they reconcile only the two operands, as before.
+        //
+        // `wide` is built from the WIDTH, not from a Type: an operand's LLVM value width can
+        // legitimately differ from its static type's width (a transient over-wide representation),
+        // so deriving the target LLVM type from a `Type` could disagree with `target_w` and make
+        // the recursive call fail to converge. Building it from `target_w` guarantees both extended
+        // operands are exactly `target_w` bits, so the recursion always terminates.
         if lv.is_int_value() && rv.is_int_value() {
             let lw = lv.into_int_value().get_type().get_bit_width();
             let rw = rv.into_int_value().get_type().get_bit_width();
-            if lw != rw && lw > 1 && rw > 1 {
-                // Extend the narrower operand to the wider width. Choose sign- vs zero-extend
-                // per the SOURCE operand's signedness so an unsigned small int (e.g. UInt8
-                // 250) widens to 250, not -6. Result type is the wider operand's static type.
-                let wide_is_left = lw > rw;
-                let wide = if wide_is_left { lv.into_int_value().get_type() } else { rv.into_int_value().get_type() };
-                let wide_ty = if wide_is_left { lty } else { rty };
+            let is_arith = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod);
+            let result_w = if is_arith && result_ty.is_integer() {
+                result_ty.bit_width().map(|b| b as u32).unwrap_or(0)
+            } else {
+                0
+            };
+            let target_w = lw.max(rw).max(result_w);
+            if (lw != target_w || rw != target_w) && lw > 1 && rw > 1 {
+                // target_w is always a real Lin integer width (8/16/32/64), the max of the two
+                // operand widths and (for arithmetic) the result width.
+                let wide = match target_w {
+                    8 => self.context.i8_type(),
+                    16 => self.context.i16_type(),
+                    32 => self.context.i32_type(),
+                    _ => self.context.i64_type(),
+                };
+                // The static type passed to the recursive dispatch (drives div/mod signedness):
+                // the result type when it sets the width (it carries the signedness the checker
+                // chose — mixed-sign widens to a signed type), else the wider operand's type.
+                let target_ty = if result_w == target_w && result_ty.is_integer() {
+                    result_ty
+                } else if lw >= rw {
+                    lty
+                } else {
+                    rty
+                };
                 let ext = |s: &Self, v: BasicValueEnum<'ctx>, src_ty: &Type| -> BasicValueEnum<'ctx> {
                     if src_ty.is_signed() {
                         s.builder.int_s_extend(v.into_int_value(), wide, "ir_sext").into()
@@ -365,9 +400,9 @@ impl<'ctx> Codegen<'ctx> {
                         s.builder.int_z_extend(v.into_int_value(), wide, "ir_zext").into()
                     }
                 };
-                let lext = if lw < wide.get_bit_width() { ext(self, lv, lty) } else { lv };
-                let rext = if rw < wide.get_bit_width() { ext(self, rv, rty) } else { rv };
-                return self.compile_binary_op_values(lext, rext, op, wide_ty, wide_ty, result_ty);
+                let lext = if lw < target_w { ext(self, lv, lty) } else { lv };
+                let rext = if rw < target_w { ext(self, rv, rty) } else { rv };
+                return self.compile_binary_op_values(lext, rext, op, target_ty, target_ty, result_ty);
             }
         }
         // Sealed scalar-record equality (sealed-records Stage 1). MUST come before the boxed-union

@@ -80,6 +80,52 @@ pub extern "C" fn lin_to_uint64(v: u64) -> u64 {
 }
 
 // -------------------------------------------------------------------------
+// Narrowing casts from a SIGNED i64 input (spec §21). The `lin_to_*` family
+// above takes u64, so only an *unsigned* value (UInt8/16/32, or a masked
+// UInt64) can reach it — a computed `Int64` cannot, because `Int64 -> UInt64`
+// is not an implicit coercion (it could wrap a negative). These take i64 so a
+// signed/computed integer narrows explicitly. Truncation is two's-complement
+// (`as`-cast), so the low bits are identical to the u64 family for the same
+// bit pattern; the only difference is the accepted input type. They back the
+// std/number `narrowToUInt8`/`narrowToInt32`/... exports.
+// -------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn lin_narrow_uint8(v: i64) -> u8 {
+    v as u8
+}
+
+#[no_mangle]
+pub extern "C" fn lin_narrow_int8(v: i64) -> i8 {
+    v as i8
+}
+
+#[no_mangle]
+pub extern "C" fn lin_narrow_uint16(v: i64) -> u16 {
+    v as u16
+}
+
+#[no_mangle]
+pub extern "C" fn lin_narrow_int16(v: i64) -> i16 {
+    v as i16
+}
+
+#[no_mangle]
+pub extern "C" fn lin_narrow_uint32(v: i64) -> u32 {
+    v as u32
+}
+
+#[no_mangle]
+pub extern "C" fn lin_narrow_int32(v: i64) -> i32 {
+    v as i32
+}
+
+#[no_mangle]
+pub extern "C" fn lin_narrow_uint64(v: i64) -> u64 {
+    v as u64
+}
+
+// -------------------------------------------------------------------------
 // Float bit-reinterpret intrinsics (spec §27.3). A float's bit pattern
 // cannot be obtained by shift-and-mask, so std/bytes needs these to
 // (de)serialize floats through UInt8[] buffers.

@@ -1,0 +1,462 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { Date, Time, DateTime, Duration, Period } from "std/datetime"
+import { date, time, dateTime, isLeapYear, daysInMonth } from "std/datetime"
+import { toEpochDay, fromEpochDay, toTimestamp, fromTimestamp } from "std/datetime"
+import { dateOf, timeOf, atTime, atStartOfDay } from "std/datetime"
+import { weekday, dayOfYear, addDays, addMonths, addYears, addPeriod, period } from "std/datetime"
+import { Weekday, Sun, Mon, Tue, Wed, Thu, Fri, Sat } from "std/datetime"
+import { millis, seconds, minutes, hours, days, plus, minus, scale } from "std/datetime"
+import { toMillis, toSeconds, toMinutes, toHours, toDays, between, plusDuration, minusDuration } from "std/datetime"
+import { compareDate, compare, isBefore, isAfter } from "std/datetime"
+import { toIsoDate, toIsoTime, toIso, parseIsoDate, parseIsoTime, parseIso } from "std/datetime"
+
+// Helpers: unwrap a `T | Error` in tests, substituting a sentinel on Error so a failed construction
+// produces a visibly-wrong value rather than a type error.
+val unwrapDate = (r: Date | Error): Date =>
+  match r
+    is Error =>
+      {
+        "year": 0,
+        "month": 0,
+        "day": 0
+      }
+    else => r
+
+val unwrapTime = (r: Time | Error): Time =>
+  match r
+    is Error =>
+      {
+        "hour": 0,
+        "minute": 0,
+        "second": 0,
+        "millis": 0
+      }
+    else => r
+
+val unwrapDt = (r: DateTime | Error): DateTime =>
+  match r
+    is Error =>
+      {
+        "year": 0,
+        "month": 0,
+        "day": 0,
+        "hour": 0,
+        "minute": 0,
+        "second": 0,
+        "millis": 0
+      }
+    else => r
+
+// A known instant: 2024-01-15T10:30:00.000Z = 1705314600000 ms.
+val KNOWN: Int64 = 1705314600000
+
+val s = suite("std/datetime", [
+  // ── isLeapYear / daysInMonth ──────────────────────────────────────────────
+  test("isLeapYear follows the Gregorian rule", () => [
+    expect(isLeapYear(2024)).toBe(true),
+    expect(isLeapYear(2023)).toBe(false),
+    expect(isLeapYear(2000)).toBe(true),
+    expect(isLeapYear(1900)).toBe(false),
+    expect(isLeapYear(0)).toBe(true)
+  ]),
+
+  test("daysInMonth is leap-aware", () => [
+    expect(daysInMonth(2024, 2)).toBe(29),
+    expect(daysInMonth(2023, 2)).toBe(28),
+    expect(daysInMonth(2024, 1)).toBe(31),
+    expect(daysInMonth(2024, 4)).toBe(30),
+    expect(daysInMonth(2024, 12)).toBe(31)
+  ]),
+
+  // ── date / time / dateTime construction & validation ──────────────────────
+  test("date accepts valid dates including leap day", () =>
+    val d = unwrapDate(date(2024, 2, 29))
+    [
+      expect(d["year"]).toBe(2024),
+      expect(d["month"]).toBe(2),
+      expect(d["day"]).toBe(29)
+    ]
+  ),
+
+  test("date rejects out-of-range month and day", () => [
+    expect(date(2024, 0, 1) is Error).toBe(true),
+    expect(date(2024, 13, 1) is Error).toBe(true),
+    expect(date(2024, 1, 0) is Error).toBe(true),
+    expect(date(2024, 1, 32) is Error).toBe(true),
+    expect(date(2023, 2, 29) is Error).toBe(true)
+  ]),
+
+  test("time defaults trailing fields to zero", () =>
+    val t = unwrapTime(time(10, 30))
+    [
+      expect(t["hour"]).toBe(10),
+      expect(t["minute"]).toBe(30),
+      expect(t["second"]).toBe(0),
+      expect(t["millis"]).toBe(0)
+    ]
+  ),
+
+  test("time rejects out-of-range fields", () => [
+    expect(time(24, 0, 0, 0) is Error).toBe(true),
+    expect(time(0, 60, 0, 0) is Error).toBe(true),
+    expect(time(0, 0, 60, 0) is Error).toBe(true),
+    expect(time(0, 0, 0, 1000) is Error).toBe(true),
+    expect(time(-1) is Error).toBe(true)
+  ]),
+
+  test("dateTime validates both halves", () => [
+    expect(dateTime(2023, 2, 29, 0, 0, 0) is Error).toBe(true),
+    expect(dateTime(2024, 1, 15, 24, 0, 0) is Error).toBe(true),
+    expect(dateTime(2024, 1, 15, 10, 30, 0) is Error).toBe(false)
+  ]),
+
+  // ── DateTime is structurally a Date and a Time (intersection width-subtyping) ──
+  test("a DateTime is usable as a Date and a Time", () =>
+    val dt = unwrapDt(dateTime(2024, 1, 15, 10, 30, 45))
+    [
+      // pass the DateTime straight to Date- and Time-typed functions
+      expect(toIsoDate(dt)).toBe("2024-01-15"),
+      expect(toIsoTime(dt)).toBe("10:30:45.000")
+    ]
+  ),
+
+  // ── epoch-day round-trips ─────────────────────────────────────────────────
+  test("toEpochDay anchors the epoch and a known date", () => [
+    expect(toEpochDay({ "year": 1970, "month": 1, "day": 1 })).toBe(0),
+    expect(toEpochDay({ "year": 1970, "month": 1, "day": 2 })).toBe(1),
+    expect(toEpochDay({ "year": 1969, "month": 12, "day": 31 })).toBe(-1),
+    expect(toEpochDay({ "year": 2024, "month": 1, "day": 1 })).toBe(19723)
+  ]),
+
+  test("fromEpochDay inverts toEpochDay across boundaries", () =>
+    val a = fromEpochDay(0)
+    val b = fromEpochDay(-1)
+    val c = fromEpochDay(19723)
+    [
+      expect(a["year"]).toBe(1970),
+      expect(a["month"]).toBe(1),
+      expect(a["day"]).toBe(1),
+      expect(b["year"]).toBe(1969),
+      expect(b["month"]).toBe(12),
+      expect(b["day"]).toBe(31),
+      expect(c["year"]).toBe(2024),
+      expect(c["month"]).toBe(1),
+      expect(c["day"]).toBe(1)
+    ]
+  ),
+
+  test("epoch-day round-trips a leap day and a pre-1970 date", () =>
+    val leap = {
+      "year": 2024,
+      "month": 2,
+      "day": 29
+    }
+    val old = {
+      "year": 1900,
+      "month": 3,
+      "day": 1
+    }
+    val rtLeap = fromEpochDay(toEpochDay(leap))
+    val rtOld = fromEpochDay(toEpochDay(old))
+    [
+      expect(rtLeap["year"]).toBe(2024),
+      expect(rtLeap["month"]).toBe(2),
+      expect(rtLeap["day"]).toBe(29),
+      expect(rtOld["year"]).toBe(1900),
+      expect(rtOld["month"]).toBe(3),
+      expect(rtOld["day"]).toBe(1)
+    ]
+  ),
+
+  // ── timestamp bridge ──────────────────────────────────────────────────────
+  test("toTimestamp / fromTimestamp anchor the epoch", () => [
+    expect(toTimestamp({
+      "year": 1970,
+      "month": 1,
+      "day": 1,
+      "hour": 0,
+      "minute": 0,
+      "second": 0,
+      "millis": 0
+    })).toBe(0),
+    expect(toIso(fromTimestamp(0))).toBe("1970-01-01T00:00:00.000")
+  ]),
+
+  test("fromTimestamp decodes a known instant", () =>
+    val dt = fromTimestamp(KNOWN)
+    [
+      expect(dt["year"]).toBe(2024),
+      expect(dt["month"]).toBe(1),
+      expect(dt["day"]).toBe(15),
+      expect(dt["hour"]).toBe(10),
+      expect(dt["minute"]).toBe(30),
+      expect(dt["second"]).toBe(0),
+      expect(dt["millis"]).toBe(0)
+    ]
+  ),
+
+  test("timestamp round-trips, including millis and pre-1970", () => [
+    expect(toTimestamp(fromTimestamp(KNOWN))).toBe(KNOWN),
+    expect(toTimestamp(fromTimestamp(1500))).toBe(1500),
+    expect(toTimestamp(fromTimestamp(-1))).toBe(-1),
+    expect(toTimestamp(fromTimestamp(-86400001))).toBe(-86400001)
+  ]),
+
+  test("fromTimestamp splits sub-second and time fields correctly", () =>
+    val dt = fromTimestamp(1705314645123) // 2024-01-15T10:30:45.123Z
+    [
+      expect(dt["hour"]).toBe(10),
+      expect(dt["minute"]).toBe(30),
+      expect(dt["second"]).toBe(45),
+      expect(dt["millis"]).toBe(123)
+    ]
+  ),
+
+  test("fromTimestamp floors negative instants into the previous day", () =>
+    val dt = fromTimestamp(-1) // 1969-12-31T23:59:59.999Z
+    [
+      expect(dt["year"]).toBe(1969),
+      expect(dt["month"]).toBe(12),
+      expect(dt["day"]).toBe(31),
+      expect(dt["hour"]).toBe(23),
+      expect(dt["minute"]).toBe(59),
+      expect(dt["second"]).toBe(59),
+      expect(dt["millis"]).toBe(999)
+    ]
+  ),
+
+  // ── dateOf / timeOf / atTime / atStartOfDay ───────────────────────────────
+  test("dateOf and timeOf split a DateTime", () =>
+    val dt = unwrapDt(dateTime(2024, 1, 15, 10, 30, 45, 500))
+    val d = dateOf(dt)
+    val t = timeOf(dt)
+    [
+      expect(d["day"]).toBe(15),
+      expect(t["hour"]).toBe(10),
+      expect(t["millis"]).toBe(500)
+    ]
+  ),
+
+  test("atTime recombines a date and time", () =>
+    val d = unwrapDate(date(2024, 1, 15))
+    val t = unwrapTime(time(10, 30, 45))
+    [
+      expect(toIso(atTime(d, t))).toBe("2024-01-15T10:30:45.000")
+    ]
+  ),
+
+  test("atStartOfDay zeroes the time fields", () =>
+    val d = unwrapDate(date(2024, 1, 15))
+    [
+      expect(toIso(atStartOfDay(d))).toBe("2024-01-15T00:00:00.000")
+    ]
+  ),
+
+  // ── weekday / dayOfYear ───────────────────────────────────────────────────
+  test("weekday matches the 0=Sunday..6=Saturday convention", () => [
+    expect(weekday({ "year": 1970, "month": 1, "day": 1 })).toBe(4), // Thursday
+    expect(weekday({ "year": 2024, "month": 1, "day": 15 })).toBe(1), // Monday
+    expect(weekday({ "year": 2024, "month": 1, "day": 14 })).toBe(0) // Sunday
+  ]),
+
+  test("weekday returns the named Weekday constants", () => [
+    expect(weekday({ "year": 1970, "month": 1, "day": 1 }) == Thu).toBe(true),
+    expect(weekday({ "year": 2024, "month": 1, "day": 14 }) == Sun).toBe(true),
+    expect(weekday({ "year": 2024, "month": 1, "day": 20 }) == Sat).toBe(true)
+  ]),
+
+  test("a Weekday is exhaustively matchable", () =>
+    val name = (w: Weekday): String =>
+      match w
+        is 0 => "Sun"
+        is 1 => "Mon"
+        is 2 => "Tue"
+        is 3 => "Wed"
+        is 4 => "Thu"
+        is 5 => "Fri"
+        is 6 => "Sat"
+    [
+      expect(name(weekday({ "year": 1970, "month": 1, "day": 1 }))).toBe("Thu"),
+      expect(name(Mon)).toBe("Mon")
+    ]
+  ),
+
+  test("dayOfYear counts from 1, leap-aware", () => [
+    expect(dayOfYear({ "year": 2024, "month": 1, "day": 1 })).toBe(1),
+    expect(dayOfYear({ "year": 2024, "month": 12, "day": 31 })).toBe(366),
+    expect(dayOfYear({ "year": 2023, "month": 12, "day": 31 })).toBe(365),
+    expect(dayOfYear({ "year": 2024, "month": 3, "day": 1 })).toBe(61) // after Feb 29
+  ]),
+
+  // ── addDays / addMonths / addYears ────────────────────────────────────────
+  test("addDays crosses month and year boundaries", () =>
+    val d = unwrapDate(date(2024, 1, 31))
+    val plus1 = addDays(d, 1)
+    val minus1 = addDays(unwrapDate(date(2024, 1, 1)), -1)
+    [
+      expect(toIsoDate(plus1)).toBe("2024-02-01"),
+      expect(toIsoDate(minus1)).toBe("2023-12-31")
+    ]
+  ),
+
+  test("addMonths clamps to the month end", () =>
+    val jan31 = unwrapDate(date(2024, 1, 31))
+    [
+      expect(toIsoDate(addMonths(jan31, 1))).toBe("2024-02-29"), // 2024 is leap
+      expect(toIsoDate(addMonths(unwrapDate(date(2023, 1, 31)), 1))).toBe("2023-02-28"),
+      expect(toIsoDate(addMonths(jan31, 12))).toBe("2025-01-31"),
+      expect(toIsoDate(addMonths(jan31, -1))).toBe("2023-12-31")
+    ]
+  ),
+
+  test("addYears clamps Feb 29 onto non-leap years", () =>
+    val leap = unwrapDate(date(2024, 2, 29))
+    [
+      expect(toIsoDate(addYears(leap, 1))).toBe("2025-02-28"),
+      expect(toIsoDate(addYears(leap, 4))).toBe("2028-02-29")
+    ]
+  ),
+
+  test("addPeriod applies months (clamped) then exact days", () =>
+    val d = unwrapDate(date(2024, 1, 31))
+    [
+      // +1 month clamps Jan 31 -> Feb 29, then +1 day -> Mar 1
+      expect(toIsoDate(addPeriod(d, period(0, 1, 1)))).toBe("2024-03-01"),
+      expect(toIsoDate(addPeriod(d, period(1, 0, 0)))).toBe("2025-01-31")
+    ]
+  ),
+
+  // ── Duration construction, arithmetic, conversion ─────────────────────────
+  test("duration constructors scale a single unit", () => [
+    expect(toMillis(seconds(1))).toBe(1000),
+    expect(toMillis(minutes(1))).toBe(60000),
+    expect(toMillis(hours(1))).toBe(3600000),
+    expect(toMillis(days(1))).toBe(86400000),
+    expect(toMillis(millis(42))).toBe(42)
+  ]),
+
+  test("duration arithmetic composes", () =>
+    val d = plus(hours(2), minutes(30))
+    [
+      expect(toMillis(d)).toBe(9000000),
+      expect(toMillis(minus(hours(2), minutes(30)))).toBe(5400000),
+      expect(toMillis(scale(minutes(15), 4))).toBe(3600000)
+    ]
+  ),
+
+  test("duration conversions truncate toward zero", () =>
+    val d = plus(hours(1), minutes(30)) // 90 minutes
+    [
+      expect(toSeconds(d)).toBe(5400),
+      expect(toMinutes(d)).toBe(90),
+      expect(toHours(d)).toBe(1),
+      expect(toDays(days(2))).toBe(2)
+    ]
+  ),
+
+  // ── between / plusDuration / minusDuration ────────────────────────────────
+  test("between is the signed exact span", () =>
+    val a = fromTimestamp(KNOWN)
+    val b = fromTimestamp(KNOWN + 3600000)
+    [
+      expect(toMillis(between(a, b))).toBe(3600000),
+      expect(toMillis(between(b, a))).toBe(-3600000)
+    ]
+  ),
+
+  test("plusDuration / minusDuration shift an instant", () =>
+    val dt = fromTimestamp(KNOWN)
+    [
+      expect(toTimestamp(plusDuration(dt, hours(1)))).toBe(KNOWN + 3600000),
+      expect(toTimestamp(minusDuration(dt, days(1)))).toBe(KNOWN - 86400000)
+    ]
+  ),
+
+  // ── comparison ────────────────────────────────────────────────────────────
+  test("compareDate orders by calendar day", () =>
+    val a = unwrapDate(date(2024, 1, 15))
+    val b = unwrapDate(date(2024, 1, 16))
+    [
+      expect(compareDate(a, b)).toBe(-1),
+      expect(compareDate(b, a)).toBe(1),
+      expect(compareDate(a, a)).toBe(0)
+    ]
+  ),
+
+  test("compare / isBefore / isAfter order by instant", () =>
+    val a = fromTimestamp(KNOWN)
+    val b = fromTimestamp(KNOWN + 1)
+    [
+      expect(compare(a, b)).toBe(-1),
+      expect(compare(a, a)).toBe(0),
+      expect(isBefore(a, b)).toBe(true),
+      expect(isAfter(b, a)).toBe(true),
+      expect(isBefore(a, a)).toBe(false)
+    ]
+  ),
+
+  // ── ISO formatting ──────────────────────────────────────────────────────────
+  test("toIsoDate / toIsoTime / toIso render canonical forms", () =>
+    val dt = unwrapDt(dateTime(2024, 1, 5, 9, 8, 7, 6))
+    [
+      expect(toIsoDate(dt)).toBe("2024-01-05"),
+      expect(toIsoTime(dt)).toBe("09:08:07.006"),
+      expect(toIso(dt)).toBe("2024-01-05T09:08:07.006")
+    ]
+  ),
+
+  test("toIsoDate zero-pads a four-digit year and renders negatives", () => [
+    expect(toIsoDate({ "year": 7, "month": 1, "day": 1 })).toBe("0007-01-01"),
+    expect(toIsoDate({ "year": -44, "month": 3, "day": 15 })).toBe("-0044-03-15")
+  ]),
+
+  // ── ISO parsing ───────────────────────────────────────────────────────────
+  test("parseIsoDate parses and validates", () =>
+    val d = unwrapDate(parseIsoDate("2024-02-29"))
+    [
+      expect(d["year"]).toBe(2024),
+      expect(d["month"]).toBe(2),
+      expect(d["day"]).toBe(29),
+      expect(parseIsoDate("2023-02-29") is Error).toBe(true),
+      expect(parseIsoDate("2024-13-01") is Error).toBe(true),
+      expect(parseIsoDate("2024-01") is Error).toBe(true),
+      expect(parseIsoDate("abc-01-01") is Error).toBe(true)
+    ]
+  ),
+
+  test("parseIsoTime parses with and without milliseconds", () =>
+    val a = unwrapTime(parseIsoTime("10:30:45.500"))
+    val b = unwrapTime(parseIsoTime("10:30:45"))
+    [
+      expect(a["hour"]).toBe(10),
+      expect(a["minute"]).toBe(30),
+      expect(a["second"]).toBe(45),
+      expect(a["millis"]).toBe(500),
+      expect(b["millis"]).toBe(0),
+      expect(parseIsoTime("24:00:00") is Error).toBe(true),
+      expect(parseIsoTime("10:30") is Error).toBe(true)
+    ]
+  ),
+
+  test("parseIso parses a full date-time and tolerates a trailing Z", () =>
+    val dt = unwrapDt(parseIso("2024-01-15T10:30:45.500Z"))
+    [
+      expect(dt["year"]).toBe(2024),
+      expect(dt["day"]).toBe(15),
+      expect(dt["hour"]).toBe(10),
+      expect(dt["second"]).toBe(45),
+      expect(dt["millis"]).toBe(500),
+      expect(parseIso("2024-01-15 10:30:45") is Error).toBe(true), // missing 'T'
+      expect(parseIso("2023-02-29T00:00:00Z") is Error).toBe(true) // invalid leap day
+    ]
+  ),
+
+  test("parseIso round-trips toIso for a known instant", () =>
+    val dt = fromTimestamp(KNOWN)
+    [
+      expect(toTimestamp(unwrapDt(parseIso(toIso(dt))))).toBe(KNOWN)
+    ]
+  )
+])
+
+run(s)

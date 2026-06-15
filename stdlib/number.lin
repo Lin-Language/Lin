@@ -5,7 +5,10 @@
 // `== null` / `is Int32`. Guard untrusted input with `isInt32`/`isFloat64`, or just use the
 // try-variants. `toInt32`/`toFloat64`/`toFloat32` convert between the numeric types (truncating or
 // widening). The fixed-width casts (toUInt8/toInt8/…/toUInt64) take a UInt64 and truncate/reinterpret
-// to the target width — the building blocks for the bit-level packing in std/bytes.
+// to the target width — the building blocks for the bit-level packing in std/bytes. The parallel
+// `narrowToUInt8`/…/`narrowToUInt64` family takes a SIGNED Int64 instead, so a value computed in
+// Int64 can be narrowed to a small field (which the UInt64-input family cannot accept, because
+// Int64 -> UInt64 is not an implicit coercion).
 //
 //   import { parseInt32, parseFloat64, toInt32, toFloat64, isInt32, isFloat64 } from "std/number"
 import foreign "lin-runtime"
@@ -37,6 +40,13 @@ import foreign "lin-runtime"
   val lin_to_uint32: (UInt64) => UInt32
   val lin_to_int64: (UInt64) => Int64
   val lin_to_uint64: (UInt64) => UInt64
+  val lin_narrow_uint8: (Int64) => UInt8
+  val lin_narrow_int8: (Int64) => Int8
+  val lin_narrow_uint16: (Int64) => UInt16
+  val lin_narrow_int16: (Int64) => Int16
+  val lin_narrow_uint32: (Int64) => UInt32
+  val lin_narrow_int32: (Int64) => Int32
+  val lin_narrow_uint64: (Int64) => UInt64
 
 // Integer limits — the min/max value of each fixed-width integer type.
 export val MAX_UINT8: UInt8 = 255
@@ -175,6 +185,31 @@ export val toInt64 = (v: UInt64): Int64 =>
 // @returns `v` as a UInt64.
 export val toUInt64 = (v: UInt64): UInt64 =>
   lin_to_uint64(v)
+
+// Narrowing casts from a SIGNED `Int64` input. The `toUInt8`/… family above takes `UInt64`, so only
+// an already-unsigned value (or a masked one) reaches it; a computed/signed `Int64` cannot, because
+// `Int64 -> UInt64` is not an implicit coercion (it could wrap a negative). These take `Int64` — the
+// widest signed integer, into which every signed/computed integer widens — and truncate to the named
+// width with two's-complement (`as`-cast) semantics. Use them to store a wide computed result into a
+// narrow field (e.g. a calendar `month: UInt8` derived from `Int64` date math). Truncation never
+// fails; an out-of-range value silently keeps its low bits, so narrow only values you know fit.
+// Truncate a signed `Int64` to a UInt8 (low 8 bits).
+// @example narrowToUInt8(300)   // 44
+export val narrowToUInt8 = (v: Int64): UInt8 => lin_narrow_uint8(v)
+// Truncate a signed `Int64` to an Int8 (low 8 bits, signed).
+export val narrowToInt8 = (v: Int64): Int8 => lin_narrow_int8(v)
+// Truncate a signed `Int64` to a UInt16 (low 16 bits).
+export val narrowToUInt16 = (v: Int64): UInt16 => lin_narrow_uint16(v)
+// Truncate a signed `Int64` to an Int16 (low 16 bits, signed).
+export val narrowToInt16 = (v: Int64): Int16 => lin_narrow_int16(v)
+// Truncate a signed `Int64` to a UInt32 (low 32 bits).
+export val narrowToUInt32 = (v: Int64): UInt32 => lin_narrow_uint32(v)
+// Truncate a signed `Int64` to an Int32 (low 32 bits, signed) — the integer-to-Int32 cast that
+// `toInt32` (which takes a `Float64`) does not cover.
+export val narrowToInt32 = (v: Int64): Int32 => lin_narrow_int32(v)
+// Reinterpret a signed `Int64` as a UInt64 (same bit pattern) — the signed→unsigned bridge that is
+// deliberately not an implicit coercion.
+export val narrowToUInt64 = (v: Int64): UInt64 => lin_narrow_uint64(v)
 
 // Test whether `s` is a valid base-10 Int32.
 // @param s  the string to test.

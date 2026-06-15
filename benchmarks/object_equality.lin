@@ -81,7 +81,7 @@ var matches = 0i64
 range(0, n).for(i =>
   val f12v = if i % 5 == 0 then 9999 else 12
   val incoming = makeIncoming(f12v)
-  matches = matches + if incoming == reference then 1i64 else 0i64
+  matches = matches + (if incoming == reference then 1i64 else 0i64)
 )
 
 // Expected matches = records where i % 5 != 0 = n - (n/5).
