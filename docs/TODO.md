@@ -11,33 +11,37 @@
 
 Each produces a design doc + a minimal POC/spike; conductor reviews + runs heavy benches before any merge.
 
-- [~] **Arena / bump allocation** (`explore/arena`) — program-lifetime data (RAPTOR's index, built once in
-  PREP, never freed) into a bump arena: zero per-object malloc-header / RC / free. Design doc exists
-  (`docs/design-arena-allocation.md`); agent refines it + POCs an arena allocator + a region/`frozen`-scope
-  routing hook. **Potentially the single biggest RAPTOR memory+speed lever.**
-- [~] **Interp Option D — stack-allocate Cursor/Token** (`explore/interpd`) — the *real* interp lever
-  (Option C RC-elision was sound-but-0%; interp is alloc-bound). Extend escape analysis +
-  `sealed_construct_stack` (today all-scalar only) to stack-allocate non-escaping per-frame records with
-  heap-pointer fields. Design doc: `docs/design-interp-call-axis.md`.
-- [~] **Columnar (struct-of-arrays) record arrays** (`explore/columnar`) — beyond 0xFE: each field its own
-  contiguous column (all `departureTime`s together) → SIMD-friendly, best locality for RAPTOR's field-scans.
-  Design + feasibility (`docs/design-columnar-arrays.md`), optional runtime spike.
-- [~] **True inline SSO** (`explore/sso`) — short strings (≤15 B = 100 % of interp/dijkstra strings) stored
-  in the 16-byte value word, zero heap. Design + an HONEST consumer-audit list (same "guard every consumer"
-  discipline that made SMI hard) + win-vs-existing-freelist analysis (`docs/design-inline-sso.md`).
+- [~] **Arena / bump allocation** (`explore/arena`) — DESIGN + partial POC; agent DIED on a socket error
+  mid-spike (partial uncommitted work preserved as a wip commit). NEEDS RE-RUN. **Fold in the freeze-as-repack
+  idea (Linus): make `freeze()` a one-time 0xFD→0xFE inline repack + arena-allocate + RC-suppress — one
+  primitive unifying arena + 0xFE + RC-elimination, signalled by the user (`freeze`) not escape-inference.**
+  Still potentially the single biggest RAPTOR memory+speed lever.
+- [~] **Interp Option D — stack-allocate Cursor/Token** (`explore/interpd`) — POC done (uncommitted→preserved):
+  extends the stack path (Stage 4b, `SEALED_STACK_HEAP_RC`) to stack-allocate NON-all-scalar sealed records
+  (records with heap-pointer fields, like Cursor/Token), **820/820 incl a new keeppacked-sumfield leak test**.
+  The real interp lever. Needs conductor review (ASan + interp wall-clock measurement) before merge.
+- [~] **Columnar (struct-of-arrays) record arrays** (`explore/columnar`) — DESIGN DOC + runtime spike
+  (`docs/design-columnar-arrays.md`, `lin-runtime/src/columnar.rs`): `0xFC` tag aliased on LinArray; 2-int +
+  1-ptr-field 1M-element array; field-get = two-ptr-load + GEP + load; scan verified. 3-phase plan (alloc/
+  scatter + field-get + materialize → push-scatter fusion → RAPTOR `@columnar`). Read-mostly, same alias gate
+  as 0xFE. Promising for RAPTOR's departureTime field-scans.
+- [~] **True inline SSO** (`explore/sso`) — DESIGN DOC + spike (`docs/design-inline-sso.md`,
+  `lin-runtime/src/sso_spike.rs`): ≤15 B inline encoding, discriminant never collides with aligned heap ptrs.
+  SSO handles ≤7 B (100 % of interp/dijkstra hot strings); freelist stays for 8–24 B. **CAVEAT (agent): same
+  "guard every consumer" surface that made SMI hard, AND it interacts with the value-record repr reset — stage
+  the repr reset first, then SSO.** Decision pending.
 
 ---
 
 ## OPEN — decisions / smaller items
 
-- [~] **SMI dates (#12) — ENABLED + working behind the default-OFF `smi` flag (`a1ba97cb`); TOGGLE REMOVAL
-  BLOCKED.** It was inert (box never emitted immediates); now flipped + consumer-guarded, VERIFIED feature-ON
-  (820/0 + 73/73 + fires `smi_int_boxes=4402` + RAPTOR digest-exact + ASan UAF-clean). Master is byte-identical
-  with the flag OFF (safe). **But making it unconditional keeps surfacing consumer-guard bugs (whack-a-mole):
-  array-slice fixed (`ed1bf6b3`); regex still SIGSEGVs.** Tests passing is necessary-but-NOT-sufficient (an
-  unguarded path with no test is invisible). **RECOMMENDATION: leave flagged until a holistic re-architecture
-  (a single typed SMI wrapper + an exhaustive deref-site audit), not ad-hoc fixes.** WIP parked on
-  `chore/smi-unconditional`. See memory `project_linmap_memory_lever`, path-10 spike ("11 bugs").
+- [x] **SMI dates (#12) — DROPPED + STRIPPED from master (`51febe63`, −811 lines); full impl on `reference/smi`.**
+  DECISION (2026-06-16): the manually-typed RAPTOR port (`lin-manually-typed/`) is FULLY TYPED — zero AnyVal,
+  dates are `UInt32` stored *unboxed* (record fields), as *raw* integer map keys (`{DateNumber: Boolean}`), and
+  as scalar map values. None call `lin_box_int`, which is SMI's ONLY optimization target. So SMI fires ZERO
+  times on the actual direction of travel ("dates as ints" = typed UInt32 scalars, the opposite of what SMI
+  helps). The real levers here are value-unbox (homogeneous `{_:UInt32}`/`{_:Boolean}` maps → 8B slot — already
+  merged) + de-materialization. Kept on `reference/smi` for any future genuinely-untyped int-boxing workload.
 - [ ] **mimalloc as default allocator** — ~10 % RSS + 3–5 % wall-clock, one-liner already behind a feature.
   A default-allocator/CI/platform POLICY call for Linus (flip default-on, or leave opt-in).
 - [ ] **#8 Float32 sealed-record size divergence** — *(believed fixed this session via NKIND_FLOAT32; verify
