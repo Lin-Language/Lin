@@ -353,9 +353,11 @@ type_tag_open delete, box_map_of, BuilderExt::select, RuntimeFns fields). Master
 
 ### IN FLIGHT / RESOLVED — parallel lanes launched 2026-06-16 (file-disjoint worktrees, Bedrock sonnet)
 Conductor (me) runs the heavy RAPTOR digest+RSS at integration; agents run light gates only.
-- [~] **Lane V — value-unbox (#16) → PARKED (sound, NO RAPTOR win).** In-house, branch `lane/map-value-unbox`
-  commit `bdc00134`. Variable-stride slots (24B homogeneous / 32B MIXED), ABI preserved via per-thread scratch
-  ring. Gates GREEN: 123 runtime + 820 integ + 73 stdlib + **RAPTOR digest EXACT**. But peak RSS unchanged.
+- [x] **Lane V — value-unbox (#16) → MERGED to master `a63e9603`.** Variable-stride slots (24B homogeneous /
+  32B MIXED), ABI preserved via per-thread scratch ring; record-materializers birth maps MIXED
+  (`lin_map_alloc_mixed`) to kill the conversion churn (240M→24.6M, ~0.7% residual). Sound + effectively
+  NEUTRAL today (RAPTOR digest EXACT, RSS 24278≈24291, ASan A/B identical to master, 123+820+73 green) — and
+  becomes a real win once the RAPTOR port stops materializing records to maps. In-house earlier commit `bdc00134`.
   **MEASURED ROOT CAUSE (LIN_VKIND_STATS): 99.99% of maps go MIXED** — first-insert tag is TAG_STR (204.8M) /
   TAG_INT32 (35.1M) then a different tag → the 51.5M dominant maps are **materialized RECORDS** (StopTime/Trip
   `{stopId:String, arrivalTime:Int64,…}`), NOT `{String:T}` index maps. Heterogeneous ⇒ value-unbox can't
