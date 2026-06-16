@@ -11,25 +11,24 @@
 
 Each produces a design doc + a minimal POC/spike; conductor reviews + runs heavy benches before any merge.
 
-- [~] **Arena / bump allocation** (`explore/arena`) — DESIGN + partial POC; agent DIED on a socket error
-  mid-spike (partial uncommitted work preserved as a wip commit). NEEDS RE-RUN. **Fold in the freeze-as-repack
-  idea (Linus): make `freeze()` a one-time 0xFD→0xFE inline repack + arena-allocate + RC-suppress — one
-  primitive unifying arena + 0xFE + RC-elimination, signalled by the user (`freeze`) not escape-inference.**
-  Still potentially the single biggest RAPTOR memory+speed lever.
-- [~] **Interp Option D — stack-allocate Cursor/Token** (`explore/interpd`) — POC done (uncommitted→preserved):
-  extends the stack path (Stage 4b, `SEALED_STACK_HEAP_RC`) to stack-allocate NON-all-scalar sealed records
-  (records with heap-pointer fields, like Cursor/Token), **820/820 incl a new keeppacked-sumfield leak test**.
-  The real interp lever. Needs conductor review (ASan + interp wall-clock measurement) before merge.
-- [~] **Columnar (struct-of-arrays) record arrays** (`explore/columnar`) — DESIGN DOC + runtime spike
-  (`docs/design-columnar-arrays.md`, `lin-runtime/src/columnar.rs`): `0xFC` tag aliased on LinArray; 2-int +
-  1-ptr-field 1M-element array; field-get = two-ptr-load + GEP + load; scan verified. 3-phase plan (alloc/
-  scatter + field-get + materialize → push-scatter fusion → RAPTOR `@columnar`). Read-mostly, same alias gate
-  as 0xFE. Promising for RAPTOR's departureTime field-scans.
-- [~] **True inline SSO** (`explore/sso`) — DESIGN DOC + spike (`docs/design-inline-sso.md`,
-  `lin-runtime/src/sso_spike.rs`): ≤15 B inline encoding, discriminant never collides with aligned heap ptrs.
-  SSO handles ≤7 B (100 % of interp/dijkstra hot strings); freelist stays for 8–24 B. **CAVEAT (agent): same
-  "guard every consumer" surface that made SMI hard, AND it interacts with the value-record repr reset — stage
-  the repr reset first, then SSO.** Decision pending.
+- [~] **`freeze`-as-repack / arena** (`explore/arena`) — **THE primary lever.** Make `frozen(v)` a one-time
+  repack: 0xFD pointer-spine record arrays → 0xFE inline + (later) arena-allocate the buffer + RC-suppress.
+  One user-driven primitive unifying inline-layout + arena + RC-elimination, sidestepping the store-then-push
+  hazard by construction (the user signals "done mutating"). `frozen()` already RC-suppresses for free today;
+  this adds the repack. Agent RUNNING (re-dispatched after a socket-death). Potentially the single biggest
+  RAPTOR memory+speed lever, and it covers interp too (parse records are program-lifetime, not frame-local).
+- [~] **Columnar (struct-of-arrays) record arrays** (`explore/columnar`) — DESIGN DOC + runtime spike landed
+  (`docs/design-columnar-arrays.md`, `lin-runtime/src/columnar.rs`: `0xFC` tag, field-get = two-ptr-load +
+  GEP + load, verified). Phase-1 codegen wiring RUNNING. Read-mostly (same alias gate as 0xFE); good for
+  RAPTOR's departureTime field-scans. Likely simplifies once records are value types (repr reset).
+- [ ] **True inline SSO** (`explore/sso`) — DESIGN DOC + spike done (`docs/design-inline-sso.md`); ≤15 B inline,
+  handles ≤7 B = 100 % of interp/dijkstra hot strings. **DEFERRED behind the value-record repr reset** (the
+  agent flagged the same "guard every consumer" fragility that sank SMI, plus it tangles with the string field
+  layout in sealed structs). Revisit after the repr reset.
+- [×] **Interp Option D — stack-alloc Cursor/Token** (`explore/interpd`, NOT merged) — verified sound (820/820,
+  ASan-clean) but **0 % on interp: the Cursor/Token records are RETURNED up the parse chain → they escape the
+  frame → 0 stack allocas fire.** Stack-alloc is the wrong tool; the interp lever is arena/region (the `freeze`
+  lane). Left on the branch for reference; not pursuing.
 
 ---
 
@@ -43,13 +42,8 @@ Each produces a design doc + a minimal POC/spike; conductor reviews + runs heavy
   helps). The real levers here are value-unbox (homogeneous `{_:UInt32}`/`{_:Boolean}` maps → 8B slot — already
   merged) + de-materialization. Kept on `reference/smi` for any future genuinely-untyped int-boxing workload.
 - [ ] **mimalloc as default allocator** — ~10 % RSS + 3–5 % wall-clock, one-liner already behind a feature.
-  A default-allocator/CI/platform POLICY call for Linus (flip default-on, or leave opt-in).
-- [ ] **#8 Float32 sealed-record size divergence** — *(believed fixed this session via NKIND_FLOAT32; verify
-  it's actually landed/closed before deleting this line.)*
-- [ ] **B2 — unify tag walkers** into one `TagClass`/`for_each_heap_payload` table (release/retain/transfer/
-  freeze dispatch through it → "handled the new tag?" becomes a compile-time exhaustiveness check). Deferred
-  all session as risky-RC / low-remaining-value — candidate to close as won't-do unless the SMI/inline-SSO
-  "guard every consumer" pain motivates it (it's the same class of problem).
+  A default-allocator/CI/platform POLICY call for Linus (flip default-on, or leave opt-in). The only real
+  open *decision* here.
 
 ---
 
@@ -69,13 +63,16 @@ These are real wins the moment the port changes how data is *written*:
 
 ## Bigger future levers (not yet scoped)
 
-- **RC elimination for immortal/program-lifetime graphs** — extend/infer `frozen` so program-lifetime data
-  skips RC entirely. Pairs with the arena lane.
-- **Header compaction 24→16 B** — one per-type metadata pointer instead of `{size,heap_desc,named_desc}`
-  (~8 B/record; ~100-site UAF-risky migration; largely subsumed by 0xFE/columnar for array-held records).
 - **Multi-core parallel RAPTOR queries** — the 24 GROUP + 5 RANGE queries are independent; fan out via the
-  existing worker/async. Speed, not memory.
+  existing worker/async. Speed, not memory; unscoped.
 - **Broaden the benchmark suite** — dijkstra/pipeline/parallel cells beyond RAPTOR; track regressions in CI.
+
+> *Dropped (won't do):* **Header compaction 24→16 B** — subsumed by `freeze`-repack/0xFE/columnar (which
+> remove the per-element header *entirely* for the dominant array-held records), ~100-site UAF-risky for ~8 B
+> on the standalone-record minority, and conflicts with the freeze/columnar lanes. **B2 tag-walker unification**
+> — deferred all session; the motivating UAF bugs (#4/#5) are long fixed; low value. **#8 Float32** — DONE
+> (NKIND_FLOAT32 shipped). **SMI** — dropped (see above; on `reference/smi`). **Interp stack-alloc (Option D)**
+> — doesn't fire (Cursor escapes); the lever is the `freeze`/arena lane.
 
 ---
 
@@ -103,7 +100,7 @@ These are real wins the moment the port changes how data is *written*:
 | `a63e9603` | **value-unbox** LinMap slots + MIXED-birth churn-fix (neutral; win after de-materialization) |
 | `c2f77121` | **0xFE inline** record arrays (sound; win after build-then-store) |
 | `139b35bd` | **RC-elision** at Borrow calls (sound; ~0 % — interp is alloc-bound) |
-| `7140c05b`/`a1ba97cb` | **SMI** infra→enabled behind default-OFF flag |
+| `51febe63` | **SMI** stripped (inert→enabled→DROPPED; never fires on typed dates; on `reference/smi`) |
 | `c8119174` | LinMap INITIAL_CAP 8→4 (−1.4 GB) |
 | docs | peak-memory finding (PERFORMANCE.md §4); arena + interp-call design docs |
 

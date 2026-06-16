@@ -244,18 +244,21 @@ preserve.
   *separate axis* from the throughput finding that "no workload is alloc-bound"
   (§5, path-7): that's about allocation *churn*; this is about *live* peak RSS.
   Per-kind attribution of the 132M-live peak (2026-06): **maps = 15.25 GB / 76 %**
-  (51.5M live `{String:Trip[]}` route tables, ~296 B each), sealed records =
-  4.47 GB, transient tag-boxes/array/string < 1 GB. The maps are *legitimately*
-  maps (dynamic route dictionaries), not mis-materialized records — so the lever
-  is per-map cost, and per-map cost is structurally floored: a slot is
-  `hash(8)+key(8)+value:TaggedVal(16) = 32 B`, 8-aligned, and the only real shrink
-  is **unboxing the value (16 B → 8 B, ~2.9 GB)**. That is *ABI-blocked*:
-  `lin_map_get` returns a **borrowed interior pointer** into the slot, so a smaller
-  in-slot value forces `get` to return a reconstructed scratch `TaggedVal`.
-  Feasibility is proven (no codegen consumer holds two live borrowed results), but
-  it narrows the hottest path's contract and is held for a supervised change.
-  The cheap win (`INITIAL_CAP` 8→4, −1.4 GB, byte-identical IR) has shipped.
-  Reducing the map *count* is an algorithmic RAPTOR change, not a repr tweak.
+  (51.5M live maps, ~296 B each), sealed records = 4.47 GB, transient
+  tag-boxes/array/string < 1 GB. **Crucially, those maps are NOT dictionaries — a
+  per-first-insert-tag census (`LIN_VKIND_STATS`) found 99.99 % of them are
+  *materialized records*** (a `StopTime{stopId:String, arrivalTime:Int64, …}`
+  flattened field-by-field into a `{String:…}` map: first key tag String 204.8 M,
+  then a differently-typed field → heterogeneous). So the lever is **stop
+  materializing records into maps** (keep them packed — the §5.6/§5.7
+  de-materialization direction), *not* a per-map slot tweak. The slot *is*
+  structurally floored (`hash 8 + key 8 + value:TaggedVal 16 = 32 B`), and
+  **value-unbox** (24 B homogeneous slots / 32 B MIXED, ABI preserved via a
+  per-thread scratch ring + record-materializers born MIXED) *shipped* this
+  session — but it's **neutral on RAPTOR** precisely because those dominant maps
+  are heterogeneous; it wins on genuinely homogeneous scalar maps (`{_:UInt32}`).
+  The cheap structural win (`INITIAL_CAP` 8→4, −1.4 GB, byte-identical IR) shipped.
+  See §5.7 for the full memory deep-dive.
 - **No reference-cycle collection** (ADR-024). Cycles between long-lived heap
   objects leak; documented, the fix is to null a field to break the cycle.
 - **`Number` (boxed numeric union) is ~3.6× slower than a concrete family**
@@ -360,6 +363,73 @@ allocating — the alloc count is what matters.)
 
 ---
 
+### 5.7 Memory + interp — the 2026-06 deep-dive (what worked, what was sound-but-0%, and why)
+
+This session attacked the two open gaps from §5.6 — typed-RAPTOR peak memory (~25 GB) and the interp
+call/value axis — with a fleet of file-disjoint lanes. The headline reinforces §5/§5.6: **both gaps are
+allocation/materialization-bound, and that lives in *how the program is written*, not in the representation.**
+Nearly every "clean" compiler-side repr/RC optimization came back **sound but ~0 %**; the wins came from
+changing what the program *allocates*.
+
+**Map attribution, corrected.** §4's 76 %-of-peak LinMap is **99.99 % materialized records**, not dictionaries
+(`LIN_VKIND_STATS` census). Confirms the de-materialization direction, not a per-map tweak.
+
+**What worked (merged):**
+- **`Cursor.node` union-field sealing (lane U).** The interp's per-node `Cursor{node:<sum>, pos}` was boxed as
+  a hashmap because its single-pointer union field disqualified sealing. Admitting single-pointer (`*SumNode`)
+  union fields into the packed layout (`NKIND_SUMNODE`) cut the parser hot loop **1.66 M `lin_map_get`/run → 0**
+  and dropped the interp leak 10×. (Distinct from §5.6's "sealed-struct Cursor regressed 9 %" — that made the
+  whole record a value struct; this seals one *field* and keeps reference semantics + removes the map.)
+- **Interp leak fix.** Interp leaked ~34 MB / 1.49 M allocs *per run* (a String-TCO under-release in
+  `lin_string_slice`/`char_at`) → **424 B / 27 allocs** (residual = intentional string-interning).
+- **LinMap `INITIAL_CAP` 8→4** (−1.4 GB, byte-identical) — the one cheap structural memory win.
+
+**Sound but ~0 % (the pattern is the point):**
+
+| Lever | State | Why ~0 % |
+|---|---|---|
+| **value-unbox** (24 B homogeneous slots / 32 B MIXED; ABI kept via a scratch ring; materializers born MIXED) | merged, neutral | dominant RAPTOR maps are heterogeneous materialized records → can't shrink. *Wins on homogeneous scalar maps* (`{_:UInt32}`/`{_:Boolean}` — the fully-typed port). |
+| **0xFE inline record arrays** | merged, sound | RAPTOR builds arrays **store-then-push** (`g[k]=[]; push(g[k],…)`), incompatible with inline (push corrupts the headerless buffer). Fires only for local read-only arrays. *Unblocks once the port build-then-stores / `freeze`s.* |
+| **RC-elision at Borrow calls** (Option C) | merged, sound | interp is alloc-bound, not RC-bound — 28 elided RC ops are dwarfed by `lin_map_alloc`/node. |
+| **stack-alloc heap-field records** (interp-D) | branch, not merged | the interp's `Cursor`/`Token` are *returned up the parse chain* → escape the frame → 0 stack allocas in interp IR. The lever is **arena/region**, not stack. |
+
+The recurring shape: an optimization is sound and passes every gate, but moves ~0 % because the program's data
+doesn't meet its precondition (heterogeneous maps; store-then-push arrays; escaping frames). The wins need to
+attack the *allocation* directly — de-materialize records (port-side), eliminate the per-node alloc (arena),
+and the convergent idea, **`freeze`** (below).
+
+**SMI — inert → enabled → dropped (a full round-trip, worth recording).** Pointer-tagged small-int inlining
+(`(n<<1)|1`) was carried as "what dates-as-ints needs." Three findings killed it: (1) the merged `smi` feature
+was **inert** — `lin_box_int*` never emitted immediates, so "it passes all gates" was verifying a no-op;
+(2) when actually enabled it was a **whack-a-mole of consumer-guard bugs** — every `*const u8` deref must check
+`is_smi_ptr`, and **"tests pass" is necessary but NOT sufficient** (an unguarded path with no test is invisible:
+array-slice and regex both shipped green and segfaulted later); (3) decisively, the fully-typed RAPTOR port
+stores dates as **typed `UInt32`** — unboxed record fields, raw integer map keys, scalar map values — which
+**never call `lin_box_int`**, SMI's only target. SMI fires *zero times* on the real workload. Stripped from
+master (−811 lines), preserved on `reference/smi`. The general lesson — a tagged-pointer scheme with scattered
+consumer guards is fragile by construction — also gates **inline SSO** (its design agent independently flagged
+the same surface).
+
+**Process lessons (cost real time):**
+- **Agent self-reports are not trustworthy.** Lanes self-reported "820/0, mergeable" with real regressions (a
+  4-RAPTOR-query break; an all-scalar stack-residence regression; the SMI guard bugs). Re-run every gate.
+- **Stale / feature-mixed incremental builds give *flaky* failures.** Interleaving `--features`/ASan builds in
+  a worktree produced phantom "2 failed" that vanished after `cargo clean` — which led to chasing non-bugs
+  *and* nearly dismissing a real one as "stale." Rule: `cargo build --workspace` first, then test; `cargo
+  clean` between feature states.
+
+**The convergent direction — `freeze` as a repack primitive.** RAPTOR's `Trip[]` can't go 0xFE because it's
+store-then-push — but `frozen(v)` is the missing *signal*: build naturally with `push`, then `freeze` when
+done. `frozen()` already deep-immortalizes (RC-suppresses) the graph for free *today*; the lane in flight
+extends it to **repack 0xFD pointer-spine arrays → 0xFE inline** (then arena-allocate the buffer). One
+primitive unifies inline-layout + arena + RC-elimination, driven by an explicit user signal instead of
+compile-time escape inference — and it sidesteps the store-then-push hazard by construction. This is the most
+promising open memory+speed lever. (Exploration spikes also landed: **columnar** struct-of-arrays record
+arrays — `0xFC`, two-ptr-load + GEP field reads, for RAPTOR's field-scans — and **inline SSO**, both gated
+behind the value-record repr-reset per their design docs.)
+
+---
+
 ## 6. Guidance for writing fast Lin
 
 1. **Prefer typed records and `&`-composed named types over `AnyVal`.** This is the
@@ -381,6 +451,12 @@ allocating — the alloc count is what matters.)
    (immortal, zero-copy, lock-free reads) and `Shared<T>` only for genuine shared
    *mutable* state.
 8. **Break reference cycles manually** (null a field) — there is no cycle collector.
+9. **`freeze` load-once, never-mutated data** (e.g. the return of a `loadData`/index-build function).
+   `frozen(v)` deep-immortalizes the graph: for the rest of the program its retain/release become no-ops
+   (the LIN_NO_RC ceiling showed RC is pure overhead for program-lifetime retention). Build the structure
+   naturally with `push`, then `freeze` once you're done mutating — that "done" signal is also what lets the
+   compiler repack it to a compact inline layout (in progress). Only freeze genuinely read-after-this data;
+   a frozen value is never reclaimed until process exit.
 
 ---
 
