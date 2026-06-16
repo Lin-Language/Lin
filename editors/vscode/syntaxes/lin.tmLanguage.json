@@ -5,8 +5,8 @@
   "patterns": [
     { "include": "#comment" },
     { "include": "#import-statement" },
-    { "include": "#export-keyword" },
     { "include": "#type-declaration" },
+    { "include": "#export-keyword" },
     { "include": "#binding" },
     { "include": "#keywords" },
     { "include": "#string" },
@@ -62,12 +62,13 @@
     },
 
     "type-declaration": {
-      "comment": "type Foo = ...",
-      "begin": "^\\s*(type)\\s+([A-Z][a-zA-Z0-9_]*)",
+      "comment": "type Foo = ... (optionally `export type Foo = ...`)",
+      "begin": "^\\s*(?:(export)\\s+)?(type)\\s+([A-Z][a-zA-Z0-9_]*)",
       "end": "$",
       "beginCaptures": {
-        "1": { "name": "keyword.other.type.lin" },
-        "2": { "name": "entity.name.type.declaration.lin" }
+        "1": { "name": "keyword.other.export.lin" },
+        "2": { "name": "keyword.other.type.lin" },
+        "3": { "name": "entity.name.type.declaration.lin" }
       },
       "patterns": [
         { "include": "#comment" },
