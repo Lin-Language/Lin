@@ -4,7 +4,7 @@ std/fs — filesystem read, write, and directory operations.
 
 All operations are synchronous and blocking. Fallible calls return their value or an Error shape
 (`{ "type": "error", "message": ... }`) that you narrow with `is Error`; the predicates exists,
-isFile, isDir, and isSymlink are total and return a plain Boolean. The `opts` Json argument on
+isFile, isDir, and isSymlink are total and return a plain Boolean. The `opts` AnyVal argument on
 ls, mkdir, rm, and writeJson selects a variant via keys such as `{ recursive }`, `{ parents }`,
 or `{ compact }`. For incremental reads, openRead returns a lazy byte stream.
 
@@ -110,12 +110,12 @@ Read a file and split it into an array of lines (line terminators removed).
 #### `readJson`
 
 ```lin
-val readJson = (path: String): Json | Error
+val readJson = (path: String): AnyVal | Error
 ```
 
 Read a file and parse its contents as JSON.
 - **`path`** — the file to read.
-- **Returns** the parsed Json value, or an Error if the file cannot be read or is not valid JSON.
+- **Returns** the parsed AnyVal value, or an Error if the file cannot be read or is not valid JSON.
 
 **Example:**
 
@@ -126,12 +126,12 @@ val data = readJson("config.json")   // then data["version"], or Error on failur
 #### `writeJson`
 
 ```lin
-val writeJson = (path: String, value: Json, opts: WriteJsonOpts | Null): Null | Error
+val writeJson = (path: String, value: AnyVal, opts: WriteJsonOpts | Null): Null | Error
 ```
 
 Serialise `value` to JSON and write it to `path`, truncating any existing file.
 - **`path`** — the file to write.
-- **`value`** — the Json value to serialise.
+- **`value`** — the AnyVal value to serialise.
 - **`opts`** — accepts `{ compact }`; when true, output is minified rather than pretty-printed.
 - **Returns** Null on success, or an Error if the write fails.
 

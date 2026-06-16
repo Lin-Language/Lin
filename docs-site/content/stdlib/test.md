@@ -29,7 +29,7 @@ permitted only in a `*.test.lin`.
 #### `expect`
 
 ```lin
-val expect = (value: Json): Json
+val expect = (value: AnyVal): AnyVal
 ```
 
 Begin an assertion by wrapping `value` in an asserter for a matcher to inspect.
@@ -40,7 +40,7 @@ Begin an assertion by wrapping `value` in an asserter for a matcher to inspect.
 #### `toBe`
 
 ```lin
-val toBe = (asserter: Json, expected: Json): Json
+val toBe = (asserter: AnyVal, expected: AnyVal): AnyVal
 ```
 
 Assert the asserter's value equals `expected` (structural `==`).
@@ -63,7 +63,7 @@ expect("hi".toUpper()).toBe("HI")
 #### `toBeNull`
 
 ```lin
-val toBeNull = (asserter: Json): Json
+val toBeNull = (asserter: AnyVal): AnyVal
 ```
 
 Assert the asserter's value is `null`.
@@ -73,18 +73,18 @@ Assert the asserter's value is `null`.
 #### `toSatisfy`
 
 ```lin
-val toSatisfy = (asserter: Json, pred: Function): Json
+val toSatisfy = (asserter: AnyVal, pred: Function): AnyVal
 ```
 
 Assert the asserter's value satisfies a predicate.
 - **`asserter`** — the asserter from `expect`.
-- **`pred`** — a `(Json) => Boolean` predicate the value must satisfy.
+- **`pred`** — a `(AnyVal) => Boolean` predicate the value must satisfy.
 - **Returns** a passing assertion if `pred(value)` is true, otherwise a failing one.
 
 #### `toSucceed`
 
 ```lin
-val toSucceed = (asserter: Json): Json
+val toSucceed = (asserter: AnyVal): AnyVal
 ```
 
 Assert the asserter's value is a success result (`{ "type": "success" }`).
@@ -94,7 +94,7 @@ Assert the asserter's value is a success result (`{ "type": "success" }`).
 #### `toFail`
 
 ```lin
-val toFail = (asserter: Json): Json
+val toFail = (asserter: AnyVal): AnyVal
 ```
 
 Assert the asserter's value is a failure result (`{ "type": "failure" }`).
@@ -104,7 +104,7 @@ Assert the asserter's value is a failure result (`{ "type": "failure" }`).
 #### `toFailWith`
 
 ```lin
-val toFailWith = (asserter: Json, message: String): Json
+val toFailWith = (asserter: AnyVal, message: String): AnyVal
 ```
 
 Assert the asserter's value is a failure result whose `error` equals `message`.
@@ -116,7 +116,7 @@ Assert the asserter's value is a failure result whose `error` equals `message`.
 #### `test`
 
 ```lin
-val test = (name: String, body: () => Json[]): Json
+val test = (name: String, body: () => AnyVal[]): AnyVal
 ```
 
 Define a test: eagerly run its body and store the result alongside the name.
@@ -130,7 +130,7 @@ Define a test: eagerly run its body and store the result alongside the name.
 #### `withFixture`
 
 ```lin
-val withFixture = (setup: () => Json, teardown: (Json) => Null, name: String, body: (Json) => Json[]): Json
+val withFixture = (setup: () => AnyVal, teardown: (AnyVal) => Null, name: String, body: (AnyVal) => AnyVal[]): AnyVal
 ```
 
 Run a test with per-test setup/teardown and dependency injection: build a fixture, inject it into
@@ -147,7 +147,7 @@ beforeEach/afterEach; compose via partial application into a per-fixture helper,
 #### `suite`
 
 ```lin
-val suite = (name: String, tests: Json[]): Json
+val suite = (name: String, tests: AnyVal[]): AnyVal
 ```
 
 Group test results into a named suite for `report`/`run`.
@@ -158,7 +158,7 @@ Group test results into a named suite for `report`/`run`.
 #### `report`
 
 ```lin
-val report = (s: Json): Int32
+val report = (s: AnyVal): Int32
 ```
 
 Print a suite's results and return the failure count. Unlike `run`, does not call `exit`, so
@@ -173,7 +173,7 @@ teardown: `val failures = report(s); cleanup(); if failures > 0 then exit(1)`.
 #### `run`
 
 ```lin
-val run = (s: Json): Null
+val run = (s: AnyVal): Null
 ```
 
 Run a suite: print results and `exit(1)` if any test failed (the common case — a non-zero status

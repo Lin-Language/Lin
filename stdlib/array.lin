@@ -15,7 +15,7 @@ import foreign "lin-runtime"
   val lin_array_slice_dyn: (AnyVal, Int32, Int32) => AnyVal
   val lin_array_append_dyn: (AnyVal, AnyVal) => AnyVal
   val lin_array_prepend_dyn: (AnyVal, AnyVal) => AnyVal
-  val lin_object_get_or_insert_array: (AnyVal, String) => AnyVal
+  val lin_map_get_or_insert_array: (AnyVal, String) => AnyVal
 
 // Iterable combinators moved to std/iter (Stage 1 of the std/iter unification). The array-shaped
 // functions below that need them internally (reverse/partition/zip/unique/chunk/sort/scan/groupBy/
@@ -551,7 +551,7 @@ export val groupBy = <T>(arr: T[], keyFn: (T) => String): { String: T[] } =>
     val key = keyFn(item)
     // One hash lookup: fetch the group array for `key`, creating it if absent, then push in
     // place (no separate null-check + assign double lookup).
-    val group = lin_object_get_or_insert_array(result, key)
+    val group = lin_map_get_or_insert_array(result, key)
     push(group, item)
   )
   result

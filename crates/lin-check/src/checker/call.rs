@@ -965,6 +965,7 @@ impl Checker {
         &mut self,
         receiver: &Expr,
         method: &str,
+        method_span: Span,
         args: &Option<Vec<Expr>>,
         partial: bool,
         span: Span,
@@ -988,6 +989,12 @@ impl Checker {
                     span,
                     full_span: span,
                 };
+                // Record the method-name span for semantic colouring before desugaring.
+                if let Some(ty) = self.env.effective_type(method) {
+                    if let Some(info) = self.env.lookup(method) {
+                        self.span_type_map.push((method_span, ty.to_string(), info.def_span));
+                    }
+                }
                 return self.infer_expr(&dummy_call);
             }
         }
@@ -1425,6 +1432,7 @@ impl Checker {
                 };
 
                 let info = self.env.lookup(method).unwrap();
+                self.span_type_map.push((method_span, method_ty.to_string(), info.def_span));
                 let func_expr = TypedExpr::LocalGet { slot: info.slot, ty: method_ty, span };
                 return Ok(TypedExpr::Call {
                     func: Box::new(func_expr),
@@ -1513,6 +1521,7 @@ impl Checker {
                 _ => self.env.fresh_type_var(),
             };
             let info = self.env.lookup(method).unwrap();
+            self.span_type_map.push((method_span, ty.to_string(), info.def_span));
             let func_expr = TypedExpr::LocalGet { slot: info.slot, ty, span };
             Ok(TypedExpr::Call {
                 func: Box::new(func_expr),

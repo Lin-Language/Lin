@@ -20,6 +20,7 @@ pub const TAG_INT64: u8 = 3;
 pub const TAG_FLOAT32: u8 = 4;
 pub const TAG_FLOAT64: u8 = 5;
 pub const TAG_STR: u8 = 6;
+/// RETIRED — no producers; reserved tag value 7. Kept so defensive match arms compile.
 pub const TAG_OBJECT: u8 = 7;
 pub const TAG_ARRAY: u8 = 8;
 pub const TAG_FUNCTION: u8 = 9;
@@ -37,11 +38,11 @@ pub const TAG_STREAM: u8 = 19;
 pub const TAG_MAP: u8 = 20;
 /// KEEP-PACKED unboxed sum node (`*SumNode`, `crate::sumnode`) wrapped by-pointer in a 16-byte
 /// `TaggedVal` so an unboxed sum value can live in a BOXED record/object FIELD slot WITHOUT
-/// materializing to a `LinObject` (the keep-packed-through-record-fields optimization, ADR-062
+/// materializing to a `LinMap` (the keep-packed-through-record-fields optimization, ADR-062
 /// Stage 4 follow-up). A SumNode has the SEALED header shape (`[rc|size|desc|tag|pad|payload]`), NOT
-/// the `LinObject` shape, so the slot MUST carry this distinct tag — dispatching its release/retain
+/// the `LinMap` shape, so the slot MUST carry this distinct tag — dispatching its release/retain
 /// to `lin_sumnode_*` and its display/equality/serialization/transfer to a MATERIALIZE-on-demand
-/// boundary. A `TAG_OBJECT` here would type-confuse `lin_object_release` (offset-4 size read as len).
+/// boundary. Using TAG_MAP here would type-confuse `lin_map_release` (offset-4 reads size, not rc).
 pub const TAG_SUMNODE: u8 = 21;
 /// Arbitrary-precision integer (`std/bignum`, `crate::bignum`). An opaque, immutable, refcounted
 /// heap handle wrapping a `num_bigint::BigInt`, in the `TAG_STREAM`/`TAG_SHARED` opaque-handle
@@ -65,8 +66,45 @@ pub const TAG_TAR_ENTRY: u8 = 24;
 /// a `*sealed-struct` (same shape as a `lin_sealed_alloc` allocation: `[u32 rc | u32 size |
 /// u64 desc_ptr | payload...]`). The descriptor pointer is recoverable from the struct at offset 8
 /// (`SealedDesc`), which also provides field names+kinds for display/equality/field-access. This
-/// avoids materialising a `LinObject` on widening (O(1) wrap vs O(n) copy). All dynamic consumers
+/// avoids materialising a `LinMap` on widening (O(1) wrap vs O(n) copy). All dynamic consumers
 /// (`lin_tagged_eq` / `lin_tagged_to_string` / `push_json_value` / worker transfer / field-access)
 /// read fields via the named descriptor exactly as `TAG_SUMNODE` does via `lin_sumnode_materialize`.
-/// A `TAG_RECORD` and a `TAG_OBJECT` with identical fields compare EQUAL (`lin_tagged_eq`).
+/// A `TAG_RECORD` and a `TAG_MAP` with identical fields compare EQUAL (`lin_tagged_eq`).
 pub const TAG_RECORD: u8 = 25;
+
+// ── Named-descriptor field kind codes (NKIND_*) ───────────────────────────────────────────────────
+// Shared by `lin-runtime` (sealed.rs) and `lin-codegen` (types.rs). Both crates MUST reference
+// these constants and call `nkind_size_align` for field-size derivation — never re-derive locally.
+pub const NKIND_INT32: u32 = 1; // Int8/Int16/Int32 → 4 bytes
+pub const NKIND_INT64: u32 = 2; // Int64, UInt8/UInt16/UInt32 (zero-extended) → 8 bytes
+pub const NKIND_UINT64: u32 = 3; // UInt64 → 8 bytes
+pub const NKIND_FLOAT64: u32 = 4; // Float64 → 8 bytes
+pub const NKIND_BOOL: u32 = 5; // Bool → 1 byte
+pub const NKIND_STRING: u32 = 6; // *LinString heap field → 8-byte pointer
+pub const NKIND_ARRAY: u32 = 7; // *LinArray heap field → 8-byte pointer
+pub const NKIND_SEALED: u32 = 8; // *sealed-struct heap field → 8-byte pointer
+pub const NKIND_MAP: u32 = 9; // *LinMap heap field → 8-byte pointer
+/// Float32 field stored as 4 bytes in-struct (physical f32), boxed as TAG_FLOAT64 via fpext.
+/// Distinct from NKIND_FLOAT64 so `nkind_size_align` returns (4,4) and `struct_size_from_named_desc`
+/// reconstructs the correct 4-byte slot size instead of over-sizing to 8 bytes.
+pub const NKIND_FLOAT32: u32 = 10; // Float32 → 4 bytes (fpext to f64 on dynamic read)
+
+/// Returns `(byte_size, alignment)` for a named-descriptor field kind code.
+/// This is the SINGLE SOURCE OF TRUTH for the nkind → layout mapping shared by the
+/// runtime (`lin_runtime::sealed`) and the codegen (`lin_codegen::codegen::types`).
+/// Heap-pointer field kinds (String/Array/Sealed/Map) all occupy an 8-byte pointer slot.
+/// Scalar kinds use their natural width (which equals their natural alignment for all cases here).
+/// Returns `(8, 8)` for any unknown code as a safe fail-open (pointer-sized slot).
+#[inline]
+pub const fn nkind_size_align(nkind: u32) -> (u32, u32) {
+    match nkind {
+        NKIND_INT32   => (4, 4),
+        NKIND_INT64   => (8, 8),
+        NKIND_UINT64  => (8, 8),
+        NKIND_FLOAT64 => (8, 8),
+        NKIND_FLOAT32 => (4, 4),
+        NKIND_BOOL    => (1, 1),
+        // All heap-pointer kinds: String, Array, Sealed, Map — and any future additions.
+        _ => (8, 8),
+    }
+}

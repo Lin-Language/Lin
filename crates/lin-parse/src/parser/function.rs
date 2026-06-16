@@ -56,6 +56,7 @@ impl Parser {
             if self.check(TokenKind::Dot) {
                 let dot_span = self.current_span();
                 self.advance();
+                let method_span = self.current_span();
                 let method = self.expect_ident();
                 let (call_args, partial) = if self.check(TokenKind::LParen) {
                     self.advance();
@@ -70,6 +71,7 @@ impl Parser {
                 return Expr::DotCall {
                     receiver: Box::new(Expr::TupleArgs(args, span)),
                     method,
+                    method_span,
                     args: call_args,
                     partial,
                     span: dot_span,
@@ -87,6 +89,7 @@ impl Parser {
             let dot_span = self.current_span();
             self.advance();
             self.skip_newlines();
+            let method_span = self.current_span();
             let method = self.expect_ident();
             let (call_args, partial) = if self.check(TokenKind::LParen) {
                 self.advance();
@@ -101,6 +104,7 @@ impl Parser {
             return Expr::DotCall {
                 receiver: Box::new(first),
                 method,
+                method_span,
                 args: call_args,
                 partial,
                 span: dot_span,

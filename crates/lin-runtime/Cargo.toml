@@ -8,7 +8,11 @@ publish.workspace = true
 name = "lin_runtime"
 crate-type = ["staticlib", "rlib"]
 
+[features]
+mimalloc-allocator = ["dep:mimalloc"]
+
 [dependencies]
+mimalloc = { version = "0.1", optional = true }
 lin-common = { path = "../lin-common" }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # Jinja-style templating for std/template. default-features off to keep deps minimal;

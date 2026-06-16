@@ -168,24 +168,6 @@ unsafe fn stream_arg_error(s: *const u8) -> Option<String> {
     }
     let tv = &*(s as *const TaggedVal);
     match tv.tag {
-        crate::tagged::TAG_OBJECT => {
-            use crate::object::LinObject;
-            let obj = tv.payload as *const LinObject;
-            if obj.is_null() { return None; }
-            let get = |key: &str| -> Option<String> {
-                let k = crate::fs::make_string(key);
-                let v = crate::object::lin_object_get(obj, k);
-                crate::string::lin_string_release(k);
-                if v.is_null() || (*v).tag != crate::tagged::TAG_STR { return None; }
-                let sp = (*v).payload as *const LinString;
-                let slice = std::slice::from_raw_parts((*sp).data.as_ptr(), (*sp).len as usize);
-                std::str::from_utf8(slice).ok().map(|x| x.to_string())
-            };
-            match get("type") {
-                Some(ref t) if t == "error" => Some(get("message").unwrap_or_else(|| "stream error".to_string())),
-                _ => None,
-            }
-        }
         crate::tagged::TAG_MAP => {
             let map = tv.payload as *const crate::map::LinMap;
             if map.is_null() { return None; }
@@ -1104,7 +1086,7 @@ unsafe fn window_array_from(items: &[*mut u8]) -> *mut u8 {
     use crate::tagged::{alloc_tagged, TAG_ARRAY};
     let arr = crate::array::lin_array_alloc(items.len().max(1) as u64);
     for &it in items {
-        let cloned = crate::object::lin_tagged_clone(it);
+        let cloned = crate::tagged::lin_tagged_clone(it);
         crate::array::lin_array_push_tagged(arr as *mut crate::array::LinArray, cloned);
     }
     alloc_tagged(TAG_ARRAY, arr as u64)
@@ -1225,7 +1207,7 @@ impl StreamSource for IntersperseSource {
                 } else {
                     // Emit the separator now; stash the item to emit on the next pull.
                     self.pending = Some(item);
-                    TaggedOutcome::Item(crate::object::lin_tagged_clone(self.sep))
+                    TaggedOutcome::Item(crate::tagged::lin_tagged_clone(self.sep))
                 }
             }
         }
@@ -1272,7 +1254,7 @@ impl StreamSource for DedupSource {
                     if let Some(old) = self.last.take() {
                         crate::tagged::lin_tagged_release(old);
                     }
-                    self.last = Some(crate::object::lin_tagged_clone(item));
+                    self.last = Some(crate::tagged::lin_tagged_clone(item));
                     return TaggedOutcome::Item(item);
                 }
             }
@@ -1367,7 +1349,7 @@ impl StreamSource for RepeatSource {
             }
             self.remaining -= 1;
         }
-        TaggedOutcome::Item(crate::object::lin_tagged_clone(self.value))
+        TaggedOutcome::Item(crate::tagged::lin_tagged_clone(self.value))
     }
     fn close(&mut self) {
         unsafe {
@@ -1808,7 +1790,7 @@ pub unsafe extern "C" fn lin_stream_pairwise(s: *const u8) -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_intersperse(s: *const u8, sep: *mut u8) -> *mut u8 {
     let up = own_upstream(s);
-    let sep_owned = crate::object::lin_tagged_clone(sep as *const u8);
+    let sep_owned = crate::tagged::lin_tagged_clone(sep as *const u8);
     StreamBox::new_boxed(Box::new(IntersperseSource { up, sep: sep_owned, emitted_first: false, pending: None }))
 }
 
@@ -1824,7 +1806,7 @@ pub unsafe extern "C" fn lin_stream_dedup(s: *const u8) -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_zip_with(s: *const u8, b: *mut u8, f: *mut u8) -> *mut u8 {
     let up = own_upstream(s);
-    let b_owned = crate::object::lin_tagged_clone(b as *const u8);
+    let b_owned = crate::tagged::lin_tagged_clone(b as *const u8);
     let b_len = if b_owned.is_null() {
         0
     } else {
@@ -1845,7 +1827,7 @@ pub unsafe extern "C" fn lin_stream_count(start: i64, step: i64) -> *mut u8 {
 /// `value` arrives boxed; one owned reference is taken (cloned per emitted copy).
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_repeat(value: *mut u8, n: i64) -> *mut u8 {
-    let value_owned = crate::object::lin_tagged_clone(value as *const u8);
+    let value_owned = crate::tagged::lin_tagged_clone(value as *const u8);
     let infinite = n < 0;
     StreamBox::new_boxed(Box::new(RepeatSource { value: value_owned, remaining: n, infinite }))
 }
@@ -1854,7 +1836,7 @@ pub unsafe extern "C" fn lin_stream_repeat(value: *mut u8, n: i64) -> *mut u8 {
 /// An empty `arr` yields an empty stream. One owned reference to `arr` is taken.
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_cycle(arr: *mut u8) -> *mut u8 {
-    let arr_owned = crate::object::lin_tagged_clone(arr as *const u8);
+    let arr_owned = crate::tagged::lin_tagged_clone(arr as *const u8);
     let len = if arr_owned.is_null() {
         0
     } else {

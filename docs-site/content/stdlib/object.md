@@ -6,10 +6,10 @@ std/object — object introspection and transformation, plus Result/Option ergon
 import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, isEmpty } from "std/object"
 ```
 
-`keys`/`values`/`entries` are tag-aware — they work on both a plain `{}`/`Json` record and a typed
+`keys`/`values`/`entries` are tag-aware — they work on both a plain `{}`/`AnyVal` record and a typed
 index-signature map `{ String: T }`. `merge`/`pick`/`omit`/`mapValues` are generic over
 `{ String: T }` and return a typed map; pass them a value annotated `{ String: T }` (there is no
-implicit `Json -> { String: T }` coercion). Over a typed map, key order is hash order, not insertion
+implicit `AnyVal -> { String: T }` coercion). Over a typed map, key order is hash order, not insertion
 order. `get` is the idiomatic defaulted read (`m[k] ?? default`) — a bare `m[k]` already yields
 `T | Null`, so the helper folds in a fallback whose type `D` is independent of the value type `T`.
 
@@ -23,17 +23,17 @@ This module also carries the Result/Option ergonomics folded in from the former 
 #### `keys`
 
 ```lin
-val keys = (obj: { String: Json } | {  }): String[]
+val keys = (obj: { String: AnyVal } | {  }): String[]
 ```
 
 `keys`/`values`/`entries` are tag-aware at runtime, so one function serves both a record
 (`{}`/`{ String: T }`, insertion order) and an index-signature map (hash order). The parameter is
-the union `{ String: Json } | {}` — accepting a record literal, a typed map, or a `Json` value
+the union `{ String: AnyVal } | {}` — accepting a record literal, a typed map, or a `AnyVal` value
 (any of which may carry an object), while REJECTING a non-object argument (`keys(1)`, `keys("s")`,
-`keys([…])` are compile errors). A `Json` holding a non-object yields an empty result at runtime.
+`keys([…])` are compile errors). A `AnyVal` holding a non-object yields an empty result at runtime.
 
 Return the keys of an object or map.
-- **`obj`** — a record, an index-signature map, or a `Json` object.
+- **`obj`** — a record, an index-signature map, or a `AnyVal` object.
 - **Returns** a `String[]` of the keys (insertion order for a record, hash order for a map).
 
 **Example:**
@@ -45,12 +45,12 @@ keys({ "a": 1, "b": 2 })   // ["a", "b"]
 #### `values`
 
 ```lin
-val values = (obj: { String: Json } | {  }): Json[]
+val values = (obj: { String: AnyVal } | {  }): AnyVal[]
 ```
 
 Return the values of an object or map.
-- **`obj`** — a record, an index-signature map, or a `Json` object.
-- **Returns** a `Json[]` of the values, in key order.
+- **`obj`** — a record, an index-signature map, or a `AnyVal` object.
+- **Returns** a `AnyVal[]` of the values, in key order.
 
 **Example:**
 
@@ -61,12 +61,12 @@ values({ "a": 1, "b": 2 })   // [1, 2]
 #### `entries`
 
 ```lin
-val entries = (obj: { String: Json } | {  }): Json[]
+val entries = (obj: { String: AnyVal } | {  }): AnyVal[]
 ```
 
 Return the key/value pairs of an object or map.
-- **`obj`** — a record, an index-signature map, or a `Json` object.
-- **Returns** a `Json[]` of `[key, value]` pairs, in key order.
+- **`obj`** — a record, an index-signature map, or a `AnyVal` object.
+- **Returns** a `AnyVal[]` of `[key, value]` pairs, in key order.
 
 **Example:**
 
@@ -202,7 +202,7 @@ counts.get("z", "n/a")    // "n/a"   (independent default type -> Int32 | String
 #### `isEmpty`
 
 ```lin
-val isEmpty = (x: Json): Boolean
+val isEmpty = (x: AnyVal): Boolean
 ```
 
 Test whether an object, map, array, or string is empty.
@@ -250,41 +250,41 @@ test, or a hand-rolled fallible function.
 #### `isError`
 
 ```lin
-val isError = (x: Json): Boolean
+val isError = (x: AnyVal): Boolean
 ```
 
 Test whether `x` is the canonical Error — the `is Error` discriminant as a plain predicate, usable
 in `if`/`&&` positions and combinator callbacks (e.g. `xs.filter`).
 Note: this does not narrow the union — after `if isError(x)` the compiler still sees `x : T | Error`.
 Use the built-in `is Error` test to unlock the success arm's fields; this is for filtering/counting/branching.
-- **`x`** — any value (typed `Json`, the supertype any union flows into).
+- **`x`** — any value (typed `AnyVal`, the supertype any union flows into).
 - **Returns** `true` iff `x` is the canonical Error.
 
 #### `isOk`
 
 ```lin
-val isOk = (x: Json): Boolean
+val isOk = (x: AnyVal): Boolean
 ```
 
 Test whether `x` is not the canonical Error — the negation of `isError`. A `Null` `x` is "ok"
 here (it is not an Error); use `isNull` to test absence.
-- **`x`** — any value (typed `Json`).
+- **`x`** — any value (typed `AnyVal`).
 - **Returns** `true` unless `x` is the canonical Error.
 
 #### `isNull`
 
 ```lin
-val isNull = (x: Json): Boolean
+val isNull = (x: AnyVal): Boolean
 ```
 
 Test whether `x` is the `Null` value (the absence arm of a `T | Null`).
-- **`x`** — any value (typed `Json`).
+- **`x`** — any value (typed `AnyVal`).
 - **Returns** `true` iff `x` is `null`.
 
 #### `unwrapOr`
 
 ```lin
-val unwrapOr = <D>(x: Json, default: D): Json | D
+val unwrapOr = <D>(x: AnyVal, default: D): AnyVal | D
 ```
 
 Collapse the failure arm of a fallible value with a default. Handles both conventions: the
@@ -301,6 +301,6 @@ val port: Int32 = parsePort(input).unwrapOr(8080)    // T | Error -> T
 ```lin
 val name: String = config["name"].unwrapOr("anon")   // T | Null  -> T
 ```
-- **`x`** — any value (typed `Json`, so any `T | Error` / `T | Null` union flows in).
+- **`x`** — any value (typed `AnyVal`, so any `T | Error` / `T | Null` union flows in).
 - **`default`** — the fallback returned for the `Error`/`Null` arms; pins `D`.
-- **Returns** the success value, or `default`, typed `Json | D` (the static success type is recovered via `D`, as in `at`/`get`).
+- **Returns** the success value, or `default`, typed `AnyVal | D` (the static success type is recovered via `D`, as in `at`/`get`).

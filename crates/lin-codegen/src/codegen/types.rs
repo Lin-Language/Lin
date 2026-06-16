@@ -30,8 +30,8 @@ impl<'ctx> Codegen<'ctx> {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
             Type::Array(_) | Type::FixedArray(_) => self.array_ptr_type.into(),
-            // Stage 0.5: codegen IGNORES the `sealed` marker — every object, sealed or not, is the
-            // boxed string-keyed `LinObject` pointer, exactly as before. Stage 1 will branch here.
+            // Every object type, sealed or not, is an opaque pointer — sealed records are packed
+            // structs, unsealed objects are `LinMap*`; both are pointer-sized at the LLVM level.
             Type::Object { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             // A typed index-signature map (`{ String: T }`, ADR-055) is a `LinMap*` — an opaque
             // pointer to the hashed container.
@@ -79,7 +79,7 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Stage 6a: Returns true if `ty` represents a value whose tagged-box payload is a HEAP POINTER
-    /// (LinString*, LinArray*, LinObject*, LinMap*) — as opposed to a scalar (Int, Float, Bool,
+    /// (LinString*, LinArray*, sealed-struct*, LinMap*) — as opposed to a scalar (Int, Float, Bool,
     /// Null) whose payload is an integer or zero. Used to decide whether to retain the inner before
     /// releasing an owned box (e.g. a TAG_RECORD field-lookup result from `lin_record_get_field`).
     pub(crate) fn result_is_heap_pointer(ty: &Type) -> bool {
@@ -180,14 +180,7 @@ impl<'ctx> Codegen<'ctx> {
     /// the tag field and matched by `is`-checks. This must EXACTLY mirror `box_value` /
     /// `tagged_payload_i64` so the runtime reads the payload back the same way it was written.
     ///
-    /// Like `type_tag` but for GENUINELY OPEN (non-sealed) objects — returns TAG_MAP.
-    /// A sealed Object (`sealed_scalar_fields(..).is_some()` OR `packed_struct_fields()` non-None)
-    /// must NOT use this — it stays TAG_RECORD / TAG_OBJECT as before.
-    pub(crate) fn type_tag_open_object() -> u8 {
-        lin_common::tags::TAG_MAP
-    }
-
-    /// Floats: both Float32 and Float64 box as TAG_FLOAT64 with an f64-bits payload (codegen
+/// Floats: both Float32 and Float64 box as TAG_FLOAT64 with an f64-bits payload (codegen
     /// fpext's a Float32 to f64 before boxing), so TAG_FLOAT32 (a flat-array elem_tag only)
     /// must NEVER be emitted for a boxed scalar — doing so made the runtime read an f64-bits
     /// payload as `f32::from_bits(payload as u32)` → garbage, and made `x is Float64` compare
@@ -206,7 +199,11 @@ impl<'ctx> Codegen<'ctx> {
             // Both float widths box as f64 bits (see doc above).
             Type::Float32 | Type::Float64 => TAG_FLOAT64,
             Type::Str | Type::StrLit(_) => TAG_STR,
-            Type::Object { .. } => TAG_OBJECT,
+            // After Phase 3: non-sealed open objects are TAG_MAP (LinMap); sealed objects are
+            // packed structs (TAG_RECORD in union slots). type_tag returns TAG_MAP for both since
+            // sealed records boxed into union slots use TAG_RECORD (handled by sealed arm in
+            // compile_ir_is_type_single), and open objects are always TAG_MAP.
+            Type::Object { .. } => TAG_MAP,
             Type::Map { .. } => TAG_MAP,
             Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => TAG_ARRAY,
             Type::Function { .. } => TAG_FUNCTION,
@@ -214,21 +211,7 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Like `type_tag` but returns `TAG_MAP` for a genuinely-open (non-sealed) `Type::Object` and
-    /// `TAG_OBJECT` for sealed records. Use at sites that produce a concrete open-object value (the
-    /// `MakeObject` open literal, materializer outputs) which are `LinMap*` after Stage 6b Phase 2.
-    /// Sealed `Type::Object` values are packed structs whose tag is managed separately; leave them
-    /// with TAG_OBJECT so the existing sealed-record paths are unaffected.
-    pub(crate) fn type_tag_open(ty: &Type) -> u8 {
-        if let Type::Object { .. } = ty {
-            if Self::sealed_fields(ty).is_none() {
-                return TAG_MAP;
-            }
-        }
-        Self::type_tag(ty)
-    }
-
-    /// Byte size of `SEALED_HEADER` (refcount u32 + size u32 + heap_desc_ptr u64 + named_desc_ptr u64).
+/// Byte size of `SEALED_HEADER` (refcount u32 + size u32 + heap_desc_ptr u64 + named_desc_ptr u64).
     /// Kept in lockstep with `lin_runtime::sealed::SEALED_HEADER` (24). Sealed-record field payload begins here.
     /// Stage 6a: the 3rd slot (offset 16) is the named descriptor pointer (all fields + names) for TAG_RECORD
     /// field access via `lin_record_get_field`.
@@ -242,11 +225,11 @@ impl<'ctx> Codegen<'ctx> {
     /// (0x8000_0000).
     pub(crate) const SEALED_IMMORTAL_RC: u32 = 0x8000_0000;
 
-    /// True when `ty` is an unboxed scalar field of a sealed record: a fixed-width numeric (mirrors
-    /// `is_flat_scalar`) OR `Bool` OR `IntLit` (which is Int32 at runtime). Scalar fields are stored
-    /// inline at their natural-aligned offset and need NO per-field RC.
+    /// True when `ty` is an unboxed scalar field of a sealed record: a fixed-width numeric,
+    /// `Bool`, or `IntLit` (Int32 at runtime). Delegates to the canonical definition in
+    /// `lin_check::types::Type::is_sealed_scalar_field`.
     pub(crate) fn is_sealed_scalar_field(ty: &Type) -> bool {
-        Self::is_flat_scalar(ty) || matches!(ty, Type::Bool | Type::IntLit(_))
+        ty.is_sealed_scalar_field()
     }
 
     /// The descriptor kind code for a HEAP field of a sealed record, or `None` if `ty` is not an
@@ -278,20 +261,20 @@ impl<'ctx> Codegen<'ctx> {
     /// two are in DISJOINT descriptor namespaces — see the runtime const's doc comment.)
     pub(crate) const KIND_MAP: u32 = 4;
 
-    /// NAMED full-field descriptor kind codes (ADR-063 Stage 3b mechanism (i)). Unlike the heap-only
-    /// `KIND_*`, these cover SCALARS too, since the named descriptor lists EVERY field for the boxed
-    /// materialize-on-read path. MUST stay in lockstep with `lin_runtime::sealed::NKIND_*`. The boxing
-    /// each code implies matches `type_tag` / `box_value` exactly (so a materialized field reads back
-    /// identically to a directly-boxed value).
-    pub(crate) const NKIND_INT32: u32 = 1; // Int8/Int16/Int32
-    pub(crate) const NKIND_INT64: u32 = 2; // Int64, UInt8/UInt16/UInt32 (zero-extended positive)
-    pub(crate) const NKIND_UINT64: u32 = 3; // UInt64
-    pub(crate) const NKIND_FLOAT64: u32 = 4; // Float32/Float64
-    pub(crate) const NKIND_BOOL: u32 = 5; // Bool
-    pub(crate) const NKIND_STRING: u32 = 6; // String/StrLit
-    pub(crate) const NKIND_ARRAY: u32 = 7; // Array/FixedArray
-    pub(crate) const NKIND_SEALED: u32 = 8; // nested sealed record
-    pub(crate) const NKIND_MAP: u32 = 9; // { String: T } index-signature map (*LinMap)
+    /// NAMED full-field descriptor kind codes — canonical definitions live in `lin_common::tags`.
+    /// Re-exported here as associated constants for call-site clarity. The boxing each code implies
+    /// matches `type_tag` / `box_value` exactly (so a materialized field reads back identically to a
+    /// directly-boxed value).
+    pub(crate) const NKIND_INT32: u32 = lin_common::tags::NKIND_INT32;
+    pub(crate) const NKIND_INT64: u32 = lin_common::tags::NKIND_INT64;
+    pub(crate) const NKIND_UINT64: u32 = lin_common::tags::NKIND_UINT64;
+    pub(crate) const NKIND_FLOAT64: u32 = lin_common::tags::NKIND_FLOAT64;
+    pub(crate) const NKIND_FLOAT32: u32 = lin_common::tags::NKIND_FLOAT32;
+    pub(crate) const NKIND_BOOL: u32 = lin_common::tags::NKIND_BOOL;
+    pub(crate) const NKIND_STRING: u32 = lin_common::tags::NKIND_STRING;
+    pub(crate) const NKIND_ARRAY: u32 = lin_common::tags::NKIND_ARRAY;
+    pub(crate) const NKIND_SEALED: u32 = lin_common::tags::NKIND_SEALED;
+    pub(crate) const NKIND_MAP: u32 = lin_common::tags::NKIND_MAP;
 
     /// The NAMED-descriptor kind for `ty` (a sealed-record field). Covers every permissible sealed
     /// field — scalar OR heap. Returns `None` only for a type that is not a valid sealed field (which
@@ -302,7 +285,12 @@ impl<'ctx> Codegen<'ctx> {
             Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => Some(Self::NKIND_INT32),
             Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::Int64 => Some(Self::NKIND_INT64),
             Type::UInt64 => Some(Self::NKIND_UINT64),
-            Type::Float32 | Type::Float64 => Some(Self::NKIND_FLOAT64),
+            // Float32 occupies a 4-byte slot in the packed struct (physical f32). The dynamic boxing
+            // path fpext's to f64 and uses TAG_FLOAT64 (matching type_tag / box_value). Distinct from
+            // NKIND_FLOAT64 so nkind_size_align returns (4,4) and struct_size_from_named_desc
+            // reconstructs the correct slot size instead of over-sizing to 8 bytes.
+            Type::Float32 => Some(Self::NKIND_FLOAT32),
+            Type::Float64 => Some(Self::NKIND_FLOAT64),
             Type::Str | Type::StrLit(_) => Some(Self::NKIND_STRING),
             Type::Array(_) | Type::FixedArray(_) => Some(Self::NKIND_ARRAY),
             Type::Map { .. } => Some(Self::NKIND_MAP),
@@ -311,36 +299,19 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// True when `ty` is a permissible field of a sealed record: a scalar OR an eligible heap field.
+    /// True when `ty` is a permissible field of a sealed record. Delegates to the canonical
+    /// definition in `lin_check::types::Type::is_sealed_field`.
     pub(crate) fn is_sealed_field(ty: &Type) -> bool {
-        Self::is_sealed_scalar_field(ty) || Self::sealed_field_kind(ty).is_some()
+        ty.is_sealed_field()
     }
 
-    /// THE sealed-record gate (sealed-records Stages 1–2). Returns `Some(fields)` iff `ty` is a
-    /// `Type::Object { sealed: true }` whose fields are ALL either unboxed scalars OR eligible heap
-    /// fields (String/Array/nested-sealed). Returns `None` (→ keep the boxed `LinObject` path) for:
-    /// an unsealed object (anonymous literal/inferred shape), any object with an INELIGIBLE field
-    /// (union/Json/Iterator/Stream/Shared/Function/unsealed-object), and every non-object type.
-    /// FAIL SAFE: when unsure, `None` (boxed). The field order is the TYPE DECLARATION's `IndexMap`
-    /// order, preserved by Stage 0.5 resolution — this fixes a single canonical physical layout.
-    ///
-    /// Note on recursion termination: a nested-sealed field calls back into `sealed_fields`; a
-    /// directly self-recursive record (a field of its own type) survives resolution as `Type::Named`
-    /// (not an inlined `Type::Object`), so `sealed_field_kind` sees `Named` → `None` → that record
-    /// is kept boxed. Hence `sealed_fields` cannot recurse infinitely on a cyclic type.
+    /// THE sealed-record gate. Delegates to the canonical `Type::sealed_fields`
+    /// (`lin_check::types`). See that function for the full contract and fail-safe semantics.
     pub(crate) fn sealed_fields(ty: &Type) -> Option<&indexmap::IndexMap<String, Type>> {
-        match ty {
-            Type::Object { fields, sealed: true } if !fields.is_empty()
-                && fields.values().all(Self::is_sealed_field) =>
-            {
-                Some(fields)
-            }
-            _ => None,
-        }
+        Type::sealed_fields(ty)
     }
 
-    /// Backwards-compatible alias retained for the (now generalized) gate. Stage 1 call sites used
-    /// `sealed_scalar_fields`; it now accepts heap fields too via `sealed_fields`.
+    /// Backwards-compatible alias; delegates to `sealed_fields`.
     pub(crate) fn sealed_scalar_fields(ty: &Type) -> Option<&indexmap::IndexMap<String, Type>> {
         Self::sealed_fields(ty)
     }
@@ -397,7 +368,7 @@ impl<'ctx> Codegen<'ctx> {
     /// shell (which the caller frees with `lin_tagged_free_box`, leaving the borrowed inner alone)?
     ///
     /// `box_value` MATERIALIZES — i.e. allocates a fresh +1 — only for nested SEALED records
-    /// (`Type::Object` with sealed fields) → fresh boxed `LinObject` (`sealed_materialize_to_object`).
+    /// (`Type::Object` with sealed fields) → fresh boxed `LinMap` (`sealed_materialize_to_map`).
     ///
     /// For sealed-record ARRAYS (Stage-2a: 0xFD pointer-backed), `box_value` calls `lin_box_array`
     /// which wraps the raw `LinArray*` pointer directly (BORROWED, no retain and no fresh
@@ -417,70 +388,14 @@ impl<'ctx> Codegen<'ctx> {
         matches!(ty, Type::Object { .. }) && Self::sealed_fields(ty).is_some()
     }
 
-    /// THE sealed-record-ARRAY gate (sealed-records Stage 3). Returns `Some(fields)` iff `ty` is an
-    /// `Array(elem)` (or `FixedArray`) whose element is an ALL-SCALAR sealed record — the high-value,
-    /// lowest-RC-risk case (no per-element heap fields, so array drop is a single free). FAIL SAFE:
-    /// arrays of heap-field sealed records, anonymous-record arrays, union/Json/opaque-element
-    /// arrays, and non-arrays all return `None` (→ keep the boxed/flat path). Stage 3b (heap-field
-    /// element records) is intentionally NOT yet accepted here.
+    /// THE sealed-record-ARRAY gate. Delegates to the canonical `Type::sealed_array_elem`
+    /// (`lin_check::types`). See that function for the full contract and fail-safe semantics.
     pub(crate) fn sealed_array_elem(ty: &Type) -> Option<&indexmap::IndexMap<String, Type>> {
-        let elem = match ty {
-            Type::Array(e) => e.as_ref(),
-            _ => return None,
-        };
-        let fields = Self::sealed_fields(elem)?;
-        // sealed-records Stage 3 (scalar) + Stage 3b (heap-field): a record-array element is laid out
-        // contiguously and header-less iff EVERY field is eligible for the packed representation —
-        // either an unboxed scalar (Stage 3a) or a packed-eligible HEAP field (Stage 3b: String /
-        // nested-sealed / Array, decided by `sealed_array_elem_field_packable`). Any field that is
-        // NOT packable (Union/Json/TypeVar/Iterator/non-sealed Object/Function) → fail-safe to the
-        // BOXED `Object[]` path for the whole array.
-        if fields.values().all(Self::sealed_array_elem_field_packable) {
-            Some(fields)
-        } else {
-            None
-        }
+        Type::sealed_array_elem(ty)
     }
 
-    /// THE Stage-3b heap-field eligibility predicate — the SINGLE source of truth for which sealed
-    /// record fields may live inline in a contiguous element buffer. MUST be mirrored EXACTLY by
-    /// `lin_ir::lower::is_sealed_array_elem_field_packable`, `lin_ir::monomorphize::field_packed_scalar`,
-    /// and `lin_ir::repr::sealed_array_elem_field_packable` (the gate is multi-site; any disagreement
-    /// makes the lowerer's ownership/Coerce insertion diverge from the physical layout → UAF / mis-read).
-    ///
-    /// CURRENTLY: SCALARS ONLY (Stage 3a). The per-element-per-field RC machinery, the materializers
-    /// (`sealed_array_elem_materializer` / `sealed_array_materialize_elem`, both heap-field-aware), and
-    /// the dynamic-consumer boundaries are all COMPLETE and ASan-clean on hand-written heap-field
-    /// fixtures (construct / push / field-read / index-set / drop / transfer / `==` / toString /
-    /// filter / map / sortBy — single-module). Two of the three historical blockers are now CLOSED:
-    ///   1. FIELD OMISSION — structurally omitting a declared sealed field is a COMPILE error
-    ///      (`omits_required_field`), so a packed element can never store a NULL heap pointer.
-    ///   2. PRODUCER/CONSUMER LITERAL DRIFT — an inferred array literal (`[]`, `Array(Never)`) now
-    ///      ADOPTS the concrete param's resolved element representation in BOTH `infer_call` AND
-    ///      `infer_dot_call` (the latter previously bypassed it — the calc-lexer `scan(.., [])` UAF),
-    ///      so a producer and its consumer agree. `repr::verify` (now covering every repr-consuming
-    ///      opcode) makes any residual mismatch a debug-build compile panic, not a silent runtime UAF.
-    ///
-    /// THE REMAINING BLOCKER (why heap fields stay scalar-only): WHOLE-PROGRAM RECORD REPRESENTATION
-    /// CONSISTENCY for records that reach a `{ String: T[] }` MAP-VALUE position (the dijkstra
-    /// `{String: Neighbor[]}` shape). A `{String: T[]}` map is pervasively read into a `T[] | Null`
-    /// UNION (`match adj[u] is Null => [] else => …`) and then BOTH mutated in place (`push(it, x)`)
-    /// AND read by the generic boxed `for`. In-place mutation REQUIRES keep-packed-by-pointer (a
-    /// shared 0xFE buffer); the boxed `for`/`lin_array_get_tagged` reader REQUIRES a boxed `Object[]`
-    /// (it reads a 0xFE buffer's packed structs as TaggedVals → the `0x07` heap-field deref crash; for
-    /// SCALARS it silently misreads → garbage, a latent bug that exists on master but no corpus test
-    /// hits). The two are irreconcilable at one map-value representation UNLESS `lin_array_get_tagged`
-    /// materializes a packed element using a NAMED full-field descriptor (a runtime-layout change) OR
-    /// the record `Neighbor` is boxed CONSISTENTLY everywhere it is reachable from the map (a
-    /// cross-module record-taint pass — a record is packed everywhere or boxed everywhere, never
-    /// per-occurrence). Either is a larger change than a local gate; until then heap-field element
-    /// arrays stay boxed (fail-safe). Re-enable by returning `Self::is_sealed_field(ty)` here AND in
-    /// the three mirrors, AND landing one of those two whole-program mechanisms, then re-run corpus +
-    /// ASan (the `repr::verify` debug_assert is the structural guard that the swap is consistent).
+    /// Element-field packability gate. Delegates to `Type::is_sealed_array_field_packable`.
     pub(crate) fn sealed_array_elem_field_packable(ty: &Type) -> bool {
-        // Delegates to the SINGLE source of truth (ADR-063 gate consolidation). Stage 3b widens the
-        // gate by editing `Type::is_sealed_array_field_packable` alone; this and the three lin-ir
-        // mirrors all defer to it, so they cannot drift.
         ty.is_sealed_array_field_packable()
     }
 
@@ -501,144 +416,37 @@ impl<'ctx> Codegen<'ctx> {
     /// (unboxed-sumtype Stage 2). MUST stay in lockstep with `lin_runtime::sumnode::KIND_SUMNODE`.
     pub(crate) const KIND_SUMNODE: u32 = 4;
 
-    /// True when `ty` is a permissible SCALAR field of a Stage-1 sum-type variant (a fixed-width
-    /// numeric or Bool — no per-field RC). The discriminant field is a StrLit; it is laid out as a
-    /// scalar slot is NOT — it is carried inline by the tag, never stored, so it is excluded from the
-    /// payload (see `sumnode_variant_payload_fields`).
+    /// True when `ty` is a permissible scalar field of a Stage-1 sum-type variant. Delegates to
+    /// `Type::is_sealed_scalar_field` (the canonical definition in `lin_check::types`).
     pub(crate) fn is_sum_scalar_field(ty: &Type) -> bool {
-        Self::is_sealed_scalar_field(ty)
+        ty.is_sealed_scalar_field()
     }
 
-    /// The UNIQUE recursive self-reference name of a candidate sum union (unboxed-sumtype Stage 2),
-    /// or `None` if the union has no recursive child or more than one distinct self-name.
-    ///
-    /// A self-recursive sum type (`type Ast = Num | BinOp` with `BinOp.left/right : Ast`) survives
-    /// type resolution with its recursive child fields as `Type::Named(n)` (the checker leaves the
-    /// cyclic back-reference unexpanded — `lin-check::resolve::resolve_named_cycle`). At every real
-    /// codegen/repr site the recursive child is `Type::Named(n)` for the SINGLE alias name `n` of the
-    /// sum type itself. We detect recursion ENV-FREE by collecting the set of `Named` names appearing
-    /// directly as a variant field value; a well-formed direct-self-recursive sum type has exactly one
-    /// such name. Mutual recursion (two distinct names) is OUT OF SCOPE this stage → `None` (the gate
-    /// then falls back to boxed, fail-safe). This is the SINGLE source of truth, mirrored in
-    /// `lin_ir::repr::sum_recursive_self_name`.
+    /// The UNIQUE recursive self-reference name of a candidate sum union. Delegates to the
+    /// canonical `Type::sum_recursive_self_name` (`lin_check::types`).
     pub(crate) fn sum_recursive_self_name(ty: &Type) -> Option<String> {
-        let variants = match ty {
-            Type::Union(vs) => vs,
-            _ => return None,
-        };
-        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for v in variants {
-            if let Type::Object { fields, .. } = v {
-                for fty in fields.values() {
-                    if let Type::Named(n) = fty {
-                        names.insert(n.clone());
-                    }
-                }
-            }
-        }
-        if names.len() == 1 {
-            names.into_iter().next()
-        } else {
-            None
-        }
+        Type::sum_recursive_self_name(ty)
     }
 
-    /// True when `fty` is a RECURSIVE child field of the sum type whose self-name is `self_name`
-    /// (unboxed-sumtype Stage 2): a `Type::Named(self_name)` slot, stored as an 8-byte owned
-    /// `*SumNode` pointer. (The inlined-`Union` form does not appear at real sites — see
-    /// `sum_recursive_self_name`.)
+    /// True when `fty` is a recursive self-child field (a `Type::Named(self_name)` slot).
     pub(crate) fn is_sum_recursive_child(fty: &Type, self_name: &str) -> bool {
         matches!(fty, Type::Named(n) if n == self_name)
     }
 
-    /// THE Stage-1 sum-type gate (SINGLE source of truth, mirrored in `lin_ir::repr::sum_type_eligible`).
-    /// Returns the discriminant key iff `ty` is a `Type::Union` of 2+ variants where:
-    ///   (1) every variant is a `Type::Object` (sealed or not — the union itself is the seal);
-    ///   (2) a SHARED key exists whose value is a distinct `StrLit` on every variant (the
-    ///       discriminant — same soundness rule as the shipped union-discrimination);
-    ///   (3) every OTHER field of every variant is EITHER a sealed-eligible field (scalar, String,
-    ///       Array, nested-sealed) OR (Stage 2) a RECURSIVE self-child (`Type::Named(self_name)`,
-    ///       stored as an owned `*SumNode` pointer). Heap fields → heap-field SumNode Stage 3
-    ///       (descriptor + construct + materializer extended). Any violation → `None` → fall back to
-    ///       the boxed union (fail-safe).
-    /// A `Null` member disqualifies (a nullable sum stays boxed — fail-safe, strict scope).
+    /// THE Stage-1 sum-type gate. Delegates to the canonical `Type::sum_type_discriminant`
+    /// (`lin_check::types`). See that function for the full contract.
     pub(crate) fn sum_type_discriminant(ty: &Type) -> Option<String> {
-        let variants = match ty {
-            Type::Union(vs) => vs,
-            _ => return None,
-        };
-        if variants.len() < 2 {
-            return None;
-        }
-        // Stage 2: the unique recursive self-name (if any). A field equal to `Named(self_name)` is a
-        // legal recursive child (`*SumNode` slot). `None` when the type is non-recursive (Stage 1) OR
-        // when it has >1 distinct Named name (mutual recursion — out of scope → those Named fields
-        // then fail `is_sum_scalar_field` → the gate rejects, fail-safe to boxed).
-        let self_name = Self::sum_recursive_self_name(ty);
-        // All variants must be concrete records (no Null/Named/scalar member).
-        let mut recs: Vec<&indexmap::IndexMap<String, Type>> = Vec::with_capacity(variants.len());
-        for v in variants {
-            match v {
-                Type::Object { fields, .. } if !fields.is_empty() => recs.push(fields),
-                _ => return None,
-            }
-        }
-        // Find a shared key that is a distinct StrLit on every variant.
-        let first = recs[0];
-        'keys: for (key, kty) in first.iter() {
-            if !matches!(kty, Type::StrLit(_)) {
-                continue;
-            }
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for rec in &recs {
-                match rec.get(key) {
-                    Some(Type::StrLit(s)) => {
-                        if !seen.insert(s.clone()) {
-                            continue 'keys; // not distinct
-                        }
-                    }
-                    _ => continue 'keys, // missing/non-StrLit on some variant
-                }
-            }
-            // Every OTHER field of every variant must be a sealed-eligible field OR a recursive
-            // self-child. Heap fields (String/Array/nested-sealed) are now admitted (Stage 3).
-            for rec in &recs {
-                for (fk, fty) in rec.iter() {
-                    if fk == key {
-                        continue; // the discriminant (a StrLit) is carried by the tag, not stored
-                    }
-                    if matches!(fty, Type::StrLit(_)) {
-                        // A second StrLit field is not a scalar slot — out of scope.
-                        return None;
-                    }
-                    // Stage 2: a recursive self-child (`Named(self_name)`) is an 8-byte `*SumNode`
-                    // slot. Any OTHER `Named` (foreign type) / union field → not packable.
-                    let is_recursive_child = self_name
-                        .as_deref()
-                        .is_some_and(|n| Self::is_sum_recursive_child(fty, n));
-                    // Heap-field SumNode Stage 3: admit any sealed-eligible field (scalar, String,
-                    // Array, nested-sealed). MUST stay in lockstep with repr.rs.
-                    if !Self::is_sealed_field(fty) && !is_recursive_child {
-                        return None;
-                    }
-                }
-            }
-            return Some(key.clone());
-        }
-        None
+        Type::sum_type_discriminant(ty)
     }
 
-    /// `Some(())` shorthand: is `ty` a Stage-1-eligible unboxed sum type?
+    /// True when `ty` is a Stage-1-eligible unboxed sum type. Delegates to `Type::sum_type_eligible`.
     pub(crate) fn is_sum_type(ty: &Type) -> bool {
-        Self::sum_type_discriminant(ty).is_some()
+        Type::sum_type_eligible(ty)
     }
 
-    /// Stage 3 NullableRecord: if `ty` is a union of EXACTLY ONE sealed Object type plus `Null`
-    /// (e.g. `Trip | Null` from a nullable typed-map read), return the sealed type's fields.
-    /// Such a value at runtime is a raw `*sealed_T` (non-null) or a null pointer.
-    /// True when `ty` is `Union([Named(n), Null])` — a self-recursive Named alias union where
-    /// `nullable_sealed_record_type` cannot resolve the sealed fields (Named isn't an Object).
-    /// Used to treat a PackedStruct → Named-nullable coerce as a pass-through identity.
+    /// True when `ty` is `Union([Named(n), Null])` — a self-recursive Named alias union where the
+    /// sealed fields cannot be resolved (Named isn't an inlined Object). Used to treat a
+    /// PackedStruct → Named-nullable coerce as a pass-through identity.
     pub(crate) fn is_named_nullable_union(ty: &Type) -> bool {
         let Type::Union(members) = ty else { return false };
         let mut has_named = false;
@@ -652,19 +460,10 @@ impl<'ctx> Codegen<'ctx> {
         has_named
     }
 
+    /// Stage-3 NullableRecord gate. Delegates to the canonical `Type::nullable_sealed_record`
+    /// (`lin_check::types`). See that function for the full contract.
     pub(crate) fn nullable_sealed_record_type(ty: &Type) -> Option<&indexmap::IndexMap<String, Type>> {
-        let Type::Union(members) = ty else { return None };
-        // Must not be a Stage-1 sum type — those get the SumNode path instead.
-        if Self::is_sum_type(ty) { return None; }
-        let mut record: Option<&indexmap::IndexMap<String, Type>> = None;
-        for m in members {
-            if matches!(m, Type::Null) { continue; }
-            match Self::sealed_fields(m) {
-                Some(f) if record.is_none() => record = Some(f),
-                _ => return None,
-            }
-        }
-        record
+        Type::nullable_sealed_record(ty)
     }
 
     /// unboxed-sumtype Stage 3: if `ty` is a union of EXACTLY a Stage-eligible sum type plus `Null`
@@ -688,22 +487,7 @@ impl<'ctx> Codegen<'ctx> {
         sum
     }
 
-    /// The (unsealed) object Type of the FIRST variant of a sum type — used purely to give
-    /// `box_value` a TAG_OBJECT box tag when boxing a materialized SumNode for a dynamic edge. Any
-    /// variant's object type yields the same box tag (TAG_OBJECT); the first is a convenient
-    /// representative. `ty` must be a sum type.
-    pub(crate) fn sumnode_first_variant_obj_ty(ty: &Type) -> Type {
-        let fields = match ty {
-            Type::Union(vs) => match vs.first() {
-                Some(Type::Object { fields, .. }) => fields.clone(),
-                _ => Default::default(),
-            },
-            _ => Default::default(),
-        };
-        Type::object(fields)
-    }
-
-    /// The PAYLOAD field map of one variant (the discriminant key removed — it is the inline tag).
+/// The PAYLOAD field map of one variant (the discriminant key removed — it is the inline tag).
     /// Only the scalar fields remain. Declaration order is preserved (the layout key).
     pub(crate) fn sumnode_variant_payload_fields(
         variant: &indexmap::IndexMap<String, Type>,

@@ -96,10 +96,10 @@ val grid: Int32[][] = [[1, 2], [3, 4]]
 val cell: Int32 = grid[1][0]   // 3
 ```
 
-For an array whose elements have mixed types, use `Json[]` — an array of arbitrary JSON values:
+For an array whose elements have mixed types, use `AnyVal[]` — an array of arbitrary JSON values:
 
 ```lin
-val mixed: Json[] = ["age", 42, true]
+val mixed: AnyVal[] = ["age", 42, true]
 ```
 
 ### Fixed-length array types
@@ -116,7 +116,7 @@ val age: Int32 = pair[1]     // 42
 
 These are not a separate runtime kind — they remain ordinary JSON arrays, and the form simply constrains the length and the per-position element types at the type level. Supplying the wrong number of elements is a compile-time error.
 
-A fixed-length array type is assignable to the matching unbounded type (`[String, Int32]` to `Json[]`) when the positional types are compatible; the reverse is not.
+A fixed-length array type is assignable to the matching unbounded type (`[String, Int32]` to `AnyVal[]`) when the positional types are compatible; the reverse is not.
 
 ## Union types
 
@@ -129,17 +129,17 @@ val id: String | Int32 = "user-42"
 
 Union types are written with `|`. The most common union is `T | Null` — a value that might be absent.
 
-## The `Json` type
+## The `AnyVal` type
 
-`Json` represents any JSON-compatible value:
+`AnyVal` represents any JSON-compatible value:
 
 ```lin
-val data: Json = { "name": "Alice", "scores": [10, 20, 30] }
+val data: AnyVal = { "name": "Alice", "scores": [10, 20, 30] }
 ```
 
-Use `Json` when you need a dynamically shaped value — for example, data read from a file or HTTP response.
+Use `AnyVal` when you need a dynamically shaped value — for example, data read from a file or HTTP response.
 
-Any value assigns *into* `Json`, but `Json` does not implicitly assign *out* to a concrete object type with required fields. To go from untrusted `Json` to a concrete type, validate it with `fromJson` (from `std/json`) or narrow it with an `is`/`has` pattern:
+Any value assigns *into* `AnyVal`, but `AnyVal` does not implicitly assign *out* to a concrete object type with required fields. To go from untrusted `AnyVal` to a concrete type, validate it with `fromJson` (from `std/json`) or narrow it with an `is`/`has` pattern:
 
 ```lin
 import { fromJson } from "std/json"
@@ -182,5 +182,5 @@ val i = toInt32(f)   // 9 (truncates toward zero)
 - `val` for immutable, `var` for mutable.
 - Type annotations are optional but encouraged.
 - Primitive types: `String`, `Boolean`, `Null`, `Int32`, `Float64`.
-- `T | U` for unions; `Json` for any JSON value.
+- `T | U` for unions; `AnyVal` for any JSON value.
 - Numbers widen automatically; explicit narrowing uses stdlib functions.

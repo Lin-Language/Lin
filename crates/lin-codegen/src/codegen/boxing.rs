@@ -44,6 +44,7 @@ impl<'ctx> Codegen<'ctx> {
     /// For concrete types, allocates and fills a TaggedVal with the appropriate tag.
     /// For TypeVar, dispatches on the actual LLVM type (int/float/pointer) to pick the right box call.
     pub(crate) fn box_value(&mut self, val: BasicValueEnum<'ctx>, val_ty: &Type) -> BasicValueEnum<'ctx> {
+        #[allow(unreachable_patterns)] // _ arm is a future-proof guard; currently exhaustive
         let ptr = match val_ty {
             Type::Null => self.builder.call(self.rt.box_null, &[], "boxnull")
                 .try_as_basic_value().unwrap_basic(),
@@ -145,16 +146,16 @@ impl<'ctx> Codegen<'ctx> {
                     .try_as_basic_value().unwrap_basic()
             }
             // UNBOXED SUM TYPE (unboxed-sumtype Stage 3): a Stage-eligible sum type's value is
-            // physically a `*SumNode`, NOT a `LinObject`. `box_value` is the GENERICALLY-DYNAMIC
-            // boxing entry (toString / `==` / match-discriminator `object_get` / spread / closure
-            // arg / a `sum|Null` param) — those consumers read the boxed value as a LinObject, so the
-            // node MUST be MATERIALIZED to a real boxed `LinObject` here (boxing the raw `*SumNode` as
-            // TAG_OBJECT was a latent type-confusion bug: the consumer's `object_get`/release walked a
-            // SumNode header as a LinObject → garbage discriminant / crash). The keep-packed
-            // container-store boundary (Map value slot) does NOT route through `box_value`; it stores a
-            // TAG_SUMNODE node directly so only the genuinely-dynamic consumers pay the materialize.
+            // physically a `*SumNode`, NOT a `LinMap`. `box_value` is the GENERICALLY-DYNAMIC
+            // boxing entry (toString / `==` / match-discriminator `map_get` / spread / closure
+            // arg / a `sum|Null` param) — those consumers read the boxed value as a LinMap, so the
+            // node MUST be MATERIALIZED to a real boxed `LinMap` here (Phase 2: sumnode materializes
+            // to LinMap* — box as TAG_MAP; formerly TAG_OBJECT, which was a latent type-confusion bug:
+            // the consumer walked a SumNode header as a LinObject → garbage discriminant / crash).
+            // The keep-packed container-store boundary (Map value slot) does NOT route through
+            // `box_value`; it stores a TAG_SUMNODE node directly so only the genuinely-dynamic
+            // consumers pay the materialize.
             // Handle BEFORE the generic Union arm (a sum type IS a `Type::Union`).
-            // Stage 6b Phase 2: sumnode materializes to LinMap* — box as TAG_MAP.
             Type::Union(_) if Self::is_sum_type(val_ty) && val.is_pointer_value() => {
                 let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 let map = self.sumnode_materialize_to_object(val, val_ty, llvm_fn);
@@ -233,20 +234,35 @@ impl<'ctx> Codegen<'ctx> {
                     val
                 }
             }
-            _ => val,
+            // Opaque handle types whose runtime value is already a boxed TaggedVal* — pass through
+            // unchanged. is_union_type() returns true for all of these, so call sites that guard
+            // with is_union_type() never reach here; the pass-through is the safety net for any
+            // site that doesn't guard.
+            Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
+            | Type::Named(_) | Type::Never => val,
+            // Any Type variant that reaches here was not expected to be boxed. In a release build
+            // the old fall-through behaviour is preserved (return val unchanged) so existing
+            // behaviour is not regressed; in debug/test builds this fires as a panic so the corpus
+            // gate catches the unhandled case immediately rather than silently miscompiling.
+            _ => {
+                debug_assert!(false, "box_value: unhandled type {val_ty:?} — add an explicit arm");
+                val
+            }
         };
         ptr
     }
 
     /// Unbox a tagged union pointer to the concrete type `target_ty`.
+    /// Handles the same type set as `unbox_tagged_val_to_type`; call sites in the closure-wrapper
+    /// ABI (call.rs) and index key paths use this entry point with concrete scalar/ptr types.
     pub(crate) fn unbox_value(&mut self, ptr: BasicValueEnum<'ctx>, target_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_val = ptr.into_pointer_value();
+        #[allow(unreachable_patterns)] // _ arm is a future-proof guard; currently exhaustive
         match target_ty {
             Type::Null => self.context.ptr_type(AddressSpace::default()).const_null().into(),
             Type::Bool => {
                 let v = self.builder.call(self.rt.unbox_bool, &[ptr_val.into()], "ubool")
                     .try_as_basic_value().unwrap_basic();
-                // Convert i8 to i1
                 self.builder.int_truncate(v.into_int_value(), self.context.bool_type(), "utobool").into()
             }
             Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => {
@@ -256,8 +272,6 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.int_truncate_or_bit_cast(v.into_int_value(), ity, "toi").into()
             }
             Type::UInt8 | Type::UInt16 | Type::UInt32 => {
-                // UInt8/16/32 are boxed as TAG_INT64 (zero-extended). Read the full i64 payload
-                // and truncate to the target width — this preserves all value bits.
                 let v = self.builder.call(self.rt.unbox_int64, &[ptr_val.into()], "uu64")
                     .try_as_basic_value().unwrap_basic();
                 let ity = self.llvm_type(target_ty).into_int_type();
@@ -268,9 +282,6 @@ impl<'ctx> Codegen<'ctx> {
                     .try_as_basic_value().unwrap_basic()
             }
             Type::UInt64 => {
-                // Boxed as TAG_UINT64; the bits are identical to TAG_INT64 so unbox_int64
-                // returns the correct 64-bit pattern (the value's signedness only matters at
-                // display/compare time, handled by the runtime tag).
                 self.builder.call(self.rt.unbox_uint64, &[ptr_val.into()], "uu64v")
                     .try_as_basic_value().unwrap_basic()
             }
@@ -291,17 +302,30 @@ impl<'ctx> Codegen<'ctx> {
                 let fields = Self::sealed_scalar_fields(target_ty).unwrap().clone();
                 self.sealed_project_from(ptr, &Type::TypeVar(u32::MAX), &fields)
             }
-            // Keep in sync with `unbox_tagged_val_to_type` below. A typed index-signature map
-            // (`{ String: T }`, `Type::Map`) is boxed as TAG_MAP whose payload is the raw
-            // `LinMap*`; unbox it back to that pointer here too, or it leaks through the
-            // closure-ABI wrapper as a TaggedVal box masquerading as a `LinMap*`.
             Type::Object { .. } | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } | Type::Map { .. } => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "uptr")
                     .try_as_basic_value().unwrap_basic()
             }
-            // Already tagged — return as-is
+            // KEEP-PACKED-THROUGH-RECORD-FIELDS: `sum | Null` union box — materialize TAG_SUMNODE
+            // slots to a real TAG_MAP so dynamic consumers see a valid LinMap*.
+            Type::Union(_) if Self::sum_member_of_nullable_union(target_ty).is_some() => {
+                let sum_ty = Self::sum_member_of_nullable_union(target_ty).unwrap();
+                self.sumnode_box_readback_to_object_box(ptr, &sum_ty)
+            }
+            // Already tagged — return as-is.
             Type::Union(_) | Type::TypeVar(_) => ptr,
-            _ => ptr,
+            // Opaque handle types: their runtime value IS the tagged box pointer.
+            Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
+            | Type::Named(_) | Type::Never | Type::Iterator(_) => ptr,
+            // Sum type: project from the boxed LinMap back to a fresh *SumNode.
+            _ if Self::is_sum_type(target_ty) => {
+                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                self.sumnode_project_from_boxed(ptr, target_ty, target_ty, llvm_fn)
+            }
+            _ => {
+                debug_assert!(false, "unbox_value: unhandled type {target_ty:?} — add an explicit arm");
+                ptr
+            }
         }
     }
 
@@ -363,8 +387,7 @@ impl<'ctx> Codegen<'ctx> {
         // map_flat_scalar segfault). Mirrors the home-alloca hoist in mod.rs.
         let alloca = self.entry_block_alloca(tagged_ty, "tv");
 
-        // Use type_tag_open so a concrete open-object payload (LinMap*) is tagged TAG_MAP.
-        let tag = Self::type_tag_open(val_ty);
+        let tag = Self::type_tag(val_ty);
         let tag_val = i8_ty.const_int(tag as u64, false);
         let tag_ptr = self.builder.struct_gep(tagged_ty, alloca, 0, "tv_tag");
         self.builder.store(tag_ptr, tag_val);
@@ -401,8 +424,8 @@ impl<'ctx> Codegen<'ctx> {
 
     /// KEEP-PACKED box (repr pass Stage 4): wrap a still-packed `LinArray*` (elem_tag 0xFE) / packed
     /// sealed struct* into a 16-byte `TaggedVal` WITHOUT materializing. O(1), borrows the inner. A
-    /// sealed ARRAY uses `lin_box_array` (TAG_ARRAY) and a sealed RECORD uses `lin_box_object`
-    /// (TAG_OBJECT) — both store the payload pointer verbatim; the runtime dispatches release/free on
+    /// sealed ARRAY uses `lin_box_array` (TAG_ARRAY) and a sealed RECORD uses `lin_box_record`
+    /// (TAG_RECORD) — both store the payload pointer verbatim; the runtime dispatches release/free on
     /// the header (`elem_tag` for arrays, the sealed offset-4 size for structs). The box shell is a
     /// fresh +1; the inner's owning reference is supplied by the surrounding container transfer.
     pub(crate) fn compile_ir_box_keep_packed(&mut self, val: BasicValueEnum<'ctx>, arr: bool) -> BasicValueEnum<'ctx> {
@@ -445,9 +468,9 @@ impl<'ctx> Codegen<'ctx> {
     /// (keep-packed-through-record-fields). Wraps the still-packed node by-pointer in a 16-byte
     /// `TaggedVal(TAG_SUMNODE)` — O(1), no `lin_summat` materialize. The DISTINCT tag is what makes
     /// this sound: the slot's release routes to `lin_sumnode_release_self` (the node's own size), not
-    /// `lin_object_release`. Borrows the inner (shell is +1); the slot's owning reference comes from
+    /// `lin_map_release`. Borrows the inner (shell is +1); the slot's owning reference comes from
     /// the IR `transfer_into_container`. The read-back twin is `compile_ir_unbox_keep_sumnode`, which
-    /// tag-checks before unwrapping — so a slot that was instead MATERIALIZED (TAG_OBJECT, the
+    /// tag-checks before unwrapping — so a slot that was instead MATERIALIZED (TAG_MAP, the
     /// fallback / cross-thread / boundary path) reads back correctly too (runtime-tag dispatch removes
     /// the store/read static asymmetry entirely).
     pub(crate) fn compile_ir_box_keep_sumnode(&mut self, val: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
@@ -455,6 +478,14 @@ impl<'ctx> Codegen<'ctx> {
             return val;
         }
         self.builder.call(self.rt.box_sumnode, &[val.into()], "kp_boxsum")
+            .try_as_basic_value().unwrap_basic()
+    }
+
+    /// Box a raw `LinMap*` pointer directly as TAG_MAP. Replaces the pattern
+    /// `box_value(obj, sumnode_first_variant_obj_ty(&sum_ty))` at dynamic-boundary sites
+    /// where a materialized SumNode `LinMap*` needs wrapping into a TaggedVal.
+    pub(crate) fn box_map_of(&mut self, obj_ptr: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        self.builder.call(self.rt.box_map, &[obj_ptr.into()], "boxmap_obj")
             .try_as_basic_value().unwrap_basic()
     }
 
@@ -472,6 +503,7 @@ impl<'ctx> Codegen<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         if !tagged.is_pointer_value() { return tagged; }
         let ptr = tagged.into_pointer_value();
+        #[allow(unreachable_patterns)] // _ arm is a future-proof guard; currently exhaustive
         match ty {
             Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => {
                 // Boxed as TAG_INT32 (sign-extended at box time). Read i32 and truncate to the
@@ -497,7 +529,12 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.unbox_uint64, &[ptr.into()], "ir_u64").try_as_basic_value().unwrap_basic()
             }
             Type::Float64 | Type::Float32 => {
-                self.builder.call(self.rt.unbox_float64, &[ptr.into()], "ir_uf64").try_as_basic_value().unwrap_basic()
+                let v = self.builder.call(self.rt.unbox_float64, &[ptr.into()], "ir_uf64").try_as_basic_value().unwrap_basic();
+                if matches!(ty, Type::Float32) {
+                    self.builder.float_trunc(v.into_float_value(), self.context.f32_type(), "tof32").into()
+                } else {
+                    v
+                }
             }
             Type::Bool => {
                 let i8v = self.builder.call(self.rt.unbox_bool, &[ptr.into()], "ir_ubool").try_as_basic_value().unwrap_basic().into_int_value();
@@ -507,13 +544,13 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.unbox_ptr, &[ptr.into()], "ir_ustr").try_as_basic_value().unwrap_basic()
             }
             // Unboxing a boxed Json/object into a SEALED scalar record target = a PROJECTION:
-            // the boxed value is a TaggedVal* (or raw LinObject*); project it into a fresh sealed
+            // the boxed value is a TaggedVal* (or raw LinMap*); project it into a fresh sealed
             // struct. Routed through the central projection helper so the source representation is
-            // handled correctly (it unboxes a union box to the raw LinObject internally).
+            // handled correctly (it unboxes a union box to the raw LinMap internally).
             Type::Object { .. } if Self::sealed_scalar_fields(ty).is_some() => {
                 let fields = Self::sealed_scalar_fields(ty).unwrap().clone();
                 // The incoming `tagged` is a boxed value (Json). Use the union-typed projection
-                // path: sealed_project_from unboxes a union source to the raw LinObject itself.
+                // path: sealed_project_from unboxes a union source to the raw LinMap itself.
                 self.sealed_project_from(tagged, &Type::TypeVar(u32::MAX), &fields)
             }
             // Typed index-signature map (`{ String: T }`, ADR-055): a `m[k]` whose value type is
@@ -526,9 +563,9 @@ impl<'ctx> Codegen<'ctx> {
             }
             // KEEP-PACKED-THROUGH-RECORD-FIELDS read into UNION/Json position: a `sum | Null` result
             // (the safe-access `cur["node"] : Expr | Null` shape) stays a BOXED union value. If the slot
-            // holds a keep-packed `TAG_SUMNODE`, MATERIALIZE it to a real TAG_OBJECT box so the dynamic
-            // consumers (toString/eq/json, or a later `is`-narrowing match's `object_get`) see a real
-            // object — NOT a SumNode pointer they cannot interpret. A non-keep-packed box / null passes
+            // holds a keep-packed `TAG_SUMNODE`, MATERIALIZE it to a real TAG_MAP box so the dynamic
+            // consumers (toString/eq/json, or a later `is`-narrowing match's `map_get`) see a real
+            // LinMap — NOT a SumNode pointer they cannot interpret. A non-keep-packed box / null passes
             // through. (A subsequent narrow into a sum PARAM re-projects the materialized box → correct.)
             // This keeps the keep-packed STORE win while making EVERY read boundary correct + sound.
             Type::Union(_) if Self::sum_member_of_nullable_union(ty).is_some() => {
@@ -538,21 +575,39 @@ impl<'ctx> Codegen<'ctx> {
             // UNBOXED SUM TYPE (unboxed-sumtype Stage 3): unboxing a boxed Json/object into a sum-typed
             // target is a PROJECTION back into a fresh `*SumNode` — the consumer (a SumNode param / a
             // `match` over the packed scrutinee / a recursive eval) requires the packed repr the type
-            // implies, NOT the boxed LinObject. Without this arm the sum union fell to `_ => tagged`,
+            // implies, NOT the boxed LinMap. Without this arm the sum union fell to `_ => tagged`,
             // returning the boxed value where a SumNode was expected → garbage tag read. Reads the
-            // discriminant + scalar/recursive-child fields from the boxed object (recursing for
+            // discriminant + scalar/recursive-child fields from the boxed map (recursing for
             // children). This is the read-back twin of the `box_value` sum-materialize boundary above.
             _ if Self::is_sum_type(ty) => {
                 // KEEP-PACKED-THROUGH-RECORD-FIELDS read-back: `sumnode_project_from_boxed` tag-dispatches
                 // on the boxed value — a keep-packed `TAG_SUMNODE` (cursor zero-copy store) is unwrapped
-                // to the still-packed `*SumNode` (+retain, zero copy); a materialized `TAG_OBJECT` is
+                // to the still-packed `*SumNode` (+retain, zero copy); a materialized `TAG_MAP` is
                 // projected into a fresh node. Sound with NO static store/read agreement. (`ty` is a
                 // union here, so the tag probe is on a genuine box.)
                 let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 self.sumnode_project_from_boxed(tagged, ty, ty, llvm_fn)
             }
             Type::Null => ptr_ty.const_null().into(),
-            _ => tagged, // pass through for union/unknown
+            // Already-tagged values: the caller has a boxed TaggedVal* and the target type is
+            // itself tagged — return the box unchanged. Includes generic unions, TypeVar (unknown
+            // concrete type at compile time), opaque handle types (Shared/Stream/Promise/TarEntry
+            // whose runtime rep IS a tagged box), Named aliases, and Never (unreachable in
+            // practice).
+            Type::Union(_) | Type::TypeVar(_)
+            | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
+            | Type::Named(_) | Type::Never => tagged,
+            // Iterator<T> values materialise as a LinArray* (TAG_ARRAY) at the IR boundary;
+            // unboxing to the raw pointer falls through here when Iterator is the stated target
+            // type. Pass through unchanged — the pointer IS the value.
+            Type::Iterator(_) => tagged,
+            // Any Type variant that reaches here was not expected to be unboxed via this entry
+            // point. Preserve old fall-through in release builds; panic in debug/test so the
+            // corpus gate catches the gap immediately.
+            _ => {
+                debug_assert!(false, "unbox_tagged_val_to_type: unhandled type {ty:?} — add an explicit arm");
+                tagged
+            }
         }
     }
 

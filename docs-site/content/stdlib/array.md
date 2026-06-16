@@ -43,7 +43,7 @@ val slice = <T>(arr: T[], start: Int32, end: Int32 = length(arr)): T[]
 ```
 
 Copy the sub-range `[start, end)` into a new array, preserving the element type (a `UInt8[]`
-yields a `UInt8[]`, an `Int32[]` an `Int32[]`, a `Json[]` a `Json[]`).
+yields a `UInt8[]`, an `Int32[]` an `Int32[]`, a `AnyVal[]` a `AnyVal[]`).
 - **`arr`** — the source array.
 - **`start`** — start index (inclusive); negative counts from the end; clamped to `[0, length]`.
 - **`end`** — end index (exclusive); defaults to `length(arr)`; negative counts from the end; clamped to `[0, length]`.
@@ -76,13 +76,13 @@ yields a `UInt8[]`, an `Int32[]` an `Int32[]`, a `Json[]` a `Json[]`).
 #### `arrayAllocate`
 
 ```lin
-val arrayAllocate = (n: Int32): Json
+val arrayAllocate = (n: Int32): AnyVal
 ```
 
-Allocate an uninitialised length-`n` array (boxed/tagged `Json`, so untyped use needs no
+Allocate an uninitialised length-`n` array (boxed/tagged `AnyVal`, so untyped use needs no
 annotation). For a flat unboxed scalar array, use `arrayAllocateFilled` instead.
 - **`n`** — the length of the array to allocate.
-- **Returns** an uninitialised `Json` array of length `n`.
+- **Returns** an uninitialised `AnyVal` array of length `n`.
 
 #### `arrayAllocateFilled`
 
@@ -100,7 +100,7 @@ else a tagged array; untyped use (`arrayAllocateFilled(n, 0)`) needs no annotati
 #### `length`
 
 ```lin
-val length = (x: Json): Int32
+val length = (x: AnyVal): Int32
 ```
 
 The number of elements in an array (or characters/entries in a string/object).
@@ -305,13 +305,13 @@ original input order, and it scales to large inputs. Does not mutate `arr`.
 #### `sortBy`
 
 ```lin
-val sortBy = <T>(arr: T[], keyFn: (T) => Json): T[]
+val sortBy = <T>(arr: T[], keyFn: (T) => AnyVal): T[]
 ```
 
 Stably sort `arr` by a key extracted from each element, comparing keys with Lin's natural
 `<`/`>` ordering. Does not mutate `arr`. (Paired with `searchBy`, which searches such an array.)
 - **`arr`** — the array to sort.
-- **`keyFn`** — maps an element to its (comparable `Json`) sort key; must accept the element type `T`.
+- **`keyFn`** — maps an element to its (comparable `AnyVal`) sort key; must accept the element type `T`.
 - **Returns** a new `T[]` sorted ascending by key, ties in original order.
 
 **Example:**
@@ -384,7 +384,7 @@ Binary search a sorted array for `target`. O(log n). Precondition: `arr` is sort
 #### `searchBy`
 
 ```lin
-val searchBy = <T>(arr: T[], key: Json, f: (T) => Json): { "found": Boolean, "index": Int32 }
+val searchBy = <T>(arr: T[], key: AnyVal, f: (T) => AnyVal): { "found": Boolean, "index": Int32 }
 ```
 
 Key-extractor variant of `binarySearch`, mirroring `sortBy`: search an array sorted by `f`'s key
@@ -494,7 +494,7 @@ val append = <T>(arr: T[], item: T): T[]
 ```
 
 Append `item` to the end of `arr`, returning a new array (does not mutate `arr`). A flat array
-(e.g. `UInt8[]`) stays flat; a tagged `Json[]` stays tagged.
+(e.g. `UInt8[]`) stays flat; a tagged `AnyVal[]` stays tagged.
 - **`arr`** — the source array; its element type pins `T` for element checking.
 - **`item`** — the element to append; must be assignable to `T` (`append(intArr, "s")` is a compile error).
 - **Returns** a new `T[]` with `item` appended.
@@ -581,11 +581,11 @@ Index of the last element for which `f` returns `true`.
 #### `dedupBy`
 
 ```lin
-val dedupBy = <T>(arr: T[], f: (T) => Json): T[][]
+val dedupBy = <T>(arr: T[], f: (T) => AnyVal): T[][]
 ```
 
 Group consecutive elements with the same key into sub-arrays (maximal runs of adjacent
 equal-keyed elements, in order). The positional analogue of `groupBy` (which is global and hashed).
 - **`arr`** — the array to scan.
-- **`f`** — maps each element to its (comparable `Json`) run key.
+- **`f`** — maps each element to its (comparable `AnyVal`) run key.
 - **Returns** a `T[][]` of the consecutive runs (`[]` for an empty input).

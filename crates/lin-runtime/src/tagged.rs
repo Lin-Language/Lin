@@ -76,13 +76,13 @@ const _: () = {
 /// Cached integer range `[SMALL_INT_MIN, SMALL_INT_MAX)`. Boxing an int in this range returns
 /// an immutable static box instead of allocating — the dominant cost of map/filter/reduce
 /// callbacks, whose results (loop indices, counts, byte values, small sums) are usually small.
-/// `[-128, 1024)` (1152 entries × 16 B × 2 int caches ≈ 37 KB of static data) covers byte
-/// values, common loop bounds, and small arithmetic results; values outside fall back to a
-/// fresh heap box. (Measured: widening 256→1024 on the map/filter/reduce benchmark cut mallocs
-/// ~24% and runtime ~16%.)
+/// `[-128, 65536)` (65664 entries × 16 B × 2 int caches ≈ 2.0 MB of static data) covers byte
+/// values, common loop bounds, UInt16 values, and small arithmetic results; values outside fall
+/// back to a fresh heap box. (Measured: widening 256→1024 on the map/filter/reduce benchmark cut
+/// mallocs ~24% and runtime ~16%.)
 pub const SMALL_INT_MIN: i64 = -128;
 /// One past the largest cached integer.
-pub const SMALL_INT_MAX: i64 = 1024;
+pub const SMALL_INT_MAX: i64 = 65536;
 const SMALL_INT_LEN: usize = (SMALL_INT_MAX - SMALL_INT_MIN) as usize;
 
 const fn tv(tag: u8, payload: u64) -> TaggedVal {
@@ -201,11 +201,6 @@ pub unsafe extern "C" fn lin_box_str(p: *mut u8) -> *mut u8 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_box_object(p: *mut u8) -> *mut u8 {
-    alloc_tagged(TAG_OBJECT, p as u64)
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn lin_box_array(p: *mut u8) -> *mut u8 {
     alloc_tagged(TAG_ARRAY, p as u64)
 }
@@ -234,14 +229,24 @@ pub unsafe extern "C" fn lin_box_sumnode(p: *mut u8) -> *mut u8 {
 
 /// Box a `*sealed-struct` by-pointer as a TaggedVal(TAG_RECORD) — Stage 6a dynamic-slot widening.
 /// The sealed struct carries its own descriptor at offset 8 (`[u32 rc | u32 size | u64 desc_ptr | ...]`),
-/// so no separate descriptor argument is needed. The struct is BORROWED here (the shell is the only
-/// fresh +1 added by this function); the slot's owning reference is retained by the struct itself
-/// (the RC at offset 0). The distinct TAG_RECORD tag routes the slot's release to
-/// `lin_sealed_release_self` (reads the size from offset 4), NOT `lin_object_release` (which would
-/// misinterpret the sealed header). RC contract mirrors `lin_box_sumnode` exactly.
+/// so no separate descriptor argument is needed. The distinct TAG_RECORD tag routes the slot's release
+/// to `lin_sealed_release_self` (reads the size from offset 4), NOT `lin_object_release` (which would
+/// misinterpret the sealed header).
+///
+/// RC contract — this RETAINS (+1), and that is DELIBERATELY DIFFERENT from `lin_box_sumnode` (which
+/// does NOT retain). The two boxers are used in different ownership contexts:
+///   * `lin_box_record` is called only on the COERCE/escape paths (`val j: AnyVal = rec`, NullableRecord
+///     coercion — codegen `match.rs`), where the SOURCE struct stays a live owner in its own scope and
+///     the box is an ADDITIONAL independent owner → it must take its own +1.
+///   * `lin_box_sumnode` is called only on the keep-packed MOVE-into-a-container path
+///     (`compile_ir_box_keep_sumnode`), where the IR's `transfer_into_container` MOVES the single +1
+///     into the slot and suppresses the source release → the box must NOT add a second +1.
+/// (The keep-packed record-into-container MOVE goes through `lin_box_map`/`lin_box_array`, not this
+/// function — see `compile_ir_box_keep_packed` — so `lin_box_record` never participates in a move.)
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_record(p: *mut u8) -> *mut u8 {
-    // Retain the sealed struct: the new TaggedVal shell is an additional owner (+1).
+    // Retain the sealed struct: the new TaggedVal shell is an additional owner (+1). See the contract
+    // note above for why this differs from lin_box_sumnode.
     if !p.is_null() {
         crate::memory::lin_rc_retain(p as *mut u32);
     }
@@ -249,8 +254,8 @@ pub unsafe extern "C" fn lin_box_record(p: *mut u8) -> *mut u8 {
 }
 
 /// Stage 6a: read one field from a union-typed TaggedVal box by name, returning an OWNED +1
-/// `TaggedVal*` (null = field missing or null source). Handles both TAG_OBJECT and TAG_RECORD:
-///   - TAG_OBJECT → `lin_object_get` (borrowed interior) → `lin_tagged_clone` → owned +1.
+/// `TaggedVal*` (null = field missing or null source). Handles TAG_MAP and TAG_RECORD:
+///   - TAG_MAP → `lin_map_get` (borrowed interior) → `lin_tagged_clone` → owned +1.
 ///   - TAG_RECORD → `lin_record_get_field` (already owned +1).
 ///   - anything else (null, scalar, array, …) → null.
 ///
@@ -267,15 +272,6 @@ pub unsafe extern "C" fn lin_union_get_field(tv: *const u8, key: *const crate::s
     let tag = (*(tv as *const TaggedVal)).tag;
     let payload = (*(tv as *const TaggedVal)).payload;
     match tag {
-        TAG_OBJECT => {
-            let obj = payload as *const crate::object::LinObject;
-            if obj.is_null() {
-                return std::ptr::null_mut();
-            }
-            // lin_object_get returns a BORROWED interior pointer; clone it into an OWNED box.
-            let borrowed = crate::object::lin_object_get(obj, key);
-            crate::object::lin_tagged_clone(borrowed as *const u8)
-        }
         TAG_MAP => {
             let map = payload as *const crate::map::LinMap;
             if map.is_null() {
@@ -283,7 +279,7 @@ pub unsafe extern "C" fn lin_union_get_field(tv: *const u8, key: *const crate::s
             }
             // lin_map_get returns a BORROWED interior pointer; clone it into an OWNED box.
             let borrowed = crate::map::lin_map_get(map, key);
-            crate::object::lin_tagged_clone(borrowed as *const u8)
+            lin_tagged_clone(borrowed as *const u8)
         }
         TAG_RECORD => {
             let sealed = payload as *const u8;
@@ -357,14 +353,11 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
     let bt = if bv.is_null() { TAG_NULL } else { (*bv).tag };
     if at == TAG_NULL && bt == TAG_NULL { return 1; }
     if at == TAG_NULL || bt == TAG_NULL { return 0; }
-    // Dynamic-object equality during the LinObject→LinMap migration (Stage 6b): if EITHER side is a
-    // map and both sides are dynamic-object-shaped, normalize both to a `LinMap` and compare
-    // structurally (order-independent). Covers map==map AND the mixed case map==object /
-    // map==record / map==sumnode — a producer migrated to emit TAG_MAP compared against one that
-    // still emits a TAG_OBJECT (or a kept-packed record/sumnode). Without this, map==map would fall
-    // to raw pointer identity below and map==object would return 0.
-    let a_dynobj = at == TAG_MAP || at == TAG_OBJECT || at == TAG_RECORD || at == TAG_SUMNODE;
-    let b_dynobj = bt == TAG_MAP || bt == TAG_OBJECT || bt == TAG_RECORD || bt == TAG_SUMNODE;
+    // Dynamic-object equality: if EITHER side is a map and both sides are dynamic-object-shaped,
+    // normalize both to a `LinMap` and compare structurally (order-independent). Covers map==map
+    // and the kept-packed cases map==record / map==sumnode.
+    let a_dynobj = at == TAG_MAP || at == TAG_RECORD || at == TAG_SUMNODE;
+    let b_dynobj = bt == TAG_MAP || bt == TAG_RECORD || bt == TAG_SUMNODE;
     if (at == TAG_MAP || bt == TAG_MAP) && a_dynobj && b_dynobj {
         let am = crate::map::dynamic_to_map(av);
         let bm = crate::map::dynamic_to_map(bv);
@@ -374,11 +367,11 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
         return eq;
     }
     // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` (TAG_SUMNODE) or a
-    // sealed-record pointer (TAG_RECORD) or TAG_OBJECT escaped into a dynamic equality. Normalize
-    // both operands to LinMap and compare structurally (order-independent). Transient maps released.
-    if at == TAG_SUMNODE || bt == TAG_SUMNODE || at == TAG_RECORD || bt == TAG_RECORD || at == TAG_OBJECT || bt == TAG_OBJECT {
-        let a_dynobj = at == TAG_MAP || at == TAG_OBJECT || at == TAG_RECORD || at == TAG_SUMNODE;
-        let b_dynobj = bt == TAG_MAP || bt == TAG_OBJECT || bt == TAG_RECORD || bt == TAG_SUMNODE;
+    // sealed-record pointer (TAG_RECORD) escaped into a dynamic equality. Normalize both operands
+    // to LinMap and compare structurally (order-independent). Transient maps released.
+    if at == TAG_SUMNODE || bt == TAG_SUMNODE || at == TAG_RECORD || bt == TAG_RECORD {
+        let a_dynobj = at == TAG_MAP || at == TAG_RECORD || at == TAG_SUMNODE;
+        let b_dynobj = bt == TAG_MAP || bt == TAG_RECORD || bt == TAG_SUMNODE;
         if !a_dynobj || !b_dynobj { return 0; }
         let am = crate::map::dynamic_to_map(av);
         let bm = crate::map::dynamic_to_map(bv);
@@ -407,11 +400,6 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
             let as_ptr = ap as *const crate::string::LinString;
             let bs_ptr = bp as *const crate::string::LinString;
             crate::string::lin_string_eq(as_ptr, bs_ptr) as u8
-        }
-        TAG_OBJECT => {
-            let ao = ap as *const crate::object::LinObject;
-            let bo = bp as *const crate::object::LinObject;
-            crate::object::lin_object_eq(ao, bo)
         }
         TAG_ARRAY => {
             let aa = ap as *const crate::array::LinArray;
@@ -523,7 +511,7 @@ pub unsafe extern "C-unwind" fn lin_tagged_arith(a: *const u8, b: *const u8, op:
             0 => "+", 1 => "-", 2 => "*", 3 => "/", 4 => "%", _ => "arithmetic",
         };
         crate::fault::runtime_fault(&format!(
-            "Runtime error: cannot apply operator '{}' to dynamic Json operands of kind {} and {} \
+            "Runtime error: cannot apply operator '{}' to dynamic AnyVal operands of kind {} and {} \
              (a missing object key reads as Null — guard with `is`/`!= null` or `has` before arithmetic)",
             op_name, describe(at), describe(bt),
         ));
@@ -590,10 +578,6 @@ pub unsafe extern "C" fn lin_length_dyn(p: *const u8) -> i32 {
         TAG_STR => crate::string::lin_string_length(payload as *const crate::string::LinString),
         TAG_ARRAY => {
             let n = crate::array::lin_array_length(payload as *const crate::array::LinArray);
-            n as i32
-        }
-        TAG_OBJECT => {
-            let n = crate::object::lin_object_length(payload as *const crate::object::LinObject);
             n as i32
         }
         TAG_MAP => {
@@ -666,7 +650,6 @@ pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
     match tag {
         TAG_STR => crate::string::lin_string_release(payload as *mut crate::string::LinString),
         TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
-        TAG_OBJECT => crate::object::lin_object_release(payload as *mut crate::object::LinObject),
         TAG_MAP => crate::map::lin_map_release(payload as *mut crate::map::LinMap),
         // KEEP-PACKED sum node in a record-field slot: dispatch to the SumNode self-release (reads
         // its own size from the header), NOT lin_object_release (which would read the SumNode's
@@ -692,6 +675,179 @@ pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
     }
     // Free the TaggedVal box itself.
     std::alloc::dealloc(p, std::alloc::Layout::new::<TaggedVal>());
+}
+
+/// Retain the heap-allocated payload of a TaggedVal (increment refcount). Used when copying a
+/// TaggedVal into a map/array slot so the new owner has a reference. Moved from object.rs
+/// in Cluster D: TAG_OBJECT arm dropped (no producers after Phase 3).
+pub(crate) unsafe fn retain_tagged_payload(tv: &TaggedVal) {
+    let payload = tv.payload;
+    match tv.tag {
+        TAG_STR => {
+            crate::string::lin_string_inc_ref(payload as *mut crate::string::LinString);
+        }
+        TAG_ARRAY => {
+            let a = payload as *mut crate::array::LinArray;
+            if !a.is_null() && (*a).refcount < crate::string::IMMORTAL_RC { (*a).refcount += 1; }
+        }
+        TAG_MAP => {
+            let m = payload as *mut crate::map::LinMap;
+            if !m.is_null() && (*m).refcount < crate::string::IMMORTAL_RC { (*m).refcount += 1; }
+        }
+        TAG_SUMNODE => {
+            let s = payload as *mut u32;
+            if !s.is_null() && *s < crate::string::IMMORTAL_RC { *s += 1; }
+        }
+        TAG_RECORD => {
+            let s = payload as *mut u32;
+            if !s.is_null() && *s < crate::string::IMMORTAL_RC { *s += 1; }
+        }
+        TAG_FUNCTION => {
+            let c = payload as *mut u32;
+            if !c.is_null() {
+                crate::memory::lin_rc_retain(c);
+            }
+        }
+        TAG_SHARED => {
+            crate::shared::lin_shared_retain_box(payload as *const u8);
+        }
+        TAG_STREAM => {
+            crate::stream::lin_stream_retain_box(payload as *const u8);
+        }
+        TAG_BIGNUM => {
+            crate::bignum::lin_bignum_retain_box(payload as *const u8);
+        }
+        TAG_DECIMAL => {
+            crate::decimal::lin_decimal_retain_box(payload as *const u8);
+        }
+        TAG_TAR_ENTRY => {
+            crate::stream::lin_tar_entry_retain_box(payload as *const u8);
+        }
+        _ => {} // scalars (and retired TAG_OBJECT = 7): no heap payload to retain
+    }
+}
+
+/// Public wrapper for retain_tagged_payload, used by array.rs and map.rs.
+pub unsafe fn retain_tagged_payload_pub(tv: &TaggedVal) {
+    retain_tagged_payload(tv);
+}
+
+/// Public wrapper for release_tagged_payload, used by map.rs (the typed-map container reuses the
+/// exact object value RC discipline; see ADR-055).
+pub unsafe fn release_tagged_payload_pub(tv: &TaggedVal) {
+    // release_tagged_payload is the body of lin_tagged_release (without the shell free).
+    // For simplicity, box the value, release it (which frees the payload), then rebuild — but
+    // this would double-free the shell. Instead: inline the payload-only release here.
+    let payload = tv.payload;
+    match tv.tag {
+        TAG_STR => crate::string::lin_string_release(payload as *mut crate::string::LinString),
+        TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
+        TAG_MAP => crate::map::lin_map_release(payload as *mut crate::map::LinMap),
+        TAG_SUMNODE => crate::sumnode::lin_sumnode_release_self(payload as *mut u8),
+        TAG_RECORD => crate::sealed::lin_sealed_release_self(payload as *mut u8),
+        TAG_FUNCTION => crate::memory::lin_closure_release(payload as *mut u8),
+        TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
+        TAG_STREAM => crate::stream::lin_stream_release_box(payload as *const u8),
+        TAG_BIGNUM => crate::bignum::lin_bignum_release_box(payload as *const u8),
+        TAG_DECIMAL => crate::decimal::lin_decimal_release_box(payload as *const u8),
+        TAG_TAR_ENTRY => crate::stream::lin_tar_entry_release_box(payload as *const u8),
+        _ => {} // scalars (and retired TAG_OBJECT = 7): no heap payload
+    }
+}
+
+/// Retain the heap payload of a boxed TaggedVal* (tag-aware). Null-safe.
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_retain(p: *const u8) {
+    if p.is_null() {
+        return;
+    }
+    retain_tagged_payload(&*(p as *const TaggedVal));
+}
+
+/// Clone a boxed TaggedVal*: allocate a FRESH TaggedVal box copying the tag+payload and retain
+/// the inner heap payload (if any). Returns an independently-owned box.
+/// Null-safe. Cached scalar boxes are returned as-is (immutable statics).
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_clone(p: *const u8) -> *mut u8 {
+    if p.is_null() {
+        return std::ptr::null_mut();
+    }
+    if is_cached_box_pub(p) {
+        return p as *mut u8;
+    }
+    let src = &*(p as *const TaggedVal);
+    retain_tagged_payload(src);
+    alloc_tagged(src.tag, src.payload)
+}
+
+// ── Cluster D: dispatch helpers moved from object.rs ─────────────────────────────────────────────
+// TAG_OBJECT (= 7) has no producers after Phase 3; all arms below dispatch TAG_MAP/TAG_RECORD.
+
+/// Return a `String[]` of the keys of a boxed object/map/record value.
+/// Dispatches on the runtime tag: TAG_MAP → `lin_map_keys` (O(1)), TAG_RECORD → materialize to
+/// LinMap then return its keys, else return an empty array.
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_keys(tv: *const u8) -> *mut crate::array::LinArray {
+    if tv.is_null() {
+        return crate::array::lin_array_alloc(0);
+    }
+    let src = &*(tv as *const TaggedVal);
+    match src.tag {
+        TAG_MAP => {
+            crate::map::lin_map_keys(src.payload as *const crate::map::LinMap)
+        }
+        TAG_RECORD => {
+            let sealed = src.payload as *mut u8;
+            if sealed.is_null() {
+                return crate::array::lin_array_alloc(0);
+            }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+            let arr = crate::map::lin_map_keys(mat as *const crate::map::LinMap);
+            crate::map::lin_map_release(mat);
+            arr
+        }
+        _ => crate::array::lin_array_alloc(0),
+    }
+}
+
+/// Check if a boxed value (TaggedVal*) has a given string key. Returns 0/1.
+/// Dispatches: TAG_MAP → `lin_map_has`, TAG_RECORD → materialize + check, else 0.
+#[no_mangle]
+pub unsafe extern "C" fn lin_value_has_field(tagged: *const u8, key: *const crate::string::LinString) -> u8 {
+    if tagged.is_null() { return 0; }
+    let tv = tagged as *const TaggedVal;
+    match (*tv).tag {
+        TAG_MAP => {
+            let map = (*tv).payload as *const crate::map::LinMap;
+            if map.is_null() { 0 } else { crate::map::lin_map_has(map, key) }
+        }
+        TAG_RECORD => {
+            let sealed = (*tv).payload as *mut u8;
+            if sealed.is_null() { return 0; }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+            let result = if mat.is_null() { 0 } else { crate::map::lin_map_has(mat, key) };
+            crate::map::lin_map_release(mat);
+            result
+        }
+        _ => 0,
+    }
+}
+
+/// Check if a boxed value (TaggedVal*) is an array of length `n` (exact) or `>= n` when
+/// `at_least != 0`. Returns 0 for null/non-array values. Branchless helper for the IR
+/// array-pattern lowering.
+#[no_mangle]
+pub unsafe extern "C" fn lin_value_array_len_check(tagged: *const u8, n: u64, at_least: u8) -> u8 {
+    if tagged.is_null() { return 0; }
+    let tv = &*(tagged as *const TaggedVal);
+    if tv.tag != TAG_ARRAY { return 0; }
+    let arr = tv.payload as *const crate::array::LinArray;
+    if arr.is_null() { return 0; }
+    let len = (*arr).len as u64;
+    let ok = if at_least != 0 { len >= n } else { len == n };
+    ok as u8
 }
 
 #[cfg(test)]
