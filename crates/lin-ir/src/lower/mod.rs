@@ -1269,21 +1269,39 @@ impl FuncBuilder {
             }
         }
         // Release each scheduled temp. Non-arg owned temps are released ONCE (dedup), preserving
-        // prior behavior — EXCEPT a SEALED SCALAR RECORD temp, which is released once PER
-        // REGISTRATION. A fresh `val cur: Trip = {…}` / `= arr[i]` source struct threaded into a
-        // `Trip | Null` tail param accrues TWO genuine owned references — the alloc/projection (+1)
-        // AND `coerce_and_own_store`'s `own_for_store` RETAIN at the binding (+1) — each with its own
-        // scope registration. In straight-line code both are released at scope exit (balanced); on a
-        // TCO back-edge the dedup released only ONE, leaking the surplus packed struct (and its heap
-        // fields) every iteration — the `Trip | Null` sealed-record-union tail-param per-iteration
-        // leak. Both of a sealed record's retains are GENUINE (`own_for_store`/field retains, never a
-        // read-retain rc_elide pairs on the tail path), so releasing per registration is balanced.
-        // The gate is restricted to sealed-packed records precisely because BOXED (Json/union/object)
-        // temps DO accrue rc_elide-elided read-retain duplicates, where per-registration release
-        // over-releases (a use-after-free in calc's `parseTermLoop`) — those keep the dedup.
+        // prior behavior — EXCEPT temps whose every scope registration corresponds to a GENUINE,
+        // non-elide-able Retain. Two classes qualify:
+        //
+        // 1. SEALED SCALAR RECORD: a fresh `val cur: Trip = {…}` / `= arr[i]` source struct
+        //    threaded into a `Trip | Null` tail param accrues TWO genuine owned references — the
+        //    alloc/projection (+1) AND `coerce_and_own_store`'s `own_for_store` RETAIN at the
+        //    binding (+1) — each with its own scope registration. In straight-line code both are
+        //    released at scope exit (balanced); on a TCO back-edge the dedup released only ONE,
+        //    leaking the surplus packed struct (and its heap fields) every iteration. Both of a
+        //    sealed record's retains are GENUINE (`own_for_store`/field retains, never rc_elide
+        //    read-retain pairs on the tail path), so releasing per registration is balanced.
+        //
+        // 2. STRING (Str / StrLit): a `val op = tokens[pos]["text"]` sealed-field read registers
+        //    the string once (field-read retain). If `op` is then used as the LEFT operand of a
+        //    `&&` short-circuit, `lower_short_circuit` calls `lower_cond_as_bool(left)` in the
+        //    OUTER scope (no push_scope/pop_scope wrapper) — the LocalGet emits a second Retain
+        //    and a second scope registration. Because the `&&` branch terminates in a TailCall
+        //    back-edge, the enclosing scope never pops: both registrations remain in `scope_owned`
+        //    when `release_owned_for_tail_call` fires, but the dedup emitted only ONE Release,
+        //    leaking one reference per operator consumed. A String LocalGet registration in
+        //    `scope_owned` at TailCall time is ALWAYS genuine: if the Retain and its Release had
+        //    been in the same block (pop_scope_releasing_keep), the registration would already have
+        //    been removed from `scope_owned` — so every remaining registration maps 1-to-1 to a
+        //    surviving, cross-block Retain that needs exactly one Release.
+        //
+        // The gate EXCLUDES BOXED (union/object/Json) temps: their registrations CAN be phantom
+        // (e.g. a union narrowed to a sealed record via `narrowed_to_sealed` registers owned
+        // WITHOUT a Retain; per-registration release would over-release — the use-after-free in
+        // calc's `parseTermLoop` that originally motivated the dedup). Those keep the dedup.
         let mut non_arg_seen: Vec<Temp> = Vec::new();
         for (t, ty) in to_release {
-            let per_registration = is_sealed_scalar_repr(&ty);
+            let per_registration = is_sealed_scalar_repr(&ty)
+                || matches!(ty, Type::Str | Type::StrLit(_));
             if !args.contains(&t) && !per_registration {
                 if non_arg_seen.contains(&t) {
                     continue;
