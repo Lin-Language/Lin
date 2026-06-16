@@ -4,7 +4,7 @@ use super::*;
 /// refcount. Used to decide whether a combinator's element read can use the FLAT scalar getter
 /// (`combinator_read_elem_ty`): a scalar element has no refcount and a flat representation, so a
 /// flat read on a provably-flat source is sound.
-pub fn is_inline_scalar(ty: &Type) -> bool {
+pub(crate) fn is_inline_scalar(ty: &Type) -> bool {
     matches!(ty,
         Type::Int8 | Type::UInt8 | Type::Int16 | Type::UInt16 |
         Type::Int32 | Type::UInt32 | Type::Int64 | Type::UInt64 |
@@ -30,7 +30,7 @@ pub fn is_inline_scalar(ty: &Type) -> bool {
 /// these intrinsics whose declared result is `Array<scalar>` from a flat producer chain — or a
 /// non-empty scalar array literal (`[1,2,3]`). A `[]`+push builder returns a plain `Array`, never an
 /// `Iterator`, and a bare param/projection is also not trusted.
-pub fn combinator_read_elem_ty(iterable: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> Type {
+pub(crate) fn combinator_read_elem_ty(iterable: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> Type {
     let static_elem = iter_elem_type(&iterable.ty());
     if !is_inline_scalar(&static_elem) {
         // Heap/union element: already read tagged; nothing to gate.
@@ -51,7 +51,7 @@ pub fn combinator_read_elem_ty(iterable: &TypedExpr, builder: &FuncBuilder, ctx:
 /// through `lin_iterable_length` (array length, else 0) makes a non-array iterable a no-op loop,
 /// keeping the combinator sound for any Json value. Concrete scalar-array pipelines (the ADR-044
 /// fast path) are unaffected — they take the `Intrinsic::Length` branch.
-pub fn emit_iterable_len(iterable_temp: Temp, iterable_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn emit_iterable_len(iterable_temp: Temp, iterable_ty: &Type, builder: &mut FuncBuilder) -> Temp {
     let len = builder.alloc_temp(Type::Int64);
     if is_union_ty(iterable_ty) {
         builder.emit(Instruction::Call {
@@ -72,7 +72,7 @@ pub fn emit_iterable_len(iterable_temp: Temp, iterable_ty: &Type, builder: &mut 
 }
 
 /// True when `expr` provably produces a FLAT-buffer array for its (flat-scalar) element type.
-pub fn is_provably_flat_producer(expr: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> bool {
+pub(crate) fn is_provably_flat_producer(expr: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> bool {
     match expr {
         // A non-empty scalar array literal lowers to a flat MakeArray.
         TypedExpr::MakeArray { elements, .. } => !elements.is_empty(),
@@ -107,7 +107,7 @@ pub fn is_provably_flat_producer(expr: &TypedExpr, builder: &FuncBuilder, ctx: &
 /// Conservatively requires EXACTLY the two `lin_range` args. `range` is always eager + array-shaped,
 /// so the fused loop preserves `for` semantics exactly (the only observable effect of a `for` body is
 /// its side effects, executed once per element in order — identical here).
-pub fn range_for_bounds<'a>(
+pub(crate) fn range_for_bounds<'a>(
     iterable: &'a TypedExpr,
     builder: &FuncBuilder,
     ctx: &LowerCtx,
@@ -137,7 +137,7 @@ pub fn range_for_bounds<'a>(
 
 /// Intrinsic names whose IR lowering allocates a FLAT scalar buffer (so a flat read on the result
 /// is sound). `lin_map`/`lin_filter` allocate flat output for a flat-scalar element type.
-pub fn is_flat_producer_name(name: &str) -> bool {
+pub(crate) fn is_flat_producer_name(name: &str) -> bool {
     matches!(name,
         "lin_range" | "lin_map" | "lin_filter"
             | "lin_array_allocate" | "lin_array_allocate_filled")
@@ -146,7 +146,7 @@ pub fn is_flat_producer_name(name: &str) -> bool {
 /// Stdlib export names that thinly wrap a flat producer (`range`→`lin_range`, `map`/`filter`, the
 /// flat array allocators). Used when a combinator result reaches another combinator via the
 /// importer's Named call (`import_fn_slots`) rather than an inlined intrinsic.
-pub fn is_flat_producer_export(name: &str) -> bool {
+pub(crate) fn is_flat_producer_export(name: &str) -> bool {
     matches!(name,
         "range" | "map" | "filter" | "arrayAllocate" | "arrayAllocateFilled")
 }
@@ -157,7 +157,7 @@ pub fn is_flat_producer_export(name: &str) -> bool {
 /// param to a loop temp and lower the body inline — no closure alloc, no boxed indirect call. A
 /// capturing lambda or a non-literal callback (a stored/passed `Function` value) returns `None` and
 /// the caller falls back to the closure-call path.
-pub fn inlinable_lambda(expr: &TypedExpr) -> Option<(&[TypedParam], &TypedExpr)> {
+pub(crate) fn inlinable_lambda(expr: &TypedExpr) -> Option<(&[TypedParam], &TypedExpr)> {
     match expr {
         TypedExpr::Function { params, body, captures, .. } if captures.is_empty() => {
             Some((params, body))
@@ -183,7 +183,7 @@ pub fn inlinable_lambda(expr: &TypedExpr) -> Option<(&[TypedParam], &TypedExpr)>
 /// only a plain local temp here (no cell), inlining a `CellSet` would have no cell to hit — bail. A
 /// representation mismatch between `cap.ty` and the binding's stored type would mean the inlined body
 /// reads/writes the wrong physical shape — bail.
-pub fn inlinable_capturing_lambda<'a>(
+pub(crate) fn inlinable_capturing_lambda<'a>(
     expr: &'a TypedExpr,
     builder: &FuncBuilder,
     ctx: &LowerCtx,
@@ -201,7 +201,7 @@ pub fn inlinable_capturing_lambda<'a>(
 
 /// Is a single capture's `outer_slot` resolvable in the enclosing builder with a matching
 /// representation? See `inlinable_capturing_lambda` for the rationale.
-pub fn capture_resolvable(cap: &Capture, builder: &FuncBuilder, ctx: &LowerCtx) -> bool {
+pub(crate) fn capture_resolvable(cap: &Capture, builder: &FuncBuilder, ctx: &LowerCtx) -> bool {
     let slot = cap.outer_slot;
     // Module-level `var` (global). A captured `var` write becomes a `GlobalValSet` to this slot.
     if ctx.global_var_slots.contains(&slot) {
@@ -243,7 +243,7 @@ pub fn capture_resolvable(cap: &Capture, builder: &FuncBuilder, ctx: &LowerCtx) 
 /// are bound BEFORE the scope is pushed-over (they are the loop's element/accumulator temps, owned by
 /// the loop, not by this body scope — so the scope-exit release must not free them). We bind the raw
 /// temps directly without registering them owned in the body scope.
-pub fn inline_lambda_body(
+pub(crate) fn inline_lambda_body(
     params: &[TypedParam],
     body: &TypedExpr,
     arg_temps: &[(Temp, Type)],
@@ -277,7 +277,7 @@ pub fn inline_lambda_body(
 /// SHELL after the iteration (mirroring the NON-inline `elem_boxes` + `FreeBoxShellIfDistinct` path).
 /// Only SCALAR→union coercions are tracked: the payload is a scalar (no inner heap) so freeing the
 /// 16-byte shell is sound, and a cached small-int box is skipped by the runtime free (no double-free).
-pub fn inline_lambda_body_tracking_elem_boxes(
+pub(crate) fn inline_lambda_body_tracking_elem_boxes(
     params: &[TypedParam],
     body: &TypedExpr,
     arg_temps: &[(Temp, Type)],
@@ -359,7 +359,7 @@ pub fn inline_lambda_body_tracking_elem_boxes(
 /// uses the element as anything but a scalar-field read, this returns false and the caller falls back
 /// to the generic materialize path (identical to today's boxed behaviour — no regression). Bare-key
 /// reads (`p[i]`) and whole-value uses are conservatively rejected.
-pub fn elem_used_only_for_scalar_fields(slot: usize, body: &TypedExpr) -> bool {
+pub(crate) fn elem_used_only_for_scalar_fields(slot: usize, body: &TypedExpr) -> bool {
     // `ok`: this position is NOT a bare element use (it is a field-read object, handled by the caller).
     // Returns false the moment a bare/whole-value use of `slot` is found.
     fn walk(slot: usize, e: &TypedExpr) -> bool {
@@ -442,7 +442,7 @@ pub fn elem_used_only_for_scalar_fields(slot: usize, body: &TypedExpr) -> bool {
 /// per-element `lin_sealed_alloc`+memcpy AND the `Json`-param re-box+`lin_object_get`. The view is
 /// removed when this body returns (its lifetime is exactly this one inlined body), so a later
 /// combinator in the same function cannot mis-resolve the slot.
-pub fn inline_lambda_body_packed_view(
+pub(crate) fn inline_lambda_body_packed_view(
     params: &[TypedParam],
     body: &TypedExpr,
     array: Temp,
@@ -475,7 +475,7 @@ pub fn inline_lambda_body_packed_view(
 /// union/Json param, or unbox a union value into a concrete param; pass through when the
 /// representations already match. (A two-directional companion to `coerce_arg_to_param`, which only
 /// boxes — the inliner can also need to UNBOX, e.g. a Json element bound to a concrete scalar param.)
-pub fn coerce_arg_to_param_repr(arg: Temp, arg_ty: &Type, param_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn coerce_arg_to_param_repr(arg: Temp, arg_ty: &Type, param_ty: &Type, builder: &mut FuncBuilder) -> Temp {
     // Two distinct numeric WIDTHS (e.g. an `Int32` element bound to an `Int64` callback param) are the
     // same *representation* (both unboxed scalars, so `type_repr_differs` is false) but NOT the same
     // physical width — a `Coerce` (sext/zext/sitofp/trunc) is still required, else the body computes on
@@ -498,7 +498,7 @@ pub fn coerce_arg_to_param_repr(arg: Temp, arg_ty: &Type, param_ty: &Type, build
 /// declared parameter type (e.g. box a concrete element to Json when the callback param
 /// is Json) so the closure ABI lines up. Returns the result temp typed as the closure's
 /// declared return type.
-pub fn call_body_closure(body: Temp, raw_args: &[(Temp, Type)], param_tys: &[Type], ret_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn call_body_closure(body: Temp, raw_args: &[(Temp, Type)], param_tys: &[Type], ret_ty: &Type, builder: &mut FuncBuilder) -> Temp {
     // TRUNCATE to the closure's REAL arity: a combinator may offer MORE arguments (e.g. the
     // trailing 0-based index) than the callback declares. A closure's compiled wrapper has exactly
     // `param_tys.len()` parameters, so calling it with surplus args would be ABI UB — drop them.
@@ -541,7 +541,7 @@ pub fn call_body_closure(body: Temp, raw_args: &[(Temp, Type)], param_tys: &[Typ
 /// leak is unchanged from before — provably reclaiming it needs the runtime move-vs-retain
 /// conventions to change, out of scope). `map`/`filter`/`reduce` use the plain
 /// `call_body_closure` and never reach this path, so their element-into-result moves are intact.
-pub fn call_body_closure_with_elem_boxes(body: Temp, raw_args: &[(Temp, Type)], param_tys: &[Type], ret_ty: &Type, builder: &mut FuncBuilder) -> (Temp, Vec<Temp>) {
+pub(crate) fn call_body_closure_with_elem_boxes(body: Temp, raw_args: &[(Temp, Type)], param_tys: &[Type], ret_ty: &Type, builder: &mut FuncBuilder) -> (Temp, Vec<Temp>) {
     // TRUNCATE to the closure's REAL arity (see `call_body_closure`): never pass surplus
     // combinator args (e.g. the trailing index) to a callback that declares fewer parameters.
     let n = param_tys.len();
@@ -578,7 +578,7 @@ pub fn call_body_closure_with_elem_boxes(body: Temp, raw_args: &[(Temp, Type)], 
 /// expects. `emit_index_loop` carries `i` as `Int64`, but the optional iterator-callback index
 /// param is `Int32` (checker + intrinsic signatures), so an explicit truncation is emitted here
 /// via `Coerce` (codegen lowers Int64→Int32 as a `trunc`). Returns a fresh `Int32` temp.
-pub fn narrow_loop_index(i: Temp, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn narrow_loop_index(i: Temp, builder: &mut FuncBuilder) -> Temp {
     let dst = builder.alloc_temp(Type::Int32);
     builder.emit(Instruction::Coerce {
         dst, src: i, from_ty: Type::Int64, to_ty: Type::Int32,
@@ -587,7 +587,7 @@ pub fn narrow_loop_index(i: Temp, builder: &mut FuncBuilder) -> Temp {
 }
 
 /// Coerce a concrete argument to a union/Json parameter (box it); pass through otherwise.
-pub fn coerce_arg_to_param(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn coerce_arg_to_param(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: &mut FuncBuilder) -> Temp {
     match param_ty {
         Some(pty) if is_union_ty(pty) && !is_union_ty(arg_ty) => box_to_json(arg, arg_ty, builder),
         _ => arg,
@@ -596,7 +596,7 @@ pub fn coerce_arg_to_param(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, bu
 
 /// Allocate an output array whose storage matches `elem_ty`: a flat scalar array for
 /// Int32/Int64/Float32/Float64, otherwise a tagged array. Returns (array_temp, is_flat).
-pub fn alloc_output_array(elem_ty: &Type, result_type: &Type, builder: &mut FuncBuilder) -> (Temp, Option<FlatElemKind>) {
+pub(crate) fn alloc_output_array(elem_ty: &Type, result_type: &Type, builder: &mut FuncBuilder) -> (Temp, Option<FlatElemKind>) {
     let flat = FlatElemKind::from_type(elem_ty);
     let out = builder.alloc_temp(result_type.clone());
     let intrinsic = match flat {
@@ -622,7 +622,7 @@ pub fn alloc_output_array(elem_ty: &Type, result_type: &Type, builder: &mut Func
 /// reference the same object at refcount 1, and releasing both double-frees it (the `filter` over an
 /// object array UAF; ADR-044 R2). A UNION element pushes via the retaining `lin_push_dyn`, and a
 /// flat-scalar element carries no refcount, so neither needs the extra retain.
-pub fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp, val_ty: &Type, borrowed: bool, builder: &mut FuncBuilder) {
+pub(crate) fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp, val_ty: &Type, borrowed: bool, builder: &mut FuncBuilder) {
     let push_dst = builder.alloc_temp(Type::Null);
     match flat {
         Some(kind) => {
@@ -690,7 +690,7 @@ pub fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: T
 /// True when two types have a different runtime representation such that a value of one
 /// must be coerced (boxed/unboxed) to be used as the other. Specifically: one is a
 /// union/Json (TaggedVal*) and the other is a concrete type.
-pub fn type_repr_differs(from: &Type, to: &Type) -> bool {
+pub(crate) fn type_repr_differs(from: &Type, to: &Type) -> bool {
     // A sealed scalar record flowing into (or out of) a `Named` type reference: same physical
     // representation (an opaque struct ptr), no conversion. `Named` is treated as union-ish by
     // `is_union_ty` (recursive types are boxed), which would otherwise box/materialize the sealed
@@ -810,7 +810,7 @@ pub fn type_repr_differs(from: &Type, to: &Type) -> bool {
 /// straight into `lin_flat_array_push_f64`, producing an i32-arg-to-f64-param type mismatch in
 /// the emitted IR. Reusing the existing `Coerce` instruction lets codegen's `compile_ir_coerce`
 /// emit the proper int→float / float-width conversion at the push site.
-pub fn scalar_numeric_repr_differs(from: &Type, to: &Type) -> bool {
+pub(crate) fn scalar_numeric_repr_differs(from: &Type, to: &Type) -> bool {
     if !from.is_numeric() || !to.is_numeric() {
         return false;
     }
@@ -837,7 +837,7 @@ pub fn scalar_numeric_repr_differs(from: &Type, to: &Type) -> bool {
 ///
 /// `compile_ir_coerce` picks the extension by the SOURCE type's signedness (sext for signed,
 /// zext for unsigned) — so a `UInt8` 0xFF widens to 255, a signed `Int8` -1 to -1.
-pub fn int_width_repr_differs(from: &Type, to: &Type) -> bool {
+pub(crate) fn int_width_repr_differs(from: &Type, to: &Type) -> bool {
     from.is_integer()
         && to.is_integer()
         && from.bit_width() != to.bit_width()
@@ -852,7 +852,7 @@ pub fn int_width_repr_differs(from: &Type, to: &Type) -> bool {
 /// but `arr[0]` uses the static dest stride and did not). Codegen's `compile_ir_coerce` materializes
 /// the converted buffer (`flat_array_widen`). This is the whole-array analogue of
 /// `scalar_numeric_repr_differs` (the mixed-numeric array LITERAL element case).
-pub fn flat_scalar_array_repr_differs(from: &Type, to: &Type) -> bool {
+pub(crate) fn flat_scalar_array_repr_differs(from: &Type, to: &Type) -> bool {
     if let (Type::Array(fe), Type::Array(te)) = (from, to) {
         return fe.is_flat_scalar() && te.is_flat_scalar() && fe != te;
     }
@@ -866,7 +866,7 @@ pub fn flat_scalar_array_repr_differs(from: &Type, to: &Type) -> bool {
 /// result is unconditionally +1 owned (register_owned), and the input keeps its own ownership
 /// (released later by normal liveness). `result_type` is `T | Error` (a boxed union), so the
 /// result temp is treated as a union box.
-pub fn lower_from_json(
+pub(crate) fn lower_from_json(
     target: &Type,
     value: &TypedExpr,
     result_type: &Type,
@@ -891,7 +891,7 @@ pub fn lower_from_json(
     dst
 }
 
-pub fn box_to_json(val: Temp, val_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn box_to_json(val: Temp, val_ty: &Type, builder: &mut FuncBuilder) -> Temp {
     if is_union_ty(val_ty) {
         return val;
     }
@@ -905,7 +905,7 @@ pub fn box_to_json(val: Temp, val_ty: &Type, builder: &mut FuncBuilder) -> Temp 
 
 /// `range(start, end)` → a flat Int32 array [start, start+1, ..., end-1].
 /// Lowered as: alloc flat array, then a fill loop pushing each value.
-pub fn lower_range(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_range(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let start_raw = lower_expr(&args[0], builder, ctx);
     let end_raw = lower_expr(&args[1], builder, ctx);
     // `lin_range` drives a NATIVE i32 loop counter, so its bounds must be concrete i32. A bound
@@ -975,7 +975,7 @@ pub fn lower_range(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut Lowe
 /// `iter(init, cond, next, current)` → eagerly build a Json array by looping:
 /// `s = init(); while cond(s) { push(current(s)); s = next(s) }`. The four callbacks are
 /// closures (uniform boxed ABI), so the state is carried as Json.
-pub fn lower_iter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_iter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let json = Type::TypeVar(u32::MAX);
     let init = lower_expr(&args[0], builder, ctx);
     let cond = lower_expr(&args[1], builder, ctx);
@@ -1036,7 +1036,7 @@ pub fn lower_iter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuil
 }
 
 /// How `emit_combinator_loop` obtains the per-iteration element it hands to the body callback.
-enum ElemAccess<'a> {
+pub(crate) enum ElemAccess<'a> {
     /// MATERIALIZE the element via `Instruction::Index` (`iterable[i]`) into a fresh temp of the
     /// given type, then pass that temp to the body. The standard tagged/flat read (ADR-044).
     Materialize(&'a Type),
@@ -1046,7 +1046,7 @@ enum ElemAccess<'a> {
 }
 
 /// What a combinator loop body decided after running — drives how the latch wires back to the header.
-enum LoopFlow {
+pub(crate) enum LoopFlow {
     /// `for`/`map`/`filter`/fusion: the body fell through (it never asks to stop the loop early);
     /// the latch unconditionally increments and back-edges to the header.
     Fallthrough,
@@ -1078,7 +1078,7 @@ enum LoopFlow {
 /// loop SCAFFOLDING, not the per-element ownership decision. (The `Index` op for a union/Json `elem`
 /// allocates a fresh 16-byte `TaggedVal*` shell each iteration; `map`/`filter`/`for` reclaim it via
 /// their `free_combinator_*` calls, the move-vs-retain subtlety documented at those call sites.)
-pub fn emit_combinator_loop<F>(
+pub(crate) fn emit_combinator_loop<F>(
     iterable: Temp,
     iterable_ty: &Type,
     access: ElemAccess,
@@ -1159,7 +1159,7 @@ pub fn emit_combinator_loop<F>(
 /// configuration of [`emit_combinator_loop`] that reads `iterable[i]` into a fresh `elem_ty` temp
 /// and always falls through to the latch. `body_fn(i, elem)` builds the body (and owns the
 /// element-box reclaim). Leaves the builder in the exit block.
-pub fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
+pub(crate) fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
     iterable: Temp,
     iterable_ty: &Type,
     elem_ty: &Type,
@@ -1178,7 +1178,7 @@ pub fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
 /// NOT materialize the element — it passes the loop counter `i` (Int64) to `body_fn` along with the
 /// (already-lowered) `iterable` temp, so the body can register a packed-element VIEW and read fields
 /// by const-offset. `body_fn(i, array, builder, ctx)`.
-pub fn emit_packed_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
+pub(crate) fn emit_packed_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
     iterable: Temp,
     iterable_ty: &Type,
     builder: &mut FuncBuilder,
@@ -1203,7 +1203,7 @@ pub fn emit_packed_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut Lower
 // ===========================================================================================
 
 /// One inlinable transformer stage of a fused combinator chain.
-enum FuseStage {
+pub(crate) enum FuseStage {
     Map { params: Vec<TypedParam>, body: TypedExpr, out_elem_ty: Type },
     Filter { params: Vec<TypedParam>, body: TypedExpr },
     /// `flatMap(f)` where `f: (T, Int32) => U[]`. Unlike Map/Filter (which transform/skip the carried
@@ -1219,7 +1219,7 @@ enum FuseStage {
 /// (`emit_flatmap_chain`), since a FlatMap wraps the rest of the pipeline in an inner loop rather than
 /// transforming the carried value in place. A flatMap-FREE chain keeps the original linear
 /// `apply_fuse_stages`/`emit_fused_loop` lowering byte-identically.
-pub fn chain_has_flatmap(stages: &[FuseStage]) -> bool {
+pub(crate) fn chain_has_flatmap(stages: &[FuseStage]) -> bool {
     stages.iter().any(|s| matches!(s, FuseStage::FlatMap { .. }))
 }
 
@@ -1227,7 +1227,7 @@ pub fn chain_has_flatmap(stages: &[FuseStage]) -> bool {
 /// a leading `std_iter_`/`std_array_` module prefix, returning the bare export name. Used to detect a
 /// `flatMap` specialization (`flatMap`, `flatMap$Int32_…`, `std_iter_flatMap`). Returns the matched
 /// canonical name for the names the fusion engine cares about, else None.
-pub fn combinator_base_name(sym: &str) -> Option<&'static str> {
+pub(crate) fn combinator_base_name(sym: &str) -> Option<&'static str> {
     let base = sym.split('$').next().unwrap_or(sym);
     let base = base.rsplit('_').next().unwrap_or(base);
     match base {
@@ -1240,7 +1240,7 @@ pub fn combinator_base_name(sym: &str) -> Option<&'static str> {
 /// is a direct call to one (via an intrinsic slot, an imported stdlib export, or — for `flatMap`, a
 /// genuine generic with no intrinsic — a monomorphized top-level spec tagged in `combinator_spec_slots`);
 /// else None.
-pub fn combinator_callee_name(expr: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> Option<&'static str> {
+pub(crate) fn combinator_callee_name(expr: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> Option<&'static str> {
     let TypedExpr::Call { func, .. } = expr else { return None };
     let TypedExpr::LocalGet { slot, .. } = func.as_ref() else { return None };
     // A monomorphized `flatMap` spec resolves via `global_fn_slots`, not an intrinsic/import slot.
@@ -1277,7 +1277,7 @@ pub fn combinator_callee_name(expr: &TypedExpr, builder: &FuncBuilder, ctx: &Low
 /// straight back into this terminal lowering, re-running `extract_fuse_chain` on the barrier's own
 /// receiver. So the barrier materialises exactly ONE intermediate array between two FUSED runs (a
 /// downstream pass over the barrier's output + an upstream pass producing it), never N unfused stages.
-pub fn extract_fuse_chain<'a>(
+pub(crate) fn extract_fuse_chain<'a>(
     recv: &'a TypedExpr,
     builder: &FuncBuilder,
     ctx: &LowerCtx,
@@ -1369,7 +1369,7 @@ pub fn extract_fuse_chain<'a>(
 /// one pass). So for the purpose of chain extraction the Coerce is transparent: peel it to the inner
 /// combinator call. Only peels an `Array -> Array` Coerce around a recognised combinator call (the
 /// exact generic-combinator boundary); any other Coerce is left intact (the chain stops there).
-pub fn peel_combinator_coerce<'a>(expr: &'a TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> &'a TypedExpr {
+pub(crate) fn peel_combinator_coerce<'a>(expr: &'a TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> &'a TypedExpr {
     if let TypedExpr::Coerce { expr: inner, from, to, .. } = expr {
         if matches!(from, Type::Array(_) | Type::Iterator(_))
             && matches!(to, Type::Array(_) | Type::Iterator(_))
@@ -1400,7 +1400,7 @@ pub fn peel_combinator_coerce<'a>(expr: &'a TypedExpr, builder: &FuncBuilder, ct
 ///     with `borrowed = is_borrowed_heap_elem(ty)` (retain into the result), mirroring the eager
 ///     `push(result, x)` retain exactly. (WAVE D: widened from the original scalar/sealed/union gate
 ///     so heap-element SOURCES and heap flatMap INNER arrays — `["a","b"].flatMap(s => [s, s])` — fuse.)
-pub fn fuse_elem_repr_reclaimable(ty: &Type) -> bool {
+pub(crate) fn fuse_elem_repr_reclaimable(ty: &Type) -> bool {
     is_inline_scalar(ty) || is_sealed_scalar_repr(ty) || is_union_ty(ty) || is_borrowed_heap_elem(ty)
 }
 
@@ -1409,7 +1409,7 @@ pub fn fuse_elem_repr_reclaimable(ty: &Type) -> bool {
 /// on a drop/consume path, but DOES need a retain when MOVED into a result array (a combinator that
 /// pushes it must use `borrowed = true`, mirroring the eager `push`). Excludes sealed records (a
 /// fresh +1 materialize) and unions (a fresh +1 box) — those take the dedicated reclaim helpers.
-pub fn is_borrowed_heap_elem(ty: &Type) -> bool {
+pub(crate) fn is_borrowed_heap_elem(ty: &Type) -> bool {
     !is_sealed_scalar_repr(ty) && !is_union_ty(ty) && is_heap_ty(ty)
 }
 
@@ -1418,7 +1418,7 @@ pub fn is_borrowed_heap_elem(ty: &Type) -> bool {
 /// frees it; a filter drop frees it; a filter-only chain leaves it as the carried value for the
 /// terminal to reclaim.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_fuse_stages(
+pub(crate) fn apply_fuse_stages(
     stages: &[FuseStage],
     mut elem: Temp,
     mut elem_ty: Type,
@@ -1500,7 +1500,7 @@ pub fn apply_fuse_stages(
 /// body reads the element, applies the stages, then runs `terminal` on the survivor. A filter skip
 /// jumps to a per-iteration `fuse_cont` latch; the terminal path converges there. Reuses
 /// `emit_index_loop` (back-edge patched to the CURRENT block = fuse_cont, the true latch).
-pub fn emit_fused_loop<T>(
+pub(crate) fn emit_fused_loop<T>(
     iterable: Temp,
     iterable_ty: &Type,
     read_elem_ty: &Type,
@@ -1560,7 +1560,7 @@ pub fn emit_fused_loop<T>(
 /// such counter is a loop-invariant `Int32` heap cell (allocated ONCE before the outer loop, init 0),
 /// incremented per element ARRIVING at that position. `None` when that position's lambda is 1-arg (no
 /// index used) — then no cell is allocated and no per-element increment is emitted.
-pub fn fm_next_index(counters: &[Option<Temp>], pos: usize, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn fm_next_index(counters: &[Option<Temp>], pos: usize, builder: &mut FuncBuilder) -> Temp {
     match counters.get(pos).and_then(|c| *c) {
         Some(cell) => {
             let cur = builder.alloc_temp(Type::Int32);
@@ -1581,7 +1581,7 @@ pub fn fm_next_index(counters: &[Option<Temp>], pos: usize, builder: &mut FuncBu
 /// Fully reclaim a per-iteration combinator element materialize (the SAME discipline the single-
 /// combinator + linear-fused paths use): a union/Json box (shell + retained inner) and/or a sealed
 /// struct. A no-op for an inline scalar. Used at every CONSUMING site in `fm_process`.
-pub fn fm_reclaim_elem(elem: Temp, elem_ty: &Type, builder: &mut FuncBuilder) {
+pub(crate) fn fm_reclaim_elem(elem: Temp, elem_ty: &Type, builder: &mut FuncBuilder) {
     free_combinator_elem_box_full(elem, elem_ty, builder);
     free_combinator_sealed_elem(elem, &Type::Null, elem_ty, builder);
 }
@@ -1594,7 +1594,7 @@ pub fn fm_reclaim_elem(elem: Temp, elem_ty: &Type, builder: &mut FuncBuilder) {
 /// whatever loop this stage runs in: the source loop for a pre-flatMap stage, an inner loop for a
 /// post-flatMap stage).
 #[allow(clippy::too_many_arguments)]
-pub fn fm_process(
+pub(crate) fn fm_process(
     stages: &[FuseStage],
     elem: Temp,
     elem_ty: Type,
@@ -1686,7 +1686,7 @@ pub fn fm_process(
 /// lambda declares ≥2 params (so it actually reads an index) — otherwise `None` (no cell, no
 /// per-element increment). Position 0 (the source-driven stage) always uses the raw source index.
 /// Returns a vec indexed by position (length `stages.len()+1`); index 0 is always `None`.
-pub fn fm_alloc_counters(
+pub(crate) fn fm_alloc_counters(
     stages: &[FuseStage],
     terminal_param_count: usize,
     builder: &mut FuncBuilder,
@@ -1719,7 +1719,7 @@ pub fn fm_alloc_counters(
 
 /// Free the counter cells allocated by `fm_alloc_counters` (plain `Int32` cells — `FreeCell` just
 /// reclaims the allocation, no value release). Called after the outer loop completes.
-pub fn fm_free_counters(counters: &[Option<Temp>], builder: &mut FuncBuilder) {
+pub(crate) fn fm_free_counters(counters: &[Option<Temp>], builder: &mut FuncBuilder) {
     for cell in counters.iter().flatten() {
         builder.emit(Instruction::FreeCell { cell: *cell, ty: Type::Int32 });
     }
@@ -1730,7 +1730,7 @@ pub fn fm_free_counters(counters: &[Option<Temp>], builder: &mut FuncBuilder) {
 /// element. `terminal(survivor, ty, out_idx)` is invoked at the leaf of the pipeline for each
 /// surviving element (and CONSUMES it — see the module note).
 #[allow(clippy::too_many_arguments)]
-pub fn emit_flatmap_fused_loop<T>(
+pub(crate) fn emit_flatmap_fused_loop<T>(
     iterable: Temp,
     iterable_ty: &Type,
     read_elem_ty: &Type,
@@ -1762,7 +1762,7 @@ pub fn emit_flatmap_fused_loop<T>(
 }
 
 /// `for(iterable, body)` → index loop calling `body(elem)` for side effects; returns Null.
-pub fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
     // STREAM `.for(fn)` (Stage 5): a `for` over a Stream is driven by the runtime, not the
     // index-loop. EOF ends the loop normally (→ Null); the first read Error becomes the for-expr's
@@ -1946,7 +1946,7 @@ pub fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerC
 /// ABI exactly as the generic `for` does over a flat-i32 source, and the per-iteration release /
 /// shell-reclaim sequence is byte-for-byte the generic-path logic — so RC behaviour (captured-`var`
 /// mutation, callback-return discard) is identical.
-pub fn lower_range_for(
+pub(crate) fn lower_range_for(
     start_e: &TypedExpr,
     end_e: &TypedExpr,
     callback: &TypedExpr,
@@ -2060,7 +2060,7 @@ pub fn lower_range_for(
 }
 
 /// `while(iterable, body)` → like `for`, but stops early when `body(elem)` returns false.
-pub fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[1]);
     // Read at the source's PROVABLE representation (ADR-044): tagged Json read unless provably flat,
@@ -2153,7 +2153,7 @@ pub fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut Lowe
 /// allocated, unshared 16-byte `TaggedVal*`, so freeing it is sound; it is null/cached-box safe.
 ///
 /// No-op for a flat-scalar element read (no box was allocated — the read produced a raw scalar).
-pub fn free_combinator_elem_box(elem: Temp, elem_ty: &Type, builder: &mut FuncBuilder) {
+pub(crate) fn free_combinator_elem_box(elem: Temp, elem_ty: &Type, builder: &mut FuncBuilder) {
     // Only a union/Json read allocates a standalone box; flat-scalar reads carry no shell.
     if is_union_ty(elem_ty) {
         builder.emit(Instruction::FreeBoxShell { val: elem });
@@ -2166,7 +2166,7 @@ pub fn free_combinator_elem_box(elem: Temp, elem_ty: &Type, builder: &mut FuncBu
 /// null/cached-box safe. Only fires for a union/Json read (a box was allocated). NEVER used on the
 /// KEEP path — there the element's inner was moved/retained into the result (see
 /// `free_combinator_elem_box`, the shell-only counterpart).
-pub fn free_combinator_elem_box_full(elem: Temp, elem_ty: &Type, builder: &mut FuncBuilder) {
+pub(crate) fn free_combinator_elem_box_full(elem: Temp, elem_ty: &Type, builder: &mut FuncBuilder) {
     if is_union_ty(elem_ty) {
         builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
     }
@@ -2195,7 +2195,7 @@ pub fn free_combinator_elem_box_full(elem: Temp, elem_ty: &Type, builder: &mut F
 /// `Release` on a sealed `Object` routes to `lin_sealed_release` (rc-- + heap-field walk on zero), so
 /// the struct's own field references are reclaimed and the (separately owned) source/result
 /// references are untouched — never a double-free. No-op unless the element is a sealed scalar repr.
-pub fn free_combinator_sealed_elem(elem: Temp, _iterable_ty: &Type, elem_ty: &Type, builder: &mut FuncBuilder) {
+pub(crate) fn free_combinator_sealed_elem(elem: Temp, _iterable_ty: &Type, elem_ty: &Type, builder: &mut FuncBuilder) {
     if is_sealed_scalar_repr(elem_ty) {
         builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
     }
@@ -2206,7 +2206,7 @@ pub fn free_combinator_sealed_elem(elem: Temp, _iterable_ty: &Type, elem_ty: &Ty
 /// the fusion engine should drive directly rather than calling the eager stdlib body. Mirrors the
 /// `combinator_callee_name` resolution, restricted to `flatMap` (the only generic combinator with no
 /// intrinsic). A genuine intrinsic combinator never reaches here (it dispatched earlier in `lower_call`).
-pub fn callee_is_flatmap(func: &TypedExpr, ctx: &LowerCtx) -> bool {
+pub(crate) fn callee_is_flatmap(func: &TypedExpr, ctx: &LowerCtx) -> bool {
     let TypedExpr::LocalGet { slot, .. } = func else { return false };
     if ctx.combinator_spec_slots.get(slot) == Some(&"flatMap") {
         return true;
@@ -2234,7 +2234,7 @@ pub fn callee_is_flatmap(func: &TypedExpr, ctx: &LowerCtx) -> bool {
 ///   - UNION/SEALED — a FRESH +1 box/struct. `push_output` (borrowed=false) takes the retaining
 ///     `lin_push_dyn` (the result owns its own ref) and does NOT release the box; `fm_reclaim_elem`
 ///     fully releases the original +1 box/struct. Net balanced.
-pub fn lower_flatmap_terminal(
+pub(crate) fn lower_flatmap_terminal(
     args: &[TypedExpr],
     result_type: &Type,
     builder: &mut FuncBuilder,
@@ -2286,7 +2286,7 @@ pub fn lower_flatmap_terminal(
 }
 
 /// `map(iterable, f)` → new array of `f(elem)` for each element.
-pub fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
     let (param_tys, cb_ret) = callback_signature(&args[1]);
 
@@ -2414,7 +2414,7 @@ pub fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuild
 }
 
 /// `filter(iterable, pred)` → new array of elements where `pred(elem)` is true.
-pub fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[1]);
 
@@ -2582,7 +2582,7 @@ pub fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBu
 /// caller gates `is_inline_scalar(result_type)`), so the cell store is a plain write (no RC) and the
 /// cell free reclaims only the allocation. The reducer's optional 3rd param is the OUTPUT index.
 #[allow(clippy::too_many_arguments)]
-pub fn lower_fused_reduce_flatmap(
+pub(crate) fn lower_fused_reduce_flatmap(
     base: &TypedExpr,
     stages: &[FuseStage],
     reducer_params: &[TypedParam],
@@ -2634,7 +2634,7 @@ pub fn lower_fused_reduce_flatmap(
 /// folds acc = f(acc, survivor). No intermediate array per stage, no per-stage closure call. The
 /// accumulator is carried UNBOXED through a value phi (gated to a scalar result_type by the caller).
 #[allow(clippy::too_many_arguments)]
-pub fn lower_fused_reduce(
+pub(crate) fn lower_fused_reduce(
     base: &TypedExpr,
     stages: &[FuseStage],
     reducer_params: &[TypedParam],
@@ -2731,7 +2731,7 @@ pub fn lower_fused_reduce(
 /// Like `apply_fuse_stages`, but for the FUSED REDUCE loop: a filter skip carries the unchanged
 /// accumulator `acc` to the shared `latch`. Returns the surviving (value, type) on the keep path.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_fuse_stages_reduce(
+pub(crate) fn apply_fuse_stages_reduce(
     stages: &[FuseStage],
     mut elem: Temp,
     mut elem_ty: Type,
@@ -2801,7 +2801,7 @@ pub fn apply_fuse_stages_reduce(
     Some((elem, elem_ty))
 }
 
-pub fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let json = Type::TypeVar(u32::MAX);
 
     // FUSED CHAIN (path-6 6a): when the reducer's receiver is a map/filter chain of inlinable lambdas
@@ -3039,7 +3039,7 @@ pub fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBu
 /// buffers are FLAT scalar arrays (sound for a numeric scalar element); the comparator reads them via
 /// the inlined flat getter. The copy-IN from `arr` uses the representation-agnostic tagged `Index`
 /// (sound even for a `[]`+push array statically typed flat).
-pub fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let arr_ty = args[0].ty();
     // Element type to STORE (the buffers' flat scalar repr) — from the array's static element type.
     let elem_ty = match result_type {
@@ -3283,7 +3283,7 @@ pub fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuil
 
 /// `min(a, b)` over two Int64 temps via a select-style CondJump+phi. Used by `lower_sort` for the
 /// run-boundary clamps (`min(lo+width, n)`).
-pub fn emit_min_i64(a: Temp, b: Temp, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn emit_min_i64(a: Temp, b: Temp, builder: &mut FuncBuilder) -> Temp {
     let cond = builder.alloc_temp(Type::Bool);
     builder.emit(Instruction::Binary { dst: cond, op: BinOp::Lt, lhs: a, rhs: b, operand_ty: Type::Int64, ty: Type::Bool });
     let then_b = builder.alloc_block("min_a");
