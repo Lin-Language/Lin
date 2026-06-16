@@ -761,16 +761,6 @@ unsafe fn push_display_value(out: &mut String, tagged: *const TaggedVal) {
         out.push_str("null");
         return;
     }
-    // SMI guard: inline integer — decode and display directly.
-    #[cfg(feature = "smi")]
-    {
-        let p = tagged as *const u8;
-        if crate::tagged::is_smi_ptr(p) {
-            let n: i64 = if crate::tagged::is_smi_int64_pub(p) { (p as i64) >> 2 } else { ((p as i64) >> 2) as i32 as i64 };
-            let _ = write!(out, "{}", n);
-            return;
-        }
-    }
     let tag = (*tagged).tag;
     let payload = (*tagged).payload;
     if tag == TAG_NULL { out.push_str("null"); return; }
@@ -946,15 +936,6 @@ unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
     if tagged.is_null() {
         return "N".to_string();
     }
-    // SMI guard: inline integer — use numeric key format.
-    #[cfg(feature = "smi")]
-    {
-        let p = tagged as *const u8;
-        if is_smi_ptr(p) {
-            let n: i64 = if is_smi_int64_pub(p) { (p as i64) >> 2 } else { ((p as i64) >> 2) as i32 as i64 };
-            return if is_smi_int64_pub(p) { format!("I:{}", n) } else { format!("i:{}", n as i32) };
-        }
-    }
     let tag = (*tagged).tag;
     let payload = (*tagged).payload;
     match tag {
@@ -1100,21 +1081,6 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
     if tagged.is_null() {
         return lin_null_to_string();
     }
-    // SMI guard: an inline integer is not a heap pointer — decode and stringify directly.
-    #[cfg(feature = "smi")]
-    {
-        let p = tagged as *const u8;
-        if crate::tagged::is_smi_ptr(p) {
-            let n = if crate::tagged::is_smi_int64_pub(p) {
-                // Int64 SMI: decode full 62-bit signed value.
-                (p as i64) >> 2
-            } else {
-                // Int32 SMI: decode 30-bit signed value, sign-extend.
-                ((p as i64) >> 2) as i32 as i64
-            };
-            return lin_int_to_string(n);
-        }
-    }
     let tag = (*tagged).tag;
     let payload = (*tagged).payload;
     if tag == TAG_NULL {
@@ -1193,17 +1159,6 @@ unsafe fn push_json_value(out: &mut String, tagged: *const TaggedVal) {
     if tagged.is_null() {
         out.push_str("null");
         return;
-    }
-    // SMI guard: inline integer — encode as JSON number directly.
-    #[cfg(feature = "smi")]
-    {
-        let p = tagged as *const u8;
-        if is_smi_ptr(p) {
-            let n: i64 = if is_smi_int64_pub(p) { (p as i64) >> 2 } else { ((p as i64) >> 2) as i32 as i64 };
-            use std::fmt::Write as _;
-            let _ = write!(out, "{}", n);
-            return;
-        }
     }
     let tag = (*tagged).tag;
     let payload = (*tagged).payload;
@@ -1495,7 +1450,6 @@ fn push_code_point(out: &mut Vec<u8>, code: i32, cbuf: &mut [u8; 4]) {
 /// (+1) LinString the caller must release. It never retains/releases the input and never frees
 /// anything it did not allocate — so, unlike `lin_tagged_to_string`'s TAG_STR fast path, there
 /// is no aliasing of the input string and thus no double-free risk on the input.
-/// SMI-safe: push_json_value guards is_smi_ptr internally.
 #[no_mangle]
 pub unsafe extern "C" fn lin_to_json(tagged: *const TaggedVal) -> *mut LinString {
     let mut out = String::new();
