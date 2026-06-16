@@ -364,6 +364,30 @@ impl Checker {
                 }
             }
         }
+        // Promote the forward-declared return type to the RESOLVED declared_ret BEFORE checking
+        // the body. Forward-declare runs with placeholder type bodies (e.g. `Named("Cursor")`)
+        // because type aliases are resolved during check_stmt, which runs AFTER both forward-
+        // declare passes. Without this, a recursive self-call inside the body sees the unresolved
+        // `Named("Cursor")` return type rather than the sealed expanded type, so the call's result
+        // type is `Named("Cursor")` (non-sealed). That propagates into if/match phi joins and
+        // prevents the outer object literal from auto-sealing (its "node" field appears unsealed).
+        // By patching the env slot here — before the body check — recursive calls inside the body
+        // already see the correct sealed_Cursor type, so all branches produce sealed_Cursor and
+        // the phi stays sealed.
+        if let (Some(name), Some(ref promoted_ret)) = (fn_name, &declared_ret) {
+            if let Some(binding) = self.env.lookup(name) {
+                if self.forward_declared.contains(&binding.slot) {
+                    if let Type::Function { params, required, lset, .. } = binding.ty.clone() {
+                        self.env.update_type(name, Type::Function {
+                            params,
+                            ret: Box::new(promoted_ret.clone()),
+                            required,
+                            lset,
+                        });
+                    }
+                }
+            }
+        }
         let typed_body_raw = match &declared_ret {
             Some(declared) if super::expr::expected_pushes_into_branches(declared) => {
                 checked_against_declared = true;
@@ -450,7 +474,16 @@ impl Checker {
                     ),
                 ));
             }
-            declared
+            // When the declared return is an unsealed object but the body inferred a structurally
+            // identical SEALED object, prefer the sealed type: the sealed repr is strictly better
+            // (no TAG_MAP allocs), and the two types are compat-equal (sealed flag is invisible to
+            // `types_compatible`). This lets a function declared as `: Cursor` that actually
+            // returns a sealed struct propagate the sealed repr through recursive calls and if
+            // merges instead of degrading every phi to a boxed TAG_MAP.
+            let promote_to_sealed = matches!((&declared, &body_ty),
+                (Type::Object { fields: df, sealed: false }, Type::Object { fields: bf, sealed: true })
+                if df == bf);
+            if promote_to_sealed { body_ty } else { declared }
         } else {
             // A bare `Number` return (ADR-014, reversed): require the body to be numeric (or itself
             // a numeric-bounded var that monomorphizes to a numeric family), then return the body's
