@@ -258,15 +258,27 @@ impl<'ctx> Codegen<'ctx> {
                     // repr (`func.repr`, threaded in as `arg_reprs[0]`) — the pass already applied
                     // the `sealed_array_elem` all-scalar gate. Oracle-proven equal to the former
                     // `sealed_array_elem(&arr_ty).is_some()` decision.
-                    if arg_reprs.first().and_then(|r| r.packed_sealed_array_layout()).is_some() {
-                        // Stage 1 pointer-backed array: push retains the struct pointer (+1).
-                        // The source struct stays owned (lower.rs no longer skips the ownership
-                        // transfer for this case — the array DOES take a ref now).
-                        let push_fn = self.get_or_declare_fn(
-                            "lin_sealed_ptr_array_push",
-                            self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
-                        self.builder.call(push_fn, &[arr.into(), elem.into()], "");
-                        return ptr_ty.const_null().into();
+                    if let Some(arr_repr) = arg_reprs.first() {
+                        if arr_repr.packed_sealed_array_layout().is_some() {
+                            if arr_repr.is_inline_sealed_array() {
+                                // 0xFE inline array: copy element payload + retain heap fields.
+                                // Source struct is NOT retained by this call (stays owned by the
+                                // caller's scope-exit release). RC is balanced: push retains heap
+                                // fields (+1); scope-exit release frees the source struct header
+                                // and releases heap fields (-1) → net heap fields at rc=1 (array owns).
+                                let push_fn = self.get_or_declare_fn(
+                                    "lin_sealed_array_push_struct_retaining",
+                                    self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                                self.builder.call(push_fn, &[arr.into(), elem.into()], "");
+                            } else {
+                                // 0xFD pointer-backed array: retain the struct pointer (+1).
+                                let push_fn = self.get_or_declare_fn(
+                                    "lin_sealed_ptr_array_push",
+                                    self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                                self.builder.call(push_fn, &[arr.into(), elem.into()], "");
+                            }
+                            return ptr_ty.const_null().into();
+                        }
                     }
                     let arr_elem_flat = matches!(&arr_ty, Type::Array(e) if Self::is_flat_scalar(e));
                     // A `Json[]` array (`Array(TypeVar(MAX))`, the Json/wildcard element) can hold a
