@@ -888,13 +888,17 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// FUSED `arr[idx].field` over a SEALED-RECORD ARRAY (Stage 3): a single constant-offset scalar
-    /// load directly from the contiguous, header-less element — no per-element struct
-    /// materialization. The element payload begins at `data + idx*stride`; the field lives at the
-    /// struct-relative `sealed_field_layout` offset MINUS `SEALED_HEADER` (array elements are
-    /// header-less). Bounds-checked inline (Python-style negative index; OOB defers to the runtime
-    /// `lin_sealed_array_elem_ptr` so the fault message is byte-identical). `arr_ty` is `Array(elem)`.
-    /// LinArray layout: len u64 @ byte 8, data ptr @ byte 24, elem_stride u64 @ byte 32.
+    /// FUSED `arr[idx].field` over a SEALED-RECORD ARRAY: a single constant-offset scalar load from
+    /// the element — no per-element struct materialization. Dispatches on the array's repr:
+    ///
+    /// - **0xFE inline** (`arr_repr.is_inline_sealed_array()`): element payload at
+    ///   `data + actual*stride + (field_off - SEALED_HEADER)`. Stride is loaded from `arr+32`.
+    ///   OOB cold-path: `lin_sealed_array_elem_ptr(arr, idx)` (faults).
+    ///
+    /// - **0xFD pointer-backed** (default): struct pointer at `*(ptr*)(data + actual*8)`; field at
+    ///   `sptr + field_off` (full struct-relative offset). OOB: `lin_sealed_ptr_array_get_ptr`.
+    ///
+    /// `arr_ty` is `Array(elem)`. LinArray layout: len u64 @ 8, data ptr @ 24, stride u64 @ 32.
     pub(crate) fn compile_ir_sealed_array_field_get(
         &mut self,
         arr: BasicValueEnum<'ctx>,
@@ -907,24 +911,18 @@ impl<'ctx> Codegen<'ctx> {
         let _ = arr_ty;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
-        // STAGE 3: the packed-sealed-array ASSUME is read from the array operand's repr (proven by
-        // the pass + verifier to carry a real `elem_tag==0xFE` packed buffer exactly where the old
-        // `sealed_array_elem(arr_ty)` gate fired). Oracle-proven byte identical.
         let Some(fields) = arr_repr.packed_sealed_array_layout() else {
             return ptr_ty.const_null().into();
         };
         let fields = fields.clone();
-        // A field NOT in the sealed element's shape is statically absent — `sealed_field_layout`
-        // would assert. Follow safe-access (§6.1: missing key → Null) instead of panicking.
         if !fields.contains_key(field) {
             return self.null_value_for(result_ty);
         }
         let (field_off, _total) = Self::sealed_field_layout(&fields, field);
-        // Stage 1 pointer-backed: use full struct-relative offset (includes SEALED_HEADER) —
-        // the GEP goes into sptr which points at the struct base, not the payload.
         let fld_ty = fields.get(field).cloned().unwrap_or(Type::Null);
         let llvm_fld = self.llvm_type(&fld_ty);
         let arr_ptr = arr.into_pointer_value();
+        let is_inline = arr_repr.is_inline_sealed_array();
 
         // Normalise idx to i64.
         let idx = if idx.is_int_value() {
@@ -934,7 +932,7 @@ impl<'ctx> Codegen<'ctx> {
             self.unbox_value(idx, &Type::Int64).into_int_value()
         };
 
-        // len = *(u64*)(arr + 8); data = *(ptr*)(arr + 24)
+        // len = *(u64*)(arr + 8)
         let len_ptr = unsafe { self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(8, false)], "sarr_len_p") };
         let len = self.builder.load(i64_ty, len_ptr, "sarr_len").into_int_value();
         let zero = i64_ty.const_zero();
@@ -948,27 +946,74 @@ impl<'ctx> Codegen<'ctx> {
         let oob_b = self.context.append_basic_block(llvm_fn, "sarr_oob");
         self.builder.conditional_branch(oob, oob_b, ok_b);
 
-        // Cold OOB path: defer to the runtime accessor (bounds-checked, faults) with the ORIGINAL
-        // index for the correct fault message; it does not return. For pointer-backed arrays,
-        // lin_sealed_ptr_array_get_ptr has the same signature and faulting behaviour.
+        // Cold OOB path: delegate to a runtime fault function (same for both layouts).
         self.builder.position_at_end(oob_b);
-        let elem_fn = self.get_or_declare_fn("lin_sealed_ptr_array_get_ptr",
-            ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
-        self.builder.call(elem_fn, &[arr_ptr.into(), idx.into()], "sarr_oob_call");
+        if is_inline {
+            let elem_fn = self.get_or_declare_fn("lin_sealed_array_elem_ptr",
+                ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+            self.builder.call(elem_fn, &[arr_ptr.into(), idx.into()], "sarr_oob_call");
+        } else {
+            let elem_fn = self.get_or_declare_fn("lin_sealed_ptr_array_get_ptr",
+                ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+            self.builder.call(elem_fn, &[arr_ptr.into(), idx.into()], "sarr_oob_call");
+        }
         self.builder.unreachable();
 
-        // Fast path (Stage 1 pointer-backed): data = *(ptr*)(arr+24);
-        //   sptr = *(ptr*)(data + actual*8);   // load the struct pointer from the 8-byte slot
-        //   field_ptr = sptr + field_off;       // full struct-relative offset (includes SEALED_HEADER)
         self.builder.position_at_end(ok_b);
+        // data = *(ptr*)(arr + 24)
         let data_pp = unsafe { self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(24, false)], "sarr_data_pp") };
         let data = self.builder.load(ptr_ty, data_pp, "sarr_data").into_pointer_value();
-        // Each slot is 8 bytes (pointer size); byte offset = actual * 8.
-        let slot_off = self.builder.int_mul(actual, i64_ty.const_int(8, false), "sarr_slot_off");
-        let slot_p = unsafe { self.builder.gep(self.context.i8_type(), data, &[slot_off], "sarr_slot_p") };
-        let sptr = self.builder.load(ptr_ty, slot_p, "sarr_sptr").into_pointer_value();
-        // field_off is the full struct-relative offset (SEALED_HEADER + payload offset).
-        let fld_p = unsafe { self.builder.gep(self.context.i8_type(), sptr, &[i64_ty.const_int(field_off, false)], "sarr_fld_p") };
+
+        let fld_p = if is_inline {
+            // 0xFE inline (statically known): stride from arr+32; field at data + actual*stride + payload_off.
+            let stride_pp = unsafe { self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(32, false)], "sarr_str_p") };
+            let stride = self.builder.load(i64_ty, stride_pp, "sarr_stride").into_int_value();
+            let elem_off = self.builder.int_mul(actual, stride, "sarr_elem_off");
+            let payload_off = field_off - Self::SEALED_HEADER;
+            let byte_off = self.builder.int_add(elem_off, i64_ty.const_int(payload_off, false), "sarr_byte_off");
+            unsafe { self.builder.gep(self.context.i8_type(), data, &[byte_off], "sarr_fld_p") }
+        } else {
+            // repr is 0xFD (or unknown/container-sourced). Check the runtime elem_tag to handle
+            // 0xFE arrays that escaped via a container store (Phase-2: the array pointer was kept
+            // packed and stored into a map value / record field; on read-back the repr is not
+            // statically inline but the buffer IS a 0xFE contiguous payload buffer).
+            let i8_ty = self.context.i8_type();
+            let etag_p = unsafe { self.builder.gep(i8_ty, arr_ptr, &[i64_ty.const_int(4, false)], "sarr_etag_p") };
+            let etag = self.builder.load(i8_ty, etag_p, "sarr_etag").into_int_value();
+            let is_fe = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFE, false), "sarr_isfe");
+
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let fe_b   = self.context.append_basic_block(llvm_fn, "sarr_fe");
+            let fd_b   = self.context.append_basic_block(llvm_fn, "sarr_fd");
+            let fld_b  = self.context.append_basic_block(llvm_fn, "sarr_fld_m");
+            self.builder.conditional_branch(is_fe, fe_b, fd_b);
+
+            // 0xFE branch: inline stride path.
+            self.builder.position_at_end(fe_b);
+            let stride_pp = unsafe { self.builder.gep(i8_ty, arr_ptr, &[i64_ty.const_int(32, false)], "sarr_fe_str_p") };
+            let stride = self.builder.load(i64_ty, stride_pp, "sarr_fe_stride").into_int_value();
+            let elem_off_fe = self.builder.int_mul(actual, stride, "sarr_fe_eoff");
+            let payload_off = field_off - Self::SEALED_HEADER;
+            let byte_off_fe = self.builder.int_add(elem_off_fe, i64_ty.const_int(payload_off, false), "sarr_fe_boff");
+            let fe_fld_p = unsafe { self.builder.gep(i8_ty, data, &[byte_off_fe], "sarr_fe_fp") };
+            let fe_fld_p_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(fld_b);
+
+            // 0xFD branch: pointer-backed path.
+            self.builder.position_at_end(fd_b);
+            let slot_off = self.builder.int_mul(actual, i64_ty.const_int(8, false), "sarr_fd_soff");
+            let slot_p = unsafe { self.builder.gep(i8_ty, data, &[slot_off], "sarr_fd_sp") };
+            let sptr = self.builder.load(ptr_ty, slot_p, "sarr_fd_sptr").into_pointer_value();
+            let fd_fld_p = unsafe { self.builder.gep(i8_ty, sptr, &[i64_ty.const_int(field_off, false)], "sarr_fd_fp") };
+            let fd_fld_p_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(fld_b);
+
+            // Merge: phi the field pointer from both branches.
+            self.builder.position_at_end(fld_b);
+            let phi = self.builder.phi(ptr_ty, "sarr_fld_phi");
+            phi.add_incoming(&[(&fe_fld_p, fe_fld_p_exit), (&fd_fld_p, fd_fld_p_exit)]);
+            phi.as_basic_value().into_pointer_value()
+        };
         let loaded = self.builder.load(llvm_fld, fld_p, "sarr_fld");
         if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
     }

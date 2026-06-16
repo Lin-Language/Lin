@@ -212,12 +212,21 @@ The 23GB is genuinely-live object/array structures. Each lever below was measure
 Per-kind attribution of RAPTOR's peak (132M live): **map 51.5M = 15.25GB (76%)**, sealed 69.8M = 4.47GB,
 tagbox 6.9M live (transient), array/string 0.38GB. So:
 - **LinMap memory efficiency is the #1 MEMORY lever** (15GB). Each LinMap = INITIAL_CAP slots × 32B
-  (hash8+key8+value:TaggedVal16) + a 64B order array, fixed regardless of entry count. Each slot stores a
-  16B TaggedVal even for a `{String:Int32}` value (12B wasted/entry). Sub-levers: (a) INITIAL_CAP 8→4
-  measured **−1.4GB, digest exact** [cheap, ready to merge once master green]; (b) **unboxed/typed map
-  values** — `{String:Int32}` stores Int32 inline (4B) not a 16B TaggedVal → big for the large scalar maps
-  (routeStopIndex, ScanResults rounds); (c) inline-small-map (≤2-4 entries in header, no slots/order alloc).
-  Also investigate the 51.5M COUNT — high for RAPTOR's index; size-histogram + alloc-site needed.
+  (hash8+key8+value:TaggedVal16) + an order array, fixed regardless of entry count. Sub-levers:
+  - (a) **INITIAL_CAP 8→4 — DONE+MERGED** (`c8119174`, −1.4GB, byte-identical IR). The cheap safe win.
+  - (b) **unboxed/typed map values (16B TaggedVal→8B payload) — ~2.9GB, but ABI-BLOCKED, scoped not landed.**
+    Per-map memory is structurally floored at 32B/slot (TaggedVal is 16B + 8-aligned; hash u64→u32 re-pads;
+    slots+order can't co-allocate — they grow at different times). The only real shrink is value-unbox, but
+    `lin_map_get` returns a BORROWED interior `*const TaggedVal` into the slot (runtime.rs:24). Shrinking the
+    in-slot value forces get to return a pointer to a reconstructed scratch TaggedVal. **FEASIBILITY PROVEN
+    (2026-06-16): every codegen consumer (index.rs:179-238, object.rs, mod.rs) loads tag+payload immediately
+    and none holds two live borrowed results across a second get → a thread-local scratch return is safe.**
+    BUT it narrows the documented "interior pointer" contract on the hottest 15GB-critical path → a latent
+    UAF if future codegen ever interleaves two gets. **DECISION: do NOT land unsupervised; queue for a
+    supervised session.** See memory `project_linmap_memory_lever`.
+  - (c) inline-small-map (≤2-4 entries in header) — not pursued; same scratch-ABI issue for the value read.
+  - The 51.5M COUNT is the structural floor (one `{String:Trip[]}` route table per stop, legitimately maps).
+    Fewer maps = an algorithmic RAPTOR change (bigger project), not a per-map repr tweak.
 - **`0xFE` inline records STAYS A PRIORITY** (not demoted): the beyond-Node array repr (headerless inline,
   no per-element header/malloc/pointer) — speed + locality + ~1.5GB; pursue alongside the map lever.
 - interning ❌ (0.1%), arena ~17%/4GB (`frozen()` free half), seal-union-fields = interp speed (separate).
@@ -240,10 +249,10 @@ tagbox 6.9M live (transient), array/string 0.38GB. So:
   construction paths to escape-gated `0xFE`. Runtime support + read paths already accept `0xFE`. Whether
   it's worth the multi-path migration needs the per-KIND attribution (below) to confirm records dominate.
 
-- [ ] **Small-int CACHE widen — cheap safe win (≤65536 only).** A CPython-style cache `[-128,1024)` already
-  exists (tagged.rs); widening to 65536 = 2.0MB static, zero codegen/consumer changes (3 lines), makes
-  in-range int boxes shared-immortal. DO NOT widen to dates (20991225 = 640MB static = memory regression +
-  binary bloat + bad CPU-cache locality). The cache is O(range) — small ranges only.
+- [x] **Small-int CACHE widen — DONE (≤65536).** Widened `[-128,1024)` → 65536 in tagged.rs (2.0MB static,
+  3-line change, in-range int boxes shared-immortal). DO NOT widen to dates (20991225 = 640MB static =
+  memory regression + binary bloat + bad CPU-cache locality). The cache is O(range) — small ranges only.
+  Dates-as-ints need the SMI mechanism below, not a cache.
 
 - [ ] **Pointer-tagged SMI (small-int inlining) — the RIGHT mechanism for DATES-as-ints.** Stores small
   ints immediate in the value word (low tag bit; pointers are 8-aligned) → zero allocation, zero static,
@@ -252,11 +261,12 @@ tagbox 6.9M live (transient), array/string 0.38GB. So:
   cache can't cover the date range). Bigger adventure; do after the cache widen if it disappoints, OR
   pull forward for the dates feature. Probe: experiment/small-int-inline (LIN_SMI_STATS, unmerged).
 
-- [ ] **Per-KIND / per-PHASE attribution (the gating measurement).** The 265M live by size class points at
-  records (≤48-64B = 174M) but is NOT yet confirmed by KIND (string/array/map/sealed/box) or PHASE (is it
-  LOAD intermediates retained into PREP = reclaimable, or the typed records themselves = representation?).
-  This decides whether the `0xFE` multi-path migration is worth it. (A 6-kind net-live counter was started
-  on experiment/wave-r-attribution but parked.)
+- [x] **Per-KIND / per-PHASE attribution — DONE (gating measurement).** Result: at peak (132M live), **map
+  51.5M = 15.25GB (76%)**, sealed 69.8M = 4.47GB, tagbox 6.9M (transient, 232M cum allocs → mostly freed),
+  array 0.30GB, string 0.08GB, sumnode 0. PHASE: LOAD's allocs are 100% RETAINED into PREP (peak is during
+  PREP); maps grow 2.9M→51.5M during PREP building `{String:Trip[]}` route tables; sealed grows 6.4M→69.8M
+  (the Trip/StopTime records). So: the dominant lever is MAP per-map cost (→ ABI-blocked, above), NOT 0xFE
+  (records are sealed=4.47GB, second place). The maps are legitimately maps, not mis-materialized records.
 
 - [ ] **Header compaction 24→16B** — merge `{size,heap_desc,named_desc}` (16B) into one per-type metadata
   pointer (8B). ~100-site / 20-file layout migration (every field offset shifts 8B, UAF risk). ~8B/record.
@@ -341,9 +351,55 @@ TAG_OBJECT comment sweep + lin_object→lin_map rename. **B2 (TagClass walker) D
 refactor, motivating bugs already fixed. Plus **bc** codegen box/unbox cleanup (5 items: unbox dedup,
 type_tag_open delete, box_map_of, BuilderExt::select, RuntimeFns fields). Master `1999bc3e`.
 
+### IN FLIGHT / RESOLVED — parallel lanes launched 2026-06-16 (file-disjoint worktrees, Bedrock sonnet)
+Conductor (me) runs the heavy RAPTOR digest+RSS at integration; agents run light gates only.
+- [~] **Lane V — value-unbox (#16) → PARKED (sound, NO RAPTOR win).** In-house, branch `lane/map-value-unbox`
+  commit `bdc00134`. Variable-stride slots (24B homogeneous / 32B MIXED), ABI preserved via per-thread scratch
+  ring. Gates GREEN: 123 runtime + 820 integ + 73 stdlib + **RAPTOR digest EXACT**. But peak RSS unchanged.
+  **MEASURED ROOT CAUSE (LIN_VKIND_STATS): 99.99% of maps go MIXED** — first-insert tag is TAG_STR (204.8M) /
+  TAG_INT32 (35.1M) then a different tag → the 51.5M dominant maps are **materialized RECORDS** (StopTime/Trip
+  `{stopId:String, arrivalTime:Int64,…}`), NOT `{String:T}` index maps. Heterogeneous ⇒ value-unbox can't
+  shrink them. **THE HEADLINE LEVER IS THEREFORE: eliminate record→map materialization (keep records PACKED)
+  = the 0xFE / Path-9 packed-record campaign**, not map-slot value-unbox. Branch parked, ready for a
+  homogeneous-scalar-map workload. See memory `project_linmap_memory_lever`.
+- [ ] **Lane U — seal union-ptr fields (#17)** · /tmp/wt-union, `lane/seal-union-ptr` · owns lin-check checker +
+  `codegen/boxing.rs`+`types.rs`. Admit single-pointer union fields (interp `Cursor.node`) into sealing.
+  STILL RUNNING (no commits yet).
+- [~] **Interp Option C (RC elision at Borrow calls) → SOUND but ~0% measured.** `lane/interp-borrow-rc` commit
+  `139b35bd`: convention-aware RC elision across Borrow calls + intrinsics (reuses ownership_verify, no new
+  analysis), 28 RC ops elided (IR-confirmed), 820/0 + 73/73 + ASan-clean on interp/calc/report/sumtree. Wall:
+  2.69→2.71s (NOISE). REFUTES the design's 15-30% — interp is ALLOC/MAP-CHURN bound (lin_map_alloc per AST
+  node), NOT RC-bound. Keepable as a general RC-traffic reduction but RC elision is UAF-sensitive → gate on
+  RAPTOR digest+ASan before merge. **The real interp lever = Option D: stack-allocate per-frame Cursor/Token
+  records (alloc elimination)** — overlaps lane F escape.rs, sequence after F.
+
+> META-PATTERN (2026-06-16): the "clean" repr/RC optimizations (map value-unbox, RC elision) are each SOUND but
+> move ~0% on the headline workloads — both bottlenecks are ALLOCATION/MATERIALIZATION, not repr or RC traffic.
+> RAPTOR = record→map materialization (lane F 0xFE / packed records); interp = per-AST-node alloc churn (Option D
+> stack-alloc). The real wins require attacking alloc/materialization directly.
+- [x] **Lane S — SMI dates (#12) → MERGED to master `7140c05b`.** Pointer-tagged immediate small ints behind
+  cargo feature `smi` (default OFF → master byte-identical: workspace 820/0 + 73/73 + fmt all green feature-off;
+  feature-on compiles). Cherry-picked off the stale experiment branch onto master (fixed a duplicate-`[features]`
+  collision with mimalloc). INCOMPLETE SLICE — the flag stages it: ~180 consumer sites must guard the tag bit
+  before it can flip default-ON. Foundation for Linus's dates-as-ints feature.
+- [x] **Lane F — 0xFE phase-2 (#9) → MERGED to master `c2f77121` (sound; no RAPTOR win today, keepable win for
+  local read-only record arrays + foundation for build-then-store ports).** Conductor-verified comprehensively:
+  gate audited (strict allowlist, fails-safe — only Index/FieldGet/SealedArrayFieldGet/Retain/Release promote
+  to 0xFE; push/sort/Call/IndexSet/Return/capture/Phi all → 0xFD), workspace 820/0 + 73/73, RAPTOR digest-EXACT
+  + no-crash, 0xFE-firing correctness test PASS (10 & 100), ASan-CLEAN on a 0xFE-firing build (channel confirmed
+  via UAF control). Regression tests committed: 0xfe_inline_read.test.lin + 0xfe_sort_repro.lin.
+  Crash fixed `be60bf77` (removed the unsound container-escape allowance). ROOT FINDING via the repro: RAPTOR
+  builds arrays with **store-then-push** (`groups[key]=[]; push(groups[key], trip)`) — fundamentally
+  incompatible with 0xFE inline (push corrupts the inline buffer / breaks element addressing). So
+  container-escaping arrays MUST stay 0xFD, and 0xFE only ever fires for LOCAL read-only arrays (which RAPTOR's
+  hot path doesn't have) → no RAPTOR win, ≈ Phase-1. Gates green (820/0, 73/73, ASan-clean, repro passes).
+  **KEEPABLE FOUNDATION (Linus's RAPTOR port):** 0xFE becomes viable IFF the port restructures to
+  **build-the-array-fully-THEN-store** (read-only after escape) — then inline saves ~48B/record (header+malloc+
+  ptr) AND avoids read-materialization. Parked as a sound gate, ready for that port shape. Branch unmerged.
+
 ### OPEN — concrete next items (post-Wave-B)
-- [ ] **Wave R** (above) — per-kind attribution → escape-gated `0xFE` inline (big) OR small-int cache
-  widen to 65536 (cheap) OR SMI for dates (Linus's feature). interning RULED OUT.
+- [ ] **Wave R** (above) — per-kind attribution DONE → the 4 lanes above are the chosen levers.
+  Headline LinMap value-unbox is ABI-blocked (lane V attempts the thread-local-scratch workaround).
 - [ ] **#8 Float32 sealed-record size divergence** — sealed_named_field_kind(Float32)=NKIND_FLOAT64(8B) vs
   physical 4B → over-alloc in the dynamic alloc path. Fix = NKIND_FLOAT32 in table + materializer arm.
   Changes boxing semantics (not byte-identical) → ASan+digest+crafted-test. Attended-grade.
