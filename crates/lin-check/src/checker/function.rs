@@ -2,6 +2,7 @@ use lin_common::{Diagnostic, Span};
 use lin_parse::ast::{Expr, Param, Pattern};
 
 use super::Checker;
+use super::helpers::is_all_scalar_sealed_record;
 use crate::resolve::resolve_type;
 use crate::typed_ir::*;
 use crate::types::Type;
@@ -374,16 +375,27 @@ impl Checker {
         // By patching the env slot here — before the body check — recursive calls inside the body
         // already see the correct sealed_Cursor type, so all branches produce sealed_Cursor and
         // the phi stays sealed.
+        //
+        // EXCEPTION: do NOT patch when the promoted return is a pure all-scalar sealed record.
+        // For those, the `Named(...)` placeholder left in the env is what makes `unify_types`
+        // produce a Union intermediate for if-branches (sealed ≠ Named → Union). That Union causes
+        // a boxing Coerce to be emitted in `coerce_if_branch`, which prevents the function param
+        // from flowing directly into the Phi. Without that alias break the param joins the
+        // TailCall arg's carry class and is marked escaping, suppressing Stage-4 stack allocation
+        // for the TCO construction. Records with pointer/sum-type fields are not all-scalar, so
+        // they still get the patch and retain the sealed-field-read optimization.
         if let (Some(name), Some(ref promoted_ret)) = (fn_name, &declared_ret) {
-            if let Some(binding) = self.env.lookup(name) {
-                if self.forward_declared.contains(&binding.slot) {
-                    if let Type::Function { params, required, lset, .. } = binding.ty.clone() {
-                        self.env.update_type(name, Type::Function {
-                            params,
-                            ret: Box::new(promoted_ret.clone()),
-                            required,
-                            lset,
-                        });
+            if !is_all_scalar_sealed_record(promoted_ret) {
+                if let Some(binding) = self.env.lookup(name) {
+                    if self.forward_declared.contains(&binding.slot) {
+                        if let Type::Function { params, required, lset, .. } = binding.ty.clone() {
+                            self.env.update_type(name, Type::Function {
+                                params,
+                                ret: Box::new(promoted_ret.clone()),
+                                required,
+                                lset,
+                            });
+                        }
                     }
                 }
             }
