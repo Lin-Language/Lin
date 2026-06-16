@@ -1128,7 +1128,7 @@ mod tests {
     #[test]
     fn sum_type_gate_accepts_scalar_variants() {
         assert!(super::sum_type_eligible(&shape_union()));
-        assert_eq!(super::sum_type_discriminant(&shape_union()).as_deref(), Some("kind"));
+        assert_eq!(super::sum_type_discriminant_of(&shape_union()).as_deref(), Some("kind"));
     }
 
     #[test]
@@ -1148,7 +1148,7 @@ mod tests {
             Type::Object { fields: b, sealed: true },
         ]);
         assert!(super::sum_type_eligible(&u), "String-field variant is eligible (Stage 3)");
-        assert_eq!(super::sum_type_discriminant(&u).as_deref(), Some("kind"));
+        assert_eq!(super::sum_type_discriminant_of(&u).as_deref(), Some("kind"));
     }
 
     #[test]
@@ -1203,7 +1203,7 @@ mod tests {
         // `Ast` detected env-free as the unique `Named` appearing in a variant field.
         let ast = ast_union();
         assert!(super::sum_type_eligible(&ast), "recursive sum type must be eligible");
-        assert_eq!(super::sum_type_discriminant(&ast).as_deref(), Some("kind"));
+        assert_eq!(super::sum_type_discriminant_of(&ast).as_deref(), Some("kind"));
         assert_eq!(super::sum_recursive_self_name(&ast).as_deref(), Some("Ast"));
     }
 
