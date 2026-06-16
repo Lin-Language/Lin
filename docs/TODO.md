@@ -189,22 +189,59 @@ experiment/mem-profile — NOT merged, it's a probe):
   same data in 2-4GB because V8 stores object arrays contiguously with inline fields and small-int
   values; Lin allocates a separate heap object per record AND per field/value, with no columnar storage.
 
-This is the dominant remaining gap and an ARCHITECTURAL project (call it Wave R — representation
-efficiency), bigger than the Wave B cleanups. Candidate levers, roughly highest-ROI first:
-- [ ] **Attribute the 265M precisely**: split the counter by allocation KIND (string/array/map/sealed/
-  box) and by phase (LOAD vs PREP vs RANGE) to see whether LOAD intermediates (parsed CSV rows / Json)
-  are retained into PREP (a reclaimable retention) vs the typed records themselves (representation).
-- [ ] **Intern repeated strings**: stop_id/route_id/trip_id repeat across millions of stop_times; if each
-  record holds its own LinString copy, interning collapses millions of duplicates to thousands.
-- [ ] **Columnar / flat scalar storage for record arrays**: a `StopTime[]` of all-scalar (Int) fields
-  could be a flat struct-of-arrays (one allocation for N records) instead of N boxed records — the
-  0xFE packed-array path already exists; widen it so a big record array is one buffer, not N objects.
-- [ ] **Stop boxing scalar values in dynamic containers** (the ≤16B 38M boxes) — immediate/tagged
-  small-int values (the path-10 8-byte-immediate spike) avoid a heap box per dynamic scalar.
-- [ ] **Avoid PREP record-copy doubling** (memory note: "value-array regroup copies records") — regroup
-  by index/reference instead of copying record values.
-Deliverable already achieved: root cause (allocation amplification ~100×) + allocator ruled out. Next is
-the per-kind/per-phase attribution to pick the highest-ROI lever.
+This is the dominant remaining gap and an ARCHITECTURAL project = **Wave R (representation efficiency)**.
+
+## WAVE R — representation efficiency (levers MEASURED 2026-06-16)
+
+The 23GB is genuinely-live object/array structures. Each lever below was measured; status reflects data.
+
+- [x] **String interning — RULED OUT (measured negative, 0.1% RSS).** Dedup ratio is huge (347×: 65k
+  distinct short strings, millions of requests) BUT peak RSS dropped only ~31MB / 25GB. RAPTOR's parse is
+  STREAMING → transient duplicate strings are already freed before peak; the retained string keys are few
+  and same-byte-count interned-or-not. Node's main trick does NOT transfer to a streaming loader. (Gave a
+  minor ~3-4% wall-clock from fewer allocs.) Probe: experiment/string-intern (unmerged).
+
+- [ ] **Contiguous inline `0xFE` record arrays — the measured-correct DIRECTION, but a multi-path migration
+  (not done).** KEY INSIGHT (with Linus): Node's "contiguous arrays" are a contiguous array of POINTERS to
+  heap objects (V8 FixedArray) — which Lin's `0xFD` SEALED_PTR repr ALREADY IS (contiguous ptr spine +
+  separate structs, reference semantics preserved). So Lin already matches Node here; inline `0xFE` (one
+  buffer of header-less record payloads) goes BEYOND Node, eliminating the 24B per-element header + 16B
+  malloc overhead + 8B pointer (~48B/record). It COPIES the record, so it breaks `push(arr,t); t.x=5`
+  visibility → SOUND ONLY when the element does not escape/mutate after push (escape-gated; escape.rs
+  exists). A 2-site spike (MakeArray literal + Push intrinsic) was BUILT (branch experiment/contiguous-
+  arrays) and is alias-safe (819/0 + RAPTOR GROUP digest held) — but produced ZERO `0xFE` in RAPTOR's IR:
+  RAPTOR builds record arrays via the PROJECTION path (`data/array.rs:496` sealed_array_project_from) +
+  combinators + intrinsics.rs:1182, NOT the 2 sites changed. So the real lever = migrate ALL array-
+  construction paths to escape-gated `0xFE`. Runtime support + read paths already accept `0xFE`. Whether
+  it's worth the multi-path migration needs the per-KIND attribution (below) to confirm records dominate.
+
+- [ ] **Small-int CACHE widen — cheap safe win (≤65536 only).** A CPython-style cache `[-128,1024)` already
+  exists (tagged.rs); widening to 65536 = 2.0MB static, zero codegen/consumer changes (3 lines), makes
+  in-range int boxes shared-immortal. DO NOT widen to dates (20991225 = 640MB static = memory regression +
+  binary bloat + bad CPU-cache locality). The cache is O(range) — small ranges only.
+
+- [ ] **Pointer-tagged SMI (small-int inlining) — the RIGHT mechanism for DATES-as-ints.** Stores small
+  ints immediate in the value word (low tag bit; pointers are 8-aligned) → zero allocation, zero static,
+  any int ≤ ~2⁶¹. ~180 consumer sites, higher risk (path-10 spike found 11 bugs but PROVED the
+  architecture, 5.1× on scalar microbench). This is what Linus's "dates will be ints" feature needs (a
+  cache can't cover the date range). Bigger adventure; do after the cache widen if it disappoints, OR
+  pull forward for the dates feature. Probe: experiment/small-int-inline (LIN_SMI_STATS, unmerged).
+
+- [ ] **Per-KIND / per-PHASE attribution (the gating measurement).** The 265M live by size class points at
+  records (≤48-64B = 174M) but is NOT yet confirmed by KIND (string/array/map/sealed/box) or PHASE (is it
+  LOAD intermediates retained into PREP = reclaimable, or the typed records themselves = representation?).
+  This decides whether the `0xFE` multi-path migration is worth it. (A 6-kind net-live counter was started
+  on experiment/wave-r-attribution but parked.)
+
+- [ ] **Header compaction 24→16B** — merge `{size,heap_desc,named_desc}` (16B) into one per-type metadata
+  pointer (8B). ~100-site / 20-file layout migration (every field offset shifts 8B, UAF risk). ~8B/record.
+  SUBSUMED by `0xFE` inline for array-held records; mainly helps STANDALONE records. Lower priority.
+
+- [ ] **mimalloc global allocator** — one-liner in lin-runtime, ~10% RSS + 3-5% wall-clock, drop-in. A
+  default-allocator/dependency/CI/platform POLICY call for Linus (or behind a feature flag). Not the fix.
+
+Deliverables achieved: root cause (allocation amplification, allocator ruled out) + interning ruled out +
+contiguous=Node-already-matched insight + the lever map. NEXT: per-kind attribution → then the chosen lever.
 
 ## Sequencing
 
@@ -227,6 +264,19 @@ then:            Wave B  (B5 B7 B9 parallel; B1→B3→B4→B8 serial spine; B2 
 - **A4** (rc_elide BFS→post-dom idom-chain walk): IR diff = only-removed-RC-pairs, ASan clean, RAPTOR
   JSON digest exact; typed digest confirming → merge pending.
 
-### TODO — Wave B (architectural single-source-of-truth consolidation), as specified above.
-B1 gate predicate · B2 TagClass walker (conductor) · B3 nkind→size table · B4 lower.rs split ·
-B5 data.rs split · B6 stale-comment sweep (last) · B7 infer_if join · B8 is_rc_type shared · B9 docs/ADR.
+### Wave B — COMPLETE + MERGED (all byte-identical-IR verified vs staged baselines, or digest-verified)
+B1 gate predicate single-source (−440 lines, found IntLit drift) · B3 nkind→size table (found Float32
+divergence = bug below) · B4 lower.rs split (10.6k→9 files) · B5 data.rs split · B7 infer_if join+tests ·
+B8 is_rc_type shared (found lower.rs's is intentionally narrower) · B9 docs/ADR-069 addendum · B6
+TAG_OBJECT comment sweep + lin_object→lin_map rename. **B2 (TagClass walker) DEFERRED** — risky RC
+refactor, motivating bugs already fixed. Plus **bc** codegen box/unbox cleanup (5 items: unbox dedup,
+type_tag_open delete, box_map_of, BuilderExt::select, RuntimeFns fields). Master `1999bc3e`.
+
+### OPEN — concrete next items (post-Wave-B)
+- [ ] **Wave R** (above) — per-kind attribution → escape-gated `0xFE` inline (big) OR small-int cache
+  widen to 65536 (cheap) OR SMI for dates (Linus's feature). interning RULED OUT.
+- [ ] **#8 Float32 sealed-record size divergence** — sealed_named_field_kind(Float32)=NKIND_FLOAT64(8B) vs
+  physical 4B → over-alloc in the dynamic alloc path. Fix = NKIND_FLOAT32 in table + materializer arm.
+  Changes boxing semantics (not byte-identical) → ASan+digest+crafted-test. Attended-grade.
+- [ ] **B2 TagClass walker** — deferred (risky RC, low remaining value).
+- [ ] **mimalloc as default allocator** — ~10% RSS, policy call.
