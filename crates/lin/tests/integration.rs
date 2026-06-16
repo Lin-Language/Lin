@@ -441,6 +441,35 @@ print(err)
     assert_eq!(output, vec!["ok: 5.0", "err: div by zero"]);
 }
 
+// Regression (calc-example segfault): a typed sealed record built in one function,
+// returned through an `AnyVal`-typed function (so it is boxed as TAG_RECORD), then
+// coerced to a named union and matched with `has { ... }`. The match's discriminant
+// FieldGet used to call `lin_map_get` unconditionally on the unboxed pointer, reading
+// the sealed struct as a LinMap → SIGSEGV in `find_slot_string`. The union FieldGet
+// must tag-dispatch (TAG_RECORD → lin_record_get_field) like the index path does.
+#[test]
+fn test_match_has_on_record_laundered_through_anyval() {
+    let output = run(r#"import { print } from "std/io"
+
+type Failure = { "type": String, "error": String }
+type Success = { "type": String, "value": Int32 }
+type R = Success | Failure
+
+val fail = (msg: String): Failure => { "type": "failure", "error": msg }
+val produce = (): AnyVal => fail("boom")
+val entry = (): R => produce()
+
+val show = (r: R): String =>
+  match r
+    has { "type": "success", value } => "ok: ${value}"
+    has { "type": "failure", error } => "err: ${error}"
+    else => "?"
+
+print(show(entry()))
+"#);
+    assert_eq!(output, vec!["err: boom"]);
+}
+
 #[test]
 fn test_closures_and_var() {
     let output = run(r#"import { print } from "std/io"
