@@ -36,12 +36,17 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 //   other_allocs — everything else (str, array, map, function, float, …)
 // Stats are printed to stderr at process exit via atexit. Zero overhead when env var absent.
 //
-// Note: cached ints ([-128, 1024)) and bools are intercepted by lin_box_int32/int64/bool BEFORE
-// reaching alloc_tagged, so int_allocs counts only OUT-OF-RANGE integer boxes.
+// Note: with feature `smi` ON, lin_box_int32/int64 emit SMI immediates and NEVER reach
+// alloc_tagged, so int_allocs should be ~0 when smi is active (only TAG_UINT64 / out-of-62-bit
+// i64 boxes land here). With smi OFF, cached ints [-128, 65536) and bools are intercepted before
+// alloc_tagged, so int_allocs counts only out-of-cache-range heap boxes.
 
 static SMI_STATS_STATE: AtomicU8 = AtomicU8::new(0); // 0=uninit 1=disabled 2=enabled
 static SMI_INT_ALLOCS: AtomicU64 = AtomicU64::new(0);
 static SMI_OTHER_ALLOCS: AtomicU64 = AtomicU64::new(0);
+// Count of integer boxes that were encoded as SMI immediates (only meaningful with feature `smi`).
+#[cfg(feature = "smi")]
+static SMI_INT_BOXES: AtomicU64 = AtomicU64::new(0);
 
 #[cold]
 fn init_smi_stats() -> u8 {
@@ -72,9 +77,17 @@ extern "C" fn smi_stats_atexit() {
         "SMI_STATS: total_alloc_tagged={total} int_boxes={int_allocs} ({pct:.1}%) \
          other_boxes={other_allocs}"
     );
+    #[cfg(feature = "smi")]
+    {
+        let smi_int_boxes = SMI_INT_BOXES.load(Ordering::Relaxed);
+        eprintln!(
+            "SMI_STATS: smi_int_boxes={smi_int_boxes} (inline immediates, never reach alloc_tagged)"
+        );
+    }
+    #[cfg(not(feature = "smi"))]
     eprintln!(
-        "SMI_STATS: (cached ints [-128,1024) and bools never reach alloc_tagged; \
-         int_boxes = out-of-cache-range only)"
+        "SMI_STATS: (cached ints [-128,65536) and bools never reach alloc_tagged; \
+         int_boxes = out-of-cache-range heap boxes only)"
     );
 }
 
@@ -356,23 +369,36 @@ pub unsafe extern "C" fn lin_box_bool(v: u8) -> *mut u8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_int32(v: i32) -> *mut u8 {
-    // NOTE (feature = "smi"): The full SMI implementation would emit smi_encode_i32(v) here
-    // instead of heap-boxing. That requires ALL runtime consumers that receive a `*const TaggedVal`
-    // (lin_map_set, lin_array_push_tagged, lin_tagged_to_string, etc.) to guard with is_smi_ptr
-    // before dereferencing. Those files are outside the initial scope (tagged.rs only). The
-    // encode/decode/retain/release infrastructure is in place; consumer guards are the remaining
-    // work. For now, always use heap boxes (cached or allocated) so all consumers stay correct.
-    let n = v as i64;
-    if n >= SMALL_INT_MIN && n < SMALL_INT_MAX {
-        return &INT32_CACHE[(n - SMALL_INT_MIN) as usize] as *const TaggedVal as *mut u8;
+    // SMI: all i32 values fit in the 30-bit signed field — always emit inline, no heap.
+    #[cfg(feature = "smi")]
+    {
+        if smi_stats_state() == 2 {
+            SMI_INT_BOXES.fetch_add(1, Ordering::Relaxed);
+        }
+        return smi_encode_i32(v) as *mut u8;
     }
-    alloc_tagged(TAG_INT32, v as i64 as u64)
+    // Without SMI: use cache for common range, heap otherwise.
+    #[cfg(not(feature = "smi"))]
+    {
+        let n = v as i64;
+        if n >= SMALL_INT_MIN && n < SMALL_INT_MAX {
+            return &INT32_CACHE[(n - SMALL_INT_MIN) as usize] as *const TaggedVal as *mut u8;
+        }
+        alloc_tagged(TAG_INT32, v as i64 as u64)
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_int64(v: i64) -> *mut u8 {
-    // NOTE (feature = "smi"): Same as lin_box_int32 — the full SMI path would use
-    // smi_encode_i64(v) with heap fallback for out-of-range values. Consumer guards needed first.
+    // SMI: encode inline if in 62-bit range; fall back to heap for rare large values.
+    #[cfg(feature = "smi")]
+    if let Some(p) = smi_encode_i64(v) {
+        if smi_stats_state() == 2 {
+            SMI_INT_BOXES.fetch_add(1, Ordering::Relaxed);
+        }
+        return p as *mut u8;
+    }
+    // Without SMI (or out-of-range): use cache for common range, heap otherwise.
     if v >= SMALL_INT_MIN && v < SMALL_INT_MAX {
         return &INT64_CACHE[(v - SMALL_INT_MIN) as usize] as *const TaggedVal as *mut u8;
     }
@@ -787,14 +813,10 @@ pub unsafe extern "C-unwind" fn lin_tagged_arith(a: *const u8, b: *const u8, op:
             // Non-numeric fault check (same as non-SMI path).
             let tag_is_numeric = |t: u8| (t >= TAG_INT32 && t <= TAG_FLOAT64) || t == TAG_UINT64;
             if !tag_is_numeric(at) || !tag_is_numeric(bt) {
-                // Fall through to the full non-SMI path for the fault message.
-                // (Reconstruct a local av/bv/at/bt/ap/bp for the non-SMI code below.)
-                let av2 = a as *const TaggedVal;
-                let bv2 = b as *const TaggedVal;
-                let at2 = if av2.is_null() { TAG_NULL } else { (*av2).tag };
-                let bt2 = if bv2.is_null() { TAG_NULL } else { (*bv2).tag };
-                let at2 = if a_smi { at } else { at2 };
-                let bt2 = if b_smi { bt } else { bt2 };
+                // Use already-decoded tags (at/bt) directly — av2/bv2 may be SMI pointers,
+                // so skip the raw deref and rely on the already-computed at/bt.
+                let at2 = at;
+                let bt2 = bt;
                 let describe = |t: u8| match t {
                     TAG_NULL => "Null", TAG_BOOL => "Bool",
                     TAG_INT32 | TAG_INT64 | TAG_UINT64 => "Int",
@@ -1407,12 +1429,21 @@ mod cache_tests {
                 let p = lin_box_int32(v);
                 assert_eq!(lin_get_tag(p), TAG_INT32);
                 assert_eq!(lin_unbox_int32(p), v);
-                assert!(is_cached_box(p), "in-range int {v} should be cached");
-                // Boxing the same value twice returns the identical cached pointer.
-                assert_eq!(p, lin_box_int32(v));
-                // Releasing a cached box must be a harmless no-op (no free).
+                #[cfg(not(feature = "smi"))]
+                {
+                    assert!(is_cached_box(p), "in-range int {v} should be cached (non-SMI)");
+                    assert_eq!(p, lin_box_int32(v), "same value should return same cached pointer");
+                }
+                #[cfg(feature = "smi")]
+                {
+                    assert!(is_smi_ptr(p), "in-range int {v} should be SMI");
+                    assert_eq!(p, lin_box_int32(v), "same i32 value encodes to same SMI pointer");
+                }
                 lin_tagged_release(p);
-                assert_eq!(lin_unbox_int32(p), v, "cached box survived release");
+                // After release, boxing the same value again must still work.
+                let p2 = lin_box_int32(v);
+                assert_eq!(lin_unbox_int32(p2), v, "int {v} must still unbox correctly after release");
+                lin_tagged_release(p2);
             }
         }
     }
@@ -1423,8 +1454,15 @@ mod cache_tests {
             let v = SMALL_INT_MAX as i32; // one past the cache
             let p = lin_box_int32(v);
             assert_eq!(lin_unbox_int32(p), v);
-            assert!(!is_cached_box(p), "out-of-range int should be heap-allocated");
-            lin_tagged_release(p); // frees the heap box
+            #[cfg(feature = "smi")]
+            assert!(is_smi_ptr(p), "out-of-cache i32 must still be SMI (full i32 range is inline)");
+            #[cfg(not(feature = "smi"))]
+            {
+                assert!(!is_cached_box(p), "out-of-range int should be heap-allocated");
+                lin_tagged_release(p); // frees the heap box
+            }
+            #[cfg(feature = "smi")]
+            lin_tagged_release(p); // no-op for SMI
         }
     }
 
@@ -1446,8 +1484,9 @@ mod cache_tests {
             assert_eq!((*s).refcount, 2);
             // Box it TAG_STR (the box does not retain — it owns the existing +1).
             let elem = lin_box_str(s as *mut u8);
-            // Some OTHER distinct pointer (a separate box) standing in for the callback-return box.
-            let other = lin_box_int32(SMALL_INT_MAX as i32); // out-of-range → fresh heap box
+            // Some OTHER distinct pointer (a separate box / SMI) standing in for the callback-return box.
+            // Use lin_box_float64 to get a guaranteed heap box that is NEVER an SMI pointer.
+            let other = lin_box_float64(3.14);
             assert_ne!(elem, other);
             // Full release of the DISTINCT element box: frees the shell AND releases the inner String
             // (rc 2 → 1). A shell-only free would have left rc at 2 (the leak).
@@ -1478,12 +1517,23 @@ mod cache_tests {
     fn release_if_distinct_scalar_box_degrades_to_shell_free() {
         unsafe {
             // A flat-scalar element box has no heap inner, so a full release just frees the shell.
-            // Use an out-of-range int so the box is a fresh heap allocation (not a cached static).
-            let elem = lin_box_int64(SMALL_INT_MAX);
-            let other = lin_box_int64(SMALL_INT_MAX + 1);
-            assert!(!is_cached_box(elem) && !is_cached_box(other));
-            lin_tagged_release_if_distinct(elem, other); // frees elem's shell (no inner)
-            lin_tagged_release(other);
+            // With SMI off: use out-of-range ints that heap-allocate. With SMI on: use floats (always heap).
+            #[cfg(not(feature = "smi"))]
+            {
+                let elem = lin_box_int64(SMALL_INT_MAX);
+                let other = lin_box_int64(SMALL_INT_MAX + 1);
+                assert!(!is_cached_box(elem) && !is_cached_box(other));
+                lin_tagged_release_if_distinct(elem, other); // frees elem's shell (no inner)
+                lin_tagged_release(other);
+            }
+            #[cfg(feature = "smi")]
+            {
+                // SMI path: use float boxes (always heap-allocated, never SMI).
+                let elem = lin_box_float64(1.0);
+                let other = lin_box_float64(2.0);
+                lin_tagged_release_if_distinct(elem, other); // frees elem's shell (no inner)
+                lin_tagged_release(other);
+            }
         }
     }
 
@@ -1507,7 +1557,11 @@ mod cache_tests {
             let p = lin_box_int64(5);
             assert_eq!(lin_get_tag(p), TAG_INT64);
             assert_eq!(lin_unbox_int64(p), 5);
+            #[cfg(feature = "smi")]
+            assert!(is_smi_ptr(p), "int64(5) must be SMI when feature is on");
+            #[cfg(not(feature = "smi"))]
             assert!(is_cached_box(p));
+            lin_tagged_release(p);
         }
     }
 
