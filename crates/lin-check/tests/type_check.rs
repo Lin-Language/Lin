@@ -211,10 +211,10 @@ import foreign "libmath.a"
 fn test_foreign_import_illegal_type_reports_error() {
     let src = r#"
 import foreign "libfoo.a"
-  val badFn: (Json) => Json
+  val badFn: (AnyVal) => AnyVal
 "#;
     let result = parse_and_check(src);
-    // Json is not a legal FFI type, should have errors
+    // AnyVal (the dynamic top type) is not a legal FFI type, should have errors
     assert!(result.is_err(), "FFI with illegal type should produce error");
     let errs = result.unwrap_err();
     let has_ffi_error = errs.iter().any(|d| d.message.contains("illegal FFI type"));
@@ -344,43 +344,43 @@ val p = lin_async(() => 42)
 }
 
 // Regression: the match-arm-union-vs-declared-object bug. A function declared to return a named
-// object type `R`, whose body is a `match`/`if` with one arm yielding a `Json` value and another
-// yielding a concrete object literal, previously formed the union `Json | {concrete}` and rejected
+// object type `R`, whose body is a `match`/`if` with one arm yielding an `AnyVal` value and another
+// yielding a concrete object literal, previously formed the union `AnyVal | {concrete}` and rejected
 // it against `R`. Each arm is now checked against `R` directly (bidirectional push): the object
-// literal checks structurally, and a `Json` value is accept-any in arm position.
+// literal checks structurally, and an `AnyVal` value is accept-any in arm position.
 #[test]
 fn test_match_json_arm_plus_object_arm_against_declared_object_return() {
     let src = r#"
-type R = { "status": Int32, "headers": Json, "body": String }
-val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
+type R = { "status": Int32, "headers": AnyVal, "body": String }
+val other = (): AnyVal => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
 val handle = (b: Boolean): R =>
   match b
     is true => other()
     else => { "status": 404, "headers": { "a": 1 }, "body": "no" }
 "#;
     let result = parse_and_check(src);
-    assert!(result.is_ok(), "match Json-arm + object-arm vs declared object should check: {:?}", result.err());
+    assert!(result.is_ok(), "match AnyVal-arm + object-arm vs declared object should check: {:?}", result.err());
 }
 
-// Same bug, `if` form: `if cond then jsonValue else objectLiteral` declared `: R`.
+// Same bug, `if` form: `if cond then anyValValue else objectLiteral` declared `: R`.
 #[test]
 fn test_if_json_arm_plus_object_arm_against_declared_object_return() {
     let src = r#"
-type R = { "status": Int32, "headers": Json, "body": String }
-val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
+type R = { "status": Int32, "headers": AnyVal, "body": String }
+val other = (): AnyVal => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
 val handle = (b: Boolean): R =>
   if b then other() else { "status": 404, "headers": { "a": 1 }, "body": "no" }
 "#;
     let result = parse_and_check(src);
-    assert!(result.is_ok(), "if Json-arm + object-arm vs declared object should check: {:?}", result.err());
+    assert!(result.is_ok(), "if AnyVal-arm + object-arm vs declared object should check: {:?}", result.err());
 }
 
 // Guard against over-broadening: a genuinely wrong-shaped object arm must STILL error.
 #[test]
 fn test_match_wrong_shaped_object_arm_still_errors() {
     let src = r#"
-type R = { "status": Int32, "headers": Json, "body": String }
-val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
+type R = { "status": Int32, "headers": AnyVal, "body": String }
+val other = (): AnyVal => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
 val handle = (b: Boolean): R =>
   match b
     is true => other()
@@ -390,18 +390,18 @@ val handle = (b: Boolean): R =>
     assert!(result.is_err(), "wrong-shaped object arm must still error");
 }
 
-// Guard against over-broadening (ADR-045): a DIRECT `Json` body returned as a structured object
+// Guard against over-broadening (ADR-045): a DIRECT `AnyVal` body returned as a structured object
 // (not via a match/if arm with a concrete-object companion) must still error — the relaxation is
 // scoped to checked match/if arms, not bare bodies.
 #[test]
 fn test_bare_json_body_against_declared_object_still_errors() {
     let src = r#"
-type R = { "status": Int32, "headers": Json, "body": String }
-val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
+type R = { "status": Int32, "headers": AnyVal, "body": String }
+val other = (): AnyVal => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
 val handle = (): R => other()
 "#;
     let result = parse_and_check(src);
-    assert!(result.is_err(), "bare Json body vs structured object return must still error (ADR-045)");
+    assert!(result.is_err(), "bare AnyVal body vs structured object return must still error (ADR-045)");
 }
 
 // A SCALAR numeric annotation on an ARRAY literal is a genuine type error and must STAY one —
