@@ -7,7 +7,7 @@ use super::*;
 // Adding NullableRecord here would double-retain nullable-record reads → double-free.
 // Sum types are also excluded: a SumNode IS refcounted but ownership is tracked via
 // construction-site `register_owned` + the runtime KIND_SUMNODE drop walk, not here.
-pub fn is_rc_type(ty: &Type) -> bool {
+pub(crate) fn is_rc_type(ty: &Type) -> bool {
     matches!(
         ty,
         Type::Str
@@ -30,7 +30,7 @@ pub fn is_rc_type(ty: &Type) -> bool {
 /// iff it is present in `obj_ty` with a sum-eligible field type. We return that child sum type (used
 /// as the FieldGet's effective sum type so codegen reads it as a `*SumNode` and the result seeds
 /// Packed(SumNode)). Returns `None` for a non-recursive / non-sum field.
-pub fn sum_recursive_child_field_ty(obj_ty: &Type, field: &str) -> Option<Type> {
+pub(crate) fn sum_recursive_child_field_ty(obj_ty: &Type, field: &str) -> Option<Type> {
     let Type::Object { fields, .. } = obj_ty else { return None };
     let fty = fields.get(field)?;
     if crate::repr::sum_type_eligible(fty) {
@@ -47,7 +47,7 @@ pub fn sum_recursive_child_field_ty(obj_ty: &Type, field: &str) -> Option<Type> 
 /// the `match node is BinOp => evalNode(node["left"])` shape. Returns `None` for anything else (the
 /// caller then falls back to the regular `lower_expr` path). Does NOT add a reference (the FieldGet
 /// site handles the borrowed-child retain-on-escape).
-pub fn lower_sum_scrutinee_raw(
+pub(crate) fn lower_sum_scrutinee_raw(
     object: &TypedExpr,
     builder: &mut FuncBuilder,
     _ctx: &mut LowerCtx,
@@ -82,7 +82,7 @@ pub fn lower_sum_scrutinee_raw(
 /// (caught by `nullable_sealed_record`) and the `Union([Named("T"), Null])` Named-alias form that
 /// appears in self-recursive functions before Named is expanded. Used by `lower_coerce_arg` to
 /// avoid boxing a concrete sealed arg into a boxing Coerce for such a param.
-pub fn is_nullable_record_param(ty: &Type) -> bool {
+pub(crate) fn is_nullable_record_param(ty: &Type) -> bool {
     if crate::repr::nullable_sealed_record(ty).is_some() {
         return true;
     }
@@ -101,14 +101,14 @@ pub fn is_nullable_record_param(ty: &Type) -> bool {
 
 /// True when `ty` is a sealed record (the PackedStruct gate). Delegates to
 /// `crate::repr::sealed_fields` which calls the canonical `Type::sealed_fields`.
-pub fn is_sealed_scalar_repr(ty: &Type) -> bool {
+pub(crate) fn is_sealed_scalar_repr(ty: &Type) -> bool {
     crate::repr::sealed_fields(ty).is_some()
 }
 
 /// True when `ty` is `Array(elem)` whose element is a packed-sealed record (the PackedSealedArray
 /// gate). Delegates to the canonical `Type::sealed_array_elem` via `crate::repr`.
 /// The function name is kept for call-site stability.
-pub fn is_sealed_scalar_array(ty: &Type) -> bool {
+pub(crate) fn is_sealed_scalar_array(ty: &Type) -> bool {
     Type::sealed_array_elem(ty).is_some()
 }
 
@@ -117,7 +117,7 @@ pub fn is_sealed_scalar_array(ty: &Type) -> bool {
 /// packed array must be materialized for. A `Named`-element array (an unexpanded self-recursive alias,
 /// which the callee reads as the SAME packed sealed struct) and a sealed-Object-element array are NOT
 /// boxed and must pass through unchanged.
-pub fn param_elem_is_boxed_repr(param_ty: &Type) -> bool {
+pub(crate) fn param_elem_is_boxed_repr(param_ty: &Type) -> bool {
     match param_ty {
         Type::Array(elem) => matches!(elem.as_ref(),
             // Never = an empty array literal `[]` whose element type was not yet resolved;
@@ -136,7 +136,7 @@ pub fn param_elem_is_boxed_repr(param_ty: &Type) -> bool {
 /// TypeVar/Json-array param is not released by the owning model), so the caller must fully release it
 /// right after the call — else it leaks every call (ASan-confirmed in a sort-in-loop). MUST mirror the
 /// materialize trigger in `lower_coerce_arg`.
-pub fn sealed_array_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
+pub(crate) fn sealed_array_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
     is_sealed_scalar_array(arg_ty)
         && !is_sealed_scalar_array(param_ty)
         && (is_union_ty(param_ty) || param_elem_is_boxed_repr(param_ty))
@@ -157,7 +157,7 @@ pub fn sealed_array_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
 /// != is_union_ty(arg)` arm), so it must mirror that trigger: arg is a sealed scalar record, param
 /// is a union and NOT itself a sealed record. (A sealed→`Named` pass-through is handled earlier and
 /// never reaches the union arm.)
-pub fn sealed_record_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
+pub(crate) fn sealed_record_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
     is_sealed_scalar_repr(arg_ty) && is_union_ty(param_ty) && !is_union_ty(arg_ty)
         // A sum-eligible param takes `lower_coerce_arg`'s sum arm (project to a fresh `*SumNode`,
         // registered owned), NOT the sealed-record→Json materialize-to-boxed-object path. Without
@@ -176,7 +176,7 @@ pub fn sealed_record_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
 /// this exclusion the arg is BOTH released (sum release) AND shell-freed (`lin_tagged_free_box`
 /// reading the SumNode's offset-0 RC as a 16-byte box → mismatched-size dealloc + double free; an
 /// ASan heap-use-after-free for a `{String:Expr}` map / sum-union arg read-back, ADR-062 Stage 3).
-pub fn sum_arg_projected(arg_ty: &Type, param_ty: &Type) -> bool {
+pub(crate) fn sum_arg_projected(arg_ty: &Type, param_ty: &Type) -> bool {
     crate::repr::sum_type_eligible(param_ty)
         && !crate::repr::sum_type_eligible(arg_ty)
         && !matches!(arg_ty, Type::Named(_))
@@ -187,7 +187,7 @@ pub fn sum_arg_projected(arg_ty: &Type, param_ty: &Type) -> bool {
 /// one-level `is_sealed_scalar_array`/`is_sealed_scalar_repr` don't catch the outer container, but its
 /// Coerce result (built by codegen's `array_coerce_elementwise`) is still a fresh +1 owned value that
 /// must be released. Mirrors codegen's `Codegen::ty_contains_sealed`, restricted to the array-outer case.
-pub fn to_contains_sealed_array(ty: &Type) -> bool {
+pub(crate) fn to_contains_sealed_array(ty: &Type) -> bool {
     fn contains(ty: &Type) -> bool {
         if is_sealed_scalar_array(ty) || is_sealed_scalar_repr(ty) {
             return true;
@@ -207,7 +207,7 @@ pub fn to_contains_sealed_array(ty: &Type) -> bool {
 /// AND `from`'s inner element is a BOXED view (Json/union/TypeVar — the type-erased boxed-fallback
 /// result). MUST mirror the codegen gate exactly so the ownership registration matches what codegen
 /// actually emits (a same-representation array coerce is a pointer pass-through, NOT a fresh +1).
-pub fn nested_sealed_repr_change(from: &Type, to: &Type) -> bool {
+pub(crate) fn nested_sealed_repr_change(from: &Type, to: &Type) -> bool {
     let Type::Array(inner_to) = to else { return false };
     let Type::Array(inner_from) = from else { return false };
     // Mirror codegen's gate: a NESTED sealed re-projection fires only when `to`'s inner contains a
@@ -218,7 +218,7 @@ pub fn nested_sealed_repr_change(from: &Type, to: &Type) -> bool {
 
 /// True when `ty` is a permissible field of a sealed record. Delegates to the canonical
 /// `Type::is_sealed_field` (defined in `lin_check::types`).
-pub fn is_sealed_field_ty(ty: &Type) -> bool {
+pub(crate) fn is_sealed_field_ty(ty: &Type) -> bool {
     ty.is_sealed_field()
 }
 
@@ -230,7 +230,7 @@ pub fn is_sealed_field_ty(ty: &Type) -> bool {
 /// payload's refcount and are null/scalar/cached-box safe). Store, read, release-old and
 /// teardown must ALL use this predicate together — an asymmetry causes a double-free
 /// (release without matching retain) or a leak (retain without matching release).
-pub fn needs_owning(ty: &Type) -> bool {
+pub(crate) fn needs_owning(ty: &Type) -> bool {
     is_rc_type(ty) || is_union_ty(ty) || is_nullable_sealed_record(ty)
 }
 
@@ -243,7 +243,7 @@ pub fn needs_owning(ty: &Type) -> bool {
 /// - otherwise: no-op, returns the value unchanged.
 /// Mirrors `own_for_read`; together with codegen's release-old these keep the four sides
 /// (store/read/release-old/teardown) symmetric for both concrete and union slot types.
-pub fn own_for_store(t: Temp, ty: &Type, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn own_for_store(t: Temp, ty: &Type, builder: &mut FuncBuilder) -> Temp {
     match crate::ownership_verify::owning_strategy(ty) {
         crate::ownership_verify::OwningStrategy::Clone => {
             let dst = builder.alloc_temp(ty.clone());
@@ -268,7 +268,7 @@ pub fn own_for_store(t: Temp, ty: &Type, builder: &mut FuncBuilder) -> Temp {
 /// (once by the raw value's scope-exit release, once by the cell's clone). We therefore free
 /// `b`'s 16-byte shell (NOT its inner) to avoid a per-store box leak. When no transient box
 /// was created (already-union value, or non-union slot), nothing extra is freed.
-pub fn coerce_and_own_store(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn coerce_and_own_store(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
     // Box-shell-reclaim ownership fact (whether widening into the union slot made a fresh distinct
     // shell that must be `FreeBoxShell`d) lives in the ownership authority; `type_repr_differs` is the
     // lower-only repr predicate it requires, passed in.
@@ -291,7 +291,7 @@ pub fn coerce_and_own_store(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &
 /// - union: `CloneBox` into a fresh temp (the reader owns its own box; releasing it at scope
 ///   exit never frees the cell's box) + register the cloned temp.
 /// Returns the temp to use as the read result.
-pub fn own_for_read(t: Temp, ty: &Type, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn own_for_read(t: Temp, ty: &Type, builder: &mut FuncBuilder) -> Temp {
     match crate::ownership_verify::owning_strategy(ty) {
         crate::ownership_verify::OwningStrategy::Clone => {
             let dst = builder.alloc_temp(ty.clone());
@@ -327,7 +327,7 @@ pub fn own_for_read(t: Temp, ty: &Type, builder: &mut FuncBuilder) -> Temp {
 /// allocate or call) qualifies. Whenever this returns `Some`, `lower_container_base_borrowed_check`
 /// for the same `object`/`ctx` returns `true` (the eligibility predicate the caller uses to pick
 /// key/base lowering order).
-pub fn lower_container_base_borrowed(
+pub(crate) fn lower_container_base_borrowed(
     object: &TypedExpr,
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -379,7 +379,7 @@ pub fn lower_container_base_borrowed(
 /// Eligibility predicate for `lower_container_base_borrowed`, WITHOUT emitting any IR. Mirrors its
 /// guards exactly so the `Index` caller can decide key/base lowering order before committing.
 /// Must stay in lockstep with `lower_container_base_borrowed` (every `Some` path here is `true`).
-pub fn lower_container_base_borrowed_check(object: &TypedExpr, ctx: &LowerCtx) -> bool {
+pub(crate) fn lower_container_base_borrowed_check(object: &TypedExpr, ctx: &LowerCtx) -> bool {
     let TypedExpr::LocalGet { slot, ty, .. } = object else { return false };
     // Mirror `lower_container_base_borrowed`'s strategy gate exactly (Retain == concrete-rc,
     // non-union container).

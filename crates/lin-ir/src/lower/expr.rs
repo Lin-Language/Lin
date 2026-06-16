@@ -1,6 +1,6 @@
 use super::*;
 
-pub fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     // Attribute instructions emitted while lowering this expression to its source span (debug-only
     // metadata for DWARF line tables). Restore the enclosing span afterwards so instructions emitted
     // by the PARENT after this child returns (e.g. a Binary after its operands) get the parent's span,
@@ -12,7 +12,7 @@ pub fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCt
     result
 }
 
-pub fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     match expr {
         TypedExpr::IntLit(v, ty, _) => {
             builder.const_temp(Const::Int(*v, ty.clone()))
