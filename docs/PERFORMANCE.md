@@ -240,6 +240,22 @@ preserve.
   representation change — and that change (end-to-end packing) measured *slower*
   (§5). Honest status: the biggest real-world lever (typed RAPTOR end-to-end) is
   not yet a net win.
+- **Peak memory on typed RAPTOR is high (~25 GB vs Node ~2–4 GB).** This is a
+  *separate axis* from the throughput finding that "no workload is alloc-bound"
+  (§5, path-7): that's about allocation *churn*; this is about *live* peak RSS.
+  Per-kind attribution of the 132M-live peak (2026-06): **maps = 15.25 GB / 76 %**
+  (51.5M live `{String:Trip[]}` route tables, ~296 B each), sealed records =
+  4.47 GB, transient tag-boxes/array/string < 1 GB. The maps are *legitimately*
+  maps (dynamic route dictionaries), not mis-materialized records — so the lever
+  is per-map cost, and per-map cost is structurally floored: a slot is
+  `hash(8)+key(8)+value:TaggedVal(16) = 32 B`, 8-aligned, and the only real shrink
+  is **unboxing the value (16 B → 8 B, ~2.9 GB)**. That is *ABI-blocked*:
+  `lin_map_get` returns a **borrowed interior pointer** into the slot, so a smaller
+  in-slot value forces `get` to return a reconstructed scratch `TaggedVal`.
+  Feasibility is proven (no codegen consumer holds two live borrowed results), but
+  it narrows the hottest path's contract and is held for a supervised change.
+  The cheap win (`INITIAL_CAP` 8→4, −1.4 GB, byte-identical IR) has shipped.
+  Reducing the map *count* is an algorithmic RAPTOR change, not a repr tweak.
 - **No reference-cycle collection** (ADR-024). Cycles between long-lived heap
   objects leak; documented, the fix is to null a field to break the cycle.
 - **`Number` (boxed numeric union) is ~3.6× slower than a concrete family**
