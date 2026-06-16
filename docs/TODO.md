@@ -1,5 +1,12 @@
 # Post-Reset Quality + Perf + Cleanup Plan
 
+> ## ⚑ CURRENT STATE (2026-06-16) — read this first
+> **Waves A, J, A4, and B are ALL COMPLETE + MERGED** (master `1999bc3e`; 819/0, 73/73, both RAPTOR
+> digests exact, ASan clean). The `[ ]` checkboxes and the "Sequencing" block in the sections BELOW are
+> the *original plan* and are now historical — see the **Status** section at the bottom for what actually
+> landed. **The only OPEN work is: Wave R (memory representation — see lever map), bug #8 (Float32), and
+> the deferred B2.** Wave A is done — don't re-run it.
+
 Driving source: 4 parallel opus code reviews (architecture, lin-runtime, lin-codegen, lin-check+lin-ir)
 + alloc/RC profiling of interp/dijkstra/records (instrumented runtime). Reports in `/tmp/review/*.report.md`.
 
@@ -243,12 +250,12 @@ The 23GB is genuinely-live object/array structures. Each lever below was measure
 Deliverables achieved: root cause (allocation amplification, allocator ruled out) + interning ruled out +
 contiguous=Node-already-matched insight + the lever map. NEXT: per-kind attribution → then the chosen lever.
 
-## Sequencing
+## Sequencing (HISTORICAL — this was the original plan; A/J/B all executed + merged, see Status)
 
 ```
-NOW (parallel):  A1 A2 A3 A4 A6 | J1 J2 J3      (+ conductor drives A5)
-then conductor:  merge each lane after its gates + RAPTOR digests pass; run J4 after J1
-then:            Wave B  (B5 B7 B9 parallel; B1→B3→B4→B8 serial spine; B2 conductor; B6 last)
+DONE:  A1 A2 A3 A4 A5 A6 | J1 J2 J3 J4   (Wave A + Json retirement — merged)
+DONE:  Wave B  (B1 B3 B4 B5 B6 B7 B8 B9 merged; B2 deferred) + bc codegen cleanup
+OPEN:  Wave R (memory) · #8 Float32 · B2 (deferred)
 ```
 
 ## Status
