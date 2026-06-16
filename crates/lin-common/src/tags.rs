@@ -78,12 +78,16 @@ pub const TAG_RECORD: u8 = 25;
 pub const NKIND_INT32: u32 = 1; // Int8/Int16/Int32 → 4 bytes
 pub const NKIND_INT64: u32 = 2; // Int64, UInt8/UInt16/UInt32 (zero-extended) → 8 bytes
 pub const NKIND_UINT64: u32 = 3; // UInt64 → 8 bytes
-pub const NKIND_FLOAT64: u32 = 4; // Float32/Float64 → 8 bytes
+pub const NKIND_FLOAT64: u32 = 4; // Float64 → 8 bytes
 pub const NKIND_BOOL: u32 = 5; // Bool → 1 byte
 pub const NKIND_STRING: u32 = 6; // *LinString heap field → 8-byte pointer
 pub const NKIND_ARRAY: u32 = 7; // *LinArray heap field → 8-byte pointer
 pub const NKIND_SEALED: u32 = 8; // *sealed-struct heap field → 8-byte pointer
 pub const NKIND_MAP: u32 = 9; // *LinMap heap field → 8-byte pointer
+/// Float32 field stored as 4 bytes in-struct (physical f32), boxed as TAG_FLOAT64 via fpext.
+/// Distinct from NKIND_FLOAT64 so `nkind_size_align` returns (4,4) and `struct_size_from_named_desc`
+/// reconstructs the correct 4-byte slot size instead of over-sizing to 8 bytes.
+pub const NKIND_FLOAT32: u32 = 10; // Float32 → 4 bytes (fpext to f64 on dynamic read)
 
 /// Returns `(byte_size, alignment)` for a named-descriptor field kind code.
 /// This is the SINGLE SOURCE OF TRUTH for the nkind → layout mapping shared by the
@@ -94,11 +98,12 @@ pub const NKIND_MAP: u32 = 9; // *LinMap heap field → 8-byte pointer
 #[inline]
 pub const fn nkind_size_align(nkind: u32) -> (u32, u32) {
     match nkind {
-        NKIND_INT32  => (4, 4),
-        NKIND_INT64  => (8, 8),
-        NKIND_UINT64 => (8, 8),
+        NKIND_INT32   => (4, 4),
+        NKIND_INT64   => (8, 8),
+        NKIND_UINT64  => (8, 8),
         NKIND_FLOAT64 => (8, 8),
-        NKIND_BOOL   => (1, 1),
+        NKIND_FLOAT32 => (4, 4),
+        NKIND_BOOL    => (1, 1),
         // All heap-pointer kinds: String, Array, Sealed, Map — and any future additions.
         _ => (8, 8),
     }
