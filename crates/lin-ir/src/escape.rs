@@ -73,7 +73,17 @@ use lin_check::types::Type;
 use crate::carry::{self, UnionFind};
 use crate::ir::*;
 
-/// Run the escape-analysis pass on all functions in a module, mutating `MakeObject.stack` in place.
+/// Run the escape-analysis pass on all functions in a module, mutating `MakeObject.stack` and
+/// `MakeArray.inline` in place.
+/// Mark non-escaping sealed-record-array MakeArray sites as `inline = true` (0xFE) iff
+/// the array is only used via local reads (FieldGet/Index/SealedArrayFieldGet), Release, or Retain.
+/// Must run BEFORE `repr::run` so that the repr seeding pass sees the updated `inline` flags.
+pub fn analyze_array_inline(module: &mut LinModule) {
+    for func in &mut module.functions {
+        analyze_array_inline_fn(func);
+    }
+}
+
 pub fn analyze(module: &mut LinModule) {
     for func in &mut module.functions {
         analyze_fn(func);
@@ -233,6 +243,198 @@ fn analyze_fn(func: &mut LinFunction) {
             block.instr_spans = kept_spans;
         }
     }
+}
+
+/// 0xFE inline gate (Phase 1): for each `MakeArray` whose element type is a sealed scalar record,
+/// mark `inline = true` iff:
+///   1. Every ELEMENT temp is ONLY used in that MakeArray + Release instructions, AND
+///   2. The ARRAY itself (its `dst` temp) only reaches SAFE consumers: reads (FieldGet/Index/
+///      SealedArrayFieldGet), Release, or Retain.
+///
+/// Container stores (MakeObject field, IndexSet value, nested MakeArray element, GlobalValSet,
+/// MakeCell, CellSet) block 0xFE because the array is read back from the container with repr
+/// `inline=false`, and any subsequent push uses `lin_sealed_ptr_array_push` on the inline buffer
+/// → wrong-offset write + wrong-size realloc → header corruption (elem_tag overwrite) → crash.
+///
+/// What is NOT allowed (fails safe to 0xFD):
+///   - Any container store (see above).
+///   - `Call`/`CallIntrinsic` arg (unknown callee might push into it via a container read-back).
+///   - `Return` of the array (crosses function boundary; caller may do anything).
+///   - Closure capture of the array (MakeClosure).
+///   - TailCall / CondJump / Switch.
+///
+/// Fail-safe: on any doubt `inline` stays `false` (0xFD pointer-backed, correct today).
+fn analyze_array_inline_fn(func: &mut LinFunction) {
+    // Collect sealed-record-array MakeArray sites: (bi, ii, dst, elements).
+    let mut make_array_sites: Vec<(usize, usize, Temp, Vec<Temp>)> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, instr) in block.instructions.iter().enumerate() {
+            if let Instruction::MakeArray { elem_ty, elements, dst, .. } = instr {
+                if Type::sealed_array_elem(&Type::Array(Box::new(elem_ty.clone()))).is_some() {
+                    make_array_sites.push((bi, ii, *dst, elements.clone()));
+                }
+            }
+        }
+    }
+    if make_array_sites.is_empty() {
+        return;
+    }
+
+    // For each site, decide inline=true/false. Collect decisions first, then apply (two-phase
+    // to avoid holding an immutable borrow of func.blocks when we later need a mutable one).
+    let decisions: Vec<bool> = make_array_sites
+        .iter()
+        .map(|(site_bi, site_ii, arr_dst, site_elements)| {
+            // Check 1: all element temps used only in the MakeArray + Release.
+            for &elem in site_elements {
+                if !temp_escape_free(&func.blocks, elem, *site_bi, *site_ii, false) {
+                    return false;
+                }
+            }
+            // Check 2 (Phase-2 widened gate): array DST only reaches safe consumers.
+            array_inline_escape_ok(&func.blocks, *arr_dst, *site_bi, *site_ii)
+        })
+        .collect();
+
+    // Apply decisions.
+    for ((site_bi, site_ii, _, _), safe) in make_array_sites.iter().zip(decisions.iter()) {
+        if *safe {
+            if let Instruction::MakeArray { inline, .. } =
+                &mut func.blocks[*site_bi].instructions[*site_ii]
+            {
+                *inline = true;
+            }
+        }
+    }
+}
+
+/// Phase-1 gate for the ARRAY dst of a 0xFE MakeArray site.
+///
+/// Returns true iff every use of temp `t` in `blocks` is INLINE-SAFE, meaning codegen handles
+/// it correctly for a 0xFE array:
+///   - at instruction (site_bi, site_ii) — the defining MakeArray itself,
+///   - Release — scope-exit drop,
+///   - read-only consumers: FieldGet/Index/SealedArrayFieldGet (local reads, repr statically inline),
+///   - Retain — a refcount bump; does NOT observe the element layout, safe.
+///
+/// Container stores (`MakeObject` field, `IndexSet` value, nested `MakeArray` element,
+/// `GlobalValSet`, `MakeCell`, `CellSet`) are NOT SAFE and block 0xFE promotion.
+///
+/// Soundness: when an array is stored into a container (map/object/cell/global), it is read back
+/// with repr `inline=false` (container-sourced arrays always get 0xFD repr in repr.rs).  Any
+/// subsequent `push` on the retrieved pointer calls `lin_sealed_ptr_array_push`, which writes an
+/// 8-byte struct pointer at `data + len * 8`.  For a 0xFE inline buffer whose stride != 8 (any
+/// record with heap fields — String, Map, nested array…) that is a wrong-offset write plus a
+/// wrong-size realloc, silently corrupting the array header (including the `elem_tag` byte).
+/// `lin_sealed_any_to_tagged` later sees the corrupted `elem_tag` (no longer 0xFE), falls to
+/// the `_ =>` arm, and calls `lin_sealed_ptr_array_to_tagged` on an inline-payload buffer →
+/// garbage dereferences → abort.  The safe fix is: block 0xFE whenever the array might escape
+/// to a context where its `inline=false` clone is pushed into.  Container stores are the only
+/// paths where a 0xFE pointer survives across a function-local repr boundary and can reappear
+/// with `inline=false` repr, so they are the exact set to block.
+///
+/// What is NOT safe: Return (crosses frame), TailCall, CondJump/Switch on the array value, any
+/// Call/CallIntrinsic arg, or any container store.
+fn array_inline_escape_ok(
+    blocks: &[crate::ir::BasicBlock],
+    t: Temp,
+    site_bi: usize,
+    site_ii: usize,
+) -> bool {
+    for (bi, block) in blocks.iter().enumerate() {
+        for (ii, instr) in block.instructions.iter().enumerate() {
+            if bi == site_bi && ii == site_ii {
+                continue; // Defining instruction.
+            }
+            let uses = crate::liveness::instr_use_def(instr).0;
+            if !uses.contains(&t) {
+                continue;
+            }
+            let ok = match instr {
+                Instruction::Release { val, .. } if *val == t => true,
+                // Read-only consumers (statically known inline repr at these sites).
+                Instruction::FieldGet { object, .. } if *object == t => true,
+                Instruction::Index { object, .. } if *object == t => true,
+                Instruction::SealedArrayFieldGet { array, .. } if *array == t => true,
+                // Retain is a refcount bump only; does NOT observe the inline layout.
+                Instruction::Retain { val, .. } if *val == t => true,
+                // Everything else (Call, CallIntrinsic, MakeObject, IndexSet, MakeArray elem,
+                // MakeClosure, GlobalValSet, MakeCell, CellSet, Return, TailCall, …) — fail safe.
+                // Container stores (MakeObject field, IndexSet value, nested MakeArray elem,
+                // GlobalValSet, MakeCell, CellSet) are blocked because the array is read back
+                // with repr inline=false (container-sourced), and any subsequent push uses
+                // lin_sealed_ptr_array_push on a 0xFE buffer → wrong-offset write + wrong-size
+                // realloc → heap/header corruption.
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        // Terminators: Return and TailCall cross frame boundaries → not safe.
+        let term_uses: Vec<Temp> = match &block.terminator {
+            Terminator::Return(Some(v)) => vec![*v],
+            Terminator::TailCall { args } => args.clone(),
+            Terminator::CondJump { cond, .. } => vec![*cond],
+            Terminator::Switch { val, .. } => vec![*val],
+            _ => vec![],
+        };
+        if term_uses.contains(&t) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Returns true iff every use of temp `t` in `blocks` is either:
+///   - at instruction (site_bi, site_ii) [the defining instruction], or
+///   - a Release { val: t }, or
+///   - (when `allow_reads`) a read-only consumer: FieldGet/Index/SealedArrayFieldGet.
+fn temp_escape_free(
+    blocks: &[crate::ir::BasicBlock],
+    t: Temp,
+    site_bi: usize,
+    site_ii: usize,
+    allow_reads: bool,
+) -> bool {
+    for (bi, block) in blocks.iter().enumerate() {
+        for (ii, instr) in block.instructions.iter().enumerate() {
+            if bi == site_bi && ii == site_ii {
+                continue; // The defining instruction — skip
+            }
+            let uses = crate::liveness::instr_use_def(instr).0;
+            if uses.contains(&t) {
+                if matches!(instr, Instruction::Release { val, .. } if *val == t) {
+                    continue; // Scope-exit release: safe
+                }
+                if allow_reads {
+                    let is_read_only = matches!(instr,
+                        Instruction::FieldGet { object, .. } if *object == t
+                    ) || matches!(instr,
+                        Instruction::Index { object, .. } if *object == t
+                    ) || matches!(instr,
+                        Instruction::SealedArrayFieldGet { array, .. } if *array == t
+                    );
+                    if is_read_only {
+                        continue;
+                    }
+                }
+                return false; // Escaping consumer found
+            }
+        }
+        // Check terminators.
+        let term_uses: Vec<Temp> = match &block.terminator {
+            Terminator::Return(Some(v)) => vec![*v],
+            Terminator::TailCall { args } => args.clone(),
+            Terminator::CondJump { cond, .. } => vec![*cond],
+            Terminator::Switch { val, .. } => vec![*val],
+            _ => vec![],
+        };
+        if term_uses.contains(&t) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Classify one instruction: add carry edges (union) and mark escaping uses. EVERY use of a temp

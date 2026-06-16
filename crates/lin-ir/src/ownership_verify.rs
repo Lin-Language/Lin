@@ -1257,7 +1257,7 @@ mod tests {
             vec![
                 blk(
                     0,
-                    vec![Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32 }],
+                    vec![Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false }],
                     Terminator::TailCall { args: vec![] },
                 ),
                 // Dead block: never reached (TailCall has no successors).
@@ -1285,7 +1285,7 @@ mod tests {
                 blk(
                     0,
                     vec![
-                        Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32 },
+                        Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false },
                         Instruction::Release { val: Temp(0), ty: arr.clone() },
                     ],
                     Terminator::TailCall { args: vec![] },
@@ -1311,7 +1311,7 @@ mod tests {
             vec![blk(
                 0,
                 vec![
-                    Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32 },
+                    Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false },
                     Instruction::Release { val: Temp(0), ty: arr.clone() },
                     Instruction::Release { val: Temp(0), ty: arr.clone() },
                 ],
@@ -1333,7 +1333,7 @@ mod tests {
             vec![blk(
                 0,
                 vec![
-                    Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32 },
+                    Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false },
                     Instruction::Retain { val: Temp(0), ty: arr.clone() },
                     Instruction::Release { val: Temp(0), ty: arr.clone() },
                     Instruction::Release { val: Temp(0), ty: arr.clone() },

@@ -421,8 +421,14 @@ pub enum Instruction {
     /// boundary / unknown-retaining call — those stay heap. A wrong `true` is a use-after-return;
     /// the analysis fails safe to `false` (heap) on any doubt.
     MakeObject { dst: Temp, fields: Vec<(String, Temp)>, spreads: Vec<Temp>, ty: Type, stack: bool },
-    /// result = [ elements... ]  — allocates array on heap
-    MakeArray { dst: Temp, elements: Vec<Temp>, elem_ty: Type },
+    /// result = [ elements... ]  — allocates array on heap.
+    ///
+    /// `inline` (0xFE Phase 1): when `true`, the escape analysis (`escape.rs`) proved that NONE of
+    /// the element temps escape (no aliasing after the copy), so codegen uses `lin_sealed_array_alloc`
+    /// + `lin_sealed_array_push_struct_retaining` (contiguous inline 0xFE buffer) instead of the
+    /// pointer-backed 0xFD path. Only set on sealed-record-array literals whose elements are all
+    /// proven non-escaping. `false` → 0xFD pointer-backed (current default; safe, supports aliasing).
+    MakeArray { dst: Temp, elements: Vec<Temp>, elem_ty: Type, inline: bool },
     /// result = object[key]  — safe field access (missing key → null temp)
     Index { dst: Temp, object: Temp, key: Temp, obj_ty: Type, key_ty: Type, result_ty: Type },
     /// object[key] = value  — in-place array/object element assignment (no result).

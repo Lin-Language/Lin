@@ -478,6 +478,11 @@ pub unsafe fn materialize_sealed_elem_boxed(payload: *const u8, named_desc: *con
     alloc_tagged(TAG_MAP, map as u64) as *mut TaggedVal
 }
 
+/// Public wrapper — called from `lin_sealed_any_to_tagged` in array.rs.
+pub(crate) unsafe fn materialize_named_payload_to_map_pub(payload: *const u8, named_desc: *const u8) -> *mut crate::map::LinMap {
+    materialize_named_payload_to_map(payload, named_desc)
+}
+
 /// WRITE-direction inverse of `materialize_named_payload` (ADR-063 mechanism (i), the fail-safe
 /// boxed view): pack a keyed `LinObject`'s fields into the HEADER-LESS packed element `slot` of a
 /// 0xFE sealed-record array, via the array's NAMED descriptor.
