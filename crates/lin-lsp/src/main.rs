@@ -7880,6 +7880,55 @@ export val thingCount = 7
         }
     }
 
+    /// The DEFINITION NAME of a function-typed `val` is coloured `function`; a plain-value `val`
+    /// is coloured `variable`; and a lambda parameter at its definition site is `parameter`.
+    #[test]
+    fn semantic_tokens_val_def_site_coloured_by_type() {
+        // `foo` binds a function; `bar` binds an integer; `x` is a parameter.
+        let src = "val foo = (x: Int32) => x * 2\nval bar = 3\n";
+        let analysis = analyse(src, None);
+        let toks = decode_semantic(&semantic_tokens(src, &analysis));
+
+        // `foo` — definition name of a function-typed val (offset 4, len 3).
+        let foo_off = src.find("foo").unwrap();
+        let foo_pos = offset_to_position(src, foo_off);
+        let foo_tok = toks
+            .iter()
+            .find(|(l, c, _, _)| *l == foo_pos.line && *c == foo_pos.character)
+            .expect("expected a token at the definition of `foo`");
+        assert_eq!(foo_tok.3, ST_FUNCTION, "function-typed val def should be `function`: {:?}", foo_tok);
+
+        // `bar` — definition name of a plain Int32 val (line 1, offset 4).
+        let line1 = src.find('\n').unwrap() + 1;
+        let bar_off = line1 + src[line1..].find("bar").unwrap();
+        let bar_pos = offset_to_position(src, bar_off);
+        let bar_tok = toks
+            .iter()
+            .find(|(l, c, _, _)| *l == bar_pos.line && *c == bar_pos.character)
+            .expect("expected a token at the definition of `bar`");
+        assert_eq!(bar_tok.3, ST_VARIABLE, "plain val def should be `variable`: {:?}", bar_tok);
+
+        // `x` — parameter at its definition site (inside the param list).
+        let x_off = src.find("(x:").unwrap() + 1; // skip the `(`
+        let x_pos = offset_to_position(src, x_off);
+        let x_tok = toks
+            .iter()
+            .find(|(l, c, _, _)| *l == x_pos.line && *c == x_pos.character)
+            .expect("expected a token at the definition of `x`");
+        assert_eq!(x_tok.3, ST_PARAMETER, "param def site should be `parameter`: {:?}", x_tok);
+
+        // Non-overlapping invariant.
+        let mut sorted = toks.clone();
+        sorted.sort_by_key(|(l, c, _, _)| (*l, *c));
+        for w in sorted.windows(2) {
+            let (l0, c0, len0, _) = w[0];
+            let (l1, c1, _, _) = w[1];
+            if l0 == l1 {
+                assert!(c0 + len0 <= c1, "tokens overlap: {:?} then {:?}", w[0], w[1]);
+            }
+        }
+    }
+
     // ── Tier-2: signature help ──────────────────────────────────────────────────
 
     /// The active parameter is the count of top-level commas before the cursor.
