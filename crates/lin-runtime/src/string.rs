@@ -987,20 +987,17 @@ unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
         TAG_MAP => {
             let map = payload as *const crate::map::LinMap;
             if map.is_null() { return "o:{}".to_string(); }
-            let cap = (*map).cap as usize;
             let mut pairs: Vec<(String, String)> = Vec::new();
-            for i in 0..cap {
-                let slot = (*map).slots.add(i);
-                if (*slot).hash == 0 { continue; }
-                let key_ptr = (*slot).key as *const crate::string::LinString;
+            crate::map::map_for_each_slot(map, |key_bits, val| {
+                let key_ptr = key_bits as *const crate::string::LinString;
                 let key_str = if key_ptr.is_null() {
                     String::new()
                 } else {
                     (*key_ptr).as_str().to_string()
                 };
-                let val_str = tagged_to_key_string(&(*slot).value as *const TaggedVal);
+                let val_str = tagged_to_key_string(&val as *const TaggedVal);
                 pairs.push((key_str, val_str));
-            }
+            });
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             let inner: Vec<String> = pairs.into_iter().map(|(k, v)| format!("{}:{}", k, v)).collect();
             format!("o:{{{}}}", inner.join(","))

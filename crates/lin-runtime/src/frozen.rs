@@ -47,18 +47,11 @@ pub(crate) unsafe fn freeze_map(map: *mut LinMap) {
         return;
     }
     (*map).refcount = IMMORTAL_RC;
-    let cap = (*map).cap as usize;
-    for i in 0..cap {
-        let slot = (*map).slots.add(i);
-        if (*slot).hash == 0 {
-            continue;
-        }
-        // Freeze the string key.
-        let key_ptr = (*slot).key as *mut crate::string::LinString;
-        freeze_string(key_ptr);
-        // Freeze the value payload.
-        freeze_payload((*slot).value.tag, (*slot).value.payload);
-    }
+    // Value-unboxed slots: iterate via the map's encapsulated helper (reconstructs each value).
+    crate::map::map_for_each_slot(map, |key_bits, val| {
+        freeze_string(key_bits as *mut crate::string::LinString);
+        freeze_payload(val.tag, val.payload);
+    });
 }
 
 /// Seal one tagged payload by kind.
