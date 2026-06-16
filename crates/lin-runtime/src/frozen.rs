@@ -112,6 +112,7 @@ pub(crate) unsafe fn freeze_sealed(ptr: *mut u8) {
             crate::sealed::KIND_ARRAY => freeze_array(payload as *mut LinArray),
             crate::sealed::KIND_SEALED => freeze_sealed(payload),
             crate::sealed::KIND_MAP => freeze_map(payload as *mut LinMap),
+            crate::sealed::KIND_SUMNODE_FIELD => crate::sumnode::lin_sumnode_freeze(payload),
             _ => {}
         }
     }
