@@ -352,10 +352,17 @@ unsafe fn transfer_payload(tag: u8, payload: u64) -> u64 {
 
 /// Deep-copy a transferable value graph rooted at a boxed `TaggedVal*`. Returns a fresh,
 /// independently-owned box (or null for the null value). The caller owns the result.
+/// SMI-safe: inline integers are pure values — reconstruct a real box from the encoded value.
 #[no_mangle]
 pub unsafe extern "C" fn lin_transfer_clone(p: *const u8) -> *mut u8 {
     if p.is_null() {
         return std::ptr::null_mut();
+    }
+    #[cfg(feature = "smi")]
+    if crate::tagged::is_smi_ptr(p) {
+        let tag = if crate::tagged::is_smi_int64_pub(p) { crate::tagged::TAG_INT64 } else { crate::tagged::TAG_INT32 };
+        let val: i64 = if crate::tagged::is_smi_int64_pub(p) { (p as i64) >> 2 } else { ((p as i64) >> 2) as i32 as i64 };
+        return crate::tagged::alloc_tagged(tag, val as u64);
     }
     let src = &*(p as *const TaggedVal);
     // Deep-clone the value graph. transfer_clone_value handles the record/sum-node → LinMap

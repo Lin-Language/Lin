@@ -65,11 +65,16 @@ impl Desc {
 /// `(tag, payload)` of a (possibly null) boxed Json value.
 unsafe fn tag_payload(v: *const u8) -> (u8, u64) {
     if v.is_null() {
-        (TAG_NULL, 0)
-    } else {
-        let tv = &*(v as *const TaggedVal);
-        (tv.tag, tv.payload)
+        return (TAG_NULL, 0);
     }
+    #[cfg(feature = "smi")]
+    if crate::tagged::is_smi_ptr(v) {
+        let tag = if crate::tagged::is_smi_int64_pub(v) { crate::tagged::TAG_INT64 } else { crate::tagged::TAG_INT32 };
+        let val: i64 = if crate::tagged::is_smi_int64_pub(v) { (v as i64) >> 2 } else { ((v as i64) >> 2) as i32 as i64 };
+        return (tag, val as u64);
+    }
+    let tv = &*(v as *const TaggedVal);
+    (tv.tag, tv.payload)
 }
 
 /// True if `tag` is any numeric tag.
