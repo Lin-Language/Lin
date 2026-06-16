@@ -2,6 +2,10 @@
 //! Provides memory management, string operations, array operations, and I/O
 //! that are linked into every compiled binary.
 
+#[cfg(feature = "mimalloc-allocator")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod array;
 pub mod async_rt;
 pub mod decode;
