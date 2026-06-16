@@ -162,6 +162,13 @@ pub unsafe extern "C" fn lin_array_free(arr: *mut LinArray) {
         dealloc(arr as *mut u8, array_layout());
         return;
     }
+    if (*arr).elem_tag == crate::columnar::COLUMNAR_ARRAY_TAG {
+        // Columnar array (0xFC): column buffers and col_ptrs were already freed by
+        // free_columnar_array_cols (called from lin_array_release before lin_array_free).
+        // Here we only free the LinArray header itself.
+        dealloc(arr as *mut u8, array_layout());
+        return;
+    }
     let (esize, ealign) = flat_elem_size_align((*arr).elem_tag);
     let data_layout = Layout::from_size_align_unchecked(esize * cap, ealign);
     dealloc((*arr).data as *mut u8, data_layout);
@@ -222,6 +229,13 @@ pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
                     crate::sealed::lin_sealed_release_self(sptr);
                 }
             }
+        } else if (*arr).elem_tag == crate::columnar::COLUMNAR_ARRAY_TAG {
+            // Columnar array (0xFC): free each column buffer + col_ptrs indirection array.
+            // For a scalar-only columnar array (no heap fields) just free the column buffers.
+            // For pointer-field columns, release each element pointer first (currently not possible
+            // via codegen since columnar requires all-scalar fields, but correct for future use).
+            crate::columnar::free_columnar_array_cols(arr);
+            // lin_array_free for 0xFC only frees the header; col_ptrs already freed above.
         }
         lin_array_free(arr);
     }

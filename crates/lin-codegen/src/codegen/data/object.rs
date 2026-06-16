@@ -165,6 +165,116 @@ impl<'ctx> Codegen<'ctx> {
         global.as_pointer_value()
     }
 
+    // ────────────────────────── Columnar array (0xFC) descriptors ──────────────────────────
+
+    /// Emit (and cache) the static `ColMeta` global for a columnar array type and return a pointer
+    /// to it. Layout (must match `lin_runtime::columnar::ColMeta` / `ColFieldMeta`):
+    /// ```text
+    /// ColMeta      = [ u32 n_fields | u32 _pad ]
+    /// ColFieldMeta = [ u8 kind | u8 _pad[3] | u32 elem_size ]  (8 bytes each, in field order)
+    /// ```
+    /// `kind`: 0 = SCALAR, 1 = STRING, 2 = ARRAY, 3 = SEALED. For the Phase-1 POC (all-scalar fields)
+    /// every entry is `COL_KIND_SCALAR = 0` with `elem_size` = the field's natural byte width.
+    /// Cached by the field sequence so identical types share one global.
+    pub(crate) fn columnar_col_meta_descriptor(
+        &mut self,
+        fields: &indexmap::IndexMap<String, Type>,
+    ) -> inkwell::values::PointerValue<'ctx> {
+        let i8_ty  = self.context.i8_type();
+        let i32_ty = self.context.i32_type();
+
+        // Build a cache key from field names, kinds, and sizes.
+        let key: String = format!(
+            "__colmeta_{}",
+            fields.iter().map(|(k, fty)| {
+                let (kind, sz) = Self::col_field_kind_and_size(fty);
+                format!("{}:{}:{}", k, kind, sz)
+            }).collect::<Vec<_>>().join("__")
+        );
+        if let Some(g) = self.module.get_global(&key) {
+            return g.as_pointer_value();
+        }
+
+        let n = fields.len() as u64;
+        // Header: [u32 n_fields, u32 _pad]
+        let mut members: Vec<inkwell::values::BasicValueEnum<'ctx>> = Vec::new();
+        let mut member_tys: Vec<inkwell::types::BasicTypeEnum<'ctx>> = Vec::new();
+        members.push(i32_ty.const_int(n, false).into());
+        member_tys.push(i32_ty.into());
+        members.push(i32_ty.const_int(0, false).into()); // _pad
+        member_tys.push(i32_ty.into());
+        // Per-field entries: [u8 kind, u8 _pad, u8 _pad, u8 _pad, u32 elem_size]
+        for fty in fields.values() {
+            let (kind, sz) = Self::col_field_kind_and_size(fty);
+            members.push(i8_ty.const_int(kind as u64, false).into());
+            member_tys.push(i8_ty.into());
+            // 3 padding bytes
+            for _ in 0..3 {
+                members.push(i8_ty.const_int(0, false).into());
+                member_tys.push(i8_ty.into());
+            }
+            members.push(i32_ty.const_int(sz as u64, false).into());
+            member_tys.push(i32_ty.into());
+        }
+        let desc_ty = self.context.struct_type(&member_tys, true); // packed
+        let desc_val = self.context.const_struct(&members, true);
+        let global = self.module.add_global(desc_ty, None, &key);
+        global.set_initializer(&desc_val);
+        global.set_constant(true);
+        global.as_pointer_value()
+    }
+
+    /// `(kind, elem_size_bytes)` for one columnar field.
+    /// kind=0 (SCALAR) for every flat-scalar / Bool field (Phase-1 all-scalar gate).
+    /// kind=1/2/3 for String/Array/Sealed (future; not reachable in Phase 1).
+    pub(crate) fn col_field_kind_and_size(fty: &Type) -> (u8, u32) {
+        use lin_check::types::Type::*;
+        match fty {
+            Bool | UInt8 | Int8 => (0, 1),
+            UInt16 | Int16 => (0, 2),
+            Int32 | UInt32 | Float32 | IntLit(_) => (0, 4),
+            Int64 | UInt64 | Float64 => (0, 8),
+            Str | StrLit(_) => (1, 8),
+            Array(_) | FixedArray(_) => (2, 8),
+            Object { sealed: true, .. } => (3, 8),
+            _ => (0, 8), // fallback: 8-byte scalar
+        }
+    }
+
+    /// Column index (0-based, declaration order) of `field` in `fields`.
+    /// Returns `None` when the field is absent.
+    pub(crate) fn col_field_index(fields: &indexmap::IndexMap<String, Type>, field: &str) -> Option<usize> {
+        fields.keys().position(|k| k == field)
+    }
+
+    /// Emit (and cache) a static `[u32 × n_fields]` array of SEALED-STRUCT field offsets for a
+    /// columnar record type. `lin_columnar_push_from_sealed` expects `field_offsets[i]` to be the
+    /// byte offset of field `i` WITHIN the sealed struct (INCLUDING the 16-byte sealed header).
+    /// This allows the push function to read each field from a freshly-constructed sealed struct and
+    /// scatter it into the correct column buffer.
+    pub(crate) fn columnar_field_offsets_global(
+        &mut self,
+        fields: &indexmap::IndexMap<String, Type>,
+    ) -> inkwell::values::PointerValue<'ctx> {
+        let i32_ty = self.context.i32_type();
+        let key: String = format!(
+            "__coloffsets_{}",
+            fields.keys().map(|k| k.as_str()).collect::<Vec<_>>().join("__")
+        );
+        if let Some(g) = self.module.get_global(&key) {
+            return g.as_pointer_value();
+        }
+        let offsets: Vec<inkwell::values::IntValue<'ctx>> = fields.keys().map(|k| {
+            let (off, _) = Self::sealed_field_layout(fields, k);
+            i32_ty.const_int(off, false)
+        }).collect();
+        let arr = i32_ty.const_array(&offsets);
+        let global = self.module.add_global(arr.get_type(), None, &key);
+        global.set_initializer(&arr);
+        global.set_constant(true);
+        global.as_pointer_value()
+    }
+
     /// Emit (and cache) the static `SumDesc` global for a sum type and return a pointer to it (NULL
     /// pointer constant when NO variant has a heap/recursive field — a Stage-1 scalar-only sum type,
     /// whose drop is a pure refcount decrement + free). The descriptor is the variant-indexed

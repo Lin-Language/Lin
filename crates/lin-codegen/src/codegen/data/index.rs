@@ -911,6 +911,64 @@ impl<'ctx> Codegen<'ctx> {
         let _ = arr_ty;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
+        let arr_ptr = arr.into_pointer_value();
+
+        // ── 0xFC Columnar fast path (BEFORE the PackedSealedArray early-return guard) ─────────
+        // Two-pointer-load + stride-N load: col_ptrs @ arr+24; col_ptr = col_ptrs[col_idx];
+        // elem_ptr = col_ptr + i * elem_size.
+        if arr_repr.is_columnar_array() {
+            let col_fields = arr_repr.columnar_array_layout().unwrap().clone();
+            let col_idx = match Self::col_field_index(&col_fields, field) {
+                Some(i) => i,
+                None => return self.null_value_for(result_ty),
+            };
+            let fld_ty_col = col_fields.get(field).cloned().unwrap_or(Type::Null);
+            let (_, elem_sz) = Self::col_field_kind_and_size(&fld_ty_col);
+            let elem_sz = elem_sz as u64;
+            let llvm_fld_col = self.llvm_type(&fld_ty_col);
+
+            // Normalise idx to i64.
+            let idx_i64 = if idx.is_int_value() {
+                let iv = idx.into_int_value();
+                if iv.get_type().get_bit_width() == 64 { iv } else { self.builder.int_s_extend(iv, i64_ty, "carr_idx64") }
+            } else {
+                self.unbox_value(idx, &Type::Int64).into_int_value()
+            };
+            // len @ arr+8; bounds-check; wrap negative index.
+            let len_p = unsafe { self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(8, false)], "carr_len_p") };
+            let len = self.builder.load(i64_ty, len_p, "carr_len").into_int_value();
+            let zero = i64_ty.const_zero();
+            let is_neg = self.builder.int_compare(IntPredicate::SLT, idx_i64, zero, "carr_neg");
+            let wrapped = self.builder.int_add(len, idx_i64, "carr_wrap");
+            let actual = self.builder.select(is_neg, wrapped, idx_i64, "carr_actual").into_int_value();
+            let oob = self.builder.int_compare(IntPredicate::UGE, actual, len, "carr_oob");
+
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let ok_b  = self.context.append_basic_block(llvm_fn, "carr_ok");
+            let oob_b = self.context.append_basic_block(llvm_fn, "carr_oob");
+            self.builder.conditional_branch(oob, oob_b, ok_b);
+            // OOB: fault via lin_sealed_array_elem_ptr (reuses the 0xFE fault path).
+            self.builder.position_at_end(oob_b);
+            let elem_fn = self.get_or_declare_fn("lin_sealed_array_elem_ptr",
+                ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+            self.builder.call(elem_fn, &[arr_ptr.into(), idx_i64.into()], "carr_oob_call");
+            self.builder.unreachable();
+
+            self.builder.position_at_end(ok_b);
+            // col_ptrs = *(ptr*)(arr + 24)
+            let col_ptrs_pp = unsafe { self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(24, false)], "carr_cpp") };
+            let col_ptrs = self.builder.load(ptr_ty, col_ptrs_pp, "carr_colptrs").into_pointer_value();
+            // col_ptr = col_ptrs[col_idx]  (col_ptrs is an array of pointers, each 8 bytes on 64-bit)
+            let col_ptr_p = unsafe { self.builder.gep(self.context.i8_type(), col_ptrs, &[i64_ty.const_int((col_idx * 8) as u64, false)], "carr_cp_p") };
+            let col_ptr = self.builder.load(ptr_ty, col_ptr_p, "carr_cp").into_pointer_value();
+            // elem_ptr = col_ptr + actual * elem_size
+            let byte_off = self.builder.int_mul(actual, i64_ty.const_int(elem_sz, false), "carr_boff");
+            let elem_p = unsafe { self.builder.gep(self.context.i8_type(), col_ptr, &[byte_off], "carr_ep") };
+            let loaded = self.builder.load(llvm_fld_col, elem_p, "carr_val");
+            return if &fld_ty_col == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty_col, result_ty) };
+        }
+
+        // ── 0xFE / 0xFD packed sealed array path ─────────────────────────────────────────────
         let Some(fields) = arr_repr.packed_sealed_array_layout() else {
             return ptr_ty.const_null().into();
         };
@@ -921,7 +979,7 @@ impl<'ctx> Codegen<'ctx> {
         let (field_off, _total) = Self::sealed_field_layout(&fields, field);
         let fld_ty = fields.get(field).cloned().unwrap_or(Type::Null);
         let llvm_fld = self.llvm_type(&fld_ty);
-        let arr_ptr = arr.into_pointer_value();
+
         let is_inline = arr_repr.is_inline_sealed_array();
 
         // Normalise idx to i64.

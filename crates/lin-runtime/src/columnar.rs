@@ -283,8 +283,56 @@ pub unsafe fn lin_columnar_field_get_ptr(arr: *const LinArray, i: u64, col_idx: 
 // Release
 // ---------------------------------------------------------------------------
 
+/// Free the column buffers and the col_ptrs indirection array for a columnar array whose refcount
+/// has already reached zero. Called by `lin_array_release` (array.rs) BEFORE `lin_array_free`.
+/// Does NOT free the LinArray header (that is done by `lin_array_free`).
+/// Does NOT decrement refcount (caller already did that).
+///
+/// # Safety
+/// `arr` must be a valid 0xFC columnar array with refcount already at zero.
+pub unsafe fn free_columnar_array_cols(arr: *mut LinArray) {
+    let nf = n_fields(arr) as u32;
+    let meta = col_meta(arr);
+    let ptrs = col_ptrs(arr);
+    let len = (*arr).len as usize;
+    let cap = (*arr).cap as usize;
+
+    for i in 0..nf {
+        let fm = col_meta_field(meta, i);
+        if fm.kind != COL_KIND_SCALAR {
+            // Release pointer-typed elements (String/Array/Sealed) in this column.
+            let col_ptr = *ptrs.add(i as usize) as *mut *mut u8;
+            for j in 0..len {
+                let p = *col_ptr.add(j);
+                if !p.is_null() {
+                    match fm.kind {
+                        COL_KIND_STRING => crate::string::lin_string_release(p as *mut crate::string::LinString),
+                        COL_KIND_ARRAY  => crate::array::lin_array_release(p as *mut LinArray),
+                        COL_KIND_SEALED => crate::sealed::lin_sealed_release_self(p),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Free the column buffer itself.
+        let col_layout = std::alloc::Layout::from_size_align_unchecked(
+            cap * fm.elem_size as usize,
+            fm.elem_size.max(8) as usize,
+        );
+        dealloc(*ptrs.add(i as usize), col_layout);
+    }
+
+    // Free the col_ptrs indirection array.
+    let ptrs_layout = std::alloc::Layout::from_size_align_unchecked(
+        nf as usize * std::mem::size_of::<*mut u8>(),
+        std::mem::align_of::<*mut u8>(),
+    );
+    dealloc(ptrs as *mut u8, ptrs_layout);
+}
+
 /// Release a columnar array. Decrements refcount; at zero frees all column buffers, the
-/// col_ptrs array, and the LinArray header.
+/// col_ptrs array, and the LinArray header. This is the standalone (direct) release path
+/// for columnar arrays not going through `lin_array_release`.
 #[no_mangle]
 pub unsafe extern "C" fn lin_columnar_array_release(arr: *mut LinArray) {
     if arr.is_null() {
@@ -300,43 +348,8 @@ pub unsafe extern "C" fn lin_columnar_array_release(arr: *mut LinArray) {
         return;
     }
 
-    let nf = n_fields(arr) as u32;
-    let meta = col_meta(arr);
-    let ptrs = col_ptrs(arr);
-    let len = (*arr).len as usize;
-    let cap = (*arr).cap as usize;
-
-    for i in 0..nf {
-        let fm = col_meta_field(meta, i);
-        if fm.kind != COL_KIND_SCALAR {
-            // Release all pointer elements in this column.
-            let col_ptr = *ptrs.add(i as usize) as *mut *mut u8;
-            for j in 0..len {
-                let p = *col_ptr.add(j);
-                if !p.is_null() {
-                    match fm.kind {
-                        COL_KIND_STRING => crate::string::lin_string_release(p as *mut crate::string::LinString),
-                        COL_KIND_ARRAY  => crate::array::lin_array_release(p as *mut LinArray),
-                        COL_KIND_SEALED => crate::sealed::lin_sealed_release_self(p),
-                        _ => {}
-                    }
-                }
-            }
-        }
-        // Free the column buffer.
-        let col_layout = Layout::from_size_align_unchecked(
-            cap * fm.elem_size as usize,
-            fm.elem_size.max(8) as usize,
-        );
-        dealloc(*ptrs.add(i as usize), col_layout);
-    }
-
-    // Free the col_ptrs indirection array.
-    let ptrs_layout = Layout::from_size_align_unchecked(
-        nf as usize * std::mem::size_of::<*mut u8>(),
-        std::mem::align_of::<*mut u8>(),
-    );
-    dealloc(ptrs as *mut u8, ptrs_layout);
+    // Free all column buffers + the col_ptrs array.
+    free_columnar_array_cols(arr);
 
     // Free the LinArray header.
     let arr_layout = Layout::from_size_align_unchecked(
