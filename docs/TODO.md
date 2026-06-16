@@ -208,6 +208,24 @@ The 23GB is genuinely-live object/array structures. Each lever below was measure
   and same-byte-count interned-or-not. Node's main trick does NOT transfer to a streaming loader. (Gave a
   minor ~3-4% wall-clock from fewer allocs.) Probe: experiment/string-intern (unmerged).
 
+### UPDATE (2026-06-16, measured): the headline is LinMap, but `0xFE` inline stays a PRIORITY (Linus)
+Per-kind attribution of RAPTOR's peak (132M live): **map 51.5M = 15.25GB (76%)**, sealed 69.8M = 4.47GB,
+tagbox 6.9M live (transient), array/string 0.38GB. So:
+- **LinMap memory efficiency is the #1 MEMORY lever** (15GB). Each LinMap = INITIAL_CAP slots × 32B
+  (hash8+key8+value:TaggedVal16) + a 64B order array, fixed regardless of entry count. Each slot stores a
+  16B TaggedVal even for a `{String:Int32}` value (12B wasted/entry). Sub-levers: (a) INITIAL_CAP 8→4
+  measured **−1.4GB, digest exact** [cheap, ready to merge once master green]; (b) **unboxed/typed map
+  values** — `{String:Int32}` stores Int32 inline (4B) not a 16B TaggedVal → big for the large scalar maps
+  (routeStopIndex, ScanResults rounds); (c) inline-small-map (≤2-4 entries in header, no slots/order alloc).
+  Also investigate the 51.5M COUNT — high for RAPTOR's index; size-histogram + alloc-site needed.
+- **`0xFE` inline records STAYS A PRIORITY** (not demoted): the beyond-Node array repr (headerless inline,
+  no per-element header/malloc/pointer) — speed + locality + ~1.5GB; pursue alongside the map lever.
+- interning ❌ (0.1%), arena ~17%/4GB (`frozen()` free half), seal-union-fields = interp speed (separate).
+
+> NOTE: J4 (Json retirement) was INCOMPLETE — missed `Json` type refs in lin-check/lin-parse/lin-lsp TEST
+> files (my J4 verify used `cargo test -p lin` against CACHED binaries, not `cargo test --workspace` clean).
+> Lesson: always `cargo test --workspace` with a fresh build. Linus has an agent sweeping the rest.
+
 - [ ] **Contiguous inline `0xFE` record arrays — the measured-correct DIRECTION, but a multi-path migration
   (not done).** KEY INSIGHT (with Linus): Node's "contiguous arrays" are a contiguous array of POINTERS to
   heap objects (V8 FixedArray) — which Lin's `0xFD` SEALED_PTR repr ALREADY IS (contiguous ptr spine +
