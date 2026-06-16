@@ -1,3 +1,112 @@
-import { StopId } from "../gtfs/gtfs"
+import { DayOfWeek, StopId, Time, Transfer, Trip } from "../gtfs/gtfs"
+import { QueueFactory } from "./QueueFactory"
+import { RouteId, RouteScanner, RouteScannerFactory } from "./RouteScanner"
+import { Arrivals, ConnectionIndex, ScanResults } from "./ScanResults"
+import { ScanResultsFactory } from "./ScanResultsFactory"
 
+export type RaptorAlgorithm = {
+  "routeStopIndex": RouteStopIndex,
+  "routePath": RoutePaths,
+  "transfers": TransfersByOrigin,
+  "interchange": Interchange,
+  "scanResultsFactory": ScanResultsFactory,
+  "queueFactory": QueueFactory,
+  "routeScannerFactory": RouteScannerFactory
+}
+
+// 
+// Implementation of the Raptor journey planning algorithm
+// 
+export val createRaptorAlgorithm = (
+  routeStopIndex: RouteStopIndex,
+  routePath: RoutePaths,
+  transfers: TransfersByOrigin,
+  interchange: Interchange,
+  scanResultsFactory: ScanResultsFactory,
+  queueFactory: QueueFactory,
+  routeScannerFactory: RouteScannerFactory
+) => {
+  routeStopIndex,
+  routePath,
+  transfers,
+  interchange,
+  scanResultsFactory,
+  queueFactory,
+  routeScannerFactory
+}
+
+// 
+// Perform a plan of the routes at a given time and return the resulting kConnections index
+// 
+export val scan = (
+  raptor: RaptorAlgorithm, 
+  origins: StopTimes, 
+  date: number, 
+  dow: DayOfWeek
+): [ConnectionIndex, Arrivals] =>
+  val routeScanner = raptor["routeScannerFactory"].create(date, dow)
+  val results = raptor["scanResultsFactory"].create(origins)
+  var markedStops = origins.keys()
+
+  while (markedStops.length() > 0) {
+    results.addRound()
+
+    raptor.scanRoutes(results, routeScanner, markedStops)
+    raptor.scanTransfers(results, markedStops)
+
+    markedStops = results.getMarkedStops()
+  }
+
+  results.finalize()
+
+
+val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: RouteScanner, markedStops: StopId[]) =>
+  val queue = raptor["queueFactory"].getQueue(markedStops)
+
+  queue.entries([routeId, stopP] =>
+    var boardingPoint = -1
+    var trip: Trip | Null = null
+    val routePath = raptor["routePath"][routeId]
+    val routePathLength = raptor["routePath"].length()
+
+    range(raptor["routeStopIndex"][routeId][stopP], routePathLength).for(pi => 
+      val stopPi = routePath[pi]
+      val previousArrival = results.previousArrival(stopPi)
+
+      if trip != null then
+        val i = raptor["interchange"][stopPi]
+        val stopTime = trip.stopTimes[pi]
+
+        if stopTime.dropOff && stopTime["arrivalTime"] + i < results.bestArrival(stopPi) then
+          results.setTrip(trip, boardingPoint, pi, i)
+        else if previousArrival != null && previousArrival < stopTime["arrivalTime"] + i then
+          val newTrip = routeScanner.getTrip(routeId, pi, previousArrival)
+
+          if newTrip != null then
+            trip = newTrip
+            boardingPoint = pi
+      else if (previousArrival) then
+        val newTrip = routeScanner.getTrip(routeId, pi, previousArrival)
+
+        if newTrip != null then
+          trip = newTrip
+          boardingPoint = pi
+    )
+  )
+
+
+val scanTransfers = (raptor: RaptorAlgorithm, results: ScanResults, markedStops: StopId[]) =>
+  markedStops.for(stopP =>
+    raptor["transfers"][stopP].for(transfer =>
+      val stopPi = transfer["destination"]
+      val arrival = results.previousArrival(stopP) + transfer["duration"] + raptor["interchange"][stopPi]
+
+      if transfer["startTime"] <= arrival && transfer["endTime"] >= arrival && arrival < results.bestArrival(stopPi) then
+        results.setTransfer(transfer, arrival) 
+  )
+
+export type RouteStopIndex = { RouteId: { StopId: UInt8 } }
+export type RoutePaths = { RouteId: StopId[] }
+export type Interchange = { StopId: Time }
+export type TransfersByOrigin = { StopId: Transfer[] }
 export type StopTimes = { StopId: UInt32 }

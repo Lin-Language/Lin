@@ -1,0 +1,42 @@
+import { StopId } from "../gtfs/gtfs"
+import { RouteId } from "./route-scanner"
+import { RouteStopIndex } from "./raptor-algorithm"
+
+export type QueueFactory {
+  "routesAtStop": RoutesIndexedByStop, 
+  "routeStopIndex": RouteStopIndex
+}
+
+
+// 
+// Create a queue for the Raptor algorithm to use on each iteration of the algorithm.
+// 
+export val createQueueFactory = (routesAtStop: RoutesIndexedByStop, routeStopIndex: RouteStopIndex) => {
+  routesAtStop, 
+  routeStopIndex
+}
+
+
+// 
+// Take the marked stops and return an index of any routes that pass through those stops.
+// 
+export val getQueue = (factory: QueueFactory, markedStops: StopId[]): RouteQueue =>
+  markedStops.reduce({}, (queue, stop) => 
+    factory["routesAtStop"][stop].for(routeId => 
+      queue[routeId] = 
+        if factory.isStopBefore(routeId, queue[routeId], stop) then
+          queue[routeId]
+        else
+          stop
+    )
+
+    queue
+  )
+
+
+val isStopBefore = (factory: QueueFactory, routeId: RouteId, stopA: StopId, stopB: StopId): Boolean => 
+  factory["routeStopIndex"][routeId][stopA] < factory["routeStopIndex"][routeId][stopB]
+ 
+
+export type RouteQueue = { RouteId, StopId }
+export type RoutesIndexedByStop = { StopId: RouteID }

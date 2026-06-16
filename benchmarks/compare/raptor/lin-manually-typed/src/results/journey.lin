@@ -1,0 +1,16 @@
+import { Time, TimetableLeg, Transfer } from "../gtfs/gtfs"
+
+// 
+// A leg is either a timetable leg where the journey passes a number of stops at given 
+// times, or a fixed duration between two stops
+// 
+export type AnyLeg = Transfer | TimetableLeg
+
+// 
+// A journey is a collection of legs
+// 
+export type Journey = {
+  "legs": AnyLeg[],
+  "departureTime": Time,
+  "arrivalTime": Time
+}
