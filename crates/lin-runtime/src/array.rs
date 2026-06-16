@@ -501,6 +501,38 @@ pub unsafe extern "C" fn lin_sealed_array_to_tagged(
     out
 }
 
+/// Materialize a sealed-record array (0xFE inline OR 0xFD pointer-backed) to a tagged `Object[]`.
+/// Dispatches on `elem_tag` at runtime — safe to call on either representation.
+/// Used by codegen's `sealed_array_to_tagged` for container-sourced arrays whose repr is unknown.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_any_to_tagged(arr: *const LinArray) -> *mut LinArray {
+    if arr.is_null() { return lin_array_alloc(4); }
+    match (*arr).elem_tag {
+        SEALED_ARRAY_TAG => {
+            // 0xFE inline: materialize each packed payload via named descriptor into a fresh map.
+            use crate::tagged::*;
+            let len = (*arr).len;
+            let out = lin_array_alloc(len.max(4));
+            let named_desc = (*arr).elem_named_desc;
+            let stride = (*arr).elem_stride;
+            for i in 0..len {
+                let payload = ((*arr).data as *const u8).add((i * stride) as usize);
+                let map = crate::sealed::materialize_named_payload_to_map_pub(payload, named_desc);
+                let slot = (*out).data.add(i as usize);
+                (*slot).tag = TAG_MAP;
+                (*slot)._pad = [0; 7];
+                (*slot).payload = map as u64;
+            }
+            (*out).len = len;
+            out
+        }
+        _ => {
+            // 0xFD pointer-backed (or unknown): delegate to existing function.
+            lin_sealed_ptr_array_to_tagged(arr)
+        }
+    }
+}
+
 /// Push an element. `elem_ptr` points to the value; `tag` is the type tag.
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_push(arr: *mut LinArray, elem_ptr: *const u8, tag: u8) {

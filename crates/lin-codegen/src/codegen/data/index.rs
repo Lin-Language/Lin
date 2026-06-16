@@ -965,7 +965,7 @@ impl<'ctx> Codegen<'ctx> {
         let data = self.builder.load(ptr_ty, data_pp, "sarr_data").into_pointer_value();
 
         let fld_p = if is_inline {
-            // 0xFE inline: stride from arr+32; field at data + actual*stride + payload_off.
+            // 0xFE inline (statically known): stride from arr+32; field at data + actual*stride + payload_off.
             let stride_pp = unsafe { self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(32, false)], "sarr_str_p") };
             let stride = self.builder.load(i64_ty, stride_pp, "sarr_stride").into_int_value();
             let elem_off = self.builder.int_mul(actual, stride, "sarr_elem_off");
@@ -973,11 +973,46 @@ impl<'ctx> Codegen<'ctx> {
             let byte_off = self.builder.int_add(elem_off, i64_ty.const_int(payload_off, false), "sarr_byte_off");
             unsafe { self.builder.gep(self.context.i8_type(), data, &[byte_off], "sarr_fld_p") }
         } else {
-            // 0xFD pointer-backed: load struct pointer from slot, GEP by full struct-relative offset.
-            let slot_off = self.builder.int_mul(actual, i64_ty.const_int(8, false), "sarr_slot_off");
-            let slot_p = unsafe { self.builder.gep(self.context.i8_type(), data, &[slot_off], "sarr_slot_p") };
-            let sptr = self.builder.load(ptr_ty, slot_p, "sarr_sptr").into_pointer_value();
-            unsafe { self.builder.gep(self.context.i8_type(), sptr, &[i64_ty.const_int(field_off, false)], "sarr_fld_p") }
+            // repr is 0xFD (or unknown/container-sourced). Check the runtime elem_tag to handle
+            // 0xFE arrays that escaped via a container store (Phase-2: the array pointer was kept
+            // packed and stored into a map value / record field; on read-back the repr is not
+            // statically inline but the buffer IS a 0xFE contiguous payload buffer).
+            let i8_ty = self.context.i8_type();
+            let etag_p = unsafe { self.builder.gep(i8_ty, arr_ptr, &[i64_ty.const_int(4, false)], "sarr_etag_p") };
+            let etag = self.builder.load(i8_ty, etag_p, "sarr_etag").into_int_value();
+            let is_fe = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFE, false), "sarr_isfe");
+
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let fe_b   = self.context.append_basic_block(llvm_fn, "sarr_fe");
+            let fd_b   = self.context.append_basic_block(llvm_fn, "sarr_fd");
+            let fld_b  = self.context.append_basic_block(llvm_fn, "sarr_fld_m");
+            self.builder.conditional_branch(is_fe, fe_b, fd_b);
+
+            // 0xFE branch: inline stride path.
+            self.builder.position_at_end(fe_b);
+            let stride_pp = unsafe { self.builder.gep(i8_ty, arr_ptr, &[i64_ty.const_int(32, false)], "sarr_fe_str_p") };
+            let stride = self.builder.load(i64_ty, stride_pp, "sarr_fe_stride").into_int_value();
+            let elem_off_fe = self.builder.int_mul(actual, stride, "sarr_fe_eoff");
+            let payload_off = field_off - Self::SEALED_HEADER;
+            let byte_off_fe = self.builder.int_add(elem_off_fe, i64_ty.const_int(payload_off, false), "sarr_fe_boff");
+            let fe_fld_p = unsafe { self.builder.gep(i8_ty, data, &[byte_off_fe], "sarr_fe_fp") };
+            let fe_fld_p_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(fld_b);
+
+            // 0xFD branch: pointer-backed path.
+            self.builder.position_at_end(fd_b);
+            let slot_off = self.builder.int_mul(actual, i64_ty.const_int(8, false), "sarr_fd_soff");
+            let slot_p = unsafe { self.builder.gep(i8_ty, data, &[slot_off], "sarr_fd_sp") };
+            let sptr = self.builder.load(ptr_ty, slot_p, "sarr_fd_sptr").into_pointer_value();
+            let fd_fld_p = unsafe { self.builder.gep(i8_ty, sptr, &[i64_ty.const_int(field_off, false)], "sarr_fd_fp") };
+            let fd_fld_p_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(fld_b);
+
+            // Merge: phi the field pointer from both branches.
+            self.builder.position_at_end(fld_b);
+            let phi = self.builder.phi(ptr_ty, "sarr_fld_phi");
+            phi.add_incoming(&[(&fe_fld_p, fe_fld_p_exit), (&fd_fld_p, fd_fld_p_exit)]);
+            phi.as_basic_value().into_pointer_value()
         };
         let loaded = self.builder.load(llvm_fld, fld_p, "sarr_fld");
         if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
