@@ -75,7 +75,8 @@ use crate::ir::*;
 
 /// Run the escape-analysis pass on all functions in a module, mutating `MakeObject.stack` and
 /// `MakeArray.inline` in place.
-/// Phase-1: mark non-escaping sealed-record-array MakeArray sites as `inline = true` (0xFE).
+/// Mark non-escaping sealed-record-array MakeArray sites as `inline = true` (0xFE) iff
+/// the array is only used via local reads (FieldGet/Index/SealedArrayFieldGet), Release, or Retain.
 /// Must run BEFORE `repr::run` so that the repr seeding pass sees the updated `inline` flags.
 pub fn analyze_array_inline(module: &mut LinModule) {
     for func in &mut module.functions {
@@ -244,29 +245,23 @@ fn analyze_fn(func: &mut LinFunction) {
     }
 }
 
-/// 0xFE inline gate (Phase 1+2): for each `MakeArray` whose element type is a sealed scalar record,
+/// 0xFE inline gate (Phase 1): for each `MakeArray` whose element type is a sealed scalar record,
 /// mark `inline = true` iff:
 ///   1. Every ELEMENT temp is ONLY used in that MakeArray + Release instructions, AND
 ///   2. The ARRAY itself (its `dst` temp) only reaches SAFE consumers: reads (FieldGet/Index/
-///      SealedArrayFieldGet), Release, or CONTAINER STORES (MakeObject field, IndexSet value,
-///      nested MakeArray element, MakeClosure capture, GlobalValSet, MakeCell, CellSet).
+///      SealedArrayFieldGet), Release, or Retain.
 ///
-/// Phase-2 extension: condition 2 now ALLOWS the array to escape into containers. An array stored
-/// into a map value or record field is safe for 0xFE because:
-///   - The container write path (emit_map_set/compile_ir_index_set) calls `compile_ir_box_keep_packed`
-///     which wraps the 0xFE pointer in a TAG_ARRAY TaggedVal — no representation change, O(1).
-///   - The container read path (sealed_array_project_from/sealed_array_project_owned) dispatches on
-///     the runtime elem_tag (0xFE vs 0xFD), so 0xFE arrays read back correctly.
-///   - The fused `arr[i].field` read (compile_ir_sealed_array_field_get) does a runtime tag dispatch
-///     when the repr is not statically known inline (container-sourced arrays: repr inline=false).
-/// Container stores do NOT alias array elements — only the ARRAY POINTER is stored, not any element
-/// reference. The element aliasing is still guarded by condition 1.
+/// Container stores (MakeObject field, IndexSet value, nested MakeArray element, GlobalValSet,
+/// MakeCell, CellSet) block 0xFE because the array is read back from the container with repr
+/// `inline=false`, and any subsequent push uses `lin_sealed_ptr_array_push` on the inline buffer
+/// → wrong-offset write + wrong-size realloc → header corruption (elem_tag overwrite) → crash.
 ///
-/// What is NOT allowed (still fails safe to 0xFD):
-///   - `Retain { val: arr }` — someone wants an extra owner via the boxed API; ambiguous aliasing.
-///   - `Call`/`CallIntrinsic` arg (unknown callee might mutate elements via index set).
+/// What is NOT allowed (fails safe to 0xFD):
+///   - Any container store (see above).
+///   - `Call`/`CallIntrinsic` arg (unknown callee might push into it via a container read-back).
 ///   - `Return` of the array (crosses function boundary; caller may do anything).
-///   - Closure captures of the array when the closure might mutate elements.
+///   - Closure capture of the array (MakeClosure).
+///   - TailCall / CondJump / Switch.
 ///
 /// Fail-safe: on any doubt `inline` stays `false` (0xFD pointer-backed, correct today).
 fn analyze_array_inline_fn(func: &mut LinFunction) {
@@ -313,24 +308,33 @@ fn analyze_array_inline_fn(func: &mut LinFunction) {
     }
 }
 
-/// Phase-2 widened gate for the ARRAY dst of a 0xFE MakeArray site.
+/// Phase-1 gate for the ARRAY dst of a 0xFE MakeArray site.
 ///
 /// Returns true iff every use of temp `t` in `blocks` is INLINE-SAFE, meaning codegen handles
 /// it correctly for a 0xFE array:
 ///   - at instruction (site_bi, site_ii) — the defining MakeArray itself,
 ///   - Release — scope-exit drop,
 ///   - read-only consumers: FieldGet/Index/SealedArrayFieldGet (local reads, repr statically inline),
-///   - container stores: `MakeObject` field, `IndexSet` where `t` is the VALUE (not the container),
-///     nested `MakeArray` element, `MakeClosure` capture, `GlobalValSet`, `MakeCell` init,
-///     `CellSet` value.
-///     These stores keep the 0xFE pointer tagged as TAG_ARRAY in the container slot; the read-back
-///     path does a runtime elem_tag dispatch (0xFE vs 0xFD) so the inline layout is used correctly.
 ///   - Retain — a refcount bump; does NOT observe the element layout, safe.
 ///
-/// What is NOT safe: Return (crosses frame → caller may do anything including `IndexSet` with
-/// aliased element refs), TailCall, CondJump/Switch on the array value, or any Call/CallIntrinsic
-/// arg (unknown callee may `IndexSet` into it using element aliases). Also NOT safe:
-/// `IndexSet` where `t` is the CONTAINER (arr[k]=v, which might mutate elements).
+/// Container stores (`MakeObject` field, `IndexSet` value, nested `MakeArray` element,
+/// `GlobalValSet`, `MakeCell`, `CellSet`) are NOT SAFE and block 0xFE promotion.
+///
+/// Soundness: when an array is stored into a container (map/object/cell/global), it is read back
+/// with repr `inline=false` (container-sourced arrays always get 0xFD repr in repr.rs).  Any
+/// subsequent `push` on the retrieved pointer calls `lin_sealed_ptr_array_push`, which writes an
+/// 8-byte struct pointer at `data + len * 8`.  For a 0xFE inline buffer whose stride != 8 (any
+/// record with heap fields — String, Map, nested array…) that is a wrong-offset write plus a
+/// wrong-size realloc, silently corrupting the array header (including the `elem_tag` byte).
+/// `lin_sealed_any_to_tagged` later sees the corrupted `elem_tag` (no longer 0xFE), falls to
+/// the `_ =>` arm, and calls `lin_sealed_ptr_array_to_tagged` on an inline-payload buffer →
+/// garbage dereferences → abort.  The safe fix is: block 0xFE whenever the array might escape
+/// to a context where its `inline=false` clone is pushed into.  Container stores are the only
+/// paths where a 0xFE pointer survives across a function-local repr boundary and can reappear
+/// with `inline=false` repr, so they are the exact set to block.
+///
+/// What is NOT safe: Return (crosses frame), TailCall, CondJump/Switch on the array value, any
+/// Call/CallIntrinsic arg, or any container store.
 fn array_inline_escape_ok(
     blocks: &[crate::ir::BasicBlock],
     t: Temp,
@@ -352,45 +356,15 @@ fn array_inline_escape_ok(
                 Instruction::FieldGet { object, .. } if *object == t => true,
                 Instruction::Index { object, .. } if *object == t => true,
                 Instruction::SealedArrayFieldGet { array, .. } if *array == t => true,
-                // Container stores of the ARRAY VALUE (not the container object being mutated).
-                // These wrap the 0xFE pointer in TAG_ARRAY; the read path dispatches on elem_tag.
-                Instruction::MakeObject { fields, spreads, .. } => {
-                    // Safe only if `t` appears as a FIELD VALUE, not a spread source
-                    // (a spread unpacks the object — but `t` is an array, not an object; the
-                    // checker would reject `{...arr}` for a non-object type; treat defensively).
-                    let as_field = fields.iter().any(|(_, fv)| *fv == t);
-                    let as_spread = spreads.iter().any(|s| *s == t);
-                    as_field && !as_spread
-                }
-                Instruction::IndexSet { value, object, .. } => {
-                    // Safe if `t` is the VALUE being stored (arr goes INTO a container).
-                    // NOT safe if `t` is the OBJECT (someone is doing `t[k]=v` — mutating
-                    // elements of our inline array from outside, breaking the no-alias guarantee).
-                    *value == t && *object != t
-                }
-                Instruction::MakeArray { elements, .. } => {
-                    // Safe if `t` is one of the nested MakeArray's elements (storing the array
-                    // pointer as an element of an outer array). The outer array stores a pointer;
-                    // elements of `t` are never accessed through `t`'s element temps.
-                    elements.contains(&t)
-                }
-                Instruction::MakeClosure { captures, .. } => {
-                    // A closure that captures the array can later store into it (IndexSet via a
-                    // captured arr reference with element aliases). NOT safe — fall through.
-                    let _ = captures;
-                    false
-                }
-                // GlobalValSet, MakeCell, CellSet: these store the array into a mutable location
-                // that can later be read via GlobalValGet/CellGet. The read yields repr inline=false,
-                // and any subsequent `Push` (Intrinsic::Push) takes the 0xFD push path, writing a
-                // struct pointer into the inline byte buffer → data corruption. The `var arr = []`
-                // + `push(arr, elem)` pattern hits exactly this path. NOT safe for 0xFE.
-                Instruction::GlobalValSet { .. } => false,
-                Instruction::MakeCell { .. } => false,
-                Instruction::CellSet { .. } => false,
                 // Retain is a refcount bump only; does NOT observe the inline layout.
                 Instruction::Retain { val, .. } if *val == t => true,
-                // Everything else (Call, CallIntrinsic args, unknown uses) — fail safe.
+                // Everything else (Call, CallIntrinsic, MakeObject, IndexSet, MakeArray elem,
+                // MakeClosure, GlobalValSet, MakeCell, CellSet, Return, TailCall, …) — fail safe.
+                // Container stores (MakeObject field, IndexSet value, nested MakeArray elem,
+                // GlobalValSet, MakeCell, CellSet) are blocked because the array is read back
+                // with repr inline=false (container-sourced), and any subsequent push uses
+                // lin_sealed_ptr_array_push on a 0xFE buffer → wrong-offset write + wrong-size
+                // realloc → heap/header corruption.
                 _ => false,
             };
             if !ok {
