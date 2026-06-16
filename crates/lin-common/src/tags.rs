@@ -88,6 +88,11 @@ pub const NKIND_MAP: u32 = 9; // *LinMap heap field → 8-byte pointer
 /// Distinct from NKIND_FLOAT64 so `nkind_size_align` returns (4,4) and `struct_size_from_named_desc`
 /// reconstructs the correct 4-byte slot size instead of over-sizing to 8 bytes.
 pub const NKIND_FLOAT32: u32 = 10; // Float32 → 4 bytes (fpext to f64 on dynamic read)
+/// Unboxed sum-type (`*SumNode`) heap field stored in a sealed record. The slot is an 8-byte
+/// owned pointer to a `SumNode` heap allocation (header `[rc|size|desc|tag|pad]`). On drop:
+/// `lin_sumnode_release_self`. On materialize: `lin_sumnode_materialize` → TAG_MAP. On transfer:
+/// `clone_sumnode`. Distinct from `NKIND_SEALED` (nested sealed struct) and `NKIND_MAP`.
+pub const NKIND_SUMNODE: u32 = 11; // *SumNode heap field → 8-byte pointer
 
 /// Returns `(byte_size, alignment)` for a named-descriptor field kind code.
 /// This is the SINGLE SOURCE OF TRUTH for the nkind → layout mapping shared by the
