@@ -525,42 +525,98 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Materialize a whole SEALED-RECORD ARRAY into a tagged `Object[]` `LinArray*` (the Json view).
-    /// Convert a sealed-record array to a tagged `Object[]` at the Json boundary. For Stage 1
-    /// pointer-backed arrays (0xFD), calls `lin_sealed_ptr_array_to_tagged` which materializes each
-    /// struct pointer via the named descriptor. Used where the dynamic reader can't process struct
-    /// pointers directly. The returned tagged array is fresh +1 owned.
+    /// Dispatches at runtime on `elem_tag`: 0xFE (inline Phase-2) OR 0xFD (pointer-backed Stage-1).
+    /// The returned tagged array is fresh +1 owned.
     pub(crate) fn sealed_array_to_tagged(&mut self, arr: BasicValueEnum<'ctx>, arr_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
         if Self::sealed_array_elem(arr_ty).is_none() {
             return arr;
         }
-        // Stage 1 pointer-backed: use lin_sealed_ptr_array_to_tagged (materializes via named desc).
-        let to_tagged = self.get_or_declare_fn("lin_sealed_ptr_array_to_tagged",
+        // Dynamic dispatch: lin_sealed_any_to_tagged reads elem_tag and routes to 0xFE or 0xFD path.
+        let to_tagged = self.get_or_declare_fn("lin_sealed_any_to_tagged",
             ptr_ty.fn_type(&[ptr_ty.into()], false));
         self.builder.call(to_tagged, &[arr.into()], "sarr_tagged")
             .try_as_basic_value().unwrap_basic()
     }
 
-    /// Load element `idx` of a pointer-backed sealed-record array as an owned (+1) sealed struct
-    /// pointer. For Stage 1 pointer-backed arrays (0xFD), `arr[i]` loads the 8-byte struct pointer
-    /// from the data buffer and retains it (+1 rc). The caller receives an independent +1 ownership
-    /// of the same struct the array holds. Used for `arr[i]` as a whole value (the fused
-    /// `arr[i].field` read goes through `compile_ir_sealed_array_field_get` instead).
+    /// Load element `idx` of a packed sealed-record array as an owned (+1) sealed struct pointer.
+    ///
+    /// Dispatches on the runtime `elem_tag` (byte at arr+4):
+    ///   - **0xFD pointer-backed** (common, statically-known): load the 8-byte struct pointer from
+    ///     the data buffer and retain it (+1 rc). The caller owns an independent +1 copy.
+    ///   - **0xFE inline** (container-sourced Phase-2 arrays whose repr is NOT statically inline):
+    ///     get the element payload pointer (`lin_sealed_array_elem_ptr`, bounds-checked), allocate a
+    ///     fresh sealed struct (`lin_sealed_alloc`), `memcpy` the payload into it, and retain any
+    ///     heap fields. The result is a fresh +1 standalone struct identical to a 0xFD materialize.
+    ///
+    /// Used for `arr[i]` as a whole value. The fused `arr[i].field` path uses
+    /// `compile_ir_sealed_array_field_get` (which also runtime-dispatches for container-sourced arrays).
     pub(crate) fn sealed_array_materialize_elem(
         &mut self,
         arr: BasicValueEnum<'ctx>,
         idx: inkwell::values::IntValue<'ctx>,
-        _fields: &indexmap::IndexMap<String, Type>,
+        fields: &indexmap::IndexMap<String, Type>,
     ) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
         let i64_ty = self.context.i64_type();
-        // Load the struct pointer from `data + idx*8` (bounds-checked via lin_sealed_ptr_array_get_ptr).
+        let i8_ty = self.context.i8_type();
+        let arr_ptr = arr.into_pointer_value();
+
+        // Runtime dispatch on elem_tag (arr+4) to handle container-sourced 0xFE arrays.
+        let etag_p = unsafe { self.builder.gep(i8_ty, arr_ptr, &[i64_ty.const_int(4, false)], "smat_etag_p") };
+        let etag = self.builder.load(i8_ty, etag_p, "smat_etag").into_int_value();
+        let is_fe = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFE, false), "smat_isfe");
+
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let fe_b    = self.context.append_basic_block(llvm_fn, "smat_fe");
+        let fd_b    = self.context.append_basic_block(llvm_fn, "smat_fd");
+        let merge_b = self.context.append_basic_block(llvm_fn, "smat_mrg");
+        self.builder.conditional_branch(is_fe, fe_b, fd_b);
+
+        // ── 0xFE branch: allocate a fresh standalone struct from the inline payload ──────────────
+        self.builder.position_at_end(fe_b);
+        // lin_sealed_array_elem_ptr(arr, idx) → payload pointer (bounds-checked, faults OOB).
+        let elem_ptr_fn = self.get_or_declare_fn("lin_sealed_array_elem_ptr",
+            ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+        let payload_ptr = self.builder.call(elem_ptr_fn, &[arr_ptr.into(), idx.into()], "smat_fe_pp")
+            .try_as_basic_value().unwrap_basic().into_pointer_value();
+        // Allocate the standalone sealed struct.
+        let struct_size = Self::sealed_struct_size(fields);
+        let size_v = i64_ty.const_int(struct_size, false);
+        let heap_desc = self.sealed_descriptor(fields);
+        let named_desc = self.sealed_named_descriptor(fields);
+        let alloc_fn = self.get_or_declare_fn("lin_sealed_alloc",
+            ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), ptr_ty.into()], false));
+        let fresh = self.builder.call(alloc_fn, &[size_v.into(), heap_desc.into(), named_desc.into()], "smat_fe_s")
+            .try_as_basic_value().unwrap_basic().into_pointer_value();
+        // Copy element payload → struct header + SEALED_HEADER.
+        let stride = struct_size - Self::SEALED_HEADER;
+        let dst_payload = unsafe { self.builder.gep(i8_ty, fresh, &[i64_ty.const_int(Self::SEALED_HEADER as u64, false)], "smat_fe_dp") };
+        let memcpy_fn = self.get_or_declare_fn("memcpy",
+            ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), i64_ty.into()], false));
+        self.builder.call(memcpy_fn, &[dst_payload.into(), payload_ptr.into(), i64_ty.const_int(stride as u64, false).into()], "");
+        // Retain heap fields so the fresh struct independently owns them.
+        let retain_fn = self.get_or_declare_fn("retain_sealed_payload_fields",
+            self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+        self.builder.call(retain_fn, &[dst_payload.into(), heap_desc.into()], "");
+        let fe_exit = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(merge_b);
+
+        // ── 0xFD branch: load struct pointer + retain ─────────────────────────────────────────────
+        self.builder.position_at_end(fd_b);
         let get_fn = self.get_or_declare_fn("lin_sealed_ptr_array_get_ptr",
             ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
-        let sptr = self.builder.call(get_fn, &[arr.into(), idx.into()], "sarr_mat")
+        let sptr = self.builder.call(get_fn, &[arr_ptr.into(), idx.into()], "smat_fd_sp")
             .try_as_basic_value().unwrap_basic();
-        // Retain: the caller takes +1 ownership (the array keeps its own +1).
         self.builder.call(self.rt.rc_retain, &[sptr.into()], "");
-        sptr
+        let fd_exit = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(merge_b);
+
+        // ── Merge ──────────────────────────────────────────────────────────────────────────────────
+        self.builder.position_at_end(merge_b);
+        let phi = self.builder.phi(ptr_ty, "smat_phi");
+        let fresh_bv: BasicValueEnum<'ctx> = fresh.into();
+        phi.add_incoming(&[(&fresh_bv, fe_exit), (&sptr, fd_exit)]);
+        phi.as_basic_value()
     }
 }

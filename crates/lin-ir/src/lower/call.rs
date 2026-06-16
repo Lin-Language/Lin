@@ -707,11 +707,15 @@ pub fn lower_intrinsic_call(
     let mut shell_to_free: Option<Temp> = None;
     // `push(arr, elem)` ownership accounting — three sealed cases:
     //
-    // A. `elem` is sealed-repr AND `arr` is a pointer-backed sealed array (0xFD, Stage 1):
-    //    `lin_sealed_ptr_array_push` takes its OWN +1 retain internally. The caller keeps its
-    //    own +1 which the scope-exit release reclaims. Do NOT emit an extra retain here — that
-    //    would leave rc=3 (push-retain + caller-borrow-retain + extra-retain) with only rc-1 at
-    //    scope exit → leak.
+    // A. `elem` is sealed-repr AND `arr` is a sealed-record array (0xFD pointer-backed OR 0xFE
+    //    inline): RC is balanced WITHOUT any extra transfer here.
+    //      0xFD: `lin_sealed_ptr_array_push` internally retains the struct pointer (+1). Caller
+    //            keeps its own +1; scope-exit release reclaims it. Net: array owns +1, caller
+    //            releases +1 at scope exit. Do NOT emit a retain here → would cause leak.
+    //      0xFE: `lin_sealed_array_push_struct_retaining` copies the payload + retains heap fields
+    //            (+1 each). Caller's struct is released at scope exit (struct header freed +
+    //            heap fields −1 each). Net: array owns the heap fields at rc=1; source freed. RC
+    //            balanced without any extra ownership transfer.
     //
     // B. `elem` is sealed-repr AND `arr` is a TAGGED array (the `push$Object` materialization
     //    path): codegen MATERIALIZES the sealed struct into a fresh boxed LinObject and stores
