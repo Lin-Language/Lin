@@ -1117,14 +1117,21 @@ impl<'ctx> Codegen<'ctx> {
             return ptr_ty.const_null().into();
         }
         if obj.is_pointer_value() {
-            // A Json/union object arrives as a boxed TaggedVal*; unbox to the raw LinMap*.
-            let container = if Self::is_union_type(obj_ty) {
-                self.builder.call(self.rt.unbox_ptr, &[obj.into()], "ir_fget_unbox").try_as_basic_value().unwrap_basic()
-            } else {
-                obj
-            };
+            // A Json/union object arrives as a boxed TaggedVal* whose runtime value may be a
+            // TAG_MAP or TAG_RECORD (e.g. a sealed record laundered through AnyVal, then read by a
+            // `match has { "type": ... }` discriminant FieldGet). A blind `lin_map_get` on the
+            // unboxed pointer treats a sealed struct as a LinMap and crashes (`find_slot_string`
+            // on garbage). Delegate to the Index path, which tag-dispatches map/record exactly like
+            // `obj[field]` does. The packed-struct / sumnode / nullable-record reprs were already
+            // handled by the early returns above, so `obj_repr` here is the boxed dynamic case
+            // those Index branches correctly skip.
+            if Self::is_union_type(obj_ty) {
+                let key_str = self.compile_string_lit(field);
+                return self.compile_ir_index(obj, key_str, obj_ty, &Type::Str, result_ty, obj_repr);
+            }
             let key_str = self.compile_string_lit(field).into_pointer_value();
-            // Phase 2: concrete open-object container is now a LinMap*; use map_get.
+            // Stage 6b Phase 2: concrete (non-union) open-object container is a LinMap*; use map_get.
+            let container = obj;
             let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_fget_m").try_as_basic_value().unwrap_basic();
             // No string_release: `compile_string_lit` returns an interned, immortal
             // LinString (refcount == IMMORTAL_RC), so the release is a runtime no-op
