@@ -83,6 +83,10 @@ pub const KIND_SEALED: u32 = 3;
 /// inside a sealed record reached from a sum node is released through THAT sealed record's own
 /// descriptor via `sealed::release_field`, so the value `4` is always interpreted in the right walk.
 pub const KIND_MAP: u32 = 4;
+/// Unboxed sum-type (`*SumNode`) field stored in a sealed record. Runtime value is an owned `*SumNode`
+/// pointer. Drop → `lin_sumnode_release_self`. Transfer → `clone_sumnode`. Freeze → `lin_sumnode_freeze`.
+/// Materialize (NKIND_SUMNODE path) → `lin_sumnode_materialize` → TAG_MAP.
+pub const KIND_SUMNODE_FIELD: u32 = 5;
 
 /// Read the HEAP descriptor pointer from a sealed struct's header (offset 8). Null = no heap fields.
 #[inline]
@@ -132,6 +136,7 @@ unsafe fn release_field(payload: *mut u8, kind: u32) {
         KIND_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
         KIND_SEALED => lin_sealed_release_self(payload),
         KIND_MAP => crate::map::lin_map_release(payload as *mut crate::map::LinMap),
+        KIND_SUMNODE_FIELD => crate::sumnode::lin_sumnode_release_self(payload),
         // KIND_SCALAR / unknown: never recorded in a descriptor; defensively a no-op.
         _ => {}
     }
@@ -305,7 +310,7 @@ pub unsafe extern "C" fn lin_sealed_release_self(ptr: *mut u8) {
 /// keep existing call-sites in this file working without qualification changes.
 pub use lin_common::tags::{
     NKIND_INT32, NKIND_INT64, NKIND_UINT64, NKIND_FLOAT64, NKIND_FLOAT32, NKIND_BOOL,
-    NKIND_STRING, NKIND_ARRAY, NKIND_SEALED, NKIND_MAP,
+    NKIND_STRING, NKIND_ARRAY, NKIND_SEALED, NKIND_MAP, NKIND_SUMNODE,
 };
 
 /// Read a NamedField row at byte offset `cur` in the blob. Returns the parsed fields and the offset
@@ -357,6 +362,16 @@ unsafe fn box_named_heap_field(p: *mut u8, nkind: u32, nested: *const u8) -> *mu
             // keeps its own +1, untouched.
             let nested_map = materialize_sealed_struct_to_map(p, nested);
             alloc_tagged(TAG_MAP, nested_map as u64)
+        }
+        NKIND_SUMNODE => {
+            // A `*SumNode` field: materialize to a fresh LinMap via the per-type materializer fn-ptr
+            // stored in the node's SumDesc. The node keeps its own +1; the materialized map is fresh.
+            let map = crate::sumnode::lin_sumnode_materialize(p);
+            if map.is_null() {
+                crate::tagged::lin_box_null()
+            } else {
+                alloc_tagged(TAG_MAP, map as u64)
+            }
         }
         // A scalar kind should never reach here.
         _ => crate::tagged::lin_box_null(),
@@ -447,6 +462,23 @@ unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *cons
                     let boxed = alloc_tagged(TAG_MAP, nested_map as u64) as *const TaggedVal;
                     crate::map::lin_map_set(map, key, boxed);
                     crate::tagged::lin_tagged_release(boxed as *mut u8);
+                }
+            }
+            NKIND_SUMNODE => {
+                // SumNode field: materialize via the per-type fn-ptr → fresh LinMap → TAG_MAP.
+                let p = *(slot as *const *mut u8);
+                if p.is_null() {
+                    use crate::tagged::TAG_NULL;
+                    let tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
+                    crate::map::lin_map_set(map, key, &tv);
+                } else {
+                    use crate::tagged::{TaggedVal, TAG_MAP, alloc_tagged};
+                    let sum_map = crate::sumnode::lin_sumnode_materialize(p);
+                    if !sum_map.is_null() {
+                        let boxed = alloc_tagged(TAG_MAP, sum_map as u64) as *const TaggedVal;
+                        crate::map::lin_map_set(map, key, boxed);
+                        crate::tagged::lin_tagged_release(boxed as *mut u8);
+                    }
                 }
             }
             _ => {}
@@ -607,6 +639,11 @@ unsafe fn pack_named_payload_impl(
             NKIND_SEALED => {
                 crate::fault::runtime_fault(
                     "Runtime error: internal — packing a nested sealed-record field from a boxed element is not supported (widen pack_named_payload_from_object with the packing gate)",
+                );
+            }
+            NKIND_SUMNODE => {
+                crate::fault::runtime_fault(
+                    "Runtime error: internal — packing a sum-type field from a boxed element is not supported (extend pack_named_payload_impl with NKIND_SUMNODE when the array gate admits sum fields)",
                 );
             }
             _ => {
@@ -836,6 +873,14 @@ pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const cra
                 let nested_map = materialize_sealed_struct_to_map(p, nested);
                 if nested_map.is_null() { return std::ptr::null_mut(); }
                 alloc_tagged(TAG_MAP, nested_map as u64)
+            }
+            NKIND_SUMNODE => {
+                // SumNode field: materialize via the per-type fn-ptr → fresh LinMap → TAG_MAP.
+                let p = *(slot as *const *mut u8);
+                if p.is_null() { return std::ptr::null_mut(); }
+                let sum_map = crate::sumnode::lin_sumnode_materialize(p);
+                if sum_map.is_null() { return std::ptr::null_mut(); }
+                alloc_tagged(TAG_MAP, sum_map as u64)
             }
             _ => return std::ptr::null_mut(),
         };

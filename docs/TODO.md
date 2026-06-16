@@ -379,11 +379,25 @@ Conductor (me) runs the heavy RAPTOR digest+RSS at integration; agents run light
 > move ~0% on the headline workloads — both bottlenecks are ALLOCATION/MATERIALIZATION, not repr or RC traffic.
 > RAPTOR = record→map materialization (lane F 0xFE / packed records); interp = per-AST-node alloc churn (Option D
 > stack-alloc). The real wins require attacking alloc/materialization directly.
-- [x] **Lane S — SMI dates (#12) → MERGED to master `7140c05b`.** Pointer-tagged immediate small ints behind
-  cargo feature `smi` (default OFF → master byte-identical: workspace 820/0 + 73/73 + fmt all green feature-off;
-  feature-on compiles). Cherry-picked off the stale experiment branch onto master (fixed a duplicate-`[features]`
-  collision with mimalloc). INCOMPLETE SLICE — the flag stages it: ~180 consumer sites must guard the tag bit
-  before it can flip default-ON. Foundation for Linus's dates-as-ints feature.
+
+- [~] **Interp LEAK investigation — agent on `investigate/interp-leak` (/tmp/wt-leak).** The interp benchmark
+  leaks **33,960,676 bytes / 1,490,048 allocs PER RUN** under LeakSanitizer — PRE-EXISTING on master (surfaced
+  by the Option C ASan A/B, which was byte-identical, so NOT caused by any recent change). Likely an RC
+  imbalance or a reference CYCLE (ADR-024 — RC can't collect cycles) in the interp's Token/Cursor/AST graph,
+  or benign program-lifetime data held at exit. Agent: confirm real-vs-residual (scale REPS), find the dominant
+  leaking alloc site (ASan stacks), root-cause (cycle / missing-release / lifetime), and fix if low-risk.
+  If a real leak, this is also part of WHY interp is alloc-bound (it never reclaims per-iteration garbage).
+- [~] **SMI dates (#12) → ENABLED + WORKING, merged behind default-OFF flag `a1ba97cb`; toggle-removal in progress
+  (`chore/smi-unconditional`).** The first SMI merge (`7140c05b`) was INERT — `lin_box_int32/64` never emitted
+  immediates (heap-boxed). Linus chose COMPLETE+ENABLE. Now: box flipped to smi_encode + consumer guards
+  completed at the container-store boundary (map_set/array_push convert SMI→real TaggedVal) + retain/release
+  no-op on immediates. VERIFIED (conductor): feature-OFF 820/0+73/73 byte-identical; feature-ON 820/0+73/73 +
+  SMI FIRES (smi_int_boxes=4402) + RAPTOR digest EXACT + ASan UAF-clean with SMI live. Merged behind the
+  default-OFF flag (zero behavior change). TOGGLE REMOVAL: must collapse the paired cfg(smi)/cfg(not(smi))
+  blocks per-site (keep+un-gate the guarded smi half, DELETE the not-smi half — a blind sed leaves the
+  unguarded not-smi half shadowing the guard → UAF; caught + reverted). Agent doing it with the pair rule +
+  warning-free-build + SMI-fires + ASan gates. LESSON: stale/feature-mixed incremental builds produce flaky
+  test failures (bit my verification 3×) — always `cargo clean` between feature states.
 - [x] **Lane F — 0xFE phase-2 (#9) → MERGED to master `c2f77121` (sound; no RAPTOR win today, keepable win for
   local read-only record arrays + foundation for build-then-store ports).** Conductor-verified comprehensively:
   gate audited (strict allowlist, fails-safe — only Index/FieldGet/SealedArrayFieldGet/Retain/Release promote

@@ -248,6 +248,8 @@ impl<'ctx> Codegen<'ctx> {
             // A nested sealed record (a field whose type is itself sealed-eligible). The recursion
             // bottoms out: a field's eligibility is decided by `sealed_fields` on that field type.
             Type::Object { .. } if Self::sealed_fields(ty).is_some() => Some(Self::KIND_SEALED),
+            // A sum-type union: runtime value is a `*SumNode` owned pointer slot.
+            Type::Union(_) if Self::is_sum_type(ty) => Some(Self::KIND_SUMNODE_FIELD),
             _ => None,
         }
     }
@@ -260,6 +262,10 @@ impl<'ctx> Codegen<'ctx> {
     /// lockstep with `lin_runtime::sealed::KIND_MAP`. (Numerically equals `KIND_SUMNODE = 4`, but the
     /// two are in DISJOINT descriptor namespaces — see the runtime const's doc comment.)
     pub(crate) const KIND_MAP: u32 = 4;
+    /// Unboxed sum-type (`*SumNode`) field stored in a sealed record. Drop → `lin_sumnode_release_self`.
+    /// Transfer → `clone_sumnode`. Freeze → `lin_sumnode_freeze`. MUST stay in lockstep with
+    /// `lin_runtime::sealed::KIND_SUMNODE_FIELD`.
+    pub(crate) const KIND_SUMNODE_FIELD: u32 = 5;
 
     /// NAMED full-field descriptor kind codes — canonical definitions live in `lin_common::tags`.
     /// Re-exported here as associated constants for call-site clarity. The boxing each code implies
@@ -275,6 +281,8 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) const NKIND_ARRAY: u32 = lin_common::tags::NKIND_ARRAY;
     pub(crate) const NKIND_SEALED: u32 = lin_common::tags::NKIND_SEALED;
     pub(crate) const NKIND_MAP: u32 = lin_common::tags::NKIND_MAP;
+    /// SumNode pointer field in named descriptor. On materialize: `lin_sumnode_materialize` → TAG_MAP.
+    pub(crate) const NKIND_SUMNODE: u32 = lin_common::tags::NKIND_SUMNODE;
 
     /// The NAMED-descriptor kind for `ty` (a sealed-record field). Covers every permissible sealed
     /// field — scalar OR heap. Returns `None` only for a type that is not a valid sealed field (which
@@ -295,6 +303,8 @@ impl<'ctx> Codegen<'ctx> {
             Type::Array(_) | Type::FixedArray(_) => Some(Self::NKIND_ARRAY),
             Type::Map { .. } => Some(Self::NKIND_MAP),
             Type::Object { .. } if Self::sealed_fields(ty).is_some() => Some(Self::NKIND_SEALED),
+            // A sum-type union stored as a `*SumNode` pointer slot.
+            Type::Union(_) if Self::is_sum_type(ty) => Some(Self::NKIND_SUMNODE),
             _ => None,
         }
     }
@@ -385,7 +395,10 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn box_value_yields_fresh_owned(ty: &Type) -> bool {
         // Nested sealed record: materialized to a fresh boxed object. NOT sealed-record arrays:
         // Stage-2a changed box_value for those to lin_box_array (borrowed pointer, no fresh alloc).
-        matches!(ty, Type::Object { .. }) && Self::sealed_fields(ty).is_some()
+        // Sum type: box_value materializes *SumNode → fresh LinMap (via sumnode_materialize_to_object),
+        // boxes as TAG_MAP → fresh +1. Same lifecycle as sealed-record materialization.
+        (matches!(ty, Type::Object { .. }) && Self::sealed_fields(ty).is_some())
+            || (matches!(ty, Type::Union(_)) && Self::is_sum_type(ty))
     }
 
     /// THE sealed-record-ARRAY gate. Delegates to the canonical `Type::sealed_array_elem`
