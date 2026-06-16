@@ -14,6 +14,55 @@
 ///   9 = Function (payload: closure pointer)
 
 use std::alloc::{Layout, alloc};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+// ── LIN_SMI_STATS instrumentation ──────────────────────────────────────────────────────────────
+// When LIN_SMI_STATS=1, every alloc_tagged call is counted by class:
+//   int_allocs   — TAG_INT32 / TAG_INT64 / TAG_UINT64 heap boxes
+//   other_allocs — everything else (str, array, map, function, float, …)
+// Stats are printed to stderr at process exit via atexit. Zero overhead when env var absent.
+//
+// Note: cached ints ([-128, 1024)) and bools are intercepted by lin_box_int32/int64/bool BEFORE
+// reaching alloc_tagged, so int_allocs counts only OUT-OF-RANGE integer boxes.
+
+static SMI_STATS_STATE: AtomicU8 = AtomicU8::new(0); // 0=uninit 1=disabled 2=enabled
+static SMI_INT_ALLOCS: AtomicU64 = AtomicU64::new(0);
+static SMI_OTHER_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+#[cold]
+fn init_smi_stats() -> u8 {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let enabled = std::env::var("LIN_SMI_STATS").as_deref() == Ok("1");
+        SMI_STATS_STATE.store(if enabled { 2 } else { 1 }, Ordering::SeqCst);
+        if enabled {
+            unsafe { libc::atexit(smi_stats_atexit); }
+        }
+    });
+    SMI_STATS_STATE.load(Ordering::SeqCst)
+}
+
+#[inline(always)]
+fn smi_stats_state() -> u8 {
+    let s = SMI_STATS_STATE.load(Ordering::Relaxed);
+    if s == 0 { init_smi_stats() } else { s }
+}
+
+extern "C" fn smi_stats_atexit() {
+    let int_allocs = SMI_INT_ALLOCS.load(Ordering::Relaxed);
+    let other_allocs = SMI_OTHER_ALLOCS.load(Ordering::Relaxed);
+    let total = int_allocs + other_allocs;
+    let pct = if total > 0 { int_allocs as f64 / total as f64 * 100.0 } else { 0.0 };
+    eprintln!(
+        "SMI_STATS: total_alloc_tagged={total} int_boxes={int_allocs} ({pct:.1}%) \
+         other_boxes={other_allocs}"
+    );
+    eprintln!(
+        "SMI_STATS: (cached ints [-128,1024) and bools never reach alloc_tagged; \
+         int_boxes = out-of-cache-range only)"
+    );
+}
 
 // The canonical tag values live in `lin_common::tags` — the SINGLE source of truth shared
 // with the compiler backend (`lin-codegen`) so a tag byte can never drift from how the
@@ -138,6 +187,27 @@ pub unsafe fn is_cached_box_pub(p: *const u8) -> bool {
 }
 
 pub unsafe fn alloc_tagged(tag: u8, payload: u64) -> *mut u8 {
+    if smi_stats_state() == 2 {
+        let is_int = tag == TAG_INT32 || tag == TAG_INT64 || tag == TAG_UINT64;
+        let total = if is_int {
+            let prev = SMI_INT_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            let other = SMI_OTHER_ALLOCS.load(Ordering::Relaxed);
+            prev + 1 + other
+        } else {
+            let int_allocs = SMI_INT_ALLOCS.load(Ordering::Relaxed);
+            let prev = SMI_OTHER_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            int_allocs + prev + 1
+        };
+        // Print a running snapshot every 50M alloc_tagged calls so long-running programs
+        // (killed before natural exit) still produce useful numbers.
+        if total % 5_000_000 == 0 {
+            let int_allocs = SMI_INT_ALLOCS.load(Ordering::Relaxed);
+            let other_allocs = SMI_OTHER_ALLOCS.load(Ordering::Relaxed);
+            let t = int_allocs + other_allocs;
+            let pct = if t > 0 { int_allocs as f64 / t as f64 * 100.0 } else { 0.0 };
+            eprintln!("[SMI_STATS @{t}M] int_boxes={int_allocs} ({pct:.1}%) other_boxes={other_allocs}");
+        }
+    }
     let layout = Layout::new::<TaggedVal>();
     let ptr = alloc(layout);
     if ptr.is_null() {
