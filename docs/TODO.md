@@ -250,6 +250,50 @@ The 23GB is genuinely-live object/array structures. Each lever below was measure
 Deliverables achieved: root cause (allocation amplification, allocator ruled out) + interning ruled out +
 contiguous=Node-already-matched insight + the lever map. NEXT: per-kind attribution → then the chosen lever.
 
+## SEQUENCING THE REMAINING WORK (max parallel; big memory levers are serial on shared core files)
+
+**Phase R0 — PARALLEL NOW (file-disjoint lanes + throwaway-experiment measurements):**
+- [ ] **R0-attr** — per-kind/per-phase attribution (experiment, instruments allocators; never merges) → the
+  gating data for the big lever. [task #13]
+- [ ] **R0-cache** — small-int cache widen 1024→65536 (`tagged.rs` only). cheap, measure wall-clock+RSS. [#11]
+- [ ] **R0-float32** — bug #8 fix (`lin-common/tags.rs` + `codegen/types.rs` + `sealed.rs`). ASan+digest gate. [#8]
+- [ ] **R0-mimalloc** — mimalloc behind a cargo FEATURE flag (`lin-runtime/Cargo.toml` + `lib.rs`, disjoint).
+  measure RSS/wall-clock; default off (policy call).
+- [ ] **R0-explore×N** — read-only exploration agents for the Additional Areas below (no conflict).
+
+**Phase R1 — the BIG memory lever, chosen by R0-attr (SERIAL, conductor-driven):**
+- [ ] IF records dominate → **contiguous `0xFE` inline migration** (all array-build paths: projection
+  data/array.rs:496 + combinators + intrinsics.rs:1182 + MakeArray + Push), escape-gated. [#9]
+- [ ] OR for the dates feature → **pointer-tagged SMI** (~180 sites). [#12]
+  (These two + header compaction overlap core files → cannot run concurrently with each other.)
+
+**Phase R2 — secondary (serial):** header compaction 24→16B (if not subsumed by inline) · B2 TagClass walker.
+
+## ADDITIONAL AREAS TO EXPLORE (new — Wave R+ and beyond)
+
+- [ ] **Arena / bump allocation for program-lifetime data** — RAPTOR's index is built once in PREP and never
+  freed until exit. A bump arena (one region, freed all-at-once / never) → ZERO per-object malloc header,
+  ZERO per-object RC, ZERO free. The LIN_NO_RC experiment proved RC is pure overhead for this retention
+  pattern. **Potentially the single biggest RAPTOR memory+speed lever.** Needs an arena allocator + a
+  lifetime/region marker (escape-analysis-inferred, or an explicit `region {}`/`frozen`-like scope).
+- [ ] **Columnar (struct-of-arrays) record arrays** — beyond `0xFE` array-of-structs: each field its own
+  contiguous column (all `departureTime`s together). Max compactness (no per-record padding), SIMD-friendly,
+  best cache locality for field-at-a-time scans (RAPTOR scans departureTimes). Bigger than `0xFE`.
+- [ ] **RC elimination for immortal/program-lifetime graphs** — extend/infer `frozen` so program-lifetime
+  data skips RC entirely (retain/release → no-ops). Pairs with arena. The LIN_NO_RC ceiling showed the win.
+- [ ] **True inline SSO** — short strings (≤15 B = 100% of interp strings) stored IN the value slot, zero
+  heap. The small-string freelist (A6) only reuses; inline eliminates the alloc. Codegen-touching.
+- [ ] **Multi-core parallel RAPTOR queries** — the 24 GROUP + 5 RANGE queries are independent; fan out across
+  cores via the existing worker/async. Speed, not memory.
+- [ ] **Interp cell — call/value box-unbox axis** — Lin's WEAKEST cell (363ms; loses to Python 216 AND Node
+  42). Gap is indirect-call + box/unbox on the hot loop, NOT representation (project_interp_profile_measured).
+  Separate speed project: devirtualize hot calls + cancel box/unbox across the call boundary.
+- [ ] **Shrink LinMap + sealed headers** — pack rc/size widths, share per-type metadata pointers (header
+  compaction generalized to maps too).
+- [ ] **Stack-allocate more non-escaping records** — extend escape analysis to keep short-lived records off
+  the heap (alloca, not malloc) — eliminates the alloc entirely for the common fresh-temporary case.
+- [ ] **Broaden the benchmark suite** — dijkstra/pipeline/parallel cells beyond RAPTOR; track regressions in CI.
+
 ## Sequencing (HISTORICAL — this was the original plan; A/J/B all executed + merged, see Status)
 
 ```
