@@ -5,14 +5,13 @@
   "patterns": [
     { "include": "#comment" },
     { "include": "#import-statement" },
-    { "include": "#export-keyword" },
     { "include": "#type-declaration" },
+    { "include": "#export-keyword" },
     { "include": "#binding" },
     { "include": "#keywords" },
     { "include": "#string" },
     { "include": "#number" },
     { "include": "#builtin-types" },
-    { "include": "#builtin-functions" },
     { "include": "#operator" },
     { "include": "#punctuation" },
     { "include": "#identifier" }
@@ -62,12 +61,13 @@
     },
 
     "type-declaration": {
-      "comment": "type Foo = ...",
-      "begin": "^\\s*(type)\\s+([A-Z][a-zA-Z0-9_]*)",
+      "comment": "type Foo = ... (optionally `export type Foo = ...`)",
+      "begin": "^\\s*(?:(export)\\s+)?(type)\\s+([A-Z][a-zA-Z0-9_]*)",
       "end": "$",
       "beginCaptures": {
-        "1": { "name": "keyword.other.type.lin" },
-        "2": { "name": "entity.name.type.declaration.lin" }
+        "1": { "name": "keyword.other.export.lin" },
+        "2": { "name": "keyword.other.type.lin" },
+        "3": { "name": "entity.name.type.declaration.lin" }
       },
       "patterns": [
         { "include": "#comment" },
@@ -113,12 +113,6 @@
       "comment": "Built-in and standard types",
       "match": "\\b(String|Boolean|Null|Number|Json|Error|Function|Int8|Int16|Int32|Int64|UInt8|UInt16|UInt32|UInt64|Float8|Float16|Float32|Float64|Iterator|Iterable)\\b",
       "name": "support.type.builtin.lin"
-    },
-
-    "builtin-functions": {
-      "comment": "Known stdlib and intrinsic functions",
-      "match": "\\b(print|length|toString|trim|toUpper|toLower|substring|indexOf|parseInt32|parseInt64|parseFloat64|toInt32|toFloat64|isInt32|range|map|filter|reduce|iter|iterOf|for|push|pop|charAt|repeat)\\b",
-      "name": "support.function.builtin.lin"
     },
 
     "string": {
@@ -169,7 +163,6 @@
         { "include": "#number" },
         { "include": "#keywords" },
         { "include": "#builtin-types" },
-        { "include": "#builtin-functions" },
         { "include": "#operator" },
         { "include": "#punctuation" },
         { "include": "#identifier" }

@@ -3262,8 +3262,9 @@ fn semantic_tokens(source: &str, analysis: &Analysis) -> Vec<SemanticToken> {
         .collect();
 
     // 4. Generic identifier use-sites from the type map. Precedence: a use whose def_span is a
-    // parameter is a `parameter`; an imported name is a `namespace`; a function-typed use is a
-    // `function`; everything else is a `variable`.
+    // parameter is a `parameter`; a function-typed use is a `function` (even if imported — a
+    // callable should always read as a function, not a namespace); an imported non-function is a
+    // `namespace`; everything else is a `variable`.
     for (use_span, ty_str, def_span) in &analysis.span_type_map {
         let text = source
             .get(use_span.start as usize..use_span.end as usize)
@@ -3273,10 +3274,10 @@ fn semantic_tokens(source: &str, analysis: &Analysis) -> Vec<SemanticToken> {
             .unwrap_or(false)
         {
             ST_PARAMETER
-        } else if imported.contains(text) {
-            ST_NAMESPACE
         } else if ty_str.contains("=>") {
             ST_FUNCTION
+        } else if imported.contains(text) {
+            ST_NAMESPACE
         } else {
             ST_VARIABLE
         };
@@ -7869,6 +7870,85 @@ export val thingCount = 7
         assert_eq!(g_tok.3, ST_FUNCTION, "function-typed use should be `function`: {:?}", g_tok);
 
         // No token may overlap the next (sorted, non-overlapping invariant).
+        let mut sorted = toks.clone();
+        sorted.sort_by_key(|(l, c, _, _)| (*l, *c));
+        for w in sorted.windows(2) {
+            let (l0, c0, len0, _) = w[0];
+            let (l1, c1, _, _) = w[1];
+            if l0 == l1 {
+                assert!(c0 + len0 <= c1, "tokens overlap: {:?} then {:?}", w[0], w[1]);
+            }
+        }
+    }
+
+    /// The DEFINITION NAME of a function-typed `val` is coloured `function`; a plain-value `val`
+    /// is coloured `variable`; and a lambda parameter at its definition site is `parameter`.
+    #[test]
+    fn semantic_tokens_val_def_site_coloured_by_type() {
+        // `foo` binds a function; `bar` binds an integer; `x` is a parameter.
+        let src = "val foo = (x: Int32) => x * 2\nval bar = 3\n";
+        let analysis = analyse(src, None);
+        let toks = decode_semantic(&semantic_tokens(src, &analysis));
+
+        // `foo` — definition name of a function-typed val (offset 4, len 3).
+        let foo_off = src.find("foo").unwrap();
+        let foo_pos = offset_to_position(src, foo_off);
+        let foo_tok = toks
+            .iter()
+            .find(|(l, c, _, _)| *l == foo_pos.line && *c == foo_pos.character)
+            .expect("expected a token at the definition of `foo`");
+        assert_eq!(foo_tok.3, ST_FUNCTION, "function-typed val def should be `function`: {:?}", foo_tok);
+
+        // `bar` — definition name of a plain Int32 val (line 1, offset 4).
+        let line1 = src.find('\n').unwrap() + 1;
+        let bar_off = line1 + src[line1..].find("bar").unwrap();
+        let bar_pos = offset_to_position(src, bar_off);
+        let bar_tok = toks
+            .iter()
+            .find(|(l, c, _, _)| *l == bar_pos.line && *c == bar_pos.character)
+            .expect("expected a token at the definition of `bar`");
+        assert_eq!(bar_tok.3, ST_VARIABLE, "plain val def should be `variable`: {:?}", bar_tok);
+
+        // `x` — parameter at its definition site (inside the param list).
+        let x_off = src.find("(x:").unwrap() + 1; // skip the `(`
+        let x_pos = offset_to_position(src, x_off);
+        let x_tok = toks
+            .iter()
+            .find(|(l, c, _, _)| *l == x_pos.line && *c == x_pos.character)
+            .expect("expected a token at the definition of `x`");
+        assert_eq!(x_tok.3, ST_PARAMETER, "param def site should be `parameter`: {:?}", x_tok);
+
+        // Non-overlapping invariant.
+        let mut sorted = toks.clone();
+        sorted.sort_by_key(|(l, c, _, _)| (*l, *c));
+        for w in sorted.windows(2) {
+            let (l0, c0, len0, _) = w[0];
+            let (l1, c1, _, _) = w[1];
+            if l0 == l1 {
+                assert!(c0 + len0 <= c1, "tokens overlap: {:?} then {:?}", w[0], w[1]);
+            }
+        }
+    }
+
+    /// Dot-method call names are classified `function` by the semantic-token layer.
+    #[test]
+    fn semantic_tokens_dot_method_names_classified_as_function() {
+        // Import filter from stdlib so the method resolves to a typed function in scope.
+        let src = "import { filter } from \"std/iter\"\nval xs = [1, 2, 3].filter(x => x > 0)\n";
+        let analysis = analyse(src, None);
+        let toks = decode_semantic(&semantic_tokens(src, &analysis));
+
+        // Locate the `.filter` method call on line 1 (the dot-call, not the import on line 0).
+        let line1 = src.find('\n').unwrap() + 1;
+        let filter_off = line1 + src[line1..].find("filter").unwrap();
+        let filter_pos = offset_to_position(src, filter_off);
+        let filter_tok = toks
+            .iter()
+            .find(|(l, c, _, _)| *l == filter_pos.line && *c == filter_pos.character)
+            .expect("expected a semantic token at the `.filter` method name");
+        assert_eq!(filter_tok.3, ST_FUNCTION, "`filter` method name should be `function`: {:?}", filter_tok);
+
+        // Non-overlapping invariant.
         let mut sorted = toks.clone();
         sorted.sort_by_key(|(l, c, _, _)| (*l, *c));
         for w in sorted.windows(2) {

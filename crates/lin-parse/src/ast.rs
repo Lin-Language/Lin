@@ -128,6 +128,8 @@ pub enum Expr {
     DotCall {
         receiver: Box<Expr>,
         method: String,
+        /// Source span of just the method identifier (used for semantic-token colouring).
+        method_span: Span,
         args: Option<Vec<Expr>>,
         /// True when the argument list ended with an explicit trailing comma.
         partial: bool,
