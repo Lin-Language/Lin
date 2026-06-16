@@ -73,7 +73,16 @@ use lin_check::types::Type;
 use crate::carry::{self, UnionFind};
 use crate::ir::*;
 
-/// Run the escape-analysis pass on all functions in a module, mutating `MakeObject.stack` in place.
+/// Run the escape-analysis pass on all functions in a module, mutating `MakeObject.stack` and
+/// `MakeArray.inline` in place.
+/// Phase-1: mark non-escaping sealed-record-array MakeArray sites as `inline = true` (0xFE).
+/// Must run BEFORE `repr::run` so that the repr seeding pass sees the updated `inline` flags.
+pub fn analyze_array_inline(module: &mut LinModule) {
+    for func in &mut module.functions {
+        analyze_array_inline_fn(func);
+    }
+}
+
 pub fn analyze(module: &mut LinModule) {
     for func in &mut module.functions {
         analyze_fn(func);
@@ -233,6 +242,112 @@ fn analyze_fn(func: &mut LinFunction) {
             block.instr_spans = kept_spans;
         }
     }
+}
+
+/// 0xFE inline gate (Phase 1): for each `MakeArray` whose element type is a sealed scalar record,
+/// mark `inline = true` iff:
+///   1. Every ELEMENT temp is ONLY used in that MakeArray + Release instructions, AND
+///   2. The ARRAY itself (its `dst` temp) does NOT escape into a container store, closure capture,
+///      Return, or any other use except FieldGet/Index/SealedArrayFieldGet reads and Release.
+///
+/// Condition 1 ensures element aliasing is safe: no `push(arr, t); t.x=5` mutation pattern.
+/// Condition 2 ensures the 0xFE array doesn't get stored into a struct/container where later reads
+/// via FieldGet would use the wrong (0xFD pointer) access pattern → crash.
+///
+/// Fail-safe: on any doubt `inline` stays `false` (0xFD pointer-backed, correct today).
+fn analyze_array_inline_fn(func: &mut LinFunction) {
+    // Collect sealed-record-array MakeArray sites: (bi, ii, dst, elements).
+    let mut make_array_sites: Vec<(usize, usize, Temp, Vec<Temp>)> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, instr) in block.instructions.iter().enumerate() {
+            if let Instruction::MakeArray { elem_ty, elements, dst, .. } = instr {
+                if Type::sealed_array_elem(&Type::Array(Box::new(elem_ty.clone()))).is_some() {
+                    make_array_sites.push((bi, ii, *dst, elements.clone()));
+                }
+            }
+        }
+    }
+    if make_array_sites.is_empty() {
+        return;
+    }
+
+    // For each site, decide inline=true/false. Collect decisions first, then apply (two-phase
+    // to avoid holding an immutable borrow of func.blocks when we later need a mutable one).
+    let decisions: Vec<bool> = make_array_sites
+        .iter()
+        .map(|(site_bi, site_ii, arr_dst, site_elements)| {
+            // Check 1: all element temps used only in the MakeArray + Release.
+            for &elem in site_elements {
+                if !temp_escape_free(&func.blocks, elem, *site_bi, *site_ii, false) {
+                    return false;
+                }
+            }
+            // Check 2: array DST used only for reads (FieldGet/Index/SealedArrayFieldGet) + Release.
+            temp_escape_free(&func.blocks, *arr_dst, *site_bi, *site_ii, true)
+        })
+        .collect();
+
+    // Apply decisions.
+    for ((site_bi, site_ii, _, _), safe) in make_array_sites.iter().zip(decisions.iter()) {
+        if *safe {
+            if let Instruction::MakeArray { inline, .. } =
+                &mut func.blocks[*site_bi].instructions[*site_ii]
+            {
+                *inline = true;
+            }
+        }
+    }
+}
+
+/// Returns true iff every use of temp `t` in `blocks` is either:
+///   - at instruction (site_bi, site_ii) [the defining instruction], or
+///   - a Release { val: t }, or
+///   - (when `allow_reads`) a read-only consumer: FieldGet/Index/SealedArrayFieldGet.
+fn temp_escape_free(
+    blocks: &[crate::ir::BasicBlock],
+    t: Temp,
+    site_bi: usize,
+    site_ii: usize,
+    allow_reads: bool,
+) -> bool {
+    for (bi, block) in blocks.iter().enumerate() {
+        for (ii, instr) in block.instructions.iter().enumerate() {
+            if bi == site_bi && ii == site_ii {
+                continue; // The defining instruction — skip
+            }
+            let uses = crate::liveness::instr_use_def(instr).0;
+            if uses.contains(&t) {
+                if matches!(instr, Instruction::Release { val, .. } if *val == t) {
+                    continue; // Scope-exit release: safe
+                }
+                if allow_reads {
+                    let is_read_only = matches!(instr,
+                        Instruction::FieldGet { object, .. } if *object == t
+                    ) || matches!(instr,
+                        Instruction::Index { object, .. } if *object == t
+                    ) || matches!(instr,
+                        Instruction::SealedArrayFieldGet { array, .. } if *array == t
+                    );
+                    if is_read_only {
+                        continue;
+                    }
+                }
+                return false; // Escaping consumer found
+            }
+        }
+        // Check terminators.
+        let term_uses: Vec<Temp> = match &block.terminator {
+            Terminator::Return(Some(v)) => vec![*v],
+            Terminator::TailCall { args } => args.clone(),
+            Terminator::CondJump { cond, .. } => vec![*cond],
+            Terminator::Switch { val, .. } => vec![*val],
+            _ => vec![],
+        };
+        if term_uses.contains(&t) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Classify one instruction: add carry edges (union) and mark escaping uses. EVERY use of a temp
