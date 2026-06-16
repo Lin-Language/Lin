@@ -219,6 +219,10 @@ impl Checker {
                     _ => {}
                 }
 
+                // Record the binding name span for LSP semantic colouring (function vs variable).
+                if let lin_parse::ast::Pattern::Ident(_, name_span) = pattern {
+                    self.binding_def_span_types.push((*name_span, ty.clone()));
+                }
                 let slot = self.bind_pattern(pattern, &ty, false)?;
                 let stmt_name = match pattern {
                     lin_parse::ast::Pattern::Ident(n, _) => Some(n.clone()),
@@ -271,6 +275,8 @@ impl Checker {
                     ));
                 }
                 let slot = self.env.define_at(name.clone(), ty.clone(), true, Some(*name_span));
+                // Record the binding name span for LSP semantic colouring (function vs variable).
+                self.binding_def_span_types.push((*name_span, ty.clone()));
                 // Track mutable globals for the async var-capture check.
                 if self.function_scope_depths.is_empty() {
                     self.mutable_global_slots.insert(slot, name.clone());

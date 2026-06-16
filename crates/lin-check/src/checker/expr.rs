@@ -510,7 +510,7 @@ impl Checker {
             Expr::Coalesce { left, right, span } => self.infer_coalesce(left, right, *span),
             Expr::UnaryOp { op, operand, span } => self.infer_unary_op(*op, operand, *span),
             Expr::Call { func, args, partial, span, .. }  => self.infer_call(func, args, *partial, *span),
-            Expr::DotCall { receiver, method, args, partial, span, .. } => self.infer_dot_call(receiver, method, args, *partial, *span),
+            Expr::DotCall { receiver, method, method_span, args, partial, span, .. } => self.infer_dot_call(receiver, method, *method_span, args, *partial, *span),
             Expr::Index { object, key, span, .. }         => self.infer_index(object, key, *span),
             Expr::If { condition, then_branch, else_branch, span, .. } => self.infer_if(condition, then_branch, else_branch, *span),
             Expr::Match { scrutinee, arms, span, .. }     => self.infer_match(scrutinee, arms, *span),

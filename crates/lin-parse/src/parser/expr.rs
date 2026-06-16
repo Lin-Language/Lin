@@ -446,6 +446,7 @@ impl Parser {
                     let recv_start = expr.full_span();
                     self.advance(); // .
                     self.skip_newlines();
+                    let method_span = self.current_span();
                     let method = self.expect_ident();
                     let (args, partial) = if self.check(TokenKind::LParen) {
                         self.advance();
@@ -459,7 +460,7 @@ impl Parser {
                     // there is no parenthesised call (`x.foo`). Either way `prev_span` is the
                     // last token consumed for this dot-call.
                     let full_span = recv_start.to(self.prev_span());
-                    expr = Expr::DotCall { receiver: Box::new(expr), method, args, partial, span, full_span };
+                    expr = Expr::DotCall { receiver: Box::new(expr), method, method_span, args, partial, span, full_span };
                 }
                 TokenKind::Newline => {
                     // Look ahead past newlines/indent for dot-chaining
