@@ -119,7 +119,7 @@ pub struct Slot {
     pub value: TaggedVal,
 }
 
-const INITIAL_CAP: u32 = 8;
+const INITIAL_CAP: u32 = 4;
 #[inline]
 fn over_load(len: u32, cap: u32) -> bool {
     (len as u64) * 10 >= (cap as u64) * 7
