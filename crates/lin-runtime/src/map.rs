@@ -505,15 +505,56 @@ unsafe fn convert_to_mixed(map: *mut LinMap) {
     (*map).value_kind = VKIND_MIXED;
 }
 
+// ── Value-kind diagnostics (env-gated LIN_VKIND_STATS=1, zero cost when off) ─────────────────────
+static VKIND_STATS_ON: AtomicU8 = AtomicU8::new(0); // 0=uninit 1=off 2=on
+static VK_FIRST: [AtomicU64; 40] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; 40]
+};
+static VK_MIXED_CONV: AtomicU64 = AtomicU64::new(0);
+static VK_SLOT_BYTES_HOMO: AtomicU64 = AtomicU64::new(0); // payload bytes saved est. (8 * inserts into homo)
+
+#[cold]
+fn vkind_stats_on() -> bool {
+    let s = VKIND_STATS_ON.load(Ordering::Relaxed);
+    if s != 0 { return s == 2; }
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let on = std::env::var("LIN_VKIND_STATS").as_deref() == Ok("1");
+        VKIND_STATS_ON.store(if on { 2 } else { 1 }, Ordering::SeqCst);
+        if on { unsafe { libc::atexit(vkind_stats_atexit); } }
+    });
+    VKIND_STATS_ON.load(Ordering::SeqCst) == 2
+}
+extern "C" fn vkind_stats_atexit() {
+    let mixed = VK_MIXED_CONV.load(Ordering::Relaxed);
+    let mut total = 0u64;
+    eprint!("VKIND_STATS: first-insert tag histogram: ");
+    for (t, c) in VK_FIRST.iter().enumerate() {
+        let n = c.load(Ordering::Relaxed);
+        if n > 0 { eprint!("tag{t}={n} "); total += n; }
+    }
+    eprintln!("\nVKIND_STATS: total_maps_first_inserted={total} mixed_conversions={mixed} \
+        homogeneous={}", total.saturating_sub(mixed));
+}
+
 /// Establish / upgrade `value_kind` for an incoming value tag, converting to MIXED on a mismatch.
 #[inline]
 unsafe fn note_value_tag(map: *mut LinMap, vtag: u8) {
     let vk = (*map).value_kind;
     if vk == VKIND_UNINIT {
         (*map).value_kind = vtag as u32;
+        if vkind_stats_on() {
+            VK_FIRST[(vtag as usize).min(39)].fetch_add(1, Ordering::Relaxed);
+        }
     } else if vk != VKIND_MIXED && vk != vtag as u32 {
+        if vkind_stats_on() {
+            VK_MIXED_CONV.fetch_add(1, Ordering::Relaxed);
+        }
         convert_to_mixed(map);
     }
+    let _ = &VK_SLOT_BYTES_HOMO;
 }
 
 /// Ensure `slots` is allocated and has room for one more entry (lazy first-alloc + load-factor grow).
