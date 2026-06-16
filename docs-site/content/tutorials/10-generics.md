@@ -78,17 +78,17 @@ import { length } from "std/array"
 
 type Person = { "name": String, "age": Int32 }
 
-val countAll = (items: Json[]): Int32 => length(items)
+val countAll = (items: AnyVal[]): Int32 => length(items)
 
 val people: Person[] = [
   { "name": "Ada", "age": 36 },
   { "name": "Bob", "age": 41 }
 ]
 
-countAll(people)   // Person[] is assignable to Json[]
+countAll(people)   // Person[] is assignable to AnyVal[]
 ```
 
-Likewise, `Iterator<Person>` is assignable to `Iterator<Json>`, and a function returning `Person` is assignable to one returning `Json`.
+Likewise, `Iterator<Person>` is assignable to `Iterator<AnyVal>`, and a function returning `Person` is assignable to one returning `AnyVal`.
 
 ## Matching generic values
 

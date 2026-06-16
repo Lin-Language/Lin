@@ -366,11 +366,13 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         // table on each `func.repr` for codegen to consume at every packed-vs-boxed DECIDE / ASSUME
         // site; in debug builds also asserts the Stage-2 oracle (new analysis == old type
         // predicates) + the soundness verifier.
-        // Ownership conventions (Path-10/11 Leg 1) — SHADOW MODE. Infer per-param/per-return
-        // conventions and, when `LIN_OWNERSHIP_SHADOW` is set, run the report-only verifier over the
-        // lowered IR (BEFORE repr/rc_elide, so it sees the lowerer's own RC emission and dead-block
-        // shape verbatim). Inference is pure data on the IR; codegen ignores the convention fields
-        // this round, so neither call changes any output.
+        // Ownership conventions — `ownership_verify` is the load-bearing RC authority. `infer_conventions`
+        // annotates each IR function with per-param/per-return owning strategy, escape-alias maps, and
+        // container-insert conventions; lower.rs consumes these at 12+ call sites (owning_strategy,
+        // container_insert_convention, escape_alias_convention, box_shell_reclaim, …) to decide actual
+        // Retain/Release emission. When `LIN_OWNERSHIP_SHADOW` is set, the verifier runs over the
+        // lowered IR and hard-rejects UnauditedIntrinsic violations (also enforced by codegen verify_module).
+        // Both calls are load-bearing: removing either changes RC output or drops the soundness check.
         lin_ir::ownership_verify::infer_conventions(&mut ir_module);
         if std::env::var("LIN_OWNERSHIP_SHADOW").is_ok() {
             emit_ownership_shadow_report(&ir_module, &opts.source_path.to_string_lossy());

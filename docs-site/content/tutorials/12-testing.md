@@ -155,8 +155,8 @@ exceptions), teardown always runs:
 ```lin
 import { withFixture } from "std/test"
 
-val openConn = (): Json => { "rows": [] }
-val closeConn = (c: Json): Null => null
+val openConn = (): AnyVal => { "rows": [] }
+val closeConn = (c: AnyVal): Null => null
 
 // Partial application builds a reusable per-fixture helper:
 val withConn = withFixture(openConn, closeConn,)
@@ -176,7 +176,7 @@ statement (test files only) swaps an imported export for the whole test program:
 import { suite, test, run, expect, toBe } from "std/test"
 import { readFile } from "std/fs"
 
-replace readFile = (path: String): Json => "mock contents of ${path}"
+replace readFile = (path: String): AnyVal => "mock contents of ${path}"
 
 val tests = [
   test("reads the (mocked) file", () => [
@@ -214,7 +214,7 @@ import { appendFile } from "std/fs"
 var writes = 0
 var lastLine = ""
 
-replace appendFile = (path: String, content: String): Json =>
+replace appendFile = (path: String, content: String): AnyVal =>
   writes = writes + 1
   lastLine = content
   { "type": "success" }

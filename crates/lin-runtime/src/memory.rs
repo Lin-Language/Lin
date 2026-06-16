@@ -135,7 +135,8 @@ unsafe fn release_captures(env_ptr: *mut u8, cap_desc: *const u8) {
         match *kinds.add(i) {
             1 => crate::string::lin_string_release(word as *mut crate::string::LinString),
             2 => crate::array::lin_array_release(word as *mut crate::array::LinArray),
-            3 => crate::object::lin_object_release(word as *mut crate::object::LinObject),
+            // CAP_OBJECT (3): after Phase 3, open objects are LinMap-backed; release via lin_map_release.
+            3 => crate::map::lin_map_release(word as *mut crate::map::LinMap),
             4 => lin_closure_release(word),
             5 => crate::tagged::lin_tagged_release(word),
             // 7 Sealed: a captured sealed scalar record (packed struct). Release via its self-sized

@@ -18,14 +18,14 @@ Null, a Boolean, or an array, and never an Error.
 #### `Regex`
 
 ```lin
-type Regex = Json
+type Regex = AnyVal
 ```
 
 
 #### `Match`
 
 ```lin
-type Match = { "text": String, "start": Int32, "end": Int32, "groups": Json, "named": Json }
+type Match = { "text": String, "start": Int32, "end": Int32, "groups": AnyVal, "named": AnyVal }
 ```
 
 A single match. `groups` is the array of positional capture groups: participating groups are

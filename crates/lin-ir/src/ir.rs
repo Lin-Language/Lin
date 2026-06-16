@@ -743,3 +743,29 @@ impl LinModule {
         self.functions.iter_mut().find(|f| f.id == id)
     }
 }
+
+/// Concrete refcounted heap value types: the set for which `lin_rc_retain`/typed-release
+/// manages ownership. Includes Stage-3 NullableRecord (`T|Null` where T is a sealed record) —
+/// a raw nullable `*sealed_T` pointer whose RC lives at offset 0, managed via
+/// `lin_rc_retain`/`lin_sealed_release` exactly like a sealed struct.
+///
+/// This is the single authority shared by `lower`, `rc_elide`, and `ownership_verify`.
+/// Sum types (`sum_type_eligible`) are intentionally excluded: a SumNode's ownership is
+/// tracked via construction-site `register_owned` + runtime KIND_SUMNODE drop walk, not
+/// via this predicate (adding them would double-retain match scrutinees and leak the tree).
+pub fn is_concrete_rc_ty(ty: &Type) -> bool {
+    if crate::repr::nullable_sealed_record(ty).is_some() {
+        return true;
+    }
+    matches!(
+        ty,
+        Type::Str
+            | Type::StrLit(_)
+            | Type::Array(_)
+            | Type::FixedArray(_)
+            | Type::Object { .. }
+            | Type::Map { .. }
+            | Type::Iterator(_)
+            | Type::Function { .. }
+    )
+}

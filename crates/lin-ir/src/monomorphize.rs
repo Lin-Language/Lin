@@ -508,9 +508,9 @@ fn mangle_type(ty: &Type) -> String {
         }
         Type::Union(_) => "Union".into(),
         Type::Function { .. } => "Fn".into(),
-        // The `u32::MAX` Json wildcard (an erased non-concrete type-arg) mangles to `Json`, so a
-        // type-erased specialization is named `name$Json` rather than `name$T4294967295`.
-        Type::TypeVar(id) if *id == u32::MAX => "Json".into(),
+        // The `u32::MAX` AnyVal wildcard (an erased non-concrete type-arg) mangles to `Json`, so a
+        // type-erased specialization is named `name$AnyVal` rather than `name$T4294967295`.
+        Type::TypeVar(id) if *id == u32::MAX => "AnyVal".into(),
         Type::TypeVar(id) => format!("T{}", id),
         _ => "X".into(),
     }

@@ -448,7 +448,7 @@ pub unsafe extern "C" fn lin_retry(thunk: *mut u8, n: i32) -> *mut LinPromise {
     lin_make_promise(last)
 }
 
-/// True if `v` is an Error-shaped value `{ "type": "error", ... }` (TAG_MAP or TAG_OBJECT).
+/// True if `v` is an Error-shaped value `{ "type": "error", ... }` (TAG_MAP).
 /// Used by `retry` to decide success vs. failure.
 unsafe fn is_error_value(v: *mut u8) -> bool {
     use crate::tagged::{TaggedVal, TAG_MAP, TAG_STR};
@@ -461,20 +461,29 @@ unsafe fn is_error_value(v: *mut u8) -> bool {
             let g = crate::map::lin_map_get_bytes(map, b"type".as_ptr(), 4);
             if g.is_null() { None } else { Some(g) }
         }
-        _ => {
-            use crate::object::{lin_object_get, tagged_as_object};
-            use crate::string::lin_string_from_bytes;
-            let (obj, owned) = match tagged_as_object(tv as *const TaggedVal) {
-                Some(pair) => pair,
-                None => return false,
+        crate::tagged::TAG_RECORD => {
+            // Sealed struct in a dynamic slot: materialize to map and look up "type".
+            let sealed = tv.payload as *mut u8;
+            if sealed.is_null() { return false; }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let lmap = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+            if lmap.is_null() { return false; }
+            let g = crate::map::lin_map_get_bytes(lmap, b"type".as_ptr(), 4);
+            let result = if g.is_null() { None } else { Some(g as *const TaggedVal) };
+            // Evaluate before releasing the map since g is a borrow from it.
+            let is_err = match result {
+                None => false,
+                Some(got) => {
+                    if (*got).tag != TAG_STR { false } else {
+                        let s = (*got).payload as *const crate::string::LinString;
+                        !s.is_null() && (*s).as_str() == "error"
+                    }
+                }
             };
-            let key = lin_string_from_bytes("type".as_ptr(), 4);
-            let got = lin_object_get(obj, key);
-            crate::string::lin_string_release(key);
-            if owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
-            if got.is_null() { return false; }
-            Some(got)
+            crate::map::lin_map_release(lmap);
+            return is_err;
         }
+        _ => return false,
     };
     match got_type {
         None => false,

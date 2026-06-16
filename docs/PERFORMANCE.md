@@ -18,14 +18,14 @@ workload (`map`/`filter`/`reduce`) **beats Rust ~4×** (25 ms vs 100 ms) because
 chain fuses to a single zero-allocation loop.
 
 Lin is **slow exactly where the program leans on its dynamic escape hatch**:
-`Json`-typed field access is a string-keyed O(n) linear scan that is an LLVM
+`AnyVal`-typed field access is a string-keyed O(n) linear scan that is an LLVM
 optimization barrier — measured **~4× slower** than the equivalent typed record
-on the `records` workload, and ~70× slower on heavily `Json`-read-bound code
+on the `records` workload, and ~70× slower on heavily `AnyVal`-read-bound code
 (RAPTOR). The other structural cost is the **call boundary**: a polymorphic
 combinator calling a non-devirtualizable closure boxes each element and unboxes
 the result across an opaque indirect call. The one-line story: **Lin is a
 fast native language when you give it types, and a slow dynamic one when you
-hand it `Json`.**
+hand it `AnyVal`.**
 
 ---
 
@@ -40,7 +40,7 @@ There are two harnesses, deliberately separate:
   | File | Hot path exercised |
   |------|--------------------|
   | `recursion` | call/return overhead, TCO loop transform, non-tail self-recursion (`fib`); mostly unboxed `Int32` so isolates call + branch |
-  | `array_pipeline` | `map`/`filter`/`reduce` over a range: indirect closure calls, Int32 box/unbox through the `Json` element slot, RC on intermediates |
+  | `array_pipeline` | `map`/`filter`/`reduce` over a range: indirect closure calls, Int32 box/unbox through the `AnyVal` element slot, RC on intermediates |
   | `object_access` | object construction + the O(n) linear-scan field lookup; chained reads multiply the scan |
   | `string_build` | string allocation (historically no SSO), interpolation/concat, string RC |
   | `map_flat_scalar` | packed scalar array + `{String:T}` map store in a hot loop |
@@ -91,17 +91,17 @@ correctness gate):
 - **`parallel`/`async_io` ≈ Rust** (native threads; async_io is latency-floored,
   every language pins to the sleep floor).
 
-### Typed vs `Json` (RAPTOR)
+### Typed vs `AnyVal` (RAPTOR)
 
 RAPTOR is the load-bearing real-world workload — a GTFS journey planner threaded
 through many generic boundaries. We measured a **fully-typed** RAPTOR (trips as
 `Trip{tripId, stopTimes: StopTime[], service}` records, the route map as
-`{String: Trip[]}`) against the `Json` baseline on the same compiler, full feed,
+`{String: Trip[]}`) against the `AnyVal` baseline on the same compiler, full feed,
 O2, single-run min, digest byte-identical (`group=26203913 range=773022892
 journeys=139`). The "naive typed" column is the straightforward typed port; the
 "typed" column is after the **de-materialization** pass described below:
 
-| phase | `Json` (ms) | naive typed | typed (de-mat) | typed / `Json` |
+| phase | `AnyVal` (ms) | naive typed | typed (de-mat) | typed / `AnyVal` |
 |-------|----:|----:|----:|----:|
 | LOAD  | 15779 | 16209 | 17353 | 1.10× |
 | PREP  | 28365 | 119567 | 104264 | **3.67×** |
@@ -112,7 +112,7 @@ journeys=139`). The "naive typed" column is the straightforward typed port; the
 **Two distinct costs, with opposite outlooks — this is the key finding.**
 
 A typed heap-field record (`Trip` holds a `String` and a `StopTime[]`) does **not**
-reach the packed flat layout — it is boxed, like the `Json` form — and a *typed*
+reach the packed flat layout — it is boxed, like the `AnyVal` form — and a *typed*
 read **materializes the record per access** (a `lin_sealed_alloc` re-projection as
 it is read out of a `{String: Trip[]}` map, narrowed from a `Trip | Null`, or bound
 out of a boxed `Trip[]`). The naive typed port paid this everywhere, for the ~2×
@@ -134,24 +134,24 @@ query penalty.
    **3.67×** because it does not *read* records, it *builds and copies* them:
    `tripsByRoute[routeId]` is grown by `push(arr, sorted[i])`, and a packed value
    array **copies each `Trip` record in** (a required `lin_sealed_alloc`), where the
-   `Json` form copies a pointer. The stable `sort` likewise binds whole `Trip`s per
+   `AnyVal` form copies a pointer. The stable `sort` likewise binds whole `Trip`s per
    comparison. De-materialization removed only the incidental per-stop `StopTime`
    binds (the −13% PREP delta); the regroup/sort copies are the price of value
    semantics for a construct-heavy workload and are not addressable without storing
    indices in place of records. **Typing reaches ~1.8× on read-heavy query work, but
-   record construction/regrouping carries an inherent copy cost `Json`'s pointer
+   record construction/regrouping carries an inherent copy cost `AnyVal`'s pointer
    sharing avoids.**
 
 Two honesty notes: (a) the comparison is kept **algorithmically faithful to the
 reference** (node/go/rust) — a `runsOn`-by-`serviceId` memo that would have shaved
 another ~20s was *dropped*, not added, because the reference does not memoize and
-mirroring it into the `Json` port would have let Lin cheat cross-language; (b) the
+mirroring it into the `AnyVal` port would have let Lin cheat cross-language; (b) the
 typed RAPTOR is **leak-free** (RSS bounded/flat, ASan-clean), so the residual gap is
 materialization *time*, not allocation churn.
 
 The orthogonal win that *did* pay independently of all this: typing the
 **dictionaries** — the `{String: Int32}`/`{String: Trip[]}` index and scan-state
-maps that were `Json` objects — replaced O(n) association-list scans with O(1)
+maps that were `AnyVal` objects — replaced O(n) association-list scans with O(1)
 hashed `LinMap` lookups. So the guidance is nuanced: typing your *dictionaries* and
 *scalar records* is a clear win; typing *heap-field record graphs* is a clear win
 for the **read** path (use the const-offset-index idiom) but carries an inherent
@@ -171,7 +171,7 @@ preserve.
   all-scalar `type State { a..f: Int64 }` is laid out as a packed heap struct;
   `state["a"]` is a constant-offset load, not a string-keyed hash probe. This is
   what puts `records` at Rust parity. (`records` bench; measured ~4× over the
-  same code typed `Json`.)
+  same code typed `AnyVal`.)
 - **Combinator fusion.** `range().map().filter().reduce()` lowers to one counted
   loop with **zero per-element boxing** at `-O2` (ADR-044). Measured ~3.3× over
   the unfused path (200 M elements: 0.817 s → 0.247 s, Path 6); the `pipeline`
@@ -213,11 +213,11 @@ preserve.
 
 ## 4. Where it struggles
 
-- **`Json`-read-bound code is the cliff.** `Json` field access is a string-keyed
+- **`AnyVal`-read-bound code is the cliff.** `AnyVal` field access is a string-keyed
   O(n) linear scan over the object's entries *and* an LLVM optimization barrier —
   the compiler can't elide, hoist, or fold it the way it does a typed record's
   constant-offset slot. Measured ~4× on `records`, ~70× on RAPTOR-class code.
-  `Json` is a genuine escape hatch (untyped wire data, recursive ASTs), not a
+  `AnyVal` is a genuine escape hatch (untyped wire data, recursive ASTs), not a
   default. The fix is *userland*: type the data (§6), not a codegen tweak — see
   the path-9 closed-negative in §5.
 - **The non-devirtualizable call boundary.** A polymorphic combinator (or any
@@ -252,7 +252,7 @@ preserve.
 This is the heart of the document: one row per perf-investigation path, distilled
 so the `path-*` proposal docs can be deleted without losing the conclusion. The
 recurring theme: **two bottlenecks in two programs** — `interp` is *call-bound*,
-RAPTOR is *`Json`-read-bound* — and the cost is always *work per operation*
+RAPTOR is *`AnyVal`-read-bound* — and the cost is always *work per operation*
 (reads, calls, materialization), never allocation/reclamation itself.
 
 ### The big closed-negatives (do not re-try these)
@@ -262,7 +262,7 @@ RAPTOR is *`Json`-read-bound* — and the cost is always *work per operation*
 | **7 — tracing GC** | Replace RC with generational tracing GC to make allocation cheap | `LIN_NO_RC` ceiling (entire allocator+RC as no-ops): **0.48 s vs 0.408 s = NO speedup**; RAPTOR ~1.0× all phases despite textbook GC-bait retention (32.9 GB allocated, 0.039 retention, 96% dying young) | **CLOSED-NEGATIVE** | A GC can't recover a cost that deleting the *entire* heap+RC subsystem doesn't recover — the cost is work-per-allocation (reads + calls), which GC doesn't touch. **No workload is alloc-bound.** Revisit only for correctness (RC-UAF), never perf. |
 | **9 — end-to-end packed records** | Pack heap-field records all the way (loader→map→read) so RAPTOR's 630 M linear scans become const-offset loads | Three independent agents built digest-correct end-to-end typed RAPTOR: PREP 7.7 s→27.2 s (**3.5× slower**), GROUP 19.9 s→36.2 s (**1.82×**), RANGE 59.4 s→105.3 s (**1.77×**) | **CLOSED-NEGATIVE as a flow-sensitive oracle → re-approached and RESOLVED by the representation reset (§5.6)** | The cost is **representation-boundary materialization, not field reads.** Each packing fix repaired a bug a prior packing fix introduced — "fix-for-a-fix all the way down" — *because* it tried to reconcile packed-vs-boxed at compile time. The **reset (§5.6)** deletes that reconciliation: representation is type-determined (a record is *always* packed; the dynamic case is runtime-tagged `TAG_RECORD`/`AnyVal`). That landed the architecture — but the honest re-measure (§5.6) shows it lands at **parity**, because representation is ≤4% of RAPTOR; the real lever is the call/value axis. |
 | **5 — value records** | Make fixed-key records inline values (no header/shell RC), claimed semantics-preserving | Falsifying test on master: `val b=a; a["state"]=99; b["state"]` → **99** | **CLOSED-NEGATIVE (premise falsified)** | Records are observably-mutable **reference** types; value semantics is a *breaking* change, not a free representation swap. Cost diagnosis was right; the "non-breaking" framing was wrong. The live form is Path 1 (packed *representation*, not value *semantics*). |
-| **2 — inline caches / hidden classes** | Shape ids + per-site inline cache for `Json` field offset resolution | **99.56% cache hit rate** (656.6 M/659.5 M); but RAPTOR GROUP −3.3%, RANGE +3.8% slower, interp +2.5% slower — **net wash-to-loss** | **CLOSED-NEGATIVE (built, sound, gated off)** | The IC mechanism works perfectly, but it optimizes the *cheapest* part. The real per-read cost is the wrapper (key-intern + unbox + tag-dispatch + owning clone), not offset resolution. The cheap corollary is to use `{String:T}` → `lin_map_get` instead. |
+| **2 — inline caches / hidden classes** | Shape ids + per-site inline cache for `AnyVal` field offset resolution | **99.56% cache hit rate** (656.6 M/659.5 M); but RAPTOR GROUP −3.3%, RANGE +3.8% slower, interp +2.5% slower — **net wash-to-loss** | **CLOSED-NEGATIVE (built, sound, gated off)** | The IC mechanism works perfectly, but it optimizes the *cheapest* part. The real per-read cost is the wrapper (key-intern + unbox + tag-dispatch + owning clone), not offset resolution. The cheap corollary is to use `{String:T}` → `lin_map_get` instead. |
 | **8 Tier-1 — bitcode runtime** | Compile runtime to bitcode + `alwaysinline` so box/unbox can cancel | Spike: **<2%** (interp −0.6%, object_access −1.8%); box/unbox pairs do **not** cancel | **Dead-end alone** | The *consumer* (indirect closure call / `lin_tagged_arith` / `lin_object_get`) stays opaque, so the box never meets its unbox. Inline the consumer (Tier 2/3) first; Tier 1 last. Reversed the path-8 sequencing. |
 | **8 Tier-3 — named-call devirt** | Devirtualize known/named calls | Named calls are **already** direct; interp hot path 100% direct; devirtualizable population ~0 | **Dead-end** | The lever is *lambda-set*-shaped (callback sites *inside* stdlib combinator bodies), not named-call devirt. |
 | **3 — inferred arenas (full)** | Whole region inference: bump-allocate scoped graphs, suppress RC, bulk-free | Foundation (escape analysis) proven live; full arena **not attempted**; borrow prototype returned **wrong values** | **Deferred (soundness risk)** | Multi-week with high region-drop-UAF risk. The shippable sub-piece (B2 escape-RC elision for non-escaping heap-field records) is sound and landed; full arena isn't worth the UAF surface. |
@@ -277,7 +277,7 @@ RAPTOR is *`Json`-read-bound* — and the cost is always *work per operation*
 | **6b — monomorphic dispatch** | Monomorphic dispatch for polymorphic stdlib ops | ~1.35× on length-bound loops | Direct dispatch removes one indirect hop. |
 | **Wave C — lambda-set devirt (this session)** | `find`/`some`/`every` with a *named no-capture* callback: per-callback spec axis substitutes the callback param with the named fn `L`, turning the per-element boxed indirect call into a direct `@isEven(i32)` call | **2.54×** (find+some over 2 M Int32[], 200 iters: 32.6 s→12.85 s); RAPTOR IR byte-identical | Attacks the call boundary (§4) directly for the devirtualizable subset. Capturing-lambda callbacks correctly stay on the indirect path. This is the realized, narrow form of path-11's lambda-set thesis. |
 | **flatMap fusion (Wave D, this session)** | flatMap fuses as a push-model loop-nest stage; empty-inner (`x=>[]`) case fuses + reclaims | byte-identical corpus | flatMap is fusable as a nested push loop, not a pull-fusion barrier. |
-| **dict→Map fidelity (path-9 salvage)** | `Json`-as-dict → real `{String:T}` `LinMap` | 783k reads, digest-identical | O(1) hashed lookup vs O(n) assoc-list — the cheap corollary of the path-2 finding. |
+| **dict→Map fidelity (path-9 salvage)** | `AnyVal`-as-dict → real `{String:T}` `LinMap` | 783k reads, digest-identical | O(1) hashed lookup vs O(n) assoc-list — the cheap corollary of the path-2 finding. |
 | **capturing-lambda inline + stack-overflow fix (this session)** | Admit capturing literal lambdas at the Layer-1 inline gate | ~3.9× on local-capture map/reduce microbench | Earlier revert was a *stack* overflow (per-iteration `alloca` in the loop body), not a heap leak; fixed by hoisting the scratch alloca to the entry block (`entry_block_alloca`). |
 | **9C salvage — seal-propagation** | Producer/consumer seal agreement in the checker | fixed live data corruption (nested all-scalar sealed-record-array read: garbage `7 0` → correct `33 44`) | A correctness fix surfaced by the packing work; merged independently of the (negative) packing chain. |
 | **Runtime alloc wins (this session)** | toString small-int cache (~33% allocs); one-pass `utf8Bytes`/`fromCodePoints`/`tryParse*` intrinsics; byte-key `lin_object_get_bytes` (no temp LinString); display stringifier into one buffer; float/decode via `write!` not `format!`; union-probe save-len/truncate not clone | per-commit allocation reductions; map_flat_scalar wall ~5.8 s→5.5 s | Eliminate per-call transient allocation in hot runtime paths. |
@@ -300,7 +300,7 @@ optimization barrier even when the field set was statically known. The fix draws
 - **Records are flat packed sealed structs** with constant-offset field access — and keep **reference
   semantics** (`val b = a` shares; mutation through a parameter is visible). Representation is now
   **type-determined**, not inferred: a record is *always* a packed struct; there is no boxed shadow.
-- **The dynamic value is `AnyVal`** (née `Json`) — a **JSON-shaped** tagged union (`Null | Bool | Int* |
+- **The dynamic value is `AnyVal`** (née `AnyVal`) — a **JSON-shaped** tagged union (`Null | Bool | Int* |
   Float* | String | AnyVal[] | {String:AnyVal} | <record>`) that is **runtime-tagged** (`TAG_RECORD`
   carries a sealed pointer + descriptor, modelled on `SumNode`/ADR-064) rather than reconciled by a
   compile-time oracle. It deliberately **cannot hold an opaque handle** (`Function`/`Iterator`/`Stream`/
@@ -346,10 +346,10 @@ allocating — the alloc count is what matters.)
 
 ## 6. Guidance for writing fast Lin
 
-1. **Prefer typed records and `&`-composed named types over `Json`.** This is the
+1. **Prefer typed records and `&`-composed named types over `AnyVal`.** This is the
    single biggest lever — a typed record field read is a constant-offset load;
-   `Json` field access is an O(n) scan and an optimization barrier (~4–70× slower).
-   `Json` is for genuinely unknowable shapes only.
+   `AnyVal` field access is an O(n) scan and an optimization barrier (~4–70× slower).
+   `AnyVal` is for genuinely unknowable shapes only.
 2. **Use `{String:T}` for dictionary data**, not an open object. It's an O(1)
    hashed `LinMap`, not an O(n) association list.
 3. **Use the fusable eager combinators** (`map`/`filter`/`reduce`/`for`) in chains
@@ -373,6 +373,6 @@ allocating — the alloc count is what matters.)
 Synthesized from the `docs/DECISIONS.md` perf ADRs
 (014/015/016/024/028/034/040/044/045/055), the `benchmarks/` + `benchmarks/compare/`
 suites, and the perf/cleanup work merged through this codebase's history. All
-cross-language and typed-vs-`Json` numbers are measured (`compare.sh` and the RAPTOR
+cross-language and typed-vs-`AnyVal` numbers are measured (`compare.sh` and the RAPTOR
 A/B harness); every quantitative claim is cited to its measured source. The path-n
 learnings table (§5) is the consolidated record of the perf-investigation paths.

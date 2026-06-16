@@ -20,7 +20,7 @@ val msg = match parseAge("42")
 
 print(msg)
 
-// fromJson validates untrusted Json against a type, recursively, returning
+// fromJson validates untrusted AnyVal against a type, recursively, returning
 // the typed value or the built-in Error — no unchecked casts.
 val decoded: User | Error = User.fromJson({ "name": "Ada", "age": 36 })
 match decoded

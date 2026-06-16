@@ -183,8 +183,8 @@ impl<'ctx> DebugInfoState<'ctx> {
     }
 
     /// Map a Lin `Type` to the `DIType` to attach to a local of that type. Pointer-shaped Lin
-    /// values use a pointer-to-named-runtime-struct so the Phase 2 lldb formatters apply
-    /// (`TaggedVal`/`LinArray`/`LinString`/`LinObject`); scalars use a primitive base type and
+    /// values use a pointer-to-named-runtime-struct so the lldb formatters apply
+    /// (`TaggedVal`/`LinArray`/`LinString`/`LinMap`); scalars use a primitive base type and
     /// render as their raw logical value.
     fn ditype_for(&mut self, context: &'ctx inkwell::context::Context, ty: &Type) -> DIType<'ctx> {
         match ty {
@@ -203,10 +203,12 @@ impl<'ctx> DebugInfoState<'ctx> {
             Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => {
                 self.runtime_ptr_type(context, "LinArray")
             }
-            // Concrete objects are a `LinObject*`. Maps are a `LinMap*` (no dedicated formatter;
-            // the TaggedVal renderer shows them minimally) — route through the TaggedVal type so a
-            // boxed map still gets the dispatcher.
-            Type::Object { .. } => self.runtime_ptr_type(context, "LinObject"),
+            // After Cluster D: concrete open objects are LinMap*; sealed records are packed structs.
+            // Use LinMap debug type for open objects; TaggedVal for sealed (like union/any).
+            Type::Object { .. } if super::Codegen::sealed_fields(ty).is_none() => {
+                self.runtime_ptr_type(context, "LinMap")
+            }
+            Type::Object { .. } => self.runtime_ptr_type(context, "TaggedVal"),
             // Everything else is a boxed `TaggedVal*` at runtime (union / Json / Null / Named /
             // function / shared / stream / map): the TaggedVal summary+synthetic dispatcher decodes
             // the tag and renders/expands whatever it holds.

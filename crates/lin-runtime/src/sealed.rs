@@ -46,6 +46,12 @@
 //!     descriptor (share-nothing); release frees them via the same descriptor walk.
 
 use std::alloc::{alloc, dealloc, Layout};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+// One heap descriptor is built per distinct sealed type. Named-desc pointers are stable (static
+// codegen globals), so the pointer value is a sound key.
+static HEAP_DESC_MEMO: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
 /// Header size in bytes: `u32 refcount` + `u32 size` + `u64 heap_desc_ptr` + `u64 named_desc_ptr`.
 /// Field payload begins at offset 24. Kept in lockstep with `Codegen::SEALED_HEADER`.
@@ -294,19 +300,22 @@ pub unsafe extern "C" fn lin_sealed_release_self(ptr: *mut u8) {
 // codes below — they cover SCALARS too (unlike the heap-only `KIND_*`), and their boxing matches
 // `Codegen::type_tag` / `box_value` exactly (UInt8/16/32 → INT64-positive; Float32 → FLOAT64).
 
-/// Named-descriptor field kinds. MUST stay in lockstep with `Codegen::sealed_named_field_kind`.
-pub const NKIND_INT32: u32 = 1; // Int8/Int16/Int32 → lin_box_int32
-pub const NKIND_INT64: u32 = 2; // Int64, UInt8/UInt16/UInt32 (zero-extended positive) → lin_box_int64
-pub const NKIND_UINT64: u32 = 3; // UInt64 → lin_box_uint64
-pub const NKIND_FLOAT64: u32 = 4; // Float32/Float64 → lin_box_float64
-pub const NKIND_BOOL: u32 = 5; // Bool → lin_box_bool
-pub const NKIND_STRING: u32 = 6; // *LinString heap field → retain + lin_box_str
-pub const NKIND_ARRAY: u32 = 7; // *LinArray heap field → retain + lin_box_array
-pub const NKIND_SEALED: u32 = 8; // *sealed-struct heap field → recurse via nested NamedDesc
-pub const NKIND_MAP: u32 = 9; // *LinMap heap field → retain + lin_box_map
+/// Named-descriptor field kinds — re-exported from `lin_common::tags` (the single source of truth).
+/// Both the runtime and codegen reference `lin_common::tags::NKIND_*` directly; these re-exports
+/// keep existing call-sites in this file working without qualification changes.
+pub use lin_common::tags::{
+    NKIND_INT32, NKIND_INT64, NKIND_UINT64, NKIND_FLOAT64, NKIND_FLOAT32, NKIND_BOOL,
+    NKIND_STRING, NKIND_ARRAY, NKIND_SEALED, NKIND_MAP,
+};
 
 /// Read a NamedField row at byte offset `cur` in the blob. Returns the parsed fields and the offset
-/// just past the row (so the caller can walk to the next field).
+/// of the NEXT row (so the caller can walk to the next field).
+///
+/// Layout per row (matches `Codegen::sealed_named_descriptor`):
+///   [ u32 offset | u32 nkind | u64 nested_ptr | u16 name_len | name_bytes | pad-to-8 ]
+/// Each row is padded to a multiple of 8 bytes (and the blob header is an 8-byte `[u32 count | u32
+/// pad]`) so that every `nested_ptr` lands on an 8-byte boundary — macOS ld64 rejects misaligned
+/// pointer relocations. Hence the returned next-offset is rounded UP to the next multiple of 8.
 #[inline]
 unsafe fn read_named_field(base: *const u8, cur: usize) -> (u32, u32, *const u8, &'static str, usize) {
     let offset = u32::from_le_bytes([*base.add(cur), *base.add(cur + 1), *base.add(cur + 2), *base.add(cur + 3)]);
@@ -318,7 +327,8 @@ unsafe fn read_named_field(base: *const u8, cur: usize) -> (u32, u32, *const u8,
     let name_len = u16::from_le_bytes([*base.add(cur + 16), *base.add(cur + 17)]) as usize;
     let name_off = cur + 18;
     let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(base.add(name_off), name_len));
-    (offset, nkind, nested, name, name_off + name_len)
+    let next = (name_off + name_len + 7) & !7; // round the row stride up to a multiple of 8
+    (offset, nkind, nested, name, next)
 }
 
 /// Box one already-loaded heap-field POINTER `p` (non-null) for the named-materialize path. RETAINS
@@ -326,7 +336,7 @@ unsafe fn read_named_field(base: *const u8, cur: usize) -> (u32, u32, *const u8,
 /// its own +1. `nested` is the nested NamedDesc for `NKIND_SEALED` (else ignored). Returns a fresh
 /// heap `TaggedVal*` the caller owns (and must `lin_tagged_release`).
 unsafe fn box_named_heap_field(p: *mut u8, nkind: u32, nested: *const u8) -> *mut u8 {
-    use crate::tagged::{TAG_OBJECT, lin_box_str, lin_box_array, lin_box_map, alloc_tagged};
+    use crate::tagged::{TAG_MAP, lin_box_str, lin_box_array, lin_box_map, alloc_tagged};
     match nkind {
         NKIND_STRING => {
             crate::memory::lin_rc_retain(p as *mut u32);
@@ -342,87 +352,17 @@ unsafe fn box_named_heap_field(p: *mut u8, nkind: u32, nested: *const u8) -> *mu
         }
         NKIND_SEALED => {
             // A nested sealed record stored as a STANDALONE struct (with header). Recurse to a fresh
-            // boxed LinObject so the materialized view is uniform Json. Its heap fields are retained
-            // by the recursive materialize; the parent's pointer keeps its own +1, untouched.
-            let nested_obj = materialize_sealed_struct(p, nested);
-            alloc_tagged(TAG_OBJECT, nested_obj as u64)
+            // LinMap so the materialized view is uniformly map-backed (TAG_MAP).
+            // Its heap fields are retained by the recursive materialize; the parent's pointer
+            // keeps its own +1, untouched.
+            let nested_map = materialize_sealed_struct_to_map(p, nested);
+            alloc_tagged(TAG_MAP, nested_map as u64)
         }
         // A scalar kind should never reach here.
         _ => crate::tagged::lin_box_null(),
     }
 }
 
-/// Materialize a HEADER-LESS packed element payload `payload` (the `data + idx*stride` interior
-/// pointer) into a fresh +1-owned keyed `LinObject` via the NAMED descriptor `named_desc`. Each
-/// scalar field is boxed by value; each heap field is RETAINED and boxed (the returned object owns a
-/// +1, the packed buffer keeps its own). Returns NULL if `named_desc` is NULL (defensive — a 0xFE
-/// array always carries one once codegen emits it).
-unsafe fn materialize_named_payload(payload: *const u8, named_desc: *const u8) -> *mut crate::object::LinObject {
-    use crate::tagged::{
-        TaggedVal, TAG_INT32, TAG_INT64, TAG_UINT64, TAG_FLOAT64, TAG_BOOL,
-    };
-    if named_desc.is_null() {
-        return std::ptr::null_mut();
-    }
-    let field_count = u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)]) as usize;
-    let obj = crate::object::lin_object_alloc(field_count as u32);
-    let mut cur = 4usize;
-    for _ in 0..field_count {
-        let (offset, nkind, nested, name, next) = read_named_field(named_desc, cur);
-        cur = next;
-        let slot = payload.add(offset as usize - SEALED_HEADER);
-        let key = crate::string::lin_string_from_bytes(name.as_ptr(), name.len() as u32);
-        // Build the field's TaggedVal. For SCALAR kinds we read the raw value and stack-build a
-        // TaggedVal (lin_object_set_fresh copies it by value, no inner RC). For HEAP kinds we box a
-        // fresh +1-retained view, then free our temporary box AFTER set_fresh (which took its own +1).
-        match nkind {
-            NKIND_INT32 => {
-                let v = *(slot as *const i32);
-                let tv = TaggedVal { tag: TAG_INT32, _pad: [0; 7], payload: v as i64 as u64 };
-                crate::object::lin_object_set_fresh(obj, key, &tv);
-            }
-            NKIND_INT64 => {
-                let v = *(slot as *const i64);
-                let tv = TaggedVal { tag: TAG_INT64, _pad: [0; 7], payload: v as u64 };
-                crate::object::lin_object_set_fresh(obj, key, &tv);
-            }
-            NKIND_UINT64 => {
-                let v = *(slot as *const u64);
-                let tv = TaggedVal { tag: TAG_UINT64, _pad: [0; 7], payload: v };
-                crate::object::lin_object_set_fresh(obj, key, &tv);
-            }
-            NKIND_FLOAT64 => {
-                let v = *(slot as *const f64);
-                let tv = TaggedVal { tag: TAG_FLOAT64, _pad: [0; 7], payload: v.to_bits() };
-                crate::object::lin_object_set_fresh(obj, key, &tv);
-            }
-            NKIND_BOOL => {
-                let v = *(slot as *const u8);
-                let tv = TaggedVal { tag: TAG_BOOL, _pad: [0; 7], payload: (v != 0) as u64 };
-                crate::object::lin_object_set_fresh(obj, key, &tv);
-            }
-            NKIND_STRING | NKIND_ARRAY | NKIND_SEALED | NKIND_MAP => {
-                // Heap field: the slot holds an 8-byte owned pointer.
-                let p = *(slot as *const *mut u8);
-                if p.is_null() {
-                    use crate::tagged::TAG_NULL;
-                    let tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
-                    crate::object::lin_object_set_fresh(obj, key, &tv);
-                } else {
-                    let boxed = box_named_heap_field(p, nkind, nested);
-                    // set_fresh retains the inner payload (+1 for the object). `boxed` is our fresh
-                    // construction +1; release it to drop construction back to the object's owned +1
-                    // AND free the box shell.
-                    crate::object::lin_object_set_fresh(obj, key, boxed as *const TaggedVal);
-                    crate::tagged::lin_tagged_release(boxed);
-                }
-            }
-            _ => {}
-        }
-        crate::string::lin_string_release(key);
-    }
-    obj
-}
 
 /// Materialize a HEADER-LESS payload into a fresh +1-owned `LinMap` (String-keyed).
 /// Mirrors `materialize_named_payload` but builds a LinMap instead of a LinObject.
@@ -434,12 +374,16 @@ unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *cons
     }
     let field_count = u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)]) as usize;
     let map = crate::map::lin_map_alloc(field_count as u32, crate::map::KEY_KIND_STRING);
-    let mut cur = 4usize;
+    let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
         let (offset, nkind, nested, name, next) = read_named_field(named_desc, cur);
         cur = next;
         let slot = payload.add(offset as usize - SEALED_HEADER);
-        let key = crate::string::lin_string_from_bytes(name.as_ptr(), name.len() as u32);
+        // Intern the field-name string once per type (static descriptor bytes → stable ptr+len).
+        // lin_string_literal returns an immortal LinString (IMMORTAL_RC); lin_map_set's retain
+        // and lin_map_release's release are both no-ops on immortal strings, so no alloc/free
+        // per materialize call.
+        let key = crate::string::lin_string_literal(name.as_ptr(), name.len() as u32);
         match nkind {
             NKIND_INT32 => {
                 let v = *(slot as *const i32);
@@ -458,6 +402,12 @@ unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *cons
             }
             NKIND_FLOAT64 => {
                 let v = *(slot as *const f64);
+                let tv = TaggedVal { tag: TAG_FLOAT64, _pad: [0; 7], payload: v.to_bits() };
+                crate::map::lin_map_set(map, key, &tv);
+            }
+            NKIND_FLOAT32 => {
+                // Physical slot is 4-byte f32; box as TAG_FLOAT64 via fpext (mirrors box_value).
+                let v = *(slot as *const f32) as f64;
                 let tv = TaggedVal { tag: TAG_FLOAT64, _pad: [0; 7], payload: v.to_bits() };
                 crate::map::lin_map_set(map, key, &tv);
             }
@@ -499,7 +449,8 @@ unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *cons
             }
             _ => {}
         }
-        crate::string::lin_string_release(key);
+        // Immortal strings don't need release, but calling lin_string_release on them is a safe
+        // no-op (IMMORTAL_RC guard returns early). Omitting the call removes the branch.
     }
     map
 }
@@ -516,22 +467,6 @@ pub unsafe fn materialize_sealed_to_map_pub(ptr: *mut u8, named_desc: *const u8)
     materialize_sealed_struct_to_map(ptr as *const u8, named_desc)
 }
 
-/// Materialize a STANDALONE sealed struct `ptr` (header + payload) into a fresh boxed LinObject via
-/// its NAMED descriptor — used for a nested `NKIND_SEALED` field. The struct's payload begins at
-/// `SEALED_HEADER`; the named descriptor stores struct-relative offsets, so we pass the struct base
-/// adjusted: `materialize_named_payload` expects a header-LESS payload and rebases by
-/// `-SEALED_HEADER`, so we hand it `ptr + SEALED_HEADER`.
-unsafe fn materialize_sealed_struct(ptr: *const u8, named_desc: *const u8) -> *mut crate::object::LinObject {
-    materialize_named_payload(ptr.add(SEALED_HEADER), named_desc)
-}
-
-/// Public wrapper around `materialize_sealed_struct` for use by the pointer-backed array path in
-/// `lin_array_get_tagged`. Takes the struct base pointer (WITH 16-byte header) + named descriptor;
-/// returns a fresh +1-owned `LinObject` for the caller to box and return. Non-null assumption: the
-/// caller checks for null before calling.
-pub unsafe fn materialize_sealed_struct_pub(ptr: *mut u8, named_desc: *const u8) -> *mut crate::object::LinObject {
-    materialize_sealed_struct(ptr as *const u8, named_desc)
-}
 
 /// Materialize element `idx`'s packed payload of a 0xFE sealed-record array into a FRESH +1-owned
 /// keyed `LinMap`, wrapped in a fresh `TaggedVal*` tagged `TAG_MAP`. The caller OWNS the returned
@@ -588,14 +523,14 @@ unsafe fn pack_named_payload_impl(
         );
     }
     let field_count = u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)]) as usize;
-    let mut cur = 4usize;
+    let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
         let (offset, nkind, _nested, name, next) = read_named_field(named_desc, cur);
         cur = next;
         let dst = slot.add(offset as usize - SEALED_HEADER);
-        let key = crate::string::lin_string_from_bytes(name.as_ptr(), name.len() as u32);
+        // Intern the field-name string once per type (same rationale as materialize_named_payload_to_map).
+        let key = crate::string::lin_string_literal(name.as_ptr(), name.len() as u32);
         let tv = get_tv(key);
-        crate::string::lin_string_release(key);
         let (tag, payload) = if tv.is_null() { (TAG_NULL, 0u64) } else { ((*tv).tag, (*tv).payload) };
         match nkind {
             NKIND_INT32 => {
@@ -635,6 +570,17 @@ unsafe fn pack_named_payload_impl(
                 };
                 *(dst as *mut f64) = v;
             }
+            NKIND_FLOAT32 => {
+                // Physical slot is 4-byte f32; coerce from the boxed f64/f32 representation.
+                let v: f32 = match tag {
+                    TAG_FLOAT64 => f64::from_bits(payload) as f32,
+                    TAG_FLOAT32 => f32::from_bits(payload as u32),
+                    TAG_INT32 => payload as i32 as f32,
+                    TAG_INT64 | TAG_UINT64 => payload as i64 as f32,
+                    _ => 0.0,
+                };
+                *(dst as *mut f32) = v;
+            }
             NKIND_BOOL => {
                 *dst = (tag == TAG_BOOL && payload != 0) as u8;
             }
@@ -665,16 +611,6 @@ unsafe fn pack_named_payload_impl(
     }
 }
 
-/// Pack sealed-record payload from a `LinObject` (TAG_OBJECT) source.
-pub unsafe fn pack_named_payload_from_object(
-    slot: *mut u8,
-    obj: *const crate::object::LinObject,
-    named_desc: *const u8,
-) {
-    pack_named_payload_impl(slot, named_desc, |key| {
-        crate::object::lin_object_get(obj, key)
-    });
-}
 
 /// Pack sealed-record payload from a `LinMap` (TAG_MAP) source — Phase 2 open objects.
 pub unsafe fn pack_named_payload_from_map(
@@ -697,17 +633,11 @@ unsafe fn struct_size_from_named_desc(named_desc: *const u8) -> usize {
     }
     let field_count = u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)]) as usize;
     let mut max_end: usize = SEALED_HEADER;
-    let mut cur = 4usize;
+    let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
         let (offset, nkind, _nested, _name, next) = read_named_field(named_desc, cur);
         cur = next;
-        let field_size: usize = match nkind {
-            NKIND_INT32 => 4,
-            NKIND_INT64 | NKIND_UINT64 | NKIND_FLOAT64 => 8,
-            NKIND_BOOL => 1,
-            // heap fields and anything else: pointer = 8 bytes
-            _ => 8,
-        };
+        let field_size: usize = lin_common::tags::nkind_size_align(nkind).0 as usize;
         let end = offset as usize + field_size;
         if end > max_end { max_end = end; }
     }
@@ -717,20 +647,29 @@ unsafe fn struct_size_from_named_desc(named_desc: *const u8) -> usize {
 
 /// Build a heap-only field descriptor from a named descriptor, for the dynamic alloc path on
 /// 0xFD pointer-backed arrays (Stage 2a: heap fields like String/Array/Map). The returned
-/// pointer is valid for the lifetime of the process (leaked once per distinct named_desc, which
-/// is bounded by the number of distinct sealed record types). Returns NULL if there are no heap
-/// fields (scalar-only type → no descriptor needed). The allocation is intentionally leaked (one
-/// per type, not per element) because the heap descriptor must survive all structs of that type.
+/// pointer is valid for the lifetime of the process (allocated once per distinct named_desc
+/// type, memoised in HEAP_DESC_MEMO keyed on the stable static named_desc pointer). Returns
+/// NULL if there are no heap fields (scalar-only type → no descriptor needed).
 pub unsafe fn build_heap_desc_from_named_desc(named_desc: *const u8) -> *const u8 {
     if named_desc.is_null() {
         return std::ptr::null();
+    }
+    let key = named_desc as usize;
+    // Fast path: check the memo under lock before doing any work.
+    {
+        let guard = HEAP_DESC_MEMO.lock().unwrap();
+        if let Some(ref map) = *guard {
+            if let Some(&cached) = map.get(&key) {
+                return cached as *const u8;
+            }
+        }
     }
     let field_count = u32::from_le_bytes([
         *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
     ]) as usize;
     // Collect heap fields: (offset, kind) pairs.
     let mut heap_fields: Vec<(u32, u32)> = Vec::new();
-    let mut cur = 4usize;
+    let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
         let (offset, nkind, _nested, _name, next) = read_named_field(named_desc, cur);
         cur = next;
@@ -744,38 +683,39 @@ pub unsafe fn build_heap_desc_from_named_desc(named_desc: *const u8) -> *const u
         };
         heap_fields.push((offset, kind));
     }
-    if heap_fields.is_empty() {
-        return std::ptr::null();
+    let result_ptr: *const u8 = if heap_fields.is_empty() {
+        std::ptr::null()
+    } else {
+        // Build the heap descriptor blob: [ u32 count | { u32 offset, u32 kind } * count ]
+        let byte_len = 4 + heap_fields.len() * 8;
+        let layout = std::alloc::Layout::from_size_align_unchecked(byte_len, 4);
+        let ptr = std::alloc::alloc(layout);
+        if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
+        *(ptr as *mut u32) = heap_fields.len() as u32;
+        for (i, (off, kind)) in heap_fields.iter().enumerate() {
+            let ent = ptr.add(4 + i * 8) as *mut u32;
+            *ent = *off;
+            *ent.add(1) = *kind;
+        }
+        ptr as *const u8
+    };
+    // Store in the memo (initialising the map on first use).
+    let mut guard = HEAP_DESC_MEMO.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    // Another thread may have raced and inserted while we built; prefer the winner's allocation
+    // to avoid a double-free: if already present, free the blob we just built and return theirs.
+    if let Some(&existing) = map.get(&key) {
+        if !result_ptr.is_null() {
+            let byte_len = 4 + heap_fields.len() * 8;
+            let layout = std::alloc::Layout::from_size_align_unchecked(byte_len, 4);
+            std::alloc::dealloc(result_ptr as *mut u8, layout);
+        }
+        return existing as *const u8;
     }
-    // Build the heap descriptor blob: [ u32 count | { u32 offset, u32 kind } * count ]
-    let byte_len = 4 + heap_fields.len() * 8;
-    let layout = std::alloc::Layout::from_size_align_unchecked(byte_len, 4);
-    let ptr = std::alloc::alloc(layout);
-    if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
-    *(ptr as *mut u32) = heap_fields.len() as u32;
-    for (i, (off, kind)) in heap_fields.iter().enumerate() {
-        let ent = ptr.add(4 + i * 8) as *mut u32;
-        *ent = *off;
-        *ent.add(1) = *kind;
-    }
-    ptr as *const u8
+    map.insert(key, result_ptr as usize);
+    result_ptr
 }
 
-/// Allocate a fresh sealed struct from a `LinObject` using the named descriptor (for field
-/// names/offsets/kinds) and an optional heap-only descriptor (for RC on drop). For the dynamic
-/// push/set path on a 0xFD pointer-backed array. Returns a +1-owned struct pointer.
-/// `heap_desc` may be NULL for scalar-only records; pass `(*arr).elem_desc` for 0xFD arrays so
-/// that String/Array/Map heap fields are properly released on drop.
-pub unsafe fn alloc_sealed_struct_from_object(
-    obj: *const crate::object::LinObject,
-    named_desc: *const u8,
-    heap_desc: *const u8,
-) -> *mut u8 {
-    let size = struct_size_from_named_desc(named_desc);
-    let sptr = lin_sealed_alloc(size, heap_desc, named_desc);
-    pack_named_payload_from_object(sptr.add(SEALED_HEADER), obj, named_desc);
-    sptr
-}
 
 /// Allocate a fresh sealed struct from a `LinMap` (Phase 2 open objects) using the named
 /// descriptor. For the dynamic push/set path when the source is a TAG_MAP.
@@ -786,6 +726,13 @@ pub unsafe fn alloc_sealed_struct_from_map(
 ) -> *mut u8 {
     let size = struct_size_from_named_desc(named_desc);
     let sptr = lin_sealed_alloc(size, heap_desc, named_desc);
+    // Verify that our dynamically-reconstructed size matches what lin_sealed_alloc stored in the
+    // header (offset 4). A mismatch means nkind_size_align diverged from codegen's sealed_slot_size.
+    debug_assert_eq!(
+        *((sptr.add(4)) as *const u32) as usize,
+        size,
+        "sealed alloc size mismatch: nkind_size_align reconstruction ({size}) != header stored size"
+    );
     pack_named_payload_from_map(sptr.add(SEALED_HEADER), map, named_desc);
     sptr
 }
@@ -805,7 +752,7 @@ pub unsafe fn alloc_sealed_struct_from_map(
 ///    no inner heap payload → release is a no-op on the inner (just frees the box shell).
 ///  - String/Array/Map: the slot holds an owned pointer; we RETAIN it before boxing (the struct keeps
 ///    its own +1; the caller's +1 release is balanced by this retain). Mirrors `box_named_heap_field`.
-///  - Sealed (nested struct): recurse materialize to a LinObject, box as TAG_OBJECT. Same contract
+///  - Sealed (nested struct): recurse materialize to a LinMap, box as TAG_MAP. Same contract
 ///    as `box_named_heap_field(NKIND_SEALED)`.
 #[no_mangle]
 pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const crate::string::LinString) -> *mut u8 {
@@ -822,7 +769,7 @@ pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const cra
         *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
     ]) as usize;
     let key_bytes = std::slice::from_raw_parts((*key).data.as_ptr(), (*key).len as usize);
-    let mut cur = 4usize;
+    let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
         let (offset, nkind, nested, name, next) = read_named_field(named_desc, cur);
         cur = next;
@@ -846,6 +793,11 @@ pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const cra
             }
             NKIND_FLOAT64 => {
                 let v = *(slot as *const f64);
+                alloc_tagged(TAG_FLOAT64, v.to_bits())
+            }
+            NKIND_FLOAT32 => {
+                // Physical slot is 4-byte f32; box as TAG_FLOAT64 via fpext (mirrors box_value).
+                let v = *(slot as *const f32) as f64;
                 alloc_tagged(TAG_FLOAT64, v.to_bits())
             }
             NKIND_BOOL => {
@@ -895,19 +847,25 @@ mod named_desc_tests {
     //! correct keyed object that is RC-balanced (run under ASan to judge UAF/leak).
 
     use super::*;
-    use crate::tagged::{TAG_MAP, TAG_OBJECT, TAG_INT32, TAG_STR};
+    use crate::tagged::{TAG_MAP, TAG_INT32, TAG_STR, TAG_FLOAT64};
 
     /// Build a NamedDesc byte blob matching `Codegen::sealed_named_descriptor`:
-    /// `[u32 count | { u32 offset, u32 nkind, u64 nested_ptr, u16 name_len, name_bytes } * count]`.
+    /// `[u32 count | u32 pad | { u32 offset, u32 nkind, u64 nested_ptr, u16 name_len, name_bytes,
+    ///   pad-to-8 } * count]`. The 8-byte header + per-row pad-to-8 keep every `nested_ptr` 8-aligned
+    /// (macOS ld64 requires it); the runtime walks the blob byte-by-byte, rounding each row up to 8.
     fn build_named_desc(fields: &[(&str, u32, u32, *const u8)]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // header pad → 8-byte header
         for (name, offset, nkind, nested) in fields {
             b.extend_from_slice(&offset.to_le_bytes());
             b.extend_from_slice(&nkind.to_le_bytes());
             b.extend_from_slice(&(*nested as u64).to_le_bytes());
             b.extend_from_slice(&(name.len() as u16).to_le_bytes());
             b.extend_from_slice(name.as_bytes());
+            let row_len = 18 + name.len();
+            let pad_len = (8 - (row_len % 8)) % 8;
+            b.extend(std::iter::repeat(0u8).take(pad_len)); // pad row to a multiple of 8
         }
         b
     }
@@ -934,7 +892,7 @@ mod named_desc_tests {
             // Read element 1 via the DYNAMIC boxed reader (the new 0xFE branch).
             let tv = crate::array::lin_array_get_tagged(arr, 1);
             assert!(!tv.is_null());
-            // Phase 3: materialized sealed records are now TAG_MAP, not TAG_OBJECT.
+            // Materialized sealed records are TAG_MAP.
             assert_eq!((*tv).tag, TAG_MAP);
             let map = (*tv).payload as *const crate::map::LinMap;
             let kx = crate::string::lin_string_from_bytes(b"x".as_ptr(), 1);
@@ -989,7 +947,7 @@ mod named_desc_tests {
             // DYNAMIC boxed read: materialize the element. The materialized map must take its OWN
             // +1 on the string (rc -> 2) so the packed buffer's reference is independent.
             let tv = crate::array::lin_array_get_tagged(arr, 0);
-            // Phase 3: materialized sealed records are TAG_MAP, not TAG_OBJECT.
+            // Materialized sealed records are TAG_MAP.
             assert_eq!((*tv).tag, TAG_MAP);
             assert_eq!((*s).refcount, 2); // array + materialized map
             let map = (*tv).payload as *const crate::map::LinMap;
@@ -1016,22 +974,22 @@ mod named_desc_tests {
         }
     }
 
-    // ----- WRITE direction: `pack_named_payload_from_object` through the dynamic/tagged sinks -----
-    // (the inverse of the materialize tests above; guards the map-value-fetch/push corruption fix —
-    // before it, lin_array_push blind-wrote 16-byte TaggedVal slots into the stride-sized packed
-    // buffer (heap overflow at the 3rd element) and lin_push_dyn silently dropped the element.)
+    // ----- WRITE direction: `pack_named_payload_from_map` through the dynamic/tagged sinks -----
+    // Guards the map-value-fetch/push corruption fix — before it, lin_array_push blind-wrote
+    // 16-byte TaggedVal slots into the stride-sized packed buffer (heap overflow at the 3rd
+    // element) and lin_push_dyn silently dropped the element.
 
-    /// Build a fresh keyed LinObject `{ x: Int32(xv), y: Int32(yv) }` (rc = 1).
-    unsafe fn make_obj_xy(xv: i32, yv: i32) -> *mut crate::object::LinObject {
+    /// Build a fresh LinMap `{ x: Int32(xv), y: Int32(yv) }` (rc = 1).
+    unsafe fn make_map_xy(xv: i32, yv: i32) -> *mut crate::map::LinMap {
         use crate::tagged::TaggedVal;
-        let obj = crate::object::lin_object_alloc(2);
+        let map = crate::map::lin_map_alloc(2, crate::map::KEY_KIND_STRING);
         for (name, v) in [("x", xv), ("y", yv)] {
             let key = crate::string::lin_string_from_bytes(name.as_ptr(), name.len() as u32);
             let tv = TaggedVal { tag: TAG_INT32, _pad: [0; 7], payload: v as i64 as u64 };
-            crate::object::lin_object_set_fresh(obj, key, &tv);
+            crate::map::lin_map_set(map, key, &tv);
             crate::string::lin_string_release(key);
         }
-        obj
+        map
     }
 
     // Scalar record P { x: Int32, y: Int32 } pushed through BOTH dynamic write sinks, crossing the
@@ -1043,35 +1001,33 @@ mod named_desc_tests {
         unsafe {
             use crate::tagged::TaggedVal;
             // Struct-relative offsets (24-byte SEALED_HEADER): x@payload0 → 24, y@payload4 → 28.
-            // Stale-offset fix (were 16/20 from the old 16-byte header).
             let named = build_named_desc(&[
                 ("x", 24, NKIND_INT32, std::ptr::null()),
                 ("y", 28, NKIND_INT32, std::ptr::null()),
             ]);
             let arr = crate::array::lin_sealed_array_alloc(4, 8, std::ptr::null(), named.as_ptr());
-            // 5 pushes via lin_push_dyn (RETAINING contract: the caller keeps its object ref).
+            // 5 pushes via lin_push_dyn (RETAINING contract: the caller keeps its map ref).
             for i in 0..5i32 {
-                let obj = make_obj_xy(i, i * 10);
-                let tv = TaggedVal { tag: TAG_OBJECT, _pad: [0; 7], payload: obj as u64 };
+                let map = make_map_xy(i, i * 10);
+                let tv = TaggedVal { tag: TAG_MAP, _pad: [0; 7], payload: map as u64 };
                 crate::array::lin_push_dyn(arr, &tv);
-                assert_eq!((*obj).refcount, 1, "lin_push_dyn must not consume the caller's ref");
-                crate::object::lin_object_release(obj);
+                assert_eq!((*map).refcount, 1, "lin_push_dyn must not consume the caller's ref");
+                crate::map::lin_map_release(map);
             }
             assert_eq!((*arr).len, 5);
             // Packed bytes are real field values at the element stride (not TaggedVal slots).
             let p = crate::array::lin_sealed_array_elem_ptr(arr, 4);
             assert_eq!(*(p as *const i32), 4);
             assert_eq!(*(p.add(4) as *const i32), 40);
-            // lin_array_push (MOVE contract: consumes one transferred object ref).
-            let obj = make_obj_xy(7, 8);
-            crate::memory::lin_rc_retain(obj as *mut u32); // the codegen-transferred +1 (rc -> 2)
-            let cell: *mut crate::object::LinObject = obj;
-            crate::array::lin_array_push(arr, &cell as *const _ as *const u8, TAG_OBJECT);
-            assert_eq!((*obj).refcount, 1, "lin_array_push must consume exactly the transferred ref");
-            crate::object::lin_object_release(obj);
+            // lin_array_push (MOVE contract: consumes one transferred map ref).
+            let map = make_map_xy(7, 8);
+            crate::memory::lin_rc_retain(map as *mut u32); // the codegen-transferred +1 (rc -> 2)
+            let cell: *mut crate::map::LinMap = map;
+            crate::array::lin_array_push(arr, &cell as *const _ as *const u8, TAG_MAP);
+            assert_eq!((*map).refcount, 1, "lin_array_push must consume exactly the transferred ref");
+            crate::map::lin_map_release(map);
             // Roundtrip element 5 through the materializing boxed reader.
             let tv = crate::array::lin_array_get_tagged(arr, 5);
-            // Phase 3: materialized sealed records are TAG_MAP, not TAG_OBJECT.
             assert_eq!((*tv).tag, TAG_MAP);
             let mat = (*tv).payload as *const crate::map::LinMap;
             let kx = crate::string::lin_string_from_bytes(b"x".as_ptr(), 1);
@@ -1084,16 +1040,84 @@ mod named_desc_tests {
         }
     }
 
+    // Two-Float32-field record F { a: Float32, b: Float32 }.
+    // Physical layout (24-byte header): a@24 (4 bytes, align 4), b@28 (4 bytes, align 4), total=32.
+    // The dynamic boundary must reconstruct total=32 (not 40 as NKIND_FLOAT64 would) and box both
+    // fields as TAG_FLOAT64 (fpext). Tests both the materialize path (read) and the
+    // alloc_sealed_struct_from_map path (write via struct_size_from_named_desc).
+    #[test]
+    fn two_float32_fields_round_trip_dynamic_boundary() {
+        unsafe {
+            use crate::tagged::TaggedVal;
+            // Named descriptor: a@24 NKIND_FLOAT32, b@28 NKIND_FLOAT32 (stride=8, total=32).
+            let named = build_named_desc(&[
+                ("a", 24, NKIND_FLOAT32, std::ptr::null()),
+                ("b", 28, NKIND_FLOAT32, std::ptr::null()),
+            ]);
+            // Verify struct_size_from_named_desc returns 32, not 40 (the old NKIND_FLOAT64 over-size).
+            let computed_size = struct_size_from_named_desc(named.as_ptr());
+            assert_eq!(computed_size, 32, "struct_size should be 32 for two Float32 fields, got {computed_size}");
+
+            // Build a standalone sealed struct manually (header + two f32 fields).
+            let sptr = lin_sealed_alloc(32, std::ptr::null(), named.as_ptr());
+            *(sptr.add(24) as *mut f32) = 1.5f32;
+            *(sptr.add(28) as *mut f32) = 2.25f32;
+
+            // materialize_sealed_struct_to_map: read both fields, box as TAG_FLOAT64.
+            let map = materialize_sealed_struct_to_map(sptr as *const u8, named.as_ptr());
+            assert!(!map.is_null());
+            let ka = crate::string::lin_string_from_bytes(b"a".as_ptr(), 1);
+            let kb = crate::string::lin_string_from_bytes(b"b".as_ptr(), 1);
+            let fa = crate::map::lin_map_get(map, ka);
+            let fb = crate::map::lin_map_get(map, kb);
+            assert!(!fa.is_null(), "field 'a' missing from materialized map");
+            assert!(!fb.is_null(), "field 'b' missing from materialized map");
+            assert_eq!((*fa).tag, TAG_FLOAT64, "Float32 field must box as TAG_FLOAT64");
+            assert_eq!((*fb).tag, TAG_FLOAT64, "Float32 field must box as TAG_FLOAT64");
+            let va = f64::from_bits((*fa).payload);
+            let vb = f64::from_bits((*fb).payload);
+            assert!((va - 1.5f64).abs() < 1e-9, "a should be 1.5, got {va}");
+            assert!((vb - 2.25f64).abs() < 1e-9, "b should be 2.25, got {vb}");
+            crate::string::lin_string_release(ka);
+            crate::string::lin_string_release(kb);
+            crate::map::lin_map_release(map);
+
+            // alloc_sealed_struct_from_map: reconstruct a struct from a map with Float64 values
+            // (mirrors what the dynamic boundary sees after fpext boxing).
+            let src_map = crate::map::lin_map_alloc(2, crate::map::KEY_KIND_STRING);
+            for (name, val) in [("a", 3.0f64), ("b", 4.5f64)] {
+                let key = crate::string::lin_string_from_bytes(name.as_ptr(), name.len() as u32);
+                let tv = TaggedVal { tag: TAG_FLOAT64, _pad: [0; 7], payload: val.to_bits() };
+                crate::map::lin_map_set(src_map, key, &tv);
+                crate::string::lin_string_release(key);
+            }
+            let heap_desc = build_heap_desc_from_named_desc(named.as_ptr());
+            let rebuilt = alloc_sealed_struct_from_map(src_map, named.as_ptr(), heap_desc);
+            assert!(!rebuilt.is_null());
+            // Verify the header size is 32.
+            let stored_size = *((rebuilt.add(4)) as *const u32) as usize;
+            assert_eq!(stored_size, 32, "rebuilt struct header size should be 32, got {stored_size}");
+            // Read back the f32 field values directly.
+            let ra = *(rebuilt.add(24) as *const f32);
+            let rb = *(rebuilt.add(28) as *const f32);
+            assert!((ra - 3.0f32).abs() < 1e-6, "rebuilt a should be 3.0, got {ra}");
+            assert!((rb - 4.5f32).abs() < 1e-6, "rebuilt b should be 4.5, got {rb}");
+
+            lin_sealed_release_self(sptr);
+            lin_sealed_release_self(rebuilt);
+            crate::map::lin_map_release(src_map);
+        }
+    }
+
     // Heap-field record R { name: String, n: Int32 }: the pack retains the String into the slot
-    // (the source object keeps its own ref), and the materialize/drop chain releases it exactly
+    // (the source map keeps its own ref), and the materialize/drop chain releases it exactly
     // once each — RC-balanced end to end (ASan judges leak/double-free).
     #[test]
     fn dynamic_push_packs_heap_field_rc_balanced() {
         unsafe {
             use crate::tagged::TaggedVal;
             // Offsets are struct-relative (include the 24-byte SEALED_HEADER): name@payload0 → 24,
-            // n@payload8 → 32. Stale-offset fix: these read 16/24 from the OLD 16-byte header and were
-            // missed when SEALED_HEADER grew 16→24 for the TAG_RECORD named-desc slot.
+            // n@payload8 → 32.
             let named = build_named_desc(&[
                 ("name", 24, NKIND_STRING, std::ptr::null()),
                 ("n", 32, NKIND_INT32, std::ptr::null()),
@@ -1103,30 +1127,29 @@ mod named_desc_tests {
             heap_desc.extend_from_slice(&24u32.to_le_bytes());
             heap_desc.extend_from_slice(&KIND_STRING.to_le_bytes());
             let arr = crate::array::lin_sealed_array_alloc(4, 16, heap_desc.as_ptr(), named.as_ptr());
-            // Source object { name: "hello", n: 42 } — it owns its own +1 on the string.
+            // Source map { name: "hello", n: 42 } — it owns its own +1 on the string.
             let s = crate::string::lin_string_from_bytes(b"hello".as_ptr(), 5);
-            let obj = crate::object::lin_object_alloc(2);
+            let map = crate::map::lin_map_alloc(2, crate::map::KEY_KIND_STRING);
             let kname = crate::string::lin_string_from_bytes(b"name".as_ptr(), 4);
             let tv_name = TaggedVal { tag: TAG_STR, _pad: [0; 7], payload: s as u64 };
-            crate::object::lin_object_set_fresh(obj, kname, &tv_name); // retains: s rc -> 2
+            crate::map::lin_map_set(map, kname, &tv_name); // retains: s rc -> 2
             crate::string::lin_string_release(kname);
             let kn = crate::string::lin_string_from_bytes(b"n".as_ptr(), 1);
             let tv_n = TaggedVal { tag: TAG_INT32, _pad: [0; 7], payload: 42u64 };
-            crate::object::lin_object_set_fresh(obj, kn, &tv_n);
+            crate::map::lin_map_set(map, kn, &tv_n);
             crate::string::lin_string_release(kn);
-            crate::string::lin_string_release(s); // drop our construction ref: obj is sole owner (rc 1)
+            crate::string::lin_string_release(s); // drop our construction ref: map is sole owner (rc 1)
             assert_eq!((*s).refcount, 1);
 
-            let tv = TaggedVal { tag: TAG_OBJECT, _pad: [0; 7], payload: obj as u64 };
+            let tv = TaggedVal { tag: TAG_MAP, _pad: [0; 7], payload: map as u64 };
             crate::array::lin_push_dyn(arr, &tv); // pack retains the string into the slot (rc -> 2)
             assert_eq!((*s).refcount, 2, "the packed slot must take its OWN string ref");
-            crate::object::lin_object_release(obj); // source object drops its ref (rc -> 1, array owns)
+            crate::map::lin_map_release(map); // source map drops its ref (rc -> 1, array owns)
             assert_eq!((*s).refcount, 1);
 
             // Materialize-on-read takes another independent +1.
             let out = crate::array::lin_array_get_tagged(arr, 0);
             assert_eq!((*s).refcount, 2);
-            // Phase 3: materialized sealed records are TAG_MAP, not TAG_OBJECT.
             assert_eq!((*out).tag, TAG_MAP);
             let mat = (*out).payload as *const crate::map::LinMap;
             let k = crate::string::lin_string_from_bytes(b"name".as_ptr(), 4);

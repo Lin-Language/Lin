@@ -80,7 +80,7 @@ A `Worker<Msg, Reply>` is a long-lived OS thread that processes messages sequent
 ```lin
 import { worker, request, close } from "std/async"
 
-val makeCounter = (): Json =>
+val makeCounter = (): AnyVal =>
   var count = 0
   worker(
     (msg: String) =>

@@ -20,7 +20,7 @@ A Decimal cannot be transferred across workers, since the handle is a pointer.
 #### `Decimal`
 
 ```lin
-type Decimal = Json
+type Decimal = AnyVal
 ```
 
 

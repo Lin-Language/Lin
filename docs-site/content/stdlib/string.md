@@ -515,7 +515,7 @@ from a file, socket, or a base64/percent decode.
 #### `toString`
 
 ```lin
-val toString = (x: Json): String
+val toString = (x: AnyVal): String
 ```
 
 Render any JSON value as its string representation.

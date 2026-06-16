@@ -1,8 +1,7 @@
 /// JSON parsing and serialization for Lin runtime.
 use crate::string::LinString;
-use crate::object::tagged_as_object;
 use crate::array::{LinArray, lin_array_alloc};
-use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_OBJECT, TAG_ARRAY, TAG_MAP, alloc_tagged};
+use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_ARRAY, TAG_MAP, alloc_tagged};
 use crate::fs::{make_string, make_error_tagged, resolve_lin_str};
 use crate::sealed::{
     SEALED_HEADER,
@@ -124,17 +123,24 @@ unsafe fn get_or_build_descriptors(
     let (offsets, _total_size) = compute_layout(&nkinds);
 
     // ----- Named descriptor blob -----
-    // Layout: [ u32 field_count | NamedField * count ]
+    // Layout: [ u32 field_count | u32 pad | NamedField * count ]
     // NamedField = [ u32 byte_offset | u32 nkind | u64 nested_named_desc_ptr |
-    //                u16 name_len | name_bytes ]
+    //                u16 name_len | name_bytes | pad-to-8 ]
+    // The 8-byte header + per-row pad-to-8 keep every `nested_named_desc_ptr` 8-byte aligned, matching
+    // `Codegen::sealed_named_descriptor` so the same byte-walking readers handle both. (Codegen needs
+    // it for macOS ld64; here it just keeps the layout identical so `read_named_field` agrees.)
     let mut named_blob: Vec<u8> = Vec::new();
     named_blob.extend_from_slice(&(field_schema.len() as u32).to_le_bytes());
+    named_blob.extend_from_slice(&0u32.to_le_bytes());                    // header pad → 8-byte header
     for (i, (name, nkind, nested)) in field_schema.iter().enumerate() {
         named_blob.extend_from_slice(&(offsets[i] as u32).to_le_bytes()); // byte_offset
         named_blob.extend_from_slice(&nkind.to_le_bytes());               // nkind
         named_blob.extend_from_slice(&(*nested as u64).to_le_bytes());    // nested_named_desc_ptr
         named_blob.extend_from_slice(&(name.len() as u16).to_le_bytes()); // name_len
         named_blob.extend_from_slice(name.as_bytes());                    // name_bytes
+        let row_len = 18 + name.len();
+        let pad_len = (8 - (row_len % 8)) % 8;
+        named_blob.extend(std::iter::repeat(0u8).take(pad_len));          // pad row to a multiple of 8
     }
     let named_ptr: *const u8 = Box::leak(named_blob.into_boxed_slice()).as_ptr();
 
@@ -406,20 +412,6 @@ pub unsafe fn tagged_to_json(tv: *const u8) -> serde_json::Value {
             }
             serde_json::Value::Array(vec)
         }
-        TAG_OBJECT => {
-            let obj = payload as *const crate::object::LinObject;
-            let len = (*obj).len as usize;
-            let mut map = serde_json::Map::new();
-            for i in 0..len {
-                let entry = (*obj).entries.add(i);
-                let key_s = (*entry).key;
-                let slice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
-                let key_str = std::str::from_utf8_unchecked(slice).to_owned();
-                let val_tv = &(*entry).value as *const TaggedVal as *const u8;
-                map.insert(key_str, tagged_to_json(val_tv));
-            }
-            serde_json::Value::Object(map)
-        }
         TAG_MAP => {
             // Phase 2: non-sealed open objects are now backed by LinMap (TAG_MAP).
             // Iterate in insertion order so toJson preserves key order.
@@ -444,25 +436,28 @@ pub unsafe fn tagged_to_json(tv: *const u8) -> serde_json::Value {
             serde_json::Value::Object(smap)
         }
         crate::tagged::TAG_RECORD => {
-            // Stage 6a: sealed-struct pointer in a dynamic slot. Materialize to a LinObject
-            // and serialize as an object, then release the transient.
-            match tagged_as_object(t) {
-                Some((obj, owned)) => {
-                    let len = (*obj).len as usize;
-                    let mut map = serde_json::Map::new();
-                    for i in 0..len {
-                        let entry = (*obj).entries.add(i);
-                        let key_s = (*entry).key;
-                        let slice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
-                        let key_str = std::str::from_utf8_unchecked(slice).to_owned();
-                        let val_tv = &(*entry).value as *const TaggedVal as *const u8;
-                        map.insert(key_str, tagged_to_json(val_tv));
-                    }
-                    if owned { crate::object::lin_object_release(obj as *mut crate::object::LinObject); }
-                    serde_json::Value::Object(map)
+            // Materialize the sealed struct to a LinMap and serialize from it.
+            let sealed = (*t).payload as *mut u8;
+            if sealed.is_null() { return serde_json::Value::Null; }
+            let named_desc = *((sealed.add(16)) as *const *const u8);
+            let lmap = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
+            if lmap.is_null() { return serde_json::Value::Null; }
+            let mut smap = serde_json::Map::new();
+            if !(*lmap).order.is_null() {
+                let len = (*lmap).len as usize;
+                for i in 0..len {
+                    let key_bits = *(*lmap).order.add(i);
+                    let key_s = key_bits as *const LinString;
+                    if key_s.is_null() { continue; }
+                    let kslice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
+                    let key_str = std::str::from_utf8_unchecked(kslice).to_owned();
+                    let val = crate::map::lin_map_get(lmap, key_s);
+                    let val_ptr = if val.is_null() { std::ptr::null() } else { val as *const u8 };
+                    smap.insert(key_str, tagged_to_json(val_ptr));
                 }
-                None => serde_json::Value::Null,
             }
+            crate::map::lin_map_release(lmap);
+            serde_json::Value::Object(smap)
         }
         _ => serde_json::Value::Null,
     }

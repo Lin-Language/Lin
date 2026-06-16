@@ -216,7 +216,6 @@ fn resolve_named_cycle(
         // a JSON-shaped value whose shape is not statically known. `Json` is retained as a
         // deprecated alias so existing code keeps compiling; both resolve to the same wildcard.
         "AnyVal" => Ok(any_val_type()),
-        "Json" => Ok(any_val_type()),
         // `Error` is the conventional error value (spec §20, §24.2.2) and a structural object
         // alias (ADR-031): an object carrying a `type` discriminant and a `message`. Both the
         // async runtime (on a caught thunk fault) and `fromJson` produce this shape — the

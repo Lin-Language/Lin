@@ -112,6 +112,14 @@ pub struct Checker {
     /// directly at its name span for LSP inlay hints, including UNUSED unannotated params (which
     /// `infer_ident` never records, since only USES populate `span_type_map`). Metadata-only.
     param_def_span_types: Vec<(Span, Type)>,
+    /// Definition-site (`name_span`, inferred `Type`) entry for every simple `val`/`var` binding.
+    /// Pushed in `check_stmt` once the binding's final type is known (after `typed_value.ty()`
+    /// and any annotation reconciliation). At end of `check_module` each `Type` is zonked and
+    /// appended to `span_type_map` as a self-entry (`use_span == def_span == name_span`), so
+    /// the LSP can colour the binding NAME correctly (e.g. `function` when the RHS is a lambda).
+    /// Only simple `Pattern::Ident` bindings emit an entry; destructuring patterns are skipped.
+    /// Purely additive metadata: does not affect `typed_module`, inferred types, or diagnostics.
+    binding_def_span_types: Vec<(Span, Type)>,
     /// Path-11 lambda-set inference: monotonic id generator for syntactic lambdas. Each
     /// `TypedExpr::Function` the checker builds is stamped with a fresh id (≥1; 0 means
     /// "unassigned"), so its function type can carry `LambdaSet::singleton(id)`. Inert metadata —
@@ -168,6 +176,7 @@ impl Checker {
             import_origins: std::collections::HashMap::new(),
             replacements: Vec::new(),
             param_def_span_types: Vec::new(),
+            binding_def_span_types: Vec::new(),
             next_lambda_id: 1,
             index_narrowings: Vec::new(),
             raw_type_decls: std::collections::HashMap::new(),
@@ -249,6 +258,12 @@ impl Checker {
             // Purely additive metadata: it never affects `typed_module`, inferred types, or
             // diagnostics. See `param_def_span_types`.
             for (name_span, ty) in std::mem::take(&mut self.param_def_span_types) {
+                let resolved = crate::zonk::zonk_type(&ty, &subs);
+                self.span_type_map.push((name_span, resolved.to_string(), Some(name_span)));
+            }
+            // Append definition-site entries for simple val/var bindings so the LSP can colour
+            // the binding name correctly (e.g. `function` when the RHS is a lambda).
+            for (name_span, ty) in std::mem::take(&mut self.binding_def_span_types) {
                 let resolved = crate::zonk::zonk_type(&ty, &subs);
                 self.span_type_map.push((name_span, resolved.to_string(), Some(name_span)));
             }

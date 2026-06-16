@@ -17,32 +17,18 @@ impl<'ctx> Codegen<'ctx> {
         // binary ops), dispatch on the LLVM value type to produce a correct toString.
         if matches!(ty, Type::TypeVar(_)) {
             if val.is_pointer_value() {
-                return self.builder
-                    .build_call(self.rt.tagged_to_string, &[val.into()], "ttos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
+                return self.builder.call(self.rt.tagged_to_string, &[val.into()], "ttos")
+                    .try_as_basic_value().unwrap_basic();
             } else if val.is_int_value() {
-                // Concretized int (e.g. after TypeVar+TypeVar arithmetic) — use int toString.
                 let i64_ty = self.context.i64_type();
-                let i64_val = self.builder
-                    .build_int_s_extend_or_bit_cast(val.into_int_value(), i64_ty, "tv_iext")
-                    .unwrap();
-                return self.builder
-                    .build_call(self.rt.int_to_string, &[i64_val.into()], "tv_itos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
+                let i64_val = self.builder.int_s_extend_or_bit_cast(val.into_int_value(), i64_ty, "tv_iext");
+                return self.builder.call(self.rt.int_to_string, &[i64_val.into()], "tv_itos")
+                    .try_as_basic_value().unwrap_basic();
             } else if val.is_float_value() {
                 let f64_ty = self.context.f64_type();
-                let f64_val = self.builder
-                    .build_float_ext(val.into_float_value(), f64_ty, "tv_fext")
-                    .unwrap();
-                return self.builder
-                    .build_call(self.rt.float_to_string, &[f64_val.into()], "tv_ftos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
+                let f64_val = self.builder.float_ext(val.into_float_value(), f64_ty, "tv_fext");
+                return self.builder.call(self.rt.float_to_string, &[f64_val.into()], "tv_ftos")
+                    .try_as_basic_value().unwrap_basic();
             }
         }
         match ty {
@@ -67,11 +53,8 @@ impl<'ctx> Codegen<'ctx> {
             Type::UInt64 => {
                 let i64_ty = self.context.i64_type();
                 let u64_val = self.builder.int_z_extend_or_bit_cast(val.into_int_value(), i64_ty, "uext");
-                self.builder
-                    .build_call(self.rt.uint_to_string, &[u64_val.into()], "utos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
+                self.builder.call(self.rt.uint_to_string, &[u64_val.into()], "utos")
+                    .try_as_basic_value().unwrap_basic()
             }
             Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64
             | Type::UInt8 | Type::UInt16 | Type::UInt32 => {
@@ -81,40 +64,25 @@ impl<'ctx> Codegen<'ctx> {
                 } else {
                     self.builder.int_z_extend_or_bit_cast(val.into_int_value(), i64_ty, "iext")
                 };
-                self.builder
-                    .build_call(self.rt.int_to_string, &[i64_val.into()], "itos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
+                self.builder.call(self.rt.int_to_string, &[i64_val.into()], "itos")
+                    .try_as_basic_value().unwrap_basic()
             }
             Type::Float32 => {
                 let f64_val = self.builder.float_ext(val.into_float_value(), self.context.f64_type(), "fext");
-                self.builder
-                    .build_call(self.rt.float_to_string, &[f64_val.into()], "ftos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
+                self.builder.call(self.rt.float_to_string, &[f64_val.into()], "ftos")
+                    .try_as_basic_value().unwrap_basic()
             }
             Type::Float64 => {
-                self.builder
-                    .build_call(self.rt.float_to_string, &[val.into()], "ftos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
+                self.builder.call(self.rt.float_to_string, &[val.into()], "ftos")
+                    .try_as_basic_value().unwrap_basic()
             }
             Type::Bool => {
-                self.builder
-                    .build_call(self.rt.bool_to_string, &[val.into()], "btos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
+                self.builder.call(self.rt.bool_to_string, &[val.into()], "btos")
+                    .try_as_basic_value().unwrap_basic()
             }
             Type::Null => {
-                self.builder
-                    .build_call(self.rt.null_to_string, &[], "ntos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
+                self.builder.call(self.rt.null_to_string, &[], "ntos")
+                    .try_as_basic_value().unwrap_basic()
             }
             Type::Array(_) if Self::sealed_array_elem(ty).is_some() => {
                 // Sealed-record array (Stage 3): materialize to the tagged Object[] view, stringify,
@@ -150,11 +118,16 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(f, &[val.into()], "atos").try_as_basic_value().unwrap_basic()
             }
             Type::Object { .. } if Self::sealed_scalar_fields(ty).is_some() => {
-                // Sealed record: still LinObject*-backed; use lin_object_to_string.
+                // Sealed record (TAG_RECORD packed struct): box it first then use lin_tagged_to_string.
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
-                let f = self.get_or_declare_fn("lin_object_to_string",
+                let tagged = self.builder.call(self.rt.box_record, &[val.into()], "stos_box")
+                    .try_as_basic_value().unwrap_basic();
+                let str_fn = self.get_or_declare_fn("lin_tagged_to_string",
                     ptr_ty.fn_type(&[ptr_ty.into()], false));
-                self.builder.call(f, &[val.into()], "otos").try_as_basic_value().unwrap_basic()
+                let s = self.builder.call(str_fn, &[tagged.into()], "stos")
+                    .try_as_basic_value().unwrap_basic();
+                self.builder.call(self.rt.tagged_release, &[tagged.into()], "");
+                s
             }
             Type::Object { .. } => {
                 // Non-sealed open object: now backed by LinMap* (Phase 2 flip).
@@ -164,13 +137,9 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(f, &[val.into()], "mtos").try_as_basic_value().unwrap_basic()
             }
             _ => {
-                // For unknown complex types, fall back to runtime tagged dispatch.
                 if val.is_pointer_value() {
-                    self.builder
-                        .build_call(self.rt.tagged_to_string, &[val.into()], "ttos")
-                        .unwrap()
-                        .try_as_basic_value()
-                        .unwrap_basic()
+                    self.builder.call(self.rt.tagged_to_string, &[val.into()], "ttos")
+                        .try_as_basic_value().unwrap_basic()
                 } else {
                     self.compile_string_lit("[object]")
                 }
@@ -227,10 +196,18 @@ impl<'ctx> Codegen<'ctx> {
                             i64_ty.fn_type(&[ptr_ty.into()], false));
                         self.builder.call(len_fn, &[arg.into()], "ir_alen").try_as_basic_value().unwrap_basic()
                     }
+                    // Cluster D: object length dispatch. Sealed records are packed structs
+                    // with a statically-known field count; return it as a compile-time constant.
+                    // Non-sealed open objects are LinMap* — call lin_map_length.
+                    // Named types are treated as unsealed open objects (LinMap* at runtime).
+                    ty @ Type::Object { .. } if Self::sealed_fields(ty).is_some() => {
+                        let n_fields = Self::sealed_fields(ty).map(|f| f.len()).unwrap_or(0);
+                        i64_ty.const_int(n_fields as u64, false).into()
+                    }
                     Type::Object { .. } | Type::Named(_) => {
-                        let obj_len_fn = self.get_or_declare_fn("lin_object_length",
+                        let map_len_fn = self.get_or_declare_fn("lin_map_length",
                             i64_ty.fn_type(&[ptr_ty.into()], false));
-                        self.builder.call(obj_len_fn, &[arg.into()], "ir_olen").try_as_basic_value().unwrap_basic()
+                        self.builder.call(map_len_fn, &[arg.into()], "ir_olen").try_as_basic_value().unwrap_basic()
                     }
                     // Typed index-signature map `{ K: V }` (ADR-055 + numeric-key): entry count.
                     Type::Map { .. } => {
@@ -271,7 +248,7 @@ impl<'ctx> Codegen<'ctx> {
                     // owned — `lower.rs` `push_into_sealed_array` skips the ownership transfer — and
                     // is released at scope exit, balancing the retain. WITHOUT this, a sealed-array
                     // `push` fell through to `tagged_array_push_value`, which materialized a BOXED
-                    // LinObject and tagged-pushed it (TAG_OBJECT) into the packed-scalar buffer → a
+                    // LinMap and tagged-pushed it (TAG_MAP) into the packed-scalar buffer → a
                     // pointer-sized tagged element written into a scalar-stride slot → heap-buffer
                     // overflow (`realloc(): invalid next size`; ASan: heap-buffer-overflow in
                     // lin_array_push). Stage-3 tests dodged this by using array LITERALS only. Scalar
@@ -1037,10 +1014,10 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 ptr_ty.const_null().into()
             }
-            // lin_keys(obj) => String[]. Unbox to LinObject*, call lin_object_keys.
-            // Stage 6a: when the argument is a union/Json type, it may be TAG_RECORD (sealed
-            // struct by pointer). Use lin_tagged_keys which dispatches on the tag and handles
-            // both TAG_OBJECT and TAG_RECORD (materializing the sealed struct for the latter).
+            // lin_keys(obj) => String[].
+            // Dispatch: union/Json → lin_tagged_keys (handles TAG_MAP, TAG_RECORD, TAG_SUMNODE);
+            // sealed concrete Object → box as TAG_RECORD + lin_tagged_keys (materialized path);
+            // non-sealed concrete Object / Named / Map → lin_map_keys directly on the LinMap*.
             Intrinsic::Keys => {
                 if let Some(&obj_v) = args.first() {
                     let arg_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
@@ -1054,11 +1031,19 @@ impl<'ctx> Codegen<'ctx> {
                         let f = self.get_or_declare_fn("lin_tagged_keys",
                             ptr_ty.fn_type(&[ptr_ty.into()], false));
                         self.builder.call(f, &[tagged_v.into()], "ir_tagged_keys").try_as_basic_value().unwrap_basic()
-                    } else {
-                        let obj_ptr = self.ir_as_raw_ptr(obj_v, &arg_ty);
-                        let f = self.get_or_declare_fn("lin_object_keys",
+                    } else if matches!(&arg_ty, Type::Object { .. }) && Self::sealed_fields(&arg_ty).is_some() {
+                        // Sealed concrete record: box as TAG_RECORD, then use lin_tagged_keys
+                        // (which materialises it to a LinMap and returns the keys).
+                        let boxed = self.box_value(obj_v, &arg_ty);
+                        let f = self.get_or_declare_fn("lin_tagged_keys",
                             ptr_ty.fn_type(&[ptr_ty.into()], false));
-                        self.builder.call(f, &[obj_ptr.into()], "ir_keys").try_as_basic_value().unwrap_basic()
+                        self.builder.call(f, &[boxed.into()], "ir_tagged_keys_s").try_as_basic_value().unwrap_basic()
+                    } else {
+                        // Non-sealed open object (LinMap*) or Named type — call lin_map_keys.
+                        let obj_ptr = self.ir_as_raw_ptr(obj_v, &arg_ty);
+                        let f = self.get_or_declare_fn("lin_map_keys",
+                            ptr_ty.fn_type(&[ptr_ty.into()], false));
+                        self.builder.call(f, &[obj_ptr.into()], "ir_mkeys").try_as_basic_value().unwrap_basic()
                     }
                 } else { ptr_ty.const_null().into() }
             }
@@ -1145,7 +1130,7 @@ impl<'ctx> Codegen<'ctx> {
                 // Allocate a 0xFD array and push the fill N times (retaining per push). This mirrors
                 // the array-literal path for sealed elements (lin_sealed_ptr_array_alloc + push).
                 // Without this special case, the `else` branch below creates a 0xFF tagged array and
-                // stores TAG_OBJECT struct-pointer TaggedVals — but later ops (IndexSet, field reads)
+                // stores TAG_RECORD struct-pointer TaggedVals — but later ops (IndexSet, field reads)
                 // assume 0xFD repr → wrong element layout → crash at runtime.
                 if let Some(fill_fields) = arg_reprs.get(1).and_then(|r| r.packed_struct_fields()) {
                     let fill_fields = fill_fields.clone();

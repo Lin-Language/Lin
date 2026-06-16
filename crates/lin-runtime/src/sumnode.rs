@@ -54,17 +54,17 @@ pub const KIND_SUMNODE: u32 = 4;
 /// `Codegen::sumnode_descriptor` (which emits `{ ptr matfn, [N x i32] table }`).
 pub const SUMDESC_TABLE_OFFSET: usize = 8;
 
-/// The materializer function pointer signature: `*SumNode -> *LinObject` (the per-type
+/// The materializer function pointer signature: `*SumNode -> *LinMap` (the per-type
 /// `lin_summat_<key>` codegen emits). Used to materialize a kept-packed `TAG_SUMNODE` slot that
 /// escaped a record field into the type-erased dynamic domain (toString/eq/json).
 type SumMatFn = unsafe extern "C" fn(*mut u8) -> *mut u8;
 
-/// Materialize an unboxed `*SumNode` to a real boxed `LinObject` (the universal Json representation),
-/// via the per-type materializer fn-ptr stored at the head of the node's SumDesc. Returns a +1
-/// `LinObject*` (NOT a TaggedVal box — the caller boxes it as TAG_OBJECT). Null/desc-less safe
-/// (returns null — a scalar-only sum type still carries a descriptor under this scheme, so the
-/// desc is non-null for every keep-packed-eligible node). Used by the runtime dynamic-boundary
-/// walkers (`lin_tagged_to_string` / `push_json_value` / `lin_tagged_eq`) for a TAG_SUMNODE payload.
+/// Materialize an unboxed `*SumNode` to a fresh +1 `LinMap*`, via the per-type materializer
+/// fn-ptr stored at the head of the node's SumDesc. Returns a `*mut LinMap` cast as `*mut u8`.
+/// Null/desc-less safe (returns null — a scalar-only sum type still carries a descriptor under
+/// this scheme, so the desc is non-null for every keep-packed-eligible node). Used by the runtime
+/// dynamic-boundary walkers (`lin_tagged_to_string` / `push_json_value` / `lin_tagged_eq`) for a
+/// TAG_SUMNODE payload.
 #[no_mangle]
 pub unsafe extern "C" fn lin_sumnode_materialize(node: *mut u8) -> *mut u8 {
     if node.is_null() {
@@ -173,6 +173,63 @@ unsafe fn release_heap_fields(ptr: *mut u8) {
         // The field slot holds an owned heap-payload pointer (8 bytes), at a node-relative offset.
         let slot = ptr.add(offset) as *mut *mut u8;
         release_field(*slot, kind);
+    }
+}
+
+/// Immortal-seal a `*SumNode` and (recursively) every heap field of its current variant — the
+/// sum-node arm of `frozen()`. Mirrors `release_heap_fields`' variant-indexed descriptor walk but
+/// saturates the refcount instead of decrementing, and seals each heap field via the shared
+/// `frozen::freeze_*` primitives. Needed because a kept-packed sum node can be boxed into a dynamic
+/// (AnyVal/union) slot (`lin_box_sumnode`); when such a graph is `frozen()`, the node must be sealed
+/// too or it stays mortal and is freeable while shared read-only across threads (cross-thread UAF).
+/// Idempotent (inert once IMMORTAL_RC). Null-safe.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sumnode_freeze(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    let rc = ptr as *mut u32;
+    if *rc >= crate::string::IMMORTAL_RC {
+        return; // already frozen — also breaks any accidental sharing/cycle
+    }
+    *rc = crate::string::IMMORTAL_RC;
+    let desc = desc_of(ptr);
+    if desc.is_null() {
+        return; // scalar-only sum type: no heap fields to seal
+    }
+    let table = desc.add(SUMDESC_TABLE_OFFSET);
+    let variant_count = *(table as *const u32);
+    let tag = tag_of(ptr);
+    if tag >= variant_count {
+        return;
+    }
+    // Skip to this variant's VariantDesc (variable-length blocks, exactly as release_heap_fields).
+    let mut cur = table.add(4);
+    for _ in 0..tag {
+        let hc = *(cur as *const u32) as usize;
+        cur = cur.add(4 + hc * 8);
+    }
+    let heap_count = *(cur as *const u32) as usize;
+    let entries = cur.add(4);
+    for i in 0..heap_count {
+        let ent = entries.add(i * 8);
+        let offset = *(ent as *const u32) as usize;
+        let kind = *((ent.add(4)) as *const u32);
+        let payload = *(ptr.add(offset) as *const *mut u8);
+        if payload.is_null() {
+            continue;
+        }
+        match kind {
+            crate::sealed::KIND_STRING => {
+                crate::frozen::freeze_string(payload as *mut crate::string::LinString)
+            }
+            crate::sealed::KIND_ARRAY => {
+                crate::frozen::freeze_array(payload as *mut crate::array::LinArray)
+            }
+            crate::sealed::KIND_SEALED => crate::frozen::freeze_sealed(payload),
+            KIND_SUMNODE => lin_sumnode_freeze(payload), // recursive child
+            _ => {}
+        }
     }
 }
 
