@@ -589,6 +589,18 @@ pub unsafe extern "C" fn lin_map_alloc(hint: u32, key_kind: u32) -> *mut LinMap 
     ptr
 }
 
+/// Allocate a `LinMap` pre-committed to MIXED value layout (full 16-byte `TaggedVal` slots).
+/// Used by the record/sumnode → map materializers, which build heterogeneous maps field-by-field:
+/// birthing them MIXED avoids the optimistic-narrow-then-realloc churn that `lin_map_alloc` would
+/// incur (it would size slots at 24B on the first field, then `convert_to_mixed`-realloc on the
+/// second differently-tagged field — ~one extra slot realloc per materialized record). Genuine
+/// `{String:T}` map literals keep `lin_map_alloc` (the value-unbox path).
+pub(crate) unsafe fn lin_map_alloc_mixed(hint: u32, key_kind: u32) -> *mut LinMap {
+    let m = lin_map_alloc(hint, key_kind);
+    (*m).value_kind = VKIND_MIXED;
+    m
+}
+
 /// Insert / overwrite `key -> *val` (String map). Retains value and key on insert.
 /// A null `val` pointer means the null value.
 #[no_mangle]
