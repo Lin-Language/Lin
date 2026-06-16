@@ -379,6 +379,14 @@ Conductor (me) runs the heavy RAPTOR digest+RSS at integration; agents run light
 > move ~0% on the headline workloads — both bottlenecks are ALLOCATION/MATERIALIZATION, not repr or RC traffic.
 > RAPTOR = record→map materialization (lane F 0xFE / packed records); interp = per-AST-node alloc churn (Option D
 > stack-alloc). The real wins require attacking alloc/materialization directly.
+
+- [~] **Interp LEAK investigation — agent on `investigate/interp-leak` (/tmp/wt-leak).** The interp benchmark
+  leaks **33,960,676 bytes / 1,490,048 allocs PER RUN** under LeakSanitizer — PRE-EXISTING on master (surfaced
+  by the Option C ASan A/B, which was byte-identical, so NOT caused by any recent change). Likely an RC
+  imbalance or a reference CYCLE (ADR-024 — RC can't collect cycles) in the interp's Token/Cursor/AST graph,
+  or benign program-lifetime data held at exit. Agent: confirm real-vs-residual (scale REPS), find the dominant
+  leaking alloc site (ASan stacks), root-cause (cycle / missing-release / lifetime), and fix if low-risk.
+  If a real leak, this is also part of WHY interp is alloc-bound (it never reclaims per-iteration garbage).
 - [x] **Lane S — SMI dates (#12) → MERGED to master `7140c05b`.** Pointer-tagged immediate small ints behind
   cargo feature `smi` (default OFF → master byte-identical: workspace 820/0 + 73/73 + fmt all green feature-off;
   feature-on compiles). Cherry-picked off the stale experiment branch onto master (fixed a duplicate-`[features]`
