@@ -107,10 +107,22 @@ impl<'ctx> Codegen<'ctx> {
             nested_ptrs.push(ptr_ty.const_null());
         }
         // Assemble the packed struct field-by-field so byte offsets are exact (no struct padding).
+        //
+        // 8-byte-alignment invariant (macOS ld64): the descriptor is a PACKED const global, but each
+        // field row embeds a real `nested_named_desc_ptr` relocation. macOS's linker rejects a pointer
+        // fixup whose final address is not 8-byte aligned ("ld: pointer not aligned"). To keep every
+        // `nested` ptr 8-aligned we (a) align the global to 8, (b) pad the header to 8 bytes (u32
+        // field_count + u32 pad) so the first row starts at a multiple of 8, and (c) pad each row to a
+        // multiple of 8 so every subsequent row also starts 8-aligned. The ptr sits at row_start+8, so
+        // it lands on an 8-byte boundary. The runtime reads the blob byte-by-byte (offset-walked, not
+        // strided), so it is agnostic to this padding as long as it skips the header pad and rounds the
+        // row stride up to 8 — see `read_named_field` / the `cur` init in `lin-runtime/src/sealed.rs`.
         let mut members: Vec<inkwell::values::BasicValueEnum<'ctx>> = Vec::new();
         let mut member_tys: Vec<inkwell::types::BasicTypeEnum<'ctx>> = Vec::new();
-        // field_count (u32)
+        // field_count (u32) + u32 pad → 8-byte header so the first row starts 8-aligned.
         members.push(i32_ty.const_int(fields.len() as u64, false).into());
+        member_tys.push(i32_ty.into());
+        members.push(i32_ty.const_int(0, false).into());
         member_tys.push(i32_ty.into());
         for ((k, fty), nested) in fields.iter().zip(nested_ptrs.iter()) {
             let (off, _) = Self::sealed_field_layout(fields, k);
@@ -121,7 +133,7 @@ impl<'ctx> Codegen<'ctx> {
             // u32 nkind
             members.push(i32_ty.const_int(nkind as u64, false).into());
             member_tys.push(i32_ty.into());
-            // u64 nested_named_desc_ptr (a real pointer global, or NULL)
+            // u64 nested_named_desc_ptr (a real pointer global, or NULL) — at row_start+8, kept aligned.
             members.push((*nested).into());
             member_tys.push(ptr_ty.into());
             // u16 name_len
@@ -133,12 +145,23 @@ impl<'ctx> Codegen<'ctx> {
             let name_arr = i8_ty.const_array(&bytes);
             member_tys.push(name_arr.get_type().into());
             members.push(name_arr.into());
+            // Pad the row to a multiple of 8 bytes. Row content so far = 4+4+8+2+name_len = 18+name_len.
+            let row_len = 18 + k.len();
+            let pad_len = (8 - (row_len % 8)) % 8;
+            if pad_len > 0 {
+                let pad_bytes: Vec<inkwell::values::IntValue<'ctx>> =
+                    (0..pad_len).map(|_| i8_ty.const_int(0, false)).collect();
+                let pad_arr = i8_ty.const_array(&pad_bytes);
+                member_tys.push(pad_arr.get_type().into());
+                members.push(pad_arr.into());
+            }
         }
         let desc_ty = self.context.struct_type(&member_tys, true); // PACKED
         let desc_val = self.context.const_struct(&members, true);
         let global = self.module.add_global(desc_ty, None, &key);
         global.set_initializer(&desc_val);
         global.set_constant(true);
+        global.set_alignment(8); // macOS ld64: pointer fixups in the blob must be 8-byte aligned.
         global.as_pointer_value()
     }
 

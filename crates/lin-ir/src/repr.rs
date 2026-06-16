@@ -49,9 +49,12 @@ pub enum Layout {
     /// A sealed scalar/heap-field record laid out as a packed `[u32 rc | u32 size | desc | fields…]`
     /// struct (the `Codegen::sealed_fields` representation).
     PackedStruct { fields: IndexMap<String, Type> },
-    /// A `LinArray` with `elem_tag == 0xFE`: a contiguous, header-less buffer of packed sealed-record
-    /// elements (the `Codegen::sealed_array_elem` representation).
-    PackedSealedArray { elem_layout: IndexMap<String, Type> },
+    /// A sealed-record-element `LinArray`. Two sub-layouts:
+    ///   - `inline == true`  (0xFE): contiguous, header-less buffer — elements are VALUE copies;
+    ///     `push` does NOT preserve aliases (`push(arr,t); t.x=5` is NOT visible through `arr[i]`).
+    ///   - `inline == false` (0xFD): pointer-backed — each slot is an 8-byte struct pointer;
+    ///     `push` retains the struct, so mutations via the original reference ARE visible.
+    PackedSealedArray { elem_layout: IndexMap<String, Type>, inline: bool },
     /// An unboxed tagged sum-type value (`lin_runtime::sumnode` — unboxed-sumtype Stage 1): a pointer
     /// to a heap `SumNode` `[u32 rc | u32 size | u64 desc | u32 tag | u32 pad | max-variant payload]`.
     /// The layout key is the WHOLE sum type's field shape: the discriminant key plus the ordered
@@ -136,13 +139,20 @@ impl Repr {
         }
     }
 
-    /// `Some(elem_layout)` iff this repr is a packed sealed ARRAY (`elem_tag == 0xFE`) — codegen's
-    /// gate for the contiguous packed-element buffer read/write/push fast path.
+    /// `Some(elem_layout)` iff this repr is a packed sealed array (either 0xFE inline or 0xFD
+    /// pointer-backed) — codegen's gate for the sealed-array read/write/push path. Use
+    /// `is_inline_sealed_array()` to distinguish 0xFE from 0xFD when the push function matters.
     pub fn packed_sealed_array_layout(&self) -> Option<&IndexMap<String, Type>> {
         match self {
             Repr::Packed(Layout::PackedSealedArray { elem_layout, .. }) => Some(elem_layout),
             _ => None,
         }
+    }
+
+    /// True iff this repr is a packed sealed array in the INLINE 0xFE representation — contiguous
+    /// value-copy buffer. Codegen uses `lin_sealed_array_alloc` + `push_struct_retaining` for these.
+    pub fn is_inline_sealed_array(&self) -> bool {
+        matches!(self, Repr::Packed(Layout::PackedSealedArray { inline: true, .. }))
     }
 
     /// True iff this repr is a packed value of EITHER kind (struct or sealed array).
@@ -313,8 +323,11 @@ fn type_seed(ty: &Type) -> Repr {
         return Repr::Packed(Layout::NullableRecord { fields: fields.clone() });
     }
     if let Some(elem_fields) = sealed_array_elem(ty) {
+        // Type-seed: inline flag unknown statically; default to false (0xFD pointer-backed).
+        // The MakeArray DECIDE site overrides this with the correct inline flag from the instruction.
         return Repr::Packed(Layout::PackedSealedArray {
             elem_layout: elem_fields.clone(),
+            inline: false,
         });
     }
     if let Some(fields) = sealed_fields(ty) {
@@ -358,6 +371,9 @@ fn make_object_repr(ty: &Type, fields: &[(String, Temp)], spreads: &[Temp]) -> R
 /// `sealed_array_elem(Array(elem)).is_some()`, otherwise a heap `LinArray` pointer (a flat-scalar
 /// buffer when the element is a flat scalar, a boxed `Object[]` otherwise).
 ///
+/// `inline` mirrors `MakeArray.inline`: `true` = 0xFE contiguous value-copy buffer,
+/// `false` = 0xFD pointer-backed (default; escape.rs promotes to `true` when safe).
+///
 /// NOTE: a flat-scalar ARRAY is NOT `Repr::FlatScalar` — that variant is the single-unboxed-scalar
 /// PRIMITIVE (a loop counter, a field value), not a contiguous buffer. The flat-array path is the
 /// pre-existing `lin_flat_array_*` representation, orthogonal to the sealed packed-vs-boxed decision
@@ -365,12 +381,13 @@ fn make_object_repr(ty: &Type, fields: &[(String, Temp)], spreads: &[Temp]) -> R
 /// (nothing asserts a more specific repr on an array temp — assume sites dispatch on the array TYPE,
 /// not its repr). Conflating it with `FlatScalar` was an analysis bug the Stage-2 oracle surfaced on
 /// `Float64[]` literals in stdlib (`nextPair`/`applyKey`).
-fn make_array_repr(elem_ty: &Type) -> Repr {
+fn make_array_repr(elem_ty: &Type, inline: bool) -> Repr {
     // Reconstruct the Array(elem) view the codegen predicate gates on.
     let arr_ty = Type::Array(Box::new(elem_ty.clone()));
     if let Some(elem_fields) = sealed_array_elem(&arr_ty) {
         return Repr::Packed(Layout::PackedSealedArray {
             elem_layout: elem_fields.clone(),
+            inline,
         });
     }
     Repr::boxed_opaque()
@@ -483,8 +500,8 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
         Instruction::MakeObject { dst, ty, fields, spreads, .. } => {
             set(seeds, *dst, make_object_repr(ty, fields, spreads));
         }
-        Instruction::MakeArray { dst, elem_ty, .. } => {
-            set(seeds, *dst, make_array_repr(elem_ty));
+        Instruction::MakeArray { dst, elem_ty, inline, .. } => {
+            set(seeds, *dst, make_array_repr(elem_ty, *inline));
         }
         // A whole sealed-record element read by Index yields a PACKED struct REGARDLESS of whether
         // the array is packed: a packed sealed array goes through `sealed_array_materialize_elem`
@@ -526,6 +543,7 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
                 // the downstream SealedArrayFieldGet oracle check → debug panic, release UAF.
                 set(seeds, *dst, Repr::Packed(Layout::PackedSealedArray {
                     elem_layout: elem_fields.clone(),
+                    inline: false, // arrays read from containers are always pointer-backed (0xFD)
                 }));
             } else if let Some(s) = ScalarTy::from_type(result_ty) {
                 // Flat element read (only when the array is genuinely flat — but the result type
@@ -557,6 +575,7 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
                 // RAPTOR Trip{stopTimes:StopTime[]} shape). Mirrors `type_seed`'s array arm.
                 set(seeds, *dst, Repr::Packed(Layout::PackedSealedArray {
                     elem_layout: elem_fields.clone(),
+                    inline: false, // nested arrays read from struct fields are always pointer-backed (0xFD)
                 }));
             } else if let Some(f) = sealed_fields(result_ty) {
                 set(seeds, *dst, Repr::Packed(Layout::PackedStruct { fields: f.clone() }));
@@ -570,6 +589,7 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
                 // PackedSealedArray (the dedicated packed-element field-read op).
                 set(seeds, *dst, Repr::Packed(Layout::PackedSealedArray {
                     elem_layout: elem_fields.clone(),
+                    inline: false, // nested arrays from packed-element reads are pointer-backed (0xFD)
                 }));
             } else if let Some(f) = sealed_fields(result_ty) {
                 set(seeds, *dst, Repr::Packed(Layout::PackedStruct { fields: f.clone() }));
@@ -709,8 +729,8 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                 // the flat-vs-boxed-Object[] distinction is the orthogonal pre-existing flat-array
                 // path (assume sites dispatch on the array TYPE), so the oracle only asserts the
                 // sealed-array case is Packed and the non-sealed case is NOT Packed.
-                Instruction::MakeArray { dst, elem_ty, .. } => {
-                    let expected = make_array_repr(elem_ty);
+                Instruction::MakeArray { dst, elem_ty, inline, .. } => {
+                    let expected = make_array_repr(elem_ty, *inline);
                     let r = &repr[dst.0 as usize];
                     match &expected {
                         Repr::Packed(Layout::PackedSealedArray { elem_layout, .. }) => {
@@ -1329,7 +1349,7 @@ mod tests {
         let instrs = vec![
             Instruction::Const { dst: Temp(0), val: Const::Float(1.0, Type::Float64) },
             Instruction::Const { dst: Temp(1), val: Const::Float(2.0, Type::Float64) },
-            Instruction::MakeArray { dst: Temp(2), elements: vec![Temp(0), Temp(1)], elem_ty: Type::Float64 },
+            Instruction::MakeArray { dst: Temp(2), elements: vec![Temp(0), Temp(1)], elem_ty: Type::Float64, inline: false },
         ];
         let f = func_of(instrs, Some(Temp(2)), 3, vec![]);
         let repr = analyze(&f);

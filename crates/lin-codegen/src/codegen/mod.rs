@@ -1639,12 +1639,25 @@ impl<'ctx> Codegen<'ctx> {
                             let _ = ty;
                             temp_map.insert(*dst, obj_ptr.into());
                         }
-                        Instruction::MakeArray { dst, elements, elem_ty } => {
+                        Instruction::MakeArray { dst, elements, elem_ty, inline } => {
                             let cap = i64_ty.const_int(elements.len().max(4) as u64, false);
-                            // Sealed-record array (Stage 3): contiguous, unboxed, header-less
-                            // elements. Allocate via lin_sealed_array_alloc(cap, stride, desc) and
-                            // copy each element struct's field payload into the buffer (scalar
-                            // fields → no retain). `elem_ty` is the sealed Object type.
+                            // Sealed-record array: two layouts selected by escape analysis.
+                            //
+                            // 0xFE INLINE (`inline == true`, escape-proven non-aliasing elements):
+                            //   lin_sealed_array_alloc(cap, stride, desc, named_desc) — contiguous
+                            //   value-copy buffer. Each element is byte-copied via
+                            //   lin_sealed_array_push_struct_retaining; source struct is released at
+                            //   scope exit. Heap fields are retained (+1) by push_struct_retaining;
+                            //   scope-exit release on the source struct drops the header only (RC→0 →
+                            //   free struct, but heap fields were already +1'd by push → they survive
+                            //   at rc=1 owned by the array slot). RC is balanced.
+                            //
+                            // 0xFD POINTER-BACKED (`inline == false`, default):
+                            //   lin_sealed_ptr_array_alloc(cap, named_desc) — each slot is an 8-byte
+                            //   struct pointer. lin_sealed_ptr_array_push retains the struct pointer
+                            //   (+1). Array and temp are independent owners; mutations to the original
+                            //   temp are visible through arr[i] (reference semantics).
+                            //
                             // STAGE 3: the packed-sealed-array decision comes from `func.repr` (the
                             // pass's `make_array_repr` already applied the `sealed_array_elem` gate —
                             // sealed element with all-packable fields). The flat-scalar-vs-boxed split
@@ -1653,28 +1666,48 @@ impl<'ctx> Codegen<'ctx> {
                             let arr_repr = func.repr_of(*dst);
                             let arr = if let Some(fields) = arr_repr.packed_sealed_array_layout() {
                                 let fields = fields.clone();
-                                let named_desc = self.sealed_named_descriptor(&fields); // ADR-063 (i)
-                                // Stage 1 pointer-backed array: alloc via lin_sealed_ptr_array_alloc(cap, named_desc).
-                                // Each element struct `ev` is a BORROWED standalone struct (owned by its own temp,
-                                // released at scope exit). lin_sealed_ptr_array_push retains the struct pointer (+1),
-                                // so the array and the temp are both independent owners until the temp's scope-exit
-                                // release (which drops back to the array's sole ownership when the temp goes out of
-                                // scope). After Stage 1: push(arr, t); t["x"] = 5 IS visible through arr[i]["x"].
-                                let alloc_fn = self.get_or_declare_fn(
-                                    "lin_sealed_ptr_array_alloc",
-                                    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false));
-                                let arr_v = self.builder.call(alloc_fn,
-                                    &[cap.into(), named_desc.into()],
-                                    "ir_sptrr").try_as_basic_value().unwrap_basic();
-                                let push_fn = self.get_or_declare_fn(
-                                    "lin_sealed_ptr_array_push",
-                                    self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
-                                for e_temp in elements {
-                                    if let Some(&ev) = temp_map.get(e_temp) {
-                                        self.builder.call(push_fn, &[arr_v.into(), ev.into()], "");
+                                let named_desc = self.sealed_named_descriptor(&fields);
+                                if *inline {
+                                    // 0xFE inline path: contiguous value-copy buffer.
+                                    let total = Self::sealed_struct_size(&fields);
+                                    let stride = total - Self::SEALED_HEADER;
+                                    let stride_v = i64_ty.const_int(stride, false);
+                                    // heap_desc: NULL for scalar-only; non-null for heap-field records.
+                                    // `sealed_descriptor` already returns null when there are no heap fields.
+                                    let heap_desc = self.sealed_descriptor(&fields);
+                                    let alloc_fn = self.get_or_declare_fn(
+                                        "lin_sealed_array_alloc",
+                                        ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into(), ptr_ty.into()], false));
+                                    let arr_v = self.builder.call(alloc_fn,
+                                        &[cap.into(), stride_v.into(), heap_desc.into(), named_desc.into()],
+                                        "ir_sarr").try_as_basic_value().unwrap_basic();
+                                    let push_fn = self.get_or_declare_fn(
+                                        "lin_sealed_array_push_struct_retaining",
+                                        self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                                    for e_temp in elements {
+                                        if let Some(&ev) = temp_map.get(e_temp) {
+                                            self.builder.call(push_fn, &[arr_v.into(), ev.into()], "");
+                                        }
                                     }
+                                    arr_v
+                                } else {
+                                    // 0xFD pointer-backed path (default): retain struct pointer on push.
+                                    let alloc_fn = self.get_or_declare_fn(
+                                        "lin_sealed_ptr_array_alloc",
+                                        ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false));
+                                    let arr_v = self.builder.call(alloc_fn,
+                                        &[cap.into(), named_desc.into()],
+                                        "ir_sptrr").try_as_basic_value().unwrap_basic();
+                                    let push_fn = self.get_or_declare_fn(
+                                        "lin_sealed_ptr_array_push",
+                                        self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                                    for e_temp in elements {
+                                        if let Some(&ev) = temp_map.get(e_temp) {
+                                            self.builder.call(push_fn, &[arr_v.into(), ev.into()], "");
+                                        }
+                                    }
+                                    arr_v
                                 }
-                                arr_v
                             } else if Self::is_flat_scalar(elem_ty) {
                                 let suffix = Self::flat_suffix(elem_ty);
                                 let alloc_fn = self.get_or_declare_fn(
