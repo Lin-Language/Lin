@@ -12,7 +12,6 @@
     { "include": "#string" },
     { "include": "#number" },
     { "include": "#builtin-types" },
-    { "include": "#builtin-functions" },
     { "include": "#operator" },
     { "include": "#punctuation" },
     { "include": "#identifier" }
@@ -116,12 +115,6 @@
       "name": "support.type.builtin.lin"
     },
 
-    "builtin-functions": {
-      "comment": "Known stdlib and intrinsic functions",
-      "match": "\\b(print|length|toString|trim|toUpper|toLower|substring|indexOf|parseInt32|parseInt64|parseFloat64|toInt32|toFloat64|isInt32|range|map|filter|reduce|iter|iterOf|for|push|pop|charAt|repeat)\\b",
-      "name": "support.function.builtin.lin"
-    },
-
     "string": {
       "patterns": [
         { "include": "#string-interpolated" },
@@ -170,7 +163,6 @@
         { "include": "#number" },
         { "include": "#keywords" },
         { "include": "#builtin-types" },
-        { "include": "#builtin-functions" },
         { "include": "#operator" },
         { "include": "#punctuation" },
         { "include": "#identifier" }
