@@ -345,12 +345,17 @@ impl Checker {
             }
         }
 
-        // Propagate the expected type into the final expression of a block — both for `StrLit`
-        // singleton refinement (ADR-034) and for a non-default scalar width, so a block whose tail
-        // is a bare numeric literal (`(): Int64 => …; 28`) re-types it to the declared width
-        // instead of inferring the `Int32`/`Float64` default (codegen IR-width mismatch otherwise).
+        // Propagate the expected type into the final expression of a block — for `StrLit`
+        // singleton refinement (ADR-034), non-default scalar widths (block whose tail is a bare
+        // numeric literal adopts the declared width), and STRUCTURED types (Object / Named /
+        // Union). The structured-type case lets a sealed-record expected type flow into a nested
+        // `if`/`match` inside the block via `check_branch_against` → `check_object_fields`,
+        // producing sealed object literals. Without this, `check_expr(block, sealed_Cursor)`
+        // would fall through to `infer_expr(block)` → `infer_if` → `infer_object` → unsealed,
+        // triggering a `Coerce` at the function-return boundary (sealed_project_from →
+        // lin_map_get per field) even though the object was NEVER stored in a LinMap.
         if let (Expr::Block(stmts, final_expr, span, _), true) =
-            (expr, type_mentions_strlit(expected) || expected_pushes_scalar_width(expected))
+            (expr, expected_pushes_into_branches(expected))
         {
             self.env.push_scope();
             let mut typed_stmts = Vec::new();
@@ -1433,6 +1438,21 @@ impl Checker {
             return Type::TypeVar(u32::MAX);
         }
 
+        // Arm 4.5 — sealed-record wins over its unsealed twin. When one branch is a sealed object
+        // (`sealed=true`) and the other is the structurally identical unsealed object, prefer the
+        // sealed representation so the phi does not degrade it to a boxed TAG_MAP. `sealed` is a
+        // representation detail invisible to `types_compatible` (which ignores the flag), so
+        // without this arm Arm 5 would pick `else_ty` (the first ⊆ check fires) regardless of
+        // which side is sealed — degrading a sealed literal to boxed when the else branch is the
+        // declared-return-type unsealed alias.
+        match (&then_ty, &else_ty) {
+            (Type::Object { fields: tf, sealed: true }, Type::Object { fields: ef, sealed: false })
+                if tf == ef => return then_ty,
+            (Type::Object { fields: tf, sealed: false }, Type::Object { fields: ef, sealed: true })
+                if tf == ef => return else_ty,
+            _ => {}
+        }
+
         // Arm 5 — structural subtype collapse: standard path.
         if self.types_compatible(&then_ty, &else_ty) {
             return else_ty;
@@ -2136,37 +2156,82 @@ impl Checker {
                         Some(ft) => self.check_expr(val_expr, ft)?,
                         None => self.infer_expr(val_expr)?,
                     };
-                    obj_type.insert(key.clone(), typed_val.ty());
+                    // When building a SEALED record and the expected field type is a sum-type union
+                    // (which maps to a single *SumNode pointer at runtime), record the EXPECTED type
+                    // rather than the value's narrowed variant type. Without this, checking
+                    // `{ "node": { "kind": "num", "value": 42 } }` against `{ "node": Expr, "pos": Int32 }`
+                    // would record `node: unsealed_variant_obj` (the matched variant type), which
+                    // `is_sealed_heap_field()` rejects — preventing the outer Cursor from being sealed.
+                    // Using the expected sum type is sound: the value is compatible with it (the
+                    // check above already enforced that), and codegen's `sealed_construct` emits a
+                    // `compile_ir_coerce(val, from=variant_obj, to=Expr)` → `sumnode_project_from_boxed`
+                    // to project the variant into the correct *SumNode layout.
+                    let field_ty = match expected_fields.get(key) {
+                        Some(ft) if Type::sum_type_eligible(ft)
+                            && self.types_compatible(&typed_val.ty(), ft) =>
+                        {
+                            ft.clone()
+                        }
+                        _ => typed_val.ty(),
+                    };
+                    obj_type.insert(key.clone(), field_ty);
                     typed_fields.push((key.clone(), typed_val));
                 }
             }
         }
         self.in_tail_position = saved_tail;
         // Carry the EXPECTED type's seal flag onto the refined literal's own type (Path-9C) — but
-        // ONLY when every field is gate-packable. This is the producer/consumer SEAL SYMMETRY fix:
+        // ONLY when every field is sealed-eligible. This is the producer/consumer SEAL SYMMETRY fix:
         // recording the literal SEALED makes the PRODUCER build the same packed representation the
         // CONSUMER reads back at, keeping the two sides' repr classification (and codegen layout) in
-        // agreement. The packability AND is load-bearing, not merely an optimisation:
-        //   - Gate-packable fields (scalar+Bool today): a sealed element flows into a sealed-scalar
-        //     array (`is_sealed_scalar_array`) → the array PACKS, the element is laid out inline, no
-        //     box. The consumer reads it packed. Symmetric, leak-free.
-        //   - A NON-packable field (e.g. String under the scalar+Bool gate): the consumer reads the
-        //     array BOXED (its repr pass uses the SAME gate). If we sealed the producer's element
-        //     anyway, the array stays boxed (`is_sealed_scalar_array` is false) but each element is
-        //     now a SEALED STRUCT that the boxed-array lowering MATERIALIZES to a `LinObject` and
-        //     then LEAKS the transient struct (~one alloc/field/element/build, ASan-confirmed). So
-        //     for an unpackable record we keep the element UNSEALED — the producer builds the boxed
-        //     `LinObject` directly (the historical path), which is ALSO what the consumer reads:
-        //     still symmetric, and leak-free.
-        // When the gate later widens to String (Path-9A), those records become packable and this AND
-        // automatically starts sealing them — no further checker change needed. `Type`
-        // equality/subtyping ignores the seal flag (types.rs), so this is representation-only and
-        // never changes assignability. A field directed only because of a nested `StrLit`/`Map`
-        // (the outer literal itself unsealed) keeps the historical UNSEALED result.
-        let all_fields_packable =
-            !obj_type.is_empty() && obj_type.values().all(|t| t.is_sealed_array_field_packable());
-        let ty = if sealed && all_fields_packable {
-            Type::sealed_object(obj_type)
+        // agreement. `is_sealed_field` is the canonical sealed-record gate (scalar + Bool + String +
+        // Array + Map + nested sealed record + sum-type pointer). Sealed-ARRAY eligibility
+        // (`is_sealed_array_field_packable`) is a stricter sub-gate: only fields whose type allows
+        // a packed sealed-array element (not sum-type pointers yet — pack_named_payload_impl lacks
+        // NKIND_SUMNODE support). The sealed flag on the LITERAL drives whether the standalone record
+        // is a packed struct; the sealed-ARRAY gate is checked separately by `sealed_array_elem` when
+        // the record type appears as an array element. Keeping both gates in sync:
+        //   - A record with only sealed-array-packable fields → sealed literal AND sealed array elem.
+        //   - A record with a sum-type pointer field (e.g. Cursor{node:Ast, pos:Int32}) → sealed
+        //     literal (no map alloc, field reads are const-offset), but Cursor[] stays a boxed array
+        //     (sealed_array_elem returns None). No pack_named_payload_impl NKIND_SUMNODE path taken.
+        // `Type` equality/subtyping ignores the seal flag, so this is representation-only and never
+        // changes assignability. A field directed only because of a nested `StrLit`/`Map` (the outer
+        // literal itself unsealed) keeps the historical UNSEALED result.
+        //
+        // Two-gate rule for auto-seal:
+        //   (A) ALL fields pass `is_sealed_field()` — the necessary condition.
+        //   (B) EITHER `sealed=true` was passed by the caller (the expected type was already
+        //       sealed, so the producer/consumer repr is already coordinated) OR at least one
+        //       field is `sum_type_eligible` (a SumNode-pointer field like Cursor.node — the new
+        //       capability this PR adds, not covered by the old packability gate).
+        //
+        // Gate B guards against spurious auto-sealing of types like Journey/Trip/TimetableLeg
+        // (whose fields are Array/String/Int32, all passing gate A) that the CONSUMER reads as
+        // boxed TAG_MAP. If the consumer path was built without `sealed=true` on the expected
+        // type, it never set up packed-struct readers, so a sealed producer would mismatch →
+        // segfault. The SumNode exemption is safe: SumNode-pointer records are always consumed
+        // via the sealed-record path (codegen checks `is_sum_type` and routes to SumNode reads),
+        // so no consumer/producer repr mismatch arises.
+        let all_fields_sealed =
+            !obj_type.is_empty() && obj_type.values().all(|t| t.is_sealed_field());
+        let has_sum_field = obj_type.values().any(|t| Type::sum_type_eligible(t));
+        let ty = if all_fields_sealed && (sealed || has_sum_field) {
+            // Use the EXPECTED field order for the sealed struct descriptor, not the literal's
+            // field order. The sealed struct's byte layout is determined by the type's field order,
+            // and the consumer (field reads, function return coerces) uses the declared type's
+            // order. A literal like `{ "departureTime": x, "legs": y }` checked against
+            // `Journey = { "legs": Leg[], "departureTime": Int32 }` must produce a struct with
+            // `legs` at the first slot (matching Journey's declared order), not `departureTime`.
+            // Without this, the producer writes `departureTime` at offset 24 but the consumer
+            // reads `legs` (a pointer) from offset 24 → mis-read → crash.
+            let ordered: IndexMap<String, Type> = expected_fields.keys()
+                .filter_map(|k| obj_type.get(k).map(|v| (k.clone(), v.clone())))
+                .chain(obj_type.iter()
+                    .filter(|(k, _)| !expected_fields.contains_key(k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone())))
+                .collect();
+            Type::sealed_object(ordered)
         } else {
             Type::object(obj_type)
         };
