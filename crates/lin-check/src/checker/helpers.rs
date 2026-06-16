@@ -392,6 +392,30 @@ pub(crate) fn first_mutable_global_in_body(
     }
 }
 
+/// True iff `ty` is a sealed object record whose fields are ALL unboxed scalars (Int*/UInt*/Float*/Bool).
+/// Used to gate the forward-declare return-type patch: all-scalar sealed records must NOT get the
+/// patch because the `Named(...)` placeholder in the forward-declared env slot is what causes
+/// `unify_types` to produce a Union intermediate, which in turn enables the Stage-4 escape-analysis
+/// chain (a boxing Coerce is emitted for the sealed→Union branch, preventing the param from flowing
+/// directly into the Phi and being marked escaping). If we patch eagerly, the Union disappears,
+/// the param flows into the Phi, joins the carry class with the TailCall construction, and stack
+/// allocation is suppressed. Records with pointer/sum fields (e.g. Cursor) are NOT all-scalar so
+/// they still get the patch, preserving the sealed-field-read optimization on the hot parse path.
+pub(crate) fn is_all_scalar_sealed_record(ty: &Type) -> bool {
+    match ty {
+        Type::Object { fields, sealed: true } if !fields.is_empty() => fields.values().all(|f| {
+            matches!(
+                f,
+                Type::Bool
+                    | Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64
+                    | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64
+                    | Type::Float32 | Type::Float64
+            )
+        }),
+        _ => false,
+    }
+}
+
 pub(crate) fn unify_types(types: &[Type]) -> Type {
     if types.is_empty() {
         return Type::Never;
