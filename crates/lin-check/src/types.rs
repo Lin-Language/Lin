@@ -496,12 +496,14 @@ impl Type {
     }
 
     /// True when `ty` is an eligible HEAP field of a sealed record (String/StrLit, Array/FixedArray,
-    /// Map, or a nested sealed record). Stored as an 8-byte owned pointer slot.
+    /// Map, nested sealed record, or a single-pointer union — a sum type whose runtime value is a
+    /// `*SumNode`). Stored as an 8-byte owned pointer slot.
     pub fn is_sealed_heap_field(&self) -> bool {
         self.is_string_ish()
             || matches!(self, Type::Array(_) | Type::FixedArray(_))
             || matches!(self, Type::Map { .. })
             || (matches!(self, Type::Object { .. }) && Type::sealed_fields(self).is_some())
+            || Type::sum_type_eligible(self)
     }
 
     /// True when `ty` is a permissible field of a sealed record: scalar or eligible heap field.

@@ -398,6 +398,19 @@ impl<'ctx> Codegen<'ctx> {
                     return self.builder.call(self.rt.box_record, &[val.into()], "boxrec")
                         .try_as_basic_value().unwrap_basic();
                 }
+                // sealed → SUM TYPE: project to a fresh *SumNode. Must come BEFORE the generic
+                // `is_union_type` arm below, which would materialize to LinMap+TAG_MAP — the wrong
+                // representation for a SUMNODE_FIELD slot. Applies when the concrete source is a
+                // sealed Object variant AND the target is a Stage-1 eligible sum union.
+                if Self::is_sum_type(to_ty) && val.is_pointer_value() {
+                    let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                    let map_val = self.sealed_materialize_to_map(val, &sf);
+                    let node = self.sumnode_project_from_boxed(map_val, &Type::object(Default::default()), to_ty, llvm_fn);
+                    if map_val.is_pointer_value() {
+                        self.builder.call(self.rt.map_release, &[map_val.into_pointer_value().into()], "");
+                    }
+                    return node;
+                }
                 if Self::is_union_type(to_ty) {
                     // sealed → multi-variant union (if-merge, named union type): materialize to
                     // LinMap for TAG_MAP. TAG_RECORD would be unboxed by lin_unbox_ptr on
@@ -514,6 +527,44 @@ impl<'ctx> Codegen<'ctx> {
         if let (Type::Object { sealed: false, fields: to_fields }, Type::Object { sealed: false, .. }) = (to_ty, from_ty) {
             let tf = to_fields.clone();
             return self.boxed_object_project(val, &tf);
+        }
+        // SUM TYPE → SAME SUM TYPE: when both sides are sum-type-eligible (physically *SumNode) and
+        // share the same discriminant, the value is already the right representation — carry it
+        // verbatim. This fires when two expansions of the same recursive type (e.g. the `Expr` param
+        // type vs the `Cursor.node` field type) are structurally different enough that `from != to`
+        // returns true in `sealed_repr_differs`, but both are still physically *SumNode pointers.
+        // Materializing + re-boxing in this case would corrupt the tree.
+        if Self::is_sum_type(to_ty) && Self::is_sum_type(from_ty) {
+            return val;
+        }
+        // OBJECT → SUM TYPE: when the target is a sum-type union (a *SumNode slot — e.g. the `node`
+        // field of a sealed `Cursor` or the `left`/`right` fields of a sealed `BinOp`), the source
+        // object must be projected into a fresh *SumNode rather than boxed into a generic TaggedVal.
+        // `box_value` would produce TAG_MAP/TAG_RECORD (wrong representation for a SUMNODE_FIELD
+        // slot) and the sumnode materializer would read garbage.  Only applies when `from_ty` is a
+        // concrete Object (not a union/TypeVar — those might already carry a *SumNode or a TaggedVal;
+        // the NOTE above explains why we cannot gate on type for a union source).
+        if Self::is_sum_type(to_ty)
+            && matches!(from_ty, Type::Object { .. })
+            && val.is_pointer_value()
+        {
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            // For a sealed source, materialize to a fresh LinMap* so the per-sum-type projector
+            // (which calls lin_map_get to read the discriminant) receives the correct layout.
+            let (map_val, release_map) = if let Some(sf) = Self::sealed_scalar_fields(from_ty) {
+                let sf = sf.clone();
+                (self.sealed_materialize_to_map(val, &sf), true)
+            } else {
+                (val, false)
+            };
+            // Non-union source path in sumnode_project_from_boxed: passes map_val straight to the
+            // per-type projector without tag-probing (correct, since map_val is a raw LinMap*).
+            let node = self.sumnode_project_from_boxed(map_val, &Type::object(Default::default()), to_ty, llvm_fn);
+            // Release the intermediate LinMap that sealed_materialize_to_map freshly allocated.
+            if release_map && map_val.is_pointer_value() {
+                self.builder.call(self.rt.map_release, &[map_val.into_pointer_value().into()], "");
+            }
+            return node;
         }
         // Box to union. Use heap boxing (lin_box_*) rather than a stack alloca, because
         // a coerced value may escape its defining function (returned, stored in an array,
