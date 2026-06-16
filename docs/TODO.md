@@ -365,17 +365,37 @@ Conductor (me) runs the heavy RAPTOR digest+RSS at integration; agents run light
 - [ ] **Lane U — seal union-ptr fields (#17)** · /tmp/wt-union, `lane/seal-union-ptr` · owns lin-check checker +
   `codegen/boxing.rs`+`types.rs`. Admit single-pointer union fields (interp `Cursor.node`) into sealing.
   STILL RUNNING (no commits yet).
+- [~] **Interp Option C (RC elision at Borrow calls) → SOUND but ~0% measured.** `lane/interp-borrow-rc` commit
+  `139b35bd`: convention-aware RC elision across Borrow calls + intrinsics (reuses ownership_verify, no new
+  analysis), 28 RC ops elided (IR-confirmed), 820/0 + 73/73 + ASan-clean on interp/calc/report/sumtree. Wall:
+  2.69→2.71s (NOISE). REFUTES the design's 15-30% — interp is ALLOC/MAP-CHURN bound (lin_map_alloc per AST
+  node), NOT RC-bound. Keepable as a general RC-traffic reduction but RC elision is UAF-sensitive → gate on
+  RAPTOR digest+ASan before merge. **The real interp lever = Option D: stack-allocate per-frame Cursor/Token
+  records (alloc elimination)** — overlaps lane F escape.rs, sequence after F.
+
+> META-PATTERN (2026-06-16): the "clean" repr/RC optimizations (map value-unbox, RC elision) are each SOUND but
+> move ~0% on the headline workloads — both bottlenecks are ALLOCATION/MATERIALIZATION, not repr or RC traffic.
+> RAPTOR = record→map materialization (lane F 0xFE / packed records); interp = per-AST-node alloc churn (Option D
+> stack-alloc). The real wins require attacking alloc/materialization directly.
 - [x] **Lane S — SMI dates (#12) → MERGED to master `7140c05b`.** Pointer-tagged immediate small ints behind
   cargo feature `smi` (default OFF → master byte-identical: workspace 820/0 + 73/73 + fmt all green feature-off;
   feature-on compiles). Cherry-picked off the stale experiment branch onto master (fixed a duplicate-`[features]`
   collision with mimalloc). INCOMPLETE SLICE — the flag stages it: ~180 consumer sites must guard the tag bit
   before it can flip default-ON. Foundation for Linus's dates-as-ints feature.
-- [~] **Lane F — 0xFE phase-2 (#9) → CRASHES RAPTOR, re-dispatched.** `lane/0xfe-phase2` commit `e689235c`
-  lets `{String:Trip[]}`/`StopTime[]` arrays go 0xFE inline (the REAL materialization lever) — but ABORTS the
-  typed RAPTOR in `lin_sealed_ptr_array_to_tagged` via gtfsLoader sortByKey: a repr producer/consumer
-  disagreement (a sort-reordered array goes 0xFE-physical but is tagged 0xFD). Agent's gate widening was too
-  aggressive (sort-bound arrays must stay 0xFD). Re-dispatched with the crash + a self-verifiable synthetic
-  repro; conductor re-runs RAPTOR digest+RSS. THIS lane is the headline now (value-unbox redirected here).
+- [x] **Lane F — 0xFE phase-2 (#9) → MERGED to master `c2f77121` (sound; no RAPTOR win today, keepable win for
+  local read-only record arrays + foundation for build-then-store ports).** Conductor-verified comprehensively:
+  gate audited (strict allowlist, fails-safe — only Index/FieldGet/SealedArrayFieldGet/Retain/Release promote
+  to 0xFE; push/sort/Call/IndexSet/Return/capture/Phi all → 0xFD), workspace 820/0 + 73/73, RAPTOR digest-EXACT
+  + no-crash, 0xFE-firing correctness test PASS (10 & 100), ASan-CLEAN on a 0xFE-firing build (channel confirmed
+  via UAF control). Regression tests committed: 0xfe_inline_read.test.lin + 0xfe_sort_repro.lin.
+  Crash fixed `be60bf77` (removed the unsound container-escape allowance). ROOT FINDING via the repro: RAPTOR
+  builds arrays with **store-then-push** (`groups[key]=[]; push(groups[key], trip)`) — fundamentally
+  incompatible with 0xFE inline (push corrupts the inline buffer / breaks element addressing). So
+  container-escaping arrays MUST stay 0xFD, and 0xFE only ever fires for LOCAL read-only arrays (which RAPTOR's
+  hot path doesn't have) → no RAPTOR win, ≈ Phase-1. Gates green (820/0, 73/73, ASan-clean, repro passes).
+  **KEEPABLE FOUNDATION (Linus's RAPTOR port):** 0xFE becomes viable IFF the port restructures to
+  **build-the-array-fully-THEN-store** (read-only after escape) — then inline saves ~48B/record (header+malloc+
+  ptr) AND avoids read-materialization. Parked as a sound gate, ready for that port shape. Branch unmerged.
 
 ### OPEN — concrete next items (post-Wave-B)
 - [ ] **Wave R** (above) — per-kind attribution DONE → the 4 lanes above are the chosen levers.
