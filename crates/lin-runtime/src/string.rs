@@ -1081,6 +1081,21 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
     if tagged.is_null() {
         return lin_null_to_string();
     }
+    // SMI guard: an inline integer is not a heap pointer — decode and stringify directly.
+    #[cfg(feature = "smi")]
+    {
+        let p = tagged as *const u8;
+        if crate::tagged::is_smi_ptr(p) {
+            let n = if crate::tagged::is_smi_int64_pub(p) {
+                // Int64 SMI: decode full 62-bit signed value.
+                (p as i64) >> 2
+            } else {
+                // Int32 SMI: decode 30-bit signed value, sign-extend.
+                ((p as i64) >> 2) as i32 as i64
+            };
+            return lin_int_to_string(n);
+        }
+    }
     let tag = (*tagged).tag;
     let payload = (*tagged).payload;
     if tag == TAG_NULL {
