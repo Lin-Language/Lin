@@ -253,6 +253,8 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Unbox a tagged union pointer to the concrete type `target_ty`.
+    /// Handles the same type set as `unbox_tagged_val_to_type`; call sites in the closure-wrapper
+    /// ABI (call.rs) and index key paths use this entry point with concrete scalar/ptr types.
     pub(crate) fn unbox_value(&mut self, ptr: BasicValueEnum<'ctx>, target_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_val = ptr.into_pointer_value();
         #[allow(unreachable_patterns)] // _ arm is a future-proof guard; currently exhaustive
@@ -261,7 +263,6 @@ impl<'ctx> Codegen<'ctx> {
             Type::Bool => {
                 let v = self.builder.call(self.rt.unbox_bool, &[ptr_val.into()], "ubool")
                     .try_as_basic_value().unwrap_basic();
-                // Convert i8 to i1
                 self.builder.int_truncate(v.into_int_value(), self.context.bool_type(), "utobool").into()
             }
             Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => {
@@ -271,8 +272,6 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.int_truncate_or_bit_cast(v.into_int_value(), ity, "toi").into()
             }
             Type::UInt8 | Type::UInt16 | Type::UInt32 => {
-                // UInt8/16/32 are boxed as TAG_INT64 (zero-extended). Read the full i64 payload
-                // and truncate to the target width — this preserves all value bits.
                 let v = self.builder.call(self.rt.unbox_int64, &[ptr_val.into()], "uu64")
                     .try_as_basic_value().unwrap_basic();
                 let ity = self.llvm_type(target_ty).into_int_type();
@@ -283,9 +282,6 @@ impl<'ctx> Codegen<'ctx> {
                     .try_as_basic_value().unwrap_basic()
             }
             Type::UInt64 => {
-                // Boxed as TAG_UINT64; the bits are identical to TAG_INT64 so unbox_int64
-                // returns the correct 64-bit pattern (the value's signedness only matters at
-                // display/compare time, handled by the runtime tag).
                 self.builder.call(self.rt.unbox_uint64, &[ptr_val.into()], "uu64v")
                     .try_as_basic_value().unwrap_basic()
             }
@@ -306,27 +302,26 @@ impl<'ctx> Codegen<'ctx> {
                 let fields = Self::sealed_scalar_fields(target_ty).unwrap().clone();
                 self.sealed_project_from(ptr, &Type::TypeVar(u32::MAX), &fields)
             }
-            // Keep in sync with `unbox_tagged_val_to_type` below. A typed index-signature map
-            // (`{ String: T }`, `Type::Map`) is boxed as TAG_MAP whose payload is the raw
-            // `LinMap*`; unbox it back to that pointer here too, or it leaks through the
-            // closure-ABI wrapper as a TaggedVal box masquerading as a `LinMap*`.
             Type::Object { .. } | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } | Type::Map { .. } => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "uptr")
                     .try_as_basic_value().unwrap_basic()
+            }
+            // KEEP-PACKED-THROUGH-RECORD-FIELDS: `sum | Null` union box — materialize TAG_SUMNODE
+            // slots to a real TAG_MAP so dynamic consumers see a valid LinMap*.
+            Type::Union(_) if Self::sum_member_of_nullable_union(target_ty).is_some() => {
+                let sum_ty = Self::sum_member_of_nullable_union(target_ty).unwrap();
+                self.sumnode_box_readback_to_object_box(ptr, &sum_ty)
             }
             // Already tagged — return as-is.
             Type::Union(_) | Type::TypeVar(_) => ptr,
             // Opaque handle types: their runtime value IS the tagged box pointer.
             Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
-            | Type::Named(_) | Type::Never
-            // Iterator<T> is boxed as TAG_ARRAY (lin_iter returns a LinArray*); unboxing to the
-            // raw pointer is the same as Array — handled identically by the unbox_ptr call above,
-            // but Iterator was not listed in that explicit arm. Pass through; the pointer IS the
-            // value the caller needs (it's already unboxed at the IR level for Iterator results).
-            | Type::Iterator(_) => ptr,
-            // Any Type variant that reaches here was not expected to be unboxed via this entry
-            // point. Preserve old fall-through in release builds; panic in debug/test so the
-            // corpus gate catches the gap immediately.
+            | Type::Named(_) | Type::Never | Type::Iterator(_) => ptr,
+            // Sum type: project from the boxed LinMap back to a fresh *SumNode.
+            _ if Self::is_sum_type(target_ty) => {
+                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                self.sumnode_project_from_boxed(ptr, target_ty, target_ty, llvm_fn)
+            }
             _ => {
                 debug_assert!(false, "unbox_value: unhandled type {target_ty:?} — add an explicit arm");
                 ptr
@@ -392,8 +387,7 @@ impl<'ctx> Codegen<'ctx> {
         // map_flat_scalar segfault). Mirrors the home-alloca hoist in mod.rs.
         let alloca = self.entry_block_alloca(tagged_ty, "tv");
 
-        // Use type_tag_open so a concrete open-object payload (LinMap*) is tagged TAG_MAP.
-        let tag = Self::type_tag_open(val_ty);
+        let tag = Self::type_tag(val_ty);
         let tag_val = i8_ty.const_int(tag as u64, false);
         let tag_ptr = self.builder.struct_gep(tagged_ty, alloca, 0, "tv_tag");
         self.builder.store(tag_ptr, tag_val);
@@ -487,6 +481,14 @@ impl<'ctx> Codegen<'ctx> {
             .try_as_basic_value().unwrap_basic()
     }
 
+    /// Box a raw `LinMap*` pointer directly as TAG_MAP. Replaces the pattern
+    /// `box_value(obj, sumnode_first_variant_obj_ty(&sum_ty))` at dynamic-boundary sites
+    /// where a materialized SumNode `LinMap*` needs wrapping into a TaggedVal.
+    pub(crate) fn box_map_of(&mut self, obj_ptr: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        self.builder.call(self.rt.box_map, &[obj_ptr.into()], "boxmap_obj")
+            .try_as_basic_value().unwrap_basic()
+    }
+
     pub(crate) fn compile_ir_box(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> BasicValueEnum<'ctx> {
         // Heap-box (see compile_ir_coerce) so the boxed value can safely escape.
         self.box_value(val, ty)
@@ -527,7 +529,12 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.unbox_uint64, &[ptr.into()], "ir_u64").try_as_basic_value().unwrap_basic()
             }
             Type::Float64 | Type::Float32 => {
-                self.builder.call(self.rt.unbox_float64, &[ptr.into()], "ir_uf64").try_as_basic_value().unwrap_basic()
+                let v = self.builder.call(self.rt.unbox_float64, &[ptr.into()], "ir_uf64").try_as_basic_value().unwrap_basic();
+                if matches!(ty, Type::Float32) {
+                    self.builder.float_trunc(v.into_float_value(), self.context.f32_type(), "tof32").into()
+                } else {
+                    v
+                }
             }
             Type::Bool => {
                 let i8v = self.builder.call(self.rt.unbox_bool, &[ptr.into()], "ir_ubool").try_as_basic_value().unwrap_basic().into_int_value();

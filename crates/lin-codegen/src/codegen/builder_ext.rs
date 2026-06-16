@@ -243,6 +243,14 @@ pub trait BuilderExt<'ctx> {
         int_type: <T::BaseType as PointerMathType<'ctx>>::PtrConvType,
         name: &str,
     ) -> <<T::BaseType as PointerMathType<'ctx>>::PtrConvType as IntMathType<'ctx>>::ValueType;
+
+    fn select<BV: BasicValue<'ctx>>(
+        &self,
+        condition: IntValue<'ctx>,
+        then_value: BV,
+        else_value: BV,
+        name: &str,
+    ) -> BasicValueEnum<'ctx>;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -585,5 +593,15 @@ impl<'ctx> BuilderExt<'ctx> for Builder<'ctx> {
         name: &str,
     ) -> <<T::BaseType as PointerMathType<'ctx>>::PtrConvType as IntMathType<'ctx>>::ValueType {
         self.build_ptr_to_int(ptr, int_type, name).unwrap()
+    }
+
+    fn select<BV: BasicValue<'ctx>>(
+        &self,
+        condition: IntValue<'ctx>,
+        then_value: BV,
+        else_value: BV,
+        name: &str,
+    ) -> BasicValueEnum<'ctx> {
+        self.build_select(condition, then_value, else_value, name).unwrap()
     }
 }

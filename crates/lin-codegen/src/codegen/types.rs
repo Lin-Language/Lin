@@ -211,16 +211,7 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Like `type_tag` but historically returned `TAG_MAP` for non-sealed and `TAG_OBJECT` for
-    /// sealed `Type::Object`. After Cluster D (TAG_OBJECT producers removed), `type_tag` already
-    /// returns `TAG_MAP` for all `Type::Object` variants, so this is now identical to `type_tag`.
-    /// Kept as a separate entry point for call-site clarity (indicates the site produces a
-    /// concrete value, not a boxed union tag check).
-    pub(crate) fn type_tag_open(ty: &Type) -> u8 {
-        Self::type_tag(ty)
-    }
-
-    /// Byte size of `SEALED_HEADER` (refcount u32 + size u32 + heap_desc_ptr u64 + named_desc_ptr u64).
+/// Byte size of `SEALED_HEADER` (refcount u32 + size u32 + heap_desc_ptr u64 + named_desc_ptr u64).
     /// Kept in lockstep with `lin_runtime::sealed::SEALED_HEADER` (24). Sealed-record field payload begins here.
     /// Stage 6a: the 3rd slot (offset 16) is the named descriptor pointer (all fields + names) for TAG_RECORD
     /// field access via `lin_record_get_field`.
@@ -490,22 +481,7 @@ impl<'ctx> Codegen<'ctx> {
         sum
     }
 
-    /// The (unsealed) object Type of the FIRST variant of a sum type — used purely to give
-    /// `box_value` a TAG_MAP box tag when boxing a materialized SumNode for a dynamic edge. Any
-    /// variant's object type yields the same box tag (TAG_MAP); the first is a convenient
-    /// representative. `ty` must be a sum type.
-    pub(crate) fn sumnode_first_variant_obj_ty(ty: &Type) -> Type {
-        let fields = match ty {
-            Type::Union(vs) => match vs.first() {
-                Some(Type::Object { fields, .. }) => fields.clone(),
-                _ => Default::default(),
-            },
-            _ => Default::default(),
-        };
-        Type::object(fields)
-    }
-
-    /// The PAYLOAD field map of one variant (the discriminant key removed — it is the inline tag).
+/// The PAYLOAD field map of one variant (the discriminant key removed — it is the inline tag).
     /// Only the scalar fields remain. Declaration order is preserved (the layout key).
     pub(crate) fn sumnode_variant_payload_fields(
         variant: &indexmap::IndexMap<String, Type>,

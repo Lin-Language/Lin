@@ -126,10 +126,7 @@ impl<'ctx> Codegen<'ctx> {
         let zero = i64_ty.const_zero();
         let is_neg = self.builder.int_compare(IntPredicate::SLT, idx, zero, "flat_idx_neg");
         let wrapped = self.builder.int_add(len, idx, "flat_idx_wrap");
-        let actual = self.builder
-            .build_select(is_neg, wrapped, idx, "flat_idx_actual")
-            .unwrap()
-            .into_int_value();
+        let actual = self.builder.select(is_neg, wrapped, idx, "flat_idx_actual").into_int_value();
 
         // Bounds check folded to a single UNSIGNED compare: `(u64)actual >= (u64)len` catches
         // BOTH `actual < 0` (a still-negative wrap reads as a huge unsigned value ≥ len) and
@@ -189,7 +186,7 @@ impl<'ctx> Codegen<'ctx> {
         if let Type::Object { .. } = val_ty {
             if let Some(fields) = Self::sealed_fields(val_ty).cloned() {
                 let obj = self.sealed_materialize_to_map(val, &fields);
-                let tag = i8_ty.const_int(Self::type_tag_open(val_ty) as u64, false);
+                let tag = i8_ty.const_int(Self::type_tag(val_ty) as u64, false);
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
                 let cell = self.entry_alloca(ptr_ty, "arr_cell");
                 self.builder.store(cell, obj);
@@ -207,8 +204,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::TypeVar(_) | Type::Union(_) | Type::Promise(_) | Type::Shared(_) | Type::Stream(_) | Type::TarEntry =>
                 self.push_tagged_val(arr, val, val_ty),
             _ => {
-                // type_tag_open: all object types now resolve to TAG_MAP (no TAG_OBJECT producers).
-                let tag_val = Self::type_tag_open(val_ty);
+                let tag_val = Self::type_tag(val_ty);
                 let tag = i8_ty.const_int(tag_val as u64, false);
                 // lin_array_push copies a full 8 bytes from the cell into the payload, so the
                 // cell must hold 8 defined bytes. Pointers are stored as the raw 8-byte pointer;
@@ -285,10 +281,7 @@ impl<'ctx> Codegen<'ctx> {
         let zero = i64_ty.const_zero();
         let is_neg = self.builder.int_compare(IntPredicate::SLT, idx, zero, "fset_idx_neg");
         let wrapped = self.builder.int_add(len, idx, "fset_idx_wrap");
-        let actual = self.builder
-            .build_select(is_neg, wrapped, idx, "fset_idx_actual")
-            .unwrap()
-            .into_int_value();
+        let actual = self.builder.select(is_neg, wrapped, idx, "fset_idx_actual").into_int_value();
         // Single unsigned compare catches both a still-negative wrap and actual >= len.
         let oob = self.builder.int_compare(IntPredicate::UGE, actual, len, "fset_oob");
 
@@ -342,7 +335,7 @@ impl<'ctx> Codegen<'ctx> {
         if let Type::Object { .. } = val_ty {
             if let Some(fields) = Self::sealed_fields(val_ty).cloned() {
                 let obj = self.sealed_materialize_to_map(value, &fields);
-                let tag = i8_ty.const_int(Self::type_tag_open(val_ty) as u64, false);
+                let tag = i8_ty.const_int(Self::type_tag(val_ty) as u64, false);
                 let cell = self.builder.alloca(self.context.struct_type(
                     &[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false), "set_tv");
                 let tag_ptr = self.builder.struct_gep(

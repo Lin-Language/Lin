@@ -488,7 +488,7 @@ impl<'ctx> Codegen<'ctx> {
                 let sum_ty = sum_ty.clone();
                 let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 let obj = self.sumnode_materialize_to_object(value, &sum_ty, llvm_fn);
-                let boxed = self.box_value(obj, &Self::sumnode_first_variant_obj_ty(&sum_ty));
+                let boxed = self.box_map_of(obj);
                 self.builder.call(self.rt.map_set, &[map_ptr.into(), key_ptr.into(), boxed.into()], "");
                 if boxed.is_pointer_value() {
                     self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
@@ -940,7 +940,7 @@ impl<'ctx> Codegen<'ctx> {
         let zero = i64_ty.const_zero();
         let is_neg = self.builder.int_compare(IntPredicate::SLT, idx, zero, "sarr_idx_neg");
         let wrapped = self.builder.int_add(len, idx, "sarr_idx_wrap");
-        let actual = self.builder.build_select(is_neg, wrapped, idx, "sarr_idx_actual").unwrap().into_int_value();
+        let actual = self.builder.select(is_neg, wrapped, idx, "sarr_idx_actual").into_int_value();
         let oob = self.builder.int_compare(IntPredicate::UGE, actual, len, "sarr_oob");
 
         let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
