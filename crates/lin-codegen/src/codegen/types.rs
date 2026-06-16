@@ -269,6 +269,7 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) const NKIND_INT64: u32 = lin_common::tags::NKIND_INT64;
     pub(crate) const NKIND_UINT64: u32 = lin_common::tags::NKIND_UINT64;
     pub(crate) const NKIND_FLOAT64: u32 = lin_common::tags::NKIND_FLOAT64;
+    pub(crate) const NKIND_FLOAT32: u32 = lin_common::tags::NKIND_FLOAT32;
     pub(crate) const NKIND_BOOL: u32 = lin_common::tags::NKIND_BOOL;
     pub(crate) const NKIND_STRING: u32 = lin_common::tags::NKIND_STRING;
     pub(crate) const NKIND_ARRAY: u32 = lin_common::tags::NKIND_ARRAY;
@@ -284,7 +285,12 @@ impl<'ctx> Codegen<'ctx> {
             Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => Some(Self::NKIND_INT32),
             Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::Int64 => Some(Self::NKIND_INT64),
             Type::UInt64 => Some(Self::NKIND_UINT64),
-            Type::Float32 | Type::Float64 => Some(Self::NKIND_FLOAT64),
+            // Float32 occupies a 4-byte slot in the packed struct (physical f32). The dynamic boxing
+            // path fpext's to f64 and uses TAG_FLOAT64 (matching type_tag / box_value). Distinct from
+            // NKIND_FLOAT64 so nkind_size_align returns (4,4) and struct_size_from_named_desc
+            // reconstructs the correct slot size instead of over-sizing to 8 bytes.
+            Type::Float32 => Some(Self::NKIND_FLOAT32),
+            Type::Float64 => Some(Self::NKIND_FLOAT64),
             Type::Str | Type::StrLit(_) => Some(Self::NKIND_STRING),
             Type::Array(_) | Type::FixedArray(_) => Some(Self::NKIND_ARRAY),
             Type::Map { .. } => Some(Self::NKIND_MAP),

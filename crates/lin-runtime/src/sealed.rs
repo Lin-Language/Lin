@@ -304,7 +304,7 @@ pub unsafe extern "C" fn lin_sealed_release_self(ptr: *mut u8) {
 /// Both the runtime and codegen reference `lin_common::tags::NKIND_*` directly; these re-exports
 /// keep existing call-sites in this file working without qualification changes.
 pub use lin_common::tags::{
-    NKIND_INT32, NKIND_INT64, NKIND_UINT64, NKIND_FLOAT64, NKIND_BOOL,
+    NKIND_INT32, NKIND_INT64, NKIND_UINT64, NKIND_FLOAT64, NKIND_FLOAT32, NKIND_BOOL,
     NKIND_STRING, NKIND_ARRAY, NKIND_SEALED, NKIND_MAP,
 };
 
@@ -395,6 +395,12 @@ unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *cons
             }
             NKIND_FLOAT64 => {
                 let v = *(slot as *const f64);
+                let tv = TaggedVal { tag: TAG_FLOAT64, _pad: [0; 7], payload: v.to_bits() };
+                crate::map::lin_map_set(map, key, &tv);
+            }
+            NKIND_FLOAT32 => {
+                // Physical slot is 4-byte f32; box as TAG_FLOAT64 via fpext (mirrors box_value).
+                let v = *(slot as *const f32) as f64;
                 let tv = TaggedVal { tag: TAG_FLOAT64, _pad: [0; 7], payload: v.to_bits() };
                 crate::map::lin_map_set(map, key, &tv);
             }
@@ -556,6 +562,17 @@ unsafe fn pack_named_payload_impl(
                     _ => 0.0,
                 };
                 *(dst as *mut f64) = v;
+            }
+            NKIND_FLOAT32 => {
+                // Physical slot is 4-byte f32; coerce from the boxed f64/f32 representation.
+                let v: f32 = match tag {
+                    TAG_FLOAT64 => f64::from_bits(payload) as f32,
+                    TAG_FLOAT32 => f32::from_bits(payload as u32),
+                    TAG_INT32 => payload as i32 as f32,
+                    TAG_INT64 | TAG_UINT64 => payload as i64 as f32,
+                    _ => 0.0,
+                };
+                *(dst as *mut f32) = v;
             }
             NKIND_BOOL => {
                 *dst = (tag == TAG_BOOL && payload != 0) as u8;
@@ -771,6 +788,11 @@ pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const cra
                 let v = *(slot as *const f64);
                 alloc_tagged(TAG_FLOAT64, v.to_bits())
             }
+            NKIND_FLOAT32 => {
+                // Physical slot is 4-byte f32; box as TAG_FLOAT64 via fpext (mirrors box_value).
+                let v = *(slot as *const f32) as f64;
+                alloc_tagged(TAG_FLOAT64, v.to_bits())
+            }
             NKIND_BOOL => {
                 let v = *(slot as *const u8);
                 alloc_tagged(TAG_BOOL, (v != 0) as u64)
@@ -818,7 +840,7 @@ mod named_desc_tests {
     //! correct keyed object that is RC-balanced (run under ASan to judge UAF/leak).
 
     use super::*;
-    use crate::tagged::{TAG_MAP, TAG_INT32, TAG_STR};
+    use crate::tagged::{TAG_MAP, TAG_INT32, TAG_STR, TAG_FLOAT64};
 
     /// Build a NamedDesc byte blob matching `Codegen::sealed_named_descriptor`:
     /// `[u32 count | { u32 offset, u32 nkind, u64 nested_ptr, u16 name_len, name_bytes } * count]`.
@@ -1002,6 +1024,75 @@ mod named_desc_tests {
             crate::string::lin_string_release(kx);
             crate::tagged::lin_tagged_release(tv as *mut u8);
             crate::array::lin_array_release(arr);
+        }
+    }
+
+    // Two-Float32-field record F { a: Float32, b: Float32 }.
+    // Physical layout (24-byte header): a@24 (4 bytes, align 4), b@28 (4 bytes, align 4), total=32.
+    // The dynamic boundary must reconstruct total=32 (not 40 as NKIND_FLOAT64 would) and box both
+    // fields as TAG_FLOAT64 (fpext). Tests both the materialize path (read) and the
+    // alloc_sealed_struct_from_map path (write via struct_size_from_named_desc).
+    #[test]
+    fn two_float32_fields_round_trip_dynamic_boundary() {
+        unsafe {
+            use crate::tagged::TaggedVal;
+            // Named descriptor: a@24 NKIND_FLOAT32, b@28 NKIND_FLOAT32 (stride=8, total=32).
+            let named = build_named_desc(&[
+                ("a", 24, NKIND_FLOAT32, std::ptr::null()),
+                ("b", 28, NKIND_FLOAT32, std::ptr::null()),
+            ]);
+            // Verify struct_size_from_named_desc returns 32, not 40 (the old NKIND_FLOAT64 over-size).
+            let computed_size = struct_size_from_named_desc(named.as_ptr());
+            assert_eq!(computed_size, 32, "struct_size should be 32 for two Float32 fields, got {computed_size}");
+
+            // Build a standalone sealed struct manually (header + two f32 fields).
+            let sptr = lin_sealed_alloc(32, std::ptr::null(), named.as_ptr());
+            *(sptr.add(24) as *mut f32) = 1.5f32;
+            *(sptr.add(28) as *mut f32) = 2.25f32;
+
+            // materialize_sealed_struct_to_map: read both fields, box as TAG_FLOAT64.
+            let map = materialize_sealed_struct_to_map(sptr as *const u8, named.as_ptr());
+            assert!(!map.is_null());
+            let ka = crate::string::lin_string_from_bytes(b"a".as_ptr(), 1);
+            let kb = crate::string::lin_string_from_bytes(b"b".as_ptr(), 1);
+            let fa = crate::map::lin_map_get(map, ka);
+            let fb = crate::map::lin_map_get(map, kb);
+            assert!(!fa.is_null(), "field 'a' missing from materialized map");
+            assert!(!fb.is_null(), "field 'b' missing from materialized map");
+            assert_eq!((*fa).tag, TAG_FLOAT64, "Float32 field must box as TAG_FLOAT64");
+            assert_eq!((*fb).tag, TAG_FLOAT64, "Float32 field must box as TAG_FLOAT64");
+            let va = f64::from_bits((*fa).payload);
+            let vb = f64::from_bits((*fb).payload);
+            assert!((va - 1.5f64).abs() < 1e-9, "a should be 1.5, got {va}");
+            assert!((vb - 2.25f64).abs() < 1e-9, "b should be 2.25, got {vb}");
+            crate::string::lin_string_release(ka);
+            crate::string::lin_string_release(kb);
+            crate::map::lin_map_release(map);
+
+            // alloc_sealed_struct_from_map: reconstruct a struct from a map with Float64 values
+            // (mirrors what the dynamic boundary sees after fpext boxing).
+            let src_map = crate::map::lin_map_alloc(2, crate::map::KEY_KIND_STRING);
+            for (name, val) in [("a", 3.0f64), ("b", 4.5f64)] {
+                let key = crate::string::lin_string_from_bytes(name.as_ptr(), name.len() as u32);
+                let tv = TaggedVal { tag: TAG_FLOAT64, _pad: [0; 7], payload: val.to_bits() };
+                crate::map::lin_map_set(src_map, key, &tv);
+                crate::string::lin_string_release(key);
+            }
+            let heap_desc = build_heap_desc_from_named_desc(named.as_ptr());
+            let rebuilt = alloc_sealed_struct_from_map(src_map, named.as_ptr(), heap_desc);
+            assert!(!rebuilt.is_null());
+            // Verify the header size is 32.
+            let stored_size = *((rebuilt.add(4)) as *const u32) as usize;
+            assert_eq!(stored_size, 32, "rebuilt struct header size should be 32, got {stored_size}");
+            // Read back the f32 field values directly.
+            let ra = *(rebuilt.add(24) as *const f32);
+            let rb = *(rebuilt.add(28) as *const f32);
+            assert!((ra - 3.0f32).abs() < 1e-6, "rebuilt a should be 3.0, got {ra}");
+            assert!((rb - 4.5f32).abs() < 1e-6, "rebuilt b should be 4.5, got {rb}");
+
+            lin_sealed_release_self(sptr);
+            lin_sealed_release_self(rebuilt);
+            crate::map::lin_map_release(src_map);
         }
     }
 
