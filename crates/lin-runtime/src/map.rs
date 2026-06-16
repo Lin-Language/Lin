@@ -7,7 +7,23 @@
 //!   - `KEY_KIND_INT` (1) — Int-keyed: arbitrary i64 integer keys. Hash = fmix64 mixer.
 //!
 //! Backing representation: a single open-addressing (linear-probing) hash table.
-//! Each occupied slot stores `(hash: u64, key: u64, value: TaggedVal)`.
+//! Each occupied slot stores `(hash: u64, key: u64, value)`.
+//!
+//! ## Value-unboxed slots (Wave R memory lever)
+//! A slot is NOT a fixed struct — it is a byte region of `slot_stride()` bytes:
+//!   hash:u64 @ +0, key:u64 @ +8, value @ +16.
+//! The value region is sized by the map's `value_kind`:
+//!   - HOMOGENEOUS (the common case): all values share one tag. `value_kind` records that tag,
+//!     the value region is **8 bytes** (the `TaggedVal.payload` only — the tag is implicit), and
+//!     the slot is 24 bytes instead of 32. This is the memory win: a `{String:Trip[]}` /
+//!     `{String:Int32}` map stops storing a redundant 8-byte tag word per entry.
+//!   - MIXED (`value_kind == VKIND_MIXED`): values have differing tags. The value region is a full
+//!     16-byte `TaggedVal`, slot = 32 bytes (the old layout). A map upgrades to MIXED the first time
+//!     an insert's tag differs from the established `value_kind`.
+//! `lin_map_get` preserves its borrowed-`*const TaggedVal` ABI: for MIXED it returns the slot's
+//! interior `TaggedVal`; for the homogeneous case it reconstructs a `TaggedVal{ tag: value_kind,
+//! payload }` into a small per-thread scratch ring and returns a pointer to that (valid until the
+//! next several gets on the same thread — every codegen consumer reads tag+payload immediately).
 //!
 //! **Occupancy rule (changed from old key==null)**: empty slots are identified by `hash == 0`.
 //! For both key kinds we guarantee every real key's hash is nonzero, so `hash==0` unambiguously
@@ -26,6 +42,7 @@
 //! These are printed to stderr at process exit.
 
 use std::alloc::{alloc, alloc_zeroed, dealloc, Layout};
+use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::string::{LinString, lin_string_inc_ref, lin_string_release, IMMORTAL_RC};
 use crate::tagged::{TaggedVal, TAG_NULL};
@@ -33,6 +50,43 @@ use crate::tagged::{TaggedVal, TAG_NULL};
 // Key-kind constants.
 pub const KEY_KIND_STRING: u32 = 0;
 pub const KEY_KIND_INT: u32 = 1;
+
+// ── Value-kind (the per-map value tag selector) ─────────────────────────────────────────────────
+// A real tag is a small u8 (widened to u32). Two sentinels live above the u8 range:
+/// No value inserted yet — slots not yet allocated, value width unknown.
+const VKIND_UNINIT: u32 = u32::MAX;
+/// Heterogeneous values — slots store full 16-byte `TaggedVal`s (the old layout).
+const VKIND_MIXED: u32 = u32::MAX - 1;
+
+// Slot byte offsets (both modes share the header; only the value width differs).
+const SLOT_HASH_OFF: usize = 0;
+const SLOT_KEY_OFF: usize = 8;
+const SLOT_VAL_OFF: usize = 16;
+
+/// Width of the value region (bytes) for a given `value_kind`.
+#[inline(always)]
+fn value_bytes(vk: u32) -> usize {
+    if vk == VKIND_MIXED { 16 } else { 8 }
+}
+
+/// Stride (bytes) between consecutive slots for a given `value_kind`.
+/// Always a multiple of 8, so every slot's `hash`/`key`/value words stay 8-aligned.
+#[inline(always)]
+fn slot_stride(vk: u32) -> usize {
+    SLOT_VAL_OFF + value_bytes(vk)
+}
+
+// ── Per-thread scratch ring for the homogeneous `lin_map_get` reconstruction ─────────────────────
+// A get on a homogeneous map returns a borrowed `*const TaggedVal`, but the slot holds only the
+// 8-byte payload — so we reconstruct `{tag: value_kind, payload}` into a small rotating ring of
+// per-thread `TaggedVal`s. Every codegen consumer extracts tag+payload immediately after the call;
+// the ring of 8 gives a wide safety margin against any caller that holds two borrowed results live.
+thread_local! {
+    static GET_SCRATCH: UnsafeCell<[TaggedVal; 8]> = const {
+        UnsafeCell::new([TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 }; 8])
+    };
+    static GET_SCRATCH_IDX: Cell<usize> = const { Cell::new(0) };
+}
 
 // ── Profiling counters (env-gated, zero cost when disabled) ─────────────────────────────────
 use std::sync::atomic::AtomicU8;
@@ -84,45 +138,116 @@ pub extern "C" fn lin_map_profile_print() {
     }
 }
 
-/// A hashed map. `slots` points at `cap` `Slot`s (cap is always a power of two).
-/// `key_kind` selects the key type: KEY_KIND_STRING (0) or KEY_KIND_INT (1).
-/// `order` is a heap-allocated `*mut u64` array of length `len` tracking insertion order:
-/// each entry is a raw key (pointer for String maps, i64 bits for Int maps) in the order
-/// the key was FIRST inserted. This lets `lin_map_keys` return keys in insertion order,
-/// matching `lin_object_keys` behavior. The order array is grown by doubling (cap_order
+/// A hashed map. `slots` points at `cap` value-unboxed slots, each `slot_stride(value_kind)` bytes
+/// (cap is always a power of two). `slots` is null until the first insert (we cannot size a slot
+/// until `value_kind` is known). `key_kind` selects the key type: KEY_KIND_STRING (0) or
+/// KEY_KIND_INT (1). `value_kind` selects the value width (a tag, or VKIND_UNINIT / VKIND_MIXED).
+/// `order` is a heap-allocated `*mut u64` array tracking insertion order (raw key bits), so
+/// `lin_map_keys` returns keys in insertion order. The order array is grown by doubling (cap_order
 /// tracks its allocation size; always >= len).
 #[repr(C)]
 pub struct LinMap {
     pub refcount: u32,
-    pub len: u32,       // number of occupied slots
-    pub cap: u32,       // table size (power of two), 0 = no table allocated yet
-    pub key_kind: u32,  // KEY_KIND_STRING (0) or KEY_KIND_INT (1)
-    pub slots: *mut Slot,
+    pub len: u32,        // number of occupied slots
+    pub cap: u32,        // table size (power of two)
+    pub key_kind: u32,   // KEY_KIND_STRING (0) or KEY_KIND_INT (1)
+    pub slots: *mut u8,  // `cap` slots of `slot_stride(value_kind)` bytes; null before first insert
     pub order: *mut u64, // insertion-order key list, length = len, capacity = cap_order
     pub cap_order: u32,  // allocated capacity of `order` array
-    pub _pad: u32,       // padding for 8-byte alignment
-}
-
-/// Each slot stores the full 64-bit hash inline so probe steps can skip `key_eq`
-/// whenever hashes differ.
-///
-/// **Occupancy rule**: an empty slot has `hash == 0`. We ensure every real key's
-/// hash is nonzero so this is unambiguous (no null pointer sentinel needed).
-/// The `key` field is a raw `u64`: for String maps it holds a `*mut LinString` cast to u64;
-/// for Int maps it holds the raw i64 key bits. When `hash == 0` the `key` field is ignored.
-#[repr(C)]
-pub struct Slot {
-    /// Nonzero hash = occupied; zero = empty.
-    pub hash: u64,
-    /// String map: *mut LinString (cast to u64). Int map: i64 key (cast to u64).
-    pub key: u64,
-    pub value: TaggedVal,
+    pub value_kind: u32, // VKIND_UNINIT / VKIND_MIXED / a real value tag
 }
 
 const INITIAL_CAP: u32 = 4;
 #[inline]
 fn over_load(len: u32, cap: u32) -> bool {
     (len as u64) * 10 >= (cap as u64) * 7
+}
+
+// ── Raw slot accessors (byte-offset, stride-aware) ───────────────────────────────────────────────
+
+#[inline(always)]
+unsafe fn slot_at(base: *mut u8, idx: usize, stride: usize) -> *mut u8 {
+    base.add(idx * stride)
+}
+#[inline(always)]
+unsafe fn slot_hash(s: *mut u8) -> u64 {
+    *(s.add(SLOT_HASH_OFF) as *const u64)
+}
+#[inline(always)]
+unsafe fn set_slot_hash(s: *mut u8, h: u64) {
+    *(s.add(SLOT_HASH_OFF) as *mut u64) = h;
+}
+#[inline(always)]
+unsafe fn slot_key(s: *mut u8) -> u64 {
+    *(s.add(SLOT_KEY_OFF) as *const u64)
+}
+#[inline(always)]
+unsafe fn set_slot_key(s: *mut u8, k: u64) {
+    *(s.add(SLOT_KEY_OFF) as *mut u64) = k;
+}
+
+/// Reconstruct an owned `TaggedVal` from a slot's value region (a by-value copy; no RC change).
+#[inline(always)]
+unsafe fn slot_value_owned(s: *mut u8, vk: u32) -> TaggedVal {
+    if vk == VKIND_MIXED {
+        std::ptr::read(s.add(SLOT_VAL_OFF) as *const TaggedVal)
+    } else {
+        TaggedVal { tag: vk as u8, _pad: [0; 7], payload: *(s.add(SLOT_VAL_OFF) as *const u64) }
+    }
+}
+
+/// Write a value into a slot's value region (value bits only; caller handles RC).
+#[inline(always)]
+unsafe fn store_slot_value(s: *mut u8, vk: u32, v: &TaggedVal) {
+    if vk == VKIND_MIXED {
+        std::ptr::write(s.add(SLOT_VAL_OFF) as *mut TaggedVal,
+            TaggedVal { tag: v.tag, _pad: [0; 7], payload: v.payload });
+    } else {
+        *(s.add(SLOT_VAL_OFF) as *mut u64) = v.payload;
+    }
+}
+
+/// Return a borrowed `*const TaggedVal` for a slot's value (the `lin_map_get` ABI). For MIXED this
+/// is the slot's interior TaggedVal; for the homogeneous case it is a per-thread scratch-ring entry.
+#[inline]
+unsafe fn slot_value_ptr(vk: u32, s: *mut u8) -> *const TaggedVal {
+    if vk == VKIND_MIXED {
+        s.add(SLOT_VAL_OFF) as *const TaggedVal
+    } else {
+        let payload = *(s.add(SLOT_VAL_OFF) as *const u64);
+        let tag = vk as u8;
+        GET_SCRATCH.with(|ring| {
+            let idx = GET_SCRATCH_IDX.with(|c| {
+                let n = (c.get() + 1) & 7;
+                c.set(n);
+                n
+            });
+            let p = (*ring.get()).as_mut_ptr().add(idx);
+            (*p).tag = tag;
+            (*p).payload = payload;
+            p as *const TaggedVal
+        })
+    }
+}
+
+/// Iterate every occupied slot as `(key_bits, owned TaggedVal)`. The single public entry point for
+/// external consumers (frozen.rs, the structural-key stringifier) so the value-unboxed slot layout
+/// stays encapsulated here. The value is reconstructed by-value (no RC change, no scratch aliasing).
+pub(crate) unsafe fn map_for_each_slot(map: *const LinMap, mut f: impl FnMut(u64, TaggedVal)) {
+    if map.is_null() || (*map).slots.is_null() {
+        return;
+    }
+    let cap = (*map).cap as usize;
+    let vk = (*map).value_kind;
+    let stride = slot_stride(vk);
+    let base = (*map).slots;
+    for i in 0..cap {
+        let s = slot_at(base, i, stride);
+        if slot_hash(s) == 0 {
+            continue;
+        }
+        f(slot_key(s), slot_value_owned(s, vk));
+    }
 }
 
 unsafe fn map_header_layout() -> Layout {
@@ -132,16 +257,13 @@ unsafe fn map_header_layout() -> Layout {
     )
 }
 
-unsafe fn slots_layout(cap: u32) -> Layout {
-    Layout::from_size_align_unchecked(
-        std::mem::size_of::<Slot>() * cap as usize,
-        std::mem::align_of::<Slot>(),
-    )
+unsafe fn slots_layout(cap: u32, stride: usize) -> Layout {
+    Layout::from_size_align_unchecked(stride * cap as usize, 8)
 }
 
-/// Allocate a zeroed slot table of `cap` slots (every slot empty: hash = 0).
-unsafe fn alloc_slots(cap: u32) -> *mut Slot {
-    alloc_zeroed(slots_layout(cap)) as *mut Slot
+/// Allocate a zeroed slot table of `cap` slots at `stride` bytes each (every slot empty: hash = 0).
+unsafe fn alloc_slots(cap: u32, stride: usize) -> *mut u8 {
+    alloc_zeroed(slots_layout(cap, stride))
 }
 
 unsafe fn order_layout(cap: u32) -> Layout {
@@ -162,7 +284,7 @@ unsafe fn order_push(map: *mut LinMap, key: u64) {
     if len >= (*map).cap_order {
         let old_cap = (*map).cap_order;
         let new_cap = if old_cap == 0 { INITIAL_CAP } else { old_cap * 2 };
-        let new_order = alloc_order(new_cap) as *mut u64;
+        let new_order = alloc_order(new_cap);
         std::ptr::copy_nonoverlapping((*map).order, new_order, len as usize);
         dealloc((*map).order as *mut u8, order_layout(old_cap));
         (*map).order = new_order;
@@ -236,13 +358,16 @@ unsafe fn string_key_eq(a: *const LinString, b: *const LinString) -> bool {
 unsafe fn find_slot_string(map: *const LinMap, key: *const LinString, khash: u64) -> usize {
     let cap = (*map).cap as usize;
     let mask = cap - 1;
+    let stride = slot_stride((*map).value_kind);
+    let base = (*map).slots;
     let mut idx = (khash as usize) & mask;
     for _ in 0..cap {
-        let slot = (*map).slots.add(idx);
-        if (*slot).hash == 0 {
+        let slot = slot_at(base, idx, stride);
+        let h = slot_hash(slot);
+        if h == 0 {
             return idx; // empty → insertion point or miss
         }
-        if (*slot).hash == khash && string_key_eq((*slot).key as *const LinString, key) {
+        if h == khash && string_key_eq(slot_key(slot) as *const LinString, key) {
             return idx; // found
         }
         idx = (idx + 1) & mask;
@@ -254,20 +379,23 @@ unsafe fn find_slot_string(map: *const LinMap, key: *const LinString, khash: u64
 unsafe fn find_slot_string_profiled(map: *const LinMap, key: *const LinString, khash: u64) -> usize {
     let cap = (*map).cap as usize;
     let mask = cap - 1;
+    let stride = slot_stride((*map).value_kind);
+    let base = (*map).slots;
     let mut idx = (khash as usize) & mask;
     for _ in 0..cap {
-        let slot = (*map).slots.add(idx);
-        if (*slot).hash == 0 {
+        let slot = slot_at(base, idx, stride);
+        let h = slot_hash(slot);
+        if h == 0 {
             MAP_KEY_EQ_CALLS.fetch_add(1, Ordering::Relaxed);
             return idx;
         }
-        if (*slot).hash != khash {
+        if h != khash {
             MAP_HASH_SKIPS.fetch_add(1, Ordering::Relaxed);
             idx = (idx + 1) & mask;
             continue;
         }
         MAP_KEY_EQ_CALLS.fetch_add(1, Ordering::Relaxed);
-        if string_key_eq((*slot).key as *const LinString, key) {
+        if string_key_eq(slot_key(slot) as *const LinString, key) {
             return idx;
         }
         MAP_KEY_EQ_MISS.fetch_add(1, Ordering::Relaxed);
@@ -283,13 +411,16 @@ unsafe fn find_slot_string_profiled(map: *const LinMap, key: *const LinString, k
 unsafe fn find_slot_int(map: *const LinMap, key_bits: u64, khash: u64) -> usize {
     let cap = (*map).cap as usize;
     let mask = cap - 1;
+    let stride = slot_stride((*map).value_kind);
+    let base = (*map).slots;
     let mut idx = (khash as usize) & mask;
     for _ in 0..cap {
-        let slot = (*map).slots.add(idx);
-        if (*slot).hash == 0 {
+        let slot = slot_at(base, idx, stride);
+        let h = slot_hash(slot);
+        if h == 0 {
             return idx; // empty → miss or insertion point
         }
-        if (*slot).hash == khash && (*slot).key == key_bits {
+        if h == khash && slot_key(slot) == key_bits {
             return idx; // found
         }
         idx = (idx + 1) & mask;
@@ -297,38 +428,102 @@ unsafe fn find_slot_int(map: *const LinMap, key_bits: u64, khash: u64) -> usize 
     idx
 }
 
-// ── grow ─────────────────────────────────────────────────────────────────────────────────────
+// ── grow / mixed-upgrade ───────────────────────────────────────────────────────────────────────
 
-/// Double the table size and re-insert all live entries. Works for both key kinds:
-/// empty detection via `hash == 0`, re-hash via stored hash.
+/// Double the table size and re-insert all live entries. Preserves `value_kind` (and therefore
+/// stride) — value bits are moved verbatim, so no RC change.
 unsafe fn grow(map: *mut LinMap) {
     let old_cap = (*map).cap;
     let old_slots = (*map).slots;
+    let vk = (*map).value_kind;
+    let stride = slot_stride(vk);
+    let val_bytes = value_bytes(vk);
     let new_cap = if old_cap == 0 { INITIAL_CAP } else { old_cap * 2 };
-    let new_slots = alloc_slots(new_cap);
+    let new_slots = alloc_slots(new_cap, stride);
     (*map).slots = new_slots;
     (*map).cap = new_cap;
     let mask = (new_cap - 1) as usize;
     for i in 0..old_cap as usize {
-        let src = old_slots.add(i);
-        if (*src).hash == 0 {
+        let src = slot_at(old_slots, i, stride);
+        let h = slot_hash(src);
+        if h == 0 {
             continue; // empty slot — skip
         }
         // Re-use the stored hash — no need to recompute.
-        let mut dst_idx = ((*src).hash as usize) & mask;
+        let mut dst_idx = (h as usize) & mask;
         loop {
-            let dst = new_slots.add(dst_idx);
-            if (*dst).hash == 0 {
-                (*dst).hash = (*src).hash;
-                (*dst).key = (*src).key;
-                std::ptr::copy_nonoverlapping(&(*src).value, &mut (*dst).value, 1);
+            let dst = slot_at(new_slots, dst_idx, stride);
+            if slot_hash(dst) == 0 {
+                set_slot_hash(dst, h);
+                set_slot_key(dst, slot_key(src));
+                std::ptr::copy_nonoverlapping(
+                    src.add(SLOT_VAL_OFF), dst.add(SLOT_VAL_OFF), val_bytes);
                 break;
             }
             dst_idx = (dst_idx + 1) & mask;
         }
     }
-    if old_cap > 0 {
-        dealloc(old_slots as *mut u8, slots_layout(old_cap));
+    if old_cap > 0 && !old_slots.is_null() {
+        dealloc(old_slots, slots_layout(old_cap, stride));
+    }
+}
+
+/// Upgrade a homogeneous map to MIXED: widen every slot's value region from 8 to 16 bytes.
+/// Slot positions are preserved (same cap, same hashes → same probe positions), so no rehash and
+/// no RC change — only the layout widens.
+unsafe fn convert_to_mixed(map: *mut LinMap) {
+    let old_vk = (*map).value_kind;
+    if old_vk == VKIND_MIXED {
+        return;
+    }
+    if (*map).slots.is_null() {
+        // Nothing allocated yet — just record MIXED; the first alloc will use the wide stride.
+        (*map).value_kind = VKIND_MIXED;
+        return;
+    }
+    let cap = (*map).cap;
+    let old_stride = slot_stride(old_vk);
+    let new_stride = slot_stride(VKIND_MIXED);
+    let old_slots = (*map).slots;
+    let new_slots = alloc_slots(cap, new_stride);
+    for i in 0..cap as usize {
+        let src = slot_at(old_slots, i, old_stride);
+        let h = slot_hash(src);
+        if h == 0 {
+            continue;
+        }
+        let dst = slot_at(new_slots, i, new_stride);
+        set_slot_hash(dst, h);
+        set_slot_key(dst, slot_key(src));
+        // Expand the 8-byte payload into a full TaggedVal carrying the old (homogeneous) tag.
+        let payload = *(src.add(SLOT_VAL_OFF) as *const u64);
+        std::ptr::write(dst.add(SLOT_VAL_OFF) as *mut TaggedVal,
+            TaggedVal { tag: old_vk as u8, _pad: [0; 7], payload });
+    }
+    dealloc(old_slots, slots_layout(cap, old_stride));
+    (*map).slots = new_slots;
+    (*map).value_kind = VKIND_MIXED;
+}
+
+/// Establish / upgrade `value_kind` for an incoming value tag, converting to MIXED on a mismatch.
+#[inline]
+unsafe fn note_value_tag(map: *mut LinMap, vtag: u8) {
+    let vk = (*map).value_kind;
+    if vk == VKIND_UNINIT {
+        (*map).value_kind = vtag as u32;
+    } else if vk != VKIND_MIXED && vk != vtag as u32 {
+        convert_to_mixed(map);
+    }
+}
+
+/// Ensure `slots` is allocated and has room for one more entry (lazy first-alloc + load-factor grow).
+#[inline]
+unsafe fn ensure_capacity(map: *mut LinMap) {
+    if (*map).slots.is_null() {
+        let stride = slot_stride((*map).value_kind);
+        (*map).slots = alloc_slots((*map).cap, stride);
+    } else if over_load((*map).len + 1, (*map).cap) {
+        grow(map);
     }
 }
 
@@ -336,7 +531,8 @@ unsafe fn grow(map: *mut LinMap) {
 
 /// Allocate a new `LinMap` with the given `key_kind` (KEY_KIND_STRING or KEY_KIND_INT).
 /// `hint` is the expected initial capacity; the table is sized to the next power-of-two
-/// >= max(hint, INITIAL_CAP) so that maps built with a known count avoid an early grow.
+/// >= max(hint, INITIAL_CAP). Slot bytes are allocated lazily on the first insert (once the value
+/// width is known); `cap` records the intended table size so that first allocation honors `hint`.
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_alloc(hint: u32, key_kind: u32) -> *mut LinMap {
     let cap = hint.next_power_of_two().max(INITIAL_CAP);
@@ -345,10 +541,10 @@ pub unsafe extern "C" fn lin_map_alloc(hint: u32, key_kind: u32) -> *mut LinMap 
     (*ptr).len = 0;
     (*ptr).cap = cap;
     (*ptr).key_kind = key_kind;
-    (*ptr).slots = alloc_slots(cap);
+    (*ptr).slots = std::ptr::null_mut();
     (*ptr).order = alloc_order(cap);
     (*ptr).cap_order = cap;
-    (*ptr)._pad = 0;
+    (*ptr).value_kind = VKIND_UNINIT;
     ptr
 }
 
@@ -358,25 +554,27 @@ pub unsafe extern "C" fn lin_map_alloc(hint: u32, key_kind: u32) -> *mut LinMap 
 pub unsafe extern "C" fn lin_map_set(map: *mut LinMap, key: *mut LinString, val: *const TaggedVal) {
     let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
     let val_ref: &TaggedVal = if val.is_null() { &null_tv } else { &*val };
-    if (*map).cap == 0 || over_load((*map).len + 1, (*map).cap) {
-        grow(map);
-    }
+    note_value_tag(map, val_ref.tag);
+    ensure_capacity(map);
+    let vk = (*map).value_kind;
+    let stride = slot_stride(vk);
     let khash = hash_string_key(key);
     let idx = find_slot_string(map, key, khash);
-    let slot = (*map).slots.add(idx);
-    if (*slot).hash == 0 {
+    let slot = slot_at((*map).slots, idx, stride);
+    if slot_hash(slot) == 0 {
         // Fresh insert — record insertion order before incrementing len.
         order_push(map, key as u64);
-        (*slot).hash = khash;
+        set_slot_hash(slot, khash);
         lin_string_inc_ref(key);
-        (*slot).key = key as u64;
-        std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
+        set_slot_key(slot, key as u64);
+        store_slot_value(slot, vk, val_ref);
         crate::tagged::retain_tagged_payload_pub(val_ref);
         (*map).len += 1;
     } else {
-        // Overwrite — order unchanged (key already present).
-        crate::tagged::release_tagged_payload_pub(&(*slot).value);
-        std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
+        // Overwrite — order unchanged (key already present). Release the old value first.
+        let old = slot_value_owned(slot, vk);
+        crate::tagged::release_tagged_payload_pub(&old);
+        store_slot_value(slot, vk, val_ref);
         crate::tagged::retain_tagged_payload_pub(val_ref);
     }
 }
@@ -384,7 +582,7 @@ pub unsafe extern "C" fn lin_map_set(map: *mut LinMap, key: *mut LinString, val:
 /// Look up `key` (String map). Returns borrowed pointer or null if absent.
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_get(map: *const LinMap, key: *const LinString) -> *const TaggedVal {
-    if map.is_null() || (*map).cap == 0 || (*map).len == 0 {
+    if map.is_null() || (*map).slots.is_null() || (*map).len == 0 {
         return std::ptr::null();
     }
     let khash = hash_string_key(key);
@@ -394,11 +592,12 @@ pub unsafe extern "C" fn lin_map_get(map: *const LinMap, key: *const LinString) 
     } else {
         find_slot_string(map, key, khash)
     };
-    let slot = (*map).slots.add(idx);
-    if (*slot).hash == 0 {
+    let vk = (*map).value_kind;
+    let slot = slot_at((*map).slots, idx, slot_stride(vk));
+    if slot_hash(slot) == 0 {
         std::ptr::null()
     } else {
-        &(*slot).value
+        slot_value_ptr(vk, slot)
     }
 }
 
@@ -407,25 +606,27 @@ pub unsafe extern "C" fn lin_map_get(map: *const LinMap, key: *const LinString) 
 pub unsafe extern "C" fn lin_map_set_int(map: *mut LinMap, key: i64, val: *const TaggedVal) {
     let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
     let val_ref: &TaggedVal = if val.is_null() { &null_tv } else { &*val };
-    if (*map).cap == 0 || over_load((*map).len + 1, (*map).cap) {
-        grow(map);
-    }
+    note_value_tag(map, val_ref.tag);
+    ensure_capacity(map);
+    let vk = (*map).value_kind;
+    let stride = slot_stride(vk);
     let key_bits = key as u64;
     let khash = fmix64(key_bits);
     let idx = find_slot_int(map, key_bits, khash);
-    let slot = (*map).slots.add(idx);
-    if (*slot).hash == 0 {
+    let slot = slot_at((*map).slots, idx, stride);
+    if slot_hash(slot) == 0 {
         // Fresh insert: no key RC (scalar) — record insertion order.
         order_push(map, key_bits);
-        (*slot).hash = khash;
-        (*slot).key = key_bits;
-        std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
+        set_slot_hash(slot, khash);
+        set_slot_key(slot, key_bits);
+        store_slot_value(slot, vk, val_ref);
         crate::tagged::retain_tagged_payload_pub(val_ref);
         (*map).len += 1;
     } else {
         // Overwrite — order unchanged.
-        crate::tagged::release_tagged_payload_pub(&(*slot).value);
-        std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
+        let old = slot_value_owned(slot, vk);
+        crate::tagged::release_tagged_payload_pub(&old);
+        store_slot_value(slot, vk, val_ref);
         crate::tagged::retain_tagged_payload_pub(val_ref);
     }
 }
@@ -433,17 +634,18 @@ pub unsafe extern "C" fn lin_map_set_int(map: *mut LinMap, key: i64, val: *const
 /// Look up `key` (Int map). Returns borrowed pointer or null if absent.
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_get_int(map: *const LinMap, key: i64) -> *const TaggedVal {
-    if map.is_null() || (*map).cap == 0 || (*map).len == 0 {
+    if map.is_null() || (*map).slots.is_null() || (*map).len == 0 {
         return std::ptr::null();
     }
     let key_bits = key as u64;
     let khash = fmix64(key_bits);
     let idx = find_slot_int(map, key_bits, khash);
-    let slot = (*map).slots.add(idx);
-    if (*slot).hash == 0 {
+    let vk = (*map).value_kind;
+    let slot = slot_at((*map).slots, idx, slot_stride(vk));
+    if slot_hash(slot) == 0 {
         std::ptr::null()
     } else {
-        &(*slot).value
+        slot_value_ptr(vk, slot)
     }
 }
 
@@ -455,26 +657,30 @@ pub(crate) unsafe fn lin_map_get_bytes(
     key_ptr: *const u8,
     key_len: u32,
 ) -> *const TaggedVal {
-    if map.is_null() || (*map).cap == 0 || (*map).len == 0 {
+    if map.is_null() || (*map).slots.is_null() || (*map).len == 0 {
         return std::ptr::null();
     }
     let bytes = std::slice::from_raw_parts(key_ptr, key_len as usize);
     let h = fnv1a_bytes(bytes);
     let cap = (*map).cap as usize;
     let mask = cap - 1;
+    let vk = (*map).value_kind;
+    let stride = slot_stride(vk);
+    let base = (*map).slots;
     let mut idx = (h as usize) & mask;
     for _ in 0..cap {
-        let slot = (*map).slots.add(idx);
-        if (*slot).hash == 0 {
+        let slot = slot_at(base, idx, stride);
+        let sh = slot_hash(slot);
+        if sh == 0 {
             return std::ptr::null();
         }
-        if (*slot).hash == h {
-            let slot_key = (*slot).key as *const LinString;
-            let kl = (*slot_key).len as usize;
+        if sh == h {
+            let slot_key_ptr = slot_key(slot) as *const LinString;
+            let kl = (*slot_key_ptr).len as usize;
             if kl == bytes.len() {
-                let kb = std::slice::from_raw_parts((*slot_key).data.as_ptr(), kl);
+                let kb = std::slice::from_raw_parts((*slot_key_ptr).data.as_ptr(), kl);
                 if kb == bytes {
-                    return &(*slot).value;
+                    return slot_value_ptr(vk, slot);
                 }
             }
         }
@@ -527,19 +733,18 @@ pub unsafe extern "C" fn lin_map_values(map: *const LinMap) -> *mut crate::array
         let is_int = (*map).key_kind == KEY_KIND_INT;
         for i in 0..len as usize {
             let key = *(*map).order.add(i);
-            let src = if is_int {
-                lin_map_get_int(map, key as i64)
+            // Reconstruct an OWNED value (do not hold a get-scratch pointer across the loop).
+            let v = if is_int {
+                let p = lin_map_get_int(map, key as i64);
+                if p.is_null() { TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 } } else { *p }
             } else {
-                lin_map_get(map, key as *const LinString)
+                let p = lin_map_get(map, key as *const LinString);
+                if p.is_null() { TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 } } else { *p }
             };
             let dst = (*arr).data.add(i) as *mut TaggedVal;
-            if src.is_null() {
-                (*dst).tag = TAG_NULL;
-                (*dst).payload = 0;
-            } else {
-                std::ptr::copy_nonoverlapping(src, dst, 1);
-                crate::tagged::retain_tagged_payload_pub(&*src);
-            }
+            (*dst).tag = v.tag;
+            (*dst).payload = v.payload;
+            crate::tagged::retain_tagged_payload_pub(&v);
         }
     }
     (*arr).len = len as u64;
@@ -565,19 +770,17 @@ pub unsafe extern "C" fn lin_map_entries(map: *const LinMap) -> *mut crate::arra
                 (*(*pair).data.add(0)).tag = crate::tagged::TAG_STR;
                 (*(*pair).data.add(0)).payload = key;
             }
-            let src = if is_int {
-                lin_map_get_int(map, key as i64)
+            let v = if is_int {
+                let p = lin_map_get_int(map, key as i64);
+                if p.is_null() { TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 } } else { *p }
             } else {
-                lin_map_get(map, key as *const LinString)
+                let p = lin_map_get(map, key as *const LinString);
+                if p.is_null() { TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 } } else { *p }
             };
             let val_dst = (*pair).data.add(1) as *mut TaggedVal;
-            if src.is_null() {
-                (*val_dst).tag = TAG_NULL;
-                (*val_dst).payload = 0;
-            } else {
-                std::ptr::copy_nonoverlapping(src, val_dst, 1);
-                crate::tagged::retain_tagged_payload_pub(&*src);
-            }
+            (*val_dst).tag = v.tag;
+            (*val_dst).payload = v.payload;
+            crate::tagged::retain_tagged_payload_pub(&v);
             (*pair).len = 2;
             let dst = (*out).data.add(i);
             (*dst).tag = crate::tagged::TAG_ARRAY;
@@ -604,19 +807,23 @@ pub unsafe extern "C" fn lin_map_release(map: *mut LinMap) {
     let cap = (*map).cap;
     if cap > 0 && !(*map).slots.is_null() {
         let is_int = (*map).key_kind == KEY_KIND_INT;
+        let vk = (*map).value_kind;
+        let stride = slot_stride(vk);
+        let base = (*map).slots;
         for i in 0..cap as usize {
-            let slot = (*map).slots.add(i);
-            if (*slot).hash == 0 {
+            let slot = slot_at(base, i, stride);
+            if slot_hash(slot) == 0 {
                 continue;
             }
             if !is_int {
                 // Release string key.
-                lin_string_release((*slot).key as *mut LinString);
+                lin_string_release(slot_key(slot) as *mut LinString);
             }
             // Int keys are scalar — no release needed.
-            crate::tagged::release_tagged_payload_pub(&(*slot).value);
+            let v = slot_value_owned(slot, vk);
+            crate::tagged::release_tagged_payload_pub(&v);
         }
-        dealloc((*map).slots as *mut u8, slots_layout(cap));
+        dealloc(base, slots_layout(cap, stride));
     }
     let cap_order = (*map).cap_order;
     if cap_order > 0 && !(*map).order.is_null() {
@@ -737,19 +944,25 @@ pub unsafe extern "C" fn lin_map_eq(a: *const LinMap, b: *const LinMap) -> u8 {
     if a.is_null() || b.is_null() { return 0; }
     if (*a).key_kind != (*b).key_kind { return 0; }
     if (*a).len != (*b).len { return 0; }
+    if (*a).slots.is_null() { return 1; } // len matched and a is empty → equal
     let cap = (*a).cap as usize;
     let is_int = (*a).key_kind == KEY_KIND_INT;
+    let vk = (*a).value_kind;
+    let stride = slot_stride(vk);
+    let base = (*a).slots;
     for i in 0..cap {
-        let slot = (*a).slots.add(i);
-        if (*slot).hash == 0 { continue; }
+        let slot = slot_at(base, i, stride);
+        if slot_hash(slot) == 0 { continue; }
+        // a's value reconstructed OWNED on the stack (must not alias b's get-scratch).
+        let av = slot_value_owned(slot, vk);
         let bval = if is_int {
-            lin_map_get_int(b, (*slot).key as i64)
+            lin_map_get_int(b, slot_key(slot) as i64)
         } else {
-            lin_map_get(b, (*slot).key as *const LinString)
+            lin_map_get(b, slot_key(slot) as *const LinString)
         };
         if bval.is_null() { return 0; } // key absent in b → unequal
-        let av = &(*slot).value as *const TaggedVal as *const u8;
-        if crate::tagged::lin_tagged_eq(av, bval as *const u8) == 0 {
+        let av_ptr = &av as *const TaggedVal as *const u8;
+        if crate::tagged::lin_tagged_eq(av_ptr, bval as *const u8) == 0 {
             return 0;
         }
     }
@@ -767,17 +980,15 @@ pub unsafe extern "C-unwind" fn lin_map_merge(dst: *mut LinMap, src: *const LinM
     if (*src).order.is_null() || len == 0 { return; }
     for i in 0..len {
         let key = *(*src).order.add(i);
-        // Look up the value by key to pass to lin_map_set.
+        // Reconstruct an OWNED value before calling set (avoids any scratch-lifetime coupling).
         if is_int {
-            let val = lin_map_get_int(src, key as i64);
-            let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
-            let val_ref = if val.is_null() { &null_tv } else { &*val };
-            lin_map_set_int(dst, key as i64, val_ref);
+            let p = lin_map_get_int(src, key as i64);
+            let v = if p.is_null() { TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 } } else { *p };
+            lin_map_set_int(dst, key as i64, &v);
         } else {
-            let val = lin_map_get(src, key as *const LinString);
-            let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
-            let val_ref = if val.is_null() { &null_tv } else { &*val };
-            lin_map_set(dst, key as *mut LinString, val_ref);
+            let p = lin_map_get(src, key as *const LinString);
+            let v = if p.is_null() { TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 } } else { *p };
+            lin_map_set(dst, key as *mut LinString, &v);
         }
     }
 }
@@ -802,10 +1013,9 @@ pub unsafe extern "C" fn lin_map_copy_except(
                 continue 'outer;
             }
         }
-        let val = lin_map_get(src, key);
-        let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
-        let val_ref = if val.is_null() { &null_tv } else { &*val };
-        lin_map_set(dst, key as *mut LinString, val_ref);
+        let p = lin_map_get(src, key);
+        let v = if p.is_null() { TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 } } else { *p };
+        lin_map_set(dst, key as *mut LinString, &v);
     }
 }
 
@@ -913,7 +1123,7 @@ mod tests {
 
     #[test]
     fn test_string_map_regression() {
-        // Existing string map behaviour still works after the slot layout change.
+        // Existing string map behaviour still works after the value-unboxed slot layout change.
         unsafe {
             let m = lin_map_alloc(0, KEY_KIND_STRING);
             assert_eq!((*m).key_kind, KEY_KIND_STRING);
@@ -924,6 +1134,8 @@ mod tests {
                 lin_string_release(k);
             }
             assert_eq!(lin_map_length(m), 200);
+            // Homogeneous Int32 values → unboxed (24-byte) slots.
+            assert_eq!((*m).value_kind, TAG_INT32 as u32);
             for i in 0..200i32 {
                 let k = str_key(&format!("k{i}"));
                 let got = lin_map_get(m, k);
@@ -1049,6 +1261,8 @@ mod tests {
                 lin_string_release(k);
                 lin_string_release(sv);
             }
+            // Homogeneous String (pointer) values → unboxed slots, RC on the pointer payload.
+            assert_eq!((*m).value_kind, TAG_STR as u32);
             let keys = lin_map_keys(m);
             let vals = lin_map_values(m);
             let ents = lin_map_entries(m);
@@ -1059,6 +1273,69 @@ mod tests {
             crate::array::lin_array_release(vals);
             crate::array::lin_array_release(ents);
             lin_map_release(m);
+        }
+    }
+
+    #[test]
+    fn heterogeneous_values_upgrade_to_mixed() {
+        // First an Int32 value (unboxed), then a String value (different tag) → MIXED.
+        // Both must round-trip with the correct tag, and string RC must balance.
+        unsafe {
+            let m = lin_map_alloc(0, KEY_KIND_STRING);
+            let ka = str_key("a");
+            let va = int_val(7);
+            lin_map_set(m, ka, &va);
+            lin_string_release(ka);
+            assert_eq!((*m).value_kind, TAG_INT32 as u32, "first insert sets homogeneous kind");
+
+            let kb = str_key("b");
+            let (sv, vb) = str_tagged_val("hello");
+            lin_map_set(m, kb, &vb);
+            lin_string_release(kb);
+            lin_string_release(sv);
+            assert_eq!((*m).value_kind, VKIND_MIXED, "tag mismatch upgrades to MIXED");
+
+            // a is still the Int32 7, b is the String "hello".
+            let ka2 = str_key("a");
+            let ga = lin_map_get(m, ka2);
+            assert!(!ga.is_null());
+            assert_eq!((*ga).tag, TAG_INT32);
+            assert_eq!((*ga).payload as u32 as i32, 7);
+            lin_string_release(ka2);
+
+            let kb2 = str_key("b");
+            let gb = lin_map_get(m, kb2);
+            assert!(!gb.is_null());
+            assert_eq!((*gb).tag, TAG_STR);
+            let s = (*gb).payload as *const LinString;
+            assert_eq!((*s).as_str(), "hello");
+            lin_string_release(kb2);
+
+            assert_eq!(lin_map_length(m), 2);
+            lin_map_release(m); // releases the String value's payload exactly once
+        }
+    }
+
+    #[test]
+    fn many_string_values_no_leak_after_release() {
+        // RC-balance probe: each value string is created with rc=1, inserted (rc→2 in map),
+        // our construction handle kept. Dropping the map must take each back to rc=1.
+        unsafe {
+            let m = lin_map_alloc(0, KEY_KIND_STRING);
+            let mut handles: Vec<*mut LinString> = Vec::new();
+            for i in 0..30i32 {
+                let k = str_key(&format!("k{i}"));
+                let (sv, v) = str_tagged_val(&format!("v{i}"));
+                lin_map_set(m, k, &v);
+                lin_string_release(k);
+                assert_eq!((*sv).refcount, 2, "value held by map + our handle");
+                handles.push(sv);
+            }
+            lin_map_release(m);
+            for sv in handles {
+                assert_eq!((*sv).refcount, 1, "map over-retained or leaked a value");
+                lin_string_release(sv);
+            }
         }
     }
 
