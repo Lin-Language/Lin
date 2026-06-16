@@ -418,15 +418,58 @@ the same surface).
   *and* nearly dismissing a real one as "stale." Rule: `cargo build --workspace` first, then test; `cargo
   clean` between feature states.
 
-**The convergent direction — `freeze` as a repack primitive.** RAPTOR's `Trip[]` can't go 0xFE because it's
-store-then-push — but `frozen(v)` is the missing *signal*: build naturally with `push`, then `freeze` when
-done. `frozen()` already deep-immortalizes (RC-suppresses) the graph for free *today*; the lane in flight
-extends it to **repack 0xFD pointer-spine arrays → 0xFE inline** (then arena-allocate the buffer). One
-primitive unifies inline-layout + arena + RC-elimination, driven by an explicit user signal instead of
-compile-time escape inference — and it sidesteps the store-then-push hazard by construction. This is the most
-promising open memory+speed lever. (Exploration spikes also landed: **columnar** struct-of-arrays record
-arrays — `0xFC`, two-ptr-load + GEP field reads, for RAPTOR's field-scans — and **inline SSO**, both gated
-behind the value-record repr-reset per their design docs.)
+**The convergent direction — `freeze` as a repack primitive (MERGED `46cc61f7`).** RAPTOR's `Trip[]` can't go
+0xFE at compile time because it's store-then-push — but `frozen(v)` is the missing *signal*: build naturally
+with `push`, then `freeze` when done. `frozen()` already deep-immortalizes (RC-suppresses) the graph; it now
+also **repacks 0xFD pointer-spine record arrays → 0xFE inline** (allocate a headerless buffer, copy payloads,
+swap `elem_tag→0xFE`, free the old spine — sound because the frozen contract forbids post-freeze mutation).
+One user-driven primitive unifies inline-layout + RC-elimination, sidestepping the store-then-push hazard by
+construction. **This is the lever for the typed-port memory gap** — `frozen(...)` the loadGTFS return and the
+`Trip[]`/`StopTime[]` arrays go inline (~48 B/record saved). A `std/arena` bump-allocator (`arena.build(thunk)`
+→ thread-local bump-alloc with immortal-RC) was also prototyped but **not merged**. The measurement: a full
+arena would save **~15–18 % / 3.5–4.2 GB** of the 23 GB by removing the 16 B malloc header per object — but
+**representation is the bigger lever, not the arena**: 0xFE/columnar/freeze-repack remove the *objects*, the
+arena only removes their per-object *tax* (Node holds the same data in 2–4 GB, a 6–10× gap that dwarfs the
+arena's 17 %). And `frozen` already delivers the arena's RC-churn-elimination subset for free, with zero new
+machinery. So `frozen` covers the shippable program-lifetime case; the bump-arena spike is parked on
+`explore/arena` as a complementary follow-up *after* representation, not before.
+
+**Columnar (struct-of-arrays) record arrays (MERGED `20876032`).** Beyond 0xFE's array-of-structs: a `0xFC`
+columnar array stores each field in its own contiguous buffer (`dep[]`, `arr[]`, `stop[]`) instead of
+interleaved records. The win is **field-at-a-time scans** — RAPTOR's hot loop scans `trip.dep` across all
+trips of a route, and on AoS (0xFE, stride 24 B) each cache line loads ~2–3 elements with the unused `arr`/
+`stop` fields, ≈3× wasted bandwidth; SoA loads only `dep`. Escape-analysis-gated like 0xFE (read-only,
+non-aliased), field-get = two-ptr-load + GEP + scalar-load. Verified sound + RAPTOR-digest-exact. **But it
+fires on nothing today** (RAPTOR's arrays are store-then-push → 0xFD; no benchmark opts in) — Phase-2
+(push-scatter fusion) + Phase-3 (`@columnar` on the port's `Trip` type) + a field-scan measurement remain.
+
+**Honest scoreboard for the memory work.** value-unbox, 0xFE, freeze-repack, and columnar are all **merged,
+verified, and neutral** — but they **fire on nothing in the current benchmarks** (RAPTOR calls `frozen()` 0
+times; produces 0 columnar arrays). They are *enabling infrastructure*; their measured impact is **0 until the
+typed port uses `frozen()` + build-then-store**. The only *measured* perf wins this session are on interp
+(Cursor-sealing 1.66 M map_gets→0; leak fix 34 MB→424 B). The decisive next experiment is getting
+`lin-manually-typed` compiling and measured with `frozen()` applied — that tells us whether this infrastructure
+actually closes the 25 GB gap, and it's the natural test because that one change exercises value-unbox +
+freeze-repack + RC-suppression at once.
+
+**Parked / decided (2026-06):**
+- **interp-D (stack-alloc heap-field records)** — sound but 0%: the interp's `Cursor`/`Token` are returned up
+  the parse chain (escape the frame), so 0 stack allocas fire. The interp alloc lever is arena/region (those
+  records are parse-lifetime), i.e. the `freeze`/region direction — not stack. On `explore/interpd`, not pursuing.
+- **inline SSO** (`explore/sso`, design + spike only) — ≤15 B strings inline in the value word, eliminating the
+  alloc for the ≤7 B strings that are 100 % of interp/dijkstra hot strings. **Deferred behind the value-record
+  repr reset**: same "guard every consumer" fragility as SMI (every `LinString` consumer must branch
+  inline-vs-heap), and it tangles with the string-field layout inside sealed structs.
+- **mimalloc default allocator** — left **opt-in (default-off)**. It's ~10 % RSS but **−3–5 % wall-clock** and a
+  build dependency, and Wave M proved it does NOT fix the RAPTOR peak (glibc ≈ arena-max ≈ mimalloc at peak —
+  the 25 GB is genuinely live, not fragmentation). Not worth flipping for a memory-for-speed trade that doesn't
+  even address the real problem.
+- **SMI** — dropped/stripped (above); on `reference/smi`. **Header compaction 24→16 B**, **B2 tag-walker
+  unification** — won't-do (subsumed / low-value). **#8 Float32 sealed size divergence** — fixed (`NKIND_FLOAT32`).
+
+**Still-open ideas (unscoped):** multi-core parallel RAPTOR queries (the 24 GROUP + 5 RANGE queries are
+independent — fan out via the existing worker/async; speed not memory); broaden the benchmark suite beyond
+RAPTOR (dijkstra/pipeline/parallel cells) with CI regression tracking.
 
 ---
 
@@ -452,11 +495,11 @@ behind the value-record repr-reset per their design docs.)
    *mutable* state.
 8. **Break reference cycles manually** (null a field) — there is no cycle collector.
 9. **`freeze` load-once, never-mutated data** (e.g. the return of a `loadData`/index-build function).
-   `frozen(v)` deep-immortalizes the graph: for the rest of the program its retain/release become no-ops
-   (the LIN_NO_RC ceiling showed RC is pure overhead for program-lifetime retention). Build the structure
-   naturally with `push`, then `freeze` once you're done mutating — that "done" signal is also what lets the
-   compiler repack it to a compact inline layout (in progress). Only freeze genuinely read-after-this data;
-   a frozen value is never reclaimed until process exit.
+   `frozen(v)` deep-immortalizes the graph (retain/release become no-ops for the rest of the program — the
+   LIN_NO_RC ceiling showed RC is pure overhead for program-lifetime retention) **and** repacks its 0xFD
+   pointer-spine record arrays to compact 0xFE inline (~48 B/record saved). Build naturally with `push`, then
+   `freeze` once you're done mutating. Only freeze genuinely read-after-this data; a frozen value is never
+   reclaimed until process exit.
 
 ---
 
