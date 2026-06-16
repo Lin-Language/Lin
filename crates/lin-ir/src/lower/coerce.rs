@@ -846,11 +846,11 @@ pub fn try_lower_sum_literal(
     // whose CHILD SUM TYPE is `slot_ty` itself (direct self-recursion). Used to push a nested literal
     // into the right child sum slot so it constructs a `SumNode`.
     let self_name = crate::repr::sum_recursive_self_name(slot_ty);
-    // Recursive-child temps whose ownership TRANSFERS into the constructed SumNode (the node owns +1
-    // of each child; codegen does NOT retain at the store). Recorded with their source expr so we can
-    // apply `transfer_into_container` AFTER the MakeObject: a fresh child literal is unregistered (its
-    // +1 moves into the node), a borrowed child sub-expression is retained.
-    let mut recursive_children: Vec<(Temp, &TypedExpr)> = Vec::new();
+    // `recursive_children` stores (slot_temp, src_expr, raw_temp_before_coerce).
+    // `slot_temp` is the SumNode*-typed temp passed to MakeObject (after coerce if any).
+    // `raw_temp_before_coerce` is the temp produced by lower_expr BEFORE any coerce was
+    // applied; it may equal `slot_temp` when no coerce was needed.
+    let mut recursive_children: Vec<(Temp, &TypedExpr, Temp)> = Vec::new();
     let lowered_fields: Vec<(String, Temp)> = fields
         .iter()
         .map(|(k, v)| {
@@ -863,13 +863,25 @@ pub fn try_lower_sum_literal(
                     Some(Type::Named(fn_name)) if fn_name == n)
             });
             let t = if is_recursive_child {
-                lower_value_into_slot(v, slot_ty, builder, ctx)
+                // Lower the raw value first (without the coerce), then coerce to the slot type.
+                // We record BOTH so the ownership-transfer decision below can distinguish a
+                // pfb-Coerce case (raw_temp IS owned — the CloneBox result — but the returned
+                // coerced SumNode* is NOT, because pfb already provides +1) from a bare-param
+                // case (raw_temp NOT owned either).
+                let t_raw = if let Some(inner) = try_lower_sum_literal(v, slot_ty, builder, ctx) {
+                    // Nested literal: already a SumNode*, registered owned. No coerce needed.
+                    inner
+                } else if let Some(inner) = try_lower_sealed_literal(v, slot_ty, builder, ctx) {
+                    inner
+                } else {
+                    lower_expr(v, builder, ctx)
+                };
+                let t_coerced = coerce_to_slot_type_owning_bind(t_raw, &v.ty(), slot_ty, builder);
+                recursive_children.push((t_coerced, v, t_raw));
+                t_coerced
             } else {
                 lower_expr(v, builder, ctx)
             };
-            if is_recursive_child {
-                recursive_children.push((t, v));
-            }
             if k == &disc_key {
                 if let TypedExpr::StringLit(s, _, _) = v {
                     builder.temp_types.insert(t, Type::StrLit(s.clone()));
@@ -899,8 +911,38 @@ pub fn try_lower_sum_literal(
     // (unregister from this scope); a borrowed child sub-expr is retained. Mirrors the
     // `transfer_into_container` rule for array/object element inserts — codegen does not retain at
     // the store, so this is the sole balancing reference for the node's owned child slot.
-    for (t, src) in recursive_children {
-        builder.transfer_into_container(t, src, true);
+    //
+    // EXCEPTION — SUMNODE-COERCE RECURSIVE CHILD (SumNode double-retain fix):
+    // When a recursive child value `v` has a type that is NOT directly sum-type-eligible (e.g.
+    // `Union([...with Named("Ast") children...])` — an intermediate form the monomorphizer may
+    // produce when one level of Named alias is expanded), but the `slot_ty` IS sum-type-eligible,
+    // `type_repr_differs` detects a repr change and a Coerce instruction is emitted. Codegen's
+    // `compile_ir_coerce` for this cross-SumNode-boundary case calls `sumnode_project_from_boxed`
+    // (pfb) → the pfb_kp or pfb_proj path — BOTH of which already provide +1 for the SumNode slot.
+    //
+    // In this case `t_coerced` (the SumNode* from pfb) is NOT registered owned (the Coerce
+    // instruction does not register its result), but `t_raw` (the pre-Coerce value, e.g. a
+    // TaggedVal* from a CloneBox) IS owned in scope. The scope-exit Release of `t_raw` emits
+    // `lin_tagged_release` which decrements the inner SumNode once — exactly cancelling the
+    // `lin_tagged_clone`'s +1. Pfb's +1 then accounts for the BinOp.right slot ownership.
+    //
+    // Emitting an ADDITIONAL `Retain` via `transfer_into_container` adds a second +1 that is
+    // never balanced → SumNode leak (one per BinOp construction). SKIP the Retain by checking:
+    //   `t_raw IS owned` (a CloneBox/fresh source) AND `t_coerced != t_raw` (a Coerce fired).
+    //
+    // By contrast, for a BORROWED param child (e.g. `"left": left`):
+    //   `t_raw NOT owned` AND `t_coerced == t_raw` (no Coerce, same repr) → Retain STILL fires.
+    // For a FRESH literal child (nested SumNode literal, `try_lower_sum_literal` path):
+    //   `t_raw IS owned` AND `t_coerced == t_raw` (no Coerce, already SumNode*) → Transfer.
+    for (t_coerced, src, t_raw) in &recursive_children {
+        let raw_owned = builder.is_owned_in_scope(*t_raw);
+        let coerce_fired = t_coerced != t_raw;
+        let pfb_provides_plus1 = coerce_fired && raw_owned;
+        if !pfb_provides_plus1 {
+            builder.transfer_into_container(*t_coerced, src, true);
+        }
+        // When pfb_provides_plus1 is true: skip — pfb (+1) + scope-exit tagged_release (-1 on
+        // inner SumNode) net to exactly +1 for the slot ownership. No extra Retain needed.
     }
     builder.register_owned(dst, slot_ty.clone());
     Some(dst)

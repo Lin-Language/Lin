@@ -584,6 +584,24 @@ pub fn lower_function_expr_with_id(
         && is_union_ty(&body_ty)
         && !is_union_ty(&effective_ret)
         && !is_rc_type(&effective_ret);
+    // UNBOX-TO-HEAP shell leak fix: when a union/Named body is UNBOXED to a concrete HEAP type
+    // (Object/Array/String/Map), `ret_temp` holds the inner LinMap*/LinArray*/etc. pointer (the
+    // actual return value), and `raw_ret` is the 16-byte TaggedVal* shell whose inner IS `ret_temp`.
+    // The scope-exit Release for `raw_ret` would call `lin_tagged_release` — decrementing the inner's
+    // rc (UAF/double-free since `ret_temp` also holds that reference) and then freeing the shell.
+    // We must NOT release `raw_ret` via scope-exit; instead, emit `FreeBoxShell` after scope pop to
+    // free ONLY the 16-byte TaggedVal shell (not the inner). The `return_keep` set includes `raw_ret`
+    // (preventing scope-exit Release), and the FreeBoxShell is emitted just before `Return`.
+    //
+    // Root cause: `coerce_if_branch` boxes both branches to a union-typed phi (because
+    // `Named("Cursor")` is treated as union-ish by `is_union_ty`). The unbox coercion at the return
+    // site (`Named("Cursor") → Object{...}`) then calls `lin_unbox_ptr`, leaving the shell owned but
+    // unfreed. Without this fix, the shell leaked one 16-byte TaggedVal per call to every function
+    // whose `Named(T)` return type expands to a concrete Object/Array/String/Map.
+    let unboxes_to_concrete_heap = ret_coerced
+        && is_union_ty(&body_ty)
+        && !is_union_ty(&effective_ret)
+        && is_rc_type(&effective_ret);
     // SEALED PROJECTION from a concrete heap object: when a concrete unsealed `LinObject*`
     // (`raw_ret`) is PROJECTED into a fresh sealed struct (`ret_temp`), the projection produces
     // an INDEPENDENT copy — it calls `lin_object_get` for each field and retains the heap values
@@ -619,6 +637,10 @@ pub fn lower_function_expr_with_id(
         // For both cases `raw_ret` does not alias `ret_temp`: release it via scope-exit.
         vec![ret_temp]
     } else {
+        // Default: keep both ret_temp and raw_ret from scope-exit release.
+        // For unboxes_to_concrete_heap, raw_ret is kept here (preventing scope-exit Release which
+        // would incorrectly call lin_tagged_release → decrement inner + free shell). The shell is
+        // freed separately via FreeBoxShell below, after scope pop.
         vec![ret_temp, raw_ret]
     };
     // Captured-cell cleanup: free PROVABLY-non-escaping cells created in this function body.
@@ -655,6 +677,14 @@ pub fn lower_function_expr_with_id(
     // Release Function-typed params that are not being returned. This balances the
     // retain_call_arg retain emitted by every caller for each Function argument.
     inner_builder.pop_scope_releasing_keep(&return_keep); // param scope
+    // UNBOX-TO-HEAP shell leak fix: `raw_ret` was kept in `return_keep` to prevent the scope-exit
+    // Release from calling `lin_tagged_release` (which would decrement the inner's rc and UAF).
+    // Now that the scope pops are done, free ONLY the 16-byte TaggedVal shell via FreeBoxShell.
+    // This is safe: the inner pointer lives on as `ret_temp` (the return value), and FreeBoxShell
+    // frees only the box struct without touching the inner payload.
+    if !inner_builder.is_current_block_terminated() && unboxes_to_concrete_heap && raw_ret != ret_temp {
+        inner_builder.emit(Instruction::FreeBoxShell { val: raw_ret });
+    }
     if !inner_builder.is_current_block_terminated() {
         // Void-returning functions must Return(None) — codegen gives them a void LLVM
         // signature, so returning a value would be a type mismatch.
