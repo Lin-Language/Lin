@@ -398,6 +398,18 @@ Conductor (me) runs the heavy RAPTOR digest+RSS at integration; agents run light
   unguarded not-smi half shadowing the guard → UAF; caught + reverted). Agent doing it with the pair rule +
   warning-free-build + SMI-fires + ASan gates. LESSON: stale/feature-mixed incremental builds produce flaky
   test failures (bit my verification 3×) — always `cargo clean` between feature states.
+  FINAL STATE: TOGGLE REMOVAL BLOCKED. Making SMI unconditional keeps surfacing consumer-guard bugs
+  (whack-a-mole): FIXED array-slice (lin_array_slice_tagged, `ed1bf6b3`); STILL BROKEN regex (regex.rs SMI
+  guard SIGSEGVs — a Regex handle is a pointer not an int; passes on master only because the guard is
+  cfg-gated off). cf path-10 spike's "11 bugs". **SMI-on soundness needs an EXHAUSTIVE deref-site audit, NOT
+  ad-hoc test-driven fixes — tests passing is necessary but not sufficient (an unguarded path with no test is
+  invisible). RECOMMENDATION: leave SMI behind the default-OFF flag (real advance from inert + safe in master)
+  until a systematic audit.** Unconditional WIP parked on branch chore/smi-unconditional (820/0 integ + 73/73
+  but regex unit-test SIGSEGVs — NOT mergeable).
+- [x] **Interp LEAK fix → MERGED `05140712`.** String-TCO under-release in lin_string_slice/char_at leaked
+  ~33MB/1.49M-allocs PER interp run; fixed in lin-ir/src/lower/{mod,func}.rs. ASan-verified: 34MB → **424 bytes
+  / 27 allocs** (residual = intentional string-interning), UAF=0, 820/0 + 73/73. With lane U's Cursor-sealing,
+  the interp per-iteration leak is essentially GONE.
 - [x] **Lane F — 0xFE phase-2 (#9) → MERGED to master `c2f77121` (sound; no RAPTOR win today, keepable win for
   local read-only record arrays + foundation for build-then-store ports).** Conductor-verified comprehensively:
   gate audited (strict allowlist, fails-safe — only Index/FieldGet/SealedArrayFieldGet/Retain/Release promote
