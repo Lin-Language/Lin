@@ -387,11 +387,16 @@ Conductor (me) runs the heavy RAPTOR digest+RSS at integration; agents run light
   or benign program-lifetime data held at exit. Agent: confirm real-vs-residual (scale REPS), find the dominant
   leaking alloc site (ASan stacks), root-cause (cycle / missing-release / lifetime), and fix if low-risk.
   If a real leak, this is also part of WHY interp is alloc-bound (it never reclaims per-iteration garbage).
-- [x] **Lane S — SMI dates (#12) → MERGED to master `7140c05b`.** Pointer-tagged immediate small ints behind
-  cargo feature `smi` (default OFF → master byte-identical: workspace 820/0 + 73/73 + fmt all green feature-off;
-  feature-on compiles). Cherry-picked off the stale experiment branch onto master (fixed a duplicate-`[features]`
-  collision with mimalloc). INCOMPLETE SLICE — the flag stages it: ~180 consumer sites must guard the tag bit
-  before it can flip default-ON. Foundation for Linus's dates-as-ints feature.
+- [~] **SMI dates (#12) → INFRASTRUCTURE merged `7140c05b` but INERT; being ENABLED FOR REAL on `feat/enable-smi`.**
+  CRITICAL FINDING (2026-06-16): the `smi` feature is a NO-OP — `lin_box_int32/int64` (tagged.rs:349,363) never
+  emit immediates; they still heap-box ("for now, always use heap boxes... consumer guards are the remaining
+  work"). So feature-ON passed all gates because SMI does NOTHING (verifying inert code). The encode/decode
+  helpers + MANY tagged.rs guards (eq/arith/unbox/retain/release) exist, but the BOX is never flipped and the
+  CONTAINER-STORE boundary (lin_map_set val-param, lin_array_push_tagged) is unguarded. Linus chose COMPLETE+ENABLE:
+  agent flips the box to smi_encode + completes the store-boundary/retain-release guards, with hard gates that
+  prove SMI actually FIRES (LIN_SMI_STATS int_boxes>0) + ASan-clean with SMI LIVE + 820/73 + RAPTOR digest.
+  Conductor removes the toggle ONLY after this is proven sound. Data-flow model: SMI immediates are transient
+  opaque boxes; container-store converts them to real 16B TaggedVals so freeze/transfer/downstream stay safe.
 - [x] **Lane F — 0xFE phase-2 (#9) → MERGED to master `c2f77121` (sound; no RAPTOR win today, keepable win for
   local read-only record arrays + foundation for build-then-store ports).** Conductor-verified comprehensively:
   gate audited (strict allowlist, fails-safe — only Index/FieldGet/SealedArrayFieldGet/Retain/Release promote
