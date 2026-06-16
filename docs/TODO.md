@@ -11,16 +11,20 @@
 
 Each produces a design doc + a minimal POC/spike; conductor reviews + runs heavy benches before any merge.
 
-- [~] **`freeze`-as-repack / arena** (`explore/arena`) — **THE primary lever.** Make `frozen(v)` a one-time
-  repack: 0xFD pointer-spine record arrays → 0xFE inline + (later) arena-allocate the buffer + RC-suppress.
-  One user-driven primitive unifying inline-layout + arena + RC-elimination, sidestepping the store-then-push
-  hazard by construction (the user signals "done mutating"). `frozen()` already RC-suppresses for free today;
-  this adds the repack. Agent RUNNING (re-dispatched after a socket-death). Potentially the single biggest
-  RAPTOR memory+speed lever, and it covers interp too (parse records are program-lifetime, not frame-local).
-- [~] **Columnar (struct-of-arrays) record arrays** (`explore/columnar`) — DESIGN DOC + runtime spike landed
-  (`docs/design-columnar-arrays.md`, `lin-runtime/src/columnar.rs`: `0xFC` tag, field-get = two-ptr-load +
-  GEP + load, verified). Phase-1 codegen wiring RUNNING. Read-mostly (same alias gate as 0xFE); good for
-  RAPTOR's departureTime field-scans. Likely simplifies once records are value types (repr reset).
+- [x] **`freeze`-as-repack → MERGED `46cc61f7`.** `frozen(v)` now does a one-time repack: when the deep
+  immortal-seal walk hits a 0xFD pointer-spine record array, it allocates a headerless 0xFE inline buffer,
+  copies payloads in, swaps `elem_tag→0xFE`, frees the old spine. Sound (frozen contract forbids post-freeze
+  mutation; 0xFE read path exists). Verified: 820/0 + 73/73 + workspace + ASan UAF-clean + correct reads. The
+  user-signalled build-with-push-then-`freeze` path — eliminates ~48 B/record for program-lifetime indexes
+  without the store-then-push hazard. **Apply `frozen(...)` to the loadGTFS return to use it.** (The
+  `std/arena` bump-allocator the agent also built is intentionally NOT merged — parked on `explore/arena`.)
+- [x] **Columnar (struct-of-arrays) record arrays → MERGED `20876032`.** `0xFC` tag; escape-analysis-driven
+  (auto-chosen for read-only non-aliased record arrays, same gate class as 0xFE); field-get = two-ptr-load +
+  GEP + scalar-load (good for RAPTOR's departureTime field-scans). Verified: 820/0 + 74/74, fires (POC +
+  loop), ASan UAF=0, leak-free on create+drop, **store-then-push hazard handled** (stays 0xFD), **RAPTOR
+  digest EXACT** (no perturbation of existing arrays). `docs/design-columnar-arrays.md` has the 3-phase plan
+  (Phase-2 push-scatter fusion + Phase-3 `@columnar` RAPTOR integration remain). NEXT: measure the actual
+  RAPTOR field-scan win once the port uses typed records + `frozen()`.
 - [ ] **True inline SSO** (`explore/sso`) — DESIGN DOC + spike done (`docs/design-inline-sso.md`); ≤15 B inline,
   handles ≤7 B = 100 % of interp/dijkstra hot strings. **DEFERRED behind the value-record repr reset** (the
   agent flagged the same "guard every consumer" fragility that sank SMI, plus it tangles with the string field
