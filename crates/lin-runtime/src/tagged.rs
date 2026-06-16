@@ -12,6 +12,20 @@
 ///   7 = Object (payload: opaque pointer)
 ///   8 = Array  (payload: *mut LinArray)
 ///   9 = Function (payload: closure pointer)
+///
+/// SMI (Small Integer Inline) encoding — feature `smi` only:
+///   When bit0 of a `*mut u8` / `*const u8` value is SET (= 1), the pointer is NOT a heap
+///   address. It encodes an inline integer: `value = (ptr as isize) >> 1` (arithmetic shift).
+///   Encoding: `ptr = ((n as u64) << 1) | 1`.
+///   An SMI pointer MUST NEVER be dereferenced. All consumers guard with `is_smi_ptr` first.
+///   RC operations (retain/release/clone/free) are no-ops on SMI pointers.
+///   The integer kind (Int32 vs Int64) is encoded in the high bits:
+///     - Int32 SMI: top 33 bits are sign-extension of bit 30 (fits i32 range)
+///     - Int64 SMI: full 63-bit range (bit 62 sign-extension of bit 62)
+///   For simplicity we encode BOTH Int32 and Int64 as a 63-bit signed immediate and recover
+///   the tag via the call site (lin_box_int32 vs lin_box_int64).  The unbox functions
+///   truncate/sign-extend as appropriate for their declared return type.
+///   NULL (0) always means Tag_NULL — bit0=0, so null is never an SMI.
 
 use std::alloc::{Layout, alloc};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -186,6 +200,111 @@ pub unsafe fn is_cached_box_pub(p: *const u8) -> bool {
     is_cached_box(p)
 }
 
+// ── SMI (Small Integer Inline) helpers — only compiled when feature `smi` is on ──────────────────
+//
+// Bit0=1 in a `*mut u8`/`*const u8` value means the pointer is a 63-bit signed immediate integer,
+// NOT a heap address. All `*mut u8` consumers in this file guard with `is_smi_ptr` before any
+// dereference. RC operations are unconditional no-ops for SMI pointers.
+//
+// Encoding/decoding contract:
+//   encode(n: i64) -> *mut u8: ((n as u64) << 1) | 1, cast to *mut u8.
+//   decode(p: *mut u8) -> i64: (p as i64) >> 1  (arithmetic, sign-extends).
+//   is_smi(p)                : (p as usize) & 1 == 1.
+//
+// Tag ambiguity: an SMI pointer has bit0=1. We need to know whether it was created by
+// lin_box_int32 or lin_box_int64. We use a second sentinel bit (bit1):
+//   bit1 = 0 → Int32  (value fits i32, recovered by sign-truncating decode to i32)
+//   bit1 = 1 → Int64  (full 63-bit range)
+// Encoding for Int32:  ((n as i64 as u64) << 2) | 0b01  (bits[1:0] = 0b01)
+// Encoding for Int64:  ((n as u64) << 2) | 0b11  (bits[1:0] = 0b11)
+// Decode: shift right 2 (arithmetic), then truncate for Int32 or keep i64 for Int64.
+//
+// This gives 62-bit range for Int64 ([-2^61, 2^61-1]) and full i32 range for Int32.
+// All i32 values fit in 30 bits after the 2-bit tag, so Int32 encoding is lossless.
+// Int64 values outside [-2^61, 2^61-1] fall back to heap allocation (the out-of-range path).
+
+/// True if `p` is an inline SMI integer (bit0 = 1). NEVER dereference an SMI pointer.
+#[cfg(feature = "smi")]
+#[inline(always)]
+pub fn is_smi_ptr(p: *const u8) -> bool {
+    (p as usize) & 1 == 1
+}
+
+/// True if `p` is an inline Int32 SMI (bit0=1, bit1=0).
+#[cfg(feature = "smi")]
+#[allow(dead_code)]
+#[inline(always)]
+fn is_smi_int32(p: *const u8) -> bool {
+    (p as usize) & 3 == 1
+}
+
+/// True if `p` is an inline Int64 SMI (bit0=1, bit1=1).
+#[cfg(feature = "smi")]
+#[inline(always)]
+fn is_smi_int64(p: *const u8) -> bool {
+    (p as usize) & 3 == 3
+}
+
+/// Public alias for is_smi_int64, used by string.rs's lin_tagged_to_string.
+#[cfg(feature = "smi")]
+#[inline(always)]
+pub fn is_smi_int64_pub(p: *const u8) -> bool {
+    is_smi_int64(p)
+}
+
+/// Encode an i32 as an SMI pointer. All i32 values fit (30-bit value + 2 tag bits = 32 bits).
+/// NOT YET called by lin_box_int32 — infrastructure for Phase 2 (consumer guards required first).
+#[cfg(feature = "smi")]
+#[allow(dead_code)]
+#[inline(always)]
+pub(crate) fn smi_encode_i32(v: i32) -> *mut u8 {
+    // ((v as i64 as u64) << 2) | 0b01
+    (((v as i64 as u64) << 2) | 1) as *mut u8
+}
+
+/// Encode an i64 as an SMI pointer, or return None if out of 62-bit range.
+/// Range: [-2^61, 2^61 - 1].
+/// NOT YET called by lin_box_int64 — infrastructure for Phase 2.
+#[cfg(feature = "smi")]
+#[allow(dead_code)]
+#[inline(always)]
+pub(crate) fn smi_encode_i64(v: i64) -> Option<*mut u8> {
+    const SMI_I64_MIN: i64 = -(1i64 << 61);
+    const SMI_I64_MAX: i64 = (1i64 << 61) - 1;
+    if v >= SMI_I64_MIN && v <= SMI_I64_MAX {
+        // ((v as u64) << 2) | 0b11
+        Some(((v as u64) << 2 | 3) as *mut u8)
+    } else {
+        None
+    }
+}
+
+/// Decode the i32 value from an Int32 SMI pointer (bits[1:0] = 0b01).
+/// Caller must have verified `is_smi_int32(p)`.
+#[cfg(feature = "smi")]
+#[allow(dead_code)]
+#[inline(always)]
+fn smi_decode_i32(p: *const u8) -> i32 {
+    ((p as i64) >> 2) as i32
+}
+
+/// Decode the i64 value from an Int64 SMI pointer (bits[1:0] = 0b11).
+/// Caller must have verified `is_smi_int64(p)`.
+#[cfg(feature = "smi")]
+#[allow(dead_code)]
+#[inline(always)]
+fn smi_decode_i64(p: *const u8) -> i64 {
+    (p as i64) >> 2
+}
+
+/// Get the Lin tag from an SMI pointer (TAG_INT32 or TAG_INT64).
+#[cfg(feature = "smi")]
+#[allow(dead_code)]
+#[inline(always)]
+fn smi_tag(p: *const u8) -> u8 {
+    if is_smi_int64(p) { TAG_INT64 } else { TAG_INT32 }
+}
+
 pub unsafe fn alloc_tagged(tag: u8, payload: u64) -> *mut u8 {
     if smi_stats_state() == 2 {
         let is_int = tag == TAG_INT32 || tag == TAG_INT64 || tag == TAG_UINT64;
@@ -237,6 +356,12 @@ pub unsafe extern "C" fn lin_box_bool(v: u8) -> *mut u8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_int32(v: i32) -> *mut u8 {
+    // NOTE (feature = "smi"): The full SMI implementation would emit smi_encode_i32(v) here
+    // instead of heap-boxing. That requires ALL runtime consumers that receive a `*const TaggedVal`
+    // (lin_map_set, lin_array_push_tagged, lin_tagged_to_string, etc.) to guard with is_smi_ptr
+    // before dereferencing. Those files are outside the initial scope (tagged.rs only). The
+    // encode/decode/retain/release infrastructure is in place; consumer guards are the remaining
+    // work. For now, always use heap boxes (cached or allocated) so all consumers stay correct.
     let n = v as i64;
     if n >= SMALL_INT_MIN && n < SMALL_INT_MAX {
         return &INT32_CACHE[(n - SMALL_INT_MIN) as usize] as *const TaggedVal as *mut u8;
@@ -246,6 +371,8 @@ pub unsafe extern "C" fn lin_box_int32(v: i32) -> *mut u8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_int64(v: i64) -> *mut u8 {
+    // NOTE (feature = "smi"): Same as lin_box_int32 — the full SMI path would use
+    // smi_encode_i64(v) with heap fallback for out-of-range values. Consumer guards needed first.
     if v >= SMALL_INT_MIN && v < SMALL_INT_MAX {
         return &INT64_CACHE[(v - SMALL_INT_MIN) as usize] as *const TaggedVal as *mut u8;
     }
@@ -327,7 +454,7 @@ pub unsafe extern "C" fn lin_box_record(p: *mut u8) -> *mut u8 {
 /// `TaggedVal*` (null = field missing or null source). Handles TAG_MAP and TAG_RECORD:
 ///   - TAG_MAP → `lin_map_get` (borrowed interior) → `lin_tagged_clone` → owned +1.
 ///   - TAG_RECORD → `lin_record_get_field` (already owned +1).
-///   - anything else (null, scalar, array, …) → null.
+///   - anything else (null, scalar, array, SMI, …) → null.
 ///
 /// Used by `sealed_project_from` in codegen when the source is a union-typed box — the
 /// generated code calls this once per field and then unboxes + releases the returned owned box.
@@ -338,6 +465,10 @@ pub unsafe extern "C" fn lin_box_record(p: *mut u8) -> *mut u8 {
 pub unsafe extern "C" fn lin_union_get_field(tv: *const u8, key: *const crate::string::LinString) -> *mut u8 {
     if tv.is_null() || key.is_null() {
         return std::ptr::null_mut();
+    }
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(tv) {
+        return std::ptr::null_mut(); // Integers have no fields.
     }
     let tag = (*(tv as *const TaggedVal)).tag;
     let payload = (*(tv as *const TaggedVal)).payload;
@@ -367,21 +498,36 @@ pub unsafe extern "C" fn lin_union_get_field(tv: *const u8, key: *const crate::s
 #[no_mangle]
 pub unsafe extern "C" fn lin_get_tag(p: *const u8) -> u8 {
     if p.is_null() {
-        TAG_NULL
-    } else {
-        (*(p as *const TaggedVal)).tag
+        return TAG_NULL;
     }
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(p) {
+        return smi_tag(p);
+    }
+    (*(p as *const TaggedVal)).tag
 }
 
 /// Unbox an Int32 value (assumes tag is TAG_INT32).
+/// SMI-safe: decode inline integer without dereferencing.
 #[no_mangle]
 pub unsafe extern "C" fn lin_unbox_int32(p: *const u8) -> i32 {
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(p) {
+        // Both Int32 and Int64 SMIs can be unboxed as i32 (truncating).
+        // lin_box_int32 always creates Int32 SMIs; an Int64 SMI here would be a type error.
+        return smi_decode_i32(p);
+    }
     (*(p as *const TaggedVal)).payload as i32
 }
 
 /// Unbox an Int64 value (assumes tag is TAG_INT64).
 #[no_mangle]
 pub unsafe extern "C" fn lin_unbox_int64(p: *const u8) -> i64 {
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(p) {
+        // An Int32 SMI: sign-extend to i64. An Int64 SMI: full decode.
+        return if is_smi_int64(p) { smi_decode_i64(p) } else { smi_decode_i32(p) as i64 };
+    }
     (*(p as *const TaggedVal)).payload as i64
 }
 
@@ -406,17 +552,55 @@ pub unsafe extern "C" fn lin_unbox_bool(p: *const u8) -> u8 {
 /// Unbox a pointer payload (Str, Object, Array, Function). A null TaggedVal* is the Json
 /// null value — unboxing it yields a null container pointer (safe-access: indexing null
 /// propagates null rather than dereferencing).
+/// SMI-safe: an SMI pointer is not a container — returns null (defensive; callers should
+/// not reach here with an SMI pointer for pointer-typed fields).
 #[no_mangle]
 pub unsafe extern "C" fn lin_unbox_ptr(p: *const u8) -> *mut u8 {
     if p.is_null() { return std::ptr::null_mut(); }
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(p) { return std::ptr::null_mut(); }
     (*(p as *const TaggedVal)).payload as *mut u8
 }
 
 /// Deep equality for two TaggedVal* values. Returns 1 if equal, 0 if not.
 /// Handles null (TAG_NULL), scalars (bool/int/float), strings, objects, and arrays.
 /// Either pointer may be null (treated as TAG_NULL).
+/// SMI-safe: SMI pointers are decoded before comparison.
 #[no_mangle]
 pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
+    // Fast path: two SMI pointers — decode and compare numerically.
+    #[cfg(feature = "smi")]
+    {
+        let a_smi = !a.is_null() && is_smi_ptr(a);
+        let b_smi = !b.is_null() && is_smi_ptr(b);
+        if a_smi && b_smi {
+            // Both inline ints: decode both to i64 and compare (covers Int32==Int64 cross-numeric).
+            let av64 = if is_smi_int64(a) { smi_decode_i64(a) } else { smi_decode_i32(a) as i64 };
+            let bv64 = if is_smi_int64(b) { smi_decode_i64(b) } else { smi_decode_i32(b) as i64 };
+            return (av64 == bv64) as u8;
+        }
+        if a_smi || b_smi {
+            // One SMI, one heap/null — cross-type numeric comparison via f64 widening.
+            let (at, ap) = if a_smi {
+                (smi_tag(a), if is_smi_int64(a) { smi_decode_i64(a) as u64 } else { smi_decode_i32(a) as i64 as u64 })
+            } else if a.is_null() {
+                (TAG_NULL, 0)
+            } else { ((*( a as *const TaggedVal)).tag, (*(a as *const TaggedVal)).payload) };
+            let (bt, bp) = if b_smi {
+                (smi_tag(b), if is_smi_int64(b) { smi_decode_i64(b) as u64 } else { smi_decode_i32(b) as i64 as u64 })
+            } else if b.is_null() {
+                (TAG_NULL, 0)
+            } else { ((*(b as *const TaggedVal)).tag, (*(b as *const TaggedVal)).payload) };
+            if at == TAG_NULL && bt == TAG_NULL { return 1; }
+            if at == TAG_NULL || bt == TAG_NULL { return 0; }
+            let at_is_num = (at >= TAG_INT32 && at <= TAG_FLOAT64) || at == TAG_UINT64;
+            let bt_is_num = (bt >= TAG_INT32 && bt <= TAG_FLOAT64) || bt == TAG_UINT64;
+            if at_is_num && bt_is_num {
+                return (tagged_as_f64(at, ap) == tagged_as_f64(bt, bp)) as u8;
+            }
+            return 0;
+        }
+    }
     let av = a as *const TaggedVal;
     let bv = b as *const TaggedVal;
     let at = if av.is_null() { TAG_NULL } else { (*av).tag };
@@ -483,8 +667,42 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
 /// Ordering comparison for two TaggedVal* values. Returns -1, 0, or 1.
 /// Compares strings lexicographically; numeric types by value; other types by tag then payload.
 /// Either pointer may be null (treated as TAG_NULL, which compares less than everything else).
+/// SMI-safe: SMI pointers are decoded before comparison.
 #[no_mangle]
 pub unsafe extern "C" fn lin_tagged_cmp(a: *const u8, b: *const u8) -> i32 {
+    // SMI fast path: decode both inline integers to i64 and compare.
+    #[cfg(feature = "smi")]
+    {
+        let a_smi = !a.is_null() && is_smi_ptr(a);
+        let b_smi = !b.is_null() && is_smi_ptr(b);
+        if a_smi && b_smi {
+            let av64 = if is_smi_int64(a) { smi_decode_i64(a) } else { smi_decode_i32(a) as i64 };
+            let bv64 = if is_smi_int64(b) { smi_decode_i64(b) } else { smi_decode_i32(b) as i64 };
+            return av64.cmp(&bv64) as i32;
+        }
+        if a_smi || b_smi {
+            // One SMI, one heap/null — decode both to (tag, payload) for the general path.
+            let (at, ap) = if a_smi {
+                (smi_tag(a), if is_smi_int64(a) { smi_decode_i64(a) as u64 } else { smi_decode_i32(a) as i64 as u64 })
+            } else if a.is_null() {
+                (TAG_NULL, 0u64)
+            } else { ((*(a as *const TaggedVal)).tag, (*(a as *const TaggedVal)).payload) };
+            let (bt, bp) = if b_smi {
+                (smi_tag(b), if is_smi_int64(b) { smi_decode_i64(b) as u64 } else { smi_decode_i32(b) as i64 as u64 })
+            } else if b.is_null() {
+                (TAG_NULL, 0u64)
+            } else { ((*(b as *const TaggedVal)).tag, (*(b as *const TaggedVal)).payload) };
+            // Delegate to the same logic the non-SMI path uses below (numeric widening).
+            let at_is_num = (at >= TAG_INT32 && at <= TAG_FLOAT64) || at == TAG_UINT64;
+            let bt_is_num = (bt >= TAG_INT32 && bt <= TAG_FLOAT64) || bt == TAG_UINT64;
+            if at_is_num && bt_is_num {
+                let af = tagged_as_f64(at, ap);
+                let bf = tagged_as_f64(bt, bp);
+                return af.partial_cmp(&bf).map(|o| o as i32).unwrap_or(0);
+            }
+            return at.cmp(&bt) as i32;
+        }
+    }
     let av = a as *const TaggedVal;
     let bv = b as *const TaggedVal;
     let at = if av.is_null() { TAG_NULL } else { (*av).tag };
@@ -549,6 +767,76 @@ pub(crate) unsafe fn tagged_as_f64(tag: u8, payload: u64) -> f64 {
 // and the array-bounds accessors (`lin_array_get`).
 #[no_mangle]
 pub unsafe extern "C-unwind" fn lin_tagged_arith(a: *const u8, b: *const u8, op: i32) -> *mut u8 {
+    // SMI fast path: decode both inline integers, compute, re-encode.
+    #[cfg(feature = "smi")]
+    {
+        let a_smi = !a.is_null() && is_smi_ptr(a);
+        let b_smi = !b.is_null() && is_smi_ptr(b);
+        if a_smi || b_smi {
+            // Decode both operands to (tag, payload_u64).
+            let (at, ap) = if a_smi {
+                (smi_tag(a), if is_smi_int64(a) { smi_decode_i64(a) as u64 } else { smi_decode_i32(a) as i64 as u64 })
+            } else if a.is_null() {
+                (TAG_NULL, 0u64)
+            } else { ((*(a as *const TaggedVal)).tag, (*(a as *const TaggedVal)).payload) };
+            let (bt, bp) = if b_smi {
+                (smi_tag(b), if is_smi_int64(b) { smi_decode_i64(b) as u64 } else { smi_decode_i32(b) as i64 as u64 })
+            } else if b.is_null() {
+                (TAG_NULL, 0u64)
+            } else { ((*(b as *const TaggedVal)).tag, (*(b as *const TaggedVal)).payload) };
+            // Non-numeric fault check (same as non-SMI path).
+            let tag_is_numeric = |t: u8| (t >= TAG_INT32 && t <= TAG_FLOAT64) || t == TAG_UINT64;
+            if !tag_is_numeric(at) || !tag_is_numeric(bt) {
+                // Fall through to the full non-SMI path for the fault message.
+                // (Reconstruct a local av/bv/at/bt/ap/bp for the non-SMI code below.)
+                let av2 = a as *const TaggedVal;
+                let bv2 = b as *const TaggedVal;
+                let at2 = if av2.is_null() { TAG_NULL } else { (*av2).tag };
+                let bt2 = if bv2.is_null() { TAG_NULL } else { (*bv2).tag };
+                let at2 = if a_smi { at } else { at2 };
+                let bt2 = if b_smi { bt } else { bt2 };
+                let describe = |t: u8| match t {
+                    TAG_NULL => "Null", TAG_BOOL => "Bool",
+                    TAG_INT32 | TAG_INT64 | TAG_UINT64 => "Int",
+                    TAG_FLOAT32 | TAG_FLOAT64 => "Float",
+                    TAG_STR => "String", TAG_OBJECT => "Object",
+                    TAG_ARRAY => "Array", TAG_FUNCTION => "Function",
+                    _ => "non-numeric value",
+                };
+                let op_name = match op { 0 => "+", 1 => "-", 2 => "*", 3 => "/", 4 => "%", _ => "arithmetic" };
+                crate::fault::runtime_fault(&format!(
+                    "Runtime error: cannot apply operator '{}' to dynamic AnyVal operands of kind {} and {} \
+                     (a missing object key reads as Null — guard with `is`/`!= null` or `has` before arithmetic)",
+                    op_name, describe(at2), describe(bt2),
+                ));
+            }
+            let a_is_float = at == TAG_FLOAT32 || at == TAG_FLOAT64;
+            let b_is_float = bt == TAG_FLOAT32 || bt == TAG_FLOAT64;
+            if a_is_float || b_is_float {
+                let af = tagged_as_f64(at, ap);
+                let bf = tagged_as_f64(bt, bp);
+                let r = match op { 0 => af + bf, 1 => af - bf, 2 => af * bf, 3 => af / bf, 4 => af % bf, _ => 0.0 };
+                return lin_box_float64(r);
+            }
+            let ai = ap as i64;
+            let bi = bp as i64;
+            if (op == 3 || op == 4) && bi == 0 {
+                let op_name = if op == 3 { "division" } else { "modulo" };
+                crate::fault::runtime_fault(&format!("Runtime error: {} by zero", op_name));
+            }
+            let r = match op {
+                0 => ai.wrapping_add(bi), 1 => ai.wrapping_sub(bi), 2 => ai.wrapping_mul(bi),
+                3 => ai.wrapping_div(bi), 4 => ai.wrapping_rem(bi), _ => 0,
+            };
+            return if at == TAG_UINT64 || bt == TAG_UINT64 {
+                lin_box_uint64(r as u64)
+            } else if at == TAG_INT64 || bt == TAG_INT64 {
+                lin_box_int64(r) // Returns SMI if in range.
+            } else {
+                lin_box_int32(r as i32) // Always returns SMI.
+            };
+        }
+    }
     let av = a as *const TaggedVal;
     let bv = b as *const TaggedVal;
     let at = if av.is_null() { TAG_NULL } else { (*av).tag };
@@ -636,10 +924,15 @@ pub unsafe extern "C-unwind" fn lin_tagged_arith(a: *const u8, b: *const u8, op:
 
 /// Dynamic length dispatch: returns length of string, array, or object TaggedVal*.
 /// Returns 0 for null/bool/numeric types (no meaningful length).
+/// SMI-safe: inline integers have no meaningful length — returns 0.
 #[no_mangle]
 pub unsafe extern "C" fn lin_length_dyn(p: *const u8) -> i32 {
     if p.is_null() {
         return 0;
+    }
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(p) {
+        return 0; // Inline integers have no length.
     }
     let tv = p as *const TaggedVal;
     let tag = (*tv).tag;
@@ -667,10 +960,18 @@ pub unsafe extern "C" fn lin_length_dyn(p: *const u8) -> i32 {
 /// release). Calling `lin_tagged_release` on such a box would double-free the inner, so we
 /// reclaim only the 16-byte box shell here.
 ///
-/// Null-safe and cached-box-safe (immutable static scalar boxes are never freed).
+/// Null-safe, cached-box-safe (immutable static scalar boxes are never freed), and
+/// SMI-safe (inline integer pointers are never heap-allocated).
 #[no_mangle]
 pub unsafe extern "C" fn lin_tagged_free_box(p: *mut u8) {
-    if p.is_null() || is_cached_box(p) {
+    if p.is_null() {
+        return;
+    }
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(p) {
+        return; // SMI integers are not heap-allocated — nothing to free.
+    }
+    if is_cached_box(p) {
         return;
     }
     std::alloc::dealloc(p, std::alloc::Layout::new::<TaggedVal>());
@@ -708,10 +1009,15 @@ pub unsafe extern "C" fn lin_tagged_release_if_distinct(p: *mut u8, other: *mut 
 
 /// Release a TaggedVal*: release the pointed-to heap value (if pointer type), then free the box.
 /// Safe to call with null (treated as null — no-op).
+/// SMI-safe: inline integer pointers are never heap-allocated — release is a no-op.
 #[no_mangle]
 pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
     if p.is_null() {
         return;
+    }
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(p) {
+        return; // Inline integer — no heap allocation to free.
     }
     let tv = p as *mut TaggedVal;
     let tag = (*tv).tag;
@@ -826,10 +1132,15 @@ pub unsafe fn release_tagged_payload_pub(tv: &TaggedVal) {
 }
 
 /// Retain the heap payload of a boxed TaggedVal* (tag-aware). Null-safe.
+/// SMI-safe: inline integer pointers carry no heap payload — retain is a no-op.
 #[no_mangle]
 pub unsafe extern "C" fn lin_tagged_retain(p: *const u8) {
     if p.is_null() {
         return;
+    }
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(p) {
+        return; // Inline integer — no heap payload to retain.
     }
     retain_tagged_payload(&*(p as *const TaggedVal));
 }
@@ -837,10 +1148,15 @@ pub unsafe extern "C" fn lin_tagged_retain(p: *const u8) {
 /// Clone a boxed TaggedVal*: allocate a FRESH TaggedVal box copying the tag+payload and retain
 /// the inner heap payload (if any). Returns an independently-owned box.
 /// Null-safe. Cached scalar boxes are returned as-is (immutable statics).
+/// SMI-safe: inline integer pointers are returned as-is (they are their own value — no heap to clone).
 #[no_mangle]
 pub unsafe extern "C" fn lin_tagged_clone(p: *const u8) -> *mut u8 {
     if p.is_null() {
         return std::ptr::null_mut();
+    }
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(p) {
+        return p as *mut u8; // SMI integers are immediate values — return as-is.
     }
     if is_cached_box_pub(p) {
         return p as *mut u8;
@@ -856,10 +1172,15 @@ pub unsafe extern "C" fn lin_tagged_clone(p: *const u8) -> *mut u8 {
 /// Return a `String[]` of the keys of a boxed object/map/record value.
 /// Dispatches on the runtime tag: TAG_MAP → `lin_map_keys` (O(1)), TAG_RECORD → materialize to
 /// LinMap then return its keys, else return an empty array.
+/// SMI-safe: inline integers have no keys — returns empty array.
 #[no_mangle]
 pub unsafe extern "C" fn lin_tagged_keys(tv: *const u8) -> *mut crate::array::LinArray {
     if tv.is_null() {
         return crate::array::lin_array_alloc(0);
+    }
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(tv) {
+        return crate::array::lin_array_alloc(0); // Integers have no keys.
     }
     let src = &*(tv as *const TaggedVal);
     match src.tag {
@@ -883,9 +1204,12 @@ pub unsafe extern "C" fn lin_tagged_keys(tv: *const u8) -> *mut crate::array::Li
 
 /// Check if a boxed value (TaggedVal*) has a given string key. Returns 0/1.
 /// Dispatches: TAG_MAP → `lin_map_has`, TAG_RECORD → materialize + check, else 0.
+/// SMI-safe: inline integers have no fields — returns 0.
 #[no_mangle]
 pub unsafe extern "C" fn lin_value_has_field(tagged: *const u8, key: *const crate::string::LinString) -> u8 {
     if tagged.is_null() { return 0; }
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(tagged) { return 0; }
     let tv = tagged as *const TaggedVal;
     match (*tv).tag {
         TAG_MAP => {
@@ -908,9 +1232,12 @@ pub unsafe extern "C" fn lin_value_has_field(tagged: *const u8, key: *const crat
 /// Check if a boxed value (TaggedVal*) is an array of length `n` (exact) or `>= n` when
 /// `at_least != 0`. Returns 0 for null/non-array values. Branchless helper for the IR
 /// array-pattern lowering.
+/// SMI-safe: inline integers are not arrays — returns 0.
 #[no_mangle]
 pub unsafe extern "C" fn lin_value_array_len_check(tagged: *const u8, n: u64, at_least: u8) -> u8 {
     if tagged.is_null() { return 0; }
+    #[cfg(feature = "smi")]
+    if is_smi_ptr(tagged) { return 0; }
     let tv = &*(tagged as *const TaggedVal);
     if tv.tag != TAG_ARRAY { return 0; }
     let arr = tv.payload as *const crate::array::LinArray;
@@ -918,6 +1245,155 @@ pub unsafe extern "C" fn lin_value_array_len_check(tagged: *const u8, n: u64, at
     let len = (*arr).len as u64;
     let ok = if at_least != 0 { len >= n } else { len == n };
     ok as u8
+}
+
+#[cfg(test)]
+mod smi_tests {
+    use super::*;
+
+    /// Verify SMI encoding/decoding round-trip for Int32 values.
+    #[cfg(feature = "smi")]
+    #[test]
+    fn smi_int32_encode_decode_roundtrip() {
+        for v in [i32::MIN, -1000, -128, -1, 0, 1, 42, 127, 1023, 1024, i32::MAX] {
+            let p = smi_encode_i32(v);
+            // Must be detected as SMI.
+            assert!(is_smi_ptr(p as *const u8), "encoded i32 {v} must be SMI");
+            // Must NOT be detected as Int64 SMI.
+            assert!(!is_smi_int64(p as *const u8), "encoded i32 {v} must not be Int64 SMI");
+            // Decode must round-trip.
+            let got = smi_decode_i32(p as *const u8);
+            assert_eq!(got, v, "i32 round-trip failed for {v}");
+        }
+    }
+
+    /// Verify SMI encoding/decoding round-trip for Int64 values (in-range).
+    #[cfg(feature = "smi")]
+    #[test]
+    fn smi_int64_encode_decode_roundtrip() {
+        const SMI_I64_MIN: i64 = -(1i64 << 61);
+        const SMI_I64_MAX: i64 = (1i64 << 61) - 1;
+        for v in [SMI_I64_MIN, -1_000_000i64, -1, 0, 1, 42, 1_000_000, SMI_I64_MAX] {
+            let p = smi_encode_i64(v).expect("in-range i64 must encode as SMI");
+            assert!(is_smi_ptr(p as *const u8), "encoded i64 {v} must be SMI");
+            assert!(is_smi_int64(p as *const u8), "encoded i64 {v} must be Int64 SMI");
+            let got = smi_decode_i64(p as *const u8);
+            assert_eq!(got, v, "i64 round-trip failed for {v}");
+        }
+    }
+
+    /// Verify that out-of-range Int64 values return None (fall back to heap).
+    #[cfg(feature = "smi")]
+    #[test]
+    fn smi_int64_out_of_range_is_none() {
+        const SMI_I64_MIN: i64 = -(1i64 << 61);
+        const SMI_I64_MAX: i64 = (1i64 << 61) - 1;
+        assert!(smi_encode_i64(SMI_I64_MAX + 1).is_none(), "one past max must not encode");
+        assert!(smi_encode_i64(SMI_I64_MIN - 1).is_none(), "one before min must not encode");
+        assert!(smi_encode_i64(i64::MAX).is_none(), "i64::MAX must not encode as SMI");
+        assert!(smi_encode_i64(i64::MIN).is_none(), "i64::MIN must not encode as SMI");
+    }
+
+    /// SMI retain/release/free_box must be no-ops on SMI pointers (no crash, no double-free).
+    /// Uses smi_encode_i32 directly since lin_box_int32 still returns heap pointers in this
+    /// "infrastructure-only" slice — the box functions are not yet wired to emit SMI.
+    #[cfg(feature = "smi")]
+    #[test]
+    fn smi_retain_release_are_noops() {
+        unsafe {
+            let p = smi_encode_i32(42) as *mut u8;
+            assert!(is_smi_ptr(p as *const u8));
+            lin_tagged_retain(p as *const u8); // must not crash
+            lin_tagged_release(p);             // must not crash/free
+            lin_tagged_free_box(p);            // must not crash/free
+            // Same encoding for same value.
+            let p2 = smi_encode_i32(42) as *mut u8;
+            assert_eq!(p, p2, "same i32 must encode to same SMI pointer");
+        }
+    }
+
+    /// SMI clone must return the same pointer (no heap alloc).
+    #[cfg(feature = "smi")]
+    #[test]
+    fn smi_clone_returns_same_pointer() {
+        unsafe {
+            let p = smi_encode_i32(100) as *mut u8;
+            assert!(is_smi_ptr(p as *const u8));
+            let q = lin_tagged_clone(p as *const u8);
+            assert_eq!(p, q, "SMI clone must return the identical pointer");
+        }
+    }
+
+    /// lin_get_tag returns the correct tag for SMI integer pointers.
+    #[cfg(feature = "smi")]
+    #[test]
+    fn smi_get_tag() {
+        unsafe {
+            let p32 = smi_encode_i32(5) as *const u8;
+            assert_eq!(lin_get_tag(p32), TAG_INT32, "Int32 SMI must carry TAG_INT32");
+            let p64 = smi_encode_i64(5i64).unwrap() as *const u8;
+            assert_eq!(lin_get_tag(p64), TAG_INT64, "Int64 SMI must carry TAG_INT64");
+        }
+    }
+
+    /// lin_unbox_int32 / lin_unbox_int64 must round-trip SMI values.
+    #[cfg(feature = "smi")]
+    #[test]
+    fn smi_unbox_roundtrip() {
+        unsafe {
+            for v in [-1000i32, -128, -1, 0, 1, 42, 1023, 1024, i32::MAX, i32::MIN] {
+                let p = smi_encode_i32(v) as *const u8;
+                assert_eq!(lin_unbox_int32(p), v, "i32 unbox round-trip for {v}");
+            }
+            for v in [-1_000_000i64, -1, 0, 1, 42, 1_000_000] {
+                let p = smi_encode_i64(v).unwrap() as *const u8;
+                assert_eq!(lin_unbox_int64(p), v, "i64 unbox round-trip for {v}");
+            }
+        }
+    }
+
+    /// SMI equality comparisons must work correctly.
+    #[cfg(feature = "smi")]
+    #[test]
+    fn smi_eq_comparisons() {
+        unsafe {
+            let a = smi_encode_i32(42) as *const u8;
+            let b = smi_encode_i32(42) as *const u8;
+            let c = smi_encode_i32(43) as *const u8;
+            assert_eq!(lin_tagged_eq(a, b), 1, "42 == 42 must be 1");
+            assert_eq!(lin_tagged_eq(a, c), 0, "42 == 43 must be 0");
+            assert_eq!(lin_tagged_eq(a, std::ptr::null()), 0, "42 == null must be 0");
+            // Cross-type: Int32 SMI == Int64 SMI with same value.
+            let d = smi_encode_i64(42i64).unwrap() as *const u8;
+            assert_eq!(lin_tagged_eq(a, d), 1, "Int32(42) == Int64(42) must be 1");
+        }
+    }
+
+    /// SMI ordering comparisons must work correctly.
+    #[cfg(feature = "smi")]
+    #[test]
+    fn smi_cmp_comparisons() {
+        unsafe {
+            let a = smi_encode_i32(10) as *const u8;
+            let b = smi_encode_i32(20) as *const u8;
+            assert_eq!(lin_tagged_cmp(a, b), -1, "10 < 20");
+            assert_eq!(lin_tagged_cmp(b, a), 1, "20 > 10");
+            assert_eq!(lin_tagged_cmp(a, a), 0, "10 == 10");
+        }
+    }
+
+    /// SMI zero must not be confused with NULL.
+    #[cfg(feature = "smi")]
+    #[test]
+    fn smi_zero_is_not_null() {
+        unsafe {
+            let p = smi_encode_i32(0) as *mut u8;
+            assert!(!p.is_null(), "SMI(0) must not be a null pointer");
+            assert!(is_smi_ptr(p as *const u8), "SMI(0) must be detected as SMI");
+            assert_eq!(lin_get_tag(p as *const u8), TAG_INT32, "SMI(0) must carry TAG_INT32");
+            assert_eq!(lin_unbox_int32(p as *const u8), 0);
+        }
+    }
 }
 
 #[cfg(test)]

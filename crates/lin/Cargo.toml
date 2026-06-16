@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# Forward the smi feature to lin-compile/lin-runtime.
+smi = ["lin-compile/smi"]
+
 [dependencies]
 lin-common = { path = "../lin-common" }
 lin-lex = { path = "../lin-lex" }
