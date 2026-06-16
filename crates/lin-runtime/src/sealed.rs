@@ -309,7 +309,13 @@ pub use lin_common::tags::{
 };
 
 /// Read a NamedField row at byte offset `cur` in the blob. Returns the parsed fields and the offset
-/// just past the row (so the caller can walk to the next field).
+/// of the NEXT row (so the caller can walk to the next field).
+///
+/// Layout per row (matches `Codegen::sealed_named_descriptor`):
+///   [ u32 offset | u32 nkind | u64 nested_ptr | u16 name_len | name_bytes | pad-to-8 ]
+/// Each row is padded to a multiple of 8 bytes (and the blob header is an 8-byte `[u32 count | u32
+/// pad]`) so that every `nested_ptr` lands on an 8-byte boundary — macOS ld64 rejects misaligned
+/// pointer relocations. Hence the returned next-offset is rounded UP to the next multiple of 8.
 #[inline]
 unsafe fn read_named_field(base: *const u8, cur: usize) -> (u32, u32, *const u8, &'static str, usize) {
     let offset = u32::from_le_bytes([*base.add(cur), *base.add(cur + 1), *base.add(cur + 2), *base.add(cur + 3)]);
@@ -321,7 +327,8 @@ unsafe fn read_named_field(base: *const u8, cur: usize) -> (u32, u32, *const u8,
     let name_len = u16::from_le_bytes([*base.add(cur + 16), *base.add(cur + 17)]) as usize;
     let name_off = cur + 18;
     let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(base.add(name_off), name_len));
-    (offset, nkind, nested, name, name_off + name_len)
+    let next = (name_off + name_len + 7) & !7; // round the row stride up to a multiple of 8
+    (offset, nkind, nested, name, next)
 }
 
 /// Box one already-loaded heap-field POINTER `p` (non-null) for the named-materialize path. RETAINS
@@ -367,7 +374,7 @@ unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *cons
     }
     let field_count = u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)]) as usize;
     let map = crate::map::lin_map_alloc(field_count as u32, crate::map::KEY_KIND_STRING);
-    let mut cur = 4usize;
+    let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
         let (offset, nkind, nested, name, next) = read_named_field(named_desc, cur);
         cur = next;
@@ -521,7 +528,7 @@ unsafe fn pack_named_payload_impl(
         );
     }
     let field_count = u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)]) as usize;
-    let mut cur = 4usize;
+    let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
         let (offset, nkind, _nested, name, next) = read_named_field(named_desc, cur);
         cur = next;
@@ -631,7 +638,7 @@ unsafe fn struct_size_from_named_desc(named_desc: *const u8) -> usize {
     }
     let field_count = u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)]) as usize;
     let mut max_end: usize = SEALED_HEADER;
-    let mut cur = 4usize;
+    let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
         let (offset, nkind, _nested, _name, next) = read_named_field(named_desc, cur);
         cur = next;
@@ -667,7 +674,7 @@ pub unsafe fn build_heap_desc_from_named_desc(named_desc: *const u8) -> *const u
     ]) as usize;
     // Collect heap fields: (offset, kind) pairs.
     let mut heap_fields: Vec<(u32, u32)> = Vec::new();
-    let mut cur = 4usize;
+    let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
         let (offset, nkind, _nested, _name, next) = read_named_field(named_desc, cur);
         cur = next;
@@ -767,7 +774,7 @@ pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const cra
         *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
     ]) as usize;
     let key_bytes = std::slice::from_raw_parts((*key).data.as_ptr(), (*key).len as usize);
-    let mut cur = 4usize;
+    let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
         let (offset, nkind, nested, name, next) = read_named_field(named_desc, cur);
         cur = next;
@@ -848,16 +855,22 @@ mod named_desc_tests {
     use crate::tagged::{TAG_MAP, TAG_INT32, TAG_STR, TAG_FLOAT64};
 
     /// Build a NamedDesc byte blob matching `Codegen::sealed_named_descriptor`:
-    /// `[u32 count | { u32 offset, u32 nkind, u64 nested_ptr, u16 name_len, name_bytes } * count]`.
+    /// `[u32 count | u32 pad | { u32 offset, u32 nkind, u64 nested_ptr, u16 name_len, name_bytes,
+    ///   pad-to-8 } * count]`. The 8-byte header + per-row pad-to-8 keep every `nested_ptr` 8-aligned
+    /// (macOS ld64 requires it); the runtime walks the blob byte-by-byte, rounding each row up to 8.
     fn build_named_desc(fields: &[(&str, u32, u32, *const u8)]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // header pad → 8-byte header
         for (name, offset, nkind, nested) in fields {
             b.extend_from_slice(&offset.to_le_bytes());
             b.extend_from_slice(&nkind.to_le_bytes());
             b.extend_from_slice(&(*nested as u64).to_le_bytes());
             b.extend_from_slice(&(name.len() as u16).to_le_bytes());
             b.extend_from_slice(name.as_bytes());
+            let row_len = 18 + name.len();
+            let pad_len = (8 - (row_len % 8)) % 8;
+            b.extend(std::iter::repeat(0u8).take(pad_len)); // pad row to a multiple of 8
         }
         b
     }
