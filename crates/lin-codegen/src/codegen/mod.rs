@@ -1639,7 +1639,7 @@ impl<'ctx> Codegen<'ctx> {
                             let _ = ty;
                             temp_map.insert(*dst, obj_ptr.into());
                         }
-                        Instruction::MakeArray { dst, elements, elem_ty, inline, columnar } => {
+                        Instruction::MakeArray { dst, elements, elem_ty, inline, columnar: _ } => {
                             let cap = i64_ty.const_int(elements.len().max(4) as u64, false);
                             // Sealed-record array: three layouts selected by escape analysis.
                             //

@@ -4,7 +4,7 @@ use super::*;
 // Statement lowering
 // -------------------------------------------------------------------------
 
-pub fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
+pub(crate) fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
     match stmt {
         TypedStmt::Val { slot, value, ty, name, span } => {
             // A top-level function val was pre-assigned a FuncId in `global_fn_slots`
