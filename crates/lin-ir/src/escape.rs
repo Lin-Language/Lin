@@ -299,10 +299,20 @@ fn analyze_array_inline_fn(func: &mut LinFunction) {
     // Apply decisions.
     for ((site_bi, site_ii, _, _), safe) in make_array_sites.iter().zip(decisions.iter()) {
         if *safe {
-            if let Instruction::MakeArray { inline, .. } =
+            if let Instruction::MakeArray { inline, columnar, elem_ty, .. } =
                 &mut func.blocks[*site_bi].instructions[*site_ii]
             {
                 *inline = true;
+                // Columnar gate: set columnar=true when ALL fields are flat scalars (no heap
+                // fields). Bool is included (1-byte scalar). Columnar is strictly an
+                // improvement over 0xFE for pure-scalar sealed arrays; it never perturbs
+                // correctness since the release path checks elem_tag at runtime.
+                let all_scalar = if let Type::Object { fields, sealed: true } = elem_ty {
+                    fields.values().all(|f| f.is_flat_scalar() || matches!(f, Type::Bool))
+                } else {
+                    false
+                };
+                *columnar = all_scalar;
             }
         }
     }

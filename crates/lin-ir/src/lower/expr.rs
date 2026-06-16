@@ -807,7 +807,8 @@ pub fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut L
                 dst,
                 elements: lowered,
                 elem_ty,
-                inline: false, // escape.rs sets true for non-escaping sealed elements
+                inline: false,    // escape.rs sets true for non-escaping sealed elements
+                columnar: false,  // escape.rs sets true when inline=true AND all-scalar fields
             });
             // Reclaim the freshly-boxed element shells now that their 16 bytes are copied into the
             // array (the inner payload's ownership stays with the array's copy / the raw value's
