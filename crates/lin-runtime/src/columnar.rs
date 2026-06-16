@@ -24,8 +24,8 @@
 //! # Scope
 //!
 //! This module provides the runtime primitives only. Codegen integration (repr lattice variant,
-//! MakeArray + SealedArrayFieldGet LLVM emission) is the Phase 1 work described in
-//! `docs/design-columnar-arrays.md`.
+//! MakeArray + SealedArrayFieldGet LLVM emission) is Phase 1; the struct-of-arrays rationale and
+//! remaining phases (push-scatter fusion, `@columnar` opt-in) are in `docs/PERFORMANCE.md` §5.7.
 
 use std::alloc::{alloc, dealloc, realloc, Layout};
 
