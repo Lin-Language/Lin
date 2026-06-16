@@ -2135,7 +2135,7 @@ impl Checker {
         &mut self,
         fields: &[ObjectField],
         expected_fields: &IndexMap<String, Type>,
-        _sealed: bool,
+        sealed: bool,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
         let mut typed_fields = Vec::new();
@@ -2198,14 +2198,40 @@ impl Checker {
         // `Type` equality/subtyping ignores the seal flag, so this is representation-only and never
         // changes assignability. A field directed only because of a nested `StrLit`/`Map` (the outer
         // literal itself unsealed) keeps the historical UNSEALED result.
-        // Auto-seal when ALL fields are sealed-eligible, regardless of whether the expected type was
-        // already marked sealed. This handles the common case where a type alias like
-        // `type Cursor = { "node": Ast, "pos": Int32 }` is UNSEALED but has all-sealed fields —
-        // directing an object literal against it should still produce the packed sealed representation.
+        //
+        // Two-gate rule for auto-seal:
+        //   (A) ALL fields pass `is_sealed_field()` — the necessary condition.
+        //   (B) EITHER `sealed=true` was passed by the caller (the expected type was already
+        //       sealed, so the producer/consumer repr is already coordinated) OR at least one
+        //       field is `sum_type_eligible` (a SumNode-pointer field like Cursor.node — the new
+        //       capability this PR adds, not covered by the old packability gate).
+        //
+        // Gate B guards against spurious auto-sealing of types like Journey/Trip/TimetableLeg
+        // (whose fields are Array/String/Int32, all passing gate A) that the CONSUMER reads as
+        // boxed TAG_MAP. If the consumer path was built without `sealed=true` on the expected
+        // type, it never set up packed-struct readers, so a sealed producer would mismatch →
+        // segfault. The SumNode exemption is safe: SumNode-pointer records are always consumed
+        // via the sealed-record path (codegen checks `is_sum_type` and routes to SumNode reads),
+        // so no consumer/producer repr mismatch arises.
         let all_fields_sealed =
             !obj_type.is_empty() && obj_type.values().all(|t| t.is_sealed_field());
-        let ty = if all_fields_sealed {
-            Type::sealed_object(obj_type)
+        let has_sum_field = obj_type.values().any(|t| Type::sum_type_eligible(t));
+        let ty = if all_fields_sealed && (sealed || has_sum_field) {
+            // Use the EXPECTED field order for the sealed struct descriptor, not the literal's
+            // field order. The sealed struct's byte layout is determined by the type's field order,
+            // and the consumer (field reads, function return coerces) uses the declared type's
+            // order. A literal like `{ "departureTime": x, "legs": y }` checked against
+            // `Journey = { "legs": Leg[], "departureTime": Int32 }` must produce a struct with
+            // `legs` at the first slot (matching Journey's declared order), not `departureTime`.
+            // Without this, the producer writes `departureTime` at offset 24 but the consumer
+            // reads `legs` (a pointer) from offset 24 → mis-read → crash.
+            let ordered: IndexMap<String, Type> = expected_fields.keys()
+                .filter_map(|k| obj_type.get(k).map(|v| (k.clone(), v.clone())))
+                .chain(obj_type.iter()
+                    .filter(|(k, _)| !expected_fields.contains_key(k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone())))
+                .collect();
+            Type::sealed_object(ordered)
         } else {
             Type::object(obj_type)
         };
