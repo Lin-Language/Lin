@@ -258,7 +258,7 @@ impl<'ctx> Codegen<'ctx> {
             // box as TAG_MAP if the target is a union/Json wildcard.
             let obj = self.sumnode_materialize_to_object(val, &sum_ty, llvm_fn);
             if Self::is_union_type(to_ty) || matches!(to_ty, Type::TypeVar(_)) {
-                return self.box_value(obj, &Self::sumnode_first_variant_obj_ty(&sum_ty));
+                return self.box_map_of(obj);
             }
             return obj;
         }

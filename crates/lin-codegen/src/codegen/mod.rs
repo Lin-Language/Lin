@@ -955,12 +955,12 @@ impl<'ctx> Codegen<'ctx> {
                                 if let Some(sum_ty) = lrepr.sumnode_sum_ty() {
                                     let sum_ty = sum_ty.clone();
                                     let obj = self.sumnode_materialize_to_object(lv, &sum_ty, llvm_fn);
-                                    lv = self.box_value(obj, &Self::sumnode_first_variant_obj_ty(&sum_ty));
+                                    lv = self.box_map_of(obj);
                                 }
                                 if let Some(sum_ty) = rrepr.sumnode_sum_ty() {
                                     let sum_ty = sum_ty.clone();
                                     let obj = self.sumnode_materialize_to_object(rv, &sum_ty, llvm_fn);
-                                    rv = self.box_value(obj, &Self::sumnode_first_variant_obj_ty(&sum_ty));
+                                    rv = self.box_map_of(obj);
                                 }
                             }
                             let result = self.compile_binary_op_values(lv, rv, op, operand_ty, &rty, ty);

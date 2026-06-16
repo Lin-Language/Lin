@@ -17,32 +17,18 @@ impl<'ctx> Codegen<'ctx> {
         // binary ops), dispatch on the LLVM value type to produce a correct toString.
         if matches!(ty, Type::TypeVar(_)) {
             if val.is_pointer_value() {
-                return self.builder
-                    .build_call(self.rt.tagged_to_string, &[val.into()], "ttos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
+                return self.builder.call(self.rt.tagged_to_string, &[val.into()], "ttos")
+                    .try_as_basic_value().unwrap_basic();
             } else if val.is_int_value() {
-                // Concretized int (e.g. after TypeVar+TypeVar arithmetic) — use int toString.
                 let i64_ty = self.context.i64_type();
-                let i64_val = self.builder
-                    .build_int_s_extend_or_bit_cast(val.into_int_value(), i64_ty, "tv_iext")
-                    .unwrap();
-                return self.builder
-                    .build_call(self.rt.int_to_string, &[i64_val.into()], "tv_itos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
+                let i64_val = self.builder.int_s_extend_or_bit_cast(val.into_int_value(), i64_ty, "tv_iext");
+                return self.builder.call(self.rt.int_to_string, &[i64_val.into()], "tv_itos")
+                    .try_as_basic_value().unwrap_basic();
             } else if val.is_float_value() {
                 let f64_ty = self.context.f64_type();
-                let f64_val = self.builder
-                    .build_float_ext(val.into_float_value(), f64_ty, "tv_fext")
-                    .unwrap();
-                return self.builder
-                    .build_call(self.rt.float_to_string, &[f64_val.into()], "tv_ftos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
+                let f64_val = self.builder.float_ext(val.into_float_value(), f64_ty, "tv_fext");
+                return self.builder.call(self.rt.float_to_string, &[f64_val.into()], "tv_ftos")
+                    .try_as_basic_value().unwrap_basic();
             }
         }
         match ty {
@@ -67,11 +53,8 @@ impl<'ctx> Codegen<'ctx> {
             Type::UInt64 => {
                 let i64_ty = self.context.i64_type();
                 let u64_val = self.builder.int_z_extend_or_bit_cast(val.into_int_value(), i64_ty, "uext");
-                self.builder
-                    .build_call(self.rt.uint_to_string, &[u64_val.into()], "utos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
+                self.builder.call(self.rt.uint_to_string, &[u64_val.into()], "utos")
+                    .try_as_basic_value().unwrap_basic()
             }
             Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64
             | Type::UInt8 | Type::UInt16 | Type::UInt32 => {
@@ -81,40 +64,25 @@ impl<'ctx> Codegen<'ctx> {
                 } else {
                     self.builder.int_z_extend_or_bit_cast(val.into_int_value(), i64_ty, "iext")
                 };
-                self.builder
-                    .build_call(self.rt.int_to_string, &[i64_val.into()], "itos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
+                self.builder.call(self.rt.int_to_string, &[i64_val.into()], "itos")
+                    .try_as_basic_value().unwrap_basic()
             }
             Type::Float32 => {
                 let f64_val = self.builder.float_ext(val.into_float_value(), self.context.f64_type(), "fext");
-                self.builder
-                    .build_call(self.rt.float_to_string, &[f64_val.into()], "ftos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
+                self.builder.call(self.rt.float_to_string, &[f64_val.into()], "ftos")
+                    .try_as_basic_value().unwrap_basic()
             }
             Type::Float64 => {
-                self.builder
-                    .build_call(self.rt.float_to_string, &[val.into()], "ftos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
+                self.builder.call(self.rt.float_to_string, &[val.into()], "ftos")
+                    .try_as_basic_value().unwrap_basic()
             }
             Type::Bool => {
-                self.builder
-                    .build_call(self.rt.bool_to_string, &[val.into()], "btos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
+                self.builder.call(self.rt.bool_to_string, &[val.into()], "btos")
+                    .try_as_basic_value().unwrap_basic()
             }
             Type::Null => {
-                self.builder
-                    .build_call(self.rt.null_to_string, &[], "ntos")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
+                self.builder.call(self.rt.null_to_string, &[], "ntos")
+                    .try_as_basic_value().unwrap_basic()
             }
             Type::Array(_) if Self::sealed_array_elem(ty).is_some() => {
                 // Sealed-record array (Stage 3): materialize to the tagged Object[] view, stringify,
@@ -151,21 +119,14 @@ impl<'ctx> Codegen<'ctx> {
             }
             Type::Object { .. } if Self::sealed_scalar_fields(ty).is_some() => {
                 // Sealed record (TAG_RECORD packed struct): box it first then use lin_tagged_to_string.
-                // lin_object_to_string is retired (Phase 3: sealed records are packed structs, not
-                // LinObjects). Box with lin_box_record (retains → rc+1), call lin_tagged_to_string,
-                // then release the box with lin_tagged_release.
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
-                let box_fn = self.get_or_declare_fn("lin_box_record",
-                    ptr_ty.fn_type(&[ptr_ty.into()], false));
-                let tagged = self.builder.call(box_fn, &[val.into()], "stos_box")
+                let tagged = self.builder.call(self.rt.box_record, &[val.into()], "stos_box")
                     .try_as_basic_value().unwrap_basic();
                 let str_fn = self.get_or_declare_fn("lin_tagged_to_string",
                     ptr_ty.fn_type(&[ptr_ty.into()], false));
                 let s = self.builder.call(str_fn, &[tagged.into()], "stos")
                     .try_as_basic_value().unwrap_basic();
-                let rel_fn = self.get_or_declare_fn("lin_tagged_release",
-                    self.context.void_type().fn_type(&[ptr_ty.into()], false));
-                self.builder.call(rel_fn, &[tagged.into()], "");
+                self.builder.call(self.rt.tagged_release, &[tagged.into()], "");
                 s
             }
             Type::Object { .. } => {
@@ -176,13 +137,9 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(f, &[val.into()], "mtos").try_as_basic_value().unwrap_basic()
             }
             _ => {
-                // For unknown complex types, fall back to runtime tagged dispatch.
                 if val.is_pointer_value() {
-                    self.builder
-                        .build_call(self.rt.tagged_to_string, &[val.into()], "ttos")
-                        .unwrap()
-                        .try_as_basic_value()
-                        .unwrap_basic()
+                    self.builder.call(self.rt.tagged_to_string, &[val.into()], "ttos")
+                        .try_as_basic_value().unwrap_basic()
                 } else {
                     self.compile_string_lit("[object]")
                 }

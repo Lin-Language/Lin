@@ -131,8 +131,7 @@ impl<'ctx> Codegen<'ctx> {
         let i64_ty = self.context.i64_type();
         let result = if ty.is_string_ish() {
             self.builder
-                .build_call(self.rt.string_eq, &[lv.into(), rv.into()], "seq")
-                .unwrap()
+                .call(self.rt.string_eq, &[lv.into(), rv.into()], "seq")
                 .try_as_basic_value()
                 .unwrap_basic()
                 .into_int_value()
@@ -140,8 +139,7 @@ impl<'ctx> Codegen<'ctx> {
             // Structural object equality via runtime (order-independent). Phase 2: open objects
             // are LinMap* (TAG_MAP) so use lin_map_eq.
             let eq_i8 = self.builder
-                .build_call(self.rt.map_eq, &[lv.into(), rv.into()], "meq")
-                .unwrap()
+                .call(self.rt.map_eq, &[lv.into(), rv.into()], "meq")
                 .try_as_basic_value()
                 .unwrap_basic()
                 .into_int_value();
@@ -175,9 +173,7 @@ impl<'ctx> Codegen<'ctx> {
             };
             self.builder.int_truncate(eq_i8, self.context.bool_type(), "aeq_b")
         } else if ty.is_float() {
-            self.builder
-                .build_float_compare(FloatPredicate::OEQ, lv.into_float_value(), rv.into_float_value(), "feq")
-                .unwrap()
+            self.builder.float_compare(FloatPredicate::OEQ, lv.into_float_value(), rv.into_float_value(), "feq")
         } else if lv.is_pointer_value() || rv.is_pointer_value() {
             // Pointer comparison (closures, etc.) — compare addresses.
             let lp = if lv.is_pointer_value() {
@@ -192,9 +188,7 @@ impl<'ctx> Codegen<'ctx> {
             };
             self.builder.int_compare(IntPredicate::EQ, lp, rp, "peq")
         } else {
-            self.builder
-                .build_int_compare(IntPredicate::EQ, lv.into_int_value(), rv.into_int_value(), "ieq")
-                .unwrap()
+            self.builder.int_compare(IntPredicate::EQ, lv.into_int_value(), rv.into_int_value(), "ieq")
         };
 
         if negate {
@@ -220,16 +214,12 @@ impl<'ctx> Codegen<'ctx> {
             let cmp_fn_ty = i32_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
             let cmp_fn = self.get_or_declare_fn("lin_string_cmp", cmp_fn_ty);
             let result = self.builder
-                .build_call(cmp_fn, &[lv.into(), rv.into()], "scmp_result")
-                .unwrap()
+                .call(cmp_fn, &[lv.into(), rv.into()], "scmp_result")
                 .try_as_basic_value()
                 .unwrap_basic()
                 .into_int_value();
             let zero = i32_ty.const_zero();
-            return self.builder
-                .build_int_compare(signed_pred, result, zero, "scmp")
-                .unwrap()
-                .into();
+            return self.builder.int_compare(signed_pred, result, zero, "scmp").into();
         }
 
         let i64_ty = self.context.i64_type();

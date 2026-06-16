@@ -990,7 +990,7 @@ impl<'ctx> Codegen<'ctx> {
                     // a fresh +1 that `map_set` retains, so we release our copy after.
                     let child = self.sumnode_recursive_child_get(node, k, sum_ty);
                     let child_obj = self.builder.call(func, &[child.into()], "sumnode_mat_child").try_as_basic_value().unwrap_basic();
-                    let boxed = self.box_value(child_obj, &Self::sumnode_first_variant_obj_ty(sum_ty));
+                    let boxed = self.box_map_of(child_obj);
                     self.builder.call(self.rt.map_set, &[obj.into(), key_str.into(), boxed.into()], "");
                     if boxed.is_pointer_value() {
                         self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
