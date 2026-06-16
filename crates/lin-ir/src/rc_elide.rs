@@ -53,16 +53,25 @@ use lin_check::types::Type;
 
 use crate::ir::*;
 use crate::liveness::Liveness;
+use crate::ownership_verify::intrinsic_conventions;
 
 
 /// Run the RC elision pass on all functions in a module, mutating in place.
 pub fn elide_rc(module: &mut LinModule) {
+    // Build a stable function-id → convention table before mutating.
+    // We only need the param_conventions (populated by infer_conventions which runs first).
+    let conv_map: HashMap<FuncId, Vec<Convention>> = module
+        .functions
+        .iter()
+        .map(|f| (f.id, f.param_conventions.clone()))
+        .collect();
+
     for func in &mut module.functions {
-        elide_rc_fn(func);
+        elide_rc_fn(func, &conv_map);
     }
 }
 
-fn elide_rc_fn(func: &mut LinFunction) {
+fn elide_rc_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Vec<Convention>>) {
     let liveness = Liveness::compute(func);
     // Post-dominators over the CFG: used to require that a cross-block Release is
     // reached on every path leaving the Retain before we elide the pair.
@@ -105,7 +114,7 @@ fn elide_rc_fn(func: &mut LinFunction) {
                     to_remove.contains(&(block_idx, i))
                 })
             {
-                if path_has_no_interference(*retain_val, retain_idx, release_idx, &instrs)
+                if path_has_no_interference(*retain_val, retain_idx, release_idx, &instrs, conv_map)
                     && release_is_last_use(
                         &liveness,
                         &func.blocks[block_idx],
@@ -138,7 +147,7 @@ fn elide_rc_fn(func: &mut LinFunction) {
             // The tail of the current block (instructions after the Retain) must
             // itself be clean before we leave the block.
             let tail_clean =
-                path_has_no_interference(*retain_val, retain_idx, instrs.len(), &instrs);
+                path_has_no_interference(*retain_val, retain_idx, instrs.len(), &instrs, conv_map);
             if !tail_clean {
                 continue;
             }
@@ -150,6 +159,7 @@ fn elide_rc_fn(func: &mut LinFunction) {
                 &block_index,
                 &to_remove,
                 &postdom,
+                conv_map,
             ) {
                 let release_block_id = func.blocks[release_block_idx].id;
                 let retain_block_id = func.blocks[block_idx].id;
@@ -159,6 +169,7 @@ fn elide_rc_fn(func: &mut LinFunction) {
                     usize::MAX, // sentinel: start from instruction 0
                     release_instr_idx,
                     &func.blocks[release_block_idx].instructions,
+                    conv_map,
                 );
                 // SOUNDNESS: the Release must be reached on EVERY path leaving the
                 // Retain. If the release block only post-dominates the retain block
@@ -273,6 +284,7 @@ fn find_paired_release_cross_block(
     block_index: &HashMap<BlockId, usize>,
     claimed: &HashSet<(usize, usize)>,
     postdom: &PostDom,
+    conv_map: &HashMap<FuncId, Vec<Convention>>,
 ) -> Option<(usize, usize)> {
     let origin_id = func.blocks[origin_block_idx].id;
 
@@ -305,7 +317,7 @@ fn find_paired_release_cross_block(
 
         // If the block is tainted (interference or temp redefined) we cannot
         // skip over it; stop the walk.
-        if !block_is_clean_for(temp, block) || !block_temp_survives(temp, block) {
+        if !block_is_clean_for(temp, block, conv_map) || !block_temp_survives(temp, block) {
             break;
         }
 
@@ -339,9 +351,13 @@ fn find_release_at_block_start(
 
 /// Returns true if `block` contains no call, allocation, or Release of `temp`
 /// (i.e., the block is safe to traverse for cross-block elision).
-fn block_is_clean_for(temp: Temp, block: &BasicBlock) -> bool {
+fn block_is_clean_for(
+    temp: Temp,
+    block: &BasicBlock,
+    conv_map: &HashMap<FuncId, Vec<Convention>>,
+) -> bool {
     for instr in &block.instructions {
-        if instr_is_interference(temp, instr) {
+        if instr_is_interference(temp, instr, conv_map) {
             return false;
         }
     }
@@ -357,10 +373,54 @@ fn block_is_clean_for(temp: Temp, block: &BasicBlock) -> bool {
 ///     its own reference later. A retain balancing such an escape is load-bearing; eliding
 ///     it causes a use-after-free when the second owner releases. The escape checks are
 ///     value-agnostic (any escape on the path taints it) to stay conservative.
-fn instr_is_interference(temp: Temp, instr: &Instruction) -> bool {
+///
+/// Convention-aware exceptions: a `CallIntrinsic` or `Call { Direct(..) }` is NOT
+/// interference for `temp` when every position where `temp` appears in the argument
+/// list has a verified `Borrow` convention — meaning the callee does not retain,
+/// store, or consume that argument, so it cannot create an independent owner.
+/// `Named` and `Indirect` calls remain interference (we cannot know their conventions
+/// at this call site).
+fn instr_is_interference(
+    temp: Temp,
+    instr: &Instruction,
+    conv_map: &HashMap<FuncId, Vec<Convention>>,
+) -> bool {
     match instr {
-        Instruction::Call { .. }
-        | Instruction::CallIntrinsic { .. }
+        // CallIntrinsic: use the hand-audited intrinsic convention table. If temp
+        // only appears at Borrow positions, this call doesn't create a new owner.
+        Instruction::CallIntrinsic { intrinsic, args, .. } => {
+            if let Some(ic) = intrinsic_conventions(intrinsic) {
+                // For each position where temp appears, check the convention.
+                // If ALL such positions are Borrow, no interference.
+                let all_borrow = args.iter().enumerate().all(|(i, &a)| {
+                    if a != temp {
+                        return true; // irrelevant arg — not interference for THIS temp
+                    }
+                    ic.params.get(i).copied().unwrap_or(Convention::Own) == Convention::Borrow
+                });
+                if all_borrow {
+                    return false;
+                }
+            }
+            true
+        }
+        // Direct call to a known function: use the inferred convention table.
+        // Named/Indirect calls remain interference (unknown conventions).
+        Instruction::Call { callee: CallTarget::Direct(fid), args, .. } => {
+            if let Some(convs) = conv_map.get(fid) {
+                let all_borrow = args.iter().enumerate().all(|(i, &a)| {
+                    if a != temp {
+                        return true;
+                    }
+                    convs.get(i).copied().unwrap_or(Convention::Own) == Convention::Borrow
+                });
+                if all_borrow {
+                    return false;
+                }
+            }
+            true
+        }
+        Instruction::Call { callee: CallTarget::Named(_) | CallTarget::Indirect(_), .. }
         | Instruction::MakeObject { .. }
         | Instruction::MakeArray { .. }
         | Instruction::MakeClosure { .. }
@@ -561,11 +621,12 @@ fn path_has_no_interference(
     start_exclusive: usize,
     end_exclusive: usize,
     instrs: &[Instruction],
+    conv_map: &HashMap<FuncId, Vec<Convention>>,
 ) -> bool {
     let start = if start_exclusive == usize::MAX { 0 } else { start_exclusive + 1 };
     let end = end_exclusive.min(instrs.len());
     for i in start..end {
-        if instr_is_interference(temp, &instrs[i]) {
+        if instr_is_interference(temp, &instrs[i], conv_map) {
             return false;
         }
     }

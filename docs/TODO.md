@@ -353,9 +353,11 @@ type_tag_open delete, box_map_of, BuilderExt::select, RuntimeFns fields). Master
 
 ### IN FLIGHT / RESOLVED — parallel lanes launched 2026-06-16 (file-disjoint worktrees, Bedrock sonnet)
 Conductor (me) runs the heavy RAPTOR digest+RSS at integration; agents run light gates only.
-- [~] **Lane V — value-unbox (#16) → PARKED (sound, NO RAPTOR win).** In-house, branch `lane/map-value-unbox`
-  commit `bdc00134`. Variable-stride slots (24B homogeneous / 32B MIXED), ABI preserved via per-thread scratch
-  ring. Gates GREEN: 123 runtime + 820 integ + 73 stdlib + **RAPTOR digest EXACT**. But peak RSS unchanged.
+- [x] **Lane V — value-unbox (#16) → MERGED to master `a63e9603`.** Variable-stride slots (24B homogeneous /
+  32B MIXED), ABI preserved via per-thread scratch ring; record-materializers birth maps MIXED
+  (`lin_map_alloc_mixed`) to kill the conversion churn (240M→24.6M, ~0.7% residual). Sound + effectively
+  NEUTRAL today (RAPTOR digest EXACT, RSS 24278≈24291, ASan A/B identical to master, 123+820+73 green) — and
+  becomes a real win once the RAPTOR port stops materializing records to maps. In-house earlier commit `bdc00134`.
   **MEASURED ROOT CAUSE (LIN_VKIND_STATS): 99.99% of maps go MIXED** — first-insert tag is TAG_STR (204.8M) /
   TAG_INT32 (35.1M) then a different tag → the 51.5M dominant maps are **materialized RECORDS** (StopTime/Trip
   `{stopId:String, arrivalTime:Int64,…}`), NOT `{String:T}` index maps. Heterogeneous ⇒ value-unbox can't
@@ -377,11 +379,24 @@ Conductor (me) runs the heavy RAPTOR digest+RSS at integration; agents run light
 > move ~0% on the headline workloads — both bottlenecks are ALLOCATION/MATERIALIZATION, not repr or RC traffic.
 > RAPTOR = record→map materialization (lane F 0xFE / packed records); interp = per-AST-node alloc churn (Option D
 > stack-alloc). The real wins require attacking alloc/materialization directly.
-- [x] **Lane S — SMI dates (#12) → MERGED to master `7140c05b`.** Pointer-tagged immediate small ints behind
-  cargo feature `smi` (default OFF → master byte-identical: workspace 820/0 + 73/73 + fmt all green feature-off;
-  feature-on compiles). Cherry-picked off the stale experiment branch onto master (fixed a duplicate-`[features]`
-  collision with mimalloc). INCOMPLETE SLICE — the flag stages it: ~180 consumer sites must guard the tag bit
-  before it can flip default-ON. Foundation for Linus's dates-as-ints feature.
+
+- [~] **Interp LEAK investigation — agent on `investigate/interp-leak` (/tmp/wt-leak).** The interp benchmark
+  leaks **33,960,676 bytes / 1,490,048 allocs PER RUN** under LeakSanitizer — PRE-EXISTING on master (surfaced
+  by the Option C ASan A/B, which was byte-identical, so NOT caused by any recent change). Likely an RC
+  imbalance or a reference CYCLE (ADR-024 — RC can't collect cycles) in the interp's Token/Cursor/AST graph,
+  or benign program-lifetime data held at exit. Agent: confirm real-vs-residual (scale REPS), find the dominant
+  leaking alloc site (ASan stacks), root-cause (cycle / missing-release / lifetime), and fix if low-risk.
+  If a real leak, this is also part of WHY interp is alloc-bound (it never reclaims per-iteration garbage).
+- [~] **SMI dates (#12) → INFRASTRUCTURE merged `7140c05b` but INERT; being ENABLED FOR REAL on `feat/enable-smi`.**
+  CRITICAL FINDING (2026-06-16): the `smi` feature is a NO-OP — `lin_box_int32/int64` (tagged.rs:349,363) never
+  emit immediates; they still heap-box ("for now, always use heap boxes... consumer guards are the remaining
+  work"). So feature-ON passed all gates because SMI does NOTHING (verifying inert code). The encode/decode
+  helpers + MANY tagged.rs guards (eq/arith/unbox/retain/release) exist, but the BOX is never flipped and the
+  CONTAINER-STORE boundary (lin_map_set val-param, lin_array_push_tagged) is unguarded. Linus chose COMPLETE+ENABLE:
+  agent flips the box to smi_encode + completes the store-boundary/retain-release guards, with hard gates that
+  prove SMI actually FIRES (LIN_SMI_STATS int_boxes>0) + ASan-clean with SMI LIVE + 820/73 + RAPTOR digest.
+  Conductor removes the toggle ONLY after this is proven sound. Data-flow model: SMI immediates are transient
+  opaque boxes; container-store converts them to real 16B TaggedVals so freeze/transfer/downstream stay safe.
 - [x] **Lane F — 0xFE phase-2 (#9) → MERGED to master `c2f77121` (sound; no RAPTOR win today, keepable win for
   local read-only record arrays + foundation for build-then-store ports).** Conductor-verified comprehensively:
   gate audited (strict allowlist, fails-safe — only Index/FieldGet/SealedArrayFieldGet/Retain/Release promote

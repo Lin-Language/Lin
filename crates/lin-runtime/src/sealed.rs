@@ -388,7 +388,9 @@ unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *cons
         return crate::map::lin_map_alloc(0, crate::map::KEY_KIND_STRING);
     }
     let field_count = u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)]) as usize;
-    let map = crate::map::lin_map_alloc(field_count as u32, crate::map::KEY_KIND_STRING);
+    // A record's fields are heterogeneously typed → the map is MIXED. Birth it MIXED to skip the
+    // optimistic-narrow-then-realloc churn (one realloc per materialized record at ~240M/RAPTOR-run).
+    let map = crate::map::lin_map_alloc_mixed(field_count as u32, crate::map::KEY_KIND_STRING);
     let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
         let (offset, nkind, nested, name, next) = read_named_field(named_desc, cur);
