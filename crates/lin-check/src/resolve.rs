@@ -154,12 +154,12 @@ fn resolve_type_inner(
             };
             let val_ty = resolve_type_inner(value, env, visiting)?;
             if key_ty == Type::Str {
-                Ok(Type::Map { key: Box::new(Type::Str), value: Box::new(val_ty) })
+                Ok(Type::Map { key: Box::new(Type::Str), value: Box::new(val_ty), name: None })
             } else if key_ty.is_integer() {
                 // Integer-keyed map: `{ Int: T }`, `{ Int32: T }`, etc.
                 // Normalise to Int64 as the canonical key type (all integer values are stored as i64
                 // in the runtime Int-map slots).
-                Ok(Type::Map { key: Box::new(key_ty), value: Box::new(val_ty) })
+                Ok(Type::Map { key: Box::new(key_ty), value: Box::new(val_ty), name: None })
             } else if let Some(int_keys) = closed_int_literal_set(&key_ty) {
                 // A closed union of integer literals (e.g. `0 | 1 | 2 | 3 | 4 | 5 | 6`): expand to
                 // a fixed record keyed by the integer string representations, mirroring the
@@ -369,7 +369,10 @@ fn expand_named_body(
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(expand_named_body(inner, env, visiting)?))),
         Type::Stream(inner) => Ok(Type::Stream(Box::new(expand_named_body(inner, env, visiting)?))),
         Type::Promise(inner) => Ok(Type::Promise(Box::new(expand_named_body(inner, env, visiting)?))),
-        Type::Map { key, value } => Ok(Type::Map { key: Box::new(expand_named_body(key, env, visiting)?), value: Box::new(expand_named_body(value, env, visiting)?) }),
+        // Preserve any DISPLAY-ONLY alias name already attached to a nested map (e.g. `Arrivals`
+        // appearing as the value type of `type ByChanges = { UInt8: Arrivals }`): unfolding the
+        // OUTER alias must not erase the INNER alias's name, or it reverts to the expanded form.
+        Type::Map { key, value, name } => Ok(Type::Map { key: Box::new(expand_named_body(key, env, visiting)?), value: Box::new(expand_named_body(value, env, visiting)?), name: name.clone() }),
         other => Ok(other.clone()),
     }
 }
@@ -479,7 +482,7 @@ fn substitute(
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(substitute(inner, params, args, env, visiting)?))),
         Type::Stream(inner) => Ok(Type::Stream(Box::new(substitute(inner, params, args, env, visiting)?))),
         Type::Promise(inner) => Ok(Type::Promise(Box::new(substitute(inner, params, args, env, visiting)?))),
-        Type::Map { key, value } => Ok(Type::Map { key: Box::new(substitute(key, params, args, env, visiting)?), value: Box::new(substitute(value, params, args, env, visiting)?) }),
+        Type::Map { key, value, name } => Ok(Type::Map { key: Box::new(substitute(key, params, args, env, visiting)?), value: Box::new(substitute(value, params, args, env, visiting)?), name: name.clone() }),
         _ => Ok(ty.clone()),
     }
 }

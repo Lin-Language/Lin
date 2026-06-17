@@ -58,7 +58,7 @@ fn mentions_generic_tv(ty: &Type) -> bool {
     match ty {
         Type::TypeVar(id) => *id >= GENERIC_TV_BASE && *id != u32::MAX,
         Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Promise(t) => mentions_generic_tv(t),
-        Type::Map { key, value } => mentions_generic_tv(key) || mentions_generic_tv(value),
+        Type::Map { key, value, .. } => mentions_generic_tv(key) || mentions_generic_tv(value),
         Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(mentions_generic_tv),
         Type::Object { fields, .. } => fields.values().any(mentions_generic_tv),
         Type::Function { params, ret, .. } => {
@@ -194,7 +194,7 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
         Type::Shared(t) => Type::Shared(Box::new(subst_type(t, subs))),
         Type::Stream(t) => Type::Stream(Box::new(subst_type(t, subs))),
         Type::Promise(t) => Type::Promise(Box::new(subst_type(t, subs))),
-        Type::Map { key, value } => Type::Map { key: Box::new(subst_type(key, subs)), value: Box::new(subst_type(value, subs)) },
+        Type::Map { key, value, .. } => Type::Map { key: Box::new(subst_type(key, subs)), value: Box::new(subst_type(value, subs)), name: None },
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| subst_type(t, subs)).collect()),
         Type::Union(ts) => {
             // Substituting a union's members can produce DUPLICATES or collapse to a single type.
@@ -280,7 +280,7 @@ fn erase_nonconcrete_typevars(ty: &Type) -> Type {
         Type::Shared(t) => Type::Shared(Box::new(erase_nonconcrete_typevars(t))),
         Type::Stream(t) => Type::Stream(Box::new(erase_nonconcrete_typevars(t))),
         Type::Promise(t) => Type::Promise(Box::new(erase_nonconcrete_typevars(t))),
-        Type::Map { key, value } => Type::Map { key: Box::new(erase_nonconcrete_typevars(key)), value: Box::new(erase_nonconcrete_typevars(value)) },
+        Type::Map { key, value, .. } => Type::Map { key: Box::new(erase_nonconcrete_typevars(key)), value: Box::new(erase_nonconcrete_typevars(value)), name: None },
         Type::FixedArray(ts) => {
             Type::FixedArray(ts.iter().map(erase_nonconcrete_typevars).collect())
         }
@@ -345,7 +345,7 @@ fn collect_subs(pattern: &Type, actual: &Type, subs: &mut HashMap<u32, Type>) {
         // An index-signature map param `{ String: T }` unified against a concrete `{ String: A }`
         // value (or the `Json` wildcard): recover the element TypeVar from the value type, exactly
         // like the `Array`/`Iterator` element cases above.
-        (Type::Map { key: pk, value: pv }, Type::Map { key: ak, value: av }) => {
+        (Type::Map { key: pk, value: pv, .. }, Type::Map { key: ak, value: av, .. }) => {
             collect_subs(pk, ak, subs);
             collect_subs(pv, av, subs);
         }
@@ -594,7 +594,7 @@ fn subst_anon_type(ty: &Type, anon_subs: &HashMap<String, Type>) -> Type {
         Type::Shared(t) => Type::Shared(Box::new(subst_anon_type(t, anon_subs))),
         Type::Stream(t) => Type::Stream(Box::new(subst_anon_type(t, anon_subs))),
         Type::Promise(t) => Type::Promise(Box::new(subst_anon_type(t, anon_subs))),
-        Type::Map { key, value } => Type::Map { key: Box::new(subst_anon_type(key, anon_subs)), value: Box::new(subst_anon_type(value, anon_subs)) },
+        Type::Map { key, value, .. } => Type::Map { key: Box::new(subst_anon_type(key, anon_subs)), value: Box::new(subst_anon_type(value, anon_subs)), name: None },
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| subst_anon_type(t, anon_subs)).collect()),
         Type::Union(ts) => Type::Union(ts.iter().map(|t| subst_anon_type(t, anon_subs)).collect()),
         Type::Object { fields, sealed, .. } => Type::Object {

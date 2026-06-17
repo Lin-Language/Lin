@@ -288,7 +288,7 @@ pub fn is_compatible_env(
         // either direction (a value is one or the other; ADR-055). A non-`Map` value can only
         // flow into a `Map` target via the TypeVar/Json arms above (and `Json -> Map` is gated as a
         // structured decode in user code).
-        (Type::Map { key: k1, value: v1 }, Type::Map { key: k2, value: v2 }) => k1 == k2 && is_compatible_env(v1, v2, env, lenient_json, depth),
+        (Type::Map { key: k1, value: v1, .. }, Type::Map { key: k2, value: v2, .. }) => k1 == k2 && is_compatible_env(v1, v2, env, lenient_json, depth),
 
         _ => false,
     }
@@ -487,8 +487,8 @@ fn explain_walk(
 
         // Both Map: check key, then value.
         (
-            Type::Map { key: k1, value: v1 },
-            Type::Map { key: k2, value: v2 },
+            Type::Map { key: k1, value: v1, .. },
+            Type::Map { key: k2, value: v2, .. },
         ) => {
             if k1 != k2 {
                 out.push(format!("the key type `{k1}` doesn't match `{k2}`"));
@@ -594,7 +594,7 @@ mod tests {
     }
 
     fn map_type(key: Type, value: Type) -> Type {
-        Type::Map { key: Box::new(key), value: Box::new(value) }
+        Type::Map { key: Box::new(key), value: Box::new(value), name: None }
     }
 
     fn union(vs: Vec<Type>) -> Type {

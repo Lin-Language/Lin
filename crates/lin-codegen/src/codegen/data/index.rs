@@ -181,7 +181,7 @@ impl<'ctx> Codegen<'ctx> {
         // The key is a String (raw LinString*, or unbox a Json/union-boxed key); the result is
         // `T | Null` — `lin_map_get` returns null for a missing key, which `unbox_tagged_val_to_type`
         // maps to the language Null.
-        if let Type::Map { key: map_key_ty, value: map_elem } = obj_ty {
+        if let Type::Map { key: map_key_ty, value: map_elem, .. } = obj_ty {
             let _ = map_elem;
             // Int-keyed map: coerce the key to i64 and call lin_map_get_int.
             if map_key_ty.is_int_map_key() {
@@ -699,7 +699,7 @@ impl<'ctx> Codegen<'ctx> {
             // Typed index-signature map `{ K: V }` (ADR-055 + numeric-key): O(1) hashed insert/overwrite.
             // Pass the map's value type `V` so a flat-scalar `V` is stored UNBOXED (inline in the
             // slot's TaggedVal, no heap box) and a narrower source value is widened to `V`.
-            Type::Map { key: map_key_ty, value: elem } => {
+            Type::Map { key: map_key_ty, value: elem, .. } => {
                 if map_key_ty.is_int_map_key() {
                     // Int-keyed map: coerce key to i64 and call lin_map_set_int.
                     let i64_key = self.index_value_to_i64(key);
@@ -819,7 +819,7 @@ impl<'ctx> Codegen<'ctx> {
                         let i64_key = self.index_value_to_i64(key);
                         let elem_ty = match obj_ty {
                             Type::Union(vs) => vs.iter().find_map(|v| match v {
-                                Type::Map { key: k, value: e } if k.is_integer() => Some(e.as_ref().clone()),
+                                Type::Map { key: k, value: e, .. } if k.is_integer() => Some(e.as_ref().clone()),
                                 _ => None,
                             }).unwrap_or(Type::TypeVar(u32::MAX)),
                             Type::Map { value: e, .. } => (**e).clone(),

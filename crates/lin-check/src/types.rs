@@ -121,7 +121,19 @@ pub enum Type {
     /// `Object` record. Backed at runtime by the hashed `LinMap` container (O(1) average lookup),
     /// NOT the assoc-list `LinObject`. `obj[k]` yields `V | Null`; `obj[k] = v` requires `v : V`.
     /// `key` is the key type: `Type::Str` for String-keyed maps, `Type::Int64` for Int-keyed maps.
-    Map { key: Box<Type>, value: Box<Type> },
+    ///
+    /// `name` is a DISPLAY-ONLY inert alias name, mirroring `Object::name`. `Some(n)` iff this map
+    /// resolved from a NON-GENERIC named index-signature decl `type n = { K: V }` (set in
+    /// resolve.rs). Invisible to `PartialEq` (manual impl below ignores it), to `compat.rs`, and to
+    /// the monomorphization key (erased by `erase_lambda_sets`). Renders as the bare name in
+    /// `Display`. `#[serde(default)]` so old caches decode as `None`.
+    Map {
+        key: Box<Type>,
+        value: Box<Type>,
+        /// DISPLAY-ONLY inert alias name. See variant docs above.
+        #[serde(default)]
+        name: Option<String>,
+    },
     Union(Vec<Type>),
     Function {
         params: Vec<Type>,
@@ -207,7 +219,8 @@ impl PartialEq for Type {
             (FixedArray(a), FixedArray(b)) => a == b,
             // Ignore `sealed`: structural identity is the field map only.
             (Object { fields: a, .. }, Object { fields: b, .. }) => a == b,
-            (Map { key: k1, value: v1 }, Map { key: k2, value: v2 }) => k1 == k2 && v1 == v2,
+            // Ignore `name`: structural identity is the key/value types only (mirrors `sealed`).
+            (Map { key: k1, value: v1, .. }, Map { key: k2, value: v2, .. }) => k1 == k2 && v1 == v2,
             (Union(a), Union(b)) => a == b,
             // Ignore `lset`: the lambda-set metadata rides along structurally but is invisible to
             // `==` (mirrors the `sealed` flag above). Two function types with identical
@@ -248,6 +261,7 @@ impl Type {
     pub fn with_type_name(self, name: &str) -> Type {
         match self {
             Type::Object { fields, sealed, .. } => Type::Object { fields, sealed, name: Some(name.to_string()) },
+            Type::Map { key, value, .. } => Type::Map { key, value, name: Some(name.to_string()) },
             other => other,
         }
     }
@@ -271,7 +285,7 @@ impl Type {
             Type::Stream(t) => Type::Stream(Box::new(t.erase_lambda_sets())),
             Type::Shared(t) => Type::Shared(Box::new(t.erase_lambda_sets())),
             Type::Promise(t) => Type::Promise(Box::new(t.erase_lambda_sets())),
-            Type::Map { key, value } => Type::Map { key: Box::new(key.erase_lambda_sets()), value: Box::new(value.erase_lambda_sets()) },
+            Type::Map { key, value, .. } => Type::Map { key: Box::new(key.erase_lambda_sets()), value: Box::new(value.erase_lambda_sets()), name: None },
             Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| t.erase_lambda_sets()).collect()),
             Type::Union(ts) => Type::Union(ts.iter().map(|t| t.erase_lambda_sets()).collect()),
             Type::Object { fields, sealed, .. } => Type::Object {
@@ -435,7 +449,7 @@ impl Type {
             Type::FixedArray(elems) => elems.iter().any(|t| t.contains_type_var()),
             Type::Union(variants) => variants.iter().any(|t| t.contains_type_var()),
             Type::Object { fields, .. } => fields.values().any(|t| t.contains_type_var()),
-            Type::Map { key, value } => key.contains_type_var() || value.contains_type_var(),
+            Type::Map { key, value, .. } => key.contains_type_var() || value.contains_type_var(),
             Type::Function { params, ret, .. } => {
                 params.iter().any(|t| t.contains_type_var()) || ret.contains_type_var()
             }
@@ -752,7 +766,12 @@ impl fmt::Display for Type {
                 }
                 write!(f, ") => {}", ret)
             }
-            Type::Map { key, value } => write!(f, "{{ {}: {} }}", key, value),
+            Type::Map { key, value, name, .. } => {
+                if let Some(n) = name {
+                    return write!(f, "{}", n);
+                }
+                write!(f, "{{ {}: {} }}", key, value)
+            }
             Type::Iterator(inner) => write!(f, "Iterator<{}>", inner),
             Type::Shared(inner) => write!(f, "Shared<{}>", inner),
             Type::Stream(inner) => write!(f, "Stream<{}>", inner),

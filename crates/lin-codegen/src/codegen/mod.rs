@@ -1412,7 +1412,7 @@ impl<'ctx> Codegen<'ctx> {
                             // constant (encoded as the decimal string representation in the IR field
                             // name, parsed back here). The checker only produces a `Type::Map`
                             // MakeObject for spread-free literals (incl. the common empty `{}`).
-                            if let Type::Map { key: map_key_ty, value: elem_ty } = ty {
+                            if let Type::Map { key: map_key_ty, value: elem_ty, .. } = ty {
                                 let cap = i32_ty.const_int(fields.len().max(1) as u64, false);
                                 let key_kind_val = i32_ty.const_int(if map_key_ty.is_int_map_key() { 1 } else { 0 }, false);
                                 let map_ptr = self.builder
@@ -2448,7 +2448,7 @@ fn type_mentions_typevar(ty: &Type) -> bool {
         Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Promise(t) => {
             type_mentions_typevar(t)
         }
-        Type::Map { key, value } => type_mentions_typevar(key) || type_mentions_typevar(value),
+        Type::Map { key, value, .. } => type_mentions_typevar(key) || type_mentions_typevar(value),
         Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(type_mentions_typevar),
         Type::Function { params, ret, .. } => {
             params.iter().any(type_mentions_typevar) || type_mentions_typevar(ret)

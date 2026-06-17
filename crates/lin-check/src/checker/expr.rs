@@ -715,7 +715,7 @@ impl Checker {
             // yields `V | Null` (the missing-key → Null safe-bracket rule, §6.1). No per-key field
             // tracking — the key set is dynamic by construction. The key type must be compatible with
             // the map's declared key type.
-            Type::Map { key: map_key_ty, value: val_ty } => {
+            Type::Map { key: map_key_ty, value: val_ty, .. } => {
                 let key_ty = typed_key.ty();
                 let key_ok = if map_key_ty.is_integer() {
                     key_ty.is_integer() || matches!(key_ty, Type::TypeVar(_))
@@ -1049,7 +1049,7 @@ impl Checker {
                     self.object_index_nonliteral(fields, &typed_key.ty())
                 }
             }
-            Type::Map { key: map_key_ty, value: val_ty } => {
+            Type::Map { key: map_key_ty, value: val_ty, .. } => {
                 // Map key must match the map's key type (mirrors `infer_index` / the index-assign guard).
                 let key_ty = typed_key.ty();
                 let key_ok = if map_key_ty.is_integer() {
@@ -1923,7 +1923,7 @@ impl Checker {
         Ok(TypedExpr::MakeObject {
             fields: typed_fields,
             spreads: Vec::new(),
-            ty: Type::Map { key: Box::new(key_ty), value: Box::new(value_ty) },
+            ty: Type::Map { key: Box::new(key_ty), value: Box::new(value_ty), name: None },
             span,
         })
     }
@@ -2043,7 +2043,7 @@ impl Checker {
             // typed `Map{K,V}` and lowered into a `LinMap`. The empty `{}` literal is the common
             // case (`var m: { String: T } = {}`), which produces an empty hashed map of the right
             // type — this is how `{}` infers a map from its assignment-target / return-type context.
-            Type::Map { key: map_key_ty, value: val_ty } => {
+            Type::Map { key: map_key_ty, value: val_ty, .. } => {
                 let mut typed_fields = Vec::new();
                 if map_key_ty.is_integer() {
                     // Integer-keyed map: each key must be an integer literal.
@@ -2074,7 +2074,7 @@ impl Checker {
                 Ok(Some(TypedExpr::MakeObject {
                     fields: typed_fields,
                     spreads: Vec::new(),
-                    ty: Type::Map { key: map_key_ty.clone(), value: val_ty.clone() },
+                    ty: Type::Map { key: map_key_ty.clone(), value: val_ty.clone(), name: None },
                     span,
                 }))
             }
@@ -2343,7 +2343,7 @@ impl Checker {
             }
             // Typed index-signature map `{ K: V }` (ADR-055 + numeric-key extension): the key must
             // be compatible with `K` and the value must be `V`.
-            Type::Map { key: map_key_ty, value: val_ty } => {
+            Type::Map { key: map_key_ty, value: val_ty, .. } => {
                 let key_ty = typed_key.ty();
                 let key_ok = if map_key_ty.is_integer() {
                     key_ty.is_integer() || matches!(key_ty, Type::TypeVar(_))
@@ -2590,7 +2590,7 @@ pub(crate) fn erase_generic_type_vars(ty: &Type) -> Type {
         Type::Shared(t) => Type::Shared(Box::new(erase_generic_type_vars(t))),
         Type::Stream(t) => Type::Stream(Box::new(erase_generic_type_vars(t))),
         Type::Promise(t) => Type::Promise(Box::new(erase_generic_type_vars(t))),
-        Type::Map { key, value } => Type::Map { key: Box::new(erase_generic_type_vars(key)), value: Box::new(erase_generic_type_vars(value)) },
+        Type::Map { key, value, .. } => Type::Map { key: Box::new(erase_generic_type_vars(key)), value: Box::new(erase_generic_type_vars(value)), name: None },
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(erase_generic_type_vars).collect()),
         Type::Union(ts) => Type::Union(ts.iter().map(erase_generic_type_vars).collect()),
         Type::Object { fields, sealed, name } => Type::Object {
@@ -2614,7 +2614,7 @@ pub(crate) fn type_mentions_generic_tv(ty: &Type) -> bool {
     match ty {
         Type::TypeVar(id) => *id != u32::MAX,
         Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) | Type::Stream(inner) | Type::Promise(inner) => type_mentions_generic_tv(inner),
-        Type::Map { key, value } => type_mentions_generic_tv(key) || type_mentions_generic_tv(value),
+        Type::Map { key, value, .. } => type_mentions_generic_tv(key) || type_mentions_generic_tv(value),
         Type::FixedArray(elems) => elems.iter().any(type_mentions_generic_tv),
         Type::Union(variants) => variants.iter().any(type_mentions_generic_tv),
         Type::Object { fields, .. } => fields.values().any(type_mentions_generic_tv),

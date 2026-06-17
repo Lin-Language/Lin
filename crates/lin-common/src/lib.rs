@@ -146,8 +146,15 @@ impl Diagnostic {
         let start = self.span.start as usize;
         let end = (self.span.end as usize).max(start + 1);
 
+        // ariadne prints the report message in TWO places: the header (`Error: <msg>`) and the
+        // primary label under the span. For a multi-line message — e.g. a type-mismatch with an
+        // appended `↳` drill-down breakdown — repeating the whole block in both spots is noise.
+        // Show only the first line (the summary) in the header; the label carries the full message
+        // (summary + breakdown) once, under the offending span.
+        let header_msg = self.message.split('\n').next().unwrap_or(&self.message);
+
         let mut report = Report::build(kind, (file_name, start..end))
-            .with_message(&self.message)
+            .with_message(header_msg)
             .with_label(
                 Label::new((file_name, start..end))
                     .with_message(&self.message)
