@@ -766,6 +766,37 @@ val r = outer(10)
     assert!(ok, "mutual local recursion with union returns should type-check:\n{}", out);
 }
 
+// ADR-082 follow-up: a self-tail-recursive function with a UNION return that passes a FRESHLY-
+// CREATED record as a NullableRecord accumulator arg. The fresh `{ "x": n }` literal is typed
+// UNSEALED by the checker; the param slot's repr is NullableRecord (a raw packed-struct pointer).
+// Before the fix the unresolved-`Named` union param (`T | Null` on a TOP-LEVEL directly-called fn)
+// caused the Coerce to box the object as TAG_MAP, while the slot's RC release used `lin_sealed_release`
+// — a representation mismatch that freed the box once too often: garbage at shallow depth (`got 33`)
+// and a SEGFAULT deep. Assert the exact FIELD VALUE (not just `is T`, which a corrupt box can still
+// satisfy) AND survival of a deep TCO run (no stack overflow / no UAF / no per-iteration leak).
+#[test]
+fn test_tco_fresh_record_nullable_union_arg_value_and_deep() {
+    // Shallow: the last accumulator built is `{ "x": 1 }` at n == 1 — the field must read back as 1.
+    let shallow = run(r#"import { print } from "std/io"
+type T = { "x": Int32 }
+val go = (n: Int32, acc: T | Null): T | Null =>
+  if n <= 0 then acc else go(n - 1, { "x": n })
+val r = go(10, null)
+print(if r == null then "null" else "got ${ r["x"] }")
+"#);
+    assert_eq!(shallow, vec!["got 1"]);
+
+    // Deep: 3,000,000 iterations must TCO (no stack overflow) and still produce the right value.
+    let deep = run(r#"import { print } from "std/io"
+type T = { "x": Int32 }
+val go = (n: Int32, acc: T | Null): T | Null =>
+  if n <= 0 then acc else go(n - 1, { "x": n })
+val r = go(3000000, null)
+print(if r == null then "null" else "got ${ r["x"] }")
+"#);
+    assert_eq!(deep, vec!["got 1"]);
+}
+
 #[test]
 fn test_for_and_range() {
     let output = run(r#"import { print } from "std/io"
