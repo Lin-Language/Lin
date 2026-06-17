@@ -8,7 +8,7 @@ use super::*;
 /// already Bool (e.g. a call to an untyped `f: Function` predicate, which returns a boxed
 /// Json) is coerced — codegen lowers a Json→Bool Coerce via lin_unbox_bool. Without this,
 /// codegen's CondJump sees a non-i1 value and defaults the branch to `false`.
-pub fn lower_cond_as_bool(cond: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_cond_as_bool(cond: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let t = lower_expr(cond, builder, ctx);
     let cond_ty = cond.ty();
     if matches!(cond_ty, Type::Bool) {
@@ -22,7 +22,7 @@ pub fn lower_cond_as_bool(cond: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut
     }
 }
 
-pub fn lower_if(
+pub(crate) fn lower_if(
     cond: &TypedExpr,
     then_br: &TypedExpr,
     else_br: &TypedExpr,
@@ -177,7 +177,7 @@ pub fn lower_if(
 /// rebound (slot → branch-local temp). `*_pred` is the actual predecessor block at the end of the
 /// branch (it may differ from the branch entry if the branch had nested control flow), or None if
 /// that branch diverged (no edge into the merge — its slot values are unreachable there).
-pub fn merge_var_slots(
+pub(crate) fn merge_var_slots(
     builder: &mut FuncBuilder,
     pre_slots: &[(usize, Temp, Type)],
     then_reassigned: &[(usize, Temp)],
@@ -249,7 +249,7 @@ pub fn merge_var_slots(
 /// owned temps it allocates are released there and are only ever created on the taken path —
 /// exactly as lower_if handles a branch arm. Both operands are booleans (scalars), so the result
 /// is RC-trivial.
-pub fn lower_short_circuit(
+pub(crate) fn lower_short_circuit(
     left: &TypedExpr,
     op: BinOp,
     right: &TypedExpr,
@@ -350,14 +350,14 @@ pub enum Discriminator {
 /// Resolve a (possibly `Named`) type to its concrete `Object` field map using
 /// the resolved `named_defs` bodies carried by `TypeCheckDeep`. Returns `None`
 /// for any non-object, or a Named not in `named_defs`.
-pub fn resolve_object_fields<'a>(
+pub(crate) fn resolve_object_fields<'a>(
     ty: &'a Type,
     named_defs: &'a [(String, Type)],
 ) -> Option<&'a indexmap::IndexMap<String, Type>> {
     resolve_object_fields_bounded(ty, named_defs, 0)
 }
 
-pub fn resolve_object_fields_bounded<'a>(
+pub(crate) fn resolve_object_fields_bounded<'a>(
     ty: &'a Type,
     named_defs: &'a [(String, Type)],
     depth: usize,
@@ -381,7 +381,7 @@ pub fn resolve_object_fields_bounded<'a>(
 /// using the resolved `named_defs` bodies. Returns the input unchanged for any
 /// non-`Named` type or an unresolvable/cyclic `Named`. Bounded against alias
 /// cycles.
-pub fn resolve_union_alias<'a>(ty: &'a Type, named_defs: &'a [(String, Type)], depth: usize) -> &'a Type {
+pub(crate) fn resolve_union_alias<'a>(ty: &'a Type, named_defs: &'a [(String, Type)], depth: usize) -> &'a Type {
     if depth > 64 {
         return ty;
     }
@@ -399,7 +399,7 @@ pub fn resolve_union_alias<'a>(ty: &'a Type, named_defs: &'a [(String, Type)], d
 /// or references a `Named` we cannot resolve (conservative). `seen` guards against
 /// cyclic recursive types (e.g. `Expr = Num | Add` where `Add` references `Expr`):
 /// a `Named` already on the resolution stack is a safe cycle, not a TypeVar.
-pub fn variant_has_type_var(ty: &Type, named_defs: &[(String, Type)], seen: &mut Vec<String>) -> bool {
+pub(crate) fn variant_has_type_var(ty: &Type, named_defs: &[(String, Type)], seen: &mut Vec<String>) -> bool {
     match ty {
         Type::Named(n) => {
             if seen.contains(n) {
@@ -436,7 +436,7 @@ pub fn variant_has_type_var(ty: &Type, named_defs: &[(String, Type)], seen: &mut
 /// the cheap discriminator fast path, and if so which discriminator. Returns
 /// `None` (→ caller emits `MatchesSchema`) whenever the fast path is not PROVEN
 /// sound or no single-field-class discriminator uniquely selects `target`.
-pub fn union_discriminator(
+pub(crate) fn union_discriminator(
     scrut_ty: &Type,
     target: &Type,
     named_defs: &[(String, Type)],
@@ -512,7 +512,7 @@ pub fn union_discriminator(
 /// Emit the IR for a chosen `Discriminator` over the boxed scrutinee `scrut`,
 /// returning the Bool result temp. Reuses the existing `Index`+`Eq` machinery —
 /// no new instructions.
-pub fn emit_discriminator(
+pub(crate) fn emit_discriminator(
     disc: &Discriminator,
     scrut: Temp,
     scrut_ty: &Type,
@@ -577,7 +577,7 @@ pub fn emit_discriminator(
 // Match lowering
 // -------------------------------------------------------------------------
 
-pub fn lower_match(
+pub(crate) fn lower_match(
     scrutinee: &TypedExpr,
     arms: &[TypedMatchArm],
     result_type: &Type,
@@ -713,7 +713,7 @@ pub enum PatternTest {
     Cond(Temp),
 }
 
-pub fn lower_match_pattern(
+pub(crate) fn lower_match_pattern(
     pattern: &TypedMatchPattern,
     scrut: Temp,
     scrut_ty: &Type,
@@ -825,7 +825,7 @@ pub fn lower_match_pattern(
 /// that HAS the listed fields, with each value-constrained field equal to its literal. Used
 /// by both `Is(Object)` and `Has(Object)` — for an object shape check the two are equivalent
 /// (tag-is-object + required fields + value constraints).
-pub fn lower_object_pattern_test(
+pub(crate) fn lower_object_pattern_test(
     tp: &TypedPattern,
     scrut: Temp,
     builder: &mut FuncBuilder,
@@ -898,7 +898,7 @@ pub fn lower_object_pattern_test(
 }
 
 /// After a pattern test succeeds, bind pattern variables into slots.
-pub fn lower_match_bindings(
+pub(crate) fn lower_match_bindings(
     pattern: &TypedMatchPattern,
     scrut: Temp,
     builder: &mut FuncBuilder,
@@ -911,7 +911,7 @@ pub fn lower_match_bindings(
     lower_typed_pattern_bindings(typed_pattern, scrut, builder);
 }
 
-pub fn lower_typed_pattern_bindings(
+pub(crate) fn lower_typed_pattern_bindings(
     pattern: &TypedPattern,
     scrut: Temp,
     builder: &mut FuncBuilder,
@@ -1016,7 +1016,7 @@ pub fn lower_typed_pattern_bindings(
     }
 }
 
-pub fn pattern_elem_type(pattern: &TypedPattern) -> Type {
+pub(crate) fn pattern_elem_type(pattern: &TypedPattern) -> Type {
     match pattern {
         TypedPattern::Binding(_, ty, _) => ty.clone(),
         TypedPattern::TypeCheck(ty, _) => ty.clone(),

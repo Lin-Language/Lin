@@ -10,7 +10,7 @@ use super::*;
 /// reassignment to it is seen inside a branch we can tell whether it needs owning. Nested function
 /// bodies are NOT descended into here: their `var`s have their own slot namespace and their own
 /// pre-scan; a capture of an OUTER var becomes a cell via the capture analysis instead.
-pub fn collect_branch_reassigned_var_slots_stmt(
+pub(crate) fn collect_branch_reassigned_var_slots_stmt(
     stmt: &TypedStmt,
     in_branch: bool,
     owning_vars: &mut HashMap<usize, Type>,
@@ -34,7 +34,7 @@ pub fn collect_branch_reassigned_var_slots_stmt(
     }
 }
 
-pub fn collect_branch_reassigned_var_slots_expr(
+pub(crate) fn collect_branch_reassigned_var_slots_expr(
     expr: &TypedExpr,
     in_branch: bool,
     owning_vars: &mut HashMap<usize, Type>,
@@ -127,7 +127,7 @@ pub fn collect_branch_reassigned_var_slots_expr(
     }
 }
 
-pub fn collect_mutable_capture_slots_stmt(stmt: &TypedStmt, out: &mut std::collections::HashSet<usize>) {
+pub(crate) fn collect_mutable_capture_slots_stmt(stmt: &TypedStmt, out: &mut std::collections::HashSet<usize>) {
     match stmt {
         TypedStmt::Val { value, .. } | TypedStmt::Var { value, .. } => {
             collect_mutable_capture_slots_expr(value, out);
@@ -140,7 +140,7 @@ pub fn collect_mutable_capture_slots_stmt(stmt: &TypedStmt, out: &mut std::colle
     }
 }
 
-pub fn collect_mutable_capture_slots_expr(expr: &TypedExpr, out: &mut std::collections::HashSet<usize>) {
+pub(crate) fn collect_mutable_capture_slots_expr(expr: &TypedExpr, out: &mut std::collections::HashSet<usize>) {
     match expr {
         TypedExpr::Function { captures, body, .. } => {
             for cap in captures {
@@ -230,7 +230,7 @@ pub fn mangle_module_key(path: &str) -> String {
 /// Such a union is represented as a raw nullable sealed-struct pointer (NOT a `TaggedVal*` box),
 /// so it must not flow through any of the `TaggedVal` boxing/cloning/releasing paths. The repr
 /// pass seeds it as `Packed(NullableRecord)` and codegen dispatches on that repr separately.
-pub fn is_union_ty(ty: &Type) -> bool {
+pub(crate) fn is_union_ty(ty: &Type) -> bool {
     if is_nullable_sealed_record(ty) { return false; }
     matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry)
 }
@@ -238,13 +238,13 @@ pub fn is_union_ty(ty: &Type) -> bool {
 /// True iff `ty` is a `T | Null` union where `T` is a sealed record — the Stage-3 NullableRecord
 /// repr. Such a value is physically a raw nullable `*sealed_T` pointer (not a `TaggedVal*`).
 /// Delegates to `repr::nullable_sealed_record` as the single gate definition.
-pub fn is_nullable_sealed_record(ty: &Type) -> bool {
+pub(crate) fn is_nullable_sealed_record(ty: &Type) -> bool {
     crate::repr::nullable_sealed_record(ty).is_some()
 }
 
 /// True if `ty` IS a `Stream` or a `Union` containing one. A streamish capture crosses a thread
 /// boundary by MOVE (CAP_MOVE), not copy. Mirrors `lin_check::checker::expr::type_is_streamish`.
-pub fn type_is_streamish_ir(ty: &Type) -> bool {
+pub(crate) fn type_is_streamish_ir(ty: &Type) -> bool {
     match ty {
         Type::Stream(_) => true,
         Type::Union(variants) => variants.iter().any(type_is_streamish_ir),
@@ -257,7 +257,7 @@ pub fn type_is_streamish_ir(ty: &Type) -> bool {
 /// (via Coerce → `lin_box_str`/`lin_box_array`/`lin_box_object`) allocates a FRESH 16-byte
 /// `TaggedVal*` shell whose inner is the (separately owned) heap pointer. Scalars
 /// (int/bool/float/null) are excluded: their boxes may be cached/immutable.
-pub fn is_heap_ty(ty: &Type) -> bool {
+pub(crate) fn is_heap_ty(ty: &Type) -> bool {
     matches!(
         ty,
         Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Iterator(_)
@@ -270,7 +270,7 @@ pub fn is_heap_ty(ty: &Type) -> bool {
 /// scope-exit release), so after the call the caller must free ONLY the shell.
 /// True iff: param is union, arg is concrete heap. Excludes already-union args (the box
 /// belongs to someone else) and scalar args (cached boxes).
-pub fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
+pub(crate) fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
     match param_ty {
         // A SEALED-RECORD ARRAY *or a SEALED SCALAR RECORD* boxed into a Json param MATERIALIZES a
         // FRESH inner heap value (a tagged `Object[]` for the array; a `box_object(LinObject)` for the
@@ -296,7 +296,7 @@ pub fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Type>) -> 
 /// (small-int/bool boxes are immortal statics and never freed) and result-alias safe (a callee that
 /// returns its Json param hands the same box back as the result — skipped when shell == result).
 /// Without this, `f(1_000_000)` / `f(3.14)` into a Json param leaked the 16-byte box shell per call.
-pub fn arg_box_is_caller_owned_scalar_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
+pub(crate) fn arg_box_is_caller_owned_scalar_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
     match param_ty {
         Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && !is_heap_ty(arg_ty)
             && !is_sealed_scalar_repr(arg_ty)
@@ -309,7 +309,7 @@ pub fn arg_box_is_caller_owned_scalar_shell(arg_ty: &Type, param_ty: Option<&Typ
 /// to a call. AST-compiled callees release their Function-typed parameters at return; a
 /// borrowed (non-fresh) closure must be retained to balance that, while a fresh closure's
 /// existing +1 is consumed by the callee. Mirrors `call_global_fn`'s `arg_is_fn_owned`.
-pub fn retain_call_arg(arg: Temp, ty: &Type, _is_fresh: bool, builder: &mut FuncBuilder) {
+pub(crate) fn retain_call_arg(arg: Temp, ty: &Type, _is_fresh: bool, builder: &mut FuncBuilder) {
     if matches!(ty, Type::Function { .. }) {
         builder.emit(Instruction::Retain { val: arg, ty: ty.clone() });
     }
@@ -318,7 +318,7 @@ pub fn retain_call_arg(arg: Temp, ty: &Type, _is_fresh: bool, builder: &mut Func
 /// Whether an argument expression produces a freshly-allocated value (a function/closure
 /// literal, a literal allocation, or a call result) whose +1 reference can be transferred
 /// to a consuming callee or container. Mirrors AST `expr_is_owned_alloc` exactly.
-pub fn expr_is_fresh_alloc(expr: &TypedExpr) -> bool {
+pub(crate) fn expr_is_fresh_alloc(expr: &TypedExpr) -> bool {
     match expr {
         TypedExpr::Call { .. }
         | TypedExpr::MakeArray { .. }
@@ -353,7 +353,7 @@ pub fn expr_is_fresh_alloc(expr: &TypedExpr) -> bool {
 /// its Json param (e.g. an identity/pass-through) hands the very same box back as the result,
 /// which the caller now owns (`register_owned(dst)`) and will release later — freeing that
 /// shell here would corrupt the returned value, so we skip it when the shell == result.
-pub fn free_arg_box_shells(shell_boxes: &[Temp], dst: Temp, builder: &mut FuncBuilder) {
+pub(crate) fn free_arg_box_shells(shell_boxes: &[Temp], dst: Temp, builder: &mut FuncBuilder) {
     for &shell in shell_boxes {
         builder.emit(Instruction::FreeBoxShellIfDistinct { val: shell, other: dst });
     }
@@ -362,7 +362,7 @@ pub fn free_arg_box_shells(shell_boxes: &[Temp], dst: Temp, builder: &mut FuncBu
 /// Coerce a call argument to the callee's declared parameter type: box a concrete value
 /// for a Json/union param, OR widen/narrow a numeric mismatch (e.g. an Int32 literal `0`
 /// passed to an Int64 param) so the call signature matches.
-pub fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: &mut FuncBuilder) -> Temp {
     let Some(param_ty) = param_ty else { return arg; };
     // A sealed scalar-record arg flowing into a `Named` param (a recursive/self-referential type
     // reference that resolution left unexpanded) is passed THROUGH unchanged: the callee reads
@@ -386,7 +386,7 @@ pub fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, build
     // structural compatibility guarantees it has the named type's shape, PROJECT it into the
     // sealed struct layout (a fresh +1 owned struct) so the representation matches the callee.
     if matches!(param_ty, Type::Named(_)) {
-        if let Type::Object { fields, sealed: false } = arg_ty {
+        if let Type::Object { fields, sealed: false, .. } = arg_ty {
             if !fields.is_empty() && fields.values().all(is_sealed_field_ty) {
                 let sealed_ty = Type::sealed_object(fields.clone());
                 let dst = builder.alloc_temp(sealed_ty.clone());
@@ -558,7 +558,7 @@ pub fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, build
 /// not apply (caller falls back to `lower_expr` + `coerce_to_slot_type`). This is the construction
 /// half of the sealed-records win (sealed-records Stage 1); it fires for `val p: T = { … }`,
 /// `(…): T => { … }` returns, and arg/assignment boundaries.
-pub fn try_lower_sealed_literal(
+pub(crate) fn try_lower_sealed_literal(
     value: &TypedExpr,
     slot_ty: &Type,
     builder: &mut FuncBuilder,
@@ -593,7 +593,7 @@ pub fn try_lower_sealed_literal(
 /// reading its field. Returns `Some(dst)` on the fast path, `None` to fall through to the generic
 /// path. Sound because the field is a scalar (no RC, no escaping interior pointer). The array base
 /// is BORROWED where possible (a bare local) so no retain/release pair is paid in the hot loop.
-pub fn try_lower_sealed_array_field(
+pub(crate) fn try_lower_sealed_array_field(
     object: &TypedExpr,
     field: &str,
     result_ty: &Type,
@@ -652,7 +652,7 @@ pub fn try_lower_sealed_array_field(
 /// pure const-offset load with no RC and no escaping interior pointer — identical to the receiver
 /// `arr[i]["field"]` fusion. The recorded `array`/`index` temps are the loop's own (the array base
 /// is live for the whole loop; the index is the loop counter), so no dangling.
-pub fn try_lower_packed_elem_field(
+pub(crate) fn try_lower_packed_elem_field(
     object: &TypedExpr,
     field: &str,
     result_ty: &Type,
@@ -729,7 +729,7 @@ pub fn try_lower_packed_elem_field(
 /// for the SEALED-element case (so the element is a real `LinObject`, never a packed buffer): the
 /// `is_sealed_scalar_array` guard EXCLUDES packed sealed-scalar arrays (handled by the
 /// `SealedArrayFieldGet` fusion), and the element must be a sealed record (`is_sealed_scalar_repr`).
-pub fn try_lower_boxed_array_field(
+pub(crate) fn try_lower_boxed_array_field(
     object: &TypedExpr,
     field: &str,
     result_ty: &Type,
@@ -788,7 +788,7 @@ pub fn try_lower_boxed_array_field(
 /// Lower `value` into a slot of declared type `slot_ty`, producing a temp in the slot's
 /// representation. Uses the sealed-literal direct-construction fast path when applicable
 /// (`try_lower_sealed_literal`), otherwise `lower_expr` + `coerce_to_slot_type`.
-pub fn lower_value_into_slot(
+pub(crate) fn lower_value_into_slot(
     value: &TypedExpr,
     slot_ty: &Type,
     builder: &mut FuncBuilder,
@@ -811,7 +811,7 @@ pub fn lower_value_into_slot(
 /// build-a-boxed-`LinObject`-then-`sumnode_project_from_boxed` round-trip the generic coercion path
 /// would otherwise pay every construction (the dominant cost the sum-dispatch benchmark exposed).
 /// The discriminant field must be a `StrLit` (the variant tag); otherwise fall through (None).
-pub fn try_lower_sum_literal(
+pub(crate) fn try_lower_sum_literal(
     value: &TypedExpr,
     slot_ty: &Type,
     builder: &mut FuncBuilder,
@@ -959,9 +959,9 @@ pub fn try_lower_sum_literal(
 /// value flowing into a `{}`-typed slot (e.g. a `{}[]` element, the factory-of-counters pattern)
 /// is stripped to an empty `LinObject` → every field reads `Null` (scalar) or a garbage pointer
 /// (Function field → segfault on call). Regression: `test_var_cell_escaping_via_object_in_loop_body`.
-pub fn anon_object_slot_repr_differs(from: &Type, to: &Type) -> bool {
+pub(crate) fn anon_object_slot_repr_differs(from: &Type, to: &Type) -> bool {
     matches!((from, to),
-        (Type::Object { sealed: false, fields: ff }, Type::Object { sealed: false, fields: tf })
+        (Type::Object { sealed: false, fields: ff, .. }, Type::Object { sealed: false, fields: tf, .. })
         if ff != tf && !tf.is_empty())
 }
 
@@ -991,7 +991,7 @@ pub fn anon_object_slot_repr_differs(from: &Type, to: &Type) -> bool {
 /// `lower_value_into_slot`), or the value is already a union (the box is a clone/forward handled
 /// elsewhere) or non-rc (scalar→union boxing carries no inner heap payload to balance — the cached
 /// scalar box has nothing to release, and the raw scalar is not registered owned anyway).
-pub fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
     // Box-transfer ownership fact (whether widening this concrete-rc value into the union slot makes
     // a fresh box that takes over the source's inner +1 — so the lowerer must MOVE that reference)
     // lives in the ownership authority; `type_repr_differs` is the lower-only repr predicate it
@@ -1049,7 +1049,7 @@ pub fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty: &Type,
 /// Coerce a value temp to a slot's declared type when their runtime representations
 /// differ (box concrete → union, or unbox union → concrete). Returns the (possibly new)
 /// temp; a no-op when representations match.
-pub fn coerce_to_slot_type(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+pub(crate) fn coerce_to_slot_type(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
     if type_repr_differs(value_ty, slot_ty)
         || scalar_numeric_repr_differs(value_ty, slot_ty)
         || int_width_repr_differs(value_ty, slot_ty)
@@ -1088,7 +1088,7 @@ pub fn coerce_to_slot_type(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &m
 /// projection) into a fresh +1 box. A value already owned by the CURRENT branch scope (a fresh
 /// allocation / call result) just transfers its +1. A concrete value boxed to union transfers
 /// via the kept raw temp.
-pub fn coerce_if_branch(
+pub(crate) fn coerce_if_branch(
     raw: Temp,
     value_ty: &Type,
     result_type: &Type,
@@ -1136,7 +1136,7 @@ pub fn coerce_if_branch(
     (val, vec![val, raw], false)
 }
 
-pub fn const_type(c: &Const) -> Type {
+pub(crate) fn const_type(c: &Const) -> Type {
     match c {
         Const::Int(_, t) => t.clone(),
         Const::Float(_, t) => t.clone(),
