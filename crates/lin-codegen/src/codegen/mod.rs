@@ -1414,7 +1414,7 @@ impl<'ctx> Codegen<'ctx> {
                             // MakeObject for spread-free literals (incl. the common empty `{}`).
                             if let Type::Map { key: map_key_ty, value: elem_ty } = ty {
                                 let cap = i32_ty.const_int(fields.len().max(1) as u64, false);
-                                let key_kind_val = i32_ty.const_int(if map_key_ty.is_integer() { 1 } else { 0 }, false);
+                                let key_kind_val = i32_ty.const_int(if map_key_ty.is_int_map_key() { 1 } else { 0 }, false);
                                 let map_ptr = self.builder
                                     .call(self.rt.map_alloc, &[cap.into(), key_kind_val.into()], "ir_map")
                                     .try_as_basic_value().unwrap_basic().into_pointer_value();
@@ -1442,7 +1442,7 @@ impl<'ctx> Codegen<'ctx> {
                                             // own +1 (released at scope exit). UNCHANGED RC behaviour.
                                             self.build_tagged_val_alloca(&val, &val_ty)
                                         };
-                                        if map_key_ty.is_integer() {
+                                        if map_key_ty.is_int_map_key() {
                                             // Key was stored as its decimal string representation in
                                             // the IR; parse it back to an i64 constant for map_set_int.
                                             let key_i64: i64 = key.parse().expect("int-map IR key must be a decimal i64");

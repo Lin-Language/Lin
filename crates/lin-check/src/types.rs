@@ -304,6 +304,23 @@ impl Type {
         matches!(self, Type::Float32 | Type::Float64)
     }
 
+    /// True when a map with this KEY type should use the integer-keyed runtime representation
+    /// (`lin_map_*_int`). Covers concrete fixed-width integer types AND closed integer-literal
+    /// sets — `IntLit(_)` alone, or a `Union` whose every member is an integer-map key (e.g.
+    /// `type DayOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6`). An empty union does NOT qualify.
+    /// All four map alloc/set/get key-kind dispatch sites in codegen MUST use this one predicate
+    /// so that allocation, stores, and loads always agree on the key representation.
+    pub fn is_int_map_key(&self) -> bool {
+        match self {
+            t if t.is_integer() => true,
+            Type::IntLit(_) => true,
+            Type::Union(variants) if !variants.is_empty() => {
+                variants.iter().all(|v| v.is_int_map_key())
+            }
+            _ => false,
+        }
+    }
+
     /// True when this element type maps to a FLAT unboxed scalar array (a concrete
     /// fixed-width numeric). Mirrors codegen's `Codegen::is_flat_scalar` — the two MUST
     /// agree, since the checker decides when to refine an `arrayAllocate` result to a
