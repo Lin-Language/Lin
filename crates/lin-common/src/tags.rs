@@ -75,7 +75,7 @@ pub const TAG_RECORD: u8 = 25;
 // ── Named-descriptor field kind codes (NKIND_*) ───────────────────────────────────────────────────
 // Shared by `lin-runtime` (sealed.rs) and `lin-codegen` (types.rs). Both crates MUST reference
 // these constants and call `nkind_size_align` for field-size derivation — never re-derive locally.
-pub const NKIND_INT32: u32 = 1; // Int8/Int16/Int32 → 4 bytes
+pub const NKIND_INT32: u32 = 1; // Int32/IntLit → 4 bytes
 pub const NKIND_INT64: u32 = 2; // Int64 → 8 bytes
 pub const NKIND_UINT64: u32 = 3; // UInt64 → 8 bytes
 pub const NKIND_FLOAT64: u32 = 4; // Float64 → 8 bytes
