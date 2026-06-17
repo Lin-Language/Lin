@@ -3852,6 +3852,36 @@ print(toString(unwrap({{ "value": 99 }})))
 }
 
 #[test]
+fn test_imported_type_with_forward_referenced_field_type() {
+    // Regression: an exported type alias whose body references a SIBLING type declared LATER in
+    // the same file must be importable WITHOUT also importing that sibling. The importer only uses
+    // the alias; the field type is an internal detail of the alias's definition.
+    //
+    // Previously this failed with "Unknown type 'Trip'": type-decl bodies were resolved in
+    // (hoisted) source order, so `TimetableLeg` (declared before `Trip`) collapsed its `Trip`
+    // field to a bare `Named("Trip")` via the cycle guard — the sibling was still a placeholder.
+    // That unexpanded forward reference leaked into the module signature and then failed to resolve
+    // in the importer, where `Trip` is not in scope. The export-collection pass now re-resolves
+    // bodies against the fully-populated env, expanding such forward references inline.
+    let dir = std::env::temp_dir().join(format!("lin_imptype_fwd_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    // `TimetableLeg` references `Trip`, declared AFTER it — mirrors gtfs.lin's ordering.
+    std::fs::write(dir.join("gtfs.lin"),
+        "export type Leg = { \"origin\": String }\n\
+         export type TimetableLeg = Leg & { \"trip\": Trip }\n\
+         export type Trip = { \"tripId\": String }\n").unwrap();
+    // The importer pulls in ONLY `TimetableLeg`, never `Trip`.
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ TimetableLeg }} from "{}/gtfs"
+val leg: TimetableLeg = {{ "origin": "NRW", "trip": {{ "tripId": "t1" }} }}
+print(leg["trip"]["tripId"])
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["t1"]);
+}
+
+#[test]
 fn test_imported_type_unknown_without_import() {
     // The type is only visible when imported: using `Point` without importing it from the
     // module that exports it is still "Unknown type" (the registration is scoped to imports).
@@ -15063,6 +15093,39 @@ print(toString(o2["B"][1] ?? -1))
 print(toString(o["B"][99] ?? -1))
 "#);
     assert_eq!(output, vec!["77", "99", "-1"]);
+}
+
+#[test]
+fn test_nested_map_write_auto_vivifies_intermediate_levels() {
+    // Auto-vivification: a nested write `m[k1][k2] = v` creates absent intermediate MAP levels
+    // (an empty map of the static value type, stored back) so the write succeeds, instead of the
+    // previous silent no-op. Deep nesting vivifies every level; reads still null-propagate WITHOUT
+    // mutating the intermediate.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+// Single-level: kConn["StopB"] is absent; the write must create it and persist.
+type Conn = { String: String }
+type CIdx = { String: { UInt8: Conn } }
+val kConn: CIdx = {}
+val c: Conn = { "x": "y" }
+kConn["StopB"][1] = c
+print(if kConn["StopB"][1] == null then "LOST" else "stored")
+
+// Deep (3-level): o["a"] and o["a"]["b"] are both auto-created.
+type T = { String: { String: { String: Int32 } } }
+val o: T = {}
+o["a"]["b"]["c"] = 5
+print(toString(o["a"]["b"]["c"] ?? -1))
+
+// A read through an absent intermediate must NOT vivify it.
+type R = { String: { String: Int32 } }
+val r: R = {}
+val got = r["a"]["b"]
+print(if got == null then "read-null" else "read-val")
+print(if r["a"] == null then "still-absent" else "MUTATED")
+"#);
+    assert_eq!(output, vec!["stored", "5", "read-null", "still-absent"]);
 }
 
 #[test]
