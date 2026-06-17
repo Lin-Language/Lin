@@ -287,6 +287,38 @@ impl<'ctx> Codegen<'ctx> {
                 self.unbox_tagged_val_to_type(tagged, result_ty)
             };
         }
+        // Union/`T|Null` container with a typed Map member that has integer keys:
+        // `outer["key"][int_key]` where `outer["key"]` evaluates to `{ K: V } | Null`.
+        // The `container` has already been unboxed from the TaggedVal* wrapper to a raw
+        // LinMap* by the `is_union_type` check above. Route to `lin_map_get_int` rather
+        // than the array path below (which would read off a LinArray, not a LinMap).
+        // This fires BEFORE the `is_array_access` test that would otherwise capture the
+        // numeric key and mis-route it to `emit_array_get`.
+        if Self::is_union_type(obj_ty) && key_ty.is_integer() {
+            let int_map_elem = match obj_ty {
+                Type::Union(vs) => vs.iter().find_map(|v| match v {
+                    Type::Map { key: k, value: e, .. } if k.is_integer() => Some((**e).clone()),
+                    _ => None,
+                }),
+                Type::Map { key: k, value: e, .. } if k.is_integer() => Some((**e).clone()),
+                _ => None,
+            };
+            if let Some(_elem) = int_map_elem {
+                let i64_key = if key.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(key.into_int_value(), self.context.i64_type(), "ir_umkey_i64")
+                } else if key.is_pointer_value() {
+                    self.unbox_value(key, &Type::Int64).into_int_value()
+                } else {
+                    self.context.i64_type().const_zero()
+                };
+                let tagged = self.builder.call(self.rt.map_get_int, &[container.into(), i64_key.into()], "ir_umget_int").try_as_basic_value().unwrap_basic();
+                return if Self::is_union_type(result_ty) {
+                    tagged
+                } else {
+                    self.unbox_tagged_val_to_type(tagged, result_ty)
+                };
+            }
+        }
         // Array indexing when the object is an array type or the key is numeric (any int
         // width — e.g. an Int32 literal index like `lines[0]`, not just i64).
         let is_array_access = matches!(obj_ty, Type::Array(_) | Type::FixedArray(_))

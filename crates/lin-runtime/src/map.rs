@@ -661,7 +661,8 @@ pub unsafe extern "C" fn lin_map_get(map: *const LinMap, key: *const LinString) 
 /// Insert / overwrite `key -> *val` (Int map). `key` is a raw i64.
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_set_int(map: *mut LinMap, key: i64, val: *const TaggedVal) {
-    // Null-map write: no-op (mirrors lin_array_set's and lin_map_set's null-guard).
+    // A null map is a legal no-op (mirrors lin_array_set's null guard): writing into a
+    // `{ K: V } | Null` container that resolved to null at runtime is silently ignored.
     if map.is_null() { return; }
     let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
     let val_ref: &TaggedVal = if val.is_null() { &null_tv } else { &*val };

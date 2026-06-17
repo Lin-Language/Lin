@@ -311,7 +311,7 @@ pub unsafe extern "C" fn lin_sealed_release_self(ptr: *mut u8) {
 pub use lin_common::tags::{
     NKIND_INT32, NKIND_INT64, NKIND_UINT64, NKIND_FLOAT64, NKIND_FLOAT32, NKIND_BOOL,
     NKIND_STRING, NKIND_ARRAY, NKIND_SEALED, NKIND_MAP, NKIND_SUMNODE,
-    NKIND_UINT32, NKIND_UINT16, NKIND_UINT8,
+    NKIND_UINT32, NKIND_UINT16, NKIND_UINT8, NKIND_INT16, NKIND_INT8,
 };
 
 /// Read a NamedField row at byte offset `cur` in the blob. Returns the parsed fields and the offset
@@ -408,9 +408,36 @@ unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *cons
                 let tv = TaggedVal { tag: TAG_INT32, _pad: [0; 7], payload: v as i64 as u64 };
                 crate::map::lin_map_set(map, key, &tv);
             }
+            // Narrow signed ints — sign-extend to i32, box as TAG_INT32 (matching box_value).
+            NKIND_INT16 => {
+                let v = *(slot as *const i16) as i32;
+                let tv = TaggedVal { tag: TAG_INT32, _pad: [0; 7], payload: v as i64 as u64 };
+                crate::map::lin_map_set(map, key, &tv);
+            }
+            NKIND_INT8 => {
+                let v = *(slot as *const i8) as i32;
+                let tv = TaggedVal { tag: TAG_INT32, _pad: [0; 7], payload: v as i64 as u64 };
+                crate::map::lin_map_set(map, key, &tv);
+            }
             NKIND_INT64 => {
                 let v = *(slot as *const i64);
                 let tv = TaggedVal { tag: TAG_INT64, _pad: [0; 7], payload: v as u64 };
+                crate::map::lin_map_set(map, key, &tv);
+            }
+            // Narrow unsigned ints — zero-extend to i64, box as TAG_INT64 (matching box_value for UInt8/16/32).
+            NKIND_UINT32 => {
+                let v = *(slot as *const u32) as u64;
+                let tv = TaggedVal { tag: TAG_INT64, _pad: [0; 7], payload: v };
+                crate::map::lin_map_set(map, key, &tv);
+            }
+            NKIND_UINT16 => {
+                let v = *(slot as *const u16) as u64;
+                let tv = TaggedVal { tag: TAG_INT64, _pad: [0; 7], payload: v };
+                crate::map::lin_map_set(map, key, &tv);
+            }
+            NKIND_UINT8 => {
+                let v = *(slot as *const u8) as u64;
+                let tv = TaggedVal { tag: TAG_INT64, _pad: [0; 7], payload: v };
                 crate::map::lin_map_set(map, key, &tv);
             }
             NKIND_UINT64 => {
@@ -432,23 +459,6 @@ unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *cons
             NKIND_BOOL => {
                 let v = *(slot as *const u8);
                 let tv = TaggedVal { tag: TAG_BOOL, _pad: [0; 7], payload: (v != 0) as u64 };
-                crate::map::lin_map_set(map, key, &tv);
-            }
-            NKIND_UINT32 => {
-                // Physical slot is 4 bytes (u32), zero-extended to i64 and boxed as TAG_INT64
-                // (matching how UInt8/16/32 are always boxed — they are always-positive i64 values).
-                let v = *(slot as *const u32) as i64;
-                let tv = TaggedVal { tag: TAG_INT64, _pad: [0; 7], payload: v as u64 };
-                crate::map::lin_map_set(map, key, &tv);
-            }
-            NKIND_UINT16 => {
-                let v = *(slot as *const u16) as i64;
-                let tv = TaggedVal { tag: TAG_INT64, _pad: [0; 7], payload: v as u64 };
-                crate::map::lin_map_set(map, key, &tv);
-            }
-            NKIND_UINT8 => {
-                let v = *(slot as *const u8) as i64;
-                let tv = TaggedVal { tag: TAG_INT64, _pad: [0; 7], payload: v as u64 };
                 crate::map::lin_map_set(map, key, &tv);
             }
             NKIND_STRING | NKIND_ARRAY | NKIND_MAP => {
@@ -599,6 +609,25 @@ unsafe fn pack_named_payload_impl(
                 };
                 *(dst as *mut i32) = v;
             }
+            // Narrow signed ints — sign-truncate from i32 to i16/i8.
+            NKIND_INT16 => {
+                let v: i16 = match tag {
+                    TAG_INT32 => payload as i32 as i16,
+                    TAG_INT64 | TAG_UINT64 => payload as i64 as i16,
+                    TAG_FLOAT64 => f64::from_bits(payload) as i16,
+                    _ => 0,
+                };
+                *(dst as *mut i16) = v;
+            }
+            NKIND_INT8 => {
+                let v: i8 = match tag {
+                    TAG_INT32 => payload as i32 as i8,
+                    TAG_INT64 | TAG_UINT64 => payload as i64 as i8,
+                    TAG_FLOAT64 => f64::from_bits(payload) as i8,
+                    _ => 0,
+                };
+                *(dst as *mut i8) = v;
+            }
             NKIND_INT64 => {
                 let v: i64 = match tag {
                     TAG_INT32 => payload as i32 as i64,
@@ -607,6 +636,34 @@ unsafe fn pack_named_payload_impl(
                     _ => 0,
                 };
                 *(dst as *mut i64) = v;
+            }
+            // Narrow unsigned ints — zero-truncate from u64 to u32/u16/u8.
+            NKIND_UINT32 => {
+                let v: u32 = match tag {
+                    TAG_INT32 => payload as i32 as u32,
+                    TAG_INT64 | TAG_UINT64 => payload as u32,
+                    TAG_FLOAT64 => f64::from_bits(payload) as u32,
+                    _ => 0,
+                };
+                *(dst as *mut u32) = v;
+            }
+            NKIND_UINT16 => {
+                let v: u16 = match tag {
+                    TAG_INT32 => payload as i32 as u16,
+                    TAG_INT64 | TAG_UINT64 => payload as u16,
+                    TAG_FLOAT64 => f64::from_bits(payload) as u16,
+                    _ => 0,
+                };
+                *(dst as *mut u16) = v;
+            }
+            NKIND_UINT8 => {
+                let v: u8 = match tag {
+                    TAG_INT32 => payload as i32 as u8,
+                    TAG_INT64 | TAG_UINT64 => payload as u8,
+                    TAG_FLOAT64 => f64::from_bits(payload) as u8,
+                    _ => 0,
+                };
+                *dst = v;
             }
             NKIND_UINT64 => {
                 let v: u64 = match tag {
@@ -640,33 +697,6 @@ unsafe fn pack_named_payload_impl(
             }
             NKIND_BOOL => {
                 *dst = (tag == TAG_BOOL && payload != 0) as u8;
-            }
-            NKIND_UINT32 => {
-                let v: u32 = match tag {
-                    TAG_INT32 => payload as i32 as u32,
-                    TAG_INT64 | TAG_UINT64 => payload as u32,
-                    TAG_FLOAT64 => f64::from_bits(payload) as u32,
-                    _ => 0,
-                };
-                *(dst as *mut u32) = v;
-            }
-            NKIND_UINT16 => {
-                let v: u16 = match tag {
-                    TAG_INT32 => payload as i32 as u16,
-                    TAG_INT64 | TAG_UINT64 => payload as u16,
-                    TAG_FLOAT64 => f64::from_bits(payload) as u16,
-                    _ => 0,
-                };
-                *(dst as *mut u16) = v;
-            }
-            NKIND_UINT8 => {
-                let v: u8 = match tag {
-                    TAG_INT32 => payload as i32 as u8,
-                    TAG_INT64 | TAG_UINT64 => payload as u8,
-                    TAG_FLOAT64 => f64::from_bits(payload) as u8,
-                    _ => 0,
-                };
-                *dst = v;
             }
             NKIND_STRING | NKIND_ARRAY | NKIND_MAP => {
                 let expect = match nkind {
@@ -872,9 +902,31 @@ pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const cra
                 let v = *(slot as *const i32);
                 alloc_tagged(TAG_INT32, v as i64 as u64)
             }
+            // Narrow signed ints — sign-extend to i32, box as TAG_INT32 (matching box_value).
+            NKIND_INT16 => {
+                let v = *(slot as *const i16) as i32;
+                alloc_tagged(TAG_INT32, v as i64 as u64)
+            }
+            NKIND_INT8 => {
+                let v = *(slot as *const i8) as i32;
+                alloc_tagged(TAG_INT32, v as i64 as u64)
+            }
             NKIND_INT64 => {
                 let v = *(slot as *const i64);
                 alloc_tagged(TAG_INT64, v as u64)
+            }
+            // Narrow unsigned ints — zero-extend to u64, box as TAG_INT64 (matching box_value for UInt8/16/32).
+            NKIND_UINT32 => {
+                let v = *(slot as *const u32) as u64;
+                alloc_tagged(TAG_INT64, v)
+            }
+            NKIND_UINT16 => {
+                let v = *(slot as *const u16) as u64;
+                alloc_tagged(TAG_INT64, v)
+            }
+            NKIND_UINT8 => {
+                let v = *(slot as *const u8) as u64;
+                alloc_tagged(TAG_INT64, v)
             }
             NKIND_UINT64 => {
                 let v = *(slot as *const u64);
@@ -892,18 +944,6 @@ pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const cra
             NKIND_BOOL => {
                 let v = *(slot as *const u8);
                 alloc_tagged(TAG_BOOL, (v != 0) as u64)
-            }
-            NKIND_UINT32 => {
-                let v = *(slot as *const u32) as i64;
-                alloc_tagged(TAG_INT64, v as u64)
-            }
-            NKIND_UINT16 => {
-                let v = *(slot as *const u16) as i64;
-                alloc_tagged(TAG_INT64, v as u64)
-            }
-            NKIND_UINT8 => {
-                let v = *(slot as *const u8) as i64;
-                alloc_tagged(TAG_INT64, v as u64)
             }
             NKIND_STRING => {
                 let p = *(slot as *const *mut u8);
