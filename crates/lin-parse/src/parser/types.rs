@@ -1,4 +1,4 @@
-use lin_common::Span;
+use lin_common::{Diagnostic, Span};
 use lin_lex::TokenKind;
 use crate::ast::*;
 use super::Parser;
@@ -143,6 +143,44 @@ impl Parser {
                     self.expect(TokenKind::Colon);
                     let val_ty = self.parse_type_expr();
                     self.skip_newlines();
+                    // HINT B: if a comma follows the single `Key: Value` entry, this is almost
+                    // certainly a TypeScript-style record with bare (unquoted) field keys, e.g.
+                    // `{ bestArrivals: Arrivals, k: UInt8 }`.  Emit ONE clear diagnostic with a
+                    // quoting hint, recover by skipping to the matching `}`, and return an empty
+                    // placeholder record so downstream checking doesn't pile on more errors.
+                    if self.check(TokenKind::Comma) {
+                        let comma_span = self.current_span();
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                comma_span,
+                                "a `{ Key: Value }` index-signature type has exactly one entry; \
+                                 multiple comma-separated entries look like a record",
+                            )
+                            .with_help(
+                                "for a record type, quote each field key, e.g. \
+                                 { \"field\": Type, \"other\": Type }. \
+                                 A bare `name: T` is parsed as a { KeyType: ValueType } \
+                                 map/index-signature, so `name` is read as a type name.",
+                            ),
+                        );
+                        // Recovery: skip tokens until the matching closing `}`, tracking nesting.
+                        let mut depth: usize = 1;
+                        while !self.is_at_end() && depth > 0 {
+                            match self.peek_kind() {
+                                TokenKind::LBrace => { self.advance(); depth += 1; }
+                                TokenKind::RBrace => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        self.advance(); // consume the closing `}`
+                                        break;
+                                    }
+                                    self.advance();
+                                }
+                                _ => { self.advance(); }
+                            }
+                        }
+                        return TypeExpr::Object(Vec::new(), span);
+                    }
                     self.expect(TokenKind::RBrace);
                     TypeExpr::IndexSig(Box::new(key_ty), Box::new(val_ty), span)
                 } else {

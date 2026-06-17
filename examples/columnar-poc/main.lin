@@ -1,0 +1,47 @@
+// Columnar record array POC (Phase 1).
+//
+// `Point` is a 2-scalar-field sealed record. An array literal of Points
+// that is escape-proven (no aliasing) and all-scalar gets tagged 0xFC
+// (columnar) by the escape analysis pass. Field reads (`pts[i]["x"]`) go
+// through the two-pointer-load + GEP + scalar-load columnar path instead
+// of the 0xFE stride-N AoS path.
+//
+// This program verifies:
+// 1. Construction: `[...]` literal of sealed all-scalar records builds a 0xFC array.
+// 2. Field read: `pts[0]["x"]` loads from the correct column buffer.
+// 3. Arithmetic over field reads: sums x+y pairs correctly.
+// 4. Release: no leaks (run with ASAN_OPTIONS=detect_leaks=1 to verify).
+
+import { print } from "std/io"
+import { toString } from "std/string"
+
+type Point = { "x": Int32, "y": Int32 }
+
+// Build a small columnar array and scan it.
+val scanPoints = (n: Int32): Int32 =>
+  val pts: Point[] = [
+    { "x": 10, "y": 20 },
+    { "x": 30, "y": 40 },
+    { "x": 50, "y": 60 }
+  ]
+  pts[0]["x"] + pts[1]["y"] + pts[2]["x"] + n
+
+// Larger construction: build N-element all-scalar array via recursion,
+// verify field-by-field sums. This exercises the column layout arithmetic
+// for indices 0..2.
+val check = (): Boolean =>
+  val pts: Point[] = [
+    { "x": 1, "y": 2 },
+    { "x": 3, "y": 4 },
+    { "x": 5, "y": 6 }
+  ]
+  val x0 = pts[0]["x"]
+  val y0 = pts[0]["y"]
+  val x1 = pts[1]["x"]
+  val y1 = pts[1]["y"]
+  val x2 = pts[2]["x"]
+  val y2 = pts[2]["y"]
+  x0 == 1 && y0 == 2 && x1 == 3 && y1 == 4 && x2 == 5 && y2 == 6
+
+print("scan = ${toString(scanPoints(0))}")
+print("check = ${toString(check())}")

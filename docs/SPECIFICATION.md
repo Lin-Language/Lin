@@ -1270,6 +1270,74 @@ val greet = (name: String, greeting: String = "Hello") =>
   "${greeting}, ${name}"
 ```
 
+### 14.6 Function Overloading
+
+Several functions in the same scope may share a name, provided they differ in
+their **parameter types**. They form an **overload set**; each call selects one
+member based on the types of its arguments.
+
+```txt
+val area = (c: Circle): Float64 => 3.14159 * c["radius"] * c["radius"]
+val area = (r: Rect): Float64   => r["width"] * r["height"]
+
+area(myCircle)   // selects the Circle overload
+area(myRect)     // selects the Rect overload
+```
+
+**Dispatch is over all arguments.** Selection considers the whole tuple of
+argument types, not just the first:
+
+```txt
+val combine = (a: Int32, b: Int32)  => a + b
+val combine = (a: Int32, b: String) => "${a}${b}"
+
+combine(1, 2)     // Int32, Int32  overload
+combine(1, "x")   // Int32, String overload
+```
+
+**Resolution rules.** For a call `f(a₁ … aₙ)` where `f` is an overload set:
+
+1. A candidate is **applicable** if its arity matches (after default parameters
+   are filled, §15.6, and allowing for callback arity-width subtyping, §5.5) and
+   every argument's type is assignable to the corresponding parameter's type.
+2. The **most specific** applicable candidate is chosen: candidate `A` is
+   preferred over `B` when every parameter of `A` is a subtype of the
+   corresponding parameter of `B`. A concrete overload is preferred over a
+   generic one that matched only by instantiating a type variable.
+3. If specificity leaves no unique winner, a **numeric-conversion tie-break**
+   applies: among the remaining candidates, the one whose arguments convert most
+   cheaply wins, where a same-signedness widening (and least width gap) beats a
+   cross-signedness or int→float conversion. This resolves overloads on numerics
+   that are mutually incomparable by subtyping — e.g. an unsigned argument prefers
+   a `UInt64` overload, a signed one an `Int64` overload. Only numeric widenings
+   break the tie; non-numeric positions do not.
+4. If **no** candidate is applicable, it is a compile error
+   (`no matching overload`).
+5. If candidates remain tied after the numeric tie-break, it is a compile error
+   (`ambiguous call`).
+
+**Resolution is static.** The overload is chosen at compile time from the
+*static* types of the arguments; there is no runtime dispatch.
+
+**Union arguments must resolve unambiguously.** An argument is matched by its
+static type as a whole. A union argument is applicable to a parameter only if the
+*entire* union is assignable to it. A union that would select different overloads
+for different members therefore matches none, and the call is a compile error —
+the compiler never silently inserts a runtime branch to choose an overload.
+
+```txt
+val show = (n: Int32)  => "int"
+val show = (s: String) => "str"
+
+val x: Int32 | String = …
+show(x)   // error: no overload of `show` accepts `Int32 | String`
+```
+
+**Distinguished by parameters only.** Two overloads with identical parameter
+types are a compile error even if their return types differ — the return type is
+never used to select an overload. Only functions may overload; a name cannot be
+both a non-function value and an overload set.
+
 ## 15. Function Calls and Partial Application
 
 ### 15.1 Function Calls

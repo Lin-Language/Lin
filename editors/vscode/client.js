@@ -146,6 +146,7 @@ const SUPPORTED_SCHEMA = 2;
 
 const TEST_DECL_RE = /\btest\s*\(\s*"((?:[^"\\]|\\.)*)"/g;
 const WITHFIXTURE_DECL_RE = /\bwithFixture\s*\(/g;
+const SUITE_DECL_RE = /\bsuite\s*\(\s*"((?:[^"\\]|\\.)*)"/g;
 
 // Strip an unquoted `//` line-comment from a single source line. We walk the line
 // tracking whether we're inside a double-quoted string literal (respecting `\`
@@ -301,21 +302,143 @@ function discoverLine(line) {
   return found;
 }
 
-// (Re)build a file's child TestItems from its current text.
+// Scan the full text of a .test.lin file and return a structure-aware summary:
+//   { suites: [{ name, line, col, tests: [{ name, line, col }] }], looseTests: [{ name, line, col }] }
+// Suites are detected by `suite("name"` pattern; each test is assigned to the innermost
+// open suite (bracket-depth tracking across lines). Tests not inside any suite go to looseTests.
+// This is best-effort (same caveats as discoverLine): dynamic names are missed, corrected at run-time.
+function discoverFileStructure(text) {
+  const suites = [];
+  const looseTests = [];
+
+  // Running bracket/brace/paren depth across all lines.
+  let depth = 0;
+  // Stack of open suites: each entry is { name, line, col, openDepth, tests }.
+  // openDepth is the depth AFTER the `(` of suite(...) was counted.
+  const suiteStack = [];
+
+  const lines = text.split("\n");
+
+  // Count bracket delimiters in a line's code region, respecting string literals.
+  function countDeltas(line) {
+    const code = stripLineComment(line);
+    let open = 0, close = 0;
+    let inStr = false;
+    for (let i = 0; i < code.length; i++) {
+      const ch = code[i];
+      if (inStr) {
+        if (ch === "\\") { i++; continue; }
+        if (ch === '"') { inStr = false; }
+      } else if (ch === '"') {
+        inStr = true;
+      } else if (ch === "{" || ch === "[" || ch === "(") {
+        open++;
+      } else if (ch === "}" || ch === "]" || ch === ")") {
+        close++;
+      }
+    }
+    return { open, close };
+  }
+
+  const seenSuiteNames = new Set();
+  const seenTestNames = new Set();
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const code = stripLineComment(line);
+
+    // Check for suite declarations on this line (before updating depth).
+    SUITE_DECL_RE.lastIndex = 0;
+    let sm;
+    while ((sm = SUITE_DECL_RE.exec(code)) !== null) {
+      if (isInsideString(code, sm.index)) continue;
+      const suiteName = unescapeLinString(sm[1]);
+      if (seenSuiteNames.has(suiteName)) continue;
+      seenSuiteNames.add(suiteName);
+      // The `(` of suite( increases depth. Count open delimiters up to and including the
+      // matched `(` position to determine the depth at which this suite opens.
+      // We count the `(` that is part of `suite(` — find it after the match end.
+      const openParenIdx = code.indexOf("(", sm.index + sm[0].length - 1);
+      // openDepth is current depth + 1 (after the opening paren is counted).
+      suiteStack.push({
+        name: suiteName,
+        line: i,
+        col: sm.index,
+        openDepth: depth + 1,  // we'll process open delimiters below
+        tests: [],
+      });
+    }
+
+    // Check for test declarations on this line.
+    for (const { name, col } of discoverLine(line)) {
+      if (seenTestNames.has(name)) continue;
+      seenTestNames.add(name);
+      const entry = { name, line: i, col };
+      // Assign to innermost open suite, if any.
+      if (suiteStack.length > 0) {
+        suiteStack[suiteStack.length - 1].tests.push(entry);
+      } else {
+        looseTests.push(entry);
+      }
+    }
+
+    // Update bracket depth AFTER processing this line's declarations.
+    const { open, close } = countDeltas(line);
+    depth += open - close;
+
+    // Pop suites whose openDepth is now above the current depth (the suite's `[...]` closed).
+    while (suiteStack.length > 0 && depth < suiteStack[suiteStack.length - 1].openDepth) {
+      suites.push(suiteStack.pop());
+    }
+  }
+
+  // Flush any still-open suites (unclosed file).
+  while (suiteStack.length > 0) {
+    suites.push(suiteStack.pop());
+  }
+
+  // Sort suites by their source line for deterministic order.
+  suites.sort((a, b) => a.line - b.line);
+
+  return { suites, looseTests };
+}
+
+// (Re)build a file's child TestItems from its current text. Groups tests by suite when
+// suite() calls are present; tests not inside any suite remain direct file children.
 function refreshFileTests(controller, fileItem, text) {
   fileItem.children.replace([]);
-  const seen = new Set();
-  const lines = text.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    for (const { name, col } of discoverLine(lines[i])) {
-      const id = testItemId(fileItem.uri.fsPath, name);
-      if (seen.has(id)) continue;
-      seen.add(id);
-      const child = controller.createTestItem(id, name, fileItem.uri);
-      const startCol = col >= 0 ? col : 0;
-      child.range = new Range(new Position(i, startCol), new Position(i, startCol + name.length));
-      fileItem.children.add(child);
+  const { suites, looseTests } = discoverFileStructure(text);
+
+  for (const suite of suites) {
+    const suiteId = testItemId(fileItem.uri.fsPath, "suite::" + suite.name);
+    const suiteItem = controller.createTestItem(suiteId, suite.name, fileItem.uri);
+    suiteItem.canResolveChildren = false;
+    suiteItem.range = new Range(
+      new Position(suite.line, suite.col >= 0 ? suite.col : 0),
+      new Position(suite.line, (suite.col >= 0 ? suite.col : 0) + suite.name.length)
+    );
+    for (const t of suite.tests) {
+      const testId = testItemId(fileItem.uri.fsPath, t.name);
+      const testItem = controller.createTestItem(testId, t.name, fileItem.uri);
+      const startCol = t.col >= 0 ? t.col : 0;
+      testItem.range = new Range(
+        new Position(t.line, startCol),
+        new Position(t.line, startCol + t.name.length)
+      );
+      suiteItem.children.add(testItem);
     }
+    fileItem.children.add(suiteItem);
+  }
+
+  for (const t of looseTests) {
+    const testId = testItemId(fileItem.uri.fsPath, t.name);
+    const testItem = controller.createTestItem(testId, t.name, fileItem.uri);
+    const startCol = t.col >= 0 ? t.col : 0;
+    testItem.range = new Range(
+      new Position(t.line, startCol),
+      new Position(t.line, startCol + t.name.length)
+    );
+    fileItem.children.add(testItem);
   }
 }
 
@@ -346,8 +469,17 @@ async function resolveFileChildren(controller, fileItem) {
   }
 }
 
+// Walk up the parent chain of a TestItem to find the file-level item (the one with no parent),
+// returning its uri.fsPath. Works for 3-level trees: file → suite → test.
+function fileOfItem(it) {
+  let cur = it;
+  while (cur.parent) cur = cur.parent;
+  return cur.uri.fsPath;
+}
+
 // Map a requested set of TestItems to the file paths we should pass to `lin test`.
-// A child item resolves to its parent file. An undefined include means "everything".
+// Works for 3-level trees (file → suite → test): climb to the root for any item.
+// An undefined include means "everything".
 function collectTargetFiles(controller, request) {
   const files = new Set();
   const items = [];
@@ -357,18 +489,33 @@ function collectTargetFiles(controller, request) {
     controller.items.forEach((it) => items.push(it));
   }
   for (const it of items) {
-    // A test child has id `<file>::<name>`; a file item's id IS the fsPath.
-    const fsPath = it.parent ? it.parent.uri.fsPath : it.uri.fsPath;
-    files.add(fsPath);
+    files.add(fileOfItem(it));
   }
   return [...files];
 }
 
+// Collect every leaf-level test label reachable from a TestItem.
+// A leaf is an item with no children; a non-leaf expands its children recursively.
+function collectLeafLabels(item) {
+  const labels = [];
+  function recurse(it) {
+    let hasChildren = false;
+    it.children.forEach(() => { hasChildren = true; });
+    if (!hasChildren) {
+      labels.push(it.label);
+    } else {
+      it.children.forEach((c) => recurse(c));
+    }
+  }
+  recurse(item);
+  return labels;
+}
+
 // Build the `lin test` argument vector for a run/coverage request. Whole-project runs (no
 // include) pass the workspace root so the CLI also discovers files we never enumerated. When
-// the request targets INDIVIDUAL test items (gutter arrow on a single test), we additionally
-// pass `--filter-test "<name>"` per selected child so the CLI runs only those tests, not the
-// whole file. File-level selections (and a child mixed with its own file) run the whole file.
+// the request targets INDIVIDUAL test items (gutter arrow on a single test or suite), we
+// additionally pass `--filter-test "<name>"` per LEAF test so the CLI runs only those tests.
+// File-level selections (and any item whose file is also directly included) run the whole file.
 function buildTestArgs(request, targetFiles, wsRoot) {
   const wholeProject = !(request.include && request.include.length > 0);
   const args = ["test"];
@@ -383,25 +530,42 @@ function buildTestArgs(request, targetFiles, wsRoot) {
     // Files explicitly included as whole files — don't narrow those by name.
     const wholeFiles = new Set();
     for (const it of request.include) {
-      if (!it.parent) wholeFiles.add(it.uri.fsPath);
+      // A file item has no parent (top-level in the tree).
+      if (!it.parent) wholeFiles.add(fileOfItem(it));
     }
-    // Child test items whose file isn't being run wholesale → filter by name.
+    // Collect leaf test labels for items whose file isn't being run wholesale.
     for (const it of request.include) {
-      if (it.parent && !wholeFiles.has(it.parent.uri.fsPath)) {
-        args.push("--filter-test", it.label);
+      if (it.parent && !wholeFiles.has(fileOfItem(it))) {
+        for (const label of collectLeafLabels(it)) {
+          args.push("--filter-test", label);
+        }
       }
     }
   }
   return args;
 }
 
+// Recursively search a TestItem's descendants for one with the given id. The tree is up to
+// three levels (file → suite → test), and `TestItemCollection.get` only sees DIRECT children,
+// so a grouped (under-suite) test must be found by descending — otherwise the run-result
+// handler would create a duplicate flat item under the file and the real tree item would stay
+// stuck "enqueued".
+function findDescendantById(item, id) {
+  const direct = item.children.get(id);
+  if (direct) return direct;
+  let found;
+  item.children.forEach((c) => { if (!found) found = findDescendantById(c, id); });
+  return found;
+}
+
 // Find the TestItem for a `<file>::<name>` pair, creating it under the file item
 // if it wasn't statically discovered (e.g. an interpolated/dynamic test name).
+// Searches the whole file subtree (including suite groups), not just direct file children.
 function findOrCreateTestItem(controller, file, name) {
   const fileUri = Uri.file(file);
   const fileItem = getOrCreateFileItem(controller, fileUri);
   const id = testItemId(file, name);
-  let child = fileItem.children.get(id);
+  let child = findDescendantById(fileItem, id);
   if (!child) {
     child = controller.createTestItem(id, name, fileUri);
     fileItem.children.add(child);
@@ -534,9 +698,14 @@ function setupTestController(context, linBin) {
     } else {
       controller.items.forEach((it) => requested.push(it));
     }
-    for (const it of requested) {
+    // Recursively mark items and all their descendants as enqueued so suite grandchildren
+    // (file → suite → test) show as pending too.
+    function enqueueRecursive(it) {
       run.enqueued(it);
-      it.children.forEach((c) => run.enqueued(c));
+      it.children.forEach((c) => enqueueRecursive(c));
+    }
+    for (const it of requested) {
+      enqueueRecursive(it);
     }
 
     // Whole-project run: pass the workspace root rather than enumerating files,
@@ -553,6 +722,12 @@ function setupTestController(context, linBin) {
       args.push("--coverage", "--format", "llvm-cov", "--output", lcovFile);
     }
 
+    // Accumulate pass/fail counts for the status-bar summary shown at the end.
+    let passCount = 0;
+    let failCount = 0;
+    let firstFailName = null;
+    let hasOutput = false;
+
     // End the run exactly once and notify the caller (palette runs use this to dispose their
     // CancellationTokenSource). Guarded so multiple termination paths (spawn error, child error,
     // normal close) don't double-end.
@@ -561,6 +736,21 @@ function setupTestController(context, linBin) {
       if (finished) return;
       finished = true;
       run.end();
+      // Feature E-1: status-bar summary.
+      if (passCount + failCount > 0) {
+        let msg;
+        if (failCount === 0) {
+          msg = `Lin: ✓ ${passCount} passed`;
+        } else {
+          const failPart = firstFailName ? `✗ ${failCount} failed ("${firstFailName}")` : `✗ ${failCount} failed`;
+          msg = `Lin: ${failPart}, ${passCount} passed`;
+        }
+        window.setStatusBarMessage(msg, 5000);
+      }
+      // Feature E-2: auto-open Test Results panel if any output was produced.
+      if (hasOutput) {
+        try { commands.executeCommand("testing.showMostRecentOutput"); } catch (_) { /* best-effort */ }
+      }
       if (typeof onDone === "function") onDone();
     };
 
@@ -610,9 +800,13 @@ function setupTestController(context, linBin) {
         const mark = rec.status === "pass" ? "✓" : "✗";
         const durSuffix = typeof durationMs === "number" ? ` (${durationMs}ms)` : "";
         run.appendOutput(`${mark} ${rec.name}${durSuffix}\r\n`, undefined, item);
+        hasOutput = true;
         if (rec.status === "pass") {
+          passCount++;
           run.passed(item, durationMs);
         } else {
+          failCount++;
+          if (!firstFailName) firstFailName = rec.name;
           const msg = rec.message || "test failed";
           // Surface the failure message (indented) in the output tab too.
           run.appendOutput(`    ${msg.replace(/\r?\n/g, "\r\n    ")}\r\n`, undefined, item);
@@ -635,12 +829,15 @@ function setupTestController(context, linBin) {
         }
       } else if (rec.event === "file") {
         if (rec.status === "compile_error" || rec.status === "timeout") {
+          hasOutput = true;
+          failCount++;
           const fileItem = getOrCreateFileItem(controller, Uri.file(rec.file));
           const tm = new TestMessage(rec.message || rec.status);
-          // Mark the file item and any known children as errored so the failure
-          // is visible even when no per-test records were produced.
+          // Mark the file item and ALL its descendants (suite groups → tests) as errored so
+          // the failure is visible even when no per-test records were produced.
           run.errored(fileItem, tm);
-          fileItem.children.forEach((c) => run.errored(c, tm));
+          const erroredAll = (it) => it.children.forEach((c) => { run.errored(c, tm); erroredAll(c); });
+          erroredAll(fileItem);
         }
       }
     };
@@ -1099,7 +1296,41 @@ function activate(context) {
       }
       const fsPath = Uri.parse(documentUri).fsPath;
       const child = findOrCreateTestItem(testController, fsPath, testName);
+      // Feature E-3: best-effort reveal in the Test Explorer.
+      try { commands.executeCommand("vscode.revealTestInExplorer", child); } catch (_) { /* best-effort */ }
       runWithFreshToken(`runTest:${fsPath}::${testName}`, new TestRunRequest([child]));
+    }),
+    // CodeLens-driven suite run. The LSP emits CodeLenses with command id `lin.runSuite`
+    // and argument order: [documentUri: string, suiteName: string, memberNames: string[]].
+    // We resolve the suite item if already discovered; otherwise materialise each member
+    // test item directly (which still emits correct `--filter-test` args via collectLeafLabels).
+    commands.registerCommand("lin.runSuite", (documentUri, suiteName, memberNames) => {
+      if (typeof documentUri !== "string" || typeof suiteName !== "string" || !Array.isArray(memberNames)) {
+        window.showWarningMessage("Lin: Run Suite invoked with invalid arguments.");
+        return;
+      }
+      const fsPath = Uri.parse(documentUri).fsPath;
+      const fileUri = Uri.file(fsPath);
+      const fileItem = getOrCreateFileItem(testController, fileUri);
+
+      // Prefer the statically-discovered suite item if present.
+      const suiteId = testItemId(fsPath, "suite::" + suiteName);
+      const suiteItem = fileItem.children.get(suiteId);
+
+      let itemsToRun;
+      if (suiteItem) {
+        itemsToRun = [suiteItem];
+        // Feature E-3: reveal suite item.
+        try { commands.executeCommand("vscode.revealTestInExplorer", suiteItem); } catch (_) { /* best-effort */ }
+      } else {
+        // Suite not yet in the tree — materialise each member test directly.
+        itemsToRun = memberNames.map((name) => findOrCreateTestItem(testController, fsPath, name));
+        if (itemsToRun.length > 0) {
+          try { commands.executeCommand("vscode.revealTestInExplorer", itemsToRun[0]); } catch (_) { /* best-effort */ }
+        }
+      }
+      if (itemsToRun.length === 0) return;
+      runWithFreshToken(`runSuite:${fsPath}::${suiteName}`, new TestRunRequest(itemsToRun));
     }),
   );
 }
@@ -1115,5 +1346,5 @@ module.exports = {
   deactivate,
   // Exposed for the standalone discovery/unescape unit test (test/discovery.test.js).
   // These are pure (no VS Code API) and safe to call directly.
-  _test: { discoverLine, unescapeLinString, stripLineComment, isInsideString, firstStringArg },
+  _test: { discoverLine, unescapeLinString, stripLineComment, isInsideString, firstStringArg, discoverFileStructure, findDescendantById },
 };

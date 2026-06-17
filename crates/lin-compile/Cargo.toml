@@ -4,10 +4,6 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-[features]
-# Forward the smi feature to lin-runtime so `cargo build --features lin-compile/smi`
-# propagates the flag down to the runtime library (and the linked staticlib).
-smi = ["lin-runtime/smi"]
 
 [dependencies]
 lin-common = { path = "../lin-common" }

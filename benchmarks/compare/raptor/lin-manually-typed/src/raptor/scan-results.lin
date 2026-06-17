@@ -7,7 +7,7 @@ export type ScanResults = {
   k: UInt8
 }
 
-export val createScanResults = =>
+export val createScanResults = () =>
   bestArrivals: Arrivals,
   kArrivals: ArrivalsByNumChanges,
   kConnections: ConnectionIndex,
@@ -25,7 +25,7 @@ val addRound = (results: ScanResults): void =>
 
 
 val previousArrival = (results: ScanResults, stopPi: StopID): Time =>
-  return results["kArrivals"][results["k"] - 1][stopPi]
+  results["kArrivals"][results["k"] - 1][stopPi]
 
 
 val setTrip = (results: ScanResults, trip: Trip, startIndex: number, endIndex: number, interchange: number): void =>

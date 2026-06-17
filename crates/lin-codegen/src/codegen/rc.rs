@@ -138,6 +138,12 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.array_release, &[val.into_pointer_value().into()], "");
                 return;
             }
+            // COLUMNAR array (0xFC) → the standard array release (lin_array_release dispatches on
+            // elem_tag = 0xFC and calls free_columnar_array_cols + lin_array_free).
+            Repr::Packed(lin_ir::repr::Layout::ColumnarArray { .. }) => {
+                self.builder.call(self.rt.array_release, &[val.into_pointer_value().into()], "");
+                return;
+            }
             // UNBOXED SUM TYPE (unboxed-sumtype Stage 1) → `lin_sumnode_release(ptr, total_size)`.
             // Stage 1 is scalar-only so this is a refcount decrement + free (no per-field walk).
             Repr::Packed(lin_ir::repr::Layout::SumNode { sum_ty }) => {
