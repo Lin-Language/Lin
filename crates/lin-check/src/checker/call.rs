@@ -820,15 +820,16 @@ impl Checker {
                 {
                     let arg_ty = arg.ty();
                     if !self.arg_compatible(&arg_ty, param_ty) {
-                        return Err(Diagnostic::error(
-                            args[i].span(),
-                            format!(
-                                "Argument {} has type {}, expected {}",
-                                i + 1,
-                                arg_ty,
-                                param_ty
-                            ),
-                        ));
+                        let mut msg = format!(
+                            "Argument {} has type {}, expected {}",
+                            i + 1,
+                            arg_ty,
+                            param_ty
+                        );
+                        if let Some(breakdown) = self.explain_mismatch(&arg_ty, param_ty) {
+                            msg.push_str(&breakdown);
+                        }
+                        return Err(Diagnostic::error(args[i].span(), msg));
                     }
                 }
 
@@ -1610,14 +1611,18 @@ impl Checker {
                         continue;
                     }
                     if !self.arg_compatible(&arg_ty, param_ty) {
+                        let mut msg = format!(
+                            "Argument {} has type {}, expected {}",
+                            i + 1,
+                            arg_ty,
+                            param_ty
+                        );
+                        if let Some(breakdown) = self.explain_mismatch(&arg_ty, param_ty) {
+                            msg.push_str(&breakdown);
+                        }
                         return Err(Diagnostic::error(
                             all_arg_exprs.get(i).map(|e| e.span()).unwrap_or(span),
-                            format!(
-                                "Argument {} has type {}, expected {}",
-                                i + 1,
-                                arg_ty,
-                                param_ty
-                            ),
+                            msg,
                         ));
                     }
                 }

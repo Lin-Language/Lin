@@ -20923,3 +20923,45 @@ print(enc(c))
 "#);
     assert_eq!(out, vec!["16", "32", "64"]);
 }
+
+// ---------------------------------------------------------------------------
+// Diagnostic drill-down tests
+// ---------------------------------------------------------------------------
+
+/// A union-into-non-null-param mismatch (the `keys()` case): passing `M | Null` where only
+/// `M` is expected should produce a drill-down mentioning `Null` or "not assignable".
+#[test]
+fn test_check_drill_down_union_null_mismatch() {
+    // keys() expects { String: AnyVal } | {}; m[k] returns M | Null.
+    // The drill-down should explain that Null is the problematic variant.
+    let (ok, output) = check_source(
+        r#"import { keys } from "std/object"
+type M = { String: UInt32 }
+val f = (m: { UInt8: M }, k: UInt8): String[] =>
+  m[k].keys()
+"#,
+    );
+    assert!(!ok, "expected type error, but check passed:\n{}", output);
+    assert!(
+        output.contains("\u{21b3}") && (output.contains("Null") || output.contains("not assignable")),
+        "expected drill-down with ↳ mentioning Null/not assignable, got:\n{}",
+        output
+    );
+}
+
+/// A simple scalar-vs-scalar mismatch must NOT produce a drill-down (message stays byte-identical).
+#[test]
+fn test_check_no_drill_down_scalar_mismatch() {
+    let (ok, output) = check_source(
+        r#"import { trim } from "std/string"
+val x = trim(42)
+"#,
+    );
+    assert!(!ok, "expected type error");
+    // The ↳ character must NOT appear for a plain scalar mismatch.
+    assert!(
+        !output.contains("\u{21b3}"),
+        "unexpected drill-down for scalar mismatch, got:\n{}",
+        output
+    );
+}
