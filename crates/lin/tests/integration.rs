@@ -19775,6 +19775,77 @@ print(last)
     assert_eq!(out, vec!["a:item4:4"]);
 }
 
+// Regression (ADR-083): a `while`-thunk closure that captures an outer `var last: Record | Null`
+// (a NullableRecord — physically a raw nullable sealed-struct pointer) AND, in the same body,
+// (a) ASSIGNS a sealed record to that var (`lastFound = t`) and (b) CALLS a heap-touching function
+// over a multi-map record corrupted memory. The captured var's slot holds a NullableRecord, but
+// codegen's union-typed Retain (the sealed `Trip` value carries a `Trip | Null` STATIC type when it
+// flows into the cell — same raw-pointer repr, no Coerce) routed it through `lin_tagged_retain`,
+// which reads offset 0 of the sealed struct as a TAG byte and offset 8 as an inner payload pointer
+// — type-confusion + UAF (segfault). The CellSet release-of-old likewise used `lin_tagged_release`,
+// dealloc-ing the 56-byte struct as a 16-byte TaggedVal box (mismatched-size double-free). Fix:
+// codegen retains/releases ANY packed-pointer repr (incl. a packed value carrying a union static
+// type) by-rc / null-guarded-sealed, never by-tag. The deep loop (300k record-var assigns across a
+// heap-touching call) is the per-iteration UAF/double-free guard.
+#[test]
+fn test_while_thunk_captured_record_var_across_heap_call_no_uaf() {
+    let out = run(r#"import { print } from "std/io"
+import { length } from "std/array"
+import { while } from "std/iter"
+
+type Service = { "startDate": UInt32, "endDate": UInt32, "days": { Int32: Boolean }, "dates": { Int32: Boolean } }
+type Trip = { "tripId": String, "service": Service, "dep": UInt32 }
+
+val mkService = (s: UInt32): Service =>
+  { "startDate": s, "endDate": 20991231, "days": { 0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true }, "dates": { 20180615: true } }
+
+val runsOn = (svc: Service, date: UInt32, dow: Int32): Boolean =>
+  val exception = svc["dates"][date]
+  if exception == true then true
+  else if exception == false then false
+  else if date < svc["startDate"] then false
+  else if date > svc["endDate"] then false
+  else svc["days"][dow] == true
+
+val mkTrip = (id: String, dep: UInt32): Trip => { "tripId": id, "service": mkService(20180101), "dep": dep }
+
+val gt = (trips: Trip[], time: UInt32): Trip | Null =>
+  var i = trips.length() - 1
+  var lastFound: Trip | Null = null
+  while(() =>
+    if i < 0 then false
+    else
+      val t = trips[i]
+      if t["dep"] < time then false
+      else
+        val foundHere = t["service"].runsOn(20180615, 5)
+        if foundHere then
+          lastFound = t
+        i = i - 1
+        true
+  )
+  lastFound
+
+val main = () =>
+  val trips = [mkTrip("t1", 1000), mkTrip("t2", 1000), mkTrip("t3", 1000)]
+  var n: Int32 = 0
+  var last = "none"
+  while(() =>
+    if n >= 100000 then false
+    else
+      val r = gt(trips, 500)
+      last = if r == null then "null" else r["tripId"]
+      n = n + 1
+      true
+  )
+  print(last)
+main()
+"#);
+    // Last matching trip (highest index, since the scan walks downward and keeps the last write)
+    // is "t1" (index 0, the final assignment). Survives 100k gt-calls × 3 record-var assigns.
+    assert_eq!(out, vec!["t1"]);
+}
+
 #[test]
 fn test_heap_sumnode_array_field_match_read() {
     // A variant with an Array field (Int32[]). Match-narrow and read the array length.
