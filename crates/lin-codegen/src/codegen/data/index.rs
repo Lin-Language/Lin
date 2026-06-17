@@ -135,7 +135,7 @@ impl<'ctx> Codegen<'ctx> {
         if let Type::Map { key: map_key_ty, value: map_elem } = obj_ty {
             let _ = map_elem;
             // Int-keyed map: coerce the key to i64 and call lin_map_get_int.
-            if map_key_ty.is_integer() {
+            if map_key_ty.is_int_map_key() {
                 let i64_key = if key.is_int_value() {
                     self.builder.int_s_extend_or_bit_cast(key.into_int_value(), self.context.i64_type(), "ir_mkey_i64")
                 } else if key.is_pointer_value() {
@@ -309,16 +309,41 @@ impl<'ctx> Codegen<'ctx> {
             if obj.is_pointer_value() {
                 // Stage 6b Phase 2: materialize sealed record to a fresh LinMap* then map_get.
                 let mat = self.sealed_materialize_to_map(obj, &fields).into_pointer_value();
-                let key_raw = if Self::is_union_type(key_ty) && key.is_pointer_value() {
-                    self.builder.call(self.rt.unbox_ptr, &[key.into()], "sealed_dynk_unbox").try_as_basic_value().unwrap_basic()
+                // The materialized map always uses STRING keys (the field names are always strings,
+                // even when the original index-signature key was an integer-literal union, e.g.
+                // `{ DayOfWeek: V }` expands to fields "0", "1", ..., "6"). When the runtime key
+                // is an integer or an integer-literal-union value, convert it to a string first so
+                // the lookup matches the string field names in the materialized map.
+                let (key_str, int_key_str_to_release) = if key_ty.is_int_map_key() {
+                    // Extract the raw i64 value from the (possibly boxed) key and convert to string.
+                    let i64_val = if key.is_int_value() {
+                        self.builder.int_s_extend_or_bit_cast(key.into_int_value(), self.context.i64_type(), "sealed_dynk_i64")
+                    } else if key.is_pointer_value() {
+                        // Boxed integer (TaggedVal*): unbox to scalar first.
+                        let unboxed = self.unbox_value(key, &Type::Int64);
+                        unboxed.into_int_value()
+                    } else {
+                        self.context.i64_type().const_zero()
+                    };
+                    let key_str_val = self.builder.call(self.rt.int_to_string, &[i64_val.into()], "sealed_dynk_kstr")
+                        .try_as_basic_value().unwrap_basic();
+                    (key_str_val, true)
+                } else if Self::is_union_type(key_ty) && key.is_pointer_value() {
+                    let raw = self.builder.call(self.rt.unbox_ptr, &[key.into()], "sealed_dynk_unbox")
+                        .try_as_basic_value().unwrap_basic();
+                    (raw, false)
                 } else {
-                    key
+                    (key, false)
                 };
-                let entry = self.builder.call(self.rt.map_get, &[mat.into(), key_raw.into()], "sealed_dynk_get").try_as_basic_value().unwrap_basic();
+                let entry = self.builder.call(self.rt.map_get, &[mat.into(), key_str.into()], "sealed_dynk_get").try_as_basic_value().unwrap_basic();
                 // `entry` is a borrowed interior `*TaggedVal` (or null) into `mat`; clone it into an
                 // independent owned box, then free `mat` (the clone keeps the inner alive).
                 let clone_fn = self.get_or_declare_fn("lin_tagged_clone", ptr_ty.fn_type(&[ptr_ty.into()], false));
                 let owned = self.builder.call(clone_fn, &[entry.into()], "sealed_dynk_clone").try_as_basic_value().unwrap_basic();
+                // Release the temporary int-to-string result if we created one.
+                if int_key_str_to_release {
+                    self.builder.call(self.rt.string_release, &[key_str.into()], "");
+                }
                 self.builder.call(self.rt.map_release, &[mat.into()], "");
                 // `owned` is a +1 box; the IR lowering's projection CloneBox (union result) clones it
                 // again into the binding's owned box — balanced. Match the surrounding repr.
@@ -626,7 +651,7 @@ impl<'ctx> Codegen<'ctx> {
             // Pass the map's value type `V` so a flat-scalar `V` is stored UNBOXED (inline in the
             // slot's TaggedVal, no heap box) and a narrower source value is widened to `V`.
             Type::Map { key: map_key_ty, value: elem } => {
-                if map_key_ty.is_integer() {
+                if map_key_ty.is_int_map_key() {
                     // Int-keyed map: coerce key to i64 and call lin_map_set_int.
                     let i64_key = self.index_value_to_i64(key);
                     self.emit_map_set_int(obj, i64_key.into(), value, val_ty, elem, val_repr);

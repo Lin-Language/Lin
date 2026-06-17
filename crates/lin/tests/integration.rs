@@ -5805,6 +5805,33 @@ print(toString(length(values(m))))
 }
 
 #[test]
+fn test_int_literal_union_keyed_object_dynamic_lookup() {
+    // Regression: `{ DayOfWeek: Boolean }` where `DayOfWeek = 0|1|...|6` expands at type-check
+    // time to a sealed record with string field names "0".."6" (closed-int-literal-union sugar).
+    // When accessed with a DYNAMIC integer key (`dow: DayOfWeek = 1`), the codegen must convert
+    // the integer key to its string form (via lin_int_to_string) before looking up in the
+    // materialized string-keyed LinMap, not pass the raw integer as a LinString* (which caused
+    // a misaligned-pointer panic in lin-runtime's hash_string_key). All seven day-keys round-trip.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type DayOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6
+type ServiceDays = { DayOfWeek: Boolean }
+val days: ServiceDays = { 0: true, 1: false, 2: true, 3: true, 4: true, 5: true, 6: true }
+val lookup = (dow: DayOfWeek): String =>
+  if days[dow] then "yes" else "no"
+val d0: DayOfWeek = 0
+val d1: DayOfWeek = 1
+val d2: DayOfWeek = 2
+val d6: DayOfWeek = 6
+print(lookup(d0))
+print(lookup(d1))
+print(lookup(d2))
+print(lookup(d6))
+"#);
+    assert_eq!(output, vec!["yes", "no", "yes", "yes"]);
+}
+
+#[test]
 fn test_json_not_assignable_to_typed_map() {
     // Type-soundness: there is intentionally NO implicit `AnyVal -> { String: T }` coercion
     // (§5.1.1, §6.3, ADR-055). A `AnyVal` value's runtime payload is a `LinObject` (or any tag),
