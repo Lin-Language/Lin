@@ -7,6 +7,22 @@ use crate::resolve::resolve_type;
 use crate::typed_ir::*;
 use crate::types::Type;
 
+/// Build the unique LLVM symbol for one member of a function overload set (ADR-074):
+/// `base$<param-type-tokens>_<slot>`. The trailing slot guarantees uniqueness regardless of the
+/// token encoder; the type tokens make IR dumps / coverage readable. `$` is not a legal Lin
+/// identifier character, so this never collides with a user-written name.
+fn overload_symbol(base: &str, params: &[Type], slot: usize) -> String {
+    let sanitize = |s: &str| -> String {
+        s.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect()
+    };
+    let tokens = if params.is_empty() {
+        "void".to_string()
+    } else {
+        params.iter().map(|p| sanitize(&p.to_string())).collect::<Vec<_>>().join("_")
+    };
+    format!("{}${}_{}", base, tokens, slot)
+}
+
 impl Checker {
     /// Build the diagnostic for `import { name } from "path"` where `path` is a resolved module
     /// that does not export `name`. Prefers a cross-module suggestion (another module that DOES
@@ -228,6 +244,20 @@ impl Checker {
                     lin_parse::ast::Pattern::Ident(n, _) => Some(n.clone()),
                     _ => None,
                 };
+
+                // ADR-074: give each member of a function overload set a unique LLVM symbol.
+                // Calls dispatch via slot→FuncId, so only the emitted *symbol* (the
+                // `TypedExpr::Function.name`) must be unique; the `TypedStmt::Val.name` — used for
+                // cross-module exports and DWARF — stays the source name.
+                if let Some(bn) = binding_name {
+                    if self.env.is_overloaded(bn) {
+                        if let (TypedExpr::Function { name, .. }, Type::Function { params, .. }) =
+                            (&mut typed_value, &ty)
+                        {
+                            *name = Some(overload_symbol(bn, params, slot));
+                        }
+                    }
+                }
 
                 Ok(TypedStmt::Val {
                     slot,

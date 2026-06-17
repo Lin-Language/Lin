@@ -318,6 +318,32 @@ impl Checker {
         }
     }
 
+    /// ADR-074: find the forward-declared overload slot of `name` that this val (with parameter
+    /// types `params`) defines. Matches the first STILL-UNBOUND candidate whose parameters are
+    /// type-compatible (treating un-annotated `TypeVar` params as wildcards). The unbound gate
+    /// resolves order among equally-matching candidates: the Nth source definition binds the Nth
+    /// forward-declared slot. Tolerant `types_compatible` matching absorbs named-vs-structural
+    /// differences between the pre-scan's and the body check's type resolution.
+    fn match_overload_slot(&self, name: &str, params: &[Type]) -> Option<usize> {
+        for (slot, ty) in self.env.overload_candidates(name) {
+            if !self.forward_declared.contains(&slot) {
+                continue;
+            }
+            if let Type::Function { params: cps, .. } = &ty {
+                if cps.len() == params.len()
+                    && cps.iter().zip(params.iter()).all(|(a, b)| {
+                        matches!(a, Type::TypeVar(_))
+                            || matches!(b, Type::TypeVar(_))
+                            || (self.types_compatible(a, b) && self.types_compatible(b, a))
+                    })
+                {
+                    return Some(slot);
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn bind_pattern(
         &mut self,
         pattern: &Pattern,
@@ -326,6 +352,18 @@ impl Checker {
     ) -> Result<usize, Diagnostic> {
         match pattern {
             Pattern::Ident(name, span) => {
+                // ADR-074: when `name` is a function overload set, this val re-binds its OWN
+                // forward-declared slot — matched by parameter types, not the primary's slot —
+                // so each overload keeps its distinct slot (hence FuncId/symbol).
+                if self.env.is_overloaded(name) {
+                    if let Type::Function { params, .. } = ty {
+                        if let Some(slot) = self.match_overload_slot(name, params) {
+                            self.env.update_overload_type(slot, ty.clone());
+                            self.forward_declared.remove(&slot);
+                            return Ok(slot);
+                        }
+                    }
+                }
                 // If this name was forward-declared (pre-scan for mutual recursion),
                 // reuse the existing slot and update its type.
                 if let Some(existing) = self.env.lookup(name) {

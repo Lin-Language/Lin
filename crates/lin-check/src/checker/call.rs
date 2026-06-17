@@ -7,6 +7,18 @@ use crate::resolve::{error_type, any_val_type};
 use crate::typed_ir::*;
 use crate::types::Type;
 
+/// Render a function type as a readable `(P1, P2) => Ret` signature for overload diagnostics
+/// (ADR-074). Non-function types fall back to their plain display.
+fn overload_signature(ty: &Type) -> String {
+    match ty {
+        Type::Function { params, ret, .. } => {
+            let ps = params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
+            format!("({}) => {}", ps, ret)
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Whether an argument type may satisfy a `Number` (numeric-bounded) parameter (ADR-014, reversed).
 /// Accepts:
 ///   * a concrete numeric family (the monomorphizable case),
@@ -349,7 +361,17 @@ impl Checker {
         // Function expression and arguments are not in tail position.
         let prev_tail = self.in_tail_position;
         self.in_tail_position = false;
-        let typed_func = self.infer_expr(func)?;
+        // ADR-074: when the callee names a function overload set, select the overload by argument
+        // types here and pin the callee to the chosen overload's slot. The arg-checking block
+        // below then runs unchanged against the selected signature.
+        let typed_func = match func {
+            Expr::Ident(callee, callee_span) if self.env.is_overloaded(callee) => {
+                let (slot, fn_ty) =
+                    self.select_overloaded_callee(callee, args, partial, *callee_span)?;
+                TypedExpr::LocalGet { slot, ty: fn_ty, span: *callee_span }
+            }
+            _ => self.infer_expr(func)?,
+        };
         let func_ty = typed_func.ty();
 
         let (typed_args, result_type) = match &func_ty {
@@ -959,6 +981,157 @@ impl Checker {
             partial,
             span,
         })
+    }
+
+    /// ADR-074: select the overload of `name` to call, given the argument expressions. Returns the
+    /// chosen overload's `(slot, function_type)`. Argument types are obtained by a SPECULATIVE
+    /// inference pass that is rolled back (scopes truncated, stream-consumption restored) so the
+    /// real arg-checking in `infer_call` runs exactly once with no double side effects. Lambda
+    /// (function-literal) arguments are left untyped and treated as wildcards for selection — they
+    /// are checked for real against the chosen signature afterwards.
+    fn select_overloaded_callee(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        partial: bool,
+        span: Span,
+    ) -> Result<(usize, Type), Diagnostic> {
+        let candidates = self.env.overload_candidates(name);
+        // Speculatively infer argument types (rolled back below).
+        let stream_snap = self.consumed_streams.clone();
+        let snap = self.checker_state_snapshot();
+        let arg_tys: Vec<Option<Type>> = args
+            .iter()
+            .map(|a| {
+                if matches!(a, Expr::Function { .. }) {
+                    None
+                } else {
+                    self.infer_expr(a).ok().map(|t| t.ty())
+                }
+            })
+            .collect();
+        self.restore_checker_state(snap);
+        self.consumed_streams = stream_snap;
+        self.select_overload(&candidates, &arg_tys, partial, name, span)
+    }
+
+    /// Pure overload-resolution core (ADR-074): pick the unique most-specific applicable candidate.
+    fn select_overload(
+        &self,
+        candidates: &[(usize, Type)],
+        arg_tys: &[Option<Type>],
+        partial: bool,
+        name: &str,
+        span: Span,
+    ) -> Result<(usize, Type), Diagnostic> {
+        // Applicability: every SUPPLIED argument is assignable to its parameter as a whole (a union
+        // arg is applicable only if the ENTIRE union is assignable, §14.6); an untyped lambda arg is
+        // a wildcard matching any function-typed parameter. Arity: a complete call supplies between
+        // `required` and `params` arguments; a partial application (`f(x,)`) supplies a prefix, so
+        // only the upper bound applies and selection ranks on that prefix.
+        let n = arg_tys.len();
+        let applicable: Vec<&(usize, Type)> = candidates
+            .iter()
+            .filter(|(_, ty)| {
+                let Type::Function { params, required, .. } = ty else { return false };
+                if n > params.len() || (!partial && n < *required) {
+                    return false;
+                }
+                arg_tys.iter().zip(params.iter()).all(|(arg, param)| match arg {
+                    Some(at) => self.arg_compatible(at, param),
+                    None => matches!(param, Type::Function { .. }),
+                })
+            })
+            .collect();
+
+        if applicable.is_empty() {
+            return Err(self.no_matching_overload_diag(candidates, arg_tys, name, span));
+        }
+        if applicable.len() == 1 {
+            return Ok(applicable[0].clone());
+        }
+        // Is parameter `x` at least as specific as `y`? A generic (`TypeVar`) parameter is the
+        // least specific (a wildcard): anything is ≤ a wildcard, but a wildcard is not ≤ a concrete
+        // type. Two concrete types compare by assignability. This makes a concrete overload strictly
+        // dominate a generic one that matched only by instantiation (§14.6).
+        let param_le = |x: &Type, y: &Type| -> bool {
+            if matches!(y, Type::TypeVar(_)) {
+                true
+            } else if matches!(x, Type::TypeVar(_)) {
+                false
+            } else {
+                self.types_compatible(x, y)
+            }
+        };
+        // Rank over the SUPPLIED prefix (length `n`): every applicable candidate has at least `n`
+        // parameters, and unsupplied (defaulted/curried) params can't distinguish overloads.
+        let dominates = |a: &Type, b: &Type| -> bool {
+            let (Type::Function { params: pa, .. }, Type::Function { params: pb, .. }) = (a, b)
+            else {
+                return false;
+            };
+            pa.iter().take(n).zip(pb.iter().take(n)).all(|(x, y)| param_le(x, y))
+        };
+        let winners: Vec<&&(usize, Type)> = applicable
+            .iter()
+            .filter(|cand| {
+                applicable
+                    .iter()
+                    .all(|other| cand.0 == other.0 || dominates(&cand.1, &other.1))
+            })
+            .collect();
+        match winners.as_slice() {
+            [w] => Ok((***w).clone()),
+            _ => Err(self.ambiguous_overload_diag(&applicable, arg_tys, name, span)),
+        }
+    }
+
+    fn no_matching_overload_diag(
+        &self,
+        candidates: &[(usize, Type)],
+        arg_tys: &[Option<Type>],
+        name: &str,
+        span: Span,
+    ) -> Diagnostic {
+        let got = arg_tys
+            .iter()
+            .map(|t| t.as_ref().map(|t| t.to_string()).unwrap_or_else(|| "<function>".to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cands = candidates
+            .iter()
+            .map(|(_, t)| format!("  • {}", overload_signature(t)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Diagnostic::error(
+            span,
+            format!("no matching overload for `{}({})`", name, got),
+        )
+        .with_help(format!("the candidate overloads are:\n{}", cands))
+    }
+
+    fn ambiguous_overload_diag(
+        &self,
+        applicable: &[&(usize, Type)],
+        arg_tys: &[Option<Type>],
+        name: &str,
+        span: Span,
+    ) -> Diagnostic {
+        let got = arg_tys
+            .iter()
+            .map(|t| t.as_ref().map(|t| t.to_string()).unwrap_or_else(|| "<function>".to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cands = applicable
+            .iter()
+            .map(|(_, t)| format!("  • {}", overload_signature(t)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Diagnostic::error(
+            span,
+            format!("ambiguous call to `{}({})` — more than one overload matches equally well", name, got),
+        )
+        .with_help(format!("the matching overloads are:\n{}\nthese cannot be ranked by specificity (§14.6)", cands))
     }
 
     pub(crate) fn infer_dot_call(
