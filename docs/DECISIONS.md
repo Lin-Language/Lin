@@ -3035,3 +3035,40 @@ tie-break is deliberately conservative — it differentiates *only* numeric wide
 ambiguity (records, unions, generics already handled at the specificity tier) exactly as ADR-074 left it.
 Spec §14.6 notes the numeric preference. Regression tests cover same-signedness selection, signed/unsigned
 selection of the incomparable pair, and the unchanged record-ambiguity error.
+
+## ADR-076: Nested map writes auto-vivify absent intermediate levels
+
+**Status**: Accepted.
+
+**Context**: Bracket reads are safe and null-propagating (§6.1/§7.1): `m[k1][k2]` yields `Null` when any
+level is absent. The write side was under-specified: a nested assignment `m[k1][k2] = v` whose intermediate
+`m[k1]` was absent (a `{K: V}` map value typed `V | Null`) *silently no-opped* — the runtime `lin_map_set`
+guards against writing into a null inner map, so the assignment compiled and ran but stored nothing. That is
+a footgun: the statement's intent is to store, and it silently didn't. Requiring callers to hand-write
+`m[k1] = m[k1] ?? {}` before every nested write is noisy and easy to forget.
+
+**Decision**: A nested index-assignment auto-vivifies absent **intermediate map levels**. When lowering an
+`IndexSet` whose object operand is itself an `Index` read of map type, that read is lowered as
+*get-or-create*: read the level; if `Null`, construct an empty map of the level's statically-known value
+type, store it back into its parent, and continue. This recurses outermost-first so every intermediate map
+level of an arbitrarily deep `m[a][b][c] = v` is created. The final-level set assigns the leaf unchanged.
+
+Scope is deliberately bounded to **map** intermediates (`Type::Map`): records are total (their fields always
+exist, nothing to create) and arrays cannot be vivified by key (an out-of-range array index stays a runtime
+error, §7.1). **Reads are unchanged** — they null-propagate and never mutate. The read/write asymmetry is
+intentional and is the design's core: a read retrieves (absence is a valid `Null` answer); a write stores
+(so it must ensure the path).
+
+**Implementation**: Lowering-only, in `lin-ir` (`lower/expr.rs`, the `IndexSet` path) — no new IR opcode, no
+codegen change, no runtime change. The get-or-create is emitted with existing instructions (`Index` read,
+null-test branch, `MakeObject` for the empty map keyed by the level's value type, `IndexSet` store-back). The
+level's map type is derived from the *parent container's* static type rather than the `Index` node's
+`result_type`, which the checker can erase to a bare `TypeVar | Null` for a map-of-map read. RC care: the
+created intermediate is a fresh `+1` owner stored via `IndexSet` (which retains); the parent is taken as a
+*borrowed* write-through base so the per-scope release stays balanced (no over-release of e.g. a re-borrowed
+TCO parameter). Verified leak/UAF-free against the existing RC regression suite.
+
+**Consequences**: `m[k1][k2] = v` "just works" with no `?? {}` boilerplate and never silently drops a write.
+The deeper nested-write paths in real code (e.g. the RAPTOR `ConnectionIndex = { StopId: { UInt8: … } }`)
+become direct assignments. The only behavioural change is that a write that previously no-opped now succeeds;
+no program that relied on the silent no-op (there is no sound reason to) is affected.
