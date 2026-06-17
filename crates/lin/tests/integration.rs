@@ -1425,6 +1425,35 @@ print(toString(scanWhile()))
     assert_eq!(output, vec!["36750", "38250", "36750"]);
 }
 
+// Condition-only `while(() => Boolean)` overload: pure-Lin tail-recursive loop over a captured
+// `var`. Verifies: (a) correct output, (b) no stack overflow from the TCO transform (the helper
+// `whileLoop` self-recurses in tail position → alloca/loop in LLVM IR). Also checks that the
+// existing iterable `while(xs, pred)` form is unaffected.
+#[test]
+fn test_condition_only_while_overload() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { while } from "std/iter"
+
+// 1-arg overload: accumulate via captured var
+var i = 0
+while(() =>
+  i = i + 1
+  i < 5
+)
+print(toString(i))
+
+// iterable while still works: collect values until pred fails
+var last = 0
+[1, 2, -3, 4].while(x =>
+  last = x
+  x >= 0
+)
+print(toString(last))
+"#);
+    assert_eq!(output, vec!["5", "-3"]);
+}
+
 // Regression (call-arg-box leak): a concrete Object passed to a AnyVal-typed param (`keys`)
 // repeatedly under churn. Each call boxes the object into a fresh shell; the shell free must
 // not touch the object's inner payload (which the object's own scope-exit release owns).

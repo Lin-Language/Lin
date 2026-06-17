@@ -1241,7 +1241,7 @@ pub(crate) fn combinator_base_name(sym: &str) -> Option<&'static str> {
 /// genuine generic with no intrinsic — a monomorphized top-level spec tagged in `combinator_spec_slots`);
 /// else None.
 pub(crate) fn combinator_callee_name(expr: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> Option<&'static str> {
-    let TypedExpr::Call { func, .. } = expr else { return None };
+    let TypedExpr::Call { func, args, .. } = expr else { return None };
     let TypedExpr::LocalGet { slot, .. } = func.as_ref() else { return None };
     // A monomorphized `flatMap` spec resolves via `global_fn_slots`, not an intrinsic/import slot.
     if let Some(name) = ctx.combinator_spec_slots.get(slot) {
@@ -1259,7 +1259,11 @@ pub(crate) fn combinator_callee_name(expr: &TypedExpr, builder: &FuncBuilder, ct
         "filter" => "filter",
         "reduce" => "reduce",
         "for" => "for",
-        "while" => "while",
+        // `while` has a condition-only 1-arg overload `(f: () => Boolean)` (ADR-081). Only
+        // treat this slot as the ITERABLE combinator when ≥2 args are present (iterable + pred);
+        // a 1-arg call is a plain Lin function call into the stdlib 1-arg overload body and must
+        // NOT be routed to `lower_while`, which unconditionally reads `args[1]`.
+        "while" if args.len() >= 2 => "while",
         "range" => "range",
         "flatMap" => "flatMap",
         _ => return None,

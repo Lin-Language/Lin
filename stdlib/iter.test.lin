@@ -3,7 +3,7 @@ import { toString } from "std/string"
 import { push, length } from "std/array"
 import { writeFile } from "std/fs"
 import { readStream, lines } from "std/stream"
-import { sliding, pairwise, zipWith, intersperse, dedup, count, repeat, cycle, take, map, for } from "std/iter"
+import { sliding, pairwise, zipWith, intersperse, dedup, count, repeat, cycle, take, map, for, while } from "std/iter"
 
 // Empty-literal sources need an annotation to pin the element type (ADR-058): an unannotated `[]`
 // is `Never[]`, which a `T`-element combinator rejects. These module-level empties stand in for the
@@ -206,6 +206,46 @@ val s = suite("std/iter combinators", [
     [
       expect(out.toString()).toBe("[\"x1\", \"y2\", \"z3\"]")
     ]
+  ),
+
+  // ---- condition-only while (1-arg overload) ----
+  test("while loop runs until condition is false", () =>
+    var i = 0
+    while(() =>
+      i = i + 1
+      i < 5
+    )
+    [expect(i).toBe(5)]
+  ),
+
+  test("while loop body runs at least once", () =>
+    var calls = 0
+    while(() =>
+      calls = calls + 1
+      false
+    )
+    [expect(calls).toBe(1)]
+  ),
+
+  test("while loop accumulates a result", () =>
+    val acc: Int32[] = []
+    var n = 0
+    while(() =>
+      push(acc, n)
+      n = n + 1
+      n < 4
+    )
+    [expect(acc.toString()).toBe("[0, 1, 2, 3]")]
+  ),
+
+  // Iterable while still works unchanged
+  test("iterable while stops at first false predicate", () =>
+    val seen: Int32[] = []
+    [1, 2, -3, 4].while(x =>
+      push(seen, x)
+      x >= 0
+    )
+    [expect(seen.toString()).toBe("[1, 2, -3]")]
   )
 ])
 

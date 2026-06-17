@@ -72,6 +72,21 @@ export val while = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean) =
   // cannot round-trip a parametric `Iterator<T>`).
   lin_while(arr, f)
 
+// Condition-only `while` loop: call `f` repeatedly until it returns `false` (ADR-081).
+// @param f   a zero-argument closure `() => Boolean`; the loop continues while it returns `true`.
+// @returns `null`.
+// @example while(() => i = i + 1; i < 5)   // imperative loop; loops until i reaches 5
+export val while = (f: () => Boolean): Null =>
+  // Delegate to a private tail-recursive helper so the self-call gets the TCO alloca/loop
+  // transform. The helper name does NOT end in `_while` so it is never caught by the IR
+  // combinator-dispatch path (which gates on the trailing `_while` symbol component and ≥2 args).
+  whileLoop(f)
+
+// Private tail-recursive driver for the condition-only `while` overload. TCO applies because
+// the self-call is in tail position.
+val whileLoop = (f: () => Boolean): Null =>
+  if f() then whileLoop(f) else null
+
 // Build the ascending integer sequence `[start, start+1, …, end-1]` (half-open; empty if `start >= end`).
 // @param start  the first value (inclusive).
 // @param end    the upper bound (exclusive).
