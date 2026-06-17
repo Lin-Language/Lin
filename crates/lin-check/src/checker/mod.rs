@@ -3,6 +3,7 @@ use lin_parse::ast::{Expr, Module, Stmt};
 
 use crate::compat::is_compatible_env;
 use crate::env::TypeEnv;
+use crate::resolve::resolve_type_spanned;
 use crate::typed_ir::*;
 use crate::types::Type;
 
@@ -238,9 +239,23 @@ impl Checker {
             // self-referential/recursive types keep their `Named(name)` cycle points.
             let mut exported_types = std::collections::HashMap::new();
             for stmt in &module.statements {
-                if let lin_parse::ast::Stmt::TypeDecl { name, exported: true, .. } = stmt {
-                    if let Some(decl) = self.env.lookup_type(name) {
-                        exported_types.insert(name.clone(), (decl.params.clone(), decl.body.clone()));
+                if let lin_parse::ast::Stmt::TypeDecl { name, params, body, exported: true, .. } = stmt {
+                    // Re-resolve the body against the now-complete env. The first resolution pass
+                    // runs in (hoisted) source order, so an exported type that references a sibling
+                    // declared LATER in the file collapsed that reference to a bare `Named(...)` via
+                    // the cycle guard (the sibling was still a placeholder at the time). Left
+                    // unexpanded, that forward reference leaks into this module's signature and then
+                    // fails to resolve in a consumer that imports the alias but not the sibling
+                    // (e.g. `import { TimetableLeg }` where `TimetableLeg` has a `Trip` field but
+                    // `Trip` is never imported). Re-resolving now expands all such forward references
+                    // inline; genuine recursive cycles still terminate at the cycle guard and keep
+                    // their `Named(self)` (which the consumer can resolve, since it imports the alias).
+                    let resolved = self
+                        .resolve_type_decl_body(params, body)
+                        .ok()
+                        .or_else(|| self.env.lookup_type(name).map(|d| d.body.clone()));
+                    if let Some(resolved) = resolved {
+                        exported_types.insert(name.clone(), (params.clone(), resolved));
                     }
                 }
             }
@@ -406,6 +421,31 @@ impl Checker {
                     }
                 }
             }
+        }
+    }
+
+    /// Resolve a single type-declaration body against the current type env. For a generic alias
+    /// (`type Box<T> = …`) each declared param is bound into a scratch env as a self-referential
+    /// `Named(param)` so it survives resolution (and `substitute` replaces it at each use-site).
+    /// Shared by the in-order `check_stmt` resolution pass and the export-collection re-resolution
+    /// (`check_module`) that repairs forward references to later-declared sibling types.
+    fn resolve_type_decl_body(
+        &self,
+        params: &[String],
+        body: &lin_parse::ast::TypeExpr,
+    ) -> Result<Type, Diagnostic> {
+        let map_resolve_err = |(s, e, help): (Span, String, Option<String>)| {
+            let d = Diagnostic::error(s, e);
+            if let Some(h) = help { d.with_help(h) } else { d }
+        };
+        if params.is_empty() {
+            resolve_type_spanned(body, &self.env).map_err(map_resolve_err)
+        } else {
+            let mut scratch = self.env.clone();
+            for param in params {
+                scratch.define_type(param.clone(), Vec::new(), Type::Named(param.clone()));
+            }
+            resolve_type_spanned(body, &scratch).map_err(map_resolve_err)
         }
     }
 
