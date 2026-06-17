@@ -281,11 +281,23 @@ impl Checker {
             .statements
             .iter()
             .partition(|s| matches!(s, Stmt::TypeDecl { .. }));
+        // Module-level transient state to restore after each statement. A statement whose check
+        // fails (e.g. a function body that `?`-returned mid-check) can leak the scopes/frames it
+        // pushed before erroring; left in place, that leak poisons later statements — in particular
+        // the shadowing check would see a failed sibling function's parameters as an enclosing
+        // scope and report a spurious shadow. Restoring (truncate-only, never grows) is a no-op on
+        // the success path and does NOT touch `self.diagnostics`, so the real error is preserved.
+        let module_scope_depth = self.env.scope_depth();
+        let module_fsd = self.function_scope_depths.len();
+        let module_cap = self.capture_stack.len();
         for stmt in type_decls.into_iter().chain(other_stmts) {
             match self.check_stmt(stmt) {
                 Ok(typed_stmt) => stmts.push(typed_stmt),
                 Err(diag) => self.diagnostics.push(diag),
             }
+            self.env.truncate_scopes(module_scope_depth);
+            self.function_scope_depths.truncate(module_fsd);
+            self.capture_stack.truncate(module_cap);
         }
 
         if self.diagnostics.iter().any(|d| d.severity == lin_common::Severity::Error) {
