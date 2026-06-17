@@ -14914,6 +14914,39 @@ print(toString(o["B"][99] ?? -1))
 }
 
 #[test]
+fn test_nested_map_write_auto_vivifies_intermediate_levels() {
+    // Auto-vivification: a nested write `m[k1][k2] = v` creates absent intermediate MAP levels
+    // (an empty map of the static value type, stored back) so the write succeeds, instead of the
+    // previous silent no-op. Deep nesting vivifies every level; reads still null-propagate WITHOUT
+    // mutating the intermediate.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+// Single-level: kConn["StopB"] is absent; the write must create it and persist.
+type Conn = { String: String }
+type CIdx = { String: { UInt8: Conn } }
+val kConn: CIdx = {}
+val c: Conn = { "x": "y" }
+kConn["StopB"][1] = c
+print(if kConn["StopB"][1] == null then "LOST" else "stored")
+
+// Deep (3-level): o["a"] and o["a"]["b"] are both auto-created.
+type T = { String: { String: { String: Int32 } } }
+val o: T = {}
+o["a"]["b"]["c"] = 5
+print(toString(o["a"]["b"]["c"] ?? -1))
+
+// A read through an absent intermediate must NOT vivify it.
+type R = { String: { String: Int32 } }
+val r: R = {}
+val got = r["a"]["b"]
+print(if got == null then "read-null" else "read-val")
+print(if r["a"] == null then "still-absent" else "MUTATED")
+"#);
+    assert_eq!(output, vec!["stored", "5", "read-null", "still-absent"]);
+}
+
+#[test]
 fn test_check_accepts_valid_imported_symbol_program() {
     let (ok, output) = check_source(
         r#"import { trim } from "std/string"
