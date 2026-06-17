@@ -233,6 +233,7 @@ impl Checker {
             }
             Pattern::Ident(name, span) => {
                 let ty = scrutinee_ty.clone();
+                self.check_shadowing(name, *span);
                 let slot = self.env.define(name.clone(), ty.clone(), false);
                 Ok(TypedPattern::Binding(slot, ty, *span))
             }
@@ -255,7 +256,8 @@ impl Checker {
                     };
 
                     let binding_slot = match &field.pattern {
-                        Pattern::Ident(name, _) => {
+                        Pattern::Ident(name, name_span) => {
+                            self.check_shadowing(name, *name_span);
                             Some(self.env.define(name.clone(), field_ty.clone(), false))
                         }
                         _ => None,
@@ -275,10 +277,12 @@ impl Checker {
                     });
                 }
 
-                let rest_slot = rest.as_ref().map(|name| {
-                    self.env
-                        .define(name.clone(), Type::object(IndexMap::new()), false)
-                });
+                let rest_slot = if let Some(name) = rest {
+                    self.check_shadowing(name, *span);
+                    Some(self.env.define(name.clone(), Type::object(IndexMap::new()), false))
+                } else {
+                    None
+                };
 
                 Ok(TypedPattern::Object {
                     fields: typed_fields,
@@ -299,14 +303,17 @@ impl Checker {
                     typed_elements.push(self.check_pattern(elem, &elem_ty)?);
                 }
 
-                let rest_slot = rest.as_ref().map(|name| {
+                let rest_slot = if let Some(name) = rest {
+                    self.check_shadowing(name, *span);
                     let elem_ty = if let Type::Array(ref inner) = scrutinee_ty {
                         Type::Array(inner.clone())
                     } else {
                         Type::Array(Box::new(self.env.fresh_type_var()))
                     };
-                    self.env.define(name.clone(), elem_ty, false)
-                });
+                    Some(self.env.define(name.clone(), elem_ty, false))
+                } else {
+                    None
+                };
 
                 Ok(TypedPattern::Array {
                     elements: typed_elements,
@@ -374,6 +381,7 @@ impl Checker {
                         return Ok(slot);
                     }
                 }
+                self.check_shadowing(name, *span);
                 Ok(self.env.define_at(name.clone(), ty.clone(), mutable, Some(*span)))
             }
             Pattern::Wildcard(_) => Ok(self.env.define("_".to_string(), ty.clone(), false)),
@@ -402,6 +410,7 @@ impl Checker {
                     self.bind_pattern(&field.pattern, &field_ty, mutable)?;
                 }
                 if let Some(rest_name) = rest {
+                    self.check_shadowing(rest_name, *span);
                     // rest collects remaining fields as a Json object
                     self.env.define(rest_name.clone(), crate::resolve::any_val_type(), mutable);
                 }
@@ -425,6 +434,7 @@ impl Checker {
                     self.bind_pattern(elem, &elem_ty, mutable)?;
                 }
                 if let Some(rest_name) = rest {
+                    self.check_shadowing(rest_name, *span);
                     let rest_ty = if let Type::Array(inner) = ty {
                         Type::Array(inner.clone())
                     } else {

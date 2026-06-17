@@ -178,6 +178,7 @@ impl Checker {
                             } else { Type::TypeVar(u32::MAX) };
                             let slot = match &f.pattern {
                                 lin_parse::ast::Pattern::Ident(name, name_span) => {
+                                    self.check_shadowing(name, *name_span);
                                     self.env.define_at(name.clone(), field_ty.clone(), false, Some(*name_span))
                                 }
                                 _ => self.env.define("_".to_string(), field_ty.clone(), false),
@@ -186,6 +187,7 @@ impl Checker {
                         }
                         // Bind the rest slot if present
                         let rest_slot = if let Some(rest_name) = obj_rest {
+                            self.check_shadowing(rest_name, *span);
                             let slot = self.env.define(rest_name.clone(), Type::TypeVar(u32::MAX), false);
                             Some(slot)
                         } else {
@@ -212,6 +214,7 @@ impl Checker {
                         for (i, elem) in elements.iter().enumerate() {
                             let slot = match elem {
                                 lin_parse::ast::Pattern::Ident(name, name_span) => {
+                                    self.check_shadowing(name, *name_span);
                                     self.env.define_at(name.clone(), elem_ty_inner.clone(), false, Some(*name_span))
                                 }
                                 _ => self.env.define("_".to_string(), elem_ty_inner.clone(), false),
@@ -219,6 +222,7 @@ impl Checker {
                             typed_elements.push((i, slot, elem_ty_inner.clone()));
                         }
                         let rest_info = if let Some(rest_name) = arr_rest {
+                            self.check_shadowing(rest_name, *span);
                             let rest_ty = Type::Array(Box::new(elem_ty_inner.clone()));
                             let rest_slot = self.env.define(rest_name.clone(), rest_ty.clone(), false);
                             Some((rest_slot, rest_ty))
@@ -239,7 +243,8 @@ impl Checker {
                 }
 
                 // Record the binding name span for LSP semantic colouring (function vs variable).
-                if let lin_parse::ast::Pattern::Ident(_, name_span) = pattern {
+                if let lin_parse::ast::Pattern::Ident(name, name_span) = pattern {
+                    self.check_shadowing(name, *name_span);
                     self.binding_def_span_types.push((*name_span, ty.clone()));
                 }
                 let slot = self.bind_pattern(pattern, &ty, false)?;
@@ -310,6 +315,7 @@ impl Checker {
                          affine resource, used at most once; `var` reassignment would alias it)",
                     ));
                 }
+                self.check_shadowing(name, *name_span);
                 let slot = self.env.define_at(name.clone(), ty.clone(), true, Some(*name_span));
                 // Record the binding name span for LSP semantic colouring (function vs variable).
                 self.binding_def_span_types.push((*name_span, ty.clone()));

@@ -142,6 +142,9 @@ pub struct Checker {
     /// keyed by name. Populated during `forward_declare_types` so error messages can show
     /// the source-level shape of a Named type even before `check_stmt` has resolved it.
     pub(crate) raw_type_decls: std::collections::HashMap<String, lin_parse::ast::TypeExpr>,
+    /// Spans already reported as shadowing errors (keyed by `(file_id, start, end)`).
+    /// Prevents duplicate diagnostics when a speculative type-check re-visits a binding site.
+    reported_shadow_spans: std::collections::HashSet<(u32, u32, u32)>,
 }
 
 impl Default for Checker {
@@ -186,6 +189,60 @@ impl Checker {
             next_lambda_id: 1,
             index_narrowings: Vec::new(),
             raw_type_decls: std::collections::HashMap::new(),
+            reported_shadow_spans: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Emit a hard-error diagnostic when `name` at `span` shadows a binding in an ENCLOSING scope.
+    ///
+    /// Rules:
+    /// - Same-scope redefinition (overloads, forward-declared functions, destructuring temps) is NOT
+    ///   flagged — only inner-shadows-outer.
+    /// - Synthetic compiler-internal names are skipped: `_`, `__destr_*`, `__param_*`, `$*`,
+    ///   `lin_*`, and the empty string.
+    /// - Duplicate reporting at the same span (from speculative re-checks) is suppressed.
+    pub(crate) fn check_shadowing(&mut self, name: &str, span: Span) {
+        // Skip synthetic / wildcard names.
+        if name.is_empty()
+            || name == "_"
+            || name.starts_with("__destr_")
+            || name.starts_with("__param_")
+            || name.starts_with('$')
+            || name.starts_with("lin_")
+        {
+            return;
+        }
+
+        // Dedup: don't re-report the same physical binding site.
+        let key = (span.file_id, span.start, span.end);
+        if self.reported_shadow_spans.contains(&key) {
+            return;
+        }
+
+        let current_depth = self.env.scope_depth(); // number of scopes = len
+        let current_innermost = current_depth.saturating_sub(1); // 0-based index of innermost
+
+        if let Some((def_depth, info)) = self.env.lookup_with_depth(name) {
+            // Only flag if it lives in a STRICTLY outer scope (not the current innermost scope).
+            if def_depth < current_innermost {
+                // If it's a forward-declared (pending) binding, don't flag — the val is completing
+                // its own pre-scan slot in the same block.
+                if !self.forward_declared.contains(&info.slot) {
+                    self.reported_shadow_spans.insert(key);
+                    let mut diag = Diagnostic::error(
+                        span,
+                        format!("`{}` shadows a binding from an enclosing scope", name),
+                    )
+                    .with_help(format!(
+                        "rename this binding; Lin does not allow an inner scope to reuse the outer name `{}`",
+                        name
+                    ));
+                    if let Some(prev_span) = info.def_span {
+                        diag = diag.with_note(prev_span, format!("`{}` is already bound here", name));
+                    }
+                    self.diagnostics.push(diag);
+                }
+            }
         }
     }
 
@@ -289,7 +346,7 @@ impl Checker {
     /// phantom capture set (which would give a top-level function a spurious closure env and break
     /// its call ABI). Restore only ever TRUNCATES (never grows) — a clean attempt leaves the lengths
     /// unchanged, so this is a no-op on the success path.
-    pub(crate) fn checker_state_snapshot(&self) -> (usize, usize, usize, Option<String>, bool, usize) {
+    pub(crate) fn checker_state_snapshot(&self) -> (usize, usize, usize, Option<String>, bool, usize, usize) {
         (
             self.function_scope_depths.len(),
             self.capture_stack.len(),
@@ -300,17 +357,23 @@ impl Checker {
             // failed hint can't leave a wrongly-typed parameter entry in `span_type_map` — only
             // the kept attempt's params are recorded.
             self.param_def_span_types.len(),
+            // Drop any shadow-error diagnostics pushed during a discarded speculative check.
+            // The `reported_shadow_spans` dedup set is intentionally NOT rolled back — keeping
+            // a site marked as "reported" prevents a re-checked site from emitting the diagnostic
+            // a second time on the committed path, but rolling it back would allow double-reporting.
+            self.diagnostics.len(),
         )
     }
 
-    pub(crate) fn restore_checker_state(&mut self, snap: (usize, usize, usize, Option<String>, bool, usize)) {
-        let (fsd_len, cap_len, scope_len, cur_fn, tail, param_types_len) = snap;
+    pub(crate) fn restore_checker_state(&mut self, snap: (usize, usize, usize, Option<String>, bool, usize, usize)) {
+        let (fsd_len, cap_len, scope_len, cur_fn, tail, param_types_len, diag_len) = snap;
         self.function_scope_depths.truncate(fsd_len);
         self.capture_stack.truncate(cap_len);
         self.env.truncate_scopes(scope_len);
         self.current_function = cur_fn;
         self.in_tail_position = tail;
         self.param_def_span_types.truncate(param_types_len);
+        self.diagnostics.truncate(diag_len);
     }
 
     pub(crate) fn types_compatible(&self, value: &Type, target: &Type) -> bool {

@@ -792,6 +792,31 @@ A `val` whose right-hand side is *not* a function literal may **not** reference 
 
 Mutual recursion between two top-level `val` bindings of function literals is permitted: both names are in scope across both bodies.
 
+### 6.4 Shadowing
+
+A binding introduced in a nested scope may not reuse a name that is already visible from any enclosing
+scope. Attempting to do so is a **compile-time error**:
+
+```txt
+val x = 1
+val f = () =>
+  val x = 2  // Error: `x` shadows a binding from an enclosing scope
+  x
+```
+
+This applies to `val`/`var` bindings, lambda and function parameters, and destructuring captures.
+
+Same-scope sequential rebinding and sibling-scope parameter reuse are **not** shadowing and remain
+permitted:
+
+```txt
+// OK — sibling lambdas; neither shadows the other
+val result = [1, 2, 3].map(x => x * 2).filter(x => x > 2)
+```
+
+Compiler-generated synthetic names (`_`, `__destr_*`, `__param_*`, `$*`, `lin_*`) are exempt from the
+check. See ADR-077.
+
 ## 7. JSON Access
 
 Bracket notation is used for both JSON object key access and array indexing. Bracket access is **safe by default**: object accesses never raise an error, and `Null` propagates through chains.
