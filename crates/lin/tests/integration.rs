@@ -3869,6 +3869,114 @@ fn test_cyclic_imports_value_init_cycle_still_errors() {
 }
 
 #[test]
+fn test_cyclic_imports_exported_type_alias_across_cycle() {
+    // ADR-083: an exported `type` alias defined in one cycle member, imported and used in TYPE
+    // position by another member of the same SCC, must resolve (not "Unknown type 'T'"). `a`
+    // defines `type T` and imports the VALUE `useT` from `b`; `b` imports the TYPE `T` from `a`
+    // and annotates a parameter with it. Both must check, and the record must flow across the
+    // boundary with a consistent representation (sealed record, not a boxed map) so `useT` reads
+    // the right value back.
+    let dir = std::env::temp_dir().join(format!("lin_cyc_typealias_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("a.lin"),
+        "import { useT } from \"b\"\n\
+         export type T = { \"x\": Int32 }\n\
+         export val g = (): Int32 => useT({ \"x\": 5 })\n").unwrap();
+    std::fs::write(dir.join("b.lin"),
+        "import { T } from \"a\"\n\
+         export val useT = (t: T): Int32 => t[\"x\"]\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ g }} from "{d}/a"
+print(toString(g()))
+"#, d = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["5"]);
+}
+
+#[test]
+fn test_cyclic_imports_exported_type_alias_three_module_cycle() {
+    // ADR-083, 3-module SCC A -> B -> C -> A: a `type P` defined in A is imported and used in
+    // TYPE position by C (two hops away around the cycle). The cross-cycle type import must
+    // resolve and the value flows back through B's pass-through call.
+    let dir = std::env::temp_dir().join(format!("lin_cyc_type3_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("A.lin"),
+        "import { fromB } from \"B\"\n\
+         export type P = { \"v\": Int32 }\n\
+         export val a = (): Int32 => fromB()\n").unwrap();
+    std::fs::write(dir.join("B.lin"),
+        "import { fromC } from \"C\"\n\
+         export val fromB = (): Int32 => fromC()\n").unwrap();
+    std::fs::write(dir.join("C.lin"),
+        "import { P } from \"A\"\n\
+         export val fromC = (): Int32 => useP({ \"v\": 7 })\n\
+         export val useP = (p: P): Int32 => p[\"v\"]\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ a }} from "{d}/A"
+print(toString(a()))
+"#, d = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["7"]);
+}
+
+#[test]
+fn test_cyclic_imports_mutually_referencing_type_aliases() {
+    // ADR-083: two type aliases that reference each other ACROSS the cycle — `Outer` (in m1)
+    // wraps `Inner` (in m2), and `Inner`'s defining module imports `Outer`. Both modules export
+    // a type the other imports in type position; both must resolve and the nested record must
+    // round-trip.
+    let dir = std::env::temp_dir().join(format!("lin_cyc_mutual_types_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("m1.lin"),
+        "import { Inner } from \"m2\"\n\
+         export type Outer = { \"inner\": Inner }\n\
+         export val mk = (): Outer => { \"inner\": { \"n\": 9 } }\n").unwrap();
+    std::fs::write(dir.join("m2.lin"),
+        "import { Outer } from \"m1\"\n\
+         export type Inner = { \"n\": Int32 }\n\
+         export val readN = (o: Outer): Int32 => o[\"inner\"][\"n\"]\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ mk }} from "{d}/m1"
+import {{ readN }} from "{d}/m2"
+print(toString(readN(mk())))
+"#, d = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["9"]);
+}
+
+#[test]
+fn test_acyclic_undefined_type_still_errors() {
+    // Guard: the cross-cycle type-alias seeding (ADR-083) must NOT mask a genuinely undefined
+    // type in an ordinary acyclic module — that still has to be a clean "Unknown type" error.
+    let dir = std::env::temp_dir().join(format!("lin_acyc_undeftype_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let only = dir.join("only.lin");
+    std::fs::write(&only,
+        "export val f = (x: Nonexistent): Int32 => 1\n").unwrap();
+    let out = lin_cmd()
+        .args(["check", only.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!out.status.success(), "expected a check failure, got success: {combined}");
+    assert!(
+        combined.contains("Unknown type 'Nonexistent'"),
+        "expected 'Unknown type' diagnostic, got: {combined}"
+    );
+}
+
+#[test]
 fn test_missing_stdlib_import_gives_module_not_found_with_suggestion() {
     // A doubled `std/` typo (`std/std/stream`) is not an embedded stdlib module and must not
     // fall through to a raw io error. We want an actionable "module not found" diagnostic that
