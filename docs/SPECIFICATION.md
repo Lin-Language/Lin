@@ -1304,10 +1304,17 @@ combine(1, "x")   // Int32, String overload
    preferred over `B` when every parameter of `A` is a subtype of the
    corresponding parameter of `B`. A concrete overload is preferred over a
    generic one that matched only by instantiating a type variable.
-3. If **no** candidate is applicable, it is a compile error
+3. If specificity leaves no unique winner, a **numeric-conversion tie-break**
+   applies: among the remaining candidates, the one whose arguments convert most
+   cheaply wins, where a same-signedness widening (and least width gap) beats a
+   cross-signedness or int→float conversion. This resolves overloads on numerics
+   that are mutually incomparable by subtyping — e.g. an unsigned argument prefers
+   a `UInt64` overload, a signed one an `Int64` overload. Only numeric widenings
+   break the tie; non-numeric positions do not.
+4. If **no** candidate is applicable, it is a compile error
    (`no matching overload`).
-4. If two or more candidates are applicable with **no unique** most-specific one,
-   it is a compile error (`ambiguous call`).
+5. If candidates remain tied after the numeric tie-break, it is a compile error
+   (`ambiguous call`).
 
 **Resolution is static.** The overload is chosen at compile time from the
 *static* types of the arguments; there is no runtime dispatch.

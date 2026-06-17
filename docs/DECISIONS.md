@@ -2989,3 +2989,49 @@ diagnostic classes (`no matching overload`, `ambiguous call`) plus duplicate-sig
 Spec §14.6 documents the user-facing rules; integration tests cover resolution by each argument position,
 no-match, union-spanning rejection, ambiguity, concrete-over-generic preference, and the default/partial
 interactions. `examples/overloading/` is a runnable demo.
+
+## ADR-075: Numeric-conversion tie-break for overload resolution
+
+**Status**: Accepted. Refines ADR-074.
+
+**Context**: ADR-074 selects the unique *most-specific* applicable overload, where specificity is the
+subtype order. That order is total for numeric types of the **same signedness** (`UInt8 <: UInt16 <:
+UInt32 <: UInt64`), so an exact-width argument already resolves correctly — `toBe(uint32Value)` picks the
+`UInt32` overload over the also-applicable `UInt64` one. But two numerics of **different signedness** are
+mutually incomparable: a narrower value widens into *both* (`UInt16` is assignable to `UInt64` *and* to
+`Int64`), and neither parameter is a subtype of the other, so subtype specificity finds no winner and the
+call is rejected as ambiguous. This blocked the natural stdlib cleanup of folding the signed-input
+`narrowTo*` family into the unsigned-input `to*` family as overloads (the `UInt64` vs `Int64` pair is
+exactly the incomparable case). Empirically confirmed: `f(UInt16)` over `f(UInt64)`/`f(Int64)` → ambiguous.
+
+**Decision**: Add a **numeric-conversion tie-break** that runs only *after* subtype specificity fails to
+produce a unique winner (so it never changes a case ADR-074 already resolved, and a former hard ambiguity
+can only become a resolution, never a regression). Among the applicable candidates, rank by how cheaply
+each argument converts to its parameter and apply the "better function member" rule: candidate `A` beats
+`B` when, over the supplied arguments, every conversion into `A` is no more expensive than into `B` and at
+least one is strictly cheaper. A unique maximal candidate wins; otherwise the call stays an ambiguity
+error.
+
+Per-argument conversion cost (`numeric_conv_cost`, `checker/call.rs`):
+- exact type match → `0`;
+- same sign-class widening (signed→signed, unsigned→unsigned, float→float) → `1 + width-gap` (cheapest
+  non-exact);
+- cross-signedness int widening → `10 + gap`; int→float → `20 + gap`; float→int → `30 + gap`;
+- any non-numeric or unknown conversion → a single neutral constant, so non-numeric argument positions
+  never drive the ranking — a record-vs-record tie (ADR-074's ambiguity case) stays ambiguous because
+  both candidates share that neutral cost at every position.
+
+**Consequence for the stdlib (ADR-073 reversal)**: the `narrowTo*` family is folded into `to*` as
+`Int64`-input overloads (`toUInt8(v: UInt64)` + `toUInt8(v: Int64)`, etc.). Resolution now reads
+intuitively: an **unsigned** argument prefers the unsigned (`UInt64`) overload — the old `to*` truncation
+of an already-unsigned value; a **signed/computed `Int64`** argument prefers the signed overload — the old
+`narrowTo*` two's-complement truncation; an `Int32`/narrower-signed argument is applicable only to the
+`Int64` overload (signed→unsigned is not implicit), so it resolves there unambiguously. `toInt32` gains an
+`Int64` overload alongside its `Float64` one (disjoint, no tie-break needed). The narrowing semantics are
+unchanged — only the spelling collapses from two name families to one overloaded family.
+
+**Consequences**: One new, self-contained ranking pass in `select_overload`; no IR/codegen impact. The
+tie-break is deliberately conservative — it differentiates *only* numeric widenings, leaving every other
+ambiguity (records, unions, generics already handled at the specificity tier) exactly as ADR-074 left it.
+Spec §14.6 notes the numeric preference. Regression tests cover same-signedness selection, signed/unsigned
+selection of the incomparable pair, and the unchanged record-ambiguity error.
