@@ -972,11 +972,18 @@ impl<'ctx> Codegen<'ctx> {
                                     // UNBOXED SUM TYPE: a SumNode's refcount is the offset-0 u32
                                     // (lin_rc_retain) — NOT a tagged inner-payload retain (which would
                                     // corrupt the header). Read the proven repr.
-                                    if func.repr_of(*val).sumnode_sum_ty().is_some() {
-                                        self.builder.call(self.rt.rc_retain, &[v.into()], "");
-                                    } else if func.repr_of(*val).nullable_record_fields().is_some() {
-                                        // Stage 3 NullableRecord: raw nullable sealed ptr — NOT a
-                                        // TaggedVal. lin_rc_retain null-guards (no-op on null ptr).
+                                    if func.repr_of(*val).is_packed_pointer() {
+                                        // ANY packed repr (PackedStruct / PackedSealedArray /
+                                        // ColumnarArray / SumNode / NullableRecord) is a RAW heap
+                                        // pointer whose offset-0 u32 is its own refcount — bump it
+                                        // with lin_rc_retain (null-guarded). This MUST take priority
+                                        // over the `is_union_type(ty)` arm below: a packed value
+                                        // (e.g. a `Trip` PackedStruct) can carry a union STATIC type
+                                        // when it flows into a `Trip | Null` slot (shared raw-pointer
+                                        // repr, no Coerce). Routing it to lin_tagged_retain would read
+                                        // offset 0 as a TAG byte and offset 8 as an inner payload
+                                        // pointer — type-confusion + UAF (the captured-record-`var`
+                                        // -across-a-call-in-a-closure crash, ADR-083).
                                         self.builder.call(self.rt.rc_retain, &[v.into()], "");
                                     } else if Self::is_union_type(ty) {
                                         // A boxed TaggedVal*: bump the INNER payload's rc
@@ -1033,6 +1040,18 @@ impl<'ctx> Codegen<'ctx> {
                                     let phi = self.builder.phi(ptr_ty, "nr_clone_phi");
                                     phi.add_incoming(&[(&p, null_pred), (&p, nn_pred)]);
                                     temp_map.insert(*dst, phi.as_basic_value());
+                                    continue;
+                                }
+                                // ANY OTHER packed repr (PackedStruct / PackedSealedArray /
+                                // ColumnarArray) is a NON-NULL raw heap pointer with an offset-0
+                                // refcount: an owning read is a plain lin_rc_retain forwarding the
+                                // SAME pointer. Must precede the `is_union_type(ty)` arm — a packed
+                                // value carrying a union STATIC type (e.g. a `Trip` PackedStruct
+                                // stored into a `Trip | Null` slot) would otherwise be handed to
+                                // lin_tagged_clone, which reads offset 0 as a tag byte → UAF (ADR-083).
+                                if func.repr_of(*src).is_packed_pointer() && v.is_pointer_value() {
+                                    self.builder.call(self.rt.rc_retain, &[v.into()], "");
+                                    temp_map.insert(*dst, v);
                                     continue;
                                 }
                                 let cloned = if Self::is_union_type(ty) && v.is_pointer_value() {
