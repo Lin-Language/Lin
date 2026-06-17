@@ -458,7 +458,9 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
 // A `.typed`/`.sig` written by a v2 binary must be rejected (stale layout → mis-decode).
 // v4 (feat/tar-entries): `Type::TarEntry` added as a new enum variant (after `Promise`), shifting
 // the bincode discriminant of every variant that follows. Stale v3 `.typed`/`.sig` must be rejected.
-const CACHE_FORMAT_VERSION: u32 = 4;
+// v5 (fix/lsp-named-type-display): `Type::Object` gained a `name: Option<String>` field. Old caches
+// decode as `None` via `#[serde(default)]`, but the stamp is bumped to be safe.
+const CACHE_FORMAT_VERSION: u32 = 5;
 
 /// Magic prefix written at the head of every `.typed`/`.sig` cache file. Combined with the
 /// compiler version and `CACHE_FORMAT_VERSION`, this is the on-disk compatibility stamp checked

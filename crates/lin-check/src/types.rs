@@ -103,9 +103,18 @@ pub enum Type {
     /// narrowing, exhaustiveness, zonk, and cache identity behaving exactly as before the flag
     /// existed. Codegen ignores it entirely (no representation change). Stage 1 will be the first
     /// consumer. Construct via `Type::object(fields)` (unsealed) / `Type::sealed_object(fields)`.
+    ///
+    /// `name` is a DISPLAY-ONLY inert alias name. `Some(n)` iff this object resolved from a
+    /// NON-GENERIC named record decl `type n = { … }` (set in resolve.rs). Invisible to
+    /// `PartialEq` (manual impl below already ignores everything but `fields`), to `compat.rs`,
+    /// and to the monomorphization key (erased by `erase_lambda_sets`). Renders as the bare name
+    /// in `Display`. `#[serde(default)]` so old caches decode as `None`.
     Object {
         fields: IndexMap<String, Type>,
         sealed: bool,
+        /// DISPLAY-ONLY inert alias name. See variant docs above.
+        #[serde(default)]
+        name: Option<String>,
     },
     /// A typed index-signature object type `{ K: V }` (ADR-055): an object used as a
     /// dictionary — arbitrary keys all mapping to value type `V`. Distinct from a fixed
@@ -225,13 +234,22 @@ impl Type {
     /// Construct an UNSEALED structural object type (the default: anonymous literals, inferred
     /// shapes, built-in aliases). See the `Object` variant docs for the `sealed` semantics.
     pub fn object(fields: IndexMap<String, Type>) -> Type {
-        Type::Object { fields, sealed: false }
+        Type::Object { fields, sealed: false, name: None }
     }
 
     /// Construct a SEALED object type — used ONLY when unfolding a named record-type declaration
     /// in `resolve.rs`. Inert in Stage 0.5 (codegen ignores it).
     pub fn sealed_object(fields: IndexMap<String, Type>) -> Type {
-        Type::Object { fields, sealed: true }
+        Type::Object { fields, sealed: true, name: None }
+    }
+
+    /// Attach a DISPLAY-ONLY alias name to an object type (no-op on non-Object). Used by
+    /// resolve.rs when unfolding a named record decl so the name survives to Display/LSP.
+    pub fn with_type_name(self, name: &str) -> Type {
+        match self {
+            Type::Object { fields, sealed, .. } => Type::Object { fields, sealed, name: Some(name.to_string()) },
+            other => other,
+        }
     }
 
     /// Construct a function type with no default arguments (`required == params.len()`).
@@ -256,9 +274,10 @@ impl Type {
             Type::Map { key, value } => Type::Map { key: Box::new(key.erase_lambda_sets()), value: Box::new(value.erase_lambda_sets()) },
             Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| t.erase_lambda_sets()).collect()),
             Type::Union(ts) => Type::Union(ts.iter().map(|t| t.erase_lambda_sets()).collect()),
-            Type::Object { fields, sealed } => Type::Object {
+            Type::Object { fields, sealed, .. } => Type::Object {
                 fields: fields.iter().map(|(k, v)| (k.clone(), v.erase_lambda_sets())).collect(),
                 sealed: *sealed,
+                name: None,  // STRIP name from mono keys — inert display metadata is not part of the key
             },
             Type::Function { params, ret, required, .. } => Type::Function {
                 params: params.iter().map(|t| t.erase_lambda_sets()).collect(),
@@ -341,7 +360,7 @@ impl Type {
             || self.is_string_ish()
             || matches!(self, Type::Array(_) | Type::FixedArray(_))
             || matches!(self, Type::Map { .. })
-            || matches!(self, Type::Object { fields, sealed: true }
+            || matches!(self, Type::Object { fields, sealed: true, .. }
                 if !fields.is_empty() && fields.values().all(|f| f.is_sealed_array_field_packable()))
     }
 
@@ -515,7 +534,7 @@ impl Type {
     /// fields are all sealed-eligible. FAIL SAFE: `None` → boxed path.
     pub fn sealed_fields(ty: &Type) -> Option<&IndexMap<String, Type>> {
         match ty {
-            Type::Object { fields, sealed: true }
+            Type::Object { fields, sealed: true, .. }
                 if !fields.is_empty() && fields.values().all(|f| f.is_sealed_field()) =>
             {
                 Some(fields)
@@ -673,7 +692,10 @@ impl fmt::Display for Type {
                 }
                 write!(f, "]")
             }
-            Type::Object { fields, .. } => {
+            Type::Object { fields, name, .. } => {
+                if let Some(n) = name {
+                    return write!(f, "{}", n);
+                }
                 if fields.is_empty() {
                     // An empty object type (e.g. the `{}` arm of an index-map param union
                     // `{ String: T } | {}`) renders as `{}`, not `{  }` — the latter reads as a
