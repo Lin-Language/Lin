@@ -408,11 +408,11 @@ impl Checker {
         for stmt in stmts {
             if let Stmt::Val { pattern, value, .. } = stmt {
                 if let Expr::Function { type_params, params, return_type, .. } = value {
-                    let name = match pattern {
-                        lin_parse::ast::Pattern::Ident(n, _) => Some(n.clone()),
+                    let name_and_span = match pattern {
+                        lin_parse::ast::Pattern::Ident(n, sp) => Some((n.clone(), *sp)),
                         _ => None,
                     };
-                    if let Some(name) = name {
+                    if let Some((name, name_span)) = name_and_span {
                         let (env_for_resolve, param_assign) = if type_params.is_empty() {
                             (self.env.clone(), Vec::new())
                         } else {
@@ -452,7 +452,28 @@ impl Checker {
                             required,
                             lset: crate::types::LambdaSet::Top,
                         };
-                        let slot = self.env.define(name, fn_type, false);
+                        // ADR-074: register as a function overload. A name with several function
+                        // definitions in this scope forms an overload set; resolution at the call
+                        // site selects by argument types. The first definition is the primary.
+                        let (slot, dup) =
+                            self.env.define_fn_overload(name.clone(), fn_type, Some(name_span));
+                        if dup {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    name_span,
+                                    format!(
+                                        "duplicate definition: an overload of `{}` with these \
+                                         parameter types already exists",
+                                        name
+                                    ),
+                                )
+                                .with_help(
+                                    "function overloads must differ in their parameter types — \
+                                     the return type alone cannot distinguish them (spec §14.6)"
+                                        .to_string(),
+                                ),
+                            );
+                        }
                         self.forward_declared.insert(slot);
                     }
                 }

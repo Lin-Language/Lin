@@ -2892,3 +2892,95 @@ revisit this.
 **Consequences**: A computed `Int64` can now be stored into any fixed-width integer. Regression guards
 in `stdlib/number.test.lin` (in-range, out-of-range-truncation, negative-`Int32`, signed→unsigned
 reinterpret). Spec §21 and STDLIB.md document the family and the read-back-overflow caution.
+
+## ADR-074: Function overloading — statically-resolved, type-directed, all-arguments dispatch
+
+**Status**: Accepted.
+
+**Context**: Lin binds a function name to exactly one value. Defining a second function with the same
+name silently overwrote the first (`TypeEnv` is a flat `IndexMap<String, VarInfo>`; `define` is a plain
+`insert`), and a call resolved its callee by **name alone** — argument types were checked *against* the
+resolved type, never used to *select* it. This precludes the common idiom of one conceptual operation
+with several concrete shapes (`area(c: Circle)` / `area(r: Rect)`, `encode(s: String)` /
+`encode(n: Int32)`), forcing artificial name suffixes (`areaCircle`, `areaRect`). The backend, by
+contrast, was already overload-ready: monomorphization mangles specialized generics into per-type
+symbols (`identity$Int32`), and codegen looks functions up by string name (`module.get_function`). The
+only true blockers were in `lin-check`: the one-name-per-scope environment, and the resolve-callee-then-
+check-arguments inference order.
+
+**Decision**: Add **function overloading** — multiple top-level functions (or function-typed `val`s in the
+same scope) may share a name, distinguished by their **parameter types**. Resolution is:
+
+1. **Type-directed and over *all* arguments.** The selected overload is a function of the full tuple of
+   argument types, not just the receiver/first argument. `combine(1, 2)` and `combine(1, "x")` pick
+   different overloads. (We considered first-argument-only single dispatch — cheaper, fits dot-syntax —
+   but chose all-argument dispatch for expressiveness; the cost is the inference-order change below.)
+2. **Static only.** The overload is chosen at compile time from the static types of the arguments and
+   baked into a fixed call target. There is **no** runtime tag dispatch to select an overload.
+3. **Union ambiguity is a compile error.** An argument is matched by its static type *as a whole*. A
+   union argument `A | B` is applicable to a parameter only if the *entire* union is assignable to it; a
+   union that would select different overloads for different members matches none and is rejected. This
+   is what keeps (2) honest — the compiler never silently inserts a runtime branch.
+
+**Registration (`lin-check`)**: A name may bind an **overload set** of functions instead of a single
+`VarInfo` (`VarInfo.overloads: Vec<OverloadAlt>`, each alternate carrying its own slot + function type).
+Rules:
+- Only **functions** overload. A name cannot be both a non-function `val` and an overload set, and a
+  non-function binding still cannot be redefined (unchanged shadowing rules for values).
+- Two overloads with **identical parameter-type signatures** are a duplicate-definition error — the
+  return type is never consulted during dispatch, so it cannot disambiguate.
+- Overloading is **scope-local**: an overload set lives in one scope; an inner binding of the same name
+  shadows the whole set as today.
+- The function pre-scan registers each definition via `define_fn_overload`; the per-val bind
+  (`bind_pattern`) re-binds each definition to its OWN forward-declared slot, matched by parameter type
+  (tolerant `types_compatible`, first still-unbound candidate wins) so each overload keeps a distinct
+  slot — hence a distinct FuncId and LLVM symbol.
+
+**Call-site resolution (`lin-check`, `checker/call.rs`)**: For `f(a₁…aₙ)`:
+1. If `f` resolves to a **single** binding, behave exactly as before (fast path; no inference reorder,
+   no behaviour change for existing programs).
+2. If `f` resolves to an **overload set**:
+   a. Infer all argument types first via a SPECULATIVE pass that is rolled back (scopes truncated,
+      stream-consumption restored) so the real arg-checking runs exactly once with no double side
+      effects. Lambda (function-literal) args are left untyped and treated as wildcards for selection,
+      then checked for real against the chosen signature.
+   b. **Applicability filter**: keep candidates whose arity fits (a complete call supplies between
+      `required` and `params` arguments after default-filling, §15.6; a partial application supplies a
+      prefix) and each of whose parameters the corresponding argument type is assignable to (whole-union
+      rule above; the callback arity-width rule §5.5 applies inside an argument).
+   c. **Most-specific selection**: candidate `A` dominates `B` iff every supplied-prefix parameter of `A`
+      is at least as specific as `B`'s, where a concrete type is more specific than a generic `TypeVar`
+      wildcard. Choose the unique dominator (so `f(3)` prefers `f(Int32)` over `f<T>(T)`).
+   d. **Zero applicable** → `no matching overload for f(...)`, listing candidate signatures and the
+      argument types.
+   e. **≥2 applicable with no unique dominator** → `ambiguous call to f`, listing the tied candidates.
+
+**Lowering & codegen**: Each overload is already a separate `TypedStmt::Val` with its own slot, so it
+lowers to its own FuncId; a `Direct` call resolves through `global_fn_slots[slot]` independent of the
+symbol name. The only requirement is a unique LLVM *symbol*: the checker mangles the overloaded
+function's `TypedExpr::Function.name` to `base$<param-tokens>_<slot>` (reusing the monomorphizer's
+naming style; the trailing slot guarantees uniqueness). The `TypedStmt::Val.name` stays the source name,
+so exports and DWARF are unaffected. Functions that are *not* overloaded keep their plain symbol — no
+ABI change, no mangling churn for the overwhelming majority of code. Codegen is otherwise unchanged.
+
+**Interactions**:
+- **Partial application** (§15.2): `f(x,)` over an overload set selects on the supplied prefix by the
+  same applicability+specificity rules; if the prefix doesn't pin a single overload it is an ambiguity
+  error. (Partial application of a non-overloaded function is unchanged.)
+- **Default parameters** (§15.6): defaults are accounted for in the arity check, so an overload is a
+  candidate at every arity its defaults permit. If two overloads tie only after default-filling, that is
+  the ordinary ambiguity error.
+- **Generics/monomorphization**: a generic overload still specializes per call as today; overloading only
+  changes *which* candidate is selected before specialization runs.
+- **Cross-module (v1 limit)**: a module's signature (`ModuleSignature.exports`) is a single name→type
+  map, so importing a module that overloads a name exposes only one signature (the primary) to dependents.
+  This is not silent miscompilation — a mismatched cross-module use is an ordinary type error — but full
+  cross-module overload sets are deferred. Same-module overloading (the common case) is fully supported.
+
+**Consequences**: Existing single-binding programs are byte-for-byte unaffected (single-binding fast
+path, plain symbols). New surface area is concentrated in `lin-check` (overload-set environment +
+selection algorithm) where the risk lives; IR/codegen changes are additive name-mangling. Two new
+diagnostic classes (`no matching overload`, `ambiguous call`) plus duplicate-signature detection.
+Spec §14.6 documents the user-facing rules; integration tests cover resolution by each argument position,
+no-match, union-spanning rejection, ambiguity, concrete-over-generic preference, and the default/partial
+interactions. `examples/overloading/` is a runnable demo.
