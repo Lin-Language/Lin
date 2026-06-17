@@ -408,6 +408,20 @@ pub fn index_result_convention(obj_ty: &Type, key_ty: &Type) -> Convention {
     if matches!(obj_ty, Type::Map { .. }) {
         return Borrow;
     }
+    // A Union/`T|Null` container whose non-null member is a typed Map with integer keys:
+    // `outer["k"][int_key]` where `outer["k"]` has type `{ K: V } | Null`. Codegen routes
+    // this to `lin_map_get_int` which returns a BORROWED interior slot pointer (same contract
+    // as the plain `Type::Map` case above). Without this guard, `key_ty.is_numeric()` below
+    // would declare the result `Own` and the scope-exit Release would free an interior pointer.
+    if key_ty.is_integer() {
+        let has_int_map = match obj_ty {
+            Type::Union(vs) => vs.iter().any(|v| matches!(v, Type::Map { key: k, .. } if k.is_integer())),
+            _ => false,
+        };
+        if has_int_map {
+            return Borrow;
+        }
+    }
     if matches!(obj_ty, Type::Array(_) | Type::FixedArray(_)) || key_ty.is_numeric() {
         Own
     } else {
