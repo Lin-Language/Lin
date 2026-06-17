@@ -605,6 +605,10 @@ pub(crate) unsafe fn lin_map_alloc_mixed(hint: u32, key_kind: u32) -> *mut LinMa
 /// A null `val` pointer means the null value.
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_set(map: *mut LinMap, key: *mut LinString, val: *const TaggedVal) {
+    // Null-map write: no-op (mirrors lin_array_set's null-guard). This happens when a chained
+    // write like `outer[a][k] = v` is executed and `outer[a]` returns null (absent key). The
+    // safe-access rule (§6.1) silently ignores writes through null rather than crashing.
+    if map.is_null() { return; }
     let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
     // SMI guard: reconstruct a real TaggedVal from an SMI pointer before storing.
     #[cfg(feature = "smi")]
@@ -672,6 +676,8 @@ pub unsafe extern "C" fn lin_map_get(map: *const LinMap, key: *const LinString) 
 /// Insert / overwrite `key -> *val` (Int map). `key` is a raw i64.
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_set_int(map: *mut LinMap, key: i64, val: *const TaggedVal) {
+    // Null-map write: no-op (mirrors lin_array_set's and lin_map_set's null-guard).
+    if map.is_null() { return; }
     let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
     // SMI guard: reconstruct a real TaggedVal from an SMI pointer before storing.
     #[cfg(feature = "smi")]

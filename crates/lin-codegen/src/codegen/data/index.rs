@@ -128,6 +128,55 @@ impl<'ctx> Codegen<'ctx> {
             let res = phi.as_basic_value();
             return if Self::is_union_type(result_ty) { res } else { self.unbox_tagged_val_to_type(res, result_ty) };
         }
+        // Union/nullable wrapper around a typed int-keyed map: when `obj_ty` is a union (e.g.
+        // `{ UInt8: V } | Null`) AND the union contains a Map variant whose key is an integer type,
+        // AND the access key is a concrete numeric value — dispatch through `lin_map_get_int`.
+        //
+        // Without this guard, the `is_array_access` check below fires (because `key_ty.is_numeric()`
+        // is true) and calls `lin_array_get_tagged` on the unboxed LinMap* — treating the map as an
+        // array and returning null. This is the root cause of the "nested int-keyed map" bug:
+        //   `o["B"][1]` where `o: { String: { UInt8: Int32 } }` — `o["B"]` yields
+        //   `{ UInt8: Int32 } | Null` (union), so the inner `[1]` hits this path.
+        //
+        // `container` at this point is already the unboxed raw `LinMap*` (line 71-75 above).
+        if Self::is_union_type(obj_ty) && (key_ty.is_numeric() || key.is_int_value()) {
+            let int_map_variant: Option<()> = match obj_ty {
+                Type::Union(vs) => vs.iter().find_map(|v| match v {
+                    Type::Map { key: k, .. } if k.is_integer() => Some(()),
+                    _ => None,
+                }),
+                Type::Map { key: k, .. } if k.is_integer() => Some(()),
+                _ => None,
+            };
+            if int_map_variant.is_some() {
+                let i64_key = if key.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(key.into_int_value(), self.context.i64_type(), "ir_nmkey_i64")
+                } else if key.is_pointer_value() {
+                    let unboxed = self.unbox_value(key, &Type::Int64);
+                    unboxed.into_int_value()
+                } else {
+                    self.context.i64_type().const_zero()
+                };
+                // lin_map_get_int returns a BORROWED interior `*const TaggedVal`.
+                let tagged = self.builder.call(self.rt.map_get_int, &[container.into(), i64_key.into()], "ir_nmget_int").try_as_basic_value().unwrap_basic();
+                return if Self::is_union_type(result_ty) {
+                    // The IR lowering selected `Convention::Own` for this index (because
+                    // `key_ty.is_numeric()` fires before the map check in `index_result_convention`,
+                    // which only recognises a DIRECT `Type::Map` obj_ty — not a union wrapper).
+                    // That means the IR emits NO `CloneBox` and instead emits `Release(dst)` at
+                    // scope exit, expecting the result to be a fresh +1 owned box.
+                    // We satisfy that expectation by cloning the borrowed slot pointer here —
+                    // exactly the same clone the IR's `CloneBox` would have emitted for a Map result.
+                    let clone_fn = self.get_or_declare_fn("lin_tagged_clone",
+                        ptr_ty.fn_type(&[ptr_ty.into()], false));
+                    self.builder.call(clone_fn, &[tagged.into()], "ir_nmget_clone").try_as_basic_value().unwrap_basic()
+                } else {
+                    // Concrete result type (e.g. Int32): unbox the scalar directly from the
+                    // borrowed slot — no heap allocation needed.
+                    self.unbox_tagged_val_to_type(tagged, result_ty)
+                };
+            }
+        }
         // Typed index-signature map `{ String: T }` (ADR-055): `m[k]` is an O(1) hashed lookup.
         // The key is a String (raw LinString*, or unbox a Json/union-boxed key); the result is
         // `T | Null` — `lin_map_get` returns null for a missing key, which `unbox_tagged_val_to_type`
@@ -730,8 +779,32 @@ impl<'ctx> Codegen<'ctx> {
                     // Statically a string (object) key.
                     self.emit_obj_or_map_set(obj, container, key, value, val_ty, obj_ty);
                 } else if key.is_int_value() {
-                    let idx = self.index_value_to_i64(key);
-                    self.emit_array_set(container, idx, value, val_ty);
+                    // A concrete integer key on a union-typed container: check whether the union
+                    // contains an int-keyed Map variant. If so, route through `emit_map_set_int`
+                    // (not `emit_array_set`) — the container is a `LinMap` allocated with
+                    // `key_kind=1`, not a `LinArray`. Without this guard, `o["B"][1] = 99` where
+                    // `o: { String: { UInt8: Int32 } }` would call `lin_array_set` on the inner
+                    // LinMap and corrupt or silently no-op the write.
+                    let has_int_map = match obj_ty {
+                        Type::Union(vs) => vs.iter().any(|v| matches!(v, Type::Map { key: k, .. } if k.is_integer())),
+                        Type::Map { key: k, .. } => k.is_integer(),
+                        _ => false,
+                    };
+                    if has_int_map {
+                        let i64_key = self.index_value_to_i64(key);
+                        let elem_ty = match obj_ty {
+                            Type::Union(vs) => vs.iter().find_map(|v| match v {
+                                Type::Map { key: k, value: e } if k.is_integer() => Some(e.as_ref().clone()),
+                                _ => None,
+                            }).unwrap_or(Type::TypeVar(u32::MAX)),
+                            Type::Map { value: e, .. } => (**e).clone(),
+                            _ => Type::TypeVar(u32::MAX),
+                        };
+                        self.emit_map_set_int(container, i64_key.into(), value, val_ty, &elem_ty, val_repr);
+                    } else {
+                        let idx = self.index_value_to_i64(key);
+                        self.emit_array_set(container, idx, value, val_ty);
+                    }
                 }
             }
             _ => {}
