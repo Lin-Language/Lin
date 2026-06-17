@@ -343,23 +343,7 @@ impl Checker {
                 // `Named(param)`); `resolve_named_cycle` then leaves it as `Named(param)` via the
                 // same cycle guard used for the alias's own self-references. Without this, a bare
                 // `T` in the body resolves as `Unknown type 'T'` and the body is never stored.
-                let map_resolve_err = |(s, e, help): (Span, String, Option<String>)| {
-                    let d = Diagnostic::error(s, e);
-                    if let Some(h) = help { d.with_help(h) } else { d }
-                };
-                let resolved = if params.is_empty() {
-                    resolve_type_spanned(body, &self.env).map_err(map_resolve_err)?
-                } else {
-                    let mut scratch = self.env.clone();
-                    for param in params {
-                        scratch.define_type(
-                            param.clone(),
-                            Vec::new(),
-                            Type::Named(param.clone()),
-                        );
-                    }
-                    resolve_type_spanned(body, &scratch).map_err(map_resolve_err)?
-                };
+                let resolved = self.resolve_type_decl_body(params, body)?;
                 self.env
                     .define_type(name.clone(), params.clone(), resolved);
                 // Type declarations produce no runtime code
