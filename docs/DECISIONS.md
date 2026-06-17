@@ -3061,3 +3061,27 @@ The 1-arg form takes a zero-argument closure and loops until it returns `false`.
 **Monomorphizer overload-body fix**: when two overloads share the same source name (`"while"`), the monomorphizer's `find_exported_fn` call previously returned the first same-named export — giving the 1-arg import slot the 2-arg body (a thin `lin_while` intrinsic wrapper). The monomorphizer then re-homed the 1-arg slot to `lin_while` and triggered the panic. The fix: pass the import binding's `symbol` field (the exact mangled LLVM name, `Some("while$..._<slot>")` for overload members) to `find_exported_fn`, which now pins the lookup to the body whose `TypedExpr::Function.name` matches, preventing cross-overload body confusion. A parallel fix applies to the rehome-import-of-import path in `classify_origin_slot`.
 
 **Consequences**: `while(() => cond)` is the idiomatic imperative loop. The existing `xs.while(pred)` (2-arg) form is byte-for-byte unchanged. A single `import { while } from "std/iter"` gives both forms.
+
+## ADR-082: Forward-declare local recursive function-`val`s with a union (or Named/Object) return type
+
+**Problem**: a LOCAL (nested-in-a-function-body) recursive function-`val` whose RETURN type is a union could not call itself — the type checker reported `Undefined variable`:
+
+```lin
+type T = { "x": Int32 }
+val outer = (): T | Null =>
+  val go = (n: Int32): T | Null =>
+    if n < 0 then null else go(n - 1)   // Error: Undefined variable 'go'
+  go(5)
+```
+
+The same `go` with a non-union return (`: Int32`), at the top level, or with a union *parameter* type all type-checked fine. Only the LOCAL + union/Named/Object-*return* combination broke. This blocks the idiomatic local tail-recursive helper returning `Trip | Null` (a `getTrip`-style scan).
+
+**Root cause (type checker)**: a function body that is a block is checked by one of two paths. The default `infer_block` path calls `forward_declare_functions_in(stmts)`, which hoists every function-literal `val` (so a body can call itself / its siblings — local recursion). But when the *enclosing* function's declared return type satisfies `expected_pushes_into_branches` (true for `Union`, `Named`, `Object`, and sized-scalar types — ADR-034 bidirectional pushdown), the body is checked by the expected-type-directed block-push path in `check_expr` instead, which pushed a scope and checked the statements but **never called `forward_declare_functions_in`**. So the inner `go` was never hoisted, and its own body could not see it. A plain `Int32` return does not push into branches, so it took the `infer_block` path and worked — hence the union-only symptom. The fix adds the missing `forward_declare_functions_in(stmts)` to the block-push path, mirroring `infer_block` (`lin-check/src/checker/expr.rs`).
+
+**Two codegen fixes the type-check fix newly reached** (both were latent — a local recursive union-returning function could not be written before, so these paths were unreachable):
+
+1. **TCO arg→slot store offset for self-tail-recursive closures** (`lin-codegen/src/codegen/mod.rs`). A nested function is a *closure*: its physical param 0 is the implicit env pointer (`LinFunction.is_closure`), and the user-level `TailCall` args line up with `params[1..]`, not `params[0..]`. The TCO back-edge stored user arg `i` into `param_allocs[i]`, so the decremented counter landed in the **env** slot and the counter slot never changed → infinite loop. The store/load/release now offset by `env_offset = is_closure as usize`; the env slot (loop-invariant) is never updated nor released. Top-level functions are non-closures (offset 0), so their TCO is byte-for-byte unchanged.
+
+2. **NullableRecord indirect-call ABI bridge** (`lin-ir/src/lower/call.rs`). An anonymous closure always returns a BOXED `TaggedVal*` (the `TypeVar(MAX)` ABI). When the declared result type is a nullable sealed record (`Trip | Null`, repr `Packed(NullableRecord)`), the repr pass would seed the call result as a RAW sealed-struct pointer even though the value is boxed; the downstream `is T` narrowing then called `lin_box_record` on the already-boxed value (double-box) → schema match failed → the record was mistaken for null. Fix (mirrors the existing SumNode indirect-call bridge directly above it): emit the call with `ret_ty = TypeVar(MAX)` so the repr pass seeds the result `Boxed`, then `Coerce` boxed → NullableRecord (codegen's reverse `nr_proj` path: TAG_NULL → null ptr, else `sealed_project_from` into a fresh packed struct). This also fixed a pre-existing wrong-result bug for *non-recursive* nested functions returning `T | Null` consumed by an `is T` check.
+
+**Scope / known limitation**: this enables MUTUAL local recursion (two inner function-vals calling each other) with union returns to *type-check*. Running mutual local recursion is gated by a separate, pre-existing closure-env construction-order limitation (the first closure's env is finalized with a null pointer to the second, which is built afterwards and never back-patched) — this affects non-union mutual local recursion too and is independent of this ADR. SELF-recursive local union functions (the motivating `getTrip` pattern) work end-to-end, including deep TCO.

@@ -363,6 +363,15 @@ impl Checker {
             || matches!((expected, final_expr_of_block(expr)), (Type::FixedArray(_), Some(Expr::Array(..))));
         if let (Expr::Block(stmts, final_expr, span, _), true) = (expr, block_push) {
             self.env.push_scope();
+            // Forward-declare function-literal `val` bindings in this block so they can refer to
+            // themselves and each other regardless of definition order (local recursion / mutual
+            // recursion), exactly as `infer_block` does. Without this, a block checked via the
+            // expected-type-directed path (which fires when the enclosing function's declared
+            // return is a Union / Named / Object / sized-scalar type) would never hoist its inner
+            // function-vals, so a local recursive helper returning e.g. `T | Null` could not call
+            // itself ("Undefined variable") — while the same helper with a plain `Int32` return
+            // (inferred via `infer_block`) worked. ADR-082.
+            self.forward_declare_functions_in(stmts);
             let mut typed_stmts = Vec::new();
             // A block's non-final statements are NOT in tail position; only its final expression
             // is. Clear the flag while checking the statements (mirroring `infer_block`) so a

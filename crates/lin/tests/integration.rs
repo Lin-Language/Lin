@@ -687,6 +687,85 @@ print(toString(factorial(0)))
     assert_eq!(output, vec!["120", "1"]);
 }
 
+// ADR-082: a LOCAL (nested-in-a-function-body) recursive function-`val` whose RETURN type is a
+// union must be forward-declared so its body can call itself — exactly like the non-union case.
+// Before the fix, a local function whose enclosing function declared a Union/Named/Object return
+// went through the expected-type-directed block-check path (`check_expr` block-push), which —
+// unlike `infer_block` — never hoisted inner function-vals, so a recursive self-call reported
+// "Undefined variable". This also exercises two codegen fixes the type-check fix newly reached:
+//   - the TCO arg→slot store offset for a self-tail-recursive CLOSURE (the implicit env param at
+//     slot 0 must be skipped, else the counter is stored into the env slot → infinite loop);
+//   - the NullableRecord indirect-call ABI bridge (a closure returns a BOXED union; the call result
+//     must be Coerced boxed → NullableRecord so the consumer's `is T` narrowing sees a real record).
+#[test]
+fn test_local_recursive_fn_with_union_return() {
+    // Annotated `T | Null` return, recursing to a base that yields a record; `is T` after must
+    // narrow correctly (would print "none" if the closure-return repr were mishandled).
+    let output = run(r#"import { print } from "std/io"
+type Trip = { "id": Int32 }
+val getTrip = (target: Int32): Trip | Null =>
+  val scan = (i: Int32, lastFound: Trip | Null): Trip | Null =>
+    if i < 0 then lastFound
+    else if i == target then scan(i - 1, { "id": i })
+    else scan(i - 1, lastFound)
+  scan(20, null)
+val r = getTrip(5)
+if r is Trip then print("found") else print("none")
+"#);
+    assert_eq!(output, vec!["found"]);
+}
+
+#[test]
+fn test_local_recursive_fn_with_inferred_union_return() {
+    // INFERRED union return (no annotation on `go`): the inner function-val must still be
+    // forward-declared so `go` is in scope in its own body.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val outer = (): Int32 | Null =>
+  val go = (n: Int32) => if n < 0 then null else if n == 0 then 42 else go(n - 1)
+  go(5)
+val r = outer()
+if r is Int32 then print(toString(r)) else print("none")
+"#);
+    assert_eq!(output, vec!["42"]);
+}
+
+#[test]
+fn test_local_recursive_union_fn_deep_tco() {
+    // A self-tail-recursive local function (a CLOSURE) returning a union must tail-call-optimize:
+    // 5,000,000 iterations must terminate without a stack overflow AND produce the right answer.
+    // Regression for the TCO arg→slot store landing in the env slot (infinite loop) instead of the
+    // counter slot.
+    let output = run(r#"import { print } from "std/io"
+type Trip = { "id": Int32 }
+val getTrip = (target: Int32): Trip | Null =>
+  val scan = (i: Int32, lastFound: Trip | Null): Trip | Null =>
+    if i < 0 then lastFound
+    else if i == target then scan(i - 1, { "id": i })
+    else scan(i - 1, lastFound)
+  scan(5000000, null)
+val r = getTrip(5)
+if r is Trip then print("found") else print("none")
+"#);
+    assert_eq!(output, vec!["found"]);
+}
+
+// ADR-082: the type-check fix also enables MUTUAL local recursion (two inner function-vals calling
+// each other) with union returns to TYPE-CHECK. (Runtime mutual local recursion is gated by a
+// separate, pre-existing closure-env construction-order limitation that also affects non-union
+// mutual local recursion — see ADR-082; this test asserts only the type-check.)
+#[test]
+fn test_mutual_local_recursive_union_fn_typechecks() {
+    let (ok, out) = check_source(r#"type T = { "x": Int32 }
+val outer = (n: Int32): T | Null =>
+  val isEven = (k: Int32): T | Null => if k == 0 then { "x": 1 } else isOdd(k - 1)
+  val isOdd = (k: Int32): T | Null => if k == 0 then null else isEven(k - 1)
+  isEven(n)
+val r = outer(10)
+"#);
+    assert!(ok, "mutual local recursion with union returns should type-check:\n{}", out);
+}
+
 #[test]
 fn test_for_and_range() {
     let output = run(r#"import { print } from "std/io"
