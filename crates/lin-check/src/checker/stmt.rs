@@ -372,6 +372,27 @@ impl Checker {
                     let local_name = binding.alias.as_ref().unwrap_or(&binding.name);
                     // Use pre-resolved type if available, else fall back to TypeVar.
                     let key = (path.clone(), binding.name.clone());
+                    // ADR-074 cross-module: an imported name backed by an overload set is registered
+                    // as an overload set locally (one slot per member), so the ordinary call-site
+                    // resolution selects among them. Each member carries the exporting module's exact
+                    // mangled symbol so lowering emits the right `Named` target.
+                    if let Some(members) = self.import_overloads.get(&key).cloned() {
+                        self.import_origins.insert(
+                            local_name.clone(),
+                            (path.clone(), binding.name.clone()),
+                        );
+                        for (ty, symbol) in members {
+                            let (slot, _dup) =
+                                self.env.define_fn_overload(local_name.clone(), ty.clone(), None);
+                            import_slots.push(ImportSlot {
+                                name: binding.name.clone(),
+                                slot,
+                                ty,
+                                symbol: Some(symbol),
+                            });
+                        }
+                        continue;
+                    }
                     let has_export = self.import_types.contains_key(&key)
                         || self.import_type_decls.contains_key(&key);
                     if module_known && !has_export {
@@ -394,6 +415,7 @@ impl Checker {
                             name: binding.name.clone(),
                             slot,
                             ty,
+                            symbol: None,
                         });
                         continue;
                     }
@@ -412,6 +434,7 @@ impl Checker {
                         name: binding.name.clone(),
                         slot,
                         ty,
+                        symbol: None,
                     });
                 }
                 Ok(TypedStmt::Import {

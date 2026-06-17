@@ -20648,3 +20648,41 @@ print(toString(add5(3)))
 "#);
     assert_eq!(out, vec!["8"]);
 }
+
+#[test]
+fn test_overload_cross_module() {
+    // ADR-074 cross-module: an imported overload set resolves at the importer's call sites.
+    let dir = std::env::temp_dir().join(format!("lin_overload_xmod_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("shapes.lin"),
+        "export val describe = (n: Int32): String => \"int:${n}\"\n\
+         export val describe = (s: String): String => \"str:${s}\"\n\
+         export val describe = (a: Int32, b: Int32): String => \"pair:${a + b}\"\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ describe }} from "{}/shapes"
+print(describe(7))
+print(describe("hi"))
+print(describe(2, 3))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["int:7", "str:hi", "pair:5"]);
+}
+
+#[test]
+fn test_overload_cross_module_aliased() {
+    // An aliased import of an overloaded name still resolves all overloads under the alias.
+    let dir = std::env::temp_dir().join(format!("lin_overload_xmod_alias_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "export val enc = (n: Int32): String => \"i\"\n\
+         export val enc = (s: String): String => \"s\"\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ enc as e }} from "{}/lib"
+print(e(1))
+print(e("x"))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["i", "s"]);
+}

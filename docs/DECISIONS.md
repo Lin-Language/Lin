@@ -2972,10 +2972,15 @@ ABI change, no mangling churn for the overwhelming majority of code. Codegen is 
   the ordinary ambiguity error.
 - **Generics/monomorphization**: a generic overload still specializes per call as today; overloading only
   changes *which* candidate is selected before specialization runs.
-- **Cross-module (v1 limit)**: a module's signature (`ModuleSignature.exports`) is a single name→type
-  map, so importing a module that overloads a name exposes only one signature (the primary) to dependents.
-  This is not silent miscompilation — a mismatched cross-module use is an ordinary type error — but full
-  cross-module overload sets are deferred. Same-module overloading (the common case) is fully supported.
+- **Cross-module**: supported. `ModuleSignature` carries an `overloads` map (name → each member's
+  function type + the exact mangled symbol the exporting module emitted). A dependent seeds these into
+  `Checker.import_overloads`; the `import` handler registers the imported name as an overload set in the
+  env (one slot per member, each `ImportSlot` carrying its symbol), so ordinary call-site resolution
+  applies and each member lowers to its own `{module_key}_{symbol}` `Named` target. The one remaining gap
+  is an overload set defined *within an import cycle* and used across that cycle: SCC Phase-1 seeding
+  carries a single provisional type per name, so such a name falls back to single-signature resolution
+  inside the cycle (acyclic imports — the overwhelming majority, including all stdlib use — are fully
+  handled).
 
 **Consequences**: Existing single-binding programs are byte-for-byte unaffected (single-binding fast
 path, plain symbols). New surface area is concentrated in `lin-check` (overload-set environment +
