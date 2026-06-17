@@ -3218,3 +3218,38 @@ inner (shadowing) binding. The outer / imported binding is never changed. Spec �
 Regression tests: `test_shadowing_nested_val_is_rejected`, `test_shadowing_lambda_param_is_rejected`,
 `test_shadowing_sibling_lambdas_same_param_accepted`, `test_shadowing_same_scope_reuse_accepted` in
 `crates/lin/tests/integration.rs`.
+
+## ADR-080: Delimiter-aware top-level error recovery
+
+**Status**: Accepted.
+
+**Context**: After a top-level statement fails to parse, `Parser::parse_module` calls `synchronize()`
+to skip ahead to the next statement so a single error doesn't cascade. The original `synchronize()`
+stopped at the first Newline/Dedent OR the first statement-starting keyword (`val`/`var`/`type`/
+`import`/`export`). That interacts badly with ADR-003: INDENT/DEDENT/Newline are SUPPRESSED inside
+`( ) [ ] { }`. So a syntax error DEEP inside a delimited group (e.g. a broken lambda passed to
+`xs.for( … )`, whose body spans many lines and contains an indented `var`/`val`) leaves the next
+keyword *inside* the still-open group. `synchronize()` stopped there and `parse_module` resumed
+parsing in the middle of the broken construct — mis-parsing every line after it, never reaching the
+real top-level declarations below, and producing a cascade of garbage diagnostics plus spurious
+"unknown type" errors for `type`/`val` declarations the parser never registered.
+
+**Decision**: Make `synchronize()` recover to a genuine top-level boundary. A statement keyword is
+accepted as a recovery point ONLY when it is at module column (column 1); an indented keyword
+(column > 1 — i.e. inside the broken construct) is skipped like any other token. A Newline/Dedent
+remains a stop, and is always safe because (by ADR-003) such a token can only appear once we are
+back OUTSIDE every delimiter group. Together these skip PAST the entire broken delimited group before
+resuming, so the declarations after it still parse and register.
+
+**Why column, not a depth counter**: the opening brackets were already consumed before `synchronize()`
+runs, so a depth counter started at zero inside `synchronize()` cannot tell it is inside an unclosed
+group; a *running* parser-wide counter would be corrupted by the save/restore backtracking the postfix
+parser uses (ADR-005). Tokens already carry a 1-based `column`, and Lin's top-level declarations are
+always at column 1, so the column test is both self-contained and robust.
+
+**Consequences**: A localized syntax error now degrades gracefully — one diagnostic at the real
+location, and the rest of the module (including types declared below the error) still parses, so the
+checker no longer emits spurious "unknown type" cascades. Pure `lin-parse` change to `synchronize()`;
+the hang-regression suite (which guards termination/progress) and the full workspace suite stay green.
+A parser regression test asserts a `type` declaration after a broken delimited construct is still
+produced.
