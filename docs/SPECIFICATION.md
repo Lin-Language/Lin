@@ -1209,6 +1209,8 @@ Narrowing carries into:
 
 A null test on an **index read** narrows a re-read of the same index place: `if m[k] != null then m[k] …` (and `m[k] ?? d`) reads `m[k]` as `T` rather than `T | Null` in the guarded branch. The place may be **compound** — an identifier root followed by any number of stable index steps (string-literal or simple-identifier keys), e.g. `service["dates"][date]` — so `if service["dates"][date] != null then service["dates"][date]` narrows the inner map read. The narrowing is invalidated if any identifier the place mentions (its root or a key variable) is reassigned, or a write lands through the same root.
 
+An **assignment** to an index place narrows a re-read of that same place to its assigned non-null type, mirroring the `if m[k] != null` narrowing. After `m[k] = e` where `e` is non-null (e.g. `m[k] = m[k] ?? []`), subsequent reads of `m[k]` are typed `V` (the slot's declared non-null value type) rather than `V | Null`, so the `m[k] = m[k] ?? []` then `m[k].push(x)` idiom type-checks without re-testing for null. A stable index step's key may itself be a stable place-path (`m[row["from_stop_id"]]`), so this works for nested keys too. The narrowing holds forward across statements until invalidated — by reassigning any identifier the place mentions (its root, a key variable, or any identifier in a nested key path), a write through the same root, **any function call** (which could mutate the map), or the end of the enclosing block — and never leaks past the block it was established in. It is applied conservatively: only over non-union slot value types `V` (a single record, array, or scalar), never when `V` is a union.
+
 Narrowing is invalidated on the first assignment to a `var` whose narrowed type would no longer hold.
 
 ---

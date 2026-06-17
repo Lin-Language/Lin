@@ -2797,6 +2797,158 @@ val f = (o: Outer, j: String): Int32 =>
     );
 }
 
+// ---------------------------------------------------------------------------
+// ADR-076: ASSIGNMENT-based index-place narrowing. After a write of a non-null value to a stable
+// index place `m[k]`, a later read of that SAME place narrows to the assigned (non-null) type —
+// the `m[k] = m[k] ?? []; m[k].push(x)` idiom — until invalidated (reassign an identifier the path
+// mentions, a write through the same base prefix, a call that could mutate the map, or block exit).
+// Plus: stable nested place-path keys (`m[row["id"]]`) are admitted as narrowable places.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_assign_narrows_index_place_simple_key() {
+    // After `m[k] = m[k] ?? []`, the re-read `m[k]` is the assigned non-null `String[]`, so
+    // `m[k].push("x")` (which needs a non-null `String[]` receiver) type-checks and runs.
+    let output = run(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val f = (m: { String: String[] }, k: String): Int32 =>
+  m[k] = m[k] ?? []
+  m[k].push("x")
+  length(m[k])
+
+var m: { String: String[] } = {}
+print(toString(f(m, "a")))
+"#);
+    assert_eq!(output, vec!["1"]);
+}
+
+#[test]
+fn test_assign_narrows_index_place_nested_path_key() {
+    // The same idiom keyed on a stable NESTED place-path (`m2[row["id"]]`): the key `row["id"]` is
+    // itself a re-readable place, so the place canonicalizes and the narrowing applies. Runs the
+    // `addTransfer`/`addLink` shape end-to-end.
+    let output = run(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val f = (m2: { String: String[] }, row: AnyVal): Int32 =>
+  m2[row["id"]] = m2[row["id"]] ?? []
+  m2[row["id"]].push("x")
+  length(m2[row["id"]])
+
+var m2: { String: String[] } = {}
+val row = { "id": "k1" }
+print(toString(f(m2, row)))
+"#);
+    assert_eq!(output, vec!["1"]);
+}
+
+#[test]
+fn test_assign_narrowing_invalidated_by_key_reassignment() {
+    // Soundness: reassigning the KEY variable after the assignment means `m[k]` may denote a
+    // different slot, so the narrowing is dropped and the re-read re-widens to `String[] | Null`.
+    let err = run_expect_err(r#"import { push } from "std/array"
+val f = (m: { String: String[] }, otherKey: String) =>
+  var k: String = "a"
+  m[k] = m[k] ?? []
+  k = otherKey
+  m[k].push("x")
+"#);
+    assert!(
+        err.contains("String[] | Null"),
+        "expected re-widened `String[] | Null` after key reassignment, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_assign_narrowing_invalidated_by_nested_key_root_reassignment() {
+    // Soundness: the nested key path `row["id"]` mentions `row`; reassigning `row` may make the
+    // place denote a different slot, so the narrowing is dropped (re-widened to `String[] | Null`).
+    let err = run_expect_err(r#"import { push } from "std/array"
+val f = (m2: { String: String[] }, other: AnyVal) =>
+  var row: AnyVal = { "id": "a" }
+  m2[row["id"]] = m2[row["id"]] ?? []
+  row = other
+  m2[row["id"]].push("x")
+"#);
+    assert!(
+        err.contains("String[] | Null"),
+        "expected re-widened `String[] | Null` after nested-key root reassignment, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_assign_narrowing_invalidated_by_base_reassignment() {
+    // Soundness: reassigning the BASE map binding means `m[k]` reads a different map, so the
+    // narrowing rooted at `m` is cleared and the re-read re-widens to `String[] | Null`.
+    let err = run_expect_err(r#"import { push } from "std/array"
+val f = (k: String) =>
+  var m: { String: String[] } = {}
+  var m2: { String: String[] } = {}
+  m[k] = m[k] ?? []
+  m = m2
+  m[k].push("x")
+"#);
+    assert!(
+        err.contains("String[] | Null"),
+        "expected re-widened `String[] | Null` after base reassignment, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_assign_narrowing_different_key_still_nullable() {
+    // Soundness: only the ASSIGNED key narrows. A read of a DIFFERENT key `m[other]` is still
+    // `String[] | Null`, so `m[other].push(...)` is rejected.
+    let err = run_expect_err(r#"import { push } from "std/array"
+val f = (m: { String: String[] }, k: String, other: String) =>
+  m[k] = m[k] ?? []
+  m[other].push("x")
+"#);
+    assert!(
+        err.contains("String[] | Null"),
+        "expected `String[] | Null` for a different (unassigned) key, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_assign_narrowing_cleared_by_intervening_call() {
+    // Soundness: a function CALL between the assignment and the read could mutate the map (delete
+    // the key), so all index-narrowings are conservatively cleared after a call — the re-read
+    // re-widens to `String[] | Null`. (The receiver of `m[k].push(...)` is evaluated BEFORE the
+    // push call, so the narrowed-read idiom itself is unaffected — see the positive tests above.)
+    let err = run_expect_err(r#"import { push } from "std/array"
+val touch = (m: { String: String[] }): Int32 => 1
+val f = (m: { String: String[] }, k: String) =>
+  m[k] = m[k] ?? []
+  val z = touch(m)
+  m[k].push("x")
+"#);
+    assert!(
+        err.contains("String[] | Null"),
+        "expected re-widened `String[] | Null` after an intervening call, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_assign_narrowing_does_not_leak_past_block() {
+    // Soundness: an assignment-narrowing established INSIDE an `if` block must not leak past it. A
+    // read of `m[k]` after the block re-widens to `String[] | Null`.
+    let err = run_expect_err(r#"import { push } from "std/array"
+val f = (m: { String: String[] }, k: String): String[] =>
+  if k != "" then
+    m[k] = m[k] ?? []
+    m[k].push("inside")
+  val b: String[] = m[k]
+  b
+"#);
+    assert!(
+        err.contains("String[] | Null"),
+        "expected re-widened `String[] | Null` after the block, got:\n{err}"
+    );
+}
+
 #[test]
 fn test_map_read_with_non_string_key_rejected() {
     // A `{ String: T }` map READ must reject a non-String key (mirrors the index-ASSIGN guard,
@@ -19116,12 +19268,15 @@ print("${a ?? b ?? 7}")
 fn test_coalesce_map_read_usable_as_bare_type() {
     // `m[k] ?? default` on a `{ String: Int32 }`: present and absent keys, and the result is a
     // bare `Int32` usable in arithmetic with no further narrowing.
+    // ADR-076: the present key is read DIRECTLY — after `m["a"] = 5` it narrows to a non-null
+    // `Int32`, so `m["a"] ?? 99` would be a dead-default error. The absent-key coalesces (`"b"`,
+    // never assigned) keep the genuine `?? default` path.
     let output = run(r#"import { print } from "std/io"
 
 val m: { String: Int32 } = {}
 m["a"] = 5
 
-val present = m["a"] ?? 99
+val present = m["a"]
 val absent = m["b"] ?? 99
 print("${present + 1}")
 print("${absent + 1}")
@@ -19302,20 +19457,26 @@ print(toString(length(xs)))
 fn test_coalesce_mismatched_default_still_unions() {
     // When the RHS default is genuinely a different type, `??` still produces a union result
     // (the documented `stripped | D` behaviour is preserved — no regression).
+    // ADR-076: the present-key read is sourced from a function-PARAM map (`use`), so it stays the
+    // nullable map-read `Int32 | Null` and the mismatched `?? "fallback"` is a live union — an
+    // assign-then-coalesce of the SAME key would narrow to non-null `Int32` and make the default
+    // dead. The absent-key coalesce (`"missing"`) is unaffected either way.
     let output = run(r#"import { print } from "std/io"
 
+val use = (m: { String: Int32 }) =>
+  val r = m["x"] ?? "fallback"
+  val s = m["missing"] ?? "fallback"
+  match r
+    is String => print("string: ${r}")
+    is Int32 => print("int: ${r}")
+    else => print("other")
+  match s
+    is String => print("string: ${s}")
+    is Int32 => print("int: ${s}")
+    else => print("other")
 var m: { String: Int32 } = {}
 m["x"] = 7
-val r = m["x"] ?? "fallback"
-val s = m["missing"] ?? "fallback"
-match r
-  is String => print("string: ${r}")
-  is Int32 => print("int: ${r}")
-  else => print("other")
-match s
-  is String => print("string: ${s}")
-  is Int32 => print("int: ${s}")
-  else => print("other")
+use(m)
 "#);
     assert_eq!(output, vec!["int: 7", "string: fallback"]);
 }
@@ -20292,6 +20453,10 @@ main()
 #[test]
 fn test_map_bare_record_value_coalesce_and_named_narrow() {
     // ?? coalesce read (bare-T result) and a 5.9.1 named-narrow projection store — both panicked.
+    // ADR-076: a present-key read AFTER `m["k"] = w` now narrows to the assigned non-null `Wide`,
+    // so `m["k"] ?? d` there would be a "left operand is never null" error (the default is dead).
+    // The bare-T present-key read is exercised directly; `m["absent"] ?? d` keeps the genuine
+    // coalesce-over-`Null` path (the absent key is not narrowed).
     let out = run(r#"import { print } from "std/io"
 type Wide = { "type": String, "extra": Int32 }
 type Narrow = { "type": String }
@@ -20300,7 +20465,7 @@ val main = () =>
   var m: { String: Wide } = {}
   m["k"] = w
   val d: Wide = { "type": "dflt", "extra": 0 }
-  val got: Wide = m["k"] ?? d
+  val got: Wide = m["k"]
   print("coalesce=${got["type"]}")
   val miss: Wide = m["absent"] ?? d
   print("miss=${miss["type"]}")
@@ -20566,10 +20731,12 @@ val main = () =>
   var routes: { String: Stop[] } = {}
   val stops: Stop[] = [{ "id": "a", "time": 1 }, { "id": "b", "time": 2 }]
   routes["r1"] = stops
-  val got = routes["r1"] ?? []
+  val got: Stop[] = routes["r1"]
   print(toString(length(got)))
 main()
 "#);
+    // ADR-076: after `routes["r1"] = stops`, the re-read narrows to the assigned non-null `Stop[]`,
+    // so it is directly assignable to a `Stop[]` binding (a `?? []` default would now be dead).
     assert_eq!(out, vec!["2"]);
 }
 
