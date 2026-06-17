@@ -95,7 +95,7 @@ pub fn coerce_is_carry(from_ty: &Type, to_ty: &Type) -> bool {
 /// delegates to this so there is a single definition.
 pub fn is_stack_eligible_type(ty: &Type) -> bool {
     match ty {
-        Type::Object { fields, sealed: true } if !fields.is_empty() => {
+        Type::Object { fields, sealed: true, .. } if !fields.is_empty() => {
             fields.values().all(is_scalar_field)
         }
         _ => false,

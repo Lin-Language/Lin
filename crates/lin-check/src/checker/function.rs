@@ -493,7 +493,7 @@ impl Checker {
             // returns a sealed struct propagate the sealed repr through recursive calls and if
             // merges instead of degrading every phi to a boxed TAG_MAP.
             let promote_to_sealed = matches!((&declared, &body_ty),
-                (Type::Object { fields: df, sealed: false }, Type::Object { fields: bf, sealed: true })
+                (Type::Object { fields: df, sealed: false, .. }, Type::Object { fields: bf, sealed: true, .. })
                 if df == bf);
             if promote_to_sealed { body_ty } else { declared }
         } else {

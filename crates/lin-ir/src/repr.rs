@@ -1131,7 +1131,7 @@ mod tests {
     }
 
     fn sealed(fields: IndexMap<String, Type>) -> Type {
-        Type::Object { fields, sealed: true }
+        Type::Object { fields, sealed: true, name: None }
     }
 
     /// Build a single-block function from a list of instructions + a return temp.
@@ -1194,8 +1194,8 @@ mod tests {
         square.insert("kind".into(), Type::StrLit("square".into()));
         square.insert("side".into(), Type::Int32);
         Type::Union(vec![
-            Type::Object { fields: circle, sealed: true },
-            Type::Object { fields: square, sealed: true },
+            Type::Object { fields: circle, sealed: true, name: None },
+            Type::Object { fields: square, sealed: true, name: None },
         ])
     }
 
@@ -1218,8 +1218,8 @@ mod tests {
         b.insert("kind".into(), Type::StrLit("b".into()));
         b.insert("n".into(), Type::Int32);
         let u = Type::Union(vec![
-            Type::Object { fields: a, sealed: true },
-            Type::Object { fields: b, sealed: true },
+            Type::Object { fields: a, sealed: true, name: None },
+            Type::Object { fields: b, sealed: true, name: None },
         ]);
         assert!(super::sum_type_eligible(&u), "String-field variant is eligible (Stage 3)");
         assert_eq!(super::sum_type_discriminant_of(&u).as_deref(), Some("kind"));
@@ -1235,8 +1235,8 @@ mod tests {
         b.insert("kind".into(), Type::StrLit("b".into()));
         b.insert("n".into(), Type::Int32);
         let u = Type::Union(vec![
-            Type::Object { fields: a, sealed: true },
-            Type::Object { fields: b, sealed: true },
+            Type::Object { fields: a, sealed: true, name: None },
+            Type::Object { fields: b, sealed: true, name: None },
         ]);
         assert!(!super::sum_type_eligible(&u), "TypeVar/generic field must keep union boxed");
     }
@@ -1249,8 +1249,8 @@ mod tests {
         let mut b = IndexMap::new();
         b.insert("y".into(), Type::Int32);
         let u = Type::Union(vec![
-            Type::Object { fields: a, sealed: true },
-            Type::Object { fields: b, sealed: true },
+            Type::Object { fields: a, sealed: true, name: None },
+            Type::Object { fields: b, sealed: true, name: None },
         ]);
         assert!(!super::sum_type_eligible(&u));
     }
@@ -1266,8 +1266,8 @@ mod tests {
         binop.insert("left".into(), Type::Named("Ast".into()));
         binop.insert("right".into(), Type::Named("Ast".into()));
         Type::Union(vec![
-            Type::Object { fields: num, sealed: true },
-            Type::Object { fields: binop, sealed: true },
+            Type::Object { fields: num, sealed: true, name: None },
+            Type::Object { fields: binop, sealed: true, name: None },
         ])
     }
 
@@ -1292,8 +1292,8 @@ mod tests {
         b.insert("kind".into(), Type::StrLit("b".into()));
         b.insert("other".into(), Type::Named("B".into())); // a SECOND distinct Named
         let u = Type::Union(vec![
-            Type::Object { fields: a, sealed: true },
-            Type::Object { fields: b, sealed: true },
+            Type::Object { fields: a, sealed: true, name: None },
+            Type::Object { fields: b, sealed: true, name: None },
         ]);
         assert!(super::sum_recursive_self_name(&u).is_none(), "two distinct Names → no self-name");
         assert!(!super::sum_type_eligible(&u), "ambiguous recursion must be boxed (fail-safe)");
