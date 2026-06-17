@@ -392,11 +392,11 @@ export val minusDuration = (dt: DateTime, d: Duration): DateTime => fromTimestam
 
 // ── Period ───────────────────────────────────────────────────────────────────────
 // Construct a calendar `Period`. Trailing fields default to zero, so `period(1)` is one year.
-export val period = (years: Int64, months: Int64 = 0, days: Int64 = 0): Period =>
+export val period = (years: Int64, months: Int64 = 0, numDays: Int64 = 0): Period =>
   {
     "years": years,
     "months": months,
-    "days": days
+    "days": numDays
   }
 
 // ── Comparison ───────────────────────────────────────────────────────────────────

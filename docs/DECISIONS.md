@@ -3036,6 +3036,224 @@ ambiguity (records, unions, generics already handled at the specificity tier) ex
 Spec §14.6 notes the numeric preference. Regression tests cover same-signedness selection, signed/unsigned
 selection of the incomparable pair, and the unchanged record-ambiguity error.
 
+## ADR-079: Destructuring lambda parameters (bare + parenthesized)
+
+**Status**: Accepted.
+
+**Context**: A `Param` already carries a full `Pattern`, and the parser's `parse_param` already runs
+`parse_binding_pattern`, so a *parenthesized* destructuring parameter such as `({ name, age }) => name`
+parsed and — for OBJECT patterns — bound correctly. Two gaps remained:
+
+1. **Array-pattern params never bound.** `([a, b]) => a` parsed but the checker only emitted a
+   destructuring preamble for `Pattern::Object`, so `a`/`b` were reported as undefined variables.
+2. **Bare destructuring forms didn't parse.** `[a, b] => a` (no surrounding parens) hit
+   `expected RParen, got Arrow`, because the bare-lambda recognizer `is_bare_lambda` matched only a
+   single `Ident` followed by `=>`. The motivating idiom is a map-entries-style iteration —
+   `entries.for([routeId, stopP] => …)` — which should read as cleanly as the single-ident form.
+
+**Decision**: Support destructuring lambda parameters for BOTH array and object patterns, in BOTH the
+bare (single-param, argument-position) and parenthesized (also multi-param) forms.
+
+- **Checker / lowering (gap 1).** Function-entry binding for ALL non-`Ident` param patterns is unified
+  in one helper, `Checker::bind_destructure_param`, used by both `infer_function` and
+  `infer_function_with_hints`. It emits the SAME typed statements the `val { … } = …` / `val [ … ] = …`
+  forms emit in `check_stmt` — `TypedStmt::Destructure` for objects and `TypedStmt::ArrayDestructure`
+  for arrays — into a body preamble (the existing `param_destr_stmts` → `Block` wrap). Element types
+  come positionally from a tuple/`FixedArray` param type (`[T0, T1]` → `a: T0`, `b: T1`), or from the
+  array element for an `Array(T)` param (`T[]` → each element `T`), or the `AnyVal` wildcard otherwise.
+  Nested patterns (`[a, [b, c]]`, `{ p: { x } }`) recurse through fresh intermediate slots, and a
+  `...rest` array element binds a sliced tail — exactly to the extent the `val`-destructuring path
+  already supports. Sharing one code path keeps params and `val` destructuring consistent for free.
+
+- **Parser (gap 2).** `is_bare_lambda` now also returns true when the upcoming tokens are a
+  BRACKET-BALANCED `[ … ]` or `{ … }` (counting nested `[]`/`{}`) immediately followed — skipping
+  newlines — by `=>`. The balanced-close-then-`=>` scan (`balanced_close_then_arrow`) is what
+  distinguishes a bare destructuring lambda from an array/record LITERAL argument: a `[1, 2]` or
+  `{ "a": 1 }` with no trailing `=>` has no arrow and stays a literal. `parse_bare_lambda` then parses
+  the pattern with the same `parse_binding_pattern` params use and builds a single-`Param` lambda. As
+  before, this is recognised ONLY in argument position (ADR-006), so nothing outside argument position
+  changes. The parenthesized multi-param path was already accepting destructuring params via
+  `parse_param`; with gap 1 fixed it now binds.
+
+**Consequences**: `[a, b] => a + b`, `([a, b]) => a + b`, `{ name } => name`, `({ name }) => name`,
+and mixed multi-param lambdas (`(x, [a, b]) => …`) all parse, bind and run. Array/record literal
+arguments are unaffected (verified by the literal-not-a-lambda regression). A destructuring param with
+more elements than a tuple type provides binds the extra names to `Null` and is an array-OOB runtime
+error at use — the same safe-by-default behaviour as `val [a, b, c] = [1, 2]` (no compiler panic). Spec
+§ on lambda/parameter syntax documents both forms.
+## ADR-077: Assignment-based index-place narrowing + stable place-path keys
+
+**Status**: Accepted. Extends the index-place null-test narrowing (the `if m[k] != null then m[k]`
+machinery in `checker/expr.rs`).
+
+**Context**: A `{ K: V }`-map read is nullable by the safe-bracket rule (spec §6.1): `m[k] : V | Null`.
+So the idiom "default the slot, then mutate it" —
+```
+m[k] = m[k] ?? []
+m[k].push(x)
+```
+did not type-check: the second `m[k]` was still typed `V | Null`, and `.push` needs a non-null `V[]`
+receiver. The existing flow-narrowing only fired inside an `if m[k] != null` branch; a plain assignment
+recorded nothing, so the re-read stayed nullable. The motivating real case is the RAPTOR GTFS loader's
+`addTransfer`, where the slot is keyed by a *nested* place (`transfers[row["from_stop_id"]]`) that the
+original canonicalizer rejected outright.
+
+**Decision** — two changes, both reusing the existing `PlacePath` / `IndexNarrow` / `index_narrowings`
+stack so the same invalidation and scoping rules apply.
+
+1. **Assignment-based narrowing.** When an index-assignment `m[k] = e` is checked
+   (`infer_index_assign`), after the existing write-invalidation (clear narrowings rooted at the same
+   base), if (a) the LHS canonicalizes to a stable `PlacePath::Index`, (b) the slot's *read* type is
+   nullable (`V | Null` — the map idiom), and (c) `typeof(e)` is non-null (strictly more specific than the
+   nullable read type — it is already checked assignable to `V`, so it is a `Null`-dropping subtype), we
+   record `IndexNarrow { path, ty: typeof(e) }`. A later read of that same path then narrows to the
+   assigned type. The narrowing persists FORWARD across subsequent statements in the block.
+
+2. **Stable place-path keys.** `IndexKey` gains a `Path(Box<PlacePath>)` variant. `index_key_of_expr`
+   (shared by `place_path_of_expr` and `lookup_index_narrowing`) admits a key that is itself a stable
+   nested place (`row["from_stop_id"]` = `Index(Root("row"), StrLit("from_stop_id"))`); a key with a call,
+   arithmetic, etc. stays rejected. `place_path_mentions` recurses into the nested key path, so reassigning
+   ANY identifier in the key (e.g. `row`) invalidates the narrowing.
+
+**Soundness / invalidation** — a recorded narrowing of `m[k]` is dropped when, between the assignment and
+a later read:
+- the base root identifier OR any identifier in the (possibly nested) key path is reassigned —
+  `clear_index_narrowings_for` via `place_path_mentions` (now recursing into key paths);
+- a write lands through the same base prefix (`m[j] = …`) — conservatively keyed on the root identifier;
+- **a function call occurs** — `clear_index_narrowings_after_call` clears ALL index-narrowings after any
+  `Call`/`DotCall` (a call could delete the key or re-key the map). This runs *after* the call's
+  receiver/arguments are inferred, so the `m[k].push(x)` idiom is unaffected: the `m[k]` receiver read
+  captures its narrowed type before `push` is dispatched;
+- the enclosing **block** ends — `infer_block` records the stack depth on entry and truncates on exit, so a
+  narrowing established inside an `if`/block never leaks past it (mirrors `infer_if`'s truncation).
+
+When any precondition is uncertain we simply do not record / over-clear: a missed narrowing only re-widens
+the read to `V | Null` (a usability nit), never a type hole. Both `IndexKey::Path` boxing breaks the
+`PlacePath` ⇄ `IndexKey` recursion.
+
+**Consequences**: Pure `lin-check` change; no IR/codegen impact (the narrowed read is the same TaggedVal,
+only its static type tightens — identical to the if-test narrowing). One existing bare-record test
+(`test_map_bare_record_value_coalesce_and_named_narrow`) was updated: a present-key `m["k"] ?? d`
+immediately after `m["k"] = w` is now a "left operand is never null" error because the read narrows to the
+assigned non-null record — the `??` default is genuinely dead. Spec §7.2 documents the rule. Regression
+tests cover both positive idioms (simple + nested-path key) and the four invalidation classes (key/base/
+nested-key reassignment, intervening call, different key, block-scope leak).
+
+## ADR-076: Nested map writes auto-vivify absent intermediate levels
+
+**Status**: Accepted.
+
+**Context**: Bracket reads are safe and null-propagating (§6.1/§7.1): `m[k1][k2]` yields `Null` when any
+level is absent. The write side was under-specified: a nested assignment `m[k1][k2] = v` whose intermediate
+`m[k1]` was absent (a `{K: V}` map value typed `V | Null`) *silently no-opped* — the runtime `lin_map_set`
+guards against writing into a null inner map, so the assignment compiled and ran but stored nothing. That is
+a footgun: the statement's intent is to store, and it silently didn't. Requiring callers to hand-write
+`m[k1] = m[k1] ?? {}` before every nested write is noisy and easy to forget.
+
+**Decision**: A nested index-assignment auto-vivifies absent **intermediate map levels**. When lowering an
+`IndexSet` whose object operand is itself an `Index` read of map type, that read is lowered as
+*get-or-create*: read the level; if `Null`, construct an empty map of the level's statically-known value
+type, store it back into its parent, and continue. This recurses outermost-first so every intermediate map
+level of an arbitrarily deep `m[a][b][c] = v` is created. The final-level set assigns the leaf unchanged.
+
+Scope is deliberately bounded to **map** intermediates (`Type::Map`): records are total (their fields always
+exist, nothing to create) and arrays cannot be vivified by key (an out-of-range array index stays a runtime
+error, §7.1). **Reads are unchanged** — they null-propagate and never mutate. The read/write asymmetry is
+intentional and is the design's core: a read retrieves (absence is a valid `Null` answer); a write stores
+(so it must ensure the path).
+
+**Implementation**: Lowering-only, in `lin-ir` (`lower/expr.rs`, the `IndexSet` path) — no new IR opcode, no
+codegen change, no runtime change. The get-or-create is emitted with existing instructions (`Index` read,
+null-test branch, `MakeObject` for the empty map keyed by the level's value type, `IndexSet` store-back). The
+level's map type is derived from the *parent container's* static type rather than the `Index` node's
+`result_type`, which the checker can erase to a bare `TypeVar | Null` for a map-of-map read. RC care: the
+created intermediate is a fresh `+1` owner stored via `IndexSet` (which retains); the parent is taken as a
+*borrowed* write-through base so the per-scope release stays balanced (no over-release of e.g. a re-borrowed
+TCO parameter). Verified leak/UAF-free against the existing RC regression suite.
+
+**Consequences**: `m[k1][k2] = v` "just works" with no `?? {}` boilerplate and never silently drops a write.
+The deeper nested-write paths in real code (e.g. the RAPTOR `ConnectionIndex = { StopId: { UInt8: … } }`)
+become direct assignments. The only behavioural change is that a write that previously no-opped now succeeds;
+no program that relied on the silent no-op (there is no sound reason to) is affected.
+
+## ADR-078: Inner-scope shadowing is a hard compile-time error
+
+**Status**: Accepted.
+
+**Context**: Prior to this ADR, a binding introduced in a nested scope (a lambda body, an `if`/`match`
+arm, an inner function parameter) could reuse any name already visible from an enclosing scope without
+warning. ADR-074 noted that "shadowing rules for values … [are] a precedent for overloading" and left the
+door open, but practical experience showed that accidental shadowing is a common source of subtle bugs:
+a developer adds an import or a top-level `val`, forgets an inner binding of the same name, and silently
+changes which value the inner scope references.
+
+**Decision**: Reuse of an outer binding's name in a strictly inner scope is a **hard compile-time error**:
+`"<name> shadows a binding from an enclosing scope"`. The restriction applies to:
+- `val` / `var` bindings whose enclosing block already has the name in scope.
+- Function and lambda parameters that match a name visible in the enclosing scope.
+- Destructuring pattern bindings (object-field captures, rest-bindings, match-arm captures).
+
+The restriction does **not** apply to:
+- **Same-scope sequential rebinding** — two `val x` statements in the same block are not inner-shadows-
+  outer; the second merely updates the environment at the same depth.
+- **Sibling-scope reuse** — two adjacent lambdas (e.g. `.map(x => …).filter(x => …)`) each start a
+  fresh scope at the same nesting depth; neither shadows the other.
+- **Synthetic / internal names** — names beginning with `__destr_`, `__param_`, `$`, or `lin_`, and
+  the wildcard `_`, are exempt (these are compiler-generated or intentionally throwaway).
+- **Forward-declared recursive bindings** — a function body that references its own pre-scanned slot
+  is exempt (the slot was placed by the pre-scan, not by an inner definition shadowing an outer one).
+
+This reverses the implicit permissiveness noted in ADR-074 ("shadowing rules for values"). ADR-074's
+actual feature (function overloading) is orthogonal and unaffected: overloaded functions in the **same**
+scope all live in the same overload set, which is a different mechanism from inner-scope shadowing.
+
+**Implementation**: `Checker::check_shadowing` in `crates/lin-check/src/checker/mod.rs` compares the
+`def_depth` of any found binding against the current innermost scope depth. A binding found at a strictly
+shallower depth triggers the diagnostic. The check is called at every binding site: function/lambda
+parameters (`function.rs`), `val`/`var` statements (`stmt.rs`), and destructuring patterns
+(`pattern.rs`).
+
+**Consequences**: All `.lin` files in the corpus that used accidental shadowing required a rename of the
+inner (shadowing) binding. The outer / imported binding is never changed. Spec §6.4 documents the rule.
+Regression tests: `test_shadowing_nested_val_is_rejected`, `test_shadowing_lambda_param_is_rejected`,
+`test_shadowing_sibling_lambdas_same_param_accepted`, `test_shadowing_same_scope_reuse_accepted` in
+`crates/lin/tests/integration.rs`.
+
+## ADR-080: Delimiter-aware top-level error recovery
+
+**Status**: Accepted.
+
+**Context**: After a top-level statement fails to parse, `Parser::parse_module` calls `synchronize()`
+to skip ahead to the next statement so a single error doesn't cascade. The original `synchronize()`
+stopped at the first Newline/Dedent OR the first statement-starting keyword (`val`/`var`/`type`/
+`import`/`export`). That interacts badly with ADR-003: INDENT/DEDENT/Newline are SUPPRESSED inside
+`( ) [ ] { }`. So a syntax error DEEP inside a delimited group (e.g. a broken lambda passed to
+`xs.for( … )`, whose body spans many lines and contains an indented `var`/`val`) leaves the next
+keyword *inside* the still-open group. `synchronize()` stopped there and `parse_module` resumed
+parsing in the middle of the broken construct — mis-parsing every line after it, never reaching the
+real top-level declarations below, and producing a cascade of garbage diagnostics plus spurious
+"unknown type" errors for `type`/`val` declarations the parser never registered.
+
+**Decision**: Make `synchronize()` recover to a genuine top-level boundary. A statement keyword is
+accepted as a recovery point ONLY when it is at module column (column 1); an indented keyword
+(column > 1 — i.e. inside the broken construct) is skipped like any other token. A Newline/Dedent
+remains a stop, and is always safe because (by ADR-003) such a token can only appear once we are
+back OUTSIDE every delimiter group. Together these skip PAST the entire broken delimited group before
+resuming, so the declarations after it still parse and register.
+
+**Why column, not a depth counter**: the opening brackets were already consumed before `synchronize()`
+runs, so a depth counter started at zero inside `synchronize()` cannot tell it is inside an unclosed
+group; a *running* parser-wide counter would be corrupted by the save/restore backtracking the postfix
+parser uses (ADR-005). Tokens already carry a 1-based `column`, and Lin's top-level declarations are
+always at column 1, so the column test is both self-contained and robust.
+
+**Consequences**: A localized syntax error now degrades gracefully — one diagnostic at the real
+location, and the rest of the module (including types declared below the error) still parses, so the
+checker no longer emits spurious "unknown type" cascades. Pure `lin-parse` change to `synchronize()`;
+the hang-regression suite (which guards termination/progress) and the full workspace suite stay green.
+A parser regression test asserts a `type` declaration after a broken delimited construct is still
+produced.
+
 ## ADR-081: Condition-only `while(() => Boolean)` loop overload
 
 **Status**: Accepted.
