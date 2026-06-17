@@ -31,23 +31,9 @@ use regex::Regex;
 /// `X | Error` union with a *scalar* `X` hits an `is Error` narrowing/codegen gap — see the
 /// module's design notes; a boxed `Json` member narrows correctly.) Returns `None` for a null
 /// pointer or a `0` payload (the invalid-pattern sentinel) so callers degenerate gracefully.
-/// SMI-safe: when the `smi` feature is on, lin_regex_compile returns a lin_box_int64 which
-/// encodes the Regex* as an SMI integer; decode it directly here.
 unsafe fn handle_to_regex(handle: *const u8) -> Option<&'static Regex> {
     if handle.is_null() {
         return None;
-    }
-    // SMI guard: lin_regex_compile boxes the Regex pointer as lin_box_int64, which with the
-    // smi feature becomes an SMI immediate. Decode the raw integer (= the Regex*) directly.
-    #[cfg(feature = "smi")]
-    if crate::tagged::is_smi_ptr(handle) {
-        let v: i64 = if crate::tagged::is_smi_int64_pub(handle) {
-            (handle as i64) >> 2
-        } else {
-            ((handle as i64) >> 2) as i32 as i64
-        };
-        let payload = v as usize;
-        return if payload == 0 { None } else { Some(&*(payload as *const Regex)) };
     }
     let payload = (*(handle as *const TaggedVal)).payload as usize;
     if payload == 0 {

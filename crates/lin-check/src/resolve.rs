@@ -307,7 +307,7 @@ fn resolve_named_cycle(
                     visiting.insert(name.to_string());
                     let expanded = expand_named_body(&decl.body.clone(), env, visiting)?;
                     visiting.remove(name);
-                    Ok(expanded)
+                    Ok(expanded.with_type_name(name))
                 } else {
                     Err(format!(
                         "Type '{}' requires {} type argument(s)",
@@ -349,7 +349,7 @@ fn expand_named_body(
         Type::Union(ts) => Ok(Type::Union(
             ts.iter().map(|t| expand_named_body(t, env, visiting)).collect::<Result<_, _>>()?
         )),
-        Type::Object { fields, sealed: _ } => {
+        Type::Object { fields, .. } => {
             // STAGE 0.5 SEAL POINT. `expand_named_body` is reached ONLY while unfolding the body
             // of a named record type declaration (`type T = { … }`) for a non-recursive `: T`
             // annotation. Mark the unfolded object SEALED so named-record identity survives
@@ -443,15 +443,17 @@ fn substitute(
             // Otherwise expand it as a regular named type.
             resolve_named_cycle(n, env, visiting)
         }
-        Type::Object { fields, sealed } => {
+        Type::Object { fields, sealed, .. } => {
             // Generic named-type instantiation (`type Box<T> = { value: T }` → `Box<Int32>`) is
             // also a named record unfold: preserve the declaration's sealed-ness. Bodies of named
             // record types arrive here sealed (set when the decl body was first resolved).
+            // Do NOT propagate `name` here: generic instantiations keep `name: None` (structural
+            // display) — the alias name is only attached for non-generic named records.
             let substituted: Result<IndexMap<String, Type>, String> = fields
                 .iter()
                 .map(|(k, v)| substitute(v, params, args, env, visiting).map(|t| (k.clone(), t)))
                 .collect();
-            Ok(Type::Object { fields: substituted?, sealed: *sealed })
+            Ok(Type::Object { fields: substituted?, sealed: *sealed, name: None })
         }
         Type::Array(inner) => Ok(Type::Array(Box::new(substitute(inner, params, args, env, visiting)?))),
         Type::FixedArray(types) => {
@@ -573,7 +575,7 @@ mod sealed_marker_tests {
         let env = TypeEnv::new();
         let resolved = resolve_type(&te, &env).expect("intersection resolves");
         match &resolved {
-            Type::Object { fields, sealed } => {
+            Type::Object { fields, sealed, .. } => {
                 assert!(fields.contains_key("a") && fields.contains_key("b"));
                 assert_eq!(*sealed, false, "inline intersection must be UNSEALED");
             }
@@ -733,5 +735,37 @@ mod sealed_marker_tests {
             "uppercase bare key must NOT produce a quoting hint; got: {:?}",
             err_upper.2
         );
+    }
+
+    #[test]
+    fn named_record_display_shows_alias_name() {
+        // type Date = { "year": Int64, "month": Int64, "day": Int64 }
+        // Resolving `: Date` must produce a type whose Display is "Date", not the structural form.
+        let mut fields = IndexMap::new();
+        fields.insert("year".to_string(), Type::Int64);
+        fields.insert("month".to_string(), Type::Int64);
+        fields.insert("day".to_string(), Type::Int64);
+        let mut env = TypeEnv::new();
+        env.define_type("Date".to_string(), vec![], Type::object(fields));
+
+        let date_ty = resolve_type(&TypeExpr::Named("Date".to_string(), Span::dummy()), &env)
+            .expect("Date resolves");
+        assert_eq!(date_ty.to_string(), "Date", "named record must display as alias name");
+
+        // A function (Date) => UInt32 must display as "(Date) => UInt32"
+        let fn_ty = Type::func(vec![date_ty.clone()], Type::UInt32);
+        assert_eq!(fn_ty.to_string(), "(Date) => UInt32", "function with named param must show alias name");
+
+        // Equality: a named Date object == equivalent anonymous object (name is inert)
+        let mut anon_fields = IndexMap::new();
+        anon_fields.insert("year".to_string(), Type::Int64);
+        anon_fields.insert("month".to_string(), Type::Int64);
+        anon_fields.insert("day".to_string(), Type::Int64);
+        let anon = Type::object(anon_fields);
+        assert_eq!(date_ty, anon, "named Date must equal anonymous object with same fields");
+
+        // Compat: named Date is compatible with the anonymous structural type
+        assert!(crate::compat::is_compatible(&date_ty, &anon));
+        assert!(crate::compat::is_compatible(&anon, &date_ty));
     }
 }

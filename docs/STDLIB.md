@@ -156,21 +156,14 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`parseFloat64`](#parseFloat64) | `(String) -> Float64` | Parse decimal string to Float64 |
 | [`parseInt32`](#parseInt32) | `(String) -> Int32` | Parse decimal string to Int32 |
 | [`toFloat64`](#toFloat64) | `(Int32) -> Float64` | Widen Int32 to Float64 |
-| [`toInt32`](#toInt32) | `(Float64) -> Int32` | Truncate float to Int32 |
-| [`toUInt8`](#narrowing-casts) | `(UInt64) -> UInt8` | Truncate to an 8-bit unsigned byte |
-| [`toInt8`](#narrowing-casts) | `(UInt64) -> Int8` | Truncate to an 8-bit signed byte |
-| [`toUInt16`](#narrowing-casts) | `(UInt64) -> UInt16` | Truncate to a 16-bit unsigned int |
-| [`toInt16`](#narrowing-casts) | `(UInt64) -> Int16` | Truncate to a 16-bit signed int |
-| [`toUInt32`](#narrowing-casts) | `(UInt64) -> UInt32` | Truncate to a 32-bit unsigned int |
+| [`toInt32`](#toInt32) | `(Float64) -> Int32` / `(Int64) -> Int32` | Truncate a float (or signed Int64) to Int32 |
+| [`toUInt8`](#narrowing-casts) | `(UInt64) -> UInt8` / `(Int64) -> UInt8` | Truncate to an 8-bit unsigned byte |
+| [`toInt8`](#narrowing-casts) | `(UInt64) -> Int8` / `(Int64) -> Int8` | Truncate to an 8-bit signed byte |
+| [`toUInt16`](#narrowing-casts) | `(UInt64) -> UInt16` / `(Int64) -> UInt16` | Truncate to a 16-bit unsigned int |
+| [`toInt16`](#narrowing-casts) | `(UInt64) -> Int16` / `(Int64) -> Int16` | Truncate to a 16-bit signed int |
+| [`toUInt32`](#narrowing-casts) | `(UInt64) -> UInt32` / `(Int64) -> UInt32` | Truncate to a 32-bit unsigned int |
 | [`toInt64`](#narrowing-casts) | `(UInt64) -> Int64` | Reinterpret to a 64-bit signed int |
-| [`toUInt64`](#narrowing-casts) | `(UInt64) -> UInt64` | Identity / reinterpret to 64-bit unsigned int |
-| [`narrowToUInt8`](#narrowing-casts) | `(Int64) -> UInt8` | Truncate a signed Int64 to an 8-bit unsigned byte |
-| [`narrowToInt8`](#narrowing-casts) | `(Int64) -> Int8` | Truncate a signed Int64 to an 8-bit signed byte |
-| [`narrowToUInt16`](#narrowing-casts) | `(Int64) -> UInt16` | Truncate a signed Int64 to a 16-bit unsigned int |
-| [`narrowToInt16`](#narrowing-casts) | `(Int64) -> Int16` | Truncate a signed Int64 to a 16-bit signed int |
-| [`narrowToUInt32`](#narrowing-casts) | `(Int64) -> UInt32` | Truncate a signed Int64 to a 32-bit unsigned int |
-| [`narrowToInt32`](#narrowing-casts) | `(Int64) -> Int32` | Truncate a signed Int64 to a 32-bit signed int |
-| [`narrowToUInt64`](#narrowing-casts) | `(Int64) -> UInt64` | Reinterpret a signed Int64 as 64-bit unsigned |
+| [`toUInt64`](#narrowing-casts) | `(UInt64) -> UInt64` / `(Int64) -> UInt64` | Identity / reinterpret to 64-bit unsigned int |
 | [`tryParseFloat64`](#tryParseFloat64) | `(String) -> Float64 \| Null` | Parse Float64, returning Null on failure |
 | [`tryParseInt32`](#tryParseInt32) | `(String) -> Int32 \| Null` | Parse Int32, returning Null on failure |
 
@@ -1873,14 +1866,17 @@ toFloat64(42)   // 42.0
 ### toInt32
 
 ```txt
-val toInt32: (v: Float64) -> Int32
+val toInt32: (v: Float64) -> Int32   // and  (v: Int64) -> Int32
 ```
 
-Converts a `Float64` to `Int32` by truncating toward zero.
+Converts to `Int32`, overloaded by argument type (ADR-074/075): a `Float64` is truncated toward
+zero; a signed `Int64` is truncated to its low 32 bits (two's-complement). See [Narrowing
+casts](#narrowing-casts) for the integer overloads of the whole `to*` family.
 
 ```txt
-toInt32(3.9)    // 3
-toInt32(-2.1)   // -2
+toInt32(3.9)          // 3
+toInt32(-2.1)         // -2
+toInt32(5000000000)   // 705032704   (low 32 bits of a wide Int64)
 ```
 
 ---
@@ -1888,44 +1884,29 @@ toInt32(-2.1)   // -2
 ### Narrowing casts
 
 ```txt
-val toUInt8:  (v: UInt64) -> UInt8
-val toInt8:   (v: UInt64) -> Int8
-val toUInt16: (v: UInt64) -> UInt16
-val toInt16:  (v: UInt64) -> Int16
-val toUInt32: (v: UInt64) -> UInt32
+val toUInt8:  (v: UInt64) -> UInt8   // and  (v: Int64) -> UInt8
+val toInt8:   (v: UInt64) -> Int8    // and  (v: Int64) -> Int8
+val toUInt16: (v: UInt64) -> UInt16  // and  (v: Int64) -> UInt16
+val toInt16:  (v: UInt64) -> Int16   // and  (v: Int64) -> Int16
+val toUInt32: (v: UInt64) -> UInt32  // and  (v: Int64) -> UInt32
 val toInt64:  (v: UInt64) -> Int64
-val toUInt64: (v: UInt64) -> UInt64
+val toUInt64: (v: UInt64) -> UInt64  // and  (v: Int64) -> UInt64
+val toInt32:  (v: Float64) -> Int32  // and  (v: Int64) -> Int32
 ```
 
-Explicit integer narrowing. Implicit narrowing — assigning a wider numeric to a narrower one — is a compile-time error; these casts perform it explicitly, truncating to the target width with two's-complement (`as`-cast) semantics. The input is taken as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value masked down to a byte/word — widens into the parameter without range loss; a bare integer literal in range is accepted directly. They are the byte-extraction mechanism used by `std/bytes`, but are generally useful wherever explicit width control is needed.
+Explicit integer narrowing. Implicit narrowing — assigning a wider numeric to a narrower one — is a compile-time error; these casts perform it explicitly, truncating to the target width with two's-complement (`as`-cast) semantics. Each width is **overloaded on the source type** (ADR-074/075):
+
+- an **unsigned** argument selects the `UInt64` overload — any narrower *unsigned* integer (or a value masked down to a byte/word) widens into it without range loss;
+- a **signed/computed `Int64`** argument selects the `Int64` overload — a value **computed in `Int64`** cannot reach the `UInt64` overload (`Int64 → UInt64` is not an implicit coercion: it could wrap a negative), so it resolves to the signed overload instead. A suffixless integer literal is `Int32`, which widens only into the `Int64` overload.
+
+Both overloads truncate to identical low bits; the source type just records whether the value was unsigned or signed. (`toInt32` pairs its `Int64` overload with a `Float64` one — truncating a float toward zero — selected by argument type.) These are the byte-extraction mechanism used by `std/bytes`, but are generally useful wherever explicit width control is needed. Truncation never fails — an out-of-range value keeps its low bits — so narrow only values you know fit.
 
 ```txt
-toUInt8(0x1234)              // 0x34  (52)
+toUInt8(0x1234)              // 0x34  (52)        — unsigned source
 toUInt8((v >> 24) & 0xFF)    // top byte of a UInt32 v
-toUInt16(b[0]) << 8          // widen a byte for endian assembly
-```
-
-The `to*` family takes `UInt64`, so it reaches only *unsigned* (or masked) inputs. A value
-**computed in `Int64`** cannot reach them — `Int64 → UInt64` is not an implicit coercion (it could
-wrap a negative). The parallel `narrowTo*` family takes a signed `Int64` and covers that case:
-
-```txt
-val narrowToUInt8:  (v: Int64) -> UInt8
-val narrowToInt8:   (v: Int64) -> Int8
-val narrowToUInt16: (v: Int64) -> UInt16
-val narrowToInt16:  (v: Int64) -> Int16
-val narrowToUInt32: (v: Int64) -> UInt32
-val narrowToInt32:  (v: Int64) -> Int32     // the integer→Int32 cast toInt32 (Float64-input) lacks
-val narrowToUInt64: (v: Int64) -> UInt64    // signed→unsigned reinterpret
-```
-
-Same two's-complement truncation; the only difference is the accepted input. Use them to store a
-wide computed result into a narrow field. Truncation never fails — an out-of-range value keeps its
-low bits — so narrow only values you know fit.
-
-```txt
-narrowToUInt8(300)           // 44   (300 & 0xFF)
-narrowToInt32(0 - 44)        // -44  (computed negative into an Int32 field)
+toUInt8(300)                 // 44    (300 & 0xFF) — signed/computed source
+toInt32(0 - 44)              // -44   (computed negative into an Int32 field)
+toInt32(3.9)                 // 3     (Float64 source, truncated toward zero)
 ```
 
 > Reading a narrow field *back* into wide arithmetic does not auto-widen: `153 * month` with

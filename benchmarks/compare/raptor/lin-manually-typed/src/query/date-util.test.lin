@@ -1,0 +1,29 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { Date } from "std/datetime"
+import { getDateNumber } from "./date-util"
+
+// `getDateNumber` collapses a Date into the GTFS numeric form YYYYMMDD, e.g. 2019-04-17 -> 20190417.
+val d = (year: Int64, month: Int64, day: Int64): Date =>
+  {
+    "year": year,
+    "month": month,
+    "day": day
+  }
+
+val s = suite("query/date-util", [
+  test("collapses a date into the numeric YYYYMMDD form", () => [
+    expect(getDateNumber(d(2019, 4, 17))).toBe(20190417),
+    expect(getDateNumber(d(2018, 10, 16))).toBe(20181016)
+  ]),
+
+  test("zero-pads single-digit months and days", () => [
+    expect(getDateNumber(d(2019, 1, 1))).toBe(20190101),
+    expect(getDateNumber(d(2020, 9, 5))).toBe(20200905)
+  ]),
+
+  test("handles a leap day", () => [
+    expect(getDateNumber(d(2024, 2, 29))).toBe(20240229)
+  ])
+])
+
+run(s)

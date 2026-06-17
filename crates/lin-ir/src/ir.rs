@@ -428,7 +428,14 @@ pub enum Instruction {
     /// + `lin_sealed_array_push_struct_retaining` (contiguous inline 0xFE buffer) instead of the
     /// pointer-backed 0xFD path. Only set on sealed-record-array literals whose elements are all
     /// proven non-escaping. `false` → 0xFD pointer-backed (current default; safe, supports aliasing).
-    MakeArray { dst: Temp, elements: Vec<Temp>, elem_ty: Type, inline: bool },
+    ///
+    /// `columnar` (Phase 1 columnar POC): when `true` AND `inline == true`, the escape analysis
+    /// additionally proved ALL element fields are flat scalars (no String/Array/nested-record fields),
+    /// so codegen uses `lin_columnar_array_alloc` (tag `0xFC`) — one contiguous column buffer per
+    /// field. Field reads (`SealedArrayFieldGet`) are two pointer loads + GEP + load (same depth as
+    /// 0xFE, but cache-line-efficient for single-field sequential scans). Always `false` unless
+    /// `inline == true` AND `all_scalar_fields`. `false` → fall back to 0xFE/0xFD (safe default).
+    MakeArray { dst: Temp, elements: Vec<Temp>, elem_ty: Type, inline: bool, columnar: bool },
     /// result = object[key]  — safe field access (missing key → null temp)
     Index { dst: Temp, object: Temp, key: Temp, obj_ty: Type, key_ty: Type, result_ty: Type },
     /// object[key] = value  — in-place array/object element assignment (no result).

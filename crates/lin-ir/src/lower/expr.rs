@@ -1,6 +1,6 @@
 use super::*;
 
-pub fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     // Attribute instructions emitted while lowering this expression to its source span (debug-only
     // metadata for DWARF line tables). Restore the enclosing span afterwards so instructions emitted
     // by the PARENT after this child returns (e.g. a Binary after its operands) get the parent's span,
@@ -12,7 +12,7 @@ pub fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCt
     result
 }
 
-pub fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     match expr {
         TypedExpr::IntLit(v, ty, _) => {
             builder.const_temp(Const::Int(*v, ty.clone()))
@@ -807,7 +807,8 @@ pub fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut L
                 dst,
                 elements: lowered,
                 elem_ty,
-                inline: false, // escape.rs sets true for non-escaping sealed elements
+                inline: false,    // escape.rs sets true for non-escaping sealed elements
+                columnar: false,  // escape.rs sets true when inline=true AND all-scalar fields
             });
             // Reclaim the freshly-boxed element shells now that their 16 bytes are copied into the
             // array (the inner payload's ownership stays with the array's copy / the raw value's

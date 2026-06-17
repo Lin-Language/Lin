@@ -1,0 +1,19 @@
+import { print } from "std/io"
+import { toString } from "std/string"
+
+type Circle = { "radius": Float64 }
+type Rect = { "width": Float64, "height": Float64 }
+
+val area = (c: Circle): Float64 => 3.14159 * c["radius"] * c["radius"]
+val area = (r: Rect): Float64 => r["width"] * r["height"]
+
+val combine = (a: Int32, b: Int32): String => "ints:${a + b}"
+val combine = (a: Int32, b: String): String => "mix:${a}${b}"
+
+val c: Circle = { "radius": 2.0 }
+val r: Rect = { "width": 3.0, "height": 4.0 }
+
+print(toString(area(c)))
+print(toString(area(r)))
+print(combine(1, 2))
+print(combine(7, "x"))
