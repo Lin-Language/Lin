@@ -25,7 +25,7 @@ Share-nothing concurrency with no coloured functions — you decide at the call 
 
 Or jump straight into the tutorials:
 
-- [Hello World & I/O](/tutorials/01-hello-world.html) — your first Lin program
-- [Values & Types](/tutorials/02-values-and-types.html) — understanding the type system
-- [Functions](/tutorials/03-functions.html) — first-class functions and closures
-- [Pattern Matching](/tutorials/05-pattern-matching.html) — the primary way to inspect values
+- [Hello World & I/O](/tutorials/hello-world.html) — your first Lin program
+- [Values & Types](/tutorials/values.html) — understanding the type system
+- [Functions](/tutorials/functions.html) — first-class functions and closures
+- [Pattern Matching](/tutorials/pattern-matching.html) — the primary way to inspect values

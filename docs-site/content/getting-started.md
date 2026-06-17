@@ -90,13 +90,13 @@ Lin ships a single `lin` binary with a few subcommands:
 
 Work through the tutorials in order to learn the language properly:
 
-1. [Hello World & I/O](/tutorials/01-hello-world.html) — your first Lin program
-2. [Values & Types](/tutorials/02-values-and-types.html) — the type system
-3. [Functions](/tutorials/03-functions.html) — functions and closures
-4. [Working with JSON](/tutorials/04-json-data.html) — objects and arrays
-5. [Pattern Matching](/tutorials/05-pattern-matching.html) — match and is/has
-6. [Arrays & Iteration](/tutorials/06-arrays-and-iteration.html) — map/filter/reduce
-7. [Modules](/tutorials/07-modules.html) — imports and exports
-8. [Error Handling](/tutorials/08-error-handling.html) — errors as values
-9. [Concurrency](/tutorials/09-concurrency.html) — native threads and workers
+1. [Hello World & I/O](/tutorials/hello-world.html) — your first Lin program
+2. [Values & Types](/tutorials/values.html) — the type system
+3. [Functions](/tutorials/functions.html) — functions and closures
+4. [Working with JSON](/tutorials/json-records.html) — objects and arrays
+5. [Pattern Matching](/tutorials/pattern-matching.html) — match and is/has
+6. [Arrays & Iteration](/tutorials/arrays.html) — map/filter/reduce
+7. [Modules](/tutorials/modules.html) — imports and exports
+8. [Error Handling](/tutorials/error-handling.html) — errors as values
+9. [Concurrency](/guides/concurrency.html) — native threads and workers
 ```
