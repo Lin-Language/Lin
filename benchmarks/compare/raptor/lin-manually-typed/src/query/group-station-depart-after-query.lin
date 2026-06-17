@@ -1,6 +1,8 @@
-import { StopId } from "../gtfs/gtfs"
-import { Journey } from "../journey/journey"
+import { StopId, Time } from "../gtfs/gtfs"
+import { Journey } from "../results/journey"
 import { Arrivals, ConnectionIndex } from "../raptor/scan-results"
+import { RaptorAlgorithm, StopTimes } from "../raptor/raptor-algorithm"
+import { Date } from "std/datetime"
 import { getDateNumber } from "./date-util"
 
 export type GroupStationDepartAfterQuery = {

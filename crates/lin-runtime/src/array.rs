@@ -162,6 +162,13 @@ pub unsafe extern "C" fn lin_array_free(arr: *mut LinArray) {
         dealloc(arr as *mut u8, array_layout());
         return;
     }
+    if (*arr).elem_tag == crate::columnar::COLUMNAR_ARRAY_TAG {
+        // Columnar array (0xFC): column buffers and col_ptrs were already freed by
+        // free_columnar_array_cols (called from lin_array_release before lin_array_free).
+        // Here we only free the LinArray header itself.
+        dealloc(arr as *mut u8, array_layout());
+        return;
+    }
     let (esize, ealign) = flat_elem_size_align((*arr).elem_tag);
     let data_layout = Layout::from_size_align_unchecked(esize * cap, ealign);
     dealloc((*arr).data as *mut u8, data_layout);
@@ -222,6 +229,13 @@ pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
                     crate::sealed::lin_sealed_release_self(sptr);
                 }
             }
+        } else if (*arr).elem_tag == crate::columnar::COLUMNAR_ARRAY_TAG {
+            // Columnar array (0xFC): free each column buffer + col_ptrs indirection array.
+            // For a scalar-only columnar array (no heap fields) just free the column buffers.
+            // For pointer-field columns, release each element pointer first (currently not possible
+            // via codegen since columnar requires all-scalar fields, but correct for future use).
+            crate::columnar::free_columnar_array_cols(arr);
+            // lin_array_free for 0xFC only frees the header; col_ptrs already freed above.
         }
         lin_array_free(arr);
     }
@@ -613,36 +627,6 @@ pub unsafe extern "C" fn lin_array_push(arr: *mut LinArray, elem_ptr: *const u8,
 /// The array takes ownership of the inner heap value (no retain performed).
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_push_tagged(arr: *mut LinArray, tagged: *const u8) {
-    // SMI guard: an inline integer is not a real heap TaggedVal — reconstruct a real TaggedVal
-    // and store it so the slot always holds a proper 16-byte entry (containers store real TaggedVals).
-    #[cfg(feature = "smi")]
-    if !tagged.is_null() && crate::tagged::is_smi_ptr(tagged) {
-        use crate::tagged::*;
-        let tag = if is_smi_int64_pub(tagged) { TAG_INT64 } else { TAG_INT32 };
-        let val: i64 = if is_smi_int64_pub(tagged) {
-            (tagged as i64) >> 2
-        } else {
-            ((tagged as i64) >> 2) as i32 as i64
-        };
-        let tv = TaggedVal { tag, _pad: [0; 7], payload: val as u64 };
-        let len = (*arr).len;
-        let cap = (*arr).cap;
-        if len == cap {
-            let new_cap = cap * 2;
-            let old_layout = array_elem_layout(cap);
-            let new_layout = array_elem_layout(new_cap);
-            (*arr).data = std::alloc::realloc((*arr).data as *mut u8, old_layout, new_layout.size()) as *mut LinArrayElem;
-            (*arr).cap = new_cap;
-        }
-        let slot = (*arr).data.add(len as usize);
-        std::ptr::copy_nonoverlapping(
-            &tv as *const TaggedVal as *const u8,
-            slot as *mut u8,
-            16,
-        );
-        (*arr).len = len + 1;
-        return;
-    }
     // SEALED (0xFE) destination: pack instead of blind-copying a 16-byte TaggedVal into the
     // stride-sized packed buffer (see `lin_array_push`). Same move contract: the array takes
     // ownership of the inner heap value, so the inner object is consumed (released) after its
@@ -719,17 +703,6 @@ pub unsafe extern "C" fn lin_array_push_tagged(arr: *mut LinArray, tagged: *cons
 pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::tagged::TaggedVal) {
     use crate::tagged::*;
     if arr.is_null() { return; }
-    // SMI guard: reconstruct a real TaggedVal from an SMI pointer before dispatching.
-    #[cfg(feature = "smi")]
-    {
-        let tp = tagged as *const u8;
-        if !tp.is_null() && is_smi_ptr(tp) {
-            let smi_tag = if is_smi_int64_pub(tp) { TAG_INT64 } else { TAG_INT32 };
-            let val: i64 = if is_smi_int64_pub(tp) { (tp as i64) >> 2 } else { ((tp as i64) >> 2) as i32 as i64 };
-            let tv = TaggedVal { tag: smi_tag, _pad: [0; 7], payload: val as u64 };
-            return lin_push_dyn(arr, &tv as *const TaggedVal);
-        }
-    }
     let elem_tag = (*arr).elem_tag;
     // SEALED (0xFE) destination: pack the boxed record element into a fresh packed slot. This
     // previously fell into the flat-coercion `else` below and hit its `_ => {}` arm — the push
@@ -978,17 +951,6 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len { return; }
-    // SMI guard: reconstruct a real TaggedVal from an SMI pointer before storing.
-    #[cfg(feature = "smi")]
-    {
-        let tp = tagged as *const u8;
-        if !tp.is_null() && is_smi_ptr(tp) {
-            let smi_tag = if is_smi_int64_pub(tp) { TAG_INT64 } else { TAG_INT32 };
-            let val: i64 = if is_smi_int64_pub(tp) { (tp as i64) >> 2 } else { ((tp as i64) >> 2) as i32 as i64 };
-            let tv = TaggedVal { tag: smi_tag, _pad: [0; 7], payload: val as u64 };
-            return lin_array_set(arr, idx, &tv as *const TaggedVal);
-        }
-    }
     let elem_tag = (*arr).elem_tag;
     if elem_tag == 0xFF {
         let slot = (*arr).data.add(actual as usize);
@@ -1127,10 +1089,6 @@ pub unsafe extern "C" fn lin_iterable_length(p: *const u8) -> i64 {
     use crate::tagged::{TaggedVal, TAG_ARRAY};
     if p.is_null() {
         return 0;
-    }
-    #[cfg(feature = "smi")]
-    if crate::tagged::is_smi_ptr(p) {
-        return 0; // Inline integers are not arrays.
     }
     let tv = p as *const TaggedVal;
     if (*tv).tag != TAG_ARRAY {

@@ -550,6 +550,19 @@ impl Checker {
     }
 
     pub(crate) fn infer_ident(&mut self, name: &str, span: Span) -> Result<TypedExpr, Diagnostic> {
+        // ADR-074: an overloaded function name has no single type, so it cannot be used as a bare
+        // value (passed, stored, returned). Only a direct call can select an overload from the
+        // argument types — the direct-call path in `infer_call` bypasses this method.
+        if self.env.is_overloaded(name) {
+            return Err(Diagnostic::error(
+                span,
+                format!("`{}` is an overloaded function and cannot be used as a value", name),
+            )
+            .with_help(
+                "call it directly so the overload can be resolved from the argument types (spec §14.6)"
+                    .to_string(),
+            ));
+        }
         let ty = self.env.effective_type(name).ok_or_else(|| {
             let all_names = self.env.all_names();
             let suggestion = lin_common::closest_match(name, all_names.into_iter(), 2);

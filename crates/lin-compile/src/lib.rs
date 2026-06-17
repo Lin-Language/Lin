@@ -627,6 +627,7 @@ fn check_module_with_imports(
 ) -> Result<(TypedModule, Vec<lin_common::Diagnostic>), Vec<lin_common::Diagnostic>> {
     let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
     let mut import_type_decls: HashMap<(String, String), (Vec<String>, Type)> = HashMap::new();
+    let mut import_overloads: HashMap<(String, String), Vec<(Type, String)>> = HashMap::new();
     for (path, imp_module) in imported_modules {
         let sig = ModuleSignature::from_module(imp_module);
         for (name, ty) in sig.exports {
@@ -635,9 +636,16 @@ fn check_module_with_imports(
         for (name, decl) in sig.type_exports {
             import_type_decls.insert((path.clone(), name), decl);
         }
+        for (name, members) in sig.overloads {
+            import_overloads.insert(
+                (path.clone(), name),
+                members.into_iter().map(|o| (o.ty, o.symbol)).collect(),
+            );
+        }
     }
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
+    checker.import_overloads = import_overloads;
     checker.stdlib_export_index = build_stdlib_export_index();
     checker.import_type_decls = import_type_decls;
     // Every import here is a fully-resolved `TypedModule`, so unknown-export validation is safe.
@@ -675,6 +683,7 @@ fn check_module_with_seeded_imports(
 ) -> Result<(TypedModule, Vec<lin_common::Diagnostic>), Vec<lin_common::Diagnostic>> {
     let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
     let mut import_type_decls: HashMap<(String, String), (Vec<String>, Type)> = HashMap::new();
+    let mut import_overloads: HashMap<(String, String), Vec<(Type, String)>> = HashMap::new();
     // Already-resolved (acyclic) imports first.
     for (path, imp_module) in imported_modules {
         let sig = ModuleSignature::from_module(imp_module);
@@ -684,6 +693,12 @@ fn check_module_with_seeded_imports(
         for (name, decl) in sig.type_exports {
             import_type_decls.insert((path.clone(), name), decl);
         }
+        for (name, members) in sig.overloads {
+            import_overloads.insert(
+                (path.clone(), name),
+                members.into_iter().map(|o| (o.ty, o.symbol)).collect(),
+            );
+        }
     }
     // Provisional peer signatures from within the SCC override/augment the map (a peer is not in
     // `imported_modules` yet, so this is the only source of its type).
@@ -692,6 +707,7 @@ fn check_module_with_seeded_imports(
     }
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
+    checker.import_overloads = import_overloads;
     checker.stdlib_export_index = build_stdlib_export_index();
     checker.import_type_decls = import_type_decls;
     // Only the acyclic deps (`imported_modules`) are fully resolved. The seeded SCC peers carry
