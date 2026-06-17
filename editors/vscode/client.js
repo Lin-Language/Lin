@@ -545,13 +545,27 @@ function buildTestArgs(request, targetFiles, wsRoot) {
   return args;
 }
 
+// Recursively search a TestItem's descendants for one with the given id. The tree is up to
+// three levels (file → suite → test), and `TestItemCollection.get` only sees DIRECT children,
+// so a grouped (under-suite) test must be found by descending — otherwise the run-result
+// handler would create a duplicate flat item under the file and the real tree item would stay
+// stuck "enqueued".
+function findDescendantById(item, id) {
+  const direct = item.children.get(id);
+  if (direct) return direct;
+  let found;
+  item.children.forEach((c) => { if (!found) found = findDescendantById(c, id); });
+  return found;
+}
+
 // Find the TestItem for a `<file>::<name>` pair, creating it under the file item
 // if it wasn't statically discovered (e.g. an interpolated/dynamic test name).
+// Searches the whole file subtree (including suite groups), not just direct file children.
 function findOrCreateTestItem(controller, file, name) {
   const fileUri = Uri.file(file);
   const fileItem = getOrCreateFileItem(controller, fileUri);
   const id = testItemId(file, name);
-  let child = fileItem.children.get(id);
+  let child = findDescendantById(fileItem, id);
   if (!child) {
     child = controller.createTestItem(id, name, fileUri);
     fileItem.children.add(child);
@@ -819,10 +833,11 @@ function setupTestController(context, linBin) {
           failCount++;
           const fileItem = getOrCreateFileItem(controller, Uri.file(rec.file));
           const tm = new TestMessage(rec.message || rec.status);
-          // Mark the file item and any known children as errored so the failure
-          // is visible even when no per-test records were produced.
+          // Mark the file item and ALL its descendants (suite groups → tests) as errored so
+          // the failure is visible even when no per-test records were produced.
           run.errored(fileItem, tm);
-          fileItem.children.forEach((c) => run.errored(c, tm));
+          const erroredAll = (it) => it.children.forEach((c) => { run.errored(c, tm); erroredAll(c); });
+          erroredAll(fileItem);
         }
       }
     };
@@ -1331,5 +1346,5 @@ module.exports = {
   deactivate,
   // Exposed for the standalone discovery/unescape unit test (test/discovery.test.js).
   // These are pure (no VS Code API) and safe to call directly.
-  _test: { discoverLine, unescapeLinString, stripLineComment, isInsideString, firstStringArg, discoverFileStructure },
+  _test: { discoverLine, unescapeLinString, stripLineComment, isInsideString, firstStringArg, discoverFileStructure, findDescendantById },
 };

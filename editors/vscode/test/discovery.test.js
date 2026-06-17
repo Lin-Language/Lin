@@ -213,5 +213,41 @@ check("service.test.lin structure: 1 suite 'Service' with 7 tests, 0 loose", () 
   assert.strictEqual(result.looseTests.length, 0);
 });
 
+// --- findDescendantById: must find a test nested under a suite group ----------
+// A minimal TestItem/collection fake mirroring the bits findDescendantById touches:
+// `children.get(id)` (direct only) and `children.forEach(cb)`.
+console.log("findDescendantById:");
+function fakeItem(id) {
+  const map = new Map();
+  return {
+    id,
+    children: {
+      get: (k) => map.get(k),
+      forEach: (cb) => map.forEach((v) => cb(v)),
+      add: (it) => map.set(it.id, it),
+    },
+  };
+}
+
+check("finds a test nested two levels deep (file → suite → test)", () => {
+  const { findDescendantById } = _test;
+  const file = fakeItem("/f.test.lin");
+  const suite = fakeItem("/f.test.lin::suite::S");
+  const test = fakeItem("/f.test.lin::checks a thing");
+  suite.children.add(test);
+  file.children.add(suite);
+  const found = findDescendantById(file, "/f.test.lin::checks a thing");
+  assert.ok(found, "should find the under-suite test");
+  assert.strictEqual(found.id, "/f.test.lin::checks a thing");
+});
+
+check("returns undefined for an unknown id (so caller creates it)", () => {
+  const { findDescendantById } = _test;
+  const file = fakeItem("/f.test.lin");
+  const suite = fakeItem("/f.test.lin::suite::S");
+  file.children.add(suite);
+  assert.strictEqual(findDescendantById(file, "/f.test.lin::nope"), undefined);
+});
+
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);
