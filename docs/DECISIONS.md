@@ -3035,3 +3035,61 @@ tie-break is deliberately conservative — it differentiates *only* numeric wide
 ambiguity (records, unions, generics already handled at the specificity tier) exactly as ADR-074 left it.
 Spec §14.6 notes the numeric preference. Regression tests cover same-signedness selection, signed/unsigned
 selection of the incomparable pair, and the unchanged record-ambiguity error.
+
+## ADR-076: Assignment-based index-place narrowing + stable place-path keys
+
+**Status**: Accepted. Extends the index-place null-test narrowing (the `if m[k] != null then m[k]`
+machinery in `checker/expr.rs`).
+
+**Context**: A `{ K: V }`-map read is nullable by the safe-bracket rule (spec §6.1): `m[k] : V | Null`.
+So the idiom "default the slot, then mutate it" —
+```
+m[k] = m[k] ?? []
+m[k].push(x)
+```
+did not type-check: the second `m[k]` was still typed `V | Null`, and `.push` needs a non-null `V[]`
+receiver. The existing flow-narrowing only fired inside an `if m[k] != null` branch; a plain assignment
+recorded nothing, so the re-read stayed nullable. The motivating real case is the RAPTOR GTFS loader's
+`addTransfer`, where the slot is keyed by a *nested* place (`transfers[row["from_stop_id"]]`) that the
+original canonicalizer rejected outright.
+
+**Decision** — two changes, both reusing the existing `PlacePath` / `IndexNarrow` / `index_narrowings`
+stack so the same invalidation and scoping rules apply.
+
+1. **Assignment-based narrowing.** When an index-assignment `m[k] = e` is checked
+   (`infer_index_assign`), after the existing write-invalidation (clear narrowings rooted at the same
+   base), if (a) the LHS canonicalizes to a stable `PlacePath::Index`, (b) the slot's *read* type is
+   nullable (`V | Null` — the map idiom), and (c) `typeof(e)` is non-null (strictly more specific than the
+   nullable read type — it is already checked assignable to `V`, so it is a `Null`-dropping subtype), we
+   record `IndexNarrow { path, ty: typeof(e) }`. A later read of that same path then narrows to the
+   assigned type. The narrowing persists FORWARD across subsequent statements in the block.
+
+2. **Stable place-path keys.** `IndexKey` gains a `Path(Box<PlacePath>)` variant. `index_key_of_expr`
+   (shared by `place_path_of_expr` and `lookup_index_narrowing`) admits a key that is itself a stable
+   nested place (`row["from_stop_id"]` = `Index(Root("row"), StrLit("from_stop_id"))`); a key with a call,
+   arithmetic, etc. stays rejected. `place_path_mentions` recurses into the nested key path, so reassigning
+   ANY identifier in the key (e.g. `row`) invalidates the narrowing.
+
+**Soundness / invalidation** — a recorded narrowing of `m[k]` is dropped when, between the assignment and
+a later read:
+- the base root identifier OR any identifier in the (possibly nested) key path is reassigned —
+  `clear_index_narrowings_for` via `place_path_mentions` (now recursing into key paths);
+- a write lands through the same base prefix (`m[j] = …`) — conservatively keyed on the root identifier;
+- **a function call occurs** — `clear_index_narrowings_after_call` clears ALL index-narrowings after any
+  `Call`/`DotCall` (a call could delete the key or re-key the map). This runs *after* the call's
+  receiver/arguments are inferred, so the `m[k].push(x)` idiom is unaffected: the `m[k]` receiver read
+  captures its narrowed type before `push` is dispatched;
+- the enclosing **block** ends — `infer_block` records the stack depth on entry and truncates on exit, so a
+  narrowing established inside an `if`/block never leaks past it (mirrors `infer_if`'s truncation).
+
+When any precondition is uncertain we simply do not record / over-clear: a missed narrowing only re-widens
+the read to `V | Null` (a usability nit), never a type hole. Both `IndexKey::Path` boxing breaks the
+`PlacePath` ⇄ `IndexKey` recursion.
+
+**Consequences**: Pure `lin-check` change; no IR/codegen impact (the narrowed read is the same TaggedVal,
+only its static type tightens — identical to the if-test narrowing). One existing bare-record test
+(`test_map_bare_record_value_coalesce_and_named_narrow`) was updated: a present-key `m["k"] ?? d`
+immediately after `m["k"] = w` is now a "left operand is never null" error because the read narrows to the
+assigned non-null record — the `??` default is genuinely dead. Spec §7.2 documents the rule. Regression
+tests cover both positive idioms (simple + nested-path key) and the four invalidation classes (key/base/
+nested-key reassignment, intervening call, different key, block-scope leak).
