@@ -129,7 +129,7 @@ pub(crate) fn apply_type_subs(ty: &Type, subs: &std::collections::HashMap<u32, T
         Type::Shared(t) => Type::Shared(Box::new(apply_type_subs(t, subs))),
         Type::Stream(t) => Type::Stream(Box::new(apply_type_subs(t, subs))),
         Type::Promise(t) => Type::Promise(Box::new(apply_type_subs(t, subs))),
-        Type::Map { key, value } => Type::Map { key: Box::new(apply_type_subs(key, subs)), value: Box::new(apply_type_subs(value, subs)) },
+        Type::Map { key, value, .. } => Type::Map { key: Box::new(apply_type_subs(key, subs)), value: Box::new(apply_type_subs(value, subs)), name: None },
         // Substituting a union's members can DUPLICATE or collapse it: `<T, D>(…): T | D` with
         // `T = D` (e.g. `at(ints, i, 0)` over `Int32[]`, both members `Int32`) naively becomes the
         // degenerate `Int32 | Int32`. `flatten_union` dedups members and collapses a singleton to

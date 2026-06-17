@@ -20965,3 +20965,49 @@ val x = trim(42)
         output
     );
 }
+
+/// A named index-signature (map) alias must render by its alias name in diagnostics, not its
+/// expanded `{ K: V }` form — including when reached as a NESTED alias (the value type of an
+/// outer map alias, surfaced via indexing). Regression for map-keyed alias display.
+#[test]
+fn test_check_map_alias_renders_by_name() {
+    // `Arrivals` is the value type of `ArrivalsByNumChanges`; m[k] yields `Arrivals | Null`.
+    let (ok, output) = check_source(
+        r#"import { keys } from "std/object"
+type Arrivals = { String: UInt32 }
+type ArrivalsByNumChanges = { UInt8: Arrivals }
+val f = (m: ArrivalsByNumChanges, k: UInt8): String[] =>
+  m[k].keys()
+"#,
+    );
+    assert!(!ok, "expected type error, got:\n{}", output);
+    assert!(
+        output.contains("Arrivals | Null"),
+        "expected the nested map alias to render as `Arrivals | Null`, got:\n{}",
+        output
+    );
+    // The expanded form must NOT leak into the headline type.
+    assert!(
+        !output.contains("{ String: UInt32 } | Null"),
+        "map alias should not appear expanded, got:\n{}",
+        output
+    );
+}
+
+/// A direct map-alias argument also renders by name.
+#[test]
+fn test_check_direct_map_alias_renders_by_name() {
+    let (ok, output) = check_source(
+        r#"import { trim } from "std/string"
+type Arrivals = { String: UInt32 }
+val a: Arrivals = { "x": 3 }
+val r = trim(a)
+"#,
+    );
+    assert!(!ok, "expected type error");
+    assert!(
+        output.contains("has type Arrivals"),
+        "expected `has type Arrivals`, got:\n{}",
+        output
+    );
+}
