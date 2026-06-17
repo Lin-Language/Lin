@@ -823,6 +823,15 @@ val deep = obj["some"]["prop"]["that"]["doesnt"]["exist"]  // null
 
 This is equivalent to the optional-chaining operator (`?.`) in other languages — but it applies to every bracket access by default.
 
+**Writes through absent intermediate map levels auto-vivify.** A nested assignment `m[k1][k2] = v` creates any absent *intermediate map level* — an empty map of that level's statically-known value type — and then performs the set, so the write always succeeds (it is never silently dropped):
+
+```txt
+val index: { String: { UInt8: Conn } } = {}
+index["StopB"][1] = conn   // index["StopB"] is created as an empty { UInt8: Conn } map, then [1] is set
+```
+
+This is the write-side counterpart of read null-propagation, and the asymmetry is deliberate: a *read* through an absent level retrieves nothing (`Null`) and does **not** mutate; a *write* exists to store, so it ensures the path. Vivification applies only to **map** intermediates (`{ K: V }`): record fields are total (nothing to create) and arrays cannot be vivified by key (an out-of-range array index is still a runtime error, §7.1). Only intermediate levels are created — the final-level set assigns the leaf as usual.
+
 ### 7.2 Static Typing of Access
 
 - If the operand's static type is a typed object that declares the key as `T`, the access has type `T`.
