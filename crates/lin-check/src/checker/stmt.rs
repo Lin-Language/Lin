@@ -7,6 +7,22 @@ use crate::resolve::resolve_type;
 use crate::typed_ir::*;
 use crate::types::Type;
 
+/// Build the unique LLVM symbol for one member of a function overload set (ADR-074):
+/// `base$<param-type-tokens>_<slot>`. The trailing slot guarantees uniqueness regardless of the
+/// token encoder; the type tokens make IR dumps / coverage readable. `$` is not a legal Lin
+/// identifier character, so this never collides with a user-written name.
+fn overload_symbol(base: &str, params: &[Type], slot: usize) -> String {
+    let sanitize = |s: &str| -> String {
+        s.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect()
+    };
+    let tokens = if params.is_empty() {
+        "void".to_string()
+    } else {
+        params.iter().map(|p| sanitize(&p.to_string())).collect::<Vec<_>>().join("_")
+    };
+    format!("{}${}_{}", base, tokens, slot)
+}
+
 impl Checker {
     /// Build the diagnostic for `import { name } from "path"` where `path` is a resolved module
     /// that does not export `name`. Prefers a cross-module suggestion (another module that DOES
@@ -229,6 +245,20 @@ impl Checker {
                     _ => None,
                 };
 
+                // ADR-074: give each member of a function overload set a unique LLVM symbol.
+                // Calls dispatch via slot→FuncId, so only the emitted *symbol* (the
+                // `TypedExpr::Function.name`) must be unique; the `TypedStmt::Val.name` — used for
+                // cross-module exports and DWARF — stays the source name.
+                if let Some(bn) = binding_name {
+                    if self.env.is_overloaded(bn) {
+                        if let (TypedExpr::Function { name, .. }, Type::Function { params, .. }) =
+                            (&mut typed_value, &ty)
+                        {
+                            *name = Some(overload_symbol(bn, params, slot));
+                        }
+                    }
+                }
+
                 Ok(TypedStmt::Val {
                     slot,
                     name: stmt_name,
@@ -342,6 +372,27 @@ impl Checker {
                     let local_name = binding.alias.as_ref().unwrap_or(&binding.name);
                     // Use pre-resolved type if available, else fall back to TypeVar.
                     let key = (path.clone(), binding.name.clone());
+                    // ADR-074 cross-module: an imported name backed by an overload set is registered
+                    // as an overload set locally (one slot per member), so the ordinary call-site
+                    // resolution selects among them. Each member carries the exporting module's exact
+                    // mangled symbol so lowering emits the right `Named` target.
+                    if let Some(members) = self.import_overloads.get(&key).cloned() {
+                        self.import_origins.insert(
+                            local_name.clone(),
+                            (path.clone(), binding.name.clone()),
+                        );
+                        for (ty, symbol) in members {
+                            let (slot, _dup) =
+                                self.env.define_fn_overload(local_name.clone(), ty.clone(), None);
+                            import_slots.push(ImportSlot {
+                                name: binding.name.clone(),
+                                slot,
+                                ty,
+                                symbol: Some(symbol),
+                            });
+                        }
+                        continue;
+                    }
                     let has_export = self.import_types.contains_key(&key)
                         || self.import_type_decls.contains_key(&key);
                     if module_known && !has_export {
@@ -364,6 +415,7 @@ impl Checker {
                             name: binding.name.clone(),
                             slot,
                             ty,
+                            symbol: None,
                         });
                         continue;
                     }
@@ -382,6 +434,7 @@ impl Checker {
                         name: binding.name.clone(),
                         slot,
                         ty,
+                        symbol: None,
                     });
                 }
                 Ok(TypedStmt::Import {

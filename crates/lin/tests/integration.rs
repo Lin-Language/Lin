@@ -5805,6 +5805,33 @@ print(toString(length(values(m))))
 }
 
 #[test]
+fn test_int_literal_union_keyed_object_dynamic_lookup() {
+    // Regression: `{ DayOfWeek: Boolean }` where `DayOfWeek = 0|1|...|6` expands at type-check
+    // time to a sealed record with string field names "0".."6" (closed-int-literal-union sugar).
+    // When accessed with a DYNAMIC integer key (`dow: DayOfWeek = 1`), the codegen must convert
+    // the integer key to its string form (via lin_int_to_string) before looking up in the
+    // materialized string-keyed LinMap, not pass the raw integer as a LinString* (which caused
+    // a misaligned-pointer panic in lin-runtime's hash_string_key). All seven day-keys round-trip.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type DayOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6
+type ServiceDays = { DayOfWeek: Boolean }
+val days: ServiceDays = { 0: true, 1: false, 2: true, 3: true, 4: true, 5: true, 6: true }
+val lookup = (dow: DayOfWeek): String =>
+  if days[dow] then "yes" else "no"
+val d0: DayOfWeek = 0
+val d1: DayOfWeek = 1
+val d2: DayOfWeek = 2
+val d6: DayOfWeek = 6
+print(lookup(d0))
+print(lookup(d1))
+print(lookup(d2))
+print(lookup(d6))
+"#);
+    assert_eq!(output, vec!["yes", "no", "yes", "yes"]);
+}
+
+#[test]
 fn test_json_not_assignable_to_typed_map() {
     // Type-soundness: there is intentionally NO implicit `AnyVal -> { String: T }` coercion
     // (§5.1.1, §6.3, ADR-055). A `AnyVal` value's runtime payload is a `LinObject` (or any tag),
@@ -11155,10 +11182,13 @@ val toks: Token[] = []
 push(toks, { "kind": "lparen" })
 "#,
     );
+    // With named-type display (fix/lsp-named-type-display), the expected type shows as the
+    // alias name "Token" rather than the structural form. The error still correctly identifies
+    // the mismatch; just check that "Token" (the named type) is mentioned as the expected type.
     assert!(
-        err.contains("kind") && err.contains("text"),
+        err.contains("Token"),
         "push of a record OMITTING the required `text` field must be a type error naming the \
-         expected full record type, got: {err}"
+         expected type Token, got: {err}"
     );
 }
 
@@ -14754,6 +14784,33 @@ print(m[1] ?? "?")
 }
 
 #[test]
+fn test_nested_int_keyed_map_literal_roundtrip() {
+    // Regression: an int-keyed map nested as the VALUE of an outer map was read back as null.
+    // Root cause: `o["B"]` yields `{ UInt8: Int32 } | Null` (union), and when the inner `[1]`
+    // index was compiled the codegen fell through to the `is_array_access` check (because
+    // `key_ty.is_numeric()` is true), calling `lin_array_get_tagged` on the unboxed LinMap*
+    // instead of `lin_map_get_int`. Both the literal-built and write-then-read variants are
+    // exercised here.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+// Literal-built nested int-keyed map: o["B"][1] must return 77.
+type Outer = { String: { UInt8: Int32 } }
+val o: Outer = { "B": { 1: 77 } }
+print(toString(o["B"][1] ?? -1))
+
+// Write-then-read: o2["B"][1] = 99 then read back must return 99.
+val o2: Outer = { "B": {} }
+o2["B"][1] = 99
+print(toString(o2["B"][1] ?? -1))
+
+// Missing key still returns null: o["B"][99] is absent.
+print(toString(o["B"][99] ?? -1))
+"#);
+    assert_eq!(output, vec!["77", "99", "-1"]);
+}
+
+#[test]
 fn test_check_accepts_valid_imported_symbol_program() {
     let (ok, output) = check_source(
         r#"import { trim } from "std/string"
@@ -15885,9 +15942,12 @@ type Person = { "age": UInt8, "name": String }
 type OldPerson = Person & { "wisdom": Boolean }
 val bad: OldPerson = { "age": 1u8, "name": "x" }
 "#);
+    // With named-type display (fix/lsp-named-type-display), the expected type shows as the
+    // alias name "OldPerson" rather than the structural form listing all fields. The error still
+    // correctly rejects the literal missing the "wisdom" field.
     assert!(
-        err.contains("wisdom"),
-        "expected omission error mentioning wisdom, got: {}",
+        err.contains("OldPerson"),
+        "expected omission error mentioning OldPerson type, got: {}",
         err
     );
 }
@@ -20605,4 +20665,205 @@ run(s)
     assert!(success, "nested named-record toBe must not panic; records:\n{records:?}");
     let pass = records.iter().any(|r| r["event"] == "test" && r["status"] == "pass");
     assert!(pass, "expected a passing test record; got:\n{records:?}");
+}
+
+// ---- Function overloading (ADR-074 / spec §14.6) ----
+
+#[test]
+fn test_overload_resolves_by_param_types() {
+    // Overloads distinguished by parameter types; each call selects the right one.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Circle = { "radius": Float64 }
+type Rect = { "width": Float64, "height": Float64 }
+val area = (c: Circle): Float64 => 3.14159 * c["radius"] * c["radius"]
+val area = (r: Rect): Float64 => r["width"] * r["height"]
+val c: Circle = { "radius": 2.0 }
+val r: Rect = { "width": 3.0, "height": 4.0 }
+print(toString(area(c)))
+print(toString(area(r)))
+"#);
+    assert_eq!(out, vec!["12.56636", "12.0"]);
+}
+
+#[test]
+fn test_overload_dispatches_on_all_arguments() {
+    // Selection considers the whole argument tuple, not just the first.
+    let out = run(r#"import { print } from "std/io"
+val combine = (a: Int32, b: Int32): String => "ints:${a + b}"
+val combine = (a: Int32, b: String): String => "mix:${a}${b}"
+print(combine(1, 2))
+print(combine(7, "x"))
+"#);
+    assert_eq!(out, vec!["ints:3", "mix:7x"]);
+}
+
+#[test]
+fn test_overload_concrete_preferred_over_generic() {
+    // A concrete overload beats a generic one that matched only by instantiation.
+    let out = run(r#"import { print } from "std/io"
+val describe = <T>(x: T): String => "generic"
+val describe = (x: Int32): String => "int"
+print(describe(5))
+print(describe("hi"))
+"#);
+    assert_eq!(out, vec!["int", "generic"]);
+}
+
+#[test]
+fn test_overload_duplicate_signature_is_error() {
+    let err = run_expect_err(r#"val f = (a: Int32): Int32 => a
+val f = (a: Int32): String => "x"
+"#);
+    assert!(err.contains("duplicate definition"), "got: {err}");
+}
+
+#[test]
+fn test_overload_no_matching_is_error() {
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (a: Int32): Int32 => a
+val f = (a: String): Int32 => 0
+print(toString(f(true)))
+"#);
+    assert!(err.contains("no matching overload"), "got: {err}");
+}
+
+#[test]
+fn test_overload_union_argument_is_error() {
+    // A union argument matches no single overload — static-only resolution (§14.6).
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (a: Int32): Int32 => a
+val f = (a: String): Int32 => 0
+val x: Int32 | String = 5
+print(toString(f(x)))
+"#);
+    assert!(err.contains("no matching overload"), "got: {err}");
+}
+
+#[test]
+fn test_overload_ambiguous_call_is_error() {
+    // Both overloads match equally well; neither is more specific.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type A = { "x": Int32 }
+type B = { "y": Int32 }
+val f = (a: A): Int32 => a["x"]
+val f = (b: B): Int32 => b["y"]
+val both: { "x": Int32, "y": Int32 } = { "x": 1, "y": 2 }
+print(toString(f(both)))
+"#);
+    assert!(err.contains("ambiguous call"), "got: {err}");
+}
+
+#[test]
+fn test_overload_bare_reference_is_error() {
+    // An overloaded name cannot be used as a value — only called.
+    let err = run_expect_err(r#"val f = (a: Int32): Int32 => a
+val f = (a: String): Int32 => 0
+val g = f
+"#);
+    assert!(err.contains("cannot be used as a value"), "got: {err}");
+}
+
+#[test]
+fn test_overload_with_default_parameter() {
+    // An overload with a default parameter is a candidate at every arity its default permits.
+    let out = run(r#"import { print } from "std/io"
+val g = (a: Int32, b: Int32 = 10): String => "int:${a + b}"
+val g = (a: String): String => "str:${a}"
+print(g(5))
+print(g(5, 2))
+print(g("hi"))
+"#);
+    assert_eq!(out, vec!["int:15", "int:7", "str:hi"]);
+}
+
+#[test]
+fn test_overload_partial_application() {
+    // Partial application of an overloaded function selects on the supplied prefix.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val h = (a: Int32, b: Int32): Int32 => a + b
+val h = (a: String, b: String): String => "${a}${b}"
+val add5 = h(5,)
+print(toString(add5(3)))
+"#);
+    assert_eq!(out, vec!["8"]);
+}
+
+#[test]
+fn test_overload_cross_module() {
+    // ADR-074 cross-module: an imported overload set resolves at the importer's call sites.
+    let dir = std::env::temp_dir().join(format!("lin_overload_xmod_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("shapes.lin"),
+        "export val describe = (n: Int32): String => \"int:${n}\"\n\
+         export val describe = (s: String): String => \"str:${s}\"\n\
+         export val describe = (a: Int32, b: Int32): String => \"pair:${a + b}\"\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ describe }} from "{}/shapes"
+print(describe(7))
+print(describe("hi"))
+print(describe(2, 3))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["int:7", "str:hi", "pair:5"]);
+}
+
+#[test]
+fn test_overload_cross_module_aliased() {
+    // An aliased import of an overloaded name still resolves all overloads under the alias.
+    let dir = std::env::temp_dir().join(format!("lin_overload_xmod_alias_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "export val enc = (n: Int32): String => \"i\"\n\
+         export val enc = (s: String): String => \"s\"\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ enc as e }} from "{}/lib"
+print(e(1))
+print(e("x"))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["i", "s"]);
+}
+
+#[test]
+fn test_overload_numeric_signedness_tiebreak() {
+    // ADR-075: incomparable UInt64 vs Int64 overloads — an unsigned arg prefers the unsigned
+    // overload, a signed/computed one the signed overload, via the numeric-conversion tie-break.
+    let out = run(r#"import { print } from "std/io"
+val f = (v: UInt64): String => "u64"
+val f = (v: Int64): String => "i64"
+val a: UInt16 = 5
+val b: Int32 = 7
+val c: UInt64 = 9
+val d: Int64 = 11
+print(f(a))
+print(f(b))
+print(f(c))
+print(f(d))
+"#);
+    assert_eq!(out, vec!["u64", "i64", "u64", "i64"]);
+}
+
+#[test]
+fn test_overload_numeric_same_sign_picks_narrowest() {
+    // Same-signedness numeric overloads are totally ordered by subtyping, so an exact-width
+    // argument already resolves to its own width (no tie-break needed).
+    let out = run(r#"import { print } from "std/io"
+val enc = (v: UInt16): String => "16"
+val enc = (v: UInt32): String => "32"
+val enc = (v: UInt64): String => "64"
+val a: UInt16 = 1
+val b: UInt32 = 2
+val c: UInt64 = 3
+print(enc(a))
+print(enc(b))
+print(enc(c))
+"#);
+    assert_eq!(out, vec!["16", "32", "64"]);
 }

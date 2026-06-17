@@ -128,14 +128,9 @@ pub unsafe extern "C" fn lin_box_promise(p: *mut LinPromise) -> *mut u8 {
 /// Unbox a `TaggedVal*(TAG_PROMISE)` back to the raw `*mut LinPromise`. Accepts an
 /// already-raw pointer defensively (returns it unchanged if its first byte isn't TAG_PROMISE…
 /// — but callers always pass a boxed promise). Null → null.
-/// SMI-safe: an SMI integer is never a promise — return null.
 #[no_mangle]
 pub unsafe extern "C" fn lin_unbox_promise(p: *mut u8) -> *mut LinPromise {
     if p.is_null() {
-        return std::ptr::null_mut();
-    }
-    #[cfg(feature = "smi")]
-    if crate::tagged::is_smi_ptr(p as *const u8) {
         return std::ptr::null_mut();
     }
     let tv = &*(p as *const crate::tagged::TaggedVal);
@@ -159,14 +154,9 @@ pub unsafe extern "C" fn lin_box_handle(h: *mut u8) -> *mut u8 {
 
 /// Unbox a TaggedVal*(TAG_HANDLE) back to the raw handle pointer. Accepts an already-raw
 /// pointer defensively. Null → null.
-/// SMI-safe: an SMI integer is never a handle — return null.
 #[no_mangle]
 pub unsafe extern "C" fn lin_unbox_handle(p: *mut u8) -> *mut u8 {
     if p.is_null() {
-        return std::ptr::null_mut();
-    }
-    #[cfg(feature = "smi")]
-    if crate::tagged::is_smi_ptr(p as *const u8) {
         return std::ptr::null_mut();
     }
     let tv = &*(p as *const crate::tagged::TaggedVal);
@@ -339,12 +329,6 @@ pub unsafe extern "C" fn lin_await_promise(promise: *mut LinPromise) -> *mut u8 
             // Auto-flatten nested promises (spec §24.2.3): if the thunk itself returned a
             // Promise (boxed TAG_PROMISE), resolve through it. The inner promise's result
             // ownership transfers out; we free the now-redundant outer TAG_PROMISE box shell.
-            // SMI guard: an inline integer is never a TAG_PROMISE — skip the deref.
-            #[cfg(feature = "smi")]
-            let v_is_promise = !v.is_null()
-                && !crate::tagged::is_smi_ptr(v as *const u8)
-                && (*(v as *const crate::tagged::TaggedVal)).tag == crate::tagged::TAG_PROMISE;
-            #[cfg(not(feature = "smi"))]
             let v_is_promise = !v.is_null()
                 && (*(v as *const crate::tagged::TaggedVal)).tag == crate::tagged::TAG_PROMISE;
             if v_is_promise {
@@ -471,8 +455,6 @@ pub unsafe extern "C" fn lin_retry(thunk: *mut u8, n: i32) -> *mut LinPromise {
 unsafe fn is_error_value(v: *mut u8) -> bool {
     use crate::tagged::{TaggedVal, TAG_MAP, TAG_STR};
     if v.is_null() { return false; }
-    #[cfg(feature = "smi")]
-    if crate::tagged::is_smi_ptr(v as *const u8) { return false; }
     let tv = &*(v as *const TaggedVal);
     let got_type: Option<*const TaggedVal> = match tv.tag {
         TAG_MAP => {

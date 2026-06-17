@@ -1257,7 +1257,7 @@ mod tests {
             vec![
                 blk(
                     0,
-                    vec![Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false }],
+                    vec![Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false, columnar: false }],
                     Terminator::TailCall { args: vec![] },
                 ),
                 // Dead block: never reached (TailCall has no successors).
@@ -1285,7 +1285,7 @@ mod tests {
                 blk(
                     0,
                     vec![
-                        Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false },
+                        Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false, columnar: false },
                         Instruction::Release { val: Temp(0), ty: arr.clone() },
                     ],
                     Terminator::TailCall { args: vec![] },
@@ -1311,7 +1311,7 @@ mod tests {
             vec![blk(
                 0,
                 vec![
-                    Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false },
+                    Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false, columnar: false },
                     Instruction::Release { val: Temp(0), ty: arr.clone() },
                     Instruction::Release { val: Temp(0), ty: arr.clone() },
                 ],
@@ -1333,7 +1333,7 @@ mod tests {
             vec![blk(
                 0,
                 vec![
-                    Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false },
+                    Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false, columnar: false },
                     Instruction::Retain { val: Temp(0), ty: arr.clone() },
                     Instruction::Release { val: Temp(0), ty: arr.clone() },
                     Instruction::Release { val: Temp(0), ty: arr.clone() },
@@ -1355,7 +1355,7 @@ mod tests {
         use indexmap::IndexMap;
         let mut fields = IndexMap::new();
         fields.insert("x".into(), Type::Int32);
-        let rec = Type::Object { fields, sealed: true };
+        let rec = Type::Object { fields, sealed: true, name: None };
         // fn(p: rec, q: rec) -> Int32 { read p.x; return q }  — but ret is Int32 here; q escapes via
         // being the returned temp through a Copy. Simpler: p read-only, q returned.
         let mut f = func(

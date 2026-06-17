@@ -1,0 +1,32 @@
+import { StopId, Time } from "../gtfs/gtfs"
+import { Journey } from "../results/journey"
+import { RaptorAlgorithm } from "../raptor/raptor-algorithm"
+import { ResultsFactory } from "../results/results-factory"
+import { Date } from "std/datetime"
+import { GroupStationDepartAfterQuery, createGroupStationDepartAfterQuery, plan as groupPlan } from "./group-station-depart-after-query"
+
+//
+// Implementation of Raptor that searches for journeys departing after a specific time.
+//
+// Only returns results from a single pass of the Raptor algorithm.
+//
+export type DepartAfterQuery = { "raptor": RaptorAlgorithm, "resultsFactory": ResultsFactory, "maxSearchDays": UInt8, "groupQuery": GroupStationDepartAfterQuery }
+
+export val createDepartAfterQuery = (raptor: RaptorAlgorithm, resultsFactory: ResultsFactory, maxSearchDays: UInt8 = 3) =>
+  {
+    "raptor": raptor,
+    "resultsFactory": resultsFactory,
+    "maxSearchDays": maxSearchDays,
+    "groupQuery": createGroupStationDepartAfterQuery(raptor, resultsFactory, maxSearchDays)
+  }
+
+//
+// Plan a journey between the origin and destination on the given date and time.
+//
+// This method delegates the call to a GroupStationDepartAfterQuery where the origin and
+// destination sets are just a single station.
+//
+// No filters are applied.
+//
+export val plan = (query: DepartAfterQuery, origin: StopId, destination: StopId, date: Date, time: Time): Journey[] =>
+  groupPlan(query["groupQuery"], [origin], [destination], date, time)

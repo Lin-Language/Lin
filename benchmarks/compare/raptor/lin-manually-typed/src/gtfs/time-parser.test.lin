@@ -1,0 +1,22 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { createTimeParser } from "./time-parser"
+
+// Mirrors raptor-typescript/test/unit/gtfs/TimeParser.spec.ts: a "HH:MM:SS"
+// string is parsed into seconds from midnight.
+val parse = createTimeParser()
+
+val s = suite("gtfs/time-parser", [
+  test("turns a time string into seconds from midnight", () => [
+    expect(parse("00:00:00")).toBe(0),
+    expect(parse("00:00:10")).toBe(10),
+    expect(parse("00:02:10")).toBe(130),
+    expect(parse("03:02:10")).toBe(10930)
+  ]),
+
+  test("returns the same value on a repeated input (memo cache)", () => [
+    expect(parse("03:02:10")).toBe(10930),
+    expect(parse("03:02:10")).toBe(10930)
+  ])
+])
+
+run(s)
