@@ -7,7 +7,7 @@ export type ScanResults = {
   k: UInt8
 }
 
-export val createScanResults = =>
+export val createScanResults = () =>
   bestArrivals: Arrivals,
   kArrivals: ArrivalsByNumChanges,
   kConnections: ConnectionIndex,
