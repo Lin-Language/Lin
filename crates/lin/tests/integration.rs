@@ -20549,3 +20549,204 @@ print("${{j3[1]["v"]}}")
     let _ = fs::remove_file(&tmp);
     assert_eq!(out, vec!["10", "20"]);
 }
+
+// ---- Function overloading (ADR-074 / spec §14.6) ----
+
+#[test]
+fn test_overload_resolves_by_param_types() {
+    // Overloads distinguished by parameter types; each call selects the right one.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Circle = { "radius": Float64 }
+type Rect = { "width": Float64, "height": Float64 }
+val area = (c: Circle): Float64 => 3.14159 * c["radius"] * c["radius"]
+val area = (r: Rect): Float64 => r["width"] * r["height"]
+val c: Circle = { "radius": 2.0 }
+val r: Rect = { "width": 3.0, "height": 4.0 }
+print(toString(area(c)))
+print(toString(area(r)))
+"#);
+    assert_eq!(out, vec!["12.56636", "12.0"]);
+}
+
+#[test]
+fn test_overload_dispatches_on_all_arguments() {
+    // Selection considers the whole argument tuple, not just the first.
+    let out = run(r#"import { print } from "std/io"
+val combine = (a: Int32, b: Int32): String => "ints:${a + b}"
+val combine = (a: Int32, b: String): String => "mix:${a}${b}"
+print(combine(1, 2))
+print(combine(7, "x"))
+"#);
+    assert_eq!(out, vec!["ints:3", "mix:7x"]);
+}
+
+#[test]
+fn test_overload_concrete_preferred_over_generic() {
+    // A concrete overload beats a generic one that matched only by instantiation.
+    let out = run(r#"import { print } from "std/io"
+val describe = <T>(x: T): String => "generic"
+val describe = (x: Int32): String => "int"
+print(describe(5))
+print(describe("hi"))
+"#);
+    assert_eq!(out, vec!["int", "generic"]);
+}
+
+#[test]
+fn test_overload_duplicate_signature_is_error() {
+    let err = run_expect_err(r#"val f = (a: Int32): Int32 => a
+val f = (a: Int32): String => "x"
+"#);
+    assert!(err.contains("duplicate definition"), "got: {err}");
+}
+
+#[test]
+fn test_overload_no_matching_is_error() {
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (a: Int32): Int32 => a
+val f = (a: String): Int32 => 0
+print(toString(f(true)))
+"#);
+    assert!(err.contains("no matching overload"), "got: {err}");
+}
+
+#[test]
+fn test_overload_union_argument_is_error() {
+    // A union argument matches no single overload — static-only resolution (§14.6).
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (a: Int32): Int32 => a
+val f = (a: String): Int32 => 0
+val x: Int32 | String = 5
+print(toString(f(x)))
+"#);
+    assert!(err.contains("no matching overload"), "got: {err}");
+}
+
+#[test]
+fn test_overload_ambiguous_call_is_error() {
+    // Both overloads match equally well; neither is more specific.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type A = { "x": Int32 }
+type B = { "y": Int32 }
+val f = (a: A): Int32 => a["x"]
+val f = (b: B): Int32 => b["y"]
+val both: { "x": Int32, "y": Int32 } = { "x": 1, "y": 2 }
+print(toString(f(both)))
+"#);
+    assert!(err.contains("ambiguous call"), "got: {err}");
+}
+
+#[test]
+fn test_overload_bare_reference_is_error() {
+    // An overloaded name cannot be used as a value — only called.
+    let err = run_expect_err(r#"val f = (a: Int32): Int32 => a
+val f = (a: String): Int32 => 0
+val g = f
+"#);
+    assert!(err.contains("cannot be used as a value"), "got: {err}");
+}
+
+#[test]
+fn test_overload_with_default_parameter() {
+    // An overload with a default parameter is a candidate at every arity its default permits.
+    let out = run(r#"import { print } from "std/io"
+val g = (a: Int32, b: Int32 = 10): String => "int:${a + b}"
+val g = (a: String): String => "str:${a}"
+print(g(5))
+print(g(5, 2))
+print(g("hi"))
+"#);
+    assert_eq!(out, vec!["int:15", "int:7", "str:hi"]);
+}
+
+#[test]
+fn test_overload_partial_application() {
+    // Partial application of an overloaded function selects on the supplied prefix.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val h = (a: Int32, b: Int32): Int32 => a + b
+val h = (a: String, b: String): String => "${a}${b}"
+val add5 = h(5,)
+print(toString(add5(3)))
+"#);
+    assert_eq!(out, vec!["8"]);
+}
+
+#[test]
+fn test_overload_cross_module() {
+    // ADR-074 cross-module: an imported overload set resolves at the importer's call sites.
+    let dir = std::env::temp_dir().join(format!("lin_overload_xmod_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("shapes.lin"),
+        "export val describe = (n: Int32): String => \"int:${n}\"\n\
+         export val describe = (s: String): String => \"str:${s}\"\n\
+         export val describe = (a: Int32, b: Int32): String => \"pair:${a + b}\"\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ describe }} from "{}/shapes"
+print(describe(7))
+print(describe("hi"))
+print(describe(2, 3))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["int:7", "str:hi", "pair:5"]);
+}
+
+#[test]
+fn test_overload_cross_module_aliased() {
+    // An aliased import of an overloaded name still resolves all overloads under the alias.
+    let dir = std::env::temp_dir().join(format!("lin_overload_xmod_alias_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "export val enc = (n: Int32): String => \"i\"\n\
+         export val enc = (s: String): String => \"s\"\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ enc as e }} from "{}/lib"
+print(e(1))
+print(e("x"))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["i", "s"]);
+}
+
+#[test]
+fn test_overload_numeric_signedness_tiebreak() {
+    // ADR-075: incomparable UInt64 vs Int64 overloads — an unsigned arg prefers the unsigned
+    // overload, a signed/computed one the signed overload, via the numeric-conversion tie-break.
+    let out = run(r#"import { print } from "std/io"
+val f = (v: UInt64): String => "u64"
+val f = (v: Int64): String => "i64"
+val a: UInt16 = 5
+val b: Int32 = 7
+val c: UInt64 = 9
+val d: Int64 = 11
+print(f(a))
+print(f(b))
+print(f(c))
+print(f(d))
+"#);
+    assert_eq!(out, vec!["u64", "i64", "u64", "i64"]);
+}
+
+#[test]
+fn test_overload_numeric_same_sign_picks_narrowest() {
+    // Same-signedness numeric overloads are totally ordered by subtyping, so an exact-width
+    // argument already resolves to its own width (no tie-break needed).
+    let out = run(r#"import { print } from "std/io"
+val enc = (v: UInt16): String => "16"
+val enc = (v: UInt32): String => "32"
+val enc = (v: UInt64): String => "64"
+val a: UInt16 = 1
+val b: UInt32 = 2
+val c: UInt64 = 3
+print(enc(a))
+print(enc(b))
+print(enc(c))
+"#);
+    assert_eq!(out, vec!["16", "32", "64"]);
+}

@@ -309,12 +309,6 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// True when `ty` is a permissible field of a sealed record. Delegates to the canonical
-    /// definition in `lin_check::types::Type::is_sealed_field`.
-    pub(crate) fn is_sealed_field(ty: &Type) -> bool {
-        ty.is_sealed_field()
-    }
-
     /// THE sealed-record gate. Delegates to the canonical `Type::sealed_fields`
     /// (`lin_check::types`). See that function for the full contract and fail-safe semantics.
     pub(crate) fn sealed_fields(ty: &Type) -> Option<&indexmap::IndexMap<String, Type>> {
@@ -405,11 +399,6 @@ impl<'ctx> Codegen<'ctx> {
     /// (`lin_check::types`). See that function for the full contract and fail-safe semantics.
     pub(crate) fn sealed_array_elem(ty: &Type) -> Option<&indexmap::IndexMap<String, Type>> {
         Type::sealed_array_elem(ty)
-    }
-
-    /// Element-field packability gate. Delegates to `Type::is_sealed_array_field_packable`.
-    pub(crate) fn sealed_array_elem_field_packable(ty: &Type) -> bool {
-        ty.is_sealed_array_field_packable()
     }
 
     // ── Unboxed tagged sum type (`SumNode`) — unboxed-sumtype Stage 1 ─────────────────────────────

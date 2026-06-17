@@ -55,6 +55,15 @@ pub enum Layout {
     ///   - `inline == false` (0xFD): pointer-backed — each slot is an 8-byte struct pointer;
     ///     `push` retains the struct, so mutations via the original reference ARE visible.
     PackedSealedArray { elem_layout: IndexMap<String, Type>, inline: bool },
+    /// A columnar record array (tag `0xFC`). Each field has its own contiguous column buffer;
+    /// `arr[i].field` is a two-pointer-load + GEP + load (col_ptrs[col_idx][i]). Only set when
+    /// `MakeArray.columnar == true` AND `MakeArray.inline == true` AND all fields are flat scalars.
+    /// The physical header reuses `LinArray` with `elem_tag = 0xFC`:
+    ///   `data @ 24` → col_ptrs (*mut *mut u8)
+    ///   `elem_stride @ 32` → n_fields
+    ///   `elem_desc @ 40`   → col_meta (*const ColMeta)
+    ///   `elem_named_desc @ 48` → NamedDesc (same as 0xFE)
+    ColumnarArray { elem_layout: IndexMap<String, Type> },
     /// An unboxed tagged sum-type value (`lin_runtime::sumnode` — unboxed-sumtype Stage 1): a pointer
     /// to a heap `SumNode` `[u32 rc | u32 size | u64 desc | u32 tag | u32 pad | max-variant payload]`.
     /// The layout key is the WHOLE sum type's field shape: the discriminant key plus the ordered
@@ -160,6 +169,20 @@ impl Repr {
         matches!(self, Repr::Packed(_))
     }
 
+    /// `Some(elem_layout)` iff this repr is a columnar record array (`Layout::ColumnarArray`) —
+    /// codegen's gate for the `lin_columnar_array_alloc` + two-pointer-load field-read path.
+    pub fn columnar_array_layout(&self) -> Option<&IndexMap<String, Type>> {
+        match self {
+            Repr::Packed(Layout::ColumnarArray { elem_layout }) => Some(elem_layout),
+            _ => None,
+        }
+    }
+
+    /// True iff this repr is a columnar array (`Layout::ColumnarArray`).
+    pub fn is_columnar_array(&self) -> bool {
+        matches!(self, Repr::Packed(Layout::ColumnarArray { .. }))
+    }
+
     /// `Some(sum_ty)` iff this repr is an unboxed tagged sum-type value (`Layout::SumNode`) — the
     /// codegen gate for the `lin_sumnode_*` construct / tag-switch / const-offset payload path.
     pub fn sumnode_sum_ty(&self) -> Option<&Type> {
@@ -211,7 +234,19 @@ fn join(a: &Repr, b: &Repr) -> Repr {
             if l1 == l2 {
                 Packed(l1.clone())
             } else {
-                Repr::boxed_opaque()
+                // ColumnarArray vs PackedSealedArray with same elem_layout: both are sealed arrays
+                // with the same fields; the columnar variant wins (it is the more specialised repr).
+                // This can fire on TailCall back-edges where the param is ColumnarArray but the arg
+                // at a non-literal-construction call site seeded as PackedSealedArray.
+                match (l1, l2) {
+                    (Layout::ColumnarArray { elem_layout: e1 }, Layout::PackedSealedArray { elem_layout: e2, .. }) if e1 == e2 => {
+                        Packed(Layout::ColumnarArray { elem_layout: e1.clone() })
+                    }
+                    (Layout::PackedSealedArray { elem_layout: e1, .. }, Layout::ColumnarArray { elem_layout: e2 }) if e1 == e2 => {
+                        Packed(Layout::ColumnarArray { elem_layout: e2.clone() })
+                    }
+                    _ => Repr::boxed_opaque()
+                }
             }
         }
         (FlatScalar(s1), FlatScalar(s2)) => {
@@ -381,10 +416,19 @@ fn make_object_repr(ty: &Type, fields: &[(String, Temp)], spreads: &[Temp]) -> R
 /// (nothing asserts a more specific repr on an array temp — assume sites dispatch on the array TYPE,
 /// not its repr). Conflating it with `FlatScalar` was an analysis bug the Stage-2 oracle surfaced on
 /// `Float64[]` literals in stdlib (`nextPair`/`applyKey`).
-fn make_array_repr(elem_ty: &Type, inline: bool) -> Repr {
+fn make_array_repr(elem_ty: &Type, inline: bool, columnar: bool) -> Repr {
     // Reconstruct the Array(elem) view the codegen predicate gates on.
     let arr_ty = Type::Array(Box::new(elem_ty.clone()));
     if let Some(elem_fields) = sealed_array_elem(&arr_ty) {
+        // Columnar gate: inline=true AND all fields are flat scalars (no heap fields).
+        // `columnar=true` is only set by escape.rs when ALL conditions hold; the guard here
+        // is defence-in-depth (fail safe to PackedSealedArray if somehow columnar=true but
+        // fields have heap fields).
+        if columnar && inline && elem_fields.values().all(|f| f.is_flat_scalar() || matches!(f, Type::Bool)) {
+            return Repr::Packed(Layout::ColumnarArray {
+                elem_layout: elem_fields.clone(),
+            });
+        }
         return Repr::Packed(Layout::PackedSealedArray {
             elem_layout: elem_fields.clone(),
             inline,
@@ -500,8 +544,8 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
         Instruction::MakeObject { dst, ty, fields, spreads, .. } => {
             set(seeds, *dst, make_object_repr(ty, fields, spreads));
         }
-        Instruction::MakeArray { dst, elem_ty, inline, .. } => {
-            set(seeds, *dst, make_array_repr(elem_ty, *inline));
+        Instruction::MakeArray { dst, elem_ty, inline, columnar, .. } => {
+            set(seeds, *dst, make_array_repr(elem_ty, *inline, *columnar));
         }
         // A whole sealed-record element read by Index yields a PACKED struct REGARDLESS of whether
         // the array is packed: a packed sealed array goes through `sealed_array_materialize_elem`
@@ -677,6 +721,11 @@ fn is_packed_sealed_array(repr: &Repr, elem_fields: &IndexMap<String, Type>) -> 
     matches!(repr, Repr::Packed(Layout::PackedSealedArray { elem_layout, .. }) if elem_layout == elem_fields)
 }
 
+/// Is `repr` a Packed columnar array whose element layout is `elem_fields`?
+fn is_packed_columnar_array(repr: &Repr, elem_fields: &IndexMap<String, Type>) -> bool {
+    matches!(repr, Repr::Packed(Layout::ColumnarArray { elem_layout }) if elem_layout == elem_fields)
+}
+
 /// Is `repr` a SumNode for sum type `sum_ty`?
 fn is_sumnode(repr: &Repr, sum_ty: &Type) -> bool {
     matches!(repr, Repr::Packed(Layout::SumNode { sum_ty: s }) if s == sum_ty)
@@ -729,13 +778,14 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                 // the flat-vs-boxed-Object[] distinction is the orthogonal pre-existing flat-array
                 // path (assume sites dispatch on the array TYPE), so the oracle only asserts the
                 // sealed-array case is Packed and the non-sealed case is NOT Packed.
-                Instruction::MakeArray { dst, elem_ty, inline, .. } => {
-                    let expected = make_array_repr(elem_ty, *inline);
+                Instruction::MakeArray { dst, elem_ty, inline, columnar, .. } => {
+                    let expected = make_array_repr(elem_ty, *inline, *columnar);
                     let r = &repr[dst.0 as usize];
                     match &expected {
-                        Repr::Packed(Layout::PackedSealedArray { elem_layout, .. }) => {
-                            if !is_packed_sealed_array(r, elem_layout) {
-                                report(&mut bad, "MakeArray(packed)", *dst, "Packed(sealed array)", r);
+                        Repr::Packed(Layout::PackedSealedArray { elem_layout, .. })
+                        | Repr::Packed(Layout::ColumnarArray { elem_layout, .. }) => {
+                            if !is_packed_sealed_array(r, elem_layout) && !is_packed_columnar_array(r, elem_layout) {
+                                report(&mut bad, "MakeArray(packed)", *dst, "Packed(sealed array or columnar)", r);
                             }
                         }
                         _ => {
@@ -800,17 +850,18 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                         }
                     }
                 }
-                // ASSUME: SealedArrayFieldGet — array is read as a packed sealed array (both directions).
+                // ASSUME: SealedArrayFieldGet — array is read as a packed sealed array (0xFE/0xFD)
+                // OR a columnar array (0xFC). Accept both.
                 Instruction::SealedArrayFieldGet { array, arr_ty, .. } => {
                     let r = &repr[array.0 as usize];
                     match sealed_array_elem(arr_ty) {
                         Some(ef) => {
-                            if !is_packed_sealed_array(r, ef) {
-                                report(&mut bad, "SealedArrayFieldGet(array packed)", *array, "Packed(sealed array)", r);
+                            if !is_packed_sealed_array(r, ef) && !is_packed_columnar_array(r, ef) {
+                                report(&mut bad, "SealedArrayFieldGet(array packed)", *array, "Packed(sealed array or columnar)", r);
                             }
                         }
                         None => {
-                            if r.packed_sealed_array_layout().is_some() {
+                            if r.packed_sealed_array_layout().is_some() || r.is_columnar_array() {
                                 report(&mut bad, "SealedArrayFieldGet(array NOT predicate-packed)", *array, "non-Packed-array", r);
                             }
                         }
@@ -961,9 +1012,12 @@ pub fn verify(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                 }
                 Instruction::SealedArrayFieldGet { array, arr_ty, .. } => {
                     if let Some(ef) = sealed_array_elem(arr_ty) {
-                        if !is_packed_sealed_array(&repr[array.0 as usize], ef) {
+                        // Accept both PackedSealedArray (0xFE/0xFD) and ColumnarArray (0xFC).
+                        if !is_packed_sealed_array(&repr[array.0 as usize], ef)
+                            && !is_packed_columnar_array(&repr[array.0 as usize], ef)
+                        {
                             bad.push(format!(
-                                "{fname}: SealedArrayFieldGet requires Packed(sealed array) of t{}, has {:?}",
+                                "{fname}: SealedArrayFieldGet(array packed) on t{} — old predicate says Packed(sealed array), repr says {:?}",
                                 array.0, repr[array.0 as usize]
                             ));
                         }
@@ -1349,7 +1403,7 @@ mod tests {
         let instrs = vec![
             Instruction::Const { dst: Temp(0), val: Const::Float(1.0, Type::Float64) },
             Instruction::Const { dst: Temp(1), val: Const::Float(2.0, Type::Float64) },
-            Instruction::MakeArray { dst: Temp(2), elements: vec![Temp(0), Temp(1)], elem_ty: Type::Float64, inline: false },
+            Instruction::MakeArray { dst: Temp(2), elements: vec![Temp(0), Temp(1)], elem_ty: Type::Float64, inline: false, columnar: false },
         ];
         let f = func_of(instrs, Some(Temp(2)), 3, vec![]);
         let repr = analyze(&f);

@@ -8,6 +8,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod array;
 pub mod async_rt;
+pub mod columnar;
 pub mod decode;
 pub mod env;
 pub mod fault;

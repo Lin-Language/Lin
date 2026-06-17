@@ -1,0 +1,29 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { push } from "std/array"
+import { frozen } from "std/async"
+
+type Pt = { "x": Int32, "y": Int32 }
+
+// Build a 0xFD pointer-backed record array with push, then frozen() (repacks → 0xFE inline),
+// then read fields back — they must stay correct after the in-place repack.
+val buildAndFreeze = (): Pt[] =>
+  var a: Pt[] = []
+  push(a, { "x": 1, "y": 2 })
+  push(a, { "x": 3, "y": 4 })
+  push(a, { "x": 5, "y": 6 })
+  frozen(a)
+
+val main = (): AnyVal =>
+  run([
+    suite("freeze repacks record arrays to inline; reads stay correct", [
+      test("each field of each element reads correctly after freeze", () => [
+        expect(buildAndFreeze()[0]["x"]).toBe(1),
+        expect(buildAndFreeze()[1]["y"]).toBe(4),
+        expect(buildAndFreeze()[2]["x"]).toBe(5)
+      ]),
+
+      test("sum across the frozen array", () => [
+        expect(buildAndFreeze()[0]["x"] + buildAndFreeze()[1]["y"] + buildAndFreeze()[2]["x"]).toBe(10)
+      ])
+    ])
+  ])

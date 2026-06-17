@@ -124,6 +124,6 @@ Make sure it is included in the `docs/STDLIB.md` documentation. Add a test case 
 1. `docs/SPECIFICATION.md` — what the language is meant to be.
 2. `docs/STDLIB.md` — specification of the stdlib.
 3. `docs/DECISIONS.md` — every non-obvious implementation choice and why. **Read this before touching the lexer or parser.**
-4. `docs/TODO.md` — milestone plan.
+4. `docs/PERFORMANCE.md` — measured perf/memory characteristics, the path-n learnings, and open levers.
 5. `crates/lin/tests/integration.rs` — what currently works end-to-end.
 6. `examples/*.lin` — example programs.

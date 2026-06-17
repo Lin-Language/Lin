@@ -23,6 +23,21 @@ pub struct VarInfo {
     pub narrowed_ty: Option<Type>,
     /// The span of the binding site (the name token in val/var/param).
     pub def_span: Option<Span>,
+    /// Additional function overloads sharing this name (ADR-074). Empty for the
+    /// overwhelming majority of bindings; non-empty only when several functions in
+    /// the same scope share a name. The primary signature lives in `ty`/`slot`; each
+    /// alternate carries its own slot + (function) type. Distinguished by parameter
+    /// types at the call site (`checker/call.rs`).
+    pub overloads: Vec<OverloadAlt>,
+}
+
+/// One alternate in a function overload set (ADR-074). Each alternate is a distinct
+/// top-level/local function with its own slot (hence its own FuncId/LLVM symbol).
+#[derive(Debug, Clone)]
+pub struct OverloadAlt {
+    pub slot: usize,
+    pub ty: Type,
+    pub def_span: Option<Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +96,7 @@ impl TypeEnv {
             mutable: false,
             narrowed_ty: None,
             def_span: None,
+            overloads: Vec::new(),
         };
         self.scopes.last_mut().unwrap().bindings.insert(name, info);
     }
@@ -94,9 +110,82 @@ impl TypeEnv {
             mutable,
             narrowed_ty: None,
             def_span,
+            overloads: Vec::new(),
         };
         self.scopes.last_mut().unwrap().bindings.insert(name, info);
         slot
+    }
+
+    /// Register a function overload (ADR-074). If `name` already binds a function in the
+    /// CURRENT (innermost) scope, append `ty` as an additional overload sharing that name and
+    /// return its fresh slot. Otherwise behave exactly like `define` (first definition →
+    /// primary binding). Only ever called from the function pre-scan, so both the existing
+    /// binding (if any) and `ty` are function types.
+    ///
+    /// Returns `(slot, is_duplicate)`. `is_duplicate` is true when an existing overload already
+    /// has identical parameter types — the caller turns that into a diagnostic (the return type
+    /// can never disambiguate, §14.6).
+    pub fn define_fn_overload(&mut self, name: String, ty: Type, def_span: Option<Span>) -> (usize, bool) {
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        let scope = self.scopes.last_mut().unwrap();
+        if let Some(existing) = scope.bindings.get_mut(&name) {
+            // Only extend an existing *function* binding into an overload set. A non-function
+            // binding of the same name in this scope is overwritten (ordinary shadowing) below.
+            if matches!(existing.ty, Type::Function { .. }) {
+                let new_params = fn_param_types(&ty);
+                let dup = std::iter::once(&existing.ty)
+                    .chain(existing.overloads.iter().map(|o| &o.ty))
+                    .any(|t| fn_param_types(t) == new_params);
+                existing.overloads.push(OverloadAlt { slot, ty, def_span });
+                return (slot, dup);
+            }
+        }
+        let info = VarInfo {
+            slot,
+            ty,
+            mutable: false,
+            narrowed_ty: None,
+            def_span,
+            overloads: Vec::new(),
+        };
+        scope.bindings.insert(name, info);
+        (slot, false)
+    }
+
+    /// True when `name` resolves to a function overload set (≥2 signatures).
+    pub fn is_overloaded(&self, name: &str) -> bool {
+        self.lookup(name).is_some_and(|info| !info.overloads.is_empty())
+    }
+
+    /// All function overloads bound to `name` in the nearest scope that defines it, as
+    /// `(slot, function_type)` pairs (primary first, then alternates in definition order).
+    /// Returns an empty vec when `name` is unbound.
+    pub fn overload_candidates(&self, name: &str) -> Vec<(usize, Type)> {
+        match self.lookup(name) {
+            Some(info) => std::iter::once((info.slot, info.ty.clone()))
+                .chain(info.overloads.iter().map(|o| (o.slot, o.ty.clone())))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Update the type of the overload entry (primary or alternate) identified by `slot`.
+    pub fn update_overload_type(&mut self, slot: usize, ty: Type) {
+        for scope in self.scopes.iter_mut().rev() {
+            for info in scope.bindings.values_mut() {
+                if info.slot == slot {
+                    info.ty = ty;
+                    return;
+                }
+                for alt in info.overloads.iter_mut() {
+                    if alt.slot == slot {
+                        alt.ty = ty;
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     pub fn lookup(&self, name: &str) -> Option<&VarInfo> {
@@ -184,5 +273,14 @@ impl TypeEnv {
             }
         }
         names
+    }
+}
+
+/// The parameter types of a function type, or an empty vec for a non-function. Used by the
+/// overload machinery (ADR-074).
+fn fn_param_types(ty: &Type) -> Vec<Type> {
+    match ty {
+        Type::Function { params, .. } => params.clone(),
+        _ => Vec::new(),
     }
 }
