@@ -3035,3 +3035,52 @@ tie-break is deliberately conservative — it differentiates *only* numeric wide
 ambiguity (records, unions, generics already handled at the specificity tier) exactly as ADR-074 left it.
 Spec §14.6 notes the numeric preference. Regression tests cover same-signedness selection, signed/unsigned
 selection of the incomparable pair, and the unchanged record-ambiguity error.
+
+(ADR-076 = nested-map-write auto-vivification and ADR-077 = assignment-based index-place narrowing land
+on a parallel branch; this number deliberately skips to 078 to avoid colliding with them.)
+
+## ADR-078: Destructuring lambda parameters (bare + parenthesized)
+
+**Status**: Accepted.
+
+**Context**: A `Param` already carries a full `Pattern`, and the parser's `parse_param` already runs
+`parse_binding_pattern`, so a *parenthesized* destructuring parameter such as `({ name, age }) => name`
+parsed and — for OBJECT patterns — bound correctly. Two gaps remained:
+
+1. **Array-pattern params never bound.** `([a, b]) => a` parsed but the checker only emitted a
+   destructuring preamble for `Pattern::Object`, so `a`/`b` were reported as undefined variables.
+2. **Bare destructuring forms didn't parse.** `[a, b] => a` (no surrounding parens) hit
+   `expected RParen, got Arrow`, because the bare-lambda recognizer `is_bare_lambda` matched only a
+   single `Ident` followed by `=>`. The motivating idiom is a map-entries-style iteration —
+   `entries.for([routeId, stopP] => …)` — which should read as cleanly as the single-ident form.
+
+**Decision**: Support destructuring lambda parameters for BOTH array and object patterns, in BOTH the
+bare (single-param, argument-position) and parenthesized (also multi-param) forms.
+
+- **Checker / lowering (gap 1).** Function-entry binding for ALL non-`Ident` param patterns is unified
+  in one helper, `Checker::bind_destructure_param`, used by both `infer_function` and
+  `infer_function_with_hints`. It emits the SAME typed statements the `val { … } = …` / `val [ … ] = …`
+  forms emit in `check_stmt` — `TypedStmt::Destructure` for objects and `TypedStmt::ArrayDestructure`
+  for arrays — into a body preamble (the existing `param_destr_stmts` → `Block` wrap). Element types
+  come positionally from a tuple/`FixedArray` param type (`[T0, T1]` → `a: T0`, `b: T1`), or from the
+  array element for an `Array(T)` param (`T[]` → each element `T`), or the `AnyVal` wildcard otherwise.
+  Nested patterns (`[a, [b, c]]`, `{ p: { x } }`) recurse through fresh intermediate slots, and a
+  `...rest` array element binds a sliced tail — exactly to the extent the `val`-destructuring path
+  already supports. Sharing one code path keeps params and `val` destructuring consistent for free.
+
+- **Parser (gap 2).** `is_bare_lambda` now also returns true when the upcoming tokens are a
+  BRACKET-BALANCED `[ … ]` or `{ … }` (counting nested `[]`/`{}`) immediately followed — skipping
+  newlines — by `=>`. The balanced-close-then-`=>` scan (`balanced_close_then_arrow`) is what
+  distinguishes a bare destructuring lambda from an array/record LITERAL argument: a `[1, 2]` or
+  `{ "a": 1 }` with no trailing `=>` has no arrow and stays a literal. `parse_bare_lambda` then parses
+  the pattern with the same `parse_binding_pattern` params use and builds a single-`Param` lambda. As
+  before, this is recognised ONLY in argument position (ADR-006), so nothing outside argument position
+  changes. The parenthesized multi-param path was already accepting destructuring params via
+  `parse_param`; with gap 1 fixed it now binds.
+
+**Consequences**: `[a, b] => a + b`, `([a, b]) => a + b`, `{ name } => name`, `({ name }) => name`,
+and mixed multi-param lambdas (`(x, [a, b]) => …`) all parse, bind and run. Array/record literal
+arguments are unaffected (verified by the literal-not-a-lambda regression). A destructuring param with
+more elements than a tuple type provides binds the extra names to `Null` and is an array-OOB runtime
+error at use — the same safe-by-default behaviour as `val [a, b, c] = [1, 2]` (no compiler panic). Spec
+§ on lambda/parameter syntax documents both forms.
