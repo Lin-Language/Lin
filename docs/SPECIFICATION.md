@@ -1593,10 +1593,37 @@ Object spread is also valid in object *expressions*; see §3.3.
 
 ### 17.7 Function Parameter Destructuring
 
+A function parameter may be a destructuring pattern — object or array — instead of a plain name. The
+pattern's bindings are introduced at function entry, with the same element/field types as the
+equivalent `val` destructuring (§17.1, §17.5): positionally from a tuple/fixed-array parameter type
+(`[T0, T1]` binds `a: T0`, `b: T1`), or from the array element for an `Array(T)` parameter. Nested
+patterns and a trailing array `...rest` are supported to the same extent as `val`.
+
 ```txt
 val describePerson = ({ name, age }: Person): String =>
   "${name} is ${age}"
+
+val sumPair = ([a, b]: Int32[]): Int32 =>
+  a + b
 ```
+
+In **argument position** a single destructuring parameter may also be written *bare*, without the
+surrounding parentheses — the destructuring analogue of the bare single-identifier lambda `x => …`
+(§24, §18). Both forms are equivalent:
+
+```txt
+// bare (argument position only)
+pairs.for([a, b] => print(a + b))
+items.for({ name, age } => print(name))
+
+// parenthesized (also required for multiple parameters)
+pairs.for(([a, b]) => print(a + b))
+m.for((key, [a, b]) => print(key))
+```
+
+A bare destructuring lambda is recognised by a bracket-balanced `[ … ]` or `{ … }` immediately
+followed by `=>`; an array or record *literal* argument (no trailing `=>`) is unaffected — e.g.
+`xs.push([1, 2])` and `f({ "a": 1 })` parse as literals.
 
 ## 18. Iteration
 

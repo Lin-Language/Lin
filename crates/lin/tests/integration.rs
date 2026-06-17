@@ -21077,3 +21077,112 @@ val a: M = m[0]
         output
     );
 }
+
+// ---------------------------------------------------------------------------
+// Destructuring lambda parameters (ADR-078) — bare + parenthesized, array + object.
+// ---------------------------------------------------------------------------
+
+/// Bare array-destructuring lambda in argument position: `[a, b] => …` binds `a`,`b`.
+#[test]
+fn test_destructure_lambda_bare_array() {
+    let output = run(r#"import { print } from "std/io"
+import { for } from "std/iter"
+
+val pairs: Int32[][] = [[1, 2], [3, 4]]
+pairs.for([a, b] => print(a + b))
+"#);
+    assert_eq!(output, vec!["3", "7"]);
+}
+
+/// Parenthesized array-destructuring lambda: `([a, b]) => …` binds and runs.
+#[test]
+fn test_destructure_lambda_paren_array() {
+    let output = run(r#"import { print } from "std/io"
+import { for } from "std/iter"
+
+val pairs: Int32[][] = [[1, 2], [3, 4]]
+pairs.for(([a, b]) => print(a * b))
+"#);
+    assert_eq!(output, vec!["2", "12"]);
+}
+
+/// Object-destructuring lambda, both bare and parenthesized.
+#[test]
+fn test_destructure_lambda_object_both_forms() {
+    let output = run(r#"import { print } from "std/io"
+import { for } from "std/iter"
+
+type P = { "name": String, "age": Int32 }
+val items: P[] = [{ "name": "ann", "age": 30 }, { "name": "bob", "age": 40 }]
+items.for(({ name, age }) => print(name))
+items.for({ name, age } => print(age))
+"#);
+    assert_eq!(output, vec!["ann", "bob", "30", "40"]);
+}
+
+/// Multi-param lambdas mixing an ordinary param and a destructuring param, both orders.
+#[test]
+fn test_destructure_lambda_multi_param_mixed() {
+    let output = run(r#"import { print } from "std/io"
+
+val f = (x: Int32, [a, b]: Int32[]) => print(x + a + b)
+f(1, [2, 3])
+val g = ([a, b]: Int32[], y: Int32) => print(a + b + y)
+g([10, 20], 5)
+"#);
+    assert_eq!(output, vec!["6", "35"]);
+}
+
+/// Nested array-destructuring param `([a, [b, c]]) => …`.
+#[test]
+fn test_destructure_lambda_nested_array() {
+    let output = run(r#"import { print } from "std/io"
+
+val f = ([a, [b, c]]: AnyVal) => print(a + b + c)
+f([1, [2, 3]])
+"#);
+    assert_eq!(output, vec!["6"]);
+}
+
+/// Rest element in an array-destructuring param `([a, ...rest]) => …`.
+#[test]
+fn test_destructure_lambda_array_rest() {
+    let output = run(r#"import { print } from "std/io"
+import { length } from "std/array"
+
+val f = ([a, ...rest]: Int32[]) => print(a + rest.length())
+f([10, 1, 2, 3])
+"#);
+    // a = 10, rest = [1,2,3] → 10 + 3 = 13
+    assert_eq!(output, vec!["13"]);
+}
+
+/// Map-entries-style motivating case: a `[K, V][]` iterated by a destructuring lambda,
+/// both bare and parenthesized — binds `routeId`,`stopP`.
+#[test]
+fn test_destructure_lambda_entries_motivating() {
+    let output = run(r#"import { print } from "std/io"
+import { for } from "std/iter"
+
+val entries: Int32[][] = [[10, 100], [20, 200]]
+entries.for([routeId, stopP] => print(routeId + stopP))
+entries.for(([routeId, stopP]) => print(routeId * stopP))
+"#);
+    assert_eq!(output, vec!["110", "220", "1000", "4000"]);
+}
+
+/// Negative: an array LITERAL argument (no trailing `=>`) must still parse as a literal, not be
+/// mistaken for a bare destructuring lambda. Likewise a record literal and a `[..].method()` call.
+#[test]
+fn test_destructure_lambda_literal_not_a_lambda() {
+    let (ok, output) = check_source(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+
+var xs: Int32[][] = [[0]]
+xs.push([1, 2])
+val obj: { "a": Int32 } = { "a": 1 }
+print([1, 2].length())
+print(obj["a"])
+"#);
+    assert!(ok, "expected literals to parse cleanly, got:\n{}", output);
+}
