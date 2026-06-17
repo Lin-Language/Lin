@@ -398,11 +398,26 @@ impl Checker {
         for stmt in &module.statements {
             if let Stmt::Import { bindings, path, .. } = stmt {
                 for binding in bindings {
-                    if let Some((params, body)) =
-                        self.import_type_decls.get(&(path.clone(), binding.name.clone())).cloned()
-                    {
+                    let key = (path.clone(), binding.name.clone());
+                    if let Some((params, body)) = self.import_type_decls.get(&key).cloned() {
                         let local_name = binding.alias.as_ref().unwrap_or(&binding.name);
                         self.env.define_type(local_name.clone(), params, body);
+                    } else if !self.fully_resolved_import_paths.contains(path) {
+                        // Cyclic-import Phase 1 (ADR-083): the peer module that exports this name is
+                        // still mid-resolution, so its `type` decls are not seeded yet. If this name
+                        // turns out to be an imported TYPE alias, leaving it undefined makes any
+                        // type-position use ("(t: T)") fail with "Unknown type 'T'", which aborts
+                        // Phase 1 before we can extract the peer's signature. Register a permissive
+                        // placeholder (a fresh TypeVar) so the body still checks; Phase 2 re-runs with
+                        // the peer's real `type` decl seeded into `import_type_decls` (the branch
+                        // above), which overrides this placeholder. A genuinely-undefined type from a
+                        // FULLY-RESOLVED module is excluded by the guard and still errors as before.
+                        // Registering a phantom alias for a name that is actually a VALUE import is
+                        // harmless: it lives in the type namespace and is never consulted unless the
+                        // name is used in type position.
+                        let local_name = binding.alias.as_ref().unwrap_or(&binding.name).clone();
+                        let placeholder = self.env.fresh_type_var();
+                        self.env.define_type(local_name, Vec::new(), placeholder);
                     }
                 }
             }
