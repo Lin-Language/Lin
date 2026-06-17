@@ -421,10 +421,11 @@ impl Checker {
         }
 
         if !self.types_compatible(&actual_ty, expected) {
-            let mut diag = Diagnostic::error(
-                expr.span(),
-                format!("Expected type {}, got {}", expected, actual_ty),
-            );
+            let mut msg = format!("Expected type {}, got {}", expected, actual_ty);
+            if let Some(breakdown) = self.explain_mismatch(&actual_ty, expected) {
+                msg.push_str(&breakdown);
+            }
+            let mut diag = Diagnostic::error(expr.span(), msg);
             // Hint for the common slip of a SCALAR annotation on an ARRAY literal value
             // (`val x: UInt8 = [1, 2, 3]`). The annotation describes one scalar but the value
             // is an array; if the array's elements are compatible with the scalar, the user
@@ -1623,10 +1624,11 @@ impl Checker {
         if is_any_val(&ty) || self.types_compatible(&ty, expected) {
             Ok(typed)
         } else {
-            Err(Diagnostic::error(
-                body.span(),
-                format!("Expected type {}, got {}", expected, ty),
-            ))
+            let mut msg = format!("Expected type {}, got {}", expected, ty);
+            if let Some(breakdown) = self.explain_mismatch(&ty, expected) {
+                msg.push_str(&breakdown);
+            }
+            Err(Diagnostic::error(body.span(), msg))
         }
     }
 
