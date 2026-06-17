@@ -150,10 +150,11 @@ pub(crate) fn apply_type_subs(ty: &Type, subs: &std::collections::HashMap<u32, T
         // (the `value: U` of `mapOk(...): Result<U,E>`) leaves that field's TypeVar
         // unsubstituted even when `subs` binds it — so the call result stays
         // `{ value: ?U } | …` and an index of it degrades to `?U | Null`. Substitute
-        // through the fields, preserving the sealed marker.
-        Type::Object { fields, sealed } => Type::Object {
+        // through the fields, preserving the sealed marker and alias name.
+        Type::Object { fields, sealed, name } => Type::Object {
             fields: fields.iter().map(|(k, v)| (k.clone(), apply_type_subs(v, subs))).collect(),
             sealed: *sealed,
+            name: name.clone(),
         },
         Type::FixedArray(elems) => {
             Type::FixedArray(elems.iter().map(|t| apply_type_subs(t, subs)).collect())
@@ -403,7 +404,7 @@ pub(crate) fn first_mutable_global_in_body(
 /// they still get the patch, preserving the sealed-field-read optimization on the hot parse path.
 pub(crate) fn is_all_scalar_sealed_record(ty: &Type) -> bool {
     match ty {
-        Type::Object { fields, sealed: true } if !fields.is_empty() => fields.values().all(|f| {
+        Type::Object { fields, sealed: true, .. } if !fields.is_empty() => fields.values().all(|f| {
             matches!(
                 f,
                 Type::Bool
