@@ -451,13 +451,15 @@ impl Checker {
                 checked_against_declared = true;
                 let typed = self.check_expr(body, declared)?;
                 if !self.types_compatible(&typed.ty(), declared) {
-                    return Err(Diagnostic::error(
-                        span,
-                        format!(
-                            "Function body has type {}, declared return type is {}",
-                            typed.ty(), declared
-                        ),
-                    ));
+                    let body_ty = typed.ty();
+                    let mut msg = format!(
+                        "Function body has type {}, declared return type is {}",
+                        body_ty, declared
+                    );
+                    if let Some(breakdown) = self.explain_mismatch(&body_ty, declared) {
+                        msg.push_str(&breakdown);
+                    }
+                    return Err(Diagnostic::error(span, msg));
                 }
                 typed
             }
@@ -502,13 +504,14 @@ impl Checker {
                 && !checked_against_declared
                 && !self.types_compatible(&body_ty, &declared)
             {
-                return Err(Diagnostic::error(
-                    span,
-                    format!(
-                        "Function body has type {}, declared return type is {}",
-                        body_ty, declared
-                    ),
-                ));
+                let mut msg = format!(
+                    "Function body has type {}, declared return type is {}",
+                    body_ty, declared
+                );
+                if let Some(breakdown) = self.explain_mismatch(&body_ty, &declared) {
+                    msg.push_str(&breakdown);
+                }
+                return Err(Diagnostic::error(span, msg));
             }
             // When the declared return is an unsealed object but the body inferred a structurally
             // identical SEALED object, prefer the sealed type: the sealed repr is strictly better
@@ -805,13 +808,15 @@ impl Checker {
                 checked_against_declared = true;
                 let typed = self.check_expr(body, declared)?;
                 if !self.types_compatible(&typed.ty(), declared) {
-                    return Err(Diagnostic::error(
-                        span,
-                        format!(
-                            "Function body has type {}, declared return type is {}",
-                            typed.ty(), declared
-                        ),
-                    ));
+                    let body_ty = typed.ty();
+                    let mut msg = format!(
+                        "Function body has type {}, declared return type is {}",
+                        body_ty, declared
+                    );
+                    if let Some(breakdown) = self.explain_mismatch(&body_ty, declared) {
+                        msg.push_str(&breakdown);
+                    }
+                    return Err(Diagnostic::error(span, msg));
                 }
                 typed
             }
@@ -867,9 +872,14 @@ impl Checker {
 
         let ret_type = if let Some(declared) = declared_ret {
             if !checked_against_declared && !self.types_compatible(&body_ty, &declared) {
-                return Err(Diagnostic::error(span, format!(
-                    "Function body has type {}, declared return type is {}", body_ty, declared
-                )));
+                let mut msg = format!(
+                    "Function body has type {}, declared return type is {}",
+                    body_ty, declared
+                );
+                if let Some(breakdown) = self.explain_mismatch(&body_ty, &declared) {
+                    msg.push_str(&breakdown);
+                }
+                return Err(Diagnostic::error(span, msg));
             }
             declared
         } else if matches!(expected_ret, Type::TypeVar(id)

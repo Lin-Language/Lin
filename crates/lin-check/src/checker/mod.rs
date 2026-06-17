@@ -335,6 +335,31 @@ impl Checker {
         self.types_compatible(value, target)
     }
 
+    /// Render a drill-down breakdown of why `value` is not assignable to `target`, as an indented
+    /// tree to append to a mismatch diagnostic message. Returns None when there is no useful
+    /// structural breakdown (caller appends nothing).
+    pub(crate) fn explain_mismatch(&self, value: &Type, target: &Type) -> Option<String> {
+        let reasons = crate::compat::explain_incompatibility(
+            value,
+            target,
+            Some(&self.env),
+            self.lenient_json,
+        );
+        if reasons.is_empty() {
+            return None;
+        }
+        let mut out = String::new();
+        for (depth, r) in reasons.iter().enumerate() {
+            out.push('\n');
+            for _ in 0..(depth + 1) {
+                out.push_str("  ");
+            }
+            out.push_str("\u{21b3} ");
+            out.push_str(r);
+        }
+        Some(out)
+    }
+
     /// Collect all TypeVar IDs recursively from a type into `out`.
     fn collect_typevar_ids(ty: &Type, out: &mut std::collections::HashSet<u32>) {
         match ty {

@@ -373,6 +373,336 @@ fn includes_null(t: &Type) -> bool {
     }
 }
 
+/// Produce a top-down chain of human reasons explaining why `value` is not assignable to
+/// `target`. `reasons[0]` is the outermost cause; deeper entries are nested causes (TypeScript-
+/// style "...because..."). Returns an EMPTY vec when no structural sub-part can be named beyond
+/// what the caller already prints (pure scalar-vs-scalar, or a leaf vs a union-of-leaves) — the
+/// caller then appends nothing, keeping such messages byte-identical to today.
+pub fn explain_incompatibility(
+    value: &Type,
+    target: &Type,
+    env: Option<&TypeEnv>,
+    lenient_json: bool,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    explain_walk(value, target, env, lenient_json, 0, &mut reasons);
+    reasons
+}
+
+fn explain_walk(
+    value: &Type,
+    target: &Type,
+    env: Option<&TypeEnv>,
+    lenient_json: bool,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    if depth > 32 {
+        return;
+    }
+
+    // Unfold Named types one level on BOTH sides first, exactly like is_compatible_env.
+    if let Type::Named(n) = value {
+        if let Some(env) = env {
+            if let Some(decl) = env.lookup_type(n) {
+                if decl.params.is_empty() {
+                    explain_walk(&decl.body.clone(), target, Some(env), lenient_json, depth + 1, out);
+                    return;
+                }
+            }
+        }
+        // Named without env or with params: no useful sub-explanation.
+        return;
+    }
+    if let Type::Named(n) = target {
+        if let Some(env) = env {
+            if let Some(decl) = env.lookup_type(n) {
+                if decl.params.is_empty() {
+                    explain_walk(value, &decl.body.clone(), Some(env), lenient_json, depth + 1, out);
+                    return;
+                }
+            }
+        }
+        return;
+    }
+
+    match (value, target) {
+        // Value is a union: find the first variant that is NOT compatible with the target.
+        (Type::Union(vs), target) => {
+            let bad_variant = vs
+                .iter()
+                .find(|b| !is_compatible_env(b, target, env, lenient_json, &mut 0));
+            if let Some(b) = bad_variant {
+                if matches!(b, Type::Null) {
+                    out.push(format!("this can be `Null`, but `Null` is not assignable to `{target}`"));
+                } else {
+                    out.push(format!("the `{b}` case is not assignable to `{target}`"));
+                    // Recurse only for structural types to avoid restating the obvious.
+                    let is_structural = matches!(
+                        b,
+                        Type::Object { .. }
+                            | Type::Map { .. }
+                            | Type::Array(_)
+                            | Type::FixedArray(_)
+                            | Type::Function { .. }
+                            | Type::Iterator(_)
+                    );
+                    if is_structural {
+                        explain_walk(b, target, env, lenient_json, depth + 1, out);
+                    }
+                }
+            }
+        }
+
+        // Target is a union (value is not): value must be assignable to at least one variant.
+        (value, Type::Union(ts)) => {
+            let target_list = ts
+                .iter()
+                .map(|t| format!("`{t}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!("`{value}` is not assignable to any of: {target_list}"));
+        }
+
+        // Both Object: find the first target field that doesn't match.
+        (
+            Type::Object { fields: value_fields, .. },
+            Type::Object { fields: target_fields, .. },
+        ) => {
+            for (k, tf) in target_fields {
+                let value_field_ty = value_fields.get(k).cloned().unwrap_or(Type::Null);
+                if !is_compatible_env(&value_field_ty, tf, env, lenient_json, &mut 0) {
+                    if !value_fields.contains_key(k) {
+                        out.push(format!(
+                            "the field \"{k}\" (type `{tf}`) is required but missing"
+                        ));
+                    } else {
+                        out.push(format!("field \"{k}\" doesn't match:"));
+                        explain_walk(&value_field_ty, tf, env, lenient_json, depth + 1, out);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Both Map: check key, then value.
+        (
+            Type::Map { key: k1, value: v1 },
+            Type::Map { key: k2, value: v2 },
+        ) => {
+            if k1 != k2 {
+                out.push(format!("the key type `{k1}` doesn't match `{k2}`"));
+            } else {
+                out.push("the map value type doesn't match:".to_string());
+                explain_walk(v1, v2, env, lenient_json, depth + 1, out);
+            }
+        }
+
+        // Array / Array
+        (Type::Array(a), Type::Array(b)) => {
+            out.push("the element type doesn't match:".to_string());
+            explain_walk(a, b, env, lenient_json, depth + 1, out);
+        }
+
+        // FixedArray → Array: find the first element that doesn't match
+        (Type::FixedArray(elements), Type::Array(elem_ty)) => {
+            if let Some(e) = elements
+                .iter()
+                .find(|e| !is_compatible_env(e, elem_ty, env, lenient_json, &mut 0))
+            {
+                out.push("the element type doesn't match:".to_string());
+                explain_walk(e, elem_ty, env, lenient_json, depth + 1, out);
+            }
+        }
+
+        // Both FixedArray
+        (Type::FixedArray(a), Type::FixedArray(b)) => {
+            if a.len() != b.len() {
+                out.push(format!(
+                    "expected a {}-element tuple but found {}",
+                    b.len(),
+                    a.len()
+                ));
+            } else {
+                for (i, (av, bv)) in a.iter().zip(b.iter()).enumerate() {
+                    if !is_compatible_env(av, bv, env, lenient_json, &mut 0) {
+                        out.push(format!("element {i} doesn't match:"));
+                        explain_walk(av, bv, env, lenient_json, depth + 1, out);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Iterator / Iterator
+        (Type::Iterator(a), Type::Iterator(b)) => {
+            out.push("the element type doesn't match:".to_string());
+            explain_walk(a, b, env, lenient_json, depth + 1, out);
+        }
+
+        // Iterator value vs Array target
+        (Type::Iterator(v_elem), Type::Array(t_elem)) => {
+            out.push("the element type doesn't match:".to_string());
+            explain_walk(v_elem, t_elem, env, lenient_json, depth + 1, out);
+        }
+
+        // Both Function
+        (
+            Type::Function { params: vp, ret: vr, .. },
+            Type::Function { params: tp, ret: tr, .. },
+        ) => {
+            if vp.len() != tp.len() {
+                out.push(format!(
+                    "expected a function with {} parameter{} but found {}",
+                    tp.len(),
+                    if tp.len() == 1 { "" } else { "s" },
+                    vp.len()
+                ));
+            } else {
+                // Check params (contravariant: target param vs value param)
+                for (i, (vpi, tpi)) in vp.iter().zip(tp.iter()).enumerate() {
+                    if !is_compatible_env(tpi, vpi, env, lenient_json, &mut 0) {
+                        out.push(format!("parameter {} doesn't match:", i + 1));
+                        explain_walk(tpi, vpi, env, lenient_json, depth + 1, out);
+                        return;
+                    }
+                }
+                // Check return (covariant)
+                if !is_compatible_env(vr, tr, env, lenient_json, &mut 0) {
+                    out.push("the return type doesn't match:".to_string());
+                    explain_walk(vr, tr, env, lenient_json, depth + 1, out);
+                }
+            }
+        }
+
+        // Leaf types: push nothing (caller already shows both types).
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Type;
+
+    fn object(fields: Vec<(&str, Type)>) -> Type {
+        let map: indexmap::IndexMap<String, Type> = fields
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        Type::Object { fields: map, sealed: false, name: None }
+    }
+
+    fn map_type(key: Type, value: Type) -> Type {
+        Type::Map { key: Box::new(key), value: Box::new(value) }
+    }
+
+    fn union(vs: Vec<Type>) -> Type {
+        Type::flatten_union(vs)
+    }
+
+    #[test]
+    fn test_explain_union_with_null_into_map_union() {
+        // { String: UInt32 } | Null into { String: AnyVal } | {}
+        let value = union(vec![
+            map_type(Type::Str, Type::UInt32),
+            Type::Null,
+        ]);
+        let target = union(vec![
+            map_type(Type::Str, Type::TypeVar(u32::MAX)),
+            Type::Object { fields: indexmap::IndexMap::new(), sealed: false, name: None },
+        ]);
+        let reasons = explain_incompatibility(&value, &target, None, false);
+        assert!(!reasons.is_empty(), "expected a reason for union-with-Null mismatch");
+        assert!(
+            reasons.iter().any(|r| r.contains("Null")),
+            "expected Null mentioned, got: {:?}",
+            reasons
+        );
+    }
+
+    #[test]
+    fn test_explain_object_field_scalar_mismatch() {
+        // { "x": Int32 } into { "x": String }
+        let value = object(vec![("x", Type::Int32)]);
+        let target = object(vec![("x", Type::Str)]);
+        let reasons = explain_incompatibility(&value, &target, None, false);
+        assert!(!reasons.is_empty(), "expected reason for field mismatch");
+        assert!(
+            reasons[0].contains('"') && reasons[0].contains('x'),
+            "expected field name in reason, got: {:?}",
+            reasons
+        );
+    }
+
+    #[test]
+    fn test_explain_missing_required_field() {
+        // {} into { "name": String }
+        let value = object(vec![]);
+        let target = object(vec![("name", Type::Str)]);
+        let reasons = explain_incompatibility(&value, &target, None, false);
+        assert!(!reasons.is_empty());
+        assert!(
+            reasons[0].contains("required but missing"),
+            "got: {:?}",
+            reasons
+        );
+    }
+
+    #[test]
+    fn test_explain_map_value_mismatch() {
+        // { String: Int32 } into { String: String }
+        let value = map_type(Type::Str, Type::Int32);
+        let target = map_type(Type::Str, Type::Str);
+        let reasons = explain_incompatibility(&value, &target, None, false);
+        assert!(!reasons.is_empty());
+        assert!(
+            reasons[0].contains("map value"),
+            "got: {:?}",
+            reasons
+        );
+    }
+
+    #[test]
+    fn test_explain_array_element_mismatch() {
+        // Int32[] into String[]
+        let value = Type::Array(Box::new(Type::Int32));
+        let target = Type::Array(Box::new(Type::Str));
+        let reasons = explain_incompatibility(&value, &target, None, false);
+        assert!(!reasons.is_empty());
+        assert!(
+            reasons[0].contains("element type"),
+            "got: {:?}",
+            reasons
+        );
+    }
+
+    #[test]
+    fn test_explain_fixed_array_length_mismatch() {
+        // [Int32, Int32] into [String, String, String]
+        let value = Type::FixedArray(vec![Type::Int32, Type::Int32]);
+        let target = Type::FixedArray(vec![Type::Str, Type::Str, Type::Str]);
+        let reasons = explain_incompatibility(&value, &target, None, false);
+        assert!(!reasons.is_empty());
+        assert!(
+            reasons[0].contains("tuple"),
+            "got: {:?}",
+            reasons
+        );
+    }
+
+    #[test]
+    fn test_explain_scalar_vs_scalar_empty() {
+        // Int32 into String: no structural sub-reason
+        let reasons = explain_incompatibility(&Type::Int32, &Type::Str, None, false);
+        assert!(
+            reasons.is_empty(),
+            "expected empty reasons for scalar-vs-scalar, got: {:?}",
+            reasons
+        );
+    }
+}
+
 fn is_numeric_compatible(value: &Type, target: &Type) -> bool {
     let vw = value.bit_width().unwrap_or(0);
     let tw = target.bit_width().unwrap_or(0);
