@@ -8501,6 +8501,53 @@ print(b["name"])
     assert_eq!(heapf, vec!["new"]);
 }
 
+// Regression: compound index-set `outer["key"][int_key] = value` where the outer read produces a
+// `{ K: V } | Null` union type — codegen must route the integer key to the LinMap path
+// (`lin_map_set_int`), NOT the array path (`lin_array_set`). Likewise the read-back
+// `outer["key"][int_key]` must call `lin_map_get_int`, and the IR ownership convention for that
+// result must be `Borrow` (interior slot pointer) to avoid a scope-exit double-free.
+// Also covers the NKIND fix: narrow-integer sealed-record fields (UInt16/UInt32) use native-width
+// NKIND codes so `materialize_named_payload_to_map` reads the correct byte widths — the bug that
+// previously caused a misaligned pointer panic in `toBe` deep-equality on a sealed record held in
+// a `[Int32,Int32] | Rec` union map slot.
+#[test]
+fn test_sealed_union_map_int_key_compound_index() {
+    // Basic compound write-then-read through a nested typed Map with UInt8 key.
+    let basic = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Inner = { UInt8: String }
+type Outer = { String: Inner }
+var o: Outer = {}
+o["B"] = {}
+val k: UInt8 = 1
+o["B"][k] = "hello"
+val v = o["B"][k]
+print(toString(v))
+"#);
+    assert_eq!(basic, vec!["hello"]);
+
+    // Sealed record with narrow-integer fields (UInt16, UInt32) stored into a union-typed
+    // map slot `{ UInt8: [Int32,Int32] | Rec }`. `toBe` materializes both sides and compares
+    // all five fields. Previously crashed with misaligned pointer (NKIND bug) and then returned
+    // null for the actual (compound int-key map routing bug).
+    let sealed = run(r#"import { expect, toBe, test, suite, run } from "std/test"
+type Rec = { "origin": String, "destination": String, "duration": UInt16, "startTime": UInt32, "endTime": UInt32 }
+type Inner = { UInt8: [Int32, Int32] | Rec }
+type Outer = { String: Inner }
+val s = suite("s", [ test("sealed union map", () =>
+  val o: Outer = {}
+  val rec: Rec = { "origin": "A", "destination": "B", "duration": 120, "startTime": 0, "endTime": 86400 }
+  o["B"] = o["B"] ?? {}
+  val k: UInt8 = 1
+  o["B"][k] = rec
+  [ expect(o["B"][k]).toBe(rec) ]
+) ])
+run(s)
+"#);
+    assert!(sealed.last().map(|s| s.as_str()) == Some("1 passed"),
+        "expected '1 passed', got {:?}", sealed);
+}
+
 // Variants of the mutual-recursion-record-return fix: a multi-field sealed record, a boxed record
 // (a `AnyVal` field forces the boxed `LinObject` repr), a `String` return, and a scalar return
 // (the non-record case that always worked — a regression guard). All must round-trip correctly.
