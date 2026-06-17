@@ -14754,6 +14754,33 @@ print(m[1] ?? "?")
 }
 
 #[test]
+fn test_nested_int_keyed_map_literal_roundtrip() {
+    // Regression: an int-keyed map nested as the VALUE of an outer map was read back as null.
+    // Root cause: `o["B"]` yields `{ UInt8: Int32 } | Null` (union), and when the inner `[1]`
+    // index was compiled the codegen fell through to the `is_array_access` check (because
+    // `key_ty.is_numeric()` is true), calling `lin_array_get_tagged` on the unboxed LinMap*
+    // instead of `lin_map_get_int`. Both the literal-built and write-then-read variants are
+    // exercised here.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+// Literal-built nested int-keyed map: o["B"][1] must return 77.
+type Outer = { String: { UInt8: Int32 } }
+val o: Outer = { "B": { 1: 77 } }
+print(toString(o["B"][1] ?? -1))
+
+// Write-then-read: o2["B"][1] = 99 then read back must return 99.
+val o2: Outer = { "B": {} }
+o2["B"][1] = 99
+print(toString(o2["B"][1] ?? -1))
+
+// Missing key still returns null: o["B"][99] is absent.
+print(toString(o["B"][99] ?? -1))
+"#);
+    assert_eq!(output, vec!["77", "99", "-1"]);
+}
+
+#[test]
 fn test_check_accepts_valid_imported_symbol_program() {
     let (ok, output) = check_source(
         r#"import { trim } from "std/string"
