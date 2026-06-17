@@ -21058,3 +21058,22 @@ val r = trim(a)
         output
     );
 }
+
+/// The drill-down must also fire on ASSIGNMENT / annotation mismatches (the `check_expr` against
+/// an expected type path), not just call arguments and returns. Regression for extending the
+/// breakdown to `Expected type X, got Y` sites.
+#[test]
+fn test_check_drill_down_assignment_union_null() {
+    let (ok, output) = check_source(
+        r#"type M = { String: UInt32 }
+val m: { UInt8: M } = {}
+val a: M = m[0]
+"#,
+    );
+    assert!(!ok, "expected type error, got:\n{}", output);
+    assert!(
+        output.contains("\u{21b3}") && output.contains("Null"),
+        "expected an assignment-site drill-down mentioning Null, got:\n{}",
+        output
+    );
+}
