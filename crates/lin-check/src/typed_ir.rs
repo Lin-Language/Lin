@@ -119,6 +119,11 @@ pub struct ImportSlot {
     pub name: String,
     pub slot: usize,
     pub ty: Type,
+    /// For an imported member of a function overload set (ADR-074), the exact mangled symbol the
+    /// exporting module emitted (`base$tokens_slot`). Lowering forms the `Named` call target
+    /// `{module_key}_{symbol}` from it instead of from `name`. `None` for ordinary imports.
+    #[serde(default)]
+    pub symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

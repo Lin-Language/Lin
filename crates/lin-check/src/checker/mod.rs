@@ -35,6 +35,11 @@ pub struct Checker {
     /// Pre-resolved import types: (module_path, export_name) -> Type.
     /// When set, used instead of fresh TypeVars for import bindings.
     pub import_types: std::collections::HashMap<(String, String), Type>,
+    /// Imported function overload sets (ADR-074 cross-module): (module_path, name) → all members
+    /// as (function type, mangled emitted symbol). Seeded from `ModuleSignature.overloads`. When an
+    /// imported name appears here it is registered as an overload set in the env, so the ordinary
+    /// call-site overload resolution applies and each member lowers to its own `Named` target.
+    pub import_overloads: std::collections::HashMap<(String, String), Vec<(Type, String)>>,
     /// Stdlib export index: export-name -> list of stdlib module paths that export it. Used to
     /// suggest the RIGHT module when an `import { x } from "m"` names an `x` that `m` doesn't
     /// export but some other stdlib module does (e.g. `gunzip` lives in `std/compress`).
@@ -158,6 +163,7 @@ impl Checker {
             function_scope_depths: Vec::new(),
             span_type_map: Vec::new(),
             import_types: std::collections::HashMap::new(),
+            import_overloads: std::collections::HashMap::new(),
             stdlib_export_index: std::collections::HashMap::new(),
             import_type_decls: std::collections::HashMap::new(),
             fully_resolved_import_paths: std::collections::HashSet::new(),

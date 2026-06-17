@@ -1628,7 +1628,7 @@ fn rehome_import_binding(
     } else {
         state.rehomed_imports.push(TypedStmt::Import {
             path: origin_path.to_string(),
-            bindings: vec![ImportSlot { name: name.to_string(), slot: fresh, ty }],
+            bindings: vec![ImportSlot { name: name.to_string(), slot: fresh, ty, symbol: None }],
             span,
         });
     }
