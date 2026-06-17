@@ -3,7 +3,7 @@ use lin_parse::ast::{Expr, Stmt};
 
 use super::Checker;
 use super::helpers::{empty_literal_kind, is_legal_ffi_type};
-use crate::resolve::resolve_type;
+use crate::resolve::resolve_type_spanned;
 use crate::typed_ir::*;
 use crate::types::Type;
 
@@ -74,9 +74,9 @@ impl Checker {
             } => {
                 let expected = type_ann
                     .as_ref()
-                    .map(|t| resolve_type(t, &self.env))
+                    .map(|t| resolve_type_spanned(t, &self.env))
                     .transpose()
-                    .map_err(|e| Diagnostic::error(*span, e))?;
+                    .map_err(|(s, e)| Diagnostic::error(s, e))?;
 
                 // Extract the binding name for function name propagation (TCO, direct calls).
                 let binding_name = match pattern {
@@ -247,9 +247,9 @@ impl Checker {
             } => {
                 let expected = type_ann
                     .as_ref()
-                    .map(|t| resolve_type(t, &self.env))
+                    .map(|t| resolve_type_spanned(t, &self.env))
                     .transpose()
-                    .map_err(|e| Diagnostic::error(*span, e))?;
+                    .map_err(|(s, e)| Diagnostic::error(s, e))?;
 
                 let typed_value = if let Some(ref expected_ty) = expected {
                     self.check_expr(value, expected_ty)?
@@ -294,7 +294,7 @@ impl Checker {
                 name,
                 params,
                 body,
-                span,
+                span: _span,
                 ..
             } => {
                 // The placeholder was registered in forward_declare_types.
@@ -308,7 +308,7 @@ impl Checker {
                 // same cycle guard used for the alias's own self-references. Without this, a bare
                 // `T` in the body resolves as `Unknown type 'T'` and the body is never stored.
                 let resolved = if params.is_empty() {
-                    resolve_type(body, &self.env).map_err(|e| Diagnostic::error(*span, e))?
+                    resolve_type_spanned(body, &self.env).map_err(|(s, e)| Diagnostic::error(s, e))?
                 } else {
                     let mut scratch = self.env.clone();
                     for param in params {
@@ -318,7 +318,7 @@ impl Checker {
                             Type::Named(param.clone()),
                         );
                     }
-                    resolve_type(body, &scratch).map_err(|e| Diagnostic::error(*span, e))?
+                    resolve_type_spanned(body, &scratch).map_err(|(s, e)| Diagnostic::error(s, e))?
                 };
                 self.env
                     .define_type(name.clone(), params.clone(), resolved);
@@ -394,8 +394,8 @@ impl Checker {
                 let is_runtime = path == "lin-runtime";
                 let mut foreign_slots = Vec::new();
                 for binding in bindings {
-                    let ty = resolve_type(&binding.type_ann, &self.env)
-                        .map_err(|e| Diagnostic::error(binding.span, e))?;
+                    let ty = resolve_type_spanned(&binding.type_ann, &self.env)
+                        .map_err(|(s, e)| Diagnostic::error(s, e))?;
                     // "lin-runtime" is a reserved internal path — skip FFI type validation
                     // since runtime functions use Array/Object which aren't valid in user FFI.
                     let valid = is_runtime || is_legal_ffi_type(&ty);

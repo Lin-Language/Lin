@@ -1,9 +1,20 @@
 use indexmap::IndexMap;
+use lin_common::Span;
 use lin_parse::ast::TypeExpr;
 use crate::env::TypeEnv;
 use crate::types::Type;
 
+/// Resolve a type expression, returning `Ok(Type)` on success or `Err(String)` on failure.
+/// The error string does NOT carry span information — all existing callers that need a plain
+/// `String` error (e.g. `function.rs`, `call.rs`) use this.
 pub fn resolve_type(type_expr: &TypeExpr, env: &TypeEnv) -> Result<Type, String> {
+    resolve_type_spanned(type_expr, env).map_err(|(_, m)| m)
+}
+
+/// Resolve a type expression, returning `Ok(Type)` on success or `Err((Span, String))` on
+/// failure.  The span in the error points at the offending leaf type-expression (e.g. the
+/// `Unknown type 'X'` span points at the `X` token, not the surrounding declaration).
+pub fn resolve_type_spanned(type_expr: &TypeExpr, env: &TypeEnv) -> Result<Type, (Span, String)> {
     resolve_type_inner(type_expr, env, &mut std::collections::HashSet::new())
 }
 
@@ -11,29 +22,31 @@ fn resolve_type_inner(
     type_expr: &TypeExpr,
     env: &TypeEnv,
     visiting: &mut std::collections::HashSet<String>,
-) -> Result<Type, String> {
+) -> Result<Type, (Span, String)> {
     match type_expr {
-        TypeExpr::Named(name, _span) => resolve_named_cycle(name, env, visiting),
-        TypeExpr::Generic(name, args, _span) => {
-            let resolved_args: Result<Vec<Type>, String> =
+        TypeExpr::Named(name, span) => {
+            resolve_named_cycle(name, env, visiting).map_err(|m| (*span, m))
+        }
+        TypeExpr::Generic(name, args, span) => {
+            let resolved_args: Result<Vec<Type>, (Span, String)> =
                 args.iter().map(|a| resolve_type_inner(a, env, visiting)).collect();
-            resolve_generic(name, &resolved_args?, env, visiting)
+            resolve_generic(name, &resolved_args?, env, visiting).map_err(|m| (*span, m))
         }
         TypeExpr::Array(inner, _span) => {
             let inner_ty = resolve_type_inner(inner, env, visiting)?;
             Ok(Type::Array(Box::new(inner_ty)))
         }
         TypeExpr::FixedArray(types, _span) => {
-            let resolved: Result<Vec<Type>, String> =
+            let resolved: Result<Vec<Type>, (Span, String)> =
                 types.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::FixedArray(resolved?))
         }
         TypeExpr::Union(types, _span) => {
-            let resolved: Result<Vec<Type>, String> =
+            let resolved: Result<Vec<Type>, (Span, String)> =
                 types.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::flatten_union(resolved?))
         }
-        TypeExpr::Intersection(operands, _span) => {
+        TypeExpr::Intersection(operands, span) => {
             // Record intersection `A & B` (ADR-061): record-only. Each operand must resolve to an
             // object/record type; the result is a plain `Type::Object` with the UNION of their
             // fields. A field present in more than one operand must have the SAME type (dedup) or
@@ -46,19 +59,19 @@ fn resolve_type_inner(
                 let fields = match &ty {
                     Type::Object { fields, .. } => fields,
                     other => {
-                        return Err(format!(
+                        return Err((*span, format!(
                             "intersection `&` is only valid between record types; operand `{}` is not a record",
                             other
-                        ));
+                        )));
                     }
                 };
                 for (key, field_ty) in fields {
                     if let Some(existing) = merged.get(key) {
                         if existing != field_ty {
-                            return Err(format!(
+                            return Err((*span, format!(
                                 "intersection type has conflicting field \"{}\": {} vs {}",
                                 key, existing, field_ty
-                            ));
+                            )));
                         }
                     } else {
                         merged.insert(key.clone(), field_ty.clone());
@@ -68,7 +81,7 @@ fn resolve_type_inner(
             Ok(Type::object(merged))
         }
         TypeExpr::Function(params, ret, _span) => {
-            let param_types: Result<Vec<Type>, String> =
+            let param_types: Result<Vec<Type>, (Span, String)> =
                 params.iter().map(|p| resolve_type_inner(p, env, visiting)).collect();
             let ret_type = resolve_type_inner(ret, env, visiting)?;
             // Type annotations cannot express default arguments, so every declared
@@ -86,7 +99,7 @@ fn resolve_type_inner(
             }
             Ok(Type::object(resolved))
         }
-        TypeExpr::IndexSig(key, value, _span) => {
+        TypeExpr::IndexSig(key, value, span) => {
             // `{ K: V }` — index-signature form. The key type-expr (which may be a type alias) is
             // resolved here, where aliases are expanded, and dispatches on what it denotes:
             //
@@ -127,15 +140,15 @@ fn resolve_type_inner(
                 }
                 Ok(Type::object(fields))
             } else {
-                Err(format!(
+                Err((*span, format!(
                     "Index-signature key type must be String, an integer type, or a union of string \
                      literals, but it resolves to {}",
                     key_ty
-                ))
+                )))
             }
         }
         TypeExpr::TaggedUnion(variants, _span) => {
-            let resolved: Result<Vec<Type>, String> =
+            let resolved: Result<Vec<Type>, (Span, String)> =
                 variants.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::flatten_union(resolved?))
         }
@@ -600,5 +613,41 @@ mod sealed_marker_tests {
         // And structural compatibility (invariant 1) is symmetric and unaffected.
         assert!(crate::compat::is_compatible(&sealed, &unsealed));
         assert!(crate::compat::is_compatible(&unsealed, &sealed));
+    }
+
+    /// `resolve_type_spanned` must return the span of the offending leaf type-expression, not a
+    /// dummy or enclosing span.  For `{ bestArrivals: Arrivals }` (an IndexSig whose key is the
+    /// unknown type `bestArrivals`), the error span must equal the KEY span, not the outer IndexSig
+    /// span.  This regression test pins that behaviour.
+    #[test]
+    fn resolve_type_spanned_points_at_offending_leaf() {
+        // KEY_SPAN: a distinctive non-zero, non-dummy span representing the `bestArrivals` token.
+        let key_span = Span::new(1, 10, 22);
+        // VAL_SPAN: a different span for the value type (Arrivals) — unused in this test since the
+        // key fails first, but kept distinct to prove the key span is what we get back.
+        let val_span = Span::new(1, 24, 32);
+        let outer_span = Span::new(1, 0, 40);
+
+        // `{ bestArrivals: Arrivals }` — IndexSig with unknown key type "bestArrivals".
+        let te = TypeExpr::IndexSig(
+            Box::new(TypeExpr::Named("bestArrivals".into(), key_span)),
+            Box::new(TypeExpr::Named("Arrivals".into(), val_span)),
+            outer_span,
+        );
+        let env = TypeEnv::new();
+
+        // resolve_type_spanned must return an Err whose span == KEY_SPAN (not val_span or
+        // outer_span) and whose message mentions "bestArrivals".
+        let err = resolve_type_spanned(&te, &env).unwrap_err();
+        assert_eq!(err.0, key_span, "error span must point at the offending key leaf");
+        assert!(
+            err.1.contains("bestArrivals"),
+            "error message must name the offending type; got: {}",
+            err.1
+        );
+
+        // resolve_type (the backwards-compat shim) must still return the same message string.
+        let plain_err = resolve_type(&te, &env).unwrap_err();
+        assert_eq!(plain_err, err.1, "resolve_type must return the same message as resolve_type_spanned");
     }
 }
