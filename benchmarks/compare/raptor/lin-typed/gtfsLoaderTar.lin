@@ -71,10 +71,10 @@ val makeTransfer = (origin: String, destination: String, duration: Int32, startT
   }
 
 // Map a CSV header row (split column names) to each column's index.
-val indexOfColumns = (header: String[]): { String: Int32 } =>
+val indexOfColumns = (headerRow: String[]): { String: Int32 } =>
   var idx: { String: Int32 } = {}
   var i = 0
-  header.for(name =>
+  headerRow.for(name =>
     idx[name] = i
     i = i + 1
   )
