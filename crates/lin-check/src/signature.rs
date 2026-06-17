@@ -42,11 +42,15 @@ impl ModuleSignature {
         for stmt in &module.statements {
             if let TypedStmt::Val { name: Some(n), ty, value, .. } = stmt {
                 exports.insert(n.clone(), ty.clone());
-                let symbol = match value {
-                    TypedExpr::Function { name: Some(sym), .. } => sym.clone(),
-                    _ => n.clone(),
-                };
-                grouped.entry(n.clone()).or_default().push(OverloadExport { ty: ty.clone(), symbol });
+                // Only FUNCTION definitions form overload sets (matching the env's rule). A repeated
+                // non-function name is ordinary shadowing — last wins, recorded only in `exports`.
+                if let TypedExpr::Function { name, .. } = value {
+                    let symbol = name.clone().unwrap_or_else(|| n.clone());
+                    grouped
+                        .entry(n.clone())
+                        .or_default()
+                        .push(OverloadExport { ty: ty.clone(), symbol });
+                }
             }
         }
         // The HashMap insert above keeps only the LAST definition per name; for overloaded names the
