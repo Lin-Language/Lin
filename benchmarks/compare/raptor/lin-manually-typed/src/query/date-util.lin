@@ -1,9 +1,9 @@
-import { Date, toISOString } from "std/datetime"
+import { Date } from "std/datetime"
+import { padStart, toString } from "std/string"
+import { parseUInt32 } from "std/number"
 
 // 
 // Convert a Date object into a numeric representation e.g. 20190417
 // 
 export val getDateNumber = (date: Date): UInt32 =>
-  val str = date.toISOString()
-
-  parseUInt32("${ str.slice(0, 4) }${ str.slice(5, 7) }${str.slice(8, 10) })
+  parseUInt32("${ date["year"] }${ date["month"].toString().padStart(2, "0") }${ date["day"].toString().padStart(2, "0") }")

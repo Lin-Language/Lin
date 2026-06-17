@@ -3,5 +3,5 @@ source: crates/lin-check/tests/snapshots.rs
 expression: errors
 ---
 [
-    "Expected type { \"x\": Int32, \"y\": Int32 }, got { \"x\": Int32 }",
+    "Expected type Point, got { \"x\": Int32 }",
 ]

@@ -10,7 +10,7 @@ use super::*;
 /// (non-union, non-void) return type, the closure is compiled to return that concrete type
 /// (so an AST-compiled higher-order callee receives a raw value), bypassing the uniform
 /// boxed-return ABI.
-pub fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     if let (TypedExpr::Function { name, params, body, ret_type, captures, .. },
             Some(Type::Function { params: cb_params, ret: cb_ret, .. })) = (a, param_ty)
     {
@@ -64,7 +64,7 @@ pub fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut Func
 /// ownership of the boxed-stream pointer, so the caller must NOT release it at scope exit.
 /// Unregister the lowered arg temp from the caller's owning scope. The affine check guarantees
 /// the caller never uses it again. No-op for non-stream args.
-pub fn move_streamish_arg(arg_ty: &Type, t: Temp, builder: &mut FuncBuilder) {
+pub(crate) fn move_streamish_arg(arg_ty: &Type, t: Temp, builder: &mut FuncBuilder) {
     if type_is_streamish_ir(arg_ty) {
         builder.unregister_owned(t);
     }
@@ -88,7 +88,7 @@ pub fn move_streamish_arg(arg_ty: &Type, t: Temp, builder: &mut FuncBuilder) {
 /// (The generic path's `lower_coerce_arg` still PROJECTS correctly for the cases this misses, e.g.
 /// a non-literal sealed-compatible value flowing into a `Named` param — this is only the
 /// construction fast path.)
-pub fn try_lower_sealed_literal_into_named(
+pub(crate) fn try_lower_sealed_literal_into_named(
     a: &TypedExpr,
     param_ty: Option<&Type>,
     builder: &mut FuncBuilder,
@@ -113,7 +113,7 @@ pub fn try_lower_sealed_literal_into_named(
     try_lower_sealed_literal(a, &sealed_ty, builder, ctx)
 }
 
-pub fn lower_call_arg_tracked(
+pub(crate) fn lower_call_arg_tracked(
     a: &TypedExpr,
     param_ty: Option<&Type>,
     i: usize,
@@ -145,7 +145,7 @@ pub fn lower_call_arg_tracked(
     (lower_call_arg(a, param_ty, builder, ctx), None)
 }
 
-pub fn lower_call(
+pub(crate) fn lower_call(
     func: &TypedExpr,
     args: &[TypedExpr],
     result_type: &Type,
@@ -564,7 +564,7 @@ pub fn lower_call(
     dst
 }
 
-pub fn lower_intrinsic_call(
+pub(crate) fn lower_intrinsic_call(
     name: &str,
     args: &[TypedExpr],
     result_type: &Type,
@@ -767,7 +767,7 @@ pub fn lower_intrinsic_call(
 // -------------------------------------------------------------------------
 
 /// The element type produced by iterating a value of `iterable_ty`.
-pub fn iter_elem_type(iterable_ty: &Type) -> Type {
+pub(crate) fn iter_elem_type(iterable_ty: &Type) -> Type {
     match iterable_ty {
         Type::Array(t) | Type::Iterator(t) => (**t).clone(),
         Type::FixedArray(ts) => ts.first().cloned().unwrap_or(Type::Null),
@@ -794,7 +794,7 @@ pub fn iter_elem_type(iterable_ty: &Type) -> Type {
 /// here we re-route the runtime dispatch to the lazy backend so the typed-stream result is backed
 /// by an actual lazy pipeline. The eager pure-Lin / `lin_map` bodies are bypassed entirely for a
 /// stream receiver.
-pub fn stream_combinator_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'static str> {
+pub(crate) fn stream_combinator_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'static str> {
     let export = sym.strip_prefix("std_iter_")?;
     // The receiver must be DEFINITELY a stream — not a mixed `Array | Iterator | Stream` union
     // (which would mean the eager array body must still run). A bare `Stream(_)` is the only shape
@@ -844,7 +844,7 @@ pub fn stream_combinator_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option
 /// packed/concrete `Array(elem)` receiver in place are redirected. `map`/`filter`/`reduce` already
 /// reach their inline `lower_*` path (they are generic `<T>`, not `Json`), so they are left alone —
 /// the redirect targets the `Json`-typed ops (`for`, `length`) that force the whole-array box.
-pub fn packed_array_combinator_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'static str> {
+pub(crate) fn packed_array_combinator_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'static str> {
     // The receiver must be a PACKED sealed-scalar array; only then is the redirect a win (and sound:
     // the intrinsic lowering reads the packed buffer directly via the same `is_sealed_scalar_array`
     // gate the codegen `Index`/`Length` paths honour).
@@ -872,7 +872,7 @@ pub fn packed_array_combinator_intrinsic_name(sym: &str, args: &[TypedExpr]) -> 
 /// dynamic fallback (concrete array / string / object / map). A `Json`/union/TypeVar receiver
 /// keeps the Named-call path (no behaviour change). `push` additionally requires a concrete
 /// `Array` receiver (the intrinsic's element-coercion is keyed on the array's element type).
-pub fn array_op_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'static str> {
+pub(crate) fn array_op_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'static str> {
     let export = sym.strip_prefix("std_array_")?;
     let recv_ty = args.first().map(|a| a.ty())?;
     // Concrete (statically-resolved) receiver whose `lin_length` intrinsic branch emits a FAITHFUL
@@ -897,7 +897,7 @@ pub fn array_op_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'static
     }
 }
 
-pub fn safe_combinator_callback_index(name: &str) -> Option<usize> {
+pub(crate) fn safe_combinator_callback_index(name: &str) -> Option<usize> {
     match name {
         "for" | "while" | "map" | "filter" | "find" | "some" | "every" => Some(1),
         "reduce" => Some(2),
@@ -913,7 +913,7 @@ pub fn safe_combinator_callback_index(name: &str) -> Option<usize> {
 /// callers that mark the context safe; every other use of a closure (binding, return, store,
 /// async/worker, unknown callee, or even another arg position) leaves the depth at 0, so the
 /// captured cell is conservatively marked escaping and never freed.
-pub fn lower_callback_in_safe_ctx(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+pub(crate) fn lower_callback_in_safe_ctx(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     ctx.safe_callback_depth += 1;
     let t = lower_expr(expr, builder, ctx);
     ctx.safe_callback_depth -= 1;
@@ -922,7 +922,7 @@ pub fn lower_callback_in_safe_ctx(expr: &TypedExpr, builder: &mut FuncBuilder, c
 
 /// The declared parameter types and return type of a callback expression, if it has a
 /// statically-known `Function` type. Used to match the closure's compiled ABI when calling it.
-pub fn callback_signature(expr: &TypedExpr) -> (Vec<Type>, Type) {
+pub(crate) fn callback_signature(expr: &TypedExpr) -> (Vec<Type>, Type) {
     match expr.ty() {
         Type::Function { params, ret, .. } => (params, *ret),
         _ => (vec![], Type::TypeVar(u32::MAX)),
