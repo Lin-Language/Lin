@@ -5,7 +5,7 @@ Lin pairs a minimalist syntax with a maximalist standard library — dot-applica
 ## Why Lin?
 
 ### Functional, reads like OO
-`a.f(b)` is exactly `f(a, b)` — dot-application, not methods. Functions are free-standing, first-class verbs you compose and partially apply, yet you call them noun-first, so `users.filter(...).map(...)` reads top-to-bottom and autocompletes like a method chain. It's functional programming with the call-site ergonomics OO is loved for — no classes to route every verb through, and no [kingdom of nouns](https://steve-yegge.blogspot.com/2006/03/execution-in-kingdom-of-nouns.html).
+`a.f(b)` is exactly `f(a, b)` — dot-application, not methods. Functions are free-standing, first-class verbs you compose and partially apply, yet you call them noun-first, so `users.filter(...).map(...)` reads top-to-bottom and autocompletes like a method chain. It's functional programming with the call-site ergonomics of OO — no classes to route every verb through, and no [kingdom of nouns](https://steve-yegge.blogspot.com/2006/03/execution-in-kingdom-of-nouns.html).
 
 ### Structural typing, no classes
 Types are shapes, not hierarchies — and the shapes are JSON. Records compose with `&` and vary with `|`; a `{ "name": String, "age": Int32 }` goes anywhere that shape is expected, generics stay zero-cost, and exhaustiveness checking keeps every `match` honest.
