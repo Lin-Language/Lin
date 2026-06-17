@@ -2064,9 +2064,9 @@ val dx = true
 print(toString(!!dx == dx))
 print(toString(!!false))
 
-// typevar_operand: `!flag` where `flag` flows through a generic lambda parameter exercises the
+// typevar_operand: `!b` where `b` flows through a generic lambda parameter exercises the
 // unbox-to-i1 path in IR lowering.
-val negate = (flag) => !flag
+val negate = (b) => !b
 print(toString(negate(true)))
 print(toString(negate(false)))
 "#);
@@ -2815,11 +2815,11 @@ val f = (m: M, k: UInt32): Boolean => m[k] ?? false
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 type M = { String: Boolean }
-var m: M = {}
-m["x"] = true
-val f = (m: M, k: String): Boolean => m[k] ?? false
-print(toString(f(m, "x")))
-print(toString(f(m, "y")))
+var store: M = {}
+store["x"] = true
+val f = (tbl: M, k: String): Boolean => tbl[k] ?? false
+print(toString(f(store, "x")))
+print(toString(f(store, "y")))
 "#);
     assert_eq!(output, vec!["true", "false"]);
 }
@@ -21074,6 +21074,95 @@ val a: M = m[0]
     assert!(
         output.contains("\u{21b3}") && output.contains("Null"),
         "expected an assignment-site drill-down mentioning Null, got:\n{}",
+        output
+    );
+}
+
+// ── ADR-077: inner-scope shadowing is a hard error ──────────────────────────
+
+/// A nested `val` that reuses an outer `val` name is a compile-time error.
+#[test]
+fn test_shadowing_nested_val_is_rejected() {
+    // `y` is bound in the outer scope; the inner lambda tries to rebind it.
+    let (ok, output) = check_source(
+        r#"import { print } from "std/io"
+val y = 1
+val f = (): Int32 =>
+  val y = 2
+  y
+print("${f()}")
+"#,
+    );
+    assert!(
+        !ok,
+        "expected shadowing to be rejected, but it compiled:\n{}",
+        output
+    );
+    assert!(
+        output.contains("shadows a binding from an enclosing scope"),
+        "expected the shadowing diagnostic, got:\n{}",
+        output
+    );
+}
+
+/// A lambda parameter that reuses an outer binding name is a compile-time error.
+#[test]
+fn test_shadowing_lambda_param_is_rejected() {
+    // `x` is bound at module level; the lambda parameter `x` shadows it.
+    let (ok, output) = check_source(
+        r#"import { print } from "std/io"
+val x = 1
+val result = [1, 2, 3].map(x => x + 1)
+"#,
+    );
+    assert!(
+        !ok,
+        "expected shadowing of outer `x` by lambda param to be rejected:\n{}",
+        output
+    );
+    assert!(
+        output.contains("shadows a binding from an enclosing scope"),
+        "expected the shadowing diagnostic, got:\n{}",
+        output
+    );
+}
+
+/// Sibling lambdas may reuse the same parameter name — only inner-shadows-outer is forbidden.
+#[test]
+fn test_shadowing_sibling_lambdas_same_param_accepted() {
+    // Two sibling `.map` / `.filter` chains both use `x` as their param: no shadowing.
+    let (ok, output) = check_source(
+        r#"import { map, filter } from "std/iter"
+val result = [1, 2, 3].map(x => x * 2).filter(x => x > 2)
+"#,
+    );
+    assert!(
+        ok,
+        "expected sibling-lambda param reuse to be accepted, but it failed:\n{}",
+        output
+    );
+}
+
+/// A `val` in the same scope that binds a name already bound at that scope level is still
+/// accepted (same-scope redefinition is not shadowing — it is sequencing in the same block).
+#[test]
+fn test_shadowing_same_scope_reuse_accepted() {
+    // Both `val n` bindings are in the *same* block scope; the second is a sequenced rebind,
+    // not an inner-scope shadow.
+    let (ok, output) = check_source(
+        r#"import { print } from "std/io"
+val f = (): Int32 =>
+  val n = 1
+  val n = 2
+  n
+print("${f()}")
+"#,
+    );
+    // Same-scope rebind is currently accepted (not a shadowing error). If the language later
+    // disallows it this test should be updated to assert !ok.
+    assert!(
+        ok,
+        "expected same-scope rebind to be accepted (not a shadowing error), got:\n{}",
         output
     );
 }

@@ -287,6 +287,10 @@ impl Checker {
                 }
             };
 
+            // Check for shadowing before defining the parameter slot.
+            if let Some(ns) = name_span {
+                self.check_shadowing(&name, ns);
+            }
             let slot = self.env.define_at(name.clone(), ty.clone(), false, name_span);
             // Record a definition-site type entry for this parameter (LSP inlay hints). The `ty`
             // may still be an unsolved TypeVar here; it is zonked to its final solution when
@@ -315,12 +319,16 @@ impl Checker {
                         obj_fields.get(&key).cloned().unwrap_or(Type::Null)
                     } else { Type::TypeVar(u32::MAX) };
                     let fslot = match &f.pattern {
-                        Pattern::Ident(fname, _) => self.env.define(fname.clone(), field_ty.clone(), false),
+                        Pattern::Ident(fname, fspan) => {
+                            self.check_shadowing(fname, *fspan);
+                            self.env.define(fname.clone(), field_ty.clone(), false)
+                        }
                         _ => self.env.define("_".to_string(), field_ty.clone(), false),
                     };
                     typed_fields.push((key, fslot, field_ty));
                 }
                 let rest_slot = if let Some(rest_name) = obj_rest {
+                    self.check_shadowing(rest_name, span);
                     let rslot = self.env.define(rest_name.clone(), Type::TypeVar(u32::MAX), false);
                     Some(rslot)
                 } else { None };
@@ -642,6 +650,9 @@ impl Checker {
                 }
             };
 
+            if let Some(ns) = name_span {
+                self.check_shadowing(&name, ns);
+            }
             let slot = self.env.define(name.clone(), ty.clone(), false);
             // Record a definition-site type entry for this parameter (LSP inlay hints). Here `ty`
             // is usually already the resolved hint from the call context (e.g. a `for` callback's
@@ -664,12 +675,16 @@ impl Checker {
                         obj_fields.get(&key).cloned().unwrap_or(Type::Null)
                     } else { Type::TypeVar(u32::MAX) };
                     let fslot = match &f.pattern {
-                        Pattern::Ident(fname, _) => self.env.define(fname.clone(), field_ty.clone(), false),
+                        Pattern::Ident(fname, fspan) => {
+                            self.check_shadowing(fname, *fspan);
+                            self.env.define(fname.clone(), field_ty.clone(), false)
+                        }
                         _ => self.env.define("_".to_string(), field_ty.clone(), false),
                     };
                     typed_fields.push((key, fslot, field_ty));
                 }
                 let rest_slot = if let Some(rest_name) = obj_rest {
+                    self.check_shadowing(rest_name, span);
                     Some(self.env.define(rest_name.clone(), Type::TypeVar(u32::MAX), false))
                 } else { None };
                 param_destr_stmts.push(TypedStmt::Destructure {

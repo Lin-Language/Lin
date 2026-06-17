@@ -3035,3 +3035,46 @@ tie-break is deliberately conservative — it differentiates *only* numeric wide
 ambiguity (records, unions, generics already handled at the specificity tier) exactly as ADR-074 left it.
 Spec §14.6 notes the numeric preference. Regression tests cover same-signedness selection, signed/unsigned
 selection of the incomparable pair, and the unchanged record-ambiguity error.
+
+## ADR-077: Inner-scope shadowing is a hard compile-time error
+
+**Status**: Accepted.
+
+**Context**: Prior to this ADR, a binding introduced in a nested scope (a lambda body, an `if`/`match`
+arm, an inner function parameter) could reuse any name already visible from an enclosing scope without
+warning. ADR-074 noted that "shadowing rules for values … [are] a precedent for overloading" and left the
+door open, but practical experience showed that accidental shadowing is a common source of subtle bugs:
+a developer adds an import or a top-level `val`, forgets an inner binding of the same name, and silently
+changes which value the inner scope references.
+
+**Decision**: Reuse of an outer binding's name in a strictly inner scope is a **hard compile-time error**:
+`"<name> shadows a binding from an enclosing scope"`. The restriction applies to:
+- `val` / `var` bindings whose enclosing block already has the name in scope.
+- Function and lambda parameters that match a name visible in the enclosing scope.
+- Destructuring pattern bindings (object-field captures, rest-bindings, match-arm captures).
+
+The restriction does **not** apply to:
+- **Same-scope sequential rebinding** — two `val x` statements in the same block are not inner-shadows-
+  outer; the second merely updates the environment at the same depth.
+- **Sibling-scope reuse** — two adjacent lambdas (e.g. `.map(x => …).filter(x => …)`) each start a
+  fresh scope at the same nesting depth; neither shadows the other.
+- **Synthetic / internal names** — names beginning with `__destr_`, `__param_`, `$`, or `lin_`, and
+  the wildcard `_`, are exempt (these are compiler-generated or intentionally throwaway).
+- **Forward-declared recursive bindings** — a function body that references its own pre-scanned slot
+  is exempt (the slot was placed by the pre-scan, not by an inner definition shadowing an outer one).
+
+This reverses the implicit permissiveness noted in ADR-074 ("shadowing rules for values"). ADR-074's
+actual feature (function overloading) is orthogonal and unaffected: overloaded functions in the **same**
+scope all live in the same overload set, which is a different mechanism from inner-scope shadowing.
+
+**Implementation**: `Checker::check_shadowing` in `crates/lin-check/src/checker/mod.rs` compares the
+`def_depth` of any found binding against the current innermost scope depth. A binding found at a strictly
+shallower depth triggers the diagnostic. The check is called at every binding site: function/lambda
+parameters (`function.rs`), `val`/`var` statements (`stmt.rs`), and destructuring patterns
+(`pattern.rs`).
+
+**Consequences**: All `.lin` files in the corpus that used accidental shadowing required a rename of the
+inner (shadowing) binding. The outer / imported binding is never changed. Spec §6.4 documents the rule.
+Regression tests: `test_shadowing_nested_val_is_rejected`, `test_shadowing_lambda_param_is_rejected`,
+`test_shadowing_sibling_lambdas_same_param_accepted`, `test_shadowing_same_scope_reuse_accepted` in
+`crates/lin/tests/integration.rs`.
