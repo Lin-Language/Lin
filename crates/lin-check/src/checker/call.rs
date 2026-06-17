@@ -7,6 +7,55 @@ use crate::resolve::{error_type, any_val_type};
 use crate::typed_ir::*;
 use crate::types::Type;
 
+/// Cost assigned to a non-numeric (or unknown) conversion in the overload numeric tie-break
+/// (ADR-075). Constant across candidates so non-numeric argument positions never drive the ranking —
+/// only numeric widenings (which get smaller, differentiated costs) decide a tie.
+const NEUTRAL_CONV_COST: u32 = 50;
+
+/// Classify a numeric type as `(sign-class, width-rank)` for conversion ranking (ADR-075):
+/// sign-class 0 = signed int, 1 = unsigned int, 2 = float; width-rank 1..4 by bit width. `None` for
+/// non-numeric types.
+fn numeric_class(t: &Type) -> Option<(u8, u32)> {
+    Some(match t {
+        Type::Int8 => (0, 1),
+        Type::Int16 => (0, 2),
+        Type::Int32 => (0, 3),
+        Type::Int64 => (0, 4),
+        Type::UInt8 => (1, 1),
+        Type::UInt16 => (1, 2),
+        Type::UInt32 => (1, 3),
+        Type::UInt64 => (1, 4),
+        Type::Float32 => (2, 3),
+        Type::Float64 => (2, 4),
+        _ => return None,
+    })
+}
+
+/// The cost of converting numeric `arg` into numeric `param` (ADR-075), lower = closer. An exact
+/// match is 0; a same-signedness widening is cheapest (1 + width gap); a cross-signedness widening or
+/// an int→float conversion costs more. `None` if either type is non-numeric. Used to break overload
+/// ties that subtype specificity leaves unresolved (e.g. `UInt64` vs `Int64` params, which are
+/// mutually incomparable): an unsigned argument then prefers the unsigned overload, a signed/computed
+/// argument the signed one.
+fn numeric_conv_cost(arg: &Type, param: &Type) -> Option<u32> {
+    let (sa, ra) = numeric_class(arg)?;
+    let (sp, rp) = numeric_class(param)?;
+    if arg == param {
+        return Some(0);
+    }
+    let gap = rp.saturating_sub(ra);
+    let base = if sa == sp {
+        1 // same sign-class, pure widening
+    } else if sp == 2 {
+        20 // int → float
+    } else if sa == 2 {
+        30 // float → int (rarely implicit)
+    } else {
+        10 // cross-signedness int → int
+    };
+    Some(base + gap)
+}
+
 /// Render a function type as a readable `(P1, P2) => Ret` signature for overload diagnostics
 /// (ADR-074). Non-function types fall back to their plain display.
 fn overload_signature(ty: &Type) -> String {
@@ -1080,7 +1129,51 @@ impl Checker {
                     .all(|other| cand.0 == other.0 || dominates(&cand.1, &other.1))
             })
             .collect();
-        match winners.as_slice() {
+        if winners.len() == 1 {
+            return Ok((**winners[0]).clone());
+        }
+        // ADR-075: numeric-conversion tie-break. Subtype specificity leaves some numeric overloads
+        // unresolved because their parameter types are mutually incomparable (e.g. `UInt64` and
+        // `Int64` — a narrower value widens into both). Rank the remaining applicable candidates by
+        // how cheaply each argument converts to its parameter: a candidate wins if its conversions
+        // are collectively no worse than every rival's and strictly better for at least one argument
+        // ("better function member"). Non-numeric/exact positions share a neutral cost, so only
+        // genuine numeric widenings break the tie; a true tie stays an ambiguity error.
+        let params_of = |t: &Type| -> Vec<Type> {
+            match t {
+                Type::Function { params, .. } => params.clone(),
+                _ => Vec::new(),
+            }
+        };
+        let cost = |arg: Option<&Type>, param: &Type| -> u32 {
+            match arg {
+                Some(a) if a == param => 0,
+                Some(a) => numeric_conv_cost(a, param).unwrap_or(NEUTRAL_CONV_COST),
+                None => NEUTRAL_CONV_COST,
+            }
+        };
+        let better = |a: &Type, b: &Type| -> bool {
+            let (pa, pb) = (params_of(a), params_of(b));
+            let mut strict = false;
+            for i in 0..n {
+                let ca = cost(arg_tys[i].as_ref(), &pa[i]);
+                let cb = cost(arg_tys[i].as_ref(), &pb[i]);
+                if ca > cb {
+                    return false;
+                }
+                if ca < cb {
+                    strict = true;
+                }
+            }
+            strict
+        };
+        let best: Vec<&&(usize, Type)> = applicable
+            .iter()
+            .filter(|cand| {
+                applicable.iter().all(|other| cand.0 == other.0 || better(&cand.1, &other.1))
+            })
+            .collect();
+        match best.as_slice() {
             [w] => Ok((***w).clone()),
             _ => Err(self.ambiguous_overload_diag(&applicable, arg_tys, name, span)),
         }

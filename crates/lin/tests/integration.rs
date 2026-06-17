@@ -20686,3 +20686,40 @@ print(e("x"))
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(output, vec!["i", "s"]);
 }
+
+#[test]
+fn test_overload_numeric_signedness_tiebreak() {
+    // ADR-075: incomparable UInt64 vs Int64 overloads — an unsigned arg prefers the unsigned
+    // overload, a signed/computed one the signed overload, via the numeric-conversion tie-break.
+    let out = run(r#"import { print } from "std/io"
+val f = (v: UInt64): String => "u64"
+val f = (v: Int64): String => "i64"
+val a: UInt16 = 5
+val b: Int32 = 7
+val c: UInt64 = 9
+val d: Int64 = 11
+print(f(a))
+print(f(b))
+print(f(c))
+print(f(d))
+"#);
+    assert_eq!(out, vec!["u64", "i64", "u64", "i64"]);
+}
+
+#[test]
+fn test_overload_numeric_same_sign_picks_narrowest() {
+    // Same-signedness numeric overloads are totally ordered by subtyping, so an exact-width
+    // argument already resolves to its own width (no tie-break needed).
+    let out = run(r#"import { print } from "std/io"
+val enc = (v: UInt16): String => "16"
+val enc = (v: UInt32): String => "32"
+val enc = (v: UInt64): String => "64"
+val a: UInt16 = 1
+val b: UInt32 = 2
+val c: UInt64 = 3
+print(enc(a))
+print(enc(b))
+print(enc(c))
+"#);
+    assert_eq!(out, vec!["16", "32", "64"]);
+}
