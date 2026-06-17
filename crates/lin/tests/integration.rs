@@ -20522,3 +20522,87 @@ print("${{j3[1]["v"]}}")
     let _ = fs::remove_file(&tmp);
     assert_eq!(out, vec!["10", "20"]);
 }
+
+// ── Regression: named-record `toBe` (sealed-record materialize-to-map alignment) ───────────────
+//
+// `toBe` deep-compares values by materializing sealed records into maps. Before the fix, named
+// records whose fields included UInt8/UInt16/UInt32 (mapped to NKIND_INT64 → 8-byte read) would
+// misalign reads for fields at 4-aligned offsets (e.g. the second UInt32 after a String field is
+// at struct-offset 36, which is 4-aligned but not 8-aligned). This caused a misaligned-pointer
+// panic at `lin_runtime::sealed::materialize_named_payload_to_map`. Fixed by adding distinct
+// NKIND_UINT32/UINT16/UINT8 codes that use the correct 4/2/1-byte slot sizes.
+
+#[test]
+fn test_named_record_tobe_with_uint32_fields() {
+    // { "a": String, "b": UInt32, "c": UInt32 } — "c" is at offset 36 (4-aligned, not 8-aligned).
+    // The second UInt32 used to be read as i64 (8 bytes) → misaligned panic.
+    let fixture = write_test_fixture(r#"import { expect, toBe, test, suite, run } from "std/test"
+type R = { "a": String, "b": UInt32, "c": UInt32 }
+val s = suite("sealed-tobe", [
+  test("named record toBe passes (basic)", () =>
+    val x: R = { "a": "A", "b": 9, "c": 5 }
+    [ expect(x).toBe(x) ]
+  )
+])
+run(s)
+"#);
+    let (success, lines) = run_test_json(&fixture, &[]);
+    let _ = fs::remove_file(&fixture);
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON: {l}: {e}")))
+        .collect();
+    assert!(success, "named-record toBe must not panic; records:\n{records:?}");
+    let pass = records.iter().any(|r| r["event"] == "test" && r["status"] == "pass");
+    assert!(pass, "expected a passing test record; got:\n{records:?}");
+}
+
+#[test]
+fn test_named_record_tobe_with_uint16_field() {
+    // { "a": String, "u16": UInt16, "b": UInt32 } — UInt16 at offset 32, UInt32 at offset 36
+    // (4-aligned). Both must be read at their natural slot widths (2 and 4 bytes respectively).
+    let fixture = write_test_fixture(r#"import { expect, toBe, test, suite, run } from "std/test"
+type R2 = { "a": String, "u16": UInt16, "b": UInt32 }
+val s = suite("sealed-tobe-u16", [
+  test("named record with UInt16 field", () =>
+    val x: R2 = { "a": "hello", "u16": 42, "b": 100 }
+    [ expect(x).toBe(x) ]
+  )
+])
+run(s)
+"#);
+    let (success, lines) = run_test_json(&fixture, &[]);
+    let _ = fs::remove_file(&fixture);
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON: {l}: {e}")))
+        .collect();
+    assert!(success, "UInt16-field named-record toBe must not panic; records:\n{records:?}");
+    let pass = records.iter().any(|r| r["event"] == "test" && r["status"] == "pass");
+    assert!(pass, "expected a passing test record; got:\n{records:?}");
+}
+
+#[test]
+fn test_named_record_tobe_nested() {
+    // { "outer": String, "svc": { "x": UInt32 } } — nested named record inside a named record.
+    let fixture = write_test_fixture(r#"import { expect, toBe, test, suite, run } from "std/test"
+type Inner = { "x": UInt32 }
+type Outer = { "outer": String, "svc": Inner }
+val s = suite("sealed-tobe-nested", [
+  test("nested named record toBe", () =>
+    val x: Outer = { "outer": "hello", "svc": { "x": 7 } }
+    [ expect(x).toBe(x) ]
+  )
+])
+run(s)
+"#);
+    let (success, lines) = run_test_json(&fixture, &[]);
+    let _ = fs::remove_file(&fixture);
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON: {l}: {e}")))
+        .collect();
+    assert!(success, "nested named-record toBe must not panic; records:\n{records:?}");
+    let pass = records.iter().any(|r| r["event"] == "test" && r["status"] == "pass");
+    assert!(pass, "expected a passing test record; got:\n{records:?}");
+}
