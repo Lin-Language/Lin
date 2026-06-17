@@ -386,7 +386,7 @@ pub(crate) fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>
     // structural compatibility guarantees it has the named type's shape, PROJECT it into the
     // sealed struct layout (a fresh +1 owned struct) so the representation matches the callee.
     if matches!(param_ty, Type::Named(_)) {
-        if let Type::Object { fields, sealed: false } = arg_ty {
+        if let Type::Object { fields, sealed: false, .. } = arg_ty {
             if !fields.is_empty() && fields.values().all(is_sealed_field_ty) {
                 let sealed_ty = Type::sealed_object(fields.clone());
                 let dst = builder.alloc_temp(sealed_ty.clone());
@@ -961,7 +961,7 @@ pub(crate) fn try_lower_sum_literal(
 /// (Function field → segfault on call). Regression: `test_var_cell_escaping_via_object_in_loop_body`.
 pub(crate) fn anon_object_slot_repr_differs(from: &Type, to: &Type) -> bool {
     matches!((from, to),
-        (Type::Object { sealed: false, fields: ff }, Type::Object { sealed: false, fields: tf })
+        (Type::Object { sealed: false, fields: ff, .. }, Type::Object { sealed: false, fields: tf, .. })
         if ff != tf && !tf.is_empty())
 }
 

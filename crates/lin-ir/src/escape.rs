@@ -307,7 +307,7 @@ fn analyze_array_inline_fn(func: &mut LinFunction) {
                 // fields). Bool is included (1-byte scalar). Columnar is strictly an
                 // improvement over 0xFE for pure-scalar sealed arrays; it never perturbs
                 // correctness since the release path checks elem_tag at runtime.
-                let all_scalar = if let Type::Object { fields, sealed: true } = elem_ty {
+                let all_scalar = if let Type::Object { fields, sealed: true, .. } = elem_ty {
                     fields.values().all(|f| f.is_flat_scalar() || matches!(f, Type::Bool))
                 } else {
                     false

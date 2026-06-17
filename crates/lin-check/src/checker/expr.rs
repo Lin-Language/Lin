@@ -1459,9 +1459,9 @@ impl Checker {
         // which side is sealed — degrading a sealed literal to boxed when the else branch is the
         // declared-return-type unsealed alias.
         match (&then_ty, &else_ty) {
-            (Type::Object { fields: tf, sealed: true }, Type::Object { fields: ef, sealed: false })
+            (Type::Object { fields: tf, sealed: true, .. }, Type::Object { fields: ef, sealed: false, .. })
                 if tf == ef => return then_ty,
-            (Type::Object { fields: tf, sealed: false }, Type::Object { fields: ef, sealed: true })
+            (Type::Object { fields: tf, sealed: false, .. }, Type::Object { fields: ef, sealed: true, .. })
                 if tf == ef => return else_ty,
             _ => {}
         }
@@ -1959,7 +1959,7 @@ impl Checker {
                 }
                 Ok(None)
             }
-            Type::Object { fields: expected_fields, sealed } => {
+            Type::Object { fields: expected_fields, sealed, name } => {
                 // Integer-literal-keyed object literal against a fixed record whose keys are all
                 // decimal digit strings (produced by expanding `{ DayOfWeek: Boolean }` where
                 // `DayOfWeek = 0|1|...|6`). Treat each integer key as its decimal string form and
@@ -1984,6 +1984,7 @@ impl Checker {
                     let ty = Type::Object {
                         fields: expected_fields.clone(),
                         sealed: *sealed,
+                        name: name.clone(),
                     };
                     return Ok(Some(TypedExpr::MakeObject {
                         fields: typed_fields,
@@ -2476,7 +2477,7 @@ pub(crate) fn expected_field_needs_directing(ty: &Type) -> bool {
     match ty {
         Type::StrLit(_) | Type::Map { .. } => true,
         Type::Object { sealed: true, .. } => true,
-        Type::Object { fields, sealed: false } => fields.values().any(expected_field_needs_directing),
+        Type::Object { fields, sealed: false, .. } => fields.values().any(expected_field_needs_directing),
         Type::Array(elem) | Type::Iterator(elem) | Type::Shared(elem) | Type::Stream(elem) => {
             expected_field_needs_directing(elem)
         }
@@ -2576,9 +2577,10 @@ pub(crate) fn erase_generic_type_vars(ty: &Type) -> Type {
         Type::Map { key, value } => Type::Map { key: Box::new(erase_generic_type_vars(key)), value: Box::new(erase_generic_type_vars(value)) },
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(erase_generic_type_vars).collect()),
         Type::Union(ts) => Type::Union(ts.iter().map(erase_generic_type_vars).collect()),
-        Type::Object { fields, sealed } => Type::Object {
+        Type::Object { fields, sealed, name } => Type::Object {
             fields: fields.iter().map(|(k, v)| (k.clone(), erase_generic_type_vars(v))).collect(),
             sealed: *sealed,
+            name: name.clone(),
         },
         Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(erase_generic_type_vars).collect(),
