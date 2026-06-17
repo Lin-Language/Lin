@@ -1,0 +1,57 @@
+import { StopId, Time } from "../gtfs/gtfs"
+import { Journey } from "../results/journey"
+import { RaptorAlgorithm } from "../raptor/raptor-algorithm"
+import { ResultsFactory } from "../results/results-factory"
+import { JourneyFilter, apply } from "../results/filter/journey-filter"
+import { Date } from "std/datetime"
+import { length, push, min } from "std/array"
+import { map, reduce, for } from "std/iter"
+import { GroupStationDepartAfterQuery, createGroupStationDepartAfterQuery, plan as groupPlan } from "./group-station-depart-after-query"
+
+val ONE_DAY: Time = 24u32 * 60u32 * 60u32
+
+//
+// Use the Raptor algorithm to generate a full day of results.
+//
+export type RangeQuery = { 
+  "raptor": RaptorAlgorithm, 
+  "resultsFactory": ResultsFactory, 
+  "maxSearchDays": UInt8, 
+  "filters": JourneyFilter[], 
+  "groupQuery": GroupStationDepartAfterQuery 
+}
+
+export val createRangeQuery = (raptor: RaptorAlgorithm, resultsFactory: ResultsFactory, maxSearchDays: UInt8 = 3, filters: JourneyFilter[] = []) =>
+  {
+    "raptor": raptor,
+    "resultsFactory": resultsFactory,
+    "maxSearchDays": maxSearchDays,
+    "filters": filters,
+    "groupQuery": createGroupStationDepartAfterQuery(raptor, resultsFactory, maxSearchDays)
+  }
+
+//
+// Perform a query at midnight, and then continue to search one minute after the earliest departure of each set of
+// results.
+//
+export val plan = (query: RangeQuery, origin: StopId, destination: StopId, date: Date, time: Time = 1, endTime: Time = ONE_DAY): Journey[] =>
+  // Search forward through the day, accumulating each pass into `acc` and advancing the
+  // departure time to one second after the earliest departure found. A pass that returns
+  // nothing (or running past `endTime`) ends the search and yields everything gathered so far.
+  // The tail self-call compiles to a loop, so this is the idiomatic form of the TS `while`.
+  val searchFrom = (time: Time, acc: Journey[]): Journey[] =>
+    if time >= endTime then
+      acc
+    else
+      val newResults = groupPlan(query["groupQuery"], [origin], [destination], date, time)
+      newResults.for(journey => acc.push(journey))
+
+      if newResults.length() == 0 then
+        acc
+      else
+        searchFrom(newResults.map(j => j["departureTime"]).min() + 1, acc)
+
+  val results = searchFrom(time, [])
+
+  // apply each filter to the accumulated results
+  query["filters"].reduce(results, (rs, filter) => filter.apply(rs))

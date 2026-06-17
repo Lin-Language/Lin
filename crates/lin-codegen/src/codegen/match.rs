@@ -524,7 +524,7 @@ impl<'ctx> Codegen<'ctx> {
         // D3b: Unsealed Object widening into a NARROWER unsealed Object slot. Both are physically
         // LinMap*; the source has extra or different fields the slot does not. Project-copy into
         // a fresh LinMap with exactly to_ty's fields, severing sharing.
-        if let (Type::Object { sealed: false, fields: to_fields }, Type::Object { sealed: false, .. }) = (to_ty, from_ty) {
+        if let (Type::Object { sealed: false, fields: to_fields, .. }, Type::Object { sealed: false, .. }) = (to_ty, from_ty) {
             let tf = to_fields.clone();
             return self.boxed_object_project(val, &tf);
         }

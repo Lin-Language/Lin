@@ -93,9 +93,9 @@ fn mentions_sealed(ty: &Type) -> bool {
         // mismatch source for the unsound combinators. MUST mirror the codegen packed gate
         // (`Codegen::sealed_array_elem` / lower.rs `is_sealed_array_elem_field_packable`) via the
         // shared `field_packed_scalar` predicate (scalar-field sealed records only).
-        Type::Object { fields, sealed: true } =>
+        Type::Object { fields, sealed: true, .. } =>
             !fields.is_empty() && fields.values().all(field_packed_scalar),
-        Type::Object { fields, sealed: false } => fields.values().any(mentions_sealed),
+        Type::Object { fields, sealed: false, .. } => fields.values().any(mentions_sealed),
         Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Promise(t) => mentions_sealed(t),
         Type::Map { value: t, .. } => mentions_sealed(t),
         Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(mentions_sealed),
@@ -147,7 +147,7 @@ fn is_receiver_inplace_mutator(name: &str) -> bool {
 fn is_packed_sealed_array(ty: &Type) -> bool {
     match ty {
         Type::Array(elem) => matches!(elem.as_ref(),
-            Type::Object { fields, sealed: true }
+            Type::Object { fields, sealed: true, .. }
                 if !fields.is_empty() && fields.values().all(field_packed_scalar)),
         _ => false,
     }
@@ -230,9 +230,10 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
                 Type::Union(flat)
             }
         }
-        Type::Object { fields, sealed } => Type::Object {
+        Type::Object { fields, sealed, .. } => Type::Object {
             fields: fields.iter().map(|(k, v)| (k.clone(), subst_type(v, subs))).collect(),
             sealed: *sealed,
+            name: None,
         },
         Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(|p| subst_type(p, subs)).collect(),
@@ -284,9 +285,10 @@ fn erase_nonconcrete_typevars(ty: &Type) -> Type {
             Type::FixedArray(ts.iter().map(erase_nonconcrete_typevars).collect())
         }
         Type::Union(ts) => Type::Union(ts.iter().map(erase_nonconcrete_typevars).collect()),
-        Type::Object { fields, sealed } => Type::Object {
+        Type::Object { fields, sealed, .. } => Type::Object {
             fields: fields.iter().map(|(k, v)| (k.clone(), erase_nonconcrete_typevars(v))).collect(),
             sealed: *sealed,
+            name: None,
         },
         Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(erase_nonconcrete_typevars).collect(),
@@ -496,7 +498,7 @@ fn mangle_type(ty: &Type) -> String {
         // symbol — the second body unreachable, the surviving body reading the other layout (a
         // misaligned-pointer crash). So the dedup key and the symbol name must agree about `sealed`:
         // distinct key ⇒ distinct name. Identical-shape-and-seal records still collapse to one.
-        Type::Object { fields, sealed } => {
+        Type::Object { fields, sealed, .. } => {
             let mut s = String::from(if *sealed { "SObj" } else { "Obj" });
             for (k, fty) in fields.iter() {
                 s.push('_');
@@ -539,7 +541,7 @@ type SpecKey = (usize, Vec<(u32, String)>, Option<CallbackDevirt>);
 /// a direct call with a wider concrete sealed record is monomorphised per concrete layout so the
 /// parameter reads/writes at the CALLER's offsets — preserving sharing, no copy.
 fn is_anon_struct_param(ty: &Type) -> bool {
-    matches!(ty, Type::Object { sealed: false, fields } if !fields.is_empty())
+    matches!(ty, Type::Object { sealed: false, fields, .. } if !fields.is_empty())
 }
 
 /// A top-level function with at least one anonymous structural parameter that qualifies for
@@ -595,9 +597,10 @@ fn subst_anon_type(ty: &Type, anon_subs: &HashMap<String, Type>) -> Type {
         Type::Map { key, value } => Type::Map { key: Box::new(subst_anon_type(key, anon_subs)), value: Box::new(subst_anon_type(value, anon_subs)) },
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| subst_anon_type(t, anon_subs)).collect()),
         Type::Union(ts) => Type::Union(ts.iter().map(|t| subst_anon_type(t, anon_subs)).collect()),
-        Type::Object { fields, sealed } => Type::Object {
+        Type::Object { fields, sealed, .. } => Type::Object {
             fields: fields.iter().map(|(k, v)| (k.clone(), subst_anon_type(v, anon_subs))).collect(),
             sealed: *sealed,
+            name: None,
         },
         Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(|p| subst_anon_type(p, anon_subs)).collect(),
@@ -754,8 +757,8 @@ fn rename_inner_fns(expr: &mut TypedExpr, suffix: &str) {
 /// a compatible type — AND the two types differ (so specialisation is actually needed). A call
 /// with `concrete_ty == anon_param_ty` already works today (no copy) and is not re-specialised.
 fn anon_layout_needs_spec(anon_param_ty: &Type, concrete_ty: &Type) -> bool {
-    let Type::Object { fields: param_fields, sealed: false } = anon_param_ty else { return false };
-    let Type::Object { fields: arg_fields, sealed: true } = concrete_ty else { return false };
+    let Type::Object { fields: param_fields, sealed: false, .. } = anon_param_ty else { return false };
+    let Type::Object { fields: arg_fields, sealed: true, .. } = concrete_ty else { return false };
     // Every required field of the anon param must be present in the concrete arg.
     if !param_fields.keys().all(|k| arg_fields.contains_key(k)) {
         return false;
@@ -1628,7 +1631,7 @@ fn rehome_import_binding(
     } else {
         state.rehomed_imports.push(TypedStmt::Import {
             path: origin_path.to_string(),
-            bindings: vec![ImportSlot { name: name.to_string(), slot: fresh, ty }],
+            bindings: vec![ImportSlot { name: name.to_string(), slot: fresh, ty, symbol: None }],
             span,
         });
     }

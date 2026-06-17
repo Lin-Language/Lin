@@ -8,7 +8,7 @@ use super::*;
 /// `required ..total` and queue an `AdapterSpec` to be lowered after the main pass. `real_fid`
 /// is the real function's id; `real_slot` is its binding slot (so the adapter body can issue a
 /// `Direct` call through `global_fn_slots`). Returns immediately if there are no defaults.
-pub fn register_default_adapters(
+pub(crate) fn register_default_adapters(
     real_fid: FuncId,
     real_slot: usize,
     real_symbol_prefix: &str,
@@ -94,7 +94,7 @@ pub fn register_default_adapters(
 /// and whose body is a block that binds each remaining parameter to its default expression and
 /// then calls the real function with the full argument list. Reusing `TypedExpr` means the
 /// normal lowering path handles RC, coercion, and chained/earlier-param default references.
-pub fn lower_adapter(spec: &AdapterSpec, ctx: &mut LowerCtx) {
+pub(crate) fn lower_adapter(spec: &AdapterSpec, ctx: &mut LowerCtx) {
     let AdapterSpec { adapter_fid, symbol, real_slot, real_fn_ty, params, arity, ret_type, span } = spec;
     let span = *span;
 
@@ -173,7 +173,7 @@ pub fn lower_adapter(spec: &AdapterSpec, ctx: &mut LowerCtx) {
 /// {name}`; non-function (val) mocks become a zero-arg `{sym}__val` wrapper. The replaced
 /// export's own module skipped emitting that symbol, so this is the sole definition and every
 /// caller resolves to it (single LLVM symbol). Run from the MAIN module lowering only.
-pub fn lower_replacements(replacements: &[Replacement], ctx: &mut LowerCtx) {
+pub(crate) fn lower_replacements(replacements: &[Replacement], ctx: &mut LowerCtx) {
     for Replacement { sym, is_function, value, ty, span, .. } in replacements {
         let span = *span;
         if *is_function {
@@ -262,7 +262,7 @@ pub fn lower_replacements(replacements: &[Replacement], ctx: &mut LowerCtx) {
 // Nested function lowering
 // -------------------------------------------------------------------------
 
-pub fn lower_function_expr(
+pub(crate) fn lower_function_expr(
     name: Option<&str>,
     params: &[TypedParam],
     body: &TypedExpr,
@@ -277,7 +277,7 @@ pub fn lower_function_expr(
 /// Lower a closure that is being passed as a callback argument, forcing its return type to
 /// the parameter's declared callback return (so AST-compiled higher-order callees receive a
 /// raw value). Only used when that return is a concrete (non-union, non-void) type.
-pub fn lower_callback_arg(
+pub(crate) fn lower_callback_arg(
     forced_ret: &Type,
     name: Option<&str>,
     params: &[TypedParam],
@@ -294,7 +294,7 @@ pub fn lower_callback_arg(
 /// named functions registered in `global_fn_slots` during the pre-scan, so that
 /// `CallTarget::Direct` references resolve to the actually-emitted function); pass
 /// None to allocate a fresh id (anonymous/nested closures).
-pub fn lower_function_expr_with_id(
+pub(crate) fn lower_function_expr_with_id(
     forced_fid: Option<FuncId>,
     forced_ret: Option<Type>,
     name: Option<&str>,
@@ -804,7 +804,7 @@ pub fn lower_function_expr_with_id(
 // String interpolation lowering
 // -------------------------------------------------------------------------
 
-pub fn lower_string_interp(
+pub(crate) fn lower_string_interp(
     parts: &[TypedStringPart],
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -880,7 +880,7 @@ pub fn lower_string_interp(
 // Pattern helpers
 // -------------------------------------------------------------------------
 
-pub fn pattern_type_check(pattern: &TypedPattern) -> (Type, lin_common::Span) {
+pub(crate) fn pattern_type_check(pattern: &TypedPattern) -> (Type, lin_common::Span) {
     match pattern {
         TypedPattern::TypeCheck(ty, span) => (ty.clone(), *span),
         TypedPattern::TypeCheckDeep(ty, _, span) => (ty.clone(), *span),
@@ -892,14 +892,14 @@ pub fn pattern_type_check(pattern: &TypedPattern) -> (Type, lin_common::Span) {
     }
 }
 
-pub fn pattern_required_fields(pattern: &TypedPattern) -> Vec<String> {
+pub(crate) fn pattern_required_fields(pattern: &TypedPattern) -> Vec<String> {
     match pattern {
         TypedPattern::Object { fields, .. } => fields.iter().map(|f| f.key.clone()).collect(),
         _ => vec![],
     }
 }
 
-pub fn stmt_defines_slot(stmt: &TypedStmt, slot: usize) -> bool {
+pub(crate) fn stmt_defines_slot(stmt: &TypedStmt, slot: usize) -> bool {
     match stmt {
         TypedStmt::Val { slot: s, .. } => *s == slot,
         TypedStmt::Var { slot: s, .. } => *s == slot,
@@ -917,7 +917,7 @@ pub fn stmt_defines_slot(stmt: &TypedStmt, slot: usize) -> bool {
 /// Without this, a reassignment of an outer plain-SSA `var` inside a block (e.g. `if c then sts =
 /// e`) was reverted to the pre-block temp on block exit, dropping the write (the closure-local-
 /// `var`-mutated-in-`if` bug).
-pub fn stmt_reassigns_slot(stmt: &TypedStmt, slot: usize) -> bool {
+pub(crate) fn stmt_reassigns_slot(stmt: &TypedStmt, slot: usize) -> bool {
     match stmt {
         TypedStmt::Val { value, .. } | TypedStmt::Var { value, .. } => expr_reassigns_slot(value, slot),
         TypedStmt::Expr(e) => expr_reassigns_slot(e, slot),
@@ -928,7 +928,7 @@ pub fn stmt_reassigns_slot(stmt: &TypedStmt, slot: usize) -> bool {
     }
 }
 
-pub fn expr_reassigns_slot(expr: &TypedExpr, slot: usize) -> bool {
+pub(crate) fn expr_reassigns_slot(expr: &TypedExpr, slot: usize) -> bool {
     match expr {
         TypedExpr::LocalSet { slot: s, value, .. } => *s == slot || expr_reassigns_slot(value, slot),
         // A nested function body has its OWN slot namespace; a reassignment of the SAME outer
