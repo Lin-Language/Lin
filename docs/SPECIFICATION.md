@@ -1761,6 +1761,22 @@ find(p)                   T | Null                T | Null | Error     (terminal
 some(p) / every(p)        Boolean                 Boolean | Error      (terminal)
 ```
 
+#### Condition-only `while` overload
+
+`while` has a second overload that takes a **zero-argument closure** `() => Boolean` and repeatedly calls it, looping while it returns `true`. This is the imperative `while`-loop idiom:
+
+```lin
+import { while } from "std/iter"
+var i = 0
+while(() =>
+  i = i + 1
+  i < 10
+)
+// i == 10
+```
+
+This form always returns `Null`. It is distinct from the iterable `while(xs, pred)` form; ADR-074 overload resolution picks the correct overload from the arity of the call. The implementation is a tail-recursive Lin function (TCO applies — constant stack regardless of iteration count).
+
 The dispatch is a closed, type-directed special-case over this fixed name set, not general function overloading. The precedent is `for` (§18.1), which already returns `Null` over an array and `Null | Error` over a stream. One import gives a single fluent chain that runs eagerly over an array and lazily, with bounded memory, over a stream:
 
 ```txt

@@ -110,6 +110,7 @@ below show the array/iterator (eager) form; the per-function reference notes the
 | [`take`](#take-iter) | `<T>(T[], Int32) -> T[]` | First n elements |
 | [`takeWhile`](#takeWhile-iter) | `<T>(T[], (T) -> Boolean) -> T[]` | Elements until predicate fails |
 | [`while`](#while-iter) | `<T>(T[] \| Iterator \| Stream, (T) -> Boolean) -> Null` | Iterate, stopping when callback returns false |
+| [`while`](#while-iter) | `(() -> Boolean) -> Null` | Condition-only imperative loop (TCO) |
 
 **std/array**
 
@@ -1062,6 +1063,10 @@ match outcome
 
 ### while (iter) {#while-iter}
 
+`while` has two overloads, resolved by arity:
+
+**Iterable form** (2 args — the classic short-circuiting combinator):
+
 ```txt
 val while: <T>(src: T[] | Iterator | Stream, f: (T[, i: Int32]) -> Boolean) -> Null | (Null | Error)
 ```
@@ -1073,6 +1078,24 @@ Iterates calling `f` with each element, stopping as soon as `f` returns `false`.
 
 ```txt
 [1, 2, -3, 4].while(x => x >= 0)   // visits 1, 2, stops at -3
+```
+
+**Condition-only form** (1 arg — imperative loop):
+
+```txt
+val while: (f: () -> Boolean) -> Null
+```
+
+Calls `f` repeatedly, looping while it returns `true`. Returns `Null`. Implemented as a
+tail-recursive Lin function, so the stack is constant regardless of iteration count (TCO applies).
+
+```txt
+var i = 0
+while(() =>
+  i = i + 1
+  i < 10
+)
+// i == 10
 ```
 
 ---
