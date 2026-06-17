@@ -3036,7 +3036,102 @@ ambiguity (records, unions, generics already handled at the specificity tier) ex
 Spec §14.6 notes the numeric preference. Regression tests cover same-signedness selection, signed/unsigned
 selection of the incomparable pair, and the unchanged record-ambiguity error.
 
-## ADR-077: Inner-scope shadowing is a hard compile-time error
+## ADR-077: Assignment-based index-place narrowing + stable place-path keys
+
+**Status**: Accepted. Extends the index-place null-test narrowing (the `if m[k] != null then m[k]`
+machinery in `checker/expr.rs`).
+
+**Context**: A `{ K: V }`-map read is nullable by the safe-bracket rule (spec §6.1): `m[k] : V | Null`.
+So the idiom "default the slot, then mutate it" —
+```
+m[k] = m[k] ?? []
+m[k].push(x)
+```
+did not type-check: the second `m[k]` was still typed `V | Null`, and `.push` needs a non-null `V[]`
+receiver. The existing flow-narrowing only fired inside an `if m[k] != null` branch; a plain assignment
+recorded nothing, so the re-read stayed nullable. The motivating real case is the RAPTOR GTFS loader's
+`addTransfer`, where the slot is keyed by a *nested* place (`transfers[row["from_stop_id"]]`) that the
+original canonicalizer rejected outright.
+
+**Decision** — two changes, both reusing the existing `PlacePath` / `IndexNarrow` / `index_narrowings`
+stack so the same invalidation and scoping rules apply.
+
+1. **Assignment-based narrowing.** When an index-assignment `m[k] = e` is checked
+   (`infer_index_assign`), after the existing write-invalidation (clear narrowings rooted at the same
+   base), if (a) the LHS canonicalizes to a stable `PlacePath::Index`, (b) the slot's *read* type is
+   nullable (`V | Null` — the map idiom), and (c) `typeof(e)` is non-null (strictly more specific than the
+   nullable read type — it is already checked assignable to `V`, so it is a `Null`-dropping subtype), we
+   record `IndexNarrow { path, ty: typeof(e) }`. A later read of that same path then narrows to the
+   assigned type. The narrowing persists FORWARD across subsequent statements in the block.
+
+2. **Stable place-path keys.** `IndexKey` gains a `Path(Box<PlacePath>)` variant. `index_key_of_expr`
+   (shared by `place_path_of_expr` and `lookup_index_narrowing`) admits a key that is itself a stable
+   nested place (`row["from_stop_id"]` = `Index(Root("row"), StrLit("from_stop_id"))`); a key with a call,
+   arithmetic, etc. stays rejected. `place_path_mentions` recurses into the nested key path, so reassigning
+   ANY identifier in the key (e.g. `row`) invalidates the narrowing.
+
+**Soundness / invalidation** — a recorded narrowing of `m[k]` is dropped when, between the assignment and
+a later read:
+- the base root identifier OR any identifier in the (possibly nested) key path is reassigned —
+  `clear_index_narrowings_for` via `place_path_mentions` (now recursing into key paths);
+- a write lands through the same base prefix (`m[j] = …`) — conservatively keyed on the root identifier;
+- **a function call occurs** — `clear_index_narrowings_after_call` clears ALL index-narrowings after any
+  `Call`/`DotCall` (a call could delete the key or re-key the map). This runs *after* the call's
+  receiver/arguments are inferred, so the `m[k].push(x)` idiom is unaffected: the `m[k]` receiver read
+  captures its narrowed type before `push` is dispatched;
+- the enclosing **block** ends — `infer_block` records the stack depth on entry and truncates on exit, so a
+  narrowing established inside an `if`/block never leaks past it (mirrors `infer_if`'s truncation).
+
+When any precondition is uncertain we simply do not record / over-clear: a missed narrowing only re-widens
+the read to `V | Null` (a usability nit), never a type hole. Both `IndexKey::Path` boxing breaks the
+`PlacePath` ⇄ `IndexKey` recursion.
+
+**Consequences**: Pure `lin-check` change; no IR/codegen impact (the narrowed read is the same TaggedVal,
+only its static type tightens — identical to the if-test narrowing). One existing bare-record test
+(`test_map_bare_record_value_coalesce_and_named_narrow`) was updated: a present-key `m["k"] ?? d`
+immediately after `m["k"] = w` is now a "left operand is never null" error because the read narrows to the
+assigned non-null record — the `??` default is genuinely dead. Spec §7.2 documents the rule. Regression
+tests cover both positive idioms (simple + nested-path key) and the four invalidation classes (key/base/
+nested-key reassignment, intervening call, different key, block-scope leak).
+
+## ADR-076: Nested map writes auto-vivify absent intermediate levels
+
+**Status**: Accepted.
+
+**Context**: Bracket reads are safe and null-propagating (§6.1/§7.1): `m[k1][k2]` yields `Null` when any
+level is absent. The write side was under-specified: a nested assignment `m[k1][k2] = v` whose intermediate
+`m[k1]` was absent (a `{K: V}` map value typed `V | Null`) *silently no-opped* — the runtime `lin_map_set`
+guards against writing into a null inner map, so the assignment compiled and ran but stored nothing. That is
+a footgun: the statement's intent is to store, and it silently didn't. Requiring callers to hand-write
+`m[k1] = m[k1] ?? {}` before every nested write is noisy and easy to forget.
+
+**Decision**: A nested index-assignment auto-vivifies absent **intermediate map levels**. When lowering an
+`IndexSet` whose object operand is itself an `Index` read of map type, that read is lowered as
+*get-or-create*: read the level; if `Null`, construct an empty map of the level's statically-known value
+type, store it back into its parent, and continue. This recurses outermost-first so every intermediate map
+level of an arbitrarily deep `m[a][b][c] = v` is created. The final-level set assigns the leaf unchanged.
+
+Scope is deliberately bounded to **map** intermediates (`Type::Map`): records are total (their fields always
+exist, nothing to create) and arrays cannot be vivified by key (an out-of-range array index stays a runtime
+error, §7.1). **Reads are unchanged** — they null-propagate and never mutate. The read/write asymmetry is
+intentional and is the design's core: a read retrieves (absence is a valid `Null` answer); a write stores
+(so it must ensure the path).
+
+**Implementation**: Lowering-only, in `lin-ir` (`lower/expr.rs`, the `IndexSet` path) — no new IR opcode, no
+codegen change, no runtime change. The get-or-create is emitted with existing instructions (`Index` read,
+null-test branch, `MakeObject` for the empty map keyed by the level's value type, `IndexSet` store-back). The
+level's map type is derived from the *parent container's* static type rather than the `Index` node's
+`result_type`, which the checker can erase to a bare `TypeVar | Null` for a map-of-map read. RC care: the
+created intermediate is a fresh `+1` owner stored via `IndexSet` (which retains); the parent is taken as a
+*borrowed* write-through base so the per-scope release stays balanced (no over-release of e.g. a re-borrowed
+TCO parameter). Verified leak/UAF-free against the existing RC regression suite.
+
+**Consequences**: `m[k1][k2] = v` "just works" with no `?? {}` boilerplate and never silently drops a write.
+The deeper nested-write paths in real code (e.g. the RAPTOR `ConnectionIndex = { StopId: { UInt8: … } }`)
+become direct assignments. The only behavioural change is that a write that previously no-opped now succeeds;
+no program that relied on the silent no-op (there is no sound reason to) is affected.
+
+## ADR-078: Inner-scope shadowing is a hard compile-time error
 
 **Status**: Accepted.
 
