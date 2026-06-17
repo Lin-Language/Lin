@@ -1,0 +1,69 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { ServiceDays, Service, runsOn } from "./service"
+import { DayOfWeek, DateIndex } from "./date"
+
+val allDays: ServiceDays = {
+  0: true,
+  1: true,
+  2: true,
+  3: true,
+  4: true,
+  5: true,
+  6: true
+}
+
+val allButMonday: ServiceDays = {
+  0: true,
+  1: false,
+  2: true,
+  3: true,
+  4: true,
+  5: true,
+  6: true
+}
+
+val noDates: DateIndex = {}
+val includeDate: DateIndex = { 20181022: true }
+val excludeDate: DateIndex = { 20181022: false }
+
+val makeService = (startDate, endDate, days: ServiceDays, dates): Service =>
+  {
+    "startDate": startDate,
+    "endDate": endDate,
+    "days": days,
+    "dates": dates
+  }
+
+val monday: DayOfWeek = 1
+val sunday: DayOfWeek = 0
+
+val s = suite("Service", [
+  test("checks the start date", () => [
+    expect(runsOn(makeService(20181001, 20181015, allDays, noDates), 20180930, monday)).toBe(false)
+  ]),
+
+  test("checks the end date", () => [
+    expect(runsOn(makeService(20181001, 20181015, allDays, noDates), 20181016, monday)).toBe(false)
+  ]),
+
+  test("checks dates within range", () => [
+    expect(runsOn(makeService(20181001, 20181015, allDays, noDates), 20181010, monday)).toBe(true)
+  ]),
+
+  test("checks the day of the week (DayOfWeek integer literal union key)", () => [
+    expect(runsOn(makeService(20181001, 20991231, allButMonday, noDates), 20181016, monday)).toBe(false)
+  ]),
+
+  test("checks Sunday runs when all days active", () => [
+    expect(runsOn(makeService(20181001, 20991231, allDays, noDates), 20181021, sunday)).toBe(true)
+  ]),
+
+  test("checks include dates override", () => [
+    expect(runsOn(makeService(20991231, 20991231, allDays, includeDate), 20181022, monday)).toBe(true)
+  ]),
+
+  test("checks exclude dates override", () => [
+    expect(runsOn(makeService(20181001, 20991231, allDays, excludeDate), 20181022, monday)).toBe(false)
+  ])
+])
+run(s)

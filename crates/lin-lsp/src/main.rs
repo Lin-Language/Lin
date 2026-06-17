@@ -119,8 +119,16 @@ impl LanguageServer for Backend {
                 rename_provider: Some(OneOf::Left(true)),
                 // Inlay type hints on bindings whose type is inferred (no explicit annotation).
                 inlay_hint_provider: Some(OneOf::Left(true)),
-                // Quick-fixes derived from existing diagnostics (unused imports, did-you-mean).
-                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                // Quick-fixes derived from existing diagnostics (unused imports, did-you-mean),
+                // plus the "Organise imports" source action (Shift+Alt+O in VSCode).
+                code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                    code_action_kinds: Some(vec![
+                        CodeActionKind::QUICKFIX,
+                        CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                    ]),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                    resolve_provider: Some(false),
+                })),
                 // Signature help inside a call's argument list, triggered by `(` and `,`.
                 signature_help_provider: Some(SignatureHelpOptions {
                     trigger_characters: Some(vec!["(".into(), ",".into()]),
@@ -3570,6 +3578,20 @@ fn code_actions(
             )));
         }
     }
+
+    // Organise imports: offered when the client requests source.organizeImports (or no filter).
+    let only = params.context.only.as_ref();
+    let wants_organize = only.map_or(true, |kinds| {
+        kinds.iter().any(|k| {
+            *k == CodeActionKind::SOURCE_ORGANIZE_IMPORTS || *k == CodeActionKind::SOURCE
+        })
+    });
+    if wants_organize {
+        if let Some(action) = organize_imports_action(source, uri) {
+            actions.push(CodeActionOrCommand::CodeAction(action));
+        }
+    }
+
     actions
 }
 
@@ -3641,6 +3663,163 @@ fn auto_import_edit(source: &str, name: &str, module: &str) -> Option<TextEdit> 
     })
 }
 
+/// Produce an "Organise imports" `CodeAction` that rewrites the file's import block by:
+/// 1. Removing bindings not referenced outside the import block.
+/// 2. Merging multiple imports from the same module path.
+/// 3. Sorting bindings alphabetically within each statement.
+/// 4. Sorting import statements alphabetically by module path.
+///
+/// Returns `None` if there are no imports, if the result would be byte-identical to the current
+/// block, or if any non-blank, non-import line (including comments) appears within the import
+/// block range (safety bail to avoid corrupting interleaved code/comments).
+fn organize_imports_action(source: &str, uri: &Url) -> Option<CodeAction> {
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let parsed = parser.parse_module();
+
+    // Collect all Import statements with their span-start line numbers.
+    let mut import_stmts: Vec<(u32, Vec<lin_parse::ast::ImportBinding>, String)> = Vec::new();
+    for stmt in &parsed.statements {
+        if let Stmt::Import { bindings, path, span } = stmt {
+            let line = offset_to_position(source, span.start as usize).line;
+            import_stmts.push((line, bindings.clone(), path.clone()));
+        }
+    }
+
+    if import_stmts.is_empty() {
+        return None;
+    }
+
+    let first_line = import_stmts.iter().map(|(l, _, _)| *l).min().unwrap();
+    let last_line = import_stmts.iter().map(|(l, _, _)| *l).max().unwrap();
+
+    // Collect the set of import line numbers for quick lookup.
+    let import_lines: HashSet<u32> = import_stmts.iter().map(|(l, _, _)| *l).collect();
+
+    // Safety check: every line within [first_line..=last_line] must be blank or an import.
+    // If any non-blank, non-import line appears (including comments), bail to avoid corruption.
+    for (line_idx, line_text) in source.lines().enumerate() {
+        let idx = line_idx as u32;
+        if idx < first_line || idx > last_line {
+            continue;
+        }
+        let trimmed = line_text.trim();
+        if trimmed.is_empty() {
+            continue; // blank line — ok
+        }
+        if import_lines.contains(&idx) {
+            continue; // import line — ok
+        }
+        // Any other line (comment, code, etc.) inside the import block → bail.
+        return None;
+    }
+
+    // Determine the set of non-import lines (for usage detection).
+    // We exclude ALL import lines, not just the one being checked.
+    let non_import_lines: Vec<&str> = source
+        .lines()
+        .enumerate()
+        .filter(|(idx, _)| !import_lines.contains(&(*idx as u32)))
+        .map(|(_, line)| line)
+        .collect();
+
+    // Helper: is the local name used on any non-import line?
+    let is_used = |local_name: &str| -> bool {
+        non_import_lines.iter().any(|line| contains_identifier(line, local_name))
+    };
+
+    // Build path → sorted bindings map, keeping only used bindings and deduplicating.
+    // Use a BTreeMap to keep paths sorted.
+    let mut path_to_bindings: std::collections::BTreeMap<String, Vec<lin_parse::ast::ImportBinding>> =
+        std::collections::BTreeMap::new();
+    for (_, bindings, path) in &import_stmts {
+        let entry = path_to_bindings.entry(path.clone()).or_default();
+        for binding in bindings {
+            let local_name = binding.alias.as_ref().unwrap_or(&binding.name);
+            if !is_used(local_name) {
+                continue; // remove unused
+            }
+            // Dedup: skip if (name, alias) pair already present.
+            let already = entry.iter().any(|b| b.name == binding.name && b.alias == binding.alias);
+            if !already {
+                entry.push(binding.clone());
+            }
+        }
+    }
+
+    // Drop paths that have no remaining bindings.
+    path_to_bindings.retain(|_, bindings| !bindings.is_empty());
+
+    // Sort bindings within each path alphabetically by name (case-insensitive, then bytewise).
+    for bindings in path_to_bindings.values_mut() {
+        bindings.sort_by(|a, b| {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.name.cmp(&b.name))
+        });
+    }
+
+    // Render the organised import block (paths already sorted via BTreeMap).
+    let mut lines_out: Vec<String> = Vec::new();
+    for (path, bindings) in &path_to_bindings {
+        let parts: Vec<String> = bindings
+            .iter()
+            .map(|b| match &b.alias {
+                Some(a) => format!("{} as {}", b.name, a),
+                None => b.name.clone(),
+            })
+            .collect();
+        lines_out.push(format!("import {{ {} }} from \"{}\"", parts.join(", "), path));
+    }
+    let new_block = lines_out.join("\n") + "\n";
+
+    // Compare against the existing import block text.
+    let source_lines: Vec<&str> = source.lines().collect();
+    let existing_slice: String = {
+        let mut s = String::new();
+        for idx in first_line..=last_line {
+            if let Some(line) = source_lines.get(idx as usize) {
+                s.push_str(line);
+                s.push('\n');
+            }
+        }
+        s
+    };
+
+    if new_block == existing_slice {
+        return None; // already organised — no-op
+    }
+
+    // Build the TextEdit: replace from start of first_line to start of (last_line + 1).
+    let line_count = source_lines.len() as u32;
+    let edit_range = Range {
+        start: Position { line: first_line, character: 0 },
+        end: if last_line + 1 >= line_count && !source.ends_with('\n') {
+            // Last import is on the last line and there's no trailing newline.
+            offset_to_position(source, source.chars().count())
+        } else {
+            Position { line: last_line + 1, character: 0 }
+        },
+    };
+
+    let edit = TextEdit { range: edit_range, new_text: new_block };
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+    Some(CodeAction {
+        title: "Organise imports".to_string(),
+        kind: Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS),
+        diagnostics: None,
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }),
+        command: None,
+        is_preferred: None,
+        disabled: None,
+        data: None,
+    })
+}
+
 /// Build a `QuickFix` code action with a single-document edit, attaching the source diagnostic.
 fn quick_fix(title: String, uri: Url, edits: Vec<TextEdit>, diagnostic: Diagnostic) -> CodeAction {
     let mut changes = HashMap::new();
@@ -3693,8 +3872,9 @@ fn ranges_overlap(a: Range, b: Range) -> bool {
 /// `test("name", ...)` / `withFixture(..., "name", ...)` call (mirroring the VSCode
 /// Test Explorer's `TEST_DECL_RE` / `WITHFIXTURE_DECL_RE` discovery, but driven off
 /// the parsed AST), plus a single `▶ Run File Tests` lens at the top when any test
-/// exists. Lens commands use the fixed `lin.runTest(uri, name)` / `lin.testFile(uri)`
-/// contract the extension wires against.
+/// exists, plus one `▶ Run Suite` lens per `suite("name", [...])` call.
+/// Lens commands use the fixed `lin.runTest(uri, name)` / `lin.testFile(uri)` /
+/// `lin.runSuite(uri, suiteName, memberNames)` contract the extension wires against.
 fn test_code_lenses(source: &str, uri: &Url, module: &lin_parse::ast::Module) -> Vec<CodeLens> {
     let mut tests: Vec<(String, lin_common::Span)> = Vec::new();
     for stmt in &module.statements {
@@ -3703,6 +3883,14 @@ fn test_code_lenses(source: &str, uri: &Url, module: &lin_parse::ast::Module) ->
     // De-duplicate by (name, anchor) so a test referenced once yields one lens.
     tests.sort_by_key(|(_, s)| (s.start, s.end));
     tests.dedup();
+
+    // Collect suite calls: (suite_name, anchor_span, member_test_names).
+    let mut suites: Vec<(String, lin_common::Span, Vec<String>)> = Vec::new();
+    for stmt in &module.statements {
+        collect_suite_calls_in_stmt(stmt, &mut suites);
+    }
+    suites.sort_by_key(|(_, s, _)| (s.start, s.end));
+    suites.dedup_by_key(|(n, s, _)| (n.clone(), *s));
 
     let mut lenses = Vec::new();
     if !tests.is_empty() {
@@ -3713,6 +3901,24 @@ fn test_code_lenses(source: &str, uri: &Url, module: &lin_parse::ast::Module) ->
                 title: "▶ Run File Tests".to_string(),
                 command: "lin.testFile".to_string(),
                 arguments: Some(vec![serde_json::json!(uri.to_string())]),
+            }),
+            data: None,
+        });
+    }
+    // Suite lenses, sorted by anchor span (deterministic order).
+    for (suite_name, anchor, member_names) in suites {
+        let members_json: Vec<serde_json::Value> =
+            member_names.iter().map(|n| serde_json::json!(n)).collect();
+        lenses.push(CodeLens {
+            range: span_to_range(source, anchor),
+            command: Some(Command {
+                title: "▶ Run Suite".to_string(),
+                command: "lin.runSuite".to_string(),
+                arguments: Some(vec![
+                    serde_json::json!(uri.to_string()),
+                    serde_json::json!(suite_name),
+                    serde_json::Value::Array(members_json),
+                ]),
             }),
             data: None,
         });
@@ -3743,6 +3949,52 @@ fn collect_test_calls_in_stmt(stmt: &Stmt, out: &mut Vec<(String, lin_common::Sp
         Stmt::Expr(e) => collect_test_calls_in_expr(e, out),
         _ => {}
     }
+}
+
+fn collect_suite_calls_in_stmt(
+    stmt: &Stmt,
+    out: &mut Vec<(String, lin_common::Span, Vec<String>)>,
+) {
+    match stmt {
+        Stmt::Val { value, .. } | Stmt::Var { value, .. } => {
+            collect_suite_calls_in_expr(value, out);
+        }
+        Stmt::Replace { value, .. } => collect_suite_calls_in_expr(value, out),
+        Stmt::Expr(e) => collect_suite_calls_in_expr(e, out),
+        _ => {}
+    }
+}
+
+/// Walk an expression for `suite("name", [...])` calls, recording
+/// `(suite_name, anchor_span, member_test_names)`. The anchor is the `suite`
+/// ident span. Member names are collected by running the test-name collector
+/// over the suite's argument subtree.
+fn collect_suite_calls_in_expr(
+    expr: &lin_parse::ast::Expr,
+    out: &mut Vec<(String, lin_common::Span, Vec<String>)>,
+) {
+    use lin_parse::ast::Expr as E;
+    if let E::Call { func, args, .. } = expr {
+        if let E::Ident(name, ident_span) = func.as_ref() {
+            if name.as_str() == "suite" {
+                // First arg must be the suite name string literal.
+                if let Some(E::StringLit(suite_name, _)) = args.first() {
+                    // Collect all test names from the entire call's arg subtree.
+                    let mut member_tests: Vec<(String, lin_common::Span)> = Vec::new();
+                    for arg in args.iter().skip(1) {
+                        collect_test_calls_in_expr(arg, &mut member_tests);
+                    }
+                    member_tests.sort_by_key(|(_, s)| (s.start, s.end));
+                    member_tests.dedup();
+                    let member_names: Vec<String> =
+                        member_tests.into_iter().map(|(n, _)| n).collect();
+                    out.push((suite_name.clone(), *ident_span, member_names));
+                }
+            }
+        }
+    }
+    // Recurse to find nested suites.
+    walk_child_exprs(expr, &mut |child| collect_suite_calls_in_expr(child, out));
 }
 
 /// Walk an expression for `test("name", ...)` / `withFixture(..., "name", ...)` calls,
@@ -8720,6 +8972,81 @@ export val thingCount = 7
         assert_eq!(file_lenses, 1, "expected one Run File Tests lens");
     }
 
+    /// CodeLens discovery emits a `lin.runSuite` lens for each `suite("name", [...])` call,
+    /// with the suite ident as anchor, and the member test names as a JSON array argument.
+    #[test]
+    fn code_lens_discovers_suite() {
+        let src = "import { suite, test } from \"std/test\"\n\
+                   val s = suite(\"S\", [\n\
+                     test(\"a\", () => []),\n\
+                     test(\"b\", () => []),\n\
+                   ])\n";
+        let module = parse(src);
+        let uri = dummy_uri();
+        let lenses = test_code_lenses(src, &uri, &module);
+
+        // Find the suite lens.
+        let suite_lens = lenses.iter().find(|l| {
+            l.command.as_ref().map(|c| c.command == "lin.runSuite").unwrap_or(false)
+        });
+        assert!(suite_lens.is_some(), "expected a lin.runSuite lens, got {:?}", lenses);
+        let suite_lens = suite_lens.unwrap();
+        let cmd = suite_lens.command.as_ref().unwrap();
+        assert_eq!(cmd.title, "▶ Run Suite");
+        let args = cmd.arguments.as_ref().unwrap();
+        // args[0] = uri string
+        assert_eq!(args[0].as_str().unwrap(), uri.to_string());
+        // args[1] = suite name
+        assert_eq!(args[1].as_str().unwrap(), "S");
+        // args[2] = member names array
+        let members: Vec<&str> = args[2]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(members, vec!["a", "b"], "member names mismatch: {:?}", members);
+        // The suite lens anchors on the `suite` ident — line 1 (0-indexed).
+        assert_eq!(suite_lens.range.start.line, 1, "suite lens should be on line 1");
+    }
+
+    /// Proof: lens list for the service.test.lin file. Should produce:
+    ///  1 file lens, 1 suite lens ("Service" with 7 members), 7 test lenses = 9 total.
+    #[test]
+    fn code_lens_service_test_lin_proof() {
+        let src = include_str!("../../../benchmarks/compare/raptor/lin-manually-typed/src/gtfs/service.test.lin");
+        let module = parse(src);
+        let uri = Url::parse("file:///workspace/service.test.lin").unwrap();
+        let lenses = test_code_lenses(src, &uri, &module);
+
+        let file_lenses: Vec<_> = lenses.iter().filter(|l| l.command.as_ref().map(|c| c.command == "lin.testFile").unwrap_or(false)).collect();
+        let suite_lenses: Vec<_> = lenses.iter().filter(|l| l.command.as_ref().map(|c| c.command == "lin.runSuite").unwrap_or(false)).collect();
+        let test_lenses: Vec<_> = lenses.iter().filter(|l| l.command.as_ref().map(|c| c.command == "lin.runTest").unwrap_or(false)).collect();
+
+        eprintln!("=== service.test.lin lenses ===");
+        eprintln!("File lenses: {}", file_lenses.len());
+        for l in &suite_lenses {
+            let cmd = l.command.as_ref().unwrap();
+            let args = cmd.arguments.as_ref().unwrap();
+            let members: Vec<&str> = args[2].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            eprintln!("Suite lens: title={:?}, suite={:?}, members={:?}, line={}", cmd.title, args[1].as_str().unwrap(), members, l.range.start.line);
+        }
+        for l in &test_lenses {
+            let cmd = l.command.as_ref().unwrap();
+            let args = cmd.arguments.as_ref().unwrap();
+            eprintln!("Test lens: {:?}, line={}", args[1].as_str().unwrap(), l.range.start.line);
+        }
+
+        assert_eq!(file_lenses.len(), 1, "expected 1 file lens");
+        assert_eq!(suite_lenses.len(), 1, "expected 1 suite lens");
+        let suite_cmd = suite_lenses[0].command.as_ref().unwrap();
+        let suite_args = suite_cmd.arguments.as_ref().unwrap();
+        assert_eq!(suite_args[1].as_str().unwrap(), "Service");
+        let members: Vec<&str> = suite_args[2].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(members.len(), 7, "expected 7 suite members, got {:?}", members);
+        assert_eq!(test_lenses.len(), 7, "expected 7 test lenses");
+    }
+
     /// No tests in a file → no lenses (not even the file-level one).
     #[test]
     fn code_lens_empty_when_no_tests() {
@@ -9374,6 +9701,129 @@ export val thingCount = 7
         // Second CJK char is at col 10 (one UTF-16 unit past the first).
         assert_eq!(offset_to_position(src, second), Position { line: 0, character: 10 });
         assert_eq!(position_to_offset(src, Position { line: 0, character: 10 }), second);
+    }
+
+    // ── organize_imports_action tests ─────────────────────────────────────────
+
+    /// Helper: extract the new_text from the single TextEdit the action produces.
+    fn organize_new_text(source: &str) -> Option<String> {
+        let uri = Url::parse("file:///t.lin").unwrap();
+        let action = organize_imports_action(source, &uri)?;
+        let edit = action.edit?.changes?.into_values().next()?.into_iter().next()?;
+        Some(edit.new_text)
+    }
+
+    #[test]
+    fn organize_imports_removes_unused_binding_keeps_used() {
+        let src = concat!(
+            "import { foo, bar } from \"std/io\"\n",
+            "val x = foo(1)\n",
+        );
+        // `bar` is not used; `foo` is used — only `foo` should remain.
+        let new_text = organize_new_text(src).expect("action should be produced");
+        assert_eq!(new_text, "import { foo } from \"std/io\"\n");
+    }
+
+    #[test]
+    fn organize_imports_merges_same_path_into_one_sorted_statement() {
+        let src = concat!(
+            "import { zoo } from \"std/io\"\n",
+            "import { alpha } from \"std/io\"\n",
+            "val x = zoo(alpha)\n",
+        );
+        // Both from same path → merge and sort alphabetically.
+        let new_text = organize_new_text(src).expect("action should be produced");
+        assert_eq!(new_text, "import { alpha, zoo } from \"std/io\"\n");
+    }
+
+    #[test]
+    fn organize_imports_sorts_statements_by_path() {
+        let src = concat!(
+            "import { z } from \"std/z\"\n",
+            "import { a } from \"std/a\"\n",
+            "val x = z(a)\n",
+        );
+        let new_text = organize_new_text(src).expect("action should be produced");
+        assert_eq!(new_text, "import { a } from \"std/a\"\nimport { z } from \"std/z\"\n");
+    }
+
+    #[test]
+    fn organize_imports_sorts_bindings_by_name_within_statement() {
+        let src = concat!(
+            "import { zebra, apple, mango } from \"std/io\"\n",
+            "val x = zebra(apple, mango)\n",
+        );
+        let new_text = organize_new_text(src).expect("action should be produced");
+        assert_eq!(new_text, "import { apple, mango, zebra } from \"std/io\"\n");
+    }
+
+    #[test]
+    fn organize_imports_preserves_alias_and_uses_alias_as_local_name() {
+        let src = concat!(
+            "import { test as t, suite } from \"std/test\"\n",
+            "val x = t(suite)\n",
+        );
+        // `t` is the local alias for `test`; both `t` and `suite` are used.
+        let new_text = organize_new_text(src).expect("action should be produced");
+        // suite < test alphabetically → suite first, then test as t
+        assert_eq!(new_text, "import { suite, test as t } from \"std/test\"\n");
+    }
+
+    #[test]
+    fn organize_imports_alias_not_used_removes_binding() {
+        let src = concat!(
+            "import { foo as f, bar } from \"std/io\"\n",
+            "val x = bar\n",
+        );
+        // `f` (the alias for `foo`) is not used; `bar` is used.
+        let new_text = organize_new_text(src).expect("action should be produced");
+        assert_eq!(new_text, "import { bar } from \"std/io\"\n");
+    }
+
+    #[test]
+    fn organize_imports_returns_none_for_comment_interleaved_in_block() {
+        let src = concat!(
+            "import { foo } from \"std/io\"\n",
+            "// a comment between imports\n",
+            "import { bar } from \"std/string\"\n",
+            "val x = foo(bar)\n",
+        );
+        // Comment line in the import block → bail to avoid corruption.
+        let uri = Url::parse("file:///t.lin").unwrap();
+        let action = organize_imports_action(src, &uri);
+        assert!(action.is_none(), "should bail when comment in import block");
+    }
+
+    #[test]
+    fn organize_imports_returns_none_when_no_imports() {
+        let src = "val x = 42\n";
+        let uri = Url::parse("file:///t.lin").unwrap();
+        let action = organize_imports_action(src, &uri);
+        assert!(action.is_none(), "should return None when there are no imports");
+    }
+
+    #[test]
+    fn organize_imports_returns_none_when_already_organised() {
+        let src = concat!(
+            "import { alpha, zoo } from \"std/io\"\n",
+            "val x = alpha(zoo)\n",
+        );
+        // Already sorted and no unused — should be a no-op (return None).
+        let uri = Url::parse("file:///t.lin").unwrap();
+        let action = organize_imports_action(src, &uri);
+        assert!(action.is_none(), "no-op case should return None");
+    }
+
+    #[test]
+    fn organize_imports_drops_entire_unused_path() {
+        let src = concat!(
+            "import { foo } from \"std/io\"\n",
+            "import { bar } from \"std/string\"\n",
+            "val x = bar\n",
+        );
+        // `foo` from std/io is never used → entire std/io import dropped.
+        let new_text = organize_new_text(src).expect("action should be produced");
+        assert_eq!(new_text, "import { bar } from \"std/string\"\n");
     }
 }
 

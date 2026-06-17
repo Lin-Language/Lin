@@ -6,10 +6,6 @@ publish.workspace = true
 
 [features]
 mimalloc-allocator = ["dep:mimalloc"]
-# Inline small integers as immediate values in the pointer field.
-# When enabled, lin_box_int32/int64 return (n << 1) | 1 (no heap alloc).
-# All consumers check bit0 before dereferencing. Default OFF so master is byte-identical.
-smi = []
 
 [lib]
 name = "lin_runtime"
