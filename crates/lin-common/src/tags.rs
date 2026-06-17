@@ -94,6 +94,20 @@ pub const NKIND_FLOAT32: u32 = 10; // Float32 → 4 bytes (fpext to f64 on dynam
 /// `clone_sumnode`. Distinct from `NKIND_SEALED` (nested sealed struct) and `NKIND_MAP`.
 pub const NKIND_SUMNODE: u32 = 11; // *SumNode heap field → 8-byte pointer
 
+/// Narrow unsigned integer fields stored at their native widths in the packed struct.
+/// Each is zero-extended and boxed as TAG_INT64 on dynamic read (matching `box_value` for UInt8/16/32).
+/// Distinct from NKIND_INT64 so `nkind_size_align` returns the correct (1,1)/(2,2)/(4,4) and
+/// `struct_size_from_named_desc` / `materialize_named_payload_to_map` use the right slot size.
+pub const NKIND_UINT32: u32 = 12; // UInt32 → 4-byte slot, zero-extended → TAG_INT64 on dynamic read
+pub const NKIND_UINT16: u32 = 13; // UInt16 → 2-byte slot, zero-extended → TAG_INT64 on dynamic read
+pub const NKIND_UINT8:  u32 = 14; // UInt8  → 1-byte slot, zero-extended → TAG_INT64 on dynamic read
+
+/// Narrow signed integer fields stored at their native widths in the packed struct.
+/// Each is sign-extended and boxed as TAG_INT32 on dynamic read (matching `box_value` for Int8/16).
+/// Distinct from NKIND_INT32 so `nkind_size_align` returns (2,2)/(1,1) and offsets are correct.
+pub const NKIND_INT16: u32 = 15; // Int16 → 2-byte slot, sign-extended → TAG_INT32 on dynamic read
+pub const NKIND_INT8:  u32 = 16; // Int8  → 1-byte slot, sign-extended → TAG_INT32 on dynamic read
+
 /// Returns `(byte_size, alignment)` for a named-descriptor field kind code.
 /// This is the SINGLE SOURCE OF TRUTH for the nkind → layout mapping shared by the
 /// runtime (`lin_runtime::sealed`) and the codegen (`lin_codegen::codegen::types`).
@@ -109,6 +123,13 @@ pub const fn nkind_size_align(nkind: u32) -> (u32, u32) {
         NKIND_FLOAT64 => (8, 8),
         NKIND_FLOAT32 => (4, 4),
         NKIND_BOOL    => (1, 1),
+        // Narrow unsigned ints — native width, zero-extended to i64 on dynamic read.
+        NKIND_UINT32  => (4, 4),
+        NKIND_UINT16  => (2, 2),
+        NKIND_UINT8   => (1, 1),
+        // Narrow signed ints — native width, sign-extended to i32 on dynamic read.
+        NKIND_INT16   => (2, 2),
+        NKIND_INT8    => (1, 1),
         // All heap-pointer kinds: String, Array, Sealed, Map — and any future additions.
         _ => (8, 8),
     }
