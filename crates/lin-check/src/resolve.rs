@@ -1,9 +1,25 @@
 use indexmap::IndexMap;
+use lin_common::Span;
 use lin_parse::ast::TypeExpr;
 use crate::env::TypeEnv;
 use crate::types::Type;
 
+/// Resolve a type expression, returning `Ok(Type)` on success or `Err(String)` on failure.
+/// The error string does NOT carry span information — all existing callers that need a plain
+/// `String` error (e.g. `function.rs`, `call.rs`) use this.
 pub fn resolve_type(type_expr: &TypeExpr, env: &TypeEnv) -> Result<Type, String> {
+    resolve_type_spanned(type_expr, env).map_err(|(_, m, _)| m)
+}
+
+/// Resolve a type expression, returning `Ok(Type)` on success or `Err((Span, String,
+/// Option<String>))` on failure.  The span in the error points at the offending leaf
+/// type-expression (e.g. the `Unknown type 'X'` span points at the `X` token, not the
+/// surrounding declaration).  The third element is an optional help note that callers
+/// may surface via `Diagnostic::with_help`.
+pub fn resolve_type_spanned(
+    type_expr: &TypeExpr,
+    env: &TypeEnv,
+) -> Result<Type, (Span, String, Option<String>)> {
     resolve_type_inner(type_expr, env, &mut std::collections::HashSet::new())
 }
 
@@ -11,29 +27,31 @@ fn resolve_type_inner(
     type_expr: &TypeExpr,
     env: &TypeEnv,
     visiting: &mut std::collections::HashSet<String>,
-) -> Result<Type, String> {
+) -> Result<Type, (Span, String, Option<String>)> {
     match type_expr {
-        TypeExpr::Named(name, _span) => resolve_named_cycle(name, env, visiting),
-        TypeExpr::Generic(name, args, _span) => {
-            let resolved_args: Result<Vec<Type>, String> =
+        TypeExpr::Named(name, span) => {
+            resolve_named_cycle(name, env, visiting).map_err(|m| (*span, m, None))
+        }
+        TypeExpr::Generic(name, args, span) => {
+            let resolved_args: Result<Vec<Type>, (Span, String, Option<String>)> =
                 args.iter().map(|a| resolve_type_inner(a, env, visiting)).collect();
-            resolve_generic(name, &resolved_args?, env, visiting)
+            resolve_generic(name, &resolved_args?, env, visiting).map_err(|m| (*span, m, None))
         }
         TypeExpr::Array(inner, _span) => {
             let inner_ty = resolve_type_inner(inner, env, visiting)?;
             Ok(Type::Array(Box::new(inner_ty)))
         }
         TypeExpr::FixedArray(types, _span) => {
-            let resolved: Result<Vec<Type>, String> =
+            let resolved: Result<Vec<Type>, (Span, String, Option<String>)> =
                 types.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::FixedArray(resolved?))
         }
         TypeExpr::Union(types, _span) => {
-            let resolved: Result<Vec<Type>, String> =
+            let resolved: Result<Vec<Type>, (Span, String, Option<String>)> =
                 types.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::flatten_union(resolved?))
         }
-        TypeExpr::Intersection(operands, _span) => {
+        TypeExpr::Intersection(operands, span) => {
             // Record intersection `A & B` (ADR-061): record-only. Each operand must resolve to an
             // object/record type; the result is a plain `Type::Object` with the UNION of their
             // fields. A field present in more than one operand must have the SAME type (dedup) or
@@ -46,19 +64,19 @@ fn resolve_type_inner(
                 let fields = match &ty {
                     Type::Object { fields, .. } => fields,
                     other => {
-                        return Err(format!(
+                        return Err((*span, format!(
                             "intersection `&` is only valid between record types; operand `{}` is not a record",
                             other
-                        ));
+                        ), None));
                     }
                 };
                 for (key, field_ty) in fields {
                     if let Some(existing) = merged.get(key) {
                         if existing != field_ty {
-                            return Err(format!(
+                            return Err((*span, format!(
                                 "intersection type has conflicting field \"{}\": {} vs {}",
                                 key, existing, field_ty
-                            ));
+                            ), None));
                         }
                     } else {
                         merged.insert(key.clone(), field_ty.clone());
@@ -68,7 +86,7 @@ fn resolve_type_inner(
             Ok(Type::object(merged))
         }
         TypeExpr::Function(params, ret, _span) => {
-            let param_types: Result<Vec<Type>, String> =
+            let param_types: Result<Vec<Type>, (Span, String, Option<String>)> =
                 params.iter().map(|p| resolve_type_inner(p, env, visiting)).collect();
             let ret_type = resolve_type_inner(ret, env, visiting)?;
             // Type annotations cannot express default arguments, so every declared
@@ -86,7 +104,7 @@ fn resolve_type_inner(
             }
             Ok(Type::object(resolved))
         }
-        TypeExpr::IndexSig(key, value, _span) => {
+        TypeExpr::IndexSig(key, value, span) => {
             // `{ K: V }` — index-signature form. The key type-expr (which may be a type alias) is
             // resolved here, where aliases are expanded, and dispatches on what it denotes:
             //
@@ -101,7 +119,39 @@ fn resolve_type_inner(
             //     This composes with the total-literal-key index rule: indexing the record by a key
             //     of the SAME literal union is provably total (no safe-bracket `Null`).
             //   - anything else → an error (a non-String, non-literal key type is not indexable).
-            let key_ty = resolve_type_inner(key, env, visiting)?;
+            //
+            // HINT: if the key is a bare Named identifier that starts with a lowercase letter AND
+            // the resolution fails with "Unknown type", we almost certainly have a record type that
+            // was written without quoted keys (TypeScript-style `{ field: T }`). Attach a help note
+            // explaining the quoting requirement.
+            let key_result = resolve_type_inner(key, env, visiting);
+            let key_ty = match key_result {
+                Ok(t) => t,
+                Err((key_span, msg, _existing_help)) => {
+                    // Check whether the key is a bare lowercase identifier — the hallmark of a
+                    // mistakenly-unquoted record field name. Uppercase identifiers are valid type
+                    // names (e.g. `StopId`), so we don't hint on those.
+                    let help = if msg.contains("Unknown type") {
+                        if let TypeExpr::Named(key_name, _) = key.as_ref() {
+                            if key_name.chars().next().map_or(false, |c| c.is_ascii_lowercase()) {
+                                Some(format!(
+                                    "record field keys must be quoted — write \"{name}\": T. \
+                                     A bare `{name}: T` is parsed as a `{{ KeyType: ValueType }}` \
+                                     map/index-signature, so `{name}` is read as a type name.",
+                                    name = key_name
+                                ))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    return Err((key_span, msg, help));
+                }
+            };
             let val_ty = resolve_type_inner(value, env, visiting)?;
             if key_ty == Type::Str {
                 Ok(Type::Map { key: Box::new(Type::Str), value: Box::new(val_ty) })
@@ -127,15 +177,15 @@ fn resolve_type_inner(
                 }
                 Ok(Type::object(fields))
             } else {
-                Err(format!(
+                Err((*span, format!(
                     "Index-signature key type must be String, an integer type, or a union of string \
                      literals, but it resolves to {}",
                     key_ty
-                ))
+                ), None))
             }
         }
         TypeExpr::TaggedUnion(variants, _span) => {
-            let resolved: Result<Vec<Type>, String> =
+            let resolved: Result<Vec<Type>, (Span, String, Option<String>)> =
                 variants.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::flatten_union(resolved?))
         }
@@ -257,7 +307,7 @@ fn resolve_named_cycle(
                     visiting.insert(name.to_string());
                     let expanded = expand_named_body(&decl.body.clone(), env, visiting)?;
                     visiting.remove(name);
-                    Ok(expanded)
+                    Ok(expanded.with_type_name(name))
                 } else {
                     Err(format!(
                         "Type '{}' requires {} type argument(s)",
@@ -299,7 +349,7 @@ fn expand_named_body(
         Type::Union(ts) => Ok(Type::Union(
             ts.iter().map(|t| expand_named_body(t, env, visiting)).collect::<Result<_, _>>()?
         )),
-        Type::Object { fields, sealed: _ } => {
+        Type::Object { fields, .. } => {
             // STAGE 0.5 SEAL POINT. `expand_named_body` is reached ONLY while unfolding the body
             // of a named record type declaration (`type T = { … }`) for a non-recursive `: T`
             // annotation. Mark the unfolded object SEALED so named-record identity survives
@@ -393,15 +443,17 @@ fn substitute(
             // Otherwise expand it as a regular named type.
             resolve_named_cycle(n, env, visiting)
         }
-        Type::Object { fields, sealed } => {
+        Type::Object { fields, sealed, .. } => {
             // Generic named-type instantiation (`type Box<T> = { value: T }` → `Box<Int32>`) is
             // also a named record unfold: preserve the declaration's sealed-ness. Bodies of named
             // record types arrive here sealed (set when the decl body was first resolved).
+            // Do NOT propagate `name` here: generic instantiations keep `name: None` (structural
+            // display) — the alias name is only attached for non-generic named records.
             let substituted: Result<IndexMap<String, Type>, String> = fields
                 .iter()
                 .map(|(k, v)| substitute(v, params, args, env, visiting).map(|t| (k.clone(), t)))
                 .collect();
-            Ok(Type::Object { fields: substituted?, sealed: *sealed })
+            Ok(Type::Object { fields: substituted?, sealed: *sealed, name: None })
         }
         Type::Array(inner) => Ok(Type::Array(Box::new(substitute(inner, params, args, env, visiting)?))),
         Type::FixedArray(types) => {
@@ -523,7 +575,7 @@ mod sealed_marker_tests {
         let env = TypeEnv::new();
         let resolved = resolve_type(&te, &env).expect("intersection resolves");
         match &resolved {
-            Type::Object { fields, sealed } => {
+            Type::Object { fields, sealed, .. } => {
                 assert!(fields.contains_key("a") && fields.contains_key("b"));
                 assert_eq!(*sealed, false, "inline intersection must be UNSEALED");
             }
@@ -600,5 +652,120 @@ mod sealed_marker_tests {
         // And structural compatibility (invariant 1) is symmetric and unaffected.
         assert!(crate::compat::is_compatible(&sealed, &unsealed));
         assert!(crate::compat::is_compatible(&unsealed, &sealed));
+    }
+
+    /// `resolve_type_spanned` must return the span of the offending leaf type-expression, not a
+    /// dummy or enclosing span.  For `{ bestArrivals: Arrivals }` (an IndexSig whose key is the
+    /// unknown type `bestArrivals`), the error span must equal the KEY span, not the outer IndexSig
+    /// span.  This regression test pins that behaviour and also checks the new help-note field.
+    #[test]
+    fn resolve_type_spanned_points_at_offending_leaf() {
+        // KEY_SPAN: a distinctive non-zero, non-dummy span representing the `bestArrivals` token.
+        let key_span = Span::new(1, 10, 22);
+        // VAL_SPAN: a different span for the value type (Arrivals) — unused in this test since the
+        // key fails first, but kept distinct to prove the key span is what we get back.
+        let val_span = Span::new(1, 24, 32);
+        let outer_span = Span::new(1, 0, 40);
+
+        // `{ bestArrivals: Arrivals }` — IndexSig with unknown key type "bestArrivals".
+        let te = TypeExpr::IndexSig(
+            Box::new(TypeExpr::Named("bestArrivals".into(), key_span)),
+            Box::new(TypeExpr::Named("Arrivals".into(), val_span)),
+            outer_span,
+        );
+        let env = TypeEnv::new();
+
+        // resolve_type_spanned must return an Err whose span == KEY_SPAN (not val_span or
+        // outer_span) and whose message mentions "bestArrivals".
+        let err = resolve_type_spanned(&te, &env).unwrap_err();
+        assert_eq!(err.0, key_span, "error span must point at the offending key leaf");
+        assert!(
+            err.1.contains("bestArrivals"),
+            "error message must name the offending type; got: {}",
+            err.1
+        );
+
+        // resolve_type (the backwards-compat shim) must still return the same message string.
+        let plain_err = resolve_type(&te, &env).unwrap_err();
+        assert_eq!(plain_err, err.1, "resolve_type must return the same message as resolve_type_spanned");
+    }
+
+    /// A lowercase bare key in an IndexSig (`{ foo: Bar }`) should carry a help note that
+    /// mentions quoting the field key.  An uppercase bare key (`{ StopId: Time }`) that is
+    /// simply unknown — a genuine type-alias typo — must NOT get the quoting hint, since the
+    /// user most likely intended a type name.
+    #[test]
+    fn lowercase_bare_key_gets_quoting_hint() {
+        let env = TypeEnv::new();
+        let dummy = Span::dummy();
+
+        // Lowercase: `{ foo: Bar }` — "foo" is almost certainly a mistakenly-unquoted field.
+        let te_lower = TypeExpr::IndexSig(
+            Box::new(TypeExpr::Named("foo".into(), dummy)),
+            Box::new(TypeExpr::Named("Bar".into(), dummy)),
+            dummy,
+        );
+        let err_lower = resolve_type_spanned(&te_lower, &env).unwrap_err();
+        let help_lower = err_lower.2;
+        assert!(
+            help_lower.is_some(),
+            "lowercase bare key must produce a help note"
+        );
+        let help_text = help_lower.unwrap();
+        assert!(
+            help_text.contains("quoted") || help_text.contains("quote"),
+            "help must mention quoting; got: {}",
+            help_text
+        );
+        assert!(
+            help_text.contains("foo"),
+            "help must name the offending identifier; got: {}",
+            help_text
+        );
+
+        // Uppercase: `{ StopId: Time }` — "StopId" looks like a genuine type name, no hint.
+        let te_upper = TypeExpr::IndexSig(
+            Box::new(TypeExpr::Named("StopId".into(), dummy)),
+            Box::new(TypeExpr::Named("Time".into(), dummy)),
+            dummy,
+        );
+        let err_upper = resolve_type_spanned(&te_upper, &env).unwrap_err();
+        assert_eq!(
+            err_upper.2, None,
+            "uppercase bare key must NOT produce a quoting hint; got: {:?}",
+            err_upper.2
+        );
+    }
+
+    #[test]
+    fn named_record_display_shows_alias_name() {
+        // type Date = { "year": Int64, "month": Int64, "day": Int64 }
+        // Resolving `: Date` must produce a type whose Display is "Date", not the structural form.
+        let mut fields = IndexMap::new();
+        fields.insert("year".to_string(), Type::Int64);
+        fields.insert("month".to_string(), Type::Int64);
+        fields.insert("day".to_string(), Type::Int64);
+        let mut env = TypeEnv::new();
+        env.define_type("Date".to_string(), vec![], Type::object(fields));
+
+        let date_ty = resolve_type(&TypeExpr::Named("Date".to_string(), Span::dummy()), &env)
+            .expect("Date resolves");
+        assert_eq!(date_ty.to_string(), "Date", "named record must display as alias name");
+
+        // A function (Date) => UInt32 must display as "(Date) => UInt32"
+        let fn_ty = Type::func(vec![date_ty.clone()], Type::UInt32);
+        assert_eq!(fn_ty.to_string(), "(Date) => UInt32", "function with named param must show alias name");
+
+        // Equality: a named Date object == equivalent anonymous object (name is inert)
+        let mut anon_fields = IndexMap::new();
+        anon_fields.insert("year".to_string(), Type::Int64);
+        anon_fields.insert("month".to_string(), Type::Int64);
+        anon_fields.insert("day".to_string(), Type::Int64);
+        let anon = Type::object(anon_fields);
+        assert_eq!(date_ty, anon, "named Date must equal anonymous object with same fields");
+
+        // Compat: named Date is compatible with the anonymous structural type
+        assert!(crate::compat::is_compatible(&date_ty, &anon));
+        assert!(crate::compat::is_compatible(&anon, &date_ty));
     }
 }

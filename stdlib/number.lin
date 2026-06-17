@@ -126,6 +126,12 @@ export val parseFloat64 = (s: String): Float64 =>
 export val toInt32 = (v: Float64): Int32 =>
   lin_to_int32(v)
 
+// Truncate a signed `Int64` to an Int32 (low 32 bits, two's-complement) — the integer→Int32 cast
+// the `Float64` overload above does not cover (ADR-074/075 overload of `toInt32`).
+// @example toInt32(5000000000)   // 705032704  (low 32 bits)
+export val toInt32 = (v: Int64): Int32 =>
+  lin_narrow_int32(v)
+
 // Widen an Int32 to a Float64.
 // @param v  the integer to convert.
 // @returns the equivalent Float64 (always exact).
@@ -139,77 +145,59 @@ export val toFloat64 = (v: Int32): Float64 =>
 export val toFloat32 = (v: Float64): Float32 =>
   lin_to_float32(v)
 
-// Explicit narrowing integer casts. Each truncates its input to the target width using
-// two's-complement semantics. The input is taken as a UInt64 (the widest unsigned type) so any
-// narrower unsigned integer — or a value masked down to a byte or word — widens into it at the
-// call site without losing range; truncation to the target width is then well defined.
-// Truncate `v` to a UInt8.
-// @param v  the value to narrow (taken as UInt64).
-// @returns the low 8 bits of `v` as a UInt8.
-// @example toUInt8(0x1FF)   // 255  (low 8 bits)
+// Integer narrowing casts. Each truncates its input to the target width with two's-complement
+// semantics. Every width has TWO overloads, distinguished by argument type (ADR-074/075):
+//   * a `UInt64` overload — for an already-unsigned value (or one masked down to a byte/word);
+//     any narrower UNSIGNED integer widens into it without losing range, then truncates.
+//   * an `Int64` overload — for a signed/computed integer; a value computed in `Int64` (or any
+//     narrower SIGNED integer) cannot reach the `UInt64` overload (`Int64 -> UInt64` is not an
+//     implicit coercion — it could wrap a negative), so it resolves here. Use this to store a wide
+//     computed result into a narrow field (e.g. a calendar `month: UInt8` derived from date math).
+// Both produce identical low bits; the overload just records whether the source was unsigned or
+// signed. Truncation never fails; an out-of-range value silently keeps its low bits.
+// Truncate `v` to a UInt8 (low 8 bits).
+// @example toUInt8(0x1FF)   // 255   (unsigned source)
+// @example toUInt8(300)     // 44    (signed source)
 export val toUInt8 = (v: UInt64): UInt8 =>
   lin_to_uint8(v)
+export val toUInt8 = (v: Int64): UInt8 =>
+  lin_narrow_uint8(v)
 
-// Truncate `v` to an Int8.
-// @param v  the value to narrow (taken as UInt64).
-// @returns the low 8 bits of `v` as a signed Int8.
+// Truncate `v` to an Int8 (low 8 bits, signed).
 export val toInt8 = (v: UInt64): Int8 =>
   lin_to_int8(v)
+export val toInt8 = (v: Int64): Int8 =>
+  lin_narrow_int8(v)
 
-// Truncate `v` to a UInt16.
-// @param v  the value to narrow (taken as UInt64).
-// @returns the low 16 bits of `v` as a UInt16.
+// Truncate `v` to a UInt16 (low 16 bits).
 export val toUInt16 = (v: UInt64): UInt16 =>
   lin_to_uint16(v)
+export val toUInt16 = (v: Int64): UInt16 =>
+  lin_narrow_uint16(v)
 
-// Truncate `v` to an Int16.
-// @param v  the value to narrow (taken as UInt64).
-// @returns the low 16 bits of `v` as a signed Int16.
+// Truncate `v` to an Int16 (low 16 bits, signed).
 export val toInt16 = (v: UInt64): Int16 =>
   lin_to_int16(v)
+export val toInt16 = (v: Int64): Int16 =>
+  lin_narrow_int16(v)
 
-// Truncate `v` to a UInt32.
-// @param v  the value to narrow (taken as UInt64).
-// @returns the low 32 bits of `v` as a UInt32.
+// Truncate `v` to a UInt32 (low 32 bits).
 export val toUInt32 = (v: UInt64): UInt32 =>
   lin_to_uint32(v)
+export val toUInt32 = (v: Int64): UInt32 =>
+  lin_narrow_uint32(v)
 
-// Reinterpret `v` as a signed Int64.
+// Reinterpret `v` as a signed Int64 (same bit pattern).
 // @param v  the value to convert (taken as UInt64).
-// @returns the same bit pattern as a signed Int64.
 export val toInt64 = (v: UInt64): Int64 =>
   lin_to_int64(v)
 
-// Identity cast keeping `v` as a UInt64.
-// @param v  the value.
-// @returns `v` as a UInt64.
+// Keep `v` as a UInt64: identity for an unsigned source, or the signed→unsigned bit-reinterpret
+// (deliberately not an implicit coercion) for a signed `Int64` source.
 export val toUInt64 = (v: UInt64): UInt64 =>
   lin_to_uint64(v)
-
-// Narrowing casts from a SIGNED `Int64` input. The `toUInt8`/… family above takes `UInt64`, so only
-// an already-unsigned value (or a masked one) reaches it; a computed/signed `Int64` cannot, because
-// `Int64 -> UInt64` is not an implicit coercion (it could wrap a negative). These take `Int64` — the
-// widest signed integer, into which every signed/computed integer widens — and truncate to the named
-// width with two's-complement (`as`-cast) semantics. Use them to store a wide computed result into a
-// narrow field (e.g. a calendar `month: UInt8` derived from `Int64` date math). Truncation never
-// fails; an out-of-range value silently keeps its low bits, so narrow only values you know fit.
-// Truncate a signed `Int64` to a UInt8 (low 8 bits).
-// @example narrowToUInt8(300)   // 44
-export val narrowToUInt8 = (v: Int64): UInt8 => lin_narrow_uint8(v)
-// Truncate a signed `Int64` to an Int8 (low 8 bits, signed).
-export val narrowToInt8 = (v: Int64): Int8 => lin_narrow_int8(v)
-// Truncate a signed `Int64` to a UInt16 (low 16 bits).
-export val narrowToUInt16 = (v: Int64): UInt16 => lin_narrow_uint16(v)
-// Truncate a signed `Int64` to an Int16 (low 16 bits, signed).
-export val narrowToInt16 = (v: Int64): Int16 => lin_narrow_int16(v)
-// Truncate a signed `Int64` to a UInt32 (low 32 bits).
-export val narrowToUInt32 = (v: Int64): UInt32 => lin_narrow_uint32(v)
-// Truncate a signed `Int64` to an Int32 (low 32 bits, signed) — the integer-to-Int32 cast that
-// `toInt32` (which takes a `Float64`) does not cover.
-export val narrowToInt32 = (v: Int64): Int32 => lin_narrow_int32(v)
-// Reinterpret a signed `Int64` as a UInt64 (same bit pattern) — the signed→unsigned bridge that is
-// deliberately not an implicit coercion.
-export val narrowToUInt64 = (v: Int64): UInt64 => lin_narrow_uint64(v)
+export val toUInt64 = (v: Int64): UInt64 =>
+  lin_narrow_uint64(v)
 
 // Test whether `s` is a valid base-10 Int32.
 // @param s  the string to test.

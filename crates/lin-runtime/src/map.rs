@@ -605,22 +605,11 @@ pub(crate) unsafe fn lin_map_alloc_mixed(hint: u32, key_kind: u32) -> *mut LinMa
 /// A null `val` pointer means the null value.
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_set(map: *mut LinMap, key: *mut LinString, val: *const TaggedVal) {
+    // Null-map write: no-op (mirrors lin_array_set's null-guard). This happens when a chained
+    // write like `outer[a][k] = v` is executed and `outer[a]` returns null (absent key). The
+    // safe-access rule (§6.1) silently ignores writes through null rather than crashing.
+    if map.is_null() { return; }
     let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
-    // SMI guard: reconstruct a real TaggedVal from an SMI pointer before storing.
-    #[cfg(feature = "smi")]
-    let _smi_tv: TaggedVal;
-    #[cfg(feature = "smi")]
-    let val = {
-        let vp = val as *const u8;
-        if !vp.is_null() && crate::tagged::is_smi_ptr(vp) {
-            let smi_tag = if crate::tagged::is_smi_int64_pub(vp) { crate::tagged::TAG_INT64 } else { crate::tagged::TAG_INT32 };
-            let v: i64 = if crate::tagged::is_smi_int64_pub(vp) { (vp as i64) >> 2 } else { ((vp as i64) >> 2) as i32 as i64 };
-            _smi_tv = TaggedVal { tag: smi_tag, _pad: [0; 7], payload: v as u64 };
-            &_smi_tv as *const TaggedVal
-        } else {
-            val
-        }
-    };
     let val_ref: &TaggedVal = if val.is_null() { &null_tv } else { &*val };
     note_value_tag(map, val_ref.tag);
     ensure_capacity(map);
@@ -672,22 +661,9 @@ pub unsafe extern "C" fn lin_map_get(map: *const LinMap, key: *const LinString) 
 /// Insert / overwrite `key -> *val` (Int map). `key` is a raw i64.
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_set_int(map: *mut LinMap, key: i64, val: *const TaggedVal) {
+    // Null-map write: no-op (mirrors lin_array_set's and lin_map_set's null-guard).
+    if map.is_null() { return; }
     let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
-    // SMI guard: reconstruct a real TaggedVal from an SMI pointer before storing.
-    #[cfg(feature = "smi")]
-    let _smi_tv: TaggedVal;
-    #[cfg(feature = "smi")]
-    let val = {
-        let vp = val as *const u8;
-        if !vp.is_null() && crate::tagged::is_smi_ptr(vp) {
-            let smi_tag = if crate::tagged::is_smi_int64_pub(vp) { crate::tagged::TAG_INT64 } else { crate::tagged::TAG_INT32 };
-            let v: i64 = if crate::tagged::is_smi_int64_pub(vp) { (vp as i64) >> 2 } else { ((vp as i64) >> 2) as i32 as i64 };
-            _smi_tv = TaggedVal { tag: smi_tag, _pad: [0; 7], payload: v as u64 };
-            &_smi_tv as *const TaggedVal
-        } else {
-            val
-        }
-    };
     let val_ref: &TaggedVal = if val.is_null() { &null_tv } else { &*val };
     note_value_tag(map, val_ref.tag);
     ensure_capacity(map);

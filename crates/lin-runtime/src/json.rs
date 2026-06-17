@@ -386,16 +386,6 @@ pub unsafe fn tagged_to_json(tv: *const u8) -> serde_json::Value {
     if tv.is_null() {
         return serde_json::Value::Null;
     }
-    // SMI guard: inline integer — decode and emit as JSON number.
-    #[cfg(feature = "smi")]
-    if crate::tagged::is_smi_ptr(tv) {
-        let n: i64 = if crate::tagged::is_smi_int64_pub(tv) {
-            (tv as i64) >> 2
-        } else {
-            ((tv as i64) >> 2) as i32 as i64
-        };
-        return serde_json::json!(n);
-    }
     let t = tv as *const TaggedVal;
     let tag = (*t).tag;
     let payload = (*t).payload;

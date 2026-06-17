@@ -27,7 +27,7 @@ Module._load = function (request, ...rest) {
 };
 
 const { _test } = require(path.join(__dirname, "..", "client.js"));
-const { discoverLine, unescapeLinString, stripLineComment, firstStringArg } = _test;
+const { discoverLine, unescapeLinString, stripLineComment, firstStringArg, discoverFileStructure } = _test;
 
 let failures = 0;
 function check(label, fn) {
@@ -139,6 +139,114 @@ check("discovers two tests on one line, in order", () => {
 check("trailing comment after a real test still discovers the test", () => {
   const r = discoverLine('test("kept", () => []) // ran this');
   assert.deepStrictEqual(r.map((x) => x.name), ["kept"]);
+});
+
+console.log("discoverFileStructure:");
+
+check("file with one suite wrapping tests → one suite group, no loose tests", () => {
+  const text = [
+    'import { suite, test } from "std/test"',
+    'val s = suite("MyGroup", [',
+    '  test("alpha", () => [])',
+    '  test("beta", () => [])',
+    '])',
+  ].join("\n");
+  const result = discoverFileStructure(text);
+  assert.strictEqual(result.suites.length, 1, `expected 1 suite, got ${result.suites.length}`);
+  assert.strictEqual(result.suites[0].name, "MyGroup");
+  assert.deepStrictEqual(result.suites[0].tests.map((t) => t.name), ["alpha", "beta"]);
+  assert.strictEqual(result.looseTests.length, 0, `expected 0 loose tests, got ${result.looseTests.length}`);
+});
+
+check("file mixing a suite + a loose top-level test", () => {
+  const text = [
+    'val s = suite("Suite1", [',
+    '  test("inside", () => [])',
+    '])',
+    'val t = test("outside", () => [])',
+  ].join("\n");
+  const result = discoverFileStructure(text);
+  assert.strictEqual(result.suites.length, 1);
+  assert.strictEqual(result.suites[0].name, "Suite1");
+  assert.deepStrictEqual(result.suites[0].tests.map((t) => t.name), ["inside"]);
+  assert.strictEqual(result.looseTests.length, 1);
+  assert.strictEqual(result.looseTests[0].name, "outside");
+});
+
+check("sequential suites each collect their own tests", () => {
+  const text = [
+    'val a = suite("A", [',
+    '  test("a1", () => [])',
+    '  test("a2", () => [])',
+    '])',
+    'val b = suite("B", [',
+    '  test("b1", () => [])',
+    '])',
+  ].join("\n");
+  const result = discoverFileStructure(text);
+  assert.strictEqual(result.suites.length, 2, `expected 2 suites, got ${result.suites.length}`);
+  const byName = Object.fromEntries(result.suites.map((s) => [s.name, s]));
+  assert.deepStrictEqual(byName["A"].tests.map((t) => t.name), ["a1", "a2"]);
+  assert.deepStrictEqual(byName["B"].tests.map((t) => t.name), ["b1"]);
+  assert.strictEqual(result.looseTests.length, 0);
+});
+
+check("service.test.lin structure: 1 suite 'Service' with 7 tests, 0 loose", () => {
+  // Inline the service.test.lin content (abbreviated) — just enough to verify structure parsing.
+  const text = [
+    'import { expect, toBe, test, suite, run } from "std/test"',
+    'val s = suite("Service", [',
+    '  test("checks the start date", () => [])',
+    '  test("checks the end date", () => [])',
+    '  test("checks dates within range", () => [])',
+    '  test("checks the day of the week (DayOfWeek integer literal union key)", () => [])',
+    '  test("checks Sunday runs when all days active", () => [])',
+    '  test("checks include dates override", () => [])',
+    '  test("checks exclude dates override", () => [])',
+    '])',
+    'run(s)',
+  ].join("\n");
+  const result = discoverFileStructure(text);
+  assert.strictEqual(result.suites.length, 1, `expected 1 suite, got ${result.suites.length}`);
+  assert.strictEqual(result.suites[0].name, "Service");
+  assert.strictEqual(result.suites[0].tests.length, 7, `expected 7 tests, got ${result.suites[0].tests.length}`);
+  assert.strictEqual(result.looseTests.length, 0);
+});
+
+// --- findDescendantById: must find a test nested under a suite group ----------
+// A minimal TestItem/collection fake mirroring the bits findDescendantById touches:
+// `children.get(id)` (direct only) and `children.forEach(cb)`.
+console.log("findDescendantById:");
+function fakeItem(id) {
+  const map = new Map();
+  return {
+    id,
+    children: {
+      get: (k) => map.get(k),
+      forEach: (cb) => map.forEach((v) => cb(v)),
+      add: (it) => map.set(it.id, it),
+    },
+  };
+}
+
+check("finds a test nested two levels deep (file → suite → test)", () => {
+  const { findDescendantById } = _test;
+  const file = fakeItem("/f.test.lin");
+  const suite = fakeItem("/f.test.lin::suite::S");
+  const test = fakeItem("/f.test.lin::checks a thing");
+  suite.children.add(test);
+  file.children.add(suite);
+  const found = findDescendantById(file, "/f.test.lin::checks a thing");
+  assert.ok(found, "should find the under-suite test");
+  assert.strictEqual(found.id, "/f.test.lin::checks a thing");
+});
+
+check("returns undefined for an unknown id (so caller creates it)", () => {
+  const { findDescendantById } = _test;
+  const file = fakeItem("/f.test.lin");
+  const suite = fakeItem("/f.test.lin::suite::S");
+  file.children.add(suite);
+  assert.strictEqual(findDescendantById(file, "/f.test.lin::nope"), undefined);
 });
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
