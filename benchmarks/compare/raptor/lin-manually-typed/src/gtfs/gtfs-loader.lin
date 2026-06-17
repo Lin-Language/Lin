@@ -48,10 +48,8 @@ export val loadGtfs = (path: String) =>
     )
 
   val addLink = (row: AnyVal) =>
-    val key = row["from_stop_id"]
-    val arr = transfers[key] ?? []
-    transfers[key] = arr
-    push(arr, {
+    transfers[row["from_stop_id"]] = transfers[row["from_stop_id"]] ?? []
+    transfers[row["from_stop_id"]].push({
       "origin": row["from_stop_id"],
       "destination": row["to_stop_id"],
       "duration": row["duration"].parseUInt16(),
@@ -78,8 +76,7 @@ export val loadGtfs = (path: String) =>
     }
 
   val addDate = (row: AnyVal) =>
-    dates[row["service_id"]] = dates[row["service_id"]] ?? {}                                                                                                     
-    dates[row["service_id"]][row["date"]] == row["exception_type"] == "1" 
+    dates[row["service_id"]][row["date"]] = row["exception_type"] == "1" 
 
   val addTrip = (row: AnyVal) =>
     trips.push({ "serviceId": row["service_id"], "tripId": row["trip_id"], "stopTimes": [], "service": {} }) 
@@ -139,7 +136,7 @@ export val loadGtfs = (path: String) =>
   processZip()
   addCalendarsAndStopTimesToTrips()
   
-  [trips, transfers, interchange, stops]
+  [trips, transfers, interchange, stops] // TODO: freeze
     
 
 

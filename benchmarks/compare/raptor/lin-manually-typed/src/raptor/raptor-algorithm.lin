@@ -1,9 +1,10 @@
 import { StopId, Time, Transfer, Trip } from "../gtfs/gtfs"
-import { DayOfWeek } from "../gtfs/date"
+import { DayOfWeek, DateNumber } from "../gtfs/date"
 import { QueueFactory } from "./queue-factory"
-import { RouteId, RouteScanner, RouteScannerFactory } from "./RouteScanner"
+import { RouteId, RouteScanner, RouteScannerFactory } from "./route-scanner"
 import { Arrivals, ConnectionIndex, ScanResults } from "./scan-results"
 import { ScanResultsFactory } from "./ScanResultsFactory"
+import { while, range } from "std/iter"
 
 export type RaptorAlgorithm = {
   "routeStopIndex": RouteStopIndex,
@@ -42,21 +43,22 @@ export val createRaptorAlgorithm = (
 export val scan = (
   raptor: RaptorAlgorithm, 
   origins: StopTimes, 
-  date: number, 
+  date: DateNumber, 
   dow: DayOfWeek
 ): [ConnectionIndex, Arrivals] =>
   val routeScanner = raptor["routeScannerFactory"].create(date, dow)
   val results = raptor["scanResultsFactory"].create(origins)
   var markedStops = origins.keys()
 
-  while (markedStops.length() > 0) {
+  while(() =>
     results.addRound()
 
     raptor.scanRoutes(results, routeScanner, markedStops)
     raptor.scanTransfers(results, markedStops)
 
     markedStops = results.getMarkedStops()
-  }
+    markedStops.length() > 0
+  )
 
   results.finalize()
 
@@ -76,7 +78,7 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
 
       if trip != null then
         val i = raptor["interchange"][stopPi]
-        val stopTime = trip.stopTimes[pi]
+        val stopTime = trip["stopTimes"][pi]
 
         if stopTime.dropOff && stopTime["arrivalTime"] + i < results.bestArrival(stopPi) then
           results.setTrip(trip, boardingPoint, pi, i)
@@ -104,6 +106,7 @@ val scanTransfers = (raptor: RaptorAlgorithm, results: ScanResults, markedStops:
 
       if transfer["startTime"] <= arrival && transfer["endTime"] >= arrival && arrival < results.bestArrival(stopPi) then
         results.setTransfer(transfer, arrival) 
+    )
   )
 
 export type RouteStopIndex = { RouteId: { StopId: UInt8 } }
