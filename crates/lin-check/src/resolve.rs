@@ -8,13 +8,18 @@ use crate::types::Type;
 /// The error string does NOT carry span information — all existing callers that need a plain
 /// `String` error (e.g. `function.rs`, `call.rs`) use this.
 pub fn resolve_type(type_expr: &TypeExpr, env: &TypeEnv) -> Result<Type, String> {
-    resolve_type_spanned(type_expr, env).map_err(|(_, m)| m)
+    resolve_type_spanned(type_expr, env).map_err(|(_, m, _)| m)
 }
 
-/// Resolve a type expression, returning `Ok(Type)` on success or `Err((Span, String))` on
-/// failure.  The span in the error points at the offending leaf type-expression (e.g. the
-/// `Unknown type 'X'` span points at the `X` token, not the surrounding declaration).
-pub fn resolve_type_spanned(type_expr: &TypeExpr, env: &TypeEnv) -> Result<Type, (Span, String)> {
+/// Resolve a type expression, returning `Ok(Type)` on success or `Err((Span, String,
+/// Option<String>))` on failure.  The span in the error points at the offending leaf
+/// type-expression (e.g. the `Unknown type 'X'` span points at the `X` token, not the
+/// surrounding declaration).  The third element is an optional help note that callers
+/// may surface via `Diagnostic::with_help`.
+pub fn resolve_type_spanned(
+    type_expr: &TypeExpr,
+    env: &TypeEnv,
+) -> Result<Type, (Span, String, Option<String>)> {
     resolve_type_inner(type_expr, env, &mut std::collections::HashSet::new())
 }
 
@@ -22,27 +27,27 @@ fn resolve_type_inner(
     type_expr: &TypeExpr,
     env: &TypeEnv,
     visiting: &mut std::collections::HashSet<String>,
-) -> Result<Type, (Span, String)> {
+) -> Result<Type, (Span, String, Option<String>)> {
     match type_expr {
         TypeExpr::Named(name, span) => {
-            resolve_named_cycle(name, env, visiting).map_err(|m| (*span, m))
+            resolve_named_cycle(name, env, visiting).map_err(|m| (*span, m, None))
         }
         TypeExpr::Generic(name, args, span) => {
-            let resolved_args: Result<Vec<Type>, (Span, String)> =
+            let resolved_args: Result<Vec<Type>, (Span, String, Option<String>)> =
                 args.iter().map(|a| resolve_type_inner(a, env, visiting)).collect();
-            resolve_generic(name, &resolved_args?, env, visiting).map_err(|m| (*span, m))
+            resolve_generic(name, &resolved_args?, env, visiting).map_err(|m| (*span, m, None))
         }
         TypeExpr::Array(inner, _span) => {
             let inner_ty = resolve_type_inner(inner, env, visiting)?;
             Ok(Type::Array(Box::new(inner_ty)))
         }
         TypeExpr::FixedArray(types, _span) => {
-            let resolved: Result<Vec<Type>, (Span, String)> =
+            let resolved: Result<Vec<Type>, (Span, String, Option<String>)> =
                 types.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::FixedArray(resolved?))
         }
         TypeExpr::Union(types, _span) => {
-            let resolved: Result<Vec<Type>, (Span, String)> =
+            let resolved: Result<Vec<Type>, (Span, String, Option<String>)> =
                 types.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::flatten_union(resolved?))
         }
@@ -62,7 +67,7 @@ fn resolve_type_inner(
                         return Err((*span, format!(
                             "intersection `&` is only valid between record types; operand `{}` is not a record",
                             other
-                        )));
+                        ), None));
                     }
                 };
                 for (key, field_ty) in fields {
@@ -71,7 +76,7 @@ fn resolve_type_inner(
                             return Err((*span, format!(
                                 "intersection type has conflicting field \"{}\": {} vs {}",
                                 key, existing, field_ty
-                            )));
+                            ), None));
                         }
                     } else {
                         merged.insert(key.clone(), field_ty.clone());
@@ -81,7 +86,7 @@ fn resolve_type_inner(
             Ok(Type::object(merged))
         }
         TypeExpr::Function(params, ret, _span) => {
-            let param_types: Result<Vec<Type>, (Span, String)> =
+            let param_types: Result<Vec<Type>, (Span, String, Option<String>)> =
                 params.iter().map(|p| resolve_type_inner(p, env, visiting)).collect();
             let ret_type = resolve_type_inner(ret, env, visiting)?;
             // Type annotations cannot express default arguments, so every declared
@@ -114,7 +119,39 @@ fn resolve_type_inner(
             //     This composes with the total-literal-key index rule: indexing the record by a key
             //     of the SAME literal union is provably total (no safe-bracket `Null`).
             //   - anything else → an error (a non-String, non-literal key type is not indexable).
-            let key_ty = resolve_type_inner(key, env, visiting)?;
+            //
+            // HINT: if the key is a bare Named identifier that starts with a lowercase letter AND
+            // the resolution fails with "Unknown type", we almost certainly have a record type that
+            // was written without quoted keys (TypeScript-style `{ field: T }`). Attach a help note
+            // explaining the quoting requirement.
+            let key_result = resolve_type_inner(key, env, visiting);
+            let key_ty = match key_result {
+                Ok(t) => t,
+                Err((key_span, msg, _existing_help)) => {
+                    // Check whether the key is a bare lowercase identifier — the hallmark of a
+                    // mistakenly-unquoted record field name. Uppercase identifiers are valid type
+                    // names (e.g. `StopId`), so we don't hint on those.
+                    let help = if msg.contains("Unknown type") {
+                        if let TypeExpr::Named(key_name, _) = key.as_ref() {
+                            if key_name.chars().next().map_or(false, |c| c.is_ascii_lowercase()) {
+                                Some(format!(
+                                    "record field keys must be quoted — write \"{name}\": T. \
+                                     A bare `{name}: T` is parsed as a `{{ KeyType: ValueType }}` \
+                                     map/index-signature, so `{name}` is read as a type name.",
+                                    name = key_name
+                                ))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    return Err((key_span, msg, help));
+                }
+            };
             let val_ty = resolve_type_inner(value, env, visiting)?;
             if key_ty == Type::Str {
                 Ok(Type::Map { key: Box::new(Type::Str), value: Box::new(val_ty) })
@@ -144,11 +181,11 @@ fn resolve_type_inner(
                     "Index-signature key type must be String, an integer type, or a union of string \
                      literals, but it resolves to {}",
                     key_ty
-                )))
+                ), None))
             }
         }
         TypeExpr::TaggedUnion(variants, _span) => {
-            let resolved: Result<Vec<Type>, (Span, String)> =
+            let resolved: Result<Vec<Type>, (Span, String, Option<String>)> =
                 variants.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::flatten_union(resolved?))
         }
@@ -618,7 +655,7 @@ mod sealed_marker_tests {
     /// `resolve_type_spanned` must return the span of the offending leaf type-expression, not a
     /// dummy or enclosing span.  For `{ bestArrivals: Arrivals }` (an IndexSig whose key is the
     /// unknown type `bestArrivals`), the error span must equal the KEY span, not the outer IndexSig
-    /// span.  This regression test pins that behaviour.
+    /// span.  This regression test pins that behaviour and also checks the new help-note field.
     #[test]
     fn resolve_type_spanned_points_at_offending_leaf() {
         // KEY_SPAN: a distinctive non-zero, non-dummy span representing the `bestArrivals` token.
@@ -649,5 +686,52 @@ mod sealed_marker_tests {
         // resolve_type (the backwards-compat shim) must still return the same message string.
         let plain_err = resolve_type(&te, &env).unwrap_err();
         assert_eq!(plain_err, err.1, "resolve_type must return the same message as resolve_type_spanned");
+    }
+
+    /// A lowercase bare key in an IndexSig (`{ foo: Bar }`) should carry a help note that
+    /// mentions quoting the field key.  An uppercase bare key (`{ StopId: Time }`) that is
+    /// simply unknown — a genuine type-alias typo — must NOT get the quoting hint, since the
+    /// user most likely intended a type name.
+    #[test]
+    fn lowercase_bare_key_gets_quoting_hint() {
+        let env = TypeEnv::new();
+        let dummy = Span::dummy();
+
+        // Lowercase: `{ foo: Bar }` — "foo" is almost certainly a mistakenly-unquoted field.
+        let te_lower = TypeExpr::IndexSig(
+            Box::new(TypeExpr::Named("foo".into(), dummy)),
+            Box::new(TypeExpr::Named("Bar".into(), dummy)),
+            dummy,
+        );
+        let err_lower = resolve_type_spanned(&te_lower, &env).unwrap_err();
+        let help_lower = err_lower.2;
+        assert!(
+            help_lower.is_some(),
+            "lowercase bare key must produce a help note"
+        );
+        let help_text = help_lower.unwrap();
+        assert!(
+            help_text.contains("quoted") || help_text.contains("quote"),
+            "help must mention quoting; got: {}",
+            help_text
+        );
+        assert!(
+            help_text.contains("foo"),
+            "help must name the offending identifier; got: {}",
+            help_text
+        );
+
+        // Uppercase: `{ StopId: Time }` — "StopId" looks like a genuine type name, no hint.
+        let te_upper = TypeExpr::IndexSig(
+            Box::new(TypeExpr::Named("StopId".into(), dummy)),
+            Box::new(TypeExpr::Named("Time".into(), dummy)),
+            dummy,
+        );
+        let err_upper = resolve_type_spanned(&te_upper, &env).unwrap_err();
+        assert_eq!(
+            err_upper.2, None,
+            "uppercase bare key must NOT produce a quoting hint; got: {:?}",
+            err_upper.2
+        );
     }
 }

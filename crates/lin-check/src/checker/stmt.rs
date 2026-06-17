@@ -76,7 +76,10 @@ impl Checker {
                     .as_ref()
                     .map(|t| resolve_type_spanned(t, &self.env))
                     .transpose()
-                    .map_err(|(s, e)| Diagnostic::error(s, e))?;
+                    .map_err(|(s, e, help)| {
+                        let d = Diagnostic::error(s, e);
+                        if let Some(h) = help { d.with_help(h) } else { d }
+                    })?;
 
                 // Extract the binding name for function name propagation (TCO, direct calls).
                 let binding_name = match pattern {
@@ -249,7 +252,10 @@ impl Checker {
                     .as_ref()
                     .map(|t| resolve_type_spanned(t, &self.env))
                     .transpose()
-                    .map_err(|(s, e)| Diagnostic::error(s, e))?;
+                    .map_err(|(s, e, help)| {
+                        let d = Diagnostic::error(s, e);
+                        if let Some(h) = help { d.with_help(h) } else { d }
+                    })?;
 
                 let typed_value = if let Some(ref expected_ty) = expected {
                     self.check_expr(value, expected_ty)?
@@ -307,8 +313,12 @@ impl Checker {
                 // `Named(param)`); `resolve_named_cycle` then leaves it as `Named(param)` via the
                 // same cycle guard used for the alias's own self-references. Without this, a bare
                 // `T` in the body resolves as `Unknown type 'T'` and the body is never stored.
+                let map_resolve_err = |(s, e, help): (Span, String, Option<String>)| {
+                    let d = Diagnostic::error(s, e);
+                    if let Some(h) = help { d.with_help(h) } else { d }
+                };
                 let resolved = if params.is_empty() {
-                    resolve_type_spanned(body, &self.env).map_err(|(s, e)| Diagnostic::error(s, e))?
+                    resolve_type_spanned(body, &self.env).map_err(map_resolve_err)?
                 } else {
                     let mut scratch = self.env.clone();
                     for param in params {
@@ -318,7 +328,7 @@ impl Checker {
                             Type::Named(param.clone()),
                         );
                     }
-                    resolve_type_spanned(body, &scratch).map_err(|(s, e)| Diagnostic::error(s, e))?
+                    resolve_type_spanned(body, &scratch).map_err(map_resolve_err)?
                 };
                 self.env
                     .define_type(name.clone(), params.clone(), resolved);
@@ -395,7 +405,10 @@ impl Checker {
                 let mut foreign_slots = Vec::new();
                 for binding in bindings {
                     let ty = resolve_type_spanned(&binding.type_ann, &self.env)
-                        .map_err(|(s, e)| Diagnostic::error(s, e))?;
+                        .map_err(|(s, e, help)| {
+                            let d = Diagnostic::error(s, e);
+                            if let Some(h) = help { d.with_help(h) } else { d }
+                        })?;
                     // "lin-runtime" is a reserved internal path — skip FFI type validation
                     // since runtime functions use Array/Object which aren't valid in user FFI.
                     let valid = is_runtime || is_legal_ffi_type(&ty);
