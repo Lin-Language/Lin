@@ -283,6 +283,10 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) const NKIND_MAP: u32 = lin_common::tags::NKIND_MAP;
     /// SumNode pointer field in named descriptor. On materialize: `lin_sumnode_materialize` → TAG_MAP.
     pub(crate) const NKIND_SUMNODE: u32 = lin_common::tags::NKIND_SUMNODE;
+    /// UInt32/UInt16/UInt8 stored at their natural slot widths (4/2/1 bytes), zero-extended to i64 on materialize.
+    pub(crate) const NKIND_UINT32: u32 = lin_common::tags::NKIND_UINT32;
+    pub(crate) const NKIND_UINT16: u32 = lin_common::tags::NKIND_UINT16;
+    pub(crate) const NKIND_UINT8: u32 = lin_common::tags::NKIND_UINT8;
 
     /// The NAMED-descriptor kind for `ty` (a sealed-record field). Covers every permissible sealed
     /// field — scalar OR heap. Returns `None` only for a type that is not a valid sealed field (which
@@ -291,7 +295,15 @@ impl<'ctx> Codegen<'ctx> {
         match ty {
             Type::Bool => Some(Self::NKIND_BOOL),
             Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => Some(Self::NKIND_INT32),
-            Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::Int64 => Some(Self::NKIND_INT64),
+            // UInt8/UInt16/UInt32 are stored at their NATURAL slot sizes (1/2/4 bytes) by codegen.
+            // They use distinct NKIND codes so nkind_size_align returns the correct slot size and
+            // struct_size_from_named_desc / materialize_named_payload_to_map read the right width.
+            // (Previously they mapped to NKIND_INT64 which implies 8-byte reads — causing misaligned
+            // pointer panics whenever a small-unsigned field ended up at a non-8-aligned offset.)
+            Type::UInt8 => Some(Self::NKIND_UINT8),
+            Type::UInt16 => Some(Self::NKIND_UINT16),
+            Type::UInt32 => Some(Self::NKIND_UINT32),
+            Type::Int64 => Some(Self::NKIND_INT64),
             Type::UInt64 => Some(Self::NKIND_UINT64),
             // Float32 occupies a 4-byte slot in the packed struct (physical f32). The dynamic boxing
             // path fpext's to f64 and uses TAG_FLOAT64 (matching type_tag / box_value). Distinct from
@@ -307,12 +319,6 @@ impl<'ctx> Codegen<'ctx> {
             Type::Union(_) if Self::is_sum_type(ty) => Some(Self::NKIND_SUMNODE),
             _ => None,
         }
-    }
-
-    /// True when `ty` is a permissible field of a sealed record. Delegates to the canonical
-    /// definition in `lin_check::types::Type::is_sealed_field`.
-    pub(crate) fn is_sealed_field(ty: &Type) -> bool {
-        ty.is_sealed_field()
     }
 
     /// THE sealed-record gate. Delegates to the canonical `Type::sealed_fields`
@@ -405,11 +411,6 @@ impl<'ctx> Codegen<'ctx> {
     /// (`lin_check::types`). See that function for the full contract and fail-safe semantics.
     pub(crate) fn sealed_array_elem(ty: &Type) -> Option<&indexmap::IndexMap<String, Type>> {
         Type::sealed_array_elem(ty)
-    }
-
-    /// Element-field packability gate. Delegates to `Type::is_sealed_array_field_packable`.
-    pub(crate) fn sealed_array_elem_field_packable(ty: &Type) -> bool {
-        ty.is_sealed_array_field_packable()
     }
 
     // ── Unboxed tagged sum type (`SumNode`) — unboxed-sumtype Stage 1 ─────────────────────────────

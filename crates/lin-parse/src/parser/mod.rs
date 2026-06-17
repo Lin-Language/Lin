@@ -614,3 +614,75 @@ mod missing_binding_name_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod bare_key_record_hint_tests {
+    use super::*;
+    use lin_lex::Lexer;
+
+    fn diagnostics_for(source: &str) -> Vec<Diagnostic> {
+        let mut lexer = Lexer::new(source, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let _module = parser.parse_module();
+        parser.diagnostics
+    }
+
+    /// A multi-entry bare-key brace type like `{ a: Foo, b: Bar }` (TypeScript-style record)
+    /// should produce EXACTLY ONE diagnostic whose message/help mentions quoting record keys.
+    /// It must NOT cascade into multiple "unexpected token" errors.
+    #[test]
+    fn multi_entry_bare_key_produces_single_clear_diagnostic() {
+        let diags = diagnostics_for("type T = { a: Foo, b: Bar }\n");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly 1 diagnostic for multi-entry bare-key type, got: {diags:?}"
+        );
+        let d = &diags[0];
+        // The message or help must mention "index-signature" or "record" and "quote"/"quoted".
+        let combined = format!("{} {}", d.message, d.help.as_deref().unwrap_or(""));
+        assert!(
+            combined.contains("index-signature") || combined.contains("record"),
+            "diagnostic must mention 'index-signature' or 'record'; got: {:?}",
+            combined
+        );
+        assert!(
+            combined.contains("quote") || combined.contains("quoted"),
+            "diagnostic must mention quoting; got: {:?}",
+            combined
+        );
+    }
+
+    /// A multi-line / indented bare-key record also produces exactly one diagnostic.
+    #[test]
+    fn multi_entry_bare_key_multiline_produces_single_diagnostic() {
+        let diags = diagnostics_for("type T = {\n  bestArrivals: Arrivals,\n  k: UInt8\n}\n");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly 1 diagnostic for multiline bare-key type, got: {diags:?}"
+        );
+    }
+
+    /// A legitimate single-entry index-signature with a conventional type-name key must parse
+    /// with NO diagnostics (the comma detection must not trigger here).
+    #[test]
+    fn single_entry_index_sig_is_not_affected() {
+        let diags = diagnostics_for("type M = { StopId: String }\n");
+        assert!(
+            diags.is_empty(),
+            "a valid single-entry index-signature must produce no diagnostics; got: {diags:?}"
+        );
+    }
+
+    /// A quoted-key record type must be completely unaffected.
+    #[test]
+    fn quoted_key_record_is_not_affected() {
+        let diags = diagnostics_for("type T = { \"a\": Foo, \"b\": Bar }\n");
+        assert!(
+            diags.is_empty(),
+            "a valid quoted-key record type must produce no diagnostics; got: {diags:?}"
+        );
+    }
+}

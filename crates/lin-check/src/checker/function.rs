@@ -88,6 +88,18 @@ impl Checker {
         }
     }
 
+    /// True when the function body's tail expression is an array literal `[...]`. Used to gate the
+    /// `FixedArray` (tuple) bidirectional-check path: only array literals need the positional
+    /// element check — `if`/`match`/`??` and other non-literal bodies still infer bottom-up.
+    fn body_tail_is_array_literal(body: &lin_parse::ast::Expr) -> bool {
+        use lin_parse::ast::Expr;
+        match body {
+            Expr::Array(..) => true,
+            Expr::Block(_, final_expr, _, _) => matches!(final_expr.as_ref(), Expr::Array(..)),
+            _ => false,
+        }
+    }
+
     /// Phase 4.5b: the binding name of an INTERMEDIATE `lin_array_allocate` builder body — the
     /// common map-shape combinator idiom:
     ///
@@ -405,6 +417,18 @@ impl Checker {
                 checked_against_declared = true;
                 self.check_expr(body, declared)?
             }
+            // Tuple (FixedArray) declared return with an array-literal body: check bidirectionally
+            // so the positional element types are validated against the declared tuple. Only fires
+            // when the body (or block's final expression) is itself an array literal — `if`/`match`/
+            // `??`/call bodies with a tuple return still infer bottom-up, preserving existing
+            // behaviour for all non-literal bodies. The `check_expr(body, FixedArray)` path in
+            // `expr.rs` handles both bare array literals (direct `(Expr::Array, Type::FixedArray)`
+            // match) and block-ending-in-array-literal (the `block_push` special case for FixedArray
+            // + array-literal tail in `check_expr`'s Block handling).
+            Some(declared @ Type::FixedArray(_)) if Self::body_tail_is_array_literal(body) => {
+                checked_against_declared = true;
+                self.check_expr(body, declared)?
+            }
             // Phase 4.5: a generic combinator whose body is `=> arrayAllocate(n)` and whose
             // declared return is an `Array(_)` must be CHECKED against that return so the fresh
             // allocation's Json-wildcard element type is refined to the declared element (the
@@ -493,7 +517,7 @@ impl Checker {
             // returns a sealed struct propagate the sealed repr through recursive calls and if
             // merges instead of degrading every phi to a boxed TAG_MAP.
             let promote_to_sealed = matches!((&declared, &body_ty),
-                (Type::Object { fields: df, sealed: false }, Type::Object { fields: bf, sealed: true })
+                (Type::Object { fields: df, sealed: false, .. }, Type::Object { fields: bf, sealed: true, .. })
                 if df == bf);
             if promote_to_sealed { body_ty } else { declared }
         } else {
@@ -750,6 +774,12 @@ impl Checker {
         }
         let typed_body_raw = match &declared_ret {
             Some(declared) if super::expr::expected_pushes_into_branches(declared) => {
+                checked_against_declared = true;
+                self.check_expr(body, declared)?
+            }
+            // Tuple (FixedArray) declared return with an array-literal body: same as the first
+            // `infer_function` copy above — see there for the full rationale.
+            Some(declared @ Type::FixedArray(_)) if Self::body_tail_is_array_literal(body) => {
                 checked_against_declared = true;
                 self.check_expr(body, declared)?
             }

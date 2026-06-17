@@ -4,7 +4,7 @@ use super::*;
 // Statement lowering
 // -------------------------------------------------------------------------
 
-pub fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
+pub(crate) fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
     match stmt {
         TypedStmt::Val { slot, value, ty, name, span } => {
             // A top-level function val was pre-assigned a FuncId in `global_fn_slots`
@@ -118,7 +118,11 @@ pub fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCt
             let module_key = mangle_module_key(path);
             for b in bindings {
                 if let Type::Function { params, .. } = &b.ty {
-                    let sym = format!("{}_{}", module_key, b.name);
+                    // ADR-074: an imported overload member carries the exporting module's exact
+                    // mangled function name in `symbol`; use it so the target matches the emitted
+                    // `{module_key}_{Function.name}`. Ordinary imports use the plain export name.
+                    let local_sym = b.symbol.as_deref().unwrap_or(&b.name);
+                    let sym = format!("{}_{}", module_key, local_sym);
                     ctx.import_fn_slots.insert(b.slot, (sym, params.clone()));
                     // Imported stdlib combinator (map/for/filter/…): a closure passed as its
                     // callback argument is consumed synchronously and never escapes — record the

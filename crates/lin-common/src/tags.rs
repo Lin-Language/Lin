@@ -76,7 +76,7 @@ pub const TAG_RECORD: u8 = 25;
 // Shared by `lin-runtime` (sealed.rs) and `lin-codegen` (types.rs). Both crates MUST reference
 // these constants and call `nkind_size_align` for field-size derivation — never re-derive locally.
 pub const NKIND_INT32: u32 = 1; // Int8/Int16/Int32 → 4 bytes
-pub const NKIND_INT64: u32 = 2; // Int64, UInt8/UInt16/UInt32 (zero-extended) → 8 bytes
+pub const NKIND_INT64: u32 = 2; // Int64 → 8 bytes
 pub const NKIND_UINT64: u32 = 3; // UInt64 → 8 bytes
 pub const NKIND_FLOAT64: u32 = 4; // Float64 → 8 bytes
 pub const NKIND_BOOL: u32 = 5; // Bool → 1 byte
@@ -93,6 +93,15 @@ pub const NKIND_FLOAT32: u32 = 10; // Float32 → 4 bytes (fpext to f64 on dynam
 /// `lin_sumnode_release_self`. On materialize: `lin_sumnode_materialize` → TAG_MAP. On transfer:
 /// `clone_sumnode`. Distinct from `NKIND_SEALED` (nested sealed struct) and `NKIND_MAP`.
 pub const NKIND_SUMNODE: u32 = 11; // *SumNode heap field → 8-byte pointer
+/// UInt32 field stored as 4 bytes in-struct (physical u32), zero-extended to i64 on materialize.
+/// Distinct from NKIND_INT64 so `nkind_size_align` returns (4,4) — correcting the old mapping
+/// that incorrectly treated UInt32 as an 8-byte slot, causing misaligned reads for fields that
+/// follow a UInt32 field at a 4-aligned (not 8-aligned) offset.
+pub const NKIND_UINT32: u32 = 12; // UInt32 → 4 bytes (zero-extend to i64 on materialize)
+/// UInt16 field stored as 2 bytes in-struct (physical u16), zero-extended to i64 on materialize.
+pub const NKIND_UINT16: u32 = 13; // UInt16 → 2 bytes
+/// UInt8 field stored as 1 byte in-struct (physical u8), zero-extended to i64 on materialize.
+pub const NKIND_UINT8: u32 = 14; // UInt8 → 1 byte
 
 /// Returns `(byte_size, alignment)` for a named-descriptor field kind code.
 /// This is the SINGLE SOURCE OF TRUTH for the nkind → layout mapping shared by the
@@ -109,6 +118,9 @@ pub const fn nkind_size_align(nkind: u32) -> (u32, u32) {
         NKIND_FLOAT64 => (8, 8),
         NKIND_FLOAT32 => (4, 4),
         NKIND_BOOL    => (1, 1),
+        NKIND_UINT32  => (4, 4),
+        NKIND_UINT16  => (2, 2),
+        NKIND_UINT8   => (1, 1),
         // All heap-pointer kinds: String, Array, Sealed, Map — and any future additions.
         _ => (8, 8),
     }

@@ -1414,7 +1414,7 @@ impl<'ctx> Codegen<'ctx> {
                             // MakeObject for spread-free literals (incl. the common empty `{}`).
                             if let Type::Map { key: map_key_ty, value: elem_ty } = ty {
                                 let cap = i32_ty.const_int(fields.len().max(1) as u64, false);
-                                let key_kind_val = i32_ty.const_int(if map_key_ty.is_integer() { 1 } else { 0 }, false);
+                                let key_kind_val = i32_ty.const_int(if map_key_ty.is_int_map_key() { 1 } else { 0 }, false);
                                 let map_ptr = self.builder
                                     .call(self.rt.map_alloc, &[cap.into(), key_kind_val.into()], "ir_map")
                                     .try_as_basic_value().unwrap_basic().into_pointer_value();
@@ -1442,7 +1442,7 @@ impl<'ctx> Codegen<'ctx> {
                                             // own +1 (released at scope exit). UNCHANGED RC behaviour.
                                             self.build_tagged_val_alloca(&val, &val_ty)
                                         };
-                                        if map_key_ty.is_integer() {
+                                        if map_key_ty.is_int_map_key() {
                                             // Key was stored as its decimal string representation in
                                             // the IR; parse it back to an i64 constant for map_set_int.
                                             let key_i64: i64 = key.parse().expect("int-map IR key must be a decimal i64");
@@ -1639,9 +1639,15 @@ impl<'ctx> Codegen<'ctx> {
                             let _ = ty;
                             temp_map.insert(*dst, obj_ptr.into());
                         }
-                        Instruction::MakeArray { dst, elements, elem_ty, inline } => {
+                        Instruction::MakeArray { dst, elements, elem_ty, inline, columnar: _ } => {
                             let cap = i64_ty.const_int(elements.len().max(4) as u64, false);
-                            // Sealed-record array: two layouts selected by escape analysis.
+                            // Sealed-record array: three layouts selected by escape analysis.
+                            //
+                            // 0xFC COLUMNAR (`columnar == true`, `inline == true`, all-scalar fields):
+                            //   lin_columnar_array_alloc(cap, n_fields, col_meta, named_desc) — one
+                            //   contiguous column buffer per field. Elements are scatter-pushed via
+                            //   lin_columnar_push_from_sealed; source struct is released at scope exit.
+                            //   All fields are scalars (Phase-1 gate), so no heap-field retain is needed.
                             //
                             // 0xFE INLINE (`inline == true`, escape-proven non-aliasing elements):
                             //   lin_sealed_array_alloc(cap, stride, desc, named_desc) — contiguous
@@ -1664,7 +1670,32 @@ impl<'ctx> Codegen<'ctx> {
                             // below is the ORTHOGONAL pre-existing flat-array path (assume sites dispatch
                             // on the array TYPE), which repr does not own, so it stays type-driven.
                             let arr_repr = func.repr_of(*dst);
-                            let arr = if let Some(fields) = arr_repr.packed_sealed_array_layout() {
+                            let arr = if arr_repr.is_columnar_array() {
+                                // 0xFC columnar path: scatter each element's fields into column buffers.
+                                let fields = arr_repr.columnar_array_layout().unwrap().clone();
+                                let n_fields = fields.len() as u64;
+                                let col_meta = self.columnar_col_meta_descriptor(&fields);
+                                let named_desc = self.sealed_named_descriptor(&fields);
+                                let n_fields_v = i64_ty.const_int(n_fields, false);
+                                let alloc_fn = self.get_or_declare_fn(
+                                    "lin_columnar_array_alloc",
+                                    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into(), ptr_ty.into()], false));
+                                let arr_v = self.builder.call(alloc_fn,
+                                    &[cap.into(), n_fields_v.into(), col_meta.into(), named_desc.into()],
+                                    "ir_colarr").try_as_basic_value().unwrap_basic();
+                                // Emit field_offsets static for lin_columnar_push_from_sealed.
+                                // field_offsets[i] = sealed_field_layout(fields, field_i) for each field.
+                                let field_offsets = self.columnar_field_offsets_global(&fields);
+                                let push_fn = self.get_or_declare_fn(
+                                    "lin_columnar_push_from_sealed",
+                                    self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false));
+                                for e_temp in elements {
+                                    if let Some(&ev) = temp_map.get(e_temp) {
+                                        self.builder.call(push_fn, &[arr_v.into(), ev.into(), field_offsets.into()], "");
+                                    }
+                                }
+                                arr_v
+                            } else if let Some(fields) = arr_repr.packed_sealed_array_layout() {
                                 let fields = fields.clone();
                                 let named_desc = self.sealed_named_descriptor(&fields);
                                 if *inline {

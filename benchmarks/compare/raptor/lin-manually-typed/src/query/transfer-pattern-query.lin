@@ -1,0 +1,46 @@
+import { StopId } from "../gtfs/gtfs"
+import { RaptorAlgorithm, scan, StopTimes } from "../raptor/raptor-algorithm"
+import { getDateNumber } from "./date-util"
+import { StringResults, TransferPatternIndex, add, finalize } from "../transfer-pattern/results/string-results"
+import { Date, weekday } from "std/datetime"
+
+val ONE_DAY: UInt32 = 24u32 * 60u32 * 60u32
+
+//
+// Uses the Raptor algorithm to perform full day range queries and send the results to the repository.
+//
+export type TransferPatternQuery = { "raptor": RaptorAlgorithm, "resultFactory": () => StringResults }
+
+export val createTransferPatternQuery = (raptor: RaptorAlgorithm, resultFactory: () => StringResults) =>
+  {
+    "raptor": raptor,
+    "resultFactory": resultFactory
+  }
+
+//
+// Generate a full day's set of results and store them using the resultsFactory
+//
+export val plan = (query: TransferPatternQuery, origin: StopId, dateObj: Date): TransferPatternIndex =>
+  val date = dateObj.getDateNumber()
+  val dayOfWeek = dateObj.weekday()
+  val results = query["resultFactory"]()
+
+  // scan a single-entry origin map at each departure time, feeding the kConnections to the
+  // results which return the next time to search from, until the whole day has been covered
+  val searchFrom = (time: UInt32): Null =>
+    if time < ONE_DAY then
+      // build the single-entry origin departure map { origin: time }
+      var origins: StopTimes = {}
+      origins[origin] = time
+
+      // scan returns [kConnections, bestArrivals]; only the kConnections index is needed here
+      val scanned = query["raptor"].scan(origins, date, dayOfWeek)
+      val kConnections = scanned[0]
+
+      searchFrom(results.add(kConnections))
+    else
+      null
+
+  searchFrom(1)
+
+  results.finalize()
