@@ -3253,3 +3253,29 @@ checker no longer emits spurious "unknown type" cascades. Pure `lin-parse` chang
 the hang-regression suite (which guards termination/progress) and the full workspace suite stay green.
 A parser regression test asserts a `type` declaration after a broken delimited construct is still
 produced.
+
+## ADR-081: Condition-only `while(() => Boolean)` loop overload
+
+**Status**: Accepted.
+
+**Context**: Lin's `while` was a single iterable combinator (`<T>(src: T[] | Iterator | Stream, f: (T, Int32) => Boolean) => Null`), requiring a collection to iterate over. The imperative pattern `while cond { body }` was not expressible directly — users had to reach for `range(0, n).for(...)` with a sentinel or write a manual tail-recursive function.
+
+**Decision**: Add a second `while` overload to `std/iter` using ADR-074 overload resolution:
+
+```lin
+export val while = (f: () => Boolean): Null =>
+  whileLoop(f)
+
+val whileLoop = (f: () => Boolean): Null =>
+  if f() then whileLoop(f) else null
+```
+
+The 1-arg form takes a zero-argument closure and loops until it returns `false`. It is a pure-Lin tail-recursive function: the `whileLoop` helper's self-call is in tail position, so the TCO alloca/loop transform (ADR-016) applies — the stack is constant regardless of iteration count.
+
+**Why a private helper name**: the exported `while` calls `whileLoop`, whose name does NOT end in `_while`. The IR lowering's `combinator_callee_name` function identifies intrinsic combinators by the trailing `_while` symbol component; using a distinct helper name ensures the recursive body is lowered as a plain function call, never routed through `lower_while` (which expects ≥2 args and would panic on a 1-arg call).
+
+**IR arity gate**: as a defensive measure, `combinator_callee_name` now also gates on `args.len() >= 2` before returning `"while"` for an import or intrinsic slot. This prevents any future stdlib refactor that accidentally routes a 1-arg call through the combinator path from reaching `lower_while` and panicking at `args[1]`.
+
+**Monomorphizer overload-body fix**: when two overloads share the same source name (`"while"`), the monomorphizer's `find_exported_fn` call previously returned the first same-named export — giving the 1-arg import slot the 2-arg body (a thin `lin_while` intrinsic wrapper). The monomorphizer then re-homed the 1-arg slot to `lin_while` and triggered the panic. The fix: pass the import binding's `symbol` field (the exact mangled LLVM name, `Some("while$..._<slot>")` for overload members) to `find_exported_fn`, which now pins the lookup to the body whose `TypedExpr::Function.name` matches, preventing cross-overload body confusion. A parallel fix applies to the rehome-import-of-import path in `classify_origin_slot`.
+
+**Consequences**: `while(() => cond)` is the idiomatic imperative loop. The existing `xs.while(pred)` (2-arg) form is byte-for-byte unchanged. A single `import { while } from "std/iter"` gives both forms.

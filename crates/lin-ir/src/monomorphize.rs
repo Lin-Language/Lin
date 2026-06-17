@@ -938,7 +938,10 @@ fn monomorphize_inner(
         if let TypedStmt::Import { path, bindings, .. } = stmt {
             let Some(origin) = imports.get(path) else { continue };
             for b in bindings {
-                if let Some(func) = find_exported_fn(origin, &b.name) {
+                // ADR-074: for an overload member `b.symbol` holds the exact mangled LLVM symbol;
+                // pass it to `find_exported_fn` so overloads with the same source name are
+                // resolved to the correct body, not the first same-named member.
+                if let Some(func) = find_exported_fn(origin, &b.name, b.symbol.as_deref()) {
                     if let TypedExpr::Function { params, .. } = &func {
                         // A TRUE cross-module generic has a `<T>` parameter mentioned in its PARAMS
                         // (the call site can then pin it from argument types). We deliberately do
@@ -1218,9 +1221,24 @@ fn monomorphize_inner(
 
 /// Find an exported top-level function `val name = <Function>` in `module` by name, returning a
 /// clone of its `TypedExpr::Function`. Used to pull an imported generic's body into the importer.
-fn find_exported_fn(module: &TypedModule, name: &str) -> Option<TypedExpr> {
+///
+/// For ADR-074 overload sets, pass the import binding's `symbol` (the mangled LLVM name stored in
+/// `TypedExpr::Function.name`) as `exact_symbol` to pin the lookup to the correct overload member.
+/// When `exact_symbol` is `Some`, the `TypedExpr::Function.name` must match it exactly; otherwise
+/// the first function with a matching `TypedStmt::Val.name` is returned (the pre-overload behaviour).
+fn find_exported_fn(module: &TypedModule, name: &str, exact_symbol: Option<&str>) -> Option<TypedExpr> {
     module.statements.iter().find_map(|s| match s {
         TypedStmt::Val { name: Some(n), value: value @ TypedExpr::Function { .. }, .. } if n == name => {
+            // For an overload import (exact_symbol is Some), only return this body if its emitted
+            // LLVM symbol matches the requested mangled symbol. This prevents the import of one
+            // overload member from accidentally picking up a sibling member's body.
+            if let Some(sym) = exact_symbol {
+                if let TypedExpr::Function { name: fn_name, .. } = value {
+                    if fn_name.as_deref() != Some(sym) {
+                        return None;
+                    }
+                }
+            }
             Some(value.clone())
         }
         _ => None,
@@ -1373,9 +1391,22 @@ fn classify_origin_slot(
                         // intrinsic dispatches on the array's concrete runtime element type, keeping
                         // the flat representation correct.
                         if let Some(src) = imports.get(path) {
+                            // ADR-074: for an overload member `b.symbol` holds the exact mangled
+                            // LLVM symbol; use it to select the correct overload body so a
+                            // re-homed body that references one overload member is not routed to
+                            // a sibling member that happens to be a thin intrinsic wrapper.
                             if let Some(intr) = src.statements.iter().find_map(|s| match s {
-                                TypedStmt::Val { name: Some(n), value, .. } if *n == b.name =>
-                                    thin_intrinsic_wrapper(src, value),
+                                TypedStmt::Val { name: Some(n), value, .. } if *n == b.name => {
+                                    // Pin to the exact overload body when a mangled symbol is present.
+                                    if let Some(sym) = b.symbol.as_deref() {
+                                        if let TypedExpr::Function { name: fn_name, .. } = value {
+                                            if fn_name.as_deref() != Some(sym) {
+                                                return None;
+                                            }
+                                        }
+                                    }
+                                    thin_intrinsic_wrapper(src, value)
+                                }
                                 _ => None,
                             }) {
                                 return Some(OriginRef::Intrinsic(intr));
