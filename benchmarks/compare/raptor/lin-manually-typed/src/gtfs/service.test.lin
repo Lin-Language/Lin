@@ -27,7 +27,12 @@ val includeDate: DateIndex = { 20181022: true }
 val excludeDate: DateIndex = { 20181022: false }
 
 val makeService = (startDate, endDate, days: ServiceDays, dates): Service =>
-  { "startDate": startDate, "endDate": endDate, "days": days, "dates": dates }
+  {
+    "startDate": startDate,
+    "endDate": endDate,
+    "days": days,
+    "dates": dates
+  }
 
 val monday: DayOfWeek = 1
 val sunday: DayOfWeek = 0
