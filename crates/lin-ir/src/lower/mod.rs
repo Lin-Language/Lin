@@ -25,14 +25,14 @@ mod combinator;
 mod match_;
 mod func;
 
-pub use rc::*;
+pub(crate) use rc::*;
 pub use coerce::*;
-pub use stmt::*;
-pub use expr::*;
-pub use call::*;
-pub use combinator::*;
-pub use match_::*;
-pub use func::*;
+pub(crate) use stmt::*;
+pub(crate) use expr::*;
+pub(crate) use call::*;
+pub(crate) use combinator::*;
+pub(crate) use match_::*;
+pub(crate) use func::*;
 
 /// Entry point: lower a TypedModule to a LinModule, plus any monomorphization diagnostics
 /// (e.g. a generic call whose type parameters cannot be inferred). Diagnostics are empty for
@@ -557,7 +557,7 @@ pub fn lower_import_module_with_imports(
 // Context shared across the whole module lowering
 // -------------------------------------------------------------------------
 
-struct LowerCtx {
+pub(crate) struct LowerCtx {
     functions: Vec<LinFunction>,
     pending_functions: Vec<LinFunction>,
     func_counter: u32,
@@ -654,7 +654,7 @@ struct LowerCtx {
 /// of `f`, binds each remaining parameter to its default expression, then calls `f` with the
 /// full argument list. Built as a synthetic `TypedExpr::Function` so it reuses the normal
 /// function-lowering path (RC, coercion, chained/earlier-param default references).
-struct AdapterSpec {
+pub(crate) struct AdapterSpec {
     adapter_fid: FuncId,
     symbol: String,
     /// Slot of the real function (resolved through `global_fn_slots` for the inner call).
@@ -714,7 +714,7 @@ impl LowerCtx {
 // Function builder — accumulates blocks for a single function being compiled
 // -------------------------------------------------------------------------
 
-struct FuncBuilder {
+pub(crate) struct FuncBuilder {
     id: FuncId,
     name: Option<String>,
     params: Vec<(Temp, Type)>,

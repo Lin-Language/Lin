@@ -1,4 +1,4 @@
-import { Trip, StopIndex, CalendarIndex, TripId, StopId, StopTime, ServiceId, Transfer, Duration, Time } from "./gtfs"
+import { Trip, StopIndex, CalendarIndex, TripId, StopId, StopTime, ServiceId, Transfer, Time } from "./gtfs"
 import { DateIndex } from "./date"
 import { Service } from "./service"
 import { createTimeParser } from "./time-parser"
@@ -47,7 +47,7 @@ export val loadGtfs = (path: String) =>
         rows.drain()
     )
 
-  val addLink = (row: Json) =>
+  val addLink = (row: AnyVal) =>
     val key = row["from_stop_id"]
     val arr = transfers[key] ?? []
     transfers[key] = arr
@@ -59,7 +59,7 @@ export val loadGtfs = (path: String) =>
       "endTime": row["end_time"].parseTime()
     })
     
-  val addCalendar = (row: Json) => 
+  val addCalendar = (row: AnyVal) => 
     calendars[row["service_id"]] = {
       "serviceId": row["service_id"],
       "startDate": row["start_date"].parseUInt32(),
@@ -77,14 +77,14 @@ export val loadGtfs = (path: String) =>
       "exclude": {}
     }
 
-  val addDate = (row: Json) =>
+  val addDate = (row: AnyVal) =>
     dates[row["service_id"]] = dates[row["service_id"]] ?? {}                                                                                                     
     dates[row["service_id"]][row["date"]] == row["exception_type"] == "1" 
 
-  val addTrip = (row: Json) =>
+  val addTrip = (row: AnyVal) =>
     trips.push({ "serviceId": row["service_id"], "tripId": row["trip_id"], "stopTimes": [], "service": {} }) 
 
-  val addStopTimes = (row: Json) => 
+  val addStopTimes = (row: AnyVal) => 
     stopTimes[row.trip_id] = stopTimes[row.trip_id] ?? []
     stopTimes[row.trip_id].push({
       "stop": row["stop_id"],
@@ -94,7 +94,7 @@ export val loadGtfs = (path: String) =>
       "dropOff": row["drop_off_type"] == "0" || row["drop_off_type"] == null
     })
 
-  val addTransfer = (row: Json) =>
+  val addTransfer = (row: AnyVal) =>
     if row["from_stop_id"] == row["to_stop_id"] then 
       interchange[row["from_stop_id"]] = row["min_transfer_time"].parseUInt32()
     else
@@ -107,7 +107,7 @@ export val loadGtfs = (path: String) =>
         "endTime": 4294967295u32 // TODO: MAX_UINT32
       })
     
-  val addStop = (row: Json) => 
+  val addStop = (row: AnyVal) => 
     stops[row["stop_id"]] = {
       "id": row["stop_id"],
       "code": row["stop_code"],

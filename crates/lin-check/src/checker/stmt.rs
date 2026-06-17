@@ -3,9 +3,25 @@ use lin_parse::ast::{Expr, Stmt};
 
 use super::Checker;
 use super::helpers::{empty_literal_kind, is_legal_ffi_type};
-use crate::resolve::resolve_type;
+use crate::resolve::resolve_type_spanned;
 use crate::typed_ir::*;
 use crate::types::Type;
+
+/// Build the unique LLVM symbol for one member of a function overload set (ADR-074):
+/// `base$<param-type-tokens>_<slot>`. The trailing slot guarantees uniqueness regardless of the
+/// token encoder; the type tokens make IR dumps / coverage readable. `$` is not a legal Lin
+/// identifier character, so this never collides with a user-written name.
+fn overload_symbol(base: &str, params: &[Type], slot: usize) -> String {
+    let sanitize = |s: &str| -> String {
+        s.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect()
+    };
+    let tokens = if params.is_empty() {
+        "void".to_string()
+    } else {
+        params.iter().map(|p| sanitize(&p.to_string())).collect::<Vec<_>>().join("_")
+    };
+    format!("{}${}_{}", base, tokens, slot)
+}
 
 impl Checker {
     /// Build the diagnostic for `import { name } from "path"` where `path` is a resolved module
@@ -74,9 +90,12 @@ impl Checker {
             } => {
                 let expected = type_ann
                     .as_ref()
-                    .map(|t| resolve_type(t, &self.env))
+                    .map(|t| resolve_type_spanned(t, &self.env))
                     .transpose()
-                    .map_err(|e| Diagnostic::error(*span, e))?;
+                    .map_err(|(s, e, help)| {
+                        let d = Diagnostic::error(s, e);
+                        if let Some(h) = help { d.with_help(h) } else { d }
+                    })?;
 
                 // Extract the binding name for function name propagation (TCO, direct calls).
                 let binding_name = match pattern {
@@ -229,6 +248,20 @@ impl Checker {
                     _ => None,
                 };
 
+                // ADR-074: give each member of a function overload set a unique LLVM symbol.
+                // Calls dispatch via slot→FuncId, so only the emitted *symbol* (the
+                // `TypedExpr::Function.name`) must be unique; the `TypedStmt::Val.name` — used for
+                // cross-module exports and DWARF — stays the source name.
+                if let Some(bn) = binding_name {
+                    if self.env.is_overloaded(bn) {
+                        if let (TypedExpr::Function { name, .. }, Type::Function { params, .. }) =
+                            (&mut typed_value, &ty)
+                        {
+                            *name = Some(overload_symbol(bn, params, slot));
+                        }
+                    }
+                }
+
                 Ok(TypedStmt::Val {
                     slot,
                     name: stmt_name,
@@ -247,9 +280,12 @@ impl Checker {
             } => {
                 let expected = type_ann
                     .as_ref()
-                    .map(|t| resolve_type(t, &self.env))
+                    .map(|t| resolve_type_spanned(t, &self.env))
                     .transpose()
-                    .map_err(|e| Diagnostic::error(*span, e))?;
+                    .map_err(|(s, e, help)| {
+                        let d = Diagnostic::error(s, e);
+                        if let Some(h) = help { d.with_help(h) } else { d }
+                    })?;
 
                 let typed_value = if let Some(ref expected_ty) = expected {
                     self.check_expr(value, expected_ty)?
@@ -294,7 +330,7 @@ impl Checker {
                 name,
                 params,
                 body,
-                span,
+                span: _span,
                 ..
             } => {
                 // The placeholder was registered in forward_declare_types.
@@ -307,8 +343,12 @@ impl Checker {
                 // `Named(param)`); `resolve_named_cycle` then leaves it as `Named(param)` via the
                 // same cycle guard used for the alias's own self-references. Without this, a bare
                 // `T` in the body resolves as `Unknown type 'T'` and the body is never stored.
+                let map_resolve_err = |(s, e, help): (Span, String, Option<String>)| {
+                    let d = Diagnostic::error(s, e);
+                    if let Some(h) = help { d.with_help(h) } else { d }
+                };
                 let resolved = if params.is_empty() {
-                    resolve_type(body, &self.env).map_err(|e| Diagnostic::error(*span, e))?
+                    resolve_type_spanned(body, &self.env).map_err(map_resolve_err)?
                 } else {
                     let mut scratch = self.env.clone();
                     for param in params {
@@ -318,7 +358,7 @@ impl Checker {
                             Type::Named(param.clone()),
                         );
                     }
-                    resolve_type(body, &scratch).map_err(|e| Diagnostic::error(*span, e))?
+                    resolve_type_spanned(body, &scratch).map_err(map_resolve_err)?
                 };
                 self.env
                     .define_type(name.clone(), params.clone(), resolved);
@@ -342,6 +382,27 @@ impl Checker {
                     let local_name = binding.alias.as_ref().unwrap_or(&binding.name);
                     // Use pre-resolved type if available, else fall back to TypeVar.
                     let key = (path.clone(), binding.name.clone());
+                    // ADR-074 cross-module: an imported name backed by an overload set is registered
+                    // as an overload set locally (one slot per member), so the ordinary call-site
+                    // resolution selects among them. Each member carries the exporting module's exact
+                    // mangled symbol so lowering emits the right `Named` target.
+                    if let Some(members) = self.import_overloads.get(&key).cloned() {
+                        self.import_origins.insert(
+                            local_name.clone(),
+                            (path.clone(), binding.name.clone()),
+                        );
+                        for (ty, symbol) in members {
+                            let (slot, _dup) =
+                                self.env.define_fn_overload(local_name.clone(), ty.clone(), None);
+                            import_slots.push(ImportSlot {
+                                name: binding.name.clone(),
+                                slot,
+                                ty,
+                                symbol: Some(symbol),
+                            });
+                        }
+                        continue;
+                    }
                     let has_export = self.import_types.contains_key(&key)
                         || self.import_type_decls.contains_key(&key);
                     if module_known && !has_export {
@@ -364,6 +425,7 @@ impl Checker {
                             name: binding.name.clone(),
                             slot,
                             ty,
+                            symbol: None,
                         });
                         continue;
                     }
@@ -382,6 +444,7 @@ impl Checker {
                         name: binding.name.clone(),
                         slot,
                         ty,
+                        symbol: None,
                     });
                 }
                 Ok(TypedStmt::Import {
@@ -394,8 +457,11 @@ impl Checker {
                 let is_runtime = path == "lin-runtime";
                 let mut foreign_slots = Vec::new();
                 for binding in bindings {
-                    let ty = resolve_type(&binding.type_ann, &self.env)
-                        .map_err(|e| Diagnostic::error(binding.span, e))?;
+                    let ty = resolve_type_spanned(&binding.type_ann, &self.env)
+                        .map_err(|(s, e, help)| {
+                            let d = Diagnostic::error(s, e);
+                            if let Some(h) = help { d.with_help(h) } else { d }
+                        })?;
                     // "lin-runtime" is a reserved internal path — skip FFI type validation
                     // since runtime functions use Array/Object which aren't valid in user FFI.
                     let valid = is_runtime || is_legal_ffi_type(&ty);

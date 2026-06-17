@@ -354,9 +354,14 @@ impl Checker {
         // would fall through to `infer_expr(block)` → `infer_if` → `infer_object` → unsealed,
         // triggering a `Coerce` at the function-return boundary (sealed_project_from →
         // lin_map_get per field) even though the object was NEVER stored in a LinMap.
-        if let (Expr::Block(stmts, final_expr, span, _), true) =
-            (expr, expected_pushes_into_branches(expected))
-        {
+        // Also fires for a `FixedArray` (tuple) expected type when the block's final expression
+        // is itself an array literal — the positional tuple check in `check_expr` then validates
+        // each element against its declared type. This is deliberately gated on the final
+        // expression being an array literal so `if`/`match`/`??` block-tail bodies are not
+        // affected (they still go through `infer_expr`, preserving their existing inference).
+        let block_push = expected_pushes_into_branches(expected)
+            || matches!((expected, final_expr_of_block(expr)), (Type::FixedArray(_), Some(Expr::Array(..))));
+        if let (Expr::Block(stmts, final_expr, span, _), true) = (expr, block_push) {
             self.env.push_scope();
             let mut typed_stmts = Vec::new();
             // A block's non-final statements are NOT in tail position; only its final expression
@@ -550,6 +555,19 @@ impl Checker {
     }
 
     pub(crate) fn infer_ident(&mut self, name: &str, span: Span) -> Result<TypedExpr, Diagnostic> {
+        // ADR-074: an overloaded function name has no single type, so it cannot be used as a bare
+        // value (passed, stored, returned). Only a direct call can select an overload from the
+        // argument types — the direct-call path in `infer_call` bypasses this method.
+        if self.env.is_overloaded(name) {
+            return Err(Diagnostic::error(
+                span,
+                format!("`{}` is an overloaded function and cannot be used as a value", name),
+            )
+            .with_help(
+                "call it directly so the overload can be resolved from the argument types (spec §14.6)"
+                    .to_string(),
+            ));
+        }
         let ty = self.env.effective_type(name).ok_or_else(|| {
             let all_names = self.env.all_names();
             let suggestion = lin_common::closest_match(name, all_names.into_iter(), 2);
@@ -1446,9 +1464,9 @@ impl Checker {
         // which side is sealed — degrading a sealed literal to boxed when the else branch is the
         // declared-return-type unsealed alias.
         match (&then_ty, &else_ty) {
-            (Type::Object { fields: tf, sealed: true }, Type::Object { fields: ef, sealed: false })
+            (Type::Object { fields: tf, sealed: true, .. }, Type::Object { fields: ef, sealed: false, .. })
                 if tf == ef => return then_ty,
-            (Type::Object { fields: tf, sealed: false }, Type::Object { fields: ef, sealed: true })
+            (Type::Object { fields: tf, sealed: false, .. }, Type::Object { fields: ef, sealed: true, .. })
                 if tf == ef => return else_ty,
             _ => {}
         }
@@ -1946,7 +1964,7 @@ impl Checker {
                 }
                 Ok(None)
             }
-            Type::Object { fields: expected_fields, sealed } => {
+            Type::Object { fields: expected_fields, sealed, name } => {
                 // Integer-literal-keyed object literal against a fixed record whose keys are all
                 // decimal digit strings (produced by expanding `{ DayOfWeek: Boolean }` where
                 // `DayOfWeek = 0|1|...|6`). Treat each integer key as its decimal string form and
@@ -1971,6 +1989,7 @@ impl Checker {
                     let ty = Type::Object {
                         fields: expected_fields.clone(),
                         sealed: *sealed,
+                        name: name.clone(),
                     };
                     return Ok(Some(TypedExpr::MakeObject {
                         fields: typed_fields,
@@ -2389,6 +2408,17 @@ pub(crate) fn expected_pushes_into_branches(ty: &Type) -> bool {
     }
 }
 
+/// Return the final (tail) expression of a `Block`, or `None` if the expression is not a block.
+/// Used to check whether a block's tail is an array literal, which enables the
+/// `FixedArray`-expected block-push path.
+fn final_expr_of_block(expr: &lin_parse::ast::Expr) -> Option<&lin_parse::ast::Expr> {
+    if let lin_parse::ast::Expr::Block(_, final_expr, _, _) = expr {
+        Some(final_expr.as_ref())
+    } else {
+        None
+    }
+}
+
 /// True for a concrete scalar type whose *width* must be pushed into branch / block-tail
 /// positions so a suffixless numeric literal there adopts it instead of the default
 /// (`Int32` / `Float64`). Covers every non-default sized integer and `Float32`. Without this,
@@ -2463,7 +2493,7 @@ pub(crate) fn expected_field_needs_directing(ty: &Type) -> bool {
     match ty {
         Type::StrLit(_) | Type::Map { .. } => true,
         Type::Object { sealed: true, .. } => true,
-        Type::Object { fields, sealed: false } => fields.values().any(expected_field_needs_directing),
+        Type::Object { fields, sealed: false, .. } => fields.values().any(expected_field_needs_directing),
         Type::Array(elem) | Type::Iterator(elem) | Type::Shared(elem) | Type::Stream(elem) => {
             expected_field_needs_directing(elem)
         }
@@ -2563,9 +2593,10 @@ pub(crate) fn erase_generic_type_vars(ty: &Type) -> Type {
         Type::Map { key, value } => Type::Map { key: Box::new(erase_generic_type_vars(key)), value: Box::new(erase_generic_type_vars(value)) },
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(erase_generic_type_vars).collect()),
         Type::Union(ts) => Type::Union(ts.iter().map(erase_generic_type_vars).collect()),
-        Type::Object { fields, sealed } => Type::Object {
+        Type::Object { fields, sealed, name } => Type::Object {
             fields: fields.iter().map(|(k, v)| (k.clone(), erase_generic_type_vars(v))).collect(),
             sealed: *sealed,
+            name: name.clone(),
         },
         Type::Function { params, ret, required, lset } => Type::Function {
             params: params.iter().map(erase_generic_type_vars).collect(),
