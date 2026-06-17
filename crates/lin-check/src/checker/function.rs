@@ -254,6 +254,7 @@ impl Checker {
                     } else { Type::TypeVar(u32::MAX) };
                     let fslot = match &f.pattern {
                         Pattern::Ident(fname, name_span) => {
+                            self.check_shadowing(fname, *name_span);
                             self.env.define_at(fname.clone(), field_ty.clone(), false, Some(*name_span))
                         }
                         Pattern::Object(..) | Pattern::Array(..) => {
@@ -265,9 +266,10 @@ impl Checker {
                     };
                     typed_fields.push((key, fslot, field_ty));
                 }
-                let rest_slot = obj_rest
-                    .as_ref()
-                    .map(|rest_name| self.env.define(rest_name.clone(), Type::TypeVar(u32::MAX), false));
+                let rest_slot = obj_rest.as_ref().map(|rest_name| {
+                    self.check_shadowing(rest_name, span);
+                    self.env.define(rest_name.clone(), Type::TypeVar(u32::MAX), false)
+                });
                 out.push(TypedStmt::Destructure {
                     obj_slot: value_slot,
                     value: TypedExpr::LocalGet { slot: value_slot, ty: value_ty.clone(), span },
@@ -296,6 +298,7 @@ impl Checker {
                     let et = elem_ty_at(i);
                     let slot = match elem {
                         Pattern::Ident(name, name_span) => {
+                            self.check_shadowing(name, *name_span);
                             self.env.define_at(name.clone(), et.clone(), false, Some(*name_span))
                         }
                         Pattern::Object(..) | Pattern::Array(..) => {
@@ -310,6 +313,7 @@ impl Checker {
                 // The rest type mirrors the `val` path: an array of the (single) element type.
                 let elem_ty_inner = elem_ty_at(0);
                 let rest_info = arr_rest.as_ref().map(|rest_name| {
+                    self.check_shadowing(rest_name, span);
                     let rest_ty = Type::Array(Box::new(elem_ty_inner.clone()));
                     let rest_slot = self.env.define(rest_name.clone(), rest_ty.clone(), false);
                     (rest_slot, rest_ty)
@@ -398,6 +402,10 @@ impl Checker {
                 }
             };
 
+            // Check for shadowing before defining the parameter slot.
+            if let Some(ns) = name_span {
+                self.check_shadowing(&name, ns);
+            }
             let slot = self.env.define_at(name.clone(), ty.clone(), false, name_span);
             // Record a definition-site type entry for this parameter (LSP inlay hints). The `ty`
             // may still be an unsolved TypeVar here; it is zonked to its final solution when
@@ -414,7 +422,8 @@ impl Checker {
             });
 
             // For destructuring patterns, emit synthetic Destructure/ArrayDestructure stmts into
-            // the body preamble. Shares the `val`-destructuring code path (bind_destructure_param).
+            // the body preamble. Shares the `val`-destructuring code path (bind_destructure_param),
+            // which also runs the inner-scope shadowing check (ADR-078) on each bound name.
             let param_slot = typed_params.last().unwrap().slot;
             self.bind_destructure_param(&param.pattern, param_slot, &ty, span, &mut param_destr_stmts);
         }
@@ -726,6 +735,9 @@ impl Checker {
                 }
             };
 
+            if let Some(ns) = name_span {
+                self.check_shadowing(&name, ns);
+            }
             let slot = self.env.define(name.clone(), ty.clone(), false);
             // Record a definition-site type entry for this parameter (LSP inlay hints). Here `ty`
             // is usually already the resolved hint from the call context (e.g. a `for` callback's
@@ -736,7 +748,8 @@ impl Checker {
             }
             typed_params.push(TypedParam { slot, name, ty: ty.clone(), default: typed_default });
 
-            // Destructuring param → preamble stmts, via the shared val-destructuring code path.
+            // Destructuring param → preamble stmts, via the shared val-destructuring code path
+            // (also runs the inner-scope shadowing check, ADR-078, on each bound name).
             let param_slot = typed_params.last().unwrap().slot;
             self.bind_destructure_param(&param.pattern, param_slot, &ty, span, &mut param_destr_stmts);
         }
