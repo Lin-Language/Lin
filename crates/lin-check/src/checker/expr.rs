@@ -2384,7 +2384,7 @@ impl Checker {
 /// old inference-then-unify path (pushing into them buys nothing and risks behaviour changes).
 pub(crate) fn expected_pushes_into_branches(ty: &Type) -> bool {
     match ty {
-        Type::Object { .. } | Type::Named(_) | Type::Union(_) => true,
+        Type::Object { .. } | Type::Named(_) | Type::Union(_) | Type::FixedArray(_) => true,
         _ => expected_pushes_scalar_width(ty) || type_mentions_strlit(ty),
     }
 }

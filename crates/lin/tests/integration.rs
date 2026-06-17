@@ -4871,6 +4871,62 @@ print("unreachable")
     );
 }
 
+// Bidirectional checking of array literals against a declared tuple (FixedArray) return type.
+// Before this fix, `(): [Int32, String] => [1, "x"]` was rejected with "Function body has type
+// Int32 | String[], declared return type is [Int32, String]" because `expected_pushes_into_branches`
+// did not include `FixedArray`, so the body was inferred bottom-up as a homogeneous union array.
+#[test]
+fn test_tuple_return_type_checking() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type Pair = [Int32, String]
+
+// Bare tuple literal in return position — the core regression case.
+val f = (): Pair => [1, "hello"]
+val p = f()
+print(toString(p[0]))
+print(p[1])
+
+// Inline type annotation (no named alias).
+val g = (): [Int32, String] => [42, "world"]
+val q = g()
+print(toString(q[0]))
+print(q[1])
+
+// Block body with intermediate val — still works.
+val h = (): Pair =>
+  val x = 7
+  [x, "block"]
+val r = h()
+print(toString(r[0]))
+print(r[1])
+"#);
+    assert_eq!(output, vec!["1", "hello", "42", "world", "7", "block"]);
+}
+
+// Tuple return with arity mismatch in function body is a type error.
+#[test]
+fn test_tuple_return_arity_mismatch() {
+    let result = run_expect_err(r#"val f = (): [Int32, String] => [1]
+"#);
+    assert!(
+        result.contains("2-element") || result.contains("element"),
+        "expected arity error, got: {result}"
+    );
+}
+
+// Tuple return with element type mismatch in function body is a type error.
+#[test]
+fn test_tuple_return_type_mismatch() {
+    let result = run_expect_err(r#"val f = (): [Int32, String] => [1, 2]
+"#);
+    assert!(
+        result.contains("String") || result.contains("type"),
+        "expected type error, got: {result}"
+    );
+}
+
 #[test]
 fn test_array_rest_destructuring() {
     let output = run(r#"import { print } from "std/io"
