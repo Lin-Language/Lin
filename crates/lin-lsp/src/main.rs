@@ -3872,8 +3872,9 @@ fn ranges_overlap(a: Range, b: Range) -> bool {
 /// `test("name", ...)` / `withFixture(..., "name", ...)` call (mirroring the VSCode
 /// Test Explorer's `TEST_DECL_RE` / `WITHFIXTURE_DECL_RE` discovery, but driven off
 /// the parsed AST), plus a single `▶ Run File Tests` lens at the top when any test
-/// exists. Lens commands use the fixed `lin.runTest(uri, name)` / `lin.testFile(uri)`
-/// contract the extension wires against.
+/// exists, plus one `▶ Run Suite` lens per `suite("name", [...])` call.
+/// Lens commands use the fixed `lin.runTest(uri, name)` / `lin.testFile(uri)` /
+/// `lin.runSuite(uri, suiteName, memberNames)` contract the extension wires against.
 fn test_code_lenses(source: &str, uri: &Url, module: &lin_parse::ast::Module) -> Vec<CodeLens> {
     let mut tests: Vec<(String, lin_common::Span)> = Vec::new();
     for stmt in &module.statements {
@@ -3882,6 +3883,14 @@ fn test_code_lenses(source: &str, uri: &Url, module: &lin_parse::ast::Module) ->
     // De-duplicate by (name, anchor) so a test referenced once yields one lens.
     tests.sort_by_key(|(_, s)| (s.start, s.end));
     tests.dedup();
+
+    // Collect suite calls: (suite_name, anchor_span, member_test_names).
+    let mut suites: Vec<(String, lin_common::Span, Vec<String>)> = Vec::new();
+    for stmt in &module.statements {
+        collect_suite_calls_in_stmt(stmt, &mut suites);
+    }
+    suites.sort_by_key(|(_, s, _)| (s.start, s.end));
+    suites.dedup_by_key(|(n, s, _)| (n.clone(), *s));
 
     let mut lenses = Vec::new();
     if !tests.is_empty() {
@@ -3892,6 +3901,24 @@ fn test_code_lenses(source: &str, uri: &Url, module: &lin_parse::ast::Module) ->
                 title: "▶ Run File Tests".to_string(),
                 command: "lin.testFile".to_string(),
                 arguments: Some(vec![serde_json::json!(uri.to_string())]),
+            }),
+            data: None,
+        });
+    }
+    // Suite lenses, sorted by anchor span (deterministic order).
+    for (suite_name, anchor, member_names) in suites {
+        let members_json: Vec<serde_json::Value> =
+            member_names.iter().map(|n| serde_json::json!(n)).collect();
+        lenses.push(CodeLens {
+            range: span_to_range(source, anchor),
+            command: Some(Command {
+                title: "▶ Run Suite".to_string(),
+                command: "lin.runSuite".to_string(),
+                arguments: Some(vec![
+                    serde_json::json!(uri.to_string()),
+                    serde_json::json!(suite_name),
+                    serde_json::Value::Array(members_json),
+                ]),
             }),
             data: None,
         });
@@ -3922,6 +3949,52 @@ fn collect_test_calls_in_stmt(stmt: &Stmt, out: &mut Vec<(String, lin_common::Sp
         Stmt::Expr(e) => collect_test_calls_in_expr(e, out),
         _ => {}
     }
+}
+
+fn collect_suite_calls_in_stmt(
+    stmt: &Stmt,
+    out: &mut Vec<(String, lin_common::Span, Vec<String>)>,
+) {
+    match stmt {
+        Stmt::Val { value, .. } | Stmt::Var { value, .. } => {
+            collect_suite_calls_in_expr(value, out);
+        }
+        Stmt::Replace { value, .. } => collect_suite_calls_in_expr(value, out),
+        Stmt::Expr(e) => collect_suite_calls_in_expr(e, out),
+        _ => {}
+    }
+}
+
+/// Walk an expression for `suite("name", [...])` calls, recording
+/// `(suite_name, anchor_span, member_test_names)`. The anchor is the `suite`
+/// ident span. Member names are collected by running the test-name collector
+/// over the suite's argument subtree.
+fn collect_suite_calls_in_expr(
+    expr: &lin_parse::ast::Expr,
+    out: &mut Vec<(String, lin_common::Span, Vec<String>)>,
+) {
+    use lin_parse::ast::Expr as E;
+    if let E::Call { func, args, .. } = expr {
+        if let E::Ident(name, ident_span) = func.as_ref() {
+            if name.as_str() == "suite" {
+                // First arg must be the suite name string literal.
+                if let Some(E::StringLit(suite_name, _)) = args.first() {
+                    // Collect all test names from the entire call's arg subtree.
+                    let mut member_tests: Vec<(String, lin_common::Span)> = Vec::new();
+                    for arg in args.iter().skip(1) {
+                        collect_test_calls_in_expr(arg, &mut member_tests);
+                    }
+                    member_tests.sort_by_key(|(_, s)| (s.start, s.end));
+                    member_tests.dedup();
+                    let member_names: Vec<String> =
+                        member_tests.into_iter().map(|(n, _)| n).collect();
+                    out.push((suite_name.clone(), *ident_span, member_names));
+                }
+            }
+        }
+    }
+    // Recurse to find nested suites.
+    walk_child_exprs(expr, &mut |child| collect_suite_calls_in_expr(child, out));
 }
 
 /// Walk an expression for `test("name", ...)` / `withFixture(..., "name", ...)` calls,
@@ -8897,6 +8970,81 @@ export val thingCount = 7
         // Exactly one file-level "Run File Tests" lens.
         let file_lenses = lenses.iter().filter(|l| l.command.as_ref().map(|c| c.command == "lin.testFile").unwrap_or(false)).count();
         assert_eq!(file_lenses, 1, "expected one Run File Tests lens");
+    }
+
+    /// CodeLens discovery emits a `lin.runSuite` lens for each `suite("name", [...])` call,
+    /// with the suite ident as anchor, and the member test names as a JSON array argument.
+    #[test]
+    fn code_lens_discovers_suite() {
+        let src = "import { suite, test } from \"std/test\"\n\
+                   val s = suite(\"S\", [\n\
+                     test(\"a\", () => []),\n\
+                     test(\"b\", () => []),\n\
+                   ])\n";
+        let module = parse(src);
+        let uri = dummy_uri();
+        let lenses = test_code_lenses(src, &uri, &module);
+
+        // Find the suite lens.
+        let suite_lens = lenses.iter().find(|l| {
+            l.command.as_ref().map(|c| c.command == "lin.runSuite").unwrap_or(false)
+        });
+        assert!(suite_lens.is_some(), "expected a lin.runSuite lens, got {:?}", lenses);
+        let suite_lens = suite_lens.unwrap();
+        let cmd = suite_lens.command.as_ref().unwrap();
+        assert_eq!(cmd.title, "▶ Run Suite");
+        let args = cmd.arguments.as_ref().unwrap();
+        // args[0] = uri string
+        assert_eq!(args[0].as_str().unwrap(), uri.to_string());
+        // args[1] = suite name
+        assert_eq!(args[1].as_str().unwrap(), "S");
+        // args[2] = member names array
+        let members: Vec<&str> = args[2]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(members, vec!["a", "b"], "member names mismatch: {:?}", members);
+        // The suite lens anchors on the `suite` ident — line 1 (0-indexed).
+        assert_eq!(suite_lens.range.start.line, 1, "suite lens should be on line 1");
+    }
+
+    /// Proof: lens list for the service.test.lin file. Should produce:
+    ///  1 file lens, 1 suite lens ("Service" with 7 members), 7 test lenses = 9 total.
+    #[test]
+    fn code_lens_service_test_lin_proof() {
+        let src = include_str!("../../../benchmarks/compare/raptor/lin-manually-typed/src/gtfs/service.test.lin");
+        let module = parse(src);
+        let uri = Url::parse("file:///workspace/service.test.lin").unwrap();
+        let lenses = test_code_lenses(src, &uri, &module);
+
+        let file_lenses: Vec<_> = lenses.iter().filter(|l| l.command.as_ref().map(|c| c.command == "lin.testFile").unwrap_or(false)).collect();
+        let suite_lenses: Vec<_> = lenses.iter().filter(|l| l.command.as_ref().map(|c| c.command == "lin.runSuite").unwrap_or(false)).collect();
+        let test_lenses: Vec<_> = lenses.iter().filter(|l| l.command.as_ref().map(|c| c.command == "lin.runTest").unwrap_or(false)).collect();
+
+        eprintln!("=== service.test.lin lenses ===");
+        eprintln!("File lenses: {}", file_lenses.len());
+        for l in &suite_lenses {
+            let cmd = l.command.as_ref().unwrap();
+            let args = cmd.arguments.as_ref().unwrap();
+            let members: Vec<&str> = args[2].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            eprintln!("Suite lens: title={:?}, suite={:?}, members={:?}, line={}", cmd.title, args[1].as_str().unwrap(), members, l.range.start.line);
+        }
+        for l in &test_lenses {
+            let cmd = l.command.as_ref().unwrap();
+            let args = cmd.arguments.as_ref().unwrap();
+            eprintln!("Test lens: {:?}, line={}", args[1].as_str().unwrap(), l.range.start.line);
+        }
+
+        assert_eq!(file_lenses.len(), 1, "expected 1 file lens");
+        assert_eq!(suite_lenses.len(), 1, "expected 1 suite lens");
+        let suite_cmd = suite_lenses[0].command.as_ref().unwrap();
+        let suite_args = suite_cmd.arguments.as_ref().unwrap();
+        assert_eq!(suite_args[1].as_str().unwrap(), "Service");
+        let members: Vec<&str> = suite_args[2].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(members.len(), 7, "expected 7 suite members, got {:?}", members);
+        assert_eq!(test_lenses.len(), 7, "expected 7 test lenses");
     }
 
     /// No tests in a file → no lenses (not even the file-level one).
