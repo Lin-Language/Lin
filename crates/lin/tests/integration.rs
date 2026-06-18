@@ -22798,3 +22798,46 @@ print("${m["missing"] ?? -1}")
 "#);
     assert_eq!(output, vec!["1", "1", "1", "-1"]);
 }
+
+#[test]
+fn test_inner_fn_capture_sibling_out_of_order() {
+    // Regression: a block-local function (processZip) that captures sibling functions (addLink,
+    // addCalendar) defined textually LATER in the same block caused a misaligned-pointer crash at
+    // lin_rc_retain. The type checker forward-declares all inner fns so they can reference each
+    // other, but IR lowering was sequential: when processZip was lowered, addLink's closure value
+    // was not yet in builder.slots. The capture loop fell back to alloc_temp (uninitialised), which
+    // codegen's filter_map silently dropped — the env was allocated for 1 capture but the capdesc
+    // said 3, so the function body read heap garbage through offsets 16 and 24, hitting
+    // lin_rc_retain(0x41) → SIGBUS. Fix: lower_block_stmts topo-sorts inner fn stmts so that
+    // dependencies are lowered before their capturers.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push } from "std/array"
+
+val outer = () =>
+  val result: Int32[] = []
+
+  val dispatch = (tag: String) =>
+    if tag == "a" then addA()
+    else if tag == "b" then addB()
+    else addC()
+
+  val addA = () =>
+    result.push(1)
+
+  val addB = () =>
+    result.push(2)
+
+  val addC = () =>
+    result.push(3)
+
+  dispatch("a")
+  dispatch("b")
+  dispatch("c")
+  dispatch("a")
+  "${toString(result[0])},${toString(result[1])},${toString(result[2])},${toString(result[3])}"
+
+print(outer())
+"#);
+    assert_eq!(output, vec!["1,2,3,1"]);
+}
