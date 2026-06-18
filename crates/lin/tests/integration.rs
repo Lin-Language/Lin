@@ -2833,10 +2833,11 @@ val f = (m: M, k: Int32): Boolean => m[k] ?? false
 }
 
 #[test]
-fn test_keys_over_non_string_keyed_map_typechecks_and_stringifies() {
-    // ADR-086: `keys`/`values`/`entries` accept a map with ANY key type (`{ UInt8: V }`,
-    // `{ DateNumber: V }`, …), not just `{ String: V }`. All map keys are strings at runtime, so
-    // `keys()` returns the STRINGIFIED keys as `String[]` (the int key 3 reads back as "3").
+fn test_keys_over_non_string_keyed_map_returns_native_key_type() {
+    // ADR-086 (revised): `keys`/`values`/`entries` accept a map with ANY key type (`{ UInt8: V }`,
+    // `{ DateNumber: V }`, …), not just `{ String: V }`. `keys()` returns the keys in their NATIVE
+    // type `K[]` — a `{ UInt8: V }` map yields a `UInt8[]` of INTEGERS (3, 10), usable to re-index
+    // the map and in arithmetic, NOT a stringified `String[]`.
     let output = run(r#"import { print } from "std/io"
 import { keys, values } from "std/object"
 import { length } from "std/array"
@@ -2848,12 +2849,18 @@ type M = { UInt8: String }
 var m: M = {}
 m[3] = "three"
 m[10] = "ten"
-val k: String[] = m.keys()
+val k: UInt8[] = m.keys()
 print(toString(length(k)))
-k.for(key => print(key))
+// Native int keys: iterate them, re-index the map with them, and do arithmetic.
+k.for(key => print(toString(key)))
+k.for(key => print(toString(m[key] ?? "?")))
+print(toString(k[0] + 1))
 m.values().for(v => print(v))
 "#);
-    assert_eq!(output, vec!["2", "3", "10", "three", "ten"]);
+    assert_eq!(
+        output,
+        vec!["2", "3", "10", "three", "ten", "4", "three", "ten"]
+    );
 
     // A non-map argument is still rejected: `keys(5)`, `keys("s")`, `keys([1,2])` are errors.
     for bad in ["keys(5)", "keys(\"s\")", "keys([1, 2])"] {

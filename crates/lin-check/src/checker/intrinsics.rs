@@ -50,10 +50,29 @@ impl Checker {
                 ], Type::Null),
         );
 
-        // keys: (Object) => String[]
+        // keys: <K>({ K: V } | {} | AnyVal) => K[]  (ADR-086, revised).
+        // The result element type is the receiver map's KEY type `K`: a `{ UInt8: V }` map yields a
+        // `UInt8[]` of native integer keys (usable to re-index the map and in arithmetic), a
+        // `{ String: V }` map yields `String[]` (unchanged). The param is a UNION so a record literal
+        // `{}` / `AnyVal` is also accepted (their keys are strings, so `K` binds to `String` for
+        // those members) while a non-object argument (`keys(5)`, `keys("s")`, `keys([…])`) still
+        // rejects. The KEY TypeVar (9170) is shared with the return element so a concrete-keyed map
+        // arg binds it via `collect_type_subs`'s Map arm (which recurses into the key). When the arg
+        // is a record / AnyVal the key var stays unbound and `infer_call` defaults it to `String`.
         self.define_intrinsic(
             "lin_keys",
-            Type::func(vec![Type::object(IndexMap::new())], Type::Array(Box::new(Type::Str))),
+            Type::func(
+                vec![Type::Union(vec![
+                    Type::Map {
+                        key: Box::new(Type::TypeVar(9170)),
+                        value: Box::new(Type::TypeVar(9171)),
+                        name: None,
+                    },
+                    Type::object(IndexMap::new()),
+                    Type::TypeVar(u32::MAX),
+                ])],
+                Type::Array(Box::new(Type::TypeVar(9170))),
+            ),
         );
 
         // lin_object_set: (Object, String, AnyVal) => Null — in-place object key mutation
