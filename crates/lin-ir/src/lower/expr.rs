@@ -152,6 +152,7 @@ fn lower_index_get_or_create(
         dst: fresh,
         fields: Vec::new(),
         spreads: Vec::new(),
+        computed_fields: Vec::new(),
         ty: level_map_ty.clone(),
         stack: false,
     });
@@ -812,7 +813,7 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
             lower_function_expr(name.as_deref(), params, body, ret_type, captures, builder, ctx)
         }
 
-        TypedExpr::MakeObject { fields, spreads, ty, .. } => {
+        TypedExpr::MakeObject { fields, spreads, computed_fields, ty, .. } => {
             // This is the GENERAL (boxed) MakeObject path — a sealed scalar-record TARGET is
             // constructed directly as a packed struct elsewhere (`try_lower_sealed_literal`), so
             // here `ty` is always a boxed object/Json. A field VALUE that is itself a sealed scalar
@@ -869,11 +870,21 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                     }
                 })
                 .collect();
+            // Lower runtime-computed key–value pairs (only present for Map-typed literals).
+            let lowered_computed: Vec<(Temp, Temp)> = computed_fields
+                .iter()
+                .map(|(key_expr, val_expr)| {
+                    let kt = lower_expr(key_expr, builder, ctx);
+                    let vt = lower_expr(val_expr, builder, ctx);
+                    (kt, vt)
+                })
+                .collect();
             let dst = builder.alloc_temp(ty.clone());
             builder.emit(Instruction::MakeObject {
                 dst,
                 fields: lowered_fields,
                 spreads: lowered_spreads,
+                computed_fields: lowered_computed,
                 ty: ty.clone(),
                 // Default heap; the escape-analysis pass (escape.rs) flips this to `true` only for
                 // an all-scalar sealed record it PROVES non-escaping.

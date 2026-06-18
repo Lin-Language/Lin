@@ -959,9 +959,10 @@ pub(crate) fn expr_reassigns_slot(expr: &TypedExpr, slot: usize) -> bool {
         TypedExpr::UnaryOp { operand, .. } => expr_reassigns_slot(operand, slot),
         TypedExpr::Coerce { expr, .. } => expr_reassigns_slot(expr, slot),
         TypedExpr::MakeArray { elements, .. } => elements.iter().any(|e| expr_reassigns_slot(e, slot)),
-        TypedExpr::MakeObject { fields, spreads, .. } => {
+        TypedExpr::MakeObject { fields, spreads, computed_fields, .. } => {
             fields.iter().any(|(_, v)| expr_reassigns_slot(v, slot))
                 || spreads.iter().any(|s| expr_reassigns_slot(s, slot))
+                || computed_fields.iter().any(|(k, v)| expr_reassigns_slot(k, slot) || expr_reassigns_slot(v, slot))
         }
         TypedExpr::Index { object, key, .. } => {
             expr_reassigns_slot(object, slot) || expr_reassigns_slot(key, slot)

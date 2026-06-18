@@ -1424,7 +1424,7 @@ impl<'ctx> Codegen<'ctx> {
                             let result = self.compile_ir_intrinsic(intrinsic, &arg_vals, &arg_tys, &arg_reprs, ret_ty);
                             temp_map.insert(*dst, result);
                         }
-                        Instruction::MakeObject { dst, fields, spreads, ty, stack } => {
+                        Instruction::MakeObject { dst, fields, spreads, computed_fields, ty, stack } => {
                             // Typed index-signature map `{ K: V }` (ADR-055 + numeric-key): allocate
                             // a hashed `LinMap` and set each literal field. For String-keyed maps the
                             // key is an interned LinString; for Int-keyed maps the key is a raw i64
@@ -1432,11 +1432,27 @@ impl<'ctx> Codegen<'ctx> {
                             // name, parsed back here). The checker only produces a `Type::Map`
                             // MakeObject for spread-free literals (incl. the common empty `{}`).
                             if let Type::Map { key: map_key_ty, value: elem_ty, .. } = ty {
-                                let cap = i32_ty.const_int(fields.len().max(1) as u64, false);
+                                let cap = i32_ty.const_int((fields.len() + computed_fields.len()).max(1) as u64, false);
                                 let key_kind_val = i32_ty.const_int(if map_key_ty.is_int_map_key() { 1 } else { 0 }, false);
                                 let map_ptr = self.builder
                                     .call(self.rt.map_alloc, &[cap.into(), key_kind_val.into()], "ir_map")
                                     .try_as_basic_value().unwrap_basic().into_pointer_value();
+                                // Apply spreads from map-typed sources (e.g. `{ ...acc, [k]: v }`).
+                                if !spreads.is_empty() {
+                                    let merge_fn = self.get_or_declare_fn("lin_map_merge",
+                                        void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                                    for s in spreads {
+                                        if let Some(&sv) = temp_map.get(s) {
+                                            if sv.is_pointer_value() {
+                                                let s_ty = func.temp_types.get(s).cloned().unwrap_or(Type::Null);
+                                                let src = if Self::is_union_type(&s_ty) {
+                                                    self.builder.call(self.rt.unbox_ptr, &[sv.into()], "ir_spread_unbox").try_as_basic_value().unwrap_basic()
+                                                } else { sv };
+                                                self.builder.call(merge_fn, &[map_ptr.into(), src.into()], "");
+                                            }
+                                        }
+                                    }
+                                }
                                 for (key, val_temp) in fields.iter() {
                                     if let Some(&val) = temp_map.get(val_temp) {
                                         let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
@@ -1471,6 +1487,34 @@ impl<'ctx> Codegen<'ctx> {
                                             let key_str = self.compile_string_lit(key).into_pointer_value();
                                             self.builder.call(self.rt.map_set, &[map_ptr.into(), key_str.into(), tagged.into()], "");
                                         }
+                                    }
+                                }
+                                // Computed (runtime-expression) keys: evaluate each key as a String
+                                // and insert the value. Only valid for String-keyed maps.
+                                for (key_temp, val_temp) in computed_fields.iter() {
+                                    if let (Some(&key_val), Some(&val)) = (temp_map.get(key_temp), temp_map.get(val_temp)) {
+                                        let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
+                                        let tagged = if Self::is_flat_scalar(elem_ty.as_ref()) {
+                                            let coerced = if &val_ty == elem_ty.as_ref() {
+                                                val
+                                            } else {
+                                                self.compile_ir_coerce(val, &val_ty, elem_ty.as_ref())
+                                            };
+                                            self.build_tagged_val_alloca(&coerced, elem_ty.as_ref())
+                                        } else if Self::is_union_type(&val_ty) && val.is_pointer_value() {
+                                            val.into_pointer_value()
+                                        } else {
+                                            self.build_tagged_val_alloca(&val, &val_ty)
+                                        };
+                                        // key_val is a LinString* (the evaluated key expression).
+                                        // lin_map_set retains value inner; key is not consumed here.
+                                        let key_ptr = if key_val.is_pointer_value() {
+                                            key_val.into_pointer_value()
+                                        } else {
+                                            // Wrap a scalar string value in a LinString alloca.
+                                            self.compile_ir_coerce(key_val, &func.temp_types.get(key_temp).cloned().unwrap_or(Type::Str), &Type::Str).into_pointer_value()
+                                        };
+                                        self.builder.call(self.rt.map_set, &[map_ptr.into(), key_ptr.into(), tagged.into()], "");
                                     }
                                 }
                                 temp_map.insert(*dst, map_ptr.into());

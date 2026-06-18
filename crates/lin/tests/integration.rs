@@ -22674,3 +22674,47 @@ print(toString(range(3, 3, -1).map(i => i)))
         "[]",
     ]);
 }
+
+#[test]
+fn test_computed_key_single_entry_map() {
+    // { [k]: v } infers { String: Int32 } and the entry is readable at runtime.
+    let output = run(r#"import { print } from "std/io"
+type M = { String: Int32 }
+val f = (k: String, v: Int32): M => { [k]: v }
+val m = f("hello", 42)
+print("${m["hello"] ?? -1}")
+print("${m["missing"] ?? -1}")
+"#);
+    assert_eq!(output, vec!["42", "-1"]);
+}
+
+#[test]
+fn test_computed_key_spread_plus_computed() {
+    // { ...acc, [k]: v } infers { String: Int32 } and merges spread + computed entry.
+    let output = run(r#"import { print } from "std/io"
+type M = { String: Int32 }
+val g = (acc: M, k: String, v: Int32): M => { ...acc, [k]: v }
+val m1: M = { "a": 1 }
+val m2 = g(m1, "b", 2)
+print("${m2["a"] ?? -1}")
+print("${m2["b"] ?? -1}")
+print("${m2["missing"] ?? -1}")
+"#);
+    assert_eq!(output, vec!["1", "2", "-1"]);
+}
+
+#[test]
+fn test_computed_key_reduce_builds_map() {
+    // xs.reduce({}, (acc, x) => { ...acc, [x]: 1 }) builds a presence map.
+    let output = run(r#"import { print } from "std/io"
+import { reduce } from "std/iter"
+type M = { String: Int32 }
+val xs = ["alpha", "beta", "gamma"]
+val m: M = xs.reduce({}, (acc: M, x: String): M => { ...acc, [x]: 1 })
+print("${m["alpha"] ?? -1}")
+print("${m["beta"] ?? -1}")
+print("${m["gamma"] ?? -1}")
+print("${m["missing"] ?? -1}")
+"#);
+    assert_eq!(output, vec!["1", "1", "1", "-1"]);
+}

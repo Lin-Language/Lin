@@ -97,12 +97,16 @@ pub(crate) fn collect_branch_reassigned_var_slots_expr(
                 recur(e, in_branch, owning_vars, out);
             }
         }
-        TypedExpr::MakeObject { fields, spreads, .. } => {
+        TypedExpr::MakeObject { fields, spreads, computed_fields, .. } => {
             for (_, v) in fields {
                 recur(v, in_branch, owning_vars, out);
             }
             for s in spreads {
                 recur(s, in_branch, owning_vars, out);
+            }
+            for (k, v) in computed_fields {
+                recur(k, in_branch, owning_vars, out);
+                recur(v, in_branch, owning_vars, out);
             }
         }
         TypedExpr::Index { object, key, .. } => {
@@ -183,9 +187,13 @@ pub(crate) fn collect_mutable_capture_slots_expr(expr: &TypedExpr, out: &mut std
         TypedExpr::MakeArray { elements, .. } => {
             for e in elements { collect_mutable_capture_slots_expr(e, out); }
         }
-        TypedExpr::MakeObject { fields, spreads, .. } => {
+        TypedExpr::MakeObject { fields, spreads, computed_fields, .. } => {
             for (_, v) in fields { collect_mutable_capture_slots_expr(v, out); }
             for s in spreads { collect_mutable_capture_slots_expr(s, out); }
+            for (k, v) in computed_fields {
+                collect_mutable_capture_slots_expr(k, out);
+                collect_mutable_capture_slots_expr(v, out);
+            }
         }
         TypedExpr::Index { object, key, .. } => {
             collect_mutable_capture_slots_expr(object, out);
@@ -643,7 +651,7 @@ pub(crate) fn try_lower_sealed_literal(
     let lowered_fields: Vec<(String, Temp)> =
         fields.iter().map(|(k, v)| (k.clone(), lower_expr(v, builder, ctx))).collect();
     let dst = builder.alloc_temp(slot_ty.clone());
-    builder.emit(Instruction::MakeObject { dst, fields: lowered_fields, spreads: vec![], ty: slot_ty.clone(), stack: false });
+    builder.emit(Instruction::MakeObject { dst, fields: lowered_fields, spreads: vec![], computed_fields: vec![], ty: slot_ty.clone(), stack: false });
     builder.register_owned(dst, slot_ty.clone());
     Some(dst)
 }
@@ -965,6 +973,7 @@ pub(crate) fn try_lower_sum_literal(
         dst,
         fields: lowered_fields,
         spreads: vec![],
+        computed_fields: vec![],
         ty: slot_ty.clone(),
         stack: false,
     });

@@ -420,7 +420,15 @@ pub enum Instruction {
     /// construction whose value can reach a Return / container store / closure capture / async
     /// boundary / unknown-retaining call — those stay heap. A wrong `true` is a use-after-return;
     /// the analysis fails safe to `false` (heap) on any doubt.
-    MakeObject { dst: Temp, fields: Vec<(String, Temp)>, spreads: Vec<Temp>, ty: Type, stack: bool },
+    MakeObject {
+        dst: Temp,
+        fields: Vec<(String, Temp)>,
+        spreads: Vec<Temp>,
+        /// Runtime-computed key–value pairs; only present when `ty` is a `Type::Map`.
+        computed_fields: Vec<(Temp, Temp)>,
+        ty: Type,
+        stack: bool,
+    },
     /// result = [ elements... ]  — allocates array on heap.
     ///
     /// `inline` (0xFE Phase 1): when `true`, the escape analysis (`escape.rs`) proved that NONE of

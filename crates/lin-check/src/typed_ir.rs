@@ -237,6 +237,10 @@ pub enum TypedExpr {
     MakeObject {
         fields: Vec<(String, TypedExpr)>,
         spreads: Vec<TypedExpr>,
+        /// Runtime-computed key–value pairs: `[expr]: value`. Only populated when the literal
+        /// infers to a `Type::Map`; static-key fields still go into `fields`.
+        #[serde(default)]
+        computed_fields: Vec<(TypedExpr, TypedExpr)>,
         ty: Type,
         span: Span,
     },
