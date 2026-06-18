@@ -39,9 +39,10 @@ val s = suite("std/object", [
     ]
   ),
 
-  // ADR-086: keys/values/entries accept a map with a non-String key type and return the keys
-  // STRINGIFIED (a `{ UInt8: V }` map's int key 3 reads back as "3").
-  test("keys over an int-keyed map are stringified", () =>
+  // ADR-086 (revised): keys over a non-String-keyed map returns the keys in their NATIVE type
+  // (a `{ UInt8: V }` map yields a `UInt8[]` of integers), usable to re-index the map and in
+  // arithmetic. `values`/`entries` are unchanged (entries' key element stays stringified).
+  test("keys over an int-keyed map are native integers", () =>
     var m: { UInt8: String } = {}
     m[3] = "three"
     m[10] = "ten"
@@ -50,8 +51,11 @@ val s = suite("std/object", [
     val e = m.entries()
     [
       expect(k.length()).toBe(2),
-      expect(k[0]).toBe("3"),
-      expect(k[1]).toBe("10"),
+      expect(k[0]).toBe(3),
+      expect(k[1]).toBe(10),
+      // Native int key re-indexes the map and supports arithmetic.
+      expect(m[k[0]] ?? "?").toBe("three"),
+      expect(k[0] + 1).toBe(4),
       expect(v[0]).toBe("three"),
       expect(e[0][0]).toBe("3")
     ]

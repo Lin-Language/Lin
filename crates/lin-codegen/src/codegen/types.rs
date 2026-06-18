@@ -638,6 +638,27 @@ impl<'ctx> Codegen<'ctx> {
         )
     }
 
+    /// The runtime FLAT-array `elem_tag` byte for a flat scalar element type — the distinct flat
+    /// element tag (e.g. UInt8 → TAG_UINT8, UInt32 → TAG_UINT32), NOT the boxed-scalar tag
+    /// (`type_tag`, which collapses UInt8/16/32 onto TAG_INT64). Used when building a flat scalar
+    /// array directly (e.g. `lin_keys_flat`), where the element width must round-trip through the
+    /// `lin_flat_array_get_<suffix>` / `lin_array_free` width dispatch (`flat_elem_size_align`).
+    pub(crate) fn flat_elem_tag(&self, ty: &Type) -> u8 {
+        match ty {
+            Type::Int8 => TAG_INT8,
+            Type::UInt8 => TAG_UINT8,
+            Type::Int16 => TAG_INT16,
+            Type::UInt16 => TAG_UINT16,
+            Type::Int32 => TAG_INT32,
+            Type::UInt32 => TAG_UINT32,
+            Type::Int64 => TAG_INT64,
+            Type::UInt64 => TAG_UINT64,
+            Type::Float32 => TAG_FLOAT32,
+            Type::Float64 => TAG_FLOAT64,
+            _ => unreachable!("flat_elem_tag called with non-flat-scalar type"),
+        }
+    }
+
     /// Suffix used in runtime function names for flat array variants.
     pub(crate) fn flat_suffix(ty: &Type) -> &'static str {
         match ty {
