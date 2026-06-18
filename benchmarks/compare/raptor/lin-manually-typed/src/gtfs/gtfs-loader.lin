@@ -19,7 +19,7 @@ val emptyService: Service = { "startDate": 0, "endDate": 0, "days": { 0: false, 
 // 
 // Returns trips, transfers, interchange time and calendars from a GTFS zip.
 // 
-export val loadGtfs = (path: String) =>
+export val loadGtfs = (path: String): GtfsData =>
   val parseTime = createTimeParser()
   val trips: IncompleteTrip[] = []
   val transfers: TransfersByOrigin = {}
@@ -36,7 +36,7 @@ export val loadGtfs = (path: String) =>
 
       if file == "links.txt" then
         rows.for(addLink)
-      else if file == "calenar.txt" then
+      else if file == "calendar.txt" then
         rows.for(addCalendar)
       else if file == "calendar_dates.txt" then
         rows.for(addDate)

@@ -7,7 +7,7 @@ import { Arrivals, ConnectionIndex } from "../raptor/scan-results"
 import { RaptorAlgorithm, StopTimes, scan } from "../raptor/raptor-algorithm"
 import { Date, addDays, weekday } from "std/datetime"
 import { getDateNumber } from "./date-util"
-import { filter, map, reduce, flatMap } from "std/iter"
+import { filter, map, reduce, flatMap, flatten } from "std/iter"
 import { keys, fromEntries } from "std/object"
 import { length, push, reverse } from "std/array"
 import { max } from "std/math"
@@ -44,13 +44,13 @@ export val plan = (
   time: Time
 ): Journey[] =>
   // set the departure time for each origin
-  val originTimes = origins.map(origin => [origin, time]).fromEntries()
+  val originTimes: StopTimes = origins.map(origin => [origin, time]).fromEntries()
 
   // get results for every destination and flatten into a single array
   val results = query.getJourneys(originTimes, destinations, date)
 
   // apply each filter to the results
-  query["filters"].reduce(results, (rs, filter) => filter.apply(rs))
+  query["filters"].reduce(results, (rs, f) => f.apply(rs))
 
 // 
 // Find journeys using the raptor object, if no results are found then increment the day and keep
@@ -71,7 +71,7 @@ val getJourneys = (
     val dayOfWeek = date.weekday()
     val [kConnections, bestArrivals] = query["raptor"].scan(origins, dateNumber, dayOfWeek)
     
-    results = query.getJourneysFromConnections(kConnections, connectionIndexes, destinations)
+    val results = query.getJourneysFromConnections(kConnections, connectionIndexes, destinations)
 
     if results.length() > 0 || query["maxSearchDays"] == i then
       results
@@ -95,13 +95,13 @@ val getJourneysFromConnections = (
   destinations: StopId[]
 ): Journey[] =>
   val initialResults = destinations
-    .filter(d => kConnections[d].keys().length() > 0)
-    .flatMap(d => query["resultsFactory"].getResults(kConnections, d))
+    .filter(d => (kConnections[d] ?? {  }).keys().length() > 0)
+    .flatMap(d => query["resultsFactory"]["getResults"](kConnections, d))
 
   // reverse the previous connections and then work back through each day pre-pending journeys
   prevConnections
     .reverse()
-    .reduce(initialResults, query["resultsFactory"].completeJourneys)
+    .reduce(initialResults, (journeys, connections) => completeJourneys(query, journeys, connections))
 
 
 // 
@@ -115,10 +115,9 @@ val completeJourneys = (
   // for every result we have so far
   results.flatMap(journeyB =>
     // find some results to the origin of that result and merge them together
-    query["resultsFactory"]
-      .getResults(kConnections, journeyB["legs"][0]["origin"])
+    query["resultsFactory"]["getResults"](kConnections, journeyB["legs"][0]["origin"] ?? "")
       .map(journeyA => {
-        "legs": [...journeyA["legs"], ...journeyB["legs"]],
+        "legs": flatten([journeyA["legs"], journeyB["legs"]]),
         "departureTime": journeyA["departureTime"],
         "arrivalTime": journeyB["arrivalTime"] + 86400
       })
@@ -135,12 +134,14 @@ val getFoundStations = (
   kConnections: ConnectionIndex, 
   bestArrivals: Arrivals
 ): StopTimes =>
+  val empty: StopTimes = {  }
+
   kConnections
     .keys()                                            // get stopIds
-    .filter(s => kConnections[s].keys().length() > 0)  // check stopId has result. TODO: can I call length() on an obj?
-    .reduce({}, (acc, stopId) => {                     // create the origin departure times by subtracting 1 day from the best arrival time   
-      ...acc, 
-      [stopId]: max(1, bestArrivals[s] - 86400)
+    .filter(s => (kConnections[s] ?? {  }).keys().length() > 0)  // check stopId has result
+    .reduce(empty, (acc, stopId) => {                  // create the origin departure times by subtracting 1 day from the best arrival time
+      ...acc,
+      [stopId]: if (bestArrivals[stopId] ?? 0u32) > 86400 then (bestArrivals[stopId] ?? 0u32) - 86400 else 1u32
     })
 
 
