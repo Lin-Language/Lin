@@ -22261,3 +22261,28 @@ else
 "#);
     assert_eq!(output, vec!["IC123", "Amsterdam"]);
 }
+
+/// Regression: 3-arg `range(start, end, step)` used `lin_iter` which typed elements as `AnyVal`.
+/// An `AnyVal`-boxed int does not match a numeric map key (stored unboxed), so `m[i]` returned null.
+/// Fix: 3-arg range materialises a flat `Int32[]` so the loop variable has type `Int32`.
+#[test]
+fn test_range_3arg_loop_var_indexes_numeric_map() {
+    let output = run(r#"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { toString } from "std/string"
+type M = { UInt8: String }
+val m: M = { 1: "one", 2: "two", 3: "three" }
+range(1, 4, 1).for(i => print(m[i] ?? "NULL"))
+range(3, 0, -1).for(i => print(m[i] ?? "NULL"))
+print(toString(range(0, 10, 2).map(i => i)))
+print(toString(range(5, 0, -1).map(i => i)))
+print(toString(range(3, 3, -1).map(i => i)))
+"#);
+    assert_eq!(output, vec![
+        "one", "two", "three",
+        "three", "two", "one",
+        "[0, 2, 4, 6, 8]",
+        "[5, 4, 3, 2, 1]",
+        "[]",
+    ]);
+}
