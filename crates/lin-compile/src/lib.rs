@@ -1307,12 +1307,32 @@ fn check_scc(
     // the (perfectly resolvable) alias was ever harvested. The fixpoint also lets an alias that
     // references a PEER's alias resolve: each pass seeds the previous pass's harvest back in, so a
     // dependency chain of length k settles within `members.len()` passes.
+    //
+    // The harvest must also see each member's ACYCLIC (non-cycle) imported type aliases. A member
+    // can annotate its own alias body with a peer-OUTSIDE-the-SCC type — most commonly an
+    // index-signature key alias: `type M = { Sid: UInt32 }` where `Sid = String` is imported from a
+    // module that is NOT in the cycle (already fully resolved, sitting in `cache`). Those decls are
+    // not in `provisional_types` (that map only carries SCC peers), so without seeding them the key
+    // `Sid` resolves to a placeholder TypeVar and the index-signature arm cannot prove it is
+    // String-keyed — `{ Sid: UInt32 }` then falls back to a fixed-shape RECORD with a field literally
+    // named "Sid", and dynamic `m[k]` is rejected. Pre-collect every cached (acyclic) module's
+    // exported type decls, keyed by the same import-path-string the cache uses, and layer the
+    // provisional SCC peers on top each pass.
+    let mut acyclic_type_decls: HashMap<(String, String), (Vec<String>, Type)> = HashMap::new();
+    for (path, imp_module) in cache.iter() {
+        let sig = ModuleSignature::from_module(imp_module);
+        for (name, decl) in sig.type_exports {
+            acyclic_type_decls.insert((path.clone(), name), decl);
+        }
+    }
     let mut provisional_types: HashMap<(String, String), (Vec<String>, Type)> = HashMap::new();
     for _pass in 0..members.len().max(1) {
         let before = provisional_types.clone();
         for m in &members {
             let mut checker = Checker::new();
-            checker.import_type_decls = provisional_types.clone();
+            // Acyclic imported type aliases first; provisional SCC-peer aliases override them.
+            checker.import_type_decls = acyclic_type_decls.clone();
+            checker.import_type_decls.extend(provisional_types.clone());
             checker.stdlib_export_index = build_stdlib_export_index();
             checker.allow_intrinsics =
                 m.is_stdlib || std::env::var_os("LIN_ALLOW_INTRINSICS").is_some();
