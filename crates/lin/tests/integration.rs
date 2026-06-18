@@ -21640,6 +21640,51 @@ print(e("x"))
 }
 
 #[test]
+fn test_overload_cross_module_merged_by_receiver_type() {
+    // ADR-074 cross-module merge: importing the SAME function name from TWO separate modules
+    // must form a single overload set (not shadow). Selection at the call site by receiver type.
+    let dir = std::env::temp_dir().join(format!("lin_overload_xmod_merge_recv_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("ma.lin"),
+        "export type A = { \"a\": Int32 }\n\
+         export val create = (x: A, n: Int32): Int32 => x[\"a\"] + n\n").unwrap();
+    std::fs::write(dir.join("mb.lin"),
+        "export type B = { \"b\": Int32 }\n\
+         export val create = (y: B, s: String): String => \"v${s}\"\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ A, create }} from "{dir}/ma"
+import {{ B, create }} from "{dir}/mb"
+val a: A = {{ "a": 1 }}
+val b: B = {{ "b": 2 }}
+print(a.create(5))
+print(b.create("x"))
+"#, dir = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["6", "vx"]);
+}
+
+#[test]
+fn test_overload_cross_module_merged_by_arity() {
+    // ADR-074 cross-module merge: same-name imports from two modules, distinguished by arity.
+    let dir = std::env::temp_dir().join(format!("lin_overload_xmod_merge_arity_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("m1.lin"),
+        "export val add = (a: Int32): Int32 => a + 10\n").unwrap();
+    std::fs::write(dir.join("m2.lin"),
+        "export val add = (a: Int32, b: Int32): Int32 => a + b\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ add }} from "{dir}/m1"
+import {{ add }} from "{dir}/m2"
+print(add(3))
+print(add(3, 4))
+"#, dir = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["13", "7"]);
+}
+
+#[test]
 fn test_overload_numeric_signedness_tiebreak() {
     // ADR-075: incomparable UInt64 vs Int64 overloads — an unsigned arg prefers the unsigned
     // overload, a signed/computed one the signed overload, via the numeric-conversion tie-break.

@@ -1528,8 +1528,33 @@ impl Checker {
         // arguments are inferred (so `concat`'s second stream arg is also covered) — see the
         // `consume_definite_stream_args` calls below, gated on `callee_routes_to_stream_op(method)`.
 
+        // ADR-074: when the method names a function overload set, select the right overload by
+        // building the full argument list (receiver + extra args) and running overload selection.
+        // This mirrors the prefix-call path (`infer_call` line ~497), which dispatches through
+        // `select_overloaded_callee` before arg-checking. Without this, dot-calls always used the
+        // PRIMARY binding and ignored alternates (the cross-module overload bug).
+        let overload_selected_slot: Option<usize> = if self.env.is_overloaded(method) {
+            let full_args: Vec<Expr> = std::iter::once(receiver.clone())
+                .chain(args.as_ref().map(|a| a.iter().cloned().collect::<Vec<_>>()).unwrap_or_default())
+                .collect();
+            match self.select_overloaded_callee(method, &full_args, partial, method_span) {
+                Ok((slot, _)) => Some(slot),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        // Determine the effective method type: for overloads, use the selected overload's type;
+        // otherwise use the primary binding's type via effective_type.
+        let resolved_method_ty: Option<Type> = if let Some(sel_slot) = overload_selected_slot {
+            let candidates = self.env.overload_candidates(method);
+            candidates.into_iter().find(|(s, _)| *s == sel_slot).map(|(_, ty)| ty)
+        } else {
+            self.env.effective_type(method)
+        };
+
         // Look up method type for TypeVar substitution.
-        if let Some(method_ty) = self.env.effective_type(method) {
+        if let Some(method_ty) = resolved_method_ty {
             if let Type::Function { params: method_params, ret, required: method_required, .. } = method_ty.clone() {
                 // Build all arg expressions: [receiver, ...args]
                 let all_arg_exprs: Vec<&Expr> = std::iter::once(receiver)
@@ -1986,7 +2011,8 @@ impl Checker {
 
                 let info = self.env.lookup(method).unwrap();
                 self.span_type_map.push((method_span, method_ty.to_string(), info.def_span));
-                let func_expr = TypedExpr::LocalGet { slot: info.slot, ty: method_ty, span };
+                let slot = overload_selected_slot.unwrap_or(info.slot);
+                let func_expr = TypedExpr::LocalGet { slot, ty: method_ty, span };
                 return Ok(TypedExpr::Call {
                     func: Box::new(func_expr),
                     args: all_args,

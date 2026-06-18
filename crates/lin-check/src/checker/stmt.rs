@@ -438,7 +438,21 @@ impl Checker {
                         .get(&(path.clone(), binding.name.clone()))
                         .cloned()
                         .unwrap_or_else(|| self.env.fresh_type_var());
-                    let slot = self.env.define(local_name.clone(), ty.clone(), false);
+                    // ADR-074 cross-module merge: if another import already bound this name to a
+                    // function in scope, treat this import as an additional overload rather than
+                    // shadowing the previous binding. Same-named imports from different modules
+                    // form an overload set exactly like same-module overloads do.
+                    let slot = if matches!(ty, Type::Function { .. })
+                        && self.env.lookup(local_name).is_some_and(|info| {
+                            matches!(info.ty, Type::Function { .. })
+                        })
+                    {
+                        let (s, _dup) =
+                            self.env.define_fn_overload(local_name.clone(), ty.clone(), None);
+                        s
+                    } else {
+                        self.env.define(local_name.clone(), ty.clone(), false)
+                    };
                     // Record this binding's origin so a later `replace <local_name> = ...`
                     // (ADR-046) can resolve the imported export it targets.
                     self.import_origins.insert(
