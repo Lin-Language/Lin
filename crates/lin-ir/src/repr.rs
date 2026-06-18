@@ -1414,7 +1414,7 @@ mod tests {
         let instrs = vec![
             Instruction::Const { dst: Temp(0), val: Const::Float(1.0, Type::Float64) },
             Instruction::Const { dst: Temp(1), val: Const::Float(2.0, Type::Float64) },
-            Instruction::MakeArray { dst: Temp(2), elements: vec![Temp(0), Temp(1)], elem_ty: Type::Float64, inline: false, columnar: false },
+            Instruction::MakeArray { dst: Temp(2), elements: vec![Temp(0), Temp(1)], spreads: vec![], elem_ty: Type::Float64, inline: false, columnar: false },
         ];
         let f = func_of(instrs, Some(Temp(2)), 3, vec![]);
         let repr = analyze(&f);

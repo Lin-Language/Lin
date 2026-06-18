@@ -228,7 +228,11 @@ pub fn instr_use_def(instr: &Instruction) -> (Vec<Temp>, Vec<Temp>) {
             uses.extend(spreads.iter().copied());
             (uses, vec![*dst])
         }
-        Instruction::MakeArray { dst, elements, .. } => (elements.clone(), vec![*dst]),
+        Instruction::MakeArray { dst, elements, spreads, .. } => {
+            let mut uses = elements.clone();
+            uses.extend(spreads.iter().map(|(_, t)| *t));
+            (uses, vec![*dst])
+        }
         Instruction::Index { dst, object, key, .. } => (vec![*object, *key], vec![*dst]),
         Instruction::IndexSet { object, key, value, .. } => (vec![*object, *key, *value], vec![]),
         Instruction::FieldGet { dst, object, .. } => (vec![*object], vec![*dst]),

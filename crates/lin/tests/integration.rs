@@ -22598,6 +22598,58 @@ print(pick("a", "b"))
     assert_eq!(out, vec!["x", "b", "a"]);
 }
 
+/// Array spread: concat two arrays with `[...a, ...b]`.
+#[test]
+fn test_array_spread_concat() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val a = [1, 2]
+val b = [3, 4]
+val c = [...a, ...b]
+print(toString(c))
+"#);
+    assert_eq!(output, vec!["[1, 2, 3, 4]"]);
+}
+
+/// Array spread: prepend a scalar and spread in the middle, append after.
+#[test]
+fn test_array_spread_prepend_append() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val a = [1, 2]
+val d = [0, ...a, 5]
+print(toString(d))
+"#);
+    assert_eq!(output, vec!["[0, 1, 2, 5]"]);
+}
+
+/// Array spread: copy via `[...a]` is independent from original (length differs after adding element).
+#[test]
+fn test_array_spread_copy_independence() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+val a = [1, 2]
+val e = [...a, 99]
+print(toString(a))
+print(toString(e))
+print(toString(a.length()))
+print(toString(e.length()))
+"#);
+    assert_eq!(output, vec!["[1, 2]", "[1, 2, 99]", "2", "3"]);
+}
+
+/// Array spread: spreading a non-array is a type error.
+#[test]
+fn test_array_spread_non_array_type_error() {
+    let (ok, msg) = check_source(r#"import { print } from "std/io"
+val x = 5
+val y = [...x]
+"#);
+    assert!(!ok, "expected type error but check passed");
+    assert!(msg.contains("spread element must be an array"), "expected spread error, got: {msg}");
+}
+
 /// Regression: 3-arg `range(start, end, step)` used `lin_iter` which typed elements as `AnyVal`.
 /// An `AnyVal`-boxed int does not match a numeric map key (stored unboxed), so `m[i]` returned null.
 /// Fix: 3-arg range materialises a flat `Int32[]` so the loop variable has type `Int32`.

@@ -1,6 +1,6 @@
 use indexmap::IndexMap;
 use lin_common::{Diagnostic, Span};
-use lin_parse::ast::{BinOp, Expr, MatchArm, ObjectField, Stmt, StringPart};
+use lin_parse::ast::{ArrayElement, BinOp, Expr, MatchArm, ObjectField, Stmt, StringPart};
 
 use super::Checker;
 use super::helpers::{check_int_literal_fits, default_int_literal_type, suffix_to_type, unify_types};
@@ -245,9 +245,27 @@ impl Checker {
         // expected element representation, matching the slot type at codegen). Mirrors the
         // per-element literal-coercion above for nested literals.
         if let (Expr::Array(elements, span, _), Type::Array(expected_elem)) = (expr, expected) {
-            let typed_elements: Result<Vec<_>, _> =
-                elements.iter().map(|e| self.check_expr(e, expected_elem)).collect();
-            let typed_elements = typed_elements?;
+            let mut typed_elements: Vec<TypedExpr> = Vec::new();
+            let mut typed_spreads: Vec<(usize, TypedExpr)> = Vec::new();
+            for elem in elements {
+                match elem {
+                    ArrayElement::Expr(e) => {
+                        typed_elements.push(self.check_expr(e, expected_elem)?);
+                    }
+                    ArrayElement::Spread(e) => {
+                        let te = self.infer_expr(e)?;
+                        let spread_ty = te.ty();
+                        match &spread_ty {
+                            Type::Array(_) => {}
+                            _ => return Err(Diagnostic::error(
+                                e.span(),
+                                format!("spread element must be an array, but got `{}`", spread_ty),
+                            )),
+                        }
+                        typed_spreads.push((typed_elements.len(), te));
+                    }
+                }
+            }
             // When the expected element is a TUPLE shape carrying an unresolved generic TypeVar
             // (e.g. the `[String, T]` of a `[String, T][]` param), checking each element resolves it
             // concretely (`[String, Int32]`), but `expected_elem` itself still mentions `T`. Adopt
@@ -274,6 +292,7 @@ impl Checker {
             };
             return Ok(TypedExpr::MakeArray {
                 elements: typed_elements,
+                spreads: typed_spreads,
                 ty: Type::Array(Box::new(elem_ty)),
                 span: *span,
             });
@@ -285,19 +304,22 @@ impl Checker {
         // positional type. Check arity, then push each positional expected type into the
         // matching element so per-element literal coercion (e.g. integer width) applies.
         if let (Expr::Array(elements, span, _), Type::FixedArray(expected_elems)) = (expr, expected) {
-            if elements.len() != expected_elems.len() {
+            // Spread not supported in fixed-length arrays — the arity check requires exact count.
+            let plain_count = elements.iter().filter(|e| matches!(e, ArrayElement::Expr(_))).count();
+            if plain_count != expected_elems.len() {
                 return Err(Diagnostic::error(
                     *span,
                     format!(
                         "Expected a {}-element array for type {}, got {} element(s)",
                         expected_elems.len(),
                         expected,
-                        elements.len(),
+                        plain_count,
                     ),
                 ));
             }
             let typed_elements: Result<Vec<_>, _> = elements
                 .iter()
+                .filter_map(|e| if let ArrayElement::Expr(e) = e { Some(e) } else { None })
                 .zip(expected_elems.iter())
                 .map(|(e, t)| self.check_expr(e, t))
                 .collect();
@@ -305,6 +327,7 @@ impl Checker {
             let types: Vec<Type> = typed_elements.iter().map(|t| t.ty()).collect();
             return Ok(TypedExpr::MakeArray {
                 elements: typed_elements,
+                spreads: vec![],
                 ty: Type::FixedArray(types),
                 span: *span,
             });
@@ -670,7 +693,7 @@ impl Checker {
                     let typed: Result<Vec<_>, _> = exprs.iter().map(|e| self.infer_expr(e)).collect();
                     let typed = typed?;
                     let types: Vec<Type> = typed.iter().map(|t| t.ty()).collect();
-                    Ok(TypedExpr::MakeArray { elements: typed, ty: Type::FixedArray(types), span: *span })
+                    Ok(TypedExpr::MakeArray { elements: typed, spreads: vec![], ty: Type::FixedArray(types), span: *span })
                 }
             }
         }
@@ -2525,24 +2548,57 @@ impl Checker {
         Ok(TypedExpr::MakeObject { fields: typed_fields, spreads: Vec::new(), ty, span })
     }
 
-    pub(crate) fn infer_array(&mut self, elements: &[Expr], span: Span) -> Result<TypedExpr, Diagnostic> {
-        let typed_elements: Result<Vec<_>, _> = elements.iter().map(|e| self.infer_expr(e)).collect();
-        let typed_elements = typed_elements?;
-        let elem_types: Vec<Type> = typed_elements.iter().map(|t| t.ty()).collect();
-        // Placement restriction (streams brief §8): a Stream may not live in an array element.
-        if let Some((i, _)) = elem_types.iter().enumerate().find(|(_, t)| type_is_streamish(t)) {
-            return Err(Diagnostic::error(
-                elements[i].span(),
-                "a Stream cannot be stored in an array element — keep it in a `val` binding \
-                 (a Stream is an affine resource; v1 confines it to local bindings)",
-            ));
+    pub(crate) fn infer_array(&mut self, elements: &[ArrayElement], span: Span) -> Result<TypedExpr, Diagnostic> {
+        let mut typed_elements: Vec<TypedExpr> = Vec::new();
+        let mut typed_spreads: Vec<(usize, TypedExpr)> = Vec::new();
+        let mut elem_types: Vec<Type> = Vec::new();
+
+        for elem in elements {
+            match elem {
+                ArrayElement::Expr(e) => {
+                    let te = self.infer_expr(e)?;
+                    elem_types.push(te.ty());
+                    typed_elements.push(te);
+                }
+                ArrayElement::Spread(e) => {
+                    let te = self.infer_expr(e)?;
+                    let spread_ty = te.ty();
+                    let inner_ty = match &spread_ty {
+                        Type::Array(inner) => *inner.clone(),
+                        _ => {
+                            return Err(Diagnostic::error(
+                                e.span(),
+                                format!(
+                                    "spread element must be an array, but got `{}`",
+                                    spread_ty
+                                ),
+                            ));
+                        }
+                    };
+                    elem_types.push(inner_ty);
+                    // Record insertion position (number of plain elements before this spread).
+                    typed_spreads.push((typed_elements.len(), te));
+                }
+            }
         }
+
+        // Placement restriction (streams brief §8): a Stream may not live in an array element.
+        for (te, elem) in typed_elements.iter().zip(elements.iter().filter(|e| matches!(e, ArrayElement::Expr(_)))) {
+            if type_is_streamish(&te.ty()) {
+                return Err(Diagnostic::error(
+                    elem.span(),
+                    "a Stream cannot be stored in an array element — keep it in a `val` binding \
+                     (a Stream is an affine resource; v1 confines it to local bindings)",
+                ));
+            }
+        }
+
         let ty = if elem_types.is_empty() {
             Type::Array(Box::new(Type::Never))
         } else {
             Type::Array(Box::new(unify_types(&elem_types)))
         };
-        Ok(TypedExpr::MakeArray { elements: typed_elements, ty, span })
+        Ok(TypedExpr::MakeArray { elements: typed_elements, spreads: typed_spreads, ty, span })
     }
 
     pub(crate) fn infer_assign(&mut self, target: &str, value: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {

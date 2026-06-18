@@ -883,7 +883,7 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
             dst
         }
 
-        TypedExpr::MakeArray { elements, ty, .. } => {
+        TypedExpr::MakeArray { elements, spreads, ty, .. } => {
             let elem_ty = match ty {
                 // Arrays of ALL-SCALAR sealed records (Stage 3): contiguous UNBOXED elements. Keep
                 // the SEALED element type so each element is lowered to its packed-struct
@@ -1016,10 +1016,23 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                     boxed
                 })
                 .collect();
+            // Lower each spread array expression, preserving insertion position.
+            // Each spread is borrowed (the original array stays live after the literal);
+            // codegen calls the appropriate concat function.
+            // The spread temp is owned by the container-insert rule: we do NOT transfer it into
+            // the array (the concat call retains elements, not the src array pointer itself).
+            let lowered_spreads: Vec<(usize, Temp)> = spreads
+                .iter()
+                .map(|(pos, spread_expr)| {
+                    let t = lower_expr(spread_expr, builder, ctx);
+                    (*pos, t)
+                })
+                .collect();
             let dst = builder.alloc_temp(ty.clone());
             builder.emit(Instruction::MakeArray {
                 dst,
                 elements: lowered,
+                spreads: lowered_spreads,
                 elem_ty,
                 inline: false,    // escape.rs sets true for non-escaping sealed elements
                 columnar: false,  // escape.rs sets true when inline=true AND all-scalar fields

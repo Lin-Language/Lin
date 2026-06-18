@@ -162,8 +162,9 @@ fn zonk_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
             for s in spreads { zonk_expr(s, subs); }
             *ty = zonk_type(ty, subs);
         }
-        TypedExpr::MakeArray { elements, ty, .. } => {
+        TypedExpr::MakeArray { elements, spreads, ty, .. } => {
             for e in elements { zonk_expr(e, subs); }
+            for (_, s) in spreads { zonk_expr(s, subs); }
             *ty = zonk_type(ty, subs);
         }
         TypedExpr::Index { object, key, result_type, .. } => {

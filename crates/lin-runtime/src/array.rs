@@ -1450,6 +1450,45 @@ pub unsafe extern "C" fn lin_array_concat_dyn(a: *const u8, b: *const u8) -> *mu
     alloc_tagged(TAG_ARRAY, out as u64)
 }
 
+/// Append all elements of `src` into `dst` (a tagged array built by `lin_array_alloc`),
+/// handling both flat-scalar and tagged source arrays. For a flat source, scalars are widened
+/// to TaggedVal and retained; for a tagged source, each element's heap payload is retained.
+/// `src` stays alive after the call — both `dst` and `src` own independent references.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_spread_into(dst: *mut LinArray, src: *const LinArray) {
+    use crate::tagged::*;
+    if src.is_null() || dst.is_null() { return; }
+    let et = (*src).elem_tag;
+    if et == 0xFF {
+        // Tagged source: retain each element's heap payload before copying into dst.
+        lin_array_concat_into_retaining(dst, src);
+        return;
+    }
+    // Flat source: widen scalars to tagged ValTag, then concat (move) into dst.
+    let widened: *mut LinArray = match et {
+        TAG_INT32   => lin_flat_to_tagged_i32(src),
+        TAG_INT64   => lin_flat_to_tagged_i64(src),
+        TAG_FLOAT32 => lin_flat_to_tagged_f32(src),
+        TAG_FLOAT64 => lin_flat_to_tagged_f64(src),
+        TAG_UINT8   => lin_flat_to_tagged_u8(src),
+        TAG_INT8    => lin_flat_to_tagged_i8(src),
+        TAG_UINT16  => lin_flat_to_tagged_u16(src),
+        TAG_INT16   => lin_flat_to_tagged_i16(src),
+        TAG_UINT32  => lin_flat_to_tagged_u32(src),
+        TAG_UINT64  => lin_flat_to_tagged_u64(src),
+        _ => {
+            // Unknown elem_tag — treat as tagged and retain.
+            lin_array_concat_into_retaining(dst, src);
+            return;
+        }
+    };
+    // `widened` is a fresh +1 temporary: its element payloads (scalars) are boxed.
+    // `lin_array_concat_into` moves (no retain) each element; the scalars are self-contained
+    // (no heap pointer to leak), so freeing `widened`'s struct+buffer is safe afterwards.
+    lin_array_concat_into(dst, widened);
+    lin_array_free(widened);
+}
+
 /// Append `item` to the end of `arr`, returning a NEW array. Prepend puts it first.
 /// Both PRESERVE the input's representation: a flat array of element tag T stays flat
 /// (the item is coerced into T via `lin_push_dyn`); a tagged/`Json` array stays tagged

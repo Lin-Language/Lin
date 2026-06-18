@@ -905,9 +905,12 @@ fn classify_uses(instr: &Instruction, mark: &mut impl FnMut(Temp, UseKind)) {
                 mark(*s, UseKind::Escape);
             }
         }
-        MakeArray { elements, .. } => {
+        MakeArray { elements, spreads, .. } => {
             for e in elements {
                 mark(*e, UseKind::Escape);
+            }
+            for (_, s) in spreads {
+                mark(*s, UseKind::Escape);
             }
         }
         MakeCell { init, .. } => mark(*init, UseKind::Escape),
@@ -1271,7 +1274,7 @@ mod tests {
             vec![
                 blk(
                     0,
-                    vec![Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false, columnar: false }],
+                    vec![Instruction::MakeArray { dst: Temp(0), elements: vec![], spreads: vec![], elem_ty: Type::Int32, inline: false, columnar: false }],
                     Terminator::TailCall { args: vec![] },
                 ),
                 // Dead block: never reached (TailCall has no successors).
@@ -1299,7 +1302,7 @@ mod tests {
                 blk(
                     0,
                     vec![
-                        Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false, columnar: false },
+                        Instruction::MakeArray { dst: Temp(0), elements: vec![], spreads: vec![], elem_ty: Type::Int32, inline: false, columnar: false },
                         Instruction::Release { val: Temp(0), ty: arr.clone() },
                     ],
                     Terminator::TailCall { args: vec![] },
@@ -1325,7 +1328,7 @@ mod tests {
             vec![blk(
                 0,
                 vec![
-                    Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false, columnar: false },
+                    Instruction::MakeArray { dst: Temp(0), elements: vec![], spreads: vec![], elem_ty: Type::Int32, inline: false, columnar: false },
                     Instruction::Release { val: Temp(0), ty: arr.clone() },
                     Instruction::Release { val: Temp(0), ty: arr.clone() },
                 ],
@@ -1347,7 +1350,7 @@ mod tests {
             vec![blk(
                 0,
                 vec![
-                    Instruction::MakeArray { dst: Temp(0), elements: vec![], elem_ty: Type::Int32, inline: false, columnar: false },
+                    Instruction::MakeArray { dst: Temp(0), elements: vec![], spreads: vec![], elem_ty: Type::Int32, inline: false, columnar: false },
                     Instruction::Retain { val: Temp(0), ty: arr.clone() },
                     Instruction::Release { val: Temp(0), ty: arr.clone() },
                     Instruction::Release { val: Temp(0), ty: arr.clone() },
