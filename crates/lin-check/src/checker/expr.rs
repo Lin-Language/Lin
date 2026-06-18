@@ -2202,6 +2202,60 @@ impl Checker {
                     })
                     .collect();
                 if literal_variants.is_empty() {
+                    // No discriminant variants. Try structural matching: check the object literal
+                    // against each Object variant whose required (non-nullable) fields are all
+                    // present in the literal. Pick the first compatible variant so field values
+                    // are directed against the variant's expected types rather than inferred
+                    // bottom-up (which degrades types from surrounding pattern-narrowing context).
+                    // Named aliases are resolved one level so `type TimetableLeg = Leg & {…}`
+                    // (stored as Object after intersection expansion) is reachable.
+                    // Returns Ok(None) when no variant matches, falling back to plain inference.
+                    let lit_keys: std::collections::HashSet<&str> = fields
+                        .iter()
+                        .filter_map(|f| match f {
+                            ObjectField::Pair(Expr::StringLit(k, _), _) => Some(k.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    // Resolve each variant to its Object form (expanding a Named alias once).
+                    let resolved_variants: Vec<(IndexMap<String, Type>, bool)> = variants
+                        .iter()
+                        .filter_map(|v| {
+                            let resolved = match v {
+                                Type::Named(n) => {
+                                    self.env.lookup_type(n)
+                                        .filter(|d| d.params.is_empty())
+                                        .map(|d| d.body.clone())
+                                        .unwrap_or_else(|| v.clone())
+                                }
+                                other => other.clone(),
+                            };
+                            match resolved {
+                                Type::Object { fields: f, sealed, .. } => Some((f, sealed)),
+                                _ => None,
+                            }
+                        })
+                        .collect();
+                    let structural_candidates: Vec<&(IndexMap<String, Type>, bool)> =
+                        resolved_variants
+                            .iter()
+                            .filter(|(f, _)| {
+                                // All required (non-nullable) fields of the variant must be present.
+                                f.iter().all(|(k, ft)| {
+                                    lit_keys.contains(k.as_str())
+                                        || crate::compat::is_compatible(&Type::Null, ft)
+                                })
+                            })
+                            .collect();
+                    // Unique match: direct against that variant. Ambiguous (multiple candidates
+                    // that both accept this literal) or none: defer to plain inference.
+                    if structural_candidates.len() == 1 {
+                        let (vf, _sealed) = structural_candidates[0];
+                        // Union literals are stored as TAG_MAP (boxed) by the consumer — pass
+                        // sealed=false to avoid a producer/consumer repr mismatch (see gate B in
+                        // check_object_fields). Mirrors the discriminant path above.
+                        return Ok(Some(self.check_object_fields(fields, vf, false, span)?));
+                    }
                     return Ok(None);
                 }
                 // Collect the object literal's string-literal field values for matching.

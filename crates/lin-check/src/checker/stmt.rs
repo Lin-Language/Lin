@@ -204,22 +204,37 @@ impl Checker {
                         return Ok(result);
                     }
                     lin_parse::ast::Pattern::Array(elements, arr_rest, _) => {
+                        // Resolve a Named alias one level so `type Connection = [Trip, Int32, Int32]`
+                        // exposes the FixedArray structure for per-position element typing.
+                        let resolved_ty = match &ty {
+                            Type::Named(n) => self.env.lookup_type(n)
+                                .filter(|d| d.params.is_empty())
+                                .map(|d| d.body.clone())
+                                .unwrap_or_else(|| ty.clone()),
+                            other => other.clone(),
+                        };
                         let arr_slot = self.env.define("__destr_arr".to_string(), ty.clone(), false);
-                        let elem_ty_inner = if let Type::Array(inner) = &ty {
+                        let elem_ty_inner = if let Type::Array(inner) = &resolved_ty {
                             *inner.clone()
                         } else {
                             Type::TypeVar(u32::MAX)
                         };
                         let mut typed_elements = Vec::new();
                         for (i, elem) in elements.iter().enumerate() {
+                            // For a FixedArray (typed tuple), each position has its own type.
+                            let pos_ty = if let Type::FixedArray(ref types) = resolved_ty {
+                                types.get(i).cloned().unwrap_or(Type::Never)
+                            } else {
+                                elem_ty_inner.clone()
+                            };
                             let slot = match elem {
                                 lin_parse::ast::Pattern::Ident(name, name_span) => {
                                     self.check_shadowing(name, *name_span);
-                                    self.env.define_at(name.clone(), elem_ty_inner.clone(), false, Some(*name_span))
+                                    self.env.define_at(name.clone(), pos_ty.clone(), false, Some(*name_span))
                                 }
-                                _ => self.env.define("_".to_string(), elem_ty_inner.clone(), false),
+                                _ => self.env.define("_".to_string(), pos_ty.clone(), false),
                             };
-                            typed_elements.push((i, slot, elem_ty_inner.clone()));
+                            typed_elements.push((i, slot, pos_ty));
                         }
                         let rest_info = if let Some(rest_name) = arr_rest {
                             self.check_shadowing(rest_name, *span);
