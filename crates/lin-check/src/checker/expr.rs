@@ -3153,7 +3153,7 @@ fn extract_int_key(expr: &Expr) -> Option<i64> {
 /// Returns the inner expression if this is a single-element array, `None` otherwise.
 fn extract_computed_key(expr: &Expr) -> Option<&Expr> {
     match expr {
-        Expr::Array(elems, _, _) if elems.len() == 1 => Some(&elems[0]),
+        Expr::Array(elems, _, _) if elems.len() == 1 => Some(elems[0].inner_expr()),
         _ => None,
     }
 }
