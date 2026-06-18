@@ -942,7 +942,7 @@ impl Checker {
         // var-capture check and transferability check for `async(f)` / `async(fs)`.
         // Fires on the raw intrinsic `lin_async` (stdlib-trusted code) AND on the user-facing
         // stdlib wrapper `async` (identified by its Promise<T> return type), so that user code
-        // like `async(() => t.header())` where `t: TarEntry` is caught at compile time.
+        // like `async(() => t.header())` where `t: TarEntry` (Opaque) is caught at compile time.
         let is_async_spawn = if let Expr::Ident(name, _) = func {
             name == "lin_async" || (name == "async" && matches!(result_type, Type::Promise(_)))
         } else {
@@ -961,7 +961,7 @@ impl Checker {
                     ).with_help("capture an immutable copy: `val snap = {}; async(() => snap)`".to_string()));
                 }
                 // Capture-type check: reject captures of non-transferable opaque handles
-                // (TarEntry, Iterator). Stream captures are legal via CAP_MOVE and excluded.
+                // (Opaque("TarEntry"), Iterator). Stream captures are legal via CAP_MOVE and excluded.
                 if let Some((cap_name, cap_ty)) = first_non_transferable_capture(arg) {
                     self.diagnostics.push(Diagnostic::error(
                         span,

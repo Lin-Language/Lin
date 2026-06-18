@@ -201,7 +201,7 @@ impl<'ctx> Codegen<'ctx> {
             // element's payload as the inner handle pointer — a flat raw-pointer push (the `_` arm,
             // tag 0) would store the box pointer in the payload slot AND mis-tag it, so the runtime
             // would deref the box header as the inner handle.
-            Type::TypeVar(_) | Type::Union(_) | Type::Promise(_) | Type::Shared(_) | Type::Stream(_) | Type::TarEntry =>
+            Type::TypeVar(_) | Type::Union(_) | Type::Promise(_) | Type::Shared(_) | Type::Stream(_) | Type::Opaque(_) =>
                 self.push_tagged_val(arr, val, val_ty),
             _ => {
                 let tag_val = Self::type_tag(val_ty);

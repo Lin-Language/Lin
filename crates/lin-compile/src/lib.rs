@@ -460,7 +460,10 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
 // the bincode discriminant of every variant that follows. Stale v3 `.typed`/`.sig` must be rejected.
 // v5 (fix/lsp-named-type-display): `Type::Object` gained a `name: Option<String>` field. Old caches
 // decode as `None` via `#[serde(default)]`, but the stamp is bumped to be safe.
-const CACHE_FORMAT_VERSION: u32 = 5;
+// v6 (refactor/opaque-type): `Type::TarEntry` (unit variant) replaced by `Type::Opaque(String)`
+// (newtype variant). The bincode discriminant shifts for every variant after `Promise`, and the
+// payload of what was `TarEntry` changes from unit → string. Stale v5 caches must be rejected.
+const CACHE_FORMAT_VERSION: u32 = 6;
 
 /// Magic prefix written at the head of every `.typed`/`.sig` cache file. Combined with the
 /// compiler version and `CACHE_FORMAT_VERSION`, this is the on-disk compatibility stamp checked

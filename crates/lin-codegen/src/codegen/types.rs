@@ -53,8 +53,8 @@ impl<'ctx> Codegen<'ctx> {
             Type::Stream(_) => self.context.ptr_type(AddressSpace::default()).into(),
             // Promise<T> is a boxed TaggedVal*(TAG_PROMISE) at runtime — an opaque pointer.
             Type::Promise(_) => self.context.ptr_type(AddressSpace::default()).into(),
-            // TarEntry is a boxed TaggedVal*(TAG_TAR_ENTRY) at runtime — an opaque pointer.
-            Type::TarEntry => self.context.ptr_type(AddressSpace::default()).into(),
+            // Opaque handles (e.g. TarEntry) are all boxed TaggedVal* pointers at runtime.
+            Type::Opaque(_) => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Never => self.context.i8_type().into(), // unreachable
             Type::TypeVar(_) => {
                 // Unresolved type var — use opaque pointer (Json/"any" type at runtime)
@@ -75,7 +75,7 @@ impl<'ctx> Codegen<'ctx> {
     /// included: its runtime value is a boxed `TaggedVal*(TAG_SHARED)`, so box/unbox sites must
     /// treat it as an already-boxed tagged value (never re-box or reinterpret it as a scalar).
     pub(crate) fn is_union_type(ty: &Type) -> bool {
-        matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry)
+        matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::Opaque(_))
     }
 
     /// Stage 6a: Returns true if `ty` represents a value whose tagged-box payload is a HEAP POINTER
@@ -85,7 +85,7 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn result_is_heap_pointer(ty: &Type) -> bool {
         matches!(ty, Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_)
             | Type::Object { .. } | Type::Map { .. } | Type::Function { .. }
-            | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry)
+            | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::Opaque(_))
     }
 
     /// Returns the LLVM struct type for a closure header.

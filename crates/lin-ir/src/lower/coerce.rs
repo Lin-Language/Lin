@@ -222,9 +222,10 @@ pub fn mangle_module_key(path: &str) -> String {
 /// `Stream<T>` is likewise a boxed `TaggedVal*(TAG_STREAM)` whose RC dispatches through the
 /// tag-aware path (the TAG_STREAM arm decrements the stream box's refcount, closing the fd at
 /// zero) — so it is owning too. `Promise<T>` is a boxed `TaggedVal*(TAG_PROMISE)` on the same
-/// tag-aware RC path, so it belongs here too. `TarEntry` is a boxed `TaggedVal*(TAG_TAR_ENTRY)`
-/// on the same tag-aware RC path — must be listed here so that closure captures CloneBox it
-/// (rather than CaptureRelease::None, which would UAF after the creating scope exits).
+/// tag-aware RC path, so it belongs here too. `Opaque(_)` handles (e.g. TarEntry) are boxed
+/// `TaggedVal*(TAG_*)` on the same tag-aware RC path — must be listed here so that closure
+/// captures CloneBox them (rather than CaptureRelease::None, which would UAF after the
+/// creating scope exits).
 ///
 /// Stage 3 NullableRecord: `T | Null` where T is a sealed record is EXCLUDED from `is_union_ty`.
 /// Such a union is represented as a raw nullable sealed-struct pointer (NOT a `TaggedVal*` box),
@@ -232,7 +233,7 @@ pub fn mangle_module_key(path: &str) -> String {
 /// pass seeds it as `Packed(NullableRecord)` and codegen dispatches on that repr separately.
 pub(crate) fn is_union_ty(ty: &Type) -> bool {
     if is_nullable_sealed_record(ty) { return false; }
-    matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry)
+    matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::Opaque(_))
 }
 
 /// True iff `ty` is a `T | Null` union where `T` is a sealed record — the Stage-3 NullableRecord

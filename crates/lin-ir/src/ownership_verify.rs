@@ -479,7 +479,7 @@ fn is_union_owning_ty(ty: &Type) -> bool {
     if crate::repr::nullable_sealed_record(ty).is_some() { return false; }
     matches!(
         ty,
-        Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
+        Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::Opaque(_)
     )
 }
 
