@@ -24,11 +24,12 @@ export val createQueueFactory = (routesAtStop: RoutesIndexedByStop, routeStopInd
 export val getQueue = (factory: QueueFactory, markedStops: StopId[]): RouteQueue =>
   markedStops.reduce({}, (queue, stop) => 
     factory["routesAtStop"][stop].for(routeId => 
-      queue[routeId] = 
-        if factory.isStopBefore(routeId, queue[routeId], stop) then
-          queue[routeId]
-        else
+      val current = queue[routeId]
+      queue[routeId] =
+        if current == null || !factory.isStopBefore(routeId, current, stop) then
           stop
+        else
+          current
     )
 
     queue
