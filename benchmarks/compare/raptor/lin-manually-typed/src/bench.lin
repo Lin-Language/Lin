@@ -1,0 +1,159 @@
+// Cross-language RAPTOR benchmark (Lin, manually-typed port) — mirrors node/bench.js.
+//
+// Two workloads, identical across every language port:
+//   GROUP — the 24 reference group-station origin/destination-set queries at 10:00 on
+//           2025-09-02 with the default MultipleCriteriaFilter (earliestArrival + leastChanges).
+//   RANGE — "next 20 journeys departing after 08:00" for 5 pairs: repeatedly plan, advance
+//           past the earliest departure, until 20 journeys are collected or service runs out.
+//
+// Prints per-phase timing lines plus an order-independent DIGEST line (the cross-language
+// correctness gate). Gate: group=26203913 range=773022892 journeys=139.
+import { StopId, Time } from "./gtfs/gtfs"
+import { Journey } from "./results/journey"
+import { ResultsFactory } from "./results/results-factory"
+import { getResults } from "./results/journey-factory"
+import { createMultipleCriteriaFilter } from "./results/filter/journey-filter"
+import { create } from "./raptor/raptor-algorithm-factory"
+import { loadGtfs } from "./gtfs/gtfs-loader"
+import { GroupStationDepartAfterQuery, createGroupStationDepartAfterQuery, plan as groupPlan } from "./query/group-station-depart-after-query"
+import { Date } from "std/datetime"
+import { now } from "std/time"
+import { print } from "std/io"
+import { toString } from "std/string"
+import { length, push, slice, sort, min } from "std/array"
+import { for, map, while } from "std/iter"
+
+val DATA_DIR = "/home/linus/Work/linusnorton/lin-lang/benchmarks/compare/raptor/gtfs.tar.gz"
+val DATE: Date = { "year": 2025, "month": 9, "day": 2 }
+val GROUP_TIME: Time = 36000   // 10:00
+val RANGE_START: Time = 28800  // 08:00
+val RANGE_N: Int32 = 20
+val MOD: Int64 = 1000000007
+
+// The 24 reference group-station queries: [origins, destinations].
+val GROUP_QUERIES: [StopId[], StopId[]][] = [
+  [["MRF", "LVC", "LVJ", "LIV"], ["NRW"]],
+  [["TBW", "PDW"], ["HGS"]],
+  [["PDW", "MRN"], ["LVC", "LVJ", "LIV"]],
+  [["PDW", "AFK"], ["NRW"]],
+  [["PDW"], ["BHM", "BMO", "BSW", "BHI"]],
+  [["PNZ"], ["DIS"]],
+  [["YRK"], ["DIS"]],
+  [["WEY"], ["RDG"]],
+  [["YRK"], ["NRW"]],
+  [["BHM", "BMO", "BSW", "BHI"], ["MCO", "MAN", "MCV", "EXD"]],
+  [["BHM", "BMO", "BSW", "BHI"], ["EDB"]],
+  [["COV", "RUG"], ["MAN", "MCV"]],
+  [["YRK"], ["MCO", "MAN", "MCV", "EXD"]],
+  [["STA"], ["PBO"]],
+  [["PNZ"], ["EDB"]],
+  [["RDG"], ["IPS"]],
+  [["DVP"], ["BHM", "BMO", "BSW", "BHI"]],
+  [["BXB"], ["DVP"]],
+  [["MCO", "MAN", "MCV", "EXD"], ["CBW", "CBE"]],
+  [["MCO", "MAN", "MCV", "EXD"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]],
+  [["BHM", "BMO", "BSW", "BHI"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]],
+  [["ORP"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]],
+  [["EDB"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]],
+  [["CBE", "CBW"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]]
+]
+
+// "next 20 journeys" pairs.
+val RANGE_QUERIES: [StopId, StopId][] = [
+  ["TBW", "NRW"],
+  ["BHM", "EDB"],
+  ["PNZ", "DIS"],
+  ["YRK", "NRW"],
+  ["RDG", "IPS"]
+]
+
+// Order-independent digest contribution of one journey (a sum mod a prime, so ordering never matters).
+val journeyDigest = (j: Journey): Int64 =>
+  val dep: Int64 = j["departureTime"]
+  val arr: Int64 = j["arrivalTime"]
+  val legs: Int64 = j["legs"].length()
+  ((dep % 1000000000) * 1000003i64 + (arr % 1000000000) * 31i64 + legs) % MOD
+
+val accumulate = (journeys: Journey[], acc: Int64): Int64 =>
+  var a = acc
+  journeys.for(j => a = (a + journeyDigest(j)) % MOD)
+  a
+
+// "next N journeys departing after startTime" — the RangeQuery profile loop, capped at N.
+val nextN = (
+  group: GroupStationDepartAfterQuery,
+  origin: StopId,
+  destination: StopId,
+  date: Date,
+  startTime: Time,
+  n: Int32
+): Journey[] =>
+  var results: Journey[] = []
+  var time: Time = startTime
+
+  while(() =>
+    if results.length() >= n then
+      false
+    else
+      val newResults = groupPlan(group, [origin], [destination], date, time)
+      if newResults.length() == 0 then
+        false
+      else
+        newResults.for(j => results.push(j))
+        time = newResults.map(j => j["departureTime"]).min() + 1
+        true
+  )
+
+  // sort by departureTime asc, then arrivalTime asc, and take the first n
+  val sorted = results.sort((a, b) =>
+    if a["departureTime"] < b["departureTime"] then -1
+    else if a["departureTime"] > b["departureTime"] then 1
+    else if a["arrivalTime"] < b["arrivalTime"] then -1
+    else if a["arrivalTime"] > b["arrivalTime"] then 1
+    else 0
+  )
+
+  sorted.slice(0, n)
+
+val main = () =>
+  val t0 = now()
+  val [trips, transfers, interchange, stops] = loadGtfs(DATA_DIR)
+  val loadMs = now() - t0
+  print("LOAD ms=${ toString(loadMs) }")
+
+  val t1 = now()
+  val raptor = create(trips, transfers, interchange)
+  val prepMs = now() - t1
+  print("PREP ms=${ toString(prepMs) }")
+
+  val jf: ResultsFactory = { "getResults": getResults }
+  val groupFiltered = createGroupStationDepartAfterQuery(raptor, jf, 3, [createMultipleCriteriaFilter()])
+  val groupPlain = createGroupStationDepartAfterQuery(raptor, jf, 3, [])
+
+  // GROUP workload
+  val tg = now()
+  var groupCount: Int32 = 0
+  var groupDigest: Int64 = 0
+  GROUP_QUERIES.for(q =>
+    val results = groupPlan(groupFiltered, q[0], q[1], DATE, GROUP_TIME)
+    groupCount = groupCount + results.length()
+    groupDigest = accumulate(results, groupDigest)
+  )
+  val groupMs = now() - tg
+  print("GROUP queries=${ toString(length(GROUP_QUERIES)) } journeys=${ toString(groupCount) } digest=${ toString(groupDigest) } ms=${ toString(groupMs) }")
+
+  // RANGE workload ("next 20")
+  val tr = now()
+  var rangeCount: Int32 = 0
+  var rangeDigest: Int64 = 0
+  RANGE_QUERIES.for(q =>
+    val results = nextN(groupPlain, q[0], q[1], DATE, RANGE_START, RANGE_N)
+    rangeCount = rangeCount + results.length()
+    rangeDigest = accumulate(results, rangeDigest)
+  )
+  val rangeMs = now() - tr
+  print("RANGE queries=${ toString(length(RANGE_QUERIES)) } journeys=${ toString(rangeCount) } digest=${ toString(rangeDigest) } ms=${ toString(rangeMs) }")
+
+  print("DIGEST group=${ toString(groupDigest) } range=${ toString(rangeDigest) } journeys=${ toString(groupCount + rangeCount) }")
+
+main()
