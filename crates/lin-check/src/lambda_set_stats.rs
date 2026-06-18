@@ -237,12 +237,16 @@ fn walk_expr(expr: &TypedExpr, s: &mut Stats) {
         TypedExpr::Coerce { expr, .. } => walk_expr(expr, s),
         TypedExpr::LocalSet { value, .. } => walk_expr(value, s),
         TypedExpr::FromJson { value, .. } => walk_expr(value, s),
-        TypedExpr::MakeObject { fields, spreads, .. } => {
+        TypedExpr::MakeObject { fields, spreads, computed_fields, .. } => {
             for (_, e) in fields {
                 walk_expr(e, s);
             }
             for sp in spreads {
                 walk_expr(sp, s);
+            }
+            for (k, v) in computed_fields {
+                walk_expr(k, s);
+                walk_expr(v, s);
             }
         }
         TypedExpr::MakeArray { elements, .. } => {
