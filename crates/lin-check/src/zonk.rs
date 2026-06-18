@@ -157,9 +157,10 @@ fn zonk_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
             *ret_type = zonk_type(ret_type, subs);
             for c in captures { c.ty = zonk_type(&c.ty, subs); }
         }
-        TypedExpr::MakeObject { fields, spreads, ty, .. } => {
+        TypedExpr::MakeObject { fields, spreads, computed_fields, ty, .. } => {
             for (_, e) in fields { zonk_expr(e, subs); }
             for s in spreads { zonk_expr(s, subs); }
+            for (k, v) in computed_fields { zonk_expr(k, subs); zonk_expr(v, subs); }
             *ty = zonk_type(ty, subs);
         }
         TypedExpr::MakeArray { elements, ty, .. } => {

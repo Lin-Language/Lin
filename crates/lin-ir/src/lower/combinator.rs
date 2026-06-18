@@ -400,8 +400,10 @@ pub(crate) fn elem_used_only_for_scalar_fields(slot: usize, body: &TypedExpr) ->
             // A nested function literal that captures the element would need the whole value — its
             // captures reference outer slots, so conservatively reject if the param slot is named.
             TypedExpr::Function { body, .. } => walk(slot, body),
-            TypedExpr::MakeObject { fields, spreads, .. } =>
-                fields.iter().all(|(_, v)| walk(slot, v)) && spreads.iter().all(|s| walk(slot, s)),
+            TypedExpr::MakeObject { fields, spreads, computed_fields, .. } =>
+                fields.iter().all(|(_, v)| walk(slot, v))
+                    && spreads.iter().all(|s| walk(slot, s))
+                    && computed_fields.iter().all(|(k, v)| walk(slot, k) && walk(slot, v)),
             TypedExpr::MakeArray { elements, .. } => elements.iter().all(|x| walk(slot, x)),
             TypedExpr::IndexSet { object, key, value, .. } =>
                 walk(slot, object) && walk(slot, key) && walk(slot, value),

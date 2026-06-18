@@ -223,9 +223,10 @@ pub fn instr_use_def(instr: &Instruction) -> (Vec<Temp>, Vec<Temp>) {
         Instruction::CallIntrinsic { dst, args, .. } => (args.clone(), vec![*dst]),
         Instruction::MakeClosure { dst, captures, .. } => (captures.clone(), vec![*dst]),
         Instruction::MakeNamedClosure { dst, .. } => (vec![], vec![*dst]),
-        Instruction::MakeObject { dst, fields, spreads, .. } => {
+        Instruction::MakeObject { dst, fields, spreads, computed_fields, .. } => {
             let mut uses: Vec<Temp> = fields.iter().map(|(_, t)| *t).collect();
             uses.extend(spreads.iter().copied());
+            for (k, v) in computed_fields { uses.push(*k); uses.push(*v); }
             (uses, vec![*dst])
         }
         Instruction::MakeArray { dst, elements, .. } => (elements.clone(), vec![*dst]),

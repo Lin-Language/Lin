@@ -384,9 +384,13 @@ pub(crate) fn first_mutable_global_in_body(
                 _ => None,
             }).or_else(|| first_mutable_global_in_body(expr, mutable_globals))
         }
-        TypedExpr::MakeObject { fields, spreads, .. } => {
+        TypedExpr::MakeObject { fields, spreads, computed_fields, .. } => {
             fields.iter().find_map(|(_, v)| first_mutable_global_in_body(v, mutable_globals))
                 .or_else(|| spreads.iter().find_map(|s| first_mutable_global_in_body(s, mutable_globals)))
+                .or_else(|| computed_fields.iter().find_map(|(k, v)| {
+                    first_mutable_global_in_body(k, mutable_globals)
+                        .or_else(|| first_mutable_global_in_body(v, mutable_globals))
+                }))
         }
         TypedExpr::MakeArray { elements, .. } => {
             elements.iter().find_map(|e| first_mutable_global_in_body(e, mutable_globals))
