@@ -1738,7 +1738,7 @@ This is not used because JSON-shaped types should describe JSON-shaped data. Ite
 
 ### 18.7 Receiver-Dispatched Combinators
 
-The iterable combinators — `map`, `filter`, `reduce`, `for`, `while`, `take`, `drop`, `flatMap`, `takeWhile`, `dropWhile`, `flatten`, `concat`, `find`, `some`, `every` — and the iterator constructors `range`, `rangeStep`, `iter`, `iterOf` are a **single** vocabulary that works over any iterable source: an array, an `Iterator`, or a `Stream` (§27.9). They live in one module, `std/iter`, and **dispatch on the static type of the receiver** (their first argument, in dot-application terms). This is Lin's first-argument-dispatch model (§4.4) applied to the combinator set.
+The iterable combinators — `map`, `filter`, `reduce`, `for`, `while`, `take`, `drop`, `flatMap`, `takeWhile`, `dropWhile`, `flatten`, `concat`, `find`, `some`, `every` — and the iterator constructors `range`, `iter`, `iterOf` are a **single** vocabulary that works over any iterable source: an array, an `Iterator`, or a `Stream` (§27.9). They live in one module, `std/iter`, and **dispatch on the static type of the receiver** (their first argument, in dot-application terms). This is Lin's first-argument-dispatch model (§4.4) applied to the combinator set.
 
 The same name behaves differently depending on the receiver:
 
