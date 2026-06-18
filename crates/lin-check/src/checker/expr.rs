@@ -135,9 +135,49 @@ fn expr_place_root(expr: &Expr) -> Option<&str> {
     }
 }
 
+/// Which side (then/else) of a `NarrowTest` to merge when combining facts from `&&` or `||`.
+enum Side { Then, Else }
+
+/// Merge `incoming` facts into `acc` on a single side (`Then` or `Else`), intersecting
+/// same-place types.  For `&&`, we merge the `Then` side (both operands were true); for `||`,
+/// the `Else` side (both were false). Conservative: disjoint types → drop the narrowing.
+fn merge_side_into(acc: &mut Vec<NarrowTest>, incoming: Vec<NarrowTest>, side: Side) {
+    'outer: for new_fact in incoming {
+        for existing in acc.iter_mut() {
+            if existing.place == new_fact.place {
+                let (acc_slot, new_slot) = match side {
+                    Side::Then => (&mut existing.then_ty, &new_fact.then_ty),
+                    Side::Else => (&mut existing.else_ty, &new_fact.else_ty),
+                };
+                match (acc_slot.as_ref(), new_slot.as_ref()) {
+                    (Some(a), Some(b)) => {
+                        // Keep the tighter type (intersection). `a.without_variant(b)` being
+                        // `Some` means `b` is a strict member of `a` as a union → `b` is tighter.
+                        let tighter = if a.without_variant(b).is_some() {
+                            Some(b.clone())
+                        } else if b.without_variant(a).is_some() {
+                            Some(a.clone())
+                        } else if a == b {
+                            Some(a.clone())
+                        } else {
+                            None // disjoint — drop
+                        };
+                        *acc_slot = tighter;
+                    }
+                    (None, Some(t)) => *acc_slot = Some(t.clone()),
+                    _ => {}
+                }
+                continue 'outer;
+            }
+        }
+        acc.push(new_fact);
+    }
+}
+
 /// A flow-narrowing derived from an `if`/`else` condition that is a type/null test on a simple
 /// identifier OR an index place (`m[k]`). Carries the place's narrowed static type for each
 /// branch (or `None` when that branch does not tighten the type). See `Checker::null_test_narrowing`.
+#[derive(Clone)]
 pub(crate) struct NarrowTest {
     place: NarrowPlace,
     then_ty: Option<Type>,
@@ -1298,6 +1338,64 @@ impl Checker {
         Some(NarrowTest { place, then_ty, else_ty })
     }
 
+    /// Recursive compound-condition narrowing: given a boolean condition expression, return the
+    /// list of `NarrowTest` facts that govern each branch. Each `NarrowTest` carries both the
+    /// `then_ty` (type when the overall condition is true) and `else_ty` (when false) for its
+    /// place; either field may be `None` when no sound narrowing is derivable for that branch.
+    ///
+    /// Rules (Boolean algebra of narrowing facts):
+    ///   - atomic test (`x != null`, `x is T`, …): delegate to `null_test_narrowing` directly.
+    ///   - `A && B`: then_ty = intersect(A.then_ty, B.then_ty); else_ty = None (De Morgan).
+    ///   - `A || B`: then_ty = None (De Morgan); else_ty = intersect(A.else_ty, B.else_ty).
+    ///   - `!inner`: swap `then_ty` and `else_ty` for every fact from `inner`.
+    ///
+    /// `apply_narrowings_list(facts, entering_then=true)` applies `then_ty`; `false` applies `else_ty`.
+    pub(crate) fn compound_condition_narrowings(&self, condition: &Expr) -> Vec<NarrowTest> {
+        match condition {
+            // `A && B` — then_ty = intersect; else_ty = None.
+            Expr::BinaryOp { left, op: BinOp::And, right, .. } => {
+                let mut facts_a = self.compound_condition_narrowings(left);
+                let facts_b = self.compound_condition_narrowings(right);
+                merge_side_into(&mut facts_a, facts_b, Side::Then);
+                // Null out the else side — De Morgan: ¬A ∨ ¬B, can't guarantee a single branch.
+                for f in &mut facts_a { f.else_ty = None; }
+                facts_a
+            }
+            // `A || B` — else_ty = intersect; then_ty = None.
+            Expr::BinaryOp { left, op: BinOp::Or, right, .. } => {
+                let mut facts_a = self.compound_condition_narrowings(left);
+                let facts_b = self.compound_condition_narrowings(right);
+                merge_side_into(&mut facts_a, facts_b, Side::Else);
+                // Null out the then side — De Morgan.
+                for f in &mut facts_a { f.then_ty = None; }
+                facts_a
+            }
+            // `!inner` — swap then_ty and else_ty for every inner fact.
+            Expr::UnaryOp { op: lin_parse::ast::UnaryOp::Not, operand, .. } => {
+                let mut facts = self.compound_condition_narrowings(operand);
+                for f in &mut facts {
+                    std::mem::swap(&mut f.then_ty, &mut f.else_ty);
+                }
+                facts
+            }
+            // Atomic: delegate to the existing single-test narrowing.
+            other => {
+                if let Some(test) = self.null_test_narrowing(other) {
+                    vec![test]
+                } else {
+                    vec![]
+                }
+            }
+        }
+    }
+
+    /// Apply a list of flow-narrowings within the CURRENT scope. Called after `push_scope`.
+    pub(crate) fn apply_narrowings_list(&mut self, facts: &[NarrowTest], entering_then: bool) {
+        for test in facts {
+            self.apply_null_narrowing(&Some(test.clone()), entering_then);
+        }
+    }
+
     /// If `expr` is a narrowable place — a simple identifier, or an index read `base[key]…` whose
     /// base canonicalizes to an identifier-rooted `PlacePath` and whose every key is a
     /// string-literal or a simple identifier — return the corresponding `NarrowPlace`. Otherwise
@@ -1439,18 +1537,18 @@ impl Checker {
         // (conservative — prevents a use after a possible move). The condition runs before both
         // branches, so any consume there is shared by both.
         let consumed_before = self.consumed_streams.clone();
-        // Flow-narrow a union binding on a type/null test (`x is X`, `x == null`, `x != null`):
-        // the matched branch narrows to the matched member, the other to the complement. The
-        // narrowing is scoped: pushed before the relevant branch and popped after, so it never
-        // leaks past the `if`.
-        let narrowing = self.null_test_narrowing(condition);
+        // Flow-narrow a union binding on a type/null test, including compound boolean conditions.
+        // `compound_condition_narrowings` handles `&&`, `||`, `!` recursively, delegating atomic
+        // tests to `null_test_narrowing`. The returned then/else fact-lists are applied in a scope
+        // around each branch and cleaned up after.
+        let narrowing_facts = self.compound_condition_narrowings(condition);
         // Depth of the index-narrowing stack before this `if`; index-place narrowings pushed for
         // a branch are truncated back to here after the branch is checked (the ident-place
         // narrowings are scoped by push_scope/pop_scope instead).
         let index_narrow_base = self.index_narrowings.len();
         let typed_then = {
             self.env.push_scope();
-            self.apply_null_narrowing(&narrowing, true);
+            self.apply_narrowings_list(&narrowing_facts, true);
             let r = self.infer_expr(then_branch);
             self.env.pop_scope();
             self.index_narrowings.truncate(index_narrow_base);
@@ -1461,7 +1559,7 @@ impl Checker {
         self.in_tail_position = in_tail;
         let typed_else = {
             self.env.push_scope();
-            self.apply_null_narrowing(&narrowing, false);
+            self.apply_narrowings_list(&narrowing_facts, false);
             let r = self.infer_expr(else_branch);
             self.env.pop_scope();
             self.index_narrowings.truncate(index_narrow_base);

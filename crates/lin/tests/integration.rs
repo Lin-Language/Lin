@@ -22459,6 +22459,66 @@ main()
     assert_eq!(output, vec!["0"]);
 }
 
+// ── Compound boolean-condition narrowing (`||`, `&&`, `!`) ──────────────────────────────────────
+// Before this change, flow-narrowing only applied to ATOMIC conditions (`x != null`,
+// `x == null`, `x is T`). Compound connectives (`||`, `&&`, `!`) now decompose into branch facts
+// using Boolean algebra:
+//   `A || B` else-branch → facts of (A-false) AND (B-false) (De Morgan: ¬A ∧ ¬B)
+//   `A && B` then-branch → facts of (A-true)  AND (B-true)
+//   `!A`                 → swap A's then/else facts
+
+#[test]
+fn test_compound_or_else_branch_narrows_non_null() {
+    // `if x == null || x > 5 then 0 else x` — else-branch: both `x == null` (false) and
+    // `x > 5` (false) → `x` is non-null in the else branch.
+    // Before this fix this failed: "Function body has type Int32 | Null".
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (x: Int32 | Null): Int32 =>
+  if x == null || x > 5 then 0 else x
+print(toString(f(null)))
+print(toString(f(3)))
+print(toString(f(10)))
+"#);
+    assert_eq!(out, vec!["0", "3", "0"]);
+}
+
+#[test]
+fn test_compound_and_then_branch_narrows_non_null() {
+    // `if x != null && x > 5 then x else 0` — then-branch: both `x != null` (true) and
+    // `x > 5` (true) → `x` is non-null in the then branch.
+    // Before this fix this failed: "Function body has type Int32 | Null".
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val g = (x: Int32 | Null): Int32 =>
+  if x != null && x > 5 then x else 0
+print(toString(g(null)))
+print(toString(g(3)))
+print(toString(g(10)))
+"#);
+    assert_eq!(out, vec!["0", "0", "10"]);
+}
+
+#[test]
+fn test_compound_not_negation_narrows_is_type() {
+    // `!(v is Int32)` — else-branch (condition false) means `v is Int32` was true → v: Int32.
+    // Also: `v is Int32 && v > 0` — then-branch knows v: Int32.
+    // Before this fix both failed to type-check.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type U = Int32 | String
+val h1 = (v: U): Int32 =>
+  if !(v is Int32) then 0 else v
+val h2 = (v: U): Int32 =>
+  if v is Int32 && v > 0 then v else 0
+print(toString(h1(42)))
+print(toString(h1("hello")))
+print(toString(h2(10)))
+print(toString(h2(0 - 5)))
+"#);
+    assert_eq!(out, vec!["42", "0", "10", "0"]);
+}
+
 /// Regression: 3-arg `range(start, end, step)` used `lin_iter` which typed elements as `AnyVal`.
 /// An `AnyVal`-boxed int does not match a numeric map key (stored unboxed), so `m[i]` returned null.
 /// Fix: 3-arg range materialises a flat `Int32[]` so the loop variable has type `Int32`.
