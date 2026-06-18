@@ -21963,6 +21963,40 @@ print(toString(m["a"]))
     assert_eq!(output, vec!["100"]);
 }
 
+// ADR-085 + ADR-058: `reduce(xs, {}, f): Q` where Q is a typed map — the empty `{}` init must
+// be accepted without an explicit annotation when the function's declared return type pins U.
+// Before this fix, the expected-result seed bound U = Q but the {} routing still fell through to
+// plain inference (Object{}), and the compat check fired "Expected type Q, got {}" at .reduce.
+#[test]
+fn test_reduce_empty_map_init_from_expected_return() {
+    let output = run(r#"import { reduce } from "std/iter"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Q = { String: Int32 }
+val build = (xs: String[]): Q =>
+  xs.reduce({}, (acc, x) => acc)
+val m = build(["a", "b"])
+if m["a"] == null then print("null") else print("non-null")
+"#);
+    assert_eq!(output, vec!["null"]);
+}
+
+// ADR-085 + ADR-058: a genuinely uninferrable empty literal in a call argument must point the
+// caret AT the `{}` / `[]` and emit the annotation-required message, not a misleading
+// "Expected type X, got {}" at the enclosing call span.
+#[test]
+fn test_empty_literal_arg_uninferrable_points_at_literal() {
+    let err = run_expect_err(r#"import { print } from "std/io"
+val add = (x: Int32, y: Int32): Int32 => x + y
+val result = add({}, 1)
+print("unreachable")
+"#);
+    assert!(
+        err.contains("cannot infer the value type of an empty map/object literal"),
+        "expected the ADR-058 annotation-required diagnostic at the `{{}}` site, got: {err}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Destructuring lambda parameters (ADR-079) — bare + parenthesized, array + object.
 // ---------------------------------------------------------------------------

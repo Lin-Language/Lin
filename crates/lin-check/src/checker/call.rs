@@ -2,7 +2,7 @@ use lin_common::{Diagnostic, Span};
 use lin_parse::ast::Expr;
 
 use super::Checker;
-use super::helpers::{apply_type_subs, first_mutable_capture, first_non_transferable_capture, integer_range, is_definitely_non_transferable};
+use super::helpers::{apply_type_subs, empty_literal_kind, first_mutable_capture, first_non_transferable_capture, integer_range, is_definitely_non_transferable};
 use crate::resolve::{error_type, any_val_type};
 use crate::typed_ir::*;
 use crate::types::Type;
@@ -649,7 +649,19 @@ impl Checker {
                                 && !super::expr::type_mentions_generic_tv(&substituted_param);
                         let object_lit_against_determined_union_or_record =
                             matches!(arg, Expr::Object(..))
-                                && matches!(&substituted_param, Type::Union(_) | Type::Object { .. } | Type::Named(_))
+                                && matches!(&substituted_param, Type::Union(_) | Type::Object { .. } | Type::Named(_) | Type::Map { .. })
+                                && !super::expr::type_mentions_generic_tv(&substituted_param);
+                        // An EMPTY ARRAY LITERAL `[]` flowing into a TypeVar param that was seeded
+                        // from the expected result (e.g. `reduce(arr, [], f): Int32[]` seeds
+                        // `U = Int32[]`) must be directed against the now-known `Int32[]` type so it
+                        // carries the correct element representation. Without this it infers bottom-up
+                        // as `Array(Never)` and then fails the arg-compatibility check against `Int32[]`.
+                        // Gated to a fully-determined substituted Array (no free TypeVar) for the same
+                        // soundness reasons as the integer-literal deferral — a still-free param needs
+                        // bottom-up inference, not speculative checking.
+                        let empty_array_lit_against_determined_array =
+                            matches!(arg, Expr::Array(elems, _, _) if elems.is_empty())
+                                && matches!(&substituted_param, Type::Array(_))
                                 && !super::expr::type_mentions_generic_tv(&substituted_param);
                         let typed = if array_lit_against_concrete_array
                             || object_lit_against_concrete_record
@@ -658,6 +670,7 @@ impl Checker {
                             self.check_expr(arg, param_ty)?
                         } else if call_arg_against_determined_param
                             || object_lit_against_determined_union_or_record
+                            || empty_array_lit_against_determined_array
                         {
                             let snap = self.checker_state_snapshot();
                             match self.check_expr(arg, &substituted_param) {
@@ -948,6 +961,15 @@ impl Checker {
                 {
                     let arg_ty = arg.ty();
                     if !self.arg_compatible(&arg_ty, param_ty) {
+                        // When the argument is a bare empty literal (`{}` / `[]`) that failed to
+                        // get a contextual type and collapsed to a degenerate `Object{}` /
+                        // `Array(Never)`, the real issue is that the type cannot be inferred —
+                        // the ADR-058 empty-literal annotation requirement. Emit the actionable
+                        // "add a type annotation" diagnostic at the `{}` / `[]` span rather than
+                        // a generic argument-mismatch error pointing at an unrelated enclosing call.
+                        if let Some(kind) = empty_literal_kind(&args[i]) {
+                            return Err(Diagnostic::error(args[i].span(), kind.message()));
+                        }
                         let mut msg = format!(
                             "Argument {} has type {}, expected {}",
                             i + 1,
@@ -1568,11 +1590,19 @@ impl Checker {
                             let sub_param_ty = apply_type_subs(param_ty, &subs);
                             let object_lit_against_determined_union_or_record =
                                 matches!(arg, Expr::Object(..))
-                                    && matches!(&sub_param_ty, Type::Union(_) | Type::Object { .. } | Type::Named(_))
+                                    && matches!(&sub_param_ty, Type::Union(_) | Type::Object { .. } | Type::Named(_) | Type::Map { .. })
+                                    && !super::expr::type_mentions_generic_tv(&sub_param_ty);
+                            // Empty array literal `[]` against a TypeVar param whose substituted
+                            // type is a fully-determined Array — mirror of the infer_call version.
+                            let empty_array_lit_against_determined_array =
+                                matches!(arg, Expr::Array(elems, _, _) if elems.is_empty())
+                                    && matches!(&sub_param_ty, Type::Array(_))
                                     && !super::expr::type_mentions_generic_tv(&sub_param_ty);
                             let typed = if array_lit_against_concrete_array || object_lit_against_concrete_map {
                                 self.check_expr(arg, param_ty)?
-                            } else if object_lit_against_determined_union_or_record {
+                            } else if object_lit_against_determined_union_or_record
+                                || empty_array_lit_against_determined_array
+                            {
                                 let snap = self.checker_state_snapshot();
                                 match self.check_expr(arg, &sub_param_ty) {
                                     Ok(t) => t,
@@ -1856,6 +1886,13 @@ impl Checker {
                         continue;
                     }
                     if !self.arg_compatible(&arg_ty, param_ty) {
+                        // Empty literal collapsed to a degenerate type — emit the actionable
+                        // annotation-required diagnostic at the `{}` / `[]` span (ADR-058).
+                        if let Some(src) = all_arg_exprs.get(i) {
+                            if let Some(kind) = empty_literal_kind(src) {
+                                return Err(Diagnostic::error(src.span(), kind.message()));
+                            }
+                        }
                         let mut msg = format!(
                             "Argument {} has type {}, expected {}",
                             i + 1,
