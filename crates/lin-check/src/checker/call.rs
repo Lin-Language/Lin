@@ -633,16 +633,32 @@ impl Checker {
                         // Gated to a determined param so an ordinary generic-into-generic call (param
                         // still a free `T`) keeps bottom-up inference. Speculative: a directed failure
                         // falls back to plain inference (the result is re-validated structurally).
+                        //
+                        // An OBJECT LITERAL argument also benefits when the substituted param is a
+                        // fully-determined Union or Object — e.g. `push(legs, { "trip": trip, … })`
+                        // where `legs: AnyLeg[]` binds `T = AnyLeg = Transfer | TimetableLeg`.
+                        // Without directing, the literal is inferred bottom-up and its field types
+                        // degrade (TypeVars/AnyVal for fields whose types come from pattern-
+                        // destructuring), then fail the compatibility check against `AnyLeg`.
+                        // With directing, `check_expr` calls `check_object_against` with the Union
+                        // expected type, which tries each variant in turn and picks the matching one —
+                        // preserving the real field types from the surrounding scope.
                         let substituted_param = apply_type_subs(param_ty, &subs);
                         let call_arg_against_determined_param =
                             matches!(arg, Expr::Call { .. } | Expr::DotCall { .. })
+                                && !super::expr::type_mentions_generic_tv(&substituted_param);
+                        let object_lit_against_determined_union_or_record =
+                            matches!(arg, Expr::Object(..))
+                                && matches!(&substituted_param, Type::Union(_) | Type::Object { .. } | Type::Named(_))
                                 && !super::expr::type_mentions_generic_tv(&substituted_param);
                         let typed = if array_lit_against_concrete_array
                             || object_lit_against_concrete_record
                             || array_lit_against_tuple_array
                         {
                             self.check_expr(arg, param_ty)?
-                        } else if call_arg_against_determined_param {
+                        } else if call_arg_against_determined_param
+                            || object_lit_against_determined_union_or_record
+                        {
                             let snap = self.checker_state_snapshot();
                             match self.check_expr(arg, &substituted_param) {
                                 Ok(t) => t,
@@ -1543,8 +1559,28 @@ impl Checker {
                             let object_lit_against_concrete_map = matches!(arg, Expr::Object(..))
                                 && matches!(param_ty, Type::Map { .. })
                                 && !param_ty.contains_type_var();
+                            // An object literal whose RAW param is a TypeVar should be directed
+                            // against the SUBSTITUTED type when the receiver has already bound that
+                            // TypeVar to a fully-determined Union, Object, or Named type. Without
+                            // this, `legs.push({ "trip": trip, … })` where `legs: AnyLeg[]` binds
+                            // `T = AnyLeg = Transfer | TimetableLeg` infers the literal bottom-up,
+                            // degrading field types whose sources are pattern-destructure bindings.
+                            let sub_param_ty = apply_type_subs(param_ty, &subs);
+                            let object_lit_against_determined_union_or_record =
+                                matches!(arg, Expr::Object(..))
+                                    && matches!(&sub_param_ty, Type::Union(_) | Type::Object { .. } | Type::Named(_))
+                                    && !super::expr::type_mentions_generic_tv(&sub_param_ty);
                             let typed = if array_lit_against_concrete_array || object_lit_against_concrete_map {
                                 self.check_expr(arg, param_ty)?
+                            } else if object_lit_against_determined_union_or_record {
+                                let snap = self.checker_state_snapshot();
+                                match self.check_expr(arg, &sub_param_ty) {
+                                    Ok(t) => t,
+                                    Err(_) => {
+                                        self.restore_checker_state(snap);
+                                        self.infer_expr(arg)?
+                                    }
+                                }
                             } else {
                                 self.infer_expr(arg)?
                             };

@@ -22233,3 +22233,31 @@ print(toString(length(barr)))
 "#);
     assert_eq!(output, vec!["3", "r3", "2"]);
 }
+
+#[test]
+fn test_push_object_literal_into_union_array() {
+    // Regression: pushing an object literal with computed field values into a union-typed array
+    // degraded the literal's field types to AnyVal instead of checking it against the union's
+    // element type. `push<T>(arr: T[], item: T)` must solve T from the array arg first, then
+    // check the literal against the substituted param type (the union variant), not infer it
+    // bottom-up and degrade it.
+    let output = run(r#"import { print } from "std/io"
+import { push } from "std/array"
+type Leg = { "origin": String, "destination": String }
+type TimetableLeg = Leg & { "tripId": String }
+type Transfer = Leg & { "duration": Int32 }
+type AnyLeg = Transfer | TimetableLeg
+val makeLeg = (tripId: String, origin: String, dest: String): AnyLeg[] =>
+  val legs: AnyLeg[] = []
+  legs.push({ "tripId": tripId, "origin": origin, "destination": dest })
+  legs
+val result = makeLeg("IC123", "Amsterdam", "Utrecht")
+val leg = result[0]
+if leg is TimetableLeg then
+  print(leg["tripId"])
+  print(leg["origin"])
+else
+  print("not a timetable leg")
+"#);
+    assert_eq!(output, vec!["IC123", "Amsterdam"]);
+}
