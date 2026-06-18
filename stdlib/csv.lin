@@ -85,7 +85,7 @@ val trimAsciiWs = (s: String): String =>
 // — `pos` points just past the closing quote, `ok` is false on EOF inside the quote. Tail-recursive
 // (TCO'd to a byte loop), so it allocates ZERO throwaway arrays — unlike `range(0,n).while`, which
 // materialised a length-n Int32 array on EVERY field, making `parse` O(N²) in allocation.
-val scanQuotedSpans = (s: String, n: Int32, i: Int32, segStart: Int32, parts: String[]): AnyVal =>
+val scanQuotedSpans = (s: String, n: Int32, i: Int32, segStart: Int32, parts: String[]): { "pos": Int32, "ok": Boolean } =>
   val b = byteAt(s, i)
   if b == -1 then
     // EOF inside a quoted field -> unterminated quote.
@@ -113,7 +113,7 @@ val scanQuotedSpans = (s: String, n: Int32, i: Int32, segStart: Int32, parts: St
 // stray-quote error. Returns a cursor { "pos": Int32, "ok": Boolean }. Tail-recursive (TCO'd to a
 // byte loop) — zero throwaway arrays (the old `range(0,n+1).while` allocated a length-n array per
 // field).
-val scanUnquoted = (s: String, n: Int32, i: Int32, delim: Int32): AnyVal =>
+val scanUnquoted = (s: String, n: Int32, i: Int32, delim: Int32): { "pos": Int32, "ok": Boolean } =>
   val b = byteAt(s, i)
   if b == -1 || b == delim || b == CR || b == LF then
     {
@@ -128,7 +128,7 @@ val scanUnquoted = (s: String, n: Int32, i: Int32, delim: Int32): AnyVal =>
   else
     scanUnquoted(s, n, i + 1, delim)
 
-val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean): AnyVal =>
+val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean): { "value": String, "pos": Int32, "ok": Boolean } =>
   val first = byteAt(s, start)
   if first == QUOTE then
     // Quoted field: accumulate spans between escaped quotes and join them, so the common
@@ -160,7 +160,7 @@ val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean)
 // cursor { "pos": Int32, "ok": Boolean } once the record terminator (delimiter run ends at CR / LF /
 // CRLF / EOF) is reached. Tail-recursive (TCO'd) — one field per step, no throwaway arrays (the old
 // `range(0,n+1).while` allocated a length-n Int32 array per record).
-val scanRecordFields = (s: String, n: Int32, pos: Int32, delim: Int32, trim: Boolean, fields: String[]): AnyVal =>
+val scanRecordFields = (s: String, n: Int32, pos: Int32, delim: Int32, trim: Boolean, fields: String[]): { "pos": Int32, "ok": Boolean } =>
   val cur = scanField(s, n, pos, delim, trim)
   if cur["ok"] != true then
     {
@@ -192,7 +192,7 @@ val scanRecordFields = (s: String, n: Int32, pos: Int32, delim: Int32, trim: Boo
         "ok": true
       }
 
-val scanRecord = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean): AnyVal =>
+val scanRecord = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean): { "fields": String[], "pos": Int32, "ok": Boolean } =>
   val fields: String[] = []
   val res = scanRecordFields(s, n, start, delim, trim, fields)
   {
