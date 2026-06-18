@@ -3949,6 +3949,29 @@ print(toString(scale(5, 3)))
 }
 
 #[test]
+fn test_default_args_cross_module_nullable_record() {
+    // Regression: an imported function with a `T | Null = null` default on a sealed-record param
+    // failed to link — `$defaultN` wrapper was not emitted because `is_union_ty` returns false for
+    // NullableRecord (a raw nullable ptr repr), causing `default_cannot_inhabit_param` to wrongly
+    // bail. The fix adds `!is_nullable_sealed_record(param_ty)` to the gate so the wrapper IS emitted.
+    let dir = std::env::temp_dir().join(format!("lin_da_nr_xmod_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "export type Foo = { \"x\": Int32 }\n\
+         export val g = (a: Int32, b: Int32, c: Int32, d: Foo | Null = null): Int32 =>\n\
+        \x20 if d == null then a + b + c else d[\"x\"]\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ g }} from "{}/lib"
+print(toString(g(1, 2, 3)))
+print(toString(g(1, 2, 3, {{ "x": 99 }})))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["6", "99"]);
+}
+
+#[test]
 fn test_imported_generic_object_message_across_worker() {
     // Regression: an IMPORTED generic function that builds an object literal with a scalar `T`
     // field and sends it to a worker (`message`/`request`, which deep-copy the value for thread

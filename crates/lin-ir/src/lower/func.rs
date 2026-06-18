@@ -54,6 +54,7 @@ pub(crate) fn register_default_adapters(
         matches!(default_ty, Type::Null)
             && !matches!(param_ty, Type::Null)
             && !is_union_ty(param_ty)
+            && !is_nullable_sealed_record(param_ty) // NullableRecord is a nullable ptr; null inhabits it
             && !matches!(param_ty, Type::TypeVar(_))
     }
     let any_default_repr_invalid = params[required..].iter().any(|p| {
