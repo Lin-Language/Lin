@@ -860,8 +860,8 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn("lin_stream_tar_entries", ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into()], "ir_tar_entries").try_as_basic_value().unwrap_basic()
             }
-            // header(entry) → lin_tar_header(entry) → raw LinMap* (TarHeader, Phase 2 flip). TarEntry may
-            // arrive boxed (is_union_type returns true for TarEntry); unbox to the raw *TarEntryBox.
+            // header(entry) → lin_tar_header(entry) → raw LinMap* (TarHeader, Phase 2 flip). TarEntry
+            // (Opaque) may arrive boxed (is_union_type returns true for Opaque); unbox to the raw *TarEntryBox.
             Intrinsic::TarHeader => {
                 let e = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let fnv = self.get_or_declare_fn("lin_tar_header", ptr_ty.fn_type(&[ptr_ty.into()], false));
@@ -1513,8 +1513,8 @@ impl<'a> DescEncoder<'a> {
             | Type::Stream(_)
             // `Promise<T>` is likewise opaque and never a `fromJson` target — accept-any.
             | Type::Promise(_)
-            // `TarEntry` is opaque and never a `fromJson` target — accept-any.
-            | Type::TarEntry
+            // Opaque handles (e.g. `TarEntry`) are never `fromJson` targets — accept-any.
+            | Type::Opaque(_)
             // A typed index-signature map `{ String: T }` (ADR-055) is NOT a v1 `fromJson` decode
             // target — the decoder produces a `LinObject`, not a `LinMap`, so decoding INTO a map
             // would yield the wrong representation. Treated as accept-any here only for

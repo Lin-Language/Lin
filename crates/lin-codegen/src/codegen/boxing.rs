@@ -238,7 +238,7 @@ impl<'ctx> Codegen<'ctx> {
             // unchanged. is_union_type() returns true for all of these, so call sites that guard
             // with is_union_type() never reach here; the pass-through is the safety net for any
             // site that doesn't guard.
-            Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
+            Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::Opaque(_)
             | Type::Named(_) | Type::Never => val,
             // Any Type variant that reaches here was not expected to be boxed. In a release build
             // the old fall-through behaviour is preserved (return val unchanged) so existing
@@ -315,7 +315,7 @@ impl<'ctx> Codegen<'ctx> {
             // Already tagged — return as-is.
             Type::Union(_) | Type::TypeVar(_) => ptr,
             // Opaque handle types: their runtime value IS the tagged box pointer.
-            Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
+            Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::Opaque(_)
             | Type::Named(_) | Type::Never | Type::Iterator(_) => ptr,
             // Sum type: project from the boxed LinMap back to a fresh *SumNode.
             _ if Self::is_sum_type(target_ty) => {
@@ -591,11 +591,11 @@ impl<'ctx> Codegen<'ctx> {
             Type::Null => ptr_ty.const_null().into(),
             // Already-tagged values: the caller has a boxed TaggedVal* and the target type is
             // itself tagged — return the box unchanged. Includes generic unions, TypeVar (unknown
-            // concrete type at compile time), opaque handle types (Shared/Stream/Promise/TarEntry
+            // concrete type at compile time), opaque handle types (Shared/Stream/Promise/Opaque
             // whose runtime rep IS a tagged box), Named aliases, and Never (unreachable in
             // practice).
             Type::Union(_) | Type::TypeVar(_)
-            | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::TarEntry
+            | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::Opaque(_)
             | Type::Named(_) | Type::Never => tagged,
             // Iterator<T> values materialise as a LinArray* (TAG_ARRAY) at the IR boundary;
             // unboxing to the raw pointer falls through here when Iterator is the stated target

@@ -119,17 +119,19 @@ pub fn is_compatible_env(
         (Type::Promise(_), _) => false,
         (_, Type::Promise(_)) => false,
 
-        // `TarEntry` — opaque, non-generic, non-transferable. Only compatible with itself (or a
-        // TypeVar wildcard for generic contexts). Never widens to Json.
-        (Type::TarEntry, Type::TarEntry) => true,
-        (Type::TarEntry, Type::TypeVar(n)) if *n == u32::MAX => false,
-        (Type::TypeVar(n), Type::TarEntry) if *n == u32::MAX => false,
-        (Type::TarEntry, Type::TypeVar(_)) | (Type::TypeVar(_), Type::TarEntry) => true,
-        (Type::TarEntry, Type::Union(_)) | (Type::Union(_), Type::TarEntry) => {
+        // `Opaque(name)` — nominal opaque handles (TarEntry and future registered names).
+        // Only compatible with itself (same name), or a TypeVar wildcard for generic contexts.
+        // Never widens to Json. Mismatched names are hard-rejected.
+        (Type::Opaque(a), Type::Opaque(b)) if a == b => true,
+        (Type::Opaque(_), Type::Opaque(_)) => false,
+        (Type::Opaque(_), Type::TypeVar(n)) if *n == u32::MAX => false,
+        (Type::TypeVar(n), Type::Opaque(_)) if *n == u32::MAX => false,
+        (Type::Opaque(_), Type::TypeVar(_)) | (Type::TypeVar(_), Type::Opaque(_)) => true,
+        (Type::Opaque(_), Type::Union(_)) | (Type::Union(_), Type::Opaque(_)) => {
             return union_compat(value_type, target_type, env, lenient_json, depth);
         }
-        (Type::TarEntry, _) => false,
-        (_, Type::TarEntry) => false,
+        (Type::Opaque(_), _) => false,
+        (_, Type::Opaque(_)) => false,
 
         // `Function` — a callable value. A `Function` must NOT silently widen to `AnyVal`
         // (TypeVar(u32::MAX)). If allowed, stdlib authors could declare params as `AnyVal`

@@ -295,8 +295,10 @@ fn resolve_named_cycle(
         // Promise without a type argument: Promise<Json>. The opaque async-result handle; the only
         // operation is `await` (which yields `T | Error`). Same opacity as Shared/Stream.
         "Promise" => Ok(Type::Promise(Box::new(any_val_type()))),
-        // TarEntry — opaque, generation-stamped archive entry handle. Not generic.
-        "TarEntry" => Ok(Type::TarEntry),
+        // Opaque handle registry — names that map to Type::Opaque(name) rather than a
+        // struct-expansion. Each name identifies a distinct runtime TaggedVal* box.
+        //   "TarEntry" — TAG_TAR_ENTRY: generation-stamped archive entry; non-transferable.
+        "TarEntry" => Ok(Type::Opaque(name.to_string())),
         _ => {
             // Cycle detected: return Named(name) as an opaque reference instead of expanding.
             if visiting.contains(name) {
