@@ -2723,6 +2723,91 @@ val f = (m: M, k: Int32): Boolean => m[k] ?? false
 }
 
 #[test]
+fn test_keys_over_non_string_keyed_map_typechecks_and_stringifies() {
+    // ADR-086: `keys`/`values`/`entries` accept a map with ANY key type (`{ UInt8: V }`,
+    // `{ DateNumber: V }`, …), not just `{ String: V }`. All map keys are strings at runtime, so
+    // `keys()` returns the STRINGIFIED keys as `String[]` (the int key 3 reads back as "3").
+    let output = run(r#"import { print } from "std/io"
+import { keys, values } from "std/object"
+import { length } from "std/array"
+import { toString } from "std/string"
+import { for } from "std/iter"
+
+type M = { UInt8: String }
+
+var m: M = {}
+m[3] = "three"
+m[10] = "ten"
+val k: String[] = m.keys()
+print(toString(length(k)))
+k.for(key => print(key))
+m.values().for(v => print(v))
+"#);
+    assert_eq!(output, vec!["2", "3", "10", "three", "ten"]);
+
+    // A non-map argument is still rejected: `keys(5)`, `keys("s")`, `keys([1,2])` are errors.
+    for bad in ["keys(5)", "keys(\"s\")", "keys([1, 2])"] {
+        let err = run_expect_err(&format!(
+            "import {{ keys }} from \"std/object\"\nval x = {bad}\n"
+        ));
+        assert!(
+            err.contains("Argument 1 has type"),
+            "expected arg-type rejection for {bad}, got: {err}"
+        );
+    }
+
+    // A String-keyed map keeps working exactly as before.
+    let s = run(r#"import { print } from "std/io"
+import { keys } from "std/object"
+import { for } from "std/iter"
+type S = { String: String }
+var m: S = {}
+m["a"] = "alpha"
+m["b"] = "beta"
+m.keys().for(key => print(key))
+"#);
+    assert_eq!(s, vec!["a", "b"]);
+}
+
+#[test]
+fn test_chained_nested_map_index_resolves_value_type_and_narrows() {
+    // ADR-087: a chained index `idx[a][b]` over a nested map `{ String: { K: V } }` resolves to
+    // `V | Null` — identical to binding the intermediate — rather than collapsing to a fresh
+    // TypeVar (`?T | Null`), which previously defeated downstream `is`/narrowing. Here the inner
+    // value is a union; the chained read must narrow to `Transfer` and read its field back.
+    let output = run(r#"import { print } from "std/io"
+
+type Trip = { "tripId": String }
+type Transfer = { "origin": String, "destination": String, "duration": UInt32 }
+type Connection = [Trip, Int32, Int32]
+type Inner = { UInt8: Connection | Transfer }
+type Index = { String: Inner }
+
+val f = (idx: Index, dest: String): String =>
+  val c = idx[dest][3]
+  if c is Transfer then c["origin"] else "none"
+
+val t: Transfer = { "origin": "PADTON", "destination": "READING", "duration": 25 }
+var inner: Inner = {}
+inner[3] = t
+var idx: Index = {}
+idx["A"] = inner
+
+print(f(idx, "A"))
+print(f(idx, "B"))
+"#);
+    assert_eq!(output, vec!["PADTON", "none"]);
+
+    // The pure type-check repro (chained read names the inner value type, not `?T`).
+    let (ok, msg) = check_source(r#"type V = { "x": Int32 }
+type Index = { String: { UInt8: V } }
+val f = (idx: Index, dest: String): V | Null =>
+  idx[dest][3]
+"#);
+    assert!(ok, "chained nested-map index should type-check to `V | Null`, got: {msg}");
+}
+
+#[test]
 fn test_index_place_narrowing_else_branch_and_no_leak() {
     // Two soundness facets of index-place narrowing:
     //   (a) `== null` narrows the ELSE branch to non-null: `if m[k] == null then [] else m[k]`
