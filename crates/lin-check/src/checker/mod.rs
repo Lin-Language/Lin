@@ -371,6 +371,49 @@ impl Checker {
         }
     }
 
+    /// Resolve this module's EXPORTED `type` aliases against the current import-type seeding, WITHOUT
+    /// type-checking any value/function bodies. Used by the cyclic-SCC fixpoint in `lin-compile`
+    /// (ADR-084) to harvest a member's type aliases even when its bodies don't yet type-check — e.g.
+    /// a param annotated with a peer alias that is still a placeholder TypeVar produces a spurious
+    /// body error in the first sweep, which `check_module` would surface as `Err`, dropping the
+    /// (perfectly resolvable) alias map. Mirrors `check_module`'s type-namespace prescans
+    /// (`register_imported_types` + `forward_declare_types`) and its export re-resolution, so a
+    /// self-contained alias (`type ST = { String: UInt32 }`) resolves fully and an alias that
+    /// references a peer's alias resolves once that peer's decl has been seeded (driving the fixpoint).
+    pub fn collect_exported_type_decls(
+        &mut self,
+        module: &Module,
+    ) -> std::collections::HashMap<String, (Vec<String>, Type)> {
+        self.register_intrinsics();
+        self.register_imported_types(module);
+        self.forward_declare_types(module);
+        // Resolve every top-level type decl into the env (in hoisted order, like `check_module`), so
+        // sibling references within the module resolve. Resolution errors are swallowed — this is a
+        // best-effort harvest; a genuinely-undefined alias simply won't appear in the result.
+        for stmt in &module.statements {
+            if let Stmt::TypeDecl { name, params, body, .. } = stmt {
+                if let Ok(resolved) = self.resolve_type_decl_body(params, body) {
+                    self.env.define_type(name.clone(), params.clone(), resolved);
+                }
+            }
+        }
+        // Re-resolve exported aliases against the now-complete env (expands forward references to
+        // later-declared siblings inline, matching `check_module`'s export-collection pass).
+        let mut exported_types = std::collections::HashMap::new();
+        for stmt in &module.statements {
+            if let Stmt::TypeDecl { name, params, body, exported: true, .. } = stmt {
+                let resolved = self
+                    .resolve_type_decl_body(params, body)
+                    .ok()
+                    .or_else(|| self.env.lookup_type(name).map(|d| d.body.clone()));
+                if let Some(resolved) = resolved {
+                    exported_types.insert(name.clone(), (params.clone(), resolved));
+                }
+            }
+        }
+        exported_types
+    }
+
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
     }
