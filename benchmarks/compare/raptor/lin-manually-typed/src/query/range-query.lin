@@ -39,11 +39,11 @@ export val plan = (query: RangeQuery, origin: StopId, destination: StopId, date:
   // departure time to one second after the earliest departure found. A pass that returns
   // nothing (or running past `endTime`) ends the search and yields everything gathered so far.
   // The tail self-call compiles to a loop, so this is the idiomatic form of the TS `while`.
-  val searchFrom = (time: Time, acc: Journey[]): Journey[] =>
-    if time >= endTime then
+  val searchFrom = (t: Time, acc: Journey[]): Journey[] =>
+    if t >= endTime then
       acc
     else
-      val newResults = groupPlan(query["groupQuery"], [origin], [destination], date, time)
+      val newResults = groupPlan(query["groupQuery"], [origin], [destination], date, t)
       newResults.for(journey => acc.push(journey))
 
       if newResults.length() == 0 then
