@@ -3061,3 +3061,73 @@ The 1-arg form takes a zero-argument closure and loops until it returns `false`.
 **Monomorphizer overload-body fix**: when two overloads share the same source name (`"while"`), the monomorphizer's `find_exported_fn` call previously returned the first same-named export — giving the 1-arg import slot the 2-arg body (a thin `lin_while` intrinsic wrapper). The monomorphizer then re-homed the 1-arg slot to `lin_while` and triggered the panic. The fix: pass the import binding's `symbol` field (the exact mangled LLVM name, `Some("while$..._<slot>")` for overload members) to `find_exported_fn`, which now pins the lookup to the body whose `TypedExpr::Function.name` matches, preventing cross-overload body confusion. A parallel fix applies to the rehome-import-of-import path in `classify_origin_slot`.
 
 **Consequences**: `while(() => cond)` is the idiomatic imperative loop. The existing `xs.while(pred)` (2-arg) form is byte-for-byte unchanged. A single `import { while } from "std/iter"` gives both forms.
+
+## ADR-085: Expected-result-type-driven generic inference, propagated through method chains
+
+**Status**: Accepted.
+
+**Context**: Lin's call-site generic inference was historically ARGUMENT-DRIVEN only — a function's
+type parameters were solved purely from the inferred types of its supplied arguments, never from the
+type the call's RESULT is expected to have. This left the TS-faithful, fully-unannotated form of an
+entries-builder un-typecheckable:
+
+```lin
+type M = { String: UInt32 }
+val build = (stops: String[]): M =>
+  stops.map(stop => [stop, 100]).fromEntries()   // Object.fromEntries(stops.map(...))
+```
+
+`fromEntries<T>(pairs: [String, T][]): { String: T }` has `T` appearing ONLY in its return, so the
+arguments alone never solve it; and `stops.map(stop => [stop, 100])`'s lambda return `[stop, 100]`
+inferred bottom-up as the unioned ARRAY `(String | Int32)[]`, never a tuple. The chain only worked
+with an explicit lambda-return annotation: `stops.map((stop): [String, UInt32] => [stop, 100])`.
+
+**Decision**: When a generic call (prefix `Call` or `DotCall`) has a known EXPECTED result type, use
+it to drive type-parameter inference and propagate expected types into the (lambda) arguments and the
+receiver:
+
+1. **Stash the expected result.** `check_expr`, before falling through to `infer_expr` for a
+   `Call`/`DotCall` whose context supplies a (non-`TypeVar`) expected type, stashes that type in a
+   transient `Checker.expected_call_result` slot. `infer_call`/`infer_dot_call` CONSUME (`take`) it
+   at the top so it applies only to the outermost call and never leaks into nested argument inference.
+
+2. **Seed type-param substitutions from the expected return.** Before inferring any argument, unify
+   the expected result against the function's DECLARED return type (`seed_subs_from_expected_result`
+   → `collect_type_subs`), pre-binding the type parameters. `Named` aliases in the expected type are
+   expanded first (so `M = { String: UInt32 }` unifies as a `Map`). `collect_type_subs` gained `Map`
+   (`{ String: T }`) and record (`{ field: T }`) arms so a value/field type parameter binds.
+
+3. **Compute per-argument expected types.** Each parameter's type is substituted with the seeded
+   bindings, so a lambda argument is checked against a CONCRETE expected function type. For a lambda
+   WITHOUT a written return annotation, `infer_function_with_hints` now checks the body against a
+   concrete TUPLE (`FixedArray`) expected return (`expected_ret_drives_body`) — that is the one case
+   the bottom-up path mis-infers (a 2+-element array literal unions instead of forming a tuple). So
+   `stop => [stop, 100]` against expected `[String, UInt32]` forms a tuple.
+
+4. **Propagate through method chains.** For a `DotCall` whose receiver is itself a call, the expected
+   receiver type is derived from the method's first parameter under the seeded bindings and pushed
+   down via `check_expr` (a speculative directed check that falls back to plain inference on
+   failure). This carries `fromEntries`'s solved `T = UInt32` back to `stops.map(...)`'s expected
+   element `[String, UInt32]`, which seeds `map`'s `U`.
+
+**Fallback (unchanged bottom-up path)**: The seeding is purely an inference HINT — the existing
+compatibility check at the tail of `check_expr` still validates the result against the expected type.
+When there is no expected type, or the expected type leaves a parameter free, behaviour is exactly
+today's argument-driven inference. Two soundness/representation guards keep the change conservative:
+
+- **No back-propagation through a UNION return.** `collect_type_subs`'s Union arm matches every
+  member against the whole expected actual, so seeding through `at<T, D>(…): T | D` would bind BOTH
+  `T` and `D` from a single expected `Int32`, collapsing `at(9)`'s sound `Int32 | Null` to bare
+  `Int32`. A union return is inherently ambiguous to invert, so it is excluded from seeding entirely.
+- **A lambda's ACTUAL return overrides an expected-SEED.** The seed only provides the lambda's
+  expected return; the body's real type is authoritative for the call RESULT. `seed_subs_from_expected_result`
+  returns the ids it seeded; after a function argument is checked, any seeded id its return
+  re-determines is dropped before re-collecting bottom-up. So `pts.map(p => { … })` bound to `Pt[]`
+  seeds `U = Pt` (sealed) to type the lambda, but the lambda's UNSEALED record literal wins for the
+  result representation (the boxed-`Object[]` → packed-`Pt[]` materialization path is preserved).
+
+**Consequences**: The unannotated `stops.map(stop => [stop, v]).fromEntries()` (and the array-of-one
+and empty-map-value shapes) type-check and run. Annotated lambda returns are unaffected. The full
+`cargo test --workspace`, `lin test stdlib/ examples/`, and `lin fmt --check` suites stay green —
+specifically the `at(i)` omitted-default soundness reject and the combinator boxed-result→packed
+materialization tests, which exercise the two guards above.

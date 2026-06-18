@@ -391,6 +391,81 @@ impl Checker {
         }
     }
 
+    /// Seed `subs` with type-parameter bindings obtained by unifying a call's EXPECTED RESULT type
+    /// against the function's DECLARED return type (ADR-085). This is the expected-result-driven
+    /// half of generic inference: it pre-binds the type parameters a return-position-only generic
+    /// (like `fromEntries<T>(…): { String: T }`) leaves unsolved by the arguments alone, and pins
+    /// the result-determined params of an intermediate combinator (`map`'s `U`) so a lambda
+    /// argument's expected type becomes concrete.
+    ///
+    /// Conservative by construction:
+    ///   * No-op when there is no expected type (`None`) — the bottom-up path is unchanged.
+    ///   * Only entries whose VALUE is fully concrete (no generic type var, no `Never`) are kept,
+    ///     so a partially-known expected type never poisons `subs` with another free var. The
+    ///     `Json` wildcard (`u32::MAX`) is allowed as a value (it is the dynamic/erased element).
+    ///   * `collect_type_subs` already skips the `u32::MAX` PATTERN var, and structurally walks
+    ///     arrays / maps / unions / tuples / records, so a `{ String: T }` expected vs declared
+    ///     binds `T`, and a `U[]` declared vs `[String, UInt32][]` expected binds `U`.
+    /// The argument-driven pass that follows may overwrite these (a concrete argument wins over a
+    /// speculative expected-type seed); only genuinely return-only params keep the seeded value.
+    fn seed_subs_from_expected_result(
+        &self,
+        expected: Option<&Type>,
+        declared_ret: &Type,
+        subs: &mut std::collections::HashMap<u32, Type>,
+    ) -> std::collections::HashSet<u32> {
+        let mut seeded_ids = std::collections::HashSet::new();
+        let Some(expected) = expected else { return seeded_ids };
+        // The expected type must itself be concrete enough to constrain a param — a bare generic
+        // var carries no information. (A structured expected with SOME concreteness is fine; the
+        // per-entry filter below drops any binding that resolves to a free var.)
+        if matches!(expected, Type::TypeVar(_)) {
+            return seeded_ids;
+        }
+        // SOUNDNESS GUARD: never back-propagate through a UNION declared return (`T | D`, the
+        // `at<T,D>(…): T | D` / `find(…): T | Null` shape). `collect_type_subs`'s Union arm matches
+        // EVERY member against the whole expected actual, so `Int32` expected vs `T | D` would bind
+        // BOTH `T = Int32` AND `D = Int32` — collapsing `at(9)`'s sound `Int32 | Null` to bare
+        // `Int32` (ADR-085 must NOT change which params a union return leaves free). A union return
+        // is inherently ambiguous to invert (which member did the expected come from?), so we leave
+        // it entirely to the argument-driven path. Containers (`Array`/`Map`/tuple/record) and a
+        // single concrete return invert unambiguously and are seeded.
+        if matches!(declared_ret, Type::Union(_)) {
+            return seeded_ids;
+        }
+        // Resolve any `Named` alias in the expected type so its structure (e.g. `M = { String:
+        // UInt32 }` → `Map`) unifies positionally against the declared return — `collect_type_subs`
+        // matches structurally and has no alias-resolution step of its own.
+        let expected = self.expand_named_aliases(expected);
+        let mut seeded = std::collections::HashMap::new();
+        super::helpers::collect_type_subs(declared_ret, &expected, &mut seeded);
+        for (id, ty) in seeded {
+            // Keep only fully-determined bindings: a generic var or `Never` value would just defer
+            // the hole. The `Json` wildcard is concrete enough (the dynamic element representation).
+            if ty.contains_type_var()
+                && !matches!(ty, Type::TypeVar(n) if n == u32::MAX)
+            {
+                continue;
+            }
+            if type_contains_never(&ty) {
+                continue;
+            }
+            // Never seed a sentinel slot: the `Json` wildcard pattern is already skipped by
+            // `collect_type_subs`; a numeric-bounded generic is left to the argument-driven path so
+            // the call-site numeric-family monomorphization is driven by the actual argument.
+            if id == u32::MAX || self.numeric_tvs.contains(&id) {
+                continue;
+            }
+            // Only seed (and record as expected-seeded) when this entry was NOT already bound: a
+            // real argument-driven binding must never be overwritten, nor marked re-determinable.
+            if let std::collections::hash_map::Entry::Vacant(slot) = subs.entry(id) {
+                slot.insert(ty);
+                seeded_ids.insert(id);
+            }
+        }
+        seeded_ids
+    }
+
     pub(crate) fn infer_call(
         &mut self,
         func: &Expr,
@@ -398,6 +473,11 @@ impl Checker {
         partial: bool,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
+        // Expected-result-type-driven generic inference (ADR-085). CONSUME the stashed expected
+        // result type immediately, so it applies ONLY to this (outermost) call and never leaks into
+        // the nested argument inference below (each arg goes through `infer_expr` → `infer_call`,
+        // which would otherwise re-read it). `None` for a non-directed call — the fallback path.
+        let expected_result = self.expected_call_result.take();
         // fromJson special form: `fromJson(T, value)` (ADR-031). Intercept before the callee
         // is inferred, since arg0 is a type name, not a value.
         if let Expr::Ident(name, _) = func {
@@ -477,6 +557,15 @@ impl Checker {
 
                 // First pass: infer non-function arguments to collect TypeVar substitutions.
                 let mut subs = std::collections::HashMap::new();
+                // Expected-result-type-driven seeding (ADR-085). Before inferring any argument,
+                // unify the call's expected result type (if any) with the function's DECLARED
+                // return to pre-bind type parameters (e.g. `fromEntries`'s `T` from the expected
+                // `{ String: UInt32 }`). Those bindings then flow into each parameter's expected
+                // type below, so a lambda argument is checked against a CONCRETE expected function
+                // type and a nested-tuple literal forms a tuple. Conservative: only generic
+                // (non-sentinel) type-param TypeVars are seeded, and the argument-driven pass may
+                // still refine/override entries — when nothing seeds, behaviour is unchanged.
+                self.seed_subs_from_expected_result(expected_result.as_ref(), ret, &mut subs);
                 let mut partially_typed: Vec<Option<TypedExpr>> = vec![None; args.len()];
                 for (i, (arg, param_ty)) in args.iter().zip(params.iter()).enumerate() {
                     if !matches!(arg, Expr::Function { .. }) {
@@ -534,11 +623,34 @@ impl Checker {
                         let array_lit_against_tuple_array = matches!(arg, Expr::Array(..))
                             && matches!(param_ty, Type::Array(inner)
                                 if matches!(**inner, Type::FixedArray(_)));
+                        // A CALL / DOT-CALL argument whose (seeded-substituted) parameter type is now
+                        // fully determined (no generic type var left) gets that type pushed down via
+                        // `check_expr` so its OWN generic inference is expected-result-driven — the
+                        // prefix-form mirror of the dot-call receiver push (ADR-085). This is what
+                        // makes the nested `fromEntries(map(stops, stop => [stop, 100]))` work: the
+                        // expected `{ String: UInt32 }` solves `fromEntries`'s `T`, so `map(...)`'s
+                        // param becomes the concrete `[String, UInt32][]`, which then drives `map`.
+                        // Gated to a determined param so an ordinary generic-into-generic call (param
+                        // still a free `T`) keeps bottom-up inference. Speculative: a directed failure
+                        // falls back to plain inference (the result is re-validated structurally).
+                        let substituted_param = apply_type_subs(param_ty, &subs);
+                        let call_arg_against_determined_param =
+                            matches!(arg, Expr::Call { .. } | Expr::DotCall { .. })
+                                && !super::expr::type_mentions_generic_tv(&substituted_param);
                         let typed = if array_lit_against_concrete_array
                             || object_lit_against_concrete_record
                             || array_lit_against_tuple_array
                         {
                             self.check_expr(arg, param_ty)?
+                        } else if call_arg_against_determined_param {
+                            let snap = self.checker_state_snapshot();
+                            match self.check_expr(arg, &substituted_param) {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    self.restore_checker_state(snap);
+                                    self.infer_expr(arg)?
+                                }
+                            }
                         } else {
                             self.infer_expr(arg)?
                         };
@@ -1237,6 +1349,11 @@ impl Checker {
         partial: bool,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
+        // Expected-result-type-driven generic inference (ADR-085). CONSUME the stashed expected
+        // result type immediately so it applies ONLY to this dot-call and never leaks into nested
+        // (argument/receiver) inference. Used both to pre-seed type-parameter substitutions and to
+        // derive an expected type for the RECEIVER call (propagating through method chains).
+        let expected_result = self.expected_call_result.take();
         // A dot access with no argument list (`x.f`) is partial application of the
         // receiver (spec §16.1), never default-fill. An explicit trailing comma
         // (`x.f(y,)`) is also partial.
@@ -1280,7 +1397,54 @@ impl Checker {
             }
         }
 
-        let mut typed_receiver = self.infer_expr(receiver)?;
+        // Expected-result-type-driven RECEIVER push (ADR-085). When this dot-call has an expected
+        // result type and the method is generic, unify the expected result with the method's
+        // declared return to pre-bind its type parameters, then derive the expected type of the
+        // RECEIVER (the method's FIRST parameter under those bindings). If that expected receiver
+        // type is concrete enough to constrain inference (mentions no generic type var) AND the
+        // receiver is itself a call (so it can use the hint to drive its OWN generic inference —
+        // the `.map(...).fromEntries()` chain), push it down via `check_expr`. This is what carries
+        // `fromEntries`'s solved `T = UInt32` back to `stops.map(...)`'s expected element type
+        // `[String, UInt32]`. Conservative: any failure / non-concrete hint falls back to plain
+        // bottom-up `infer_expr` (the receiver is re-validated structurally afterwards regardless).
+        let receiver_hint: Option<Type> = expected_result.as_ref().and_then(|exp| {
+            if !matches!(receiver, Expr::Call { .. } | Expr::DotCall { .. }) {
+                return None;
+            }
+            let Some(Type::Function { params: mp, ret: mret, .. }) = self.env.effective_type(method)
+            else {
+                return None;
+            };
+            let p0 = mp.first()?.clone();
+            let mut seed = std::collections::HashMap::new();
+            self.seed_subs_from_expected_result(Some(exp), &mret, &mut seed);
+            if seed.is_empty() {
+                return None;
+            }
+            let hint = apply_type_subs(&p0, &seed);
+            // Only push a hint that is fully determined — no leftover generic type var. (The Json
+            // wildcard `u32::MAX` is permitted: it is the dynamic/erased element, harmless to push.)
+            if super::expr::type_mentions_generic_tv(&hint) {
+                None
+            } else {
+                Some(hint)
+            }
+        });
+        let mut typed_receiver = match &receiver_hint {
+            Some(hint) => {
+                // Speculative directed check; on failure, fall back to plain inference so a
+                // mis-derived hint never turns a legitimate receiver into an error.
+                let snap = self.checker_state_snapshot();
+                match self.check_expr(receiver, hint) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        self.restore_checker_state(snap);
+                        self.infer_expr(receiver)?
+                    }
+                }
+            }
+            None => self.infer_expr(receiver)?,
+        };
 
         // An array/object literal RECEIVER (`[].fill()`, `{}.merge(…)`) flowing into a CONCRETE
         // (TypeVar-free) array/map FIRST param must adopt that param's resolved element representation
@@ -1318,6 +1482,15 @@ impl Checker {
                 // We already have typed_receiver; build partial list.
                 // First pass: collect substitutions from non-lambda args (receiver already typed).
                 let mut subs = std::collections::HashMap::new();
+                // Expected-result-type-driven seeding (ADR-085). Unify the call's expected result
+                // type (if any) with the method's DECLARED return to pre-bind type parameters
+                // (e.g. `map`'s `U` from the expected element of `[String, UInt32][]`), so a lambda
+                // ARGUMENT is checked against a CONCRETE expected function type — its body's tuple
+                // literal then forms a tuple. Seeded BEFORE the receiver's binding is collected so
+                // the receiver may still REFINE these (a receiver-pinned element type takes
+                // precedence); only genuinely free type params keep the seeded value.
+                let expected_seeded_ids =
+                    self.seed_subs_from_expected_result(expected_result.as_ref(), &ret, &mut subs);
                 // Defer an EMPTY array-literal RECEIVER (`[].append(1)`) flowing into a generic `T[]`
                 // param: collecting its bottom-up `Array(Never)` would bind `T = Never`, then the
                 // concrete item fails as "expected Never". Bind `T` from the item first, then re-check
@@ -1460,6 +1633,24 @@ impl Checker {
                     // Collect substitutions from lambda/function args too (e.g. to resolve return TypeVars).
                     // Don't let a bare integer literal's Int32 default clobber an already-bound TypeVar.
                     if let Some(param_ty) = method_params.get(i) {
+                        // A FUNCTION (lambda) argument's ACTUAL return type must be free to OVERRIDE a
+                        // value that was only EXPECTED-SEEDED for the same type var (ADR-085). The seed
+                        // (`map`'s `U` from the call's expected element) merely provides the lambda's
+                        // expected return; the body's real type is authoritative for the call RESULT —
+                        // e.g. `pts.map(p => {…})` bound to `Pt[]` seeds `U = Pt` (sealed) but the
+                        // lambda returns an UNSEALED record literal, whose representation must win
+                        // (the boxed-Object[] → packed materialization path). So drop any
+                        // expected-seeded entry that THIS function arg's return determines before
+                        // re-collecting, letting `collect_and_save_subs` rebind it bottom-up.
+                        if matches!(arg_expr, Expr::Function { .. }) {
+                            let mut redetermined = std::collections::HashMap::new();
+                            super::helpers::collect_type_subs(param_ty, &typed.ty(), &mut redetermined);
+                            for id in redetermined.keys() {
+                                if expected_seeded_ids.contains(id) {
+                                    subs.remove(id);
+                                }
+                            }
+                        }
                         let literal_into_bound_tv = matches!(arg_expr, Expr::IntLit(_, None, _))
                             && matches!(param_ty, Type::TypeVar(id) if *id != u32::MAX && subs.contains_key(id));
                         if !literal_into_bound_tv {

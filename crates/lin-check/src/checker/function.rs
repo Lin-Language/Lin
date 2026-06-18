@@ -100,6 +100,32 @@ impl Checker {
         }
     }
 
+    /// The TAIL expression a function body evaluates to: the body itself, or a `Block`'s final
+    /// expression. Used by the body-dispatch to detect a generic-call tail so the expected return
+    /// type can drive its inference (ADR-085).
+    fn body_tail_expr(body: &lin_parse::ast::Expr) -> Option<&lin_parse::ast::Expr> {
+        use lin_parse::ast::Expr;
+        match body {
+            Expr::Block(_, final_expr, _, _) => Some(final_expr.as_ref()),
+            other => Some(other),
+        }
+    }
+
+    /// Whether a caller-supplied `expected_ret` (for a lambda WITHOUT a written return annotation)
+    /// is concrete and structured enough that checking the body against it bidirectionally CHANGES
+    /// the body's inferred type — the expected-result-type-driven propagation into a lambda body
+    /// (ADR-085). Restricted to a TUPLE (`FixedArray`) shape with NO remaining generic type var:
+    /// that is precisely the case the bottom-up path mis-infers (a 2+-element array literal unions
+    /// to `(A|B)[]` instead of forming a tuple), and it covers the nested-tuple-into-`fromEntries`
+    /// chain (`.map(stop => [stop, v])`). Every OTHER expected return (a free generic `U`, a bare
+    /// scalar, an array/map/record) keeps plain bottom-up inference, so ordinary callbacks — whose
+    /// return is solved FROM the body — are completely unaffected. The Json wildcard is excluded by
+    /// the `contains_type_var` guard (it counts `u32::MAX`), keeping a heterogeneous `Json` tuple
+    /// hint from forcing a strict shape.
+    fn expected_ret_drives_body(expected_ret: &Type) -> bool {
+        matches!(expected_ret, Type::FixedArray(_)) && !expected_ret.contains_type_var()
+    }
+
     /// Phase 4.5b: the binding name of an INTERMEDIATE `lin_array_allocate` builder body — the
     /// common map-shape combinator idiom:
     ///
@@ -426,6 +452,19 @@ impl Checker {
             // match) and block-ending-in-array-literal (the `block_push` special case for FixedArray
             // + array-literal tail in `check_expr`'s Block handling).
             Some(declared @ Type::FixedArray(_)) if Self::body_tail_is_array_literal(body) => {
+                checked_against_declared = true;
+                self.check_expr(body, declared)?
+            }
+            // A typed index-signature MAP declared return (`{ String: T }`) whose body is a generic
+            // CALL / DOT-CALL: route through `check_expr` so the expected map type drives the call's
+            // generic inference (ADR-085) — e.g. `(stops): M => stops.map(...).fromEntries()`, where
+            // the expected `M = { String: UInt32 }` solves `fromEntries`'s `T` and flows back up the
+            // chain. `check_expr` falls through to `infer_expr` + the SAME post-pass compatibility
+            // check for any other map-returning body, so non-call bodies are unaffected. (`Map` is
+            // not in `expected_pushes_into_branches`, so the first arm does not cover this.)
+            Some(declared @ Type::Map { .. })
+                if matches!(Self::body_tail_expr(body), Some(Expr::Call { .. } | Expr::DotCall { .. })) =>
+            {
                 checked_against_declared = true;
                 self.check_expr(body, declared)?
             }
@@ -786,6 +825,19 @@ impl Checker {
                 checked_against_declared = true;
                 self.check_expr(body, declared)?
             }
+            // A typed index-signature MAP declared return (`{ String: T }`) whose body is a generic
+            // CALL / DOT-CALL: route through `check_expr` so the expected map type drives the call's
+            // generic inference (ADR-085) — e.g. `(stops): M => stops.map(...).fromEntries()`, where
+            // the expected `M = { String: UInt32 }` solves `fromEntries`'s `T` and flows back up the
+            // chain. `check_expr` falls through to `infer_expr` + the SAME post-pass compatibility
+            // check for any other map-returning body, so non-call bodies are unaffected. (`Map` is
+            // not in `expected_pushes_into_branches`, so the first arm does not cover this.)
+            Some(declared @ Type::Map { .. })
+                if matches!(Self::body_tail_expr(body), Some(Expr::Call { .. } | Expr::DotCall { .. })) =>
+            {
+                checked_against_declared = true;
+                self.check_expr(body, declared)?
+            }
             // Phase 4.5: a generic combinator whose body is `=> arrayAllocate(n)` and whose
             // declared return is an `Array(_)` must be CHECKED against that return so the fresh
             // allocation's Json-wildcard element type is refined to the declared element (the
@@ -819,6 +871,19 @@ impl Checker {
                     return Err(Diagnostic::error(span, msg));
                 }
                 typed
+            }
+            // No DECLARED (written) return on this lambda, but the calling context supplied a
+            // CONCRETE expected return type (ADR-085). Check the body against it bidirectionally so
+            // a structured expected return (especially a TUPLE / record / map) flows into the body
+            // — e.g. `.map(stop => [stop, 100])` where the callback's expected return is the solved
+            // `[String, UInt32]`: the body's array literal is then checked against that tuple shape
+            // and forms a tuple, instead of inferring the unioned `(String|Int32)[]`. Gated to a
+            // fully-concrete (no generic type var) STRUCTURED expected return so an ordinary
+            // callback whose return is still a free generic `U` (the common case) keeps plain
+            // inference and stays free for the call site to solve from the body. The post-pass
+            // `ret_type` reconciliation below still records the body's resulting type.
+            None if Self::expected_ret_drives_body(expected_ret) => {
+                self.check_expr(body, expected_ret)?
             }
             _ => self.infer_expr(body)?,
         };

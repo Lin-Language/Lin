@@ -21106,3 +21106,98 @@ val a: M = m[0]
         output
     );
 }
+
+// ADR-085: expected-RESULT-type-driven generic inference, propagated through method chains.
+// `Object.fromEntries(stops.map(stop => [stop, v]))` — the TS-faithful, fully-UNANNOTATED form —
+// must type-check and run. The lambda's `[stop, 100]` infers as a TUPLE (not the unioned
+// `(String|Int32)[]`) because the call's expected result `{ String: UInt32 }` solves
+// `fromEntries`'s `T = UInt32`, which flows back through `.map` to give the lambda the expected
+// return `[String, UInt32]`.
+#[test]
+fn test_expected_result_drives_map_fromentries_tuple() {
+    let output = run(r#"import { map } from "std/iter"
+import { fromEntries } from "std/object"
+import { print } from "std/io"
+import { toString } from "std/string"
+type M = { String: UInt32 }
+val build = (stops: String[]): M =>
+  stops.map(stop => [stop, 100]).fromEntries()
+val m = build(["a", "b"])
+print(toString(m["a"]))
+print(toString(m["b"]))
+"#);
+    assert_eq!(output, vec!["100", "100"]);
+}
+
+// ADR-085: the same chain nested inside a one-element ARRAY literal whose expected element type is
+// the map `{ String: UInt32 }`. The expected element flows into the inner `.map(...).fromEntries()`
+// exactly as a direct binding does, so `k[0]["a"]` reads back the value.
+#[test]
+fn test_expected_result_drives_map_fromentries_array_of_one() {
+    let output = run(r#"import { map } from "std/iter"
+import { fromEntries } from "std/object"
+import { print } from "std/io"
+import { toString } from "std/string"
+val stops = ["a", "b"]
+val k: { String: UInt32 }[] = [ stops.map(stop => [stop, 100]).fromEntries() ]
+print(toString(k[0]["a"]))
+"#);
+    assert_eq!(output, vec!["100"]);
+}
+
+// ADR-085: the empty-map-VALUE case — the tuple's second element is an empty `{}` whose type must
+// be taken from the expected inner-map type `{ String: String }`. The chain type-checks, a stop key
+// is present, and its inner map is empty.
+#[test]
+fn test_expected_result_drives_map_fromentries_empty_map_value() {
+    let output = run(r#"import { map } from "std/iter"
+import { fromEntries } from "std/object"
+import { print } from "std/io"
+type Inner = { String: String }
+type Conn = { String: Inner }
+val stops = ["a", "b"]
+val c: Conn = stops.map(stop => [stop, {}]).fromEntries()
+val inner = c["a"]
+if inner != null then print("has-a") else print("no-a")
+val missing = c["zzz"]
+if missing != null then print("has-zzz") else print("no-zzz")
+"#);
+    assert_eq!(output, vec!["has-a", "no-zzz"]);
+}
+
+// ADR-085 SOUNDNESS guard: the expected-result-driven seeding must NOT back-propagate through a
+// UNION declared return. `at<T, D>(…): T | D` with the default OMITTED is `T | Null`; binding
+// `ints.at(9)` to a bare `Int32` must STILL be rejected (a `Union` return is excluded from
+// seeding, so `D` is not unsoundly pinned to `Int32` from the expected `Int32`).
+#[test]
+fn test_expected_result_union_return_not_seeded_soundness() {
+    let err = run_expect_err(r#"import { at } from "std/array"
+import { print } from "std/io"
+val ints: Int32[] = [1, 2, 3]
+val bad: Int32 = ints.at(9)
+print("unreachable")
+"#);
+    assert!(
+        err.contains("Null"),
+        "expected a `T | Null` soundness error for an omitted-default `at`, got: {}",
+        err
+    );
+}
+
+// ADR-085: the PREFIX-call mirror of the dot-chain — `fromEntries(map(stops, stop => [stop, v]))`.
+// The expected result `{ String: UInt32 }` drives `fromEntries`'s `T`, whose substituted parameter
+// type is then pushed into the nested `map(...)` CALL argument, solving `map`'s `U` so the lambda's
+// tuple is formed. No annotations anywhere.
+#[test]
+fn test_expected_result_drives_prefix_map_fromentries_tuple() {
+    let output = run(r#"import { map } from "std/iter"
+import { fromEntries } from "std/object"
+import { print } from "std/io"
+import { toString } from "std/string"
+type M = { String: UInt32 }
+val stops = ["a", "b"]
+val m: M = fromEntries(map(stops, stop => [stop, 100]))
+print(toString(m["a"]))
+"#);
+    assert_eq!(output, vec!["100"]);
+}
