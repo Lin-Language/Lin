@@ -1,68 +1,58 @@
 import { StopId, Time, Transfer, Trip } from "../gtfs/gtfs"
+import { keys } from "std/object"
 
-export type ScanResults = {
-  bestArrivals: Arrivals,
-  kArrivals: ArrivalsByNumChanges,
-  kConnections: ConnectionIndex,
-  k: UInt8
+export type ScanResults = { 
+  "bestArrivals": Arrivals, 
+  "kArrivals": ArrivalsByNumChanges, 
+  "kConnections": ConnectionIndex, 
+  "k": UInt8 
 }
 
-export val createScanResults = () =>
+export val createScanResults = (
   bestArrivals: Arrivals,
   kArrivals: ArrivalsByNumChanges,
   kConnections: ConnectionIndex,
   k: UInt8 = 0
-) => {
-  bestArrivals,
-  kArrivals,
-  kConnections,
-  k
-}
+): ScanResults =>
+  {
+    "bestArrivals": bestArrivals,
+    "kArrivals": kArrivals,
+    "kConnections": kConnections,
+    "k": k
+  }
 
-val addRound = (results: ScanResults): void =>
+export val addRound = (results: ScanResults): Null =>
   results["k"] = results["k"] + 1
   results["kArrivals"][results["k"]] = {}
 
+export val previousArrival = (results: ScanResults, stopPi: StopId): Time =>
+  results["kArrivals"][results["k"] - 1][stopPi] ?? 0 // TODO should it be 0 or MAX time number
 
-val previousArrival = (results: ScanResults, stopPi: StopID): Time =>
-  results["kArrivals"][results["k"] - 1][stopPi]
-
-
-val setTrip = (results: ScanResults, trip: Trip, startIndex: number, endIndex: number, interchange: number): void =>
-  const time = trip.stopTimes[endIndex].arrivalTime + interchange
-  const stopPi = trip.stopTimes[endIndex].stop
+export val setTrip = (results: ScanResults, trip: Trip, startIndex: Int32, endIndex: Int32, interchange: Time): Null =>
+  val time = trip["stopTimes"][endIndex]["arrivalTime"] + interchange
+  val stopPi = trip["stopTimes"][endIndex]["stop"]
 
   results["kArrivals"][results["k"]][stopPi] = time
   results["bestArrivals"][stopPi] = time
   results["kConnections"][stopPi][results["k"]] = [trip, startIndex, endIndex]
 
-
-val setTransfer = (results: ScanResults, transfer: Transfer, time: Time): void =>
-  const stopPi = transfer.destination
+export val setTransfer = (results: ScanResults, transfer: Transfer, time: Time): Null =>
+  val stopPi = transfer["destination"]
 
   results["kArrivals"][results["k"]][stopPi] = time
   results["bestArrivals"][stopPi] = time
   results["kConnections"][stopPi][results["k"]] = transfer
 
+export val bestArrival = (results: ScanResults, stopPi: StopId): Time | Null =>
+  results["bestArrivals"][stopPi]
 
-val bestArrival = (this: ScanResults, stopPi: StopID): Time =>
-  return this.bestArrivals[stopPi]
+export val getMarkedStops = (results: ScanResults): StopId[] =>
+  results["kArrivals"][results["k"]].keys()
 
-
-val getMarkedStops = (this: ScanResults) =>
-  return Object.keys(this.kArrivals[this.k])
-
-
-val finalize = (this: ScanResults): [ConnectionIndex, Arrivals] =>
-  return [this.kConnections, this.bestArrivals]
-
-
+export val finalize = (results: ScanResults): [ConnectionIndex, Arrivals] =>
+  [results["kConnections"], results["bestArrivals"]] // TODO: any perf benefit from a freeze?
 
 export type Arrivals = { StopId: Time }
-export type ArrivalsByNumChanges = { UInt8: Arrivals }
-export type Connection = [Trip, UInt8, UInt8]
-export type ConnectionIndex = { 
-  StopId: {
-    UInt8: Connection | Transfer
-  }
-}
+export type ArrivalsByNumChanges = Arrivals[]
+export type Connection = [Trip, Int32, Int32]
+export type ConnectionIndex = { StopId: { UInt8: Connection | Transfer } } // TODO: (Connection | Transfer)[]

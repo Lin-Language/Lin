@@ -903,6 +903,51 @@ pub unsafe extern "C" fn lin_map_retain(map: *mut LinMap) {
 
 use crate::tagged::{TAG_MAP, TAG_RECORD};
 
+/// Rewrite a single `TAG_INT64` keys element at `dst` to a `TAG_STR` LinString of its decimal text.
+/// The `keys`/`entries` bridges are statically `String[]`, but `lin_map_keys`/`lin_map_entries`
+/// emit the raw Int64 key for an Int-keyed map (correct for the internal `merge`/`pick`/`omit`
+/// re-index callers). The boxed-value bridges STRINGIFY here so the consumer reads each key as a
+/// `LinString*`, not a raw integer dereferenced as a pointer (which faulted at a misaligned
+/// address). String keys are already TAG_STR and untouched. ADR-086.
+unsafe fn stringify_int_key_slot(dst: *mut crate::array::LinArrayElem) {
+    let dst = dst as *mut TaggedVal;
+    if (*dst).tag == crate::tagged::TAG_INT64 {
+        let n = (*dst).payload as i64;
+        let s = n.to_string();
+        let ls = crate::string::lin_string_from_bytes(s.as_ptr(), s.len() as u32);
+        (*dst).tag = crate::tagged::TAG_STR;
+        (*dst).payload = ls as u64;
+    }
+}
+
+/// Stringify every Int64 key element of a `keys()` array in place. See `stringify_int_key_slot`.
+unsafe fn stringify_int_keys(arr: *mut crate::array::LinArray) {
+    if arr.is_null() {
+        return;
+    }
+    let len = (*arr).len as usize;
+    for i in 0..len {
+        stringify_int_key_slot((*arr).data.add(i));
+    }
+}
+
+/// Stringify the key element ([0]) of every `[key, value]` pair in an `entries()` array, in place.
+unsafe fn stringify_int_entry_keys(arr: *mut crate::array::LinArray) {
+    if arr.is_null() {
+        return;
+    }
+    let len = (*arr).len as usize;
+    for i in 0..len {
+        let elem = (*arr).data.add(i);
+        if (*elem).tag == crate::tagged::TAG_ARRAY {
+            let pair = (*elem).payload as *mut crate::array::LinArray;
+            if !pair.is_null() && (*pair).len >= 1 {
+                stringify_int_key_slot((*pair).data.add(0));
+            }
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArray {
     if p.is_null() {
@@ -910,7 +955,11 @@ pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArr
     }
     let tv = &*(p as *const TaggedVal);
     match tv.tag {
-        TAG_MAP => lin_map_keys(tv.payload as *const LinMap),
+        TAG_MAP => {
+            let arr = lin_map_keys(tv.payload as *const LinMap);
+            stringify_int_keys(arr);
+            arr
+        }
         TAG_RECORD => {
             let sealed = tv.payload as *mut u8;
             if sealed.is_null() { return crate::array::lin_array_alloc(0); }
@@ -918,11 +967,34 @@ pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArr
             let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
             if mat.is_null() { return crate::array::lin_array_alloc(0); }
             let arr = lin_map_keys(mat as *const LinMap);
+            stringify_int_keys(arr);
             lin_map_release(mat);
             arr
         }
         _ => crate::array::lin_array_alloc(0),
     }
+}
+
+/// Keys of an INTEGER-keyed map as a FLAT scalar array of element-tag `elem_tag` (ADR-086, revised).
+/// `keys()` over a `{ K: V }` map with a non-`String` key type `K` returns a `K[]` (e.g. `UInt8[]`),
+/// which codegen reads as a FLAT width-K array — NOT the boxed `TAG_INT64` array `lin_map_keys`
+/// produces. Codegen knows the static `K` and supplies its flat element tag; this builds the flat
+/// array directly from the map's raw i64 keys (`order` holds the keys in insertion order). The map's
+/// `key_kind` is guaranteed `KEY_KIND_INT` here because the checker only routes a non-`String`-keyed
+/// map down the flat path. Records / `String`-keyed maps never reach this — they keep the boxed
+/// `String[]` bridge (`lin_keys_any`).
+///
+/// Takes the RAW `LinMap*` (BORROWED — not retained/released here), NOT a boxed `TaggedVal*`: the
+/// flat path only ever fires for a concrete `{ Int: V }` map receiver, so codegen passes the map
+/// pointer directly, avoiding a `lin_box_map` allocation that would leak.
+#[no_mangle]
+pub unsafe extern "C" fn lin_keys_flat(map: *const LinMap, elem_tag: u8) -> *mut crate::array::LinArray {
+    let len: u64 = if map.is_null() { 0 } else { (*map).len as u64 };
+    if len == 0 || (*map).order.is_null() {
+        return crate::array::lin_flat_array_from_i64_keys(std::ptr::null(), 0, elem_tag);
+    }
+    // `order` stores each key as a raw u64; for an int-keyed map that bit pattern IS the i64 key.
+    crate::array::lin_flat_array_from_i64_keys((*map).order as *const i64, len, elem_tag)
 }
 
 #[no_mangle]
@@ -954,7 +1026,11 @@ pub unsafe extern "C" fn lin_entries_any(p: *const u8) -> *mut crate::array::Lin
     }
     let tv = &*(p as *const TaggedVal);
     match tv.tag {
-        TAG_MAP => lin_map_entries(tv.payload as *const LinMap),
+        TAG_MAP => {
+            let arr = lin_map_entries(tv.payload as *const LinMap);
+            stringify_int_entry_keys(arr);
+            arr
+        }
         TAG_RECORD => {
             let sealed = tv.payload as *mut u8;
             if sealed.is_null() { return crate::array::lin_array_alloc(0); }
@@ -962,6 +1038,7 @@ pub unsafe extern "C" fn lin_entries_any(p: *const u8) -> *mut crate::array::Lin
             let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
             if mat.is_null() { return crate::array::lin_array_alloc(0); }
             let arr = lin_map_entries(mat as *const LinMap);
+            stringify_int_entry_keys(arr);
             lin_map_release(mat);
             arr
         }
@@ -1286,6 +1363,31 @@ mod tests {
                 let tv = &*(*keys).data.add(i);
                 assert_eq!(tv.tag, TAG_INT64);
             }
+            crate::array::lin_array_release(keys);
+            lin_map_release(m);
+        }
+    }
+
+    #[test]
+    fn test_keys_flat_narrows_to_element_width() {
+        // ADR-086 (revised): `lin_keys_flat` builds a FLAT scalar array of the requested element
+        // width directly from the map's raw i64 keys. Here as TAG_UINT8 (1-byte stride): the array
+        // is a flat u8 buffer (NOT a boxed TaggedVal array), readable via `lin_flat_array_get_u8`,
+        // and freed cleanly by `lin_array_release` (width-correct via `flat_elem_size_align`).
+        unsafe {
+            let m = lin_map_alloc(0, KEY_KIND_INT);
+            lin_map_set_int(m, 3, &int_val(30));
+            lin_map_set_int(m, 10, &int_val(100));
+            let keys = lin_keys_flat(m, crate::tagged::TAG_UINT8);
+            assert_eq!((*keys).len, 2);
+            assert_eq!(
+                (*keys).elem_tag,
+                crate::tagged::TAG_UINT8,
+                "flat array carries the u8 elem tag"
+            );
+            // Insertion order preserved; values readable raw at u8 stride.
+            assert_eq!(crate::array::lin_flat_array_get_u8(keys, 0), 3);
+            assert_eq!(crate::array::lin_flat_array_get_u8(keys, 1), 10);
             crate::array::lin_array_release(keys);
             lin_map_release(m);
         }

@@ -1,7 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
 import { indexOf, reverse, push, length, partition, zip, unique, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, arrayAllocate, arrayAllocateFilled, set, at, slice, binarySearch, lowerBound, upperBound, bisectLeft, bisectRight, searchBy, insertSorted, countInRange, findIndex, findLast, findLastIndex, dedupBy } from "std/array"
-import { map, filter, reduce, find, some, every, flatMap, concat, range, rangeStep, for, take, drop, takeWhile, dropWhile, flatten, iterOf } from "std/iter"
+import { map, filter, reduce, find, some, every, flatMap, concat, range, for, take, drop, takeWhile, dropWhile, flatten, iterOf } from "std/iter"
 
 val s = suite("std/array", [
   test("length of array", () => [
@@ -273,9 +273,9 @@ val s = suite("std/array", [
   // The "definitely present" case: over an `Int32[]`, `at(i, 0)` is `Int32 | Int32 = Int32`, a
   // bare scalar usable directly in arithmetic with no null guard (the old `atOr` ergonomic).
   test("at with a default returns a bare T usable in arithmetic", () =>
-    val sum: Int32 = [10, 20, 30].at(1, 0) + [10, 20, 30].at(7, 5)
+    val total: Int32 = [10, 20, 30].at(1, 0) + [10, 20, 30].at(7, 5)
     [
-      expect(sum).toBe(25)
+      expect(total).toBe(25)
     ]
   ),
 
@@ -694,49 +694,65 @@ val s = suite("std/array", [
     ]
   ),
 
-  test("rangeStep with positive step 2", () =>
+  test("range 2-arg fast path unchanged", () =>
     val result: Int32[] = []
-    rangeStep(0, 6, 2).for(x => result.push(x))
+    range(0, 5).for(x => result.push(x))
+    [
+      expect(result.toString()).toBe("[0, 1, 2, 3, 4]")
+    ]
+  ),
+
+  test("range 3-arg with positive step 2", () =>
+    val result: Int32[] = []
+    range(0, 6, 2).for(x => result.push(x))
     [
       expect(result.toString()).toBe("[0, 2, 4]")
     ]
   ),
 
-  test("rangeStep with positive step 3", () =>
+  test("range 3-arg with positive step 3", () =>
     val result: Int32[] = []
-    rangeStep(0, 10, 3).for(x => result.push(x))
+    range(0, 10, 3).for(x => result.push(x))
     [
       expect(result.toString()).toBe("[0, 3, 6, 9]")
     ]
   ),
 
-  test("rangeStep with negative step", () =>
+  test("range 3-arg with negative step", () =>
     val result: Int32[] = []
-    rangeStep(5, 0, -1).for(x => result.push(x))
+    range(5, 0, -1).for(x => result.push(x))
     [
       expect(result.toString()).toBe("[5, 4, 3, 2, 1]")
     ]
   ),
 
-  test("rangeStep with negative step -2", () =>
+  test("range 3-arg with negative step -2", () =>
     val result: Int32[] = []
-    rangeStep(10, 0, -2).for(x => result.push(x))
+    range(10, 0, -2).for(x => result.push(x))
     [
       expect(result.toString()).toBe("[10, 8, 6, 4, 2]")
     ]
   ),
 
-  test("rangeStep with step 0 returns empty iterator", () =>
+  test("range 3-arg with step 0 returns empty iterator", () =>
     val result: Int32[] = []
-    rangeStep(0, 10, 0).for(x => result.push(x))
+    range(0, 10, 0).for(x => result.push(x))
     [
       expect(result.length()).toBe(0)
     ]
   ),
 
-  test("rangeStep with step 1 matches range", () =>
+  test("range 3-arg with empty negative range", () =>
     val result: Int32[] = []
-    rangeStep(0, 4, 1).for(x => result.push(x))
+    range(3, 3, -1).for(x => result.push(x))
+    [
+      expect(result.length()).toBe(0)
+    ]
+  ),
+
+  test("range 3-arg with step 1 matches 2-arg range", () =>
+    val result: Int32[] = []
+    range(0, 4, 1).for(x => result.push(x))
     [
       expect(result.toString()).toBe("[0, 1, 2, 3]")
     ]

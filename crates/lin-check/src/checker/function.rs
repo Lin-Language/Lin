@@ -100,6 +100,32 @@ impl Checker {
         }
     }
 
+    /// The TAIL expression a function body evaluates to: the body itself, or a `Block`'s final
+    /// expression. Used by the body-dispatch to detect a generic-call tail so the expected return
+    /// type can drive its inference (ADR-085).
+    fn body_tail_expr(body: &lin_parse::ast::Expr) -> Option<&lin_parse::ast::Expr> {
+        use lin_parse::ast::Expr;
+        match body {
+            Expr::Block(_, final_expr, _, _) => Some(final_expr.as_ref()),
+            other => Some(other),
+        }
+    }
+
+    /// Whether a caller-supplied `expected_ret` (for a lambda WITHOUT a written return annotation)
+    /// is concrete and structured enough that checking the body against it bidirectionally CHANGES
+    /// the body's inferred type — the expected-result-type-driven propagation into a lambda body
+    /// (ADR-085). Restricted to a TUPLE (`FixedArray`) shape with NO remaining generic type var:
+    /// that is precisely the case the bottom-up path mis-infers (a 2+-element array literal unions
+    /// to `(A|B)[]` instead of forming a tuple), and it covers the nested-tuple-into-`fromEntries`
+    /// chain (`.map(stop => [stop, v])`). Every OTHER expected return (a free generic `U`, a bare
+    /// scalar, an array/map/record) keeps plain bottom-up inference, so ordinary callbacks — whose
+    /// return is solved FROM the body — are completely unaffected. The Json wildcard is excluded by
+    /// the `contains_type_var` guard (it counts `u32::MAX`), keeping a heterogeneous `Json` tuple
+    /// hint from forcing a strict shape.
+    fn expected_ret_drives_body(expected_ret: &Type) -> bool {
+        matches!(expected_ret, Type::FixedArray(_)) && !expected_ret.contains_type_var()
+    }
+
     /// Phase 4.5b: the binding name of an INTERMEDIATE `lin_array_allocate` builder body — the
     /// common map-shape combinator idiom:
     ///
@@ -220,6 +246,121 @@ impl Checker {
         }
     }
 
+    /// Bind a destructuring PARAMETER pattern at function entry. `value_slot` is the slot already
+    /// holding the incoming parameter value, `value_ty` its type, `span` the function span. The
+    /// generated `Destructure`/`ArrayDestructure` statements are appended (in order) to `out` and
+    /// become a preamble for the function body (see `infer_function`). This is the SAME code path
+    /// the `val { a, b } = …` / `val [a, b] = …` statement forms use (`check_stmt`) — params and
+    /// `val` destructuring stay consistent. Supports nested patterns (`[a, [b, c]]`,
+    /// `{ p: { x } }`) by recursing through fresh intermediate slots, and a `...rest` element.
+    ///
+    /// Emits nothing for a `Pattern::Ident`/`Pattern::Wildcard` value (the param slot already
+    /// binds the name) — only object/array patterns need a preamble.
+    pub(crate) fn bind_destructure_param(
+        &mut self,
+        pattern: &Pattern,
+        value_slot: usize,
+        value_ty: &Type,
+        span: Span,
+        out: &mut Vec<TypedStmt>,
+    ) {
+        match pattern {
+            Pattern::Object(fields, obj_rest, _) => {
+                let mut typed_fields = Vec::new();
+                // Sub-patterns that are themselves destructuring need their own preamble emitted
+                // AFTER this Destructure has bound the field slot. Collected and recursed below.
+                let mut nested: Vec<(usize, Pattern, Type)> = Vec::new();
+                for f in fields.iter() {
+                    let key = f.key.clone().or_else(|| match &f.pattern {
+                        Pattern::Ident(n, _) => Some(n.clone()),
+                        _ => None,
+                    }).unwrap_or_default();
+                    let field_ty = if let Type::Object { fields: ref obj_fields, .. } = value_ty {
+                        obj_fields.get(&key).cloned().unwrap_or(Type::Null)
+                    } else { Type::TypeVar(u32::MAX) };
+                    let fslot = match &f.pattern {
+                        Pattern::Ident(fname, name_span) => {
+                            self.check_shadowing(fname, *name_span);
+                            self.env.define_at(fname.clone(), field_ty.clone(), false, Some(*name_span))
+                        }
+                        Pattern::Object(..) | Pattern::Array(..) => {
+                            let s = self.env.define("__destr_field".to_string(), field_ty.clone(), false);
+                            nested.push((s, f.pattern.clone(), field_ty.clone()));
+                            s
+                        }
+                        _ => self.env.define("_".to_string(), field_ty.clone(), false),
+                    };
+                    typed_fields.push((key, fslot, field_ty));
+                }
+                let rest_slot = obj_rest.as_ref().map(|rest_name| {
+                    self.check_shadowing(rest_name, span);
+                    self.env.define(rest_name.clone(), Type::TypeVar(u32::MAX), false)
+                });
+                out.push(TypedStmt::Destructure {
+                    obj_slot: value_slot,
+                    value: TypedExpr::LocalGet { slot: value_slot, ty: value_ty.clone(), span },
+                    obj_ty: value_ty.clone(),
+                    fields: typed_fields,
+                    rest: rest_slot,
+                    span,
+                });
+                for (s, pat, ty) in nested {
+                    self.bind_destructure_param(&pat, s, &ty, span, out);
+                }
+            }
+            Pattern::Array(elements, arr_rest, _) => {
+                // Element type: positional from a tuple/FixedArray (`[T0, T1]`), else the array's
+                // element (`T[]` → T). Unknown for any other param type → Json wildcard.
+                let elem_ty_at = |i: usize| -> Type {
+                    match value_ty {
+                        Type::FixedArray(types) => types.get(i).cloned().unwrap_or(Type::Null),
+                        Type::Array(inner) => (**inner).clone(),
+                        _ => Type::TypeVar(u32::MAX),
+                    }
+                };
+                let mut typed_elements = Vec::new();
+                let mut nested: Vec<(usize, Pattern, Type)> = Vec::new();
+                for (i, elem) in elements.iter().enumerate() {
+                    let et = elem_ty_at(i);
+                    let slot = match elem {
+                        Pattern::Ident(name, name_span) => {
+                            self.check_shadowing(name, *name_span);
+                            self.env.define_at(name.clone(), et.clone(), false, Some(*name_span))
+                        }
+                        Pattern::Object(..) | Pattern::Array(..) => {
+                            let s = self.env.define("__destr_elem".to_string(), et.clone(), false);
+                            nested.push((s, elem.clone(), et.clone()));
+                            s
+                        }
+                        _ => self.env.define("_".to_string(), et.clone(), false),
+                    };
+                    typed_elements.push((i, slot, et));
+                }
+                // The rest type mirrors the `val` path: an array of the (single) element type.
+                let elem_ty_inner = elem_ty_at(0);
+                let rest_info = arr_rest.as_ref().map(|rest_name| {
+                    self.check_shadowing(rest_name, span);
+                    let rest_ty = Type::Array(Box::new(elem_ty_inner.clone()));
+                    let rest_slot = self.env.define(rest_name.clone(), rest_ty.clone(), false);
+                    (rest_slot, rest_ty)
+                });
+                out.push(TypedStmt::ArrayDestructure {
+                    arr_slot: value_slot,
+                    value: TypedExpr::LocalGet { slot: value_slot, ty: value_ty.clone(), span },
+                    elem_ty: elem_ty_inner,
+                    elements: typed_elements,
+                    rest: rest_info,
+                    span,
+                });
+                for (s, pat, ty) in nested {
+                    self.bind_destructure_param(&pat, s, &ty, span, out);
+                }
+            }
+            // Ident/Wildcard params bind their name via the param slot itself — no preamble.
+            _ => {}
+        }
+    }
+
     pub(crate) fn infer_function(
         &mut self,
         type_params: &[String],
@@ -287,6 +428,10 @@ impl Checker {
                 }
             };
 
+            // Check for shadowing before defining the parameter slot.
+            if let Some(ns) = name_span {
+                self.check_shadowing(&name, ns);
+            }
             let slot = self.env.define_at(name.clone(), ty.clone(), false, name_span);
             // Record a definition-site type entry for this parameter (LSP inlay hints). The `ty`
             // may still be an unsolved TypeVar here; it is zonked to its final solution when
@@ -302,37 +447,11 @@ impl Checker {
                 default: typed_default,
             });
 
-            // For destructuring patterns, emit a synthetic Destructure stmt into the body.
-            if let Pattern::Object(fields, obj_rest, _) = &param.pattern {
-                let obj_slot = typed_params.last().unwrap().slot;
-                let mut typed_fields = Vec::new();
-                for f in fields.iter() {
-                    let key = f.key.clone().or_else(|| match &f.pattern {
-                        Pattern::Ident(n, _) => Some(n.clone()),
-                        _ => None,
-                    }).unwrap_or_default();
-                    let field_ty = if let Type::Object { fields: ref obj_fields, .. } = ty {
-                        obj_fields.get(&key).cloned().unwrap_or(Type::Null)
-                    } else { Type::TypeVar(u32::MAX) };
-                    let fslot = match &f.pattern {
-                        Pattern::Ident(fname, _) => self.env.define(fname.clone(), field_ty.clone(), false),
-                        _ => self.env.define("_".to_string(), field_ty.clone(), false),
-                    };
-                    typed_fields.push((key, fslot, field_ty));
-                }
-                let rest_slot = if let Some(rest_name) = obj_rest {
-                    let rslot = self.env.define(rest_name.clone(), Type::TypeVar(u32::MAX), false);
-                    Some(rslot)
-                } else { None };
-                param_destr_stmts.push(TypedStmt::Destructure {
-                    obj_slot,
-                    value: TypedExpr::LocalGet { slot: obj_slot, ty: ty.clone(), span },
-                    obj_ty: ty.clone(),
-                    fields: typed_fields,
-                    rest: rest_slot,
-                    span,
-                });
-            }
+            // For destructuring patterns, emit synthetic Destructure/ArrayDestructure stmts into
+            // the body preamble. Shares the `val`-destructuring code path (bind_destructure_param),
+            // which also runs the inner-scope shadowing check (ADR-078) on each bound name.
+            let param_slot = typed_params.last().unwrap().slot;
+            self.bind_destructure_param(&param.pattern, param_slot, &ty, span, &mut param_destr_stmts);
         }
 
         let prev_fn = self.current_function.take();
@@ -426,6 +545,19 @@ impl Checker {
             // match) and block-ending-in-array-literal (the `block_push` special case for FixedArray
             // + array-literal tail in `check_expr`'s Block handling).
             Some(declared @ Type::FixedArray(_)) if Self::body_tail_is_array_literal(body) => {
+                checked_against_declared = true;
+                self.check_expr(body, declared)?
+            }
+            // A typed index-signature MAP declared return (`{ String: T }`) whose body is a generic
+            // CALL / DOT-CALL: route through `check_expr` so the expected map type drives the call's
+            // generic inference (ADR-085) — e.g. `(stops): M => stops.map(...).fromEntries()`, where
+            // the expected `M = { String: UInt32 }` solves `fromEntries`'s `T` and flows back up the
+            // chain. `check_expr` falls through to `infer_expr` + the SAME post-pass compatibility
+            // check for any other map-returning body, so non-call bodies are unaffected. (`Map` is
+            // not in `expected_pushes_into_branches`, so the first arm does not cover this.)
+            Some(declared @ Type::Map { .. })
+                if matches!(Self::body_tail_expr(body), Some(Expr::Call { .. } | Expr::DotCall { .. })) =>
+            {
                 checked_against_declared = true;
                 self.check_expr(body, declared)?
             }
@@ -642,6 +774,9 @@ impl Checker {
                 }
             };
 
+            if let Some(ns) = name_span {
+                self.check_shadowing(&name, ns);
+            }
             let slot = self.env.define(name.clone(), ty.clone(), false);
             // Record a definition-site type entry for this parameter (LSP inlay hints). Here `ty`
             // is usually already the resolved hint from the call context (e.g. a `for` callback's
@@ -652,35 +787,10 @@ impl Checker {
             }
             typed_params.push(TypedParam { slot, name, ty: ty.clone(), default: typed_default });
 
-            if let Pattern::Object(fields, obj_rest, _) = &param.pattern {
-                let obj_slot = typed_params.last().unwrap().slot;
-                let mut typed_fields = Vec::new();
-                for f in fields.iter() {
-                    let key = f.key.clone().or_else(|| match &f.pattern {
-                        Pattern::Ident(n, _) => Some(n.clone()),
-                        _ => None,
-                    }).unwrap_or_default();
-                    let field_ty = if let Type::Object { fields: ref obj_fields, .. } = ty {
-                        obj_fields.get(&key).cloned().unwrap_or(Type::Null)
-                    } else { Type::TypeVar(u32::MAX) };
-                    let fslot = match &f.pattern {
-                        Pattern::Ident(fname, _) => self.env.define(fname.clone(), field_ty.clone(), false),
-                        _ => self.env.define("_".to_string(), field_ty.clone(), false),
-                    };
-                    typed_fields.push((key, fslot, field_ty));
-                }
-                let rest_slot = if let Some(rest_name) = obj_rest {
-                    Some(self.env.define(rest_name.clone(), Type::TypeVar(u32::MAX), false))
-                } else { None };
-                param_destr_stmts.push(TypedStmt::Destructure {
-                    obj_slot,
-                    value: TypedExpr::LocalGet { slot: obj_slot, ty: ty.clone(), span },
-                    obj_ty: ty.clone(),
-                    fields: typed_fields,
-                    rest: rest_slot,
-                    span,
-                });
-            }
+            // Destructuring param → preamble stmts, via the shared val-destructuring code path
+            // (also runs the inner-scope shadowing check, ADR-078, on each bound name).
+            let param_slot = typed_params.last().unwrap().slot;
+            self.bind_destructure_param(&param.pattern, param_slot, &ty, span, &mut param_destr_stmts);
         }
 
         // OPTIONAL ITERATOR-CALLBACK INDEX PARAM (arity-width subtyping, in-place adapter).
@@ -786,6 +896,19 @@ impl Checker {
                 checked_against_declared = true;
                 self.check_expr(body, declared)?
             }
+            // A typed index-signature MAP declared return (`{ String: T }`) whose body is a generic
+            // CALL / DOT-CALL: route through `check_expr` so the expected map type drives the call's
+            // generic inference (ADR-085) — e.g. `(stops): M => stops.map(...).fromEntries()`, where
+            // the expected `M = { String: UInt32 }` solves `fromEntries`'s `T` and flows back up the
+            // chain. `check_expr` falls through to `infer_expr` + the SAME post-pass compatibility
+            // check for any other map-returning body, so non-call bodies are unaffected. (`Map` is
+            // not in `expected_pushes_into_branches`, so the first arm does not cover this.)
+            Some(declared @ Type::Map { .. })
+                if matches!(Self::body_tail_expr(body), Some(Expr::Call { .. } | Expr::DotCall { .. })) =>
+            {
+                checked_against_declared = true;
+                self.check_expr(body, declared)?
+            }
             // Phase 4.5: a generic combinator whose body is `=> arrayAllocate(n)` and whose
             // declared return is an `Array(_)` must be CHECKED against that return so the fresh
             // allocation's Json-wildcard element type is refined to the declared element (the
@@ -819,6 +942,19 @@ impl Checker {
                     return Err(Diagnostic::error(span, msg));
                 }
                 typed
+            }
+            // No DECLARED (written) return on this lambda, but the calling context supplied a
+            // CONCRETE expected return type (ADR-085). Check the body against it bidirectionally so
+            // a structured expected return (especially a TUPLE / record / map) flows into the body
+            // — e.g. `.map(stop => [stop, 100])` where the callback's expected return is the solved
+            // `[String, UInt32]`: the body's array literal is then checked against that tuple shape
+            // and forms a tuple, instead of inferring the unioned `(String|Int32)[]`. Gated to a
+            // fully-concrete (no generic type var) STRUCTURED expected return so an ordinary
+            // callback whose return is still a free generic `U` (the common case) keeps plain
+            // inference and stays free for the call site to solve from the body. The post-pass
+            // `ret_type` reconciliation below still records the body's resulting type.
+            None if Self::expected_ret_drives_body(expected_ret) => {
+                self.check_expr(body, expected_ret)?
             }
             _ => self.infer_expr(body)?,
         };

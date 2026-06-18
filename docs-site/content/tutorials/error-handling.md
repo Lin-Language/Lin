@@ -45,6 +45,28 @@ match result
     print("error: ${error}")
 ```
 
+## The null-coalescing operator `??`
+
+`a ?? b` evaluates to `a` — unless `a` is `null`, in which case it evaluates to `b`. `a` is evaluated once, and `b` only when needed. It's the idiomatic way to default a nullable read, such as a missing object/map key (which returns `null` rather than erroring):
+
+```lin
+import { print } from "std/io"
+
+val user: { String: String } = { "age": "30" }
+val name = user["name"] ?? "anonymous"   // "anonymous"
+
+print(name)
+```
+
+It chains left-to-right, so the first non-null operand wins:
+
+```lin
+val config: { String: String } = { "fallback": "default.txt" }
+val path = config["path"] ?? config["fallback"] ?? "none.txt"
+```
+
+`??` coalesces `null` only — an `Error` value flows through unchanged, so it never silently swallows a real failure. If the left operand can never be `null`, the default is dead code, and the compiler reports it (see ADR-066 / spec §8.3).
+
 ## The built-in `Error` type
 
 Lin has a built-in `Error` type, structurally `{ "type": String, "message": String }`. The standard library uses it for failures rather than a hand-rolled tag, so you discriminate it with `is Error`:

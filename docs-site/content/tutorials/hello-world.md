@@ -57,7 +57,7 @@ match input
   else    => print("Hello, ${input}!")
 ```
 
-The `match` / `is` / `else` pattern is the standard way to inspect union values. More on that in the [pattern matching tutorial](/tutorials/05-pattern-matching.html).
+The `match` / `is` / `else` pattern is the standard way to inspect union values. More on that in the [pattern matching tutorial](/tutorials/pattern-matching.html).
 
 ## Reading all lines
 

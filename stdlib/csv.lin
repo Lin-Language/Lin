@@ -360,16 +360,16 @@ val renderRow = (row: AnyVal, delim: Int32, sep: String): String =>
 
 // Serialize positional rows to a CSV document. A field is quoted only when it contains the
 // delimiter, a `"`, a CR, or an LF (embedded `"` is doubled); rows are LF-terminated.
-// @param rows  the rows to render (each a list of String fields).
+// @param csvRows  the rows to render (each a list of String fields).
 // @param opts  accepts `{ delimiter }`; the delimiter defaults to `,`.
 // @returns the CSV text, or "" for no rows.
-export val stringify = (rows: String[][], opts: CsvOptions = {  }): String =>
+export val stringify = (csvRows: String[][], opts: CsvOptions = {  }): String =>
   val delim = optDelimByte(opts)
   val sep = delimString(opts)
-  if length(rows) == 0 then
+  if length(csvRows) == 0 then
     ""
   else
-    val lines: String[] = rows.map(row => renderRow(row, delim, sep))
+    val lines: String[] = csvRows.map(row => renderRow(row, delim, sep))
     "${join(lines, "\n")}\n"
 
 // Collect the union of all record keys in the order `keys()` reports them per record. DEVIATION
@@ -406,14 +406,14 @@ val recordRow = (rec: AnyVal, header: String[]): String[] =>
     if v == null then "" else "${v}"
   )
 
-// Append each record's positional row to `rows` (threaded as a parameter; recursion avoids the
+// Append each record's positional row to `csvRows` (threaded as a parameter; recursion avoids the
 // captured-accumulator bug).
-val appendRecordRows = (records: AnyVal, header: String[], rows: AnyVal[], i: Int32, total: Int32): Null =>
+val appendRecordRows = (records: AnyVal, header: String[], csvRows: AnyVal[], i: Int32, total: Int32): Null =>
   if i >= total then
     null
   else
-    push(rows, recordRow(records[i], header))
-    appendRecordRows(records, header, rows, i + 1, total)
+    push(csvRows, recordRow(records[i], header))
+    appendRecordRows(records, header, csvRows, i + 1, total)
 
 // Serialize keyed records to a CSV document with a header row. The header is the union of all keys
 // across all records; a record missing a column emits an empty field.
@@ -431,10 +431,10 @@ export val stringifyRecords = (records: { String: String }[], opts: CsvOptions =
     val seen: { String: Boolean } = {}
     collectKeys(records, header, seen, 0, total)
     // Positional rows: header first, then one row per record (missing key -> empty field).
-    val rows: AnyVal[] = []
-    push(rows, header)
-    appendRecordRows(records, header, rows, 0, total)
-    stringify(rows, opts)
+    val positionalRows: AnyVal[] = []
+    push(positionalRows, header)
+    appendRecordRows(records, header, positionalRows, 0, total)
+    stringify(positionalRows, opts)
 
 // ── streaming adapters ────────────────────────────────────────────────────────
 // The streaming row assembler is quote-aware: a single quoted field may contain a newline and span

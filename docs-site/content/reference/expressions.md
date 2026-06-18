@@ -20,8 +20,11 @@ From highest to lowest:
 | 10 | `\|` | Bitwise OR (not union — value context) |
 | 11 | `&&` | Logical AND (short-circuit) |
 | 12 | `\|\|` | Logical OR (short-circuit) |
+| 13 | `??` | Null-coalescing (short-circuit; lowest rung) |
 
 All binary operators are left-associative.
+
+`??` is the lowest-precedence binary operator (below `||`), so `a ?? b == c` parses as `a ?? (b == c)`. An **unparenthesised mix of `??` directly with `&&` or `||`** is a parse error in either direction (`a || b ?? c`, `a ?? b || c`) — parenthesise the logical sub-expression: `(a || b) ?? c`.
 
 ## Arithmetic
 
@@ -66,6 +69,28 @@ val notReady = !ready
 ```
 
 (`ready == false` also works, but `!` is the idiomatic form.)
+
+## Null-coalescing
+
+`a ?? b` yields `a` when `a` is non-null, and `b` otherwise. It is exactly equivalent to `if a != null then a else b`: `a` is evaluated **once**, and `b` only when `a` is `Null` (short-circuit).
+
+```lin
+val counts: { String: Int32 } = {}
+val n = counts["missing"] ?? 0      // n : Int32 — the absent-key Null is replaced
+```
+
+The result type strips `Null` from the left and unions the right's type, collapsing to the bare type when the default is assignable to it — so `counts[k] ?? 0` is a plain `Int32`, usable in arithmetic without further narrowing.
+
+`??` chains left to right, which makes it ideal for a cascade of fallbacks:
+
+```lin
+val m: { String: String } = {}
+val pick = m["y"] ?? m["x"] ?? "default"
+```
+
+**It coalesces `Null` only — never `Error`.** A left operand of type `T | Null | Error` that holds an `Error` flows that `Error` **through** to the result; it is *not* replaced by the default, so a real failure is never silently swallowed.
+
+**A statically never-null left operand is a compile error** (ADR-066). `5 ?? 1` makes the default dead code, so the compiler reports *"left operand of `??` is never null"*. The left type must be able to be `Null` — `Null` itself, a union containing `Null`, or `AnyVal`.
 
 ## Bitwise
 
