@@ -975,6 +975,28 @@ pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArr
     }
 }
 
+/// Keys of an INTEGER-keyed map as a FLAT scalar array of element-tag `elem_tag` (ADR-086, revised).
+/// `keys()` over a `{ K: V }` map with a non-`String` key type `K` returns a `K[]` (e.g. `UInt8[]`),
+/// which codegen reads as a FLAT width-K array — NOT the boxed `TAG_INT64` array `lin_map_keys`
+/// produces. Codegen knows the static `K` and supplies its flat element tag; this builds the flat
+/// array directly from the map's raw i64 keys (`order` holds the keys in insertion order). The map's
+/// `key_kind` is guaranteed `KEY_KIND_INT` here because the checker only routes a non-`String`-keyed
+/// map down the flat path. Records / `String`-keyed maps never reach this — they keep the boxed
+/// `String[]` bridge (`lin_keys_any`).
+///
+/// Takes the RAW `LinMap*` (BORROWED — not retained/released here), NOT a boxed `TaggedVal*`: the
+/// flat path only ever fires for a concrete `{ Int: V }` map receiver, so codegen passes the map
+/// pointer directly, avoiding a `lin_box_map` allocation that would leak.
+#[no_mangle]
+pub unsafe extern "C" fn lin_keys_flat(map: *const LinMap, elem_tag: u8) -> *mut crate::array::LinArray {
+    let len: u64 = if map.is_null() { 0 } else { (*map).len as u64 };
+    if len == 0 || (*map).order.is_null() {
+        return crate::array::lin_flat_array_from_i64_keys(std::ptr::null(), 0, elem_tag);
+    }
+    // `order` stores each key as a raw u64; for an int-keyed map that bit pattern IS the i64 key.
+    crate::array::lin_flat_array_from_i64_keys((*map).order as *const i64, len, elem_tag)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_values_any(p: *const u8) -> *mut crate::array::LinArray {
     if p.is_null() {
@@ -1341,6 +1363,31 @@ mod tests {
                 let tv = &*(*keys).data.add(i);
                 assert_eq!(tv.tag, TAG_INT64);
             }
+            crate::array::lin_array_release(keys);
+            lin_map_release(m);
+        }
+    }
+
+    #[test]
+    fn test_keys_flat_narrows_to_element_width() {
+        // ADR-086 (revised): `lin_keys_flat` builds a FLAT scalar array of the requested element
+        // width directly from the map's raw i64 keys. Here as TAG_UINT8 (1-byte stride): the array
+        // is a flat u8 buffer (NOT a boxed TaggedVal array), readable via `lin_flat_array_get_u8`,
+        // and freed cleanly by `lin_array_release` (width-correct via `flat_elem_size_align`).
+        unsafe {
+            let m = lin_map_alloc(0, KEY_KIND_INT);
+            lin_map_set_int(m, 3, &int_val(30));
+            lin_map_set_int(m, 10, &int_val(100));
+            let keys = lin_keys_flat(m, crate::tagged::TAG_UINT8);
+            assert_eq!((*keys).len, 2);
+            assert_eq!(
+                (*keys).elem_tag,
+                crate::tagged::TAG_UINT8,
+                "flat array carries the u8 elem tag"
+            );
+            // Insertion order preserved; values readable raw at u8 stride.
+            assert_eq!(crate::array::lin_flat_array_get_u8(keys, 0), 3);
+            assert_eq!(crate::array::lin_flat_array_get_u8(keys, 1), 10);
             crate::array::lin_array_release(keys);
             lin_map_release(m);
         }

@@ -503,7 +503,7 @@ impl Checker {
         };
         let func_ty = typed_func.ty();
 
-        let (typed_args, result_type) = match &func_ty {
+        let (typed_args, mut result_type) = match &func_ty {
             Type::Function { params, ret, required, .. } => {
                 // Opaque `Function` annotation (resolve.rs: `func([TypeVar(MAX)], TypeVar(MAX))`):
                 // a bare `Function` type means "any function" — accept any arity and return a
@@ -1050,6 +1050,24 @@ impl Checker {
                 }
             }
         };
+
+        // `lin_keys` result-element default (ADR-086, revised). The `lin_keys` intrinsic is typed
+        // `<K>({ K: V } | {} | AnyVal) => K[]`, where the key var `K` (9170) binds from a
+        // concrete-keyed Map argument so `{ UInt8: V }.keys()` yields a `UInt8[]`. When the argument
+        // is a RECORD `{}` / `AnyVal` (whose keys are strings) the map arm never matches and `K`
+        // stays unbound — pin the result to `String[]` so the record/AnyVal path is byte-identical to
+        // the historical behaviour. Detected by the result still mentioning the unsolved 9170 var.
+        if let Expr::Ident(name, _) = func {
+            if name == "lin_keys" {
+                if let Type::Array(elem) = &result_type {
+                    if matches!(elem.as_ref(), Type::TypeVar(id) if *id == 9170 || *id >= u32::MAX - 1)
+                        || matches!(elem.as_ref(), Type::Never)
+                    {
+                        result_type = Type::Array(Box::new(Type::Str));
+                    }
+                }
+            }
+        }
 
         // var-capture check and transferability check for `async(f)` / `async(fs)`.
         // Fires on the raw intrinsic `lin_async` (stdlib-trusted code) AND on the user-facing

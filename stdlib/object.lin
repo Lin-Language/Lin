@@ -22,20 +22,23 @@ import { push, length } from "std/array"
 import { for, some } from "std/iter"
 
 // `keys`/`values`/`entries` are tag-aware at runtime, so one function serves both a record
-// (`{}`/`{ String: T }`, insertion order) and an index-signature map (hash order). The parameter is
-// the "any-map" sink `{ String: AnyVal } | {}`, which accepts a record literal, a typed map of ANY
-// key type (`{ String: T }`, `{ UInt8: T }`, `{ DateNumber: T }`, …), or a `AnyVal` value — while
-// REJECTING a non-object argument (`keys(1)`, `keys("s")`, `keys([…])` are compile errors). A map's
-// keys are always strings at runtime, so `keys` returns a `String[]` even for a non-`String`-keyed
-// map (an integer key is returned stringified, e.g. `3` → `"3"`). See ADR-086. A `AnyVal` holding a
-// non-object yields an empty result at runtime.
+// (`{}`/`{ String: T }`, insertion order) and an index-signature map (hash order). `keys` is generic
+// over the key type `K`: its param `{ K: V } | {}` accepts a record literal, a typed map of ANY key
+// type (`{ String: T }`, `{ UInt8: T }`, `{ DateNumber: T }`, …), or a `AnyVal` value — while
+// REJECTING a non-object argument (`keys(1)`, `keys("s")`, `keys([…])` are compile errors).
+//
+// `keys` returns the keys in their NATIVE type `K[]` (ADR-086, revised): a `{ UInt8: V }` map yields
+// a `UInt8[]` of integers (usable to re-index the map and in arithmetic), a `{ DateNumber: V }`
+// (UInt32) map yields `UInt32[]`, and a `{ String: V }` map / plain record yields `String[]`. A
+// `AnyVal` holding a non-object yields an empty result at runtime.
 //
 // Return the keys of an object or map.
 // @param obj  a record, an index-signature map, or a `AnyVal` object.
-// @returns a `String[]` of the keys (insertion order for a record, hash order for a map).
+// @returns a `K[]` of the keys in their native key type (insertion order for a record, hash order for a map).
 // @example keys({ "a": 1, "b": 2 })   // ["a", "b"]
-export val keys = (obj: { String: AnyVal } | {  }): String[] =>
-  lin_keys_any(obj)
+// @example { 3: "x", 10: "y" }.keys()   // [3, 10] : UInt8[]  (native integer keys)
+export val keys = <K, V>(obj: { K: V }): K[] =>
+  lin_keys(obj)
 
 // Return the values of an object or map.
 // @param obj  a record, an index-signature map, or a `AnyVal` object.

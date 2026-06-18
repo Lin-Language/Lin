@@ -140,6 +140,45 @@ pub unsafe fn lin_array_clone_flat(src: *const LinArray) -> *mut LinArray {
     ptr
 }
 
+/// Build a FLAT scalar array of element-tag `elem_tag` from `len` raw i64 keys, narrowing each
+/// key to the element's width. Used by `lin_keys_flat` (ADR-086, revised): an Int-keyed map's
+/// keys are stored as i64, but a statically `K[]`-typed (e.g. `UInt8[]`) consumer reads a FLAT
+/// width-K array. `elem_tag` MUST be one of the integer flat tags (TAG_INT8/UINT8/…/INT64/UINT64);
+/// `flat_elem_size_align` selects the element byte width and the data buffer is freed by
+/// `lin_array_free` with the same width (it dispatches on `elem_tag`). The truncating store is a
+/// plain integer cast — the static key type guarantees every key fits the width.
+pub unsafe fn lin_flat_array_from_i64_keys(
+    keys: *const i64,
+    len: u64,
+    elem_tag: u8,
+) -> *mut LinArray {
+    let cap = len.max(1);
+    let (esize, ealign) = flat_elem_size_align(elem_tag);
+    let ptr = alloc(array_layout()) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).elem_tag = elem_tag;
+    (*ptr)._pad3 = [0; 3];
+    (*ptr).len = len;
+    (*ptr).cap = cap;
+    (*ptr).elem_stride = 0;
+    (*ptr).elem_desc = std::ptr::null();
+    (*ptr).elem_named_desc = std::ptr::null();
+    let data_layout = Layout::from_size_align_unchecked(esize * cap as usize, ealign);
+    let data = alloc(data_layout) as *mut u8;
+    (*ptr).data = data as *mut LinArrayElem;
+    for i in 0..len as usize {
+        let k = *keys.add(i);
+        // Narrow the i64 key to the element width and store it raw at the correct stride.
+        match esize {
+            1 => *(data.add(i)) = k as u8,
+            2 => *(data.add(i * 2) as *mut u16) = k as u16,
+            4 => *(data.add(i * 4) as *mut u32) = k as u32,
+            _ => *(data.add(i * 8) as *mut u64) = k as u64,
+        }
+    }
+    ptr
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_free(arr: *mut LinArray) {
     let cap = (*arr).cap as usize;
