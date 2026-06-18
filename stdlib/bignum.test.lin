@@ -13,10 +13,13 @@ val s = suite("std/bignum", [
 
   test("parse round-trips through toString", () =>
     val n = parseBigInt("123456789012345678901234567890")
-    [
-      expect(n is Error).toBe(false),
-      expect(toString(n)).toBe("123456789012345678901234567890")
-    ]
+    match n
+      is Error => [expect(true).toBe(false)]
+      else =>
+        [
+          expect(n is Error).toBe(false),
+          expect(toString(n)).toBe("123456789012345678901234567890")
+        ]
   ),
 
   test("parse rejects garbage with an Error", () => [
@@ -26,13 +29,15 @@ val s = suite("std/bignum", [
   test("add / sub / mul beyond Int64 range", () =>
     // 2^70, well past Int64, computed as exact bignum arithmetic.
     val big = pow(bigInt(2), 70)
-    [
-      expect(big is Error).toBe(false),
-      expect(toString(big)).toBe("1180591620717411303424"),
-      expect(add(bigInt(2), bigInt(3)).toString()).toBe("5"),
-      expect(sub(bigInt(10), bigInt(25)).toString()).toBe("-15"),
-      expect(mul(bigInt(1000000), bigInt(1000000)).toString()).toBe("1000000000000")
-    ]
+    match big
+      is Error => [expect(true).toBe(false)]
+      else =>
+        [
+          expect(toString(big)).toBe("1180591620717411303424"),
+          expect(add(bigInt(2), bigInt(3)).toString()).toBe("5"),
+          expect(sub(bigInt(10), bigInt(25)).toString()).toBe("-15"),
+          expect(mul(bigInt(1000000), bigInt(1000000)).toString()).toBe("1000000000000")
+        ]
   ),
 
   test("exact factorial(25) (overflows Int64)", () =>
@@ -46,10 +51,12 @@ val s = suite("std/bignum", [
   test("modPow for crypto-sized exponentiation", () =>
     // 4^13 mod 497 == 445
     val r = modPow(bigInt(4), bigInt(13), bigInt(497))
-    [
-      expect(r is Error).toBe(false),
-      expect(toString(r)).toBe("445")
-    ]
+    match r
+      is Error => [expect(true).toBe(false)]
+      else =>
+        [
+          expect(toString(r)).toBe("445")
+        ]
   ),
 
   test("cmp / eq ordering", () => [
@@ -67,11 +74,15 @@ val s = suite("std/bignum", [
 
   test("toInt64 in range, Error out of range", () =>
     val ok = toInt64(bigInt(123))
-    val over = toInt64(pow(bigInt(2), 100))
-    [
-      expect(ok).toBe(123),
-      expect(over is Error).toBe(true)
-    ]
+    val bigpow = pow(bigInt(2), 100)
+    match bigpow
+      is Error => [expect(true).toBe(false)]
+      else =>
+        val over = toInt64(bigpow)
+        [
+          expect(ok).toBe(123),
+          expect(over is Error).toBe(true)
+        ]
   )
 ])
 

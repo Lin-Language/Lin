@@ -11,31 +11,25 @@
 // from `compile`. Everything downstream of a successfully compiled `Regex` is total: it returns
 // Null, a Boolean, or an array, and never an Error.
 
-export type Regex = AnyVal
-
 // A single match. `groups` is the array of positional capture groups: participating groups are
 // `String`, and non-participating positional holes are `Null`, so `m["groups"][1]` indexes it
 // directly. `named` is an object of named capture groups; an absent named group reads as `Null`.
 export type Match = { "text": String, "start": Int32, "end": Int32, "groups": AnyVal, "named": AnyVal }
 
 import foreign "lin-runtime"
-  val lin_regex_compile: (String) => AnyVal
-  val lin_regex_is_match: (AnyVal, String) => Boolean
-  val lin_regex_find: (AnyVal, String) => AnyVal
-  val lin_regex_find_all: (AnyVal, String) => AnyVal
-  val lin_regex_replace: (AnyVal, String, String, Boolean) => String
-  val lin_regex_split: (AnyVal, String) => AnyVal
+  val lin_regex_compile: (String) => Regex | Error
+  val lin_regex_is_match: (Regex, String) => Boolean
+  val lin_regex_find: (Regex, String) => AnyVal
+  val lin_regex_find_all: (Regex, String) => AnyVal
+  val lin_regex_replace: (Regex, String, String, Boolean) => String
+  val lin_regex_split: (Regex, String) => AnyVal
 // Compile a pattern into a reusable Regex handle. This is the only fault case in the module.
 // @param pattern  the RE2 source pattern.
 // @returns the compiled Regex, or an Error (detect with `is Error`) if the pattern is not valid
 //          RE2 syntax — an unbalanced group, an unterminated class, or an unsupported
 //          backreference or lookaround construct.
 export val compile = (pattern: String): Regex | Error =>
-  val r = lin_regex_compile(pattern)
-  if r is Error then
-    { "type": r["type"], "message": r["message"] }
-  else
-    r
+  lin_regex_compile(pattern)
 
 // Test whether `re` matches anywhere within `s`. Cheapest operation; allocates no Match.
 // @param re  the compiled pattern.

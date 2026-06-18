@@ -13,7 +13,6 @@
 //
 // A Decimal cannot be transferred across workers, since the handle is a pointer.
 
-export type Decimal = AnyVal
 // A rounding strategy, one of the `Round*` constants below. Passed to `div`/`round`/`setScale`.
 export type RoundingMode = Int32
 

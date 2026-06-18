@@ -11,8 +11,6 @@
 // A BigInt cannot be transferred across workers: the handle is a pointer that cannot be shared
 // across a thread boundary, so bignum math runs on the main thread.
 
-export type BigInt = AnyVal
-
 import foreign "lin-runtime"
   val lin_bignum_from_int64: (Int64) => BigInt
   val lin_bignum_parse: (String) => BigInt

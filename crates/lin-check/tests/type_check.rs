@@ -652,3 +652,106 @@ takesData(true)
         result.err()
     );
 }
+
+// ── Opaque handle types: BigInt / Decimal / Regex ───────────────────────────
+
+/// `String` is NOT assignable where `BigInt` is expected.
+#[test]
+fn test_bigint_rejects_string() {
+    let result = parse_and_check(r#"
+val takes_bigint = (b: BigInt): Null => null
+takes_bigint("hello")
+"#);
+    assert!(result.is_err(), "Expected Err: String is not BigInt");
+}
+
+/// `BigInt` is NOT assignable where `Decimal` is expected.
+#[test]
+fn test_bigint_not_assignable_to_decimal() {
+    let result = parse_and_check(r#"
+import foreign "lin-runtime"
+  val lin_bignum_from_int64: (Int64) => BigInt
+  val lin_decimal_from_int64: (Int64) => Decimal
+val takes_decimal = (d: Decimal): Null => null
+takes_decimal(lin_bignum_from_int64(1))
+"#);
+    assert!(result.is_err(), "Expected Err: BigInt is not Decimal");
+}
+
+/// `Decimal` is NOT assignable where `Regex` is expected.
+#[test]
+fn test_decimal_not_assignable_to_regex() {
+    let result = parse_and_check(r#"
+import foreign "lin-runtime"
+  val lin_decimal_from_int64: (Int64) => Decimal
+val takes_regex = (r: Regex): Null => null
+takes_regex(lin_decimal_from_int64(1))
+"#);
+    assert!(result.is_err(), "Expected Err: Decimal is not Regex");
+}
+
+/// `Regex` is NOT assignable where `BigInt` is expected.
+#[test]
+fn test_regex_not_assignable_to_bigint() {
+    let result = parse_and_check(r#"
+import foreign "lin-runtime"
+  val lin_regex_compile: (String) => Regex | Error
+val takes_bigint = (b: BigInt): Null => null
+val r = lin_regex_compile(".")
+if r is Error then null else takes_bigint(r)
+"#);
+    assert!(result.is_err(), "Expected Err: Regex is not BigInt");
+}
+
+/// `BigInt` is NOT assignable to `AnyVal` (the wildcard).
+#[test]
+fn test_bigint_not_assignable_to_anyval() {
+    let result = parse_and_check(r#"
+import foreign "lin-runtime"
+  val lin_bignum_from_int64: (Int64) => BigInt
+val takes_anyval = (x: AnyVal): Null => null
+takes_anyval(lin_bignum_from_int64(1))
+"#);
+    assert!(result.is_err(), "Expected Err: BigInt is rejected by AnyVal wildcard");
+}
+
+/// A `BigInt`-typed value is accepted where `BigInt` is expected — same-opaque is OK.
+#[test]
+fn test_bigint_assignable_to_bigint() {
+    let result = parse_and_check(r#"
+import foreign "lin-runtime"
+  val lin_bignum_from_int64: (Int64) => BigInt
+  val lin_bignum_add: (BigInt, BigInt) => BigInt
+val a = lin_bignum_from_int64(1)
+val b = lin_bignum_from_int64(2)
+val c: BigInt = lin_bignum_add(a, b)
+"#);
+    assert!(result.is_ok(), "Expected Ok for same-opaque BigInt, got: {:?}", result.err());
+}
+
+/// A `Decimal`-typed value is accepted where `Decimal` is expected.
+#[test]
+fn test_decimal_assignable_to_decimal() {
+    let result = parse_and_check(r#"
+import foreign "lin-runtime"
+  val lin_decimal_from_int64: (Int64) => Decimal
+  val lin_decimal_add: (Decimal, Decimal) => Decimal
+val a = lin_decimal_from_int64(1)
+val b = lin_decimal_from_int64(2)
+val c: Decimal = lin_decimal_add(a, b)
+"#);
+    assert!(result.is_ok(), "Expected Ok for same-opaque Decimal, got: {:?}", result.err());
+}
+
+/// A `Regex`-typed value is accepted where `Regex` is expected.
+#[test]
+fn test_regex_assignable_to_regex() {
+    let result = parse_and_check(r#"
+import foreign "lin-runtime"
+  val lin_regex_compile: (String) => Regex | Error
+  val lin_regex_is_match: (Regex, String) => Boolean
+val r = lin_regex_compile(".")
+if r is Error then false else lin_regex_is_match(r, "hello")
+"#);
+    assert!(result.is_ok(), "Expected Ok for same-opaque Regex after narrowing, got: {:?}", result.err());
+}
