@@ -22519,6 +22519,40 @@ print(toString(h2(0 - 5)))
     assert_eq!(out, vec!["42", "0", "10", "0"]);
 }
 
+#[test]
+fn test_or_right_operand_narrows_into_call_arg() {
+    // `x == null || isBefore(x, stop)` — the right side of `||` is reached only when `x != null`,
+    // so `x` must be narrowed to String inside the call argument. Before this fix the checker
+    // rejected the call with "Argument 1 has type String | Null, expected String".
+    let out = run(r#"import { print } from "std/io"
+val isBefore = (a: String, b: String): Boolean => a < b
+val pick = (cur: String | Null, stop: String): String =>
+  if cur == null || isBefore(cur, stop) then stop else cur
+print(pick(null, "x"))
+print(pick("a", "b"))
+print(pick("z", "b"))
+"#);
+    assert_eq!(out, vec!["x", "b", "z"]);
+}
+
+#[test]
+fn test_or_right_operand_narrows_into_negated_call_arg() {
+    // `x == null || !isBefore(x, stop)` — the `!` wraps the call; `x` must still be narrowed
+    // to String when the call argument is checked. Before this fix the checker rejected this too.
+    let out = run(r#"import { print } from "std/io"
+val isBefore = (a: String, b: String): Boolean => a < b
+val pick = (cur: String | Null, stop: String): String =>
+  if cur == null || !isBefore(cur, stop) then stop else cur
+print(pick(null, "x"))
+print(pick("z", "b"))
+print(pick("a", "b"))
+"#);
+    // pick(null,"x")  -> null → take stop → "x"
+    // pick("z","b")   -> !isBefore("z","b") = !("z"<"b") = true → take stop → "b"
+    // pick("a","b")   -> !isBefore("a","b") = !("a"<"b") = false → take cur → "a"
+    assert_eq!(out, vec!["x", "b", "a"]);
+}
+
 /// Regression: 3-arg `range(start, end, step)` used `lin_iter` which typed elements as `AnyVal`.
 /// An `AnyVal`-boxed int does not match a numeric map key (stored unboxed), so `m[i]` returned null.
 /// Fix: 3-arg range materialises a flat `Int32[]` so the loop variable has type `Int32`.

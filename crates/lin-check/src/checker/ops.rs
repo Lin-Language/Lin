@@ -57,16 +57,16 @@ impl Checker {
         // Binary operands are never in tail position.
         let prev_tail = std::mem::replace(&mut self.in_tail_position, false);
         let typed_left = self.infer_expr(left)?;
-        // Flow-narrowing across `&&` (short-circuit): the RIGHT operand of `a && b` is only
-        // evaluated when `a` is truthy, so a null/type test in `a` narrows the tested binding for
-        // `b` — exactly as it does in an `if` then-branch. `x != null && x.f()` must type-check
-        // (`x` is non-Null on the right of `&&`). Apply the test's "then" narrowing in a scope
-        // around the right operand, mirroring `infer_if`. (`||` does NOT narrow its right operand
-        // this way — there `a` was falsy — so this is `And`-only.)
-        let typed_right = if matches!(op, BinOp::And) {
+        // Flow-narrowing across short-circuit operators:
+        //   `a && b`: right is only reached when `a` is TRUTHY — apply `a`'s "then" narrowing.
+        //   `a || b`: right is only reached when `a` is FALSY  — apply `a`'s "else" narrowing.
+        // Both mirror `infer_if`'s branch narrowing. `x != null && f(x)` and `x == null || f(x)`
+        // must both type-check with `x` narrowed to non-Null inside the right operand.
+        let typed_right = if matches!(op, BinOp::And | BinOp::Or) {
             let narrowing = self.null_test_narrowing(left);
+            let entering_then = matches!(op, BinOp::And);
             self.env.push_scope();
-            self.apply_null_narrowing(&narrowing, true);
+            self.apply_null_narrowing(&narrowing, entering_then);
             let r = self.infer_expr(right);
             self.env.pop_scope();
             r?
