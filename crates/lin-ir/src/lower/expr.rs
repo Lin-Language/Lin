@@ -1,5 +1,219 @@
 use super::*;
 
+/// If `ty` is a MAP type (`{ K: V }`), or a `V | Null` union whose sole non-null member is a map,
+/// return a reference to that map type. (`None` for record/array/scalar — not a map container.)
+fn as_map_ty(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::Map { .. } => Some(ty),
+        Type::Union(members) => {
+            let mut map_ty: Option<&Type> = None;
+            for m in members {
+                match m {
+                    Type::Null => {}
+                    Type::Map { .. } if map_ty.is_none() => map_ty = Some(m),
+                    // Any non-null, non-map member (or a second map) → not a clean `Map | Null`.
+                    _ => return None,
+                }
+            }
+            map_ty
+        }
+        _ => None,
+    }
+}
+
+/// The VALUE type of an intermediate index level `parent[key]` for auto-vivification, derived from
+/// the PARENT container's static type — NOT from the `Index`'s `result_type`, which the checker can
+/// erase to a bare `TypeVar` for a map-of-map read (`m[a][b]` → `TypeVar | Null`), losing the map
+/// shape. The parent's type is the authoritative source: indexing a `Map { value, .. }` yields
+/// `value`. We vivify `parent[key]` only when (a) the parent IS a map container and (b) that
+/// `value` is ITSELF a map — i.e. an intermediate map LEVEL we can auto-create when absent. A map
+/// whose value is a non-map (the final leaf set's parent, e.g. `{ String: Int32 }`) is handled by
+/// the recursion's base level, not here; a record/array parent returns `None` (records are total;
+/// arrays can't be vivified by key).
+fn vivifiable_level_map_ty(parent_ty: &Type) -> Option<Type> {
+    let Type::Map { value, .. } = as_map_ty(parent_ty)? else {
+        return None;
+    };
+    // The level's own type is `*value`; it is a vivifiable MAP level only if it is itself a map.
+    if as_map_ty(value).is_some() {
+        Some((**value).clone())
+    } else {
+        None
+    }
+}
+
+/// Lower an intermediate index-assignment level as GET-OR-CREATE so a nested write
+/// `m[k1][k2]…[kn] = v` succeeds even when intermediate map levels are absent (auto-vivification).
+///
+/// `object` is the `object` operand of an `IndexSet` (or, recursively, of a parent get-or-create) —
+/// i.e. an `Index { parent, key, result_type }` read whose `result_type` is a MAP level (possibly
+/// `Map | Null`). Instead of the plain read (which yields `Null` and makes the downstream
+/// `lin_map_set` a no-op — the silent-write footgun), this emits:
+///
+/// ```text
+///   t = parent[key]                  ; Index read (Map | Null)
+///   if t == null:                    ; absent intermediate
+///       m = {}                       ; MakeObject — empty map of the level's value (map) type
+///       parent[key] = m              ; IndexSet store-back (retains m)
+///       result = box m to (Map|Null) ; same union repr as the read
+///   else:
+///       result = t                   ; existing map, already owned
+/// ```
+///
+/// The `parent` is itself lowered via `lower_index_get_or_create` so EVERY non-final map level is
+/// vivified (outermost-first). The leaf set is the caller's actual `IndexSet` — not vivified.
+///
+/// Returns a temp of the SAME type/representation the plain read would produce (an owned
+/// `Map | Null` box), so the caller's downstream `IndexSet` is unchanged — only it is now
+/// guaranteed non-null. Returns `None` (caller falls back to `lower_expr`) when `object` is not a
+/// vivifiable map-level index (e.g. a record-field or array-element intermediate).
+fn lower_index_get_or_create(
+    object: &TypedExpr,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<(Temp, Type)> {
+    let TypedExpr::Index { object: parent, key, .. } = object else {
+        return None;
+    };
+    // The intermediate level `parent[key]` must be a MAP whose value is ITSELF a map — derived from
+    // the PARENT's static type (the `Index`'s own `result_type` can be an erased `TypeVar | Null`
+    // for a map-of-map read). `level_map_ty` is the real value-map type of THIS level (what we
+    // create/return); the recursion result carries the level's real `Map` shape for shaping.
+    let level_map_ty = vivifiable_level_map_ty(&parent.ty())?;
+    // The read/return repr for this level: `Map | Null` of the real level map type. This replaces
+    // any erased `TypeVar | Null` so the Index/IndexSet/CloneBox all see a concrete map shape.
+    let read_ty = Type::Union(vec![level_map_ty.clone(), Type::Null]);
+
+    // Lower the PARENT container, recursively vivifying any deeper intermediate map level. The
+    // recursion returns `(temp, real_parent_map_ty)`; a non-vivifiable parent bottoms out at the
+    // base container (`LocalGet`/etc.) whose REAL type is `parent.ty()`. The parent's real map type
+    // becomes the `obj_ty` we index, so codegen routes the map get/set correctly even when the
+    // typed-AST type was erased.
+    //
+    // We use the parent as a BORROWED write-through base (the read + store-back below write into it
+    // without taking ownership), so for a base container we take the borrowed load — NOT the owning
+    // `lower_expr`, whose retain would be unbalanced against the single scope-exit release here
+    // (over-release → premature free of the container, e.g. a TCO param re-borrowed every iteration).
+    let (parent_temp, parent_obj_ty) = match lower_index_get_or_create(parent, builder, ctx) {
+        Some((t, ty)) => (t, ty),
+        None => {
+            let t = lower_container_base_borrowed(parent, builder, ctx)
+                .unwrap_or_else(|| lower_expr(parent, builder, ctx));
+            (t, parent.ty())
+        }
+    };
+
+    // Read the current value at parent[key]. A RAW Index (borrowed interior pointer) for the
+    // null-test + reuse — NOT the owning CloneBox the generic read path adds; ownership is
+    // re-established per-branch below. Lower the key after the base so the borrowed base read
+    // strictly dominates the index.
+    let key_temp = lower_expr(key, builder, ctx);
+    let cur = builder.alloc_temp(read_ty.clone());
+    builder.emit(Instruction::Index {
+        dst: cur,
+        object: parent_temp,
+        key: key_temp,
+        obj_ty: parent_obj_ty.clone(),
+        key_ty: key.ty(),
+        result_ty: read_ty.clone(),
+    });
+
+    // Null test: `cur == null`.
+    let null_c = builder.const_temp(Const::Null);
+    let is_null = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary {
+        dst: is_null,
+        op: BinOp::Eq,
+        lhs: cur,
+        rhs: null_c,
+        operand_ty: read_ty.clone(),
+        ty: Type::Bool,
+    });
+
+    let create_block = builder.alloc_block("viv_create");
+    let have_block = builder.alloc_block("viv_have");
+    let merge_block = builder.alloc_block("viv_merge");
+    builder.terminate(Terminator::CondJump {
+        cond: is_null,
+        then_block: create_block,
+        else_block: have_block,
+    });
+
+    let result_dst = builder.alloc_temp(read_ty.clone());
+    let mut incomings: Vec<(Temp, BlockId)> = Vec::new();
+
+    // --- create branch: build an empty map, store it back, box it to the read's union repr ---
+    builder.switch_to(create_block);
+    builder.push_scope();
+    // Fresh empty map of THIS level's map type — its key-kind (int vs string) and nested value
+    // type come straight from `level_map_ty`, so deeper writes target the right shape.
+    let fresh = builder.alloc_temp(level_map_ty.clone());
+    builder.emit(Instruction::MakeObject {
+        dst: fresh,
+        fields: Vec::new(),
+        spreads: Vec::new(),
+        ty: level_map_ty.clone(),
+        stack: false,
+    });
+    builder.register_owned(fresh, level_map_ty.clone());
+    // RC: a CONCRETE-value map store (`emit_map_set` general path) is RC-NEUTRAL on the inner — it
+    // boxes the pointer, `lin_map_set` retains it, then the transient box is released (retain +1 then
+    // release -1 net zero). So the slot's owning reference must come from an explicit IR `Retain`
+    // here, exactly as the generic `IndexSet` lowering's `transfer_into_container` does for a stored
+    // value. Retain `fresh` (rc 1 → 2): one reference for the parent slot, one kept for the merge
+    // value (moved into the union box below).
+    builder.emit(Instruction::Retain { val: fresh, ty: level_map_ty.clone() });
+    // Store it back into parent[key] (re-using the SAME borrowed parent temp and a fresh key temp).
+    let store_key = lower_expr(key, builder, ctx);
+    builder.emit(Instruction::IndexSet {
+        object: parent_temp,
+        key: store_key,
+        value: fresh,
+        obj_ty: parent_obj_ty.clone(),
+        key_ty: key.ty(),
+        val_ty: level_map_ty.clone(),
+    });
+    // Box the fresh map into this level's `Map | Null` representation. The concrete→union Coerce
+    // (codegen `lin_box_map`) MOVES `fresh`'s pointer into the box WITHOUT a retain, so the box owns
+    // `fresh`'s construction +1. Transfer ownership: unregister `fresh`, register the box. The map's
+    // two references are now the parent slot (from the Retain above) and this merge box.
+    let boxed = coerce_to_slot_type(fresh, &level_map_ty, &read_ty, builder);
+    if boxed != fresh {
+        builder.unregister_owned(fresh);
+    }
+    builder.register_owned(boxed, read_ty.clone());
+    let create_val = boxed;
+    // The boxed value transfers its single +1 up to the enclosing scope (the Phi result); keep it
+    // across the branch-scope pop.
+    builder.pop_scope_releasing_keep(&[create_val]);
+    let create_pred = builder.current_block;
+    incomings.push((create_val, create_pred));
+    builder.terminate(Terminator::Jump(merge_block));
+
+    // --- have branch: the existing map; take an independent owned reference (CloneBox), exactly
+    // as the generic union read path does, so the merge owns a +1 box not a borrowed interior. ---
+    builder.switch_to(have_block);
+    builder.push_scope();
+    let owned = builder.alloc_temp(read_ty.clone());
+    builder.emit(Instruction::CloneBox { dst: owned, src: cur, ty: read_ty.clone() });
+    builder.register_owned(owned, read_ty.clone());
+    let have_val = owned;
+    builder.pop_scope_releasing_keep(&[have_val]);
+    let have_pred = builder.current_block;
+    incomings.push((have_val, have_pred));
+    builder.terminate(Terminator::Jump(merge_block));
+
+    // --- merge: phi the two owned union boxes; register the result owned once. ---
+    builder.switch_to(merge_block);
+    builder.emit(Instruction::Phi {
+        dst: result_dst,
+        ty: read_ty.clone(),
+        incomings,
+    });
+    builder.register_owned(result_dst, read_ty.clone());
+    Some((result_dst, read_ty))
+}
+
 pub(crate) fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     // Attribute instructions emitted while lowering this expression to its source span (debug-only
     // metadata for DWARF line tables). Restore the enclosing span afterwards so instructions emitted
@@ -1249,6 +1463,10 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
             // load is the last thing before the `IndexSet` — neither sub-expression can then leave
             // a dangling borrow by reassigning the container global. The owning fallback keeps the
             // original base→key→value order (its retain makes ordering immaterial).
+            // `obj_ty` defaults to the typed-AST container type, but auto-vivification can replace an
+            // erased intermediate type (`TypeVar | Null`) with the real `Map | Null` it reconstructs;
+            // codegen routes the leaf set off this type, so adopt the vivify-returned one when it fires.
+            let mut obj_ty = obj_ty.clone();
             let (obj_temp, key_temp, val_temp) =
                 if lower_container_base_borrowed_check(object, ctx) {
                     let key_temp = lower_expr(key, builder, ctx);
@@ -1257,7 +1475,21 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                         .unwrap_or_else(|| lower_expr(object, builder, ctx));
                     (obj_temp, key_temp, val_temp)
                 } else {
-                    let obj_temp = lower_expr(object, builder, ctx);
+                    // AUTO-VIVIFY intermediate map levels (the WRITE counterpart of the read
+                    // null-propagation, spec §6.1). For `m[k1][k2] = v` the `object` here is the
+                    // intermediate `Index(m, k1)`; if that intermediate is a MAP that is absent,
+                    // `lower_index_get_or_create` creates and stores an empty map of its value type
+                    // first, so the leaf set below targets a real container instead of silently
+                    // no-opping. Records/arrays/scalars return `None` and fall back to the plain read.
+                    let obj_temp = match lower_index_get_or_create(object, builder, ctx) {
+                        Some((t, real_ty)) => {
+                            // Adopt the reconstructed real `Map | Null` container type so codegen's
+                            // leaf-set routing sees a concrete map shape, not the erased typed-AST one.
+                            obj_ty = real_ty;
+                            t
+                        }
+                        None => lower_expr(object, builder, ctx),
+                    };
                     let key_temp = lower_expr(key, builder, ctx);
                     let val_temp = lower_expr(value, builder, ctx);
                     (obj_temp, key_temp, val_temp)
@@ -1313,8 +1545,8 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
             // array never holds → a per-set leak of the source struct (ASan-confirmed once the
             // materialization crash was fixed). Skip the transfer for this case too.
             let set_sealed_elem_into_tagged = is_sealed_scalar_repr(&val_ty)
-                && !is_sealed_scalar_array(obj_ty);
-            if !is_sealed_scalar_array(obj_ty) && !set_sealed_elem_into_tagged {
+                && !is_sealed_scalar_array(&obj_ty);
+            if !is_sealed_scalar_array(&obj_ty) && !set_sealed_elem_into_tagged {
                 builder.transfer_into_container(val_temp, value, op_consumes_union);
             }
             let free_shell = op_consumes_union

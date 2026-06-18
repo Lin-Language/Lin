@@ -687,6 +687,116 @@ print(toString(factorial(0)))
     assert_eq!(output, vec!["120", "1"]);
 }
 
+// ADR-082: a LOCAL (nested-in-a-function-body) recursive function-`val` whose RETURN type is a
+// union must be forward-declared so its body can call itself — exactly like the non-union case.
+// Before the fix, a local function whose enclosing function declared a Union/Named/Object return
+// went through the expected-type-directed block-check path (`check_expr` block-push), which —
+// unlike `infer_block` — never hoisted inner function-vals, so a recursive self-call reported
+// "Undefined variable". This also exercises two codegen fixes the type-check fix newly reached:
+//   - the TCO arg→slot store offset for a self-tail-recursive CLOSURE (the implicit env param at
+//     slot 0 must be skipped, else the counter is stored into the env slot → infinite loop);
+//   - the NullableRecord indirect-call ABI bridge (a closure returns a BOXED union; the call result
+//     must be Coerced boxed → NullableRecord so the consumer's `is T` narrowing sees a real record).
+#[test]
+fn test_local_recursive_fn_with_union_return() {
+    // Annotated `T | Null` return, recursing to a base that yields a record; `is T` after must
+    // narrow correctly (would print "none" if the closure-return repr were mishandled).
+    let output = run(r#"import { print } from "std/io"
+type Trip = { "id": Int32 }
+val getTrip = (target: Int32): Trip | Null =>
+  val scan = (i: Int32, lastFound: Trip | Null): Trip | Null =>
+    if i < 0 then lastFound
+    else if i == target then scan(i - 1, { "id": i })
+    else scan(i - 1, lastFound)
+  scan(20, null)
+val r = getTrip(5)
+if r is Trip then print("found") else print("none")
+"#);
+    assert_eq!(output, vec!["found"]);
+}
+
+#[test]
+fn test_local_recursive_fn_with_inferred_union_return() {
+    // INFERRED union return (no annotation on `go`): the inner function-val must still be
+    // forward-declared so `go` is in scope in its own body.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val outer = (): Int32 | Null =>
+  val go = (n: Int32) => if n < 0 then null else if n == 0 then 42 else go(n - 1)
+  go(5)
+val r = outer()
+if r is Int32 then print(toString(r)) else print("none")
+"#);
+    assert_eq!(output, vec!["42"]);
+}
+
+#[test]
+fn test_local_recursive_union_fn_deep_tco() {
+    // A self-tail-recursive local function (a CLOSURE) returning a union must tail-call-optimize:
+    // 5,000,000 iterations must terminate without a stack overflow AND produce the right answer.
+    // Regression for the TCO arg→slot store landing in the env slot (infinite loop) instead of the
+    // counter slot.
+    let output = run(r#"import { print } from "std/io"
+type Trip = { "id": Int32 }
+val getTrip = (target: Int32): Trip | Null =>
+  val scan = (i: Int32, lastFound: Trip | Null): Trip | Null =>
+    if i < 0 then lastFound
+    else if i == target then scan(i - 1, { "id": i })
+    else scan(i - 1, lastFound)
+  scan(5000000, null)
+val r = getTrip(5)
+if r is Trip then print("found") else print("none")
+"#);
+    assert_eq!(output, vec!["found"]);
+}
+
+// ADR-082: the type-check fix also enables MUTUAL local recursion (two inner function-vals calling
+// each other) with union returns to TYPE-CHECK. (Runtime mutual local recursion is gated by a
+// separate, pre-existing closure-env construction-order limitation that also affects non-union
+// mutual local recursion — see ADR-082; this test asserts only the type-check.)
+#[test]
+fn test_mutual_local_recursive_union_fn_typechecks() {
+    let (ok, out) = check_source(r#"type T = { "x": Int32 }
+val outer = (n: Int32): T | Null =>
+  val isEven = (k: Int32): T | Null => if k == 0 then { "x": 1 } else isOdd(k - 1)
+  val isOdd = (k: Int32): T | Null => if k == 0 then null else isEven(k - 1)
+  isEven(n)
+val r = outer(10)
+"#);
+    assert!(ok, "mutual local recursion with union returns should type-check:\n{}", out);
+}
+
+// ADR-082 follow-up: a self-tail-recursive function with a UNION return that passes a FRESHLY-
+// CREATED record as a NullableRecord accumulator arg. The fresh `{ "x": n }` literal is typed
+// UNSEALED by the checker; the param slot's repr is NullableRecord (a raw packed-struct pointer).
+// Before the fix the unresolved-`Named` union param (`T | Null` on a TOP-LEVEL directly-called fn)
+// caused the Coerce to box the object as TAG_MAP, while the slot's RC release used `lin_sealed_release`
+// — a representation mismatch that freed the box once too often: garbage at shallow depth (`got 33`)
+// and a SEGFAULT deep. Assert the exact FIELD VALUE (not just `is T`, which a corrupt box can still
+// satisfy) AND survival of a deep TCO run (no stack overflow / no UAF / no per-iteration leak).
+#[test]
+fn test_tco_fresh_record_nullable_union_arg_value_and_deep() {
+    // Shallow: the last accumulator built is `{ "x": 1 }` at n == 1 — the field must read back as 1.
+    let shallow = run(r#"import { print } from "std/io"
+type T = { "x": Int32 }
+val go = (n: Int32, acc: T | Null): T | Null =>
+  if n <= 0 then acc else go(n - 1, { "x": n })
+val r = go(10, null)
+print(if r == null then "null" else "got ${ r["x"] }")
+"#);
+    assert_eq!(shallow, vec!["got 1"]);
+
+    // Deep: 3,000,000 iterations must TCO (no stack overflow) and still produce the right value.
+    let deep = run(r#"import { print } from "std/io"
+type T = { "x": Int32 }
+val go = (n: Int32, acc: T | Null): T | Null =>
+  if n <= 0 then acc else go(n - 1, { "x": n })
+val r = go(3000000, null)
+print(if r == null then "null" else "got ${ r["x"] }")
+"#);
+    assert_eq!(deep, vec!["got 1"]);
+}
+
 #[test]
 fn test_for_and_range() {
     let output = run(r#"import { print } from "std/io"
@@ -2093,9 +2203,9 @@ val dx = true
 print(toString(!!dx == dx))
 print(toString(!!false))
 
-// typevar_operand: `!flag` where `flag` flows through a generic lambda parameter exercises the
+// typevar_operand: `!b` where `b` flows through a generic lambda parameter exercises the
 // unbox-to-i1 path in IR lowering.
-val negate = (flag) => !flag
+val negate = (b) => !b
 print(toString(negate(true)))
 print(toString(negate(false)))
 "#);
@@ -2826,6 +2936,158 @@ val f = (o: Outer, j: String): Int32 =>
     );
 }
 
+// ---------------------------------------------------------------------------
+// ADR-076: ASSIGNMENT-based index-place narrowing. After a write of a non-null value to a stable
+// index place `m[k]`, a later read of that SAME place narrows to the assigned (non-null) type —
+// the `m[k] = m[k] ?? []; m[k].push(x)` idiom — until invalidated (reassign an identifier the path
+// mentions, a write through the same base prefix, a call that could mutate the map, or block exit).
+// Plus: stable nested place-path keys (`m[row["id"]]`) are admitted as narrowable places.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_assign_narrows_index_place_simple_key() {
+    // After `m[k] = m[k] ?? []`, the re-read `m[k]` is the assigned non-null `String[]`, so
+    // `m[k].push("x")` (which needs a non-null `String[]` receiver) type-checks and runs.
+    let output = run(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val f = (m: { String: String[] }, k: String): Int32 =>
+  m[k] = m[k] ?? []
+  m[k].push("x")
+  length(m[k])
+
+var m: { String: String[] } = {}
+print(toString(f(m, "a")))
+"#);
+    assert_eq!(output, vec!["1"]);
+}
+
+#[test]
+fn test_assign_narrows_index_place_nested_path_key() {
+    // The same idiom keyed on a stable NESTED place-path (`m2[row["id"]]`): the key `row["id"]` is
+    // itself a re-readable place, so the place canonicalizes and the narrowing applies. Runs the
+    // `addTransfer`/`addLink` shape end-to-end.
+    let output = run(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val f = (m2: { String: String[] }, row: AnyVal): Int32 =>
+  m2[row["id"]] = m2[row["id"]] ?? []
+  m2[row["id"]].push("x")
+  length(m2[row["id"]])
+
+var m2: { String: String[] } = {}
+val row = { "id": "k1" }
+print(toString(f(m2, row)))
+"#);
+    assert_eq!(output, vec!["1"]);
+}
+
+#[test]
+fn test_assign_narrowing_invalidated_by_key_reassignment() {
+    // Soundness: reassigning the KEY variable after the assignment means `m[k]` may denote a
+    // different slot, so the narrowing is dropped and the re-read re-widens to `String[] | Null`.
+    let err = run_expect_err(r#"import { push } from "std/array"
+val f = (m: { String: String[] }, otherKey: String) =>
+  var k: String = "a"
+  m[k] = m[k] ?? []
+  k = otherKey
+  m[k].push("x")
+"#);
+    assert!(
+        err.contains("String[] | Null"),
+        "expected re-widened `String[] | Null` after key reassignment, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_assign_narrowing_invalidated_by_nested_key_root_reassignment() {
+    // Soundness: the nested key path `row["id"]` mentions `row`; reassigning `row` may make the
+    // place denote a different slot, so the narrowing is dropped (re-widened to `String[] | Null`).
+    let err = run_expect_err(r#"import { push } from "std/array"
+val f = (m2: { String: String[] }, other: AnyVal) =>
+  var row: AnyVal = { "id": "a" }
+  m2[row["id"]] = m2[row["id"]] ?? []
+  row = other
+  m2[row["id"]].push("x")
+"#);
+    assert!(
+        err.contains("String[] | Null"),
+        "expected re-widened `String[] | Null` after nested-key root reassignment, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_assign_narrowing_invalidated_by_base_reassignment() {
+    // Soundness: reassigning the BASE map binding means `m[k]` reads a different map, so the
+    // narrowing rooted at `m` is cleared and the re-read re-widens to `String[] | Null`.
+    let err = run_expect_err(r#"import { push } from "std/array"
+val f = (k: String) =>
+  var m: { String: String[] } = {}
+  var m2: { String: String[] } = {}
+  m[k] = m[k] ?? []
+  m = m2
+  m[k].push("x")
+"#);
+    assert!(
+        err.contains("String[] | Null"),
+        "expected re-widened `String[] | Null` after base reassignment, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_assign_narrowing_different_key_still_nullable() {
+    // Soundness: only the ASSIGNED key narrows. A read of a DIFFERENT key `m[other]` is still
+    // `String[] | Null`, so `m[other].push(...)` is rejected.
+    let err = run_expect_err(r#"import { push } from "std/array"
+val f = (m: { String: String[] }, k: String, other: String) =>
+  m[k] = m[k] ?? []
+  m[other].push("x")
+"#);
+    assert!(
+        err.contains("String[] | Null"),
+        "expected `String[] | Null` for a different (unassigned) key, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_assign_narrowing_cleared_by_intervening_call() {
+    // Soundness: a function CALL between the assignment and the read could mutate the map (delete
+    // the key), so all index-narrowings are conservatively cleared after a call — the re-read
+    // re-widens to `String[] | Null`. (The receiver of `m[k].push(...)` is evaluated BEFORE the
+    // push call, so the narrowed-read idiom itself is unaffected — see the positive tests above.)
+    let err = run_expect_err(r#"import { push } from "std/array"
+val touch = (m: { String: String[] }): Int32 => 1
+val f = (m: { String: String[] }, k: String) =>
+  m[k] = m[k] ?? []
+  val z = touch(m)
+  m[k].push("x")
+"#);
+    assert!(
+        err.contains("String[] | Null"),
+        "expected re-widened `String[] | Null` after an intervening call, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_assign_narrowing_does_not_leak_past_block() {
+    // Soundness: an assignment-narrowing established INSIDE an `if` block must not leak past it. A
+    // read of `m[k]` after the block re-widens to `String[] | Null`.
+    let err = run_expect_err(r#"import { push } from "std/array"
+val f = (m: { String: String[] }, k: String): String[] =>
+  if k != "" then
+    m[k] = m[k] ?? []
+    m[k].push("inside")
+  val b: String[] = m[k]
+  b
+"#);
+    assert!(
+        err.contains("String[] | Null"),
+        "expected re-widened `String[] | Null` after the block, got:\n{err}"
+    );
+}
+
 #[test]
 fn test_map_read_with_non_string_key_rejected() {
     // A `{ String: T }` map READ must reject a non-String key (mirrors the index-ASSIGN guard,
@@ -2844,11 +3106,11 @@ val f = (m: M, k: UInt32): Boolean => m[k] ?? false
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 type M = { String: Boolean }
-var m: M = {}
-m["x"] = true
-val f = (m: M, k: String): Boolean => m[k] ?? false
-print(toString(f(m, "x")))
-print(toString(f(m, "y")))
+var store: M = {}
+store["x"] = true
+val f = (tbl: M, k: String): Boolean => tbl[k] ?? false
+print(toString(f(store, "x")))
+print(toString(f(store, "y")))
 "#);
     assert_eq!(output, vec!["true", "false"]);
 }
@@ -3729,6 +3991,36 @@ print(toString(unwrap({{ "value": 99 }})))
 }
 
 #[test]
+fn test_imported_type_with_forward_referenced_field_type() {
+    // Regression: an exported type alias whose body references a SIBLING type declared LATER in
+    // the same file must be importable WITHOUT also importing that sibling. The importer only uses
+    // the alias; the field type is an internal detail of the alias's definition.
+    //
+    // Previously this failed with "Unknown type 'Trip'": type-decl bodies were resolved in
+    // (hoisted) source order, so `TimetableLeg` (declared before `Trip`) collapsed its `Trip`
+    // field to a bare `Named("Trip")` via the cycle guard — the sibling was still a placeholder.
+    // That unexpanded forward reference leaked into the module signature and then failed to resolve
+    // in the importer, where `Trip` is not in scope. The export-collection pass now re-resolves
+    // bodies against the fully-populated env, expanding such forward references inline.
+    let dir = std::env::temp_dir().join(format!("lin_imptype_fwd_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    // `TimetableLeg` references `Trip`, declared AFTER it — mirrors gtfs.lin's ordering.
+    std::fs::write(dir.join("gtfs.lin"),
+        "export type Leg = { \"origin\": String }\n\
+         export type TimetableLeg = Leg & { \"trip\": Trip }\n\
+         export type Trip = { \"tripId\": String }\n").unwrap();
+    // The importer pulls in ONLY `TimetableLeg`, never `Trip`.
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ TimetableLeg }} from "{}/gtfs"
+val leg: TimetableLeg = {{ "origin": "NRW", "trip": {{ "tripId": "t1" }} }}
+print(leg["trip"]["tripId"])
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["t1"]);
+}
+
+#[test]
 fn test_imported_type_unknown_without_import() {
     // The type is only visible when imported: using `Point` without importing it from the
     // module that exports it is still "Unknown type" (the registration is scoped to imports).
@@ -3865,6 +4157,114 @@ fn test_cyclic_imports_value_init_cycle_still_errors() {
     assert!(
         combined.contains("circular") || combined.contains("cycle") || combined.contains("init"),
         "expected a value-init cycle diagnostic, got: {combined}"
+    );
+}
+
+#[test]
+fn test_cyclic_imports_exported_type_alias_across_cycle() {
+    // ADR-083: an exported `type` alias defined in one cycle member, imported and used in TYPE
+    // position by another member of the same SCC, must resolve (not "Unknown type 'T'"). `a`
+    // defines `type T` and imports the VALUE `useT` from `b`; `b` imports the TYPE `T` from `a`
+    // and annotates a parameter with it. Both must check, and the record must flow across the
+    // boundary with a consistent representation (sealed record, not a boxed map) so `useT` reads
+    // the right value back.
+    let dir = std::env::temp_dir().join(format!("lin_cyc_typealias_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("a.lin"),
+        "import { useT } from \"b\"\n\
+         export type T = { \"x\": Int32 }\n\
+         export val g = (): Int32 => useT({ \"x\": 5 })\n").unwrap();
+    std::fs::write(dir.join("b.lin"),
+        "import { T } from \"a\"\n\
+         export val useT = (t: T): Int32 => t[\"x\"]\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ g }} from "{d}/a"
+print(toString(g()))
+"#, d = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["5"]);
+}
+
+#[test]
+fn test_cyclic_imports_exported_type_alias_three_module_cycle() {
+    // ADR-083, 3-module SCC A -> B -> C -> A: a `type P` defined in A is imported and used in
+    // TYPE position by C (two hops away around the cycle). The cross-cycle type import must
+    // resolve and the value flows back through B's pass-through call.
+    let dir = std::env::temp_dir().join(format!("lin_cyc_type3_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("A.lin"),
+        "import { fromB } from \"B\"\n\
+         export type P = { \"v\": Int32 }\n\
+         export val a = (): Int32 => fromB()\n").unwrap();
+    std::fs::write(dir.join("B.lin"),
+        "import { fromC } from \"C\"\n\
+         export val fromB = (): Int32 => fromC()\n").unwrap();
+    std::fs::write(dir.join("C.lin"),
+        "import { P } from \"A\"\n\
+         export val fromC = (): Int32 => useP({ \"v\": 7 })\n\
+         export val useP = (p: P): Int32 => p[\"v\"]\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ a }} from "{d}/A"
+print(toString(a()))
+"#, d = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["7"]);
+}
+
+#[test]
+fn test_cyclic_imports_mutually_referencing_type_aliases() {
+    // ADR-083: two type aliases that reference each other ACROSS the cycle — `Outer` (in m1)
+    // wraps `Inner` (in m2), and `Inner`'s defining module imports `Outer`. Both modules export
+    // a type the other imports in type position; both must resolve and the nested record must
+    // round-trip.
+    let dir = std::env::temp_dir().join(format!("lin_cyc_mutual_types_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("m1.lin"),
+        "import { Inner } from \"m2\"\n\
+         export type Outer = { \"inner\": Inner }\n\
+         export val mk = (): Outer => { \"inner\": { \"n\": 9 } }\n").unwrap();
+    std::fs::write(dir.join("m2.lin"),
+        "import { Outer } from \"m1\"\n\
+         export type Inner = { \"n\": Int32 }\n\
+         export val readN = (o: Outer): Int32 => o[\"inner\"][\"n\"]\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ mk }} from "{d}/m1"
+import {{ readN }} from "{d}/m2"
+print(toString(readN(mk())))
+"#, d = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["9"]);
+}
+
+#[test]
+fn test_acyclic_undefined_type_still_errors() {
+    // Guard: the cross-cycle type-alias seeding (ADR-083) must NOT mask a genuinely undefined
+    // type in an ordinary acyclic module — that still has to be a clean "Unknown type" error.
+    let dir = std::env::temp_dir().join(format!("lin_acyc_undeftype_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let only = dir.join("only.lin");
+    std::fs::write(&only,
+        "export val f = (x: Nonexistent): Int32 => 1\n").unwrap();
+    let out = lin_cmd()
+        .args(["check", only.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!out.status.success(), "expected a check failure, got success: {combined}");
+    assert!(
+        combined.contains("Unknown type 'Nonexistent'"),
+        "expected 'Unknown type' diagnostic, got: {combined}"
     );
 }
 
@@ -14943,6 +15343,39 @@ print(toString(o["B"][99] ?? -1))
 }
 
 #[test]
+fn test_nested_map_write_auto_vivifies_intermediate_levels() {
+    // Auto-vivification: a nested write `m[k1][k2] = v` creates absent intermediate MAP levels
+    // (an empty map of the static value type, stored back) so the write succeeds, instead of the
+    // previous silent no-op. Deep nesting vivifies every level; reads still null-propagate WITHOUT
+    // mutating the intermediate.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+// Single-level: kConn["StopB"] is absent; the write must create it and persist.
+type Conn = { String: String }
+type CIdx = { String: { UInt8: Conn } }
+val kConn: CIdx = {}
+val c: Conn = { "x": "y" }
+kConn["StopB"][1] = c
+print(if kConn["StopB"][1] == null then "LOST" else "stored")
+
+// Deep (3-level): o["a"] and o["a"]["b"] are both auto-created.
+type T = { String: { String: { String: Int32 } } }
+val o: T = {}
+o["a"]["b"]["c"] = 5
+print(toString(o["a"]["b"]["c"] ?? -1))
+
+// A read through an absent intermediate must NOT vivify it.
+type R = { String: { String: Int32 } }
+val r: R = {}
+val got = r["a"]["b"]
+print(if got == null then "read-null" else "read-val")
+print(if r["a"] == null then "still-absent" else "MUTATED")
+"#);
+    assert_eq!(output, vec!["stored", "5", "read-null", "still-absent"]);
+}
+
+#[test]
 fn test_check_accepts_valid_imported_symbol_program() {
     let (ok, output) = check_source(
         r#"import { trim } from "std/string"
@@ -19145,12 +19578,15 @@ print("${a ?? b ?? 7}")
 fn test_coalesce_map_read_usable_as_bare_type() {
     // `m[k] ?? default` on a `{ String: Int32 }`: present and absent keys, and the result is a
     // bare `Int32` usable in arithmetic with no further narrowing.
+    // ADR-076: the present key is read DIRECTLY — after `m["a"] = 5` it narrows to a non-null
+    // `Int32`, so `m["a"] ?? 99` would be a dead-default error. The absent-key coalesces (`"b"`,
+    // never assigned) keep the genuine `?? default` path.
     let output = run(r#"import { print } from "std/io"
 
 val m: { String: Int32 } = {}
 m["a"] = 5
 
-val present = m["a"] ?? 99
+val present = m["a"]
 val absent = m["b"] ?? 99
 print("${present + 1}")
 print("${absent + 1}")
@@ -19331,20 +19767,26 @@ print(toString(length(xs)))
 fn test_coalesce_mismatched_default_still_unions() {
     // When the RHS default is genuinely a different type, `??` still produces a union result
     // (the documented `stripped | D` behaviour is preserved — no regression).
+    // ADR-076: the present-key read is sourced from a function-PARAM map (`use`), so it stays the
+    // nullable map-read `Int32 | Null` and the mismatched `?? "fallback"` is a live union — an
+    // assign-then-coalesce of the SAME key would narrow to non-null `Int32` and make the default
+    // dead. The absent-key coalesce (`"missing"`) is unaffected either way.
     let output = run(r#"import { print } from "std/io"
 
+val use = (m: { String: Int32 }) =>
+  val r = m["x"] ?? "fallback"
+  val s = m["missing"] ?? "fallback"
+  match r
+    is String => print("string: ${r}")
+    is Int32 => print("int: ${r}")
+    else => print("other")
+  match s
+    is String => print("string: ${s}")
+    is Int32 => print("int: ${s}")
+    else => print("other")
 var m: { String: Int32 } = {}
 m["x"] = 7
-val r = m["x"] ?? "fallback"
-val s = m["missing"] ?? "fallback"
-match r
-  is String => print("string: ${r}")
-  is Int32 => print("int: ${r}")
-  else => print("other")
-match s
-  is String => print("string: ${s}")
-  is Int32 => print("int: ${s}")
-  else => print("other")
+use(m)
 "#);
     assert_eq!(output, vec!["int: 7", "string: fallback"]);
 }
@@ -19773,6 +20215,77 @@ print(last)
 "#);
     // i=4: 4%2==0 → kind "a" → "a:item4:4"
     assert_eq!(out, vec!["a:item4:4"]);
+}
+
+// Regression (ADR-083): a `while`-thunk closure that captures an outer `var last: Record | Null`
+// (a NullableRecord — physically a raw nullable sealed-struct pointer) AND, in the same body,
+// (a) ASSIGNS a sealed record to that var (`lastFound = t`) and (b) CALLS a heap-touching function
+// over a multi-map record corrupted memory. The captured var's slot holds a NullableRecord, but
+// codegen's union-typed Retain (the sealed `Trip` value carries a `Trip | Null` STATIC type when it
+// flows into the cell — same raw-pointer repr, no Coerce) routed it through `lin_tagged_retain`,
+// which reads offset 0 of the sealed struct as a TAG byte and offset 8 as an inner payload pointer
+// — type-confusion + UAF (segfault). The CellSet release-of-old likewise used `lin_tagged_release`,
+// dealloc-ing the 56-byte struct as a 16-byte TaggedVal box (mismatched-size double-free). Fix:
+// codegen retains/releases ANY packed-pointer repr (incl. a packed value carrying a union static
+// type) by-rc / null-guarded-sealed, never by-tag. The deep loop (300k record-var assigns across a
+// heap-touching call) is the per-iteration UAF/double-free guard.
+#[test]
+fn test_while_thunk_captured_record_var_across_heap_call_no_uaf() {
+    let out = run(r#"import { print } from "std/io"
+import { length } from "std/array"
+import { while } from "std/iter"
+
+type Service = { "startDate": UInt32, "endDate": UInt32, "days": { Int32: Boolean }, "dates": { Int32: Boolean } }
+type Trip = { "tripId": String, "service": Service, "dep": UInt32 }
+
+val mkService = (s: UInt32): Service =>
+  { "startDate": s, "endDate": 20991231, "days": { 0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true }, "dates": { 20180615: true } }
+
+val runsOn = (svc: Service, date: UInt32, dow: Int32): Boolean =>
+  val exception = svc["dates"][date]
+  if exception == true then true
+  else if exception == false then false
+  else if date < svc["startDate"] then false
+  else if date > svc["endDate"] then false
+  else svc["days"][dow] == true
+
+val mkTrip = (id: String, dep: UInt32): Trip => { "tripId": id, "service": mkService(20180101), "dep": dep }
+
+val gt = (trips: Trip[], time: UInt32): Trip | Null =>
+  var i = trips.length() - 1
+  var lastFound: Trip | Null = null
+  while(() =>
+    if i < 0 then false
+    else
+      val t = trips[i]
+      if t["dep"] < time then false
+      else
+        val foundHere = t["service"].runsOn(20180615, 5)
+        if foundHere then
+          lastFound = t
+        i = i - 1
+        true
+  )
+  lastFound
+
+val main = () =>
+  val trips = [mkTrip("t1", 1000), mkTrip("t2", 1000), mkTrip("t3", 1000)]
+  var n: Int32 = 0
+  var last = "none"
+  while(() =>
+    if n >= 100000 then false
+    else
+      val r = gt(trips, 500)
+      last = if r == null then "null" else r["tripId"]
+      n = n + 1
+      true
+  )
+  print(last)
+main()
+"#);
+    // Last matching trip (highest index, since the scan walks downward and keeps the last write)
+    // is "t1" (index 0, the final assignment). Survives 100k gt-calls × 3 record-var assigns.
+    assert_eq!(out, vec!["t1"]);
 }
 
 #[test]
@@ -20321,6 +20834,10 @@ main()
 #[test]
 fn test_map_bare_record_value_coalesce_and_named_narrow() {
     // ?? coalesce read (bare-T result) and a 5.9.1 named-narrow projection store — both panicked.
+    // ADR-076: a present-key read AFTER `m["k"] = w` now narrows to the assigned non-null `Wide`,
+    // so `m["k"] ?? d` there would be a "left operand is never null" error (the default is dead).
+    // The bare-T present-key read is exercised directly; `m["absent"] ?? d` keeps the genuine
+    // coalesce-over-`Null` path (the absent key is not narrowed).
     let out = run(r#"import { print } from "std/io"
 type Wide = { "type": String, "extra": Int32 }
 type Narrow = { "type": String }
@@ -20329,7 +20846,7 @@ val main = () =>
   var m: { String: Wide } = {}
   m["k"] = w
   val d: Wide = { "type": "dflt", "extra": 0 }
-  val got: Wide = m["k"] ?? d
+  val got: Wide = m["k"]
   print("coalesce=${got["type"]}")
   val miss: Wide = m["absent"] ?? d
   print("miss=${miss["type"]}")
@@ -20595,10 +21112,12 @@ val main = () =>
   var routes: { String: Stop[] } = {}
   val stops: Stop[] = [{ "id": "a", "time": 1 }, { "id": "b", "time": 2 }]
   routes["r1"] = stops
-  val got = routes["r1"] ?? []
+  val got: Stop[] = routes["r1"]
   print(toString(length(got)))
 main()
 "#);
+    // ADR-076: after `routes["r1"] = stops`, the re-read narrows to the assigned non-null `Stop[]`,
+    // so it is directly assignable to a `Stop[]` binding (a `?? []` default would now be dead).
     assert_eq!(out, vec!["2"]);
 }
 
@@ -21200,4 +21719,202 @@ val m: M = fromEntries(map(stops, stop => [stop, 100]))
 print(toString(m["a"]))
 "#);
     assert_eq!(output, vec!["100"]);
+}
+
+// ---------------------------------------------------------------------------
+// Destructuring lambda parameters (ADR-079) — bare + parenthesized, array + object.
+// ---------------------------------------------------------------------------
+
+/// Bare array-destructuring lambda in argument position: `[a, b] => …` binds `a`,`b`.
+#[test]
+fn test_destructure_lambda_bare_array() {
+    let output = run(r#"import { print } from "std/io"
+import { for } from "std/iter"
+
+val pairs: Int32[][] = [[1, 2], [3, 4]]
+pairs.for([a, b] => print(a + b))
+"#);
+    assert_eq!(output, vec!["3", "7"]);
+}
+
+/// Parenthesized array-destructuring lambda: `([a, b]) => …` binds and runs.
+#[test]
+fn test_destructure_lambda_paren_array() {
+    let output = run(r#"import { print } from "std/io"
+import { for } from "std/iter"
+
+val pairs: Int32[][] = [[1, 2], [3, 4]]
+pairs.for(([a, b]) => print(a * b))
+"#);
+    assert_eq!(output, vec!["2", "12"]);
+}
+
+/// Object-destructuring lambda, both bare and parenthesized.
+#[test]
+fn test_destructure_lambda_object_both_forms() {
+    let output = run(r#"import { print } from "std/io"
+import { for } from "std/iter"
+
+type P = { "name": String, "age": Int32 }
+val items: P[] = [{ "name": "ann", "age": 30 }, { "name": "bob", "age": 40 }]
+items.for(({ name, age }) => print(name))
+items.for({ name, age } => print(age))
+"#);
+    assert_eq!(output, vec!["ann", "bob", "30", "40"]);
+}
+
+/// Multi-param lambdas mixing an ordinary param and a destructuring param, both orders.
+#[test]
+fn test_destructure_lambda_multi_param_mixed() {
+    let output = run(r#"import { print } from "std/io"
+
+val f = (x: Int32, [a, b]: Int32[]) => print(x + a + b)
+f(1, [2, 3])
+val g = ([a, b]: Int32[], y: Int32) => print(a + b + y)
+g([10, 20], 5)
+"#);
+    assert_eq!(output, vec!["6", "35"]);
+}
+
+/// Nested array-destructuring param `([a, [b, c]]) => …`.
+#[test]
+fn test_destructure_lambda_nested_array() {
+    let output = run(r#"import { print } from "std/io"
+
+val f = ([a, [b, c]]: AnyVal) => print(a + b + c)
+f([1, [2, 3]])
+"#);
+    assert_eq!(output, vec!["6"]);
+}
+
+/// Rest element in an array-destructuring param `([a, ...rest]) => …`.
+#[test]
+fn test_destructure_lambda_array_rest() {
+    let output = run(r#"import { print } from "std/io"
+import { length } from "std/array"
+
+val f = ([a, ...rest]: Int32[]) => print(a + rest.length())
+f([10, 1, 2, 3])
+"#);
+    // a = 10, rest = [1,2,3] → 10 + 3 = 13
+    assert_eq!(output, vec!["13"]);
+}
+
+/// Map-entries-style motivating case: a `[K, V][]` iterated by a destructuring lambda,
+/// both bare and parenthesized — binds `routeId`,`stopP`.
+#[test]
+fn test_destructure_lambda_entries_motivating() {
+    let output = run(r#"import { print } from "std/io"
+import { for } from "std/iter"
+
+val entries: Int32[][] = [[10, 100], [20, 200]]
+entries.for([routeId, stopP] => print(routeId + stopP))
+entries.for(([routeId, stopP]) => print(routeId * stopP))
+"#);
+    assert_eq!(output, vec!["110", "220", "1000", "4000"]);
+}
+
+/// Negative: an array LITERAL argument (no trailing `=>`) must still parse as a literal, not be
+/// mistaken for a bare destructuring lambda. Likewise a record literal and a `[..].method()` call.
+#[test]
+fn test_destructure_lambda_literal_not_a_lambda() {
+    let (ok, output) = check_source(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+
+var xs: Int32[][] = [[0]]
+xs.push([1, 2])
+val obj: { "a": Int32 } = { "a": 1 }
+print([1, 2].length())
+print(obj["a"])
+"#);
+    assert!(ok, "expected literals to parse cleanly, got:\n{}", output);
+}
+
+// ── ADR-078: inner-scope shadowing is a hard error ──────────────────────────
+
+/// A nested `val` that reuses an outer `val` name is a compile-time error.
+#[test]
+fn test_shadowing_nested_val_is_rejected() {
+    // `y` is bound in the outer scope; the inner lambda tries to rebind it.
+    let (ok, output) = check_source(
+        r#"import { print } from "std/io"
+val y = 1
+val f = (): Int32 =>
+  val y = 2
+  y
+print("${f()}")
+"#,
+    );
+    assert!(
+        !ok,
+        "expected shadowing to be rejected, but it compiled:\n{}",
+        output
+    );
+    assert!(
+        output.contains("shadows a binding from an enclosing scope"),
+        "expected the shadowing diagnostic, got:\n{}",
+        output
+    );
+}
+
+/// A lambda parameter that reuses an outer binding name is a compile-time error.
+#[test]
+fn test_shadowing_lambda_param_is_rejected() {
+    // `x` is bound at module level; the lambda parameter `x` shadows it.
+    let (ok, output) = check_source(
+        r#"import { print } from "std/io"
+val x = 1
+val result = [1, 2, 3].map(x => x + 1)
+"#,
+    );
+    assert!(
+        !ok,
+        "expected shadowing of outer `x` by lambda param to be rejected:\n{}",
+        output
+    );
+    assert!(
+        output.contains("shadows a binding from an enclosing scope"),
+        "expected the shadowing diagnostic, got:\n{}",
+        output
+    );
+}
+
+/// Sibling lambdas may reuse the same parameter name — only inner-shadows-outer is forbidden.
+#[test]
+fn test_shadowing_sibling_lambdas_same_param_accepted() {
+    // Two sibling `.map` / `.filter` chains both use `x` as their param: no shadowing.
+    let (ok, output) = check_source(
+        r#"import { map, filter } from "std/iter"
+val result = [1, 2, 3].map(x => x * 2).filter(x => x > 2)
+"#,
+    );
+    assert!(
+        ok,
+        "expected sibling-lambda param reuse to be accepted, but it failed:\n{}",
+        output
+    );
+}
+
+/// A `val` in the same scope that binds a name already bound at that scope level is still
+/// accepted (same-scope redefinition is not shadowing — it is sequencing in the same block).
+#[test]
+fn test_shadowing_same_scope_reuse_accepted() {
+    // Both `val n` bindings are in the *same* block scope; the second is a sequenced rebind,
+    // not an inner-scope shadow.
+    let (ok, output) = check_source(
+        r#"import { print } from "std/io"
+val f = (): Int32 =>
+  val n = 1
+  val n = 2
+  n
+print("${f()}")
+"#,
+    );
+    // Same-scope rebind is currently accepted (not a shadowing error). If the language later
+    // disallows it this test should be updated to assert !ok.
+    assert!(
+        ok,
+        "expected same-scope rebind to be accepted (not a shadowing error), got:\n{}",
+        output
+    );
 }

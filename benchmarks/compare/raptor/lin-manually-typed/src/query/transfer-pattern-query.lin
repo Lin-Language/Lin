@@ -38,8 +38,6 @@ export val plan = (query: TransferPatternQuery, origin: StopId, dateObj: Date): 
       val kConnections = scanned[0]
 
       searchFrom(results.add(kConnections))
-    else
-      null
 
   searchFrom(1)
 

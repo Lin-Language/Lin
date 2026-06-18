@@ -537,6 +537,47 @@ pub(crate) fn lower_call(
         let _ = &escape_lits;
         return coerce_dst;
     }
+    // STAGE 3 NullableRecord (indirect-call ABI bridge) — the closure-return analogue of the
+    // SumNode case above. An anonymous closure always returns a BOXED TaggedVal* (`TypeVar(MAX)`
+    // ABI — see `lower_function_expr_with_id`). When the DECLARED `result_type` is a nullable
+    // sealed record (`Trip | Null`), the repr pass would otherwise seed the `Call dst` as
+    // `Packed(NullableRecord)` (a RAW sealed-struct pointer) from `type_seed`, even though the
+    // physical value is a boxed `TaggedVal*`. The downstream `is Trip` narrowing then calls
+    // `lin_box_record` on the already-boxed value (double-box) → schema match fails → the record
+    // is mistaken for null. This is exactly why a LOCAL recursive `getTrip`-style scan returning
+    // `Trip | Null` (now type-checkable, ADR-082) produced wrong runtime results.
+    //
+    // Fix (mirrors the SumNode bridge): emit the Call with `ret_ty = TypeVar(MAX)` so the repr
+    // pass seeds the result `Boxed`, then Coerce boxed → NullableRecord. Codegen compiles that
+    // Coerce via the reverse `nr_proj` path (`compile_ir_coerce_with_repr`): TAG_NULL → null ptr,
+    // else `sealed_project_from` into a fresh packed struct — yielding the raw NullableRecord
+    // pointer the consumer expects. The intermediate box is registered owned (closure union
+    // returns are a fresh +1) so scope-exit releases it after the Coerce consumes it.
+    if crate::repr::nullable_sealed_record(result_type).is_some() {
+        let json_ty = Type::TypeVar(u32::MAX);
+        let call_dst = builder.alloc_temp(json_ty.clone());
+        builder.emit(Instruction::Call {
+            dst: call_dst,
+            callee: CallTarget::Indirect(fn_temp),
+            args: lowered_args,
+            ret_ty: json_ty.clone(),
+        });
+        free_arg_box_shells(&shell_boxes, call_dst, builder);
+        for (b, bty) in &full_release_boxes {
+            builder.emit(Instruction::Release { val: *b, ty: bty.clone() });
+        }
+        builder.register_owned(call_dst, json_ty.clone());
+        let coerce_dst = builder.alloc_temp(result_type.clone());
+        builder.emit(Instruction::Coerce {
+            dst: coerce_dst,
+            src: call_dst,
+            from_ty: json_ty,
+            to_ty: result_type.clone(),
+        });
+        builder.register_owned(coerce_dst, result_type.clone());
+        let _ = &escape_lits;
+        return coerce_dst;
+    }
     let dst = builder.alloc_temp(result_type.clone());
     builder.emit(Instruction::Call {
         dst,
