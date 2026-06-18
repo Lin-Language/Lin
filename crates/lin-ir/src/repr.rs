@@ -922,6 +922,16 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                 }
                 // DECIDE/ASSUME: Push — array operand repr (packed sealed array / flat); element
                 // operand repr for a packed array is a Packed struct.
+                //
+                // ELEMENT REPR CAVEAT: the element must be checked BOTH ways. When a sealed-record
+                // element reaches the Push via a `Coerce { sealed → TypeVar(< 9001) }` (a leftover
+                // checker inference variable that was never zonked to the concrete type — e.g. the
+                // inner `x` param of the stdlib flatMap body), codegen boxes it via `lin_box_record`
+                // (TAG_RECORD) and routes through `lin_push_dyn`, which handles TAG_RECORD→0xFD
+                // correctly. In that case `repr[elem]` is `Boxed(Opaque)` — agreeing with the
+                // physical value — and the oracle must NOT fire. Gate: only assert packed elem when
+                // the element's own static type is a sealed record (i.e. the type itself implies
+                // packed). A TypeVar/union elem type means the dynamic push path is taken.
                 Instruction::CallIntrinsic { intrinsic: Intrinsic::Push, args, .. } if args.len() >= 2 => {
                     let arr = args[0];
                     let arr_ty = func.temp_types.get(&arr).cloned().unwrap_or(Type::Null);
@@ -930,11 +940,16 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                         if !is_packed_sealed_array(r, ef) {
                             report(&mut bad, "Push(array packed)", arr, "Packed(sealed array)", r);
                         }
-                        // The pushed element is a standalone packed struct of the elem layout.
+                        // Only assert packed element repr when the element's own static type is
+                        // a sealed struct. A TypeVar/union element is physically boxed (codegen
+                        // routes it through lin_push_dyn), so Boxed(Opaque) is correct for it.
                         let elem = args[1];
-                        let er = &repr[elem.0 as usize];
-                        if !is_packed_struct(er, ef) {
-                            report(&mut bad, "Push(elem packed struct)", elem, "Packed(struct)", er);
+                        let elem_ty = func.temp_types.get(&elem).cloned().unwrap_or(Type::Null);
+                        if sealed_fields(&elem_ty).is_some() {
+                            let er = &repr[elem.0 as usize];
+                            if !is_packed_struct(er, ef) {
+                                report(&mut bad, "Push(elem packed struct)", elem, "Packed(struct)", er);
+                            }
                         }
                     }
                 }
@@ -1046,11 +1061,13 @@ pub fn verify(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                 }
                 // PUSH — the opcode the producer/consumer drift bug flowed through (a BOXED array
                 // pushed at a site that codegen reads as PACKED → garbage `elem_stride` → crash). The
-                // codegen `Intrinsic::Push` reads `arg_reprs[0].packed_sealed_array_layout()` to choose
-                // the packed `lin_sealed_array_push_struct_retaining` fast path, so when the array
-                // operand's TYPE is a packed sealed array its repr MUST be the matching Packed(sealed
-                // array) — else the packed push writes a struct into a buffer that is not physically
-                // packed. The pushed ELEMENT must then be the matching Packed(struct). This arm is the
+                // codegen `Intrinsic::Push` reads `arg_reprs[0].packed_sealed_array_layout()` AND
+                // `arg_reprs[1].packed_struct_fields()` to choose the packed fast path, so when the
+                // array operand's TYPE is a packed sealed array its repr MUST be the matching
+                // Packed(sealed array). The element operand must be Packed(struct) ONLY when its own
+                // static type is a sealed record — a TypeVar/union element is physically boxed
+                // (codegen routes it through lin_push_dyn), so Boxed(Opaque) is the correct repr and
+                // must NOT be flagged. This mirrors the codegen's dual-repr check. This arm is the
                 // structural proof the drift class is now inexpressible (a debug panic, not a UAF).
                 Instruction::CallIntrinsic { intrinsic: Intrinsic::Push, args, .. } if args.len() >= 2 => {
                     let arr = args[0];
@@ -1062,8 +1079,13 @@ pub fn verify(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                                 arr.0, repr[arr.0 as usize]
                             ));
                         }
+                        // Only require packed element repr when the element's own static type is a
+                        // sealed record. A TypeVar/union element goes through lin_push_dyn (boxed).
                         let elem = args[1];
-                        if !is_packed_struct(&repr[elem.0 as usize], ef) {
+                        let elem_ty = func.temp_types.get(&elem).cloned().unwrap_or(Type::Null);
+                        if sealed_fields(&elem_ty).is_some()
+                            && !is_packed_struct(&repr[elem.0 as usize], ef)
+                        {
                             bad.push(format!(
                                 "{fname}: Push element requires Packed(struct) of t{}, has {:?}",
                                 elem.0, repr[elem.0 as usize]
