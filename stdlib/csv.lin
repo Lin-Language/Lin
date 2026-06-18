@@ -202,20 +202,16 @@ val scanRecord = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean
   }
 
 // ── eager parse ──────────────────────────────────────────────────────────────
-// Recursively scan records from byte `pos`, ACCUMULATING into `rows` (a `AnyVal[]` threaded as a
-// PARAMETER, not a closure-captured local). Returns ONE consistent shape — a cursor
-//   { "rows": AnyVal[], "pos": Int32, "ok": Boolean }
-// — never a bare array on one branch and an Error object on another. A malformed field sets `ok`
-// false; the NON-recursive `parse` wrapper turns that into the canonical Error.
+// Recursively scan records from byte `pos`, ACCUMULATING into the `rows: String[][]` parameter.
+// Returns a cursor { "rows": String[][], "pos": Int32, "ok": Boolean }. A malformed field sets `ok`
+// false; the `parse` wrapper turns that into the canonical Error.
 //
-// WHY RECURSION (the two workarounds): (1) accumulating with a top-level `.for()` loop that
-// captures `rows` AND calls `scanRecord` (which itself runs a `.for()`) corrupts the outer
-// captured array — pushes are lost (a captured-var/array-cell aliasing bug; being fixed
-// separately). Threading `rows` as a parameter sidesteps it. (2) Returning ONE object shape from
-// the recursion (errors via the `ok` flag, the Error built in the outer wrapper) sidesteps the TCO
-// owned-param release bug (a tail-recursive fn returning an owned array PARAM on one branch and an
-// OBJECT on another corrupts its output; also being fixed separately).
-val scanRows = (rows: AnyVal[], s: String, n: Int32, pos: Int32, delim: Int32, trim: Boolean): AnyVal =>
+// (History: `rows` was once `AnyVal[]` and the accumulation was hand-rolled recursion to dodge two
+// compiler bugs — a captured-var/array-cell aliasing bug under a nested `.for`, and a TCO
+// owned-param release bug under mixed array/object returns. Both are now FIXED; `rows` is typed and
+// the captured-`.for` form is used in `mapRecords` below. Regression guards live in
+// crates/lin/tests/integration.rs.)
+val scanRows = (rows: String[][], s: String, n: Int32, pos: Int32, delim: Int32, trim: Boolean): AnyVal =>
   if pos >= n then
     {
       "rows": rows,
@@ -254,12 +250,9 @@ export val parse = (s: String, opts: CsvOptions = {  }): String[][] | Error =>
     val n = lengthBytes(s)
     val delim = optDelimByte(opts)
     val trim = optTrim(opts)
-    // The accumulator is `AnyVal[]`, NOT `String[][]`: each row is read out of `scanRecord`'s
-    // returned object as a `AnyVal` field, and pushing a `AnyVal` element grows a `AnyVal[]` via the
-    // dynamic push path. (A `AnyVal`-typed element pushed into a statically-`String[][]` array is
-    // silently dropped by the monomorphized typed-element push.) The `String[][]` element shape is
-    // recovered on return.
-    val rows: AnyVal[] = []
+    // `scanRecord` returns `fields` as a typed `String[]`, so each pushed row is statically typed and
+    // the accumulator is a plain `String[][]`.
+    val rows: String[][] = []
     val result = scanRows(rows, s, n, 0, delim, trim)
     if result["ok"] != true then
       {
@@ -272,7 +265,7 @@ export val parse = (s: String, opts: CsvOptions = {  }): String[][] | Error =>
 // ── header records ────────────────────────────────────────────────────────────
 // Build a { String: String } record from a header row + a data row, last-wins on duplicate
 // headers, lenient on ragged rows (short -> omit trailing keys; extra fields dropped).
-val rowToRecord = (header: AnyVal, row: AnyVal): { String: String } =>
+val rowToRecord = (header: String[], row: String[]): { String: String } =>
   val hlen = length(header)
   val rlen = length(row)
   var rec: { String: String } = {}
@@ -281,17 +274,12 @@ val rowToRecord = (header: AnyVal, row: AnyVal): { String: String } =>
   )
   rec
 
-// Recursively map data rows `parsed[i..]` to records, threading the `records` accumulator as a
-// PARAMETER (same captured-array workaround as `scanRows`: a top-level `.for()` capturing `records`
-// AND calling `rowToRecord` — which runs its own `.for()` — loses pushes). `parsed`/`header` are
-// kept `AnyVal` here so `parsed[i]` flows into `rowToRecord`'s `String[]` param without a typed
-// re-index crash.
-val mapRecords = (records: { String: String }[], parsed: AnyVal, header: AnyVal, i: Int32, total: Int32): Null =>
-  if i >= total then
-    null
-  else
-    push(records, rowToRecord(header, parsed[i]))
-    mapRecords(records, parsed, header, i + 1, total)
+// Map data rows `parsed[i..]` to records, pushing each onto the `records` accumulator. `parsed`/
+// `header` are typed (`String[][]`/`String[]`); `parsed[k]` is a `String[]` fed straight to
+// `rowToRecord`. (Both once used `AnyVal` + hand-rolled recursion to dodge the typed-re-index and
+// captured-array bugs noted on `scanRows`; both are now fixed — see the regression guards.)
+val mapRecords = (records: { String: String }[], parsed: String[][], header: String[], i: Int32, total: Int32): Null =>
+  range(i, total).for(k => push(records, rowToRecord(header, parsed[k])))
 
 // Parse a CSV document whose first row is a header, mapping each subsequent data row to a
 // `{ header: field }` record. Last-wins on duplicate headers; lenient on ragged rows (short rows
