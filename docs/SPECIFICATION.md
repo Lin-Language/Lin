@@ -792,6 +792,31 @@ A `val` whose right-hand side is *not* a function literal may **not** reference 
 
 Mutual recursion between two top-level `val` bindings of function literals is permitted: both names are in scope across both bodies.
 
+### 6.4 Shadowing
+
+A binding introduced in a nested scope may not reuse a name that is already visible from any enclosing
+scope. Attempting to do so is a **compile-time error**:
+
+```txt
+val x = 1
+val f = () =>
+  val x = 2  // Error: `x` shadows a binding from an enclosing scope
+  x
+```
+
+This applies to `val`/`var` bindings, lambda and function parameters, and destructuring captures.
+
+Same-scope sequential rebinding and sibling-scope parameter reuse are **not** shadowing and remain
+permitted:
+
+```txt
+// OK — sibling lambdas; neither shadows the other
+val result = [1, 2, 3].map(x => x * 2).filter(x => x > 2)
+```
+
+Compiler-generated synthetic names (`_`, `__destr_*`, `__param_*`, `$*`, `lin_*`) are exempt from the
+check. See ADR-078.
+
 ## 7. JSON Access
 
 Bracket notation is used for both JSON object key access and array indexing. Bracket access is **safe by default**: object accesses never raise an error, and `Null` propagates through chains.
@@ -822,6 +847,15 @@ val deep = obj["some"]["prop"]["that"]["doesnt"]["exist"]  // null
 ```
 
 This is equivalent to the optional-chaining operator (`?.`) in other languages — but it applies to every bracket access by default.
+
+**Writes through absent intermediate map levels auto-vivify.** A nested assignment `m[k1][k2] = v` creates any absent *intermediate map level* — an empty map of that level's statically-known value type — and then performs the set, so the write always succeeds (it is never silently dropped):
+
+```txt
+val index: { String: { UInt8: Conn } } = {}
+index["StopB"][1] = conn   // index["StopB"] is created as an empty { UInt8: Conn } map, then [1] is set
+```
+
+This is the write-side counterpart of read null-propagation, and the asymmetry is deliberate: a *read* through an absent level retrieves nothing (`Null`) and does **not** mutate; a *write* exists to store, so it ensures the path. Vivification applies only to **map** intermediates (`{ K: V }`): record fields are total (nothing to create) and arrays cannot be vivified by key (an out-of-range array index is still a runtime error, §7.1). Only intermediate levels are created — the final-level set assigns the leaf as usual.
 
 ### 7.2 Static Typing of Access
 
@@ -1209,6 +1243,8 @@ Narrowing carries into:
 
 A null test on an **index read** narrows a re-read of the same index place: `if m[k] != null then m[k] …` (and `m[k] ?? d`) reads `m[k]` as `T` rather than `T | Null` in the guarded branch. The place may be **compound** — an identifier root followed by any number of stable index steps (string-literal or simple-identifier keys), e.g. `service["dates"][date]` — so `if service["dates"][date] != null then service["dates"][date]` narrows the inner map read. The narrowing is invalidated if any identifier the place mentions (its root or a key variable) is reassigned, or a write lands through the same root.
 
+An **assignment** to an index place narrows a re-read of that same place to its assigned non-null type, mirroring the `if m[k] != null` narrowing. After `m[k] = e` where `e` is non-null (e.g. `m[k] = m[k] ?? []`), subsequent reads of `m[k]` are typed `V` (the slot's declared non-null value type) rather than `V | Null`, so the `m[k] = m[k] ?? []` then `m[k].push(x)` idiom type-checks without re-testing for null. A stable index step's key may itself be a stable place-path (`m[row["from_stop_id"]]`), so this works for nested keys too. The narrowing holds forward across statements until invalidated — by reassigning any identifier the place mentions (its root, a key variable, or any identifier in a nested key path), a write through the same root, **any function call** (which could mutate the map), or the end of the enclosing block — and never leaks past the block it was established in. It is applied conservatively: only over non-union slot value types `V` (a single record, array, or scalar), never when `V` is a union.
+
 Narrowing is invalidated on the first assignment to a `var` whose narrowed type would no longer hold.
 
 ---
@@ -1593,10 +1629,37 @@ Object spread is also valid in object *expressions*; see §3.3.
 
 ### 17.7 Function Parameter Destructuring
 
+A function parameter may be a destructuring pattern — object or array — instead of a plain name. The
+pattern's bindings are introduced at function entry, with the same element/field types as the
+equivalent `val` destructuring (§17.1, §17.5): positionally from a tuple/fixed-array parameter type
+(`[T0, T1]` binds `a: T0`, `b: T1`), or from the array element for an `Array(T)` parameter. Nested
+patterns and a trailing array `...rest` are supported to the same extent as `val`.
+
 ```txt
 val describePerson = ({ name, age }: Person): String =>
   "${name} is ${age}"
+
+val sumPair = ([a, b]: Int32[]): Int32 =>
+  a + b
 ```
+
+In **argument position** a single destructuring parameter may also be written *bare*, without the
+surrounding parentheses — the destructuring analogue of the bare single-identifier lambda `x => …`
+(§24, §18). Both forms are equivalent:
+
+```txt
+// bare (argument position only)
+pairs.for([a, b] => print(a + b))
+items.for({ name, age } => print(name))
+
+// parenthesized (also required for multiple parameters)
+pairs.for(([a, b]) => print(a + b))
+m.for((key, [a, b]) => print(key))
+```
+
+A bare destructuring lambda is recognised by a bracket-balanced `[ … ]` or `{ … }` immediately
+followed by `=>`; an array or record *literal* argument (no trailing `=>`) is unaffected — e.g.
+`xs.push([1, 2])` and `f({ "a": 1 })` parse as literals.
 
 ## 18. Iteration
 
@@ -1738,7 +1801,7 @@ This is not used because JSON-shaped types should describe JSON-shaped data. Ite
 
 ### 18.7 Receiver-Dispatched Combinators
 
-The iterable combinators — `map`, `filter`, `reduce`, `for`, `while`, `take`, `drop`, `flatMap`, `takeWhile`, `dropWhile`, `flatten`, `concat`, `find`, `some`, `every` — and the iterator constructors `range`, `rangeStep`, `iter`, `iterOf` are a **single** vocabulary that works over any iterable source: an array, an `Iterator`, or a `Stream` (§27.9). They live in one module, `std/iter`, and **dispatch on the static type of the receiver** (their first argument, in dot-application terms). This is Lin's first-argument-dispatch model (§4.4) applied to the combinator set.
+The iterable combinators — `map`, `filter`, `reduce`, `for`, `while`, `take`, `drop`, `flatMap`, `takeWhile`, `dropWhile`, `flatten`, `concat`, `find`, `some`, `every` — and the iterator constructors `range`, `iter`, `iterOf` are a **single** vocabulary that works over any iterable source: an array, an `Iterator`, or a `Stream` (§27.9). They live in one module, `std/iter`, and **dispatch on the static type of the receiver** (their first argument, in dot-application terms). This is Lin's first-argument-dispatch model (§4.4) applied to the combinator set.
 
 The same name behaves differently depending on the receiver:
 

@@ -1026,13 +1026,46 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 ptr_ty.const_null().into()
             }
-            // lin_keys(obj) => String[].
-            // Dispatch: union/Json → lin_tagged_keys (handles TAG_MAP, TAG_RECORD, TAG_SUMNODE);
-            // sealed concrete Object → box as TAG_RECORD + lin_tagged_keys (materialized path);
-            // non-sealed concrete Object / Named / Map → lin_map_keys directly on the LinMap*.
+            // lin_keys(obj) => K[].
+            // Dispatch: result `K[]` with a FLAT-SCALAR integer `K` (a non-`String`-keyed map,
+            //   e.g. `{ UInt8: V }.keys() : UInt8[]`) → box the map as TAG_MAP and call
+            //   `lin_keys_flat(map, elem_tag)`, which builds a FLAT width-K scalar array of the
+            //   native integer keys (ADR-086, revised). Codegen knows the static `K`; the runtime
+            //   only knows the i64 storage, so the width conversion happens HERE.
+            // Otherwise (String-keyed map / record / AnyVal → `String[]`):
+            //   union/Json → lin_tagged_keys (handles TAG_MAP, TAG_RECORD, TAG_SUMNODE);
+            //   sealed concrete Object → box as TAG_RECORD + lin_tagged_keys (materialized path);
+            //   non-sealed concrete Object / Named / Map → lin_map_keys directly on the LinMap*.
             Intrinsic::Keys => {
                 if let Some(&obj_v) = args.first() {
                     let arg_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
+                    // FLAT integer-keyed path: `K[]` where `K` is a flat scalar (only integer key
+                    // types ever reach here — Float keys are not valid map keys, and a String-keyed
+                    // map / record / AnyVal yields `String[]`, not a flat scalar). The receiver is
+                    // therefore always a CONCRETE `{ Int: V }` map: pass the raw `LinMap*` directly
+                    // (no `lin_box_map` shell to leak) and let the runtime narrow each i64 key to K.
+                    let flat_key_elem = match ret_ty {
+                        Type::Array(inner) if Self::is_flat_scalar(inner) => Some((**inner).clone()),
+                        _ => None,
+                    };
+                    if let Some(elem) = flat_key_elem {
+                        let map_ptr = self.ir_as_raw_ptr(obj_v, &arg_ty);
+                        let elem_tag = self.flat_elem_tag(&elem);
+                        let i8_ty = self.context.i8_type();
+                        let f = self.get_or_declare_fn(
+                            "lin_keys_flat",
+                            ptr_ty.fn_type(&[ptr_ty.into(), i8_ty.into()], false),
+                        );
+                        return self
+                            .builder
+                            .call(
+                                f,
+                                &[map_ptr.into(), i8_ty.const_int(elem_tag as u64, false).into()],
+                                "ir_keys_flat",
+                            )
+                            .try_as_basic_value()
+                            .unwrap_basic();
+                    }
                     if Self::is_union_type(&arg_ty) {
                         // obj_v is already a TaggedVal* (union is always boxed). Pass directly.
                         let tagged_v = if obj_v.is_pointer_value() {

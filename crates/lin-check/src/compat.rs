@@ -165,6 +165,20 @@ pub fn is_compatible_env(
         // (the same memory-safety precedent as the `Shared`/`Stream` arms above: a representational
         // mismatch is unsound regardless of who wrote the code). `Map -> Json` is handled by the
         // covariant-sink arm above and stays sound; `Map -> Map` covariance is below.
+        // EXCEPTION (ADR-086 revised): a `AnyVal` value DOES flow into a map parameter whose key is
+        // a QUANTIFIED-GENERIC type-parameter (`<K, V>(obj: { K: V })`, key ≥9001) — the `keys`
+        // wrapper. This is safe where the plain `AnyVal -> { String: V }` coercion is not, because
+        // `keys` reads the value through the tag-aware `lin_tagged_keys` bridge (which inspects the
+        // runtime tag: a non-object `AnyVal` yields an empty result, never a `LinObject`-as-`LinMap`
+        // misread). The result is `String[]` (the key var stays unbound → defaulted in `infer_call`).
+        // Must precede the blanket reject below.
+        (Type::TypeVar(s), Type::Map { key, value, .. })
+            if *s == u32::MAX
+                && matches!(**key, Type::TypeVar(id) if (9001..u32::MAX).contains(&id))
+                && matches!(**value, Type::TypeVar(id) if (9001..u32::MAX).contains(&id)) =>
+        {
+            true
+        }
         (Type::TypeVar(s), Type::Map { .. }) if *s == u32::MAX => false,
 
         // Json -> a concrete structured Object (one with a required, non-nullable field):
@@ -299,6 +313,37 @@ pub fn is_compatible_env(
 
         // Iterator covariance
         (Type::Iterator(a), Type::Iterator(b)) => is_compatible_env(a, b, env, lenient_json, depth),
+
+        // The "any-map" sink `{ String: AnyVal }` (target key `String`, target value the AnyVal
+        // wildcard `TypeVar(MAX)`) accepts a map with ANY key type — `{ UInt8: V }`,
+        // `{ DateNumber: V }`, etc. — not just a String-keyed one. ALL map keys are stringified at
+        // runtime regardless of their static key type, and `{ String: AnyVal }` is only ever read
+        // back through the tag-aware `lin_*_any` bridges (the basis of `std/object`'s
+        // `keys`/`values`/`entries`), so widening any-keyed map -> any-map sink is read-only and
+        // representation-safe (ADR-086). The key relaxation is gated TIGHT to the AnyVal-valued sink
+        // so it does NOT open up arbitrary `{ Int: V } -> { String: V }` cross-key assignment, which
+        // could mask a genuine key-type mismatch in user code; a non-map argument still rejects (it
+        // never reaches this Map↔Map arm). This arm must sit ahead of the strict `k1 == k2` covariance.
+        (Type::Map { value: v1, .. }, Type::Map { key: k2, value: v2, .. })
+            if matches!(**k2, Type::Str) && matches!(**v2, Type::TypeVar(n) if n == u32::MAX) =>
+        {
+            is_compatible_env(v1, v2, env, lenient_json, depth)
+        }
+
+        // A fixed `Object` RECORD flowing into a map parameter whose key is a QUANTIFIED-GENERIC
+        // type-parameter (`<K, V>(obj: { K: V })`, key TypeVar ≥9001 — only a function's own type
+        // param resolves into this range; ADR-086 revised). This is the `std/object.keys` wrapper:
+        // `keys({ "x": 1 })` passes a record into `keys = <K, V>(obj: { K: V }): K[]`. A record's
+        // keys are strings at runtime, so binding `K = String` is sound, and `keys` only READS the
+        // map (no write-back), so no mutation observes the record as a hashed map. Gated TIGHT to a
+        // quantified-generic key so it never admits an arbitrary `Object -> { String: V }` (a concrete
+        // map target) cross-shape assignment, which would mask a genuine record-vs-map mismatch.
+        (Type::Object { .. }, Type::Map { key: k2, value: v2, .. })
+            if matches!(**k2, Type::TypeVar(id) if (9001..u32::MAX).contains(&id))
+                && matches!(**v2, Type::TypeVar(id) if (9001..u32::MAX).contains(&id)) =>
+        {
+            true
+        }
 
         // Index-signature map covariance (`{ String: U }` -> `{ String: T }` when U compat T).
         // A `Map` is its OWN thing — NOT structurally compatible with a fixed `Object` record in

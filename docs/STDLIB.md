@@ -103,8 +103,7 @@ below show the array/iterator (eager) form; the per-function reference notes the
 | [`iter`](#iter) | `(() -> S, (S) -> Boolean, (S) -> S, (S) -> T) -> Iterator` | Build a custom iterator |
 | [`iterOf`](#iterOf) | `(AnyVal[]) -> Iterator` | Iterator over an array (element type erased into the iterator) |
 | [`map`](#map-iter) | `<T, U>(T[], (T) -> U) -> U[]` | Transform each element |
-| [`range`](#range) | `(Int32, Int32) -> Iterator` | Integer range `[start, end)`, step 1 |
-| [`rangeStep`](#rangeStep) | `(Int32, Int32, Int32) -> Iterator` | Integer range with an explicit (possibly negative) step |
+| [`range`](#range) | `(Int32, Int32) -> Int32[]` / `(Int32, Int32, Int32) -> Iterator` | Integer range `[start, end)`; 2-arg steps by 1 (fast array), 3-arg takes an explicit (possibly negative) step |
 | [`reduce`](#reduce-iter) | `<T, U>(T[], U, (U, T) -> U) -> U` | Fold left with an accumulator |
 | [`some`](#some-iter) | `<T>(T[], (T) -> Boolean) -> Boolean` | True if any element matches |
 | [`take`](#take-iter) | `<T>(T[], Int32) -> T[]` | First n elements |
@@ -211,7 +210,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`fromEntries`](#fromEntries) | `([String, AnyVal][]) -> {}` | Build an object from key-value pairs |
 | [`get`](#get) | `<T, D>({ String: T }, String, D = null) -> T \| D` | Value at key, or the default (`null` if omitted) when absent — the keyed convenience for the built-in `m[k] ?? default` (`??`, SPECIFICATION.md §8.3) |
 | [`isEmpty`](#isEmpty) | `(AnyVal) -> Boolean` | True if object, array, or string is empty |
-| [`keys`](#keys) | `(AnyVal) -> String[]` | Array of object keys (tag-aware: object or typed map) |
+| [`keys`](#keys) | `<K, V>({ K: V }) -> K[]` | Array of object keys in their native key type (tag-aware: object or typed map) |
 | [`mapValues`](#mapValues) | `<V,W>({ String: V }, (V) -> W) -> { String: W }` | Transform all values, keeping keys |
 | [`merge`](#merge) | `<T>({ String: T }, { String: T }) -> { String: T }` | Shallow-merge two typed maps (right wins on conflict) |
 | [`omit`](#omit) | `<T>({ String: T }, String[]) -> { String: T }` | Return typed map without specified keys |
@@ -1258,32 +1257,24 @@ empty source. **Array/Iterator** → `Boolean`. **Stream** → **terminal** `Boo
 ### range
 
 ```txt
-val range: (start: Int32, end: Int32) -> Iterator
+val range: (start: Int32, end: Int32) -> Int32[]
+val range: (start: Int32, end: Int32, step: Int32) -> Iterator
 ```
 
-Returns an iterator yielding integers from `start` up to (but not including) `end`, stepping by `1`. If
-`start >= end`, the iterator is empty. For a custom or negative step, use [`rangeStep`](#rangeStep).
+Resolved by arity into two overloads:
+
+- **2-arg** `range(start, end)` returns the half-open ascending sequence `start, start+1, …, end-1`,
+  stepping by `1`. If `start >= end` it is empty. This form materialises a flat `Int32[]` directly
+  (the fast `lin_range` builtin), so prefer it for the common counting case.
+- **3-arg** `range(start, end, step)` returns an iterator from `start` toward `end` (exclusive),
+  advancing by `step`. A positive `step` counts up while `i < end`; a negative `step` counts down
+  while `i > end`; a `step` of `0` yields an empty iterator.
 
 ```txt
-range(0, 3).for(i => print(toString(i)))   // prints 0, 1, 2
-range(1, 4).map(i => i * 2)                // [2, 4, 6]
-```
-
----
-
-### rangeStep
-
-```txt
-val rangeStep: (start: Int32, end: Int32, step: Int32) -> Iterator
-```
-
-Returns an iterator yielding integers from `start` toward `end` (exclusive), advancing by `step`. A
-positive `step` counts up while `i < end`; a negative `step` counts down while `i > end`; a `step` of
-`0` yields an empty iterator.
-
-```txt
-rangeStep(0, 10, 2).for(i => print(toString(i)))   // 0, 2, 4, 6, 8
-rangeStep(5, 0, -1).map(i => i)                    // [5, 4, 3, 2, 1]
+range(0, 3).for(i => print(toString(i)))        // prints 0, 1, 2
+range(1, 4).map(i => i * 2)                     // [2, 4, 6]
+range(0, 10, 2).for(i => print(toString(i)))    // 0, 2, 4, 6, 8
+range(5, 0, -1).map(i => i)                     // [5, 4, 3, 2, 1]
 ```
 
 ---
@@ -1330,7 +1321,7 @@ it.for(x => print(toString(x)))   // prints 10, 20, 30
 
 Array-shaped functions — these operate on a materialised, indexable, ordered array. The iterable
 combinators (`map`/`filter`/`reduce`/`for`/`while`/`take`/`drop`/`flatMap`/`takeWhile`/`dropWhile`/
-`flatten`/`concat`/`find`/`some`/`every`) and the iterator constructors (`range`/`rangeStep`/`iter`/
+`flatten`/`concat`/`find`/`some`/`every`) and the iterator constructors (`range`/`iter`/
 `iterOf`) now live in [`std/iter`](#stditer). All transformation functions here are non-mutating and
 return new values (except the in-place `push`/`set`).
 
@@ -2596,13 +2587,14 @@ isEmpty("hi")        // false
 ### keys
 
 ```txt
-val keys: (obj: AnyVal) -> String[]
+val keys: <K, V>(obj: { K: V }) -> K[]
 ```
 
-Returns an array of the object's keys. Tag-aware: works on a plain `{}`/`AnyVal` record (insertion order) or a typed `{ String: T }` map (hash order).
+Returns an array of the object's keys, in their **native key type** `K[]`. Tag-aware: works on a plain `{}`/`AnyVal` record (insertion order) or a typed map of ANY key type (hash order). A `{ UInt8: T }` map yields a `UInt8[]` of INTEGER keys (`3`, `10`) — usable to re-index the map (`m[k]`) and in arithmetic (`k + 1`); a `{ DateNumber: T }` (UInt32) map yields `UInt32[]`; a `{ String: T }` map, a plain record, and an `AnyVal` object all yield `String[]`. A non-object argument (`keys(5)`, `keys("s")`, `keys([…])`) is a compile error. See ADR-086.
 
 ```txt
 keys({ "a": 1, "b": 2 })   // ["a", "b"]
+{ 3: "x", 10: "y" }.keys()  // [3, 10] : UInt8[]  (native integer keys)
 ```
 
 ---

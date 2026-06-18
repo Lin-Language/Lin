@@ -106,6 +106,21 @@ val describe = (p: Person): String =>
 
 The type checker enforces that the object has the required fields.
 
+A named record type like this is a **value type**: it compiles to a flat, packed struct with a fixed set of fields — not a dynamic dictionary. That's why field access is fast (a known field sits at a known offset) and why the shape is fixed once declared. If you need open-ended, dynamically-keyed data, reach for a [map](/tutorials/maps.html) instead.
+
+## Combining record types
+
+Use intersection `&` to build a new record type with all the fields of two others:
+
+```lin
+type Person = { "name": String, "age": Int32 }
+type Employee = Person & { "salary": Int32 }
+
+val e: Employee = { "name": "Alice", "age": 30, "salary": 50000 }
+```
+
+`Employee` has every field of `Person` plus `salary`. The operands must be record types, and any shared field must agree on its type. For dynamic key→value data rather than a fixed set of named fields, use a [map](/tutorials/maps.html).
+
 ## Working with `AnyVal`
 
 When you don't know the shape in advance — e.g., data from a file or HTTP request — use the `AnyVal` type:

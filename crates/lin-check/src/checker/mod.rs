@@ -3,6 +3,7 @@ use lin_parse::ast::{Expr, Module, Stmt};
 
 use crate::compat::is_compatible_env;
 use crate::env::TypeEnv;
+use crate::resolve::resolve_type_spanned;
 use crate::typed_ir::*;
 use crate::types::Type;
 
@@ -142,6 +143,18 @@ pub struct Checker {
     /// keyed by name. Populated during `forward_declare_types` so error messages can show
     /// the source-level shape of a Named type even before `check_stmt` has resolved it.
     pub(crate) raw_type_decls: std::collections::HashMap<String, lin_parse::ast::TypeExpr>,
+    /// Expected RESULT type for the IMMEDIATELY-NEXT generic call/dot-call inference (ADR-085).
+    /// Set by `check_expr` just before it falls through to `infer_expr` for a `Call`/`DotCall`
+    /// whose context supplies an expected type; CONSUMED (taken) at the top of `infer_call`/
+    /// `infer_dot_call` so it never leaks into nested argument inference. Drives expected-result-
+    /// type-directed generic inference: the call unifies this against the function's declared
+    /// return to pre-seed its type-parameter substitutions (and, for a dot-call, derives an
+    /// expected type for the receiver call, propagating through method chains). When `None` (or it
+    /// fails to determine a param), inference falls back to today's bottom-up, argument-driven path.
+    expected_call_result: Option<Type>,
+    /// Spans already reported as shadowing errors (keyed by `(file_id, start, end)`).
+    /// Prevents duplicate diagnostics when a speculative type-check re-visits a binding site.
+    reported_shadow_spans: std::collections::HashSet<(u32, u32, u32)>,
 }
 
 impl Default for Checker {
@@ -186,6 +199,61 @@ impl Checker {
             next_lambda_id: 1,
             index_narrowings: Vec::new(),
             raw_type_decls: std::collections::HashMap::new(),
+            expected_call_result: None,
+            reported_shadow_spans: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Emit a hard-error diagnostic when `name` at `span` shadows a binding in an ENCLOSING scope.
+    ///
+    /// Rules:
+    /// - Same-scope redefinition (overloads, forward-declared functions, destructuring temps) is NOT
+    ///   flagged — only inner-shadows-outer.
+    /// - Synthetic compiler-internal names are skipped: `_`, `__destr_*`, `__param_*`, `$*`,
+    ///   `lin_*`, and the empty string.
+    /// - Duplicate reporting at the same span (from speculative re-checks) is suppressed.
+    pub(crate) fn check_shadowing(&mut self, name: &str, span: Span) {
+        // Skip synthetic / wildcard names.
+        if name.is_empty()
+            || name == "_"
+            || name.starts_with("__destr_")
+            || name.starts_with("__param_")
+            || name.starts_with('$')
+            || name.starts_with("lin_")
+        {
+            return;
+        }
+
+        // Dedup: don't re-report the same physical binding site.
+        let key = (span.file_id, span.start, span.end);
+        if self.reported_shadow_spans.contains(&key) {
+            return;
+        }
+
+        let current_depth = self.env.scope_depth(); // number of scopes = len
+        let current_innermost = current_depth.saturating_sub(1); // 0-based index of innermost
+
+        if let Some((def_depth, info)) = self.env.lookup_with_depth(name) {
+            // Only flag if it lives in a STRICTLY outer scope (not the current innermost scope).
+            if def_depth < current_innermost {
+                // If it's a forward-declared (pending) binding, don't flag — the val is completing
+                // its own pre-scan slot in the same block.
+                if !self.forward_declared.contains(&info.slot) {
+                    self.reported_shadow_spans.insert(key);
+                    let mut diag = Diagnostic::error(
+                        span,
+                        format!("`{}` shadows a binding from an enclosing scope", name),
+                    )
+                    .with_help(format!(
+                        "rename this binding; Lin does not allow an inner scope to reuse the outer name `{}`",
+                        name
+                    ));
+                    if let Some(prev_span) = info.def_span {
+                        diag = diag.with_note(prev_span, format!("`{}` is already bound here", name));
+                    }
+                    self.diagnostics.push(diag);
+                }
+            }
         }
     }
 
@@ -223,11 +291,23 @@ impl Checker {
             .statements
             .iter()
             .partition(|s| matches!(s, Stmt::TypeDecl { .. }));
+        // Module-level transient state to restore after each statement. A statement whose check
+        // fails (e.g. a function body that `?`-returned mid-check) can leak the scopes/frames it
+        // pushed before erroring; left in place, that leak poisons later statements — in particular
+        // the shadowing check would see a failed sibling function's parameters as an enclosing
+        // scope and report a spurious shadow. Restoring (truncate-only, never grows) is a no-op on
+        // the success path and does NOT touch `self.diagnostics`, so the real error is preserved.
+        let module_scope_depth = self.env.scope_depth();
+        let module_fsd = self.function_scope_depths.len();
+        let module_cap = self.capture_stack.len();
         for stmt in type_decls.into_iter().chain(other_stmts) {
             match self.check_stmt(stmt) {
                 Ok(typed_stmt) => stmts.push(typed_stmt),
                 Err(diag) => self.diagnostics.push(diag),
             }
+            self.env.truncate_scopes(module_scope_depth);
+            self.function_scope_depths.truncate(module_fsd);
+            self.capture_stack.truncate(module_cap);
         }
 
         if self.diagnostics.iter().any(|d| d.severity == lin_common::Severity::Error) {
@@ -238,9 +318,23 @@ impl Checker {
             // self-referential/recursive types keep their `Named(name)` cycle points.
             let mut exported_types = std::collections::HashMap::new();
             for stmt in &module.statements {
-                if let lin_parse::ast::Stmt::TypeDecl { name, exported: true, .. } = stmt {
-                    if let Some(decl) = self.env.lookup_type(name) {
-                        exported_types.insert(name.clone(), (decl.params.clone(), decl.body.clone()));
+                if let lin_parse::ast::Stmt::TypeDecl { name, params, body, exported: true, .. } = stmt {
+                    // Re-resolve the body against the now-complete env. The first resolution pass
+                    // runs in (hoisted) source order, so an exported type that references a sibling
+                    // declared LATER in the file collapsed that reference to a bare `Named(...)` via
+                    // the cycle guard (the sibling was still a placeholder at the time). Left
+                    // unexpanded, that forward reference leaks into this module's signature and then
+                    // fails to resolve in a consumer that imports the alias but not the sibling
+                    // (e.g. `import { TimetableLeg }` where `TimetableLeg` has a `Trip` field but
+                    // `Trip` is never imported). Re-resolving now expands all such forward references
+                    // inline; genuine recursive cycles still terminate at the cycle guard and keep
+                    // their `Named(self)` (which the consumer can resolve, since it imports the alias).
+                    let resolved = self
+                        .resolve_type_decl_body(params, body)
+                        .ok()
+                        .or_else(|| self.env.lookup_type(name).map(|d| d.body.clone()));
+                    if let Some(resolved) = resolved {
+                        exported_types.insert(name.clone(), (params.clone(), resolved));
                     }
                 }
             }
@@ -277,6 +371,49 @@ impl Checker {
         }
     }
 
+    /// Resolve this module's EXPORTED `type` aliases against the current import-type seeding, WITHOUT
+    /// type-checking any value/function bodies. Used by the cyclic-SCC fixpoint in `lin-compile`
+    /// (ADR-084) to harvest a member's type aliases even when its bodies don't yet type-check — e.g.
+    /// a param annotated with a peer alias that is still a placeholder TypeVar produces a spurious
+    /// body error in the first sweep, which `check_module` would surface as `Err`, dropping the
+    /// (perfectly resolvable) alias map. Mirrors `check_module`'s type-namespace prescans
+    /// (`register_imported_types` + `forward_declare_types`) and its export re-resolution, so a
+    /// self-contained alias (`type ST = { String: UInt32 }`) resolves fully and an alias that
+    /// references a peer's alias resolves once that peer's decl has been seeded (driving the fixpoint).
+    pub fn collect_exported_type_decls(
+        &mut self,
+        module: &Module,
+    ) -> std::collections::HashMap<String, (Vec<String>, Type)> {
+        self.register_intrinsics();
+        self.register_imported_types(module);
+        self.forward_declare_types(module);
+        // Resolve every top-level type decl into the env (in hoisted order, like `check_module`), so
+        // sibling references within the module resolve. Resolution errors are swallowed — this is a
+        // best-effort harvest; a genuinely-undefined alias simply won't appear in the result.
+        for stmt in &module.statements {
+            if let Stmt::TypeDecl { name, params, body, .. } = stmt {
+                if let Ok(resolved) = self.resolve_type_decl_body(params, body) {
+                    self.env.define_type(name.clone(), params.clone(), resolved);
+                }
+            }
+        }
+        // Re-resolve exported aliases against the now-complete env (expands forward references to
+        // later-declared siblings inline, matching `check_module`'s export-collection pass).
+        let mut exported_types = std::collections::HashMap::new();
+        for stmt in &module.statements {
+            if let Stmt::TypeDecl { name, params, body, exported: true, .. } = stmt {
+                let resolved = self
+                    .resolve_type_decl_body(params, body)
+                    .ok()
+                    .or_else(|| self.env.lookup_type(name).map(|d| d.body.clone()));
+                if let Some(resolved) = resolved {
+                    exported_types.insert(name.clone(), (params.clone(), resolved));
+                }
+            }
+        }
+        exported_types
+    }
+
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
     }
@@ -289,7 +426,7 @@ impl Checker {
     /// phantom capture set (which would give a top-level function a spurious closure env and break
     /// its call ABI). Restore only ever TRUNCATES (never grows) — a clean attempt leaves the lengths
     /// unchanged, so this is a no-op on the success path.
-    pub(crate) fn checker_state_snapshot(&self) -> (usize, usize, usize, Option<String>, bool, usize) {
+    pub(crate) fn checker_state_snapshot(&self) -> (usize, usize, usize, Option<String>, bool, usize, usize) {
         (
             self.function_scope_depths.len(),
             self.capture_stack.len(),
@@ -300,17 +437,23 @@ impl Checker {
             // failed hint can't leave a wrongly-typed parameter entry in `span_type_map` — only
             // the kept attempt's params are recorded.
             self.param_def_span_types.len(),
+            // Drop any shadow-error diagnostics pushed during a discarded speculative check.
+            // The `reported_shadow_spans` dedup set is intentionally NOT rolled back — keeping
+            // a site marked as "reported" prevents a re-checked site from emitting the diagnostic
+            // a second time on the committed path, but rolling it back would allow double-reporting.
+            self.diagnostics.len(),
         )
     }
 
-    pub(crate) fn restore_checker_state(&mut self, snap: (usize, usize, usize, Option<String>, bool, usize)) {
-        let (fsd_len, cap_len, scope_len, cur_fn, tail, param_types_len) = snap;
+    pub(crate) fn restore_checker_state(&mut self, snap: (usize, usize, usize, Option<String>, bool, usize, usize)) {
+        let (fsd_len, cap_len, scope_len, cur_fn, tail, param_types_len, diag_len) = snap;
         self.function_scope_depths.truncate(fsd_len);
         self.capture_stack.truncate(cap_len);
         self.env.truncate_scopes(scope_len);
         self.current_function = cur_fn;
         self.in_tail_position = tail;
         self.param_def_span_types.truncate(param_types_len);
+        self.diagnostics.truncate(diag_len);
     }
 
     pub(crate) fn types_compatible(&self, value: &Type, target: &Type) -> bool {
@@ -398,14 +541,54 @@ impl Checker {
         for stmt in &module.statements {
             if let Stmt::Import { bindings, path, .. } = stmt {
                 for binding in bindings {
-                    if let Some((params, body)) =
-                        self.import_type_decls.get(&(path.clone(), binding.name.clone())).cloned()
-                    {
+                    let key = (path.clone(), binding.name.clone());
+                    if let Some((params, body)) = self.import_type_decls.get(&key).cloned() {
                         let local_name = binding.alias.as_ref().unwrap_or(&binding.name);
                         self.env.define_type(local_name.clone(), params, body);
+                    } else if !self.fully_resolved_import_paths.contains(path) {
+                        // Cyclic-import Phase 1 (ADR-083): the peer module that exports this name is
+                        // still mid-resolution, so its `type` decls are not seeded yet. If this name
+                        // turns out to be an imported TYPE alias, leaving it undefined makes any
+                        // type-position use ("(t: T)") fail with "Unknown type 'T'", which aborts
+                        // Phase 1 before we can extract the peer's signature. Register a permissive
+                        // placeholder (a fresh TypeVar) so the body still checks; Phase 2 re-runs with
+                        // the peer's real `type` decl seeded into `import_type_decls` (the branch
+                        // above), which overrides this placeholder. A genuinely-undefined type from a
+                        // FULLY-RESOLVED module is excluded by the guard and still errors as before.
+                        // Registering a phantom alias for a name that is actually a VALUE import is
+                        // harmless: it lives in the type namespace and is never consulted unless the
+                        // name is used in type position.
+                        let local_name = binding.alias.as_ref().unwrap_or(&binding.name).clone();
+                        let placeholder = self.env.fresh_type_var();
+                        self.env.define_type(local_name, Vec::new(), placeholder);
                     }
                 }
             }
+        }
+    }
+
+    /// Resolve a single type-declaration body against the current type env. For a generic alias
+    /// (`type Box<T> = …`) each declared param is bound into a scratch env as a self-referential
+    /// `Named(param)` so it survives resolution (and `substitute` replaces it at each use-site).
+    /// Shared by the in-order `check_stmt` resolution pass and the export-collection re-resolution
+    /// (`check_module`) that repairs forward references to later-declared sibling types.
+    fn resolve_type_decl_body(
+        &self,
+        params: &[String],
+        body: &lin_parse::ast::TypeExpr,
+    ) -> Result<Type, Diagnostic> {
+        let map_resolve_err = |(s, e, help): (Span, String, Option<String>)| {
+            let d = Diagnostic::error(s, e);
+            if let Some(h) = help { d.with_help(h) } else { d }
+        };
+        if params.is_empty() {
+            resolve_type_spanned(body, &self.env).map_err(map_resolve_err)
+        } else {
+            let mut scratch = self.env.clone();
+            for param in params {
+                scratch.define_type(param.clone(), Vec::new(), Type::Named(param.clone()));
+            }
+            resolve_type_spanned(body, &scratch).map_err(map_resolve_err)
         }
     }
 

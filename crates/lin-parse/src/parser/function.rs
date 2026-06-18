@@ -115,34 +115,81 @@ impl Parser {
     }
 
     pub(crate) fn is_bare_lambda(&self) -> bool {
-        if let TokenKind::Ident(_) = self.peek_kind() {
-            // Check if next non-newline token after the ident is =>
-            let mut i = self.pos + 1;
-            while i < self.tokens.len() && matches!(self.tokens[i].kind, TokenKind::Newline) {
-                i += 1;
+        match self.peek_kind() {
+            TokenKind::Ident(_) => {
+                // Check if next non-newline token after the ident is =>
+                let mut i = self.pos + 1;
+                while i < self.tokens.len() && matches!(self.tokens[i].kind, TokenKind::Newline) {
+                    i += 1;
+                }
+                i < self.tokens.len() && self.tokens[i].kind == TokenKind::Arrow
             }
-            if i < self.tokens.len() && self.tokens[i].kind == TokenKind::Arrow {
-                return true;
-            }
-            // Also check for (ident, ident) => pattern (multi-param bare lambda)
-            false
-        } else {
-            false
+            // A bare DESTRUCTURING lambda in argument position: a balanced `[ … ]` or `{ … }`
+            // followed (skipping newlines) by `=>` is the single destructuring param of a lambda.
+            // Recognised ONLY in argument position (ADR-006), so an array/record LITERAL argument
+            // (no trailing `=>`) is unaffected — `xs.push([1, 2])`, `f({ "a": 1 })`, and
+            // `[1, 2].length()` all fall through to literal parsing.
+            TokenKind::LBracket | TokenKind::LBrace => self.balanced_close_then_arrow(),
+            _ => false,
         }
+    }
+
+    /// True when the bracket/brace at the cursor closes (with nested `[]`/`{}` balanced) and the
+    /// very next non-newline token is `=>`. Used by `is_bare_lambda` to distinguish a bare
+    /// destructuring-param lambda (`[a, b] => …`, `{ x } => …`) from an array/record literal.
+    fn balanced_close_then_arrow(&self) -> bool {
+        let (open_kind, close_kind) = match self.peek_kind() {
+            TokenKind::LBracket => (TokenKind::LBracket, TokenKind::RBracket),
+            TokenKind::LBrace => (TokenKind::LBrace, TokenKind::RBrace),
+            _ => return false,
+        };
+        let mut depth = 0i32;
+        let mut i = self.pos;
+        while i < self.tokens.len() {
+            let k = &self.tokens[i].kind;
+            if *k == open_kind {
+                depth += 1;
+            } else if *k == close_kind {
+                depth -= 1;
+                if depth == 0 {
+                    // Found the matching close; look past newlines for `=>`.
+                    let mut j = i + 1;
+                    while j < self.tokens.len()
+                        && matches!(self.tokens[j].kind, TokenKind::Newline)
+                    {
+                        j += 1;
+                    }
+                    return j < self.tokens.len() && self.tokens[j].kind == TokenKind::Arrow;
+                }
+            } else if matches!(k, TokenKind::Eof) {
+                return false;
+            }
+            i += 1;
+        }
+        false
     }
 
     pub(crate) fn parse_bare_lambda(&mut self) -> Expr {
         let span = self.current_span();
-        let name = self.expect_ident();
+        // A bare destructuring-param lambda (`[a, b] => …` / `{ x } => …`): parse the pattern with
+        // the same binding-pattern parser params use. Otherwise the single-ident form.
+        let pattern = match self.peek_kind() {
+            TokenKind::LBracket | TokenKind::LBrace => self.parse_binding_pattern(),
+            _ => {
+                let name = self.expect_ident();
+                Pattern::Ident(name, span)
+            }
+        };
         let param = Param {
-            pattern: Pattern::Ident(name, span),
+            pattern,
             type_ann: None,
             default: None,
         };
+        self.skip_newlines();
         self.expect(TokenKind::Arrow);
         self.skip_newlines();
         let body = self.parse_function_body();
-        // Bare lambda `x => body`: param-ident start .. end of body (no closing delimiter).
+        // Bare lambda `x => body` / `[a, b] => body`: param start .. end of body (no closing delim).
         let full_span = span.to(body.full_span());
         Expr::Function {
             type_params: Vec::new(),

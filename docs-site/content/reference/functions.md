@@ -76,6 +76,71 @@ val s = add(1, 2)    // complete call
 
 Over-application (more arguments than the function expects) is a compile-time error.
 
+## Overloading
+
+Several functions — or function-typed `val`s — in the **same scope** may share a name, provided they differ in their **parameter types**. They form an *overload set*; each call selects one member from the static types of its arguments (ADR-074/075; `docs/SPECIFICATION.md` §14.6).
+
+```lin
+type Circle = { "radius": Float64 }
+type Rect = { "width": Float64, "height": Float64 }
+
+val area = (c: Circle): Float64 => 3.14159 * c["radius"] * c["radius"]
+val area = (r: Rect): Float64 => r["width"] * r["height"]
+
+area(myCircle)   // selects the Circle overload
+area(myRect)     // selects the Rect overload
+```
+
+**Dispatch is over all arguments**, not just the first — the selected overload is a function of the whole tuple of argument types:
+
+```lin
+val combine = (a: Int32, b: Int32): String => "ints:${toString(a + b)}"
+val combine = (a: Int32, b: String): String => "mix:${toString(a)}${b}"
+
+combine(1, 2)     // (Int32, Int32)  overload
+combine(7, "x")   // (Int32, String) overload
+```
+
+### Resolution rules
+
+For a call `f(a₁ … aₙ)` where `f` is an overload set:
+
+1. A candidate is **applicable** if its arity matches (after default parameters are filled) and every argument's type is assignable to the corresponding parameter's type.
+2. The **most specific** applicable candidate wins: a concrete type beats a generic `<T>` parameter that matched only by instantiating a type variable.
+
+   ```lin
+   val describe = <T>(x: T): String => "any"
+   val describe = (n: Int32): String => "int"
+
+   describe(42)     // "int" — concrete beats generic <T>
+   describe("hi")   // "any" — only the generic applies
+   ```
+
+3. If subtype specificity leaves no unique winner, a **numeric-conversion tie-break** picks the candidate whose arguments convert most cheaply (a same-signedness, smallest-width-gap widening wins). This resolves overloads on numerics that are incomparable by subtyping — an unsigned argument prefers a `UInt64` overload, a signed one an `Int64` overload.
+4. **Zero applicable candidates** → a compile error, `no matching overload`.
+5. **Two or more tied candidates** → a compile error, `ambiguous call`.
+
+### Static, whole-union dispatch
+
+Resolution is **static**: the overload is chosen at compile time from the static argument types and baked into a fixed call target — there is no runtime dispatch.
+
+Because of that, an argument is matched by its static type **as a whole**. A union argument is applicable to a parameter only if the *entire* union is assignable to it; a union that would select different overloads for different members matches none and is rejected (the compiler never silently inserts a runtime branch):
+
+```lin
+val show = (n: Int32): String => "int"
+val show = (s: String): String => "str"
+
+val x: Int32 | String = 5
+show(x)   // compile error: no matching overload for `show(Int32 | String)`
+```
+
+### Other rules
+
+- Only **functions** overload. A name cannot be both a non-function `val` and an overload set.
+- Two overloads with **identical parameter-type signatures** are a duplicate-definition error — the return type is never consulted during dispatch, so it cannot disambiguate.
+- Overloading is **scope-local**: an inner binding of the same name shadows the whole set.
+- It works **across modules** — an imported name can be an overload set, and call-site resolution applies exactly as for a locally-defined one.
+
 ## Recursion
 
 A `val` whose right-hand side is a function literal may reference itself:
