@@ -1296,20 +1296,37 @@ fn check_scc(
     // (1a) Phase 1, sweep A: extract every member's exported TYPE aliases. Functions/values flow
     // through `provisional` (import_types) below; exported `type T = ...` aliases must flow
     // separately into `import_type_decls`, or a cross-cycle `import { T } from "./peer"` used in
-    // type position resolves to "Unknown type 'T'" (ADR-083). A self-contained alias resolves fully
-    // here regardless of peer value sigs; one that references a peer's alias keeps a `Named(...)`
-    // cycle point and is rounded out in Phase 2. (Cross-cycle type imports of THIS member fall back
-    // to a permissive placeholder during this sweep — see `register_imported_types` — so the check
-    // succeeds even though peer aliases are not seeded yet.)
+    // type position resolves to "Unknown type 'T'" (ADR-083).
+    //
+    // This is a FIXPOINT, and it harvests type aliases WITHOUT requiring the member's value/function
+    // BODIES to type-check (`collect_exported_type_decls`). The body-tolerance matters: a member
+    // whose parameter is annotated with a PEER alias used as a MAP (e.g. `(src: ST)` where
+    // `type ST = { String: UInt32 }` lives in the peer) cannot type-check its body until that alias
+    // is seeded — `ST` would resolve to a placeholder TypeVar, so `src[k] ?? d` reports "left operand
+    // is never null". A full `check_module` would surface that body error and abort the SCC before
+    // the (perfectly resolvable) alias was ever harvested. The fixpoint also lets an alias that
+    // references a PEER's alias resolve: each pass seeds the previous pass's harvest back in, so a
+    // dependency chain of length k settles within `members.len()` passes.
     let mut provisional_types: HashMap<(String, String), (Vec<String>, Type)> = HashMap::new();
-    for m in &members {
-        let (typed, _w) = check_module_with_imports(&m.ast, cache, m.is_stdlib)
-            .map_err(|diags| CompileError::TypeCheck(tag_diagnostics(diags, m.abs_path.as_deref())))?;
-        let sig = ModuleSignature::from_module(&typed);
-        for (name, decl) in sig.type_exports {
-            for p in &m.paths {
-                provisional_types.insert((p.clone(), name.clone()), decl.clone());
+    for _pass in 0..members.len().max(1) {
+        let before = provisional_types.clone();
+        for m in &members {
+            let mut checker = Checker::new();
+            checker.import_type_decls = provisional_types.clone();
+            checker.stdlib_export_index = build_stdlib_export_index();
+            checker.allow_intrinsics =
+                m.is_stdlib || std::env::var_os("LIN_ALLOW_INTRINSICS").is_some();
+            for (name, decl) in checker.collect_exported_type_decls(&m.ast) {
+                for p in &m.paths {
+                    provisional_types.insert((p.clone(), name.clone()), decl.clone());
+                }
             }
+        }
+        // Settle once a pass neither adds a binding nor refines an existing one (an alias that
+        // referenced a peer's still-placeholder alias resolves to a more-concrete body on the next
+        // pass — that is a content change with no key change, so compare the whole map).
+        if provisional_types == before {
+            break;
         }
     }
 
