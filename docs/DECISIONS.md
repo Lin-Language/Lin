@@ -3061,3 +3061,29 @@ The 1-arg form takes a zero-argument closure and loops until it returns `false`.
 **Monomorphizer overload-body fix**: when two overloads share the same source name (`"while"`), the monomorphizer's `find_exported_fn` call previously returned the first same-named export — giving the 1-arg import slot the 2-arg body (a thin `lin_while` intrinsic wrapper). The monomorphizer then re-homed the 1-arg slot to `lin_while` and triggered the panic. The fix: pass the import binding's `symbol` field (the exact mangled LLVM name, `Some("while$..._<slot>")` for overload members) to `find_exported_fn`, which now pins the lookup to the body whose `TypedExpr::Function.name` matches, preventing cross-overload body confusion. A parallel fix applies to the rehome-import-of-import path in `classify_origin_slot`.
 
 **Consequences**: `while(() => cond)` is the idiomatic imperative loop. The existing `xs.while(pred)` (2-arg) form is byte-for-byte unchanged. A single `import { while } from "std/iter"` gives both forms.
+
+## ADR-086: `keys`/`values`/`entries` accept any-keyed map; runtime stringifies integer keys
+
+**Status**: Accepted.
+
+**Context**: A Lin index-signature map `{ K: V }` may carry a non-`String` key type — `{ UInt8: V }`, `{ DateNumber: V }`, an integer-typed map, etc. — but at RUNTIME every map key is stored as a string (an Int-keyed map stores its keys in `LinMap`'s Int slots and stringifies on display). `std/object`'s `keys`/`values`/`entries` were typed `(obj: { String: AnyVal } | {})`, which rejected any map whose static key type was not `String`: `m.keys()` on a `{ UInt8: V }` failed with `Argument 1 has type M, expected { String: AnyVal } | {}`. The type system cannot express a generic key type — a TypeVar key is rejected at index-signature resolution (the key must resolve to `String`, an integer type, or a string/int-literal union), so a `<K, V>(m: { K: V })` signature is not available.
+
+**Decision**: Two coordinated changes.
+
+1. **Checker (compat.rs)** — the "any-map" sink `{ String: AnyVal }` (target key `String`, target value the `AnyVal` wildcard `TypeVar(MAX)`) now accepts a map with ANY key type, not just a `String`-keyed one. A new Map↔Map compat arm, gated TIGHT to the AnyVal-valued sink and sitting ahead of the strict `k1 == k2` covariance arm, drops the key-equality requirement when the target is exactly `{ String: AnyVal }`. This is sound because all map keys are strings at runtime, and `{ String: AnyVal }` is only ever read back through the tag-aware `lin_*_any` bridges (the basis of `keys`/`values`/`entries`), so the widening is read-only and representation-safe. The relaxation is deliberately scoped to the AnyVal sink so it does NOT open arbitrary `{ Int: V } -> { String: V }` cross-key assignment (which could mask a genuine key-type mismatch in user code). A non-map argument (`keys(5)`, `keys("s")`, `keys([…])`) never reaches the Map↔Map arm and still rejects.
+
+2. **Runtime (map.rs)** — `lin_keys_any`/`lin_entries_any` (the boxed-value bridges, statically typed `String[]`) now STRINGIFY integer keys. `lin_map_keys`/`lin_map_entries` emit the raw `TAG_INT64` key for an Int-keyed map, which is correct for the INTERNAL `merge`/`pick`/`omit` re-index callers (they re-index with that key), but a `String[]` consumer would dereference the raw integer as a `LinString*` and fault at a misaligned address. The bridges therefore rewrite each `TAG_INT64` key element in place to a `TAG_STR` LinString of its decimal text (no-op for already-`String` keys). The internal `lin_map_keys` callers in `map.rs` are unaffected — they call `lin_map_keys` directly, not the `*_any` bridges.
+
+**Consequences**: `m.keys()`/`m.values()`/`m.entries()` work on a map with any key type and return the keys as `String[]` (the stringified keys, e.g. the int key `3` reads back as `"3"`). `keys` over a `{ String: V }` map is byte-for-byte unchanged; non-map arguments still error. `merge`/`pick`/`omit` (typed `{ String: T }`) are unaffected.
+
+## ADR-087: Chained nested-map index resolves the inner value type, not a fresh TypeVar
+
+**Status**: Accepted.
+
+**Context**: Indexing a nested map `idx: { String: { K: V } }` with `idx[a]` yields `{ K: V } | Null` (a nullable map, per the §6.1 safe-bracket rule). Chaining a second index, `idx[a][b]`, was producing `?T | Null` — an UNRESOLVED inference variable — instead of `V | Null`. Binding the intermediate first (`val inner = idx[a] ?? {}; inner[b]`) resolved `V | Null` correctly; only the chained form dropped the value type. The unresolved `?T` defeated downstream narrowing: `if c is Transfer then c["origin"]` failed because `c` was `?T | Null`, not the union the `is` test needs.
+
+**Root cause**: in `infer_index`, the receiver of the outer index has type `{ K: V } | Null` — a `Type::Union`. The single-non-null-variant branch matched `Object`/`Array`/`FixedArray` to extract the element type but had NO `Map` arm, so a single-variant nullable map fell through to `_ => fresh_type_var()`. The directly-indexed Map case (a non-nullable `{ K: V }` receiver) extracts `V` correctly; the nullable-Map-via-union case did not.
+
+**Decision**: add a `Type::Map { value, .. } => (*value).clone()` arm to the single-variant-union match in `infer_index`. The `Null` is re-added by the existing `flatten_union(vec![inner, Null])` wrap below, so the chained read resolves to `V | Null`, IDENTICAL to the bound-intermediate path. The change is conservative: single-index, array-index, string-index, `obj.field`, multi-variant-union index, and Null-propagation through index chains are all untouched (only the previously-`fresh_type_var()` single-variant-Map case changes).
+
+**Consequences**: `idx[a][b]` over a nested map names the inner value type, so chained reads narrow and read fields correctly (the motivating RAPTOR connection-index shape). Verified by build+run that a chained read narrowed to a union variant reads its field back.

@@ -23,9 +23,12 @@ import { for, some } from "std/iter"
 
 // `keys`/`values`/`entries` are tag-aware at runtime, so one function serves both a record
 // (`{}`/`{ String: T }`, insertion order) and an index-signature map (hash order). The parameter is
-// the union `{ String: AnyVal } | {}` — accepting a record literal, a typed map, or a `AnyVal` value
-// (any of which may carry an object), while REJECTING a non-object argument (`keys(1)`, `keys("s")`,
-// `keys([…])` are compile errors). A `AnyVal` holding a non-object yields an empty result at runtime.
+// the "any-map" sink `{ String: AnyVal } | {}`, which accepts a record literal, a typed map of ANY
+// key type (`{ String: T }`, `{ UInt8: T }`, `{ DateNumber: T }`, …), or a `AnyVal` value — while
+// REJECTING a non-object argument (`keys(1)`, `keys("s")`, `keys([…])` are compile errors). A map's
+// keys are always strings at runtime, so `keys` returns a `String[]` even for a non-`String`-keyed
+// map (an integer key is returned stringified, e.g. `3` → `"3"`). See ADR-086. A `AnyVal` holding a
+// non-object yields an empty result at runtime.
 //
 // Return the keys of an object or map.
 // @param obj  a record, an index-signature map, or a `AnyVal` object.
