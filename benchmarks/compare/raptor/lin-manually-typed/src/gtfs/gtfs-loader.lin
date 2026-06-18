@@ -5,11 +5,16 @@ import { createTimeParser } from "./time-parser"
 import { gunzip } from "std/compress"
 import { entries, header, body } from "std/archive"
 import { readStream, drain } from "std/stream"
-import { for, push } from "std/iter"
+import { for, push, map } from "std/iter"
 import { parseFloat32, parseUInt32, parseUInt16 } from "std/number"
 import { push } from "std/array"
 import { values } from "std/object"
 import { recordRows } from "std/csv"
+
+// Fallback for a trip whose service_id is absent from calendar.txt (never happens in a
+// consistent feed): an empty-days, zero-range service that never runs.
+// TODO maybe the service should be nullable then we wouldn't need IncompleteTrip
+val emptyService: Service = { "startDate": 0, "endDate": 0, "days": { 0: false, 1: false, 2: false, 3: false, 4: false, 5: false, 6: false }, "dates": {  } }
 
 // 
 // Returns trips, transfers, interchange time and calendars from a GTFS zip.
@@ -82,8 +87,8 @@ export val loadGtfs = (path: String) =>
     trips.push({ "serviceId": row["service_id"], "tripId": row["trip_id"], "stopTimes": [] }) 
 
   val addStopTimes = (row: AnyVal) => 
-    stopTimes[row.trip_id] = stopTimes[row.trip_id] ?? []
-    stopTimes[row.trip_id].push({
+    stopTimes[row["trip_id"]] = stopTimes[row["trip_id"]] ?? []
+    stopTimes[row["trip_id"]].push({
       "stop": row["stop_id"],
       "departureTime": row["departure_time"].parseTime(),
       "arrivalTime": row["arrival_time"].parseTime(),
@@ -123,15 +128,15 @@ export val loadGtfs = (path: String) =>
         "startDate": c["startDate"],
         "endDate": c["endDate"],
         "days": c["days"],
-        "dates": dates[c["serviceId"]]
+        "dates": dates[c["serviceId"]] ?? {}
       }
     )
 
     trips.map(t =>
       { 
         ...t, 
-        "service": services[t["serviceId"]],
-        "stopTimes": stopTimes[t["tripId"]]
+        "service": services[t["serviceId"]] ?? emptyService,
+        "stopTimes": stopTimes[t["tripId"]] ?? []
       }
     )
   
