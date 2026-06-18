@@ -246,10 +246,19 @@ pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
                     crate::tagged::TAG_ARRAY => {
                         lin_array_release(payload as *mut LinArray);
                     }
+                    crate::tagged::TAG_MAP => {
+                        crate::map::lin_map_release(payload as *mut crate::map::LinMap);
+                    }
+                    crate::tagged::TAG_RECORD => {
+                        crate::sealed::lin_sealed_release_self(payload as *mut u8);
+                    }
+                    crate::tagged::TAG_SUMNODE => {
+                        crate::sumnode::lin_sumnode_release_self(payload as *mut u8);
+                    }
                     crate::tagged::TAG_FUNCTION => {
                         crate::memory::lin_closure_release(payload as *mut u8);
                     }
-                    _ => {} // scalars: no heap payload
+                    _ => {} // scalars and other non-heap tags: no payload to release
                 }
             }
         } else if (*arr).elem_tag == SEALED_ARRAY_TAG {
@@ -578,6 +587,15 @@ pub unsafe extern "C" fn lin_sealed_any_to_tagged(arr: *const LinArray) -> *mut 
             }
             (*out).len = len;
             out
+        }
+        0xFF => {
+            // Already a tagged array (e.g. the result of a filter/map/slice on a sealed array that
+            // returned a 0xFF array). Retain and return it as-is — the caller expects a +1 owned
+            // tagged LinArray* and the slots are already valid TaggedVal elements.
+            if (*arr).refcount < crate::string::IMMORTAL_RC {
+                (*(arr as *mut LinArray)).refcount += 1;
+            }
+            arr as *mut LinArray
         }
         _ => {
             // 0xFD pointer-backed (or unknown): delegate to existing function.

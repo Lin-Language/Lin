@@ -22842,6 +22842,38 @@ print(outer())
     assert_eq!(output, vec!["1,2,3,1"]);
 }
 
+// Regression: `sealed_array_materialize_elem` had a two-way dispatch (0xFE vs else) that
+// routed 0xFF dynamic arrays down the 0xFD pointer-backed path. A 0xFF slot is 16-byte
+// LinArrayElem{tag, payload}; reading it as an 8-byte pointer produced address 0x14
+// (TAG_MAP=20) → lin_rc_retain(0x14) → SIGSEGV. Fix: three-way dispatch adds a 0xFF
+// branch that calls lin_array_get_tagged + sealed_project_from + lin_tagged_free_box.
+// Also: lin_sealed_any_to_tagged had the same two-way dispatch; calling it on a 0xFF
+// input (e.g. after filter round-trips a sealed-record array through a tagged store)
+// crashed identically. Fix: add a 0xFF passthrough arm that retains and returns as-is.
+// Kept UN-batched: RC/repr regression tests.
+#[test]
+fn test_sealed_array_0xff_materialize_elem_roundtrip() {
+    // Build a sealed-record array, box it (which triggers sealed_any_to_tagged → 0xFF),
+    // then iterate it with for — exercises sealed_array_materialize_elem 0xFF branch.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for, filter } from "std/iter"
+import { push, length } from "std/array"
+type Pt = { "x": Int32, "y": Int32 }
+val mkPt = (i: Int32): Pt => { "x": i, "y": i * 10 }
+val run = (): Null =>
+  val pts: Pt[] = [mkPt(1), mkPt(2), mkPt(3)]
+  var sum = 0
+  pts.for(p => sum = sum + p["x"])
+  print(toString(sum))
+  val big: Pt[] = pts.filter(p => p["y"] >= 20)
+  print(toString(length(big)))
+  print(toString(big[0]["y"]))
+run()
+"#);
+    assert_eq!(out, vec!["6", "2", "20"]);
+}
+
 // Regression: packing a nested SEALED-RECORD field from a BOXED element faulted with
 // "not supported" when a `map`-built array of records (each holding a nested sealed
 // record) was stored into a `{ String: Outer[] }` map and fetched back through the
