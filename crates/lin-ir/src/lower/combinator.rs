@@ -26,7 +26,7 @@ pub(crate) fn is_inline_scalar(ty: &Type) -> bool {
 ///
 /// PROVABLY FLAT = the result of a flat-producing builtin/combinator (their lowering allocates a
 /// flat buffer for a flat-scalar element), recognised by an `Iterator<scalar>` static result —
-/// `range`/`rangeStep`/`iterOf` return `Iterator<…>`, and `map`/`filter` return arrays only via
+/// `range` (3-arg)/`iterOf` return `Iterator<…>`, and `map`/`filter` return arrays only via
 /// these intrinsics whose declared result is `Array<scalar>` from a flat producer chain — or a
 /// non-empty scalar array literal (`[1,2,3]`). A `[]`+push builder returns a plain `Array`, never an
 /// `Iterator`, and a bare param/projection is also not trusted.
@@ -76,7 +76,7 @@ pub(crate) fn is_provably_flat_producer(expr: &TypedExpr, builder: &FuncBuilder,
     match expr {
         // A non-empty scalar array literal lowers to a flat MakeArray.
         TypedExpr::MakeArray { elements, .. } => !elements.is_empty(),
-        // A call to a flat-producing builtin/combinator: range/rangeStep/iterOf (Iterator builtins),
+        // A call to a flat-producing builtin/combinator: range/iterOf (Iterator builtins),
         // map/filter (their lowering allocates a flat output for a flat-scalar element), and the
         // flat array allocators. Recognised by the callee slot resolving to one of those intrinsics
         // OR a stdlib export of that name (the importer's `import_fn_slots`).
