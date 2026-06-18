@@ -22160,3 +22160,76 @@ print("${f()}")
         output
     );
 }
+
+// ── Regression guards for the three bugs std/csv used to work around (now FIXED) ──────────────────
+// These three patterns were the documented justification for std/csv keeping `AnyVal` types,
+// hand-rolled recursion, and single-shape returns. The underlying compiler bugs have since been
+// fixed; these tests lock the fixed behaviour so the csv workaround removals can't silently regress.
+
+/// Bug A: indexing a typed nested array (`String[][]`) and passing the element into a function's
+/// typed `String[]` parameter used to crash in native codegen. Must now run correctly.
+#[test]
+fn test_typed_reindex_into_typed_param_regression() {
+    let output = run(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+val take = (row: String[]): String => row[0]
+val consume = (out: String[], parsed: String[][], i: Int32, n: Int32): Null =>
+  if i >= n then null
+  else
+    push(out, take(parsed[i]))
+    consume(out, parsed, i + 1, n)
+val parsed: String[][] = [["a", "b"], ["c", "d"], ["e", "f"]]
+val out: String[] = []
+consume(out, parsed, 0, 3)
+print(toString(out))
+"#);
+    assert_eq!(output, vec![r#"["a", "c", "e"]"#]);
+}
+
+/// Bug B: a `.for` loop capturing an outer array while calling a function that runs its OWN `.for`
+/// used to lose pushes to the captured array. All pushes must now be retained.
+#[test]
+fn test_captured_array_nested_for_regression() {
+    let output = run(r#"import { print } from "std/io"
+import { for, range } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+val fill = (dst: String[]): Null =>
+  range(0, 2).for(j => push(dst, "f"))
+val rows: String[] = []
+range(0, 4).for(i =>
+  val tmp: String[] = []
+  fill(tmp)
+  push(rows, "row-${length(tmp)}")
+)
+print(toString(length(rows)))
+print(rows[3])
+"#);
+    assert_eq!(output, vec!["4", "row-2"]);
+}
+
+/// Bug C: a tail-recursive function returning an owned array PARAM on one branch and an OBJECT on
+/// another used to corrupt its output. Both branches must now return correct values.
+#[test]
+fn test_tco_mixed_array_object_return_regression() {
+    let output = run(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+val f = (acc: String[], n: Int32, bare: Boolean): AnyVal =>
+  if bare then acc
+  else if n <= 0 then { "rows": acc, "ok": true }
+  else
+    push(acc, "r${n}")
+    f(acc, n - 1, bare)
+val a: String[] = []
+val obj = f(a, 3, false)
+val rows: String[] = obj["rows"]
+val b: String[] = ["x", "y"]
+val barr: String[] = f(b, 0, true)
+print(toString(length(rows)))
+print(rows[0])
+print(toString(length(barr)))
+"#);
+    assert_eq!(output, vec!["3", "r3", "2"]);
+}
