@@ -142,6 +142,15 @@ pub struct Checker {
     /// keyed by name. Populated during `forward_declare_types` so error messages can show
     /// the source-level shape of a Named type even before `check_stmt` has resolved it.
     pub(crate) raw_type_decls: std::collections::HashMap<String, lin_parse::ast::TypeExpr>,
+    /// Expected RESULT type for the IMMEDIATELY-NEXT generic call/dot-call inference (ADR-085).
+    /// Set by `check_expr` just before it falls through to `infer_expr` for a `Call`/`DotCall`
+    /// whose context supplies an expected type; CONSUMED (taken) at the top of `infer_call`/
+    /// `infer_dot_call` so it never leaks into nested argument inference. Drives expected-result-
+    /// type-directed generic inference: the call unifies this against the function's declared
+    /// return to pre-seed its type-parameter substitutions (and, for a dot-call, derives an
+    /// expected type for the receiver call, propagating through method chains). When `None` (or it
+    /// fails to determine a param), inference falls back to today's bottom-up, argument-driven path.
+    expected_call_result: Option<Type>,
 }
 
 impl Default for Checker {
@@ -186,6 +195,7 @@ impl Checker {
             next_lambda_id: 1,
             index_narrowings: Vec::new(),
             raw_type_decls: std::collections::HashMap::new(),
+            expected_call_result: None,
         }
     }
 

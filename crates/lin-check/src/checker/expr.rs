@@ -386,7 +386,26 @@ impl Checker {
             });
         }
 
-        let inferred = self.infer_expr(expr)?;
+        // Expected-result-type-driven generic inference (ADR-085). For a generic CALL / DOT-CALL
+        // whose context supplies an expected type, stash that type so `infer_call`/`infer_dot_call`
+        // can unify it against the function's declared return to PRE-SEED its type-parameter
+        // substitutions BEFORE the arguments are checked (so a lambda argument receives a concrete
+        // expected type, and a dot-call receiver an expected type derived through the chain). The
+        // call consumes (takes) the field immediately, so it never leaks into nested argument
+        // inference; the compatibility check at the tail of this function still validates the
+        // result against `expected`, so this is purely an inference HINT (sound either way). We only
+        // set it for an expected type that could actually constrain a type parameter — a structured
+        // (non-`TypeVar`) type — and restore the previous value afterwards (calls nest).
+        let set_expected_call_result = matches!(expr, Expr::Call { .. } | Expr::DotCall { .. })
+            && !matches!(expected, Type::TypeVar(_));
+        let inferred = if set_expected_call_result {
+            let saved = self.expected_call_result.replace(expected.clone());
+            let r = self.infer_expr(expr);
+            self.expected_call_result = saved;
+            r?
+        } else {
+            self.infer_expr(expr)?
+        };
         let actual_ty = inferred.ty();
 
         // Refine a fresh `arrayAllocate(n)` against an `Array(_)` expectation (Phase 4.5). The
