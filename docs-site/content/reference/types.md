@@ -85,6 +85,22 @@ type Result<T, E> =
 
 Union types use `|`. The type `T | Null` is the common pattern for optional values.
 
+## Intersection types
+
+The record-only intersection operator `&` combines two record types into a single record type holding **all** the fields of both. It lets you extend a named record with extra fields without re-typing the base (ADR-061; `docs/SPECIFICATION.md` "Record intersection (`&`)"):
+
+```lin
+type Person = { "name": String, "age": Int32 }
+type Employee = Person & { "salary": Int32 }
+
+val e: Employee = { "name": "Alice", "age": 30, "salary": 50000 }
+```
+
+- `A & B` resolves to an ordinary `Type::Object` whose fields are the union of both operands' fields — there is no new runtime representation, so sealed records and width-subtyping apply to the result unchanged. When `A & B` is the body of a named `type`, the result is sealed like any named record.
+- Both operands must be record types; intersecting a non-record (a scalar, an array, or a union) is a compile-time error.
+- A field present in **both** operands must have a *compatible* type; the same key with conflicting types is a compile-time error (`intersection type has conflicting field …`).
+- `&` binds **tighter than `|`**, so `A & B | C` parses as `(A & B) | C`, and `A & B & C` merges all three (left-associative).
+
 ## Object types
 
 ```lin
@@ -174,6 +190,8 @@ type Mapper<T, U> = (T) => U
 
 ## Generic types
 
+See [Generics](/reference/generics.html) for the full treatment.
+
 Generic type declarations and applications both use angle brackets:
 
 ```lin
@@ -260,4 +278,35 @@ greet({ "name": "Alice", "age": 30 })
 
 ## Numeric widening
 
-Numeric types widen automatically in arithmetic and comparison. The widened type is the smallest type that can fully represent both operands. Explicit narrowing uses stdlib functions (`toInt32`, `toFloat64`, etc.) and may fail at runtime if the value cannot be represented.
+Numeric types widen automatically in arithmetic. The result type is the smallest type that can fully represent **every value of both operands** (ADR-072). When operands differ in width *or* signedness, the result widens past both — because neither operand's type can represent the full range of the other:
+
+```lin
+val a: Int32 = 100
+val b: UInt8 = 50
+val sum: Int64 = a + b     // Int32 + UInt8 → Int64 (not Int32)
+```
+
+`Int32 + UInt32` widens to `Int64` for the same reason, even though both operands are 32-bit. (Comparison, bitwise, and shift operators keep the operand width; only arithmetic folds the result width in.)
+
+## Explicit numeric narrowing
+
+There is **no implicit narrowing** — a wider value never silently flows into a narrower type. To store a wide computed value into a narrow field, convert it explicitly with the `to*` conversion family from `std/number`. Each integer-narrowing cast is **overloaded** by argument type (ADR-073, folded into `to*` as overloads by ADR-075):
+
+- a `UInt64` overload — for an already-*unsigned* (or bit-masked) source;
+- an `Int64` overload — for a *signed/computed* `Int64` source. (`Int64 → UInt64` is not an implicit coercion, since it could wrap a negative, so a computed `Int64` resolves to this overload.)
+
+Both truncate to the named width with two's-complement semantics; the overload merely records whether the source was signed or unsigned. Truncation never fails — an out-of-range value keeps its low bits.
+
+```lin
+import { toUInt8, toUInt16, toInt32 } from "std/number"
+
+val a: Int32 = 100
+val b: UInt8 = 50
+val wide: Int64 = a + b           // a computed Int64
+
+val month: UInt8 = toUInt8(wide)  // Int64 → UInt8  (low 8 bits)
+val word: UInt16 = toUInt16(wide) // Int64 → UInt16
+val small: Int32 = toInt32(wide)  // Int64 → Int32  (low 32 bits)
+```
+
+The family is `toInt8`/`toUInt8`/`toInt16`/`toUInt16`/`toUInt32`/`toInt64`/`toUInt64`, plus `toInt32` (which has both a `Float64` overload and an `Int64` overload) and `toFloat64`/`toFloat32`. Reach for these only where a value genuinely crosses into a narrower type — hot numeric record fields are typically kept `Int64` to avoid silent overflow on read-back.

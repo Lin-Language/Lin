@@ -264,6 +264,25 @@ pub(crate) fn is_heap_ty(ty: &Type) -> bool {
     )
 }
 
+/// Whether `lower_coerce_arg` PROJECTS a fresh UNSEALED object arg into a packed NullableRecord
+/// struct (the `go(n-1, {"x": n})` self-tail-call accumulator case). Fires ONLY for the UNRESOLVED
+/// Named param form (`Union([Named("T"), Null])`), where codegen's `nr_proj` cannot resolve the
+/// sealed fields and would otherwise box the object as TAG_MAP into a NullableRecord slot — the
+/// ADR-082 follow-up UAF. The result is a fully-owned packed struct (`register_owned`), NOT a
+/// borrowed-inner box shell, so `arg_box_is_caller_owned_shell` must EXCLUDE it (kept in lockstep
+/// with the projection guard in `lower_coerce_arg`).
+pub(crate) fn arg_projects_unsealed_into_nullable_record(arg_ty: &Type, param_ty: &Type) -> bool {
+    if !is_nullable_record_param(param_ty) || crate::repr::nullable_sealed_record(param_ty).is_some() {
+        return false;
+    }
+    match arg_ty {
+        Type::Object { fields, sealed: false, .. } => {
+            !fields.is_empty() && fields.values().all(|f| f.is_sealed_field())
+        }
+        _ => false,
+    }
+}
+
 /// Whether passing an argument of `arg_ty` to a parameter of `param_ty` causes
 /// `lower_coerce_arg` to box a CONCRETE HEAP value into a fresh, caller-owned `TaggedVal*`
 /// shell. The shell's inner heap pointer is owned separately (released by the arg's own
@@ -283,7 +302,11 @@ pub(crate) fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Typ
             // A sum-projected arg is fully owned + released by the owning model (a fresh `*SumNode`),
             // NOT a borrowed-inner box shell — freeing its "shell" would mismatched-size dealloc the
             // SumNode and the owning release would then double-free it.
-            && !sum_arg_projected(arg_ty, p),
+            && !sum_arg_projected(arg_ty, p)
+            // A fresh unsealed object PROJECTED into a NullableRecord param is a fully-owned packed
+            // struct (the owning model releases it), NOT a borrowed-inner box shell — retaining it as
+            // a shell on a tail call would leak one struct per iteration (ADR-082 follow-up).
+            && !arg_projects_unsealed_into_nullable_record(arg_ty, p),
         None => false,
     }
 }
@@ -463,6 +486,44 @@ pub(crate) fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>
             || is_nullable_record_param(arg_ty);
         if arg_is_nullable_record_eligible || arg_is_null || arg_is_nullable {
             return arg;
+        }
+        // FRESH UNSEALED OBJECT into a NullableRecord param (the self-tail-call `go(n-1, {"x": n})`
+        // accumulator case). The checker types an object literal flowing into a `T | Null` param as
+        // an UNSEALED `Object { sealed: false }` (no `is_sealed_field` gate above fires).
+        //
+        // When the param is the RESOLVED nullable union (`Union([Object{sealed:true,name:T}, Null])`
+        // — e.g. a NESTED closure `scan` whose env-captured signature carries the expanded record),
+        // the generic `is_union_ty` boundary Coerce below already lowers correctly: codegen's reverse
+        // `nr_proj` path resolves `sealed_fields(inner)` and projects the unsealed object into a fresh
+        // packed struct matching the NullableRecord slot. Leave that case alone.
+        //
+        // The BUG is the UNRESOLVED Named form (`Union([Named("T"), Null])` — a TOP-LEVEL directly-
+        // called `go` whose param type still names the alias). There `nr_proj` calls
+        // `sealed_fields(Named("T"))` → None → falls through to `lin_box_map`, storing a BOXED
+        // TaggedVal into a slot whose repr is NullableRecord (a raw packed-struct pointer). The slot's
+        // RC release (`emit_tco_release_old` / `_final`) then calls `lin_sealed_release` on that boxed
+        // map → reads the TaggedVal's tag byte as a refcount header, corrupting/freeing the box: a
+        // use-after-free (garbage at shallow depth, segfault deep — ADR-082 follow-up).
+        //
+        // Fix: ONLY for the unresolved-Named form, emit the boundary Coerce to a RESOLVED nullable
+        // union built from the arg's own sealable fields (`T = {x: Int32}` and the arg IS `{x: Int32}`,
+        // so the sealed layout is identical). Codegen then takes the SAME reverse `nr_proj` path the
+        // nested case uses, producing the packed struct the slot's NullableRecord release expects.
+        // Register owned so the call-arg scope (or the TCO back-edge release-old) reclaims its +1.
+        if arg_projects_unsealed_into_nullable_record(arg_ty, param_ty) {
+            if let Type::Object { fields, .. } = arg_ty {
+                let inner = Type::Object { fields: fields.clone(), sealed: true, name: None };
+                let resolved = Type::Union(vec![inner, Type::Null]);
+                let dst = builder.alloc_temp(resolved.clone());
+                builder.emit(Instruction::Coerce {
+                    dst,
+                    src: arg,
+                    from_ty: arg_ty.clone(),
+                    to_ty: resolved.clone(),
+                });
+                builder.register_owned(dst, resolved);
+                return dst;
+            }
         }
     }
     // Box/unbox across the union boundary.
