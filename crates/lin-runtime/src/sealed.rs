@@ -582,7 +582,7 @@ unsafe fn pack_named_payload_impl(
 ) {
     use crate::tagged::{
         TAG_NULL, TAG_INT32, TAG_INT64, TAG_UINT64, TAG_FLOAT32, TAG_FLOAT64, TAG_BOOL,
-        TAG_STR, TAG_ARRAY, TAG_MAP,
+        TAG_STR, TAG_ARRAY, TAG_MAP, TAG_RECORD,
     };
     if named_desc.is_null() {
         crate::fault::runtime_fault(
@@ -592,7 +592,7 @@ unsafe fn pack_named_payload_impl(
     let field_count = u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)]) as usize;
     let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
-        let (offset, nkind, _nested, name, next) = read_named_field(named_desc, cur);
+        let (offset, nkind, nested, name, next) = read_named_field(named_desc, cur);
         cur = next;
         let dst = slot.add(offset as usize - SEALED_HEADER);
         // Intern the field-name string once per type (same rationale as materialize_named_payload_to_map).
@@ -712,9 +712,22 @@ unsafe fn pack_named_payload_impl(
                 *(dst as *mut *mut u8) = p;
             }
             NKIND_SEALED => {
-                crate::fault::runtime_fault(
-                    "Runtime error: internal — packing a nested sealed-record field from a boxed element is not supported (widen pack_named_payload_from_object with the packing gate)",
-                );
+                // Nested sealed record: the source field is either a TAG_MAP (materialized
+                // via the boxed round-trip) or a TAG_RECORD (a direct sealed-struct pointer).
+                // Either way we produce a fresh +1-owned sealed struct and store its pointer.
+                let nested_ptr: *mut u8 = if tag == TAG_MAP {
+                    let src_map = payload as *const crate::map::LinMap;
+                    let heap_desc = build_heap_desc_from_named_desc(nested);
+                    alloc_sealed_struct_from_map(src_map, nested, heap_desc)
+                } else if tag == TAG_RECORD {
+                    // Source is already a sealed struct; retain it so the slot owns a +1.
+                    let p = payload as *mut u8;
+                    crate::memory::lin_rc_retain(p as *mut u32);
+                    p
+                } else {
+                    std::ptr::null_mut()
+                };
+                *(dst as *mut *mut u8) = nested_ptr;
             }
             NKIND_SUMNODE => {
                 crate::fault::runtime_fault(

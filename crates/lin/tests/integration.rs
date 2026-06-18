@@ -22841,3 +22841,39 @@ print(outer())
 "#);
     assert_eq!(output, vec!["1,2,3,1"]);
 }
+
+// Regression: packing a nested SEALED-RECORD field from a BOXED element faulted with
+// "not supported" when a `map`-built array of records (each holding a nested sealed
+// record) was stored into a `{ String: Outer[] }` map and fetched back through the
+// generic seam (which strips the `sealed` bit, routing writes through the TAGGED sink).
+// Root fix: `pack_named_payload_impl` now handles `NKIND_SEALED` by allocating a fresh
+// nested sealed struct from TAG_MAP (materialized round-trip) or retaining a TAG_RECORD.
+// Kept UN-batched: heap-layout regression test.
+#[test]
+fn test_nested_sealed_record_field_packed_from_boxed_element() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, range } from "std/iter"
+import { push, length } from "std/array"
+import { get } from "std/object"
+type Inner = { "x": Int32, "y": Int32 }
+type Outer = { "id": Int32, "inner": Inner }
+val mkOuter = (i: Int32): Outer =>
+  { "id": i, "inner": { "x": i * 10, "y": i * 100 } }
+val run = (): Null =>
+  var byKey: { String: Outer[] } = {}
+  byKey["k"] = []
+  val items: Outer[] = range(0, 3).map(mkOuter)
+  val stored = get(byKey, "k", [])
+  push(stored, items[0])
+  push(stored, items[1])
+  push(stored, items[2])
+  val got = get(byKey, "k", [])
+  print("len=${toString(length(got))}")
+  print(toString(got[0]["inner"]["x"]))
+  print(toString(got[1]["inner"]["y"]))
+  print(toString(got[2]["id"]))
+run()
+"#);
+    assert_eq!(out, vec!["len=3", "0", "100", "2"]);
+}
