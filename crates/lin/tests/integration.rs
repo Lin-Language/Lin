@@ -22704,6 +22704,36 @@ print("${m2["missing"] ?? -1}")
 }
 
 #[test]
+fn test_forward_declared_void_fn_call_result_type() {
+    // Regression: a top-level function with no return annotation whose body is a side-effecting
+    // `.for()`/`.entries()` call (returns Null / void in LLVM) was forward-declared with a fresh
+    // TypeVar as its return type. A call to it from a sibling function that appears TEXTUALLY
+    // EARLIER in the file recorded that TypeVar as the IR Call's ret_ty. The checker never solved
+    // TypeVar -> Null in solved_type_vars, so the zonking pass left it unresolved. Codegen then
+    // saw a Direct call whose LLVM function returns void but ret_ty != Null/Never and panicked
+    // on unwrap_basic(). Fixed by solving the TypeVar when bind_pattern updates the forward-
+    // declared slot with the body's concrete return type.
+    //
+    // The minimal trigger is: caller (scan) before callee (doSideEffect) in source order, no
+    // return annotation on the callee, callee body = side-effecting `.for()` call.
+    let output = run(r#"import { print } from "std/io"
+import { for } from "std/iter"
+
+val scan = (items: Int32[]) =>
+  doSideEffect(items)
+  print("scan done")
+
+val doSideEffect = (items: Int32[]) =>
+  items.for(x =>
+    print("item")
+  )
+
+scan([1, 2])
+"#);
+    assert_eq!(output, vec!["item", "item", "scan done"]);
+}
+
+#[test]
 fn test_computed_key_reduce_builds_map() {
     // xs.reduce({}, (acc, x) => { ...acc, [x]: 1 }) builds a presence map.
     let output = run(r#"import { print } from "std/io"

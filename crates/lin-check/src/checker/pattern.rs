@@ -382,6 +382,27 @@ impl Checker {
                 if let Some(existing) = self.env.lookup(name) {
                     if self.forward_declared.contains(&existing.slot) {
                         let slot = existing.slot;
+                        // When the forward-declared return type was a fresh TypeVar (minted by
+                        // forward_declare_functions_in because no annotation was present), and the
+                        // now-checked body gives a concrete return, solve that TypeVar so the
+                        // zonking pass can replace every call-site result_type that still carries
+                        // it. Without this, a call to a forward-declared void/Null-returning
+                        // function that appears textually BEFORE the function definition emits
+                        // Instruction::Call { ret_ty: TypeVar(N) } into the IR, TypeVar(N) never
+                        // reaches solved_type_vars, zonking leaves it unresolved, and codegen
+                        // treats the call as returning a non-void value — unwrap_basic() panics.
+                        if let (
+                            Type::Function { ret: old_ret, .. },
+                            Type::Function { ret: new_ret, .. },
+                        ) = (&existing.ty, ty)
+                        {
+                            if let Type::TypeVar(id) = old_ret.as_ref() {
+                                let id = *id;
+                                if id < 9000 && !self.protected_type_vars.contains(&id) {
+                                    self.solved_type_vars.entry(id).or_insert_with(|| *new_ret.clone());
+                                }
+                            }
+                        }
                         self.env.update_type(name, ty.clone());
                         self.forward_declared.remove(&slot);
                         return Ok(slot);
