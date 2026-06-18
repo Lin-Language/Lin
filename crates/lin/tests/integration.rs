@@ -4304,6 +4304,40 @@ print(toString(go()))
 }
 
 #[test]
+fn test_cyclic_imports_map_keyed_by_imported_alias_across_cycle() {
+    // Regression: a MAP type whose KEY is a type alias IMPORTED from a module OUTSIDE the import
+    // cycle. `a` <-> `b` form an SCC; `c` (which exports `type Sid = String`) sits outside it.
+    // `a` defines `type M = { Sid: UInt32 }` — a String-keyed map, because `Sid` is an alias of
+    // String. The SCC's type-alias harvest (sweep A in `check_scc`) used to resolve `M`'s body with
+    // only its SCC-peer aliases in scope, so the imported key alias `Sid` fell back to a placeholder
+    // TypeVar; the index-signature arm then could not prove a String key and `M` degraded to a
+    // fixed-shape RECORD with a literal field named "Sid". The peer `b`, indexing `m[k]` dynamically,
+    // was rejected with "`M` is a fixed-shape record and cannot be indexed dynamically". The harvest
+    // now also seeds each SCC member's ACYCLIC imported type aliases, so `Sid` resolves to String and
+    // `M` is correctly a `{ String: UInt32 }` map — `m[k]` is legal and an empty map yields `?? 99`.
+    let dir = std::env::temp_dir().join(format!("lin_cyc_impkey_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("c.lin"), "export type Sid = String\n").unwrap();
+    std::fs::write(dir.join("a.lin"),
+        "import { useM } from \"b\"\n\
+         import { Sid } from \"c\"\n\
+         export type M = { Sid: UInt32 }\n\
+         val seed: M = {}\n\
+         export val go = (): UInt32 => useM(seed, \"x\")\n").unwrap();
+    std::fs::write(dir.join("b.lin"),
+        "import { M } from \"a\"\n\
+         export val useM = (m: M, k: String): UInt32 => m[k] ?? 99\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ go }} from "{d}/a"
+print(toString(go()))
+"#, d = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["99"]);
+}
+
+#[test]
 fn test_cyclic_imports_exported_type_alias_three_module_cycle() {
     // ADR-083, 3-module SCC A -> B -> C -> A: a `type P` defined in A is imported and used in
     // TYPE position by C (two hops away around the cycle). The cross-cycle type import must
