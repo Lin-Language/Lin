@@ -4,6 +4,9 @@ import { Arrivals, ConnectionIndex } from "../raptor/scan-results"
 import { RaptorAlgorithm, StopTimes } from "../raptor/raptor-algorithm"
 import { Date } from "std/datetime"
 import { getDateNumber } from "./date-util"
+import { filter, map, reduce } from "std/iter"
+import { keys } from "std/object"
+import { length, push } from "std/array"
 
 export type GroupStationDepartAfterQuery = {
   "raptor": RaptorAlgorithm,

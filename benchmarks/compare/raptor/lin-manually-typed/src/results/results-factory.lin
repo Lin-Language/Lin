@@ -1,0 +1,12 @@
+import { StopId } from "../gtfs/gtfs"
+import { ConnectionIndex } from "../raptor/scan-results"
+import { Journey } from "./journey"
+
+//
+// Lin has no interfaces, so the TypeScript `ResultsFactory` interface becomes a record type holding
+// the one operation it declares: turn the kConnections index into the journeys to a destination.
+// `JourneyFactory` (and any other results factory) is a value of this type — `{ "getResults": … }`.
+//
+export type ResultsFactory = {
+  "getResults": (ConnectionIndex, StopId) => Journey[]
+}
