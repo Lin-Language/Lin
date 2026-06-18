@@ -215,6 +215,141 @@ fn lower_index_get_or_create(
     Some((result_dst, read_ty))
 }
 
+/// Lower the statements of a block in dependency order.
+///
+/// The type checker's `forward_declare_functions_in` hoists all inner `val f = () => ...`
+/// declarations so sibling functions can reference each other, regardless of source order.
+/// IR lowering is sequential, so if `processZip` (defined first) captures `addLink` (defined
+/// later), `addLink`'s closure value isn't in `builder.slots` when `processZip` is lowered.
+/// The capture loop in `lower_function_expr_with_id` falls back to `alloc_temp`, producing an
+/// uninitialised temp that codegen's `filter_map` silently drops — the env is undersized vs the
+/// capdesc, and the function body reads heap garbage, triggering the RC misalignment crash.
+///
+/// Fix: lower inner fn stmts in topological order (dependencies before capturers). Non-fn stmts
+/// stay in their original positions; only fn stmts are reordered among themselves.
+pub(crate) fn lower_block_stmts(
+    stmts: &[TypedStmt],
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    // Collect the set of "inner fn slots" — Val stmts whose value is a Function literal and
+    // that are NOT already pre-registered as module-level functions (global_fn_slots).
+    let mut inner_fn_indices: HashMap<usize, usize> = HashMap::new(); // slot → stmt index
+    for (i, stmt) in stmts.iter().enumerate() {
+        if let TypedStmt::Val { slot, value: TypedExpr::Function { .. }, .. } = stmt {
+            if !ctx.global_fn_slots.contains_key(slot) {
+                inner_fn_indices.insert(*slot, i);
+            }
+        }
+    }
+
+    if inner_fn_indices.is_empty() {
+        // Fast path: no inner function stmts — just lower sequentially as before.
+        for stmt in stmts {
+            lower_stmt(stmt, builder, ctx);
+        }
+        return;
+    }
+
+    // Build dependency edges among inner fn stmts: fn A depends on fn B if B is in A's captures.
+    let inner_fn_slots: HashSet<usize> = inner_fn_indices.keys().copied().collect();
+    let mut deps: HashMap<usize, Vec<usize>> = HashMap::new(); // slot → [dep slots]
+    let mut in_degree: HashMap<usize, usize> = HashMap::new();
+    for &slot in &inner_fn_slots {
+        deps.entry(slot).or_default();
+        in_degree.entry(slot).or_insert(0);
+    }
+    for (i, stmt) in stmts.iter().enumerate() {
+        if let TypedStmt::Val { slot, value: TypedExpr::Function { captures, .. }, .. } = stmt {
+            if !inner_fn_indices.contains_key(slot) {
+                continue;
+            }
+            for cap in captures {
+                if inner_fn_slots.contains(&cap.outer_slot) {
+                    // `slot` (fn at index i) depends on `cap.outer_slot` (another inner fn).
+                    deps.entry(cap.outer_slot).or_default().push(*slot);
+                    *in_degree.entry(*slot).or_insert(0) += 1;
+                }
+            }
+            let _ = i;
+        }
+    }
+
+    // Kahn's topological sort over the inner fn slots.
+    let mut queue: VecDeque<usize> = in_degree
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&s, _)| s)
+        .collect();
+    // Stable order: process in ascending slot order among zero-in-degree candidates.
+    let mut queue_vec: Vec<usize> = queue.drain(..).collect();
+    queue_vec.sort_unstable();
+    queue.extend(queue_vec);
+
+    let mut topo_order: Vec<usize> = Vec::with_capacity(inner_fn_slots.len());
+    while let Some(slot) = queue.pop_front() {
+        topo_order.push(slot);
+        if let Some(successors) = deps.get(&slot) {
+            let mut new_ready: Vec<usize> = Vec::new();
+            for &succ in successors {
+                let deg = in_degree.entry(succ).or_insert(1);
+                *deg -= 1;
+                if *deg == 0 {
+                    new_ready.push(succ);
+                }
+            }
+            new_ready.sort_unstable();
+            queue.extend(new_ready);
+        }
+    }
+
+    // If the sort didn't cover all inner fns (cycle among inner functions), fall back to
+    // source order for the remaining ones — they're mutually recursive and ordering can't help;
+    // they would have crashed before this fix too.
+    for &slot in &inner_fn_slots {
+        if !topo_order.contains(&slot) {
+            topo_order.push(slot);
+        }
+    }
+
+    // Produce a merged stmt sequence: replace fn stmts with topo-sorted fn stmts.
+    // Non-fn stmts stay at their original positions; fn-stmt positions get refilled in topo order.
+    let fn_stmt_positions: Vec<usize> = stmts
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            if let TypedStmt::Val { slot, value: TypedExpr::Function { .. }, .. } = s {
+                inner_fn_indices.contains_key(slot)
+            } else {
+                false
+            }
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    // Map from fn slot → its TypedStmt index (for lookup)
+    let slot_to_stmt: HashMap<usize, usize> = inner_fn_indices; // slot → original stmt index
+
+    // Build a merged lower order: for each position in stmts, lower the stmt at that position,
+    // but substitute inner fn stmts with the topo-sorted list, in order of their original positions.
+    let mut topo_iter = topo_order.iter();
+    let fn_pos_set: HashSet<usize> = fn_stmt_positions.iter().copied().collect();
+
+    for (i, stmt) in stmts.iter().enumerate() {
+        if fn_pos_set.contains(&i) {
+            // This is a fn stmt slot; take the next from the topo order.
+            if let Some(&topo_slot) = topo_iter.next() {
+                let original_idx = slot_to_stmt[&topo_slot];
+                lower_stmt(&stmts[original_idx], builder, ctx);
+            }
+        } else {
+            lower_stmt(stmt, builder, ctx);
+        }
+    }
+}
+
 pub(crate) fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     // Attribute instructions emitted while lowering this expression to its source span (debug-only
     // metadata for DWARF line tables). Restore the enclosing span afterwards so instructions emitted
@@ -769,9 +904,7 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
         TypedExpr::Block { stmts, expr, .. } => {
             let outer_slots = builder.slots.clone();
             builder.push_scope();
-            for stmt in stmts {
-                lower_stmt(stmt, builder, ctx);
-            }
+            lower_block_stmts(stmts, builder, ctx);
             let result = lower_expr(expr, builder, ctx);
             // An OUTER `var` reassigned inside this block (a `LocalSet`) now binds the slot to a
             // freshly-owned temp registered in THIS block scope. That temp must SURVIVE the block
