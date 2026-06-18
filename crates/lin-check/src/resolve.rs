@@ -176,6 +176,15 @@ fn resolve_type_inner(
                     fields.insert(k, val_ty.clone());
                 }
                 Ok(Type::object(fields))
+            } else if matches!(&key_ty, Type::TypeVar(id) if (9001..u32::MAX).contains(id)) {
+                // A QUANTIFIED GENERIC key type-parameter `<K>` in `{ K: V }`. This is NOT spellable
+                // as a free inference var — only a function's own type parameter resolves into this
+                // ≥9001 range (`bind_type_params`). It lets a generic function be parametric over the
+                // map's key type (the `keys` wrapper: `<K, V>(obj: { K: V }): K[]` — ADR-086 revised).
+                // At each call site `K` binds to the receiver's CONCRETE key type, which was itself
+                // already constrained to String/integer when that map type was built, so no unsound
+                // key escapes. A genuine free inference var (id < 9001) still hits the error below.
+                Ok(Type::Map { key: Box::new(key_ty), value: Box::new(val_ty), name: None })
             } else {
                 Err((*span, format!(
                     "Index-signature key type must be String, an integer type, or a union of string \

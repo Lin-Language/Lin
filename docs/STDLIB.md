@@ -211,7 +211,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`fromEntries`](#fromEntries) | `([String, AnyVal][]) -> {}` | Build an object from key-value pairs |
 | [`get`](#get) | `<T, D>({ String: T }, String, D = null) -> T \| D` | Value at key, or the default (`null` if omitted) when absent — the keyed convenience for the built-in `m[k] ?? default` (`??`, SPECIFICATION.md §8.3) |
 | [`isEmpty`](#isEmpty) | `(AnyVal) -> Boolean` | True if object, array, or string is empty |
-| [`keys`](#keys) | `(AnyVal) -> String[]` | Array of object keys (tag-aware: object or typed map) |
+| [`keys`](#keys) | `<K, V>({ K: V }) -> K[]` | Array of object keys in their native key type (tag-aware: object or typed map) |
 | [`mapValues`](#mapValues) | `<V,W>({ String: V }, (V) -> W) -> { String: W }` | Transform all values, keeping keys |
 | [`merge`](#merge) | `<T>({ String: T }, { String: T }) -> { String: T }` | Shallow-merge two typed maps (right wins on conflict) |
 | [`omit`](#omit) | `<T>({ String: T }, String[]) -> { String: T }` | Return typed map without specified keys |
@@ -2596,13 +2596,14 @@ isEmpty("hi")        // false
 ### keys
 
 ```txt
-val keys: (obj: AnyVal) -> String[]
+val keys: <K, V>(obj: { K: V }) -> K[]
 ```
 
-Returns an array of the object's keys. Tag-aware: works on a plain `{}`/`AnyVal` record (insertion order) or a typed map of ANY key type — `{ String: T }`, `{ UInt8: T }`, `{ DateNumber: T }`, … (hash order). Map keys are always strings at runtime, so a non-`String`-keyed map returns its keys stringified (the int key `3` reads back as `"3"`). See ADR-086.
+Returns an array of the object's keys, in their **native key type** `K[]`. Tag-aware: works on a plain `{}`/`AnyVal` record (insertion order) or a typed map of ANY key type (hash order). A `{ UInt8: T }` map yields a `UInt8[]` of INTEGER keys (`3`, `10`) — usable to re-index the map (`m[k]`) and in arithmetic (`k + 1`); a `{ DateNumber: T }` (UInt32) map yields `UInt32[]`; a `{ String: T }` map, a plain record, and an `AnyVal` object all yield `String[]`. A non-object argument (`keys(5)`, `keys("s")`, `keys([…])`) is a compile error. See ADR-086.
 
 ```txt
 keys({ "a": 1, "b": 2 })   // ["a", "b"]
+{ 3: "x", 10: "y" }.keys()  // [3, 10] : UInt8[]  (native integer keys)
 ```
 
 ---
