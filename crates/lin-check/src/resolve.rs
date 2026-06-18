@@ -297,8 +297,12 @@ fn resolve_named_cycle(
         "Promise" => Ok(Type::Promise(Box::new(any_val_type()))),
         // Opaque handle registry — names that map to Type::Opaque(name) rather than a
         // struct-expansion. Each name identifies a distinct runtime TaggedVal* box.
-        //   "TarEntry" — TAG_TAR_ENTRY: generation-stamped archive entry; non-transferable.
-        "TarEntry" => Ok(Type::Opaque(name.to_string())),
+        //   "TarEntry"  — TAG_TAR_ENTRY: generation-stamped archive entry; non-transferable.
+        //   "BigInt"    — TAG_BIGNUM: arbitrary-precision integer; refcounted Rust box.
+        //   "Decimal"   — TAG_DECIMAL: exact base-10 fixed-point; refcounted Rust box.
+        //   "Regex"     — program-lifetime immortal compiled pattern (leaked *regex::Regex boxed
+        //                 as TAG_INT64); freely shareable across threads; RC is a no-op.
+        "TarEntry" | "BigInt" | "Decimal" | "Regex" => Ok(Type::Opaque(name.to_string())),
         _ => {
             // Cycle detected: return Named(name) as an opaque reference instead of expanding.
             if visiting.contains(name) {

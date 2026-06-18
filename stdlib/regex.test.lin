@@ -4,10 +4,17 @@ import { map } from "std/iter"
 import { trim } from "std/string"
 import { compile, isMatch, find, findAll, replace, replaceAll, split, matches, Match } from "std/regex"
 
+// Unwrap a known-valid compile result. The fallback compile(".") always succeeds, so this
+// terminates. Used only for test patterns that are statically known to be valid.
+val unwrapRe = (r: Regex | Error): Regex =>
+  match r
+    is Error => unwrapRe(compile("."))
+    else => r
+
 // Compile-once handles reused across tests below.
-val word = compile("[a-z]+")
-val digits = compile("^[0-9]+$")
-val ws = compile("\\s+")
+val word = unwrapRe(compile("[a-z]+"))
+val digits = unwrapRe(compile("^[0-9]+$"))
+val ws = unwrapRe(compile("\\s+"))
 
 val s = suite("std/regex", [
   // ── compile ───────────────────────────────────────────────────────────────
@@ -45,7 +52,7 @@ val s = suite("std/regex", [
   ]),
 
   test("loose email-ish anchored validator", () =>
-    val email = compile("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$")
+    val email = unwrapRe(compile("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"))
     [
       expect(email.isMatch("ada@example.com")).toBe(true),
       expect(email.isMatch("not-an-email")).toBe(false),
@@ -69,7 +76,7 @@ val s = suite("std/regex", [
   ]),
 
   test("find groups[0] equals the whole match", () =>
-    val pair = compile("([a-z]+)=([0-9]+)")
+    val pair = unwrapRe(compile("([a-z]+)=([0-9]+)"))
     val m = pair.find("x=10")
     [
       expect(m["groups"][0]).toBe("x=10"),
@@ -80,7 +87,7 @@ val s = suite("std/regex", [
 
   test("find: a non-participating positional group is a genuine Null hole", () =>
     // (a)|(b): exactly one of the two groups participates per match.
-    val alt = compile("(a)|(b)")
+    val alt = unwrapRe(compile("(a)|(b)"))
     val m = alt.find("b")
     [
       expect(m["groups"][1] == null).toBe(true),
@@ -89,7 +96,7 @@ val s = suite("std/regex", [
   ),
 
   test("find named captures via [\"named\"]", () =>
-    val logLine = compile("(?P<ip>\\d+\\.\\d+\\.\\d+\\.\\d+) (?P<method>\\w+)")
+    val logLine = unwrapRe(compile("(?P<ip>\\d+\\.\\d+\\.\\d+\\.\\d+) (?P<method>\\w+)"))
     val m = logLine.find("127.0.0.1 GET")
     [
       expect(m["named"]["ip"]).toBe("127.0.0.1"),
@@ -99,7 +106,7 @@ val s = suite("std/regex", [
   ),
 
   test("find: an absent named group reads back as Null", () =>
-    val re = compile("(?P<a>x)?y")
+    val re = unwrapRe(compile("(?P<a>x)?y"))
     val m = re.find("y")
     [
       expect(m["named"]["a"] == null).toBe(true)
@@ -108,7 +115,7 @@ val s = suite("std/regex", [
 
   // ── codepoint offsets ───────────────────────────────────────────────────────
   test("offsets are codepoints, not bytes (accented)", () =>
-    val cafe = compile("café")
+    val cafe = unwrapRe(compile("café"))
     val m = cafe.find("a café here")
     [
       expect(m["start"]).toBe(2),
@@ -118,7 +125,7 @@ val s = suite("std/regex", [
   ),
 
   test("offsets are codepoints across a multi-byte emoji prefix", () =>
-    val endRe = compile("end")
+    val endRe = unwrapRe(compile("end"))
     val m = endRe.find("🎉 the end")
     [
       // codepoints: 🎉(0) space(1) t(2)h(3)e(4) space(5) e(6)n(7)d(8) -> start 6, end 9
@@ -129,7 +136,7 @@ val s = suite("std/regex", [
 
   // ── findAll ─────────────────────────────────────────────────────────────────
   test("findAll returns all non-overlapping matches left to right", () =>
-    val num = compile("-?\\d+")
+    val num = unwrapRe(compile("-?\\d+"))
     val ms = num.findAll("a=1, b=-20, c=300")
     [
       expect(ms.length()).toBe(3),
@@ -142,7 +149,7 @@ val s = suite("std/regex", [
   ]),
 
   test("findAll with named captures", () =>
-    val pair = compile("(?P<k>\\w+)=(?P<v>[^&]+)")
+    val pair = unwrapRe(compile("(?P<k>\\w+)=(?P<v>[^&]+)"))
     val ms = pair.findAll("a=1&b=two")
     [
       expect(ms.length()).toBe(2),
@@ -165,7 +172,7 @@ val s = suite("std/regex", [
   ]),
 
   test("replaceAll with named-group substitution", () =>
-    val date = compile("(?P<y>\\d{4})-(?P<m>\\d{2})-(?P<d>\\d{2})")
+    val date = unwrapRe(compile("(?P<y>\\d{4})-(?P<m>\\d{2})-(?P<d>\\d{2})"))
     [
       // `\${` escapes Lin's string interpolation so the literal `${name}` reaches the regex
       // replacer (which interprets `${name}` as a named-group reference).
@@ -174,21 +181,21 @@ val s = suite("std/regex", [
   ),
 
   test("replaceAll with positional-group substitution", () =>
-    val date = compile("(\\d{4})-(\\d{2})-(\\d{2})")
+    val date = unwrapRe(compile("(\\d{4})-(\\d{2})-(\\d{2})"))
     [
       expect(date.replaceAll("2026-06-07", "$3/$2/$1")).toBe("07/06/2026")
     ]
   ),
 
   test("replaceAll swapping two captures", () =>
-    val at = compile("(\\w+)@(\\w+)")
+    val at = unwrapRe(compile("(\\w+)@(\\w+)"))
     [
       expect(at.replaceAll("a@b and c@d", "$2.$1")).toBe("b.a and d.c")
     ]
   ),
 
   test("replaceAll: $$ inserts a literal dollar sign", () => [
-    expect(compile("x").replaceAll("axb", "$$")).toBe("a$b")
+    expect(unwrapRe(compile("x")).replaceAll("axb", "$$")).toBe("a$b")
   ]),
 
   // ── split ────────────────────────────────────────────────────────────────
@@ -197,15 +204,15 @@ val s = suite("std/regex", [
   ]),
 
   test("split keeps empty pieces between consecutive matches", () => [
-    expect(compile(",").split("a,b,,c")).toBe(["a", "b", "", "c"])
+    expect(unwrapRe(compile(",")).split("a,b,,c")).toBe(["a", "b", "", "c"])
   ]),
 
   test("split returns [s] when the pattern never matches", () => [
-    expect(compile("x").split("hello")).toBe(["hello"])
+    expect(unwrapRe(compile("x")).split("hello")).toBe(["hello"])
   ]),
 
   test("split with leading/trailing matches yields empty edges", () => [
-    expect(compile(",").split(",a,")).toBe(["", "a", ""])
+    expect(unwrapRe(compile(",")).split(",a,")).toBe(["", "a", ""])
   ]),
 
   // ── matches (convenience) ──────────────────────────────────────────────────
