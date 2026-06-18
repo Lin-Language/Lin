@@ -681,6 +681,7 @@ fn check_module_with_seeded_imports(
     ast_module: &Module,
     imported_modules: &HashMap<String, TypedModule>,
     seeded: &HashMap<(String, String), Type>,
+    seeded_types: &HashMap<(String, String), (Vec<String>, Type)>,
     lenient_json: bool,
 ) -> Result<(TypedModule, Vec<lin_common::Diagnostic>), Vec<lin_common::Diagnostic>> {
     let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
@@ -706,6 +707,12 @@ fn check_module_with_seeded_imports(
     // `imported_modules` yet, so this is the only source of its type).
     for ((path, name), ty) in seeded {
         import_type_map.insert((path.clone(), name.clone()), ty.clone());
+    }
+    // Provisional peer TYPE aliases — same role for the type namespace. Without this, a cross-cycle
+    // `import { T } from "./peer"` used in type position resolves to "Unknown type 'T'" because the
+    // peer module is not in `imported_modules` yet (ADR-083).
+    for ((path, name), decl) in seeded_types {
+        import_type_decls.insert((path.clone(), name.clone()), decl.clone());
     }
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
@@ -1286,12 +1293,36 @@ fn check_scc(
         .map(|id| graph.modules.get(id).expect("scc member loaded"))
         .collect();
 
-    // (1) Phase 1: provisional check of each member against the current `cache` (peers fall back
-    // to fresh TypeVars). Collect provisional signatures keyed by (path-string, export-name).
-    let mut provisional: HashMap<(String, String), Type> = HashMap::new();
+    // (1a) Phase 1, sweep A: extract every member's exported TYPE aliases. Functions/values flow
+    // through `provisional` (import_types) below; exported `type T = ...` aliases must flow
+    // separately into `import_type_decls`, or a cross-cycle `import { T } from "./peer"` used in
+    // type position resolves to "Unknown type 'T'" (ADR-083). A self-contained alias resolves fully
+    // here regardless of peer value sigs; one that references a peer's alias keeps a `Named(...)`
+    // cycle point and is rounded out in Phase 2. (Cross-cycle type imports of THIS member fall back
+    // to a permissive placeholder during this sweep — see `register_imported_types` — so the check
+    // succeeds even though peer aliases are not seeded yet.)
+    let mut provisional_types: HashMap<(String, String), (Vec<String>, Type)> = HashMap::new();
     for m in &members {
         let (typed, _w) = check_module_with_imports(&m.ast, cache, m.is_stdlib)
             .map_err(|diags| CompileError::TypeCheck(tag_diagnostics(diags, m.abs_path.as_deref())))?;
+        let sig = ModuleSignature::from_module(&typed);
+        for (name, decl) in sig.type_exports {
+            for p in &m.paths {
+                provisional_types.insert((p.clone(), name.clone()), decl.clone());
+            }
+        }
+    }
+
+    // (1b) Phase 1, sweep B: re-check each member with the peer TYPE aliases seeded so cross-cycle
+    // type annotations (e.g. a param `(t: T)` where `T` is a peer alias) resolve to their REAL
+    // structural type rather than the placeholder TypeVar. Only now are the provisional VALUE
+    // signatures accurate — a function whose parameter is a peer record must advertise that record
+    // (its concrete representation) so callers box/seal the argument consistently with the callee.
+    let mut provisional: HashMap<(String, String), Type> = HashMap::new();
+    for m in &members {
+        let (typed, _w) =
+            check_module_with_seeded_imports(&m.ast, cache, &HashMap::new(), &provisional_types, m.is_stdlib)
+                .map_err(|diags| CompileError::TypeCheck(tag_diagnostics(diags, m.abs_path.as_deref())))?;
         let sig = ModuleSignature::from_module(&typed);
         for (name, ty) in sig.exports {
             // Seed under every path string this member is reached by, so a peer importing it by
@@ -1352,8 +1383,9 @@ fn check_scc(
     // (3) Phase 2: re-check each member with the provisional peer signatures merged into the
     // import-type map, so cross-module references resolve to concrete types.
     for (identity, m) in scc.iter().zip(members.iter()) {
-        let (typed, _w) = check_module_with_seeded_imports(&m.ast, cache, &provisional, m.is_stdlib)
-            .map_err(|diags| CompileError::TypeCheck(tag_diagnostics(diags, m.abs_path.as_deref())))?;
+        let (typed, _w) =
+            check_module_with_seeded_imports(&m.ast, cache, &provisional, &provisional_types, m.is_stdlib)
+                .map_err(|diags| CompileError::TypeCheck(tag_diagnostics(diags, m.abs_path.as_deref())))?;
         let sig = ModuleSignature::from_module(&typed);
         // Cyclic members are always freshly checked (their type depends on peers), so their `.typed`
         // is never read back from the cache. We still persist the signature — under the same

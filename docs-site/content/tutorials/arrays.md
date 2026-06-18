@@ -1,6 +1,6 @@
 # Arrays & Iteration
 
-Lin's array model is built on JSON arrays. The iterable combinators (`map`, `filter`, `reduce`, `for`, `find`, `range`, …) live in the [`std/iter`](/stdlib/iter.html) module, while array-shaped operations (`push`, `slice`, `sort`, `sum`, …) live in [`std/array`](/stdlib/array.html). The same combinator names work over arrays, iterators, **and** [streams](/stdlib/stream.html) — see [iterating over streams](#iterating-over-streams) below.
+Lin's array model is built on JSON arrays. The iterable combinators (`map`, `filter`, `reduce`, `for`, `while`, `find`, `range`, …) live in the [`std/iter`](/stdlib/iter.html) module, while array-shaped operations (`push`, `slice`, `sort`, `sum`, …) live in [`std/array`](/stdlib/array.html). The same combinator names work over arrays, iterators, **and** [streams](/stdlib/stream.html) — see [iterating over streams](#iterating-over-streams) below.
 
 ## Array literals
 
@@ -121,6 +121,44 @@ val first = [1, 3, 5, 6, 7].find(x => x % 2 == 0)
 [1, 2, 3].every(x => x > 0)   // true
 [1, 2, 3].every(x => x > 1)   // false
 ```
+
+## `while` — conditional iteration
+
+`while` (from `std/iter`) comes in **two forms**.
+
+**Over an iterable** — `while(iterable, predicate)` walks the items **while the predicate holds**, stopping as soon as the predicate returns `false` (or at exhaustion). It is the eager, short-circuiting sibling of `takeWhile`, and runs for side effects (it returns `null`):
+
+```lin
+import { print } from "std/io"
+import { while } from "std/iter"
+
+[1, 2, -3, 4].while(x =>
+  print(x)
+  x >= 0
+)
+// prints 1, 2, -3 — the body runs on -3, then the predicate (x >= 0) is false, so it stops before 4
+```
+
+The predicate *is* the loop body: each statement runs and the **final expression** is the boolean that decides whether to continue. Like the other combinators, it also receives the 0-based index as an optional second argument (`(x, i) => …`).
+
+**Condition-only** — `while(() => Boolean)` takes a zero-argument closure and loops **while it returns `true`**, with no underlying collection. This is the classic imperative `while (cond) { … }`, typically advancing a `var` until a data-dependent stop:
+
+```lin
+import { print } from "std/io"
+import { while } from "std/iter"
+
+var n = 1
+while(() =>
+  print(n)
+  n = n * 2
+  n < 100
+)
+// prints 1 2 4 8 16 32 64
+```
+
+The condition-only form is pure-Lin tail recursion under the hood, so it runs in **constant stack** no matter how many times it loops — there is no recursion-depth limit to worry about.
+
+Over a [`Stream`](#iterating-over-streams), the iterable form `while(stream, predicate)` is a lazy **terminal** that drives the stream one item at a time and gains an `| Error` arm, like the other stream terminals.
 
 ## `sort` and `sortBy`
 

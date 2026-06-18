@@ -109,6 +109,24 @@ pub(crate) fn collect_type_subs(pattern: &Type, actual: &Type, subs: &mut std::c
         (Type::Shared(pt), Type::Shared(at)) => collect_type_subs(pt, at, subs),
         (Type::Stream(pt), Type::Stream(at)) => collect_type_subs(pt, at, subs),
         (Type::Promise(pt), Type::Promise(at)) => collect_type_subs(pt, at, subs),
+        // Index-signature map unification (`{ String: T }` vs `{ String: UInt32 }`): bind the
+        // value type parameter element-wise. Needed for expected-result-type-driven inference of a
+        // return-only generic whose `T` lives in a map value — `fromEntries<T>(…): { String: T }`
+        // unified against the expected `{ String: UInt32 }` binds `T = UInt32` (ADR-085).
+        (Type::Map { key: pk, value: pv, .. }, Type::Map { key: ak, value: av, .. }) => {
+            collect_type_subs(pk, ak, subs);
+            collect_type_subs(pv, av, subs);
+        }
+        // A record-shaped pattern against a record actual: unify field-by-field on matching keys.
+        // Lets a type parameter nested in a declared record field bind from the expected record
+        // (e.g. `mapOk(…): { value: U }` against an expected `{ value: Int32 }`).
+        (Type::Object { fields: pf, .. }, Type::Object { fields: af, .. }) => {
+            for (k, pt) in pf {
+                if let Some(at) = af.get(k) {
+                    collect_type_subs(pt, at, subs);
+                }
+            }
+        }
         (Type::Union(pts), actual) => {
             for pt in pts { collect_type_subs(pt, actual, subs); }
         }
