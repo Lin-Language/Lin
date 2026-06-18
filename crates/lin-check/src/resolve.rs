@@ -33,9 +33,25 @@ fn resolve_type_inner(
             resolve_named_cycle(name, env, visiting).map_err(|m| (*span, m, None))
         }
         TypeExpr::Generic(name, args, span) => {
-            let resolved_args: Result<Vec<Type>, (Span, String, Option<String>)> =
-                args.iter().map(|a| resolve_type_inner(a, env, visiting)).collect();
-            resolve_generic(name, &resolved_args?, env, visiting).map_err(|m| (*span, m, None))
+            let resolved_args: Vec<Type> =
+                args.iter().map(|a| resolve_type_inner(a, env, visiting)).collect::<Result<_, _>>()?;
+            // TypeScript-style utility-type operators are builtins ONLY in applied generic
+            // position `Name<…>`, and ONLY when the user has NOT shadowed the name with their
+            // own `type Name<…>` declaration (the user definition wins — fall through below).
+            if is_utility_operator(name) && env.lookup_type(name).is_none() {
+                return resolve_utility_operator(name, &resolved_args, *span)
+                    .map_err(|(s, m, h)| (s, m, h));
+            }
+            resolve_generic(name, &resolved_args, env, visiting).map_err(|m| (*span, m, None))
+        }
+        TypeExpr::KeyOf(inner, span) => {
+            let inner_ty = resolve_type_inner(inner, env, visiting)?;
+            resolve_keyof(&inner_ty, *span)
+        }
+        TypeExpr::Index(base, key, span) => {
+            let base_ty = resolve_type_inner(base, env, visiting)?;
+            let key_ty = resolve_type_inner(key, env, visiting)?;
+            resolve_indexed_access(&base_ty, &key_ty, *span)
         }
         TypeExpr::Array(inner, _span) => {
             let inner_ty = resolve_type_inner(inner, env, visiting)?;
@@ -243,6 +259,318 @@ fn closed_string_literal_set(ty: &Type) -> Option<Vec<String>> {
         }
         _ => None,
     }
+}
+
+// ── TypeScript-style utility type operators (Type → Type transforms) ──────────────────
+//
+// These are compiler builtins resolved during type-checking; they erase to ordinary
+// record/union types and need NO codegen or runtime support. Each is recognised ONLY in
+// applied generic position `Name<…>` (see the `Generic` arm of `resolve_type_inner`), and
+// ONLY when the user has not shadowed the name with their own `type Name<…>` decl.
+//
+// All builtins return UNSEALED objects: when used as the body of a named decl, the named
+// unfold path (`expand_named_body`) seals automatically.
+
+/// The 10 reserved utility-operator names.
+fn is_utility_operator(name: &str) -> bool {
+    matches!(
+        name,
+        "Partial" | "Required" | "Pick" | "Omit" | "NonNullable" | "Exclude" | "Extract"
+            | "ReturnType" | "Parameters" | "Record"
+    )
+}
+
+type ResolveErr = (Span, String, Option<String>);
+
+fn resolve_utility_operator(
+    name: &str,
+    args: &[Type],
+    span: Span,
+) -> Result<Type, ResolveErr> {
+    // Arity validation, shared shape.
+    let expect_arity = |n: usize| -> Result<(), ResolveErr> {
+        if args.len() != n {
+            Err((
+                span,
+                format!("`{}` takes exactly {} type argument(s), got {}", name, n, args.len()),
+                None,
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    match name {
+        "Partial" => {
+            expect_arity(1)?;
+            let fields = expect_record(&args[0], name, span)?;
+            let mut out = IndexMap::new();
+            for (k, v) in fields {
+                // Make every field nullable; flatten so an already-nullable field stays deduped.
+                out.insert(
+                    k.clone(),
+                    Type::flatten_union(vec![v.clone(), Type::Null]),
+                );
+            }
+            Ok(Type::object(out))
+        }
+        "Required" => {
+            expect_arity(1)?;
+            let fields = expect_record(&args[0], name, span)?;
+            let mut out = IndexMap::new();
+            for (k, v) in fields {
+                out.insert(k.clone(), strip_null(v));
+            }
+            Ok(Type::object(out))
+        }
+        "Pick" => {
+            expect_arity(2)?;
+            let fields = expect_record(&args[0], name, span)?;
+            let keys = expect_key_set(&args[1], name, span)?;
+            let mut out = IndexMap::new();
+            // Keep T's ORIGINAL field order; error on any requested key absent from T.
+            for k in &keys {
+                if !fields.contains_key(k) {
+                    return Err(missing_field_err(k, fields, span, name));
+                }
+            }
+            for (k, v) in fields {
+                if keys.contains(k) {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+            Ok(Type::object(out))
+        }
+        "Omit" => {
+            expect_arity(2)?;
+            let fields = expect_record(&args[0], name, span)?;
+            // Lenient: keys absent from T are simply ignored (no error).
+            let keys = expect_key_set(&args[1], name, span)?;
+            let mut out = IndexMap::new();
+            for (k, v) in fields {
+                if !keys.contains(k) {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+            Ok(Type::object(out))
+        }
+        "NonNullable" => {
+            expect_arity(1)?;
+            Ok(strip_null(&args[0]))
+        }
+        "Exclude" => {
+            expect_arity(2)?;
+            Ok(exclude_extract(&args[0], &args[1], true))
+        }
+        "Extract" => {
+            expect_arity(2)?;
+            Ok(exclude_extract(&args[0], &args[1], false))
+        }
+        "ReturnType" => {
+            expect_arity(1)?;
+            match &args[0] {
+                Type::Function { ret, .. } => Ok((**ret).clone()),
+                other => Err((
+                    span,
+                    format!("`ReturnType<F>` requires F to be a function type, but got {}", other),
+                    None,
+                )),
+            }
+        }
+        "Parameters" => {
+            expect_arity(1)?;
+            match &args[0] {
+                Type::Function { params, .. } => Ok(Type::FixedArray(params.clone())),
+                other => Err((
+                    span,
+                    format!("`Parameters<F>` requires F to be a function type, but got {}", other),
+                    None,
+                )),
+            }
+        }
+        "Record" => {
+            expect_arity(2)?;
+            // Mirror IndexSig resolution: String key → Map; closed StrLit union/single → Object.
+            let key_ty = &args[0];
+            let val_ty = args[1].clone();
+            if *key_ty == Type::Str {
+                Ok(Type::Map { key: Box::new(Type::Str), value: Box::new(val_ty), name: None })
+            } else if let Some(literals) = closed_string_literal_set(key_ty) {
+                let mut fields = IndexMap::new();
+                for k in literals {
+                    fields.insert(k, val_ty.clone());
+                }
+                Ok(Type::object(fields))
+            } else {
+                Err((
+                    span,
+                    format!(
+                        "`Record<K, V>` requires K to be String or a closed union of string \
+                         literals, but K resolves to {}",
+                        key_ty
+                    ),
+                    None,
+                ))
+            }
+        }
+        _ => unreachable!("is_utility_operator gate is authoritative"),
+    }
+}
+
+/// `keyof T`: union of T's field-name string literals, or `*key` for a map.
+fn resolve_keyof(ty: &Type, span: Span) -> Result<Type, ResolveErr> {
+    match ty {
+        Type::Object { fields, .. } => {
+            if fields.is_empty() {
+                return Ok(Type::Never);
+            }
+            let members: Vec<Type> =
+                fields.keys().map(|k| Type::StrLit(k.clone())).collect();
+            Ok(Type::flatten_union(members))
+        }
+        Type::Map { key, .. } => Ok((**key).clone()),
+        other => Err((
+            span,
+            format!("`keyof` requires a record type, but got {}", other),
+            None,
+        )),
+    }
+}
+
+/// Indexed access `T[K]`: the type of the named field(s).
+fn resolve_indexed_access(base: &Type, key: &Type, span: Span) -> Result<Type, ResolveErr> {
+    let fields = match base {
+        Type::Object { fields, .. } => fields,
+        other => {
+            return Err((
+                span,
+                format!("indexed-access type `T[K]` requires T to be a record, but got {}", other),
+                None,
+            ));
+        }
+    };
+    let keys = key_set_of(key).ok_or_else(|| {
+        (
+            span,
+            format!(
+                "indexed-access key must be a string literal or a union of string literals, \
+                 but got {}",
+                key
+            ),
+            None,
+        )
+    })?;
+    let mut selected: Vec<Type> = Vec::with_capacity(keys.len());
+    for k in &keys {
+        match fields.get(k) {
+            Some(t) => selected.push(t.clone()),
+            None => return Err(missing_field_err(k, fields, span, "indexed access")),
+        }
+    }
+    Ok(Type::flatten_union(selected))
+}
+
+/// Require that `ty` is a record; return its field map or a clear error.
+fn expect_record<'a>(
+    ty: &'a Type,
+    op: &str,
+    span: Span,
+) -> Result<&'a IndexMap<String, Type>, ResolveErr> {
+    match ty {
+        Type::Object { fields, .. } => Ok(fields),
+        other => Err((
+            span,
+            format!("`{}<T>` requires T to be a record type, but got {}", op, other),
+            None,
+        )),
+    }
+}
+
+/// Strip `Null` from a type. If `ty` is a union, remove every `Null` member and collapse a
+/// singleton; if `ty` is exactly `Null`, the result is `Never`; otherwise unchanged.
+fn strip_null(ty: &Type) -> Type {
+    match ty {
+        Type::Null => Type::Never,
+        Type::Union(members) => {
+            let kept: Vec<Type> =
+                members.iter().filter(|m| **m != Type::Null).cloned().collect();
+            if kept.is_empty() {
+                Type::Never
+            } else {
+                Type::flatten_union(kept)
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// `Exclude<U, M>` (remove == true) / `Extract<U, M>` (remove == false): treat U as a set of
+/// members; M may itself be a union. Collapse singleton; empty → Never.
+fn exclude_extract(u: &Type, m: &Type, remove: bool) -> Type {
+    let u_members: Vec<Type> = match u {
+        Type::Union(ms) => ms.clone(),
+        other => vec![other.clone()],
+    };
+    let m_members: Vec<Type> = match m {
+        Type::Union(ms) => ms.clone(),
+        other => vec![other.clone()],
+    };
+    let kept: Vec<Type> = u_members
+        .into_iter()
+        .filter(|x| {
+            let in_m = m_members.contains(x);
+            if remove { !in_m } else { in_m }
+        })
+        .collect();
+    if kept.is_empty() {
+        Type::Never
+    } else {
+        Type::flatten_union(kept)
+    }
+}
+
+/// Extract a closed set of string-literal keys from a type (a single `StrLit` or a `Union` of
+/// `StrLit`s — exactly the output of `keyof`). Returns `None` if any member is not a `StrLit`.
+fn key_set_of(ty: &Type) -> Option<Vec<String>> {
+    closed_string_literal_set(ty)
+}
+
+/// As `key_set_of`, but with a uniform operator-flavoured error on failure.
+fn expect_key_set(ty: &Type, op: &str, span: Span) -> Result<Vec<String>, ResolveErr> {
+    key_set_of(ty).ok_or_else(|| {
+        (
+            span,
+            format!(
+                "`{}<T, K>` requires K to be a string literal or a union of string literals \
+                 (e.g. `\"a\" | \"b\"` or `keyof T`), but got {}",
+                op, ty
+            ),
+            None,
+        )
+    })
+}
+
+/// Build a "no such field" diagnostic with a did-you-mean help listing T's field names.
+fn missing_field_err(
+    bad_key: &str,
+    fields: &IndexMap<String, Type>,
+    span: Span,
+    op: &str,
+) -> ResolveErr {
+    let available: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
+    let help = match lin_common::closest_match(bad_key, available.iter().copied(), 3) {
+        Some(best) => format!(
+            "no field \"{}\" — did you mean \"{}\"? Available fields: {}",
+            bad_key,
+            best,
+            available.join(", ")
+        ),
+        None => format!("available fields: {}", available.join(", ")),
+    };
+    (
+        span,
+        format!("`{}`: \"{}\" is not a field of the record type", op, bad_key),
+        Some(help),
+    )
 }
 
 fn resolve_named_cycle(
@@ -785,5 +1113,292 @@ mod sealed_marker_tests {
         // Compat: named Date is compatible with the anonymous structural type
         assert!(crate::compat::is_compatible(&date_ty, &anon));
         assert!(crate::compat::is_compatible(&anon, &date_ty));
+    }
+}
+
+#[cfg(test)]
+mod utility_type_tests {
+    //! TypeScript-style utility-type operators + `keyof` + indexed-access. Each operator has a
+    //! success case and (where it can fail) an error case. Tests drive the public resolver
+    //! `resolve_type_spanned` over hand-built `TypeExpr`s.
+    use super::*;
+    use crate::env::TypeEnv;
+    use lin_common::Span;
+    use lin_parse::ast::TypeExpr as TE;
+
+    fn dummy() -> Span {
+        Span::dummy()
+    }
+
+    /// `type User = { "id": Int32, "name": String, "email": String | Null }` registered in env.
+    fn env_with_user() -> TypeEnv {
+        let mut fields = IndexMap::new();
+        fields.insert("id".to_string(), Type::Int32);
+        fields.insert("name".to_string(), Type::Str);
+        fields.insert(
+            "email".to_string(),
+            Type::Union(vec![Type::Str, Type::Null]),
+        );
+        let mut env = TypeEnv::new();
+        env.define_type("User".to_string(), vec![], Type::object(fields));
+        env
+    }
+
+    fn named(n: &str) -> TE {
+        TE::Named(n.to_string(), dummy())
+    }
+    fn strlit(s: &str) -> TE {
+        TE::StringLit(s.to_string(), dummy())
+    }
+    fn generic(n: &str, args: Vec<TE>) -> TE {
+        TE::Generic(n.to_string(), args, dummy())
+    }
+
+    fn obj_fields(ty: &Type) -> &IndexMap<String, Type> {
+        match ty {
+            Type::Object { fields, .. } => fields,
+            other => panic!("expected Object, got {:?}", other),
+        }
+    }
+
+    fn resolve(te: &TE, env: &TypeEnv) -> Type {
+        resolve_type_spanned(te, env).expect("resolves")
+    }
+
+    #[test]
+    fn partial_makes_fields_nullable_and_dedups() {
+        let env = env_with_user();
+        let ty = resolve(&generic("Partial", vec![named("User")]), &env);
+        let f = obj_fields(&ty);
+        assert_eq!(f["id"], Type::Union(vec![Type::Int32, Type::Null]));
+        // already-nullable email must NOT gain a duplicate Null
+        assert_eq!(f["email"], Type::Union(vec![Type::Str, Type::Null]));
+    }
+
+    #[test]
+    fn required_strips_null() {
+        let env = env_with_user();
+        let ty = resolve(&generic("Required", vec![named("User")]), &env);
+        let f = obj_fields(&ty);
+        assert_eq!(f["id"], Type::Int32);
+        // email: String | Null → String
+        assert_eq!(f["email"], Type::Str);
+    }
+
+    #[test]
+    fn pick_keeps_only_named_in_order() {
+        let env = env_with_user();
+        // Pick<User, "name" | "id"> — result keeps T's ORIGINAL order (id before name).
+        let key = TE::Union(vec![strlit("name"), strlit("id")], dummy());
+        let ty = resolve(&generic("Pick", vec![named("User"), key]), &env);
+        let f = obj_fields(&ty);
+        let keys: Vec<&String> = f.keys().collect();
+        assert_eq!(keys, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn pick_unknown_key_errors_with_didyoumean() {
+        let env = env_with_user();
+        let err = resolve_type_spanned(&generic("Pick", vec![named("User"), strlit("naem")]), &env)
+            .unwrap_err();
+        assert!(err.1.contains("naem"), "msg: {}", err.1);
+        let help = err.2.expect("help present");
+        assert!(help.contains("name"), "help: {}", help);
+    }
+
+    #[test]
+    fn omit_drops_named_and_is_lenient() {
+        let env = env_with_user();
+        // Omit<User, "email" | "nope"> — "nope" is absent from User but must NOT error.
+        let key = TE::Union(vec![strlit("email"), strlit("nope")], dummy());
+        let ty = resolve(&generic("Omit", vec![named("User"), key]), &env);
+        let f = obj_fields(&ty);
+        assert!(f.contains_key("id") && f.contains_key("name"));
+        assert!(!f.contains_key("email"));
+    }
+
+    #[test]
+    fn nonnullable_strips_null_union() {
+        let env = TypeEnv::new();
+        let arg = TE::Union(vec![named("String"), named("Null")], dummy());
+        let ty = resolve(&generic("NonNullable", vec![arg]), &env);
+        assert_eq!(ty, Type::Str);
+    }
+
+    #[test]
+    fn nonnullable_of_null_is_never() {
+        let env = TypeEnv::new();
+        let ty = resolve(&generic("NonNullable", vec![named("Null")]), &env);
+        assert_eq!(ty, Type::Never);
+    }
+
+    #[test]
+    fn exclude_removes_members() {
+        let mut env = TypeEnv::new();
+        env.define_type(
+            "Status".to_string(),
+            vec![],
+            Type::Union(vec![
+                Type::StrLit("a".into()),
+                Type::StrLit("b".into()),
+                Type::StrLit("c".into()),
+            ]),
+        );
+        let ty = resolve(&generic("Exclude", vec![named("Status"), strlit("b")]), &env);
+        assert_eq!(
+            ty,
+            Type::Union(vec![Type::StrLit("a".into()), Type::StrLit("c".into())])
+        );
+    }
+
+    #[test]
+    fn exclude_empty_is_never() {
+        let env = TypeEnv::new();
+        let ty = resolve(&generic("Exclude", vec![strlit("a"), strlit("a")]), &env);
+        assert_eq!(ty, Type::Never);
+    }
+
+    #[test]
+    fn extract_keeps_only_matching() {
+        let mut env = TypeEnv::new();
+        env.define_type(
+            "Status".to_string(),
+            vec![],
+            Type::Union(vec![
+                Type::StrLit("a".into()),
+                Type::StrLit("b".into()),
+            ]),
+        );
+        let ty = resolve(&generic("Extract", vec![named("Status"), strlit("a")]), &env);
+        assert_eq!(ty, Type::StrLit("a".into()));
+    }
+
+    #[test]
+    fn return_type_of_function() {
+        let env = TypeEnv::new();
+        let f = TE::Function(vec![named("Int32")], Box::new(named("Boolean")), dummy());
+        let ty = resolve(&generic("ReturnType", vec![f]), &env);
+        assert_eq!(ty, Type::Bool);
+    }
+
+    #[test]
+    fn return_type_non_function_errors() {
+        let env = TypeEnv::new();
+        let err = resolve_type_spanned(&generic("ReturnType", vec![named("Int32")]), &env)
+            .unwrap_err();
+        assert!(err.1.contains("function"), "msg: {}", err.1);
+    }
+
+    #[test]
+    fn parameters_of_function() {
+        let env = TypeEnv::new();
+        let f = TE::Function(
+            vec![named("Int32"), named("String")],
+            Box::new(named("Boolean")),
+            dummy(),
+        );
+        let ty = resolve(&generic("Parameters", vec![f]), &env);
+        assert_eq!(ty, Type::FixedArray(vec![Type::Int32, Type::Str]));
+    }
+
+    #[test]
+    fn record_string_key_is_map() {
+        let env = TypeEnv::new();
+        let ty = resolve(&generic("Record", vec![named("String"), named("Int32")]), &env);
+        match ty {
+            Type::Map { key, value, .. } => {
+                assert_eq!(*key, Type::Str);
+                assert_eq!(*value, Type::Int32);
+            }
+            other => panic!("expected Map, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn record_literal_union_key_is_object() {
+        let env = TypeEnv::new();
+        let key = TE::Union(vec![strlit("a"), strlit("b")], dummy());
+        let ty = resolve(&generic("Record", vec![key, named("Boolean")]), &env);
+        let f = obj_fields(&ty);
+        assert_eq!(f["a"], Type::Bool);
+        assert_eq!(f["b"], Type::Bool);
+    }
+
+    #[test]
+    fn keyof_record_is_strlit_union() {
+        let env = env_with_user();
+        let ty = resolve(&TE::KeyOf(Box::new(named("User")), dummy()), &env);
+        assert_eq!(
+            ty,
+            Type::Union(vec![
+                Type::StrLit("id".into()),
+                Type::StrLit("name".into()),
+                Type::StrLit("email".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn keyof_non_record_errors() {
+        let env = TypeEnv::new();
+        let err =
+            resolve_type_spanned(&TE::KeyOf(Box::new(named("Int32")), dummy()), &env).unwrap_err();
+        assert!(err.1.contains("keyof"), "msg: {}", err.1);
+    }
+
+    #[test]
+    fn indexed_access_single_key() {
+        let env = env_with_user();
+        let te = TE::Index(Box::new(named("User")), Box::new(strlit("name")), dummy());
+        let ty = resolve(&te, &env);
+        assert_eq!(ty, Type::Str);
+    }
+
+    #[test]
+    fn indexed_access_union_key() {
+        let env = env_with_user();
+        let key = TE::Union(vec![strlit("id"), strlit("name")], dummy());
+        let te = TE::Index(Box::new(named("User")), Box::new(key), dummy());
+        let ty = resolve(&te, &env);
+        assert_eq!(ty, Type::Union(vec![Type::Int32, Type::Str]));
+    }
+
+    #[test]
+    fn indexed_access_missing_field_errors() {
+        let env = env_with_user();
+        let te = TE::Index(Box::new(named("User")), Box::new(strlit("nope")), dummy());
+        let err = resolve_type_spanned(&te, &env).unwrap_err();
+        assert!(err.1.contains("nope"), "msg: {}", err.1);
+        assert!(err.2.is_some(), "should have did-you-mean help");
+    }
+
+    #[test]
+    fn user_shadows_builtin_record() {
+        // A user `type Record = { … }` (non-generic) must win over the builtin in `Record<…>`
+        // position — i.e. the builtin is only dispatched when the name is unshadowed. Here the
+        // user defines a NON-generic `Record`, so `Record<String, Int32>` should fall through to
+        // the normal generic-alias path and ERROR with an arity mismatch (0 params, 2 args),
+        // NOT silently behave as the builtin.
+        let mut env = TypeEnv::new();
+        let mut f = IndexMap::new();
+        f.insert("label".to_string(), Type::Str);
+        env.define_type("Record".to_string(), vec![], Type::object(f));
+        let err = resolve_type_spanned(
+            &generic("Record", vec![named("String"), named("Int32")]),
+            &env,
+        )
+        .unwrap_err();
+        assert!(
+            err.1.contains("argument") || err.1.contains("expects"),
+            "user-shadowed Record must hit the alias arity error, got: {}",
+            err.1
+        );
+    }
+
+    #[test]
+    fn arity_mismatch_errors() {
+        let env = env_with_user();
+        let err = resolve_type_spanned(&generic("Partial", vec![]), &env).unwrap_err();
+        assert!(err.1.contains("exactly 1"), "msg: {}", err.1);
     }
 }

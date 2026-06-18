@@ -101,20 +101,32 @@ export val range = (start: Int32, end: Int32) =>
 
 // Build an integer sequence from `start` toward `end` (exclusive) advancing by `step` (3-arg
 // overload of `range`). Resolved by arity: the 2-arg form above takes the fast `lin_range` path,
-// this 3-arg form handles an explicit (possibly negative) step via `lin_iter`.
+// this 3-arg form handles an explicit (possibly negative) step. Materialises an eager `Int32[]`
+// (ranges are always finite), so element type is `Int32` just like the 2-arg form.
 // @param start  the first value (inclusive).
 // @param end    the bound (exclusive).
 // @param step   the increment; positive counts up, negative counts down, `0` yields an empty sequence.
-// @returns an iterator over the stepped range.
+// @returns an `Int32[]` of the stepped range.
 // @example range(0, 10, 2).for(i => print(i))   // 0, 2, 4, 6, 8
 // @example range(5, 0, -1).map(i => i)           // [5, 4, 3, 2, 1]
-export val range = (start: Int32, end: Int32, step: Int32): AnyVal =>
+export val range = (start: Int32, end: Int32, step: Int32): Int32[] =>
+  val result: Int32[] = []
+  var cur = start
   if step > 0 then
-    lin_iter(() => start, i => i < end, i => i + step, i => i)
+    whileLoop(() =>
+      val keep = cur < end
+      if keep then push(result, cur)
+      cur = cur + step
+      keep
+    )
   else if step < 0 then
-    lin_iter(() => start, i => i > end, i => i + step, i => i)
-  else
-    lin_iter(() => start, i => false, i => i, i => i)
+    whileLoop(() =>
+      val keep = cur > end
+      if keep then push(result, cur)
+      cur = cur + step
+      keep
+    )
+  result
 
 // Build an opaque Iterator that yields the elements of `arr` in order.
 // @param arr  the backing array (its element type is recovered at the consuming combinator, not pinned here).

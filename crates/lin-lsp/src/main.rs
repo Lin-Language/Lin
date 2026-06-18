@@ -2597,6 +2597,8 @@ fn render_type_expr(ty: &TypeExpr) -> String {
         ),
         T::StringLit(s, _) => format!("\"{}\"", s),
         T::IntLit(n, _) => format!("{}", n),
+        T::KeyOf(inner, _) => format!("keyof {}", render_type_expr(inner)),
+        T::Index(base, key, _) => format!("{}[{}]", render_type_expr(base), render_type_expr(key)),
         T::Object(..) | T::IndexSig(..) | T::FixedArray(..) | T::TaggedUnion(..) => "{ … }".to_string(),
     }
 }
@@ -3523,6 +3525,11 @@ fn collect_type_spans_in_type(ty: &lin_parse::ast::TypeExpr, out: &mut Vec<lin_c
         }
         T::StringLit(_, _) => {}
         T::IntLit(_, _) => {}
+        T::KeyOf(inner, _) => collect_type_spans_in_type(inner, out),
+        T::Index(base, key, _) => {
+            collect_type_spans_in_type(base, out);
+            collect_type_spans_in_type(key, out);
+        }
     }
 }
 

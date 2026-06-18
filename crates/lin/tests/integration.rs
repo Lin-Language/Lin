@@ -22261,3 +22261,115 @@ else
 "#);
     assert_eq!(output, vec!["IC123", "Amsterdam"]);
 }
+
+// ── TypeScript-style utility types (Partial/Required/Pick/Omit/NonNullable/Exclude/
+//    Extract/ReturnType/Parameters/Record) + keyof + indexed access ──────────────────
+
+#[test]
+fn test_utility_partial_and_required() {
+    let output = run(r#"import { print } from "std/io"
+
+type User = { "id": Int32, "name": String, "email": String | Null }
+
+type Patch = Partial<User>
+type FullUser = Required<User>
+
+val p: Patch = { "id": 1, "name": "ann", "email": null }
+val f: FullUser = { "id": 2, "name": "bob", "email": "b@x" }
+
+print(p["name"])
+print(f["email"])
+"#);
+    assert_eq!(output, vec!["ann", "b@x"]);
+}
+
+#[test]
+fn test_utility_pick_omit_keyof_indexed() {
+    let output = run(r#"import { print } from "std/io"
+
+type User = { "id": Int32, "name": String, "email": String | Null }
+
+type Names = Pick<User, "id" | "name">
+type NoEmail = Omit<User, "email">
+type Keys = keyof User
+type NameType = User["name"]
+
+val n: Names = { "id": 7, "name": "cay" }
+val ne: NoEmail = { "id": 8, "name": "dee" }
+val k: Keys = "email"
+val nm: NameType = "elle"
+
+print(n["name"])
+print(ne["name"])
+print(k)
+print(nm)
+"#);
+    assert_eq!(output, vec!["cay", "dee", "email", "elle"]);
+}
+
+#[test]
+fn test_utility_exclude_extract_nonnullable() {
+    let output = run(r#"import { print } from "std/io"
+
+type Status = "active" | "inactive" | "pending"
+type NotPending = Exclude<Status, "pending">
+type OnlyActive = Extract<Status, "active">
+type DefStr = NonNullable<String | Null>
+
+val a: NotPending = "active"
+val b: OnlyActive = "active"
+val c: DefStr = "hi"
+
+print(a)
+print(b)
+print(c)
+"#);
+    assert_eq!(output, vec!["active", "active", "hi"]);
+}
+
+#[test]
+fn test_utility_record_and_function_ops() {
+    let output = run(r#"import { print } from "std/io"
+
+type Flags = Record<"a" | "b", Boolean>
+type F = (Int32, String) => Boolean
+type Ret = ReturnType<F>
+type Params = Parameters<F>
+
+val flags: Flags = { "a": true, "b": false }
+val r: Ret = true
+val ps: Params = [3, "x"]
+
+print(if flags["a"] then "yes" else "no")
+print(if r then "t" else "f")
+print(ps[1])
+"#);
+    assert_eq!(output, vec!["yes", "t", "x"]);
+}
+
+#[test]
+fn test_utility_pick_bad_key_errors() {
+    // Pick with a key that is not a field of T must be a compile error naming the bad key.
+    let err = run_expect_err(r#"import { print } from "std/io"
+
+type User = { "id": Int32, "name": String }
+type Bad = Pick<User, "naem">
+
+print("unreachable")
+"#);
+    assert!(err.contains("naem"), "expected error to name bad key, got: {}", err);
+}
+
+#[test]
+fn test_utility_record_user_shadow_still_checks() {
+    // A user-defined non-generic `type Record = { … }` must still type-check (the builtin only
+    // applies in `Record<…>` applied position with no user decl). Mirrors examples/report.
+    let output = run(r#"import { print } from "std/io"
+
+type Record = { "label": String, "count": Int32 }
+
+val rec: Record = { "label": "hello", "count": 3 }
+print(rec["label"])
+"#);
+    assert_eq!(output, vec!["hello"]);
+}

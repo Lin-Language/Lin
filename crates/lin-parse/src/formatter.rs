@@ -1317,6 +1317,13 @@ pub fn fmt_type(ty: &TypeExpr) -> String {
         TypeExpr::IndexSig(key, value, _) => format!("{{ {}: {} }}", fmt_type(key), fmt_type(value)),
         TypeExpr::StringLit(s, _) => format!("\"{}\"", s),
         TypeExpr::IntLit(n, _) => format!("{}", n),
+        TypeExpr::KeyOf(inner, _) => {
+            // `keyof` binds looser than postfix `[]`, so a bare operand needs no parens.
+            // A union/intersection/function operand would, but `keyof` is only meaningful
+            // over a record/named type or `T[]`, which all format without parens here.
+            format!("keyof {}", fmt_type(inner))
+        }
+        TypeExpr::Index(base, key, _) => format!("{}[{}]", fmt_type(base), fmt_type(key)),
     }
 }
 

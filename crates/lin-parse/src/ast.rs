@@ -373,4 +373,35 @@ pub enum TypeExpr {
     /// An integer-literal singleton type, e.g. `0` or `3` in type position.
     /// Negative literals (e.g. `-1`) are also representable.
     IntLit(i64, Span),
+    /// The `keyof T` type operator: the union of T's field-name string literals.
+    /// Resolved into a `Type::Union` of `StrLit`s (or `Type::Never` for an empty record,
+    /// or the key type for a map) at resolution time — no runtime representation.
+    KeyOf(Box<TypeExpr>, Span),
+    /// An indexed-access type `T[K]`: the type of the field(s) named by `K` in record `T`.
+    /// `K` is a string literal or a union of string literals. Resolved into the field's type
+    /// (or the union of the selected field types) at resolution time. Note: `T[]` (empty
+    /// brackets) is array syntax and stays `TypeExpr::Array`; only non-empty brackets are `Index`.
+    Index(Box<TypeExpr>, Box<TypeExpr>, Span),
+}
+
+impl TypeExpr {
+    /// The source span of this type expression (its leading token / recorded span).
+    pub fn span(&self) -> Span {
+        match self {
+            TypeExpr::Named(_, s) => *s,
+            TypeExpr::Generic(_, _, s) => *s,
+            TypeExpr::Array(_, s) => *s,
+            TypeExpr::FixedArray(_, s) => *s,
+            TypeExpr::Union(_, s) => *s,
+            TypeExpr::Intersection(_, s) => *s,
+            TypeExpr::Function(_, _, s) => *s,
+            TypeExpr::Object(_, s) => *s,
+            TypeExpr::IndexSig(_, _, s) => *s,
+            TypeExpr::TaggedUnion(_, s) => *s,
+            TypeExpr::StringLit(_, s) => *s,
+            TypeExpr::IntLit(_, s) => *s,
+            TypeExpr::KeyOf(_, s) => *s,
+            TypeExpr::Index(_, _, s) => *s,
+        }
+    }
 }
