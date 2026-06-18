@@ -615,14 +615,15 @@ type ParseInt32Result = Result<Int32, String>
 Type-expression operators bind in this order, tightest first:
 
 ```txt
-1. T[]                 (postfix array)
+1. T[]  /  T[K]        (postfix array / indexed access)
 2. Generic<T1, T2>     (postfix generic application)
-3. (T1, T2) => U       (function arrow)
-4. T & U               (record intersection)
-5. T | U               (union)
+3. keyof T             (prefix key-set operator)
+4. (T1, T2) => U       (function arrow)
+5. T & U               (record intersection)
+6. T | U               (union)
 ```
 
-So `Int32 | String[]` parses as `Int32 | (String[])`, `(Int32) => String[]` parses as `(Int32) => (String[])`, and `A & B | C` parses as `(A & B) | C` (`&` binds tighter than `|`). Parenthesise to disambiguate where the surface reading is unclear.
+So `Int32 | String[]` parses as `Int32 | (String[])`, `(Int32) => String[]` parses as `(Int32) => (String[])`, and `A & B | C` parses as `(A & B) | C` (`&` binds tighter than `|`). `keyof` takes a postfix-type operand, so `keyof T[]` parses as `keyof (T[])`. Parenthesise to disambiguate where the surface reading is unclear.
 
 ### 5.8 Variance
 
@@ -724,6 +725,70 @@ used as an *open carrier* that smuggles extra fields through to a later consumer
 once a value is typed as a named record, its extra fields are gone. Code that must
 preserve arbitrary extra keys (a heterogeneous bag, a pass-through envelope) should
 type the value `AnyVal`, not a named record type.
+
+### 5.10 Utility Types and Type Operators
+
+Lin provides a set of built-in **type operators** that derive new types from existing
+ones at type-check time. They are pure compile-time transforms — each one *erases* to an
+ordinary record, union, map, or array type, with no runtime representation of its own.
+
+Two are written as operators:
+
+```txt
+keyof T          // the union of T's field-name string-literal types
+T[K]             // indexed access: the type of field(s) named by K
+```
+
+```txt
+type User = { "id": Int32, "name": String, "email": String | Null }
+
+type Keys     = keyof User          // "id" | "name" | "email"
+type NameType = User["name"]        // String
+type Mixed    = User["email" | "id"]  // (String | Null) | Int32
+```
+
+`keyof` also applies to an index-signature map, yielding its key type: `keyof { String: Int32 }`
+is `String`. `T[K]` requires `K` to be a string-literal type (or a union of them, such as the
+output of `keyof`); an unknown key is a compile-time error with a "did you mean" suggestion.
+
+The remaining operators are written as generic applications. They are builtins **only** in
+applied position `Name<…>`, and a user-declared `type Name<…>` of the same name shadows the
+builtin (the user definition wins).
+
+| Operator | Result |
+|---|---|
+| `Partial<T>` | record `T` with every field made nullable (`V` → `V \| Null`) |
+| `Required<T>` | record `T` with `Null` stripped from every field type |
+| `Pick<T, K>` | record `T` keeping only the fields named by `K` (in `T`'s order); unknown key is an error |
+| `Omit<T, K>` | record `T` dropping the fields named by `K` (lenient: unknown keys ignored) |
+| `NonNullable<T>` | `T` with `Null` removed (a `Null`-only type becomes `Never`) |
+| `Exclude<U, M>` | union `U` with every member also in `M` removed |
+| `Extract<U, M>` | union `U` keeping only members also in `M` |
+| `ReturnType<F>` | the return type of function type `F` |
+| `Parameters<F>` | the parameter types of `F` as a fixed-length array `[P1, P2, …]` |
+| `Record<K, V>` | a map `{ K: V }` (sugar for the index-signature form, §5.1.1) |
+
+`K` in `Pick`/`Omit` is a string-literal type or union of them — e.g. `"name"`, `"id" \| "name"`,
+or `keyof Other`. `Exclude`/`Extract` compare union members structurally.
+
+```txt
+type Patch     = Partial<User>            // { "id": Int32|Null, "name": String|Null, "email": String|Null }
+type Names     = Pick<User, "id" | "name">
+type NoEmail   = Omit<User, "email">
+
+type Status     = "active" | "inactive" | "pending"
+type NotPending = Exclude<Status, "pending">   // "active" | "inactive"
+
+type Handler = (Int32, String) => Boolean
+type Ret     = ReturnType<Handler>         // Boolean
+type Args    = Parameters<Handler>         // [Int32, String]
+type Flags   = Record<"a" | "b", Boolean>  // { "a": Boolean, "b": Boolean }
+```
+
+Because these operators erase to ordinary structural types, the result composes with everything
+else — intersection (`&`), unions, generics, and further utility operators (`Partial<Pick<User, "name">>`).
+There is no `Readonly<T>`: Lin records are observably-mutable reference types, so a read-only record
+type would carry no enforceable meaning.
 
 ---
 

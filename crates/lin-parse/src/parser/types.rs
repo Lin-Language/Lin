@@ -221,6 +221,17 @@ impl Parser {
                 self.expect(TokenKind::RBracket);
                 TypeExpr::FixedArray(types, span)
             }
+            TokenKind::Ident(_) if matches!(self.peek_kind(), TokenKind::Ident(n) if n == "keyof") => {
+                // `keyof T` — prefix type operator. Lexes as a bare identifier today. It binds
+                // LOOSER than the postfix `[]`/`[K]`, so the operand is parsed as a full primary
+                // (which consumes its own postfix `[]`): `keyof T[]` ≡ `keyof (T[])`.
+                let span = self.current_span();
+                self.advance(); // consume `keyof`
+                let operand = self.parse_type_primary();
+                // `keyof` itself yields no further postfix suffix here; return directly so a
+                // trailing `[K]` after `keyof T` is NOT parsed (TS forbids `keyof T[K]` too).
+                return TypeExpr::KeyOf(Box::new(operand), span);
+            }
             TokenKind::Ident(_) => {
                 let span = self.current_span();
                 let name = self.expect_ident();
@@ -271,14 +282,27 @@ impl Parser {
             }
         };
 
-        // Check for postfix `[]` (array type), repeated for nested arrays: `T[][]` is
-        // `Array(Array(T))`. A single `if` only matched one `[]`, so `Int32[][]` / `UInt8[][]`
-        // failed to parse (the second `[` was left dangling → "expected Eq, got LBracket").
+        // Check for postfix `[…]`. Two distinct forms share the `[` token:
+        //   - `T[]`  (EMPTY brackets) → array type, repeated for nested arrays `T[][]`.
+        //   - `T[K]` (NON-empty)      → indexed-access type `Index(T, K)`. `K` is a type
+        //     expression (a string literal or a union of them). Left-associative: `T[K1][K2]`.
         let mut ty = base;
-        while self.check(TokenKind::LBracket) && self.check_ahead(TokenKind::RBracket, 1) {
-            self.advance(); // [
-            self.advance(); // ]
-            ty = TypeExpr::Array(Box::new(ty), Span::dummy());
+        loop {
+            if self.check(TokenKind::LBracket) && self.check_ahead(TokenKind::RBracket, 1) {
+                // `[]` — array suffix.
+                self.advance(); // [
+                self.advance(); // ]
+                ty = TypeExpr::Array(Box::new(ty), Span::dummy());
+            } else if self.check(TokenKind::LBracket) {
+                // `[K]` — indexed access.
+                let span = self.current_span();
+                self.advance(); // [
+                let key = self.parse_type_expr();
+                self.expect(TokenKind::RBracket);
+                ty = TypeExpr::Index(Box::new(ty), Box::new(key), span);
+            } else {
+                break;
+            }
         }
         ty
     }
