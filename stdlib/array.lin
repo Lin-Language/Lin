@@ -8,7 +8,7 @@
 //   import { sort, sortBy, length, push, slice, sum } from "std/array"
 //
 // The iterable combinators (map, filter, reduce, for, while, take, drop, find, some, every,
-// flatMap, takeWhile, dropWhile, flatten, concat) and the iterator constructors (range, rangeStep,
+// flatMap, takeWhile, dropWhile, flatten, concat) and the iterator constructors (range,
 // iter, iterOf) live in std/iter, where they dispatch on the receiver type (eager over
 // arrays/iterators, lazy over streams). Import those from std/iter, not std/array.
 import foreign "lin-runtime"

@@ -1285,9 +1285,23 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
 
     let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
     let mut import_type_decls: HashMap<(String, String), (Vec<String>, Type)> = HashMap::new();
+    let mut import_overloads: HashMap<(String, String), Vec<(Type, String)>> = HashMap::new();
     for (path, imp_module) in &imported {
-        for (name, ty) in extract_exports(imp_module) {
+        // Build the export view via ModuleSignature (the same path lin-compile uses) so that an
+        // OVERLOADED export name (e.g. a 2-arg and 3-arg `range`, ADR-074) is handled correctly:
+        // `exports` carries the PRIMARY (first) overload — not a last-wins HashMap collision that
+        // would otherwise leave the call site resolving against the wrong arm — and the full member
+        // set is fed into `import_overloads` so arity-based selection works in this lightweight
+        // analysis just as it does in the real compile.
+        let sig = lin_check::ModuleSignature::from_module(imp_module);
+        for (name, ty) in sig.exports {
             import_type_map.insert((path.clone(), name), ty);
+        }
+        for (name, members) in sig.overloads {
+            import_overloads.insert(
+                (path.clone(), name),
+                members.into_iter().map(|o| (o.ty, o.symbol)).collect(),
+            );
         }
         // Imported `type` declarations live on `exported_types`, NOT in the val-export map
         // above. They must be registered into `import_type_decls` or imported type aliases
@@ -1299,6 +1313,7 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
 
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
+    checker.import_overloads = import_overloads;
     checker.import_type_decls = import_type_decls;
 
     let typed = match checker.check_module(&module) {

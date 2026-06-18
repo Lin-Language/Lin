@@ -1371,7 +1371,7 @@ surface spec in §27.9; stdlib API in `std/stream` (STDLIB.md).
 
 **Decision**: The iterable combinators — `map`/`filter`/`reduce`/`for`/`while`/`take`/`drop`/`flatMap`/
 `takeWhile`/`dropWhile`/`flatten`/`concat`/`find`/`some`/`every` — plus the iterator constructors
-`range`/`rangeStep`/`iter`/`iterOf` live in **one** module, `std/iter`, and dispatch on the **static
+`range`/`iter`/`iterOf` live in **one** module, `std/iter`, and dispatch on the **static
 type of the receiver** (arg0): **eager** (a materialised `U[]`) for an `Array`/`Iterator` receiver,
 **lazy** (a `Stream<U>` adapter node) for a `Stream` receiver. Terminals over a stream gain an `| Error`
 arm (a stream read is fallible). One name, one import, one fluent chain over any iterable source — the
