@@ -131,6 +131,21 @@ pub fn is_compatible_env(
         (Type::TarEntry, _) => false,
         (_, Type::TarEntry) => false,
 
+        // `Function` — a callable value. A `Function` must NOT silently widen to `AnyVal`
+        // (TypeVar(u32::MAX)). If allowed, stdlib authors could declare params as `AnyVal`
+        // when they actually mean a specific function type, and callers would silently pass
+        // function arguments with no arity/signature checking. The covariant-sink arm
+        // `(_, TypeVar(MAX)) => true` below would otherwise pass functions through unchecked.
+        //
+        // Only the Function→AnyVal direction is rejected here (value=Function, target=AnyVal).
+        // The REVERSE (AnyVal→Function, i.e. TypeVar(MAX) flowing into a function param) remains
+        // permissive: this is the stdlib's trusted internal forwarding pattern (e.g. `parallel`
+        // accepts `AnyVal[]` and passes it to `lin_parallel(tasks: (() => T)[])`). The original
+        // comment in the lenient-decode arm explicitly lists "functions" as a permissive
+        // AnyVal→concrete category. Rejecting that direction would break the stdlib's internal
+        // plumbing. The `(TypeVar(MAX), target)` arm below governs that path.
+        (Type::Function { .. }, Type::TypeVar(n)) if *n == u32::MAX => false,
+
         // Anything is assignable INTO Json (covariant sink): concrete T -> Json. (ADR-045)
         // This INCLUDES a typed index-signature map `{ String: T }` -> Json: a `LinMap` widened to
         // `Json` is only ever read back through the tag-aware `lin_*_any` bridges (keys/values/

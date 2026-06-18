@@ -570,3 +570,85 @@ fn test_unused_lambda_param_from_for_callback_recorded() {
         checker.span_type_map
     );
 }
+
+// ── Function-as-AnyVal rejection tests (Part A of ADR-088 / compat.rs fix) ──────────────────────
+//
+// Passing a lambda/function where `AnyVal` is declared as the param type should be a compile-time
+// type error. The root cause: before this fix, `Function` was compatible with TypeVar(u32::MAX)
+// (the AnyVal wildcard) via the covariant-sink arm `(_, TypeVar(MAX)) => true`. This let stdlib
+// authors declare params as `AnyVal` when they actually expected a specific function signature,
+// defeating type checking (e.g. `iter(init: AnyVal, hasNext: AnyVal, ...)` accepted non-functions).
+
+/// A bare lambda passed to an `AnyVal`-typed parameter should be rejected.
+#[test]
+fn test_function_not_assignable_to_anyval_param() {
+    // `takesData` declares `x: AnyVal` — callers should only pass data, not functions.
+    let result = parse_and_check(r#"
+val takesData = (x: AnyVal): Null => null
+val myFn = (n: Int32): Int32 => n + 1
+takesData(myFn)
+"#);
+    assert!(
+        result.is_err(),
+        "Expected type error when passing a function to AnyVal param, but got Ok"
+    );
+}
+
+/// An inline lambda literal passed to an `AnyVal`-typed parameter should also be rejected.
+#[test]
+fn test_lambda_literal_not_assignable_to_anyval_param() {
+    let result = parse_and_check(r#"
+val takesData = (x: AnyVal): Null => null
+takesData(n => n + 1)
+"#);
+    assert!(
+        result.is_err(),
+        "Expected type error when passing an inline lambda to AnyVal param, but got Ok"
+    );
+}
+
+/// A zero-arg thunk passed to an `AnyVal`-typed parameter should be rejected.
+#[test]
+fn test_thunk_not_assignable_to_anyval_param() {
+    let result = parse_and_check(r#"
+val takesData = (x: AnyVal): Null => null
+takesData(() => 42)
+"#);
+    assert!(
+        result.is_err(),
+        "Expected type error when passing a thunk to AnyVal param, but got Ok"
+    );
+}
+
+/// A function in a TYPED `Function`-accepting param must still work (regression guard — the
+/// `Function` annotation type is `Function { params: [TypeVar], ret: TypeVar }` and the existing
+/// (Function, Function) compatibility arm must fire before our new Function-vs-MAX arm).
+#[test]
+fn test_function_assignable_to_function_typed_param() {
+    let result = parse_and_check(r#"
+val toSatisfy = (pred: Function, x: Int32): Boolean => true
+val isPositive = (n: Int32): Boolean => n > 0
+toSatisfy(isPositive, 5)
+"#);
+    assert!(
+        result.is_ok(),
+        "Expected Ok when passing function to Function-typed param, got: {:?}",
+        result.err()
+    );
+}
+
+/// A data value (Int32, String, object, etc.) must still flow into `AnyVal` normally.
+#[test]
+fn test_data_values_still_assignable_to_anyval() {
+    let result = parse_and_check(r#"
+val takesData = (x: AnyVal): Null => null
+takesData(42)
+takesData("hello")
+takesData(true)
+"#);
+    assert!(
+        result.is_ok(),
+        "Expected Ok for data values into AnyVal, got: {:?}",
+        result.err()
+    );
+}

@@ -185,8 +185,11 @@ impl Checker {
             vec![Type::Promise(Box::new(Type::TypeVar(9101)))],
             Type::Union(vec![Type::TypeVar(9101), crate::resolve::error_type()])));
         // parallel: variadic — always returns a tagged array (TypeVar(u32::MAX) = AnyVal).
-        // Using u32::MAX prevents zonking from resolving the element type to a flat scalar,
-        // which would cause codegen to use a flat array representation for a tagged array.
+        // The runtime dispatches on each element's tag (TAG_FUNCTION → spawn thunk; TAG_PROMISE →
+        // await existing promise), so both thunks and already-spawned promises are accepted.
+        // The parameter is typed as (() => T)[] (the primary use case); the stdlib wrapper widens
+        // the union ((() => T) | Promise<T>)[]) to this via the lenient_json stdlib path.
+        // Using u32::MAX on the return prevents zonking from resolving the element type to a flat scalar.
         self.define_intrinsic("lin_parallel", Type::func(vec![Type::Array(Box::new(Type::func(vec![], Type::TypeVar(9102))))], Type::Array(Box::new(Type::TypeVar(u32::MAX)))));
         // race: (Promise<T>[]) => Promise<T> — resolves with the first promise to settle.
         self.define_intrinsic("lin_race", Type::func(

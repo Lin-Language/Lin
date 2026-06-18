@@ -160,7 +160,7 @@ export val matchPath = (path: String, pattern: String): AnyVal =>
 // @param port  the TCP port to listen on.
 // @returns never returns under normal operation (runs the accept loop).
 // @example handler.serve(3000)   // handler = req => match req["path"] is "/ping" => text(200, "pong") else => notFound
-export val serve = (handler: AnyVal, port: Int32): Null =>
+export val serve = (handler: (HttpRequest) => HttpResponse, port: Int32): Null =>
   lin_serve(handler, port)
 
 // ===== URL parsing/building (folded in from the former std/url module) =====
