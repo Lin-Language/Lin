@@ -1,11 +1,11 @@
 import { StopId, Time, Transfer, Trip } from "../gtfs/gtfs"
 import { keys } from "std/object"
 
-export type ScanResults = {
-  "bestArrivals": Arrivals,
-  "kArrivals": ArrivalsByNumChanges,
-  "kConnections": ConnectionIndex,
-  "k": UInt8
+export type ScanResults = { 
+  "bestArrivals": Arrivals, 
+  "kArrivals": ArrivalsByNumChanges, 
+  "kConnections": ConnectionIndex, 
+  "k": UInt8 
 }
 
 export val createScanResults = (
@@ -47,12 +47,12 @@ export val bestArrival = (results: ScanResults, stopPi: StopId): Time | Null =>
   results["bestArrivals"][stopPi]
 
 export val getMarkedStops = (results: ScanResults): StopId[] =>
-  (results["kArrivals"][results["k"]] ?? {}).keys()
+  results["kArrivals"][results["k"]].keys()
 
 export val finalize = (results: ScanResults): [ConnectionIndex, Arrivals] =>
   [results["kConnections"], results["bestArrivals"]] // TODO: any perf benefit from a freeze?
 
 export type Arrivals = { StopId: Time }
-export type ArrivalsByNumChanges = { UInt8: Arrivals }
+export type ArrivalsByNumChanges = Arrivals[]
 export type Connection = [Trip, Int32, Int32]
-export type ConnectionIndex = { StopId: { UInt8: Connection | Transfer } }
+export type ConnectionIndex = { StopId: { UInt8: Connection | Transfer } } // TODO: (Connection | Transfer)[]
