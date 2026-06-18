@@ -1,10 +1,12 @@
 import { StopId, Time, Transfer, Trip } from "../gtfs/gtfs"
 import { DayOfWeek, DateNumber } from "../gtfs/date"
-import { QueueFactory } from "./queue-factory"
-import { RouteId, RouteScanner, RouteScannerFactory } from "./route-scanner"
-import { Arrivals, ConnectionIndex, ScanResults } from "./scan-results"
-import { ScanResultsFactory } from "./scan-results-factory"
-import { while, range } from "std/iter"
+import { QueueFactory, getQueue } from "./queue-factory"
+import { RouteId, RouteScanner, RouteScannerFactory, create, getTrip } from "./route-scanner"
+import { Arrivals, ConnectionIndex, ScanResults, addRound, previousArrival, setTrip, setTransfer, bestArrival, getMarkedStops, finalize } from "./scan-results"
+import { ScanResultsFactory, create } from "./scan-results-factory"
+import { keys, entries } from "std/object"
+import { length } from "std/array"
+import { while, range, for } from "std/iter"
 
 export type RaptorAlgorithm = {
   "routeStopIndex": RouteStopIndex,
@@ -71,8 +73,9 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
     var trip: Trip | Null = null
     val routePath = raptor["routePath"][routeId]
     val routePathLength = raptor["routePath"].length()
+    val boardingPointIndex = raptor["routeStopIndex"][routeId][stopP] ?? 0
 
-    range(raptor["routeStopIndex"][routeId][stopP], routePathLength).for(pi => 
+    range(boardingPointIndex, routePathLength).for(pi => 
       val stopPi = routePath[pi]
       val previousArrival = results.previousArrival(stopPi)
 

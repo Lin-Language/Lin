@@ -1,6 +1,7 @@
 import { StopId } from "../gtfs/gtfs"
 import { RouteId } from "./route-scanner"
 import { RouteStopIndex } from "./raptor-algorithm"
+import { for, reduce } from "std/iter"
 
 export type QueueFactory = {
   "routesAtStop": RoutesIndexedByStop, 
@@ -39,4 +40,4 @@ val isStopBefore = (factory: QueueFactory, routeId: RouteId, stopA: StopId, stop
  
 
 export type RouteQueue = { RouteId: StopId }
-export type RoutesIndexedByStop = { StopId: RouteID }
+export type RoutesIndexedByStop = { StopId: RouteId[] }

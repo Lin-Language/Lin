@@ -1,0 +1,44 @@
+import { Journey } from "../journey"
+import { length, sort } from "std/array"
+import { filter, some, every } from "std/iter"
+
+//
+// A criterion comparing two journeys: returns true if `b` is at least as good as `a` on this axis.
+//
+export type FilterCriteria = (Journey, Journey) => Boolean
+
+//
+// A journey filter: a set of criteria used to drop dominated journeys.
+//
+export type JourneyFilter = { "criteria": FilterCriteria[] }
+
+// `b` arrives before or at the same time as `a`.
+val earliestArrival = (a: Journey, b: Journey): Boolean =>
+  b["arrivalTime"] <= a["arrivalTime"]
+
+// `b` has the same or fewer changes (legs) than `a`.
+val leastChanges = (a: Journey, b: Journey): Boolean =>
+  b["legs"].length() <= a["legs"].length()
+
+export val createMultipleCriteriaFilter = (criteria: FilterCriteria[] = [earliestArrival, leastChanges]): JourneyFilter =>
+  { "criteria": criteria }
+
+//
+// Sort the journeys, then keep each one unless a LATER journey is at least as good on every
+// criterion (i.e. dominates it).
+//
+export val apply = (journeyFilter: JourneyFilter, journeys: Journey[]): Journey[] =>
+  val sorted = journeys.sort(cmp)
+
+  sorted.filter((a, i) =>
+    !sorted.some((b, j) => j > i && journeyFilter["criteria"].every(c => c(a, b)))
+  )
+
+// Sort by departure time ascending; tie-break by arrival time descending.
+val cmp = (a: Journey, b: Journey): Int32 =>
+  if a["departureTime"] < b["departureTime"] then -1
+  else if a["departureTime"] > b["departureTime"] then 1
+  else if b["arrivalTime"] > a["arrivalTime"] then 1
+  else if b["arrivalTime"] < a["arrivalTime"] then -1
+  else 0
+

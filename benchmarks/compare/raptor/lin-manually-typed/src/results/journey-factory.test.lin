@@ -1,0 +1,63 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { length } from "std/array"
+import { Trip, Transfer } from "../gtfs/gtfs"
+import { Connection, ConnectionIndex } from "../raptor/scan-results"
+import { getResults } from "./journey-factory"
+
+// A trip A -> B: departs A at 900, arrives B at 1000.
+val trip: Trip = {
+  "tripId": "t1",
+  "serviceId": "1",
+  "service": {
+    "startDate": 20180101,
+    "endDate": 20991231,
+    "days": { 0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true },
+    "dates": {  }
+  },
+  "stopTimes": [
+    { "stop": "A", "arrivalTime": 850, "departureTime": 900, "pickUp": true, "dropOff": true },
+    { "stop": "B", "arrivalTime": 1000, "departureTime": 1010, "pickUp": true, "dropOff": true }
+  ]
+}
+
+// The connection that reached B: trip, boarding at stopTime 0 (A), alighting at stopTime 1 (B).
+val tripConnection: Connection = [trip, 0, 1]
+
+val transfer: Transfer = {
+  "origin": "A",
+  "destination": "B",
+  "duration": 5,
+  "startTime": 0,
+  "endTime": 86400
+}
+
+val s = suite("results/journey-factory", [
+  test("returns no journeys when the destination is unreached", () =>
+    val kConnections: ConnectionIndex = {}
+    [
+      expect(getResults(kConnections, "B").length()).toBe(0)
+    ]
+  ),
+
+  test("builds a single timetable-leg journey with departure/arrival from the trip", () =>
+    val kConnections: ConnectionIndex = { "B": { 1: tripConnection } }
+    val journeys = getResults(kConnections, "B")
+    [
+      expect(journeys.length()).toBe(1),
+      expect(journeys[0]["legs"].length()).toBe(1),
+      expect(journeys[0]["departureTime"]).toBe(900),
+      expect(journeys[0]["arrivalTime"]).toBe(1000)
+    ]
+  ),
+
+  test("builds a transfer leg for a transfer connection", () =>
+    val kConnections: ConnectionIndex = { "B": { 1: transfer } }
+    val journeys = getResults(kConnections, "B")
+    [
+      expect(journeys.length()).toBe(1),
+      expect(journeys[0]["legs"].length()).toBe(1)
+    ]
+  )
+])
+
+run(s)
