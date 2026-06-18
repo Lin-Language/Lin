@@ -181,16 +181,26 @@ Lin is **expression-based**: there are no statement-level control keywords. `if`
 
 - **`for` and `while` are not language constructs — they are ordinary functions** in `std/iter`, exactly like `map`/`filter`/`reduce`. They are combinators dispatched on their first argument (an `Array`/`Iterator`/`Stream`), applied through the dot. Writing `while cond` / `for (…)` as if they were keywords is a parse/`Undefined variable` error — they must be **imported** and **called**:
   - `for(iterable, f)` — the universal iteration driver; runs `f` for side effects over every item; returns `Null`. `[1, 2, 3].for(x => print(x))`.
-  - `while(iterable, predicate)` — pulls items from the iterable **while `predicate` returns `true`**, stopping at the first `false` or at exhaustion (a short-circuiting terminal, the eager sibling of `takeWhile`). `[1, 2, -3, 4].while(x => x >= 0)` visits `1, 2` then stops. It is **not** a C-style `while (cond) { … }`: it iterates an existing iterable, it does not loop on a free-standing condition.
-- **A condition-driven loop with no underlying collection** (advance some state until a data-dependent stop) is expressed with **recursion** — a `val` helper that calls itself. This is idiomatic and not a perf concern: a self-call in **tail position is tail-call-optimised** (ADR-016) and lowers to a jump, so it compiles to an actual loop with no stack growth. Generative sequences can also be built lazily with the stream/iterator constructors (`range`, `rangeStep`, `iter`, …) and then driven with `for`/`while`/`reduce`.
+  - `while` has **two overloads** (ADR-074 overloading; ADR-081):
+    - `while(iterable, predicate)` — pulls items from the iterable **while `predicate` returns `true`**, stopping at the first `false` or at exhaustion (a short-circuiting terminal, the eager sibling of `takeWhile`). `[1, 2, -3, 4].while(x => x >= 0)` visits `1, 2` then stops. This form iterates an existing iterable; it does not loop on a free-standing condition.
+    - `while(() => Boolean)` — the **condition-only / C-style loop**: calls the zero-argument closure repeatedly and loops **while it returns `true`**, with no underlying collection. `while(() => i = i + 1; i < 5)` is the idiomatic `while (cond) { … }`. It is pure-Lin tail-recursive under the hood, so the stack stays constant regardless of iteration count.
+- **A condition-driven loop with no underlying collection** (advance some state until a data-dependent stop) is normally written with the **`while(() => cond)` overload above**. (It is itself just a `val` helper that calls itself in **tail position**, which is tail-call-optimised — ADR-016 — and lowers to a jump; you can still write that recursion by hand when you need a return value or to thread an accumulator, since `while` returns `Null`.) Generative sequences can also be built lazily with the stream/iterator constructors (`range`, `rangeStep`, `iter`, …) and then driven with `for`/`while`/`reduce`.
 
 ```lin
 import { for, while, range, reduce } from "std/iter"
 
 range(0, n).for(i => print(i))                 // counted iteration — no `for` keyword
-[1, 2, -3, 4].while(x => x >= 0)               // stop-early traversal — no `while` keyword
+[1, 2, -3, 4].while(x => x >= 0)               // stop-early traversal over an iterable
 
-// state-driven loop with no collection => tail recursion (TCO'd to a real loop)
+// condition-only C-style loop — no collection (while(() => Boolean) overload, ADR-081)
+var i = 0
+while(() =>
+  print(i)
+  i = i + 1
+  i < n
+)
+
+// when you need a return value or an accumulator, write the tail recursion by hand
 val countdown = (n: Int32): Null =>
   if n <= 0 then null
   else

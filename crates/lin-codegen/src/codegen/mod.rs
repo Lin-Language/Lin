@@ -972,11 +972,18 @@ impl<'ctx> Codegen<'ctx> {
                                     // UNBOXED SUM TYPE: a SumNode's refcount is the offset-0 u32
                                     // (lin_rc_retain) — NOT a tagged inner-payload retain (which would
                                     // corrupt the header). Read the proven repr.
-                                    if func.repr_of(*val).sumnode_sum_ty().is_some() {
-                                        self.builder.call(self.rt.rc_retain, &[v.into()], "");
-                                    } else if func.repr_of(*val).nullable_record_fields().is_some() {
-                                        // Stage 3 NullableRecord: raw nullable sealed ptr — NOT a
-                                        // TaggedVal. lin_rc_retain null-guards (no-op on null ptr).
+                                    if func.repr_of(*val).is_packed_pointer() {
+                                        // ANY packed repr (PackedStruct / PackedSealedArray /
+                                        // ColumnarArray / SumNode / NullableRecord) is a RAW heap
+                                        // pointer whose offset-0 u32 is its own refcount — bump it
+                                        // with lin_rc_retain (null-guarded). This MUST take priority
+                                        // over the `is_union_type(ty)` arm below: a packed value
+                                        // (e.g. a `Trip` PackedStruct) can carry a union STATIC type
+                                        // when it flows into a `Trip | Null` slot (shared raw-pointer
+                                        // repr, no Coerce). Routing it to lin_tagged_retain would read
+                                        // offset 0 as a TAG byte and offset 8 as an inner payload
+                                        // pointer — type-confusion + UAF (the captured-record-`var`
+                                        // -across-a-call-in-a-closure crash, ADR-083).
                                         self.builder.call(self.rt.rc_retain, &[v.into()], "");
                                     } else if Self::is_union_type(ty) {
                                         // A boxed TaggedVal*: bump the INNER payload's rc
@@ -1033,6 +1040,18 @@ impl<'ctx> Codegen<'ctx> {
                                     let phi = self.builder.phi(ptr_ty, "nr_clone_phi");
                                     phi.add_incoming(&[(&p, null_pred), (&p, nn_pred)]);
                                     temp_map.insert(*dst, phi.as_basic_value());
+                                    continue;
+                                }
+                                // ANY OTHER packed repr (PackedStruct / PackedSealedArray /
+                                // ColumnarArray) is a NON-NULL raw heap pointer with an offset-0
+                                // refcount: an owning read is a plain lin_rc_retain forwarding the
+                                // SAME pointer. Must precede the `is_union_type(ty)` arm — a packed
+                                // value carrying a union STATIC type (e.g. a `Trip` PackedStruct
+                                // stored into a `Trip | Null` slot) would otherwise be handed to
+                                // lin_tagged_clone, which reads offset 0 as a tag byte → UAF (ADR-083).
+                                if func.repr_of(*src).is_packed_pointer() && v.is_pointer_value() {
+                                    self.builder.call(self.rt.rc_retain, &[v.into()], "");
+                                    temp_map.insert(*dst, v);
                                     continue;
                                 }
                                 let cloned = if Self::is_union_type(ty) && v.is_pointer_value() {
@@ -2346,6 +2365,15 @@ impl<'ctx> Codegen<'ctx> {
                         // the release before the store so the slot still holds the old value when
                         // we load it; loads happen for all slots up front so a later store can't
                         // clobber an earlier old-value load.
+                        // CLOSURE ENV OFFSET: a closure's physical param 0 is the implicit env
+                        // pointer (`func.is_closure`), so the user-level TailCall `args` line up with
+                        // `func.params[1..]`, not `func.params[0..]`. The env pointer is loop-invariant
+                        // (the same closure runs every iteration) — it is never updated nor released by
+                        // the back-edge. Map user arg `i` to physical param slot `i + env_offset`.
+                        // Without this offset, a self-tail-recursive LOCAL/nested function (which is a
+                        // closure) stored its decremented counter into the env slot instead of the
+                        // counter slot, leaving the counter unchanged → infinite loop (ADR-082).
+                        let env_offset = if func.is_closure { 1 } else { 0 };
                         let new_vals: Vec<Option<BasicValueEnum<'ctx>>> =
                             args.iter().map(|t| temp_map.get(t).copied()).collect();
                         // Pointer-typed new values that an old value could alias (skip non-pointers).
@@ -2353,37 +2381,43 @@ impl<'ctx> Codegen<'ctx> {
                             .iter()
                             .filter_map(|v| v.and_then(|v| if v.is_pointer_value() { Some(v.into_pointer_value()) } else { None }))
                             .collect();
-                        // Load all old values before storing any new value (a later store must not
-                        // clobber an earlier old-value load when params share no slot, but be safe).
-                        let mut old_vals: Vec<Option<BasicValueEnum<'ctx>>> = Vec::with_capacity(param_allocs.len());
-                        for (i, (_t, ty)) in func.params.iter().enumerate() {
-                            if tco_owns.get(i).copied().flatten().is_some() && param_allocs.get(i).is_some() {
+                        // Load all old values (for the USER param slots only) before storing any new
+                        // value. `old_vals[i]` is the old value of the slot that user arg `i` targets
+                        // (`param_allocs[i + env_offset]`). The env slot is never touched here.
+                        let mut old_vals: Vec<Option<BasicValueEnum<'ctx>>> = Vec::with_capacity(new_vals.len());
+                        for i in 0..new_vals.len() {
+                            let pi = i + env_offset;
+                            if tco_owns.get(pi).copied().flatten().is_some() && param_allocs.get(pi).is_some() {
+                                let (_t, ty) = &func.params[pi];
                                 let llvm_ty = self.llvm_type(ty);
-                                old_vals.push(Some(self.builder.load(llvm_ty, param_allocs[i], "tco_old")));
+                                old_vals.push(Some(self.builder.load(llvm_ty, param_allocs[pi], "tco_old")));
                             } else {
                                 old_vals.push(None);
                             }
                         }
                         // Conditionally release each LOOP-OWNED old value (guarded against aliasing).
                         // Only release when this slot's value was stored by a prior tail iteration
-                        // (`tco_owns[i]` is true) — never the borrowed entry param — AND the old
+                        // (`tco_owns[pi]` is true) — never the borrowed entry param — AND the old
                         // pointer differs from every new arg value being stored this iteration.
-                        for (i, (_t, ty)) in func.params.iter().enumerate() {
-                            if let (Some(old), Some(Some(owns))) = (old_vals[i], tco_owns.get(i)) {
+                        for i in 0..new_vals.len() {
+                            let pi = i + env_offset;
+                            if let (Some(old), Some(Some(owns))) = (old_vals[i], tco_owns.get(pi)) {
                                 if old.is_pointer_value() {
-                                    let repr = func.repr_of(*_t).clone();
+                                    let (t, ty) = &func.params[pi];
+                                    let repr = func.repr_of(*t).clone();
                                     self.emit_tco_release_old(llvm_fn, *owns, old.into_pointer_value(), &new_ptrs, ty, &repr);
                                 }
                             }
                         }
-                        // Now store the new values, and mark every owned slot as loop-owned (the
-                        // value we just stored was produced by this iteration's body).
+                        // Now store the new values into the USER param slots, and mark every owned
+                        // slot as loop-owned (the value we just stored was produced by this iteration).
                         let bool_ty = self.context.bool_type();
                         for (i, &v) in new_vals.iter().enumerate() {
-                            if let (Some(v), Some(slot)) = (v, param_allocs.get(i)) {
+                            let pi = i + env_offset;
+                            if let (Some(v), Some(slot)) = (v, param_allocs.get(pi)) {
                                 self.builder.store(*slot, v);
                             }
-                            if let Some(Some(owns)) = tco_owns.get(i) {
+                            if let Some(Some(owns)) = tco_owns.get(pi) {
                                 self.builder.store(*owns, bool_ty.const_int(1, false));
                             }
                         }

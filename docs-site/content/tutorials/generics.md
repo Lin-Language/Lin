@@ -111,6 +111,6 @@ Note the type annotation on `ok`. A bare object literal infers its `"type"` fiel
 
 ## What's next?
 
-- [Pattern Matching](/tutorials/05-pattern-matching.html) — matching on the tagged shapes generic unions produce
-- [Error Handling](/tutorials/08-error-handling.html) — `Result<T, E>` and the built-in `Error` type in practice
+- [Pattern Matching](/tutorials/pattern-matching.html) — matching on the tagged shapes generic unions produce
+- [Error Handling](/tutorials/error-handling.html) — `Result<T, E>` and the built-in `Error` type in practice
 - [Types reference](/reference/types.html#generic-types) — the full rules, including type-expression precedence

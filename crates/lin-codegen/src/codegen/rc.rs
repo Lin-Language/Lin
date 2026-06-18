@@ -202,6 +202,29 @@ impl<'ctx> Codegen<'ctx> {
             // Typed index-signature map (`{ K: V }`, ADR-055 + numeric-key): the hashed LinMap container.
             Type::Map { .. } => { self.builder.call(self.rt.map_release, &[ptr.into()], ""); }
             Type::Function { .. } => { self.builder.call(self.rt.closure_release, &[ptr.into()], ""); }
+            // Stage 3 NullableRecord: a `T | Null` union where T is a sealed record is physically a
+            // RAW nullable sealed-struct pointer (NOT a TaggedVal box) — its repr is TYPE-DETERMINED,
+            // so this gate fires wherever such a value is released by static type (notably the
+            // CellSet/FreeCell release-of-old-value of a `var last: Record | Null` slot). Release it
+            // null-guarded as a sealed struct; routing it to `lin_tagged_release` reads offset 0 as a
+            // TAG byte and dealloc's the 56-byte struct as a 16-byte TaggedVal box → mismatched-size
+            // free / double-free (the captured-record-`var`-across-a-call closure crash, ADR-083).
+            // Gate BEFORE the generic Union arm.
+            Type::Union(_) if Self::nullable_sealed_record_type(ty).is_some() => {
+                let fields = Self::nullable_sealed_record_type(ty).unwrap().clone();
+                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let i64_ty = self.context.i64_type();
+                let pi = self.builder.ptr_to_int(ptr, i64_ty, "nr_rel_p2i");
+                let is_null = self.builder.int_compare(
+                    inkwell::IntPredicate::EQ, pi, i64_ty.const_zero(), "nr_rel_isnull");
+                let rel_bb = self.context.append_basic_block(llvm_fn, "nr_rel");
+                let cont_bb = self.context.append_basic_block(llvm_fn, "nr_relcont");
+                self.builder.conditional_branch(is_null, cont_bb, rel_bb);
+                self.builder.position_at_end(rel_bb);
+                self.emit_sealed_release(val, &fields);
+                self.builder.unconditional_branch(cont_bb);
+                self.builder.position_at_end(cont_bb);
+            }
             Type::TypeVar(_) | Type::Union(_) => { self.builder.call(self.rt.tagged_release, &[ptr.into()], ""); }
             // Stream<T> is a boxed TaggedVal*(TAG_STREAM); its release dispatches the tag-aware
             // `lin_tagged_release`, whose TAG_STREAM arm decrements the stream box's refcount and

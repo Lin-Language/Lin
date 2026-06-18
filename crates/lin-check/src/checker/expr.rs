@@ -40,6 +40,12 @@ pub(crate) enum IndexKey {
     StrLit(String),
     /// A simple identifier key (`m[k]`). Sound only while `k` is not reassigned in the branch.
     Ident(String),
+    /// A stable nested place-path key (`m[row["from_stop_id"]]`). The key is itself a re-readable
+    /// place — an identifier root with index steps over string-literals / simple identifiers — so
+    /// two syntactic reads of `base[key]` denote the same slot while no identifier the key path
+    /// mentions is reassigned. `place_path_mentions` recurses into the key path to enforce this.
+    /// Boxed to break the `PlacePath` ⇄ `IndexKey` type recursion.
+    Path(Box<PlacePath>),
 }
 
 /// An active index-place narrowing recorded on `Checker::index_narrowings`. `infer_index`
@@ -50,19 +56,35 @@ pub(crate) struct IndexNarrow {
     pub(crate) ty: Type,
 }
 
+/// Canonicalize a KEY expression into a stable `IndexKey` if it is side-effect-free and re-readable:
+/// a string literal, a simple identifier, or a nested place-path (`row["from_stop_id"]`). Anything
+/// with a call, arithmetic, etc. is rejected (`None`) — it is not guaranteed to denote the same
+/// value on a re-read, so a narrowing keyed on it would be unsound.
+fn index_key_of_expr(key: &Expr) -> Option<IndexKey> {
+    match key {
+        Expr::StringLit(s, _) => Some(IndexKey::StrLit(s.clone())),
+        Expr::Ident(k, _) => Some(IndexKey::Ident(k.clone())),
+        // A nested index read used as a key (`m[row["id"]]`): admit it only if the key itself
+        // canonicalizes to a stable index place-path. A bare `Root` is already covered by the
+        // `Ident` arm above, so this only ever produces a `PlacePath::Index`.
+        Expr::Index { .. } => match place_path_of_expr(key)? {
+            path @ PlacePath::Index(..) => Some(IndexKey::Path(Box::new(path))),
+            PlacePath::Root(_) => None,
+        },
+        _ => None,
+    }
+}
+
 /// Canonicalize a place expression into a `PlacePath` if it is stably re-readable — an identifier
-/// root with index steps whose keys are each a string-literal or a simple identifier. Otherwise
-/// `None` (a call, arithmetic, etc. in the path is not guaranteed to denote the same slot twice).
+/// root with index steps whose keys are each a string-literal, a simple identifier, or a nested
+/// stable place-path. Otherwise `None` (a call, arithmetic, etc. in the path is not guaranteed to
+/// denote the same slot twice).
 fn place_path_of_expr(expr: &Expr) -> Option<PlacePath> {
     match expr {
         Expr::Ident(n, _) => Some(PlacePath::Root(n.clone())),
         Expr::Index { object, key, .. } => {
             let base = place_path_of_expr(object)?;
-            let k = match key.as_ref() {
-                Expr::StringLit(s, _) => IndexKey::StrLit(s.clone()),
-                Expr::Ident(k, _) => IndexKey::Ident(k.clone()),
-                _ => return None,
-            };
+            let k = index_key_of_expr(key)?;
             Some(PlacePath::Index(Box::new(base), k))
         }
         _ => None,
@@ -75,8 +97,31 @@ fn place_path_mentions(path: &PlacePath, name: &str) -> bool {
     match path {
         PlacePath::Root(n) => n == name,
         PlacePath::Index(base, key) => {
-            place_path_mentions(base, name) || matches!(key, IndexKey::Ident(k) if k == name)
+            place_path_mentions(base, name) || index_key_mentions(key, name)
         }
+    }
+}
+
+/// True if `name` appears anywhere in an index KEY — directly as a simple identifier key, or as the
+/// root / an identifier key within a nested place-path key (`m[row["id"]]` mentions `row`).
+/// Reassigning such an identifier invalidates a narrowing keyed on it.
+fn index_key_mentions(key: &IndexKey, name: &str) -> bool {
+    match key {
+        IndexKey::StrLit(_) => false,
+        IndexKey::Ident(k) => k == name,
+        IndexKey::Path(p) => place_path_mentions(p, name),
+    }
+}
+
+/// True if `ty` is `Null` or a union with a `Null` member. Used to gate assignment-based index
+/// narrowing: we only narrow when the assigned value type is NON-null (strictly more specific than
+/// the nullable map-read type `V | Null`). Conservative — anything we can't prove non-null is
+/// treated as possibly-null and not narrowed.
+fn type_mentions_null(ty: &Type) -> bool {
+    match ty {
+        Type::Null => true,
+        Type::Union(variants) => variants.iter().any(|t| matches!(t, Type::Null)),
+        _ => false,
     }
 }
 
@@ -363,6 +408,15 @@ impl Checker {
             || matches!((expected, final_expr_of_block(expr)), (Type::FixedArray(_), Some(Expr::Array(..))));
         if let (Expr::Block(stmts, final_expr, span, _), true) = (expr, block_push) {
             self.env.push_scope();
+            // Forward-declare function-literal `val` bindings in this block so they can refer to
+            // themselves and each other regardless of definition order (local recursion / mutual
+            // recursion), exactly as `infer_block` does. Without this, a block checked via the
+            // expected-type-directed path (which fires when the enclosing function's declared
+            // return is a Union / Named / Object / sized-scalar type) would never hoist its inner
+            // function-vals, so a local recursive helper returning e.g. `T | Null` could not call
+            // itself ("Undefined variable") — while the same helper with a plain `Int32` return
+            // (inferred via `infer_block`) worked. ADR-082.
+            self.forward_declare_functions_in(stmts);
             let mut typed_stmts = Vec::new();
             // A block's non-final statements are NOT in tail position; only its final expression
             // is. Clear the flag while checking the statements (mirroring `infer_block`) so a
@@ -520,8 +574,16 @@ impl Checker {
             Expr::BinaryOp { left, op, right, span } => self.infer_binary_op(left, *op, right, *span),
             Expr::Coalesce { left, right, span } => self.infer_coalesce(left, right, *span),
             Expr::UnaryOp { op, operand, span } => self.infer_unary_op(*op, operand, *span),
-            Expr::Call { func, args, partial, span, .. }  => self.infer_call(func, args, *partial, *span),
-            Expr::DotCall { receiver, method, method_span, args, partial, span, .. } => self.infer_dot_call(receiver, method, *method_span, args, *partial, *span),
+            Expr::Call { func, args, partial, span, .. }  => {
+                let r = self.infer_call(func, args, *partial, *span);
+                self.clear_index_narrowings_after_call();
+                r
+            }
+            Expr::DotCall { receiver, method, method_span, args, partial, span, .. } => {
+                let r = self.infer_dot_call(receiver, method, *method_span, args, *partial, *span);
+                self.clear_index_narrowings_after_call();
+                r
+            }
             Expr::Index { object, key, span, .. }         => self.infer_index(object, key, *span),
             Expr::If { condition, then_branch, else_branch, span, .. } => self.infer_if(condition, then_branch, else_branch, *span),
             Expr::Match { scrutinee, arms, span, .. }     => self.infer_match(scrutinee, arms, *span),
@@ -1254,7 +1316,9 @@ impl Checker {
                     // itself is total for a known key, so no `| Null` is introduced here.
                     Type::Object { fields, .. } => match key {
                         IndexKey::StrLit(k) => fields.get(k).cloned(),
-                        IndexKey::Ident(_) => None,
+                        // A non-literal key (a variable or nested place-path) on a fixed record is
+                        // not statically a known field, so we cannot reach the inner type.
+                        IndexKey::Ident(_) | IndexKey::Path(_) => None,
                     },
                     _ => None,
                 }
@@ -1301,6 +1365,18 @@ impl Checker {
         self.index_narrowings.retain(|n| !place_path_mentions(&n.path, name));
     }
 
+    /// Invalidate ALL active index-narrowings after a function CALL. A call could mutate the base
+    /// map of any recorded narrowing — e.g. delete the key, reassign the slot through a captured
+    /// reference, or hand the map to code that re-keys it — so a previously-assigned non-null value
+    /// is no longer guaranteed present. Maximally conservative (clears everything regardless of
+    /// which map a call might touch); over-clearing only re-widens a read to `V | Null`, never a
+    /// type hole. Called AFTER the call's receiver/arguments have been inferred, so any narrowed
+    /// read that fed INTO the call (e.g. the `m[k]` receiver of `m[k].push(x)`) already captured
+    /// its tightened type — the brief's required ordering for the `addLink` idiom.
+    pub(crate) fn clear_index_narrowings_after_call(&mut self) {
+        self.index_narrowings.clear();
+    }
+
     /// Look up an active index-narrowing for an index read. `infer_index` calls this with the
     /// syntactic object/key; the read is canonicalized to a `PlacePath` and a hit returns the
     /// tightened (`Null`-stripped) read type.
@@ -1310,11 +1386,7 @@ impl Checker {
         }
         // Reconstruct the full read path `object[key]` and canonicalize it.
         let base = place_path_of_expr(object)?;
-        let k = match key {
-            Expr::StringLit(s, _) => IndexKey::StrLit(s.clone()),
-            Expr::Ident(k, _) => IndexKey::Ident(k.clone()),
-            _ => return None,
-        };
+        let k = index_key_of_expr(key)?;
         let path = PlacePath::Index(Box::new(base), k);
         // Last match wins (innermost/most-recent narrowing).
         self.index_narrowings
@@ -1801,6 +1873,12 @@ impl Checker {
 
     pub(crate) fn infer_block(&mut self, stmts: &[Stmt], final_expr: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
         self.env.push_scope();
+        // Index-place narrowings (assignment-based) established INSIDE this block persist forward
+        // across its statements but must NOT leak past the block. Record the stack depth on entry
+        // and truncate back to it on exit — the same scoping discipline `infer_if` uses for the
+        // null-test index narrowings. Any narrowing that mentions a block-local binding necessarily
+        // goes away here too, since that binding is out of scope after the block.
+        let index_narrow_base = self.index_narrowings.len();
         // Forward-declare any function-literal `val` bindings in this block so they can refer
         // to each other regardless of definition order (hoisting, mirrors module-level ADR-012).
         self.forward_declare_functions_in(stmts);
@@ -1810,13 +1888,17 @@ impl Checker {
         for stmt in stmts {
             match self.check_stmt(stmt) {
                 Ok(ts) => typed_stmts.push(ts),
-                Err(diag) => { self.env.pop_scope(); return Err(diag); }
+                Err(diag) => { self.env.pop_scope(); self.index_narrowings.truncate(index_narrow_base); return Err(diag); }
             }
         }
         self.in_tail_position = block_tail;
-        let typed_final = self.infer_expr(final_expr)?;
+        let typed_final = match self.infer_expr(final_expr) {
+            Ok(t) => t,
+            Err(diag) => { self.env.pop_scope(); self.index_narrowings.truncate(index_narrow_base); return Err(diag); }
+        };
         let ty = typed_final.ty();
         self.env.pop_scope();
+        self.index_narrowings.truncate(index_narrow_base);
         Ok(TypedExpr::Block { stmts: typed_stmts, expr: Box::new(typed_final), ty, span })
     }
 
@@ -2375,6 +2457,51 @@ impl Checker {
             Type::TypeVar(_) | Type::Union(_) | Type::Null => self.infer_expr(value)?,
             _ => return Err(Diagnostic::error(span, format!("Cannot assign into type {}", obj_ty))),
         };
+        // Assignment-based narrowing (mirrors the `if m[k] != null` index-place narrowing): after a
+        // write `m[k] = e` to a STABLE index place, a later read of that SAME place narrows to the
+        // assigned (non-null) type. This admits the `m[k] = m[k] ?? []; m[k].push(x)` idiom — the
+        // re-read no longer types as the nullable map-read `V | Null`.
+        //
+        // SOUNDNESS: record only when
+        //   (1) the LHS canonicalizes to a stable `PlacePath::Index` (identifier root, side-effect
+        //       free keys — so two reads denote the same slot), AND
+        //   (2) the slot's READ type is nullable (`V | Null`) — the safe-bracket map idiom — AND
+        //   (3) the assigned value's type is strictly more specific: non-null. (It is already
+        //       checked assignable to the slot's value type above, so it is a subtype that drops
+        //       `Null`.) AND
+        //   (4) the slot's non-null value type `V` is NOT itself a union. When `V` is a union
+        //       (`{ String: A | B }`) the slot is stored in the union (tagged) representation, and a
+        //       re-read narrowed to a bare member takes codegen's bare-record projection path, which
+        //       currently MISREADS the tagged value (a pre-existing hazard the `if m[k] != null`
+        //       narrowing shares — but which we must not newly trip from a plain assignment). The
+        //       motivating idioms narrow to a single record (`Wide`), an array (`V[]`), or a scalar
+        //       — all non-union — so this gate costs nothing real while keeping the narrowing sound.
+        //
+        // We narrow to the slot's DECLARED non-null value type `V` (`read_ty` minus `Null`), NOT to
+        // the assigned expression's type: a `{ String: { "type": String } }` slot only holds the
+        // narrow `{ "type": String }`, even if a wider record was assigned (the store projects it).
+        // Recording the wider assigned type would falsely claim dropped fields still exist.
+        // The narrowing is cleared by the same invalidation as the if-test narrowings: reassigning
+        // any identifier the path mentions (root or key, incl. a nested key path), or a write
+        // landing through the same base prefix (`clear_index_narrowings_for` above / on the next
+        // index-assign). It is scoped to the enclosing block (`infer_block` truncates on exit) and
+        // never leaks past the block/if it was established in. When unsure we simply do not record,
+        // which only loses a narrowing (re-widens to `V | Null`) — never a type hole.
+        if let (Some(base), Some(k)) = (place_path_of_expr(object), index_key_of_expr(key)) {
+            let path = PlacePath::Index(Box::new(base), k);
+            // Re-derive the read type of the place (nullable map-read) and the value type, gated on
+            // both being well-formed for narrowing.
+            if let Some(read_ty) = self.place_path_type(&path) {
+                let value_ty = typed_value.ty();
+                // `V` = the slot's declared non-null value type. Only narrow when it exists (the
+                // read was nullable) and is NOT a union (codegen hazard, see above).
+                if let Some(slot_value_ty) = read_ty.without_null() {
+                    if !matches!(slot_value_ty, Type::Union(_)) && !type_mentions_null(&value_ty) {
+                        self.index_narrowings.push(IndexNarrow { path, ty: slot_value_ty });
+                    }
+                }
+            }
+        }
         Ok(TypedExpr::IndexSet {
             object: Box::new(typed_obj),
             key: Box::new(typed_key),
