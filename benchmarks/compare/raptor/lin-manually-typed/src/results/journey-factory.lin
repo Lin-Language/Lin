@@ -1,0 +1,93 @@
+import { StopId, Time, TimetableLeg, Transfer } from "../gtfs/gtfs"
+import { ConnectionIndex } from "../raptor/scan-results"
+import { AnyLeg, Journey } from "./journey"
+import { keys } from "std/object"
+import { map, range, for, while } from "std/iter"
+import { length, slice, reverse, push } from "std/array"
+
+//
+// Take the best result of each round for the given destination and turn it into a journey.
+//
+export val getResults = (kConnections: ConnectionIndex, destination: StopId): Journey[] =>
+  val rounds = (kConnections[destination] ?? {}).keys()
+
+  rounds.map(k =>
+    val legs = getJourneyLegs(kConnections, k, destination)
+    { 
+      "legs": legs, 
+      "departureTime": getDepartureTime(legs), 
+      "arrivalTime": getArrivalTime(legs) 
+    }
+  )
+
+
+//
+// Iterate back through each connection and build up a series of legs to plan the journey.
+//
+val getJourneyLegs = (kConnections: ConnectionIndex, k: UInt8, finalDestination: StopId): AnyLeg[] =>
+  val legs: AnyLeg[] = []
+  var destination = finalDestination
+
+  range(k, 0, -1).for(i =>
+    val connection = kConnections[destination][i]
+    if connection is Transfer then
+      legs.push(connection)
+      destination = connection["origin"]
+    else if connection != null then
+      val [trip, start, end] = connection
+      val stopTimes = trip["stopTimes"].slice(start, end + 1)
+      val origin = stopTimes[0]["stop"]
+      legs.push({ "stopTimes": stopTimes, "origin": origin, "destination": destination, "trip": trip })
+      destination = origin
+  )
+
+  legs.reverse()
+
+//
+// The departure time is the first timetable leg's first departure, less any transfer time before it.
+//
+val getDepartureTime = (legs: AnyLeg[]): Time =>
+  var transferDuration: Time = 0
+  var result: Time = 0
+  var i = 0
+
+  while(() =>
+    if i >= legs.length() then
+      false
+    else
+      val leg = legs[i]
+      if leg is TimetableLeg then
+        result = leg["stopTimes"][0]["departureTime"] - transferDuration
+        false
+      else
+        transferDuration = transferDuration + leg["duration"]
+        i = i + 1
+        true
+  )
+
+  result
+
+//
+// The arrival time is the last timetable leg's final arrival, plus any transfer time after it.
+//
+val getArrivalTime = (legs: AnyLeg[]): Time =>
+  var transferDuration: Time = 0
+  var result: Time = 0
+  var i = legs.length() - 1
+
+  while(() =>
+    if i < 0 then
+      false
+    else
+      val leg = legs[i]
+      if leg is TimetableLeg then
+        result = leg["stopTimes"][leg["stopTimes"].length() - 1]["arrivalTime"] + transferDuration
+        false
+      else
+        transferDuration = transferDuration + leg["duration"]
+        i = i - 1
+        true
+  )
+
+  result
+

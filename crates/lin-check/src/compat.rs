@@ -283,6 +283,22 @@ pub fn is_compatible_env(
         // Iterator covariance
         (Type::Iterator(a), Type::Iterator(b)) => is_compatible_env(a, b, env, lenient_json, depth),
 
+        // The "any-map" sink `{ String: AnyVal }` (target key `String`, target value the AnyVal
+        // wildcard `TypeVar(MAX)`) accepts a map with ANY key type — `{ UInt8: V }`,
+        // `{ DateNumber: V }`, etc. — not just a String-keyed one. ALL map keys are stringified at
+        // runtime regardless of their static key type, and `{ String: AnyVal }` is only ever read
+        // back through the tag-aware `lin_*_any` bridges (the basis of `std/object`'s
+        // `keys`/`values`/`entries`), so widening any-keyed map -> any-map sink is read-only and
+        // representation-safe (ADR-086). The key relaxation is gated TIGHT to the AnyVal-valued sink
+        // so it does NOT open up arbitrary `{ Int: V } -> { String: V }` cross-key assignment, which
+        // could mask a genuine key-type mismatch in user code; a non-map argument still rejects (it
+        // never reaches this Map↔Map arm). This arm must sit ahead of the strict `k1 == k2` covariance.
+        (Type::Map { value: v1, .. }, Type::Map { key: k2, value: v2, .. })
+            if matches!(**k2, Type::Str) && matches!(**v2, Type::TypeVar(n) if n == u32::MAX) =>
+        {
+            is_compatible_env(v1, v2, env, lenient_json, depth)
+        }
+
         // Index-signature map covariance (`{ String: U }` -> `{ String: T }` when U compat T).
         // A `Map` is its OWN thing — NOT structurally compatible with a fixed `Object` record in
         // either direction (a value is one or the other; ADR-055). A non-`Map` value can only

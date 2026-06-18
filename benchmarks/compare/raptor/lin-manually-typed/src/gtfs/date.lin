@@ -1,16 +1,21 @@
-
-// 
+//
 // Date stored as a number, e.g 20181225
-// 
+//
 export type DateNumber = UInt32
 
-// 
+//
 // Index of dates, used to access exclude/include dates in O(1) time
 // e.g. 20260601: true
-// 
+//
 export type DateIndex = { DateNumber: Boolean }
 
-// 
+//
 // Sunday = 0, Monday = 1... don't blame me, blame JavaScript .getDay
-// 
+//
 export type DayOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6
+
+//
+// The largest representable Time/UInt32 value, used as a +infinity sentinel — e.g. an "unreached"
+// arrival time, or a transfer with no end time (the Number.MAX_SAFE_INTEGER analog).
+//
+export val MAX_TIME: UInt32 = 4294967295u32
