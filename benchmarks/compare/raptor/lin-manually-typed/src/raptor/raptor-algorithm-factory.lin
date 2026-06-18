@@ -1,0 +1,112 @@
+import { Trip, StopId, Transfer, Time } from "../gtfs/gtfs"
+import { runsOn } from "../gtfs/service"
+import { Date, weekday } from "std/datetime"
+import { getDateNumber } from "../query/date-util"
+import {
+  RaptorAlgorithm,
+  RouteStopIndex,
+  RoutePaths,
+  TransfersByOrigin,
+  Interchange,
+  createRaptorAlgorithm
+} from "./raptor-algorithm"
+import { RouteId, TripsIndexedByRoute, createRouteScannerFactory } from "./route-scanner"
+import { RoutesIndexedByStop, createQueueFactory } from "./queue-factory"
+import { createScanResultsFactory } from "./scan-results-factory"
+import { keys } from "std/object"
+import { join } from "std/string"
+import { length, push, sort } from "std/array"
+import { for, range, filter, some, map } from "std/iter"
+import { toUInt8 } from "std/number"
+
+// Default interchange (transfer) time at a stop, in seconds.
+val DEFAULT_INTERCHANGE_TIME: Time = 0
+
+//
+// Set up the indexes the Raptor algorithm needs from the loaded GTFS data: group trips into routes,
+// record each route's stop order (routeStopIndex / routePath), the routes passing through each stop
+// (routesAtStop), the trips on each route (tripsByRoute), and the transfers/interchange that are
+// actually reachable. If a date is supplied, trips are pre-filtered to those running on that date.
+//
+export val create = (
+  trips: Trip[],
+  transfers: TransfersByOrigin,
+  interchange: Interchange,
+  date: Date | Null = null
+): RaptorAlgorithm =>
+  val routesAtStop: RoutesIndexedByStop = {  }
+  val tripsByRoute: TripsIndexedByRoute = {  }
+  val routeStopIndex: RouteStopIndex = {  }
+  val routePath: RoutePaths = {  }
+  val usefulTransfers: TransfersByOrigin = {  }
+
+  val activeTrips =
+    if date == null then
+      trips
+    else
+      val dateNumber = getDateNumber(date)
+      val dow = date.weekday()
+      trips.filter(trip => runsOn(trip["service"], dateNumber, dow))
+
+  val sortedTrips = activeTrips.sort((a, b) =>
+    val da = a["stopTimes"][0]["departureTime"]
+    val db = b["stopTimes"][0]["departureTime"]
+    if da < db then -1 else if da > db then 1 else 0
+  )
+
+  sortedTrips.for(trip =>
+    val path = trip["stopTimes"].map(s => s["stop"])
+    val routeId = getRouteId(trip, tripsByRoute)
+
+    if routeStopIndex[routeId] == null then
+      val stopIndex: { StopId: UInt8 } = {  }
+      tripsByRoute[routeId] = []
+      routePath[routeId] = path
+
+      range(path.length() - 1, -1, -1).for(i =>
+        val stop = path[i]
+        stopIndex[stop] = i.toUInt8()
+        usefulTransfers[stop] = transfers[stop] ?? []
+        interchange[stop] = interchange[stop] ?? DEFAULT_INTERCHANGE_TIME
+
+        val stopRoutes = routesAtStop[stop] ?? []
+        if trip["stopTimes"][i]["pickUp"] then
+          stopRoutes.push(routeId)
+        routesAtStop[stop] = stopRoutes
+      )
+
+      routeStopIndex[routeId] = stopIndex
+
+    val routeTrips = tripsByRoute[routeId] ?? []
+    routeTrips.push(trip)
+    tripsByRoute[routeId] = routeTrips
+  )
+
+  createRaptorAlgorithm(
+    routeStopIndex,
+    routePath,
+    usefulTransfers,
+    interchange,
+    createScanResultsFactory(usefulTransfers.keys()),
+    createQueueFactory(routesAtStop, routeStopIndex),
+    createRouteScannerFactory(tripsByRoute)
+  )
+
+
+//
+// A route is the sequence of (stop, pickUp, dropOff) along a trip. A trip that reaches its final
+// stop earlier than an existing trip already on that route "overtakes" it; such trips are pushed
+// onto a distinct route so each route's trips stay in a consistent arrival order for the scanner.
+//
+val getRouteId = (trip: Trip, tripsByRoute: TripsIndexedByRoute): RouteId =>
+  val routeId = trip["stopTimes"]
+    .map(s => "${ s["stop"] }${ if s["pickUp"] then 1 else 0 }${ if s["dropOff"] then 1 else 0 }")
+    .join(",")
+
+  val lastArrivalA = trip["stopTimes"][trip["stopTimes"].length() - 1]["arrivalTime"]
+  val existing = tripsByRoute[routeId] ?? []
+  val overtakes = existing.some(t =>
+    lastArrivalA < t["stopTimes"][t["stopTimes"].length() - 1]["arrivalTime"]
+  )
+
+  if overtakes then "${ routeId }overtakes" else routeId
