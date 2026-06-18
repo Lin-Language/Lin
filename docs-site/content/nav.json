@@ -30,6 +30,7 @@
   { "title": "Expressions & Operators", "path": "/reference/expressions", "section": "Language Reference" },
   { "title": "Functions", "path": "/reference/functions", "section": "Language Reference" },
   { "title": "Generics", "path": "/reference/generics", "section": "Language Reference" },
+  { "title": "Utility Types", "path": "/reference/utility-types", "section": "Language Reference" },
   { "title": "Pattern Matching", "path": "/reference/pattern-matching", "section": "Language Reference" },
   { "title": "Error Handling", "path": "/reference/error-handling", "section": "Language Reference" },
   { "title": "Modules", "path": "/reference/modules", "section": "Language Reference" },
