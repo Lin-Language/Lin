@@ -179,5 +179,5 @@ fresh `readStream(...)` for each pass.
 - [std/stream reference](/stdlib/stream) — every source, adapter, sink, and terminal.
 - [std/iter reference](/stdlib/iter) — the eager/lazy dispatch rules behind `map`/`filter`/`reduce`.
 - [std/compress](/stdlib/compress) and [std/archive](/stdlib/archive) — gzip/DEFLATE and tar.
-- [Events](/tutorials/14-events) — stream records on one thread and emit the processed results to a
+- [Events](/guides/events) — stream records on one thread and emit the processed results to a
   subscriber on another.

@@ -63,10 +63,10 @@ val makeTransfer = (origin: String, destination: String, duration: Int32, startT
     "endTime": endTime
   }
 
-val indexOfColumns = (header: AnyVal): AnyVal =>
+val indexOfColumns = (headerRow: AnyVal): AnyVal =>
   var idx: AnyVal = {}
   var i = 0
-  header.for(name =>
+  headerRow.for(name =>
     idx[name] = i
     i = i + 1
   )

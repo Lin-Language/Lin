@@ -40,10 +40,10 @@ export val plan = (
   const originTimes = origins.map(origin => [origin, time]).fromEntries()
 
   // get results for every destination and flatten into a single array
-  const results = query.getJourneys(originTimes, destinations, date);
+  const results = query.getJourneys(originTimes, destinations, date)
 
   // apply each filter to the results
-  return this.filters.reduce((rs, filter) => filter.apply(rs), results);
+  return query["filters"].reduce((rs, filter) => filter.apply(rs), results)
 
 // 
 // Find journeys using the raptor object, if no results are found then increment the day and keep
@@ -70,7 +70,7 @@ val getJourneys = (
       results
     else    
       // reset the origin departure times, and increment the day by one
-      origins = this.getFoundStations(kConnections, bestArrivals);
+      origins = getFoundStations(kConnections, bestArrivals)
       connectionIndexes.push(kConnections)
       searchDay(i + 1)
 

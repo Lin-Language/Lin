@@ -1,4 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
+import { Transfer, Trip } from "../gtfs/gtfs"
+import { length } from "std/array"
+import { Connection } from "./scan-results"
 import { createScanResults, addRound, previousArrival, setTrip, setTransfer, bestArrival, getMarkedStops, finalize } from "./scan-results"
 
 // No TypeScript spec exists. Blocked until scan-results.lin compiles and `export`s its helpers
@@ -36,7 +39,7 @@ val s = suite("raptor/scan-results", [
   test("setTransfer records arrival and connection at the destination", () =>
     val r = freshResults()
     r.addRound()
-    val transfer = {
+    val transfer: Transfer = {
       "origin": "StopA",
       "destination": "StopB",
       "duration": 120,
@@ -54,37 +57,34 @@ val s = suite("raptor/scan-results", [
   test("setTrip records arrival and the trip connection", () =>
     val r = freshResults()
     r.addRound()
-    val trip = {
+    val trip: Trip = {
+      "tripId": "trip1",
+      "serviceId": "1",
+      "service": {
+        "startDate": 20180101,
+        "endDate": 20991231,
+        "days": { 0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true },
+        "dates": {  }
+      },
       "stopTimes": [
-        {
-          "stop": "StopA",
-          "arrivalTime": 100,
-          "departureTime": 100,
-          "pickUp": true,
-          "dropOff": true
-        },
-        {
-          "stop": "StopB",
-          "arrivalTime": 300,
-          "departureTime": 300,
-          "pickUp": true,
-          "dropOff": true
-        }
+        { "stop": "StopA", "arrivalTime": 100, "departureTime": 100, "pickUp": true, "dropOff": true },
+        { "stop": "StopB", "arrivalTime": 300, "departureTime": 300, "pickUp": true, "dropOff": true }
       ]
     }
     // arrival = stopTimes[1].arrivalTime (300) + interchange (5) = 305 at StopB
     r.setTrip(trip, 0, 1, 5)
+    val expectedConn: Connection = [trip, 0, 1]
     [
       expect(r["bestArrivals"]["StopB"]).toBe(305),
       expect(r["kArrivals"][r["k"]]["StopB"]).toBe(305),
-      expect(r["kConnections"]["StopB"][r["k"]]).toBe([trip, 0, 1])
+      expect(r["kConnections"]["StopB"][r["k"]]).toBe(expectedConn)
     ]
   ),
 
   test("bestArrival reads back a recorded best arrival", () =>
     val r = freshResults()
     r.addRound()
-    val transfer = {
+    val transfer: Transfer = {
       "origin": "StopA",
       "destination": "StopB",
       "duration": 120,
@@ -101,7 +101,7 @@ val s = suite("raptor/scan-results", [
     val r = freshResults()
     // Round 1: record an arrival at StopB.
     r.addRound()
-    val transfer = {
+    val transfer: Transfer = {
       "origin": "StopA",
       "destination": "StopB",
       "duration": 120,
@@ -119,14 +119,14 @@ val s = suite("raptor/scan-results", [
   test("getMarkedStops returns the stops marked this round", () =>
     val r = freshResults()
     r.addRound()
-    val tA = {
+    val tA: Transfer = {
       "origin": "X",
       "destination": "StopA",
       "duration": 1,
       "startTime": 0,
       "endTime": 86400
     }
-    val tB = {
+    val tB: Transfer = {
       "origin": "X",
       "destination": "StopB",
       "duration": 1,
@@ -151,7 +151,7 @@ val s = suite("raptor/scan-results", [
   test("finalize returns the connections index and best arrivals", () =>
     val r = freshResults()
     r.addRound()
-    val transfer = {
+    val transfer: Transfer = {
       "origin": "StopA",
       "destination": "StopB",
       "duration": 120,

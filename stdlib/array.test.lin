@@ -273,9 +273,9 @@ val s = suite("std/array", [
   // The "definitely present" case: over an `Int32[]`, `at(i, 0)` is `Int32 | Int32 = Int32`, a
   // bare scalar usable directly in arithmetic with no null guard (the old `atOr` ergonomic).
   test("at with a default returns a bare T usable in arithmetic", () =>
-    val sum: Int32 = [10, 20, 30].at(1, 0) + [10, 20, 30].at(7, 5)
+    val total: Int32 = [10, 20, 30].at(1, 0) + [10, 20, 30].at(7, 5)
     [
-      expect(sum).toBe(25)
+      expect(total).toBe(25)
     ]
   ),
 
