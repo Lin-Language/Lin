@@ -36,7 +36,10 @@ export val await = <T>(p: Promise<T>): T | Error =>
 // Run a list of thunks (or already-spawned promises) concurrently and collect their results in order.
 // @param tasks  an array of zero-argument thunks (`(() => T)[]`) or already-spawned `Promise<T>` values
 //               (or a mix: the runtime dispatches on each element's tag at runtime). Typed `AnyVal`
-//               so that both `(() => T)[]` and `Promise<T>[]` are accepted at the call site.
+//               because the element type is a genuinely heterogeneous thunk-or-promise union the
+//               type system can't express, and each element may yield a different result type. The
+//               argument is an Array (not a bare Function), so it is unaffected by the Function→AnyVal
+//               rejection rule; this is the documented dynamic-escape case, not a smuggled function.
 // @returns a `AnyVal[]` of the results, one per task, in input order.
 // @example val [a, b, c] = parallel([() => fetchUsers(), () => fetchPosts(), () => fetchComments()])
 export val parallel = (tasks: AnyVal): AnyVal[] =>
