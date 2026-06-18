@@ -4273,6 +4273,37 @@ print(toString(g()))
 }
 
 #[test]
+fn test_cyclic_imports_exported_map_alias_indexed_across_cycle() {
+    // ADR-084 follow-up: an exported MAP alias (`type ST = { String: UInt32 }`) defined in one SCC
+    // member, imported by a peer and used as a PARAMETER type that the peer then INDEXES. Before the
+    // type-alias seeding became a fixpoint that tolerated unresolved member bodies, the first sweep
+    // checked the peer with `ST` still a placeholder TypeVar, so `src[k]` lost its value type and
+    // nullability — `src[k] ?? d` errored "left operand of `??` is never null (its type is ?Tn)" and
+    // that body error aborted the whole SCC before `ST`'s alias was ever harvested. Now `ST` resolves
+    // to its real map definition, so indexing yields `UInt32 | Null` and the `??` is legal.
+    let dir = std::env::temp_dir().join(format!("lin_cyc_mapalias_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("a.lin"),
+        "import { helper } from \"b\"\n\
+         export type ST = { String: UInt32 }\n\
+         export val go = (): UInt32 =>\n  \
+           val m: ST = { \"x\": 1 }\n  \
+           helper(m, \"x\")\n").unwrap();
+    std::fs::write(dir.join("b.lin"),
+        "import { ST } from \"a\"\n\
+         export val helper = (src: ST, k: String): UInt32 =>\n  \
+           src[k] ?? 99\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ go }} from "{d}/a"
+print(toString(go()))
+"#, d = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["1"]);
+}
+
+#[test]
 fn test_cyclic_imports_exported_type_alias_three_module_cycle() {
     // ADR-083, 3-module SCC A -> B -> C -> A: a `type P` defined in A is imported and used in
     // TYPE position by C (two hops away around the cycle). The cross-cycle type import must
