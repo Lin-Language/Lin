@@ -542,15 +542,18 @@ impl<'ctx> Codegen<'ctx> {
     /// Load element `idx` of a packed sealed-record array as an owned (+1) sealed struct pointer.
     ///
     /// Dispatches on the runtime `elem_tag` (byte at arr+4):
-    ///   - **0xFD pointer-backed** (common, statically-known): load the 8-byte struct pointer from
-    ///     the data buffer and retain it (+1 rc). The caller owns an independent +1 copy.
-    ///   - **0xFE inline** (container-sourced Phase-2 arrays whose repr is NOT statically inline):
-    ///     get the element payload pointer (`lin_sealed_array_elem_ptr`, bounds-checked), allocate a
-    ///     fresh sealed struct (`lin_sealed_alloc`), `memcpy` the payload into it, and retain any
-    ///     heap fields. The result is a fresh +1 standalone struct identical to a 0xFD materialize.
+    ///   - **0xFD pointer-backed** (common): load the 8-byte struct pointer from the data buffer
+    ///     and retain it (+1 rc). The caller owns an independent +1 copy.
+    ///   - **0xFE inline** (container-sourced arrays): get the element payload pointer, allocate a
+    ///     fresh sealed struct, `memcpy` the payload into it, and retain heap fields.
+    ///   - **0xFF dynamic tagged** (array round-tripped through a boxed container, e.g. stored in a
+    ///     FixedArray tuple via `lin_sealed_any_to_tagged` → the Trip[] in GtfsData): each element
+    ///     is a `LinArrayElem` (TAG_MAP + `*LinMap`). Call `lin_array_get_tagged` → owned TaggedVal,
+    ///     then `sealed_project_from` (which calls `lin_union_force_to_map`) to produce a fresh
+    ///     owned sealed struct. Release the temporary TaggedVal box after projection.
     ///
     /// Used for `arr[i]` as a whole value. The fused `arr[i].field` path uses
-    /// `compile_ir_sealed_array_field_get` (which also runtime-dispatches for container-sourced arrays).
+    /// `compile_ir_sealed_array_field_get`.
     pub(crate) fn sealed_array_materialize_elem(
         &mut self,
         arr: BasicValueEnum<'ctx>,
@@ -562,25 +565,32 @@ impl<'ctx> Codegen<'ctx> {
         let i8_ty = self.context.i8_type();
         let arr_ptr = arr.into_pointer_value();
 
-        // Runtime dispatch on elem_tag (arr+4) to handle container-sourced 0xFE arrays.
+        // Read elem_tag at arr+4 and dispatch: 0xFE → fe_b, 0xFD → fd_b, else → dyn_b.
         let etag_p = unsafe { self.builder.gep(i8_ty, arr_ptr, &[i64_ty.const_int(4, false)], "smat_etag_p") };
         let etag = self.builder.load(i8_ty, etag_p, "smat_etag").into_int_value();
         let is_fe = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFE, false), "smat_isfe");
 
         let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-        let fe_b    = self.context.append_basic_block(llvm_fn, "smat_fe");
-        let fd_b    = self.context.append_basic_block(llvm_fn, "smat_fd");
-        let merge_b = self.context.append_basic_block(llvm_fn, "smat_mrg");
-        self.builder.conditional_branch(is_fe, fe_b, fd_b);
+        let fe_b      = self.context.append_basic_block(llvm_fn, "smat_fe");
+        let fd_check_b = self.context.append_basic_block(llvm_fn, "smat_fdck");
+        let fd_b      = self.context.append_basic_block(llvm_fn, "smat_fd");
+        let dyn_b     = self.context.append_basic_block(llvm_fn, "smat_dyn");
+        let merge_b   = self.context.append_basic_block(llvm_fn, "smat_mrg");
+
+        // Entry → fe_b if 0xFE, else fd_check_b.
+        self.builder.conditional_branch(is_fe, fe_b, fd_check_b);
+
+        // ── fd_check_b: check for 0xFD ────────────────────────────────────────────────────────────
+        self.builder.position_at_end(fd_check_b);
+        let is_fd = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFD, false), "smat_isfd");
+        self.builder.conditional_branch(is_fd, fd_b, dyn_b);
 
         // ── 0xFE branch: allocate a fresh standalone struct from the inline payload ──────────────
         self.builder.position_at_end(fe_b);
-        // lin_sealed_array_elem_ptr(arr, idx) → payload pointer (bounds-checked, faults OOB).
         let elem_ptr_fn = self.get_or_declare_fn("lin_sealed_array_elem_ptr",
             ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
         let payload_ptr = self.builder.call(elem_ptr_fn, &[arr_ptr.into(), idx.into()], "smat_fe_pp")
             .try_as_basic_value().unwrap_basic().into_pointer_value();
-        // Allocate the standalone sealed struct.
         let struct_size = Self::sealed_struct_size(fields);
         let size_v = i64_ty.const_int(struct_size, false);
         let heap_desc = self.sealed_descriptor(fields);
@@ -589,13 +599,11 @@ impl<'ctx> Codegen<'ctx> {
             ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), ptr_ty.into()], false));
         let fresh = self.builder.call(alloc_fn, &[size_v.into(), heap_desc.into(), named_desc.into()], "smat_fe_s")
             .try_as_basic_value().unwrap_basic().into_pointer_value();
-        // Copy element payload → struct header + SEALED_HEADER.
         let stride = struct_size - Self::SEALED_HEADER;
         let dst_payload = unsafe { self.builder.gep(i8_ty, fresh, &[i64_ty.const_int(Self::SEALED_HEADER as u64, false)], "smat_fe_dp") };
         let memcpy_fn = self.get_or_declare_fn("memcpy",
             ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), i64_ty.into()], false));
         self.builder.call(memcpy_fn, &[dst_payload.into(), payload_ptr.into(), i64_ty.const_int(stride as u64, false).into()], "");
-        // Retain heap fields so the fresh struct independently owns them.
         let retain_fn = self.get_or_declare_fn("retain_sealed_payload_fields",
             self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
         self.builder.call(retain_fn, &[dst_payload.into(), heap_desc.into()], "");
@@ -612,11 +620,29 @@ impl<'ctx> Codegen<'ctx> {
         let fd_exit = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_b);
 
+        // ── 0xFF dynamic branch: project from tagged element via lin_union_force_to_map ───────────
+        // The array's elements are TaggedVal slots (16 bytes each). `lin_array_get_tagged` returns
+        // an owned *TaggedVal (+1 on the inner payload). We pass it directly to `sealed_project_from`
+        // as a union source (TypeVar wildcard), which calls `lin_union_force_to_map` internally and
+        // builds a fresh owned sealed struct from the LinMap fields. Then free the TaggedVal box.
+        self.builder.position_at_end(dyn_b);
+        let get_tagged_fn = self.get_or_declare_fn("lin_array_get_tagged",
+            ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+        let tagged_val = self.builder.call(get_tagged_fn, &[arr_ptr.into(), idx.into()], "smat_dyn_tv")
+            .try_as_basic_value().unwrap_basic();
+        let fields_clone = fields.clone();
+        let dyn_struct = self.sealed_project_from(tagged_val, &Type::TypeVar(u32::MAX), &fields_clone);
+        let tagged_free_fn = self.get_or_declare_fn("lin_tagged_free_box",
+            self.context.void_type().fn_type(&[ptr_ty.into()], false));
+        self.builder.call(tagged_free_fn, &[tagged_val.into()], "");
+        let dyn_exit = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(merge_b);
+
         // ── Merge ──────────────────────────────────────────────────────────────────────────────────
         self.builder.position_at_end(merge_b);
         let phi = self.builder.phi(ptr_ty, "smat_phi");
         let fresh_bv: BasicValueEnum<'ctx> = fresh.into();
-        phi.add_incoming(&[(&fresh_bv, fe_exit), (&sptr, fd_exit)]);
+        phi.add_incoming(&[(&fresh_bv, fe_exit), (&sptr, fd_exit), (&dyn_struct, dyn_exit)]);
         phi.as_basic_value()
     }
 }
