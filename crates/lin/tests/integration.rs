@@ -6246,6 +6246,33 @@ print([1, 2, 3, 4].filter(x => x > 1).flatMap(x => [x, x * 10]).toString())
     ]);
 }
 
+// flatMap whose inner lambda returns a packed-record array (e.g. `j => [j, j]` where j: Journey):
+// `alloc_output_array` emits `Intrinsic::ArrayAlloc` which must allocate a 0xFD sealed-pointer
+// array when the element type is a sealed record, NOT a 0xFF tagged array. If 0xFF is allocated but
+// 0xFD field-read logic is applied the field access GPFs. Regression for the ArrayAlloc 0xFF/0xFD
+// mismatch in lin-codegen intrinsics.rs.
+#[test]
+fn test_flatmap_packed_record_output_array_repr() {
+    let output = run(r#"import { print } from "std/io"
+import { flatMap } from "std/iter"
+import { length } from "std/array"
+import { toString } from "std/string"
+
+type Leg = { "origin": String }
+type Journey = { "legs": Leg[], "dep": UInt32, "arr": UInt32 }
+
+val f = (xs: Journey[]): Journey[] =>
+  xs.flatMap(j => [j, j])
+
+val js: Journey[] = [{ "legs": [{ "origin": "A" }], "dep": 1u32, "arr": 2u32 }]
+val out = f(js)
+print(toString(length(out)))
+val dep = out[0]["dep"]
+print(toString(dep))
+"#);
+    assert_eq!(output, vec!["2", "1"]);
+}
+
 // WAVE D — BARRIER SPLITS, NOT KILLS: a chain with a mid-chain UNFUSABLE stage (a `map` with a
 // heap/non-scalar output, which the fuser gates off) must terminate the current fused run by
 // materialising ONE intermediate array and start a fresh fused run for the downstream stages — two

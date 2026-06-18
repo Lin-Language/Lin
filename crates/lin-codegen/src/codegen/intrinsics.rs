@@ -258,8 +258,20 @@ impl<'ctx> Codegen<'ctx> {
                     // repr (`func.repr`, threaded in as `arg_reprs[0]`) — the pass already applied
                     // the `sealed_array_elem` all-scalar gate. Oracle-proven equal to the former
                     // `sealed_array_elem(&arr_ty).is_some()` decision.
+                    //
+                    // DUAL-REPR GUARD: also check the ELEMENT's repr. When the element reached the
+                    // Push via a `Coerce { sealed → TypeVar }` (a leftover checker inference var
+                    // that was never fully resolved to the concrete type), codegen boxes it via
+                    // `lin_box_record` (TAG_RECORD). Its repr is `Boxed(Opaque)`, not
+                    // `Packed(struct)`. In that case the packed fast path is WRONG (it would pass a
+                    // boxed pointer to `lin_sealed_ptr_array_push` which expects a raw struct ptr).
+                    // Fall through to `lin_push_dyn`, which handles TAG_RECORD→0xFD correctly.
+                    // This case arises inside the monomorphized stdlib flatMap body, where the inner
+                    // `x` param retains an unresolved inference TypeVar from the stdlib AST.
                     if let Some(arr_repr) = arg_reprs.first() {
-                        if arr_repr.packed_sealed_array_layout().is_some() {
+                        let elem_is_packed = arg_reprs.get(1)
+                            .map_or(false, |r| r.packed_struct_fields().is_some());
+                        if arr_repr.packed_sealed_array_layout().is_some() && elem_is_packed {
                             if arr_repr.is_inline_sealed_array() {
                                 // 0xFE inline array: copy element payload + retain heap fields.
                                 // Source struct is NOT retained by this call (stays owned by the
@@ -326,8 +338,18 @@ impl<'ctx> Codegen<'ctx> {
                 ptr_ty.const_null().into()
             }
             Intrinsic::ArrayAlloc => {
-                // Empty tagged array (capacity grows on push).
                 let cap = self.context.i64_type().const_int(4, false);
+                // Sealed-record element: allocate a 0xFD pointer-backed array so that
+                // Push and field-read ops see a uniform 0xFD layout. lin_array_alloc
+                // yields a 0xFF tagged array which mismatches the 0xFD read path and
+                // causes a garbage-pointer crash on field access (type_seed mismatch).
+                if let Some(fields) = Self::sealed_array_elem(ret_ty).map(|f| f.clone()) {
+                    let i64_ty = self.context.i64_type();
+                    let named_desc = self.sealed_named_descriptor(&fields);
+                    let alloc_fn = self.get_or_declare_fn("lin_sealed_ptr_array_alloc",
+                        ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false));
+                    return self.builder.call(alloc_fn, &[cap.into(), named_desc.into()], "ir_sarr_alloc").try_as_basic_value().unwrap_basic();
+                }
                 self.builder.call(self.rt.array_alloc, &[cap.into()], "ir_arr_alloc").try_as_basic_value().unwrap_basic()
             }
             Intrinsic::FlatArrayAlloc(kind) => {
@@ -1159,6 +1181,17 @@ impl<'ctx> Codegen<'ctx> {
                     let alloc_fn = self.get_or_declare_fn(&fn_name,
                         ptr_ty.fn_type(&[i64_ty.into(), llvm_elem_ty.into()], false));
                     return self.builder.call(alloc_fn, &[n_i64.into(), zero.into()], "ir_alloc_flat").try_as_basic_value().unwrap_basic();
+                }
+                // Sealed-record element: allocate a 0xFD pointer-backed array so that
+                // subsequent Push and field-read ops see a uniform 0xFD layout.
+                // Without this, lin_array_alloc_null produces a 0xFF tagged array, but
+                // type_seed(Array(SealedRecord)) = Packed(SealedPtrArray) → the consumer
+                // uses 0xFD load logic → garbage-pointer crash on first field read.
+                if let Some(fields) = Self::sealed_array_elem(ret_ty).map(|f| f.clone()) {
+                    let named_desc = self.sealed_named_descriptor(&fields);
+                    let alloc_fn = self.get_or_declare_fn("lin_sealed_ptr_array_alloc",
+                        ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false));
+                    return self.builder.call(alloc_fn, &[n_i64.into(), named_desc.into()], "ir_alloc_sarr").try_as_basic_value().unwrap_basic();
                 }
                 let alloc_fn = self.get_or_declare_fn("lin_array_alloc_null",
                     ptr_ty.fn_type(&[i64_ty.into()], false));
