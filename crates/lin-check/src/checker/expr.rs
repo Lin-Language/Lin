@@ -1367,7 +1367,11 @@ impl Checker {
                     NarrowPlace::Ident(name) => {
                         if let Some(info) = self.env.lookup(name) {
                             let slot = info.slot;
-                            self.env.define_narrowed(name.clone(), narrowed_ty.clone(), slot);
+                            let mutable = info.mutable;
+                            // For the declared type: if the original binding is itself a
+                            // narrowing shadow, keep its declared_ty; otherwise use its ty.
+                            let declared = info.declared_ty.clone().unwrap_or_else(|| info.ty.clone());
+                            self.env.define_narrowed(name.clone(), narrowed_ty.clone(), slot, mutable, declared);
                         }
                     }
                     // Index places are narrowed via the `index_narrowings` stack, which
@@ -2450,7 +2454,12 @@ impl Checker {
         if !info.mutable {
             return Err(Diagnostic::error(span, format!("Cannot assign to immutable binding '{}'", target)));
         }
-        let expected_ty = info.ty.clone();
+        // If this binding is a flow-narrowing shadow (e.g. `var x: T|Null` narrowed to `T` inside
+        // `if x != null`), the RHS must be checked against the DECLARED type, not the narrowed
+        // type. The narrowing is also invalidated after the assignment so subsequent reads in the
+        // same block see the declared type rather than the stale refinement.
+        let is_narrowing_shadow = info.declared_ty.is_some();
+        let expected_ty = info.declared_ty.clone().unwrap_or_else(|| info.ty.clone());
         let slot = info.slot;
         let def_span = info.def_span;
         let is_mutable = info.mutable;
@@ -2474,7 +2483,14 @@ impl Checker {
         }
         let typed_value = self.check_expr(value, &expected_ty)?;
         self.span_type_map.push((span, expected_ty.to_string(), def_span));
-        self.env.clear_narrowing(target);
+        // Invalidate active narrowing: for a `define_narrowed` shadow push a counter-shadow in the
+        // current scope with the declared type so subsequent reads in this block see the declared
+        // type, not the stale refinement; for a `narrow()` refinement clear the narrowed_ty field.
+        if is_narrowing_shadow {
+            self.env.push_post_assign_shadow(target.to_string(), expected_ty.clone(), slot, is_mutable);
+        } else {
+            self.env.clear_narrowing(target);
+        }
         // Reassigning `target` invalidates any active index-narrowing whose path mentions it —
         // whether as the root object (`target[..]`, `target["a"][k]`) or as a key (`m[target]`) —
         // since the path may denote a possibly-different value now.

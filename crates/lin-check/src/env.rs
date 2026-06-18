@@ -21,6 +21,10 @@ pub struct VarInfo {
     pub ty: Type,
     pub mutable: bool,
     pub narrowed_ty: Option<Type>,
+    /// For flow-narrowed shadow bindings (created by `define_narrowed`): the original declared
+    /// type of the `var`. `None` for normal bindings. Assignment uses this as the expected type
+    /// so `var x: T|Null; if x != null then x = newVal` checks `newVal` against `T|Null`.
+    pub declared_ty: Option<Type>,
     /// The span of the binding site (the name token in val/var/param).
     pub def_span: Option<Span>,
     /// Additional function overloads sharing this name (ADR-074). Empty for the
@@ -89,12 +93,32 @@ impl TypeEnv {
 
     /// Shadow an existing binding with a narrowed type, reusing the same slot.
     /// Scoped: safe to call after push_scope, undone by pop_scope.
-    pub fn define_narrowed(&mut self, name: String, narrowed_ty: Type, orig_slot: usize) {
+    /// Preserves the original binding's `mutable` flag and records `declared_ty` so that
+    /// assignment checking can use the original declared type as the RHS expected type.
+    pub fn define_narrowed(&mut self, name: String, narrowed_ty: Type, orig_slot: usize, orig_mutable: bool, orig_declared_ty: Type) {
         let info = VarInfo {
             slot: orig_slot,
             ty: narrowed_ty,
-            mutable: false,
+            mutable: orig_mutable,
             narrowed_ty: None,
+            declared_ty: Some(orig_declared_ty),
+            def_span: None,
+            overloads: Vec::new(),
+        };
+        self.scopes.last_mut().unwrap().bindings.insert(name, info);
+    }
+
+    /// After assigning to a flow-narrowed `var`, install a counter-shadow in the **current**
+    /// (innermost) scope so subsequent lookups in the same block see the declared type rather
+    /// than the stale refinement. `slot`, `orig_mutable`, and `declared_ty` come from the
+    /// narrowed binding that `infer_assign` just found.
+    pub fn push_post_assign_shadow(&mut self, name: String, declared_ty: Type, slot: usize, orig_mutable: bool) {
+        let info = VarInfo {
+            slot,
+            ty: declared_ty,
+            mutable: orig_mutable,
+            narrowed_ty: None,
+            declared_ty: None,
             def_span: None,
             overloads: Vec::new(),
         };
@@ -109,6 +133,7 @@ impl TypeEnv {
             ty,
             mutable,
             narrowed_ty: None,
+            declared_ty: None,
             def_span,
             overloads: Vec::new(),
         };
@@ -146,6 +171,7 @@ impl TypeEnv {
             ty,
             mutable: false,
             narrowed_ty: None,
+            declared_ty: None,
             def_span,
             overloads: Vec::new(),
         };

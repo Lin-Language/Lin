@@ -42,7 +42,9 @@ impl Checker {
         if let (Some(name), Some(ty)) = (scrutinee_name, narrow_to) {
             if let Some(info) = self.env.lookup(name) {
                 let slot = info.slot;
-                self.env.define_narrowed(name.to_string(), ty.clone(), slot);
+                let mutable = info.mutable;
+                let declared = info.declared_ty.clone().unwrap_or_else(|| info.ty.clone());
+                self.env.define_narrowed(name.to_string(), ty.clone(), slot, mutable, declared);
             }
         }
     }
@@ -74,7 +76,9 @@ impl Checker {
                 if let (Some(name), Some(narrowed_ty)) = (scrutinee_name, narrowed) {
                     if let Some(orig_info) = self.env.lookup(name) {
                         let orig_slot = orig_info.slot;
-                        self.env.define_narrowed(name.to_string(), narrowed_ty.clone(), orig_slot);
+                        let orig_mutable = orig_info.mutable;
+                        let orig_declared = orig_info.declared_ty.clone().unwrap_or_else(|| orig_info.ty.clone());
+                        self.env.define_narrowed(name.to_string(), narrowed_ty.clone(), orig_slot, orig_mutable, orig_declared);
                     } else {
                         self.env.define(name.to_string(), narrowed_ty.clone(), false);
                     }
@@ -140,7 +144,9 @@ impl Checker {
                 if let (Some(name), Some(narrowed_ty)) = (scrutinee_name, narrowed) {
                     if let Some(orig_info) = self.env.lookup(name) {
                         let orig_slot = orig_info.slot;
-                        self.env.define_narrowed(name.to_string(), narrowed_ty.clone(), orig_slot);
+                        let orig_mutable = orig_info.mutable;
+                        let orig_declared = orig_info.declared_ty.clone().unwrap_or_else(|| orig_info.ty.clone());
+                        self.env.define_narrowed(name.to_string(), narrowed_ty.clone(), orig_slot, orig_mutable, orig_declared);
                     } else {
                         self.env.define(name.to_string(), narrowed_ty.clone(), false);
                     }

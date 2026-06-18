@@ -22408,6 +22408,57 @@ print(rec["label"])
     assert_eq!(output, vec!["hello"]);
 }
 
+/// Regression: flow-narrowing a `var` binding (e.g. `var x: Int32|Null`) inside an `if x != null`
+/// guard used to flip the binding to immutable, so `x = 5` inside the narrowed branch errored with
+/// "Cannot assign to immutable binding". The narrowed shadow now preserves the `var` mutability.
+#[test]
+fn test_narrowed_var_is_still_assignable() {
+    // Basic repro: assign through a narrowed var.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val main = () =>
+  var x: Int32 | Null = null
+  if x != null then
+    x = 5
+  print(toString(x))
+main()
+"#);
+    assert_eq!(output, vec!["null"]);
+
+    // After assignment inside a narrowing scope, the stale refinement is invalidated:
+    // a subsequent `val y: Int32 = x` must fail because `x` is back to `Int32 | Null`.
+    let err = run_expect_err(r#"import { print } from "std/io"
+val main = () =>
+  var x: Int32 | Null = 42
+  if x != null then
+    x = null
+    val y: Int32 = x
+  x
+main()
+"#);
+    assert!(err.contains("Int32 | Null") || err.contains("Null"), "expected type error after assignment invalidates narrowing, got: {}", err);
+}
+
+/// Regression: assigning through a narrowed var in a loop must converge correctly at runtime.
+#[test]
+fn test_narrowed_var_assign_in_loop() {
+    let output = run(r#"import { print } from "std/io"
+import { range, for } from "std/iter"
+import { toString } from "std/string"
+
+val main = () =>
+  var best: Int32 | Null = null
+  range(0, 5).for(i =>
+    if best == null || i < best then
+      best = i
+  )
+  print(toString(best))
+main()
+"#);
+    assert_eq!(output, vec!["0"]);
+}
+
 /// Regression: 3-arg `range(start, end, step)` used `lin_iter` which typed elements as `AnyVal`.
 /// An `AnyVal`-boxed int does not match a numeric map key (stored unboxed), so `m[i]` returned null.
 /// Fix: 3-arg range materialises a flat `Int32[]` so the loop variable has type `Int32`.
