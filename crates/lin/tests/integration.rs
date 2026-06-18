@@ -21106,3 +21106,89 @@ val a: M = m[0]
         output
     );
 }
+
+// ── Function-as-AnyVal rejection: integration tests (ADR-088) ────────────────────────────────────
+//
+// These tests verify that the stdlib signatures repaired in Parts A/B of ADR-088 still compile and
+// run correctly after the signature tightening, and that the Function-vs-AnyVal guard fires at the
+// call site when a bare function is passed where only data is valid.
+
+/// `iter` with proper function params compiles and runs (stdlib/iter.lin signature fix).
+#[test]
+fn test_iter_with_typed_closures_compiles_and_runs() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { iter, for } from "std/iter"
+import { push } from "std/array"
+
+val it = iter(() => 0, i => i < 5, i => i + 1, i => i * 2)
+val result: Int32[] = []
+it.for(x => push(result, x))
+print(toString(result))
+"#);
+    assert_eq!(output, vec!["[0, 2, 4, 6, 8]"]);
+}
+
+/// `iterOf` with a typed array compiles and iterates correctly (stdlib/iter.lin signature fix).
+#[test]
+fn test_iter_of_typed_array_compiles_and_runs() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { iterOf, for } from "std/iter"
+import { push } from "std/array"
+
+val arr = [10, 20, 30]
+val it = iterOf(arr)
+val result: Int32[] = []
+it.for(x => push(result, x))
+print(toString(result))
+"#);
+    assert_eq!(output, vec!["[10, 20, 30]"]);
+}
+
+/// `parallel` with thunks compiles and runs (regression: must still accept thunk arrays).
+#[test]
+fn test_parallel_thunks_regression_after_anyval_fix() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { parallel } from "std/async"
+
+val results = parallel([() => 10, () => 20, () => 30])
+print(toString(results))
+"#);
+    assert_eq!(output, vec!["[10, 20, 30]"]);
+}
+
+/// `worker` with typed handler compiles and runs (stdlib/async.lin signature fix).
+#[test]
+fn test_worker_typed_handler_regression() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { worker, request, close } from "std/async"
+
+val w = worker(msg => msg, () => null)
+val reply = request(w, "hello")
+close(w)
+print(toString(reply))
+"#);
+    assert_eq!(output, vec!["hello"]);
+}
+
+/// Passing a bare function to a data-typed `AnyVal` param is now a compile-time type error.
+#[test]
+fn test_function_as_anyval_param_is_type_error() {
+    let (ok, output) = check_source(r#"
+val acceptsData = (x: AnyVal): Null => null
+acceptsData(n => n + 1)
+"#);
+    assert!(
+        !ok,
+        "Expected a type error for passing a lambda to AnyVal param, got Ok"
+    );
+    // The error should mention the argument type is a function.
+    assert!(
+        output.contains("Argument") || output.contains("argument"),
+        "Expected argument error in output, got:\n{}",
+        output
+    );
+}

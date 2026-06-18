@@ -118,7 +118,7 @@ export val rangeStep = (start: Int32, end: Int32, step: Int32): AnyVal =>
 // @param arr  the backing array (its element type is recovered at the consuming combinator, not pinned here).
 // @returns an Iterator over `arr`'s elements.
 // @example val it = iterOf([10, 20, 30]); it.for(x => print(x))   // prints 10, 20, 30
-export val iterOf = (arr: AnyVal) =>
+export val iterOf = <T>(arr: T[]) =>
   lin_iter(() => 0, i => i < length(arr), i => i + 1, i => arr[i])
 
 // Build a custom Iterator from explicit state-machine closures.
@@ -128,7 +128,7 @@ export val iterOf = (arr: AnyVal) =>
 // @param value    `(state) => item` projecting the current state to its yielded element.
 // @returns an Iterator driven by those closures.
 // @example iter(() => 0, s => s < 3, s => s + 1, s => s)   // yields 0, 1, 2
-export val iter = (init: AnyVal, hasNext: AnyVal, next: AnyVal, value: AnyVal) =>
+export val iter = <S, T>(init: () => S, hasNext: (S) => Boolean, next: (S) => S, value: (S) => T) =>
   lin_iter(init, hasNext, next, value)
 
 // Concatenate two iterables into one. Two flat arrays of the same type (e.g. `UInt8[]` ++ `UInt8[]`)
@@ -138,8 +138,10 @@ export val iter = (init: AnyVal, hasNext: AnyVal, next: AnyVal, value: AnyVal) =
 // @param b  the second iterable, appended after `a`.
 // @returns the concatenation; flat when both inputs are the same flat type, tagged/`AnyVal[]` otherwise.
 // @example concat([1, 2], [3, 4])   // [1, 2, 3, 4]
-export val concat = (a: AnyVal, b: AnyVal): AnyVal =>
-  // Stays `AnyVal` rather than generic because `concat` may mix element types across its two operands.
+export val concat = <A, B>(a: A[] | Iterator | Stream, b: B[] | Iterator | Stream): AnyVal =>
+  // Return stays `AnyVal` because `concat` may mix element types across its two operands, and
+  // the two array flat-vs-tagged paths return different runtime representations.
+  // Separate type params `A` and `B` allow mixed-type concatenation (e.g. UInt8[] ++ String[]).
   lin_array_concat_dyn(a, b)
 
 // Apply `f` to every item, producing a new collection of the results.

@@ -33,8 +33,10 @@ export val async = <T>(f: () => T): Promise<T> =>
 export val await = <T>(p: Promise<T>): T | Error =>
   lin_await(p)
 
-// Run a list of thunks concurrently and collect their results in order.
-// @param tasks  an array of zero-argument thunks (`(() => T)[]`, passed as `AnyVal`).
+// Run a list of thunks (or already-spawned promises) concurrently and collect their results in order.
+// @param tasks  an array of zero-argument thunks (`(() => T)[]`) or already-spawned `Promise<T>` values
+//               (or a mix: the runtime dispatches on each element's tag at runtime). Typed `AnyVal`
+//               so that both `(() => T)[]` and `Promise<T>[]` are accepted at the call site.
 // @returns a `AnyVal[]` of the results, one per task, in input order.
 // @example val [a, b, c] = parallel([() => fetchUsers(), () => fetchPosts(), () => fetchComments()])
 export val parallel = (tasks: AnyVal): AnyVal[] =>
@@ -81,15 +83,15 @@ export val poolAsync = <T>(pool: AnyVal, f: () => T): Promise<T> =>
   lin_pool_async(pool, f)
 
 // Spawn a long-lived worker thread that owns thread-confined state.
-// @param handler  the per-message handler run on the worker thread.
-// @param onClose  a cleanup callback run when the worker shuts down.
+// @param handler  the per-message handler run on the worker thread; receives a message and returns a reply.
+// @param onClose  a zero-argument cleanup callback run when the worker shuts down.
 // @returns an opaque worker handle for `request`/`message`/`close`. Workers may close over `var`
 //   bindings; being single-threaded, they have no races.
 // @example val w = worker((msg: String) => "echo: ${msg}", () => null)
 // @example val reply = request(w, "hello")   // "echo: hello"
 // @example message(w, "fire-and-forget")
 // @example close(w)
-export val worker = (handler: AnyVal, onClose: AnyVal): AnyVal =>
+export val worker = (handler: (AnyVal) => AnyVal, onClose: () => Null): AnyVal =>
   lin_worker(handler, onClose)
 
 // Send `msg` to a worker and block until it replies. This is synchronous and gives backpressure.
