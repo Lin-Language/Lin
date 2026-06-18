@@ -1,0 +1,80 @@
+import { DayOfWeek, DateNumber } from "../gtfs/date"
+import { Time, Trip } from "../gtfs/gtfs"
+import { runsOn } from "../gtfs/service"
+import { length } from "std/array"
+import { while } from "std/iter"
+
+export type RouteId = String
+export type TripsIndexedByRoute = { RouteId: Trip[] }
+export type RouteScanPosition = { RouteId: Int32 }
+
+//
+// Returns trips for specific routes. Caches the last trip position found per route to reduce plan time.
+//
+export type RouteScanner = {
+  "tripsByRoute": TripsIndexedByRoute,
+  "date": DateNumber,
+  "dow": DayOfWeek,
+  "routeScanPosition": RouteScanPosition
+}
+
+export val createRouteScanner = (
+  tripsByRoute: TripsIndexedByRoute,
+  date: DateNumber,
+  dow: DayOfWeek
+): RouteScanner =>
+  {
+    "tripsByRoute": tripsByRoute,
+    "date": date,
+    "dow": dow,
+    "routeScanPosition": {}
+  }
+
+//
+// Return the earliest reachable trip on the given route, scanning backwards from the last position
+// found. The cached scan position only advances while no trip has been locked onto yet (a reachable
+// but non-running service before the last found trip must not move the resume point back).
+//
+export val getTrip = (scanner: RouteScanner, routeId: RouteId, stopIndex: Int32, time: Time): Trip | Null =>
+  val routeTrips = scanner["tripsByRoute"][routeId] ?? []
+
+  // first scan of this route starts at the last trip; later scans resume from the cached position
+  var i = scanner["routeScanPosition"][routeId] ?? routeTrips.length() - 1
+  scanner["routeScanPosition"][routeId] = i
+  var lastFound: Trip | Null = null
+
+  // walk backwards from the cached position, recording the latest reachable+running trip. Only
+  // advance the cached position while no trip has been locked onto yet — an earlier reachable but
+  // non-running service must not move the resume point back past the last found trip.
+  while(() =>
+    if i < 0 then
+      false
+    else
+      val trip = routeTrips[i]
+      val stopTime = trip["stopTimes"][stopIndex]
+
+      if stopTime["departureTime"] < time then
+        // unreachable from here back — stop
+        false
+      else
+        val foundHere = trip["service"].runsOn(scanner["date"], scanner["dow"])
+        if foundHere then
+          lastFound = trip
+        if foundHere || lastFound == null then
+          scanner["routeScanPosition"][routeId] = i
+        i = i - 1
+        true
+  )
+
+  lastFound
+
+//
+// Create RouteScanners from GTFS trips indexed by route.
+//
+export type RouteScannerFactory = { "tripsByRoute": TripsIndexedByRoute }
+
+export val createRouteScannerFactory = (tripsByRoute: TripsIndexedByRoute): RouteScannerFactory =>
+  { "tripsByRoute": tripsByRoute }
+
+export val create = (factory: RouteScannerFactory, date: DateNumber, dow: DayOfWeek): RouteScanner =>
+  createRouteScanner(factory["tripsByRoute"], date, dow)

@@ -2590,7 +2590,7 @@ isEmpty("hi")        // false
 val keys: (obj: AnyVal) -> String[]
 ```
 
-Returns an array of the object's keys. Tag-aware: works on a plain `{}`/`AnyVal` record (insertion order) or a typed `{ String: T }` map (hash order).
+Returns an array of the object's keys. Tag-aware: works on a plain `{}`/`AnyVal` record (insertion order) or a typed map of ANY key type — `{ String: T }`, `{ UInt8: T }`, `{ DateNumber: T }`, … (hash order). Map keys are always strings at runtime, so a non-`String`-keyed map returns its keys stringified (the int key `3` reads back as `"3"`). See ADR-086.
 
 ```txt
 keys({ "a": 1, "b": 2 })   // ["a", "b"]

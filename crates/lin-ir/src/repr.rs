@@ -183,6 +183,17 @@ impl Repr {
         matches!(self, Repr::Packed(Layout::ColumnarArray { .. }))
     }
 
+    /// True iff this repr is ANY packed layout — a raw heap pointer whose offset-0 u32 is its OWN
+    /// refcount (PackedStruct / PackedSealedArray / ColumnarArray / SumNode / NullableRecord), as
+    /// opposed to a `TaggedVal*` box. The retain/clone of such a value is `lin_rc_retain` (bump
+    /// offset 0), NEVER `lin_tagged_retain` (which would read offset 0 as a TAG byte and offset 8 as
+    /// an inner payload pointer — type-confusion + UAF). Used by codegen's Retain dispatch so a
+    /// packed value whose static `ty` is a union (e.g. a `Trip` PackedStruct stored into a
+    /// `Trip | Null` slot, which shares the raw-pointer repr) is retained by-rc, not by-tag.
+    pub fn is_packed_pointer(&self) -> bool {
+        matches!(self, Repr::Packed(_))
+    }
+
     /// `Some(sum_ty)` iff this repr is an unboxed tagged sum-type value (`Layout::SumNode`) — the
     /// codegen gate for the `lin_sumnode_*` construct / tag-switch / const-offset payload path.
     pub fn sumnode_sum_ty(&self) -> Option<&Type> {

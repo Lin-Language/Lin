@@ -39,6 +39,24 @@ val s = suite("std/object", [
     ]
   ),
 
+  // ADR-086: keys/values/entries accept a map with a non-String key type and return the keys
+  // STRINGIFIED (a `{ UInt8: V }` map's int key 3 reads back as "3").
+  test("keys over an int-keyed map are stringified", () =>
+    var m: { UInt8: String } = {}
+    m[3] = "three"
+    m[10] = "ten"
+    val k = m.keys()
+    val v = m.values()
+    val e = m.entries()
+    [
+      expect(k.length()).toBe(2),
+      expect(k[0]).toBe("3"),
+      expect(k[1]).toBe("10"),
+      expect(v[0]).toBe("three"),
+      expect(e[0][0]).toBe("3")
+    ]
+  ),
+
   test("missing key returns null", () =>
     val obj = { "a": 1 }
     [
@@ -481,8 +499,8 @@ val s = suite("std/object", [
 ])
 
 // A fallible function in the `T | Error` convention.
-val parsePort = (s: String): Int32 | Error =>
-  if s == "" then error("empty port") else 8080
+val parsePort = (str: String): Int32 | Error =>
+  if str == "" then error("empty port") else 8080
 
 // An absence-y function in the `T | Null` convention.
 val cfgGet = (k: String): String | Null =>

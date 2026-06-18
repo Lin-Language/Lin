@@ -903,6 +903,51 @@ pub unsafe extern "C" fn lin_map_retain(map: *mut LinMap) {
 
 use crate::tagged::{TAG_MAP, TAG_RECORD};
 
+/// Rewrite a single `TAG_INT64` keys element at `dst` to a `TAG_STR` LinString of its decimal text.
+/// The `keys`/`entries` bridges are statically `String[]`, but `lin_map_keys`/`lin_map_entries`
+/// emit the raw Int64 key for an Int-keyed map (correct for the internal `merge`/`pick`/`omit`
+/// re-index callers). The boxed-value bridges STRINGIFY here so the consumer reads each key as a
+/// `LinString*`, not a raw integer dereferenced as a pointer (which faulted at a misaligned
+/// address). String keys are already TAG_STR and untouched. ADR-086.
+unsafe fn stringify_int_key_slot(dst: *mut crate::array::LinArrayElem) {
+    let dst = dst as *mut TaggedVal;
+    if (*dst).tag == crate::tagged::TAG_INT64 {
+        let n = (*dst).payload as i64;
+        let s = n.to_string();
+        let ls = crate::string::lin_string_from_bytes(s.as_ptr(), s.len() as u32);
+        (*dst).tag = crate::tagged::TAG_STR;
+        (*dst).payload = ls as u64;
+    }
+}
+
+/// Stringify every Int64 key element of a `keys()` array in place. See `stringify_int_key_slot`.
+unsafe fn stringify_int_keys(arr: *mut crate::array::LinArray) {
+    if arr.is_null() {
+        return;
+    }
+    let len = (*arr).len as usize;
+    for i in 0..len {
+        stringify_int_key_slot((*arr).data.add(i));
+    }
+}
+
+/// Stringify the key element ([0]) of every `[key, value]` pair in an `entries()` array, in place.
+unsafe fn stringify_int_entry_keys(arr: *mut crate::array::LinArray) {
+    if arr.is_null() {
+        return;
+    }
+    let len = (*arr).len as usize;
+    for i in 0..len {
+        let elem = (*arr).data.add(i);
+        if (*elem).tag == crate::tagged::TAG_ARRAY {
+            let pair = (*elem).payload as *mut crate::array::LinArray;
+            if !pair.is_null() && (*pair).len >= 1 {
+                stringify_int_key_slot((*pair).data.add(0));
+            }
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArray {
     if p.is_null() {
@@ -910,7 +955,11 @@ pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArr
     }
     let tv = &*(p as *const TaggedVal);
     match tv.tag {
-        TAG_MAP => lin_map_keys(tv.payload as *const LinMap),
+        TAG_MAP => {
+            let arr = lin_map_keys(tv.payload as *const LinMap);
+            stringify_int_keys(arr);
+            arr
+        }
         TAG_RECORD => {
             let sealed = tv.payload as *mut u8;
             if sealed.is_null() { return crate::array::lin_array_alloc(0); }
@@ -918,6 +967,7 @@ pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArr
             let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
             if mat.is_null() { return crate::array::lin_array_alloc(0); }
             let arr = lin_map_keys(mat as *const LinMap);
+            stringify_int_keys(arr);
             lin_map_release(mat);
             arr
         }
@@ -954,7 +1004,11 @@ pub unsafe extern "C" fn lin_entries_any(p: *const u8) -> *mut crate::array::Lin
     }
     let tv = &*(p as *const TaggedVal);
     match tv.tag {
-        TAG_MAP => lin_map_entries(tv.payload as *const LinMap),
+        TAG_MAP => {
+            let arr = lin_map_entries(tv.payload as *const LinMap);
+            stringify_int_entry_keys(arr);
+            arr
+        }
         TAG_RECORD => {
             let sealed = tv.payload as *mut u8;
             if sealed.is_null() { return crate::array::lin_array_alloc(0); }
@@ -962,6 +1016,7 @@ pub unsafe extern "C" fn lin_entries_any(p: *const u8) -> *mut crate::array::Lin
             let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
             if mat.is_null() { return crate::array::lin_array_alloc(0); }
             let arr = lin_map_entries(mat as *const LinMap);
+            stringify_int_entry_keys(arr);
             lin_map_release(mat);
             arr
         }

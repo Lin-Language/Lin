@@ -1,0 +1,38 @@
+import { expect, toBe, toBeNull, test, suite, run } from "std/test"
+import { MAX_TIME } from "../gtfs/date"
+import { StopTimes } from "./raptor-algorithm"
+import { createScanResultsFactory, create } from "./scan-results-factory"
+
+// Stops "A", "B", "C"; "A" and "C" are origins, "B" is not.
+val factory = createScanResultsFactory(["A", "B", "C"])
+val origins: StopTimes = { "A": 1000, "C": 1200 }
+val results = create(factory, origins)
+
+val s = suite("raptor/scan-results-factory", [
+  test("seeds best arrivals at the origin departure times", () => [
+    expect(results["bestArrivals"]["A"]).toBe(1000),
+    expect(results["bestArrivals"]["C"]).toBe(1200)
+  ]),
+
+  test("seeds non-origin stops as unreached (MAX_TIME)", () => [
+    expect(results["bestArrivals"]["B"]).toBe(MAX_TIME)
+  ]),
+
+  test("round 0 arrivals mirror the seeded best arrivals", () => [
+    expect(results["kArrivals"][0]["A"]).toBe(1000),
+    expect(results["kArrivals"][0]["C"]).toBe(1200),
+    expect(results["kArrivals"][0]["B"]).toBe(MAX_TIME)
+  ]),
+
+  test("seeds an empty connection map for every stop", () => [
+    expect(results["kConnections"]["A"] != null).toBe(true),
+    expect(results["kConnections"]["B"] != null).toBe(true),
+    expect(results["kConnections"]["A"][0]).toBeNull()
+  ]),
+
+  test("starts at round 0", () => [
+    expect(results["k"]).toBe(0)
+  ])
+])
+
+run(s)
