@@ -757,6 +757,15 @@ impl Checker {
                                     unify_types(elems)
                                 }
                             }
+                            // Single-variant nullable MAP (`{ K: V } | Null`). This is the result of
+                            // indexing a NESTED map — `idx[a]` over `{ String: { K: V } }` yields
+                            // `{ K: V } | Null`, and chaining a second index `idx[a][b]` lands here.
+                            // Extract the map's value type `V` so the chained read resolves to
+                            // `V | Null` (the `Null` is re-added by the wrap below), IDENTICAL to
+                            // binding the intermediate (`val inner = idx[a] ?? {}; inner[b]`). Without
+                            // this arm the chained form fell through to a fresh TypeVar, leaving the
+                            // result `?T | Null` and defeating downstream `is`/narrowing (ADR-087).
+                            Type::Map { value: val_ty, .. } => (**val_ty).clone(),
                             _ => self.env.fresh_type_var(),
                         }
                     } else if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
