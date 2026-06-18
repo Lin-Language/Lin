@@ -151,7 +151,45 @@ Inline (anonymous) functions work too:
 val doubled = [1, 2, 3].map(x => x * 2)
 ```
 
-Passing a named function directly (`nums.map(double)`) rather than wrapping it in a lambda (`nums.map(x => double(x))`) is the point-free style — see [passing functions directly](/tutorials/06-arrays-and-iteration.html#passing-functions-directly) for when the two are equivalent.
+Passing a named function directly (`nums.map(double)`) rather than wrapping it in a lambda (`nums.map(x => double(x))`) is the point-free style — see [passing functions directly](/tutorials/arrays.html#passing-functions-directly) for when the two are equivalent.
+
+## Overloading
+
+Several functions can share one name, distinguished by their parameter types. The compiler picks which one a call means from the static types of the arguments — at compile time, with no runtime dispatch:
+
+```lin
+import { print } from "std/io"
+import { toString } from "std/string"
+
+type Circle = { "radius": Float64 }
+type Rect = { "width": Float64, "height": Float64 }
+
+val area = (c: Circle): Float64 => 3.14159 * c["radius"] * c["radius"]
+val area = (r: Rect): Float64 => r["width"] * r["height"]
+
+val c: Circle = { "radius": 2.0 }
+val r: Rect = { "width": 3.0, "height": 4.0 }
+
+print(toString(area(c)))   // picks area(Circle)
+print(toString(area(r)))   // picks area(Rect)
+```
+
+Resolution looks at **all** the argument types, not just the first — so `encode(s)` and `encode(n)` below select different overloads:
+
+```lin
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val encode = (s: String): String => "str:${s}"
+val encode = (n: Int32): String => "int:${toString(n)}"
+
+print(encode("hi"))   // str:hi
+print(encode(42))     // int:42
+```
+
+Two overloads can never have the same parameter types — the return type is not consulted. A call whose argument types match no overload, or match several with no clear winner, is a compile error (`no matching overload` / `ambiguous call`).
+
+See the [functions reference](/reference/functions.html) for the full resolution rules.
 
 ## Closures
 

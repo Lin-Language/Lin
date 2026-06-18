@@ -346,8 +346,22 @@ impl Parser {
     /// a Newline/Dedent at the top level, or EOF.
     /// This lets parse_module continue reporting errors for later statements.
     pub(crate) fn synchronize(&mut self) {
-        // Skip until a Newline, Dedent, or EOF that looks like a statement boundary.
-        // Also stop if we see a statement-starting keyword — it means we've recovered.
+        // Skip to the next top-level statement boundary so a localized syntax error doesn't cascade
+        // through the rest of the module.
+        //
+        // INDENT/DEDENT/Newline tokens are SUPPRESSED inside `( ) [ ] { }` (ADR-003). So a syntax
+        // error DEEP inside a delimited group (e.g. a broken lambda passed to `xs.for( … )`) leaves
+        // the next statement keyword INSIDE that still-open group — often an indented `var`/`val` in
+        // the construct's body. Stopping there resumes parsing in the middle of the broken construct
+        // and mis-parses everything after it (the cascade that hides the real error and produces
+        // spurious "unknown type" diagnostics for the declarations below).
+        //
+        // Key invariant: a Newline/Dedent can ONLY appear once we are back OUTSIDE every delimiter,
+        // so it is always a safe boundary. The only trap is stopping at an INDENTED keyword first.
+        // We therefore accept a statement keyword as a recovery point ONLY at module column
+        // (column 1); an indented keyword (column > 1, i.e. inside the broken construct) is skipped
+        // like any other token until we reach the first Newline/Dedent — which lands us cleanly past
+        // the whole broken delimited group.
         loop {
             match self.peek_kind() {
                 TokenKind::Eof => break,
@@ -355,13 +369,18 @@ impl Parser {
                     self.advance();
                     break;
                 }
-                // Stop before statement-starting keywords so the next loop
-                // iteration in parse_module picks them up cleanly.
+                // Stop before a TOP-LEVEL statement keyword so the next loop iteration in
+                // parse_module picks it up cleanly. Indented keywords (inside a broken delimited
+                // group) are NOT recovery points — skip them.
                 TokenKind::Val
                 | TokenKind::Var
                 | TokenKind::Type
                 | TokenKind::Import
-                | TokenKind::Export => break,
+                | TokenKind::Export
+                    if self.tokens.get(self.pos).map(|t| t.column).unwrap_or(0) == 1 =>
+                {
+                    break
+                }
                 _ => { self.advance(); }
             }
         }
@@ -422,6 +441,45 @@ mod hang_regression_tests {
         let src = "val r = match x\n  has { 1 } => 0\n  else => 1\n";
         let diags = diagnostics_for(src);
         assert!(!diags.is_empty(), "expected a diagnostic for `has {{ 1 }} =>`");
+    }
+
+    #[test]
+    fn delimiter_aware_recovery_keeps_later_top_level_declarations() {
+        // A syntax error DEEP inside a delimited call — where Newline/Dedent are suppressed
+        // (ADR-003) and the construct body contains an indented `var`/`val` keyword — must not
+        // cascade. `synchronize()` must skip PAST the whole broken group (only stopping at a
+        // statement keyword at module column 1, or a Newline/Dedent which can only appear once we
+        // are outside every delimiter) so the `type`/`val` declarations AFTER the broken construct
+        // are still parsed. Before the fix, recovery stopped at the indented `var bp` inside the
+        // group and mis-parsed everything below — `type Foo` was never produced, yielding spurious
+        // "unknown type" errors downstream.
+        let src = "\
+val scanRoutes = (q: AnyVal) =>
+  q.foo(x =>
+    var bp = -1
+    val z = +
+    bp
+  )
+
+export type Foo = { String: Int32 }
+val use = (x: Foo) => x
+";
+        let mut lexer = Lexer::new(src, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let module = parser.parse_module();
+        // The real syntax error is reported.
+        assert!(!parser.diagnostics.is_empty(), "expected a syntax error diagnostic");
+        // The declaration after the broken construct is still parsed (recovery worked).
+        let has_foo = module
+            .statements
+            .iter()
+            .any(|s| matches!(s, crate::ast::Stmt::TypeDecl { name, .. } if name == "Foo"));
+        assert!(
+            has_foo,
+            "expected `type Foo` after the broken construct to be parsed; got {} statements",
+            module.statements.len()
+        );
     }
 }
 

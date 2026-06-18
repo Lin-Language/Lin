@@ -110,7 +110,7 @@ for inference; it is never folded.
 ## Putting it together: stream in, process, emit
 
 This is where streams and events meet — the canonical use case. A producer **streams** a file on the
-calling thread (see the [Streams tutorial](/tutorials/13-streams)), parses each line into a typed
+calling thread (see the [Streams tutorial](/guides/streams)), parses each line into a typed
 record, and **sends** it to a subscriber worker that folds it into an index or a tally. The stream
 stays on the producer thread; only the parsed, transferable record crosses to the worker, so parsing
 and aggregation overlap and the whole feed is processed in constant memory.
@@ -163,7 +163,7 @@ Swapping the source for an archive is the only change needed to read straight fr
 ## What's next?
 
 - [std/event reference](/stdlib/event) — the full API and the generics notes.
-- [Streams](/tutorials/13-streams) — the lazy I/O pipelines the producer side is built on.
-- [Concurrency](/tutorials/09-concurrency) — workers, the primitive the async emitter is built on.
+- [Streams](/guides/streams) — the lazy I/O pipelines the producer side is built on.
+- [Concurrency](/guides/concurrency) — workers, the primitive the async emitter is built on.
 - The `examples/event-transfers/` project — a complete worked example (streaming a transfers file
   into a subscriber worker), with its own test suite.

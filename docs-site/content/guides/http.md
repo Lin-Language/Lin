@@ -111,6 +111,6 @@ val page = (req: AnyVal): AnyVal =>
 
 ## What's next?
 
-- [Pattern Matching](/tutorials/05-pattern-matching.html) — the routing technique used above
-- [Error Handling](/tutorials/08-error-handling.html) — handling failed requests as values
+- [Pattern Matching](/tutorials/pattern-matching.html) — the routing technique used above
+- [Error Handling](/tutorials/error-handling.html) — handling failed requests as values
 - [std/http reference](/stdlib/http.html) and [std/template reference](/stdlib/template.html) — the full API
