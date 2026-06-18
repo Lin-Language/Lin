@@ -3259,9 +3259,10 @@ fn for_each_child(expr: &TypedExpr, f: &mut dyn FnMut(&TypedExpr)) {
             f(expr);
         }
         TypedExpr::Function { body, .. } => f(body),
-        TypedExpr::MakeObject { fields, spreads, .. } => {
+        TypedExpr::MakeObject { fields, spreads, computed_fields, .. } => {
             for (_, v) in fields { f(v); }
             for s in spreads { f(s); }
+            for (k, v) in computed_fields { f(k); f(v); }
         }
         TypedExpr::MakeArray { elements, .. } => { for e in elements { f(e); } }
         TypedExpr::Index { object, key, .. } => { f(object); f(key); }
@@ -3308,9 +3309,10 @@ fn for_each_child_mut(expr: &mut TypedExpr, f: &mut dyn FnMut(&mut TypedExpr)) {
             for p in params.iter_mut() { if let Some(d) = p.default.as_mut() { f(d); } }
             f(body);
         }
-        TypedExpr::MakeObject { fields, spreads, .. } => {
+        TypedExpr::MakeObject { fields, spreads, computed_fields, .. } => {
             for (_, v) in fields { f(v); }
             for s in spreads { f(s); }
+            for (k, v) in computed_fields { f(k); f(v); }
         }
         TypedExpr::MakeArray { elements, .. } => { for e in elements { f(e); } }
         TypedExpr::Index { object, key, .. } => { f(object); f(key); }

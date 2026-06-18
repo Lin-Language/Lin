@@ -2042,6 +2042,11 @@ impl Checker {
         let first_str_key = fields.iter().any(|f| {
             matches!(f, ObjectField::Pair(Expr::StringLit(..), _))
         });
+        // A computed key uses `[expr]` syntax — parsed as a single-element array literal.
+        let has_computed_key = fields.iter().any(|f| match f {
+            ObjectField::Pair(k, _) => extract_computed_key(k).is_some(),
+            ObjectField::Spread(_) => false,
+        });
         if first_int_key.is_some() {
             // All keys must be integer literals — mixing string and int keys is a type error.
             if first_str_key {
@@ -2052,6 +2057,11 @@ impl Checker {
                 ));
             }
             return self.infer_int_map_literal(fields, span);
+        }
+        // If there are computed (runtime-expression) keys `[expr]: value`, the literal infers to
+        // a `{ String: V }` Map. Spreads alone stay on the record path below.
+        if has_computed_key {
+            return self.infer_map_literal_with_computed(fields, span);
         }
         let mut typed_fields = Vec::new();
         let mut spreads = Vec::new();
@@ -2091,7 +2101,7 @@ impl Checker {
         }
         self.in_tail_position = saved_tail;
         // Object literal → anonymous structural type → UNSEALED.
-        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads, ty: Type::object(obj_type), span })
+        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads, computed_fields: Vec::new(), ty: Type::object(obj_type), span })
     }
 
     /// Infer an integer-keyed map literal `{ 1: v, -1: w, 42: x }`.
@@ -2137,6 +2147,94 @@ impl Checker {
         Ok(TypedExpr::MakeObject {
             fields: typed_fields,
             spreads: Vec::new(),
+            computed_fields: Vec::new(),
+            ty: Type::Map { key: Box::new(key_ty), value: Box::new(value_ty), name: None },
+            span,
+        })
+    }
+
+    /// Infer an object literal that contains at least one computed (runtime-expression) key
+    /// `[expr]: value`, or a spread over a Map-typed source.
+    ///
+    /// The result is a `Type::Map { String: V }` where V is the unification of all value types
+    /// (static-key values, computed-key values, and Map spread value types). Static string-key
+    /// entries become `computed_fields` as well for uniformity — at runtime the key is a known
+    /// string but the IR representation is the same.
+    ///
+    /// For example:
+    ///   `{ [k]: v }` → `{ String: typeof(v) }` with computed_fields = [(k, v)]
+    ///   `{ ...acc, [k]: v }` (acc: {String:Int}) → `{ String: Int }` with spread + computed
+    fn infer_map_literal_with_computed(
+        &mut self,
+        fields: &[ObjectField],
+        span: Span,
+    ) -> Result<TypedExpr, Diagnostic> {
+        let saved_tail = self.in_tail_position;
+        self.in_tail_position = false;
+        let mut static_fields: Vec<(String, TypedExpr)> = Vec::new();
+        let mut computed: Vec<(TypedExpr, TypedExpr)> = Vec::new();
+        let mut spreads: Vec<TypedExpr> = Vec::new();
+        let mut key_types: Vec<Type> = Vec::new();
+        let mut val_types: Vec<Type> = Vec::new();
+        for field in fields {
+            match field {
+                ObjectField::Pair(key_expr, val_expr) => {
+                    let typed_val = self.infer_expr(val_expr)?;
+                    let val_ty = typed_val.ty();
+                    if type_is_streamish(&val_ty) {
+                        return Err(Diagnostic::error(
+                            val_expr.span(),
+                            "a Stream cannot be stored in an object field — keep it in a `val` \
+                             binding (a Stream is an affine resource; v1 confines it to local bindings)",
+                        ));
+                    }
+                    val_types.push(val_ty);
+                    if let Expr::StringLit(key, _) = key_expr {
+                        // Static string key in a computed-key map: goes into static_fields for
+                        // the IR (emitted via compile_string_lit in codegen).
+                        key_types.push(Type::Str);
+                        static_fields.push((key.clone(), typed_val));
+                    } else if let Some(inner_key) = extract_computed_key(key_expr) {
+                        // Computed key `[expr]`: the inner expression is the runtime key.
+                        let typed_key = self.infer_expr(inner_key)?;
+                        key_types.push(typed_key.ty());
+                        computed.push((typed_key, typed_val));
+                    } else {
+                        // Non-standard key expression — treat as computed.
+                        let typed_key = self.infer_expr(key_expr)?;
+                        key_types.push(typed_key.ty());
+                        computed.push((typed_key, typed_val));
+                    }
+                }
+                ObjectField::Spread(expr) => {
+                    let typed_spread = self.infer_expr(expr)?;
+                    match typed_spread.ty() {
+                        Type::Map { key: k, value: v, .. } => {
+                            key_types.push(*k);
+                            val_types.push(*v);
+                        }
+                        Type::Object { ref fields, .. } => {
+                            // Spread of a record into a map literal: contribute its field types.
+                            key_types.push(Type::Str);
+                            let merged_v = unify_types(&fields.values().cloned().collect::<Vec<_>>());
+                            val_types.push(merged_v);
+                        }
+                        _ => {
+                            key_types.push(Type::Str);
+                        }
+                    }
+                    spreads.push(typed_spread);
+                }
+            }
+        }
+        self.in_tail_position = saved_tail;
+        // All computed keys must be Strings (only String-keyed computed maps are supported).
+        let key_ty = Type::Str;
+        let value_ty = unify_types(&val_types);
+        Ok(TypedExpr::MakeObject {
+            fields: static_fields,
+            spreads,
+            computed_fields: computed,
             ty: Type::Map { key: Box::new(key_ty), value: Box::new(value_ty), name: None },
             span,
         })
@@ -2155,8 +2253,15 @@ impl Checker {
         expected: &Type,
         span: Span,
     ) -> Result<Option<TypedExpr>, Diagnostic> {
-        // Spreads are not refined (their static shape is opaque here) — defer.
-        if fields.iter().any(|f| matches!(f, ObjectField::Spread(_))) {
+        let has_spread = fields.iter().any(|f| matches!(f, ObjectField::Spread(_)));
+        let has_computed = fields.iter().any(|f| match f {
+            ObjectField::Pair(k, _) => extract_computed_key(k).is_some(),
+            ObjectField::Spread(_) => false,
+        });
+        // Computed keys against non-Map types: defer to ordinary inference.
+        // Against Map types, the Map arm handles computed keys and spreads.
+        // Plain spreads (no computed keys) against non-Map types: defer (original behaviour).
+        if (has_spread || has_computed) && !matches!(expected, Type::Map { .. } | Type::Named(_)) {
             return Ok(None);
         }
         match expected {
@@ -2208,6 +2313,7 @@ impl Checker {
                     return Ok(Some(TypedExpr::MakeObject {
                         fields: typed_fields,
                         spreads: Vec::new(),
+                        computed_fields: Vec::new(),
                         ty,
                         span,
                     }));
@@ -2259,6 +2365,8 @@ impl Checker {
             // type — this is how `{}` infers a map from its assignment-target / return-type context.
             Type::Map { key: map_key_ty, value: val_ty, .. } => {
                 let mut typed_fields = Vec::new();
+                let mut computed_fields: Vec<(TypedExpr, TypedExpr)> = Vec::new();
+                let mut spreads: Vec<TypedExpr> = Vec::new();
                 if map_key_ty.is_integer() {
                     // Integer-keyed map: each key must be an integer literal.
                     for field in fields {
@@ -2276,18 +2384,34 @@ impl Checker {
                     }
                 } else {
                     for field in fields {
-                        if let ObjectField::Pair(Expr::StringLit(key, _), val_expr) = field {
-                            let typed_val = self.check_expr(val_expr, val_ty)?;
-                            typed_fields.push((key.clone(), typed_val));
-                        } else {
-                            // A non-literal key or a dynamic field shape — defer to ordinary inference.
-                            return Ok(None);
+                        match field {
+                            ObjectField::Pair(Expr::StringLit(key, _), val_expr) => {
+                                let typed_val = self.check_expr(val_expr, val_ty)?;
+                                typed_fields.push((key.clone(), typed_val));
+                            }
+                            ObjectField::Pair(key_expr, val_expr) => {
+                                // Computed key `[expr]`: extract the inner expression and type-check
+                                // it against the map's key type. Value is checked against V.
+                                let inner_key = extract_computed_key(key_expr).unwrap_or(key_expr);
+                                let typed_key = self.check_expr(inner_key, map_key_ty)?;
+                                let typed_val = self.check_expr(val_expr, val_ty)?;
+                                computed_fields.push((typed_key, typed_val));
+                            }
+                            ObjectField::Spread(expr) => {
+                                let typed_spread = self.check_expr(expr, &Type::Map {
+                                    key: map_key_ty.clone(),
+                                    value: val_ty.clone(),
+                                    name: None,
+                                })?;
+                                spreads.push(typed_spread);
+                            }
                         }
                     }
                 }
                 Ok(Some(TypedExpr::MakeObject {
                     fields: typed_fields,
-                    spreads: Vec::new(),
+                    spreads,
+                    computed_fields,
                     ty: Type::Map { key: map_key_ty.clone(), value: val_ty.clone(), name: None },
                     span,
                 }))
@@ -2522,7 +2646,7 @@ impl Checker {
         } else {
             Type::object(obj_type)
         };
-        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads: Vec::new(), ty, span })
+        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads: Vec::new(), computed_fields: Vec::new(), ty, span })
     }
 
     pub(crate) fn infer_array(&mut self, elements: &[Expr], span: Span) -> Result<TypedExpr, Diagnostic> {
@@ -2964,6 +3088,16 @@ fn extract_int_key(expr: &Expr) -> Option<i64> {
                 None
             }
         }
+        _ => None,
+    }
+}
+
+/// Extract the inner key expression from a computed-key object entry.
+/// In Lin, computed keys use `[expr]` syntax — the parser produces `Expr::Array([expr])`.
+/// Returns the inner expression if this is a single-element array, `None` otherwise.
+fn extract_computed_key(expr: &Expr) -> Option<&Expr> {
+    match expr {
+        Expr::Array(elems, _, _) if elems.len() == 1 => Some(&elems[0]),
         _ => None,
     }
 }
