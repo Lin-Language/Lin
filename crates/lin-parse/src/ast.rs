@@ -179,7 +179,7 @@ pub enum Expr {
     Object(Vec<ObjectField>, Span, Span),
     /// `Array(elements, span, full_span)`. `span` is the opening `[` (unchanged); `full_span`
     /// covers `[` .. closing `]`.
-    Array(Vec<Expr>, Span, Span),
+    Array(Vec<ArrayElement>, Span, Span),
     Assign {
         target: String,
         value: Box<Expr>,
@@ -266,6 +266,26 @@ impl Expr {
 pub enum ObjectField {
     Pair(Expr, Expr),
     Spread(Expr),
+}
+
+#[derive(Debug, Clone)]
+pub enum ArrayElement {
+    Expr(Expr),
+    Spread(Expr),
+}
+
+impl ArrayElement {
+    pub fn span(&self) -> Span {
+        match self {
+            ArrayElement::Expr(e) => e.span(),
+            ArrayElement::Spread(e) => e.span(),
+        }
+    }
+    pub fn inner_expr(&self) -> &Expr {
+        match self {
+            ArrayElement::Expr(e) | ArrayElement::Spread(e) => e,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

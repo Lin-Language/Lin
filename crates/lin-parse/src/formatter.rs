@@ -611,9 +611,10 @@ fn collect_anchors_expr(expr: &Expr, out: &mut Vec<Anchor>) {
             // SINGLE-LINE element is stable (kept trailing); a multi-line element's last line is
             // an unreliable anchor, so there it stays leading-only (demotes to the next anchor).
             for it in items {
-                let sp = it.span();
-                out.push(Anchor { start: sp.start, end: sp.end, trailing_ok: renders_single_line(it) });
-                collect_anchors_expr(it, out);
+                let inner = it.inner_expr();
+                let sp = inner.span();
+                out.push(Anchor { start: sp.start, end: sp.end, trailing_ok: renders_single_line(inner) });
+                collect_anchors_expr(inner, out);
             }
         }
         Expr::TupleArgs(items, _) => {
@@ -713,7 +714,8 @@ fn collect_hoist_redirects(expr: &Expr, anchor_start: u32, collapse: bool, res: 
         // to the element (no collapse — Rule B keeps the author's own-line body layout).
         Expr::Array(items, _, _) => {
             for it in items {
-                collect_hoist_redirects(it, it.span().start, false, res);
+                let inner = it.inner_expr();
+                collect_hoist_redirects(inner, inner.span().start, false, res);
             }
         }
         _ => {}
@@ -1424,7 +1426,7 @@ fn renders_single_line(expr: &Expr) -> bool {
     if let Expr::Array(items, _, _) = expr {
         // Matches the array inline rule: forced multi-line only when MORE THAN ONE element
         // contains a call. A single call among simple elements still renders single-line.
-        if items.len() > 1 && items.iter().filter(|it| contains_call(it)).count() > 1 {
+        if items.len() > 1 && items.iter().filter(|it| contains_call(it.inner_expr())).count() > 1 {
             return false;
         }
     }
@@ -1456,7 +1458,7 @@ fn is_atomic(expr: &Expr) -> bool {
         }
         Expr::Is { expr, .. } | Expr::Has { expr, .. } => is_atomic(expr),
         Expr::TupleArgs(args, _) => args.iter().all(is_atomic),
-        Expr::Array(items, _, _) => items.iter().all(is_atomic),
+        Expr::Array(items, _, _) => items.iter().all(|it| is_atomic(it.inner_expr())),
         Expr::Object(fields, _, _) => fields.iter().all(|f| match f {
             ObjectField::Pair(k, v) => is_atomic(k) && is_atomic(v),
             ObjectField::Spread(e) => is_atomic(e),
@@ -1522,7 +1524,10 @@ fn fmt_inline(expr: &Expr) -> String {
             format!("{}[{}]", fmt_postfix_base(object, fmt_inline), fmt_inline(key))
         }
         Expr::Array(items, _, _) => {
-            let ss: Vec<String> = items.iter().map(fmt_inline).collect();
+            let ss: Vec<String> = items.iter().map(|it| match it {
+                crate::ast::ArrayElement::Expr(e) => fmt_inline(e),
+                crate::ast::ArrayElement::Spread(e) => format!("...{}", fmt_inline(e)),
+            }).collect();
             format!("[{}]", ss.join(", "))
         }
         Expr::Object(fields, _, _) => {
@@ -1765,14 +1770,14 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
             // Force multi-line only when MORE THAN ONE element contains a function call (a list
             // of `expect(...)` assertions reads poorly packed on one line). A single call among
             // simple elements — e.g. `[clampSpeed(left + STEP), right]` — stays inline.
-            let call_elems = items.iter().filter(|it| contains_call(it)).count();
+            let call_elems = items.iter().filter(|it| contains_call(it.inner_expr())).count();
             let inline_ok = items.len() <= 1
-                || (items.len() <= 4 && items.iter().all(is_atomic) && call_elems <= 1);
+                || (items.len() <= 4 && items.iter().all(|it| is_atomic(it.inner_expr())) && call_elems <= 1);
             // Author-multiline check: the array's `[` span is only the bracket, so scan from
             // the `[` to the last element's end for a newline (the author broke it across lines).
             let author_ml = items
                 .last()
-                .map(|last| source_span_multiline(span.start, expr_extent(last).1))
+                .map(|last| source_span_multiline(span.start, expr_extent(last.inner_expr()).1))
                 .unwrap_or(false);
             // A HARD break (over-budget trailing lambda) forces multi-line even if it fits and
             // the author wrote it inline; consume the one-shot flag.
@@ -1804,8 +1809,14 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                 let mut out = String::from("[\n");
                 let last = items.len() - 1;
                 for (idx, i) in items.iter().enumerate() {
-                    out.push_str(&take_leading(i.span().start, &child_ind));
-                    let s = fmt_expr(i, false, &child_ind);
+                    let inner = i.inner_expr();
+                    let is_spread = matches!(i, crate::ast::ArrayElement::Spread(_));
+                    out.push_str(&take_leading(inner.span().start, &child_ind));
+                    let s = if is_spread {
+                        format!("...{}", fmt_expr(inner, false, &child_ind))
+                    } else {
+                        fmt_expr(inner, false, &child_ind)
+                    };
                     out.push_str(&child_ind);
                     out.push_str(&s);
                     if idx != last {
@@ -1813,7 +1824,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                     }
                     // A trailing comment on a single-line element renders after its comma,
                     // on the same line (kept stable by the `renders_single_line` anchor above).
-                    let trailing = trailing_text(i.span().start);
+                    let trailing = trailing_text(inner.span().start);
                     if !trailing.is_empty() {
                         out.push(' ');
                         out.push_str(&trailing);
@@ -1821,7 +1832,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                     if idx != last {
                         out.push('\n');
                         // Rule iii: blank line between consecutive `test(...)` elements.
-                        if is_test_call(i) && is_test_call(&items[idx + 1]) {
+                        if is_test_call(inner) && is_test_call(items[idx + 1].inner_expr()) {
                             out.push('\n');
                         }
                     }

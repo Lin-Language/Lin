@@ -4094,7 +4094,7 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
                 }
             }
         }
-        E::Array(items, _, _) => { for it in items { f(it); } }
+        E::Array(items, _, _) => { for it in items { f(it.inner_expr()); } }
         E::Assign { value, .. } => f(value),
         E::IndexAssign { object, key, value, .. } => { f(object); f(key); f(value); }
         E::Is { expr, .. } | E::Has { expr, .. } => f(expr),
@@ -5557,7 +5557,7 @@ fn collect_unannotated_params_in_expr(
         // descend into them too — unlike the val/var binding walk, which only needs statements.
         E::Array(elements, _, _) => {
             for e in elements {
-                collect_unannotated_params_in_expr(e, span_type_map, out);
+                collect_unannotated_params_in_expr(e.inner_expr(), span_type_map, out);
             }
         }
         E::Object(fields, _, _) => {
@@ -6591,7 +6591,7 @@ fn expr_binds_name(expr: &lin_parse::ast::Expr, name: &str) -> bool {
         E::Index { object, key, .. } => {
             expr_binds_name(object, name) || expr_binds_name(key, name)
         }
-        E::Array(items, _, _) => items.iter().any(|i| expr_binds_name(i, name)),
+        E::Array(items, _, _) => items.iter().any(|i| expr_binds_name(i.inner_expr(), name)),
         E::Object(fields, _, _) => fields.iter().any(|f| {
             use lin_parse::ast::ObjectField;
             match f {

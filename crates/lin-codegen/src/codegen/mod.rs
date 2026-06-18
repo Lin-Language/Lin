@@ -1658,7 +1658,7 @@ impl<'ctx> Codegen<'ctx> {
                             let _ = ty;
                             temp_map.insert(*dst, obj_ptr.into());
                         }
-                        Instruction::MakeArray { dst, elements, elem_ty, inline, columnar: _ } => {
+                        Instruction::MakeArray { dst, elements, spreads, elem_ty, inline, columnar: _ } => {
                             let cap = i64_ty.const_int(elements.len().max(4) as u64, false);
                             // Sealed-record array: three layouts selected by escape analysis.
                             //
@@ -1764,18 +1764,66 @@ impl<'ctx> Codegen<'ctx> {
                                     &format!("lin_flat_array_alloc_{}", suffix),
                                     ptr_ty.fn_type(&[i64_ty.into()], false));
                                 let arr_v = self.builder.call(alloc_fn, &[cap.into()], "ir_farr").try_as_basic_value().unwrap_basic();
-                                for e_temp in elements {
+                                let flat_concat_fn = if !spreads.is_empty() {
+                                    Some(self.get_or_declare_fn(
+                                        &format!("lin_flat_array_concat_into_{}", suffix),
+                                        void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false)))
+                                } else { None };
+                                let mut spread_idx = 0;
+                                for (elem_idx, e_temp) in elements.iter().enumerate() {
+                                    while spread_idx < spreads.len() && spreads[spread_idx].0 <= elem_idx {
+                                        let (_, s_temp) = &spreads[spread_idx];
+                                        if let Some(&sv) = temp_map.get(s_temp) {
+                                            self.builder.call(flat_concat_fn.unwrap(), &[arr_v.into(), sv.into()], "");
+                                        }
+                                        spread_idx += 1;
+                                    }
                                     if let Some(&ev) = temp_map.get(e_temp) {
                                         self.flat_array_push(arr_v, ev, elem_ty);
                                     }
                                 }
+                                while spread_idx < spreads.len() {
+                                    let (_, s_temp) = &spreads[spread_idx];
+                                    if let Some(&sv) = temp_map.get(s_temp) {
+                                        self.builder.call(flat_concat_fn.unwrap(), &[arr_v.into(), sv.into()], "");
+                                    }
+                                    spread_idx += 1;
+                                }
                                 arr_v
                             } else {
                                 let arr_v = self.builder.call(self.rt.array_alloc, &[cap.into()], "ir_arr").try_as_basic_value().unwrap_basic();
-                                for e_temp in elements {
+                                let spread_fn = if !spreads.is_empty() {
+                                    Some(self.get_or_declare_fn(
+                                        "lin_array_spread_into",
+                                        void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false)))
+                                } else { None };
+                                let mut spread_idx = 0;
+                                for (elem_idx, e_temp) in elements.iter().enumerate() {
+                                    while spread_idx < spreads.len() && spreads[spread_idx].0 <= elem_idx {
+                                        let (_, s_temp) = &spreads[spread_idx];
+                                        if let Some(&sv) = temp_map.get(s_temp) {
+                                            let s_ty = func.temp_types.get(s_temp).cloned().unwrap_or(Type::Null);
+                                            let src = if Self::is_union_type(&s_ty) {
+                                                self.builder.call(self.rt.unbox_ptr, &[sv.into()], "ir_spread_unbox").try_as_basic_value().unwrap_basic()
+                                            } else { sv };
+                                            self.builder.call(spread_fn.unwrap(), &[arr_v.into(), src.into()], "");
+                                        }
+                                        spread_idx += 1;
+                                    }
                                     if let Some(&ev) = temp_map.get(e_temp) {
                                         self.tagged_array_push_value(arr_v, ev, elem_ty);
                                     }
+                                }
+                                while spread_idx < spreads.len() {
+                                    let (_, s_temp) = &spreads[spread_idx];
+                                    if let Some(&sv) = temp_map.get(s_temp) {
+                                        let s_ty = func.temp_types.get(s_temp).cloned().unwrap_or(Type::Null);
+                                        let src = if Self::is_union_type(&s_ty) {
+                                            self.builder.call(self.rt.unbox_ptr, &[sv.into()], "ir_spread_unbox").try_as_basic_value().unwrap_basic()
+                                        } else { sv };
+                                        self.builder.call(spread_fn.unwrap(), &[arr_v.into(), src.into()], "");
+                                    }
+                                    spread_idx += 1;
                                 }
                                 arr_v
                             };

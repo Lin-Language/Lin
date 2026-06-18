@@ -242,6 +242,7 @@ pub enum TypedExpr {
     },
     MakeArray {
         elements: Vec<TypedExpr>,
+        spreads: Vec<(usize, TypedExpr)>,
         ty: Type,
         span: Span,
     },

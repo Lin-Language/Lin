@@ -720,13 +720,20 @@ impl Parser {
     }
 
     pub(crate) fn parse_array_expr(&mut self) -> Expr {
+        use crate::ast::ArrayElement;
         let span = self.current_span();
         self.advance(); // [
         self.skip_newlines();
         let mut elements = Vec::new();
         while !self.check(TokenKind::RBracket) && !self.is_at_end() {
             let loop_start = self.pos;
-            elements.push(self.parse_expr());
+            if self.check(TokenKind::DotDotDot) {
+                self.advance();
+                let expr = self.parse_expr();
+                elements.push(ArrayElement::Spread(expr));
+            } else {
+                elements.push(ArrayElement::Expr(self.parse_expr()));
+            }
             if self.check(TokenKind::Comma) {
                 let comma_span = self.current_span();
                 self.advance();

@@ -435,7 +435,7 @@ pub enum Instruction {
     /// field. Field reads (`SealedArrayFieldGet`) are two pointer loads + GEP + load (same depth as
     /// 0xFE, but cache-line-efficient for single-field sequential scans). Always `false` unless
     /// `inline == true` AND `all_scalar_fields`. `false` → fall back to 0xFE/0xFD (safe default).
-    MakeArray { dst: Temp, elements: Vec<Temp>, elem_ty: Type, inline: bool, columnar: bool },
+    MakeArray { dst: Temp, elements: Vec<Temp>, spreads: Vec<(usize, Temp)>, elem_ty: Type, inline: bool, columnar: bool },
     /// result = object[key]  — safe field access (missing key → null temp)
     Index { dst: Temp, object: Temp, key: Temp, obj_ty: Type, key_ty: Type, result_ty: Type },
     /// object[key] = value  — in-place array/object element assignment (no result).
