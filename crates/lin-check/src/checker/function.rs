@@ -520,13 +520,51 @@ impl Checker {
                 if let Some(binding) = self.env.lookup(name) {
                     if self.forward_declared.contains(&binding.slot) {
                         if let Type::Function { params, required, lset, .. } = binding.ty.clone() {
+                            // Promote Named(...) param types to the freshly-resolved types.
+                            // forward_declare_functions_in resolves param annotations while type
+                            // aliases are still Named(...) placeholders, so the env's param types
+                            // may be Named("Foo") rather than the expanded sealed Object. A caller
+                            // that reads this function type later sees Named("Foo") as the param
+                            // type → is_union_ty = true → boxing coerce → TaggedVal* passed as
+                            // LinMap* → heap-buffer-overflow. Only promote Named(...) params —
+                            // leave TypeVars in place so unannotated-param inference is not disrupted.
+                            let promoted_params: Vec<Type> = params.iter()
+                                .zip(typed_params.iter())
+                                .map(|(old, tp)| {
+                                    if matches!(old, Type::Named(_)) { tp.ty.clone() } else { old.clone() }
+                                })
+                                .collect();
                             self.env.update_type(name, Type::Function {
-                                params,
+                                params: promoted_params,
                                 ret: Box::new(promoted_ret.clone()),
                                 required,
                                 lset,
                             });
                         }
+                    }
+                }
+            }
+        }
+        // Promote Named(...) param types for forward-declared functions that have NO declared
+        // return annotation. The block above only fires when declared_ret.is_some(), so functions
+        // without a return annotation would still expose Named(...) placeholder param types to
+        // callers, causing the same boxing coerce bug.
+        if let (Some(name), None) = (fn_name, &declared_ret) {
+            if let Some(binding) = self.env.lookup(name) {
+                if self.forward_declared.contains(&binding.slot) {
+                    if let Type::Function { params, ret, required, lset } = binding.ty.clone() {
+                        let promoted_params: Vec<Type> = params.iter()
+                            .zip(typed_params.iter())
+                            .map(|(old, tp)| {
+                                if matches!(old, Type::Named(_)) { tp.ty.clone() } else { old.clone() }
+                            })
+                            .collect();
+                        self.env.update_type(name, Type::Function {
+                            params: promoted_params,
+                            ret,
+                            required,
+                            lset,
+                        });
                     }
                 }
             }
