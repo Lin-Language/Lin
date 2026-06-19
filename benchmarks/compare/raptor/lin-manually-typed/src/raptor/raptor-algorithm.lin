@@ -72,7 +72,7 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
     var boardingPoint = -1
     var trip: Trip | Null = null
     val routePath = raptor["routePath"][routeId] ?? []
-    val routePathLength = raptor["routePath"].length()
+    val routePathLength = routePath.length()
     val boardingPointIndex = raptor["routeStopIndex"][routeId][stopP] ?? 0
 
     range(boardingPointIndex, routePathLength).for(pi => 
