@@ -1,5 +1,6 @@
 import { StopId, Time, Transfer, Trip } from "../gtfs/gtfs"
 import { keys } from "std/object"
+import { push } from "std/array"
 
 export type ScanResults = { 
   "bestArrivals": Arrivals, 
@@ -23,7 +24,9 @@ export val createScanResults = (
 
 export val addRound = (results: ScanResults): Null =>
   results["k"] = results["k"] + 1
-  results["kArrivals"][results["k"]] = {}
+  // TS `this.kArrivals[++this.k] = {}` relies on JS auto-extending the array on out-of-bounds
+  // index assignment; in Lin an out-of-bounds array set is a no-op (spec §6.1), so append explicitly.
+  results["kArrivals"].push({  })
 
 export val previousArrival = (results: ScanResults, stopPi: StopId): Time =>
   results["kArrivals"][results["k"] - 1][stopPi] ?? 0 // TODO should it be 0 or MAX time number
