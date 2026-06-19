@@ -449,18 +449,44 @@ impl<'ctx> Codegen<'ctx> {
         if to_sealed_arr && !from_sealed_arr {
             // Wider/Json/Object[] or union source → fresh sealed-record array (each element projected,
             // or a keep-packed O(1) retain when the union's inner is already 0xFD/0xFE).
-            // `sealed_array_project_from` unboxes a union source to the raw LinArray*, then checks the
-            // runtime elem_tag: 0xFD/0xFE → keep-packed (O(1) retain); otherwise → O(n) element
-            // rebuild. This handles both `Trip[]|Null → Trip[]` (O(1)) and `Json → Item[]` (O(n)).
-            return self.sealed_array_project_from(val, from_ty, to_ty);
+            if Self::is_union_type(from_ty) {
+                // Union/TypeVar source (match narrowing, call-arg unbox): the caller owns the union BOX
+                // and will release it at scope exit — that release covers the inner array's ownership.
+                // `sealed_array_project_from` BORROWS in the kp path (no extra retain), which is correct
+                // because the single release of the outer box is the sole decrement. The result temp's
+                // register_owned at the call site (lower_expr::Coerce narrowed_to_sealed) adds the
+                // scope-exit release that matches the retain the caller added when it owned the narrowed
+                // value. `sealed_array_project_from` handles both `Trip[]|Null → Trip[]` (O(1)) and
+                // `Json → Item[]` (O(n)).
+                return self.sealed_array_project_from(val, from_ty, to_ty);
+            }
+            // Non-union source (e.g. `Array<Json> → R[]` from a val binding's Coerce). The source array
+            // is independently registered_owned in the IR scope, so the lowerer emits TWO scope-exit
+            // releases: one for the source (`ir_arr_alloc`) and one for the Coerce result (`dst`). In
+            // the kp path the Coerce result aliases the source (same pointer) — if the kp branch
+            // returned verbatim (no retain), both releases decrement the same rc, freeing the array
+            // before the caller's reference is dropped → UAF. Use `sealed_array_project_owned`, which
+            // RETAINS in kp path, balancing the two scope-exit releases against the two decrements. In
+            // the rebuild path `sealed_array_project_owned` and `sealed_array_project_from` are
+            // identical (the fresh `sarrp_out` is always +1).
+            return self.sealed_array_project_owned(val, from_ty, to_ty);
         }
         if from_sealed_arr && !to_sealed_arr {
-            // Sealed-record array → tagged Object[] (Json) view, then box if the target is union.
-            let tagged = self.sealed_array_to_tagged(val, from_ty);
             if Self::is_union_type(to_ty) {
-                return self.box_value(tagged, &Type::Array(Box::new(Type::object(Default::default()))));
+                // KEEP-PACKED into a union/Json slot (e.g. a `[T[], ...]` FixedArray tuple element):
+                // box the sealed-array pointer DIRECTLY (0xFD/0xFE preserved) instead of an O(n)
+                // eager materialize to a tagged `Object[]`. The materialize produced a 0xFF
+                // dynamic-tagged array, which (a) the typed fused field-get `arr[i].field` can't read
+                // → segfault, and (b) deep-copied every element into a boxed `LinMap` and re-copied on
+                // each access → the RAPTOR PREP memory blowup. Generic consumers materialize sealed
+                // elements ON READ via `lin_array_get_tagged` (it dispatches 0xFE/0xFD), and a coerce
+                // BACK to the sealed array type (`union → T[]`) is an O(1) keep-packed retain via
+                // `sealed_array_project_from`. The lowerer's container-insert `Retain` on the source
+                // array supplies the slot's owned +1 (`lin_box_array` borrows), so RC stays balanced.
+                return self.box_value(val, from_ty);
             }
-            return tagged;
+            // Non-union target (a plain `Object[]` Json array): materialize to the tagged view.
+            return self.sealed_array_to_tagged(val, from_ty);
         }
         // ── NESTED sealed-record array (Problem A / Stage 3b) ────────────────────────────────
         // A combinator returning a NESTED sealed structure — `partition: T[][]`, `groupBy: {String:

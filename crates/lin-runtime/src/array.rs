@@ -1687,6 +1687,22 @@ pub unsafe extern "C" fn lin_array_eq(a: *const LinArray, b: *const LinArray) ->
     if a.is_null() || b.is_null() { return 0; }
     let len = (*a).len;
     if len != (*b).len { return 0; }
+    let a_sealed = (*a).elem_tag == SEALED_ARRAY_TAG || (*a).elem_tag == SEALED_PTR_ARRAY_TAG;
+    let b_sealed = (*b).elem_tag == SEALED_ARRAY_TAG || (*b).elem_tag == SEALED_PTR_ARRAY_TAG;
+    if a_sealed || b_sealed {
+        // For sealed arrays (0xFE/0xFD), `array_elem_as_tagged` returns TAG_NULL for unknown tags.
+        // Use `lin_array_get_tagged` instead — it materializes sealed elements to owned LinMap boxes,
+        // so `lin_tagged_eq` can do a deep structural compare. Release both boxes after each compare.
+        for i in 0..len as usize {
+            let ae = lin_array_get_tagged(a, i as i64);
+            let be = lin_array_get_tagged(b, i as i64);
+            let eq = crate::tagged::lin_tagged_eq(ae as *const u8, be as *const u8);
+            crate::tagged::lin_tagged_release(ae as *mut u8);
+            crate::tagged::lin_tagged_release(be as *mut u8);
+            if eq == 0 { return 0; }
+        }
+        return 1;
+    }
     // Compare element-by-element via `lin_tagged_eq` uniformly (handles flat and tagged,
     // scalars by value, heap elements deeply); the per-element TaggedVal copy is cheap and
     // avoids reading a flat scalar buffer with the 16-byte tagged stride.
