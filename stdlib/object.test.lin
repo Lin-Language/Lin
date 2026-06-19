@@ -39,6 +39,22 @@ val s = suite("std/object", [
     ]
   ),
 
+  // The callback-taking overload: `obj.entries(pair => ...)` iterates each [key, value] pair.
+  test("entries with a callback iterates each pair", () =>
+    val obj = { "a": 1, "b": 2 }
+    var count = 0
+    var firstKey = ""
+    obj.entries(pair =>
+      if count == 0 then
+        firstKey = toString(pair[0])
+      count = count + 1
+    )
+    [
+      expect(count).toBe(2),
+      expect(firstKey).toBe("a")
+    ]
+  ),
+
   // ADR-086 (revised): keys over a non-String-keyed map returns the keys in their NATIVE type
   // (a `{ UInt8: V }` map yields a `UInt8[]` of integers), usable to re-index the map and in
   // arithmetic. `values`/`entries` are unchanged (entries' key element stays stringified).
