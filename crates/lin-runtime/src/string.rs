@@ -828,6 +828,7 @@ unsafe fn array_to_json_string(arr: *const crate::array::LinArray) -> String {
 
 unsafe fn push_display_array(out: &mut String, arr: *const crate::array::LinArray) {
     use crate::tagged::*;
+    use crate::array::{SEALED_ARRAY_TAG, SEALED_PTR_ARRAY_TAG};
     use std::fmt::Write as _;
     let len = (*arr).len as usize;
     let elem_tag = (*arr).elem_tag;
@@ -853,6 +854,26 @@ unsafe fn push_display_array(out: &mut String, arr: *const crate::array::LinArra
             TAG_INT16 => { let _ = write!(out, "{}", *((*arr).data as *const i16).add(i)); }
             TAG_UINT32 => { let _ = write!(out, "{}", *((*arr).data as *const u32).add(i)); }
             TAG_UINT64 => { let _ = write!(out, "{}", *((*arr).data as *const u64).add(i)); }
+            SEALED_ARRAY_TAG => {
+                // 0xFE inline packed sealed-record element: materialize to a LinMap, display, release.
+                let payload = ((*arr).data as *const u8).add(i * (*arr).elem_stride as usize);
+                let map = crate::sealed::materialize_sealed_to_map_pub(payload as *mut u8, (*arr).elem_named_desc);
+                if map.is_null() { out.push_str("{}"); } else {
+                    push_display_map(out, map);
+                    crate::map::lin_map_release(map);
+                }
+            }
+            SEALED_PTR_ARRAY_TAG => {
+                // 0xFD pointer-backed sealed-record element: load the struct pointer, materialize, display, release.
+                let sptr = *(((*arr).data as *const *mut u8).add(i));
+                if sptr.is_null() { out.push_str("null"); } else {
+                    let map = crate::sealed::materialize_sealed_to_map_pub(sptr, (*arr).elem_named_desc);
+                    if map.is_null() { out.push_str("{}"); } else {
+                        push_display_map(out, map);
+                        crate::map::lin_map_release(map);
+                    }
+                }
+            }
             _ => out.push_str("null"),
         }
     }
@@ -978,6 +999,30 @@ unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
                     // u32 zero-extends to a positive Int64 (matches flat→tagged boxing).
                     TAG_UINT32 => format!("I:{}", *((*arr).data as *const u32).add(i) as u64),
                     TAG_UINT64 => format!("U:{}", *((*arr).data as *const u64).add(i)),
+                    crate::array::SEALED_ARRAY_TAG => {
+                        // 0xFE inline sealed-record: materialize to map, key-stringify, release.
+                        let payload = ((*arr).data as *const u8).add(i * (*arr).elem_stride as usize);
+                        let map = crate::sealed::materialize_sealed_to_map_pub(payload as *mut u8, (*arr).elem_named_desc);
+                        if map.is_null() { "o:{}".to_string() } else {
+                            let tv = crate::tagged::TaggedVal { tag: crate::tagged::TAG_MAP, _pad: [0;7], payload: map as u64 };
+                            let s = tagged_to_key_string(&tv as *const crate::tagged::TaggedVal);
+                            crate::map::lin_map_release(map);
+                            s
+                        }
+                    }
+                    crate::array::SEALED_PTR_ARRAY_TAG => {
+                        // 0xFD pointer-backed sealed-record: materialize to map, key-stringify, release.
+                        let sptr = *(((*arr).data as *const *mut u8).add(i));
+                        if sptr.is_null() { "N".to_string() } else {
+                            let map = crate::sealed::materialize_sealed_to_map_pub(sptr, (*arr).elem_named_desc);
+                            if map.is_null() { "o:{}".to_string() } else {
+                                let tv = crate::tagged::TaggedVal { tag: crate::tagged::TAG_MAP, _pad: [0;7], payload: map as u64 };
+                                let s = tagged_to_key_string(&tv as *const crate::tagged::TaggedVal);
+                                crate::map::lin_map_release(map);
+                                s
+                            }
+                        }
+                    }
                     _ => "N".to_string(),
                 };
                 parts.push(part);
@@ -1231,6 +1276,7 @@ fn push_json_float(out: &mut String, f: f64) {
 
 unsafe fn push_json_array(out: &mut String, arr: *const crate::array::LinArray) {
     use crate::tagged::*;
+    use crate::array::{SEALED_ARRAY_TAG, SEALED_PTR_ARRAY_TAG};
     if arr.is_null() {
         out.push_str("[]");
         return;
@@ -1259,6 +1305,26 @@ unsafe fn push_json_array(out: &mut String, arr: *const crate::array::LinArray) 
             TAG_INT16 => out.push_str(&(*((*arr).data as *const i16).add(i)).to_string()),
             TAG_UINT32 => out.push_str(&(*((*arr).data as *const u32).add(i)).to_string()),
             TAG_UINT64 => out.push_str(&(*((*arr).data as *const u64).add(i)).to_string()),
+            SEALED_ARRAY_TAG => {
+                // 0xFE inline packed sealed-record element: materialize to a LinMap, emit as JSON, release.
+                let payload = ((*arr).data as *const u8).add(i * (*arr).elem_stride as usize);
+                let map = crate::sealed::materialize_sealed_to_map_pub(payload as *mut u8, (*arr).elem_named_desc);
+                if map.is_null() { out.push_str("{}"); } else {
+                    push_json_map(out, map);
+                    crate::map::lin_map_release(map);
+                }
+            }
+            SEALED_PTR_ARRAY_TAG => {
+                // 0xFD pointer-backed sealed-record element: load struct pointer, materialize, emit as JSON, release.
+                let sptr = *(((*arr).data as *const *mut u8).add(i));
+                if sptr.is_null() { out.push_str("null"); } else {
+                    let map = crate::sealed::materialize_sealed_to_map_pub(sptr, (*arr).elem_named_desc);
+                    if map.is_null() { out.push_str("{}"); } else {
+                        push_json_map(out, map);
+                        crate::map::lin_map_release(map);
+                    }
+                }
+            }
             _ => out.push_str("null"),
         }
     }

@@ -300,13 +300,13 @@ pub(crate) fn arg_projects_unsealed_into_nullable_record(arg_ty: &Type, param_ty
 /// belongs to someone else) and scalar args (cached boxes).
 pub(crate) fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
     match param_ty {
-        // A SEALED-RECORD ARRAY *or a SEALED SCALAR RECORD* boxed into a Json param MATERIALIZES a
-        // FRESH inner heap value (a tagged `Object[]` for the array; a `box_object(LinObject)` for the
-        // record) whose inner is NOT borrowed, so freeing only the shell would leak the fresh inner
-        // array/object + its element/field references. Both are FULLY released via the owning model
-        // instead (see the call-arg loop's `full_release_boxes`), so neither is a shell-only box.
+        // A SEALED SCALAR RECORD boxed into a Json param MATERIALIZES a FRESH inner heap value
+        // (`box_object(LinObject)`) whose inner is NOT borrowed, so freeing only the shell would leak
+        // the fresh inner object + its field references. It is FULLY released via the owning model
+        // instead (see the call-arg loop's `full_release_boxes`), so it is NOT a shell-only box.
+        // NOTE: a SEALED-RECORD ARRAY with keep-packed boxing (`lin_box_array`) IS a shell-only box —
+        // the inner is owned by the caller's own rc scope, not by the fresh box. Include it here.
         Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && is_heap_ty(arg_ty)
-            && !is_sealed_scalar_array(arg_ty)
             && !is_sealed_scalar_repr(arg_ty)
             // A sum-projected arg is fully owned + released by the owning model (a fresh `*SumNode`),
             // NOT a borrowed-inner box shell — freeing its "shell" would mismatched-size dealloc the

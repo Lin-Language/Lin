@@ -139,7 +139,13 @@ pub(crate) fn param_elem_is_boxed_repr(param_ty: &Type) -> bool {
 pub(crate) fn sealed_array_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
     is_sealed_scalar_array(arg_ty)
         && !is_sealed_scalar_array(param_ty)
-        && (is_union_ty(param_ty) || param_elem_is_boxed_repr(param_ty))
+        // With keep-packed boxing (the `from_sealed_arr && !to_sealed_arr && is_union_type(to)`
+        // branch in `compile_ir_coerce`), a sealed array flowing into a bare union/Json param is
+        // boxed via `lin_box_array` BORROWING the inner — NOT materializing a fresh `Object[]`.
+        // The box shell is caller-owned and handled by `arg_box_is_caller_owned_shell`. Only
+        // `param_elem_is_boxed_repr` params (the type-erased boxed-fallback `T[]`) still trigger
+        // an O(n) materialize to a fresh `Object[]` that must be fully released post-call.
+        && param_elem_is_boxed_repr(param_ty)
         // A sum-projected arg is handled by `lower_coerce_arg`'s sum arm (which runs BEFORE the
         // union-boundary materialize), so it is NOT materialized to a boxed Object[] here.
         && !sum_arg_projected(arg_ty, param_ty)

@@ -18163,6 +18163,39 @@ print(toString(ps))
     );
 }
 
+// Regression: a SEALED-record array returned through a `[T[], Int32]` FixedArray TUPLE, then
+// destructured and read with the fused field-get `arr[i]["field"]`. The tuple element type is a
+// union/Json slot, so the `T[]` was coerced into it via `compile_ir_coerce`. That coerce used to
+// O(n)-MATERIALIZE the sealed array into a 0xFF dynamic-tagged `Object[]` (each element a boxed
+// LinMap) — which (a) the typed fused field-get `arr[i].field` could not read (it only handled
+// 0xFE/0xFD), so it SEGFAULTED, and (b) deep-copied every element into a LinMap and re-copied on
+// each access (the RAPTOR `create()` PREP-phase memory blowup). Fix: box the sealed array pointer
+// directly (keep-packed 0xFD/0xFE) into the union slot; generic consumers materialize-on-read via
+// `lin_array_get_tagged`, and a coerce back to `T[]` is an O(1) keep-packed retain. `run()` asserts
+// a clean exit, so this guards correct values AND RC balance (ASan-verified leak/UAF-free). Exercises
+// BOTH the rebuild path (`.map()` source) and a heap field (`"n"`), plus the sibling scalar element.
+// Kept UN-batched (RC-correctness isolation test).
+#[test]
+fn test_sealed_record_array_through_tuple_fused_field_get() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, range, for } from "std/iter"
+type R = { "a": Int32, "n": { "x": Int32 } }
+val mk = (): [R[], Int32] =>
+  val arr: R[] = range(0, 5).map(i => { "a": i, "n": { "x": i * 10 } })
+  [arr, 7]
+val main = () =>
+  val [arr, z] = mk()
+  var sum = 0
+  range(0, 5).for(i => sum = sum + arr[i]["a"] + arr[i]["n"]["x"])
+  print(toString(sum))
+  print(toString(z))
+main()
+"#);
+    // sum = Σ_{i=0..4} (i + i*10) = 11 * (0+1+2+3+4) = 110 ; z = 7.
+    assert_eq!(out, vec!["110", "7"]);
+}
+
 #[test]
 fn test_sealed_array_push_scalar_record() {
     // REGRESSION (heap-corruption bug): pushing a record into a sealed SCALAR-record array.
@@ -19475,6 +19508,32 @@ main()
     let out = run(&src);
     // sum over i in [0,300) of (i + 1) = (299*300/2) + 300 = 44850 + 300 = 45150
     assert_eq!(out, vec!["45150"]);
+}
+
+// Regression: sealed-record array extracted from a FixedArray (tuple) then passed to toString.
+// The kp path of `sealed_array_project_from` in a non-union Coerce (Array<Json>→R[]) aliased
+// the source pointer `ir_arr_alloc` and `sarrp_phi`, so both scope-exit releases hit the SAME
+// pointer while the tuple's slot still held it → UAF. Fix: use `sealed_array_project_owned`
+// (which retains in kp) for non-union sources, keeping RC balanced across both IR paths.
+#[test]
+fn test_keeppacked_tuple_sealed_arr_tostring_no_uaf() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, range } from "std/iter"
+
+type R = { "a": Int32, "n": { "x": Int32 } }
+
+val mk = (): [R[], Int32] =>
+  val arr: R[] = range(0, 4).map(i => { "a": i, "n": { "x": i * 10 } })
+  [arr, 7]
+
+val main = () =>
+  val [arr, z] = mk()
+  print(toString(arr))
+
+main()
+"#);
+    assert_eq!(output, vec![r#"[{"a": 0, "n": {"x": 0}}, {"a": 1, "n": {"x": 10}}, {"a": 2, "n": {"x": 20}}, {"a": 3, "n": {"x": 30}}]"#]);
 }
 
 // ---------------------------------------------------------------------------
