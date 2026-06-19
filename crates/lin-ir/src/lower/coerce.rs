@@ -308,6 +308,11 @@ pub(crate) fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Typ
         // the inner is owned by the caller's own rc scope, not by the fresh box. Include it here.
         Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && is_heap_ty(arg_ty)
             && !is_sealed_scalar_repr(arg_ty)
+            // An Object arg flowing into a Named param passes through as-is (no box shell is
+            // created by lower_coerce_arg — the callee compiled the Named param as its resolved
+            // type, a raw LinMap*, so we pass the raw pointer directly). Claiming it IS a shell
+            // here would cause lin_tagged_free_box on a raw LinMap* after the call → heap corruption.
+            && !(matches!(arg_ty, Type::Object { .. }) && matches!(p, Type::Named(_)))
             // A sum-projected arg is fully owned + released by the owning model (a fresh `*SumNode`),
             // NOT a borrowed-inner box shell — freeing its "shell" would mismatched-size dealloc the
             // SumNode and the owning release would then double-free it.
@@ -418,8 +423,11 @@ pub(crate) fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>
     // structural compatibility guarantees it has the named type's shape, PROJECT it into the
     // sealed struct layout (a fresh +1 owned struct) so the representation matches the callee.
     if matches!(param_ty, Type::Named(_)) {
-        if let Type::Object { fields, sealed: false, .. } = arg_ty {
-            if !fields.is_empty() && fields.values().all(is_sealed_field_ty) {
+        if let Type::Object { fields, sealed, .. } = arg_ty {
+            if !*sealed && !fields.is_empty() && fields.values().all(is_sealed_field_ty) {
+                // Unsealed object whose fields are all sealed-eligible: project it into the
+                // named type's packed sealed struct layout so the callee's constant field-slot
+                // reads don't misread a boxed LinObject.
                 let sealed_ty = Type::sealed_object(fields.clone());
                 let dst = builder.alloc_temp(sealed_ty.clone());
                 builder.emit(Instruction::Coerce {
@@ -431,6 +439,17 @@ pub(crate) fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>
                 builder.register_owned(dst, sealed_ty);
                 return dst;
             }
+            // Any Object (sealed or unsealed) flowing into a `Named` param where the callee
+            // compiled the param as its resolved type — a LinMap* (boxed LinObject). Passing a
+            // raw LinMap* here is correct. Without this guard the `is_union_ty(Named)` check
+            // below would box it into a 16-byte TaggedVal* shell, which lin_map_get then reads
+            // as a LinMap* — reading (*taggedval).len/slots instead of the real LinMap fields,
+            // a heap-buffer-overflow. This fires when:
+            //   1. An unsealed object with non-packable fields (e.g. Function-typed fields).
+            //   2. A sealed object that is not a packed struct (has Function/non-packable fields
+            //      at the top level, like GroupStationDepartAfterQuery.resultsFactory.getResults).
+            // Both cases: the callee reads it as LinMap* via lin_map_get — no boxing needed.
+            return arg;
         }
     }
     // SEALED-RECORD ARRAY BOUNDARY (Problem A / Stage 3b): a sealed-record array (packed/contiguous

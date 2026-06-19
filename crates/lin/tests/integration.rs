@@ -22968,3 +22968,49 @@ run()
 "#);
     assert_eq!(out, vec!["len=3", "0", "100", "2"]);
 }
+
+#[test]
+fn test_named_param_with_fn_field_caller_before_callee() {
+    // REGRESSION (bedrock-qbox2): a named record type containing a Function-typed field (e.g.
+    // `type Config = { "fn": (Int32) => Int32, "value": Int32 }`) is NOT a packed sealed struct
+    // (Function fields are not sealed-eligible). When the CALLER function appears textually BEFORE
+    // the CALLEE in source order, the callee is forward-declared with `Named("Config")` as its
+    // param type. The IR lowerer's `lower_coerce_arg` checked for `Object{sealed:false}` and
+    // returned early — but the expanded `Config` type is `Object{sealed:true}` (set by
+    // `expand_named_body`'s seal point) even though it is NOT a packed struct. This caused the
+    // `is_union_ty(Named) = true` fallthrough to box the raw `LinMap*` arg into a 16-byte
+    // `TaggedVal*` shell via `lin_box_map`. The callee then called `lin_map_get(TaggedVal*, key)`
+    // reading 8 bytes past the 16-byte region — a heap-buffer-overflow.
+    // Additionally, `arg_box_is_caller_owned_shell` returned true for the same (Object, Named)
+    // pair, so after the (now-unwrapped) call `lin_tagged_free_box` was called on the raw
+    // `LinMap*` pointer → use-after-free / segfault.
+    // Fix: in `lower_coerce_arg`, extend the pass-through guard to cover `Object{sealed:true}`
+    // that is NOT a packed struct; in `arg_box_is_caller_owned_shell`, exclude Object→Named pairs
+    // (no box shell was created, so none should be freed).
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+type Processor = {
+  "fn": (Int32) => Int32,
+  "value": Int32
+}
+
+val run = (p: Processor, x: Int32): Int32 =>
+  val r = compute(p, x)
+  r
+
+val compute = (p: Processor, x: Int32): Int32 =>
+  val fn = p["fn"]
+  val v = p["value"]
+  fn(x) + v
+
+val p: Processor = {
+  "fn": (x: Int32) => x * 3,
+  "value": 10
+}
+val result = run(p, 7)
+print(toString(result))
+"#);
+    assert_eq!(out, vec!["31"]);
+}
