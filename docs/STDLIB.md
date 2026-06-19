@@ -2514,12 +2514,16 @@ import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, 
 
 ```txt
 val entries: (obj: AnyVal) -> [String, AnyVal][]
+val entries: (obj: AnyVal, f: (AnyVal) -> AnyVal) -> Null
 ```
 
 Returns an array of `[key, value]` pairs. Tag-aware: works on a plain `{}`/`AnyVal` record (insertion order) or a typed `{ String: T }` map (hash order).
 
+The callback-taking overload iterates the pairs in dot-application style (like `for`/`map`), calling `f` with each `[key, value]` pair — handy for side-effecting loops over a map.
+
 ```txt
-entries({ "a": 1, "b": 2 })   // [["a", 1], ["b", 2]]
+entries({ "a": 1, "b": 2 })                          // [["a", 1], ["b", 2]]
+{ "a": 1, "b": 2 }.entries(pair => print(pair[0]))   // prints "a" then "b"
 ```
 
 ---

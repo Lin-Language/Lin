@@ -54,6 +54,15 @@ export val values = (obj: { String: AnyVal } | {  }): AnyVal[] =>
 export val entries = (obj: { String: AnyVal } | {  }): AnyVal[] =>
   lin_entries_any(obj)
 
+// Iterate the key/value pairs of an object or map, calling `f` with each `[key, value]` pair.
+// The callback-taking companion to the array-returning `entries` above — lets you write
+// `obj.entries(([k, v]) => ...)` in dot-application style (like `for`/`map`).
+// @param obj  a record, an index-signature map, or an `AnyVal` object.
+// @param f    callback receiving each `[key, value]` pair.
+// @example { "a": 1, "b": 2 }.entries(([k, v]) => print("${ k }=${ v }"))
+export val entries = (obj: { String: AnyVal } | {  }, f: (AnyVal) => AnyVal): Null =>
+  lin_entries_any(obj).for(f)
+
 // Build an object from a list of `[key, value]` pairs (the inverse of `entries`). Later pairs with
 // the same key overwrite earlier ones.
 // @param pairs  an array of `[String, T]` pairs.
