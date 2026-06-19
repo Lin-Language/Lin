@@ -455,12 +455,21 @@ impl<'ctx> Codegen<'ctx> {
             return self.sealed_array_project_from(val, from_ty, to_ty);
         }
         if from_sealed_arr && !to_sealed_arr {
-            // Sealed-record array → tagged Object[] (Json) view, then box if the target is union.
-            let tagged = self.sealed_array_to_tagged(val, from_ty);
             if Self::is_union_type(to_ty) {
-                return self.box_value(tagged, &Type::Array(Box::new(Type::object(Default::default()))));
+                // KEEP-PACKED into a union/Json slot (e.g. a `[T[], ...]` FixedArray tuple element):
+                // box the sealed-array pointer DIRECTLY (0xFD/0xFE preserved) instead of an O(n)
+                // eager materialize to a tagged `Object[]`. The materialize produced a 0xFF
+                // dynamic-tagged array, which (a) the typed fused field-get `arr[i].field` can't read
+                // → segfault, and (b) deep-copied every element into a boxed `LinMap` and re-copied on
+                // each access → the RAPTOR PREP memory blowup. Generic consumers materialize sealed
+                // elements ON READ via `lin_array_get_tagged` (it dispatches 0xFE/0xFD), and a coerce
+                // BACK to the sealed array type (`union → T[]`) is an O(1) keep-packed retain via
+                // `sealed_array_project_from`. The lowerer's container-insert `Retain` on the source
+                // array supplies the slot's owned +1 (`lin_box_array` borrows), so RC stays balanced.
+                return self.box_value(val, from_ty);
             }
-            return tagged;
+            // Non-union target (a plain `Object[]` Json array): materialize to the tagged view.
+            return self.sealed_array_to_tagged(val, from_ty);
         }
         // ── NESTED sealed-record array (Problem A / Stage 3b) ────────────────────────────────
         // A combinator returning a NESTED sealed structure — `partition: T[][]`, `groupBy: {String:
