@@ -743,7 +743,14 @@ impl Checker {
         // closure (depth N) captures a variable from depth D < N, ALL intermediate
         // closures also need to capture it so each can pass it down to its inner closure.
         // Global scope (depth 0) is always accessible directly — never captured.
-        if var_scope_depth > 0 {
+        //
+        // SELF-CAPTURE SUPPRESSION: a forward-declared inner function that references itself (e.g.
+        // for TCO: `val f = (...) => ... f(...)`) must NOT capture its own slot. The closure env
+        // is built BEFORE the closure value exists, so a self-reference would require the env to
+        // contain a circular pointer to itself. The self-call is lowered as a direct jump (TCO) or
+        // direct call — it resolves via the LLVM symbol, not through the env.
+        let is_self_ref = self.current_fn_self_slots.last().copied() == Some(slot);
+        if var_scope_depth > 0 && !is_self_ref {
             for (i, &fn_entry_depth) in self.function_scope_depths.iter().enumerate().rev() {
                 if var_scope_depth < fn_entry_depth {
                     if let Some(captures) = self.capture_stack.get_mut(i) {
