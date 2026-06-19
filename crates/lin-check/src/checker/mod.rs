@@ -155,6 +155,14 @@ pub struct Checker {
     /// Spans already reported as shadowing errors (keyed by `(file_id, start, end)`).
     /// Prevents duplicate diagnostics when a speculative type-check re-visits a binding site.
     reported_shadow_spans: std::collections::HashSet<(u32, u32, u32)>,
+    /// Slot of the CURRENT function being compiled — set when `infer_function` is entered for a
+    /// forward-declared function (one that already has a slot in the env). Used by `infer_ident`
+    /// to suppress self-capture: a locally-defined function references itself in its own body
+    /// (e.g. for TCO), but the closure env cannot hold a pointer to the closure being built (the
+    /// env is constructed BEFORE the closure value exists). The self-reference is resolved
+    /// directly via the function's LLVM symbol, not through the env. Stack of Option<usize> to
+    /// handle nested function definitions.
+    current_fn_self_slots: Vec<usize>,
 }
 
 impl Default for Checker {
@@ -201,6 +209,7 @@ impl Checker {
             raw_type_decls: std::collections::HashMap::new(),
             expected_call_result: None,
             reported_shadow_spans: std::collections::HashSet::new(),
+            current_fn_self_slots: Vec::new(),
         }
     }
 

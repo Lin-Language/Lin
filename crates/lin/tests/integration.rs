@@ -750,6 +750,48 @@ if r is Trip then print("found") else print("none")
     assert_eq!(output, vec!["found"]);
 }
 
+// Regression: a locally-defined TCO function that also captures outer vars/params must not
+// capture ITS OWN forward-declared slot. Previously the checker added the function's own binding
+// slot to its captures set (var_scope_depth < fn_entry_depth for the body's block scope), causing
+// the closure env to contain a phantom 6th capture with no corresponding value — the capdesc said
+// 6 entries but the env only stored 5, causing an OOB read on the 6th capture slot. The fix
+// suppresses self-capture by excluding the current function's own forward-declared slot.
+#[test]
+fn test_local_tco_fn_with_captured_var_does_not_self_capture() {
+    // searchDay-style: inner TCO function that captures outer vars + recurses on itself.
+    // If self-capture were happening, the closure descriptor would have one more entry than
+    // the actual env, causing a segfault / misaligned-pointer panic on the phantom slot.
+    let output = run(r#"import { print } from "std/io"
+import { push } from "std/array"
+import { toString } from "std/string"
+val run = (maxI: Int32): Int32 =>
+  var acc = 0
+  val step = (i: Int32): Int32 =>
+    if i >= maxI then acc
+    else
+      acc = acc + i
+      step(i + 1)
+  step(0)
+print(toString(run(5)))
+"#);
+    assert_eq!(output, vec!["10"]);
+
+    // Also test with multiple captured values to exercise the specific capdesc/env size mismatch.
+    let output2 = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val outer = (base: Int32, limit: Int32): Int32 =>
+  var total = base
+  val iter = (i: Int32): Int32 =>
+    if i >= limit then total
+    else
+      total = total + i
+      iter(i + 1)
+  iter(0)
+print(toString(outer(10, 5)))
+"#);
+    assert_eq!(output2, vec!["20"]);
+}
+
 // ADR-082: the type-check fix also enables MUTUAL local recursion (two inner function-vals calling
 // each other) with union returns to TYPE-CHECK. (Runtime mutual local recursion is gated by a
 // separate, pre-existing closure-env construction-order limitation that also affects non-union

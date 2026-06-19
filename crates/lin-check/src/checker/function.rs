@@ -459,6 +459,17 @@ impl Checker {
         self.current_function = fn_name.map(|s| s.to_string());
         // Function body is always in tail position of itself.
         self.in_tail_position = self.current_function.is_some();
+        // Push the self-slot for this function so infer_ident can suppress self-capture.
+        // A forward-declared inner function (e.g. a local TCO recursive `val f = (...) => f(...)`)
+        // references itself in its own body, but the closure env is built BEFORE the closure value
+        // exists — a self-reference would require the env to contain a pointer to itself (circular).
+        // The self-call resolves via the LLVM symbol directly, not through the env.
+        let self_slot: Option<usize> = fn_name
+            .and_then(|n| self.env.lookup(n).map(|info| info.slot))
+            .filter(|&s| self.forward_declared.contains(&s));
+        if let Some(s) = self_slot {
+            self.current_fn_self_slots.push(s);
+        }
 
         // Resolve the declared return type up front so the body can be CHECKED against it
         // (bidirectional), pushing the expected type into the body. Needed for singleton
@@ -652,6 +663,10 @@ impl Checker {
 
         self.current_function = prev_fn;
         self.in_tail_position = prev_tail;
+        // Pop the self-slot we pushed on entry (if any).
+        if self_slot.is_some() {
+            self.current_fn_self_slots.pop();
+        }
         self.env.pop_scope();
         // Restore any type aliases shadowed by this function's generic params (hygiene).
         self.unbind_type_params(type_param_guard);
@@ -896,6 +911,13 @@ impl Checker {
         let prev_tail = self.in_tail_position;
         self.current_function = fn_name.map(|s| s.to_string());
         self.in_tail_position = self.current_function.is_some();
+        // Push the self-slot (same rationale as infer_function).
+        let self_slot: Option<usize> = fn_name
+            .and_then(|n| self.env.lookup(n).map(|info| info.slot))
+            .filter(|&s| self.forward_declared.contains(&s));
+        if let Some(s) = self_slot {
+            self.current_fn_self_slots.push(s);
+        }
 
         // Resolve the declared return type up front so the body can be CHECKED against it
         // (bidirectional). This pushes the expected type into the body — needed for singleton
@@ -1012,6 +1034,10 @@ impl Checker {
 
         self.current_function = prev_fn;
         self.in_tail_position = prev_tail;
+        // Pop the self-slot we pushed on entry (if any).
+        if self_slot.is_some() {
+            self.current_fn_self_slots.pop();
+        }
         self.env.pop_scope();
         // Restore any type aliases shadowed by this function's generic params (hygiene).
         self.unbind_type_params(type_param_guard);
