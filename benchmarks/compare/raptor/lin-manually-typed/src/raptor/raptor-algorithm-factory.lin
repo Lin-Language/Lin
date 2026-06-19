@@ -82,6 +82,8 @@ export val create = (
     tripsByRoute[routeId] = routeTrips
   )
 
+  // TODO: freeze tripsByRoute, routesAtStop, routeStopIndex etc
+
   createRaptorAlgorithm(
     routeStopIndex,
     routePath,
