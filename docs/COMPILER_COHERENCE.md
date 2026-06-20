@@ -3,17 +3,23 @@
 Status: **in progress** (2026-06-20). Not yet an ADR — this is the rationale + plan that one or
 more ADRs should be cut from as the work lands.
 
-**Landed so far (Phase 0, the safety net):**
-- RC-balance verifier over LinIR — `LIN_VERIFY_RC=1`, off by default (`34584403`). Clean over the
-  whole corpus; ready to promote to a CI gate (needs the quiet-on-success + nonzero-exit tweak).
-- RAPTOR-shaped unit corpus + CI gate — TS spec gaps ported, RAPTOR unit suite now blocks CI
-  (`dfd750a5`).
-- Cluster-3 down payment — the dot-call capture loop, the exact drift that caused bug #4, is now a
-  single shared `record_capture_in_enclosing_fns` (`e93e4da9`).
+**Landed so far:**
+- **Phase 0 — RC-balance verifier, now a STRICT CI GATE.** `LIN_VERIFY_RC=1` informational /
+  `strict` fails the build (`34584403`, `faaa15f8`). It paid off on its very first full-corpus run:
+  it caught a **real latent leak** — RAPTOR `searchDay`'s recursive path under-released a concrete-rc
+  `Journey[]` on the tail-call branch (`release_owned_for_tail_call` deduped what the `Return` branch
+  released per-registration). Fixed in `be78e9ca`. This is the whole Cluster-2 thesis demonstrated:
+  a leak that the 240k-trip bench's clean exit masked, turned into a one-line verifier finding.
+- **Phase 0 — RAPTOR-shaped unit corpus + CI gate** — TS spec gaps ported, RAPTOR unit suite blocks
+  CI, now also under `LIN_VERIFY_RC=strict` (`dfd750a5`, `faaa15f8`).
+- **Phase 1 (Cluster 3) — DONE.** Full `x.f(a)`→`f(x, a)` desugar; `infer_dot_call`'s ~695-line
+  hand-mirrored body deleted, one `infer_call` resolution path, **mirror-comment count 8→0**, and
+  `record_dot_call_capture` subsumed so bug #4 is structurally impossible (`81c340d6`).
+- (perf, alongside) RAPTOR PREP 41s→10s (4×) via `lin_some/every/find` intrinsics (`a977b0ed`) —
+  not a coherence cluster, but the work that motivated touching this code.
 
-**Still open:** ASan-as-a-dedicated-CI-job (Phase 0); the full dot→prefix desugar (Phase 1); the
-`Repr` lattice (Phase 2, on `reset/main`); the offside helper (Phase 3). This doc stays until those
-land — it is the roadmap for them, not a record of finished work.
+**Still open:** ASan-as-a-dedicated-CI-job (Phase 0 follow-up); the `Repr` lattice (Phase 2, on
+`reset/main`); the offside helper (Phase 3, opportunistic). This doc stays until those land.
 
 ## Why this doc exists
 
@@ -112,24 +118,29 @@ leverage available and should land alongside (not after) the structural work.
 Ordered by leverage-per-risk. Each item is independently shippable; master never regresses.
 
 ### Phase 0 — Verifiers first (the safety net)
-- [x] **RC-balance verifier over `LinIR`** (Cluster 2) — `LIN_VERIFY_RC=1`, off by default,
-      `34584403`. Per-value retain/release balance + use-after-release on every path; clean over
-      stdlib/examples/RAPTOR. **Open follow-up:** quiet-on-success + nonzero-exit, then promote to a
-      CI gate.
+- [x] **RC-balance verifier over `LinIR`** (Cluster 2) — `LIN_VERIFY_RC=1` (informational) /
+      `strict` (fails the build), quiet-on-success (`34584403`, `faaa15f8`). Per-value retain/release
+      balance + use-after-release on every path. **Promoted to a STRICT CI gate** (the stdlib/examples
+      + RAPTOR test steps run under `LIN_VERIFY_RC=strict`). Its first full-corpus run caught a real
+      leak (RAPTOR `searchDay` tail-call branch under-release), fixed in `be78e9ca` — Cluster-2 thesis
+      proven.
 - [x] **RAPTOR-shaped unit corpus** (verification coverage) — TS query/results spec gaps ported
       (DepartAfterQuery/RangeQuery/MultipleCriteriaFilter), plus the multi-day `searchDay` boundary,
       calendar_dates loader fixture, and captured-closure-via-dot-call tests. `dfd750a5`.
 - [x] Wire the RAPTOR unit suite into `ci.yml` (`dfd750a5`). **Open follow-up:** run it (and the
       stdlib suite) under ASan as a dedicated job — gate on `0 failed` + no ASan reports.
 
-### Phase 1 — Cluster 3 (bounded, mechanical, do early)
-- [x] Down payment: the dot-call capture rule is now one shared `record_capture_in_enclosing_fns`
-      instead of a hand-mirrored copy (`e93e4da9`).
-- [ ] Make ADR-085 receiver-push expressible on a desugared `f(receiver, …)` call.
-- [ ] Desugar all dot-calls to prefix calls in one place; delete the parallel resolution body in
-      `infer_dot_call`, keeping only method-specific routing (stream ops, packed-array intrinsics).
-- [ ] Audit every `// mirror of the infer_call rule` comment — each should become dead code or a
-      shared helper. Track the count down to zero.
+### Phase 1 — Cluster 3 — DONE (`81c340d6`)
+- [x] Down payment: the dot-call capture rule is one shared `record_capture_in_enclosing_fns`
+      (`e93e4da9`) — then subsumed entirely by the desugar.
+- [x] ADR-085 receiver-push made expressible on a desugared `f(receiver, …)` call — it maps onto
+      `infer_call`'s arg-0 handling (seed type-param subs from the expected result, then push the
+      determined param type onto arg 0 via `call_arg_against_determined_param`).
+- [x] Desugar all dot-calls to prefix calls in one place; deleted `infer_dot_call`'s ~695-line
+      parallel resolution body, keeping only the early special forms (TupleArgs spread, `T.fromJson`,
+      partial). Two genuinely dot-only rules lifted into `infer_call` (streamish-arg compat carve-out;
+      `select_overloaded_callee` index-narrowing snapshot).
+- [x] `// mirror of the infer_call rule` comment count: **8 → 0**.
 
 ### Phase 2 — Cluster 1 (the deep one, incremental on a branch)
 - [ ] Define the `Repr` lattice explicitly (boxed / sealed-inline / sealed-ptr / packed-scalar /
