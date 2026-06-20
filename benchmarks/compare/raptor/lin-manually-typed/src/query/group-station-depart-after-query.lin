@@ -73,7 +73,7 @@ val getJourneys = (
     
     val results = query.getJourneysFromConnections(kConnections, connectionIndexes, destinations)
 
-    if results.length() > 0 || query["maxSearchDays"] == i then
+    if results.length() > 0 || query["maxSearchDays"] <= i + 1 then
       results
     else    
       // reset the origin departure times, and increment the day by one
