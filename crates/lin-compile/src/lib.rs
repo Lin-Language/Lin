@@ -385,6 +385,11 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         // stack allocation AND suppress their Retain/Release emission (see lin_ir::escape). Runs
         // after RC elision so it sees and removes the surviving Retain/Release on stack values.
         lin_ir::escape::analyze(&mut ir_module);
+        // Static RC-balance verifier (Cluster 2) — VERIFICATION ONLY, gated on `LIN_VERIFY_RC=1`,
+        // OFF by default so it can never affect a normal build. Runs on the FINAL lowered IR (after
+        // RC insertion + rc_elide + escape stack-alloc) and reports per-path leak / over-release /
+        // use-after-release imbalances to stderr. Never mutates `ir_module`.
+        lin_ir::rc_verify::verify_if_enabled(&ir_module, &opts.source_path.to_string_lossy());
         cg.compile_module_from_ir(&ir_module);
     }
 
