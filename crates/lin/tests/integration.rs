@@ -10072,6 +10072,35 @@ main()
 }
 
 #[test]
+fn test_dot_call_captures_local_closure_referenced_only_via_dot() {
+    // Regression: a dot-call `recv.method(...)` desugars to `method(recv, ...)`, but the method
+    // callee is built as a `LocalGet` directly (not via `infer_ident`), so the capture was never
+    // recorded. When an inner closure's ONLY reference to a captured local closure was a dot-call,
+    // that closure was absent from the inner closure's env → the call was silently DROPPED at
+    // lowering → the expression evaluated to null. (A prefix call `add(x)` worked, hiding the bug.)
+    // This silently zeroed every parsed GTFS time in the RAPTOR loader (`row["t"].parseTime()` in a
+    // closure capturing `parseTime`) → 0 journeys.
+    let src = "\
+import { print } from \"std/io\"
+import { toString } from \"std/string\"
+val makeAdder = (): (Int32) => Int32 =>
+  val base = 100
+  (x: Int32): Int32 => x + base
+val main = (): Null =>
+  val add = makeAdder()
+  val row: AnyVal = { \"n\": 5 }
+  var out: Int32 = 0
+  val g = (r: AnyVal): Null => out = r[\"n\"].add()
+  g(row)
+  print(toString(out))
+main()
+";
+    // `g` references `add` ONLY through the dot-call `r[\"n\"].add()`; it must still capture it.
+    // Before the fix this printed 0 (call dropped); after, 5 + 100 = 105.
+    assert_eq!(run(src), vec!["105"], "dot-call-only reference to a captured closure must capture it");
+}
+
+#[test]
 fn test_fmt_else_if_block_branch_comment_preserved_once() {
     // A leading own-line comment on the first statement of an `else if ... then` Block
     // branch body was emitted TWICE (the If arm's `take_leading` and `fmt_block` both
