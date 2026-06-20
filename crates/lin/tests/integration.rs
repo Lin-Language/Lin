@@ -10036,6 +10036,42 @@ go()
 }
 
 #[test]
+fn test_reduce_boxed_seed_returned_through_sealed_array_annotation() {
+    // Regression: a function declared `: T[]` (T a sealed record) whose body returns
+    // `arr.reduce(seed, fn)` where `seed` is a BOXED array from a generic combinator (e.g.
+    // `flatMap`) and `reduce` runs over an EMPTY array (so it returns the boxed seed unchanged).
+    // The function-return coercion (union box → sealed `T[]`) used `sealed_array_project_from`,
+    // which BORROWS the kept-packed buffer — but a function return TRANSFERS ownership to the
+    // caller, so the returned array aliased a scope-owned value that was then double-released →
+    // freed before `ret` → corrupt array header (garbage `.length()`, then a downstream
+    // `lin_unbox_int64` null-deref when the caller read a field). Fix: use the OWNED projection
+    // (retain in kp) and fully release the source box on the return path. This is the bug that
+    // silently corrupted RAPTOR journeys once the parser `else`-attachment bug was fixed.
+    let src = "\
+import { print } from \"std/io\"
+import { toString } from \"std/string\"
+import { length } from \"std/array\"
+import { flatMap, reduce } from \"std/iter\"
+type Rec = { \"x\": Int32, \"y\": UInt32 }
+type Other = { \"z\": Int32 }
+val build = (xs: Rec[], empties: Other[]): Rec[] =>
+  val seed = xs.flatMap(r => [r])
+  empties.reduce(seed, (acc, e) => acc)
+val main = (): Null =>
+  val xs: Rec[] = [{ \"x\": 1, \"y\": 1000u32 }, { \"x\": 2, \"y\": 2000u32 }]
+  val js = build(xs, [])
+  print(toString(js.length()))
+  print(toString(js[0][\"y\"]))
+main()
+";
+    assert_eq!(
+        run(src),
+        vec!["2", "1000"],
+        "boxed reduce-seed returned through `: T[]` must keep a valid, owned array"
+    );
+}
+
+#[test]
 fn test_fmt_else_if_block_branch_comment_preserved_once() {
     // A leading own-line comment on the first statement of an `else if ... then` Block
     // branch body was emitted TWICE (the If arm's `take_leading` and `fmt_block` both

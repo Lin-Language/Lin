@@ -456,9 +456,20 @@ impl<'ctx> Codegen<'ctx> {
                 // because the single release of the outer box is the sole decrement. The result temp's
                 // register_owned at the call site (lower_expr::Coerce narrowed_to_sealed) adds the
                 // scope-exit release that matches the retain the caller added when it owned the narrowed
-                // value. `sealed_array_project_from` handles both `Trip[]|Null → Trip[]` (O(1)) and
-                // `Json → Item[]` (O(n)).
-                return self.sealed_array_project_from(val, from_ty, to_ty);
+                // value. `sealed_array_project_owned` handles both `Trip[]|Null → Trip[]` (O(1)) and
+                // `Json → Item[]` (O(n)), ALWAYS returning a FRESH +1-OWNED packed array (retain the
+                // kept-packed buffer in the kp branch, fresh +1 in rebuild). This is required for an
+                // OWNING consumer — a FUNCTION RETURN of `: T[]` whose body is a union box (e.g.
+                // `f(): T[] => xs.flatMap(...).reduce(seed, …)`, where `reduce` over an empty array
+                // returns the boxed seed): the caller owns the result, so the borrow that
+                // `sealed_array_project_from` produced left the returned array aliasing a value that
+                // scope-exit then double-released → freed-before-return → corrupt array header
+                // (the bug#2 journey corruption). For a BORROWING consumer (a match-arm slot
+                // narrowing), the extra +1 is paired with that site's own scope-exit Release, and the
+                // `rc_elide` pass cancels the redundant retain/release — verified leak-free (RSS-flat
+                // over millions of narrowings). The owning side (func.rs `sealed_array_projection_from_union`)
+                // fully releases the source box to balance this retain.
+                return self.sealed_array_project_owned(val, from_ty, to_ty);
             }
             // Non-union source (e.g. `Array<Json> → R[]` from a val binding's Coerce). The source array
             // is independently registered_owned in the IR scope, so the lowerer emits TWO scope-exit
