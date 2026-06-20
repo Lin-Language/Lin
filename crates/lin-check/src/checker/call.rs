@@ -1396,6 +1396,43 @@ impl Checker {
         .with_help(format!("the matching overloads are:\n{}\nthese cannot be ranked by specificity (§14.6)", cands))
     }
 
+    /// Record `name` (the resolved method of a dot-call `recv.method(...)`) as a CAPTURE of every
+    /// enclosing closure that is strictly inside the method's defining scope. A dot-call desugars to
+    /// `method(recv, …)`, but the method callee is built as a `LocalGet` DIRECTLY here (it never
+    /// passes through `infer_ident`), so without this the capture is never recorded: an inner closure
+    /// whose ONLY reference to a captured local closure is a dot-call (`val p = make(); val g = (r) =>
+    /// r.field.p()`) ends up with `p` absent from its env → the call is dropped (returns null) at
+    /// lowering. Mirrors the capture loop in `infer_ident` exactly (same self-ref suppression).
+    pub(crate) fn record_dot_call_capture(&mut self, name: &str, ty: &Type) {
+        // Copy the looked-up fields out FIRST so the immutable `self.env` borrow ends before the
+        // mutable `self.capture_stack` borrow in the loop below.
+        let Some((var_scope_depth, slot, is_mutable)) = self
+            .env
+            .lookup_with_depth(name)
+            .map(|(d, info)| (d, info.slot, info.mutable))
+        else {
+            return;
+        };
+        let is_self_ref = self.current_fn_self_slots.last().copied() == Some(slot);
+        if var_scope_depth == 0 || is_self_ref {
+            return;
+        }
+        for (i, &fn_entry_depth) in self.function_scope_depths.iter().enumerate().rev() {
+            if var_scope_depth < fn_entry_depth {
+                if let Some(captures) = self.capture_stack.get_mut(i) {
+                    captures.entry(slot).or_insert_with(|| Capture {
+                        name: name.to_string(),
+                        outer_slot: slot,
+                        is_mutable,
+                        ty: ty.clone(),
+                    });
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
     pub(crate) fn infer_dot_call(
         &mut self,
         receiver: &Expr,
@@ -2012,6 +2049,10 @@ impl Checker {
                 let info = self.env.lookup(method).unwrap();
                 self.span_type_map.push((method_span, method_ty.to_string(), info.def_span));
                 let slot = overload_selected_slot.unwrap_or(info.slot);
+                // The method callee is a `LocalGet` built directly (not via `infer_ident`) — record
+                // the capture so an inner closure whose only reference to a captured local closure is
+                // this dot-call still captures it (else the call is dropped at lowering).
+                self.record_dot_call_capture(method, &method_ty);
                 let func_expr = TypedExpr::LocalGet { slot, ty: method_ty, span };
                 return Ok(TypedExpr::Call {
                     func: Box::new(func_expr),
@@ -2099,6 +2140,7 @@ impl Checker {
                 }
                 _ => self.env.fresh_type_var(),
             };
+            self.record_dot_call_capture(method, &ty);
             let info = self.env.lookup(method).unwrap();
             self.span_type_map.push((method_span, ty.to_string(), info.def_span));
             let func_expr = TypedExpr::LocalGet { slot: info.slot, ty, span };
