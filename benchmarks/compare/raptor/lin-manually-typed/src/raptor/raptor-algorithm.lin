@@ -85,7 +85,7 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
 
         if stopTime["dropOff"] && stopTime["arrivalTime"] + i < (results.bestArrival(stopPi) ?? MAX_TIME) then
           results.setTrip(trip, boardingPoint, pi, i)
-        else if prevArrival < stopTime["arrivalTime"] + i then
+        else if prevArrival != 0 && prevArrival < stopTime["arrivalTime"] + i then
           val newTrip = routeScanner.getTrip(routeId, pi, prevArrival)
 
           if newTrip != null then
