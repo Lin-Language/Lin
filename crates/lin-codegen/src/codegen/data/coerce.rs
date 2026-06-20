@@ -67,7 +67,7 @@ impl<'ctx> Codegen<'ctx> {
         // element), regardless of the source array's static element type. So coerce FROM the Json
         // wildcard — not `inner_from` (e.g. `Array(TypeVar)`, which the inner sealed-array projection
         // would NOT recognize as boxed and so would read the box as a raw `LinArray*` → crash). The
-        // wildcard makes `sealed_array_project_from` / `sealed_project_from` unbox the element first.
+        // wildcard makes `sealed_array_project_owned` / `sealed_project_from` unbox the element first.
         let coerced = self.compile_ir_coerce(elem_box, &Type::TypeVar(u32::MAX), inner_to);
         // `lin_array_push` (via `tagged_array_push_value`) does NOT retain — it copies the 8-byte
         // payload and TAKES OWNERSHIP of the inner heap value. The `coerced` element is a fresh +1

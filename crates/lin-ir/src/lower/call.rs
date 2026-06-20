@@ -38,7 +38,7 @@ pub(crate) fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &m
     // is a boxed `Object[]`, but the sealed slot expects a packed `StopTime[]`. Storing verbatim
     // corrupts the struct (the codegen's `sealed_repr_differs` returns false for Array→Array,
     // so no coerce fires). The Coerce path (lower_expr + lower_coerce_arg) handles this correctly
-    // via `sealed_project_from_boxed` / `sealed_array_project_from` inside codegen. Restrict to
+    // via `sealed_project_from_boxed` / `sealed_array_project_owned` inside codegen. Restrict to
     // scalar+String records where the field representation is already correct from `lower_expr`.
     if let Some(pt) = param_ty {
         if is_sealed_scalar_repr(pt) {

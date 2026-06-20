@@ -132,7 +132,7 @@ fn combinator_unsound_over_sealed(name: &str) -> bool {
 /// caller observes afterwards; the mutation must hit THAT array, not a fresh copy. This matters when
 /// the receiver is a container-stored array read (`obj[k]` / `m[k]`): its runtime representation is a
 /// BOXED tagged array, but a packed-sealed (`push$Obj_…`) specialization would coerce/MATERIALIZE the
-/// receiver to a fresh detached packed buffer (`sealed_array_project_from` →`lin_sealed_array_alloc`),
+/// receiver to a fresh detached packed buffer (`sealed_array_project_owned` →`lin_sealed_array_alloc`),
 /// so the push lands in the copy and is silently lost (the stored array stays empty). See
 /// `receiver_mutator_over_boxed_indexed_array`. Projection-only combinators (`map`/`filter`/…) build
 /// a NEW result and never write through arg0, so they are NOT listed.
@@ -2241,7 +2241,7 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                     // PACKABLE pins `T` to the packed-sealed element via the `item` arg, which would
                     // select the `push$Obj_…`/packed specialization. But the receiver `obj[k]` reads a
                     // BOXED tagged array out of the container, so the packed specialization's arg-coercion
-                    // MATERIALIZES a fresh detached packed buffer (`sealed_array_project_from`), the push
+                    // MATERIALIZES a fresh detached packed buffer (`sealed_array_project_owned`), the push
                     // mutates the copy, and the array still stored in the container is never written back
                     // (`length(obj[k])` re-reads the empty original). REBIND every packable-sealed binding
                     // to the Json wildcard so the call specializes at the boxed `$Json` representation

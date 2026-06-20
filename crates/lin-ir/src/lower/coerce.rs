@@ -1108,7 +1108,7 @@ pub(crate) fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty:
     // A BOXED-element array (a combinator result `pts.map(...)` whose lambda returns an unsealed
     // object literal, runtime repr = `Object[]` of boxed `LinObject`s) bound to a packed
     // sealed-scalar-array slot (`Pt[]`). `type_repr_differs`'s new sealed-array arm emits a `Coerce`
-    // whose codegen `sealed_array_project_from` PROJECTS the boxed array into a FRESH +1-owned packed
+    // whose codegen `sealed_array_project_owned` PROJECTS the boxed array into a FRESH +1-owned packed
     // 0xFE buffer (rebuild branch — the source is genuinely boxed, never keep-packed here because a
     // keep-packed source would be a bare Json/union caught by the union arm, not an
     // `Array(boxed-element)`). Like the flat-array widen, the source array (`t`) is NOT consumed and

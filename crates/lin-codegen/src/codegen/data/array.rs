@@ -363,67 +363,22 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.call(set_fn, &[arr_ptr.into(), idx_i64.into(), elem_tagged.into()], "");
     }
 
-    pub(crate) fn sealed_array_project_from(&mut self, src: BasicValueEnum<'ctx>, src_ty: &Type, arr_ty: &Type) -> BasicValueEnum<'ctx> {
-        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
-        let i64_ty = self.context.i64_type();
-        if Self::sealed_array_elem(arr_ty).is_none() {
-            return ptr_ty.const_null().into();
-        }
-        // Unbox the source to a raw LinArray* if it is a boxed Json/union value.
-        let src_raw = if Self::is_union_type(src_ty) {
-            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sarrp_unbox").try_as_basic_value().unwrap_basic()
-        } else { src };
-        // KEEP-PACKED fast path (repr pass, Stage 4): if the unboxed source is ALREADY a packed
-        // 0xFE buffer (a boxed sealed array stored keep-packed, e.g. a Map slot read-back or a
-        // narrowing of `T[]|Null`), there is NO representation change — clone it BY POINTER (retain
-        // the existing 0xFE buffer, O(1)) instead of rebuilding element-wise through the boxed
-        // `Object[]` machinery (which would mis-read the inline scalar bytes → UAF). Dispatch on the
-        // runtime `elem_tag` (byte 4): 0xFE ⇒ keep-packed; otherwise (a genuinely-boxed `Object[]`,
-        // e.g. a `fromJson` result) fall through to the element rebuild below.
-        {
-            let i8_ty = self.context.i8_type();
-            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-            let tag_ptr = unsafe {
-                self.builder.gep(i8_ty, src_raw.into_pointer_value(), &[i64_ty.const_int(4, false)], "sarrp_tagp")
-            };
-            let etag = self.builder.load(i8_ty, tag_ptr, "sarrp_etag").into_int_value();
-            // Accept both 0xFE (inline packed) and 0xFD (pointer-backed sealed) as already-packed.
-            let is_fe = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFE, false), "sarrp_isfe");
-            let is_fd = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFD, false), "sarrp_isfd");
-            let is_packed = self.builder.or(is_fe, is_fd, "sarrp_ispk");
-            let kp_b = self.context.append_basic_block(llvm_fn, "sarrp_kp");
-            let rebuild_b = self.context.append_basic_block(llvm_fn, "sarrp_rebuild");
-            let merge_b = self.context.append_basic_block(llvm_fn, "sarrp_merge");
-            self.builder.conditional_branch(is_packed, kp_b, rebuild_b);
-            // Keep-packed: the unboxed 0xFE buffer is the SAME object the boxed source (`src`) holds a
-            // reference to. The projection here is a non-mutating BORROW that aliases the source's
-            // existing reference (the caller releases `src`/the cloned union box at the projection's
-            // scope, which drops the inner). So return the buffer VERBATIM with NO extra retain —
-            // adding one would out-balance the single source release and leak the buffer (the map
-            // value would never reach rc 0). This mirrors the union/Json `obj[k]` projection borrow.
-            self.builder.position_at_end(kp_b);
-            let kp_exit = self.builder.get_insert_block().unwrap();
-            self.builder.unconditional_branch(merge_b);
-            self.builder.position_at_end(rebuild_b);
-            // Fall through to the element-rebuild path; capture its result and join at merge.
-            let rebuilt = self.sealed_array_rebuild_from_boxed(src_raw, arr_ty);
-            let rebuild_exit = self.builder.get_insert_block().unwrap();
-            self.builder.unconditional_branch(merge_b);
-            self.builder.position_at_end(merge_b);
-            let phi = self.builder.phi(ptr_ty, "sarrp_phi");
-            phi.add_incoming(&[(&src_raw, kp_exit), (&rebuilt, rebuild_exit)]);
-            return phi.as_basic_value();
-        }
-    }
-
-    /// Like `sealed_array_project_from`, but ALWAYS returns a FRESH +1-OWNED packed buffer (the caller
-    /// transfers ownership, e.g. into a sealed struct slot it owns). The difference is the keep-packed
-    /// branch: `sealed_array_project_from` BORROWS the source's existing reference (no retain), which
-    /// is correct for a non-owning consumer (a match/coerce that releases the source itself). But when
-    /// a SEALED-RECORD field stores a nested packed `T[]` (`Trip { stopTimes: StopTime[] }`), the
-    /// struct OWNS its field and releases it on drop — so the value MUST be +1. Here the keep-packed
-    /// branch RETAINS the aliased buffer; the rebuild branch is already +1. Either way the result is a
-    /// fresh +1 the struct construction can store verbatim (`already_owned = true`).
+    /// Project a Json/union/`Object[]` source into a sealed-record array, ALWAYS returning a FRESH
+    /// +1-OWNED packed buffer that the caller transfers ownership of (into a function return of
+    /// `: T[]`, a sealed-record field it owns, a match-arm slot, etc.). Two paths, dispatched on the
+    /// runtime `elem_tag` (byte 4): a KEEP-PACKED fast path when the unboxed source is ALREADY a
+    /// packed 0xFE (inline) / 0xFD (pointer-backed) buffer — RETAIN it by pointer (O(1)), no
+    /// element rebuild; otherwise (a genuinely-boxed `Object[]`, e.g. a `fromJson` result) fall to
+    /// the element-wise rebuild, which is already +1.
+    ///
+    /// This always-owned contract replaced an earlier borrowing variant (which returned the
+    /// keep-packed buffer verbatim with no retain). The borrow was wrong for an OWNING consumer — a
+    /// function return of `: T[]` whose body is a union box (e.g. `f(): T[] => xs.flatMap(…).reduce(
+    /// seed, …)`, where `reduce` over an empty array returns the boxed seed) had the returned array
+    /// alias a value that scope-exit then double-released → freed-before-return → corrupt header
+    /// (the bug#2 journey corruption). For a borrowing consumer the redundant retain pairs with that
+    /// site's own scope-exit Release and the `rc_elide` pass cancels them (RSS-flat over millions of
+    /// narrowings), so a single always-owned method serves both.
     pub(crate) fn sealed_array_project_owned(&mut self, src: BasicValueEnum<'ctx>, src_ty: &Type, arr_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
         let i64_ty = self.context.i64_type();
@@ -452,7 +407,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.conditional_branch(is_packed, kp_b, rebuild_b);
         // Keep-packed: the unboxed 0xFE/0xFD buffer is shared with the source. To TRANSFER a +1 into
         // the owning struct, RETAIN it (so the struct's later release is balanced against the source's
-        // own release). This is the ownership difference from `sealed_array_project_from`.
+        // own release) — the borrowing variant this replaced returned it verbatim with no retain.
         self.builder.position_at_end(kp_b);
         self.builder.call(self.rt.rc_retain, &[src_raw.into_pointer_value().into()], "sarrpo_kp_retain");
         let kp_exit = self.builder.get_insert_block().unwrap();
@@ -471,7 +426,7 @@ impl<'ctx> Codegen<'ctx> {
 
     /// Element-by-element rebuild of a sealed-record array from a genuinely-boxed `Object[]` source
     /// (each element a boxed `LinObject` projected into the sealed element layout). The cold path of
-    /// `sealed_array_project_from` — used only when the source is NOT already a sealed 0xFE/0xFD
+    /// `sealed_array_project_owned` — used only when the source is NOT already a sealed 0xFE/0xFD
     /// buffer (e.g. a `fromJson` result or a tagged literal). Split out so the keep-packed fast path
     /// is the common case. Stage 1: output is a 0xFD pointer-backed array.
     pub(crate) fn sealed_array_rebuild_from_boxed(&mut self, src_raw: BasicValueEnum<'ctx>, arr_ty: &Type) -> BasicValueEnum<'ctx> {
