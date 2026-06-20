@@ -103,44 +103,59 @@ pub fn verify_module(module: &LinModule) -> Vec<RcViolation> {
 /// module and prints any violations to stderr. No-op (returns immediately) when the env var is unset
 /// or `0`, so it can never affect a normal build. `where_` is a short label for the diagnostic (the
 /// source path or import key).
+///
+/// `LIN_VERIFY_RC` modes:
+///   - unset / `0`    → off (a normal build never runs the pass).
+///   - `1`            → informational: prints any imbalances, QUIET on success, never fails the
+///                      build (the dev/exploration mode).
+///   - `strict` / `2` → CI GATE: prints any imbalances, then exits non-zero to FAIL the build, so a
+///                      regression that unbalances RC breaks CI instead of surfacing later as a
+///                      multi-minute ASan/lldb bisect.
 pub fn verify_if_enabled(module: &LinModule, where_: &str) {
-    if std::env::var("LIN_VERIFY_RC").map(|v| v != "0").unwrap_or(false) {
-        let violations = verify_module(module);
-        if violations.is_empty() {
-            eprintln!("[rc-verify] {where_}: OK ({} functions, no imbalance)", module.functions.len());
-        } else {
-            eprintln!(
-                "[rc-verify] {where_}: {} imbalance(s) found over {} functions:",
-                violations.len(),
-                module.functions.len()
-            );
-            for v in &violations {
-                eprintln!(
-                    "[rc-verify]   {} fn={} block={} t{}: {}",
-                    v.kind.label(),
-                    v.func,
-                    v.block,
-                    v.temp.0,
-                    v.detail
-                );
-            }
-            // Debug aid (LIN_VERIFY_RC_DUMP=<fn-name-substr>): dump the offending function's IR.
-            if let Ok(want) = std::env::var("LIN_VERIFY_RC_DUMP") {
-                for f in &module.functions {
-                    let n = fname(f);
-                    if n.contains(&want) {
-                        eprintln!("--- IR dump fn={n} ---");
-                        for b in &f.blocks {
-                            eprintln!("  block {}:", b.id.0);
-                            for i in &b.instructions {
-                                eprintln!("    {i:?}");
-                            }
-                            eprintln!("    term: {:?}", b.terminator);
-                        }
+    let mode = match std::env::var("LIN_VERIFY_RC") {
+        Ok(v) if v != "0" => v,
+        _ => return,
+    };
+    let violations = verify_module(module);
+    if violations.is_empty() {
+        // Quiet on success: a clean module prints nothing, so a CI log only ever shows real
+        // imbalances. (Earlier this printed a per-module "OK" line — noise for a gate.)
+        return;
+    }
+    eprintln!(
+        "[rc-verify] {where_}: {} imbalance(s) found over {} functions:",
+        violations.len(),
+        module.functions.len()
+    );
+    for v in &violations {
+        eprintln!(
+            "[rc-verify]   {} fn={} block={} t{}: {}",
+            v.kind.label(),
+            v.func,
+            v.block,
+            v.temp.0,
+            v.detail
+        );
+    }
+    // Debug aid (LIN_VERIFY_RC_DUMP=<fn-name-substr>): dump the offending function's IR.
+    if let Ok(want) = std::env::var("LIN_VERIFY_RC_DUMP") {
+        for f in &module.functions {
+            let n = fname(f);
+            if n.contains(&want) {
+                eprintln!("--- IR dump fn={n} ---");
+                for b in &f.blocks {
+                    eprintln!("  block {}:", b.id.0);
+                    for i in &b.instructions {
+                        eprintln!("    {i:?}");
                     }
+                    eprintln!("    term: {:?}", b.terminator);
                 }
             }
         }
+    }
+    if mode == "strict" || mode == "2" {
+        eprintln!("[rc-verify] FAILED (LIN_VERIFY_RC=strict): RC imbalance(s) in {where_}");
+        std::process::exit(1);
     }
 }
 
