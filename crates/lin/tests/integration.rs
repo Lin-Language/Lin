@@ -10101,6 +10101,57 @@ main()
 }
 
 #[test]
+fn test_rc_balance_tail_call_else_branch_array_release() {
+    // Regression for the tail-call/else-branch RC under-release the RC verifier caught in the RAPTOR
+    // searchDay recursion. `release_owned_for_tail_call` deduped non-arg owned temps to a SINGLE
+    // Release, but a concrete-rc `Array` from a call accrues genuine multi-retains — the call's +1
+    // (the `val` binding) PLUS an `own_for_read` Retain when read (`results.length()` in the
+    // condition). On a tail-call (recursive) else branch the dedup released only one, leaking the
+    // surplus each recursion (the `Return` then-branch released per-registration). Fix: concrete-rc
+    // arrays release per-registration like sealed records / Strings.
+    //
+    // Build under LIN_VERIFY_RC=strict — the static RC-balance verifier fails the build on any
+    // imbalance. Pre-fix this exited non-zero (rc-leak on the tail-call branch); post-fix it builds.
+    let source = "\
+import { print } from \"std/io\"
+import { length, push } from \"std/array\"
+type R = { \"v\": Int32 }
+val makeResults = (i: Int32): R[] =>
+  val a: R[] = []
+  if i >= 3 then a.push({ \"v\": i })
+  a
+val rec = (i: Int32): R[] =>
+  val results: R[] = makeResults(i)
+  if results.length() > 0 || i >= 5 then
+    results
+  else
+    rec(i + 1)
+val main = () =>
+  print(\"${ rec(0).length() }\")
+main()
+";
+    let ws = workspace_root();
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let src_path = ws.join(format!("target/lin_test_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_{}", id));
+    fs::write(&src_path, source).unwrap();
+    let compile = lin_cmd()
+        .env("LIN_VERIFY_RC", "strict")
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        compile.status.success(),
+        "RC-balance verifier (strict) flagged an imbalance — the tail-call/else branch under-releases \
+         a concrete-rc Array:\nstderr: {}",
+        String::from_utf8_lossy(&compile.stderr),
+    );
+}
+
+#[test]
 fn test_fmt_else_if_block_branch_comment_preserved_once() {
     // A leading own-line comment on the first statement of an `else if ... then` Block
     // branch body was emitted TWICE (the If arm's `take_leading` and `fmt_block` both
