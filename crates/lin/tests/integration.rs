@@ -22491,6 +22491,7 @@ fn test_shadowing_lambda_param_is_rejected() {
     // `x` is bound at module level; the lambda parameter `x` shadows it.
     let (ok, output) = check_source(
         r#"import { print } from "std/io"
+import { map } from "std/iter"
 val x = 1
 val result = [1, 2, 3].map(x => x + 1)
 "#,

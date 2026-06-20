@@ -956,10 +956,31 @@ impl Checker {
                 }
 
                 // Check argument compatibility against concrete params.
+                //
+                // ONE carve-out: a STREAMISH ARGUMENT flowing into a STREAM-ACCEPTING param. A
+                // stream source intrinsic returns `Stream<T> | Error` (the fault-propagation shape),
+                // and the stdlib stream adapters/combinators declare their stream params as either
+                // `Stream` (e.g. `gzip = (s: Stream)`, `readText = (s: Stream)`) or the `Json`
+                // wildcard (e.g. `concat = (a: Json, b: Json)`). `arg_compatible` does NOT accept a
+                // `Stream<T>` (nor `Stream<T> | Error`) against either: a Stream must never widen to
+                // `Json` (compat.rs), and the `| Error` arm fails the union all-arms rule against a
+                // bare `Stream<U>`. Compatibility/consumption for stream arguments is instead governed
+                // by the dedicated streamish logic (`streamish_combinator_ret`,
+                // `consume_definite_stream_args`). Stream pipelines are written almost exclusively in
+                // dot form (`readStream(f).readText()`); after the Cluster-3 desugar they flow through
+                // THIS prefix loop, so the carve-out lives here (one place, applied to both call
+                // forms) — see docs/COMPILER_COHERENCE.md. STRUCTURAL gate (no stdlib name list): it
+                // covers std/iter, std/stream, std/archive AND std/compress uniformly, including
+                // `concat`'s SECOND stream arg. A non-stream argument is NOT streamish, so it is still
+                // checked exactly as before; and a stream flowing into a genuinely non-stream-accepting
+                // param is still rejected.
                 for (i, (arg, param_ty)) in
                     typed_args.iter().zip(concrete_params.iter()).enumerate()
                 {
                     let arg_ty = arg.ty();
+                    if super::expr::type_is_streamish(&arg_ty) && param_accepts_stream(param_ty) {
+                        continue;
+                    }
                     if !self.arg_compatible(&arg_ty, param_ty) {
                         // When the argument is a bare empty literal (`{}` / `[]`) that failed to
                         // get a contextual type and collapsed to a degenerate `Object{}` /
@@ -1217,6 +1238,14 @@ impl Checker {
         let candidates = self.env.overload_candidates(name);
         // Speculatively infer argument types (rolled back below).
         let stream_snap = self.consumed_streams.clone();
+        // Preserve the caller's active index-place flow narrowings (`x[k] = x[k] ?? d` then a
+        // narrowed read of `x[k]`) across the speculative pass: inferring an argument that contains a
+        // call CLEARS `index_narrowings` (`clear_index_narrowings_after_call`), which would otherwise
+        // leak out of this throw-away pass and un-narrow the REAL argument inference that follows —
+        // surfacing the receiver of an overloaded dot-call (now desugared to arg 0) as its pre-narrow
+        // nullable union. `checker_state_snapshot` doesn't cover this Vec, so snapshot it explicitly,
+        // exactly as `consumed_streams` is handled.
+        let index_narrow_snap = self.index_narrowings.clone();
         let snap = self.checker_state_snapshot();
         let arg_tys: Vec<Option<Type>> = args
             .iter()
@@ -1230,6 +1259,7 @@ impl Checker {
             .collect();
         self.restore_checker_state(snap);
         self.consumed_streams = stream_snap;
+        self.index_narrowings = index_narrow_snap;
         self.select_overload(&candidates, &arg_tys, partial, name, span)
     }
 
@@ -1398,12 +1428,13 @@ impl Checker {
 
     /// Record a capture of `(slot, name, ty)` in every enclosing function whose scope was entered
     /// strictly inside the variable's defining scope (`var_scope_depth < fn_entry_depth`). This is
-    /// the single home of the multi-level capture rule, shared by `infer_ident` (the primary
-    /// free-variable path) and `record_dot_call_capture` (the dot-call method-callee path). Keeping
-    /// it in one place is deliberate: bug #4 (a dot-call-only closure reference that was never
-    /// captured → its call silently dropped) was exactly a hand-mirrored copy of this loop drifting
-    /// out of sync — see docs/COMPILER_COHERENCE.md on dual paths. Callers apply the `depth > 0`
-    /// and self-ref guards before calling.
+    /// the single home of the multi-level capture rule, reached by `infer_ident` (the primary
+    /// free-variable path). Since dot-calls now desugar to prefix `method(recv, …)` calls whose
+    /// callee resolves through `infer_ident` (Cluster 3, docs/COMPILER_COHERENCE.md), the dot-call
+    /// method-callee capture flows through this SAME path — there is no separate hand-mirrored copy
+    /// to drift out of sync (bug #4, the dot-call-only closure reference that was never captured →
+    /// its call silently dropped, is structurally impossible). Callers apply the `depth > 0` and
+    /// self-ref guards before calling.
     pub(crate) fn record_capture_in_enclosing_fns(
         &mut self,
         var_scope_depth: usize,
@@ -1427,30 +1458,6 @@ impl Checker {
                 break;
             }
         }
-    }
-
-    /// Record `name` (the resolved method of a dot-call `recv.method(...)`) as a CAPTURE of every
-    /// enclosing closure that is strictly inside the method's defining scope. A dot-call desugars to
-    /// `method(recv, …)`, but the method callee is built as a `LocalGet` DIRECTLY here (it never
-    /// passes through `infer_ident`), so without this the capture is never recorded: an inner closure
-    /// whose ONLY reference to a captured local closure is a dot-call (`val p = make(); val g = (r) =>
-    /// r.field.p()`) ends up with `p` absent from its env → the call is dropped (returns null) at
-    /// lowering.
-    pub(crate) fn record_dot_call_capture(&mut self, name: &str, ty: &Type) {
-        // Copy the looked-up fields out FIRST so the immutable `self.env` borrow ends before the
-        // mutable `self.capture_stack` borrow in the shared helper below.
-        let Some((var_scope_depth, slot, is_mutable)) = self
-            .env
-            .lookup_with_depth(name)
-            .map(|(d, info)| (d, info.slot, info.mutable))
-        else {
-            return;
-        };
-        let is_self_ref = self.current_fn_self_slots.last().copied() == Some(slot);
-        if var_scope_depth == 0 || is_self_ref {
-            return;
-        }
-        self.record_capture_in_enclosing_fns(var_scope_depth, slot, is_mutable, name, ty);
     }
 
     pub(crate) fn infer_dot_call(
@@ -1510,671 +1517,42 @@ impl Checker {
             }
         }
 
-        // Expected-result-type-driven RECEIVER push (ADR-085). When this dot-call has an expected
-        // result type and the method is generic, unify the expected result with the method's
-        // declared return to pre-bind its type parameters, then derive the expected type of the
-        // RECEIVER (the method's FIRST parameter under those bindings). If that expected receiver
-        // type is concrete enough to constrain inference (mentions no generic type var) AND the
-        // receiver is itself a call (so it can use the hint to drive its OWN generic inference —
-        // the `.map(...).fromEntries()` chain), push it down via `check_expr`. This is what carries
-        // `fromEntries`'s solved `T = UInt32` back to `stops.map(...)`'s expected element type
-        // `[String, UInt32]`. Conservative: any failure / non-concrete hint falls back to plain
-        // bottom-up `infer_expr` (the receiver is re-validated structurally afterwards regardless).
-        let receiver_hint: Option<Type> = expected_result.as_ref().and_then(|exp| {
-            if !matches!(receiver, Expr::Call { .. } | Expr::DotCall { .. }) {
-                return None;
-            }
-            let Some(Type::Function { params: mp, ret: mret, .. }) = self.env.effective_type(method)
-            else {
-                return None;
-            };
-            let p0 = mp.first()?.clone();
-            let mut seed = std::collections::HashMap::new();
-            self.seed_subs_from_expected_result(Some(exp), &mret, &mut seed);
-            if seed.is_empty() {
-                return None;
-            }
-            let hint = apply_type_subs(&p0, &seed);
-            // Only push a hint that is fully determined — no leftover generic type var. (The Json
-            // wildcard `u32::MAX` is permitted: it is the dynamic/erased element, harmless to push.)
-            if super::expr::type_mentions_generic_tv(&hint) {
-                None
-            } else {
-                Some(hint)
-            }
-        });
-        let mut typed_receiver = match &receiver_hint {
-            Some(hint) => {
-                // Speculative directed check; on failure, fall back to plain inference so a
-                // mis-derived hint never turns a legitimate receiver into an error.
-                let snap = self.checker_state_snapshot();
-                match self.check_expr(receiver, hint) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        self.restore_checker_state(snap);
-                        self.infer_expr(receiver)?
-                    }
-                }
-            }
-            None => self.infer_expr(receiver)?,
-        };
-
-        // An array/object literal RECEIVER (`[].fill()`, `{}.merge(…)`) flowing into a CONCRETE
-        // (TypeVar-free) array/map FIRST param must adopt that param's resolved element representation
-        // — the receiver mirror of the prefix-`infer_call` / dot-call-argument rule. Pure inference of
-        // an empty `[]` receiver yields `Array(Never)`, so it lowers a BOXED buffer while the callee's
-        // packed/flat-scalar `T[]` param does packed stride-N push/get → a representation DRIFT
-        // (latent scalar packed-array UAF: `[].fill()` over `Pt[]`). The generic-`T[]`-param case is
-        // handled separately below by `defer_empty_receiver` (it must bind `T` from the item first);
-        // this covers the CONCRETE-param case, which has a definite expected type to check against.
-        if matches!(receiver, Expr::Array(..) | Expr::Object(..)) {
-            if let Some(Type::Function { params, .. }) = self.env.effective_type(method) {
-                if let Some(p0) = params.first() {
-                    let p0_concrete_container = matches!(p0, Type::Array(_) | Type::FixedArray(_) | Type::Map { .. })
-                        && !p0.contains_type_var();
-                    if p0_concrete_container {
-                        if let Ok(rechecked) = self.check_expr(receiver, p0) {
-                            typed_receiver = rechecked;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Affine consume for a dot-call routing to a stream op is applied per-argument AFTER all
-        // arguments are inferred (so `concat`'s second stream arg is also covered) — see the
-        // `consume_definite_stream_args` calls below, gated on `callee_routes_to_stream_op(method)`.
-
-        // ADR-074: when the method names a function overload set, select the right overload by
-        // building the full argument list (receiver + extra args) and running overload selection.
-        // This mirrors the prefix-call path (`infer_call` line ~497), which dispatches through
-        // `select_overloaded_callee` before arg-checking. Without this, dot-calls always used the
-        // PRIMARY binding and ignored alternates (the cross-module overload bug).
-        let overload_selected_slot: Option<usize> = if self.env.is_overloaded(method) {
-            let full_args: Vec<Expr> = std::iter::once(receiver.clone())
-                .chain(args.as_ref().map(|a| a.iter().cloned().collect::<Vec<_>>()).unwrap_or_default())
-                .collect();
-            match self.select_overloaded_callee(method, &full_args, partial, method_span) {
-                Ok((slot, _)) => Some(slot),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-        // Determine the effective method type: for overloads, use the selected overload's type;
-        // otherwise use the primary binding's type via effective_type.
-        let resolved_method_ty: Option<Type> = if let Some(sel_slot) = overload_selected_slot {
-            let candidates = self.env.overload_candidates(method);
-            candidates.into_iter().find(|(s, _)| *s == sel_slot).map(|(_, ty)| ty)
-        } else {
-            self.env.effective_type(method)
-        };
-
-        // Look up method type for TypeVar substitution.
-        if let Some(method_ty) = resolved_method_ty {
-            if let Type::Function { params: method_params, ret, required: method_required, .. } = method_ty.clone() {
-                // Build all arg expressions: [receiver, ...args]
-                let all_arg_exprs: Vec<&Expr> = std::iter::once(receiver)
-                    .chain(args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]).iter())
-                    .collect();
-                // We already have typed_receiver; build partial list.
-                // First pass: collect substitutions from non-lambda args (receiver already typed).
-                let mut subs = std::collections::HashMap::new();
-                // Expected-result-type-driven seeding (ADR-085). Unify the call's expected result
-                // type (if any) with the method's DECLARED return to pre-bind type parameters
-                // (e.g. `map`'s `U` from the expected element of `[String, UInt32][]`), so a lambda
-                // ARGUMENT is checked against a CONCRETE expected function type — its body's tuple
-                // literal then forms a tuple. Seeded BEFORE the receiver's binding is collected so
-                // the receiver may still REFINE these (a receiver-pinned element type takes
-                // precedence); only genuinely free type params keep the seeded value.
-                let expected_seeded_ids =
-                    self.seed_subs_from_expected_result(expected_result.as_ref(), &ret, &mut subs);
-                // Defer an EMPTY array-literal RECEIVER (`[].append(1)`) flowing into a generic `T[]`
-                // param: collecting its bottom-up `Array(Never)` would bind `T = Never`, then the
-                // concrete item fails as "expected Never". Bind `T` from the item first, then re-check
-                // the receiver against the resolved `T[]` (mirror of the `infer_call` empty-array fix).
-                let receiver_is_empty_array = matches!(receiver, Expr::Array(elems, _, _) if elems.is_empty());
-                let defer_empty_receiver = receiver_is_empty_array
-                    && matches!(method_params.first(), Some(Type::Array(e)) if matches!(**e, Type::TypeVar(id) if id != u32::MAX));
-                if !defer_empty_receiver {
-                    if let Some(p0) = method_params.first() {
-                        self.collect_and_save_subs(p0, &typed_receiver.ty(), &mut subs);
-                    }
-                }
-                let mut partially_typed: Vec<Option<TypedExpr>> = vec![None; all_arg_exprs.len()];
-                partially_typed[0] = Some(typed_receiver);
-                if let Some(arg_exprs) = args.as_ref() {
-                    for (i, (arg, param_ty)) in arg_exprs.iter().zip(method_params.iter().skip(1)).enumerate() {
-                        if !matches!(arg, Expr::Function { .. }) {
-                            // An array-literal argument must adopt the parameter's element
-                            // representation rather than its own bottom-up inference — the exact
-                            // mirror of the `infer_call` rule (which dot-calls bypassed). Pure
-                            // inference of an EMPTY literal `[]` yields `Array(Never)`, so the
-                            // producer lowers a BOXED buffer while a concrete packed/flat-scalar
-                            // `T[]` param's callee does packed stride-N push/get → a representation
-                            // DRIFT (the calc-lexer `scan(.., [])` boxed-vs-packed `Token[]` UAF this
-                            // change closes). Route array/object literals through expected-type-
-                            // directed checking when the param is a concrete (TypeVar-free) array or
-                            // typed-map type so the literal carries the param's resolved element repr
-                            // at codegen, identical to the prefix-call path.
-                            let array_lit_against_concrete_array = matches!(arg, Expr::Array(..))
-                                && matches!(param_ty, Type::Array(_) | Type::FixedArray(_))
-                                && !param_ty.contains_type_var();
-                            let object_lit_against_concrete_map = matches!(arg, Expr::Object(..))
-                                && matches!(param_ty, Type::Map { .. })
-                                && !param_ty.contains_type_var();
-                            // An object literal whose RAW param is a TypeVar should be directed
-                            // against the SUBSTITUTED type when the receiver has already bound that
-                            // TypeVar to a fully-determined Union, Object, or Named type. Without
-                            // this, `legs.push({ "trip": trip, … })` where `legs: AnyLeg[]` binds
-                            // `T = AnyLeg = Transfer | TimetableLeg` infers the literal bottom-up,
-                            // degrading field types whose sources are pattern-destructure bindings.
-                            let sub_param_ty = apply_type_subs(param_ty, &subs);
-                            let object_lit_against_determined_union_or_record =
-                                matches!(arg, Expr::Object(..))
-                                    && matches!(&sub_param_ty, Type::Union(_) | Type::Object { .. } | Type::Named(_) | Type::Map { .. })
-                                    && !super::expr::type_mentions_generic_tv(&sub_param_ty);
-                            // Empty array literal `[]` against a TypeVar param whose substituted
-                            // type is a fully-determined Array — mirror of the infer_call version.
-                            let empty_array_lit_against_determined_array =
-                                matches!(arg, Expr::Array(elems, _, _) if elems.is_empty())
-                                    && matches!(&sub_param_ty, Type::Array(_))
-                                    && !super::expr::type_mentions_generic_tv(&sub_param_ty);
-                            let typed = if array_lit_against_concrete_array || object_lit_against_concrete_map {
-                                self.check_expr(arg, param_ty)?
-                            } else if object_lit_against_determined_union_or_record
-                                || empty_array_lit_against_determined_array
-                            {
-                                let snap = self.checker_state_snapshot();
-                                match self.check_expr(arg, &sub_param_ty) {
-                                    Ok(t) => t,
-                                    Err(_) => {
-                                        self.restore_checker_state(snap);
-                                        self.infer_expr(arg)?
-                                    }
-                                }
-                            } else {
-                                self.infer_expr(arg)?
-                            };
-                            // Defer a bare integer literal's Int32-default substitution for a TypeVar
-                            // param so it can't clobber a binding the receiver already pinned (the
-                            // `uint8Arr.append(221)` literal-width split — mirror of `infer_call`).
-                            let defer_literal_sub = matches!(arg, Expr::IntLit(_, None, _))
-                                && matches!(param_ty, Type::TypeVar(id) if *id != u32::MAX);
-                            if !defer_literal_sub {
-                                // Non-receiver args must not clobber the receiver's canonical binding
-                                // with an assignable candidate (`out.push(item)` element-widen case).
-                                self.collect_and_save_subs_no_clobber(param_ty, &typed.ty(), &mut subs);
-                            }
-                            partially_typed[i + 1] = Some(typed);
-                        }
-                    }
-                    // Supply a binding from a deferred literal only when its TypeVar is still unbound.
-                    for (i, (arg, param_ty)) in arg_exprs.iter().zip(method_params.iter().skip(1)).enumerate() {
-                        if matches!(arg, Expr::IntLit(_, None, _)) {
-                            if let Type::TypeVar(id) = param_ty {
-                                if *id != u32::MAX && !subs.contains_key(id) {
-                                    if let Some(typed) = &partially_typed[i + 1] {
-                                        self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Re-check a deferred empty array-literal receiver against the now-resolved `T[]` param
-                // so its element type is concrete at codegen.
-                if defer_empty_receiver {
-                    if let Some(p0) = method_params.first() {
-                        let resolved = apply_type_subs(p0, &subs);
-                        if let Type::Array(_) = &resolved {
-                            if !resolved.contains_type_var() {
-                                if let Ok(rechecked) = self.check_expr(receiver, &resolved) {
-                                    self.collect_and_save_subs(p0, &rechecked.ty(), &mut subs);
-                                    partially_typed[0] = Some(rechecked);
-                                }
-                            }
-                        }
-                        // Whether or not re-check succeeded, fold the (possibly Never) receiver type in
-                        // so an unconstrained call still gets a binding.
-                        if let Some(t) = &partially_typed[0] {
-                            self.collect_and_save_subs(p0, &t.ty(), &mut subs);
-                        }
-                    }
-                }
-                // Rebind a TypeVar bound to a concrete type by the receiver to `Json` when a NON-
-                // receiver item arg is genuinely `Json` (`arr.push(jsonVal)`) — see the `infer_call`
-                // sibling for why (dynamic `$Json` monomorph via `lin_push_dyn`).
-                for (i, param_ty) in method_params.iter().enumerate() {
-                    if i == 0 { continue; }
-                    if let Type::TypeVar(id) = param_ty {
-                        if *id != u32::MAX {
-                            if let Some(t) = partially_typed.get(i).and_then(|o| o.as_ref()) {
-                                let is_json_item = matches!(t.ty(), Type::TypeVar(_));
-                                let bound_concrete = subs.get(id).map(|b| !b.contains_type_var()).unwrap_or(false);
-                                if is_json_item && bound_concrete {
-                                    subs.insert(*id, Type::TypeVar(u32::MAX));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let mut all_args = Vec::new();
-                for (i, arg_expr) in all_arg_exprs.iter().enumerate() {
-                    let typed = match partially_typed[i].take() {
-                        Some(t) => t,
-                        None => {
-                            // Re-apply subs each iteration so earlier lambdas inform later ones.
-                            let expected = method_params.get(i)
-                                .map(|p| apply_type_subs(p, &subs))
-                                .unwrap_or_else(|| self.env.fresh_type_var());
-                            if matches!(expected, Type::Function { .. }) {
-                                // Fully-pinned callback PARAMS: the back-inferred param hints are
-                                // trustworthy, so a body type error must propagate (the dot-call
-                                // mirror of the `infer_call` fix — `xs.map(x => x["k"])` over an
-                                // `Int32[]`, where `map`'s `(T, Int32) => U` pins the param to
-                                // `Int32` via the receiver even though the return `U` is free).
-                                // When a param is still an unresolved generic, fall back to plain
-                                // inference. The Json wildcard does not count (see helper).
-                                if expected_fn_params_fully_pinned(&expected) {
-                                    self.check_expr(arg_expr, &expected)?
-                                } else {
-                                    // Speculative; roll back leaked nesting state on the discarded
-                                    // path (see `infer_call`'s sibling site + `restore_checker_state`).
-                                    let snap = self.checker_state_snapshot();
-                                    match self.check_expr(arg_expr, &expected) {
-                                        Ok(t) => t,
-                                        Err(_) => {
-                                            self.restore_checker_state(snap);
-                                            self.infer_expr(arg_expr)?
-                                        }
-                                    }
-                                }
-                            } else {
-                                self.infer_expr(arg_expr)?
-                            }
-                        }
-                    };
-                    // Collect substitutions from lambda/function args too (e.g. to resolve return TypeVars).
-                    // Don't let a bare integer literal's Int32 default clobber an already-bound TypeVar.
-                    if let Some(param_ty) = method_params.get(i) {
-                        // A FUNCTION (lambda) argument's ACTUAL return type must be free to OVERRIDE a
-                        // value that was only EXPECTED-SEEDED for the same type var (ADR-085). The seed
-                        // (`map`'s `U` from the call's expected element) merely provides the lambda's
-                        // expected return; the body's real type is authoritative for the call RESULT —
-                        // e.g. `pts.map(p => {…})` bound to `Pt[]` seeds `U = Pt` (sealed) but the
-                        // lambda returns an UNSEALED record literal, whose representation must win
-                        // (the boxed-Object[] → packed materialization path). So drop any
-                        // expected-seeded entry that THIS function arg's return determines before
-                        // re-collecting, letting `collect_and_save_subs` rebind it bottom-up.
-                        if matches!(arg_expr, Expr::Function { .. }) {
-                            let mut redetermined = std::collections::HashMap::new();
-                            super::helpers::collect_type_subs(param_ty, &typed.ty(), &mut redetermined);
-                            for id in redetermined.keys() {
-                                if expected_seeded_ids.contains(id) {
-                                    subs.remove(id);
-                                }
-                            }
-                        }
-                        let literal_into_bound_tv = matches!(arg_expr, Expr::IntLit(_, None, _))
-                            && matches!(param_ty, Type::TypeVar(id) if *id != u32::MAX && subs.contains_key(id));
-                        if !literal_into_bound_tv {
-                            if i == 0 {
-                                self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
-                            } else {
-                                self.collect_and_save_subs_no_clobber(param_ty, &typed.ty(), &mut subs);
-                            }
-                        }
-                    }
-                    all_args.push(typed);
-                }
-
-                // Omitted optional argument carrying a type-parameter default (`default: D = null`):
-                // mirror of the prefix `infer_call` rule. `all_args` includes the receiver, so the
-                // omitted params are those at index `>= all_args.len()`. Bind any omitted optional
-                // param whose declared type is an unbound, non-sentinel type-parameter `TypeVar` to
-                // `Null`, modelling the omitted `= null` default. This is what makes `arr.at(i)`
-                // soundly `T | Null` (rather than leaving `D` free → unsoundly satisfying bare `T`).
-                // See the prefix-path comment for the full rationale.
-                if !partial && all_args.len() < method_params.len() {
-                    for param_ty in &method_params[all_args.len()..] {
-                        if let Type::TypeVar(id) = param_ty {
-                            let is_sentinel = *id == u32::MAX || self.numeric_tvs.contains(id);
-                            if !is_sentinel && !subs.contains_key(id) {
-                                subs.insert(*id, Type::Null);
-                            }
-                        }
-                    }
-                }
-
-                let concrete_params: Vec<Type> = method_params.iter()
-                    .map(|p| apply_type_subs(p, &subs))
-                    .collect();
-
-                // Spec §21: a suffixless integer literal takes its context type. Mirror of the
-                // prefix `infer_call` pass — re-type a bare integer-literal argument at the
-                // parameter's concrete integer width (if it fits) so e.g. `305419896.toUInt64()`
-                // (a literal receiver into a `UInt64` param) passes, exactly as `toUInt64(305419896)`
-                // does. Without this the new compatibility loop below would reject the dot form on
-                // a signed-Int32-literal → unsigned/wider-integer param while the prefix form passes.
-                for (i, param_ty) in concrete_params.iter().enumerate() {
-                    if i >= all_args.len() { break; }
-                    if let TypedExpr::IntLit(v, _, lit_span) = &all_args[i] {
-                        if let Some((lo, hi)) = integer_range(param_ty) {
-                            let (v, lit_span) = (*v, *lit_span);
-                            let signed = v as i128;
-                            let fits = (signed >= lo && signed <= hi)
-                                || (!param_ty.is_signed() && {
-                                    let unsigned = (v as u64) as i128;
-                                    unsigned >= lo && unsigned <= hi
-                                });
-                            if fits {
-                                all_args[i] = TypedExpr::IntLit(v, param_ty.clone(), lit_span);
-                            }
-                        }
-                    }
-                    // Float counterpart (see direct-call site): a bare float literal argument into
-                    // a `Float32` parameter is re-typed at `Float32`.
-                    if let TypedExpr::FloatLit(v, ty, lit_span) = &all_args[i] {
-                        if matches!(param_ty, Type::Float32) && matches!(ty, Type::Float64) {
-                            all_args[i] = TypedExpr::FloatLit(*v, Type::Float32, *lit_span);
-                        }
-                    }
-                    // String-literal counterpart (see direct-call site): a bare string literal
-                    // argument into a closed string-literal-union parameter is re-typed to the
-                    // matching member's `StrLit` so `arg_compatible` admits it.
-                    if let TypedExpr::StringLit(s, ty, lit_span) = &all_args[i] {
-                        if matches!(ty, Type::Str) {
-                            if let Some(members) = self.closed_string_literal_keys(param_ty) {
-                                if members.iter().any(|m| m == s) {
-                                    all_args[i] = TypedExpr::StringLit(
-                                        s.clone(),
-                                        Type::StrLit(s.clone()),
-                                        *lit_span,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Enforce the NUMERIC bound on a dot-call to a `Number`-parameter function (ADR-014,
-                // reversed). Mirrors the direct-call check; the receiver is arg 0.
-                for (i, param_ty) in method_params.iter().enumerate() {
-                    if i >= all_args.len() { break; }
-                    if let Type::TypeVar(id) = param_ty {
-                        if self.numeric_tvs.contains(id) {
-                            let arg_ty = all_args[i].ty();
-                            if !arg_satisfies_numeric_bound(&arg_ty) {
-                                return Err(Diagnostic::error(
-                                    all_arg_exprs.get(i).map(|e| e.span()).unwrap_or(span),
-                                    format!(
-                                        "Argument {} has type {}, expected a numeric type (Number)",
-                                        i + 1,
-                                        arg_ty
-                                    ),
-                                ).with_help(
-                                    "a `Number` parameter accepts any numeric family (Int8…Float64), \
-                                     or a dynamic `Json` value (decoded as Int32, unchecked — use \
-                                     `Int32.fromJson(v)` for a validated decode)".to_string()
-                                ));
-                            }
-                        }
-                    }
-                }
-
-                // Check argument compatibility against concrete params (mirror of the prefix
-                // `infer_call` loop). The dot path previously omitted this entirely, so a wrong
-                // callback PARAM ANNOTATION — e.g. `[1,2,3].map((x: String) => x)` or
-                // `[1,2,3].map((x, i: String) => x)` — was silently accepted. (A bad callback
-                // annotation pollutes the substitution for the element TypeVar, so the mismatch can
-                // surface on EITHER the callback arg or the receiver arg, exactly as in the prefix
-                // path; the loop therefore covers ALL args, including the receiver at index 0.)
-                //
-                // `arg_compatible` is the SAME helper the prefix path runs workspace-wide; it
-                // tolerates unsubstituted generic TypeVars, opaque `Function` params, Json, and the
-                // arity-width subtyping for shorter callbacks, so legitimate callbacks survive.
-                //
-                // ONE carve-out: a STREAMISH ARGUMENT flowing into a STREAM-ACCEPTING param. A
-                // stream source intrinsic returns `Stream<T> | Error` (the fault-propagation shape),
-                // and the stdlib stream adapters/combinators declare their stream params as either
-                // `Stream` (e.g. `gzip = (s: Stream)`, `readText = (s: Stream)`) or the `Json`
-                // wildcard (e.g. `concat = (a: Json, b: Json)` — the stream form dispatches on the
-                // receiver). `arg_compatible` does NOT accept a `Stream<T>` (nor `Stream<T> | Error`)
-                // against either: a Stream must never widen to `Json` (compat.rs), and the `| Error`
-                // arm fails the union all-arms rule against a bare `Stream<U>`. The prefix path
-                // rejects these too, but stream pipelines are written ONLY in dot form, so they
-                // historically never ran any arg check. Compatibility/consumption for stream
-                // arguments is instead governed by the dedicated streamish logic above
-                // (`streamish_combinator_ret`, `consume_definite_stream_args`).
-                //
-                // So we skip the structural check for any STREAMISH argument whose parameter can
-                // structurally ACCEPT a stream — `Stream<U>` or the `Json`/inference wildcard. This
-                // is a STRUCTURAL gate (no stdlib name list), so it covers std/iter, std/stream,
-                // std/archive AND std/compress (`gzip`/`gunzip`/`inflate`/`deflate`) uniformly,
-                // including `concat`'s SECOND stream arg. A non-stream argument (an array/object
-                // receiver, or the element-type conflict on `[1,2,3].map((x:String)=>x)`'s
-                // receiver) is NOT streamish, so it is still checked exactly as the prefix path
-                // does; and a stream flowing into a genuinely non-stream-accepting param is still
-                // rejected.
-                for (i, (arg, param_ty)) in
-                    all_args.iter().zip(concrete_params.iter()).enumerate()
-                {
-                    let arg_ty = arg.ty();
-                    if super::expr::type_is_streamish(&arg_ty)
-                        && param_accepts_stream(param_ty)
-                    {
-                        continue;
-                    }
-                    if !self.arg_compatible(&arg_ty, param_ty) {
-                        // Empty literal collapsed to a degenerate type — emit the actionable
-                        // annotation-required diagnostic at the `{}` / `[]` span (ADR-058).
-                        if let Some(src) = all_arg_exprs.get(i) {
-                            if let Some(kind) = empty_literal_kind(src) {
-                                return Err(Diagnostic::error(src.span(), kind.message()));
-                            }
-                        }
-                        let mut msg = format!(
-                            "Argument {} has type {}, expected {}",
-                            i + 1,
-                            arg_ty,
-                            param_ty
-                        );
-                        if let Some(breakdown) = self.explain_mismatch(&arg_ty, param_ty) {
-                            msg.push_str(&breakdown);
-                        }
-                        return Err(Diagnostic::error(
-                            all_arg_exprs.get(i).map(|e| e.span()).unwrap_or(span),
-                            msg,
-                        ));
-                    }
-                }
-
-                let concrete_ret = apply_type_subs(&ret, &subs);
-                let result_type = if partial {
-                    if all_args.len() < method_params.len() {
-                        let remaining = concrete_params[all_args.len()..].to_vec();
-                        let remaining_required = method_required.saturating_sub(all_args.len());
-                        Type::Function {
-                            params: remaining,
-                            ret: Box::new(concrete_ret),
-                            required: remaining_required,
-                            lset: crate::types::LambdaSet::Top,
-                        }
-                    } else {
-                        concrete_ret
-                    }
-                } else {
-                    if all_args.len() < method_required {
-                        return Err(Diagnostic::error(
-                            span,
-                            format!(
-                                "Too few arguments to '{}': expected at least {}, got {} (including the receiver)",
-                                method, method_required, all_args.len()
-                            ),
-                        ).with_help("to partially apply, add a trailing comma: x.f(y,)".to_string()));
-                    }
-                    concrete_ret
-                };
-
-                // var-capture check for pool.async(f) / pool.async(fs).
-                if method == "lin_async" || method == "lin_pool_async" {
-                    let globals = self.mutable_global_slots.clone();
-                    for arg in &all_args[1..] {
-                        if let Some(var_name) = first_mutable_capture(arg, &globals) {
-                            self.diagnostics.push(Diagnostic::error(
-                                span,
-                                format!(
-                                    "async thunk captures mutable variable '{}' — sharing mutable state across threads is not allowed",
-                                    var_name
-                                ),
-                            ).with_help("capture an immutable copy: `val snap = {}; pool.async(() => snap)`".to_string()));
-                        }
-                        if let Some((cap_name, cap_ty)) = first_non_transferable_capture(arg) {
-                            self.diagnostics.push(Diagnostic::error(
-                                span,
-                                format!(
-                                    "async thunk captures non-transferable value '{}' of type '{}' — a {} shares the archive cursor and cannot cross a thread boundary",
-                                    cap_name, cap_ty, cap_ty
-                                ),
-                            ).with_help("drain the body on the calling thread before launching the async thunk".to_string()));
-                        }
-                    }
-                }
-
-                // Affine consume (streams brief §7): if `method` routes to a stream op, mark each
-                // definitely-stream argument consumed (mirrors the IR's `move_streamish_arg`).
-                // `all_arg_exprs[0]` is the receiver; `concat`'s second stream arg is also covered.
-                if !partial && self.callee_routes_to_stream_op(method) {
-                    let pairs: Vec<(&Expr, Type)> = all_arg_exprs
-                        .iter()
-                        .copied()
-                        .zip(all_args.iter())
-                        .map(|(e, t)| (e, t.ty()))
-                        .collect();
-                    self.consume_definite_stream_args(pairs.iter().map(|(e, t)| (*e, t)));
-                }
-
-                // Receiver-dependent std/iter combinator return (unification Stage 2): when the dot
-                // receiver is a Stream and `method` is a std/iter combinator, re-type the eager
-                // array result to its stream-shaped form. Skipped for partial application.
-                let result_type = if !partial {
-                    let arg0_ty = all_args.first().map(|a| a.ty()).unwrap_or(Type::Null);
-                    self.streamish_combinator_ret(method, result_type, &arg0_ty)
-                } else {
-                    result_type
-                };
-
-                let info = self.env.lookup(method).unwrap();
-                self.span_type_map.push((method_span, method_ty.to_string(), info.def_span));
-                let slot = overload_selected_slot.unwrap_or(info.slot);
-                // The method callee is a `LocalGet` built directly (not via `infer_ident`) — record
-                // the capture so an inner closure whose only reference to a captured local closure is
-                // this dot-call still captures it (else the call is dropped at lowering).
-                self.record_dot_call_capture(method, &method_ty);
-                let func_expr = TypedExpr::LocalGet { slot, ty: method_ty, span };
-                return Ok(TypedExpr::Call {
-                    func: Box::new(func_expr),
-                    args: all_args,
-                    result_type,
-                    is_tail: false,
-                    partial,
-                    span,
-                });
-            }
-        }
-
-        // Fallback: infer all args without type guidance.
-        let mut all_args = vec![self.infer_expr(receiver)?];
-        if let Some(arg_exprs) = args {
-            for arg in arg_exprs {
-                all_args.push(self.infer_expr(arg)?);
-            }
-        }
-        // Affine consume (fallback path): mirror the typed-method path so a stream-routing op that
-        // somehow reaches here still consumes its definitely-stream argument(s).
-        if !partial && self.callee_routes_to_stream_op(method) {
-            let all_arg_exprs: Vec<&Expr> = std::iter::once(receiver)
-                .chain(args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]).iter())
-                .collect();
-            let pairs: Vec<(&Expr, Type)> = all_arg_exprs
-                .iter()
-                .copied()
-                .zip(all_args.iter())
-                .map(|(e, t)| (e, t.ty()))
-                .collect();
-            self.consume_definite_stream_args(pairs.iter().map(|(e, t)| (*e, t)));
-        }
-        // var-capture check for pool.async(f) / pool.async(fs) (fallback path).
-        if method == "lin_async" || method == "lin_pool_async" {
-            let globals = self.mutable_global_slots.clone();
-            for arg in &all_args[1..] {
-                if let Some(var_name) = first_mutable_capture(arg, &globals) {
-                    self.diagnostics.push(Diagnostic::error(
-                        span,
-                        format!(
-                            "async thunk captures mutable variable '{}' — sharing mutable state across threads is not allowed",
-                            var_name
-                        ),
-                    ).with_help("capture an immutable copy: `val snap = {}; pool.async(() => snap)`".to_string()));
-                }
-                if let Some((cap_name, cap_ty)) = first_non_transferable_capture(arg) {
-                    self.diagnostics.push(Diagnostic::error(
-                        span,
-                        format!(
-                            "async thunk captures non-transferable value '{}' of type '{}' — a {} shares the archive cursor and cannot cross a thread boundary",
-                            cap_name, cap_ty, cap_ty
-                        ),
-                    ).with_help("drain the body on the calling thread before launching the async thunk".to_string()));
-                }
-            }
-        }
-        if let Some(ty) = self.env.effective_type(method) {
-            let result_type = match &ty {
-                Type::Function { params, ret, required, .. } => {
-                    if partial {
-                        if all_args.len() < params.len() {
-                            let remaining = params[all_args.len()..].to_vec();
-                            Type::Function {
-                                params: remaining,
-                                ret: ret.clone(),
-                                required: required.saturating_sub(all_args.len()),
-                                lset: crate::types::LambdaSet::Top,
-                            }
-                        } else {
-                            *ret.clone()
-                        }
-                    } else {
-                        if all_args.len() < *required {
-                            return Err(Diagnostic::error(
-                                span,
-                                format!(
-                                    "Too few arguments to '{}': expected at least {}, got {} (including the receiver)",
-                                    method, required, all_args.len()
-                                ),
-                            ).with_help("to partially apply, add a trailing comma: x.f(y,)".to_string()));
-                        }
-                        *ret.clone()
-                    }
-                }
-                _ => self.env.fresh_type_var(),
-            };
-            self.record_dot_call_capture(method, &ty);
-            let info = self.env.lookup(method).unwrap();
-            self.span_type_map.push((method_span, ty.to_string(), info.def_span));
-            let func_expr = TypedExpr::LocalGet { slot: info.slot, ty, span };
-            Ok(TypedExpr::Call {
-                func: Box::new(func_expr),
-                args: all_args,
-                result_type,
-                is_tail: false,
-                partial,
-                span,
-            })
-        } else {
-            Err(Diagnostic::error(span, format!("Undefined function '{}'", method)))
-        }
+        // DESUGAR `recv.method(args)` -> `method(recv, args)` and route through the SINGLE
+        // callee-resolution path (`infer_call`). Cluster 3 (docs/COMPILER_COHERENCE.md): this
+        // collapses the hand-mirrored second copy of the call rule that historically drifted out of
+        // sync -- bug #4 (the dot-call capture drop, fixed in 0fc257a3) was one such forgotten rule.
+        // Every rule `infer_call` runs (overload selection ADR-074, expected-result seeding +
+        // receiver-push ADR-085, literal-representation adoption, numeric-bound enforcement,
+        // stream-arg affine consume + combinator retyping, method-name span colouring and capture
+        // recording via `infer_ident`) now applies to the dot form FOR FREE, with no second body to
+        // maintain.
+        //
+        // ADR-085 receiver-push preservation: the receiver becomes arg 0 of the synthesized call.
+        // `infer_call` seeds type-param substitutions from the expected result against the method's
+        // declared return BEFORE inferring any argument; then, for a `Call`/`DotCall` arg whose
+        // substituted parameter is fully determined, it pushes that type down via `check_expr` (the
+        // `call_arg_against_determined_param` rule). For arg 0 that derives EXACTLY the receiver hint
+        // this branch used to compute by hand (`apply_type_subs(params[0], seed)`), so the
+        // `stops.map(...).fromEntries()` chain still propagates the solved `T` back to the receiver.
+        // The empty/array/object-literal receiver representation adoption is likewise covered by
+        // `infer_call`'s arg-0 literal-against-concrete-param rules.
+        //
+        // The method-name span colouring (`span_type_map`) and the dot-call-only capture recording
+        // are produced by `infer_ident` when it resolves the synthesized `Ident(method, method_span)`
+        // callee -- the same shared `record_capture_in_enclosing_fns` the free-variable path uses, so
+        // the historically-forgotten capture rule (bug #4) cannot drift again.
+        let synthetic_args: Vec<Expr> = std::iter::once(receiver.clone())
+            .chain(
+                args.as_ref()
+                    .map(|a| a.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            )
+            .collect();
+        let synthetic_func = Expr::Ident(method.to_string(), method_span);
+        // Re-stash the expected result so `infer_call` consumes it for ADR-085 seeding/push (it was
+        // `take`n at the top of this fn to keep it out of the early special-form paths above).
+        self.expected_call_result = expected_result;
+        self.infer_call(&synthetic_func, &synthetic_args, partial, span)
     }
 
     pub(crate) fn is_tail_call(&self, func_expr: &Expr) -> bool {
