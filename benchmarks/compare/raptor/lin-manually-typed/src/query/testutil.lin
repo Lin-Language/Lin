@@ -1,0 +1,190 @@
+// Shared test fixtures + deep journey equality for the manually-typed RAPTOR port.
+// Mirrors lin-typed/testutil.lin but adapted to the manually-typed module/type API.
+import { for } from "std/iter"
+import { length, push } from "std/array"
+import { StopTime, Trip, Transfer, TimetableLeg } from "../gtfs/gtfs"
+import { Service, ServiceDays } from "../gtfs/service"
+import { DateIndex, DateNumber } from "../gtfs/date"
+import { AnyLeg, Journey } from "../results/journey"
+
+val MAX: UInt32 = 4294967295u32
+
+val allDays: ServiceDays = {
+  0: true,
+  1: true,
+  2: true,
+  3: true,
+  4: true,
+  5: true,
+  6: true
+}
+
+val noDates: DateIndex = {}
+
+export val service1: Service = {
+  "startDate": 20180101,
+  "endDate": 20991231,
+  "days": allDays,
+  "dates": noDates
+}
+
+var tripCounter = 0
+
+export val t = (stopTimes: StopTime[]): Trip =>
+  val id = tripCounter
+  tripCounter = tripCounter + 1
+  {
+    "tripId": "trip${id}",
+    "stopTimes": stopTimes,
+    "serviceId": "1",
+    "service": service1
+  }
+
+// st(stop, arr, dep): arr/dep may be null.
+// arrivalTime = arr ?? dep; departureTime = dep ?? arr; dropOff = arr != null; pickUp = dep != null.
+export val st = (stop: String, arr: UInt32 | Null, dep: UInt32 | Null): StopTime =>
+  {
+    "stop": stop,
+    "arrivalTime": arr ?? dep ?? 0u32,
+    "departureTime": dep ?? arr ?? 0u32,
+    "dropOff": arr != null,
+    "pickUp": dep != null
+  }
+
+export val tf = (origin: String, destination: String, duration: UInt16): Transfer =>
+  {
+    "origin": origin,
+    "destination": destination,
+    "duration": duration,
+    "startTime": 0u32,
+    "endTime": MAX
+  }
+
+type LegArg = StopTime[] | Transfer
+
+val depTime = (legs: LegArg[]): UInt32 =>
+  depTimeAt(legs, 0, 0u32)
+
+val depTimeAt = (legs: LegArg[], i: Int32, transferDuration: UInt32): UInt32 =>
+  if i >= length(legs) then
+    0u32
+  else
+    val leg = legs[i]
+    match leg
+      is Transfer =>
+        depTimeAt(legs, i + 1, transferDuration + leg["duration"])
+      else =>
+        leg[0]["departureTime"] - transferDuration
+
+val arrTime = (legs: LegArg[]): UInt32 =>
+  arrTimeAt(legs, length(legs) - 1, 0u32)
+
+val arrTimeAt = (legs: LegArg[], i: Int32, transferDuration: UInt32): UInt32 =>
+  if i < 0 then
+    0u32
+  else
+    val leg = legs[i]
+    match leg
+      is Transfer =>
+        arrTimeAt(legs, i - 1, transferDuration + leg["duration"])
+      else =>
+        leg[length(leg) - 1]["arrivalTime"] + transferDuration
+
+export val defaultTrip: Trip = {
+  "tripId": "1",
+  "serviceId": "1",
+  "stopTimes": [],
+  "service": service1
+}
+
+export val j = (legArgs: LegArg[]): Journey =>
+  var legs: AnyLeg[] = []
+  legArgs.for(arg =>
+    match arg
+      is Transfer =>
+        push(legs, arg)
+      else =>
+        val leg: TimetableLeg = {
+          "stopTimes": arg,
+          "origin": arg[0]["stop"],
+          "destination": arg[length(arg) - 1]["stop"],
+          "trip": defaultTrip
+        }
+        push(legs, leg)
+  )
+  {
+    "departureTime": depTime(legArgs),
+    "arrivalTime": arrTime(legArgs),
+    "legs": legs
+  }
+
+// setDefaultTrip: overwrite each timetable leg's trip with defaultTrip so journey
+// equality ignores trip identity. Mutates in place.
+export val setDefaultTrip = (results: Journey[]): Null =>
+  results.for(journey =>
+    journey["legs"].for(leg =>
+      match leg
+        is TimetableLeg =>
+          leg["trip"] = defaultTrip
+        else =>
+          null
+    )
+  )
+
+// --- Deep equality for journeys (ignores trip; distinguishes leg kinds) ---
+val stopTimeEq = (a: StopTime, b: StopTime): Boolean =>
+  a["stop"] == b["stop"] && a["arrivalTime"] == b["arrivalTime"] && a["departureTime"] == b["departureTime"] && a["dropOff"] == b["dropOff"] && a["pickUp"] == b["pickUp"]
+
+val stopTimesEq = (a: StopTime[], b: StopTime[]): Boolean =>
+  if length(a) != length(b) then
+    false
+  else
+    var ok = true
+    var i = 0
+    a.for(_ =>
+      if stopTimeEq(a[i], b[i]) == false then ok = false
+      i = i + 1
+    )
+    ok
+
+val legEq = (a: AnyLeg, b: AnyLeg): Boolean =>
+  match a
+    is Transfer =>
+      match b
+        is Transfer =>
+          a["origin"] == b["origin"] && a["destination"] == b["destination"] && a["duration"] == b["duration"] && a["startTime"] == b["startTime"] && a["endTime"] == b["endTime"]
+        else =>
+          false
+    else =>
+      match b
+        is Transfer =>
+          false
+        else =>
+          a["origin"] == b["origin"] && a["destination"] == b["destination"] && stopTimesEq(a["stopTimes"], b["stopTimes"])
+
+val legsEq = (a: AnyLeg[], b: AnyLeg[]): Boolean =>
+  if length(a) != length(b) then
+    false
+  else
+    var ok = true
+    var i = 0
+    a.for(_ =>
+      if legEq(a[i], b[i]) == false then ok = false
+      i = i + 1
+    )
+    ok
+
+export val journeyEq = (a: Journey, b: Journey): Boolean =>
+  a["departureTime"] == b["departureTime"] && a["arrivalTime"] == b["arrivalTime"] && legsEq(a["legs"], b["legs"])
+
+export val journeysEq = (actual: Journey[], expected: Journey[]): Boolean =>
+  if length(actual) != length(expected) then
+    false
+  else
+    var ok = true
+    var i = 0
+    actual.for(_ =>
+      if journeyEq(actual[i], expected[i]) == false then ok = false
+      i = i + 1
+    )
+    ok

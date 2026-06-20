@@ -602,7 +602,16 @@ pub(crate) fn lower_function_expr_with_id(
     let unboxes_to_concrete_heap = ret_coerced
         && is_union_ty(&body_ty)
         && !is_union_ty(&effective_ret)
-        && is_rc_type(&effective_ret);
+        && is_rc_type(&effective_ret)
+        // A union body returned as a sealed-record ARRAY is NOT a simple unbox-to-inner: the return
+        // coercion is `sealed_array_project_owned`, which OWNS the result (+1: retains the kept-packed
+        // buffer in the kp branch, fresh +1 in the rebuild branch) rather than aliasing the box's
+        // inner. So the FreeBoxShell-only path (which keeps `raw_ret` and frees just the 16-byte
+        // shell, assuming `ret_temp` IS the box's inner) would UNDER-release: the inner array keeps
+        // both its own ref AND project_owned's extra +1, leaking it (and the box shell's inner ref)
+        // every call. This case is handled by `sealed_array_projection_from_union` below, which fully
+        // releases `raw_ret` (shell + inner decrement) to balance project_owned's retain.
+        && !is_sealed_scalar_array(&effective_ret);
     // SEALED PROJECTION from a concrete heap object: when a concrete unsealed `LinObject*`
     // (`raw_ret`) is PROJECTED into a fresh sealed struct (`ret_temp`), the projection produces
     // an INDEPENDENT copy — it calls `lin_object_get` for each field and retains the heap values
@@ -627,6 +636,19 @@ pub(crate) fn lower_function_expr_with_id(
         && !is_union_ty(&body_ty)
         && is_rc_type(&body_ty)
         && anon_object_slot_repr_differs(&body_ty, &effective_ret);
+    // SEALED-ARRAY PROJECTION from a union box: a union/Json body (`raw_ret` is a `TaggedVal*` box)
+    // returned as a declared sealed-record array (`: T[]`). The return coercion is
+    // `sealed_array_project_owned` (compile_ir_coerce's `to_sealed_arr && !from_sealed_arr` +
+    // `is_union_type(from)` arm), which produces a FRESH +1-OWNED packed array (`ret_temp`) — it
+    // RETAINS the kept-packed buffer (kp) or rebuilds a new one. `ret_temp` therefore does NOT alias
+    // `raw_ret` in the borrow sense, so `raw_ret` (the box) must be FULLY released at scope exit
+    // (`lin_tagged_release`: free the shell AND decrement its inner), which balances project_owned's
+    // retain. Keeping `raw_ret` (the default) leaks the box shell + an inner ref every call (an
+    // RSS-linear leak, e.g. `f(): T[] => xs.flatMap(...).reduce(seed, …)` where reduce returns the
+    // boxed seed). Mirrors `sealed_projection_from_object` but for a union (boxed) body + array target.
+    let sealed_array_projection_from_union = ret_coerced
+        && is_union_ty(&body_ty)
+        && is_sealed_scalar_array(&effective_ret);
     let return_keep: Vec<Temp> = if void_ret {
         // A void (`: Null`/`Never`) function emits `Return(None)` — the body value is NOT returned.
         // Keep NOTHING, so an OWNED heap body value (now possible since a `: Null` body may be any
@@ -634,8 +656,15 @@ pub(crate) fn lower_function_expr_with_id(
         // at scope exit rather than leaked. Previously a void body was always `Null` (a non-owning
         // const), so keeping it was harmless; an owned body value must be dropped here.
         vec![]
-    } else if unboxes_to_scalar || sealed_projection_from_object || anon_object_projection_from_object {
-        // For both cases `raw_ret` does not alias `ret_temp`: release it via scope-exit.
+    } else if unboxes_to_scalar
+        || sealed_projection_from_object
+        || anon_object_projection_from_object
+        || sealed_array_projection_from_union
+    {
+        // For these cases `raw_ret` does not alias `ret_temp`: release it via scope-exit. For
+        // `sealed_array_projection_from_union`, `raw_ret` is a union box whose full release
+        // (`lin_tagged_release`) frees the shell and decrements its inner, balancing the +1 that
+        // `sealed_array_project_owned` added to the returned packed array.
         vec![ret_temp]
     } else {
         // Default: keep both ret_temp and raw_ret from scope-exit release.

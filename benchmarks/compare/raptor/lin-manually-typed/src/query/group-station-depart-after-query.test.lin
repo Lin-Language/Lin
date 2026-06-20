@@ -1,0 +1,74 @@
+// GroupStationDepartAfterQuery.spec.ts — multi-origin / multi-destination plans
+// with the default MultipleCriteriaFilter applied.
+import { expect, toSatisfy, test, suite, run } from "std/test"
+import { t, st, j, setDefaultTrip, journeysEq } from "./testutil"
+import { create } from "../raptor/raptor-algorithm-factory"
+import { createGroupStationDepartAfterQuery, plan } from "./group-station-depart-after-query"
+import { getResults } from "../results/journey-factory"
+import { ResultsFactory } from "../results/results-factory"
+import { createMultipleCriteriaFilter } from "../results/filter/journey-filter"
+import { Trip } from "../gtfs/gtfs"
+import { Journey } from "../results/journey"
+
+val runPlan = (trips: Trip[], origins: String[], destinations: String[], time: UInt32): Journey[] =>
+  val raptor = create(trips, {}, {}, null)
+  val jf: ResultsFactory = { "getResults": getResults }
+  val filters = [createMultipleCriteriaFilter()]
+  val query = createGroupStationDepartAfterQuery(raptor, jf, 1, filters)
+  val date = { "year": 2019, "month": 4, "day": 18 }
+  val result = plan(query, origins, destinations, date, time)
+  setDefaultTrip(result)
+  result
+
+val s = suite("GroupStationDepartAfterQuery", [
+  test("plans to multiple destinations", () => [
+    expect(runPlan(
+      [
+        t([
+          st("A", null, 1000u32),
+          st("B", 1030u32, 1035u32),
+          st("C", 1100u32, null)
+        ]),
+        t([
+          st("A", null, 1200u32),
+          st("B", 1230u32, 1235u32),
+          st("D", 1300u32, null)
+        ])
+      ],
+      ["A"],
+      ["C", "D"],
+      900u32
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("A", null, 1000u32), st("B", 1030u32, 1035u32), st("C", 1100u32, null)]]),
+        j([[st("A", null, 1200u32), st("B", 1230u32, 1235u32), st("D", 1300u32, null)]])
+      ])
+    )
+  ]),
+
+  test("plans from multiple origins", () => [
+    expect(runPlan(
+      [
+        t([
+          st("A", null, 1000u32),
+          st("B", 1030u32, 1035u32),
+          st("C", 1100u32, null)
+        ]),
+        t([
+          st("A", null, 1200u32),
+          st("_", 1230u32, 1235u32),
+          st("D", 1300u32, null)
+        ])
+      ],
+      ["A", "B"],
+      ["C", "D"],
+      900u32
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("B", 1030u32, 1035u32), st("C", 1100u32, null)]]),
+        j([[st("A", null, 1200u32), st("_", 1230u32, 1235u32), st("D", 1300u32, null)]])
+      ])
+    )
+  ])
+])
+run(s)
