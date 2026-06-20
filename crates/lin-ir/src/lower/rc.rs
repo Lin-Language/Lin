@@ -171,6 +171,14 @@ pub(crate) fn sealed_record_arg_materialized(arg_ty: &Type, param_ty: &Type) -> 
         // released at scope exit → double `lin_sumnode_release` (the `{String:Expr}` map → `match`
         // Num-arm `eval(back)` heap-use-after-free, ADR-062 Stage 3).
         && !sum_arg_projected(arg_ty, param_ty)
+        // A `Named` param is treated as union-ish by `is_union_ty`, but `lower_coerce_arg` passes a
+        // sealed record THROUGH a `Named` param UNCHANGED (no box / no materialize — see the
+        // `matches!(param_ty, Type::Named(_))` pass-through arms there). So there is NO fresh owned
+        // box to full-release after the call: emitting one is an UNMATCHED post-call release of the
+        // borrowed sealed struct → over-release → use-after-free. This bit the RAPTOR scan whose
+        // `scanRoutes`/`scanTransfers` params are `Named("RaptorAlgorithm")`: the while-loop closure
+        // over-released the captured (projected) raptor each round → freed mid-scan → corrupt reads.
+        && !matches!(param_ty, Type::Named(_))
 }
 
 /// True when a concrete (non-sum, non-`Named`) argument flowing into a Stage-eligible SUM param is
