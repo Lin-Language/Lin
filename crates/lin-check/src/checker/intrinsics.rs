@@ -172,6 +172,45 @@ impl Checker {
                 ], Type::Array(Box::new(Type::TypeVar(9040)))),
         );
 
+        // some: (Iterable<T>, (T, Int32) => Boolean) => Boolean
+        self.define_intrinsic(
+            "lin_some",
+            Type::func(vec![
+                    Type::Union(vec![
+                        Type::Array(Box::new(Type::TypeVar(9060))),
+                        Type::Iterator(Box::new(Type::TypeVar(9060))),
+                        Type::Stream(Box::new(Type::TypeVar(9060))),
+                    ]),
+                    Type::func(vec![Type::TypeVar(9060), Type::Int32], Type::Bool),
+                ], Type::Bool),
+        );
+
+        // every: (Iterable<T>, (T, Int32) => Boolean) => Boolean
+        self.define_intrinsic(
+            "lin_every",
+            Type::func(vec![
+                    Type::Union(vec![
+                        Type::Array(Box::new(Type::TypeVar(9061))),
+                        Type::Iterator(Box::new(Type::TypeVar(9061))),
+                        Type::Stream(Box::new(Type::TypeVar(9061))),
+                    ]),
+                    Type::func(vec![Type::TypeVar(9061), Type::Int32], Type::Bool),
+                ], Type::Bool),
+        );
+
+        // find: (Iterable<T>, (T, Int32) => Boolean) => T | Null
+        self.define_intrinsic(
+            "lin_find",
+            Type::func(vec![
+                    Type::Union(vec![
+                        Type::Array(Box::new(Type::TypeVar(9062))),
+                        Type::Iterator(Box::new(Type::TypeVar(9062))),
+                        Type::Stream(Box::new(Type::TypeVar(9062))),
+                    ]),
+                    Type::func(vec![Type::TypeVar(9062), Type::Int32], Type::Bool),
+                ], Type::Union(vec![Type::TypeVar(9062), Type::Null])),
+        );
+
         // reduce: (Iterable<T>, U, (U, T) => U) => U   (Stream receiver → U | Error at call site)
         self.define_intrinsic(
             "lin_reduce",

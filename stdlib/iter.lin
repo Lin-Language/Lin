@@ -193,14 +193,7 @@ export val reduce = <T, U>(arr: T[] | Iterator | Stream, init: U, f: (U, T, Int3
 // @example [1, 3, 5, 6].find(x => x % 2 == 0)   // 6
 // @example [1, 3, 5].find(x => x % 2 == 0)      // null
 export val find = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T | Null =>
-  var found = null
-  var idx = 0
-  lin_while(arr, item =>
-    if f(item, idx) then found = item
-    idx = idx + 1
-    found == null
-  )
-  found
+  lin_find(arr, f)
 
 // Test whether `f` returns `true` for at least one item, short-circuiting on the first match.
 // @param arr  an Array, Iterator, or Stream of `T`.
@@ -208,14 +201,7 @@ export val find = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T
 // @returns `true` if any item matches, `false` otherwise (`false` for an empty source).
 // @example [1, 2, 3].some(x => x > 2)    // true
 export val some = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): Boolean =>
-  var result = false
-  var idx = 0
-  lin_while(arr, item =>
-    if f(item, idx) then result = true
-    idx = idx + 1
-    !result
-  )
-  result
+  lin_some(arr, f)
 
 // Test whether `f` returns `true` for every item, short-circuiting on the first failure.
 // @param arr  an Array, Iterator, or Stream of `T`.
@@ -224,14 +210,7 @@ export val some = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): B
 // @example [1, 2, 3].every(x => x > 0)   // true
 // @example [1, 2, 3].every(x => x > 1)   // false
 export val every = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): Boolean =>
-  var result = true
-  var idx = 0
-  lin_while(arr, item =>
-    if !f(item, idx) then result = false
-    idx = idx + 1
-    result
-  )
-  result
+  lin_every(arr, f)
 
 // Map each item to an inner array and concatenate all the results into one array.
 // @param arr  an Array, Iterator, or Stream of `T`.

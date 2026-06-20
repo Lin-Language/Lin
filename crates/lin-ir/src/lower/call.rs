@@ -222,6 +222,17 @@ pub(crate) fn lower_call(
             if sym == "std_iter_for" && range_for_bounds(&args[0], builder, ctx).is_some() {
                 return lower_intrinsic_call("lin_for", args, result_type, builder, ctx);
             }
+            // SHORT-CIRCUIT COMBINATOR REDIRECT: when `some`/`every`/`find` is called with a
+            // CONCRETE (non-union) array receiver, redirect to the `lin_some`/`lin_every`/`lin_find`
+            // intrinsic so the lowerer sees the ORIGINAL call-site lambda (not a monomorphized
+            // function-param binding). This lets `inlinable_capturing_lambda` fire → the loop body
+            // is spliced inline with `Index { result_ty: T }` (direct sealed-struct access, no
+            // `lin_array_get_tagged` materialization). Without this redirect, the call goes through
+            // the compiled `some<T>` stdlib body where `f` is an opaque parameter — the inline
+            // check fails and every element gets materialized.
+            if let Some(intr) = concrete_array_shortcircuit_intrinsic_name(&sym, args) {
+                return lower_intrinsic_call(intr, args, result_type, builder, ctx);
+            }
             let mut shell_boxes: Vec<Temp> = Vec::new();
             // Fully-owned arg boxes (sealed-record array materialized to Json) released right after
             // the call.
@@ -285,6 +296,19 @@ pub(crate) fn lower_call(
         }
         // Check global function slots.
         if let Some(&fid) = ctx.global_fn_slots.get(slot) {
+            // SHORT-CIRCUIT: when the callee is a monomorphized spec of `some`/`every`/`find`
+            // (tagged in `combinator_spec_slots` during module pre-scan) AND the receiver is a
+            // CONCRETE array/iterator, redirect to the `lin_some`/`lin_every`/`lin_find` intrinsic
+            // before lowering any arguments. This lets `lower_some/every/find` see the ORIGINAL
+            // call-site arguments (concrete array + inline lambda) rather than the compiled
+            // `some$T` body's opaque-param view — `inlinable_capturing_lambda` can fire on the
+            // inline lambda, emitting an unboxed loop with `Index { result_ty: T }` (direct
+            // sealed-struct access, no per-element `lin_array_get_tagged` materialization).
+            if let Some(&spec_name) = ctx.combinator_spec_slots.get(slot) {
+                if let Some(intr) = concrete_array_shortcircuit_intrinsic_name_for_spec(spec_name, args) {
+                    return lower_intrinsic_call(intr, args, result_type, builder, ctx);
+                }
+            }
             // Box concrete args to Json/union params and retain Function-typed args,
             // matching the callee's compiled signature (see imported-function path).
             let param_tys: Vec<Type> = match func.ty() {
@@ -624,6 +648,9 @@ pub(crate) fn lower_intrinsic_call(
         "lin_filter" => return lower_filter(args, result_type, builder, ctx),
         "lin_reduce" => return lower_reduce(args, result_type, builder, ctx),
         "lin_sort" => return lower_sort(args, result_type, builder, ctx),
+        "lin_some" => return lower_some(args, builder, ctx),
+        "lin_every" => return lower_every(args, builder, ctx),
+        "lin_find" => return lower_find(args, result_type, builder, ctx),
         _ => {}
     }
 
@@ -812,6 +839,26 @@ pub(crate) fn iter_elem_type(iterable_ty: &Type) -> Type {
     match iterable_ty {
         Type::Array(t) | Type::Iterator(t) => (**t).clone(),
         Type::FixedArray(ts) => ts.first().cloned().unwrap_or(Type::Null),
+        // Union of iterable types (e.g. T[] | Iterator<T> | Stream<T> from a generic combinator
+        // signature): if ALL arms agree on the same concrete element type, use that type. This
+        // lets sealed-record array elements skip materialization in for/map/filter/some/every/find
+        // even when the iterable is typed as a union (e.g. inside a monomorphized stdlib wrapper).
+        Type::Union(arms) => {
+            let mut agreed: Option<Type> = None;
+            for arm in arms {
+                let arm_elem = match arm {
+                    Type::Array(t) | Type::Iterator(t) | Type::Stream(t) => Some((**t).clone()),
+                    _ => None,
+                };
+                match (arm_elem, &agreed) {
+                    (None, _) => return Type::TypeVar(u32::MAX), // non-iterable arm → can't agree
+                    (Some(e), None) => agreed = Some(e),
+                    (Some(e), Some(prev)) if e == *prev => {} // arms agree
+                    _ => return Type::TypeVar(u32::MAX), // arms disagree
+                }
+            }
+            agreed.unwrap_or(Type::TypeVar(u32::MAX))
+        }
         // Json/union iterables yield dynamically-typed (boxed) elements.
         _ => Type::TypeVar(u32::MAX),
     }
@@ -899,6 +946,67 @@ pub(crate) fn packed_array_combinator_intrinsic_name(sym: &str, args: &[TypedExp
     }
 }
 
+/// SHORT-CIRCUIT COMBINATOR REDIRECT (import-slot path): redirect `std_iter_some/every/find` to
+/// their IR intrinsics when the receiver is a CONCRETE sealed-record array or iterator.
+/// This path fires when calling an imported (non-generic) stdlib export directly — rare in practice
+/// since `some/every/find` are generic and go through monomorphization. Kept for completeness.
+///
+/// Gate: receiver must be `Array(T)` or `Iterator(T)` with a SEALED RECORD element type.
+/// Other receivers are left on the Named-call path unchanged (no regression).
+pub(crate) fn concrete_array_shortcircuit_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'static str> {
+    let recv_ty = args.first().map(|a| a.ty())?;
+    let elem_ty = match &recv_ty {
+        Type::Array(t) | Type::Iterator(t) => t.as_ref(),
+        _ => return None,
+    };
+    if !is_sealed_scalar_repr(elem_ty) {
+        return None;
+    }
+    match sym {
+        "std_iter_for" => Some("lin_for"),
+        "std_iter_some" => Some("lin_some"),
+        "std_iter_every" => Some("lin_every"),
+        "std_iter_find" => Some("lin_find"),
+        _ => None,
+    }
+}
+
+/// SHORT-CIRCUIT COMBINATOR REDIRECT (global-fn-slot / monomorphized-spec path): redirect a
+/// monomorphized `some$T`/`every$T`/`find$T` call to the matching `lin_some/every/find` intrinsic
+/// so the ORIGINAL call-site lambda is passed directly to the intrinsic lowerer, bypassing the
+/// compiled spec body where the lambda appears as an opaque function parameter.
+///
+/// The `spec_name` is the base combinator name ("some"/"every"/"find") from `combinator_spec_slots`.
+///
+/// Gate: receiver arg must be a concrete Array/Iterator whose element type is a SEALED RECORD
+/// (`is_sealed_scalar_repr`). This is the only case where the inline direct-struct-access path
+/// (`Index { result_ty: T }`) actually fires — bypassing `lin_array_get_tagged` materialization.
+/// Scalar arrays, function arrays (`FilterCriteria[]`), union-element arrays, and TypeVar elements
+/// all fall through to the compiled spec body unchanged (no regression).
+pub(crate) fn concrete_array_shortcircuit_intrinsic_name_for_spec(
+    spec_name: &str,
+    args: &[TypedExpr],
+) -> Option<&'static str> {
+    let recv_ty = args.first().map(|a| a.ty())?;
+    let elem_ty = match &recv_ty {
+        Type::Array(t) | Type::Iterator(t) => t.as_ref(),
+        _ => return None,
+    };
+    // Only redirect when the element type is a sealed record (packed struct). This is the case
+    // where `lower_some/every/find`'s inline path uses `Index { result_ty: elem_ty }` directly,
+    // avoiding the `lin_array_get_tagged` materialization. Any other element type (TypeVar, union,
+    // Function, Named that resolves to a function, scalar) must stay on the compiled-spec path.
+    if !is_sealed_scalar_repr(elem_ty) {
+        return None;
+    }
+    match spec_name {
+        "some" => Some("lin_some"),
+        "every" => Some("lin_every"),
+        "find" => Some("lin_find"),
+        _ => None,
+    }
+}
+
 /// SPIKE (6b monomorphic/specialized dispatch): redirect a concrete-typed `std/array` op
 /// (`length`, `push`) to its intrinsic lowering so the receiver is NOT boxed into the `Json`
 /// dynamic ABI on entry to the compiled `std_array_*` wrapper. The intrinsic codegen dispatches
@@ -940,7 +1048,8 @@ pub(crate) fn array_op_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&
 
 pub(crate) fn safe_combinator_callback_index(name: &str) -> Option<usize> {
     match name {
-        "for" | "while" | "map" | "filter" | "find" | "some" | "every" => Some(1),
+        "for" | "while" | "map" | "filter" | "find" | "some" | "every"
+        | "lin_some" | "lin_every" | "lin_find" => Some(1),
         "reduce" => Some(2),
         _ => None,
     }

@@ -88,9 +88,17 @@ pub fn lower_module_with_imports(
             // WAVE D: tag a monomorphized `std/iter` `flatMap` specialization so the fusion engine's
             // `combinator_callee_name` can recognise its call. The spec's `name` is the original
             // export name (`flatMap`) or a mangled monomorph (`flatMap$Int32_…`); match the base.
+            // Also tag `some`/`every`/`find` specs so the global-fn-slot path in `lower_call` can
+            // redirect them to the IR intrinsic lowering with the original call-site lambda visible.
+            // Gate on `spec_origins` containing this slot with origin "std/iter" so user-defined
+            // functions named `find`/`some`/`every` are never mistakenly redirected.
             if let Some(n) = name {
-                if combinator_base_name(n) == Some("flatMap") {
-                    ctx.combinator_spec_slots.insert(*slot, "flatMap");
+                if let Some(base) = combinator_base_name(n) {
+                    let is_stdlib_spec = base == "flatMap"
+                        || module.spec_origins.get(slot).map(|o| o == "std/iter").unwrap_or(false);
+                    if is_stdlib_spec {
+                        ctx.combinator_spec_slots.insert(*slot, base);
+                    }
                 }
             }
         }
@@ -319,6 +327,17 @@ pub fn lower_import_module_with_imports(
             if module_key == "std_iter" {
                 if let Some(idx) = safe_combinator_callback_index(name) {
                     ctx.safe_combinator_slots.insert(*slot, idx);
+                }
+            }
+            // Tag monomorphized specs of `std/iter` `some`/`every`/`find`/`flatMap` so the
+            // global-fn-slot path in `lower_call` can redirect them to the IR intrinsic lowering
+            // with the original call-site lambda visible. Same gate as in `lower_module`:
+            // require spec_origins to confirm this is a stdlib-derived spec, not a user function.
+            if let Some(base) = combinator_base_name(name) {
+                let is_stdlib_spec = base == "flatMap"
+                    || module.spec_origins.get(slot).map(|o| o == "std/iter").unwrap_or(false);
+                if is_stdlib_spec {
+                    ctx.combinator_spec_slots.insert(*slot, base);
                 }
             }
         }
