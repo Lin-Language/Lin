@@ -786,7 +786,7 @@ pub(crate) fn type_repr_differs(from: &Type, to: &Type) -> bool {
     // boxed `Object[]` bound to a `Pt[]`-annotated slot is read by downstream packed-dispatched ops
     // (index / `.for` / field read) as a contiguous struct buffer → garbage (the `7 7` mis-read).
     // Codegen's `compile_ir_coerce` already PROJECTS a boxed array into a fresh packed buffer
-    // (`sealed_array_project_from`) / MATERIALIZES a packed array to a tagged `Object[]`
+    // (`sealed_array_project_owned`) / MATERIALIZES a packed array to a tagged `Object[]`
     // (`sealed_array_to_tagged`) for exactly this Coerce — this arm just makes the lowerer emit it.
     // Gate: exactly one side is a packed sealed-scalar array AND the other is a BOXED-element array
     // (unsealed Object / Json / union / TypeVar / Map element). Mirrors `param_elem_is_boxed_repr`

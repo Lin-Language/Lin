@@ -9015,7 +9015,7 @@ print(toString(g(5)["v"]))
 // element pointers were mis-read as inline packed struct bytes → garbage (printed `7 7`, a value no
 // field holds). Fix: `lower::type_repr_differs` now detects the packed-sealed-array-vs-boxed-array
 // representation disagreement at the binding boundary and emits a `Coerce`, which codegen's
-// `sealed_array_project_from` materializes into a genuine packed buffer (matching the annotation).
+// `sealed_array_project_owned` materializes into a genuine packed buffer (matching the annotation).
 #[test]
 fn test_combinator_boxed_result_bound_to_packed_sealed_array() {
     // map → for/index/field. The lambda returns an UNSEALED literal, so map's runtime result is a
@@ -10040,9 +10040,9 @@ fn test_reduce_boxed_seed_returned_through_sealed_array_annotation() {
     // Regression: a function declared `: T[]` (T a sealed record) whose body returns
     // `arr.reduce(seed, fn)` where `seed` is a BOXED array from a generic combinator (e.g.
     // `flatMap`) and `reduce` runs over an EMPTY array (so it returns the boxed seed unchanged).
-    // The function-return coercion (union box → sealed `T[]`) used `sealed_array_project_from`,
-    // which BORROWS the kept-packed buffer — but a function return TRANSFERS ownership to the
-    // caller, so the returned array aliased a scope-owned value that was then double-released →
+    // The function-return coercion (union box → sealed `T[]`) used a BORROWING projection of the
+    // kept-packed buffer — but a function return TRANSFERS ownership to the caller, so the returned
+    // array aliased a scope-owned value that was then double-released →
     // freed before `ret` → corrupt array header (garbage `.length()`, then a downstream
     // `lin_unbox_int64` null-deref when the caller read a field). Fix: use the OWNED projection
     // (retain in kp) and fully release the source box on the return path. This is the bug that
@@ -19658,10 +19658,10 @@ main()
 }
 
 // Regression: sealed-record array extracted from a FixedArray (tuple) then passed to toString.
-// The kp path of `sealed_array_project_from` in a non-union Coerce (Array<Json>→R[]) aliased
-// the source pointer `ir_arr_alloc` and `sarrp_phi`, so both scope-exit releases hit the SAME
-// pointer while the tuple's slot still held it → UAF. Fix: use `sealed_array_project_owned`
-// (which retains in kp) for non-union sources, keeping RC balanced across both IR paths.
+// A borrowing projection's kp path in a non-union Coerce (Array<Json>→R[]) aliased the source
+// pointer `ir_arr_alloc`, so both scope-exit releases hit the SAME pointer while the tuple's slot
+// still held it → UAF. Fix: use `sealed_array_project_owned` (which retains in kp) for non-union
+// sources, keeping RC balanced across both IR paths.
 #[test]
 fn test_keeppacked_tuple_sealed_arr_tostring_no_uaf() {
     let output = run(r#"import { print } from "std/io"
