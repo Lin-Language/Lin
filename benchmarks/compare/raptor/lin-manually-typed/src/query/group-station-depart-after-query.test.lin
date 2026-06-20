@@ -32,6 +32,23 @@ val runPlanTransfer = (trips: Trip[], transfers: TransfersByOrigin, origins: Str
   val query = createGroupStationDepartAfterQuery(raptor, jf, 1, [createMultipleCriteriaFilter()])
   plan(query, origins, destinations, { "year": 2019, "month": 4, "day": 18 }, time)
 
+// As runPlan but with a caller-chosen maxSearchDays — exercises the multi-day `searchDay` loop.
+val runPlanDays = (trips: Trip[], origins: String[], destinations: String[], time: UInt32, maxDays: UInt8): Journey[] =>
+  val raptor = create(trips, {}, {}, null)
+  val jf: ResultsFactory = { "getResults": getResults }
+  val query = createGroupStationDepartAfterQuery(raptor, jf, maxDays, [createMultipleCriteriaFilter()])
+  plan(query, origins, destinations, { "year": 2019, "month": 4, "day": 18 }, time)
+
+// A journey that needs TWO service days: board A->B at 20:00 arriving 23:00, then the only B->C trip
+// departs 06:00 the NEXT morning. So day 0's scan reaches B but not C; the journey only completes when
+// the search is allowed to roll over to day 1. This pins the `searchDay` day-cap boundary, which was
+// off by one (`maxSearchDays == i` searched maxSearchDays+1 days vs TS's `for i in 0..maxSearchDays`),
+// inflating the cross-language RAPTOR benchmark with extra journeys from a day the reference never scans.
+val twoDayTrips: Trip[] = [
+  t([st("A", null, 72000u32), st("B", 82800u32, null)]),
+  t([st("B", null, 21600u32), st("C", 28800u32, null)])
+]
+
 val s = suite("GroupStationDepartAfterQuery", [
   test("plans to multiple destinations", () => [
     expect(runPlan(
@@ -97,6 +114,17 @@ val s = suite("GroupStationDepartAfterQuery", [
       ["D"],
       900u32
     ).length()).toBe(1)
+  ]),
+
+  // searchDay day-cap boundary (mirrors TS `for (i = 0; i < maxSearchDays; i++)`). With only ONE
+  // search day the cross-day journey cannot complete, so the reference returns nothing.
+  test("a two-service-day journey is NOT found within maxSearchDays=1", () => [
+    expect(runPlanDays(twoDayTrips, ["A"], ["C"], 36000u32, 1u8).length()).toBe(0)
+  ]),
+
+  // Allowed a second search day, the journey rolls over to day 1 and completes.
+  test("a two-service-day journey IS found within maxSearchDays=2", () => [
+    expect(runPlanDays(twoDayTrips, ["A"], ["C"], 36000u32, 2u8).length()).toBe(1)
   ])
 ])
 run(s)
