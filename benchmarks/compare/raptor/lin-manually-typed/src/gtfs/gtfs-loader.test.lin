@@ -1,0 +1,41 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { loadGtfs } from "./gtfs-loader"
+import { runsOn } from "./service"
+import { DayOfWeek } from "./date"
+import { length } from "std/array"
+
+// Regression for the calendar_dates loader fix. The fixture (../../fixtures/mini-gtfs.tar.gz) has
+// one service S1 that runs Mon-Fri per calendar.txt, but calendar_dates.txt removes 2025-09-02
+// (a Tuesday) with exception_type=2. The original `addDate` dropped every such exception two ways
+// — an index-set on a Null inner map is a no-op, and a String date key never matches the UInt32
+// DateNumber that runsOn looks up — so a removed service still ran. This loads the fixture through
+// the real streaming loader and asserts the exception is honoured.
+//
+// NOTE: run from the repo root (`cargo run -p lin -- test benchmarks/.../gtfs-loader.test.lin`);
+// the fixture path is resolved relative to the process CWD, not this file.
+val FIXTURE = "benchmarks/compare/raptor/lin-manually-typed/fixtures/mini-gtfs.tar.gz"
+
+val tuesday: DayOfWeek = 2
+val wednesday: DayOfWeek = 3
+
+val s = suite("gtfs/gtfs-loader", [
+  test("loads the single fixture trip", () =>
+    val [trips, transfers, interchange, stops] = loadGtfs(FIXTURE)
+    [
+      expect(trips.length()).toBe(1)
+    ]
+  ),
+
+  test("a calendar_dates exception_type=2 removes the service on that date", () =>
+    val [trips, transfers, interchange, stops] = loadGtfs(FIXTURE)
+    val service = trips[0]["service"]
+    [
+      // 2025-09-03 (Wed) is a normal running weekday.
+      expect(runsOn(service, 20250903u32, wednesday)).toBe(true),
+      // 2025-09-02 (Tue) is removed by the calendar_dates exception, even though Tuesday runs.
+      expect(runsOn(service, 20250902u32, tuesday)).toBe(false)
+    ]
+  )
+])
+
+run(s)
