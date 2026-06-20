@@ -751,21 +751,9 @@ impl Checker {
         // direct call — it resolves via the LLVM symbol, not through the env.
         let is_self_ref = self.current_fn_self_slots.last().copied() == Some(slot);
         if var_scope_depth > 0 && !is_self_ref {
-            for (i, &fn_entry_depth) in self.function_scope_depths.iter().enumerate().rev() {
-                if var_scope_depth < fn_entry_depth {
-                    if let Some(captures) = self.capture_stack.get_mut(i) {
-                        captures.entry(slot).or_insert_with(|| Capture {
-                            name: name.to_string(),
-                            outer_slot: slot,
-                            is_mutable,
-                            ty: ty.clone(),
-                        });
-                    }
-                } else {
-                    // This function owns or is the variable — no more outer captures needed.
-                    break;
-                }
-            }
+            // Shared with the dot-call method-callee path (`record_dot_call_capture`) — the multi-
+            // level capture rule lives in one place; see `record_capture_in_enclosing_fns`.
+            self.record_capture_in_enclosing_fns(var_scope_depth, slot, is_mutable, name, &ty);
         }
         // Affine use-after-move check (streams brief §7): ANY read of a `Stream`-typed binding
         // that has ALREADY been consumed (moved into an ownership-taking adapter/terminal) is a

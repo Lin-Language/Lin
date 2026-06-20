@@ -1396,27 +1396,22 @@ impl Checker {
         .with_help(format!("the matching overloads are:\n{}\nthese cannot be ranked by specificity (§14.6)", cands))
     }
 
-    /// Record `name` (the resolved method of a dot-call `recv.method(...)`) as a CAPTURE of every
-    /// enclosing closure that is strictly inside the method's defining scope. A dot-call desugars to
-    /// `method(recv, …)`, but the method callee is built as a `LocalGet` DIRECTLY here (it never
-    /// passes through `infer_ident`), so without this the capture is never recorded: an inner closure
-    /// whose ONLY reference to a captured local closure is a dot-call (`val p = make(); val g = (r) =>
-    /// r.field.p()`) ends up with `p` absent from its env → the call is dropped (returns null) at
-    /// lowering. Mirrors the capture loop in `infer_ident` exactly (same self-ref suppression).
-    pub(crate) fn record_dot_call_capture(&mut self, name: &str, ty: &Type) {
-        // Copy the looked-up fields out FIRST so the immutable `self.env` borrow ends before the
-        // mutable `self.capture_stack` borrow in the loop below.
-        let Some((var_scope_depth, slot, is_mutable)) = self
-            .env
-            .lookup_with_depth(name)
-            .map(|(d, info)| (d, info.slot, info.mutable))
-        else {
-            return;
-        };
-        let is_self_ref = self.current_fn_self_slots.last().copied() == Some(slot);
-        if var_scope_depth == 0 || is_self_ref {
-            return;
-        }
+    /// Record a capture of `(slot, name, ty)` in every enclosing function whose scope was entered
+    /// strictly inside the variable's defining scope (`var_scope_depth < fn_entry_depth`). This is
+    /// the single home of the multi-level capture rule, shared by `infer_ident` (the primary
+    /// free-variable path) and `record_dot_call_capture` (the dot-call method-callee path). Keeping
+    /// it in one place is deliberate: bug #4 (a dot-call-only closure reference that was never
+    /// captured → its call silently dropped) was exactly a hand-mirrored copy of this loop drifting
+    /// out of sync — see docs/COMPILER_COHERENCE.md on dual paths. Callers apply the `depth > 0`
+    /// and self-ref guards before calling.
+    pub(crate) fn record_capture_in_enclosing_fns(
+        &mut self,
+        var_scope_depth: usize,
+        slot: usize,
+        is_mutable: bool,
+        name: &str,
+        ty: &Type,
+    ) {
         for (i, &fn_entry_depth) in self.function_scope_depths.iter().enumerate().rev() {
             if var_scope_depth < fn_entry_depth {
                 if let Some(captures) = self.capture_stack.get_mut(i) {
@@ -1428,9 +1423,34 @@ impl Checker {
                     });
                 }
             } else {
+                // This function owns or is the variable — no more outer captures needed.
                 break;
             }
         }
+    }
+
+    /// Record `name` (the resolved method of a dot-call `recv.method(...)`) as a CAPTURE of every
+    /// enclosing closure that is strictly inside the method's defining scope. A dot-call desugars to
+    /// `method(recv, …)`, but the method callee is built as a `LocalGet` DIRECTLY here (it never
+    /// passes through `infer_ident`), so without this the capture is never recorded: an inner closure
+    /// whose ONLY reference to a captured local closure is a dot-call (`val p = make(); val g = (r) =>
+    /// r.field.p()`) ends up with `p` absent from its env → the call is dropped (returns null) at
+    /// lowering.
+    pub(crate) fn record_dot_call_capture(&mut self, name: &str, ty: &Type) {
+        // Copy the looked-up fields out FIRST so the immutable `self.env` borrow ends before the
+        // mutable `self.capture_stack` borrow in the shared helper below.
+        let Some((var_scope_depth, slot, is_mutable)) = self
+            .env
+            .lookup_with_depth(name)
+            .map(|(d, info)| (d, info.slot, info.mutable))
+        else {
+            return;
+        };
+        let is_self_ref = self.current_fn_self_slots.last().copied() == Some(slot);
+        if var_scope_depth == 0 || is_self_ref {
+            return;
+        }
+        self.record_capture_in_enclosing_fns(var_scope_depth, slot, is_mutable, name, ty);
     }
 
     pub(crate) fn infer_dot_call(
