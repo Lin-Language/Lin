@@ -269,6 +269,10 @@ impl<'ctx> Codegen<'ctx> {
         // Sealed-records Stage 4: stack-allocate non-escaping all-scalar sealed records and suppress
         // their Retain/Release emission (imports get the same analysis as the main module).
         lin_ir::escape::analyze(&mut ir_module);
+        // Static RC-balance verifier (Cluster 2) — VERIFICATION ONLY, gated on `LIN_VERIFY_RC=1`,
+        // OFF by default. Runs over each IMPORTED module's final lowered IR too (so the corpus run
+        // covers std/* + example imports). Never mutates the IR.
+        lin_ir::rc_verify::verify_if_enabled(&ir_module, &format!("import {module_key}"));
         // Prefix this module's anonymous functions so `__lin_fn_<id>` symbols don't collide
         // with the main module's or other imports' (each module numbers FuncIds from 0).
         let saved_prefix = std::mem::replace(&mut self.ir_anon_prefix, format!("{}_", module_key));
