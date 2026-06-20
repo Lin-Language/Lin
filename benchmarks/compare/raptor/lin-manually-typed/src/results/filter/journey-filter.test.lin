@@ -33,6 +33,55 @@ val s = suite("results/filter/journey-filter", [
     [
       expect(apply(f, []).length()).toBe(0)
     ]
+  ),
+
+  // --- Mirrors raptor-typescript/test/MultipleCriteriaFilter.test.js ---
+
+  // Journey at dep=900 is dominated by dep=1000: both have 1 leg and arrive at 1100, but
+  // in a transit planner the LATER departure is strictly better (more time at the origin station).
+  // The filter removes the earlier-departing journey that has no arrival or leg-count advantage.
+  test("removes an earlier-departing journey dominated by a later one with equal arrival", () =>
+    val j900: Journey = { "legs": [leg], "departureTime": 900, "arrivalTime": 1100 }
+    val j1000: Journey = { "legs": [leg], "departureTime": 1000, "arrivalTime": 1100 }
+    val j1100: Journey = { "legs": [leg], "departureTime": 1100, "arrivalTime": 1200 }
+    val j1200: Journey = { "legs": [leg], "departureTime": 1200, "arrivalTime": 1300 }
+    val result = apply(f, [j900, j1000, j1100, j1200])
+    // dep=900 is removed (dominated by dep=1000 which departs later and arrives equally early with same legs)
+    [
+      expect(result.length()).toBe(3),
+      expect(result[0]["departureTime"]).toBe(1000),
+      expect(result[1]["departureTime"]).toBe(1100),
+      expect(result[2]["departureTime"]).toBe(1200)
+    ]
+  ),
+
+  // Journey b has fewer legs even though it arrives at the same time and departs later — both kept.
+  test("keeps a slower journey when it has fewer legs", () =>
+    val fast2leg: Journey = { "legs": [leg, leg], "departureTime": 1000, "arrivalTime": 1100 }
+    val slow1leg: Journey = { "legs": [leg], "departureTime": 900, "arrivalTime": 1100 }
+    val c: Journey = { "legs": [leg], "departureTime": 1100, "arrivalTime": 1200 }
+    val d: Journey = { "legs": [leg], "departureTime": 1200, "arrivalTime": 1300 }
+    val result = apply(f, [fast2leg, slow1leg, c, d])
+    [
+      expect(result.length()).toBe(4)
+    ]
+  ),
+
+  // When two journeys depart at the same time but one arrives later, the later one is dominated.
+  test("sorts before filtering — removes a later-arriving duplicate departure", () =>
+    val j1: Journey = { "legs": [leg], "departureTime": 1000, "arrivalTime": 1100 }
+    val j2: Journey = { "legs": [leg], "departureTime": 1000, "arrivalTime": 1100 }
+    val j3: Journey = { "legs": [leg], "departureTime": 1100, "arrivalTime": 1200 }
+    val j4: Journey = { "legs": [leg], "departureTime": 1200, "arrivalTime": 1300 }
+    val j5: Journey = { "legs": [leg], "departureTime": 1200, "arrivalTime": 1330 }
+    val result = apply(f, [j1, j2, j3, j4, j5])
+    // j2 is dominated by j1 (identical), j5 is dominated by j4 (same dep, later arr, same legs)
+    [
+      expect(result.length()).toBe(3),
+      expect(result[0]["arrivalTime"]).toBe(1100),
+      expect(result[1]["arrivalTime"]).toBe(1200),
+      expect(result[2]["arrivalTime"]).toBe(1300)
+    ]
   )
 ])
 

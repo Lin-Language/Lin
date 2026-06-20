@@ -99,6 +99,10 @@ jobs:
       - name: Run stdlib and example tests
         run: cargo run -p lin --quiet -- test stdlib/ examples/ --timeout 120
 
+      - name: Run RAPTOR benchmark unit tests
+        # Run from repo root so gtfs-loader.test.lin resolves its fixture path correctly.
+        run: cargo run -p lin --quiet -- test benchmarks/compare/raptor/lin-manually-typed/ --timeout 30
+
   # AddressSanitizer leg: builds an instrumented lin-runtime and links the compiled
   # test programs against it on the LinIR path, then runs the stdlib suite under ASan.
   # This is the standing guard for loop-body / projection / container refcounting on
