@@ -97,10 +97,20 @@ jobs:
           done
 
       - name: Run stdlib and example tests
+        # LIN_VERIFY_RC=strict turns on the static RC-balance verifier (crates/lin-ir/rc_verify.rs)
+        # during every test's compile and FAILS the build on any retain/release imbalance or
+        # use-after-release — a free CI gate over the whole corpus (no extra compile). It is clean
+        # on this corpus today; a regression that unbalances RC now breaks CI here instead of
+        # surfacing later as a multi-minute ASan/lldb bisect. (docs/COMPILER_COHERENCE.md Phase 0.)
+        env:
+          LIN_VERIFY_RC: strict
         run: cargo run -p lin --quiet -- test stdlib/ examples/ --timeout 120
 
       - name: Run RAPTOR benchmark unit tests
         # Run from repo root so gtfs-loader.test.lin resolves its fixture path correctly.
+        # Same RC-balance gate as above — the RAPTOR port is the most RC-heavy corpus.
+        env:
+          LIN_VERIFY_RC: strict
         run: cargo run -p lin --quiet -- test benchmarks/compare/raptor/lin-manually-typed/ --timeout 30
 
   # AddressSanitizer leg: builds an instrumented lin-runtime and links the compiled
