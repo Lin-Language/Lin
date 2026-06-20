@@ -9996,6 +9996,46 @@ run()
 }
 
 #[test]
+fn test_nested_if_else_if_in_parens_outer_else_attaches_to_outer_if() {
+    // Regression: a nested `if … else if …` chain inside a parenthesised lambda body
+    // (`.for(... => …)`, where ADR-003 suppresses Indent/Dedent) used to mis-attach the OUTER
+    // `else if` to the nearest INNER `if`, making it DEAD whenever the inner condition path was
+    // not taken. With no Dedent to close the inner `if`, the `else` was bound greedily; the fix
+    // is an offside guard — an `else` whose line-start column is left of the chain's `if` belongs
+    // to the ENCLOSING `if`, so it is left for the outer parser. (This silently produced 0
+    // journeys in the RAPTOR scanRoutes port: boarding's outer `else if prevArrival != 0` never
+    // ran, so setTrip never fired.)
+    let src = "\
+import { print } from \"std/io\"
+import { for, range } from \"std/iter\"
+val go = (): Null =>
+  range(0, 2).for(i =>
+    var t = false
+    if t then
+      print(\"then\")
+      if i == 0 then
+        print(\"inner-then\")
+      else if i == 1 then
+        print(\"inner-elseif\")
+    else if i == 0 then
+      print(\"outer-elseif\")
+  )
+go()
+";
+    // `t` is always false, so neither the outer `then` nor the inner chain runs; only the OUTER
+    // `else if i == 0` may fire — exactly once, for i == 0. Before the fix this printed nothing.
+    assert_eq!(
+        run(src),
+        vec!["outer-elseif"],
+        "outer else-if inside .for(...) must attach to the outer if, not the inner one"
+    );
+
+    // The formatter must also round-trip the structure without changing meaning.
+    let out = fmt(src);
+    assert_eq!(out, fmt(&out), "nested else-if inside parens not idempotent:\n{}", out);
+}
+
+#[test]
 fn test_fmt_else_if_block_branch_comment_preserved_once() {
     // A leading own-line comment on the first statement of an `else if ... then` Block
     // branch body was emitted TWICE (the If arm's `take_leading` and `fmt_block` both

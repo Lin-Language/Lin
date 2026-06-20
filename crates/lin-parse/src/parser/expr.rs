@@ -802,7 +802,16 @@ impl Parser {
         };
 
         self.skip_newlines();
-        let else_branch = if self.check(TokenKind::Else) {
+        // Offside guard on `else` attachment (the ADR-003 inline/inside-parens case, where no
+        // Dedent token closes a nested `if` before its enclosing `if`'s `else`). An `else` whose
+        // line-start column is STRICTLY LEFT of this chain's `branch_col` belongs to an enclosing
+        // `if`, so leave it for the outer parser instead of greedily binding it here. Without this,
+        // a nested `if .. else if ..` inside a `.for(...)`/`.map(...)` lambda body swallows the
+        // outer `else` (it becomes dead whenever the inner condition path isn't taken). In the
+        // block (Dedent-delimited) case a Dedent already sits between the inner branch and the
+        // outer `else`, so `self.check(Else)` is false here for a foreign `else` and the guard is
+        // a no-op; for this chain's own `else` the column equals `branch_col`, so it still binds.
+        let else_branch = if self.check(TokenKind::Else) && self.line_start_column() >= branch_col {
             self.advance();
             self.skip_newlines();
             if self.check(TokenKind::Indent) {
