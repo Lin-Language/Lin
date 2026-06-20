@@ -1,7 +1,19 @@
 # Compiler coherence: structural consolidation proposal
 
-Status: **proposed** (2026-06-20). Not yet an ADR — this is the rationale + plan that one or
+Status: **in progress** (2026-06-20). Not yet an ADR — this is the rationale + plan that one or
 more ADRs should be cut from as the work lands.
+
+**Landed so far (Phase 0, the safety net):**
+- RC-balance verifier over LinIR — `LIN_VERIFY_RC=1`, off by default (`34584403`). Clean over the
+  whole corpus; ready to promote to a CI gate (needs the quiet-on-success + nonzero-exit tweak).
+- RAPTOR-shaped unit corpus + CI gate — TS spec gaps ported, RAPTOR unit suite now blocks CI
+  (`dfd750a5`).
+- Cluster-3 down payment — the dot-call capture loop, the exact drift that caused bug #4, is now a
+  single shared `record_capture_in_enclosing_fns` (`e93e4da9`).
+
+**Still open:** ASan-as-a-dedicated-CI-job (Phase 0); the full dot→prefix desugar (Phase 1); the
+`Repr` lattice (Phase 2, on `reset/main`); the offside helper (Phase 3). This doc stays until those
+land — it is the roadmap for them, not a record of finished work.
 
 ## Why this doc exists
 
@@ -100,16 +112,19 @@ leverage available and should land alongside (not after) the structural work.
 Ordered by leverage-per-risk. Each item is independently shippable; master never regresses.
 
 ### Phase 0 — Verifiers first (the safety net)
-- [ ] **RC-balance verifier over `LinIR`** (Cluster 2). Per-value retain/release balance on every
-      path + no use-after-release. Start as a debug-assert/`LIN_VERIFY_RC=1` pass; promote to a CI
-      gate once clean on the corpus.
-- [ ] **RAPTOR-shaped unit corpus** (verification coverage). Port the remaining TS query/results
-      specs; add fixtures for: multi-round scan, multi-day `searchDay` (done — boundary tests),
-      materialize↔project round-trip, captured-closure-via-dot-call (done). Run under ASan in CI.
-- [ ] Wire ASan + the corpus into `ci.yml` as a dedicated job (the suite already links a debug
-      runtime; gate on `0 failed` + no ASan reports).
+- [x] **RC-balance verifier over `LinIR`** (Cluster 2) — `LIN_VERIFY_RC=1`, off by default,
+      `34584403`. Per-value retain/release balance + use-after-release on every path; clean over
+      stdlib/examples/RAPTOR. **Open follow-up:** quiet-on-success + nonzero-exit, then promote to a
+      CI gate.
+- [x] **RAPTOR-shaped unit corpus** (verification coverage) — TS query/results spec gaps ported
+      (DepartAfterQuery/RangeQuery/MultipleCriteriaFilter), plus the multi-day `searchDay` boundary,
+      calendar_dates loader fixture, and captured-closure-via-dot-call tests. `dfd750a5`.
+- [x] Wire the RAPTOR unit suite into `ci.yml` (`dfd750a5`). **Open follow-up:** run it (and the
+      stdlib suite) under ASan as a dedicated job — gate on `0 failed` + no ASan reports.
 
 ### Phase 1 — Cluster 3 (bounded, mechanical, do early)
+- [x] Down payment: the dot-call capture rule is now one shared `record_capture_in_enclosing_fns`
+      instead of a hand-mirrored copy (`e93e4da9`).
 - [ ] Make ADR-085 receiver-push expressible on a desugared `f(receiver, …)` call.
 - [ ] Desugar all dot-calls to prefix calls in one place; delete the parallel resolution body in
       `infer_dot_call`, keeping only method-specific routing (stream ops, packed-array intrinsics).
