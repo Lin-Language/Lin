@@ -1,0 +1,537 @@
+// DepartAfterQuery.test.lin — mirrors DepartAfterQuery.test.js (25 TS cases, 25 ported).
+// Tests the REAL DepartAfterQuery SUT: scalar origin/destination, NO filters.
+import { expect, toSatisfy, toBe, test, suite, run } from "std/test"
+import { t, st, tf, j, setDefaultTrip, journeysEq } from "./testutil"
+import { Trip } from "../gtfs/gtfs"
+import { Service, ServiceDays } from "../gtfs/service"
+import { DateIndex } from "../gtfs/date"
+import { create } from "../raptor/raptor-algorithm-factory"
+import { createDepartAfterQuery, plan } from "./depart-after-query"
+import { getResults } from "../results/journey-factory"
+import { ResultsFactory } from "../results/results-factory"
+import { Journey } from "../results/journey"
+import { TransfersByOrigin, Interchange } from "../raptor/raptor-algorithm"
+import { length } from "std/array"
+
+val jf: ResultsFactory = { "getResults": getResults }
+
+val date20181016 = { "year": 2018, "month": 10, "day": 16 }
+val date20181022 = { "year": 2018, "month": 10, "day": 22 }
+val date20181231 = { "year": 2018, "month": 12, "day": 31 }
+val date20190423 = { "year": 2019, "month": 4, "day": 23 }
+
+val allDays: ServiceDays = {
+  0: true,
+  1: true,
+  2: true,
+  3: true,
+  4: true,
+  5: true,
+  6: true
+}
+
+val noDates: DateIndex = {}
+
+// Helper: run plan via the real DepartAfterQuery (scalar origin/dest, no filter).
+val runPlan = (trips: Trip[], origin: String, destination: String, date, time: UInt32, maxDays: UInt8 = 3u8): Journey[] =>
+  val raptor = create(trips, {}, {}, null)
+  val query = createDepartAfterQuery(raptor, jf, maxDays)
+  val result = plan(query, origin, destination, date, time)
+  setDefaultTrip(result)
+  result
+
+val runPlanT = (trips: Trip[], transfers: TransfersByOrigin, origin: String, dest: String, date, time: UInt32): Journey[] =>
+  val raptor = create(trips, transfers, {}, null)
+  val query = createDepartAfterQuery(raptor, jf)
+  val result = plan(query, origin, dest, date, time)
+  setDefaultTrip(result)
+  result
+
+val runPlanI = (trips: Trip[], interchange: Interchange, origin: String, dest: String, date, time: UInt32): Journey[] =>
+  val raptor = create(trips, {}, interchange, null)
+  val query = createDepartAfterQuery(raptor, jf)
+  val result = plan(query, origin, dest, date, time)
+  setDefaultTrip(result)
+  result
+
+val runPlanTI = (trips: Trip[], transfers: TransfersByOrigin, interchange: Interchange, origin: String, dest: String, date, time: UInt32): Journey[] =>
+  val raptor = create(trips, transfers, interchange, null)
+  val query = createDepartAfterQuery(raptor, jf)
+  val result = plan(query, origin, dest, date, time)
+  setDefaultTrip(result)
+  result
+
+val s = suite("DepartAfterQuery", [
+  test("finds journeys with direct connections", () =>
+    val result = runPlan(
+      [t([st("A", null, 1000u32), st("B", 1030u32, 1035u32), st("C", 1100u32, null)])],
+      "A", "C", date20181016, 900u32
+    )
+    [
+      expect(result).toSatisfy(r =>
+        journeysEq(r, [j([[st("A", null, 1000u32), st("B", 1030u32, 1035u32), st("C", 1100u32, null)]])])
+      )
+    ]
+  ),
+
+  test("finds the earliest calendars", () =>
+    val result = runPlan(
+      [
+        t([st("A", null, 1400u32), st("B", 1430u32, 1435u32), st("C", 1500u32, null)]),
+        t([st("A", null, 1000u32), st("B", 1030u32, 1035u32), st("C", 1100u32, null)])
+      ],
+      "A", "C", date20181016, 900u32
+    )
+    [
+      expect(result).toSatisfy(r =>
+        journeysEq(r, [j([[st("A", null, 1000u32), st("B", 1030u32, 1035u32), st("C", 1100u32, null)]])])
+      )
+    ]
+  ),
+
+  test("finds journeys with a single connection", () =>
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, 1035u32), st("C", 1100u32, null)]),
+        t([st("D", null, 1000u32), st("B", 1030u32, 1035u32), st("E", 1100u32, null)])
+      ],
+      "A", "E", date20181016, 900u32
+    )
+    [
+      expect(result).toSatisfy(r =>
+        journeysEq(r, [
+          j([
+            [st("A", null, 1000u32), st("B", 1030u32, 1035u32)],
+            [st("B", 1030u32, 1035u32), st("E", 1100u32, null)]
+          ])
+        ])
+      )
+    ]
+  ),
+
+  test("does not return journeys that cannot be made", () =>
+    // maxSearchDays=1: A->B arrives 1035, B->E boards at 1030 — connection impossible.
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1035u32, 1035u32), st("C", 1100u32, null)]),
+        t([st("D", null, 1000u32), st("B", 1030u32, 1030u32), st("E", 1100u32, null)])
+      ],
+      "A", "E", date20181016, 900u32, 1u8
+    )
+    [expect(result.length()).toBe(0)]
+  ),
+
+  test("returns the fastest and the least changes", () =>
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1200u32, null)]),
+        t([st("B", null, 1030u32), st("C", 1100u32, null)])
+      ],
+      "A", "C", date20181016, 900u32
+    )
+    val direct = j([[st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1200u32, null)]])
+    val change = j([
+      [st("A", null, 1000u32), st("B", 1030u32, 1030u32)],
+      [st("B", null, 1030u32), st("C", 1100u32, null)]
+    ])
+    [expect(result).toSatisfy(r => journeysEq(r, [direct, change]))]
+  ),
+
+  test("chooses the fastest journey where the number of journeys is the same", () =>
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1100u32, null)]),
+        t([st("C", null, 1200u32), st("D", 1230u32, 1230u32), st("E", 1300u32, null)]),
+        t([st("A", null, 1100u32), st("F", 1130u32, 1130u32), st("G", 1200u32, null)]),
+        t([st("G", null, 1200u32), st("H", 1230u32, 1230u32), st("E", 1255u32, null)])
+      ],
+      "A", "E", date20181016, 900u32
+    )
+    val fastest = j([
+      [st("A", null, 1100u32), st("F", 1130u32, 1130u32), st("G", 1200u32, null)],
+      [st("G", null, 1200u32), st("H", 1230u32, 1230u32), st("E", 1255u32, null)]
+    ])
+    [expect(result).toSatisfy(r => journeysEq(r, [fastest]))]
+  ),
+
+  test("chooses an arbitrary journey when they are the same", () =>
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1100u32, null)]),
+        t([st("C", null, 1200u32), st("D", 1230u32, 1230u32), st("E", 1300u32, null)]),
+        t([st("A", null, 1100u32), st("F", 1130u32, 1130u32), st("G", 1200u32, null)]),
+        t([st("G", null, 1200u32), st("H", 1230u32, 1230u32), st("E", 1300u32, null)])
+      ],
+      "A", "E", date20181016, 900u32
+    )
+    val journey1 = j([
+      [st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1100u32, null)],
+      [st("C", null, 1200u32), st("D", 1230u32, 1230u32), st("E", 1300u32, null)]
+    ])
+    [expect(result).toSatisfy(r => journeysEq(r, [journey1]))]
+  ),
+
+  test("chooses the correct change point", () =>
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, null)]),
+        t([st("A", null, 1030u32), st("C", 1200u32, null)]),
+        t([st("C", null, 1000u32), st("B", 1030u32, 1030u32), st("E", 1100u32, null)]),
+        t([st("C", null, 1200u32), st("B", 1230u32, 1230u32), st("E", 1300u32, null)])
+      ],
+      "A", "E", date20181016, 900u32
+    )
+    val change = j([
+      [st("A", null, 1000u32), st("B", 1030u32, null)],
+      [st("B", 1030u32, 1030u32), st("E", 1100u32, null)]
+    ])
+    [expect(result).toSatisfy(r => journeysEq(r, [change]))]
+  ),
+
+  test("finds journeys with a transfer", () =>
+    val result = runPlanT(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, 1035u32), st("C", 1100u32, null)]),
+        t([st("D", null, 1200u32), st("E", 1300u32, null)])
+      ],
+      { "C": [tf("C", "D", 10u16)] },
+      "A", "E", date20181016, 900u32
+    )
+    [
+      expect(result).toSatisfy(r =>
+        journeysEq(r, [
+          j([
+            [st("A", null, 1000u32), st("B", 1030u32, 1035u32), st("C", 1100u32, null)],
+            tf("C", "D", 10u16),
+            [st("D", null, 1200u32), st("E", 1300u32, null)]
+          ])
+        ])
+      )
+    ]
+  ),
+
+  test("uses a transfer if it is faster", () =>
+    val result = runPlanT(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1100u32, null)]),
+        t([st("C", null, 1130u32), st("D", 1200u32, null)])
+      ],
+      { "C": [tf("C", "D", 10u16)] },
+      "A", "D", date20181016, 900u32
+    )
+    val transfer = j([
+      [st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1100u32, null)],
+      tf("C", "D", 10u16)
+    ])
+    [expect(result).toSatisfy(r => journeysEq(r, [transfer]))]
+  ),
+
+  test("doesn't allow pick up from locations without pickup specified", () =>
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1200u32, null)]),
+        t([st("E", null, 1000u32), st("B", 1030u32, null), st("C", 1100u32, null)])
+      ],
+      "A", "C", date20181016, 900u32
+    )
+    val direct = j([[st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1200u32, null)]])
+    [expect(result).toSatisfy(r => journeysEq(r, [direct]))]
+  ),
+
+  test("doesn't allow drop off at non-drop off locations", () =>
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", null, 1030u32), st("C", 1200u32, null)]),
+        t([st("E", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1100u32, null)])
+      ],
+      "A", "C", date20181016, 900u32
+    )
+    val direct = j([[st("A", null, 1000u32), st("B", null, 1030u32), st("C", 1200u32, null)]])
+    [expect(result).toSatisfy(r => journeysEq(r, [direct]))]
+  ),
+
+  test("applies interchange times", () =>
+    val result = runPlanI(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1200u32, null)]),
+        t([st("B", null, 1030u32), st("C", 1100u32, null)]),
+        t([st("B", null, 1040u32), st("C", 1110u32, null)])
+      ],
+      { "B": 10u32 },
+      "A", "C", date20181016, 900u32
+    )
+    val direct = j([[st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1200u32, null)]])
+    val change = j([
+      [st("A", null, 1000u32), st("B", 1030u32, 1030u32)],
+      [st("B", null, 1040u32), st("C", 1110u32, null)]
+    ])
+    [expect(result).toSatisfy(r => journeysEq(r, [direct, change]))]
+  ),
+
+  test("applies interchange times to transfers", () =>
+    val result = runPlanTI(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, null)]),
+        t([st("C", null, 1030u32), st("D", 1100u32, null)]),
+        t([st("C", null, 1050u32), st("D", 1110u32, null)]),
+        t([st("C", null, 1100u32), st("D", 1120u32, null)])
+      ],
+      { "B": [tf("B", "C", 10u16)] },
+      { "B": 10u32, "C": 10u32 },
+      "A", "D", date20181016, 900u32
+    )
+    val lastPossible = j([
+      [st("A", null, 1000u32), st("B", 1030u32, null)],
+      tf("B", "C", 10u16),
+      [st("C", null, 1100u32), st("D", 1120u32, null)]
+    ])
+    [expect(result).toSatisfy(r => journeysEq(r, [lastPossible]))]
+  ),
+
+  test("omits calendars not running that day", () =>
+    // trip1 service ends 20181015; the scan date 20181016 is outside range.
+    val trip1 = t([st("B", null, 1030u32), st("C", 1100u32, null)])
+    trip1["service"] = {
+      "startDate": 20181001u32,
+      "endDate": 20181015u32,
+      "days": allDays,
+      "dates": noDates
+    }
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, null)]),
+        trip1,
+        t([st("B", null, 1040u32), st("C", 1110u32, null)])
+      ],
+      "A", "C", date20181016, 900u32
+    )
+    val change = j([
+      [st("A", null, 1000u32), st("B", 1030u32, null)],
+      [st("B", null, 1040u32), st("C", 1110u32, null)]
+    ])
+    [expect(result).toSatisfy(r => journeysEq(r, [change]))]
+  ),
+
+  test("omits calendars not running that day of the week", () =>
+    // 2018-10-22 is a Monday (dow=1); the service blocks Mondays.
+    val noMonday: ServiceDays = { 0: true, 1: false, 2: true, 3: true, 4: true, 5: true, 6: true }
+    val trip1 = t([st("B", null, 1030u32), st("C", 1100u32, null)])
+    trip1["service"] = {
+      "startDate": 20181001u32,
+      "endDate": 20991231u32,
+      "days": noMonday,
+      "dates": noDates
+    }
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, null)]),
+        trip1,
+        t([st("B", null, 1040u32), st("C", 1110u32, null)])
+      ],
+      "A", "C", date20181022, 900u32
+    )
+    val change = j([
+      [st("A", null, 1000u32), st("B", 1030u32, null)],
+      [st("B", null, 1040u32), st("C", 1110u32, null)]
+    ])
+    [expect(result).toSatisfy(r => journeysEq(r, [change]))]
+  ),
+
+  test("includes calendars with an include day", () =>
+    // Service expired but has an include exception for 20181022.
+    val trip1 = t([st("B", null, 1030u32), st("C", 1100u32, null)])
+    trip1["service"] = {
+      "startDate": 20991231u32,
+      "endDate": 20991231u32,
+      "days": allDays,
+      "dates": { 20181022: true }
+    }
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, null)]),
+        trip1,
+        t([st("B", null, 1040u32), st("C", 1110u32, null)])
+      ],
+      "A", "C", date20181022, 900u32
+    )
+    val change = j([
+      [st("A", null, 1000u32), st("B", 1030u32, null)],
+      [st("B", null, 1030u32), st("C", 1100u32, null)]
+    ])
+    [expect(result).toSatisfy(r => journeysEq(r, [change]))]
+  ),
+
+  test("omits calendars with an exclude day", () =>
+    val trip1 = t([st("B", null, 1030u32), st("C", 1100u32, null)])
+    trip1["service"] = {
+      "startDate": 20181001u32,
+      "endDate": 20991231u32,
+      "days": allDays,
+      "dates": { 20181022: false }
+    }
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, null)]),
+        trip1,
+        t([st("B", null, 1040u32), st("C", 1110u32, null)])
+      ],
+      "A", "C", date20181022, 900u32
+    )
+    val change = j([
+      [st("A", null, 1000u32), st("B", 1030u32, null)],
+      [st("B", null, 1040u32), st("C", 1110u32, null)]
+    ])
+    [expect(result).toSatisfy(r => journeysEq(r, [change]))]
+  ),
+
+  test("finds journeys after gaps in rounds", () =>
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, 1035u32), st("C", 1400u32, null)]),
+        t([st("B", null, 1035u32), st("D", 1100u32, null)]),
+        t([st("D", null, 1100u32), st("E", 1130u32, null)]),
+        t([st("E", null, 1130u32), st("C", 1200u32, null)]),
+        t([st("A", null, 1000u32), st("E", 1135u32, null)]),
+        t([st("E", null, 1135u32), st("C", 1330u32, null)])
+      ],
+      "A", "C", date20181016, 900u32
+    )
+    val direct = j([[st("A", null, 1000u32), st("B", 1030u32, 1035u32), st("C", 1400u32, null)]])
+    val slowChange = j([
+      [st("A", null, 1000u32), st("E", 1135u32, null)],
+      [st("E", null, 1135u32), st("C", 1330u32, null)]
+    ])
+    val change = j([
+      [st("A", null, 1000u32), st("B", 1030u32, 1035u32)],
+      [st("B", null, 1035u32), st("D", 1100u32, null)],
+      [st("D", null, 1100u32), st("E", 1130u32, null)],
+      [st("E", null, 1130u32), st("C", 1200u32, null)]
+    ])
+    [expect(result).toSatisfy(r => journeysEq(r, [direct, slowChange, change]))]
+  ),
+
+  test("puts overtaken trains in different routes", () =>
+    val result = runPlan(
+      [
+        t([
+          st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1100u32, 1110u32),
+          st("D", 1130u32, 1130u32), st("E", 1200u32, null)
+        ]),
+        t([
+          st("A", null, 1010u32), st("B", 1040u32, 1040u32), st("C", 1050u32, 1100u32),
+          st("D", 1120u32, 1120u32), st("E", 1150u32, null)
+        ])
+      ],
+      "A", "E", date20181016, 900u32
+    )
+    val faster = j([[
+      st("A", null, 1010u32), st("B", 1040u32, 1040u32), st("C", 1050u32, 1100u32),
+      st("D", 1120u32, 1120u32), st("E", 1150u32, null)
+    ]])
+    [expect(result).toSatisfy(r => journeysEq(r, [faster]))]
+  ),
+
+  test("finds journeys that can only be made by waiting for the next day", () =>
+    // A->B arrives 1035, B->E boards at 1030. With maxSearchDays=2 the search rolls to day+1.
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1035u32, 1035u32), st("C", 1100u32, null)]),
+        t([st("D", null, 1000u32), st("B", 1030u32, 1030u32), st("E", 1100u32, null)])
+      ],
+      "A", "E", date20181016, 900u32, 2u8
+    )
+    val expected = j([
+      [st("A", null, 1000u32), st("B", 1035u32, 1035u32)],
+      [st("B", 1030u32, 1030u32), st("E", 1100u32, null)]
+    ])
+    [
+      expect(result.length()).toBe(1),
+      expect(result[0]["legs"].length()).toBe(expected["legs"].length())
+    ]
+  ),
+
+  test("adds a day to the arrival time of journeys that are made overnight", () =>
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1035u32, 1035u32), st("C", 1100u32, null)]),
+        t([st("D", null, 1000u32), st("B", 1030u32, 1030u32), st("E", 1100u32, null)])
+      ],
+      "A", "E", date20181016, 900u32, 2u8
+    )
+    // Non-vacuous: this would be 1100 (no +86400) if the day-offset logic were absent.
+    [expect(result[0]["arrivalTime"]).toBe(1100u32 + 86400u32)]
+  ),
+
+  test("increments the day when searching subsequent days", () =>
+    // service2 starts 20190101; querying on 2018-12-31 so only day+1 (2019-01-01) qualifies.
+    val service2: Service = {
+      "startDate": 20190101u32,
+      "endDate": 20991231u32,
+      "days": allDays,
+      "dates": noDates
+    }
+    val trip2 = t([st("D", null, 1000u32), st("B", 1035u32, 1035u32), st("E", 1100u32, null)])
+    trip2["service"] = service2
+    val result = runPlan(
+      [
+        t([st("A", null, 1000u32), st("B", 1030u32, 1030u32), st("C", 1100u32, null)]),
+        trip2
+      ],
+      "A", "E", date20181231, 900u32, 2u8
+    )
+    [expect(result[0]["arrivalTime"]).toBe(1100u32 + 86400u32)]
+  ),
+
+  test("uses all results from every day", () =>
+    val result = runPlan(
+      [
+        t([st("A", null, 1900u32), st("B", 1930u32, 1935u32), st("C", 2000u32, null)]),
+        t([st("B", null, 1035u32), st("D", 1100u32, null)]),
+        t([st("D", null, 1100u32), st("E", 1130u32, null)]),
+        t([st("C", null, 1130u32), st("E", 1200u32, null)])
+      ],
+      "A", "E", date20190423, 900u32, 2u8
+    )
+    val change = j([
+      [st("A", null, 1900u32), st("B", 1930u32, 1935u32)],
+      [st("B", null, 1035u32), st("D", 1100u32, null)],
+      [st("D", null, 1100u32), st("E", 1130u32, null)]
+    ])
+    val noChange = j([
+      [st("A", null, 1900u32), st("B", 1930u32, 1935u32), st("C", 2000u32, null)],
+      [st("C", null, 1130u32), st("E", 1200u32, null)]
+    ])
+    // Both journeys are made overnight: arrival times get +86400 (as TS does journey.arrivalTime += 86400).
+    val expectedChange: Journey = {
+      "departureTime": change["departureTime"],
+      "arrivalTime": change["arrivalTime"] + 86400u32,
+      "legs": change["legs"]
+    }
+    val expectedNoChange: Journey = {
+      "departureTime": noChange["departureTime"],
+      "arrivalTime": noChange["arrivalTime"] + 86400u32,
+      "legs": noChange["legs"]
+    }
+    [expect(result).toSatisfy(r => journeysEq(r, [expectedNoChange, expectedChange]))]
+  ),
+
+  test("does not return overnight journeys that cannot be made", () =>
+    val result = runPlan(
+      [
+        t([
+          st("A", null, 86000u32), st("B", 86400u32, 86400u32),
+          st("C", 86400u32 + 3600u32 + 3600u32, null)
+        ]),
+        t([st("C", null, 3600u32), st("D", 3635u32, 3635u32), st("E", 3700u32, null)]),
+        t([
+          st("C", null, 3600u32 + 3600u32), st("D", 3635u32 + 3600u32, 3635u32 + 3600u32),
+          st("E", 3700u32 + 3600u32, null)
+        ])
+      ],
+      "A", "E", date20181231, 50000u32, 2u8
+    )
+    [expect(result[0]["arrivalTime"]).toBe(86400u32 + 3700u32 + 3600u32)]
+  )
+])
+
+run(s)

@@ -1,0 +1,83 @@
+// RangeQuery tests.
+// Mirrors raptor-typescript/test/RangeQuery.test.js.
+import { expect, toBe, toSatisfy, test, suite, run } from "std/test"
+import { t, st, j, setDefaultTrip, journeysEq } from "./testutil"
+import { create } from "../raptor/raptor-algorithm-factory"
+import { createGroupStationDepartAfterQuery, plan as groupPlan } from "./group-station-depart-after-query"
+import { createRangeQuery, plan } from "./range-query"
+import { getResults } from "../results/journey-factory"
+import { ResultsFactory } from "../results/results-factory"
+import { createMultipleCriteriaFilter } from "../results/filter/journey-filter"
+import { Trip } from "../gtfs/gtfs"
+import { Journey } from "../results/journey"
+import { length } from "std/array"
+
+val testDate = { "year": 2018, "month": 10, "day": 16 }
+
+val runRange = (trips: Trip[]): Journey[] =>
+  val raptor = create(trips, {}, {}, null)
+  val jf: ResultsFactory = { "getResults": getResults }
+  val filters = [createMultipleCriteriaFilter()]
+  val query = createRangeQuery(raptor, jf, 1, filters)
+  val result = plan(query, "A", "C", testDate)
+  setDefaultTrip(result)
+  result
+
+val s = suite("RangeQuery", [
+  test("performs profile queries — returns all non-dominated journeys across the day", () =>
+    val trips = [
+      t([st("A", null, 1000u32), st("B", 1030u32, 1035u32), st("C", 1100u32, null)]),
+      t([st("A", null, 1100u32), st("B", 1130u32, 1135u32), st("C", 1200u32, null)]),
+      t([st("A", null, 1200u32), st("B", 1230u32, 1235u32), st("C", 1300u32, null)])
+    ]
+    val result = runRange(trips)
+    val j1 = j([[st("A", null, 1000u32), st("B", 1030u32, 1035u32), st("C", 1100u32, null)]])
+    val j2 = j([[st("A", null, 1100u32), st("B", 1130u32, 1135u32), st("C", 1200u32, null)]])
+    val j3 = j([[st("A", null, 1200u32), st("B", 1230u32, 1235u32), st("C", 1300u32, null)]])
+    [
+      expect(result.length()).toBe(3),
+      expect(result).toSatisfy(r => journeysEq(r, [j1, j2, j3]))
+    ]
+  ),
+
+  // Regression: each range-query pass must use its own fresh bestArrivals / routeScanner state so
+  // earlier-pass results do not pollute a later pass.  The TS suite calls this
+  // "does not share bestArrivals or routeScanner".
+  //
+  // Setup: trip A→C at 1359 (direct, slightly later arrival 1501) and trips A→B at 1400 + B→C at 1430.
+  // The first range pass (starting at t=1) finds both the direct (A→C, 1501) and the change (A→B→C, 1500).
+  // After applying the filter: the direct (1359, 1 leg, arrival 1501) and the change (1400, 2 legs, 1500)
+  // are both kept — the change arrives earlier, the direct has fewer legs.
+  // The second range pass starts at earliest_dep+1 = 1360, finds 1400 change again. After the final
+  // filter the identical copy is dominated and removed. Net result: 2 non-dominated journeys.
+  test("each pass is independent — both direct and connection are returned", () =>
+    val trips = [
+      t([st("A", null, 1359u32), st("C", 1501u32, null)]),
+      t([st("A", null, 1400u32), st("B", 1430u32, null)]),
+      t([st("B", null, 1430u32), st("C", 1500u32, null)])
+    ]
+    val result = runRange(trips)
+    val direct = j([[st("A", null, 1359u32), st("C", 1501u32, null)]])
+    val change = j([[st("A", null, 1400u32), st("B", 1430u32, null)], [st("B", null, 1430u32), st("C", 1500u32, null)]])
+    // The Lin range query applies the MultipleCriteriaFilter after accumulating all passes:
+    // direct (1359 dep, 1501 arr, 1 leg) and change (1400 dep, 1500 arr, 2 legs) are incomparable
+    // so both are kept; any duplicate copy of change from a later pass is dominated and dropped.
+    [
+      expect(result.length()).toBe(2),
+      expect(result).toSatisfy(r => journeysEq(r, [direct, change]))
+    ]
+  ),
+
+  test("a range query with no trips returns no journeys", () =>
+    val trips: Trip[] = []
+    val raptor = create(trips, {}, {}, null)
+    val jf: ResultsFactory = { "getResults": getResults }
+    val query = createRangeQuery(raptor, jf, 1, [createMultipleCriteriaFilter()])
+    val result = plan(query, "A", "C", testDate)
+    [
+      expect(result.length()).toBe(0)
+    ]
+  )
+])
+
+run(s)
