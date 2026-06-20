@@ -1,18 +1,20 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { createRaptorAlgorithm } from "./raptor-algorithm"
+import { createRaptorAlgorithm, RouteStopIndex, RoutePaths, Interchange, TransfersByOrigin } from "./raptor-algorithm"
+import { ScanResultsFactory } from "./scan-results-factory"
+import { QueueFactory } from "./queue-factory"
+import { RouteScannerFactory } from "./route-scanner"
 
 // Only the constructor shape is unit-tested here. `scan` is integration-level (drives the
-// unported RouteScanner / ScanResultsFactory) and is covered by the query specs. Blocked until
-// the WIP raptor-algorithm.lin source and its imports compile.
+// RouteScanner / ScanResultsFactory) and is covered by the query specs.
 val s = suite("raptor/raptor-algorithm", [
   test("createRaptorAlgorithm returns a record with the expected fields", () =>
-    val routeStopIndex = { "RouteA": { "StopA": 0 } }
-    val routePath = { "RouteA": ["StopA", "StopB"] }
-    val transfers = { "StopA": [] }
-    val interchange = { "StopA": 0 }
-    val scanResultsFactory = { "kind": "scanResultsFactory" }
-    val queueFactory = { "kind": "queueFactory" }
-    val routeScannerFactory = { "kind": "routeScannerFactory" }
+    val routeStopIndex: RouteStopIndex = { "RouteA": { "StopA": 0 } }
+    val routePath: RoutePaths = { "RouteA": ["StopA", "StopB"] }
+    val transfers: TransfersByOrigin = { "StopA": [] }
+    val interchange: Interchange = { "StopA": 0 }
+    val scanResultsFactory: ScanResultsFactory = { "stops": [] }
+    val queueFactory: QueueFactory = { "routesAtStop": {  }, "routeStopIndex": {  } }
+    val routeScannerFactory: RouteScannerFactory = { "tripsByRoute": {  } }
 
     val raptor = createRaptorAlgorithm(
       routeStopIndex,

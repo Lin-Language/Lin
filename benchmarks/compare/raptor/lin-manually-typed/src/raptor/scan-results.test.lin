@@ -4,15 +4,15 @@ import { length } from "std/array"
 import { Connection } from "./scan-results"
 import { createScanResults, addRound, previousArrival, setTrip, setTransfer, bestArrival, getMarkedStops, finalize } from "./scan-results"
 
-// No TypeScript spec exists. Blocked until scan-results.lin compiles and `export`s its helpers
-// (addRound / setTrip / setTransfer / bestArrival / previousArrival / getMarkedStops / finalize),
-// which are private `val`s in the WIP source.
+// No TypeScript spec exists. `kArrivals` is `ArrivalsByNumChanges` (an Arrivals[] array, one
+// entry per round), so round 0 is seeded as `[{}]` — a one-element array holding an empty
+// arrivals map — not a `{ 0: {} }` sparse-map mock.
 val freshResults = () =>
-  createScanResults({}, { 0: {  } }, {}, 0)
+  createScanResults({}, [{  }], {}, 0)
 
 val s = suite("raptor/scan-results", [
   test("createScanResults seeds the round counter and maps", () =>
-    val r = createScanResults({}, { 0: {  } }, {}, 0)
+    val r = createScanResults({}, [{  }], {}, 0)
     [
       expect(r["k"]).toBe(0),
       expect(r["bestArrivals"]).toBe({  }),

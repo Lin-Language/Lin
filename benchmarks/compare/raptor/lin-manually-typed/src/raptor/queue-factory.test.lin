@@ -1,9 +1,9 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { createQueueFactory, getQueue } from "./queue-factory"
+import { createQueueFactory, getQueue, RoutesIndexedByStop } from "./queue-factory"
+import { RouteStopIndex } from "./raptor-algorithm"
 
-// Mirrors raptor-typescript/test/unit/raptor/QueueFactory.spec.ts. Blocked until the WIP
-// queue-factory.lin source compiles.
-val routesAtStop = {
+// Mirrors raptor-typescript/test/unit/raptor/QueueFactory.spec.ts.
+val routesAtStop: RoutesIndexedByStop = {
   "StopA": ["RouteA", "RouteB"],
   "StopB": ["RouteB", "RouteC"]
 }
@@ -11,7 +11,7 @@ val routesAtStop = {
 val s = suite("raptor/queue-factory", [
   // RouteB sits earlier at StopB (index 1) than StopA (index 2), so it enqueues at StopB
   test("enqueues stops", () =>
-    val routeStopIndex = {
+    val routeStopIndex: RouteStopIndex = {
       "RouteA": { "StopA": 1 },
       "RouteB": { "StopA": 2, "StopB": 1 },
       "RouteC": { "StopB": 1 }
@@ -25,7 +25,7 @@ val s = suite("raptor/queue-factory", [
 
   // RouteB now sits earlier at StopA (index 1), so it picks StopA even though StopB is marked first
   test("picks the earliest stop on the route", () =>
-    val routeStopIndex = {
+    val routeStopIndex: RouteStopIndex = {
       "RouteA": { "StopA": 1 },
       "RouteB": { "StopA": 1, "StopB": 2 },
       "RouteC": { "StopB": 1 }
