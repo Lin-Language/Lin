@@ -1300,8 +1300,19 @@ impl FuncBuilder {
         // calc's `parseTermLoop` that originally motivated the dedup). Those keep the dedup.
         let mut non_arg_seen: Vec<Temp> = Vec::new();
         for (t, ty) in to_release {
+            // 3. CONCRETE-RC ARRAY: a `val results: R[] = f(…)` whose element type is a concrete
+            //    record/scalar accrues genuine cross-block retains the same way a sealed record or
+            //    String does — the call result's +1 (the `val` binding) PLUS an `own_for_read`
+            //    Retain when the array is read (e.g. `results.length()` in an `if`-condition whose
+            //    else branch tail-calls). On a TailCall back-edge the dedup released only ONE,
+            //    leaking the surplus every recursion (the searchDay/RAPTOR leak the RC verifier
+            //    caught). A surviving Array registration at TailCall time is genuine for the same
+            //    reason the String comment gives: a same-block Retain/Release would already have
+            //    cleared the registration. (Unlike a UNION temp, whose `narrowed_to_sealed`
+            //    registration can be phantom — those are excluded: `Type::Array` is concrete-rc.)
             let per_registration = is_sealed_scalar_repr(&ty)
-                || matches!(ty, Type::Str | Type::StrLit(_));
+                || matches!(ty, Type::Str | Type::StrLit(_))
+                || matches!(ty, Type::Array(_) | Type::FixedArray(_));
             if !args.contains(&t) && !per_registration {
                 if non_arg_seen.contains(&t) {
                     continue;
