@@ -71,6 +71,43 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.int_compare(IntPredicate::EQ, tag, expected, "ir_is")
     }
 
+    /// Box a NullableRecord value (a raw sealed-struct pointer, or null) into a proper boxed
+    /// `TaggedVal*`: `lin_box_null()` when the pointer is null, else `lin_box_record(ptr)`
+    /// (TAG_RECORD, retains the struct). Used wherever a NullableRecord must cross into a boxed
+    /// (Json/union) world — the coerce path AND tagged equality — so the consumer reads a real tag
+    /// rather than the struct's offset-0 refcount word. (For a frozen record that word's low byte is
+    /// 0x00 = TAG_NULL, which is exactly the misread this prevents.)
+    pub(crate) fn box_nullable_record(
+        &mut self,
+        p: inkwell::values::PointerValue<'ctx>,
+        llvm_fn: inkwell::values::FunctionValue<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let pi = self.builder.ptr_to_int(p, i64_ty, "nr_box_p2i");
+        let is_null = self.builder.int_compare(
+            inkwell::IntPredicate::EQ, pi, i64_ty.const_zero(), "nr_box_isnull");
+        let null_bb = self.context.append_basic_block(llvm_fn, "nr_box_null");
+        let nn_bb = self.context.append_basic_block(llvm_fn, "nr_box_nn");
+        let merge_bb = self.context.append_basic_block(llvm_fn, "nr_box_merge");
+        self.builder.conditional_branch(is_null, null_bb, nn_bb);
+        self.builder.position_at_end(null_bb);
+        let null_box = self.builder.call(self.rt.box_null, &[], "nr_boxnull")
+            .try_as_basic_value().unwrap_basic();
+        let null_pred = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(merge_bb);
+        self.builder.position_at_end(nn_bb);
+        // box_record: retain the sealed struct + wrap as TAG_RECORD.
+        let rec_box = self.builder.call(self.rt.box_record, &[p.into()], "nr_boxrec")
+            .try_as_basic_value().unwrap_basic();
+        let nn_pred = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(merge_bb);
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.phi(ptr_ty, "nr_box_phi");
+        phi.add_incoming(&[(&null_box, null_pred), (&rec_box, nn_pred)]);
+        phi.as_basic_value()
+    }
+
     pub(crate) fn compile_ir_has_pattern(&mut self, val: BasicValueEnum<'ctx>, pattern: &lir::HasDesc) -> inkwell::values::IntValue<'ctx> {
         let bool_ty = self.context.bool_type();
         if !val.is_pointer_value() { return bool_ty.const_zero(); }
@@ -163,31 +200,7 @@ impl<'ctx> Codegen<'ctx> {
             }
             // to_ty = Json / AnyVal / multi-variant union: box with null-guard
             if val.is_pointer_value() {
-                let p = val.into_pointer_value();
-                let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
-                let i64_ty = self.context.i64_type();
-                let pi = self.builder.ptr_to_int(p, i64_ty, "nr_box_p2i");
-                let is_null = self.builder.int_compare(
-                    inkwell::IntPredicate::EQ, pi, i64_ty.const_zero(), "nr_box_isnull");
-                let null_bb = self.context.append_basic_block(llvm_fn, "nr_box_null");
-                let nn_bb = self.context.append_basic_block(llvm_fn, "nr_box_nn");
-                let merge_bb = self.context.append_basic_block(llvm_fn, "nr_box_merge");
-                self.builder.conditional_branch(is_null, null_bb, nn_bb);
-                self.builder.position_at_end(null_bb);
-                let null_box = self.builder.call(self.rt.box_null, &[], "nr_boxnull")
-                    .try_as_basic_value().unwrap_basic();
-                let null_pred = self.builder.get_insert_block().unwrap();
-                self.builder.unconditional_branch(merge_bb);
-                self.builder.position_at_end(nn_bb);
-                // box_record: retain the sealed struct + wrap as TAG_RECORD
-                let rec_box = self.builder.call(self.rt.box_record, &[p.into()], "nr_boxrec")
-                    .try_as_basic_value().unwrap_basic();
-                let nn_pred = self.builder.get_insert_block().unwrap();
-                self.builder.unconditional_branch(merge_bb);
-                self.builder.position_at_end(merge_bb);
-                let phi = self.builder.phi(ptr_ty, "nr_box_phi");
-                phi.add_incoming(&[(&null_box, null_pred), (&rec_box, nn_pred)]);
-                return phi.as_basic_value();
+                return self.box_nullable_record(val.into_pointer_value(), llvm_fn);
             }
             return val;
         }

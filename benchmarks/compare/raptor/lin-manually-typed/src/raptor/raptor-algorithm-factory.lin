@@ -13,6 +13,7 @@ import {
 import { RouteId, TripsIndexedByRoute, createRouteScannerFactory } from "./route-scanner"
 import { RoutesIndexedByStop, createQueueFactory } from "./queue-factory"
 import { createScanResultsFactory } from "./scan-results-factory"
+import { frozen } from "std/async"
 import { keys } from "std/object"
 import { join } from "std/string"
 import { length, push, sort } from "std/array"
@@ -82,16 +83,26 @@ export val create = (
     tripsByRoute[routeId] = routeTrips
   )
 
-  // TODO: freeze tripsByRoute, routesAtStop, routeStopIndex etc
+  // Freeze the load-once index graphs: they are fully built above and read-only for the rest of the
+  // program (the scan never mutates them — getTrip's mutable cursor lives in a per-scan
+  // RouteScanPosition map, not in tripsByRoute). `frozen` deep-immortalises the graph (retain/release
+  // become no-ops) and repacks 0xFD pointer-spine record arrays to compact 0xFE inline — the
+  // load-once-data lever from docs/PERFORMANCE.md §5.7 (guidance #9).
+  val frozenRouteStopIndex = frozen(routeStopIndex)
+  val frozenRoutePath = frozen(routePath)
+  val frozenTransfers = frozen(usefulTransfers)
+  val frozenInterchange = frozen(interchange)
+  val frozenRoutesAtStop = frozen(routesAtStop)
+  val frozenTripsByRoute = frozen(tripsByRoute)
 
   createRaptorAlgorithm(
-    routeStopIndex,
-    routePath,
-    usefulTransfers,
-    interchange,
-    createScanResultsFactory(usefulTransfers.keys()),
-    createQueueFactory(routesAtStop, routeStopIndex),
-    createRouteScannerFactory(tripsByRoute)
+    frozenRouteStopIndex,
+    frozenRoutePath,
+    frozenTransfers,
+    frozenInterchange,
+    createScanResultsFactory(frozenTransfers.keys()),
+    createQueueFactory(frozenRoutesAtStop, frozenRouteStopIndex),
+    createRouteScannerFactory(frozenTripsByRoute)
   )
 
 

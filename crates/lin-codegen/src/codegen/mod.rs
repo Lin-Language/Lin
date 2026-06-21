@@ -966,6 +966,63 @@ impl<'ctx> Codegen<'ctx> {
                                     let obj = self.sumnode_materialize_to_object(rv, &sum_ty, llvm_fn);
                                     rv = self.box_map_of(obj);
                                 }
+                                // NullableRecord vs `Null` (`T | Null` whose repr is a raw sealed-struct
+                                // pointer or null — e.g. `getTrip`'s `Trip | Null` result compared with
+                                // `null`): a raw struct pointer is NOT a boxed `TaggedVal`, so feeding it
+                                // to `lin_tagged_eq` (the union arm in `compile_binary_op_values`) reads
+                                // its offset-0 word as the tag. For a FROZEN record that word is the low
+                                // byte of `IMMORTAL_RC` (0x80000000) = 0x00 = TAG_NULL, so `t == null`
+                                // wrongly returns true / `t != null` wrongly returns false — the RAPTOR
+                                // `frozen()` scan-corruption bug (the scan never boards a frozen trip).
+                                // The presence test is a pure pointer-null check (matching the `IsType`
+                                // NullableRecord arm), independent of the record's refcount.
+                                let l_nr = lrepr.nullable_record_fields().is_some() && lv.is_pointer_value();
+                                let r_nr = rrepr.nullable_record_fields().is_some() && rv.is_pointer_value();
+                                // Detect the `null` literal operand by its static type being `Null`.
+                                let lhs_null_ty = matches!(func.temp_types.get(lhs), Some(Type::Null));
+                                let rhs_null_ty = matches!(&rty, Type::Null);
+                                if l_nr && rhs_null_ty {
+                                    let pi = self.builder.ptr_to_int(lv.into_pointer_value(), i64_ty, "nr_eq_p2i");
+                                    let is_null = self.builder.int_compare(
+                                        inkwell::IntPredicate::EQ, pi, i64_ty.const_zero(), "nr_eq_isnull");
+                                    let res = if matches!(op, lin_parse::ast::BinOp::NotEq) {
+                                        self.builder.not(is_null, "nr_ne")
+                                    } else { is_null };
+                                    temp_map.insert(*dst, res.into());
+                                    continue;
+                                }
+                                if r_nr && lhs_null_ty {
+                                    let pi = self.builder.ptr_to_int(rv.into_pointer_value(), i64_ty, "nr_eq_p2i");
+                                    let is_null = self.builder.int_compare(
+                                        inkwell::IntPredicate::EQ, pi, i64_ty.const_zero(), "nr_eq_isnull");
+                                    let res = if matches!(op, lin_parse::ast::BinOp::NotEq) {
+                                        self.builder.not(is_null, "nr_ne")
+                                    } else { is_null };
+                                    temp_map.insert(*dst, res.into());
+                                    continue;
+                                }
+                                // NullableRecord vs a concrete record / another NullableRecord: box each
+                                // null-guarded into a proper TaggedVal so the tagged compare reads the
+                                // correct tag rather than the struct's refcount byte, compare, then
+                                // release the fresh boxes (box_record's +1 on the struct + the shell;
+                                // net-zero on a mortal struct, no-op on a frozen one).
+                                if l_nr || r_nr {
+                                    let lb = if l_nr { self.box_nullable_record(lv.into_pointer_value(), llvm_fn) } else { self.box_value(lv, operand_ty) };
+                                    let rb = if r_nr { self.box_nullable_record(rv.into_pointer_value(), llvm_fn) } else { self.box_value(rv, &rty) };
+                                    let i8_ty = self.context.i8_type();
+                                    let eq_fn = self.get_or_declare_fn("lin_tagged_eq",
+                                        i8_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                                    let eq_u8 = self.builder.call(eq_fn, &[lb.into(), rb.into()], "nr_teq")
+                                        .try_as_basic_value().unwrap_basic().into_int_value();
+                                    let eq = self.builder.int_truncate(eq_u8, self.context.bool_type(), "nr_teq_b");
+                                    if lb.is_pointer_value() { self.builder.call(self.rt.tagged_release, &[lb.into()], ""); }
+                                    if rb.is_pointer_value() { self.builder.call(self.rt.tagged_release, &[rb.into()], ""); }
+                                    let res = if matches!(op, lin_parse::ast::BinOp::NotEq) {
+                                        self.builder.not(eq, "nr_tne")
+                                    } else { eq };
+                                    temp_map.insert(*dst, res.into());
+                                    continue;
+                                }
                             }
                             let result = self.compile_binary_op_values(lv, rv, op, operand_ty, &rty, ty);
                             temp_map.insert(*dst, result);
