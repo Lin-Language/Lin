@@ -1,7 +1,7 @@
-import { StopId, Time, Transfer } from "../gtfs/gtfs"
+import { StopId } from "../gtfs/gtfs"
 import { MAX_TIME } from "../gtfs/date"
 import { StopTimes } from "./raptor-algorithm"
-import { ScanResults, Arrivals, ArrivalsByNumChanges, Connection, ConnectionIndex, createScanResults } from "./scan-results"
+import { ScanResults, Arrivals, ArrivalsByNumChanges, ConnectionIndex, createScanResults } from "./scan-results"
 import { map } from "std/iter"
 import { fromEntries } from "std/object"
 

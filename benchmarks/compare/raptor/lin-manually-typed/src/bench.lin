@@ -126,7 +126,7 @@ val main = () =>
   val prepMs = now() - t1
   print("PREP ms=${ toString(prepMs) }")
 
-  val jf: ResultsFactory = { "getResults": getResults }
+  val jf: ResultsFactory = getResults
   val groupFiltered = createGroupStationDepartAfterQuery(raptor, jf, 3, [createMultipleCriteriaFilter()])
   val groupPlain = createGroupStationDepartAfterQuery(raptor, jf, 3, [])
 

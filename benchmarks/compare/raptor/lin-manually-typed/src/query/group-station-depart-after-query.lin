@@ -2,7 +2,6 @@ import { StopId, Time } from "../gtfs/gtfs"
 import { Journey } from "../results/journey"
 import { ResultsFactory } from "../results/results-factory"
 import { JourneyFilter, apply } from "../results/filter/journey-filter"
-import { getResults } from "../results/journey-factory"
 import { Arrivals, ConnectionIndex } from "../raptor/scan-results"
 import { RaptorAlgorithm, StopTimes, scan } from "../raptor/raptor-algorithm"
 import { Date, addDays, weekday } from "std/datetime"
@@ -10,7 +9,6 @@ import { getDateNumber } from "./date-util"
 import { filter, map, reduce, flatMap, flatten } from "std/iter"
 import { keys, fromEntries } from "std/object"
 import { length, push, reverse } from "std/array"
-import { max } from "std/math"
 
 export type GroupStationDepartAfterQuery = {
   "raptor": RaptorAlgorithm,
@@ -95,8 +93,8 @@ val getJourneysFromConnections = (
   destinations: StopId[]
 ): Journey[] =>
   val initialResults = destinations
-    .filter(d => (kConnections[d] ?? {  }).keys().length() > 0)
-    .flatMap(d => query["resultsFactory"]["getResults"](kConnections, d))
+    .filter(d => (kConnections[d] ?? {}).keys().length() > 0)
+    .flatMap(d => query["resultsFactory"](kConnections, d))
 
   // reverse the previous connections and then work back through each day pre-pending journeys
   prevConnections
@@ -115,7 +113,7 @@ val completeJourneys = (
   // for every result we have so far
   results.flatMap(journeyB =>
     // find some results to the origin of that result and merge them together
-    query["resultsFactory"]["getResults"](kConnections, journeyB["legs"][0]["origin"] ?? "")
+    query["resultsFactory"](kConnections, journeyB["legs"][0]["origin"] ?? "")
       .map(journeyA => {
         "legs": flatten([journeyA["legs"], journeyB["legs"]]),
         "departureTime": journeyA["departureTime"],
