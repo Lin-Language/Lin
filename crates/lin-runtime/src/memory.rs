@@ -191,6 +191,15 @@ pub extern "C" fn lin_rc_release(ptr: *mut u32, size: usize, align: usize) {
         return;
     }
     unsafe {
+        // Immortal (frozen / interned) objects carry a saturated refcount (>= IMMORTAL_RC) and must
+        // be inert to RC — `lin_rc_retain` and `lin_sealed_release` both skip them. This path
+        // (Type::Array/Object/Closure release) did NOT, so a `frozen()` graph whose records/arrays
+        // are released here got decremented out of the immortal range and eventually freed while
+        // still referenced → use-after-free (silent heap corruption: e.g. freezing RAPTOR's
+        // tripsByRoute Trip graph zeroed the scan). Mirror the retain/sealed-release guard.
+        if *ptr >= crate::string::IMMORTAL_RC {
+            return;
+        }
         *ptr -= 1;
         if *ptr == 0 {
             let layout = std::alloc::Layout::from_size_align_unchecked(size, align);
