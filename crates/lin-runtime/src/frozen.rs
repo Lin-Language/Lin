@@ -73,7 +73,11 @@ extern "C" fn freeze_stats_atexit() {
 /// Recursively seal a `LinString` immortal (idempotent). `pub(crate)` so the sum-node freeze walk
 /// (`sumnode::lin_sumnode_freeze`) can seal a variant's string fields with the same primitive.
 pub(crate) unsafe fn freeze_string(s: *mut LinString) {
-    if !s.is_null() {
+    // Skip when already immortal. Mirrors the `freeze_array`/`freeze_map` guards. This is NOT just an
+    // optimisation: compile-time string literals are now emitted as constant `LinString` globals in
+    // READ-ONLY rodata (with refcount already == IMMORTAL_RC; see codegen `compile_string_lit`).
+    // Writing their refcount would segfault. An already-immortal string needs no sealing anyway.
+    if !s.is_null() && (*s).refcount < IMMORTAL_RC {
         (*s).refcount = IMMORTAL_RC;
     }
 }

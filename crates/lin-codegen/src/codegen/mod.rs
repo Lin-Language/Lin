@@ -99,6 +99,12 @@ pub struct Codegen<'ctx> {
     /// module's source path is known (`init_debug_info`). Owns the `DebugInfoBuilder`/`DICompileUnit`
     /// and the per-function `DISubprogram` scopes used to attach `DILocation`s.
     debug_info: Option<DebugInfoState<'ctx>>,
+    /// Content-keyed cache of compile-time-constant `LinString` globals (one immortal `LinString`
+    /// in rodata per distinct literal). A string literal becomes a POINTER to its global — no
+    /// runtime `lin_string_literal` call, no intern-cache hash, no per-occurrence work. RAPTOR
+    /// evaluated ~457M string literals/run (constant object keys in hot scan loops); this turns
+    /// each into a constant pointer the optimiser can hoist and CSE. See `compile_string_lit`.
+    str_literal_globals: std::cell::RefCell<HashMap<String, inkwell::values::PointerValue<'ctx>>>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -139,6 +145,7 @@ impl<'ctx> Codegen<'ctx> {
             cov_import_file_idx: HashMap::new(),
             debug,
             debug_info: None,
+            str_literal_globals: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
