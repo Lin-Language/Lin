@@ -78,6 +78,51 @@ impl<'ctx> Codegen<'ctx> {
         matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::Opaque(_))
     }
 
+    /// KEEP-PACKED-INTO-UNION gate. `true` iff a SEALED record may be stored into a slot of this
+    /// `Type::Union` as an O(1) `lin_box_record` (TAG_RECORD) wrapper instead of being O(n)
+    /// materialized to a boxed `LinMap` (TAG_MAP). This is the BRIEF's keep-packed boundary for a
+    /// mixed `Connection | Transfer` (tuple | record) union value.
+    ///
+    /// The store is sound iff EVERY read-back of the union tag-dispatches TAG_RECORD. The only
+    /// read-back path that reads a union box as a raw `LinMap*` via `lin_unbox_ptr` (and would
+    /// misread a TAG_RECORD payload — the sealed struct ptr — as a map header) is a
+    /// `Coerce(union → unsealed-Object / Map)`. That path is reachable only when a variant is an
+    /// UNSEALED open object or a `Map`. So restrict to unions whose every object-shaped variant is
+    /// a SEALED record (or a NullableRecord-style inner) and which contain no `Map` variant; the
+    /// remaining read-backs (`is`-discrimination dual-tag accept TAG_RECORD; union field-access and
+    /// `sealed_project_from`/`force_to_map` materialize TAG_RECORD on demand; toString/eq/keys
+    /// dispatch TAG_RECORD) are all already TAG_RECORD-aware.
+    ///
+    /// EXCLUDES sum-type unions (handled by the dedicated `*SumNode` projection path) and any union
+    /// containing a TypeVar/Named/opaque variant (those flow through other boxed paths).
+    pub(crate) fn union_keep_packed_record_safe(ty: &Type) -> bool {
+        let variants = match ty {
+            Type::Union(vs) => vs,
+            _ => return false,
+        };
+        if Self::is_sum_type(ty) {
+            return false;
+        }
+        for v in variants {
+            match v {
+                // A sealed record variant — the keep-packed target, fully TAG_RECORD-aware.
+                Type::Object { .. } if Self::sealed_fields(v).is_some() => {}
+                // Scalars / strings / arrays / fixed-arrays: their read-backs unbox by their own
+                // concrete tag, never as a LinMap; harmless alongside a TAG_RECORD sibling.
+                Type::Bool | Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64
+                | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64
+                | Type::Float32 | Type::Float64 | Type::IntLit(_)
+                | Type::Str | Type::StrLit(_) | Type::Null
+                | Type::Array(_) | Type::FixedArray(_) => {}
+                // Anything else (UNSEALED object, Map, TypeVar, Named, opaque, nested union, sum,
+                // function) could be read back via a raw-LinMap unbox or a non-TAG_RECORD path —
+                // fail safe to the materialize path.
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Stage 6a: Returns true if `ty` represents a value whose tagged-box payload is a HEAP POINTER
     /// (LinString*, LinArray*, sealed-struct*, LinMap*) — as opposed to a scalar (Int, Float, Bool,
     /// Null) whose payload is an integer or zero. Used to decide whether to retain the inner before

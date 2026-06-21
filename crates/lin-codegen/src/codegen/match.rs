@@ -424,10 +424,27 @@ impl<'ctx> Codegen<'ctx> {
                     }
                     return node;
                 }
+                // KEEP-PACKED into a mixed union value (the BRIEF's `Connection | Transfer` =
+                // tuple | record store): when EVERY object-shaped variant is a SEALED record and no
+                // variant is read back as a raw `LinMap*`, wrap the sealed ptr O(1) as TAG_RECORD
+                // instead of the O(n) `sealed_materialize_to_map` (which deep-copied the whole Trip
+                // graph — ~3 map_alloc + 12 box + 12 map_set per `setTrip` iteration, ~623M times).
+                // All read-backs of such a union are already TAG_RECORD-aware (dual-tag `is`,
+                // tag-dispatched union field-access, `force_to_map` materialize-on-read). The
+                // restriction (no UNSEALED-object / Map variant) excludes exactly the
+                // `Coerce(union → unsealed-Object/Map)` path that would `lin_unbox_ptr` the box as a
+                // LinMap and misread the sealed struct ptr. `lin_box_record` retains the struct (+1)
+                // and the box's release routes to `lin_sealed_release_self` — RC stays balanced
+                // exactly as the TAG_MAP path's `box_value` did.
                 if Self::is_union_type(to_ty) {
-                    // sealed → multi-variant union (if-merge, named union type): materialize to
-                    // LinMap for TAG_MAP. TAG_RECORD would be unboxed by lin_unbox_ptr on
-                    // the phi result, returning a sealed ptr instead of LinMap* → crash.
+                    if Self::union_keep_packed_record_safe(to_ty) && val.is_pointer_value() {
+                        return self.builder.call(self.rt.box_record, &[val.into()], "boxrec_union")
+                            .try_as_basic_value().unwrap_basic();
+                    }
+                    // sealed → multi-variant union (if-merge, named union type) with an unsealed /
+                    // Map variant: materialize to LinMap for TAG_MAP. TAG_RECORD would be unboxed by
+                    // lin_unbox_ptr on the phi result, returning a sealed ptr instead of LinMap* →
+                    // crash.
                     let obj = self.sealed_materialize_to_map(val, &sf);
                     return self.box_value(obj, &Type::object(sf));
                 }
