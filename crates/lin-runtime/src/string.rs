@@ -34,6 +34,43 @@ pub struct LinString {
 /// address space), so a normal string can never be mistaken for immortal.
 pub const IMMORTAL_RC: u32 = 0x8000_0000;
 
+/// A fast, non-cryptographic hasher for INTERNAL runtime caches keyed by unique pointers / small
+/// ints (the literal-intern cache, descriptor memos). The standard library's default hasher is
+/// SipHash — cryptographic-grade, there to defend a `HashMap` against adversarial key collisions —
+/// which is irrelevant for these internal, pointer-keyed caches that never see user-controlled keys.
+/// Profiling RAPTOR (callgrind) showed `lin_string_literal`'s SipHash lookups were ~13% of total
+/// program cost (~453M calls/run). This FxHash-style multiply-mix is ~5–10× cheaper and
+/// collision-free enough for unique-pointer keys. Use via `HashMap::<K, V, FastBuildHasher>::default()`.
+#[derive(Default)]
+pub(crate) struct FastHasher(u64);
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0 ^ i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0 ^ i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+pub(crate) type FastBuildHasher = std::hash::BuildHasherDefault<FastHasher>;
+
 thread_local! {
     /// Interning cache for string literals, keyed by the literal's global data pointer.
     ///
@@ -54,7 +91,7 @@ thread_local! {
     /// (The scalar-box cache in tagged.rs is a compile-time `static` because TaggedVals are
     /// plain data; literals need a runtime map because the byte data lives in the compiled module,
     /// keyed by a pointer only known at run time.)
-    static LITERAL_CACHE: RefCell<HashMap<(usize, u32), *mut LinString>> = RefCell::new(HashMap::new());
+    static LITERAL_CACHE: RefCell<HashMap<(usize, u32), *mut LinString, FastBuildHasher>> = RefCell::new(HashMap::default());
 }
 
 /// Increment a string's refcount, leaving immortal (interned) strings untouched.
