@@ -16,7 +16,7 @@ val testDate = { "year": 2018, "month": 10, "day": 16 }
 
 val runRange = (trips: Trip[]): Journey[] =>
   val raptor = create(trips, {}, {}, null)
-  val jf: ResultsFactory = { "getResults": getResults }
+  val jf: ResultsFactory = getResults
   val filters = [createMultipleCriteriaFilter()]
   val query = createRangeQuery(raptor, jf, 1, filters)
   val result = plan(query, "A", "C", testDate)
@@ -71,7 +71,7 @@ val s = suite("RangeQuery", [
   test("a range query with no trips returns no journeys", () =>
     val trips: Trip[] = []
     val raptor = create(trips, {}, {}, null)
-    val jf: ResultsFactory = { "getResults": getResults }
+    val jf: ResultsFactory = getResults
     val query = createRangeQuery(raptor, jf, 1, [createMultipleCriteriaFilter()])
     val result = plan(query, "A", "C", testDate)
     [

@@ -14,7 +14,7 @@ import { length } from "std/array"
 
 val runPlan = (trips: Trip[], origins: String[], destinations: String[], time: UInt32): Journey[] =>
   val raptor = create(trips, {}, {}, null)
-  val jf: ResultsFactory = { "getResults": getResults }
+  val jf: ResultsFactory = getResults
   val filters = [createMultipleCriteriaFilter()]
   val query = createGroupStationDepartAfterQuery(raptor, jf, 1, filters)
   val date = { "year": 2019, "month": 4, "day": 18 }
@@ -28,14 +28,14 @@ val runPlan = (trips: Trip[], origins: String[], destinations: String[], time: U
 // (crash / corrupt reads / 0 journeys). This case is the fast regression for that fix.
 val runPlanTransfer = (trips: Trip[], transfers: TransfersByOrigin, origins: String[], destinations: String[], time: UInt32): Journey[] =>
   val raptor = create(trips, transfers, {}, null)
-  val jf: ResultsFactory = { "getResults": getResults }
+  val jf: ResultsFactory = getResults
   val query = createGroupStationDepartAfterQuery(raptor, jf, 1, [createMultipleCriteriaFilter()])
   plan(query, origins, destinations, { "year": 2019, "month": 4, "day": 18 }, time)
 
 // As runPlan but with a caller-chosen maxSearchDays — exercises the multi-day `searchDay` loop.
 val runPlanDays = (trips: Trip[], origins: String[], destinations: String[], time: UInt32, maxDays: UInt8): Journey[] =>
   val raptor = create(trips, {}, {}, null)
-  val jf: ResultsFactory = { "getResults": getResults }
+  val jf: ResultsFactory = getResults
   val query = createGroupStationDepartAfterQuery(raptor, jf, maxDays, [createMultipleCriteriaFilter()])
   plan(query, origins, destinations, { "year": 2019, "month": 4, "day": 18 }, time)
 
