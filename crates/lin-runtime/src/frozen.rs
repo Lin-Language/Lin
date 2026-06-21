@@ -90,9 +90,36 @@ pub(crate) unsafe fn freeze_array(arr: *mut LinArray) {
     // (elem_tag, data, elem_stride, cap) and must happen while the array is still mutable.
     if (*arr).elem_tag == SEALED_PTR_ARRAY_TAG {
         ensure_freeze_stats_init();
-        repack_ptr_array_to_inline(arr);
-        // Fall through: now elem_tag == SEALED_ARRAY_TAG; the inline elements' heap fields were
-        // frozen by repack_ptr_array_to_inline, so we only need to seal the array header.
+        // The repack FREES each element's struct shell after copying it inline — sound ONLY when this
+        // array EXCLUSIVELY owns those shells. A shared record (the same shell referenced by another
+        // live array — e.g. RAPTOR's `Trip` shared across `trips`/`sortedTrips`/`tripsByRoute`, or a
+        // `Transfer` shared between `transfers` and `usefulTransfers`) would be use-after-freed →
+        // heap corruption. Detect sharing via the shells' refcounts (the array holds one ref each, so
+        // an exclusively-owned shell has rc == 1) and, when any element is shared, immortalize the
+        // pointer-backed array IN PLACE instead — keeps the RC-suppression win, skips only the
+        // inline-packing memory win, and frees nothing.
+        let len = (*arr).len as usize;
+        let slots = (*arr).data as *const *mut u8;
+        let mut exclusive = true;
+        for i in 0..len {
+            let sptr = *slots.add(i);
+            if !sptr.is_null() && *(sptr as *const u32) > 1 {
+                exclusive = false;
+                break;
+            }
+        }
+        if exclusive {
+            repack_ptr_array_to_inline(arr);
+        } else {
+            // Freeze each element shell in place (immortalize + recurse heap fields); keep 0xFD layout.
+            for i in 0..len {
+                let sptr = *slots.add(i);
+                if !sptr.is_null() {
+                    freeze_sealed(sptr);
+                }
+            }
+        }
+        // Fall through: the elements' heap fields were frozen above; seal the array header.
         (*arr).refcount = IMMORTAL_RC;
         return;
     }
@@ -254,9 +281,16 @@ pub(crate) unsafe fn freeze_map(map: *mut LinMap) {
         return;
     }
     (*map).refcount = IMMORTAL_RC;
+    // Only a STRING-keyed map's `key_bits` is a `LinString*` to freeze. For an INT-keyed map
+    // (`{ UInt32: … }` / `{ Int64: … }`, e.g. a GTFS `dates`/`days` calendar) `key_bits` is the raw
+    // integer key — freezing it as a string pointer dereferences the integer and segfaults (a
+    // DateNumber like 20250902 read as a `LinString*`). Mirror the `lin_map_keys` key-kind gate.
+    let string_keyed = (*map).key_kind == crate::map::KEY_KIND_STRING;
     // Value-unboxed slots: iterate via the map's encapsulated helper (reconstructs each value).
     crate::map::map_for_each_slot(map, |key_bits, val| {
-        freeze_string(key_bits as *mut crate::string::LinString);
+        if string_keyed {
+            freeze_string(key_bits as *mut crate::string::LinString);
+        }
         freeze_payload(val.tag, val.payload);
     });
 }

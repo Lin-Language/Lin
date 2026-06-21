@@ -13,6 +13,33 @@ val buildAndFreeze = (): Pt[] =>
   push(a, { "x": 5, "y": 6 })
   frozen(a)
 
+// Regression: a record with INT-KEYED map fields (a GTFS-style calendar: `dates`/`days` keyed by
+// integer DateNumber / day-of-week) must freeze without crashing. freeze_map used to treat every
+// map key as a `LinString*`, so an integer key (e.g. a DateNumber like 20250902) was dereferenced
+// as a string pointer → segfault.
+type Service = { "startDate": UInt32, "days": { Int32: Boolean }, "dates": { UInt32: Boolean } }
+
+val buildServiceFrozen = (): Service[] =>
+  var a: Service[] = []
+  push(a, { "startDate": 20250519u32, "days": { 0: true, 1: false, 2: true }, "dates": { 20250902u32: false, 20251225u32: true } })
+  frozen(a)
+
+// Regression: the SAME record shared by two live arrays. freeze's 0xFD→0xFE repack frees each
+// element's struct shell after copying it inline — but a shared shell is still referenced by the
+// other array, so freeing it was a use-after-free → heap corruption. freeze now repacks only when
+// the array exclusively owns its shells (rc == 1) and otherwise immortalises in place.
+val sharedPt: Pt = { "x": 7, "y": 8 }
+
+val buildSharedFrozen = (): Pt[] =>
+  var a: Pt[] = []
+  push(a, sharedPt)
+  frozen(a)
+
+val readOtherShared = (): Pt[] =>
+  var b: Pt[] = []
+  push(b, sharedPt)
+  b
+
 val main = (): AnyVal =>
   run([
     suite("freeze repacks record arrays to inline; reads stay correct", [
@@ -24,6 +51,21 @@ val main = (): AnyVal =>
 
       test("sum across the frozen array", () => [
         expect(buildAndFreeze()[0]["x"] + buildAndFreeze()[1]["y"] + buildAndFreeze()[2]["x"]).toBe(10)
+      ])
+    ]),
+
+    suite("freeze of records with int-keyed map fields does not crash", [
+      test("int-keyed dates/days maps freeze and read back", () => [
+        expect(buildServiceFrozen()[0]["startDate"]).toBe(20250519u32),
+        expect(buildServiceFrozen()[0]["days"][2]).toBe(true),
+        expect(buildServiceFrozen()[0]["dates"][20250902u32]).toBe(false)
+      ])
+    ]),
+
+    suite("freeze of an array sharing a record with another live array", [
+      test("both arrays still read the shared record correctly (no use-after-free)", () => [
+        expect(buildSharedFrozen()[0]["x"]).toBe(7),
+        expect(readOtherShared()[0]["y"]).toBe(8)
       ])
     ])
   ])
