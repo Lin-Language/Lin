@@ -31,4 +31,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN rustup component add clippy rustfmt rust-src
 
+# Debugging toolchain for the runtime (UAF / heisenbug / logic-bug hunting):
+#   - gdb       : watchpoints on refcount words, single-stepping the runtime
+#   - valgrind  : memcheck catches UNINITIALISED reads that ASan does not (MSan-class bugs)
+#   - rr        : deterministic record/replay + reverse debugging (needs kernel.perf_event_paranoid<=1;
+#                 not usable under the default container perf restriction, installed for hosts that allow it)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gdb \
+    valgrind \
+    rr \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
