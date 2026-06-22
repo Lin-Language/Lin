@@ -23546,3 +23546,52 @@ ok.for(v => print(v["name"]))
 "#);
     assert_eq!(output, vec!["a", "b"]);
 }
+
+#[test]
+fn test_sumunion_map_callback_return_segfault() {
+    // Regression: a function returning a sum-eligible union used as a `.map()` callback
+    // previously segfaulted. Root cause: the Push intrinsic's lin_push_dyn path treated
+    // sum-type union elements as already-boxed TaggedVal* (via is_union_type check), but a
+    // sum-type function returns a raw *SumNode — not a TaggedVal*. Passing the raw *SumNode
+    // to lin_push_dyn caused garbage tag reads → SIGSEGV.
+    // Fix: intrinsics.rs Push now boxes sum-type elements (materializes *SumNode → LinMap →
+    // TaggedVal*) before lin_push_dyn, then releases the fresh box. The SumNode itself is
+    // released by the IR's scope-exit Release (ContainerInsert::Nothing leaves it owned).
+    let output = run(r#"import { print } from "std/io"
+import { map, for } from "std/iter"
+type Rec = { "name": String, "score": Int32 }
+type Success = { "type": "success", "value": Rec }
+type Failure = { "type": "failure", "error": String }
+type Parsed = Success | Failure
+val mk = (s: String): Parsed =>
+  if s == "" then { "type": "failure", "error": "e" }
+  else { "type": "success", "value": { "name": s, "score": 1 } }
+["a", ""].map(mk).for(r => print(r["type"]))
+"#);
+    assert_eq!(output, vec!["success", "failure"]);
+}
+
+#[test]
+fn test_sumunion_generic_and_then_direct_return() {
+    // Regression: a generic andThen that returns f(value) (a sum-eligible union) through a
+    // boxed-ABI Function call must NOT release the SumNode in the wrapper. The reverted fix
+    // db634a79 added a lin_sumnode_release in boxed_abi_wrapper_full after materializing,
+    // which freed the SumNode while the caller still owned it → UAF → garbage value (e.g.
+    // out["value"] printed as "49" instead of "5").
+    // Fix: the wrapper is unchanged (no release added there). Only the Push store-site was
+    // fixed in intrinsics.rs.
+    let output = run(r#"import { print } from "std/io"
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+val ok = <T, E>(v: T): Result<T, E> => { "type": "success", "value": v }
+val err = <T, E>(e: E): Result<T, E> => { "type": "failure", "error": e }
+val andThen = <T, U, E>(r: Result<T, E>, f: (T) => Result<U, E>): Result<U, E> =>
+  match r
+    has { "type": "success", value } => f(value)
+    else => err(r["error"])
+val checkPos = (n: Int32): Result<Int32, String> => if n > 0 then ok(n) else err("neg")
+val out: Result<Int32, String> = andThen(ok(5), checkPos)
+print(out["type"])
+print(out["value"])
+"#);
+    assert_eq!(output, vec!["success", "5"]);
+}
