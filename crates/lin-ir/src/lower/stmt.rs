@@ -24,6 +24,16 @@ pub(crate) fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut 
                 );
                 builder.slots.insert(*slot, t);
             } else {
+                // PATH-2: a packed-elem-view slot registered by the enclosing Block pre-scan —
+                // the array and index are already lowered and recorded in `packed_elem_slots`; the
+                // element is never materialized here (any field read goes through
+                // `try_lower_packed_elem_field`; a whole-value use falls back via the `LocalGet`
+                // handler). Skip the `lower_value_into_slot` call entirely for this slot.
+                if ctx.packed_elem_slots.contains_key(slot) {
+                    // No slot → builder.slots entry is needed: `LocalGet` checks packed_elem_slots
+                    // first and returns before reaching the builder.slots lookup.
+                    return;
+                }
                 // CL.4 LSS: if this val is a non-global capturing Function literal, record its
                 // TypedExpr so `inlinable_local_fn` can unwrap a `LocalGet{slot}` back to the
                 // original lambda body when the value is later passed as a combinator callback.

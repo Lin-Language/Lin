@@ -734,13 +734,16 @@ pub(crate) fn try_lower_sealed_array_field(
 /// the SAME instruction the shipped `arr[i]["field"]` fusion uses — instead of the generic path that
 /// would materialize a per-element struct then read it (or, worse, re-box it to a `LinObject` and do
 /// a dynamic `lin_object_get` because the param's declared type is `Json`). Returns `Some(dst)` on
-/// the fast path, `None` (no view, or a non-scalar field) to fall back.
+/// the fast path, `None` (no view, or an unsupported field type) to fall back.
 ///
-/// Sound: the field is a scalar (the in-place iteration is gated to `is_sealed_scalar_array`, all
-/// fields scalar/Bool — see `try_lower_packed_elem_field`'s scalar check below), so the read is a
-/// pure const-offset load with no RC and no escaping interior pointer — identical to the receiver
-/// `arr[i]["field"]` fusion. The recorded `array`/`index` temps are the loop's own (the array base
-/// is live for the whole loop; the index is the loop counter), so no dangling.
+/// Sound for SCALAR fields: a pure const-offset load with no RC. Sound for HEAP fields
+/// (String/Array/FixedArray/Map/nested-sealed-Object): a const-offset `load ptr` returning a
+/// BORROWED interior pointer owned by the packed buffer; a `Retain` is emitted so the caller
+/// holds an independent +1, preventing a use-after-free if the array is freed before the field
+/// value is used. This covers all `Type::is_sealed_heap_field()` field types, replacing the old
+/// scalar+String-only limit that forced a whole-struct materialization for every Array/record
+/// heap-field access (`retain_sealed_payload_fields` hotspot). The recorded `array`/`index` temps
+/// are the view's own (live for the whole view scope), so no dangling borrowed pointer.
 pub(crate) fn try_lower_packed_elem_field(
     object: &TypedExpr,
     field: &str,
@@ -758,24 +761,26 @@ pub(crate) fn try_lower_packed_elem_field(
         _ => None,
     };
     let concrete_field_ty = concrete_field_ty?;
-    // SCALAR/Bool: a pure const-offset load, no RC. STRING: a const-offset `load ptr` yielding a
-    // BORROWED interior String pointer (the array still owns it) — sound iff the result is RETAINED
-    // when it escapes the read (snapshot semantics), handled below. Other heap shapes (Array, nested
-    // record, Map) are NOT handled in-place here — fall back to materialize.
+    // SCALAR/Bool: a pure const-offset load, no RC. HEAP (String, Array, FixedArray, Map, nested
+    // sealed record): a const-offset `load ptr` yielding a BORROWED interior pointer (the array
+    // still owns it) — sound iff the result is RETAINED when it escapes the read (snapshot
+    // semantics), handled below. This covers all `is_sealed_heap_field` types, replacing the old
+    // scalar+String-only limit that forced a whole-struct materialization for every Array/record
+    // field access (the `retain_sealed_payload_fields` hotspot for Trip["stopTimes"]/["service"]).
     let scalar = concrete_field_ty.is_flat_scalar() || matches!(concrete_field_ty, Type::Bool);
-    let string_field = concrete_field_ty.is_string_ish();
-    if !(scalar || string_field) {
+    let heap_field = concrete_field_ty.is_sealed_heap_field();
+    if !(scalar || heap_field) {
         return None;
     }
-    // Read the field at its CONCRETE scalar type (the const-offset load yields an unboxed scalar).
-    // `result_ty` is the static type of `p["field"]`, which — because the element param `p` is
-    // declared `Json` on the callback ABI — is typically `Json`/`TypeVar` (NOT the concrete scalar).
-    // Allocating `dst` at `result_ty` while the instruction stores a raw i32 would mistype the temp
-    // (codegen then mis-handles the value). So read at the concrete type, then COERCE to `result_ty`
-    // (boxing the scalar into a `TaggedVal*` when `result_ty` is Json) and register that fresh box
-    // owned so the body scope releases it — without this the per-iteration operand box leaks (the
-    // tagged-arith op only READS its operand box, never frees it). When `result_ty` already equals
-    // the concrete type (a typed-element callback, post-monomorphization), the coerce is a no-op.
+    // Read the field at its CONCRETE type (the const-offset load yields an unboxed scalar or
+    // raw pointer). `result_ty` is the static type of `p["field"]`, which — because the element
+    // param `p` is declared `Json` on the callback ABI — is typically `Json`/`TypeVar` (NOT the
+    // concrete scalar). Allocating `dst` at `result_ty` while the instruction stores a raw scalar
+    // or pointer would mistype the temp (codegen then mis-handles the value). So read at the
+    // concrete type, then COERCE to `result_ty` (boxing the scalar into a `TaggedVal*` when
+    // `result_ty` is Json) and register that fresh box owned so the body scope releases it —
+    // without this the per-iteration operand box leaks. When `result_ty` already equals the
+    // concrete type (a typed-element callback, post-monomorphization), the coerce is a no-op.
     let arr_ty = Type::Array(Box::new(elem_ty));
     let raw = builder.alloc_temp(concrete_field_ty.clone());
     builder.emit(Instruction::SealedArrayFieldGet {
@@ -786,18 +791,17 @@ pub(crate) fn try_lower_packed_elem_field(
         arr_ty,
         result_ty: concrete_field_ty.clone(),
     });
-    // A STRING field read is a BORROWED interior pointer (the packed buffer owns it). Snapshot
+    // A HEAP field read is a BORROWED interior pointer (the packed buffer owns it). Snapshot
     // semantics: the reader must own its own reference, so retain it (and register owned so the body
     // scope releases it). This mirrors the generic FieldGet's `is_rc_type` retain. A scalar needs no
-    // RC. The subsequent coerce-to-Json (if any) boxes the (now-owned) String into a TaggedVal*.
-    if string_field {
+    // RC. The subsequent coerce-to-Json (if any) boxes the (now-owned) value into a TaggedVal*.
+    if heap_field {
         builder.emit(Instruction::Retain { val: raw, ty: concrete_field_ty.clone() });
         builder.register_owned(raw, concrete_field_ty.clone());
     }
     let coerced = coerce_to_slot_type(raw, &concrete_field_ty, result_ty, builder);
     if coerced != raw && is_union_ty(result_ty) {
-        // A freshly boxed scalar (or boxed String): own it so scope exit reclaims the box. (For a
-        // String the box wraps the already-owned String inner; releasing the box releases the inner.)
+        // A freshly boxed scalar (or boxed heap value): own it so scope exit reclaims the box.
         builder.register_owned(coerced, result_ty.clone());
     }
     Some(coerced)

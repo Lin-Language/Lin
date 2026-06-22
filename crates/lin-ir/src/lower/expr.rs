@@ -296,11 +296,17 @@ fn lower_index_get_or_create(
 ///
 /// Fix: lower inner fn stmts in topological order (dependencies before capturers). Non-fn stmts
 /// stay in their original positions; only fn stmts are reordered among themselves.
+/// Lower all statements in a block scope. Returns the list of packed-elem-view slot keys
+/// that were registered into `ctx.packed_elem_slots` during PATH-2 look-ahead. The CALLER is
+/// responsible for removing these entries AFTER it has also lowered the block expression —
+/// the packed views must survive until the block_expr is fully lowered so that field reads on
+/// those slots can go through `try_lower_packed_elem_field` instead of materializing.
 pub(crate) fn lower_block_stmts(
     stmts: &[TypedStmt],
+    block_expr: Option<&TypedExpr>,
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
-) {
+) -> Vec<usize> {
     use std::collections::{HashMap, HashSet, VecDeque};
 
     // Collect the set of "inner fn slots" — Val stmts whose value is a Function literal and
@@ -315,11 +321,57 @@ pub(crate) fn lower_block_stmts(
     }
 
     if inner_fn_indices.is_empty() {
-        // Fast path: no inner function stmts — just lower sequentially as before.
-        for stmt in stmts {
+        // Fast path: no inner function stmts — lower sequentially, with inline PATH-2
+        // packed-elem-stmt view look-ahead for eligible `val slot = sealed_arr[i]` bindings.
+        // At each Val stmt, stmts before position `i` are already lowered, so their temps
+        // are available. The look-ahead checks ONLY remaining stmts (stmts[i+1..]) and the
+        // optional block_expr for whole-value uses of `slot`.
+        let mut view_slots_added: Vec<usize> = Vec::new();
+        for (i, stmt) in stmts.iter().enumerate() {
+            // PATH-2 packed-elem-stmt view: `val slot = sealed_arr[idx]` where slot is only
+            // used for field reads in the remaining stmts + block_expr. Register a packed view
+            // so the element is NEVER materialized; field reads go directly to SealedArrayFieldGet.
+            if let TypedStmt::Val { slot, value: TypedExpr::Index { object, key, .. }, ty, .. } = stmt {
+                if is_sealed_scalar_repr(ty) && is_sealed_scalar_array(&object.ty())
+                    && !ctx.global_val_slots.contains_key(slot)
+                {
+                    let remaining = &stmts[(i + 1)..];
+                    let expr_ok = block_expr.map(|e| elem_used_only_for_scalar_fields(*slot, e)).unwrap_or(true);
+                    let stmts_ok = remaining.iter().all(|s| {
+                        use lin_check::typed_ir::TypedStmt;
+                        match s {
+                            TypedStmt::Expr(e) => elem_used_only_for_scalar_fields(*slot, e),
+                            TypedStmt::Val { value, .. } => elem_used_only_for_scalar_fields(*slot, value),
+                            TypedStmt::Var { value, .. } => elem_used_only_for_scalar_fields(*slot, value),
+                            TypedStmt::Destructure { value, .. } => elem_used_only_for_scalar_fields(*slot, value),
+                            TypedStmt::ArrayDestructure { value, .. } => elem_used_only_for_scalar_fields(*slot, value),
+                            TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. } => true,
+                        }
+                    });
+                    if expr_ok && stmts_ok {
+                        // Lower the array base (borrowed if possible) and index key. Stmts[0..i]
+                        // have already been lowered, so their temps are in builder.slots.
+                        let (array_temp, index_temp) = if lower_container_base_borrowed_check(object, ctx) {
+                            let idx_t = lower_expr(key, builder, ctx);
+                            let arr_t = lower_container_base_borrowed(object, builder, ctx)
+                                .unwrap_or_else(|| lower_expr(object, builder, ctx));
+                            (arr_t, idx_t)
+                        } else {
+                            let arr_t = lower_expr(object, builder, ctx);
+                            let idx_t = lower_expr(key, builder, ctx);
+                            (arr_t, idx_t)
+                        };
+                        ctx.packed_elem_slots.insert(*slot, (array_temp, index_temp, ty.clone()));
+                        view_slots_added.push(*slot);
+                        // lower_stmt sees packed_elem_slots contains the slot and skips materialization.
+                    }
+                }
+            }
             lower_stmt(stmt, builder, ctx);
         }
-        return;
+        // Return view slots to the caller (Block arm) so it can remove them AFTER lowering
+        // the block expression — the packed views must stay live until then.
+        return view_slots_added;
     }
 
     // Build dependency edges among inner fn stmts: fn A depends on fn B if B is in A's captures.
@@ -417,6 +469,8 @@ pub(crate) fn lower_block_stmts(
             lower_stmt(stmt, builder, ctx);
         }
     }
+    // Slow path (inner fn stmts): no packed-elem views were registered.
+    vec![]
 }
 
 pub(crate) fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
@@ -974,8 +1028,14 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
         TypedExpr::Block { stmts, expr, .. } => {
             let outer_slots = builder.slots.clone();
             builder.push_scope();
-            lower_block_stmts(stmts, builder, ctx);
+            let view_slots = lower_block_stmts(stmts, Some(expr), builder, ctx);
             let result = lower_expr(expr, builder, ctx);
+            // Remove packed-elem-view entries NOW (after block_expr is lowered) so sibling/outer
+            // blocks don't mis-resolve them. They must stay live through block_expr lowering so
+            // that field reads on those slots can go through try_lower_packed_elem_field.
+            for s in &view_slots {
+                ctx.packed_elem_slots.remove(s);
+            }
             // An OUTER `var` reassigned inside this block (a `LocalSet`) now binds the slot to a
             // freshly-owned temp registered in THIS block scope. That temp must SURVIVE the block
             // pop — the slot (an enclosing-scope var) still references it after the block, so

@@ -20612,6 +20612,45 @@ main()
     assert_eq!(output, vec!["7 11 22 33 44"]);
 }
 
+// RC-ELIDE PATH-2: `val s = arr[i]` used ONLY for field reads in the same block scope must
+// bypass materialization entirely — no `retain_sealed_payload_fields` call, no
+// `lin_sealed_alloc`, no `sealed_array_materialize_elem` in the consuming function's IR.
+// The optimization registers `s` as a packed-elem VIEW (array+index stored in
+// `packed_elem_slots`); field accesses go directly through `SealedArrayFieldGet`
+// (constant-offset GEP + load) without constructing an owned copy of the element.
+// This is the "s0 = arr[i], read s0["f1"], s0["f2"]" shape that was the original hotspot
+// (RAPTOR `getTrip`: `retain_sealed_payload_fields` was ~24% of RANGE self-time).
+#[test]
+fn test_rc_elide_path2_view_only_bind_no_materialize() {
+    let ir = build_ir(r#"import { print } from "std/io"
+
+type StopTime = { "arr": Int32, "dep": Int32 }
+type Trip = { "tripId": Int32, "stopTimes": StopTime[] }
+
+val mkTrip = (id: Int32): Trip =>
+  { "tripId": id, "stopTimes": [{ "arr": 11, "dep": 22 }, { "arr": 33, "dep": 44 }] }
+
+val main = () =>
+  val t = mkTrip(7)
+  val s0 = t["stopTimes"][0]
+  val s1 = t["stopTimes"][1]
+  print("${t["tripId"]} ${s0["arr"]} ${s0["dep"]} ${s1["arr"]} ${s1["dep"]}")
+main()
+"#);
+    // The main function must not call retain_sealed_payload_fields — element `s0`/`s1` are never
+    // materialized; their field reads go directly to constant-offset GEP loads.
+    let main_ir = ir_function(&ir, "main");
+    assert!(
+        !main_ir.contains("retain_sealed_payload_fields"),
+        "expected no retain_sealed_payload_fields in @main (view-only bind should bypass materialization):\n{main_ir}"
+    );
+    // And no heap allocation of the element struct (lin_sealed_alloc) either.
+    assert!(
+        !main_ir.contains("lin_sealed_alloc"),
+        "expected no lin_sealed_alloc in @main (view-only bind should bypass materialization):\n{main_ir}"
+    );
+}
+
 // Regression (Path 9 TCO param-slot leak): a HEAP-BEARING sealed (packed) record (`Trip` with a
 // `String` and a sealed-`ST[]` field) threaded through a self-tail-recursive parameter slot, with a
 // FRESH record built each iteration, must release the PRIOR slot value before the back-edge
