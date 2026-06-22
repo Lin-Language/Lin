@@ -616,9 +616,17 @@ pub(crate) fn lower_match(
 ) -> Temp {
     let scrut_ty = scrutinee.ty();
     let raw_scrut = lower_expr(scrutinee, builder, ctx);
-    // `is`/`has` pattern tests use runtime tag dispatch (lin_get_tag), which needs a
-    // boxed TaggedVal*. Box a concrete scrutinee so type checks see a real tag.
-    let scrut_temp = box_to_json(raw_scrut, &scrut_ty, builder);
+    // NullableRecord fast path: `T | Null` where T is a sealed record is physically a raw
+    // nullable pointer. Skip boxing — lower_match_pattern handles TypeCheckDeep arms on the
+    // raw scrutinee (IsType = null-ptr check). Non-NullableRecord scrutinees must be boxed
+    // because `is`/`has` pattern tests use runtime tag dispatch (lin_get_tag).
+    let scrut_temp = if is_nullable_sealed_record(&scrut_ty) {
+        raw_scrut
+    } else {
+        // `is`/`has` pattern tests use runtime tag dispatch (lin_get_tag), which needs a
+        // boxed TaggedVal*. Box a concrete scrutinee so type checks see a real tag.
+        box_to_json(raw_scrut, &scrut_ty, builder)
+    };
     let merge_block = builder.alloc_block("match_merge");
     let result_dst = builder.alloc_temp(result_type.clone());
     // Collect (arm_result, predecessor_block) for a Phi in the merge block — a shared
@@ -807,6 +815,14 @@ pub(crate) fn lower_match_pattern(
         // Deep-validate field types recursively via the `fromJson` structural walker (ADR-036).
         // `scrut` is the already-boxed scrutinee; `MatchesSchema` borrows it (no ownership change).
         TypedMatchPattern::Is(TypedPattern::TypeCheckDeep(target, named_defs, _)) => {
+            // NullableRecord fast path: `T | Null` where T is a sealed record is physically a raw
+            // nullable pointer — null ⟺ Null, non-null ⟺ T. Emit IsType directly on the raw
+            // scrutinee (codegen emits a pointer-null check). Same soundness as the expr.rs path.
+            if is_nullable_sealed_record(scrut_ty) {
+                let dst = builder.alloc_temp(Type::Bool);
+                builder.emit(Instruction::IsType { dst, val: scrut, ty: (*target).clone() });
+                return PatternTest::Cond(dst);
+            }
             // FAST PATH: when the scrutinee's static type is a closed concrete union
             // the value is type-guaranteed to conform to exactly one variant, so a
             // cheap discriminator (StrLit field value / field presence) suffices to

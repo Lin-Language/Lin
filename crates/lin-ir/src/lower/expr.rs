@@ -1574,6 +1574,20 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                 }
             }
             let raw = lower_expr(expr, builder, ctx);
+            // NullableRecord fast path: `T | Null` where T is a sealed record is physically a raw
+            // nullable pointer — null ⟺ Null, non-null ⟺ T. No boxing or schema walk needed;
+            // emit IsType directly on the raw value. Codegen dispatches on the NullableRecord repr
+            // and emits a pointer-null check (lines 2613-2627 of codegen/mod.rs). This avoids the
+            // lin_box_null/lin_box_record + lin_matches_schema round-trip on every `is T` test.
+            // SOUNDNESS: the type-checker guarantees the non-null branch IS a T (all fields
+            // type-checked at call sites); the only runtime information needed is null vs non-null.
+            if is_nullable_sealed_record(&val_ty) {
+                if let TypedPattern::TypeCheckDeep(target, _, _) = pattern {
+                    let dst = builder.alloc_temp(Type::Bool);
+                    builder.emit(Instruction::IsType { dst, val: raw, ty: (*target).clone() });
+                    return dst;
+                }
+            }
             // The tag check needs a boxed TaggedVal*; box a concrete value first.
             let val_temp = box_to_json(raw, &val_ty, builder);
             // An object pattern (`is { .. }`, and the desugared `is Error`) is a structural
