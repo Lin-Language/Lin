@@ -2271,6 +2271,68 @@ pub(crate) fn lower_some(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mu
     let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let iterable = lower_expr(&args[0], builder, ctx);
 
+    // DEVIRTUALIZED FAST PATH (path-8-B): a BARE statically-known predicate (`xs.some(isEven)`)
+    // is called DIRECTLY per element — no closure shell / boxed-ABI / indirect dispatch.
+    if let Some((target, native_params)) = bare_fn_call_target(&args[1], builder, ctx) {
+        let elem_ty = read_elem_ty.clone();
+        let len = emit_iterable_len(iterable, &iterable_ty, builder);
+        let zero = builder.const_temp(Const::Int(0, Type::Int64));
+        let false_val = builder.const_temp(Const::Bool(false));
+        let preheader = builder.current_block;
+        let header = builder.alloc_block("some_header");
+        let body_block = builder.alloc_block("some_body");
+        let latch = builder.alloc_block("some_latch");
+        let exit = builder.alloc_block("some_exit");
+        let i = builder.alloc_temp(Type::Int64);
+        let i_next = builder.alloc_temp(Type::Int64);
+        let found = builder.alloc_temp(Type::Bool);
+        let found_next = builder.alloc_temp(Type::Bool);
+        builder.terminate(Terminator::Jump(header));
+        builder.switch_to(header);
+        builder.emit(Instruction::Phi {
+            dst: i, ty: Type::Int64, incomings: vec![(zero, preheader), (i_next, latch)],
+        });
+        builder.emit(Instruction::Phi {
+            dst: found, ty: Type::Bool, incomings: vec![(false_val, preheader), (found_next, latch)],
+        });
+        let cond_len = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Binary {
+            dst: cond_len, op: BinOp::Lt, lhs: i, rhs: len, operand_ty: Type::Int64, ty: Type::Bool,
+        });
+        let not_found = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Unary { dst: not_found, op: UnaryOp::Not, operand: found, ty: Type::Bool });
+        let cond = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Binary {
+            dst: cond, op: BinOp::And, lhs: cond_len, rhs: not_found, operand_ty: Type::Bool, ty: Type::Bool,
+        });
+        builder.terminate(Terminator::CondJump { cond, then_block: body_block, else_block: exit });
+        builder.switch_to(body_block);
+        let elem = builder.alloc_temp(elem_ty.clone());
+        builder.emit(Instruction::Index {
+            dst: elem, object: iterable, key: i,
+            obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+        });
+        let idx = narrow_loop_index(i, builder);
+        let pred = call_body_direct(target, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &native_params, &Type::Bool, builder);
+        free_combinator_elem_box_full(elem, &elem_ty, builder);
+        free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, builder);
+        let back_block = builder.current_block;
+        builder.emit(Instruction::Binary {
+            dst: found_next, op: BinOp::Or, lhs: found, rhs: pred, operand_ty: Type::Bool, ty: Type::Bool,
+        });
+        builder.terminate(Terminator::Jump(latch));
+        builder.switch_to(latch);
+        let one = builder.const_temp(Const::Int(1, Type::Int64));
+        builder.emit(Instruction::Binary {
+            dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
+        });
+        builder.terminate(Terminator::Jump(header));
+        builder.patch_phi_incoming(header, i, body_block, back_block);
+        builder.patch_phi_incoming(header, found, body_block, back_block);
+        builder.switch_to(exit);
+        return found;
+    }
+
     // INLINE FAST PATH: literal lambda is spliced into the loop — no closure alloc, no
     // per-element box ABI / indirect call. The loop exits on first match (ContinueIf(!found)).
     // Element-box RC: mirrors `lower_while`'s predicate path exactly (fully reclaimed).
@@ -2409,6 +2471,66 @@ pub(crate) fn lower_every(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &m
     let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let iterable = lower_expr(&args[0], builder, ctx);
 
+    // DEVIRTUALIZED FAST PATH (path-8-B): a BARE statically-known predicate (`xs.every(isPositive)`)
+    // is called DIRECTLY per element — no closure shell / boxed-ABI / indirect dispatch.
+    if let Some((target, native_params)) = bare_fn_call_target(&args[1], builder, ctx) {
+        let elem_ty = read_elem_ty.clone();
+        let len = emit_iterable_len(iterable, &iterable_ty, builder);
+        let zero = builder.const_temp(Const::Int(0, Type::Int64));
+        let true_val = builder.const_temp(Const::Bool(true));
+        let preheader = builder.current_block;
+        let header = builder.alloc_block("every_header");
+        let body_block = builder.alloc_block("every_body");
+        let latch = builder.alloc_block("every_latch");
+        let exit = builder.alloc_block("every_exit");
+        let i = builder.alloc_temp(Type::Int64);
+        let i_next = builder.alloc_temp(Type::Int64);
+        let all_match = builder.alloc_temp(Type::Bool);
+        let all_match_next = builder.alloc_temp(Type::Bool);
+        builder.terminate(Terminator::Jump(header));
+        builder.switch_to(header);
+        builder.emit(Instruction::Phi {
+            dst: i, ty: Type::Int64, incomings: vec![(zero, preheader), (i_next, latch)],
+        });
+        builder.emit(Instruction::Phi {
+            dst: all_match, ty: Type::Bool, incomings: vec![(true_val, preheader), (all_match_next, latch)],
+        });
+        let cond_len = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Binary {
+            dst: cond_len, op: BinOp::Lt, lhs: i, rhs: len, operand_ty: Type::Int64, ty: Type::Bool,
+        });
+        let cond = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Binary {
+            dst: cond, op: BinOp::And, lhs: cond_len, rhs: all_match, operand_ty: Type::Bool, ty: Type::Bool,
+        });
+        builder.terminate(Terminator::CondJump { cond, then_block: body_block, else_block: exit });
+        builder.switch_to(body_block);
+        let elem = builder.alloc_temp(elem_ty.clone());
+        builder.emit(Instruction::Index {
+            dst: elem, object: iterable, key: i,
+            obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+        });
+        let idx = narrow_loop_index(i, builder);
+        let pred = call_body_direct(target, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &native_params, &Type::Bool, builder);
+        free_combinator_elem_box_full(elem, &elem_ty, builder);
+        free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, builder);
+        builder.emit(Instruction::Binary {
+            dst: all_match_next, op: BinOp::And, lhs: all_match, rhs: pred, operand_ty: Type::Bool, ty: Type::Bool,
+        });
+        let back_block = builder.current_block;
+        builder.terminate(Terminator::Jump(latch));
+        builder.switch_to(latch);
+        let one = builder.const_temp(Const::Int(1, Type::Int64));
+        builder.emit(Instruction::Binary {
+            dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
+        });
+        builder.terminate(Terminator::Jump(header));
+        builder.patch_phi_incoming(header, i, body_block, back_block);
+        builder.patch_phi_incoming(header, all_match, body_block, back_block);
+        builder.switch_to(exit);
+        return all_match;
+    }
+
     // INLINE FAST PATH: literal lambda spliced in. Loop while predicate holds (stop on first false).
     // Result starts `true`; the PHI flips to `false` when predicate fails.
     if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
@@ -2534,6 +2656,94 @@ pub(crate) fn lower_find(args: &[TypedExpr], result_type: &Type, builder: &mut F
     let (ni_param_tys, _) = callback_signature(&args[1]);
     let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let iterable = lower_expr(&args[0], builder, ctx);
+
+    // DEVIRTUALIZED FAST PATH (path-8-B): a BARE statically-known predicate (`xs.find(isEven)`)
+    // is called DIRECTLY per element — no closure shell / boxed-ABI / indirect dispatch.
+    if let Some((target, native_params)) = bare_fn_call_target(&args[1], builder, ctx) {
+        let elem_ty = read_elem_ty.clone();
+        let json = Type::TypeVar(u32::MAX);
+        let len = emit_iterable_len(iterable, &iterable_ty, builder);
+        let zero = builder.const_temp(Const::Int(0, Type::Int64));
+        let null_val = builder.const_temp(Const::Null);
+        let false_val = builder.const_temp(Const::Bool(false));
+        let preheader = builder.current_block;
+        let header = builder.alloc_block("find_header");
+        let body_block = builder.alloc_block("find_body");
+        let latch = builder.alloc_block("find_latch");
+        let exit = builder.alloc_block("find_exit");
+        let i = builder.alloc_temp(Type::Int64);
+        let i_next = builder.alloc_temp(Type::Int64);
+        let result = builder.alloc_temp(json.clone());
+        let result_next = builder.alloc_temp(json.clone());
+        let found = builder.alloc_temp(Type::Bool);
+        let found_next = builder.alloc_temp(Type::Bool);
+        builder.terminate(Terminator::Jump(header));
+        builder.switch_to(header);
+        builder.emit(Instruction::Phi {
+            dst: i, ty: Type::Int64, incomings: vec![(zero, preheader), (i_next, latch)],
+        });
+        builder.emit(Instruction::Phi {
+            dst: result, ty: json.clone(), incomings: vec![(null_val, preheader), (result_next, latch)],
+        });
+        builder.emit(Instruction::Phi {
+            dst: found, ty: Type::Bool, incomings: vec![(false_val, preheader), (found_next, latch)],
+        });
+        let cond_len = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Binary {
+            dst: cond_len, op: BinOp::Lt, lhs: i, rhs: len, operand_ty: Type::Int64, ty: Type::Bool,
+        });
+        let not_found = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Unary { dst: not_found, op: UnaryOp::Not, operand: found, ty: Type::Bool });
+        let cond = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Binary {
+            dst: cond, op: BinOp::And, lhs: cond_len, rhs: not_found, operand_ty: Type::Bool, ty: Type::Bool,
+        });
+        builder.terminate(Terminator::CondJump { cond, then_block: body_block, else_block: exit });
+        builder.switch_to(body_block);
+        let elem = builder.alloc_temp(elem_ty.clone());
+        builder.emit(Instruction::Index {
+            dst: elem, object: iterable, key: i,
+            obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+        });
+        let idx = narrow_loop_index(i, builder);
+        let pred = call_body_direct(target, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &native_params, &Type::Bool, builder);
+        // Keep/skip based on pred. Box elem when kept (to carry as T|Null result).
+        let llvm_merge = builder.alloc_block("find_merge");
+        let llvm_keep = builder.alloc_block("find_keep");
+        let llvm_skip = builder.alloc_block("find_skip");
+        builder.terminate(Terminator::CondJump { cond: pred, then_block: llvm_keep, else_block: llvm_skip });
+        builder.switch_to(llvm_keep);
+        let elem_boxed = box_to_json(elem, &elem_ty, builder);
+        let keep_end = builder.current_block;
+        builder.terminate(Terminator::Jump(llvm_merge));
+        builder.switch_to(llvm_skip);
+        free_combinator_elem_box_full(elem, &elem_ty, builder);
+        free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, builder);
+        let skip_end = builder.current_block;
+        builder.terminate(Terminator::Jump(llvm_merge));
+        builder.switch_to(llvm_merge);
+        builder.emit(Instruction::Phi {
+            dst: result_next, ty: json.clone(),
+            incomings: vec![(elem_boxed, keep_end), (result, skip_end)],
+        });
+        builder.emit(Instruction::Binary {
+            dst: found_next, op: BinOp::Or, lhs: found, rhs: pred, operand_ty: Type::Bool, ty: Type::Bool,
+        });
+        builder.terminate(Terminator::Jump(latch));
+        builder.switch_to(latch);
+        let one = builder.const_temp(Const::Int(1, Type::Int64));
+        builder.emit(Instruction::Binary {
+            dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
+        });
+        builder.terminate(Terminator::Jump(header));
+        builder.switch_to(exit);
+        if !matches!(result_type, Type::TypeVar(_)) {
+            let dst = builder.alloc_temp(result_type.clone());
+            builder.emit(Instruction::Coerce { dst, src: result, from_ty: json, to_ty: result_type.clone() });
+            return dst;
+        }
+        return result;
+    }
 
     // INLINE FAST PATH: literal lambda spliced in.
     if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
