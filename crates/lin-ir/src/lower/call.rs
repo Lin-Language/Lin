@@ -222,6 +222,17 @@ pub(crate) fn lower_call(
             if sym == "std_iter_for" && range_for_bounds(&args[0], builder, ctx).is_some() {
                 return lower_intrinsic_call("lin_for", args, result_type, builder, ctx);
             }
+            // ZERO-ARG WHILE INLINE: `while(() => Boolean)` — the condition-only overload that
+            // normally delegates to `whileLoop` (TCO). Intercept here so `lower_zero_arg_while`
+            // can splice the body directly into a `while_header → while_exit` loop with no closure
+            // alloc and no per-iteration indirect call. The guard is: symbol starts with
+            // `std_iter_while` and exactly 1 argument (the `() => Boolean` callback, no iterable).
+            // Falls through to the Named-call path when the callback is not inlinable.
+            if sym.starts_with("std_iter_while") && args.len() == 1 {
+                if let Some(out) = lower_zero_arg_while(&args[0], builder, ctx) {
+                    return out;
+                }
+            }
             // ENTRIES INLINE: `obj.entries(f)` over a typed `{ K: V }` map receiver (Type::Map)
             // with an inlinable capturing lambda. Bypasses the stdlib body that materializes a full
             // entries array via `lin_entries_any(obj).for(f)`, replacing it with a direct LinMap
