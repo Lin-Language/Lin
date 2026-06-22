@@ -64,10 +64,10 @@ There are two harnesses, deliberately separate:
 > testing with `target/debug/lin` links the *unoptimized* debug `liblin_runtime.a`, where every
 > runtime-call (the bounds `_oob` accessor, `lin_map_get`, RC ops, string ops) is ~8× costlier than
 > release. That inverts the signal for any change that inlines/elides runtime-calls: it looks like a
-> large win in debug and is neutral-or-negative in release. The "take-five" campaign
-> (`docs/project-performance-take-five.md`) learned this the hard way — a debug-measured **−18 % on
-> RAPTOR turned into a +2.5 % release regression** once re-measured correctly. Always: release build,
-> release runtime, same-batch interleaved, min of ≥3.
+> large win in debug and is neutral-or-negative in release. The "take-five" campaign (§5.9) learned
+> this the hard way — a debug-measured **−18 % on RAPTOR turned into a +2.5 % release regression**
+> once re-measured correctly. Always: release build, release runtime, same-batch interleaved, min of
+> ≥3 (`compare.sh` is the reference harness).
 
 ### Cross-language results
 
@@ -485,6 +485,16 @@ RAPTOR (dijkstra/pipeline/parallel cells) with CI regression tracking.
 
 ### 5.8 The 2026-06-21 session — the data layer is EXHAUSTED; the gap is the call/value axis (DEFINITIVE)
 
+> **⚠ SUPERSEDED IN PART by §5.9 (2026-06-22).** This section's headline — "data layer exhausted,
+> ≤16 %, do not propose data-layer tweaks again" — and its cycle attribution were based on a **debug
+> rdtsc profile** and **debug-runtime A/B**, which (per the §2 banner) inflate runtime-call costs and
+> mis-rank wall-time. Re-measured in **release**, a *data-layer* change — caching the string hash so
+> string-keyed `map_get`/`map_set` skip re-hashing — cut RAPTOR **−25 %** (the single biggest lever
+> found), and a combined fix landed **−29 %**. The "9.5 % map_get" / "85 % call-value" split below is
+> a debug artifact; the string-key map work was the dominant *wall* cost. The §5.8 *mechanisms*
+> (representation reset, keep-packed, etc.) remain correct and merged; only the "exhausted /
+> data-layer-is-hopeless" *conclusion* is wrong. See §5.9.
+
 This session removed, one at a time, **every** remaining data/representation-layer cost on RAPTOR — and
 *also* copied the Go port's data design — and **none of it moved the wall clock** (~82–91 s throughout,
 all digest-exact `group=26203913 range=773022892 journeys=139`). That is not a string of failures; taken
@@ -590,6 +600,84 @@ individually wall-neutral. Closing the 4–5× gap is an **execution-model proje
 update) *not* "flatten the scan", which is already done: it is **unboxing values across the already-direct
 call boundaries + eliding the per-iteration safe-access checks** in the already-flat hot loop, or a JIT.
 Not another patch. Do not propose data-layer tweaks as the RAPTOR speedup again.
+
+---
+
+### 5.9 The "take-five" campaign (2026-06-22) — debug fooled us, release found the real lever (RAPTOR −29 %)
+
+This is the consolidated record of the `project-performance-take-five.md` campaign (that doc is now
+deleted; everything load-bearing is here). It set out to close the "call/value axis" §5.8 named, ran
+14 lanes via parallel agents, **failed on a measurement mistake, then succeeded once measured
+correctly** — and in doing so overturned §5.8's "data layer is exhausted" verdict.
+
+**Act 1 — the debug-measurement mistake.** 14 lanes (internalization, bounds-check elision + IRCE,
+RC-op inlining, `map_get` inlining, `alwaysinline`, devirt generalization, LSS-v1, scalar-CPR,
+bitcode-runtime, PGO wiring) were built, verified, and A/B'd — all with `target/debug/lin`. The debug
+runtime (unoptimized `liblin_runtime.a`) makes runtime-calls ~8× costlier, so the "inline/elide a
+runtime-call" lanes looked huge: "wave-2" measured a stable **−18 % on RAPTOR**. Re-measured in
+**release** (release compiler + release runtime, the `compare.sh` configuration), that −18 % was a
+**+2.5 % regression** — the debug A/B had measured a cost profile that does not exist in production.
+The release per-phase chain (min, same-batch): pre-campaign 80 s → batch-1 (internalization/devirt/
+entries) **77 s (−4 %, a genuine win)** → +wave-2 **81 s (+5 %, wipes it)** → +phase-2 **82 s**. The
+"inline a cheap release-runtime op" lanes (`alwaysinline`, RC-inline, `map_get`-inline) removed the
+*call*, not the *work*, and their added code slightly regressed release.
+
+**Act 2 — profile in release, find the truth.** `perf` is unavailable in this container (no
+`CAP_PERFMON`) and `valgrind` SIGILLs on the AVX-512 codegen, so the release binary was profiled with
+a **sudo-gdb stack-sampler** (300 samples). Self-time, with the IR confirming each:
+
+| release self-time | bucket | mechanism |
+|---|--:|---|
+| **~30 %** | string-keyed map work | `lin_map_get`/`lin_map_set` + `lin_string_eq` + `memcmp` (every probe hashes a `StopId`/`RouteId` string and compares string keys) |
+| **~40 %** | algorithm in **boxed-closure wrappers** | `std_iter_whileLoop` (the dominant loop) calls its body via an **indirect `call ptr %fnp`** from a heap closure, boxed-`bool` return unboxed per iteration, per-iter `lin_closure_release` |
+| **~11 %** | RC | `retain_sealed_payload_fields`, releases, `tagged_clone` |
+| **~10 %** | allocation + `getTrip` record materialization | `_int_malloc`, `lin_sealed_alloc` |
+
+**Act 3 — fix it, measured in release from the start.** Three lanes, each targeting a profiled
+hotspot, baseline `c46e2379`, same-batch, min of 3, digest-exact:
+
+| lever | what | release RAPTOR | Δ |
+|---|---|--:|--:|
+| baseline | — | 76 s | — |
+| **STR-KEY** | cache the FNV-1a hash in the `LinString` header; codegen loads it, skips re-hash + hash-gates `memcmp` | **57 s** | **−25 %** |
+| CLOS-DEVIRT | inline the boxed `while(() => …)` loop into a direct loop (no `std_iter_whileLoop`, no indirect call) | 75 s | −1 % |
+| REC-CPR | `is T` on a `Record \| Null` → pointer-null check, not box + `lin_matches_schema` | 75 s | −1 % |
+| **COMBO** | all three | **54 s** | **−29 %** |
+
+Cross-language (release, same machine, digest-exact `26203913/773022892/139`): **Go ~18.7 s, Node
+~29.4 s, Lin 76 s → 54 s** — the gap closes **4.1×→2.9× vs Go and 2.6×→1.8× vs Node.** (Go/Node use
+string-keyed maps too, so the cached-hash win is like-for-like.)
+
+**The two findings that matter:**
+
+1. **Self-time ≠ wall-time lever — and it inverted the priority.** The boxed-closure dispatch was
+   **40 % of self-time** but removing it bought **−1 % wall** (the indirect call is well-predicted and
+   overlaps memory stalls). String-key map work was **30 % of self-time** but cutting it bought
+   **−25 % wall** (the hash + `string_eq` *serializes* the hot loop). Where the PC sits is not where
+   the wall-time is. This is also why §5.8's debug "inline `map_get`" (RT.2c) was neutral — it removed
+   the call; STR-KEY removed the **work**.
+
+2. **§5.8's "data layer is exhausted" was wrong, for the §2 reason.** A data-layer change (string-key
+   hashing) was the **single biggest releasable lever (−25 %)**. §5.8's debug rdtsc profile ranked
+   `map_get` at 9.5 % and declared the data layer dead; release ranks it first. Do **not** trust the
+   "≤16 % / call-value-axis-only" framing — it was a debug artifact.
+
+**Durable process lessons (the campaign's real ROI):**
+- **All perf A/B must be release** (release compiler **and** release runtime). Debug inverts the
+  signal for anything touching runtime-call overhead. (§2 banner.)
+- **Differential stdout probes** (compile+run the same program on master vs the change, diff output)
+  caught **three soundness bugs** that green test suites + RC-verify + ASan all missed — all in `is`/
+  null fast-path lowering: (a) `is`-elision used `is_compatible`, treating `Int32`→`Int64`/`Float64`
+  as widening-compatible, so `(x:Int32) is Int64` folded to `true`; (b) `is T` on `R | Null` lowered
+  to a pure non-null check, so `(Trip|Null) is Other` reported a non-null `Trip` as `Other`. `is`/
+  narrowing fast paths are a soundness minefield — keep a permanent `is`-on-`T|Null` differential.
+- **Build the integration; never trust a clean cherry-pick.** Two lanes with zero textual conflict
+  failed to compile together (one added an IR struct field the other's new sites didn't set).
+- **Same-batch interleaved, min of ≥3.** Cross-batch single-pair comparisons at RAPTOR's noise floor
+  (~7 % debug / ~1 % release) produced two false-regression alarms (machine drift, e.g. the recorded
+  a537b8c8 interp 94 ms measured 107 ms on a busier day for the *identical* commit).
+- **Agent self-reports are not trustworthy** (cf. §5.7): every lane self-reported green; the orchestrator
+  re-ran every gate and the differential, which is what caught the soundness bugs.
 
 ---
 
