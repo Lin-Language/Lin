@@ -2327,6 +2327,58 @@ pub(crate) fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &m
     builder.const_temp(Const::Null)
 }
 
+/// Zero-arg `while(() => Boolean)` — condition-only loop. The callback takes no arguments and
+/// returns `true` to continue, `false` to stop.
+///
+/// INLINE FAST PATH: when `callback` is an inlinable capturing lambda (or a stored lambda bound
+/// via `inlinable_local_fn`), splice the body DIRECTLY into a `while_header → while_exit` loop
+/// with no closure alloc, no per-iteration indirect call, no box/unbox ABI. The inlined body may
+/// switch blocks (inner `if`/nested combinator); the back-edge `CondJump` is emitted from
+/// whatever block the inlined body ends in, jumping back to `while_header` (true) or `while_exit`
+/// (false). This replaces the `whileLoop` TCO path that previously allocated a closure each call
+/// and dispatched it per iteration via `%ir_fnp(env)`.
+///
+/// Falls through to the stdlib call (`std_iter_while*`) when the callback is not inlinable —
+/// guaranteeing a sound fallback for genuinely non-resolvable captures.
+pub(crate) fn lower_zero_arg_while(
+    callback: &TypedExpr,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    let Some((lam_params, lam_body)) = inlinable_local_fn(callback, builder, ctx) else {
+        return None;
+    };
+    let lam_params = lam_params.to_vec();
+    let lam_body = lam_body.clone();
+
+    let header = builder.alloc_block("while_header");
+    let exit = builder.alloc_block("while_exit");
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(header);
+    // Inline the zero-arg body. It takes no element params; pass an empty slice and let
+    // `inline_lambda_body` bind none (the lambda declares zero params). The body result is
+    // `Boolean` (the loop-continuation predicate).
+    let (pred_raw, pred_ty) = inline_lambda_body(&lam_params, &lam_body, &[], builder, ctx);
+    // Coerce to a concrete i1 Bool (a Json/boxed-bool body is unboxed via Coerce; a concrete
+    // Bool body is a no-op; same pattern as `lower_while` / `lower_filter` inline paths).
+    let keep = if matches!(pred_ty, Type::Bool) {
+        pred_raw
+    } else {
+        let d = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Coerce { dst: d, src: pred_raw, from_ty: pred_ty, to_ty: Type::Bool });
+        d
+    };
+    // The inlined body may have switched blocks. Emit the back-edge CondJump from CURRENT block
+    // (the body's final block after all inner control flow) back to `header` (true) or to `exit`
+    // (false). This is sound even when the body emits its own blocks (inner if/for/match) because
+    // `inline_lambda_body` returns control at the merge/exit point of those inner constructs.
+    builder.terminate(Terminator::CondJump { cond: keep, then_block: header, else_block: exit });
+
+    builder.switch_to(exit);
+    Some(builder.const_temp(Const::Null))
+}
+
 /// `some(iterable, predicate)` → `true` if any element satisfies predicate, `false` otherwise.
 /// Short-circuits on the first match. Uses the same `smat_fd` direct-struct-pointer path as
 /// `for`/`while` when the source is a sealed-ptr array — avoids per-element materialization.
