@@ -592,29 +592,20 @@ impl<'ctx> Codegen<'ctx> {
         let fd_exit = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_b);
 
-        // ── 0xFF dynamic branch: project from tagged element via lin_union_force_to_map ───────────
-        // The array's elements are TaggedVal slots (16 bytes each). `lin_array_get_tagged` returns
-        // an owned *TaggedVal (+1 on the inner payload). We pass it directly to `sealed_project_from`
-        // as a union source (TypeVar wildcard), which calls `lin_union_force_to_map` internally and
-        // builds a fresh owned sealed struct from the LinMap fields. Then free the TaggedVal box.
+        // ── dyn branch: statically unreachable for a sealed array ─────────────────────────────────
+        // `sealed_array_materialize_elem` is called ONLY when the object repr is
+        // `Packed(PackedSealedArray)`, which is established at IR-lowering time for statically-typed
+        // sealed-record arrays. For such arrays the runtime elem_tag is ALWAYS 0xFE (inline) or 0xFD
+        // (pointer-backed) — any other tag would mean a type-system violation. Emit `unreachable` to
+        // let LLVM DCE the block. Do NOT branch to merge_b so it is NOT a phi predecessor.
         self.builder.position_at_end(dyn_b);
-        let get_tagged_fn = self.get_or_declare_fn("lin_array_get_tagged",
-            ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
-        let tagged_val = self.builder.call(get_tagged_fn, &[arr_ptr.into(), idx.into()], "smat_dyn_tv")
-            .try_as_basic_value().unwrap_basic();
-        let fields_clone = fields.clone();
-        let dyn_struct = self.sealed_project_from(tagged_val, &Type::TypeVar(u32::MAX), &fields_clone);
-        let tagged_free_fn = self.get_or_declare_fn("lin_tagged_free_box",
-            self.context.void_type().fn_type(&[ptr_ty.into()], false));
-        self.builder.call(tagged_free_fn, &[tagged_val.into()], "");
-        let dyn_exit = self.builder.get_insert_block().unwrap();
-        self.builder.unconditional_branch(merge_b);
+        self.builder.unreachable();
 
         // ── Merge ──────────────────────────────────────────────────────────────────────────────────
         self.builder.position_at_end(merge_b);
         let phi = self.builder.phi(ptr_ty, "smat_phi");
         let fresh_bv: BasicValueEnum<'ctx> = fresh.into();
-        phi.add_incoming(&[(&fresh_bv, fe_exit), (&sptr, fd_exit), (&dyn_struct, dyn_exit)]);
+        phi.add_incoming(&[(&fresh_bv, fe_exit), (&sptr, fd_exit)]);
         phi.as_basic_value()
     }
 }
