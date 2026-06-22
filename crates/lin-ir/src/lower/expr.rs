@@ -1,5 +1,43 @@
 use super::*;
 
+// -------------------------------------------------------------------------
+// Null/union elision helpers (CK.2)
+// -------------------------------------------------------------------------
+
+/// True iff `ty` is fully concrete — no `TypeVar` or `Named` anywhere in its tree.
+/// Used as a safety guard before calling `is_compatible` as a definite-subtype check:
+/// `is_compatible` is permissive for `Named` targets (returns `true` when the env is
+/// unavailable, which lin-ir lowering doesn't have), so we only elide when BOTH sides
+/// are fully resolved.
+fn type_is_concrete(ty: &Type) -> bool {
+    match ty {
+        Type::TypeVar(_) | Type::Named(_) => false,
+        Type::Union(vs) => vs.iter().all(type_is_concrete),
+        Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner)
+        | Type::Promise(inner) | Type::Shared(inner) => type_is_concrete(inner),
+        Type::FixedArray(elems) => elems.iter().all(type_is_concrete),
+        Type::Map { key, value, .. } => type_is_concrete(key) && type_is_concrete(value),
+        Type::Object { fields, .. } => fields.values().all(type_is_concrete),
+        Type::Function { params, ret, .. } => {
+            params.iter().all(type_is_concrete) && type_is_concrete(ret)
+        }
+        _ => true,
+    }
+}
+
+/// True iff every possible runtime value of type `val` is guaranteed to satisfy an
+/// `is check_ty` test at runtime — i.e., `val` is a (strict or equal) subtype of
+/// `check_ty` and both sides are fully concrete (no `TypeVar`/`Named`).
+///
+/// Conservative: returns `false` whenever the proof cannot be established cheaply, so
+/// we NEVER incorrectly elide a check that could genuinely be false at runtime.
+pub(crate) fn is_definitely_subtype(val: &Type, check_ty: &Type) -> bool {
+    if !type_is_concrete(val) || !type_is_concrete(check_ty) {
+        return false;
+    }
+    lin_check::compat::is_compatible(val, check_ty)
+}
+
 /// If `ty` is a MAP type (`{ K: V }`), or a `V | Null` union whose sole non-null member is a map,
 /// return a reference to that map type. (`None` for record/array/scalar — not a map container.)
 fn as_map_ty(ty: &Type) -> Option<&Type> {
@@ -1497,6 +1535,22 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
 
         TypedExpr::Is { expr, pattern, .. } => {
             let val_ty = expr.ty();
+            // CK.2: Before boxing (which allocates a TaggedVal* shell), check if the static
+            // type already proves the `is T` check will always succeed. Lower `expr` for its
+            // side-effects, then return `true` without allocating the transient box or emitting
+            // the IsType instruction. Safe only when BOTH types are fully concrete (no
+            // TypeVar/Named), so `is_compatible` is exact rather than permissive.
+            // Object patterns and TypeCheckDeep are excluded (they do structural field checks,
+            // not just tag checks, so we never elide them here).
+            if !matches!(pattern, TypedPattern::Object { .. } | TypedPattern::TypeCheckDeep(..)) {
+                let (check_ty, _) = pattern_type_check(pattern);
+                if is_definitely_subtype(&val_ty, &check_ty) {
+                    // Lower expr for side-effects; the owned temp (if any) is registered in the
+                    // current scope and released at scope exit — no box allocation to worry about.
+                    let _raw = lower_expr(expr, builder, ctx);
+                    return builder.const_temp(Const::Bool(true));
+                }
+            }
             let raw = lower_expr(expr, builder, ctx);
             // The tag check needs a boxed TaggedVal*; box a concrete value first.
             let val_temp = box_to_json(raw, &val_ty, builder);
