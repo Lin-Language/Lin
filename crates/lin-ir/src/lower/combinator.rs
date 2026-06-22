@@ -406,14 +406,15 @@ pub(crate) fn inline_lambda_body_tracking_elem_boxes(
 /// PATH-1 in-place packed iteration eligibility: true iff EVERY use of the element param `slot` in
 /// `body` is as the immediate `object` of a field read (`param.field` or `param["literalKey"]`).
 ///
-/// The in-place packed-element VIEW only services const-offset SCALAR field reads. Any OTHER use of
-/// the element (passing it whole to a call, storing it, indexing with a non-literal key, comparing
-/// it, returning it, spreading it) needs the materialized struct — and materializing-on-demand a
-/// `Json`-typed element to feed e.g. `push(out, p)` round-trips through a pre-existing
-/// push-Json-into-packed-array bug AND would defeat the no-materialize goal anyway. So when the body
-/// uses the element as anything but a scalar-field read, this returns false and the caller falls back
-/// to the generic materialize path (identical to today's boxed behaviour — no regression). Bare-key
-/// reads (`p[i]`) and whole-value uses are conservatively rejected.
+/// The in-place packed-element VIEW services SCALAR and HEAP (String/Array/nested-record) field
+/// reads — `try_lower_packed_elem_field` handles all `is_sealed_heap_field()` types with a
+/// const-offset load + Retain. Any OTHER use of the element (passing it whole to a call, storing
+/// it, indexing with a non-literal key, comparing it, returning it, spreading it) needs the
+/// materialized struct — and materializing-on-demand a `Json`-typed element to feed e.g.
+/// `push(out, p)` would defeat the no-materialize goal. So when the body uses the element as
+/// anything but a field read, this returns false and the caller falls back to the generic
+/// materialize path (identical to today's boxed behaviour — no regression). Bare-key reads (`p[i]`)
+/// and whole-value uses are conservatively rejected.
 pub(crate) fn elem_used_only_for_scalar_fields(slot: usize, body: &TypedExpr) -> bool {
     // `ok`: this position is NOT a bare element use (it is a field-read object, handled by the caller).
     // Returns false the moment a bare/whole-value use of `slot` is found.
@@ -488,6 +489,7 @@ pub(crate) fn elem_used_only_for_scalar_fields(slot: usize, body: &TypedExpr) ->
     }
     walk(slot, body)
 }
+
 
 /// PATH-1 in-place packed iteration: inline a lambda body whose ELEMENT param (index 0) is bound to
 /// a BORROWED packed-array element VIEW — the recorded `(array, index)` — instead of a materialized
