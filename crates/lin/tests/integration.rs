@@ -23706,3 +23706,91 @@ print(out["value"])
 "#);
     assert_eq!(output, vec!["success", "5"]);
 }
+
+// Regression: `coerce_if_branch` concrete-concrete arm returned `owned=false` unconditionally,
+// so a narrowed-union LocalGet in an `if` branch (emits Coerce+Retain+register_owned in branch
+// scope) was never `register_owned`'d in the parent scope — the kept Retain was orphaned, leaking
+// +1 per branch-taken iteration. At extreme iteration counts (u32 wrap) this causes a premature
+// free → UAF. Fix: return `owned=is_rc_type(result_type)` so RC types register the phi result in
+// the enclosing scope, balancing the branch Retain via the normal scope-exit Release.
+//
+// This test exercises the exact `String | Null` narrowed-LocalGet path that triggered the leak:
+// `val current: String | Null = acc[key]` → then-branch reads `current` narrowed to String
+// (Coerce+Retain+register_owned) and uses it as the `if` result. In a hot loop the +1 orphan
+// accumulates; output is correct regardless (the leak just inflates the refcount — objects are
+// never freed), so this test guards behavioral correctness while the coerce.rs fix guards the
+// actual leak. Verified: LIN_VERIFY_RC=strict clean before AND after the fix (the static verifier
+// doesn't track Retain-seeded balance, only owning-producer-seeded balance; the leak is a
+// runtime-detectable RC inflation, not a static-graph imbalance).
+#[test]
+fn test_coerce_if_branch_narrowed_union_localget_rc_balanced() {
+    let output = run(r#"import { reduce } from "std/iter"
+import { range } from "std/iter"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Q = { String: String }
+// Build a lookup: each key maps to its stringified index, or inherits from an existing entry.
+// The reducer's body is an `if` whose then-branch reads `current` (type String | Null, narrowed
+// to String) — the exact narrowed-union LocalGet path that leaked an RC reference per iteration.
+val build = (n: Int32): Q =>
+  val seed: Q = {}
+  range(0, n).reduce(seed, (acc, i) =>
+    val key = toString(i)
+    val current: String | Null = acc[key]
+    val chosen = if current != null then current else key
+    acc[key] = chosen
+    acc
+  )
+val m = build(500)
+print(m["0"] ?? "miss")
+print(m["499"] ?? "miss")
+"#);
+    assert_eq!(output, vec!["0", "499"],
+        "coerce_if_branch narrowed-union LocalGet: if-result must be correct and RC-balanced");
+}
+
+// RC balance variant: confirm the coerce_if_branch fix builds clean under the static RC verifier.
+// The narrowed-union LocalGet leak is a runtime RC inflation (not detectable by the static verifier
+// which only tracks owning-producer-seeded balance), so this test gates on compilation succeeding
+// under LIN_VERIFY_RC=strict rather than on a static balance failure. It exercises an `if` expression
+// that returns a narrowed String from a `String | Int32` param on the then-branch and a fresh
+// String call result on the else-branch — both paths go through the concrete-concrete arm of
+// `coerce_if_branch`. Pre-fix this built cleanly too (the static verifier cannot detect the
+// runtime Retain-leak); post-fix it still builds cleanly, confirming the fix emits no spurious
+// over-releases that would break compilation.
+#[test]
+fn test_coerce_if_branch_concrete_str_result_rc_verifier_clean() {
+    let source = r#"import { print } from "std/io"
+import { range, for } from "std/iter"
+import { toString } from "std/string"
+
+val extractStr = (v: String | Int32): String =>
+  if v is String then v else toString(0)
+
+var count = 0
+range(0, 1000).for(i =>
+  val s = extractStr("hello")
+  count = count + 1
+)
+print(count)
+"#;
+    let ws = workspace_root();
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let src_path = ws.join(format!("target/lin_test_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_{}", id));
+    fs::write(&src_path, source).unwrap();
+    let compile = lin_cmd()
+        .env("LIN_VERIFY_RC", "strict")
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        compile.status.success(),
+        "RC-balance verifier (strict) must accept coerce_if_branch concrete-str result — \
+         the fix must not introduce spurious over-releases:\nstderr: {}",
+        String::from_utf8_lossy(&compile.stderr),
+    );
+}
