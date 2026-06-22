@@ -11,7 +11,7 @@ use inkwell::values::{
 };
 use inkwell::attributes::AttributeLoc;
 use inkwell::{AddressSpace, OptimizationLevel};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::ffi::CString;
 
@@ -106,6 +106,11 @@ pub struct Codegen<'ctx> {
     /// evaluated ~457M string literals/run (constant object keys in hot scan loops); this turns
     /// each into a constant pointer the optimiser can hoist and CSE. See `compile_string_lit`.
     str_literal_globals: std::cell::RefCell<HashMap<String, inkwell::values::PointerValue<'ctx>>>,
+    /// VA.1 CPR return-flattening: the set of IR functions that return a simple scalar nullable
+    /// union (`T | Null` where T is a scalar) via a flat `{ i1 is_null, i64 value }` LLVM struct
+    /// instead of a heap-allocated `TaggedVal*`. Direct call sites unpack the struct in registers;
+    /// the boxed-ABI wrapper boxes the struct result for indirect/closure callers.
+    flat_union_return_fns: HashSet<lir::FuncId>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -147,6 +152,7 @@ impl<'ctx> Codegen<'ctx> {
             debug,
             debug_info: None,
             str_literal_globals: std::cell::RefCell::new(HashMap::new()),
+            flat_union_return_fns: HashSet::new(),
         }
     }
 
@@ -686,6 +692,21 @@ impl<'ctx> Codegen<'ctx> {
                     }
                     f
                 }
+            } else if Self::flat_union_scalar_type(ret_ty).is_some() {
+                // VA.1 CPR: scalar-nullable union return → flat `{ i1, i64 }` struct ABI.
+                // No heap allocation at the return site; callers unpack in registers.
+                let flat_ty = self.flat_union_struct_type();
+                let fn_ty = flat_ty.fn_type(&param_types, false);
+                self.flat_union_return_fns.insert(func.id);
+                if let Some(existing) = self.module.get_function(&name) { existing }
+                else {
+                    let f = self.module.add_function(&name, fn_ty, None);
+                    self.mark_user_fn_nounwind(f);
+                    if name != "main" {
+                        f.set_linkage(inkwell::module::Linkage::Internal);
+                    }
+                    f
+                }
             } else {
                 let ret_llvm = self.llvm_type(ret_ty);
                 let fn_ty = ret_llvm.fn_type(&param_types, false);
@@ -785,6 +806,8 @@ impl<'ctx> Codegen<'ctx> {
         // ---- Pass 2: compile each function body ----
         for func in &module.functions {
             let llvm_fn = ir_fn_to_llvm[&func.id];
+            // VA.1 CPR: true when this function was declared with a flat `{ i1, i64 }` return type.
+            let is_flat_union_fn = self.flat_union_return_fns.contains(&func.id);
 
             // Map BlockId → LLVM BasicBlock
             let mut ir_block_to_llvm: StdMap<lir::BlockId, inkwell::basic_block::BasicBlock<'ctx>> = StdMap::new();
@@ -972,7 +995,21 @@ impl<'ctx> Codegen<'ctx> {
                                 Const::Int(v, ty) => self.compile_int_lit(*v, ty),
                                 Const::Float(v, ty) => self.compile_float_lit(*v, ty),
                                 Const::Bool(b) => self.context.bool_type().const_int(*b as u64, false).into(),
-                                Const::Null => ptr_ty.const_null().into(),
+                                Const::Null => {
+                                    // VA.1 CPR: a `null` literal whose destination slot is a flat-union type
+                                    // inside a flat-union function produces `{ i1=1, i64=0 }` (the flat Null arm)
+                                    // rather than a null ptr, so the Phi node and Return can stay in struct land.
+                                    if is_flat_union_fn {
+                                        let dst_ty = func.temp_types.get(dst);
+                                        if dst_ty.map(|t| Self::flat_union_scalar_type(t).is_some()).unwrap_or(false) {
+                                            self.flat_union_null_value().into()
+                                        } else {
+                                            ptr_ty.const_null().into()
+                                        }
+                                    } else {
+                                        ptr_ty.const_null().into()
+                                    }
+                                }
                                 Const::Str(s) => self.compile_string_lit(s),
                             };
                             temp_map.insert(*dst, llvm_val);
@@ -986,7 +1023,14 @@ impl<'ctx> Codegen<'ctx> {
                             // Create the phi now so its result is available to later
                             // instructions, but defer wiring the incoming edges until all
                             // blocks are compiled (a back-edge value may be defined later).
-                            let phi_ty = self.llvm_type(ty);
+                            // VA.1 CPR: a phi over a flat-union type inside a flat-union function
+                            // uses the struct type `{ i1, i64 }` so all incoming arms produce structs.
+                            let phi_ty: inkwell::types::BasicTypeEnum<'ctx> =
+                                if is_flat_union_fn && Self::flat_union_scalar_type(ty).is_some() {
+                                    self.flat_union_struct_type().into()
+                                } else {
+                                    self.llvm_type(ty)
+                                };
                             let phi = self.builder.phi(phi_ty, "ir_phi");
                             temp_map.insert(*dst, phi.as_basic_value());
                             pending_phis.push((phi, incomings.clone()));
@@ -997,6 +1041,16 @@ impl<'ctx> Codegen<'ctx> {
                             // arithmetic. Fail loudly with the offending temp instead.
                             let mut lv = *temp_map.get(lhs).unwrap_or_else(|| panic!("Binary: undefined lhs temp {lhs:?}"));
                             let mut rv = *temp_map.get(rhs).unwrap_or_else(|| panic!("Binary: undefined rhs temp {rhs:?}"));
+                            // VA.1 CPR: if either operand is a flat-union struct `{ i1, i64 }`,
+                            // materialize it to a boxed ptr before arithmetic/comparison.
+                            if lv.is_struct_value() {
+                                let lty = func.temp_types.get(lhs).cloned().unwrap_or(Type::Null);
+                                lv = self.materialize_flat_union_if_needed(lv, &lty, llvm_fn);
+                            }
+                            if rv.is_struct_value() {
+                                let rty_for_mat = func.temp_types.get(rhs).cloned().unwrap_or(Type::Null);
+                                rv = self.materialize_flat_union_if_needed(rv, &rty_for_mat, llvm_fn);
+                            }
                             let rty = func.temp_types.get(rhs).cloned().unwrap_or(Type::Null);
                             // UNBOXED SUM TYPE (unboxed-sumtype Stage 1): `==`/`!=` over SumNode
                             // operands MATERIALIZES each to a boxed `LinObject` (order-independent
@@ -1079,6 +1133,8 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::Retain { val, ty } => {
                             if let Some(&v) = temp_map.get(val) {
+                                // VA.1 CPR: a flat-union struct `{ i1, i64 }` has no heap allocation — no-op.
+                                if v.is_struct_value() { continue; }
                                 if v.is_pointer_value() {
                                     // UNBOXED SUM TYPE: a SumNode's refcount is the offset-0 u32
                                     // (lin_rc_retain) — NOT a tagged inner-payload retain (which would
@@ -1117,6 +1173,12 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::CloneBox { dst, src, ty } => {
                             if let Some(&v) = temp_map.get(src) {
+                                // VA.1 CPR: a flat-union struct `{ i1, i64 }` has no heap allocation —
+                                // "cloning" it is a register copy. Forward verbatim.
+                                if v.is_struct_value() {
+                                    temp_map.insert(*dst, v);
+                                    continue;
+                                }
                                 // UNBOXED SUM TYPE: a SumNode value (repr Packed(SumNode)) is NOT a
                                 // boxed TaggedVal — an "owning read" of one bumps the SumNode's own
                                 // refcount (offset-0 u32, via lin_rc_retain) and keeps the SAME
@@ -1173,10 +1235,20 @@ impl<'ctx> Codegen<'ctx> {
                                         "lin_tagged_clone",
                                         ptr_ty.fn_type(&[ptr_ty.into()], false),
                                     );
-                                    self.builder
+                                    let cloned_ptr = self.builder
                                         .call(clone_fn, &[v.into()], "ir_tagged_clone")
                                         .try_as_basic_value()
-                                        .unwrap_basic()
+                                        .unwrap_basic();
+                                    // VA.1 CPR: if this is a flat-union function and the type is
+                                    // a flat-union type, convert the cloned boxed ptr to a flat
+                                    // struct inline (must happen here, not in phi backpatch, so
+                                    // we emit before the block's terminator).
+                                    if is_flat_union_fn {
+                                        if let Some(scalar_ty) = Self::flat_union_scalar_type(ty) {
+                                            self.build_ptr_to_flat_union(
+                                                cloned_ptr.into_pointer_value(), &scalar_ty, llvm_fn)
+                                        } else { cloned_ptr }
+                                    } else { cloned_ptr }
                                 } else {
                                     // Non-union (concrete rc): a plain retain, value unchanged.
                                     if v.is_pointer_value() {
@@ -1253,10 +1325,26 @@ impl<'ctx> Codegen<'ctx> {
                             }
                         }
                         Instruction::Call { dst, callee, args, ret_ty } => {
-                            let arg_vals: Vec<BasicMetadataValueEnum> = args
+                            // VA.1 CPR: if any argument is a flat-union struct `{ i1, i64 }`,
+                            // materialize it to a `TaggedVal*` before the call — the callee (for a
+                            // non-flat-union Direct or any Named/Indirect call) expects a boxed ptr.
+                            // Flat-union functions have concrete-typed params (not union), so they are
+                            // not affected here.
+                            let arg_vals_raw: Vec<BasicValueEnum> = args
                                 .iter()
-                                .filter_map(|a| temp_map.get(a).map(|v| (*v).into()))
+                                .filter_map(|a| temp_map.get(a).copied())
                                 .collect();
+                            let mut arg_vals_mat: Vec<BasicValueEnum> = arg_vals_raw;
+                            for (i, a) in args.iter().enumerate() {
+                                if let Some(v) = arg_vals_mat.get(i).copied() {
+                                    if v.is_struct_value() {
+                                        let ty = func.temp_types.get(a).cloned().unwrap_or(Type::Null);
+                                        arg_vals_mat[i] = self.materialize_flat_union_if_needed(v, &ty, llvm_fn);
+                                    }
+                                }
+                            }
+                            let arg_vals: Vec<BasicMetadataValueEnum> = arg_vals_mat
+                                .iter().map(|v| (*v).into()).collect();
                             // Detect under-application: fewer args than the callee's arity
                             // and a Function result type ⇒ build a partial-application closure.
                             let partial_app = |s: &mut Self, callee_fn: FunctionValue<'ctx>| -> Option<BasicValueEnum<'ctx>> {
@@ -1516,16 +1604,27 @@ impl<'ctx> Codegen<'ctx> {
                             temp_map.insert(*dst, result);
                         }
                         Instruction::CallIntrinsic { dst, intrinsic, args, ret_ty } => {
-                            let arg_vals: Vec<BasicValueEnum> = args
-                                .iter()
-                                .filter_map(|a| temp_map.get(a).copied())
-                                .collect();
                             // Recover each argument's static type so intrinsics can
                             // dispatch correctly (e.g. ToString of Str vs tagged ptr).
                             let arg_tys: Vec<Type> = args
                                 .iter()
                                 .map(|a| func.temp_types.get(a).cloned().unwrap_or(Type::Null))
                                 .collect();
+                            // VA.1 CPR: if an argument is a flat-union struct `{ i1, i64 }`,
+                            // materialize it to a boxed `TaggedVal*` before passing to the intrinsic —
+                            // intrinsic dispatch (ToString, Push, etc.) operates on tagged pointers.
+                            let mut arg_vals: Vec<BasicValueEnum> = args
+                                .iter()
+                                .filter_map(|a| temp_map.get(a).copied())
+                                .collect();
+                            for i in 0..args.len() {
+                                if let Some(v) = arg_vals.get(i).copied() {
+                                    if v.is_struct_value() {
+                                        let ty = arg_tys.get(i).cloned().unwrap_or(Type::Null);
+                                        arg_vals[i] = self.materialize_flat_union_if_needed(v, &ty, llvm_fn);
+                                    }
+                                }
+                            }
                             // STAGE 3: the per-operand physical representation (from `func.repr`) so
                             // repr-deciding intrinsics (Push) dispatch on the proven repr instead of
                             // re-deriving from the static type.
@@ -2176,7 +2275,7 @@ impl<'ctx> Codegen<'ctx> {
                                 // pairs this with a Retain of the new value so the global holds
                                 // an independent reference. Applies to concrete reference-counted
                                 // types AND boxed Json/union globals: the lowerer now uses the
-                                // SAME owning model (clone on store, clone+register on read,
+                                // SAME owning model (clone on store, clone+release on read,
                                 // release-old here) for unions, so `emit_release` dispatches the
                                 // tag-aware `lin_tagged_release` (null-safe: the global's zero
                                 // initial value is a no-op release).
@@ -2185,7 +2284,14 @@ impl<'ctx> Codegen<'ctx> {
                                         .load(llvm_ty, glob.as_pointer_value(), "ir_gv_old");
                                     self.emit_release(old, ty);
                                 }
-                                self.builder.store(glob.as_pointer_value(), v);
+                                // VA.1 CPR: globals always store boxed `ptr` for union types.
+                                // If the value is a flat-union struct `{ i1, i64 }`, materialize
+                                // it to a boxed ptr before storing (globals are shared across
+                                // functions and must hold a uniform representation).
+                                let store_v = if v.is_struct_value() {
+                                    self.materialize_flat_union_if_needed(v, ty, llvm_fn)
+                                } else { v };
+                                self.builder.store(glob.as_pointer_value(), store_v);
                             }
                         }
                         Instruction::GlobalValGet { dst, slot, ty, immutable } => {
@@ -2199,11 +2305,16 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::MakeCell { dst, init, ty } => {
                             if let Some(&v) = temp_map.get(init) {
+                                // VA.1 CPR: cells always hold boxed ptrs, not flat-union structs.
+                                // If the initial value is a flat-union struct, materialize it first.
+                                let store_v = if v.is_struct_value() {
+                                    self.materialize_flat_union_if_needed(v, ty, llvm_fn)
+                                } else { v };
                                 let llvm_ty = self.llvm_type(ty);
                                 let size = llvm_ty.size_of().unwrap();
                                 let size_i64 = self.builder.int_z_extend_or_bit_cast(size, i64_ty, "cell_sz");
                                 let cell = self.builder.call(self.rt.alloc, &[size_i64.into()], "ir_cell").try_as_basic_value().unwrap_basic().into_pointer_value();
-                                self.builder.store(cell, v);
+                                self.builder.store(cell, store_v);
                                 temp_map.insert(*dst, cell.into());
                             }
                         }
@@ -2228,7 +2339,7 @@ impl<'ctx> Codegen<'ctx> {
                                     // the cell holds an independent reference. Applies to concrete
                                     // reference-counted types AND boxed Json/union cells: the
                                     // lowerer uses the SAME owning model for unions (clone on
-                                    // store, clone+register on read), so `emit_release` here
+                                    // store, clone+release on read), so `emit_release` here
                                     // dispatches the tag-aware `lin_tagged_release`. The release
                                     // fns null-check the cell's initial zero.
                                     if Self::ty_is_concrete_rc(ty) || Self::is_union_type(ty) {
@@ -2237,7 +2348,11 @@ impl<'ctx> Codegen<'ctx> {
                                             .load(llvm_ty, c.into_pointer_value(), "ir_cell_old");
                                         self.emit_release(old, ty);
                                     }
-                                    self.builder.store(c.into_pointer_value(), v);
+                                    // VA.1 CPR: cells always hold boxed ptrs, not flat-union structs.
+                                    let store_v = if v.is_struct_value() {
+                                        self.materialize_flat_union_if_needed(v, ty, llvm_fn)
+                                    } else { v };
+                                    self.builder.store(c.into_pointer_value(), store_v);
                                 }
                             }
                         }
@@ -2290,7 +2405,18 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::IsType { dst, val, ty } => {
                             if let Some(&v) = temp_map.get(val) {
-                                let result = if func.repr_of(*val).nullable_record_fields().is_some()
+                                let result = if v.is_struct_value() {
+                                    // VA.1 CPR: flat-union struct `{ i1 is_null, i64 value }`.
+                                    // `is Null` → extract field 0 (is_null=1 means null).
+                                    // `is T`    → extract field 0, then NOT it (is_null=0 means non-null = T).
+                                    let is_null = self.builder.extract_value(
+                                        v.into_struct_value(), 0, "fu_isnull").into_int_value();
+                                    if matches!(ty, lin_check::types::Type::Null) {
+                                        is_null
+                                    } else {
+                                        self.builder.not(is_null, "fu_isval")
+                                    }
+                                } else if func.repr_of(*val).nullable_record_fields().is_some()
                                     && v.is_pointer_value()
                                 {
                                     // Stage 3 NullableRecord: raw sealed ptr or null.
@@ -2362,6 +2488,52 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::Coerce { dst, src, from_ty, to_ty } => {
                             if let Some(&sv) = temp_map.get(src) {
+                                // VA.1 CPR: intercept coercions involving flat-union values.
+                                // (A) scalar → flat-union (only in flat-union functions, to avoid boxing):
+                                //     wrap in `{ i1=0, i64=bits }` without boxing.
+                                // (B) Null → flat-union (only in flat-union functions):
+                                //     produce `{ i1=1, i64=0 }` without boxing.
+                                // (C) flat-union struct → scalar (match-arm narrowing, any function):
+                                //     extract field 1. This MUST fire whenever sv.is_struct_value().
+                                // (D) flat-union struct → Null (any function): produce null ptr.
+                                if is_flat_union_fn {
+                                    if let Some(scalar_ty) = Self::flat_union_scalar_type(to_ty) {
+                                        // (A) scalar → flat-union
+                                        if Self::is_flat_union_scalar(from_ty) && !sv.is_struct_value() {
+                                            let result = self.flat_union_scalar_value(sv, &scalar_ty);
+                                            temp_map.insert(*dst, result.into());
+                                            continue;
+                                        }
+                                        // (B) Null → flat-union
+                                        if matches!(from_ty, lin_check::types::Type::Null) {
+                                            temp_map.insert(*dst, self.flat_union_null_value().into());
+                                            continue;
+                                        }
+                                    }
+                                }
+                                // (C) & (D): handle flat-union struct ESCAPING from ANY function
+                                // (the caller is not necessarily a flat-union fn itself).
+                                if sv.is_struct_value() {
+                                    // (C) flat-union struct → scalar
+                                    if let Some(scalar_ty) = Self::flat_union_scalar_type(from_ty) {
+                                        if Self::is_flat_union_scalar(to_ty) {
+                                            let result = self.flat_union_extract_scalar(sv.into_struct_value(), &scalar_ty);
+                                            temp_map.insert(*dst, result);
+                                            continue;
+                                        }
+                                        // (E) flat-union struct → union/AnyVal: materialize to boxed ptr
+                                        if Self::is_union_type(to_ty) || matches!(to_ty, lin_check::types::Type::TypeVar(_)) {
+                                            let mat = self.materialize_flat_union_if_needed(sv, from_ty, llvm_fn);
+                                            temp_map.insert(*dst, mat);
+                                            continue;
+                                        }
+                                    }
+                                    // (D) flat-union struct → Null (match narrowing to the Null arm)
+                                    if matches!(to_ty, lin_check::types::Type::Null) {
+                                        temp_map.insert(*dst, ptr_ty.const_null().into());
+                                        continue;
+                                    }
+                                }
                                 // The SOURCE operand's repr decides the sum-type coercion direction:
                                 // a SumNode source materializes/projects via the `sumnode_*` helpers,
                                 // not the boxed `sealed_project_from`/`box` path (which would read a
@@ -2499,7 +2671,19 @@ impl<'ctx> Codegen<'ctx> {
                             }
                         }
                         if let Some(v) = ret_val {
-                            self.builder.r#return(Some(&v));
+                            // VA.1 CPR: a flat-union function must return a `{ i1, i64 }` struct.
+                            // If the value is already a struct (from Coerce/Phi intercepts above),
+                            // return it directly. If it is still a ptr (e.g. from a `lin_map_get`
+                            // borrow+clone path), convert at the return boundary: probe the tag,
+                            // branch null vs non-null, and build the flat struct. The owned box is
+                            // released after the unbox (HARD RC RULE: worker owns → releases before ret).
+                            let return_val: BasicValueEnum<'ctx> = if is_flat_union_fn && v.is_pointer_value() {
+                                // Only do the ptr→struct conversion when the ret_ty qualifies.
+                                if let Some(scalar_ty) = Self::flat_union_scalar_type(&func.ret_ty.clone()) {
+                                    self.build_ptr_to_flat_union(v.into_pointer_value(), &scalar_ty, llvm_fn)
+                                } else { v }
+                            } else { v };
+                            self.builder.r#return(Some(&return_val));
                         } else {
                             self.builder.r#return(None);
                         }
@@ -2659,13 +2843,36 @@ impl<'ctx> Codegen<'ctx> {
 
             // Backpatch phi incoming edges now that every block (including back-edge
             // sources) has been compiled and all temps are in temp_map.
+            let flat_union_st = self.flat_union_struct_type();
             for (phi, incomings) in &pending_phis {
+                // VA.1 CPR: if this phi is a flat-union struct type, coerce each incoming value
+                // to the flat-union struct if it isn't already (e.g. a null ptr from a `Null` branch
+                // that flows directly without a Coerce instruction).
+                let phi_is_flat = phi.as_basic_value().get_type() == flat_union_st.into();
                 for (val_temp, pred_block) in incomings {
                     // Use the predecessor's EXIT block (where its branch to the merge was
                     // actually emitted), not its entry block.
                     let pred_bb = ir_block_exit.get(pred_block).or_else(|| ir_block_to_llvm.get(pred_block));
                     if let (Some(&v), Some(&pred_bb)) = (temp_map.get(val_temp), pred_bb) {
-                        phi.add_incoming(&[(&v, pred_bb)]);
+                        let incoming_val: BasicValueEnum<'ctx> = if phi_is_flat && !v.is_struct_value() {
+                            // VA.1 CPR: phi is flat-union struct but incoming value is not yet a struct.
+                            // This happens when a null literal flows directly (e.g. from a `Null`-typed
+                            // branch without a Coerce instruction) or from a Const(Null) in another path.
+                            // CloneBox and Coerce intercepts convert all other cases; only null ptrs
+                            // should reach here.
+                            if v.is_pointer_value() {
+                                let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
+                                match val_ty {
+                                    Type::Null => self.flat_union_null_value().into(),
+                                    _ => v, // should already be a struct from CloneBox/Coerce
+                                }
+                            } else {
+                                v
+                            }
+                        } else {
+                            v
+                        };
+                        phi.add_incoming(&[(&incoming_val, pred_bb)]);
                     }
                 }
             }

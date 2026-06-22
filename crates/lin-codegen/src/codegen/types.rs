@@ -133,6 +133,248 @@ impl<'ctx> Codegen<'ctx> {
             | Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::Opaque(_))
     }
 
+    // ── VA.1 CPR flat-union return ─────────────────────────────────────────────────────────────
+    //
+    // A function returning `T | Null` where `T` is a scalar (Int32/Int64/Bool/Float64/…) currently
+    // boxes the value into a heap `TaggedVal*` at every return site, and the caller immediately
+    // calls `lin_get_tag` + `lin_unbox_*` + `lin_tagged_release` to unpack it — three opaque
+    // external calls around every hot scalar-nullable boundary. The flat-union return ABI replaces
+    // the `ptr` return with a register-resident `{ i1 is_null, i64 value }` struct. No heap
+    // allocation, no RC, no opaque calls — LLVM can fold the entire branch-and-extract sequence.
+    //
+    // `T | Null` where T is a *sealed struct* is already handled by the NullableRecord repr
+    // (raw pointer or null) and does NOT go through this path. The scalar variants are the
+    // remaining gap.
+    //
+    // Qualifying types (scalar-nullable union): exactly `Union([scalar, Null])` or the reversed
+    // order, where `scalar` is one fixed-width numeric type. Floats are bitcast to i64 on store
+    // and back on load, so the struct is always `{ i1, i64 }`.
+
+    /// If `ty` is a flat-union–qualifying type (`T | Null` with scalar T), return `T`.
+    /// Otherwise `None`.
+    pub(crate) fn flat_union_scalar_type(ty: &Type) -> Option<Type> {
+        let variants = match ty {
+            Type::Union(vs) => vs,
+            _ => return None,
+        };
+        if variants.len() != 2 {
+            return None;
+        }
+        let mut scalar: Option<Type> = None;
+        for v in variants {
+            match v {
+                Type::Null => {}
+                t if Self::is_flat_union_scalar(t) => {
+                    if scalar.is_some() { return None; } // two non-null → not simple nullable
+                    scalar = Some(t.clone());
+                }
+                _ => return None,
+            }
+        }
+        scalar
+    }
+
+    /// True for types that qualify as the scalar member of a flat-union `T | Null`.
+    pub(crate) fn is_flat_union_scalar(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Bool
+                | Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_)
+                | Type::UInt8 | Type::UInt16 | Type::UInt32
+                | Type::Int64 | Type::UInt64
+                | Type::Float32 | Type::Float64
+        )
+    }
+
+    /// The LLVM struct type for a flat-union return: `{ i1 is_null, i64 value }`.
+    /// `is_null = 1` ⟹ the Null arm; `is_null = 0` ⟹ T arm (value in `value`).
+    /// Floats are bitcast to i64-bits on store and back on load.
+    pub(crate) fn flat_union_struct_type(&self) -> inkwell::types::StructType<'ctx> {
+        self.context.struct_type(
+            &[self.context.bool_type().into(), self.context.i64_type().into()],
+            false,
+        )
+    }
+
+    /// The flat-union value for a NULL return arm: `{ i1 1, i64 0 }`.
+    pub(crate) fn flat_union_null_value(&self) -> inkwell::values::StructValue<'ctx> {
+        let i1_true = self.context.bool_type().const_int(1, false);
+        let i64_zero = self.context.i64_type().const_int(0, false);
+        self.context.const_struct(&[i1_true.into(), i64_zero.into()], false)
+    }
+
+    /// Build a flat-union value from a concrete scalar LLVM value.
+    /// Widens the scalar to i64 bits (int → sext/zext; float → bitcast double bits to i64).
+    pub(crate) fn flat_union_scalar_value(
+        &mut self,
+        scalar: BasicValueEnum<'ctx>,
+        scalar_ty: &Type,
+    ) -> inkwell::values::StructValue<'ctx> {
+        let i1_false = self.context.bool_type().const_int(0, false);
+        let i64_ty = self.context.i64_type();
+        let value_i64 = match scalar_ty {
+            Type::Bool => {
+                let b = scalar.into_int_value();
+                self.builder.int_z_extend_or_bit_cast(b, i64_ty, "fu_b2i64")
+            }
+            Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_) => {
+                let i = scalar.into_int_value();
+                self.builder.int_s_extend_or_bit_cast(i, i64_ty, "fu_sext")
+            }
+            Type::UInt8 | Type::UInt16 | Type::UInt32 => {
+                let i = scalar.into_int_value();
+                self.builder.int_z_extend_or_bit_cast(i, i64_ty, "fu_zext")
+            }
+            Type::Int64 | Type::UInt64 => {
+                // Already i64 (Int64 and UInt64 both map to i64 at the LLVM level).
+                scalar.into_int_value()
+            }
+            Type::Float32 => {
+                let f32v = scalar.into_float_value();
+                let f64v = self.builder.float_ext(f32v, self.context.f64_type(), "fu_f32ext");
+                self.builder.bit_cast(f64v, i64_ty, "fu_f64bits").into_int_value()
+            }
+            Type::Float64 => {
+                let f64v = scalar.into_float_value();
+                self.builder.bit_cast(f64v, i64_ty, "fu_f64bits").into_int_value()
+            }
+            _ => i64_ty.const_zero(),
+        };
+        let st = self.flat_union_struct_type();
+        let s0 = self.builder.insert_value(st.const_zero(), i1_false, 0, "fu_set0").into_struct_value();
+        self.builder.insert_value(s0, value_i64, 1, "fu_set1").into_struct_value()
+    }
+
+    /// Extract the scalar T from a flat-union struct `{ i1, i64 }`, narrowing to `scalar_ty`.
+    pub(crate) fn flat_union_extract_scalar(
+        &mut self,
+        flat: inkwell::values::StructValue<'ctx>,
+        scalar_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let raw_i64 = self.builder.extract_value(flat, 1, "fu_val").into_int_value();
+        match scalar_ty {
+            Type::Bool => {
+                self.builder.int_truncate_or_bit_cast(raw_i64, self.context.bool_type(), "fu_bool").into()
+            }
+            Type::Int8 => self.builder.int_truncate_or_bit_cast(raw_i64, self.context.i8_type(), "fu_i8").into(),
+            Type::Int16 => self.builder.int_truncate_or_bit_cast(raw_i64, self.context.i16_type(), "fu_i16").into(),
+            Type::Int32 | Type::IntLit(_) => self.builder.int_truncate_or_bit_cast(raw_i64, self.context.i32_type(), "fu_i32").into(),
+            Type::UInt8 => self.builder.int_truncate_or_bit_cast(raw_i64, self.context.i8_type(), "fu_u8").into(),
+            Type::UInt16 => self.builder.int_truncate_or_bit_cast(raw_i64, self.context.i16_type(), "fu_u16").into(),
+            Type::UInt32 => self.builder.int_truncate_or_bit_cast(raw_i64, self.context.i32_type(), "fu_u32").into(),
+            Type::Int64 | Type::UInt64 => raw_i64.into(),
+            Type::Float32 => {
+                let f64_ty = self.context.f64_type();
+                let f64v = self.builder.bit_cast(raw_i64, f64_ty, "fu_bitf64").into_float_value();
+                self.builder.float_trunc(f64v, self.context.f32_type(), "fu_f32").into()
+            }
+            Type::Float64 => {
+                let f64_ty = self.context.f64_type();
+                self.builder.bit_cast(raw_i64, f64_ty, "fu_f64").into()
+            }
+            _ => raw_i64.into(),
+        }
+    }
+
+    /// Materialize a flat-union `{ i1, i64 }` struct into a boxed `TaggedVal*` for use at
+    /// escape boundaries (e.g. passing to `lin_tagged_to_string`, an intrinsic, or a
+    /// runtime-named call that expects a boxed `ptr`).
+    ///
+    /// If `v` is not a struct (already a ptr), returns it unchanged.
+    /// If `v` is a flat-union struct, emits: if is_null → lin_box_null() else lin_box_scalar(val).
+    pub(crate) fn materialize_flat_union_if_needed(
+        &mut self,
+        v: BasicValueEnum<'ctx>,
+        lin_ty: &Type,
+        llvm_fn: inkwell::values::FunctionValue<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        if !v.is_struct_value() {
+            return v;
+        }
+        let scalar_ty = match Self::flat_union_scalar_type(lin_ty) {
+            Some(s) => s,
+            None => return v, // not a flat-union type, return as-is
+        };
+        let flat = v.into_struct_value();
+        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+        let is_null = self.builder.extract_value(flat, 0, "mat_isnull").into_int_value();
+        let null_bb = self.context.append_basic_block(llvm_fn, "mat_null");
+        let val_bb  = self.context.append_basic_block(llvm_fn, "mat_val");
+        let mrg_bb  = self.context.append_basic_block(llvm_fn, "mat_mrg");
+        self.builder.conditional_branch(is_null, null_bb, val_bb);
+        self.builder.position_at_end(null_bb);
+        let null_box = self.builder.call(self.rt.box_null, &[], "mat_boxnull")
+            .try_as_basic_value().unwrap_basic();
+        let null_pred = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(mrg_bb);
+        self.builder.position_at_end(val_bb);
+        let scalar_val = self.flat_union_extract_scalar(flat, &scalar_ty);
+        let scalar_box = self.box_value(scalar_val, &scalar_ty);
+        let val_pred = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(mrg_bb);
+        self.builder.position_at_end(mrg_bb);
+        let phi = self.builder.phi(ptr_ty, "mat_box");
+        phi.add_incoming(&[(&null_box, null_pred), (&scalar_box, val_pred)]);
+        phi.as_basic_value()
+    }
+
+    /// Convert a boxed `TaggedVal*` to a flat-union `{ i1, i64 }` struct at a return boundary.
+    ///
+    /// Emits:
+    ///   tag = lin_get_tag(ptr)
+    ///   is_null = (tag == TAG_NULL)
+    ///   if is_null → release ptr, return { i1=1, i64=0 }
+    ///   else       → i64 = lin_unbox_*(ptr), release ptr, return { i1=0, i64=i64 }
+    ///
+    /// This is the "Return boundary" conversion: a flat-union function that produced its
+    /// return value via an opaque box (e.g. `lin_map_get` + `lin_tagged_clone`) needs to
+    /// convert at the return site. The owned box is released after unboxing (HARD RC RULE).
+    pub(crate) fn build_ptr_to_flat_union(
+        &mut self,
+        ptr: inkwell::values::PointerValue<'ctx>,
+        scalar_ty: &Type,
+        llvm_fn: inkwell::values::FunctionValue<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        let i8_ty = self.context.i8_type();
+        let tag = self.builder.call(self.rt.get_tag, &[ptr.into()], "fu_tag")
+            .try_as_basic_value().unwrap_basic().into_int_value();
+        let is_null = self.builder.int_compare(
+            inkwell::IntPredicate::EQ, tag,
+            i8_ty.const_int(TAG_NULL as u64, false),
+            "fu_isnull",
+        );
+        let null_bb = self.context.append_basic_block(llvm_fn, "fu_ret_null");
+        let val_bb  = self.context.append_basic_block(llvm_fn, "fu_ret_val");
+        let mrg_bb  = self.context.append_basic_block(llvm_fn, "fu_ret_mrg");
+        self.builder.conditional_branch(is_null, null_bb, val_bb);
+
+        // Null arm: release the box, produce {1, 0}.
+        self.builder.position_at_end(null_bb);
+        self.builder.call(self.rt.tagged_release, &[ptr.into()], "");
+        let null_pred = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(mrg_bb);
+
+        // Value arm: unbox scalar, release the box, produce {0, bits}.
+        self.builder.position_at_end(val_bb);
+        let scalar_llvm = self.unbox_value(ptr.into(), scalar_ty);
+        self.builder.call(self.rt.tagged_release, &[ptr.into()], "");
+        let scalar_struct = self.flat_union_scalar_value(scalar_llvm, scalar_ty);
+        let val_pred = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(mrg_bb);
+
+        // Merge.
+        self.builder.position_at_end(mrg_bb);
+        let st_ty = self.flat_union_struct_type();
+        let phi = self.builder.phi(st_ty, "fu_ret_phi");
+        phi.add_incoming(&[
+            (&self.flat_union_null_value(), null_pred),
+            (&scalar_struct, val_pred),
+        ]);
+        phi.as_basic_value()
+    }
+
+    // ── end VA.1 CPR helpers ───────────────────────────────────────────────────────────────────
+
     /// Returns the LLVM struct type for a closure header.
     ///
     /// Layout (32 bytes):
