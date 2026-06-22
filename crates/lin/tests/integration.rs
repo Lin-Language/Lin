@@ -4178,6 +4178,60 @@ print(leg["trip"]["tripId"])
 }
 
 #[test]
+fn test_crossmod_recursive_union_type_does_not_hang() {
+    // Regression: importing a recursive named union type from another module used to hang the
+    // type-checker in an infinite compatibility loop. The root cause was that the export-collection
+    // pass re-resolved type bodies with a fresh `visiting` set, causing `Named("Ast")` references
+    // inside `BinOp` to be expanded one level deeper than the same-file representation. That
+    // structural mismatch prevented the fast-path equality check in `is_compatible_env`, triggering
+    // exponential recursion (2^depth paths × many checks). The fix: expand already-resolved env
+    // bodies with the type name pre-seeded in `visiting`, keeping cross-module bodies structurally
+    // identical to same-file bodies.
+    let dir = std::env::temp_dir().join(format!("lin_crossmod_rectype_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("ast.lin"),
+        "export type Num = { \"kind\": \"num\", \"value\": Int32 }\n\
+         export type BinOp = { \"kind\": \"binop\", \"op\": String, \"left\": Ast, \"right\": Ast }\n\
+         export type Ast = Num | BinOp\n",
+    )
+    .unwrap();
+    let main = format!(
+        r#"import {{ print }} from "std/io"
+import {{ Ast }} from "{dir}/ast"
+
+val ev = (node: Ast): Int32 =>
+  if node["kind"] == "num" then node["value"] ?? 0
+  else
+    val left: Ast = node["left"] ?? {{ "kind": "num", "value": 0 }}
+    val right: Ast = node["right"] ?? {{ "kind": "num", "value": 0 }}
+    ev(left) + ev(right)
+
+val lit: Ast = {{ "kind": "num", "value": 42 }}
+print(ev(lit))
+"#,
+        dir = dir.to_str().unwrap()
+    );
+    // Must type-check quickly (the old code hung indefinitely); we only care that check succeeds.
+    let main_path = dir.join("main.lin");
+    std::fs::write(&main_path, &main).unwrap();
+    let out = lin_cmd()
+        .args(["check", main_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "cross-module recursive type should type-check cleanly: {combined}"
+    );
+}
+
+#[test]
 fn test_imported_type_unknown_without_import() {
     // The type is only visible when imported: using `Point` without importing it from the
     // module that exports it is still "Unknown type" (the registration is scoped to imports).
