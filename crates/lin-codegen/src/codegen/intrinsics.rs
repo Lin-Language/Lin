@@ -320,11 +320,7 @@ impl<'ctx> Codegen<'ctx> {
                         } else {
                             arr
                         };
-                        // Sum-type unions (Packed(SumNode) repr) are NOT already-boxed TaggedVal*
-                        // even though is_union_type returns true for them — their runtime value is a
-                        // raw *SumNode. They must be materialized+boxed like concrete values.
-                        // Mirror of the fix in call.rs boxed_abi_wrapper_full return path.
-                        let elem_is_fresh_box = !Self::is_union_type(&elem_ty) || Self::is_sum_type(&elem_ty);
+                        let elem_is_fresh_box = !Self::is_union_type(&elem_ty);
                         let elem_tagged = if elem_is_fresh_box {
                             self.box_value(elem, &elem_ty)
                         } else { elem };
@@ -333,21 +329,6 @@ impl<'ctx> Codegen<'ctx> {
                         self.builder.call(push_dyn_fn, &[arr_raw.into(), elem_tagged.into()], "");
                         if elem_is_fresh_box && elem_tagged.is_pointer_value() {
                             self.builder.call(self.rt.tagged_release, &[elem_tagged.into()], "");
-                        }
-                        // A sum-type element: box_value materialized *SumNode → fresh LinMap and
-                        // boxed it. The materializer BORROWS the SumNode (borrows its fields), so
-                        // the original *SumNode owned ref is not consumed — release it here so that
-                        // the push doesn't leak the source SumNode. (Non-sum union elements are
-                        // already-boxed TaggedVal* and are NOT released here — they are consumed by
-                        // lin_push_dyn's retaining contract and freed by the tagged_release above.)
-                        if Self::is_sum_type(&elem_ty) && elem.is_pointer_value() {
-                            let i64_ty = self.context.i64_type();
-                            let total = Self::sumnode_total_size(&elem_ty);
-                            self.builder.call(
-                                self.rt.sumnode_release,
-                                &[elem.into_pointer_value().into(), i64_ty.const_int(total, false).into()],
-                                "",
-                            );
                         }
                     } else {
                         // arr is a raw tagged LinArray* of known element type (move semantics).
