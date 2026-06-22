@@ -10,6 +10,7 @@ use lin_check::typed_ir::TypedModule;
 use lin_check::types::Type;
 use lin_check::{Checker, ModuleSignature};
 use lin_codegen::Codegen;
+pub use lin_codegen::PgoMode;
 use lin_lex::Lexer;
 use lin_parse::ast::{Module, Stmt};
 use lin_parse::Parser;
@@ -27,6 +28,10 @@ pub struct CompileOptions {
     /// object file's debug sections, and keeps `val` globals at default linkage so the debugger can
     /// resolve them. Default false — normal builds are byte-unaffected.
     pub debug: bool,
+    /// Profile-Guided Optimization mode. Defaults to `PgoMode::None` (standard O2, byte-identical
+    /// to the previous behaviour). Set by `LIN_PGO_GEN=1` (instrument) or
+    /// `LIN_PGO_USE=<profdata>` (use merged profile). See `docs/PERFORMANCE.md §5.8`.
+    pub pgo: PgoMode,
 }
 
 #[derive(Debug)]
@@ -411,7 +416,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     // break the line-table mapping. `opts.optimize` is already false in `--debug` (set by the CLI),
     // but guard here too so debug info is never run through the optimiser.
     if opts.optimize && !opts.debug {
-        cg.run_optimization_passes().map_err(CompileError::Codegen)?;
+        cg.run_optimization_passes(&opts.pgo).map_err(CompileError::Codegen)?;
     }
 
     cg.verify().map_err(CompileError::Codegen)?;
@@ -433,7 +438,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     }
 
     // 8. Link with runtime and any foreign libraries
-    link(&obj_path, &opts.output_path, &foreign_libs, opts.coverage, opts.debug)?;
+    link(&obj_path, &opts.output_path, &foreign_libs, opts.coverage, &opts.pgo, opts.debug)?;
 
     // Clean up the .o file — but KEEP it for debug builds. On Linux lldb reads DWARF from the linked
     // binary, but on macOS the debug map points lldb at the individual .o, so removing it breaks
@@ -1637,15 +1642,16 @@ fn select_link_detail_lines(detail: &str) -> Vec<&str> {
     lines().take(MAX_LINES).collect()
 }
 
-fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: bool, debug: bool) -> Result<(), CompileError> {
+fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: bool, pgo: &PgoMode, debug: bool) -> Result<(), CompileError> {
     // Find the lin-runtime static library.
     let runtime_lib = find_runtime_lib();
 
-    // The default link driver is the system `cc` (typically gcc). For coverage we instead drive
-    // the link through clang, because the LLVM profile runtime (`libclang_rt.profile`) and the
-    // `-fprofile-instr-generate` flag that pulls it in are clang's — gcc doesn't understand them.
-    // clang locates the correct host-arch runtime itself, so we never hardcode a path or arch.
-    let driver = if coverage { coverage_link_driver() } else { "cc".to_string() };
+    // The default link driver is the system `cc` (typically gcc). For coverage or PGO-GEN we
+    // instead drive the link through clang, because the LLVM profile runtime
+    // (`libclang_rt.profile`) and the `-fprofile-instr-generate` flag that pulls it in are
+    // clang's — gcc doesn't understand them. clang locates the correct host-arch runtime itself.
+    let pgo_gen = matches!(pgo, PgoMode::Generate);
+    let driver = if coverage || pgo_gen { coverage_link_driver() } else { "cc".to_string() };
 
     let mut cmd = Command::new(&driver);
     cmd.arg(obj_path)
@@ -1727,13 +1733,13 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
         }
     }
 
-    // Link the LLVM profile runtime when coverage instrumentation is enabled. Rather than
+    // Link the LLVM profile runtime when coverage or PGO instrumentation is enabled. Rather than
     // hardcoding the absolute path to `libclang_rt.profile-<arch>.a` (which bakes in the LLVM
     // patch version, host arch, and install prefix), let the `cc` driver locate and link the
     // correct runtime for this host via `-fprofile-instr-generate`. clang resolves the right
     // libclang_rt.profile itself, including its required deps (pthread/dl/rt on Linux). This is
     // portable across LLVM minor versions, architectures, and distros.
-    if coverage {
+    if coverage || pgo_gen {
         cmd.arg("-fprofile-instr-generate");
     }
 

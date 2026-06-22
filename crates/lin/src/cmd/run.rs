@@ -39,6 +39,7 @@ pub fn run(args: &RunArgs) {
         optimize: !(args.no_opt || args.debug || std::env::var("LIN_NO_OPT").is_ok()),
         coverage: false,
         debug: args.debug,
+        pgo: lin_compile::PgoMode::None,
     };
 
     let path = args.file.display().to_string();

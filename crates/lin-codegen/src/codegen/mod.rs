@@ -13,6 +13,7 @@ use inkwell::attributes::AttributeLoc;
 use inkwell::{AddressSpace, OptimizationLevel};
 use std::collections::HashMap;
 use std::path::Path;
+use std::ffi::CString;
 
 use lin_check::typed_ir::*;
 use lin_check::types::Type;
@@ -331,7 +332,7 @@ impl<'ctx> Codegen<'ctx> {
     }
 
 
-    pub fn run_optimization_passes(&self) -> Result<(), String> {
+    pub fn run_optimization_passes(&self, pgo: &crate::PgoMode) -> Result<(), String> {
         Target::initialize_all(&InitializationConfig::default());
         let triple = TargetMachine::get_default_triple();
         let target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
@@ -348,9 +349,34 @@ impl<'ctx> Codegen<'ctx> {
             )
             .ok_or("Failed to create target machine for optimization")?;
 
+        let pipeline = match pgo {
+            crate::PgoMode::None => "default<O2>".to_string(),
+            // pgo-instr-gen inserts llvm.instrprof.increment intrinsics; instrprof lowers them to
+            // counter globals before the main optimisation pipeline runs on the instrumented IR.
+            crate::PgoMode::Generate => "pgo-instr-gen,instrprof,default<O2>".to_string(),
+            // pgo-instr-use annotates branch weights from the merged profile, then optimises.
+            // The profile path is communicated to the LLVM pass via the global LLVM cl option
+            // `--pgo-test-profile-file` (the only stable mechanism exposed by the C API).
+            crate::PgoMode::Use { path } => {
+                // LLVMParseCommandLineOptions sets global LLVM cl:: options. We own the strings
+                // for the lifetime of the call; they are only read inside the C function.
+                let argv0 = CString::new("lin").unwrap();
+                let flag = CString::new(format!("--pgo-test-profile-file={}", path)).unwrap();
+                let argv: [*const std::os::raw::c_char; 2] = [argv0.as_ptr(), flag.as_ptr()];
+                unsafe {
+                    llvm_sys::support::LLVMParseCommandLineOptions(
+                        2,
+                        argv.as_ptr(),
+                        std::ptr::null(),
+                    );
+                }
+                "pgo-instr-use,default<O2>".to_string()
+            }
+        };
+
         let options = PassBuilderOptions::create();
         self.module
-            .run_passes("default<O2>", &machine, options)
+            .run_passes(&pipeline, &machine, options)
             .map_err(|e| e.to_string())
     }
 
