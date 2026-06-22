@@ -3203,6 +3203,7 @@ pub(crate) fn lower_flatmap_terminal(
                 b.emit(Instruction::Index {
                     dst: inner_elem, object: inner, key: j,
                     obj_ty: fm_ret.clone(), key_ty: Type::Int64, result_ty: json.clone(),
+                    nonneg: false,
                 });
                 let borrowed = is_borrowed_heap_elem(&inner_elem_ty);
                 push_output(out, flat, &out_elem_ty, inner_elem, &json, borrowed, b);
@@ -3998,6 +3999,7 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
         builder.emit(Instruction::Index {
             dst: elem, object: iterable, key: i,
             obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
+            nonneg: false,
         });
         let idx = narrow_loop_index(i, builder);
         // Direct call: pass (acc, elem, idx) coerced to callee's native params. call_body_direct
