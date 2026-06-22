@@ -24,6 +24,16 @@ pub(crate) fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut 
                 );
                 builder.slots.insert(*slot, t);
             } else {
+                // CL.4 LSS: if this val is a non-global capturing Function literal, record its
+                // TypedExpr so `inlinable_local_fn` can unwrap a `LocalGet{slot}` back to the
+                // original lambda body when the value is later passed as a combinator callback.
+                // Only non-global (local) function vals participate — top-level functions use the
+                // `global_fn_slots` path above and are handled by CL.3 no-capture devirt.
+                if matches!(value, TypedExpr::Function { .. })
+                    && !ctx.global_fn_slots.contains_key(slot)
+                {
+                    builder.local_fn_exprs.insert(*slot, value.clone());
+                }
                 // Store the value in the slot's declared representation: a concrete value
                 // bound to a Json/union slot must be boxed so later reads (LocalGet, is/has)
                 // see a TaggedVal*. A sealed scalar-record slot bound to an object literal is

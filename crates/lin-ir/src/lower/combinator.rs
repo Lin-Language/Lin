@@ -224,6 +224,36 @@ pub(crate) fn inlinable_capturing_lambda<'a>(
     Some((params, body))
 }
 
+/// CL.4 LSS: resolve a callback expr to an inlinable lambda body, returning OWNED clones of
+/// params and body. Handles both literal lambdas and stored capturing lambdas (a `LocalGet{slot}`
+/// where `builder.local_fn_exprs[slot]` is a capturing Function literal).
+///
+/// This extends `inlinable_capturing_lambda` to cover the stored-capturing-lambda case: when a
+/// lambda is bound via `val cb = (x) => x + local` and passed to a combinator as `arr.map(cb)`,
+/// `inlinable_capturing_lambda` sees a `LocalGet` (not a `Function`) and bails to the boxed-closure
+/// indirect call. With this, the combinator inline path fires on `cb` too. Returns owned clones
+/// because the `builder` borrow (needed to look up `local_fn_exprs`) must not outlive the check —
+/// the calling site immediately mutates `builder` to emit IR.
+pub(crate) fn inlinable_local_fn(
+    expr: &TypedExpr,
+    builder: &FuncBuilder,
+    ctx: &LowerCtx,
+) -> Option<(Vec<TypedParam>, TypedExpr)> {
+    // First try the direct inline path (inline literal lambda).
+    if let Some((params, body)) = inlinable_capturing_lambda(expr, builder, ctx) {
+        return Some((params.to_vec(), body.clone()));
+    }
+    // CL.4: for a LocalGet, look up the stored lambda expression.
+    if let TypedExpr::LocalGet { slot, .. } = expr {
+        if let Some(fn_expr) = builder.local_fn_exprs.get(slot) {
+            if let Some((params, body)) = inlinable_capturing_lambda(fn_expr, builder, ctx) {
+                return Some((params.to_vec(), body.clone()));
+            }
+        }
+    }
+    None
+}
+
 /// Is a single capture's `outer_slot` resolvable in the enclosing builder with a matching
 /// representation? See `inlinable_capturing_lambda` for the rationale.
 pub(crate) fn capture_resolvable(cap: &Capture, builder: &FuncBuilder, ctx: &LowerCtx) -> bool {
@@ -1334,7 +1364,7 @@ pub(crate) fn extract_fuse_chain<'a>(
         if matches!(args[0].ty(), Type::Stream(_)) {
             break;
         }
-        let Some((params, body)) = inlinable_capturing_lambda(&args[1], builder, ctx) else { break };
+        let Some((params, body)) = inlinable_local_fn(&args[1], builder, ctx) else { break };
         // REPR GATE (Step 8.1 widening — sound subset): fuse when the value FLOWING INTO this stage
         // has a representation whose per-element materialize-and-reclaim the fused loop's RC discipline
         // covers (`fuse_elem_repr_reclaimable`): an inline scalar (no RC), a SEALED-SCALAR record
@@ -1902,7 +1932,7 @@ pub(crate) fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut
     }
     // FUSED CHAIN (path-6 6a): base.map/filter chain into the `for` loop (no intermediate array).
     // Requires an inlinable side-effecting body lambda and at least one fusible stage; bails otherwise.
-    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+    if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[1], builder, ctx) {
         let (base, stages) = extract_fuse_chain(&args[0], builder, ctx);
         if !stages.is_empty() {
             let lam_params = lam_params.to_vec();
@@ -1970,7 +2000,7 @@ pub(crate) fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut
     // per-element box ABI / indirect call. Captured slots resolve through the enclosing builder's
     // bindings (ADR-012 cell/global semantics preserved); the back-edge is patched latch-relative by
     // `emit_index_loop` even when the inlined body emits its own blocks (inner combinator / match / if).
-    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+    if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[1], builder, ctx) {
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let elem_ty = read_elem_ty.clone();
@@ -2096,7 +2126,7 @@ pub(crate) fn lower_range_for(
     // resolve through the enclosing builder's slots/cell_slots/global_var_slots (the SAME bindings the
     // closure would have captured), so a captured `var` mutation hits the same shared global/cell —
     // ADR-012 intact. No closure alloc, no per-element box, no indirect call, no return-box release.
-    let inline_lam = inlinable_capturing_lambda(callback, builder, ctx);
+    let inline_lam = inlinable_local_fn(callback, builder, ctx);
     // Lower the (boxed) callback closure ONLY when we are NOT inlining — otherwise the closure value
     // is unused.
     let body = if inline_lam.is_none() {
@@ -2221,7 +2251,7 @@ pub(crate) fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &m
     // enclosing builder's bindings (ADR-012). Unlike `for`/`map`/`filter`, `while` must EXIT early on
     // a false predicate, not just skip — so it drives `emit_combinator_loop` with `LoopFlow::ContinueIf`
     // (the helper wires the body's `keep` Bool into a `CondJump → latch / exit`).
-    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+    if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[1], builder, ctx) {
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let elem_ty = read_elem_ty.clone();
@@ -2374,7 +2404,7 @@ pub(crate) fn lower_some(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mu
     // Element-box RC: mirrors `lower_while`'s predicate path exactly (fully reclaimed).
     // Result: build an explicit PHI (Bool) that starts `false` and flips to `true` when the
     // predicate fires, then the header re-checks it to short-circuit.
-    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+    if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[1], builder, ctx) {
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let elem_ty = read_elem_ty.clone();
@@ -2571,7 +2601,7 @@ pub(crate) fn lower_every(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &m
 
     // INLINE FAST PATH: literal lambda spliced in. Loop while predicate holds (stop on first false).
     // Result starts `true`; the PHI flips to `false` when predicate fails.
-    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+    if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[1], builder, ctx) {
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let elem_ty = read_elem_ty.clone();
@@ -2786,7 +2816,7 @@ pub(crate) fn lower_find(args: &[TypedExpr], result_type: &Type, builder: &mut F
     }
 
     // INLINE FAST PATH: literal lambda spliced in.
-    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+    if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[1], builder, ctx) {
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let elem_ty = read_elem_ty.clone();
@@ -3222,7 +3252,7 @@ pub(crate) fn lower_flatmap_terminal(
         }
     }
 
-    let (fm_params, fm_body) = inlinable_capturing_lambda(&args[1], builder, ctx)?;
+    let (fm_params, fm_body) = inlinable_local_fn(&args[1], builder, ctx)?;
     let fm_params = fm_params.to_vec();
     let fm_body = fm_body.clone();
     // The flatMap inner element repr must be fuse-reclaimable (or `Never`, the provably-empty
@@ -3284,7 +3314,7 @@ pub(crate) fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut Fu
     // struct-push. A heap/sealed OUTPUT element (`map(t => t)` / `map(t => {…})` producing `Trip[]` /
     // `Object[]`) is left to the per-stage path (the packed-struct-push repr boundary is out of scope).
     if is_inline_scalar(&out_elem_ty) {
-    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+    if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[1], builder, ctx) {
         let (base, stages) = extract_fuse_chain(&args[0], builder, ctx);
         if !stages.is_empty() {
             let lam_params = lam_params.to_vec();
@@ -3355,7 +3385,7 @@ pub(crate) fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut Fu
     // with no closure alloc and no per-element box/unbox/indirect call. Captured slots resolve through
     // the enclosing builder's bindings (see `inlinable_capturing_lambda`); the CFG back-edge is patched
     // latch-relative by `emit_index_loop` even when the inlined body emits its own blocks.
-    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+    if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[1], builder, ctx) {
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
@@ -3425,7 +3455,7 @@ pub(crate) fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut
     // pushes by value with no per-element RC. A heap/sealed survivor (a `Trip[]`-preserving filter
     // chain) is left to the per-stage path — its packed/borrowed push RC is out of scope here.
     if is_inline_scalar(&out_elem_ty) {
-        if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+        if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[1], builder, ctx) {
             let (base, stages) = extract_fuse_chain(&args[0], builder, ctx);
             if !stages.is_empty() {
                 let lam_params = lam_params.to_vec();
@@ -3529,7 +3559,7 @@ pub(crate) fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut
     // no closure, no boxed call. Captured slots resolve through the enclosing builder's bindings; the
     // keep/skip blocks the body and the predicate join emit are patched latch-relative by
     // `emit_index_loop`.
-    if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[1], builder, ctx) {
+    if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[1], builder, ctx) {
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
@@ -3827,7 +3857,7 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
     // and the accumulator is a concrete scalar, fold the transformer stages INTO the reduce loop.
     // Only fires with at least one fusible stage; else falls through to the single-combinator paths.
     if is_inline_scalar(result_type) {
-        if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[2], builder, ctx) {
+        if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[2], builder, ctx) {
             let (base, stages) = extract_fuse_chain(&args[0], builder, ctx);
             if !stages.is_empty() {
                 let lam_params = lam_params.to_vec();
@@ -3859,7 +3889,7 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
     // accumulator representation): a union/Json/heap accumulator keeps the boxed Json-phi path below
     // (its phi must carry a uniform boxed ptr, and the inline machinery here assumes a value phi).
     if is_inline_scalar(result_type) {
-        if let Some((lam_params, lam_body)) = inlinable_capturing_lambda(&args[2], builder, ctx) {
+        if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[2], builder, ctx) {
             let lam_params = lam_params.to_vec();
             let lam_body = lam_body.clone();
             let acc_ty = result_type.clone();
@@ -4502,7 +4532,7 @@ pub(crate) fn lower_entries_inline(
         return Some(builder.const_temp(Const::Null));
     }
 
-    let lam = inlinable_capturing_lambda(&args[1], builder, ctx)?;
+    let lam = inlinable_local_fn(&args[1], builder, ctx)?;
     let lam_params = lam.0.to_vec();
     let lam_body = lam.1.clone();
 

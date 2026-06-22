@@ -812,6 +812,12 @@ pub(crate) struct FuncBuilder {
     /// `Instruction::Index` whose `key` temp is in this set, enabling the flat-array read
     /// path to skip the negative-wrap select and emit the IRCE-eligible `0 <= idx < len` form.
     pub(crate) nonneg_range_ivs: std::collections::HashSet<Temp>,
+    /// CL.4 LSS: local val bindings whose value is a Function expression (possibly capturing).
+    /// Slot → cloned TypedExpr::Function. Populated in `lower_stmt` for non-global `val`s whose
+    /// value is a capturing Function literal. `inlinable_local_fn` consults this map to unwrap a
+    /// `LocalGet{slot}` back to the original lambda body, enabling the combinator inline path to
+    /// fire even when the callback arrives as a stored value rather than an inline literal.
+    pub(crate) local_fn_exprs: HashMap<usize, TypedExpr>,
 }
 
 impl FuncBuilder {
@@ -861,6 +867,7 @@ impl FuncBuilder {
             escaping_cells: std::collections::HashSet::new(),
             escape_alias: HashMap::new(),
             nonneg_range_ivs: std::collections::HashSet::new(),
+            local_fn_exprs: HashMap::new(),
         }
     }
 
