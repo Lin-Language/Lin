@@ -644,6 +644,13 @@ impl<'ctx> Codegen<'ctx> {
                     // `mark_user_fn_nounwind`). (Runtime `lin_*` decls are not marked — the
                     // Rust runtime is `panic = "unwind"`.)
                     self.mark_user_fn_nounwind(f);
+                    // INT (E0.2): internal linkage lets the O2 inliner delete absorbed bodies
+                    // and allows globaldce to remove dead functions. `main` must stay external
+                    // (C runtime entry point). All other user functions are single-module and
+                    // have no cross-object-file callers.
+                    if name != "main" {
+                        f.set_linkage(inkwell::module::Linkage::Internal);
+                    }
                     f
                 }
             } else {
@@ -653,6 +660,9 @@ impl<'ctx> Codegen<'ctx> {
                 else {
                     let f = self.module.add_function(&name, fn_ty, None);
                     self.mark_user_fn_nounwind(f);
+                    if name != "main" {
+                        f.set_linkage(inkwell::module::Linkage::Internal);
+                    }
                     f
                 }
             };

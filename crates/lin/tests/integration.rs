@@ -14299,14 +14299,14 @@ print(identity("hello"))
     let _ = fs::remove_file(&ll_path);
 
     // The specialization exists, takes and returns native i32.
-    assert!(ll.contains("define i32 @\"identity$Int32\"(i32"),
+    assert!(ll.contains("define internal i32 @\"identity$Int32\"(i32"),
         "expected an unboxed i32 specialization, IR:\n{}", ll);
     // The call site passes a native i32 directly (no boxing of the argument).
     assert!(ll.contains("call i32 @\"identity$Int32\"(i32 5)"),
         "expected a native-i32 call to the Int32 specialization, IR:\n{}", ll);
 
     // No box/unbox appears inside the identity$Int32 body. Slice out its definition and check.
-    let body_start = ll.find("define i32 @\"identity$Int32\"").unwrap();
+    let body_start = ll.find("define internal i32 @\"identity$Int32\"").unwrap();
     let body = &ll[body_start..];
     let body_end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
     let body = &body[..body_end];
@@ -14375,7 +14375,7 @@ print(toString(a[0] + a[2]))
     let _ = fs::remove_file(&ll_path);
 
     // The monomorph body allocates a FLAT i32 array.
-    let body_start = ll.find("define ptr @\"allocT$Int32\"").expect("missing allocT$Int32 monomorph");
+    let body_start = ll.find("define internal ptr @\"allocT$Int32\"").expect("missing allocT$Int32 monomorph");
     let body = &ll[body_start..];
     let body_end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
     let body = &body[..body_end];
@@ -14437,7 +14437,7 @@ print(toString(scan(1, 0)))
     // not a `call lin_flat_array_get_i32`. The runtime accessor only appears on the cold OOB path
     // (`flat_get_oob`), so a `call` to it inside the function is allowed but must NOT be on the
     // straight-line read path.
-    let start = ll.find("define i32 @scan(").expect("missing scan fn");
+    let start = ll.find("define internal i32 @scan(").expect("missing scan fn");
     let body = &ll[start..];
     let end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
     let body = &body[..end];
@@ -14576,8 +14576,8 @@ print(a[1])
     let _ = fs::remove_file(&bin_path);
     let _ = fs::remove_file(&ll_path);
 
-    let body_start = ll.find("define ptr @\"allocT$Str\"")
-        .or_else(|| ll.find("define ptr @\"allocT$String\""))
+    let body_start = ll.find("define internal ptr @\"allocT$Str\"")
+        .or_else(|| ll.find("define internal ptr @\"allocT$String\""))
         .expect("missing allocT String monomorph");
     let body = &ll[body_start..];
     let body_end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
@@ -14668,7 +14668,7 @@ print(toString(doubled[0]))
     let _ = fs::remove_file(&bin_path);
     let _ = fs::remove_file(&ll_path);
 
-    let body_start = ll.find("define ptr @\"mymap$Int32_Int32\"").expect("missing mymap$Int32_Int32 monomorph");
+    let body_start = ll.find("define internal ptr @\"mymap$Int32_Int32\"").expect("missing mymap$Int32_Int32 monomorph");
     let body = &ll[body_start..];
     let body_end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
     let body = &body[..body_end];
@@ -14835,12 +14835,12 @@ print(toString(wrap(42)))
     let _ = fs::remove_file(&bin_path);
     let _ = fs::remove_file(&ll_path);
 
-    assert!(ll.contains("define i32 @\"wrap$Int32\"(i32"),
+    assert!(ll.contains("define internal i32 @\"wrap$Int32\"(i32"),
         "expected an unboxed i32 wrap specialization, IR:\n{}", ll);
-    assert!(ll.contains("define i32 @\"id$Int32\"(i32"),
+    assert!(ll.contains("define internal i32 @\"id$Int32\"(i32"),
         "expected an unboxed i32 id specialization, IR:\n{}", ll);
     // wrap$Int32 body must call id$Int32 directly (native).
-    let body_start = ll.find("define i32 @\"wrap$Int32\"").unwrap();
+    let body_start = ll.find("define internal i32 @\"wrap$Int32\"").unwrap();
     let body = &ll[body_start..];
     let body_end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
     let body = &body[..body_end];
@@ -15069,7 +15069,7 @@ print(id("hi"))
     let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
     let _ = fs::remove_dir_all(&dir);
 
-    assert!(ll.contains("define i32 @\"id$Int32\"(i32"),
+    assert!(ll.contains("define internal i32 @\"id$Int32\"(i32"),
         "expected a native i32 cross-module specialization, IR:\n{}", ll);
     assert!(ll.contains("call i32 @\"id$Int32\"(i32 5)"),
         "expected a native-i32 call to the cross-module Int32 specialization, IR:\n{}", ll);
@@ -15226,7 +15226,7 @@ print(toString(firstOf(ints)))
     // The AnyVal instantiation is named `$AnyVal` (tagged), the Int32 one `$Int32` (flat).
     assert!(ll.contains("\"firstOf$AnyVal\""),
         "expected a tagged firstOf$AnyVal monomorph for the AnyVal arg, IR:\n{}", ll);
-    assert!(ll.contains("define i32 @\"firstOf$Int32\"(ptr"),
+    assert!(ll.contains("define internal i32 @\"firstOf$Int32\"(ptr"),
         "expected a flat i32 firstOf$Int32 monomorph for the Int32[] arg, IR:\n{}", ll);
     // Soundness guard: never an unbound-TypeVar `$T<id>` garbage monomorph.
     let re = regex_lite_find_t_id(&ll);
