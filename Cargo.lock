@@ -1005,6 +1005,7 @@ dependencies = [
  "flate2",
  "indexmap",
  "inkwell",
+ "libc",
  "lin-check",
  "lin-common",
  "lin-ir",
