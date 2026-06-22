@@ -1080,24 +1080,23 @@ impl<'ctx> Codegen<'ctx> {
                                         // ANY packed repr (PackedStruct / PackedSealedArray /
                                         // ColumnarArray / SumNode / NullableRecord) is a RAW heap
                                         // pointer whose offset-0 u32 is its own refcount — bump it
-                                        // with lin_rc_retain (null-guarded). This MUST take priority
-                                        // over the `is_union_type(ty)` arm below: a packed value
-                                        // (e.g. a `Trip` PackedStruct) can carry a union STATIC type
-                                        // when it flows into a `Trip | Null` slot (shared raw-pointer
-                                        // repr, no Coerce). Routing it to lin_tagged_retain would read
-                                        // offset 0 as a TAG byte and offset 8 as an inner payload
-                                        // pointer — type-confusion + UAF (the captured-record-`var`
-                                        // -across-a-call-in-a-closure crash, ADR-083).
-                                        self.builder.call(self.rt.rc_retain, &[v.into()], "");
+                                        // inline (null-guarded). This MUST take priority over the
+                                        // `is_union_type(ty)` arm below: a packed value (e.g. a
+                                        // `Trip` PackedStruct) can carry a union STATIC type when it
+                                        // flows into a `Trip | Null` slot (shared raw-pointer repr, no
+                                        // Coerce). Routing it to lin_tagged_retain would read offset 0
+                                        // as a TAG byte and offset 8 as an inner payload pointer —
+                                        // type-confusion + UAF (ADR-083).
+                                        self.emit_rc_retain_inline(v.into_pointer_value());
                                     } else if Self::is_union_type(ty) {
                                         // A boxed TaggedVal*: bump the INNER payload's rc
-                                        // (tag-aware). lin_rc_retain would hit the tag byte at
+                                        // (tag-aware). The inline retain would hit the tag byte at
                                         // offset 0 and corrupt it.
                                         let retain_fn = self.get_or_declare_fn("lin_tagged_retain",
                                             self.context.void_type().fn_type(&[ptr_ty.into()], false));
                                         self.builder.call(retain_fn, &[v.into()], "");
                                     } else {
-                                        self.builder.call(self.rt.rc_retain, &[v.into()], "");
+                                        self.emit_rc_retain_inline(v.into_pointer_value());
                                     }
                                 }
                             }
@@ -1117,7 +1116,7 @@ impl<'ctx> Codegen<'ctx> {
                                 // pointer. `lin_tagged_clone` would read offset 0 as a tag byte and
                                 // corrupt it (the recursive sum-param crash).
                                 if func.repr_of(*src).sumnode_sum_ty().is_some() && v.is_pointer_value() {
-                                    self.builder.call(self.rt.rc_retain, &[v.into()], "");
+                                    self.emit_rc_retain_inline(v.into_pointer_value());
                                     temp_map.insert(*dst, v);
                                     continue;
                                 }
@@ -1137,7 +1136,7 @@ impl<'ctx> Codegen<'ctx> {
                                     let null_pred = self.builder.get_insert_block().unwrap();
                                     self.builder.unconditional_branch(merge_bb);
                                     self.builder.position_at_end(nonnull_bb);
-                                    self.builder.call(self.rt.rc_retain, &[p.into()], "");
+                                    self.emit_rc_retain_inline(p);
                                     let nn_pred = self.builder.get_insert_block().unwrap();
                                     self.builder.unconditional_branch(merge_bb);
                                     self.builder.position_at_end(merge_bb);
@@ -1154,7 +1153,7 @@ impl<'ctx> Codegen<'ctx> {
                                 // stored into a `Trip | Null` slot) would otherwise be handed to
                                 // lin_tagged_clone, which reads offset 0 as a tag byte → UAF (ADR-083).
                                 if func.repr_of(*src).is_packed_pointer() && v.is_pointer_value() {
-                                    self.builder.call(self.rt.rc_retain, &[v.into()], "");
+                                    self.emit_rc_retain_inline(v.into_pointer_value());
                                     temp_map.insert(*dst, v);
                                     continue;
                                 }
@@ -1174,7 +1173,7 @@ impl<'ctx> Codegen<'ctx> {
                                 } else {
                                     // Non-union (concrete rc): a plain retain, value unchanged.
                                     if v.is_pointer_value() {
-                                        self.builder.call(self.rt.rc_retain, &[v.into()], "");
+                                        self.emit_rc_retain_inline(v.into_pointer_value());
                                     }
                                     v
                                 };

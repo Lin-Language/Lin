@@ -532,7 +532,7 @@ impl<'ctx> Codegen<'ctx> {
                 && !matches!(fld_ty, Type::Map { .. });
             let owned = (*already_owned || repr_change) && !coerce_borrowed;
             if Self::sealed_field_kind(&fld_ty).is_some() && !owned && stored.is_pointer_value() {
-                self.builder.call(self.rt.rc_retain, &[stored.into_pointer_value().into()], "sealed_fld_retain");
+                self.emit_rc_retain_inline(stored.into_pointer_value());
             }
         }
         obj.into()
@@ -774,12 +774,12 @@ impl<'ctx> Codegen<'ctx> {
         acc
     }
 
-    /// Release a sealed scalar record: `lin_sealed_release(ptr, size)`. No per-field release.
+    /// Release a sealed scalar record. Emits the inline RC dec + cold-path call on zero.
     pub(crate) fn emit_sealed_release(&mut self, val: BasicValueEnum<'ctx>, fields: &indexmap::IndexMap<String, Type>) {
         if !val.is_pointer_value() { return; }
+        let ptr = val.into_pointer_value();
         let total = Self::sealed_struct_size(fields);
-        let i64_ty = self.context.i64_type();
-        self.builder.call(self.rt.sealed_release, &[val.into(), i64_ty.const_int(total, false).into()], "");
+        self.emit_sealed_release_inline(ptr, total);
     }
 
     /// The Null value in the representation `result_ty` expects. A union/Json slot holds a boxed
@@ -858,7 +858,7 @@ impl<'ctx> Codegen<'ctx> {
                 let stored = if val_ty == &fld_ty { *val } else { self.compile_ir_coerce(*val, val_ty, &fld_ty) };
                 self.builder.store(p, stored);
                 if stored.is_pointer_value() {
-                    self.builder.call(self.rt.rc_retain, &[stored.into_pointer_value().into()], "sumnode_heap_fld_retain");
+                    self.emit_rc_retain_inline(stored.into_pointer_value());
                 }
             } else {
                 // Scalar field: reconcile a wider/narrower numeric literal into the stored width.
@@ -1244,7 +1244,7 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.position_at_end(kp_bb);
             let node = self.builder.call(self.rt.unbox_ptr, &[src.into()], "pfb_kp_node").try_as_basic_value().unwrap_basic();
             if node.is_pointer_value() {
-                self.builder.call(self.rt.rc_retain, &[node.into()], "");
+                self.emit_rc_retain_inline(node.into_pointer_value());
             }
             let kp_pred = self.builder.get_insert_block().unwrap();
             self.builder.unconditional_branch(merge_bb);

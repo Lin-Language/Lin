@@ -267,6 +267,18 @@ pub unsafe extern "C" fn retain_sealed_payload_fields(payload: *mut u8, desc: *c
     }
 }
 
+/// Cold path for the inline sealed-release: walks heap fields and frees the allocation. Called
+/// ONLY after the inline LLVM code has already decremented the refcount to exactly zero. The IMMORTAL
+/// guard and the null/zero-rc guards all fire in the inline path BEFORE the decrement, so this
+/// cold path is only reached for live heap allocations with no immortal flag. NOT null-safe.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_drop_at_zero(ptr: *mut u8, size: usize) {
+    release_heap_fields(ptr);
+    let size = size.max(SEALED_HEADER);
+    let layout = Layout::from_size_align_unchecked(size, 8);
+    dealloc(ptr, layout);
+}
+
 /// Release a sealed-record struct, reading its byte `size` from the header (offset 4) instead of
 /// taking it as an argument. Used where the caller does NOT have the size available — the
 /// closure-capture-release walk (`release_captures`) and the thread-transfer release

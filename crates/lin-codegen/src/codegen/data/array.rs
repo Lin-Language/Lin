@@ -409,7 +409,7 @@ impl<'ctx> Codegen<'ctx> {
         // the owning struct, RETAIN it (so the struct's later release is balanced against the source's
         // own release) — the borrowing variant this replaced returned it verbatim with no retain.
         self.builder.position_at_end(kp_b);
-        self.builder.call(self.rt.rc_retain, &[src_raw.into_pointer_value().into()], "sarrpo_kp_retain");
+        self.emit_rc_retain_inline(src_raw.into_pointer_value());
         let kp_exit = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_b);
         // Rebuild: a genuinely-boxed `Object[]` (e.g. a Json literal field) → element-wise rebuild into
@@ -571,7 +571,7 @@ impl<'ctx> Codegen<'ctx> {
             ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
         let sptr = self.builder.call(get_fn, &[arr_ptr.into(), idx.into()], "smat_fd_sp")
             .try_as_basic_value().unwrap_basic();
-        self.builder.call(self.rt.rc_retain, &[sptr.into()], "");
+        self.emit_rc_retain_inline(sptr.into_pointer_value());
         let fd_exit = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_b);
 

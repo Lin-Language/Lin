@@ -207,3 +207,20 @@ pub extern "C" fn lin_rc_release(ptr: *mut u32, size: usize, align: usize) {
         }
     }
 }
+
+/// Cold path called by the codegen inline-retain path when `LIN_RC_COUNT=1` to tally a retain.
+/// The inline code emits the actual inc/dec, then calls this only for the counter bookkeeping.
+#[no_mangle]
+pub extern "C" fn lin_rc_retain_count_cold() {
+    RC_RETAIN_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Cold dealloc path: free a raw allocation of `size` bytes, align 8. Called by the inline release
+/// after the refcount has already been decremented to zero in the emitted LLVM IR. The IMMORTAL
+/// guard fires in the inline path before the dec, so this is only reached for genuinely live heap
+/// allocations. Not null-safe (callers must null-check before the inline dec).
+#[no_mangle]
+pub unsafe extern "C" fn lin_alloc_free(ptr: *mut u8, size: usize) {
+    let layout = std::alloc::Layout::from_size_align_unchecked(size, 8);
+    std::alloc::dealloc(ptr, layout);
+}
