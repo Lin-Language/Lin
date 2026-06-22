@@ -23213,3 +23213,39 @@ print(toString(result))
 "#);
     assert_eq!(out, vec!["31"]);
 }
+
+#[test]
+fn test_range_for_fusion_no_tagged_array() {
+    // `range(a, b).for(f)` must FUSE into a native i32 counter loop (no heap range array, no
+    // `lin_array_get_tagged` per element). The 2-arg `range` export from `std/iter` is overloaded
+    // (ADR-074), so its import slot carries the mangled symbol `std_iter_range$Int32_Int32_NN` —
+    // `range_for_bounds` must strip the `$...` suffix before checking the trailing export name.
+    let ir = build_ir(r#"
+import { range, for } from "std/iter"
+import { toString } from "std/string"
+import { print } from "std/io"
+val sum_range = (a: Int32, b: Int32): Int32 =>
+  val acc = [0]
+  range(a, b).for(i =>
+    acc[0] = acc[0] + i)
+  acc[0]
+print(toString(sum_range(0, 5)))
+"#);
+    // Scope the check to `sum_range` — the stdlib's own `for$Int32` and `rangeFill` bodies
+    // legitimately use `lin_array_get_tagged`; we only care about our fused loop.
+    let func = ir_function(&ir, "sum_range");
+    assert!(
+        !func.contains("@lin_array_get_tagged"),
+        "range(a,b).for(f) must fuse to a native i32 counter loop — \
+         no lin_array_get_tagged in sum_range:\n{func}"
+    );
+    assert!(
+        !func.contains("std_iter_range$"),
+        "range(a,b).for(f) must fuse — no materialized range array call in sum_range:\n{func}"
+    );
+    // Confirm the fused loop structure IS present.
+    assert!(
+        func.contains("range_for_header"),
+        "expected a fused range_for_header block in sum_range:\n{func}"
+    );
+}

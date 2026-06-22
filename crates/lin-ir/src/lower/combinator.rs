@@ -125,7 +125,14 @@ pub(crate) fn range_for_bounds<'a>(
                 || ctx
                     .import_fn_slots
                     .get(slot)
-                    .map(|(sym, _)| sym.rsplit('_').next() == Some("range"))
+                    .map(|(sym, _)| {
+                        // Strip the overload-disambiguation suffix (`$Int32_Int32_84`) added by
+                        // ADR-074 before extracting the trailing export name; without this,
+                        // `std_iter_range$Int32_Int32_84`.rsplit('_').next() returns "84", not
+                        // "range", and fusion never fires for the 2-arg overload.
+                        let base = sym.split('$').next().unwrap_or(sym);
+                        base.rsplit('_').next() == Some("range")
+                    })
                     .unwrap_or(false);
             if is_range {
                 return Some((&args[0], &args[1]));
