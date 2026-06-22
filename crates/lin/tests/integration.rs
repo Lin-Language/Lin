@@ -839,6 +839,58 @@ print(if r == null then "null" else "got ${ r["x"] }")
     assert_eq!(deep, vec!["got 1"]);
 }
 
+// REC-CPR regression: `is T` on a `T | Null` NullableRecord value must use a pointer-null
+// check — NOT boxing + lin_matches_schema. Before the fix, `is Trip` always evaluated to false
+// (the boxing path boxed a non-null sealed ptr as TAG_RECORD, then lin_matches_schema called
+// lin_from_json on it; separately, the `if` path boxed via lin_box_null / lin_box_record first).
+// The fix emits IsType on the raw NullableRecord value directly; codegen emits `ptr != null`.
+// Test both the `if … is T` form and the `match … is T | is Null` form, found and not-found.
+#[test]
+fn test_nullable_record_is_check_if() {
+    let output = run(r#"import { print } from "std/io"
+import { length } from "std/array"
+import { range, for } from "std/iter"
+type Trip = { "id": Int32, "dep": Int32 }
+val findTrip = (trips: Trip[], target: Int32): Trip | Null =>
+  var result: Trip | Null = null
+  range(0, trips.length()).for(i =>
+    val t = trips[i]
+    if t["dep"] <= target then result = t
+  )
+  result
+val trips: Trip[] = [{"id": 1, "dep": 100}, {"id": 2, "dep": 150}]
+val found = findTrip(trips, 160)
+if found is Trip then print("found") else print("none")
+val none = findTrip(trips, 50)
+if none is Trip then print("ERROR") else print("notfound")
+"#);
+    assert_eq!(output, vec!["found", "notfound"]);
+}
+
+#[test]
+fn test_nullable_record_is_check_match() {
+    let output = run(r#"import { print } from "std/io"
+import { length } from "std/array"
+import { range, for } from "std/iter"
+type Trip = { "id": Int32, "dep": Int32 }
+val findTrip = (trips: Trip[], target: Int32): Trip | Null =>
+  var result: Trip | Null = null
+  range(0, trips.length()).for(i =>
+    val t = trips[i]
+    if t["dep"] <= target then result = t
+  )
+  result
+val trips: Trip[] = [{"id": 1, "dep": 100}, {"id": 2, "dep": 150}]
+match findTrip(trips, 160)
+  is Trip => print("found")
+  is Null => print("none")
+match findTrip(trips, 50)
+  is Trip => print("ERROR")
+  is Null => print("notfound")
+"#);
+    assert_eq!(output, vec!["found", "notfound"]);
+}
+
 #[test]
 fn test_for_and_range() {
     let output = run(r#"import { print } from "std/io"
