@@ -1467,10 +1467,6 @@ impl<'ctx> Codegen<'ctx> {
         let vkind_uninit: u64 = 0xFFFFFFFF;
         let vkind_mixed: u64 = 0xFFFFFFFE;
 
-        // FNV-1a constants
-        let fnv_init: u64 = 0xcbf29ce484222325;
-        let fnv_mul: u64 = 0x100000001b3;
-
         let null_ptr: BasicValueEnum<'ctx> = ptr_ty.const_null().into();
 
         // ── Entry / early-exit guards ────────────────────────────────────────────────────────────
@@ -1529,95 +1525,33 @@ impl<'ctx> Codegen<'ctx> {
         let fb3_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fb3"));
         self.builder.unconditional_branch(fb3_b);
 
-        // ── PROBE2 — compute stride, read key len/data, compute FNV hash ─────────────────────────
+        // ── PROBE2 — compute stride, load cached hash from key ──────────────────────────────────
         self.builder.position_at_end(probe2_b);
         // stride = VKIND_MIXED → 32, else → 24
         let is_mixed = self.builder.int_compare(IntPredicate::EQ, vkind_i64, i64_ty.const_int(vkind_mixed, false), &format!("{label}_ismixed"));
         let stride_v = self.builder.select(is_mixed, i64_ty.const_int(32, false), i64_ty.const_int(24, false), &format!("{label}_stride")).into_int_value();
 
-        // LinString: len @ offset 4, data @ offset 8
-        let key_len_p = unsafe { self.builder.gep(i8_ty, key_ptr_v, &[i64_ty.const_int(4, false)], &format!("{label}_klen_p")) };
-        let key_len_v = self.builder.load(i32_ty, key_len_p, &format!("{label}_klen")).into_int_value();
-        let key_data_p = unsafe { self.builder.gep(i8_ty, key_ptr_v, &[i64_ty.const_int(8, false)], &format!("{label}_kdata_p")) };
-        let key_len_i64 = self.builder.int_z_extend_or_bit_cast(key_len_v, i64_ty, &format!("{label}_klen64"));
+        // LinString (STR-KEY layout): refcount@0, len@4, hash@8, data@16.
+        // Load the precomputed FNV-1a hash directly from key.hash (offset 8).
+        // If the hash field is zero (uncached heap string not yet probed), fall back to the
+        // runtime lin_map_get call which will compute+cache the hash via hash_string_key.
+        // All compile-time string literals (rodata globals emitted by compile_string_lit) have
+        // their hash baked in at codegen time, so this fast path fires for all literal keys.
+        let key_hash_p = unsafe { self.builder.gep(i8_ty, key_ptr_v, &[i64_ty.const_int(8, false)], &format!("{label}_khash_p")) };
+        let h_cached = self.builder.load(i64_ty, key_hash_p, &format!("{label}_khash")).into_int_value();
+        let hash_zero = self.builder.int_compare(IntPredicate::EQ, h_cached, i64_ty.const_zero(), &format!("{label}_hzero"));
+        let hash_ok_b = self.context.append_basic_block(llvm_fn, &format!("{label}_hok"));
+        let hash_miss_fb_b = self.context.append_basic_block(llvm_fn, &format!("{label}_hmfb"));
+        self.builder.conditional_branch(hash_zero, hash_miss_fb_b, hash_ok_b);
 
-        // ── FNV-1a loop: h = fnv_init; for i in 0..key_len { h ^= key_data[i]; h *= fnv_mul }
-        // Loop structure: pre_b → hash_loop_h → hash_body_b / hash_exit_b
-        let pre_b       = self.context.append_basic_block(llvm_fn, &format!("{label}_pre"));
-        let hash_loop_b = self.context.append_basic_block(llvm_fn, &format!("{label}_hl"));
-        let hash_body_b = self.context.append_basic_block(llvm_fn, &format!("{label}_hb"));
-        let hash_exit_b = self.context.append_basic_block(llvm_fn, &format!("{label}_he"));
-        self.builder.unconditional_branch(pre_b);
+        // hash_miss_fb_b: uncached key → fall back to runtime (it will compute+cache the hash)
+        self.builder.position_at_end(hash_miss_fb_b);
+        let fb_uncached_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fbuc"));
+        self.builder.unconditional_branch(fb_uncached_b);
 
-        // pre_b: check empty string (len == 0 → skip loop, hash = fnv_init which is nonzero → good)
-        self.builder.position_at_end(pre_b);
-        let is_zero_len = self.builder.int_compare(IntPredicate::EQ, key_len_i64, i64_ty.const_zero(), &format!("{label}_zlen"));
-        self.builder.conditional_branch(is_zero_len, hash_exit_b, hash_loop_b);
-
-        // hash_loop_b: header (phi for i, phi for h)
-        self.builder.position_at_end(hash_loop_b);
-        let phi_i = self.builder.phi(i64_ty, &format!("{label}_pi"));
-        let phi_h = self.builder.phi(i64_ty, &format!("{label}_ph"));
-
-        // hash_body_b: load byte, xor, multiply
-        self.builder.position_at_end(hash_body_b);
-        // byte_p = key_data_p + phi_i
-        let byte_p = unsafe { self.builder.gep(i8_ty, key_data_p, &[phi_i.as_basic_value().into_int_value()], &format!("{label}_bp")) };
-        let byte_v = self.builder.load(i8_ty, byte_p, &format!("{label}_bv")).into_int_value();
-        let byte_i64 = self.builder.int_z_extend_or_bit_cast(byte_v, i64_ty, &format!("{label}_bi64"));
-        let h_xor = self.builder.xor(phi_h.as_basic_value().into_int_value(), byte_i64, &format!("{label}_hxor"));
-        let h_mul = self.builder.int_mul(h_xor, i64_ty.const_int(fnv_mul, false), &format!("{label}_hmul"));
-        let next_i = self.builder.int_add(phi_i.as_basic_value().into_int_value(), i64_ty.const_int(1, false), &format!("{label}_ni"));
-        let done = self.builder.int_compare(IntPredicate::EQ, next_i, key_len_i64, &format!("{label}_done"));
-        self.builder.conditional_branch(done, hash_exit_b, hash_loop_b);
-        let body_exit = self.builder.get_insert_block().unwrap();
-
-        // Now wire the loop back-edges. hash_loop_b gets phi inputs from:
-        // - pre_b side: i=0, h=fnv_init (but pre_b branches to hash_loop_b OR hash_exit_b, and
-        //   if it goes to hash_loop_b it means len>0, so i=0, h=fnv_init)
-        // - hash_body_b: i=next_i, h=h_mul
-        // We need to add incoming BEFORE the phi is "sealed" by jumping forward,
-        // but inkwell adds incoming after the fact. Need to be back at the loop_b to add phi incoming.
-        // Correction: position DOES NOT matter for add_incoming in inkwell, it works on the phi node.
-        phi_i.add_incoming(&[
-            (&i64_ty.const_zero(), pre_b),
-            (&next_i, body_exit),
-        ]);
-        phi_h.add_incoming(&[
-            (&i64_ty.const_int(fnv_init, false), pre_b),
-            (&h_mul, body_exit),
-        ]);
-
-        // hash_exit_b: collect final hash (from pre_b → fnv_init if len==0, or from body_exit)
-        self.builder.position_at_end(hash_exit_b);
-        let phi_h_final = self.builder.phi(i64_ty, &format!("{label}_hf"));
-        phi_h_final.add_incoming(&[
-            (&i64_ty.const_int(fnv_init, false), pre_b),
-            (&h_mul, body_exit),
-        ]);
-        let h_final_pre = phi_h_final.as_basic_value().into_int_value();
-        // Normalize: if h == 0, replace with 1 (runtime does the same). FNV_INIT is nonzero and
-        // mul by nonzero stays nonzero on overflow, so this is purely a safety net.
-        let h_is_zero = self.builder.int_compare(IntPredicate::EQ, h_final_pre, i64_ty.const_zero(), &format!("{label}_hzero"));
-        let h_final = self.builder.select(h_is_zero, i64_ty.const_int(1, false), h_final_pre, &format!("{label}_hash")).into_int_value();
-
-        // hash_body_b connects back to hash_loop_b — emit the branch there
-        // (we deferred it to add phis first, but we already added the conditional_branch above in hash_body_b).
-        // Wait, we DID emit conditional_branch in hash_body_b already. But we need to go back and
-        // fix the branch target — we said "go to hash_loop_b" but we need to go back to hash_loop_b's
-        // BLOCK (phi header). The block was already created; we just need the body to branch there.
-        // Actually we already did: `self.builder.conditional_branch(done, hash_exit_b, hash_loop_b)`.
-        // This is correct! If NOT done → go back to hash_loop_b (the loop header).
-
-        // We need to make sure hash_body_b has its branch emitted properly.
-        // Actually the issue is: we need hash_loop_b to flow INTO hash_body_b.
-        // Let me look at the hash_loop_b block — we added the phi nodes but never emitted
-        // the unconditional branch to hash_body_b. Let me add that.
-        // (inkwell requires all blocks to be terminated)
-        let saved_bb = self.builder.get_insert_block().unwrap();
-        self.builder.position_at_end(hash_loop_b);
-        self.builder.unconditional_branch(hash_body_b);
-        self.builder.position_at_end(saved_bb);
+        // hash_ok_b: hash is cached and nonzero — use it directly
+        self.builder.position_at_end(hash_ok_b);
+        let h_final = h_cached;
 
         // ── FIRST-SLOT PROBE ─────────────────────────────────────────────────────────────────────
         // cap @ offset 8
@@ -1728,7 +1662,7 @@ impl<'ctx> Codegen<'ctx> {
 
         // ── Fallback blocks: merge all "call runtime" paths then branch to merge ────────────────
         let fallback_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fb"));
-        for stub in [null_fallback_b, fb1_b, fb3_b, fb4_b, fb5_b] {
+        for stub in [null_fallback_b, fb1_b, fb3_b, fb4_b, fb5_b, fb_uncached_b] {
             self.builder.position_at_end(stub);
             self.builder.unconditional_branch(fallback_b);
         }

@@ -24,25 +24,17 @@ impl<'ctx> Codegen<'ctx> {
 
     pub(crate) fn compile_string_lit(&self, s: &str) -> BasicValueEnum<'ctx> {
         // String literals are compile-time constants. Emit a full immortal `LinString` as a constant
-        // global in rodata — `{ i32 refcount=IMMORTAL_RC | i32 len | [len x i8] data }`, matching the
-        // runtime's `#[repr(C)] LinString` layout — and use a POINTER to that global as the literal's
-        // value. No runtime `lin_string_literal` call, no intern-cache hash, no per-occurrence work.
+        // global in rodata, matching the runtime's `#[repr(C)] LinString` layout:
+        //   { i32 refcount=IMMORTAL_RC | i32 len | i64 hash | [len x i8] data }
+        // refcount@0, len@4, hash@8, data@16.
         //
-        // The refcount sentinel `IMMORTAL_RC` (0x8000_0000) makes retain/release a no-op on this
-        // box (see `lin-runtime` string.rs): `lin_string_release` returns early before decrementing,
-        // and every increment path funnels through `lin_string_inc_ref`, which leaves an immortal
-        // string unchanged. So a rodata-resident constant `LinString` is observationally identical to
-        // the heap-interned one the old path produced — but free to materialise. RAPTOR evaluated
-        // ~457M string literals/run (constant object keys in hot scan loops); each is now a constant
-        // pointer the optimiser can hoist and CSE.
+        // `hash` stores the precomputed FNV-1a of the string bytes (same as lin_map_get uses).
+        // Baking it into the constant means lin_map_get/set never need to compute or cache it —
+        // every rodata literal is already hash-ready at startup. Combined with the lazy-cache for
+        // heap strings, this eliminates essentially all FNV-1a rehashing on RAPTOR hot paths.
         //
-        // Globals are deduped by content (`str_literal_globals`), so identical literals share one
-        // global — preserving the pointer-identity the runtime intern cache used to give (equality is
-        // by content anyway, so this only helps the optimiser).
-        //
-        // All callers of compile_string_lit pass genuine compile-time literals (string-literal
-        // expressions, object/match keys, panic messages, the "[object]" fallback). Dynamic strings
-        // (concat results, interpolation parts, fs reads, etc.) do NOT route through here.
+        // The refcount sentinel `IMMORTAL_RC` (0x8000_0000) makes retain/release a no-op.
+        // Globals are deduped by content (`str_literal_globals`).
         if let Some(&ptr) = self.str_literal_globals.borrow().get(s) {
             return ptr.into();
         }
@@ -50,19 +42,32 @@ impl<'ctx> Codegen<'ctx> {
         const IMMORTAL_RC: u64 = 0x8000_0000;
         let bytes = s.as_bytes();
         let i32_type = self.context.i32_type();
+        let i64_type = self.context.i64_type();
         let i8_type = self.context.i8_type();
+
+        // Precompute FNV-1a hash at compile time (matches runtime `fnv1a_bytes_str`).
+        let hash_val: u64 = {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            if h == 0 { 1 } else { h }
+        };
 
         let refcount = i32_type.const_int(IMMORTAL_RC, false);
         let len = i32_type.const_int(bytes.len() as u64, false);
+        let hash = i64_type.const_int(hash_val, false);
         let const_bytes: Vec<_> =
             bytes.iter().map(|&b| i8_type.const_int(b as u64, false)).collect();
         let data = i8_type.const_array(&const_bytes);
 
-        // The struct constant `{ i32, i32, [N x i8] }`. An unpacked struct of two i32s followed by an
-        // i8 array has no padding (the array's alignment is 1), so its layout matches `repr(C)`
-        // LinString exactly: refcount@0, len@4, data@8.
+        // Struct layout: { i32, i32, i64, [N x i8] }
+        // The i64 `hash` field forces 8-byte alignment; LLVM will add 0 padding between len and
+        // hash because both i32 and i64 are already naturally aligned in this sequence.
+        // Matches `repr(C)` LinString: refcount@0, len@4, hash@8, data@16.
         let str_const = self.context.const_struct(
-            &[refcount.into(), len.into(), data.into()],
+            &[refcount.into(), len.into(), hash.into(), data.into()],
             false,
         );
         let global = self.module.add_global(str_const.get_type(), None, "str_lit");
