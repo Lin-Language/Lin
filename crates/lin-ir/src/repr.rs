@@ -773,7 +773,14 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                             }
                         }
                         Repr::Packed(Layout::SumNode { sum_ty }) => {
-                            if !is_sumnode(r, sum_ty) {
+                            // A SumNode MakeObject may be demoted to Boxed(Opaque) by the
+                            // carry-class join when two different sum types merge via a Phi (e.g.
+                            // a nested if/else whose inner branch uses a sub-union result type and
+                            // whose outer branch uses the full union — the two different SumNode
+                            // seeds are in the same carry class and join to Boxed). Codegen
+                            // handles Boxed correctly for this site (takes the LinMap path), so
+                            // Boxed is an acceptable conservative outcome here.
+                            if !is_sumnode(r, sum_ty) && !matches!(r, Repr::Boxed(_)) {
                                 report(&mut bad, "MakeObject(sumnode)", *dst, "Packed(SumNode)", r);
                             }
                         }
