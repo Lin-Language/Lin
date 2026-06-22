@@ -92,7 +92,7 @@ val fuPrefix = (nalHdr: UInt8, first: Boolean, last: Boolean): UInt8[] =>
 // Recursive FU-A fragmentation over `payload` (NAL bytes after the header byte).
 // `seq` advances per fragment. Each fragment: RTP header (marker only on the last
 // fragment, when `marker`) ++ [FU-I, FU-H] ++ fragment bytes.
-val fragLoop = (seq: UInt16, ts: UInt32, ssrc: UInt32, nalHdr: UInt8, payload: UInt8[], offset: Int32, maxFrag: Int32, marker: Boolean, acc: AnyVal[]): Null =>
+val fragLoop = (seq: UInt16, ts: UInt32, ssrc: UInt32, nalHdr: UInt8, payload: UInt8[], offset: Int32, maxFrag: Int32, marker: Boolean, acc: UInt8[][]): Null =>
   if offset >= length(payload) then
     null
   else
@@ -110,8 +110,8 @@ val fragLoop = (seq: UInt16, ts: UInt32, ssrc: UInt32, nalHdr: UInt8, payload: U
 // Packetize one NAL unit into its RTP packets (array of UInt8[]). An empty NAL
 // produces no packets, matching Rust. Sequence threading is the caller's job:
 // pass the current seq, then advance it with nextSequence for the next call.
-export val packetize = (seq: UInt16, ts: UInt32, ssrc: UInt32, nal: UInt8[], marker: Boolean): AnyVal =>
-  val packets: AnyVal[] = []
+export val packetize = (seq: UInt16, ts: UInt32, ssrc: UInt32, nal: UInt8[], marker: Boolean): UInt8[][] =>
+  var packets: UInt8[][] = []
   if length(nal) == 0 then
     packets
   else if length(nal) <= MAX_RTP_PAYLOAD then
