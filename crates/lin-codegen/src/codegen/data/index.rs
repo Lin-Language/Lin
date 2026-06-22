@@ -1526,10 +1526,11 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.unconditional_branch(fb3_b);
 
         // ── PROBE2 — compute stride, load cached hash from key ──────────────────────────────────
+        // SwissTable layout: slots are (key:u64@+0, value@+8).
+        // stride = VKIND_MIXED → 24, else → 16  (no hash stored in slot)
         self.builder.position_at_end(probe2_b);
-        // stride = VKIND_MIXED → 32, else → 24
         let is_mixed = self.builder.int_compare(IntPredicate::EQ, vkind_i64, i64_ty.const_int(vkind_mixed, false), &format!("{label}_ismixed"));
-        let stride_v = self.builder.select(is_mixed, i64_ty.const_int(32, false), i64_ty.const_int(24, false), &format!("{label}_stride")).into_int_value();
+        let stride_v = self.builder.select(is_mixed, i64_ty.const_int(24, false), i64_ty.const_int(16, false), &format!("{label}_stride")).into_int_value();
 
         // LinString (STR-KEY layout): refcount@0, len@4, hash@8, data@16.
         // Load the precomputed FNV-1a hash directly from key.hash (offset 8).
@@ -1553,48 +1554,68 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(hash_ok_b);
         let h_final = h_cached;
 
-        // ── FIRST-SLOT PROBE ─────────────────────────────────────────────────────────────────────
-        // cap @ offset 8
+        // ── FIRST-SLOT PROBE (SwissTable ctrl-byte path) ─────────────────────────────────────────
+        // ctrl @ offset 40, cap @ offset 8.
+        // h2 = 0x80 | (hash >> 57). Probe ctrl[slot_idx] first (1 byte, cache-dense).
         let cap_p = unsafe { self.builder.gep(i8_ty, map_ptr_v, &[i64_ty.const_int(8, false)], &format!("{label}_cap_p")) };
         let cap_v = self.builder.load(i32_ty, cap_p, &format!("{label}_cap")).into_int_value();
         let cap_i64 = self.builder.int_z_extend_or_bit_cast(cap_v, i64_ty, &format!("{label}_cap64"));
-        // mask = cap - 1  (cap is a power-of-two, so mask & hash = first probe index)
         let mask_v = self.builder.int_sub(cap_i64, i64_ty.const_int(1, false), &format!("{label}_mask"));
         let slot_idx = self.builder.and(h_final, mask_v, &format!("{label}_sidx"));
-        // slot_ptr = slots + slot_idx * stride
-        let slot_off = self.builder.int_mul(slot_idx, stride_v, &format!("{label}_soff"));
-        let slot_ptr = unsafe { self.builder.gep(i8_ty, slots_v, &[slot_off], &format!("{label}_slot")) };
-        // slot_hash = *(u64*)(slot_ptr + 0)
-        let slot_hash_v = self.builder.load(i64_ty, slot_ptr, &format!("{label}_sh")).into_int_value();
 
-        // ── slot_hash == 0 → MISS → return null ─────────────────────────────────────────────────
-        let sh_zero = self.builder.int_compare(IntPredicate::EQ, slot_hash_v, i64_ty.const_zero(), &format!("{label}_shz"));
-        let miss_b  = self.context.append_basic_block(llvm_fn, &format!("{label}_miss"));
-        let chk_hash_b = self.context.append_basic_block(llvm_fn, &format!("{label}_ckhash"));
-        self.builder.conditional_branch(sh_zero, miss_b, chk_hash_b);
+        // Compute h2 = 0x80 | (h >> 57). We use i64 arithmetic then truncate to i8.
+        let h_shifted = self.builder.right_shift(h_final, i64_ty.const_int(57, false), false, &format!("{label}_hsh"));
+        let h2_64 = self.builder.or(h_shifted, i64_ty.const_int(0x80, false), &format!("{label}_h264"));
+        let h2_val = self.builder.int_truncate_or_bit_cast(h2_64, i8_ty, &format!("{label}_h2"));
+
+        // Load ctrl[slot_idx]: ctrl_pp @ map+40, load as ptr, then index by slot_idx.
+        let ctrl_pp = unsafe { self.builder.gep(i8_ty, map_ptr_v, &[i64_ty.const_int(40, false)], &format!("{label}_ctrl_pp")) };
+        let ctrl_v = self.builder.load(ptr_ty, ctrl_pp, &format!("{label}_ctrl")).into_pointer_value();
+        // Check ctrl pointer is non-null (guard — normally redundant since we already checked slots, but defensive)
+        let ctrl_p2i = self.builder.ptr_to_int(ctrl_v, i64_ty, &format!("{label}_cp2i"));
+        let ctrl_null = self.builder.int_compare(IntPredicate::EQ, ctrl_p2i, i64_ty.const_zero(), &format!("{label}_cnull"));
+        let ctrl_ok_b   = self.context.append_basic_block(llvm_fn, &format!("{label}_ctrlok"));
+        let ctrl_null_b = self.context.append_basic_block(llvm_fn, &format!("{label}_ctrlnull"));
+        self.builder.conditional_branch(ctrl_null, ctrl_null_b, ctrl_ok_b);
+
+        self.builder.position_at_end(ctrl_null_b);
+        let fb_ctrlnull_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fbcn"));
+        self.builder.unconditional_branch(fb_ctrlnull_b);
+
+        self.builder.position_at_end(ctrl_ok_b);
+        let ctrl_byte_p = unsafe { self.builder.gep(i8_ty, ctrl_v, &[slot_idx], &format!("{label}_cbp")) };
+        let ctrl_byte = self.builder.load(i8_ty, ctrl_byte_p, &format!("{label}_cb")).into_int_value();
+
+        // ctrl == 0x00 → empty → miss
+        let cb_zero = self.builder.int_compare(IntPredicate::EQ, ctrl_byte, i8_ty.const_zero(), &format!("{label}_cbz"));
+        let miss_b     = self.context.append_basic_block(llvm_fn, &format!("{label}_miss"));
+        let chk_h2_b   = self.context.append_basic_block(llvm_fn, &format!("{label}_ckh2"));
+        self.builder.conditional_branch(cb_zero, miss_b, chk_h2_b);
 
         // miss_b: emit null result
         self.builder.position_at_end(miss_b);
         let miss_done_b = self.context.append_basic_block(llvm_fn, &format!("{label}_missok"));
         self.builder.unconditional_branch(miss_done_b);
 
-        // ── slot_hash != 0: check hash equality ─────────────────────────────────────────────────
-        self.builder.position_at_end(chk_hash_b);
-        let hash_match = self.builder.int_compare(IntPredicate::EQ, slot_hash_v, h_final, &format!("{label}_hm"));
+        // ── ctrl byte != 0: check h2 match ──────────────────────────────────────────────────────
+        self.builder.position_at_end(chk_h2_b);
+        let h2_match = self.builder.int_compare(IntPredicate::EQ, ctrl_byte, h2_val, &format!("{label}_h2m"));
         let key_eq_b  = self.context.append_basic_block(llvm_fn, &format!("{label}_keq"));
-        let hash_miss_b = self.context.append_basic_block(llvm_fn, &format!("{label}_hmiss"));
-        self.builder.conditional_branch(hash_match, key_eq_b, hash_miss_b);
+        let h2_miss_b = self.context.append_basic_block(llvm_fn, &format!("{label}_h2miss"));
+        self.builder.conditional_branch(h2_match, key_eq_b, h2_miss_b);
 
-        // hash_miss_b → fallback (collision — runtime must probe further)
-        self.builder.position_at_end(hash_miss_b);
+        // h2_miss_b → fallback (ctrl byte occupied but h2 mismatch → collision, runtime probes further)
+        self.builder.position_at_end(h2_miss_b);
         let fb4_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fb4"));
         self.builder.unconditional_branch(fb4_b);
 
-        // ── key_eq_b: hash matched → verify key with lin_string_eq ──────────────────────────────
+        // ── key_eq_b: h2 matched → load slot key and verify with lin_string_eq ─────────────────
         self.builder.position_at_end(key_eq_b);
-        // slot_key_ptr = *(u64*)(slot + 8) reinterpreted as *LinString
-        let slot_key_pp = unsafe { self.builder.gep(i8_ty, slot_ptr, &[i64_ty.const_int(8, false)], &format!("{label}_skpp")) };
-        let slot_key_v = self.builder.load(ptr_ty, slot_key_pp, &format!("{label}_sk")).into_pointer_value();
+        // slot_ptr = slots + slot_idx * stride  (SwissTable: key @ slot+0, value @ slot+8)
+        let slot_off = self.builder.int_mul(slot_idx, stride_v, &format!("{label}_soff"));
+        let slot_ptr = unsafe { self.builder.gep(i8_ty, slots_v, &[slot_off], &format!("{label}_slot")) };
+        // slot_key_ptr = *(u64*)(slot_ptr + 0) reinterpreted as *LinString
+        let slot_key_v = self.builder.load(ptr_ty, slot_ptr, &format!("{label}_sk")).into_pointer_value();
         // lin_string_eq(key_ptr, slot_key_v) → bool (i8: 0=false 1=true)
         let str_eq_result = self.builder.call(self.rt.string_eq, &[key_ptr_v.into(), slot_key_v.into()], &format!("{label}_seq"))
             .try_as_basic_value().unwrap_basic().into_int_value();
@@ -1603,33 +1624,29 @@ impl<'ctx> Codegen<'ctx> {
         let str_miss_b = self.context.append_basic_block(llvm_fn, &format!("{label}_smiss"));
         self.builder.conditional_branch(str_eq_bool, hit_b, str_miss_b);
 
-        // str_miss_b → fallback (hash collision with same hash, different string)
+        // str_miss_b → fallback (h2 false positive — different key with same h2; runtime probes further)
         self.builder.position_at_end(str_miss_b);
         let fb5_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fb5"));
         self.builder.unconditional_branch(fb5_b);
 
         // ── hit_b: key matched → return the slot's TaggedVal ────────────────────────────────────
-        // slot + 16 is the value region. For MIXED: a full TaggedVal { tag:u8, pad:7, payload:u64 }.
-        // For homogeneous: only an 8-byte payload; we reconstruct into an entry-block alloca.
+        // SwissTable: value region at slot+8. For MIXED: full TaggedVal (16 bytes). For homo: 8-byte payload.
         self.builder.position_at_end(hit_b);
-        // Alloca a TaggedVal (16 bytes: {i8, [7 x i8], i64}) in the entry block, reused each call.
         let tagged_ty = self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false);
         let scratch = self.entry_block_alloca(tagged_ty, &format!("{label}_tv"));
 
-        // Detect MIXED vs homogeneous at runtime and load accordingly.
-        let val_p = unsafe { self.builder.gep(i8_ty, slot_ptr, &[i64_ty.const_int(16, false)], &format!("{label}_valp")) };
+        let val_p = unsafe { self.builder.gep(i8_ty, slot_ptr, &[i64_ty.const_int(8, false)], &format!("{label}_valp")) };
         let hit_mixed_b  = self.context.append_basic_block(llvm_fn, &format!("{label}_hitmix"));
         let hit_homo_b   = self.context.append_basic_block(llvm_fn, &format!("{label}_hithom"));
         let hit_merge_b  = self.context.append_basic_block(llvm_fn, &format!("{label}_hitmrg"));
         self.builder.conditional_branch(is_mixed, hit_mixed_b, hit_homo_b);
 
-        // MIXED: slot+16 IS a full TaggedVal — return pointer to it directly (interior pointer).
+        // MIXED: slot+8 IS a full TaggedVal — return pointer to it directly (interior pointer).
         self.builder.position_at_end(hit_mixed_b);
-        // We return val_p directly (an interior slot pointer, borrowed). This matches the runtime.
         let hitmix_exit = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(hit_merge_b);
 
-        // Homogeneous: slot+16 is an 8-byte payload; reconstruct {tag=vkind_u8, payload} into scratch.
+        // Homogeneous: slot+8 is an 8-byte payload; reconstruct {tag=vkind_u8, payload} into scratch.
         self.builder.position_at_end(hit_homo_b);
         let payload_v = self.builder.load(i64_ty, val_p, &format!("{label}_pl")).into_int_value();
         let tag_u8 = self.builder.int_truncate_or_bit_cast(vkind_v, i8_ty, &format!("{label}_tagb"));
@@ -1662,7 +1679,7 @@ impl<'ctx> Codegen<'ctx> {
 
         // ── Fallback blocks: merge all "call runtime" paths then branch to merge ────────────────
         let fallback_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fb"));
-        for stub in [null_fallback_b, fb1_b, fb3_b, fb4_b, fb5_b, fb_uncached_b] {
+        for stub in [null_fallback_b, fb1_b, fb3_b, fb4_b, fb5_b, fb_uncached_b, fb_ctrlnull_b] {
             self.builder.position_at_end(stub);
             self.builder.unconditional_branch(fallback_b);
         }
