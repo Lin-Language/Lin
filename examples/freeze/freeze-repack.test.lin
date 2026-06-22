@@ -21,7 +21,15 @@ type Service = { "startDate": UInt32, "days": { Int32: Boolean }, "dates": { UIn
 
 val buildServiceFrozen = (): Service[] =>
   var a: Service[] = []
-  push(a, { "startDate": 20250519u32, "days": { 0: true, 1: false, 2: true }, "dates": { 20250902u32: false, 20251225u32: true } })
+  push(a, {
+    "startDate": 20250519u32,
+    "days": {
+      0: true,
+      1: false,
+      2: true
+    },
+    "dates": { 20250902u32: false, 20251225u32: true }
+  })
   frozen(a)
 
 // Regression: the SAME record shared by two live arrays. freeze's 0xFD→0xFE repack frees each
@@ -53,7 +61,6 @@ val main = (): AnyVal =>
         expect(buildAndFreeze()[0]["x"] + buildAndFreeze()[1]["y"] + buildAndFreeze()[2]["x"]).toBe(10)
       ])
     ]),
-
     suite("freeze of records with int-keyed map fields does not crash", [
       test("int-keyed dates/days maps freeze and read back", () => [
         expect(buildServiceFrozen()[0]["startDate"]).toBe(20250519u32),
@@ -61,7 +68,6 @@ val main = (): AnyVal =>
         expect(buildServiceFrozen()[0]["dates"][20250902u32]).toBe(false)
       ])
     ]),
-
     suite("freeze of an array sharing a record with another live array", [
       test("both arrays still read the shared record correctly (no use-after-free)", () => [
         expect(buildSharedFrozen()[0]["x"]).toBe(7),
