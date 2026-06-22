@@ -678,7 +678,7 @@ fn resolve_named_cycle(
 /// Re-expand Named(x) references inside an already-resolved type body.
 /// This is needed when the body was stored before its recursive references
 /// were expanded (because they pointed back at the currently-being-defined type).
-fn expand_named_body(
+pub(crate) fn expand_named_body(
     ty: &Type,
     env: &TypeEnv,
     visiting: &mut std::collections::HashSet<String>,

@@ -3,7 +3,7 @@ use lin_parse::ast::{Expr, Module, Stmt};
 
 use crate::compat::is_compatible_env;
 use crate::env::TypeEnv;
-use crate::resolve::resolve_type_spanned;
+use crate::resolve::{expand_named_body, resolve_type_spanned};
 use crate::typed_ir::*;
 use crate::types::Type;
 
@@ -328,20 +328,34 @@ impl Checker {
             let mut exported_types = std::collections::HashMap::new();
             for stmt in &module.statements {
                 if let lin_parse::ast::Stmt::TypeDecl { name, params, body, exported: true, .. } = stmt {
-                    // Re-resolve the body against the now-complete env. The first resolution pass
-                    // runs in (hoisted) source order, so an exported type that references a sibling
-                    // declared LATER in the file collapsed that reference to a bare `Named(...)` via
-                    // the cycle guard (the sibling was still a placeholder at the time). Left
-                    // unexpanded, that forward reference leaks into this module's signature and then
-                    // fails to resolve in a consumer that imports the alias but not the sibling
-                    // (e.g. `import { TimetableLeg }` where `TimetableLeg` has a `Trip` field but
-                    // `Trip` is never imported). Re-resolving now expands all such forward references
-                    // inline; genuine recursive cycles still terminate at the cycle guard and keep
-                    // their `Named(self)` (which the consumer can resolve, since it imports the alias).
-                    let resolved = self
-                        .resolve_type_decl_body(params, body)
-                        .ok()
-                        .or_else(|| self.env.lookup_type(name).map(|d| d.body.clone()));
+                    // Re-expand the body against the now-complete env so that forward references to
+                    // siblings declared LATER in the file are resolved (the first pass left them as
+                    // `Named(sibling)` via the cycle guard when the sibling was still a placeholder).
+                    //
+                    // For non-generic types we expand the ALREADY-RESOLVED env body (not the original
+                    // TypeExpr) and pre-seed this type's own name into `visiting`. This ensures that
+                    // self-recursive `Named(self)` references in the body — including ones that appear
+                    // inside the bodies of OTHER types referenced by this one — are treated as cycle
+                    // terminators and left as `Named(self)` opaque references rather than being
+                    // expanded one extra level. Without this, `type Ast = Num | BinOp` (where BinOp
+                    // contains `"left": Ast`) exports a body where BinOp's "left" field is the full
+                    // expanded `Num | BinOp{...Ast...}` union instead of the opaque `Named("Ast")`.
+                    // That extra expansion makes the exported type one structural level deeper than the
+                    // same-file body, which causes exponential blowup in `is_compatible_env` when a
+                    // consumer uses the imported type recursively (the fast-path `value == target` no
+                    // longer fires because the two sides differ by one expansion level).
+                    let resolved = if params.is_empty() {
+                        // Non-generic: expand the already-resolved env body with self pre-seeded.
+                        self.env.lookup_type(name).and_then(|decl| {
+                            let mut visiting = std::collections::HashSet::new();
+                            visiting.insert(name.clone());
+                            expand_named_body(&decl.body.clone(), &self.env, &mut visiting).ok()
+                        })
+                    } else {
+                        // Generic: fall back to the TypeExpr re-resolution path (generic params must
+                        // be bound into a scratch env, which `resolve_type_decl_body` handles).
+                        self.resolve_type_decl_body(params, body).ok()
+                    };
                     if let Some(resolved) = resolved {
                         exported_types.insert(name.clone(), (params.clone(), resolved));
                     }
@@ -406,15 +420,22 @@ impl Checker {
                 }
             }
         }
-        // Re-resolve exported aliases against the now-complete env (expands forward references to
+        // Re-expand exported aliases against the now-complete env (expands forward references to
         // later-declared siblings inline, matching `check_module`'s export-collection pass).
+        // Use the same self-pre-seeded expand_named_body strategy as check_module to avoid
+        // exporting one-level-deeper bodies for recursive types.
         let mut exported_types = std::collections::HashMap::new();
         for stmt in &module.statements {
             if let Stmt::TypeDecl { name, params, body, exported: true, .. } = stmt {
-                let resolved = self
-                    .resolve_type_decl_body(params, body)
-                    .ok()
-                    .or_else(|| self.env.lookup_type(name).map(|d| d.body.clone()));
+                let resolved = if params.is_empty() {
+                    self.env.lookup_type(name).and_then(|decl| {
+                        let mut visiting = std::collections::HashSet::new();
+                        visiting.insert(name.clone());
+                        expand_named_body(&decl.body.clone(), &self.env, &mut visiting).ok()
+                    })
+                } else {
+                    self.resolve_type_decl_body(params, body).ok()
+                };
                 if let Some(resolved) = resolved {
                     exported_types.insert(name.clone(), (params.clone(), resolved));
                 }

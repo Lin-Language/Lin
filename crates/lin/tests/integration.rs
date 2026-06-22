@@ -4178,6 +4178,60 @@ print(leg["trip"]["tripId"])
 }
 
 #[test]
+fn test_crossmod_recursive_union_type_does_not_hang() {
+    // Regression: importing a recursive named union type from another module used to hang the
+    // type-checker in an infinite compatibility loop. The root cause was that the export-collection
+    // pass re-resolved type bodies with a fresh `visiting` set, causing `Named("Ast")` references
+    // inside `BinOp` to be expanded one level deeper than the same-file representation. That
+    // structural mismatch prevented the fast-path equality check in `is_compatible_env`, triggering
+    // exponential recursion (2^depth paths × many checks). The fix: expand already-resolved env
+    // bodies with the type name pre-seeded in `visiting`, keeping cross-module bodies structurally
+    // identical to same-file bodies.
+    let dir = std::env::temp_dir().join(format!("lin_crossmod_rectype_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("ast.lin"),
+        "export type Num = { \"kind\": \"num\", \"value\": Int32 }\n\
+         export type BinOp = { \"kind\": \"binop\", \"op\": String, \"left\": Ast, \"right\": Ast }\n\
+         export type Ast = Num | BinOp\n",
+    )
+    .unwrap();
+    let main = format!(
+        r#"import {{ print }} from "std/io"
+import {{ Ast }} from "{dir}/ast"
+
+val ev = (node: Ast): Int32 =>
+  if node["kind"] == "num" then node["value"] ?? 0
+  else
+    val left: Ast = node["left"] ?? {{ "kind": "num", "value": 0 }}
+    val right: Ast = node["right"] ?? {{ "kind": "num", "value": 0 }}
+    ev(left) + ev(right)
+
+val lit: Ast = {{ "kind": "num", "value": 42 }}
+print(ev(lit))
+"#,
+        dir = dir.to_str().unwrap()
+    );
+    // Must type-check quickly (the old code hung indefinitely); we only care that check succeeds.
+    let main_path = dir.join("main.lin");
+    std::fs::write(&main_path, &main).unwrap();
+    let out = lin_cmd()
+        .args(["check", main_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "cross-module recursive type should type-check cleanly: {combined}"
+    );
+}
+
+#[test]
 fn test_imported_type_unknown_without_import() {
     // The type is only visible when imported: using `Point` without importing it from the
     // module that exports it is still "Unknown type" (the registration is scoped to imports).
@@ -19333,6 +19387,41 @@ print(eval(chain(4)).toString())
 print(eval(chain(10)).toString())
 "#);
     assert_eq!(out, vec!["1", "4", "10"]);
+}
+
+#[test]
+fn test_st2_litunion_record_nested_if_else() {
+    // Regression: a named record type whose discriminant field is a string-literal union
+    // (e.g. `"rpwm" | "lpwm" | "stop"`) used in a nested if/else chain previously panicked
+    // in the repr Stage-2 ORACLE with
+    //   "MakeObject(sumnode) on t6 — old predicate says Packed(SumNode), repr says Boxed(Opaque)"
+    // and then segfaulted after the oracle fix because the Coerce at function return treated
+    // the LinMap* produced for the sub-union branch as a TaggedVal*.
+    //
+    // Root cause: the outer if produces a 3-variant sum Union; the else branch's inner if
+    // produces a 2-variant sub-union — two different SumNode seeds in the same Phi carry class
+    // → join() → Boxed(Opaque) → codegen took the LinMap path → Coerce read LinMap* as TaggedVal*.
+    //
+    // Fix: lower_if propagates the outer result_type into a nested-if else branch when both are
+    // sum-eligible, ensuring all MakeObject sites share one SumNode descriptor.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type MotorCommand = { "channel": "rpwm" | "lpwm" | "stop", "duty": Int32 }
+val motorCommand = (speed: Float64): MotorCommand =>
+  if speed > 0.0 then { "channel": "rpwm", "duty": 1 }
+  else if speed < 0.0 then { "channel": "lpwm", "duty": 2 }
+  else { "channel": "stop", "duty": 0 }
+val fwd = motorCommand(0.5)
+val rev = motorCommand(-0.5)
+val stp = motorCommand(0.0)
+print(fwd["channel"])
+print(toString(fwd["duty"]))
+print(rev["channel"])
+print(toString(rev["duty"]))
+print(stp["channel"])
+print(toString(stp["duty"]))
+"#);
+    assert_eq!(out, vec!["rpwm", "1", "lpwm", "2", "stop", "0"]);
 }
 
 #[test]
