@@ -473,6 +473,76 @@ RAPTOR (dijkstra/pipeline/parallel cells) with CI regression tracking.
 
 ---
 
+### 5.8 The 2026-06-21 session — the data layer is EXHAUSTED; the gap is the call/value axis (DEFINITIVE)
+
+This session removed, one at a time, **every** remaining data/representation-layer cost on RAPTOR — and
+*also* copied the Go port's data design — and **none of it moved the wall clock** (~82–91 s throughout,
+all digest-exact `group=26203913 range=773022892 journeys=139`). That is not a string of failures; taken
+together it is **proof**, and it closes the question of where the Go gap lives.
+
+**Why removing real costs changes nothing — the authoritative attribution.** The §5.6 rdtsc *cycle*
+profile is the wall-time truth; callgrind *instruction* counts mislead here (cheap pipelined arithmetic
+shows large instruction share but tiny cycle share). Cycle shares: `lin_map_get` 9.5%, field lookups 3.7%,
+alloc/box-unbox/ptr-chase/`tagged_eq` ~2%, typed arithmetic 0% — **≤ ~16% total.** The other **~85% is the
+call/value axis: closure + loop dispatch, control flow** (plus Lin's per-iteration safe-access null/bounds/
+union checks that Go does not pay). Map probes are 9.5%, representation ≤4%. So no data-layer lever can
+exceed single digits, and each one we shipped lands exactly there.
+
+**The wins that shipped this session (all merged, digest-exact, `cargo test --workspace` green — and all
+≤ single-digit %, confirming the ≤16% ceiling):**
+
+| Commit | Change | Measured |
+|--------|--------|----------|
+| `d2bf74c6` | **fix(codegen): NullableRecord vs null compared its refcount byte as a tag.** A `T \| Null` record (raw struct ptr or null, e.g. `getTrip`'s `Trip \| Null`) compared via `lin_tagged_eq`, which reads the first byte as a `TaggedVal` tag — but a `NullableRecord` is a raw struct pointer, so it read the struct's **refcount**. A `frozen()` record's rc is `IMMORTAL_RC = 0x80000000`, whose low byte `0x00 == TAG_NULL`, so `trip != null` wrongly returned false → the scan never boarded a frozen trip → 0 journeys. **Latent soundness bug for ANY `T\|Null` record whose rc low-byte collides with a tag.** Fix: lower `NullableRecord` Eq/NotEq to a pointer-null check / null-guarded boxing, not `lin_tagged_eq`. | correctness keystone |
+| `8bd68e34` | `lin_rc_release` was missing the `IMMORTAL_RC` guard that `lin_rc_retain`/`lin_sealed_release` have — a frozen array/object released via that path drifted out of immortal range → eventual UAF. | latent UAF closed |
+| `ae9b0775` | The `LITERAL_CACHE` (string-literal intern) used SipHash; swapped to an FxHash-style mix. callgrind put `lin_string_literal` at ~13–19% of *instructions* (~453 M calls/run). | **PREP ~12%, total ~5%** |
+| `531ec933` | Emit each string literal as a constant immortal `LinString` global in rodata (matching `#[repr(C)] LinString`); use a pointer to it — eliminates the `lin_string_literal` runtime call entirely. Needs a `freeze_string` guard (`rc < IMMORTAL_RC` before writing — rodata is read-only). Supersedes the fast-hasher path. | **PREP ~13%, total ~4%** |
+| `9b722eb1` | **keep records PACKED into mixed-union value slots (`TAG_RECORD`).** RAPTOR's `setTrip` (~623 M iters) stored `[trip,…]` into a `Connection \| Transfer` union value via the `is_union_type` coerce arm, which O(n) `sealed_materialize_to_map`-ed the **whole Trip graph per iteration** (~3 `lin_map_alloc` + ~12 `lin_box_*` + ~12 `lin_map_set`). Route it through O(1) `lin_box_record` (`TAG_RECORD`), gated by `union_keep_packed_record_safe` (fires only when every object-shaped variant is a sealed record and no read-back reads it as a raw `LinMap*`). `setTrip` materialization 42→0 refs. | **WALL-NEUTRAL + RSS-NEUTRAL** |
+
+The last row is the clincher: deleting the single biggest per-iteration instruction *and* allocation cost
+in the hottest loop in the program moved **neither the clock nor peak RSS** (~82 s and ~6.4 GB either way).
+That is only possible if the CPU was stalled elsewhere — the call/value axis — the whole time.
+
+**Closed experiments (do not re-run):**
+- **"Copy the Go data approach."** Go does NOT int-index — it uses string-keyed maps too
+  (`Interchange = map[StopID]Time`, inline scalar values), and Lin already matches that model
+  (value-unbox makes Lin's `{StopId:Time}` slots inline; `bestArrival` reads with no unbox). The one
+  structural difference is that Go's `Connection` is a single struct with a nullable `Transfer` field
+  (`IsTransfer() = Transfer != nil`), not a `Connection | Transfer` union. Collapsing the Lin union into
+  one nullable-field record (the faithful Go shape) was digest-exact and tests-green but **wall-NEUTRAL
+  (82 s)** and re-introduced the materialization keep-packed had removed → **discarded.** Data layout is
+  not the differentiator.
+- **Multi-core parallel queries** (the §5.7 "still-open idea"). The 24 GROUP + 5 RANGE queries are
+  independent; fanning them across `async`/workers (128 cores) over the `frozen()`-shared index gave
+  **GROUP 19 s→0.87 s (22×), total ~91 s→~31 s (~3×), digest-exact** — the ONLY large speedup found.
+  BUT: it needs the whole query graph `frozen()` (else cross-thread non-atomic RC corrupts the heap), and
+  a 20-run hardening pass showed **15/20** — a real intermittent cross-thread race, not production-ready.
+  And it parallelizes only the Lin bench while the other ports run sequentially, so it breaks the
+  like-for-like cross-language comparison. **Declined for benchmark fairness + race-robustness**; recorded
+  as the genuine but off-table lever.
+- **`frozen()` on the RAPTOR index.** Perf-neutral (§5.7 said so; re-confirmed). Surfaced + fixed two real
+  `frozen()` crash bugs along the way (int-keyed map keys deref'd as `LinString*` → segfault; the 0xFD→0xFE
+  repack freed *shared* element shells → heap corruption) and the `d2bf74c6` keystone above.
+
+**What it would actually take to close the Go gap (the lever is the EXECUTION MODEL, not the data layer):**
+1. **Whole-program monomorphization + loop-flattening of the hot path** so the combinator/closure scan
+   (`range().for`, `queue.entries`, the journey `map`/`filter`/`reduce`, and the non-inlined per-stop calls
+   `previousArrival`/`bestArrival`/`setTrip`/`getTrip` — `scanRoutes` emits ~40 calls/iteration) compiles
+   to a flat inlined native loop LLVM optimizes like Go's. This IS the documented "call/value axis — general
+   case unsolved" frontier. Note: plain LTO/cross-module inlining was already tried with **no speedup**
+   (§5 path / LTO investigation), so it is not call *overhead* — it is the dispatch + control-flow *work*.
+2. **A JIT** (the V8 route) — keep full dynamism, specialize map/field/closure access at runtime. A
+   different backend, multi-quarter.
+3. Int-indexed contiguous arrays (cache-friendly, no hashing) — but per the cycle profile this only attacks
+   the 9.5% map bucket, and it changes the data model the other ports share (off-table for fairness).
+
+**Bottom line.** The data-layer optimization well is **dry**: representation, allocation, RC, GC,
+materialization, literals, hashing, map-value-boxing, and Go-style data layout are all measured ≤ ~16% and
+individually wall-neutral. Closing the 4–5× gap is an **execution-model project** (monomorphize + flatten
+the hot path, or JIT), not another patch. Do not propose data-layer tweaks as the RAPTOR speedup again.
+
+---
+
 ## 6. Guidance for writing fast Lin
 
 1. **Prefer typed records and `&`-composed named types over `AnyVal`.** This is the
