@@ -4,10 +4,26 @@ import { map, filter, reduce, for } from "std/iter"
 type Order = { "id": Int32, "total": Float64, "paid": Boolean }
 
 val orders: Order[] = [
-  { "id": 1, "total": 42.0, "paid": true },
-  { "id": 2, "total": 18.5, "paid": false },
-  { "id": 3, "total": 99.0, "paid": true },
-  { "id": 4, "total": 12.0, "paid": true }
+  {
+    "id": 1,
+    "total": 42.0,
+    "paid": true
+  },
+  {
+    "id": 2,
+    "total": 18.5,
+    "paid": false
+  },
+  {
+    "id": 3,
+    "total": 99.0,
+    "paid": true
+  },
+  {
+    "id": 4,
+    "total": 12.0,
+    "paid": true
+  }
 ]
 
 // Dot application turns the left value into the first argument, so pipelines
@@ -21,8 +37,7 @@ print("paid revenue: ${revenue}")
 
 // Partial application: a trailing comma supplies some arguments now, rest later.
 val taxed = (rate: Float64, amount: Float64): Float64 => amount * (1.0 + rate)
-val withVat = taxed(0.2,)           // a new (Float64) => Float64 function
-
+val withVat = taxed(0.2,) // a new (Float64) => Float64 function
 orders
   .sortBy(o => o["total"])
   .for(o => print("order ${o["id"]}: ${withVat(o["total"])}"))

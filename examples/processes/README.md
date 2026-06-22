@@ -64,25 +64,19 @@ lin test examples/processes/ --coverage
 A few idioms in this project are shaped to avoid live compiler bugs hit while writing it.
 They are documented here (rather than silently worked around) so they can be fixed:
 
-1. **Named-record arrays are built with explicit `push` recursion, not `.map`.** Producing
-   a `NamedRecord[]` via `xs.map(...)` trips a representation-pass assertion
-   (`repr Stage-2 ORACLE disagreement … Push(elem packed struct) … Packed(struct) vs
-   Boxed(Opaque)`). `runAll` (task.lin) and `collect` (scheduler.lin) therefore accumulate
-   with `push`. Mapping to a *scalar* or *anonymous* element type is unaffected.
-
-2. **`async` thunks call top-level functions, not captured function-typed parameters.**
+1. **`async` thunks call top-level functions, not captured function-typed parameters.**
    `async(() => runner())` where `runner` is a captured function *parameter* runs the body
    without real concurrency, so `timeout` never trips. Calling the top-level `runTask`
    inside the thunk (and mocking its `exec`) is correct *and* keeps the scheduler testable.
 
-3. **Result combinators that introduce a fresh result type (`andThen`, `mapOk`) bind their
+2. **Result combinators that introduce a fresh result type (`andThen`, `mapOk`) bind their
    result to an annotated `val`, and `mapOk`'s test bodies are named lambdas.** A generic
    call whose return type parameter is only resolvable from the surrounding expectation
    fails to infer it when nested inside an inline anonymous thunk argument
    (`() => [ … mapOk(r, f) … ]`), leaking the return type as `?T | Null`. Binding to an
    annotated `val` and/or defining the test body as a named top-level lambda fixes it.
 
-4. **`outcome.lin` coverage is under-reported.** `lin test --coverage` does not attribute a
+3. **`outcome.lin` coverage is under-reported.** `lin test --coverage` does not attribute a
    *monomorphized generic function* back to its source module, so `outcome.lin` (all
    generic) reports low line coverage even though every combinator and branch is tested.
    A trivial generic module reproduces this at 0% while its tests pass; the same generic

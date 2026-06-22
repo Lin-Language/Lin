@@ -22,7 +22,7 @@ import { toInt32 } from "std/number"
 
 // A PWM command: which channel to drive ("rpwm"|"lpwm"|"stop") and its duty
 // cycle in microseconds (0..PWM_PERIOD).
-export type MotorCommand = { "channel": String, "duty": Int32 }
+export type MotorCommand = { "channel": "rpwm" | "lpwm" | "stop", "duty": Int32 }
 
 // Software-PWM period in microseconds (1 kHz). Duty is in the same units.
 export val PWM_PERIOD = 1000.0

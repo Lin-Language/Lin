@@ -3,8 +3,8 @@
 //
 // `serve` blocks its thread for the lifetime of the server, so to keep a graceful
 // shutdown path we run it on a background thread (`async`) and block the main
-// thread on `waitSignal` for SIGINT (2) / SIGTERM (15). When either is delivered
-// the main thread wakes, logs, and exits the process — the conventional
+// thread on `waitSignal` for SIGTERM (15). When it is delivered the main thread
+// wakes, logs, and exits the process — the conventional
 // "wait for a termination signal, then shut down" server loop.
 //
 // Run:  lin build examples/web-server/main.lin -o web-server && ./web-server
@@ -18,7 +18,6 @@ import { async } from "std/async"
 import { print, exit } from "std/io"
 import { toString } from "std/string"
 
-val SIGINT = 2
 val SIGTERM = 15
 
 // The service config. In a real deployment this would come from a file or the

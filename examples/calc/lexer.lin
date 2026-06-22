@@ -15,7 +15,7 @@ import { push, length } from "std/array"
 // A lexer token. `kind` is the discriminant ("num" | "op" | "lparen" |
 // "rparen" | "bad"); `text` carries the source slice for the kinds that need
 // it (num/op/bad). lparen/rparen omit `text` — structurally still a Token.
-type Token = { "kind": String, "text": String }
+export type Token = { "kind": String, "text": String }
 
 // Character classes (ASCII). charCode gives the codepoint at an index.
 val isDigit = (c: Int32): Boolean =>

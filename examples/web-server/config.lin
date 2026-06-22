@@ -16,11 +16,9 @@ export type Config = { "host": String, "port": Int32, "debug": Boolean, "name": 
 // absent for required fields, so it stays dynamic (AnyVal).
 export type SchemaEntry = { "type": String, "default": AnyVal }
 
-// load() returns a tagged result the caller pattern-matches on. The discriminant
-// field is a String (string-literal singleton types are not supported), so
-// Success/Failure are told apart by matching on "type".
-export type Success = { "type": String, "value": Config }
-export type Failure = { "type": String, "error": String }
+// load() returns a tagged result the caller pattern-matches on.
+export type Success = { "type": "success", "value": Config }
+export type Failure = { "type": "failure", "error": String }
 export type LoadResult = Success | Failure
 
 // The config schema. Each entry is { "type", "default" }; `name` is required so it
@@ -46,7 +44,7 @@ val typeName = (v: AnyVal): String =>
 // caller's input is not mutated.
 export val applyDefaults = (cfg: AnyVal): AnyVal =>
   val sch = schema()
-  var out: {  } = {}
+  var out: { String: AnyVal } = {}
   sch
     .keys()
     .for(k =>

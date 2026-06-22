@@ -320,7 +320,13 @@ impl<'ctx> Codegen<'ctx> {
                         } else {
                             arr
                         };
-                        let elem_is_fresh_box = !Self::is_union_type(&elem_ty);
+                        // Sum-type unions (Packed(SumNode) repr) are NOT already-boxed TaggedVal*
+                        // even though is_union_type returns true — their runtime value is a raw
+                        // *SumNode. box_value materializes *SumNode → fresh LinMap → TaggedVal*.
+                        // The IR emits a scope-exit Release for the SumNode (ContainerInsert::Nothing
+                        // leaves it owned), so we must NOT release it here — only release the fresh
+                        // TaggedVal shell we created (tagged_release below handles both shell + inner).
+                        let elem_is_fresh_box = !Self::is_union_type(&elem_ty) || Self::is_sum_type(&elem_ty);
                         let elem_tagged = if elem_is_fresh_box {
                             self.box_value(elem, &elem_ty)
                         } else { elem };

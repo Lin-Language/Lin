@@ -22,7 +22,7 @@
 // `health` and `link` are 0..15 quality codes packed into one status byte with
 // nibble packing — a compact way to carry two small enums in a single TLV value.
 import { push, length, slice } from "std/array"
-import { concat } from "std/iter"
+import { concat, reduce, find } from "std/iter"
 import { encode, decode, Field } from "./tlv"
 
 // A telemetry snapshot. `leftDuty`/`rightDuty` are the PWM duty cycles
@@ -48,16 +48,9 @@ export val highNibble = (b: Int32): Int32 =>
 export val lowNibble = (b: Int32): Int32 =>
   b & 0x0F
 
-// A one-byte XOR checksum over a byte list — the frame trailer. Both operands
-// are UInt8, so the running XOR stays a single byte (no wider widening).
-val checksumFrom = (bytes: UInt8[], i: Int32, acc: UInt8): UInt8 =>
-  if i >= length(bytes) then
-    acc
-  else
-    checksumFrom(bytes, i + 1, acc ^ bytes[i])
-
+// A one-byte XOR checksum over a byte list — the frame trailer.
 export val checksum = (bytes: UInt8[]): UInt8 =>
-  checksumFrom(bytes, 0, 0)
+  bytes.reduce(0, (acc, b) => acc ^ b)
 
 // --- Frame construction ---
 // The two motor duties packed as a big-endian UInt16 pair (4 bytes total),
@@ -84,17 +77,13 @@ export val encodeTelemetry = (t: Telemetry): UInt8[] =>
 
 // --- Frame parsing ---
 // Look up a decoded field's value bytes by tag (Null if the field is absent).
-val fieldFor = (fields: Field[], tag: Int32, i: Int32): Int32[] | Null =>
-  if i >= length(fields) then
-    null
-  else if fields[i]["tag"] == tag then
-    fields[i]["bytes"]
-  else
-    fieldFor(fields, tag, i + 1)
+val fieldFor = (fields: Field[], tag: Int32): Int32[] | Null =>
+  val f = fields.find(f => f["tag"] == tag)
+  if f == null then null else f["bytes"]
 
 // Read a single-byte field's value (0 if the field is missing).
 val byteField = (fields: Field[], tag: Int32): Int32 =>
-  val bytes = fieldFor(fields, tag, 0)
+  val bytes = fieldFor(fields, tag)
   match bytes
     is Null => 0
     else => bytes[0]
@@ -111,7 +100,7 @@ val u16At = (bytes: Int32[], off: Int32): Int32 =>
 
 // Decode the [leftDuty, rightDuty] pair from tag-2's 4 value bytes.
 val motorsField = (fields: Field[]): Int32[] =>
-  val bytes = fieldFor(fields, TAG_MOTORS, 0)
+  val bytes = fieldFor(fields, TAG_MOTORS)
   match bytes
     is Null => [0, 0]
     else =>

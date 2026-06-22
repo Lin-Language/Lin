@@ -1,9 +1,6 @@
 import { print } from "std/io"
 import { for } from "std/iter"
-type Shape =
-  | { "kind": "circle", "r": Float64 }
-  | { "kind": "rect", "w": Float64, "h": Float64 }
-  | { "kind": "point" }
+type Shape = { "kind": "circle", "r": Float64 } | { "kind": "rect", "w": Float64, "h": Float64 } | { "kind": "point" }
 
 // `match` is exhaustive: the checker rejects the program if a case is unhandled.
 // `has` checks a value's shape and destructures it; `when` adds a guard.
@@ -22,7 +19,11 @@ val describe = (s: Shape): String =>
 
 val shapes: Shape[] = [
   { "kind": "circle", "r": 12.0 },
-  { "kind": "rect", "w": 3.0, "h": 4.0 },
+  {
+    "kind": "rect",
+    "w": 3.0,
+    "h": 4.0
+  },
   { "kind": "point" }
 ]
 
