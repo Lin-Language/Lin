@@ -2122,7 +2122,9 @@ impl<'ctx> Codegen<'ctx> {
                                     void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into(), i32_ty.into()], false));
                                 let n_exc = exclude.len() as u32;
                                 let arr_ty = ptr_ty.array_type(n_exc.max(1));
-                                let keys_arr = self.builder.alloca(arr_ty, "orest_keys");
+                                // Hoist to entry block: `n_exc` is statically known (compile-time
+                                // constant), so one entry-block slot is reused safely every call.
+                                let keys_arr = self.entry_block_alloca(arr_ty, "orest_keys");
                                 for (i, key) in exclude.iter().enumerate() {
                                     let key_str = self.compile_string_lit(key);
                                     let gep = unsafe { self.builder.gep(arr_ty, keys_arr,

@@ -1223,7 +1223,7 @@ impl<'ctx> Codegen<'ctx> {
                         "lin_sealed_ptr_array_push",
                         self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                     let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-                    let i_alloc = self.builder.alloca(i64_ty, "ir_fis_i");
+                    let i_alloc = self.entry_block_alloca(i64_ty, "ir_fis_i");
                     self.builder.store(i_alloc, i64_ty.const_zero());
                     let check = self.context.append_basic_block(llvm_fn, "ir_fis_check");
                     let body = self.context.append_basic_block(llvm_fn, "ir_fis_body");
@@ -1284,7 +1284,7 @@ impl<'ctx> Codegen<'ctx> {
                     let retain_fn = self.get_or_declare_fn("lin_tagged_retain",
                         self.context.void_type().fn_type(&[ptr_ty.into()], false));
                     let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-                    let i_alloc = self.builder.alloca(i64_ty, "ir_fi");
+                    let i_alloc = self.entry_block_alloca(i64_ty, "ir_fi");
                     self.builder.store(i_alloc, i64_ty.const_zero());
                     let check = self.context.append_basic_block(llvm_fn, "ir_fill_check");
                     let body = self.context.append_basic_block(llvm_fn, "ir_fill_body");

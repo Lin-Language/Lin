@@ -336,15 +336,15 @@ impl<'ctx> Codegen<'ctx> {
             if let Some(fields) = Self::sealed_fields(val_ty).cloned() {
                 let obj = self.sealed_materialize_to_map(value, &fields);
                 let tag = i8_ty.const_int(Self::type_tag(val_ty) as u64, false);
-                let cell = self.builder.alloca(self.context.struct_type(
-                    &[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false), "set_tv");
-                let tag_ptr = self.builder.struct_gep(
-                    self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false),
-                    cell, 0, "set_tv_tag");
+                // Hoist to entry block: TaggedVal is a fixed 16-byte scratch slot; emitting it
+                // at the call site (potentially inside a fused loop body) would leak one stack
+                // slot per iteration — same class as the flatMap stack-overflow fix.
+                let tv_ty = self.context.struct_type(
+                    &[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false);
+                let cell = self.entry_alloca(tv_ty, "set_tv");
+                let tag_ptr = self.builder.struct_gep(tv_ty, cell, 0, "set_tv_tag");
                 self.builder.store(tag_ptr, tag);
-                let pay_ptr = self.builder.struct_gep(
-                    self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false),
-                    cell, 2, "set_tv_pay");
+                let pay_ptr = self.builder.struct_gep(tv_ty, cell, 2, "set_tv_pay");
                 let pay = self.builder.ptr_to_int(obj.into_pointer_value(), i64_ty, "set_tv_payi");
                 self.builder.store(pay_ptr, pay);
                 let set_fn = self.get_or_declare_fn("lin_array_set",
@@ -454,7 +454,7 @@ impl<'ctx> Codegen<'ctx> {
         let head = self.context.append_basic_block(llvm_fn, "sarrp_head");
         let body = self.context.append_basic_block(llvm_fn, "sarrp_body");
         let done = self.context.append_basic_block(llvm_fn, "sarrp_done");
-        let idx_slot = self.builder.alloca(i64_ty, "sarrp_i");
+        let idx_slot = self.entry_alloca(i64_ty, "sarrp_i");
         self.builder.store(idx_slot, i64_ty.const_zero());
         self.builder.unconditional_branch(head);
         self.builder.position_at_end(head);
