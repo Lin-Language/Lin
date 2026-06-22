@@ -1226,8 +1226,17 @@ pub(crate) fn coerce_if_branch(
     // Concrete merge, concrete branch (or scalar unbox): the existing coercion, no extra
     // ownership. Keep BOTH the value and the raw pre-coercion temp — a box (e.g. lin_box_object)
     // shares the underlying pointer, so releasing the raw would free what the kept box wraps.
+    //
+    // RC OWNERSHIP: for heap result types (String/Array/Object) the branch may contain a retained
+    // read of the raw value (e.g. a narrowed-union LocalGet emits Coerce+Retain+register_owned in
+    // the branch scope). That Retain is kept by `pop_scope_releasing_keep` but NOT re-registered in
+    // the parent scope when `owned=false` — the +1 is orphaned, causing an RC leak that inflates to
+    // u32 overflow under high-iteration workloads (RAPTOR queue-factory: malloc_consolidate error).
+    // Fix: return `owned=true` for RC result types so `lower_if` calls `register_owned(result_dst)`
+    // in the enclosing scope, balancing the branch's kept Retain via the normal scope-exit Release.
+    // Scalar result types (Bool/Int/Float/Null) are unaffected: `needs_owning` guards register_owned.
     let val = coerce_to_slot_type(raw, value_ty, result_type, builder);
-    (val, vec![val, raw], false)
+    (val, vec![val, raw], is_rc_type(result_type))
 }
 
 pub(crate) fn const_type(c: &Const) -> Type {
