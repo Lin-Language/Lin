@@ -13,10 +13,6 @@ import { for, filter, map, range } from "std/iter"
 val stdlibDir = "stdlib"
 val outDir = "docs-site/content/stdlib"
 
-// True if a value is the stdlib Error shape.
-val isErr = (v: AnyVal): Boolean =>
-  v != null && v["type"] == "error"
-
 // Strip the leading "// " (or "//") from a comment line, returning the bare text.
 val stripComment = (line: String): String =>
   val t = trimStart(line)
@@ -264,7 +260,7 @@ modules.for(fname =>
     val md = genModule(modName, srcJson)
     val outPath = "${outDir}/${modName}.md"
     val w = writeFile(outPath, md)
-    if isErr(w) then
+    if w is Error then
       print("  ERROR writing ${outPath}")
     else
       print("  ${outPath}")
