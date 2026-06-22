@@ -2019,12 +2019,21 @@ fn collect_no_capture_fn_slots(module: &TypedModule) -> HashMap<usize, Type> {
 
 /// Higher-order generic combinators for which Wave C devirtualizes a named no-capture callback by
 /// minting a per-callback specialization whose callback parameter is substituted with the callback
-/// symbol `L`. Restricted to these three short-circuiting scan combinators for now: each invokes its
-/// callback `f` from inside a nested `item => …f…` closure passed to `lin_while`, so devirting `f`
-/// turns the per-element indirect boxed call into a direct call to `L`. Other HOFs (`flatMap`,
-/// `sortBy`, `groupBy`, …) are deferred — the mechanism is general but the gate is conservative.
+/// symbol `L`. The substitution turns the per-element indirect boxed call into a direct call that
+/// LLVM can inline. Combinators not listed here keep the existing closure-indirect path.
+///
+/// Conservative exclusions: `sortBy`/`groupBy`/`countBy`/`minBy`/`maxBy`/`partition`/`unique` —
+/// these route through a sealed-array materialization boundary (`combinator_unsound_over_sealed`)
+/// that already defends their non-inline path; adding devirt there adds complexity for limited gain.
 fn devirt_callback_combinator(name: &str) -> bool {
-    matches!(name, "find" | "some" | "every")
+    matches!(
+        name,
+        "find" | "some" | "every"    // short-circuiting scans (Wave C — shipped)
+        | "map" | "filter" | "for"   // element-projection combinators
+        | "reduce"                   // fold with (acc, item[, i]) => acc
+        | "flatMap"                  // flat-projection: (item[, i]) => U[]
+        | "while"                    // predicate-driven while loop
+    )
 }
 
 /// Highest slot index referenced anywhere in the module (Val/Var/param/destructure/LocalGet).
