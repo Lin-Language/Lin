@@ -4,11 +4,22 @@ use std::collections::HashMap;
 use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_FLOAT32, TAG_ARRAY, TAG_MAP};
 
 /// Runtime string representation: reference-counted, UTF-8.
-/// Layout: refcount (u32) | len (u32) | data ([u8; len])
+/// Layout: refcount (u32) | len (u32) | hash (u64) | data ([u8; len])
+///
+/// `hash` stores the cached FNV-1a hash of the string bytes (the same value `lin_map_get`
+/// needs). A zero `hash` means "not yet computed"; on first use the hash is computed and
+/// stored. Immortal string literals (emitted by codegen as constant globals) have their hash
+/// precomputed at compile time into the constant struct. Because immortal strings are immutable
+/// and live for the entire program run the hash is trivially stable. For heap strings the field
+/// starts zeroed (from `lin_string_alloc`'s `alloc_zeroed`) and is written at most once.
+///
+/// ABI NOTE: the header is now 16 bytes (refcount@0, len@4, pad@6 (to align hash), hash@8,
+/// data@16). All codegen that reads LinString fields must use these offsets.
 #[repr(C)]
 pub struct LinString {
     pub refcount: u32,
     pub len: u32,
+    pub hash: u64,   // cached FNV-1a of data bytes; 0 = not yet computed
     pub data: [u8; 0],
 }
 
@@ -130,6 +141,9 @@ pub unsafe extern "C" fn lin_string_literal(data: *const u8, len: u32) -> *mut L
         if len > 0 {
             std::ptr::copy_nonoverlapping(data, (*ptr).data.as_mut_ptr(), len as usize);
         }
+        // Precompute and cache the hash so lin_map_get/set can use it without recomputing.
+        let bytes = std::slice::from_raw_parts(data, len as usize);
+        (*ptr).hash = fnv1a_bytes_str(bytes);
         cache.borrow_mut().insert(key, ptr);
         ptr
     })
@@ -140,6 +154,37 @@ impl LinString {
         let slice = std::slice::from_raw_parts(self.data.as_ptr(), self.len as usize);
         std::str::from_utf8_unchecked(slice)
     }
+
+    /// Return the FNV-1a hash of this string's bytes, using the cached value if available.
+    /// A zero `hash` field means "not yet computed"; this writes the computed value back.
+    /// SAFETY: must not be called on a string stored in read-only memory (rodata). Callers that
+    /// deal with potentially-rodata strings (codegen-emitted literals) must ensure the hash was
+    /// precomputed at construction time (as `lin_string_literal` and `compile_string_lit` do).
+    #[inline]
+    pub unsafe fn get_or_init_hash(&self) -> u64 {
+        if self.hash != 0 {
+            return self.hash;
+        }
+        let bytes = std::slice::from_raw_parts(self.data.as_ptr(), self.len as usize);
+        let h = fnv1a_bytes_str(bytes);
+        // Write-back through a const ptr: the hash field is a cache that is safe to mutate
+        // because (a) its value is deterministic (same bytes → same hash), (b) an observed
+        // stale 0 on a concurrent reader is harmless — it will just recompute the same value.
+        let self_mut = self as *const LinString as *mut LinString;
+        (*self_mut).hash = h;
+        h
+    }
+}
+
+/// FNV-1a over raw bytes, returns nonzero (maps 0 → 1). Mirrors `fnv1a_bytes` in map.rs.
+#[inline]
+pub(crate) fn fnv1a_bytes_str(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    if h == 0 { 1 } else { h }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,16 +211,19 @@ impl LinString {
 // no two threads access the pool concurrently.
 // ---------------------------------------------------------------------------
 
-/// LinString header size in bytes (refcount:u32 + len:u32).
+/// LinString header size in bytes (refcount:u32 + len:u32 + hash:u64 = 16 bytes).
 const HEADER_SIZE: usize = std::mem::size_of::<LinString>();
-/// Alignment requirement for LinString allocations (u32 = 4 bytes).
-const HEADER_ALIGN: usize = std::mem::align_of::<u32>();
+/// Alignment requirement for LinString allocations (u64 in header = 8 bytes).
+const HEADER_ALIGN: usize = std::mem::align_of::<u64>();
 
 /// Maximum total block size (header + data) served from the freelist.
-const MAX_SMALL_SIZE: usize = 32;
+/// Header grew to 16 bytes; cover strings up to 24 data bytes (40 bytes total).
+const MAX_SMALL_SIZE: usize = 48;
 
-/// Rounded allocation sizes for size classes (all multiples of HEADER_ALIGN).
-const SIZE_CLASSES: [usize; 4] = [8, 12, 20, 32];
+/// Rounded allocation sizes for size classes (all multiples of 8, ≥ HEADER_SIZE = 16).
+/// The smallest possible block is HEADER_SIZE (16 bytes, for a 0-byte string). All sizes
+/// are multiples of HEADER_ALIGN (8) so all slots stay naturally aligned.
+const SIZE_CLASSES: [usize; 5] = [16, 24, 32, 40, 48];
 
 /// Maximum free blocks to retain per size class.
 const POOL_CAP: usize = 512;
@@ -186,7 +234,7 @@ unsafe impl Send for RawPtr {}
 unsafe impl Sync for RawPtr {}
 
 struct StringPool {
-    classes: [Mutex<Vec<RawPtr>>; 4],
+    classes: [Mutex<Vec<RawPtr>>; 5],
 }
 
 static STRING_POOL: OnceLock<StringPool> = OnceLock::new();
@@ -194,6 +242,7 @@ static STRING_POOL: OnceLock<StringPool> = OnceLock::new();
 fn string_pool() -> &'static StringPool {
     STRING_POOL.get_or_init(|| StringPool {
         classes: [
+            Mutex::new(Vec::new()),
             Mutex::new(Vec::new()),
             Mutex::new(Vec::new()),
             Mutex::new(Vec::new()),
@@ -481,6 +530,8 @@ fn int_str_cache() -> &'static IntStrCache {
                 if !s.is_empty() {
                     std::ptr::copy_nonoverlapping(s.as_ptr(), (*ptr).data.as_mut_ptr(), s.len());
                 }
+                // Precompute hash so these strings are instantly usable as map keys.
+                (*ptr).hash = fnv1a_bytes_str(s.as_bytes());
                 v.push(ptr);
             }
         }

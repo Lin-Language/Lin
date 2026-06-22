@@ -1571,7 +1571,7 @@ impl<'ctx> Codegen<'ctx> {
                                     // scanning. The runtime fn is a non-inlinable staticlib call; emit
                                     // the bounds-checked indexed load inline so LLVM keeps the string
                                     // pointer in a register and hoists the length load out of the loop.
-                                    // LinString layout: refcount@0 (u32), len@4 (u32), data@8 ([u8]).
+                                    // LinString layout: refcount@0 (u32), len@4 (u32), hash@8 (u64), data@16 ([u8]).
                                     let s = arg_vals[0];
                                     let idx = arg_vals[1];
                                     if s.is_pointer_value() && idx.is_int_value() {
@@ -1593,10 +1593,10 @@ impl<'ctx> Codegen<'ctx> {
                                         // OOB → -1
                                         self.builder.position_at_end(oob_b);
                                         self.builder.unconditional_branch(mrg);
-                                        // OK → zero-extend the byte at data+index to i32. data@8.
+                                        // OK → zero-extend the byte at data+index to i32. data@16.
                                         self.builder.position_at_end(ok_b);
                                         let idx64 = self.builder.int_z_extend_or_bit_cast(index, i64_ty, "sba_i64");
-                                        let data_p = unsafe { self.builder.gep(i8_ty, sp, &[i64_ty.const_int(8, false)], "sba_data") };
+                                        let data_p = unsafe { self.builder.gep(i8_ty, sp, &[i64_ty.const_int(16, false)], "sba_data") };
                                         let byte_p = unsafe { self.builder.in_bounds_gep(i8_ty, data_p, &[idx64], "sba_byte_p") };
                                         let byte = self.builder.load(i8_ty, byte_p, "sba_byte").into_int_value();
                                         let byte_i32 = self.builder.int_z_extend(byte, i32_ty, "sba_zext");

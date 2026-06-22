@@ -298,25 +298,24 @@ unsafe fn order_push(map: *mut LinMap, key: u64) {
 /// FNV-1a hash over a raw byte slice. Returns nonzero (maps 0 → 1).
 #[inline]
 fn fnv1a_bytes(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    if h == 0 { 1 } else { h }
+    crate::string::fnv1a_bytes_str(bytes)
 }
 
 /// FNV-1a hash over the key bytes (String kind).
-/// Returns a nonzero value (maps 0 → 1 to avoid the empty-slot sentinel).
+/// Uses the cached hash in `LinString.hash` when available (non-zero), avoiding recomputation.
+/// Immortal string literals and recently-probed strings always have a cached hash.
 #[inline]
 unsafe fn hash_string_key(key: *const LinString) -> u64 {
     if key.is_null() {
         return 1; // degenerate — shouldn't happen for a valid string key
     }
-    let len = (*key).len as usize;
-    let data = (*key).data.as_ptr();
-    let bytes = std::slice::from_raw_parts(data, len);
-    fnv1a_bytes(bytes)
+    // Fast path: use the cached hash (precomputed for literals, cached-on-first-use for heap strings).
+    let h = (*key).hash;
+    if h != 0 {
+        return h;
+    }
+    // Slow path: compute, cache, return.
+    (*key).get_or_init_hash()
 }
 
 /// Murmurhash3 finalizer (fmix64) for Int keys.
@@ -343,6 +342,14 @@ unsafe fn string_key_eq(a: *const LinString, b: *const LinString) -> bool {
     }
     let (al, bl) = ((*a).len, (*b).len);
     if al != bl {
+        return false;
+    }
+    // Hash short-circuit: if both hashes are cached and differ, the strings can't be equal.
+    // Both hashes are nonzero when cached (0 = not yet computed), so two cached nonzero
+    // hashes that differ mean "definitely not equal" — skip memcmp entirely.
+    let ha = (*a).hash;
+    let hb = (*b).hash;
+    if ha != 0 && hb != 0 && ha != hb {
         return false;
     }
     let aa = std::slice::from_raw_parts((*a).data.as_ptr(), al as usize);
