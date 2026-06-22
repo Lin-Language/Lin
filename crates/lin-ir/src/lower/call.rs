@@ -222,6 +222,17 @@ pub(crate) fn lower_call(
             if sym == "std_iter_for" && range_for_bounds(&args[0], builder, ctx).is_some() {
                 return lower_intrinsic_call("lin_for", args, result_type, builder, ctx);
             }
+            // ENTRIES INLINE: `obj.entries(f)` over a typed `{ K: V }` map receiver (Type::Map)
+            // with an inlinable capturing lambda. Bypasses the stdlib body that materializes a full
+            // entries array via `lin_entries_any(obj).for(f)`, replacing it with a direct LinMap
+            // slot-walk loop driven by `lin_map_raw_len`/`lin_map_raw_key_at`/`lin_map_raw_value_at`.
+            // Falls through to the Named-call path when the receiver is not a Type::Map or the
+            // callback is not inlinable — the guard is conservative (sound fallback).
+            if sym.starts_with("std_object_entries") && args.len() == 2 {
+                if let Some(out) = lower_entries_inline(args, builder, ctx) {
+                    return out;
+                }
+            }
             // SHORT-CIRCUIT COMBINATOR REDIRECT: when `some`/`every`/`find` is called with a
             // CONCRETE (non-union) array receiver, redirect to the `lin_some`/`lin_every`/`lin_find`
             // intrinsic so the lowerer sees the ORIGINAL call-site lambda (not a monomorphized
