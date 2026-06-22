@@ -3,7 +3,7 @@
 // Walks the tree produced by the parser, computing an Int32 result. Division by
 // zero is reported as a recoverable failure value (not a trap), so the whole
 // `evaluate` pipeline returns a tagged result the caller pattern-matches on.
-import { Failure } from "./parser"
+import { Num, BinOp, Ast, Parsed, Failure } from "./parser"
 
 // Tagged-result shapes. The discriminant field `type` is a string-literal singleton.
 type EvalSuccess = { "type": "success", "value": Int32 }
@@ -13,37 +13,36 @@ val fail = (msg: String): Failure =>
   { "type": "failure", "error": msg }
 
 // Evaluate one AST node to either a number wrapped in success, or a failure.
-// `node` stays AnyVal: calling evalNode(node["left"]) where "left": Ast triggers
-// infinite type-expansion in the checker when the recursive Ast type is imported
-// from another module. The typed boundary is evalAst's Parsed input/Evaluated output.
-val evalNode = (node: AnyVal): AnyVal =>
-  if node["kind"] == "num" then
-    { "type": "success", "value": node["value"] }
-  else
-    val left = evalNode(node["left"])
-    match left
-      is Failure => left
-      else =>
-        val right = evalNode(node["right"])
-        match right
-          is Failure => right
-          else =>
-            val a = left["value"]
-            val b = right["value"]
-            val op = node["op"]
-            if op == "+" then
-              { "type": "success", "value": a + b }
-            else if op == "-" then
-              { "type": "success", "value": a - b }
-            else if op == "*" then
-              { "type": "success", "value": a * b }
-            else if b == 0 then
-              fail("division by zero")
-            else
-              { "type": "success", "value": a / b }
+// The recursive `Ast` union is matched by variant; in the `BinOp` arm
+// `node["left"]`/`node["right"]` are typed `Ast` reads.
+val evalNode = (node: Ast): Evaluated =>
+  match node
+    is Num => { "type": "success", "value": node["value"] }
+    is BinOp =>
+      val left = evalNode(node["left"])
+      match left
+        is Failure => left
+        else =>
+          val right = evalNode(node["right"])
+          match right
+            is Failure => right
+            else =>
+              val a = left["value"]
+              val b = right["value"]
+              val op = node["op"]
+              if op == "+" then
+                { "type": "success", "value": a + b }
+              else if op == "-" then
+                { "type": "success", "value": a - b }
+              else if op == "*" then
+                { "type": "success", "value": a * b }
+              else if b == 0 then
+                fail("division by zero")
+              else
+                { "type": "success", "value": a / b }
 
 // Public entry: an AST result (success/failure from the parser) -> evaluated result.
-export val evalAst = (parsed: AnyVal): Evaluated =>
+export val evalAst = (parsed: Parsed): Evaluated =>
   match parsed
     is Failure => parsed
     else => evalNode(parsed["value"])
