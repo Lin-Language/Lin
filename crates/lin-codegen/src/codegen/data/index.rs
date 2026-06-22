@@ -272,8 +272,9 @@ impl<'ctx> Codegen<'ctx> {
             // container, not a boxed TaggedVal), so its tag is NOT readable here — we rely on the
             // Json→Map coercion boundary (`compile_ir_coerce`) having already materialized any
             // object-shaped source into a real `LinMap`, so a `Type::Map` value is always a `LinMap`
-            // at runtime. `lin_map_get` returns null for a missing key.
-            let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
+            // at runtime. Inline the first-probe hit path (FNV hash + slot check); fall back to the
+            // runtime `lin_map_get` for misses, collisions, and unusual value_kind states.
+            let tagged = self.inline_map_get_str(container, key_str, "ir_mget");
             // UNBOXED SUM TYPE: a `{ String: Expr }` map value is stored MATERIALIZED as a boxed
             // `LinMap` (TAG_MAP — see `emit_map_set`); the read-back returns the borrowed box for
             // the `Expr | Null` union result, which the consumer's `box_value`/match boundary handles.
@@ -482,7 +483,7 @@ impl<'ctx> Codegen<'ctx> {
             let final_mrg = self.context.append_basic_block(llvm_fn, "ir_idx_final_mrg"); // all paths
             self.builder.conditional_branch(is_map, map_b, chk_rec);
             self.builder.position_at_end(map_b);
-            let map_entry = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget_u").try_as_basic_value().unwrap_basic();
+            let map_entry = self.inline_map_get_str(container, key_str, "ir_mget_u");
             let map_exit = self.builder.get_insert_block().unwrap();
             self.builder.unconditional_branch(inner_mrg);
             self.builder.position_at_end(chk_rec);
@@ -542,7 +543,8 @@ impl<'ctx> Codegen<'ctx> {
             return final_phi.as_basic_value();
         }
         // Stage 6b Phase 2: concrete open-object container is now a LinMap*; use map_get.
-        let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_oget").try_as_basic_value().unwrap_basic();
+        // Inline the first-probe hit path; runtime fallback for misses/collisions.
+        let tagged = self.inline_map_get_str(container, key_str, "ir_oget");
         self.unbox_tagged_val_to_type(tagged, result_ty)
     }
 
@@ -1427,5 +1429,322 @@ impl<'ctx> Codegen<'ctx> {
         let phi = self.builder.phi(ptr_ty, "fgb_sum_phi");
         phi.add_incoming(&[(&kp_box, kp_pred), (&tagged, pass_bb)]);
         phi.as_basic_value()
+    }
+
+    /// Inline the FAST (hit) path of `lin_map_get` for string-keyed maps.
+    ///
+    /// Emits: FNV-1a hash of `key_str` → probe the FIRST slot → on exact hit return the
+    /// borrowed interior `*const TaggedVal`; on miss (hash==0) return null; on any other
+    /// case (collision, unknown value_kind) fall back to the real `lin_map_get` call.
+    ///
+    /// Exactly mirrors the runtime semantics:
+    ///   - Empty slot marker: `slot_hash == 0`
+    ///   - Hash: FNV-1a over key bytes (init=0xcbf29ce484222325, mul=0x100000001b3, 0→1)
+    ///   - Key equality: `lin_string_eq`
+    ///   - Return: for VKIND_MIXED an interior pointer to the 16-byte `TaggedVal` in the slot;
+    ///     for homogeneous an entry-block-alloca `TaggedVal` built from `(value_kind_u8, payload)`.
+    ///
+    /// Only string-keyed maps (`key_kind == 0`) are inlined. Int-keyed maps are already direct
+    /// calls to `lin_map_get_int` and are not the hot bucket. The fallback call preserves
+    /// correctness for all other cases (collision, probe wrap-around, uninitialized map, etc.)
+    /// so this is purely an optimistic fast path with no semantic risk.
+    ///
+    /// `map_ptr` must be a raw `LinMap*` (NOT a boxed `TaggedVal*`).
+    /// `key_ptr` must be a raw `*LinString` (NOT a boxed `TaggedVal*`).
+    pub(crate) fn inline_map_get_str(
+        &mut self,
+        map_ptr: BasicValueEnum<'ctx>,
+        key_ptr: BasicValueEnum<'ctx>,
+        label: &str,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i8_ty = self.context.i8_type();
+        let i32_ty = self.context.i32_type();
+        let i64_ty = self.context.i64_type();
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+
+        // VKIND_UNINIT = 0xFFFFFFFF, VKIND_MIXED = 0xFFFFFFFE
+        let vkind_uninit: u64 = 0xFFFFFFFF;
+        let vkind_mixed: u64 = 0xFFFFFFFE;
+
+        // FNV-1a constants
+        let fnv_init: u64 = 0xcbf29ce484222325;
+        let fnv_mul: u64 = 0x100000001b3;
+
+        let null_ptr: BasicValueEnum<'ctx> = ptr_ty.const_null().into();
+
+        // ── Entry / early-exit guards ────────────────────────────────────────────────────────────
+        // If map is null, slots is null, or len==0, fall back immediately.
+        let map_ptr_v = map_ptr.into_pointer_value();
+        let key_ptr_v = key_ptr.into_pointer_value();
+
+        let map_p2i = self.builder.ptr_to_int(map_ptr_v, i64_ty, &format!("{label}_mp2i"));
+        let is_null_map = self.builder.int_compare(IntPredicate::EQ, map_p2i, i64_ty.const_zero(), &format!("{label}_isnull"));
+
+        let null_b = self.context.append_basic_block(llvm_fn, &format!("{label}_null"));
+        let nn_b   = self.context.append_basic_block(llvm_fn, &format!("{label}_nn"));
+        self.builder.conditional_branch(is_null_map, null_b, nn_b);
+
+        self.builder.position_at_end(null_b);
+        let null_fallback_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fb0"));
+        self.builder.unconditional_branch(null_fallback_b);
+
+        self.builder.position_at_end(nn_b);
+        // len @ offset 4
+        let len_p = unsafe { self.builder.gep(i8_ty, map_ptr_v, &[i64_ty.const_int(4, false)], &format!("{label}_len_p")) };
+        let len_v = self.builder.load(i32_ty, len_p, &format!("{label}_len")).into_int_value();
+        let is_empty = self.builder.int_compare(IntPredicate::EQ, len_v, i32_ty.const_zero(), &format!("{label}_isempty"));
+
+        // slots @ offset 16
+        let slots_pp = unsafe { self.builder.gep(i8_ty, map_ptr_v, &[i64_ty.const_int(16, false)], &format!("{label}_slots_pp")) };
+        let slots_v = self.builder.load(ptr_ty, slots_pp, &format!("{label}_slots")).into_pointer_value();
+        let slots_p2i = self.builder.ptr_to_int(slots_v, i64_ty, &format!("{label}_sp2i"));
+        let slots_null = self.builder.int_compare(IntPredicate::EQ, slots_p2i, i64_ty.const_zero(), &format!("{label}_slnull"));
+        let need_fallback_early = self.builder.or(is_empty, slots_null, &format!("{label}_fb_early"));
+
+        let guard_b  = self.context.append_basic_block(llvm_fn, &format!("{label}_guard"));
+        let probe_b  = self.context.append_basic_block(llvm_fn, &format!("{label}_probe"));
+        self.builder.conditional_branch(need_fallback_early, guard_b, probe_b);
+
+        // Guard block: more fallback cases
+        self.builder.position_at_end(guard_b);
+        let fb1_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fb1"));
+        self.builder.unconditional_branch(fb1_b);
+
+        // ── PROBE BLOCK — read map header fields ─────────────────────────────────────────────────
+        self.builder.position_at_end(probe_b);
+
+        // value_kind @ offset 36
+        let vkind_p = unsafe { self.builder.gep(i8_ty, map_ptr_v, &[i64_ty.const_int(36, false)], &format!("{label}_vkind_p")) };
+        let vkind_v = self.builder.load(i32_ty, vkind_p, &format!("{label}_vkind")).into_int_value();
+        // Fallback for VKIND_UNINIT (should be unreachable given len>0, but safe)
+        let vkind_i64 = self.builder.int_z_extend_or_bit_cast(vkind_v, i64_ty, &format!("{label}_vkind64"));
+        let is_uninit = self.builder.int_compare(IntPredicate::EQ, vkind_i64, i64_ty.const_int(vkind_uninit, false), &format!("{label}_isuninit"));
+        let probe2_b = self.context.append_basic_block(llvm_fn, &format!("{label}_probe2"));
+        let fb2_b    = self.context.append_basic_block(llvm_fn, &format!("{label}_fb2"));
+        self.builder.conditional_branch(is_uninit, fb2_b, probe2_b);
+
+        // fb2 → join with other fallbacks
+        self.builder.position_at_end(fb2_b);
+        let fb3_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fb3"));
+        self.builder.unconditional_branch(fb3_b);
+
+        // ── PROBE2 — compute stride, read key len/data, compute FNV hash ─────────────────────────
+        self.builder.position_at_end(probe2_b);
+        // stride = VKIND_MIXED → 32, else → 24
+        let is_mixed = self.builder.int_compare(IntPredicate::EQ, vkind_i64, i64_ty.const_int(vkind_mixed, false), &format!("{label}_ismixed"));
+        let stride_v = self.builder.select(is_mixed, i64_ty.const_int(32, false), i64_ty.const_int(24, false), &format!("{label}_stride")).into_int_value();
+
+        // LinString: len @ offset 4, data @ offset 8
+        let key_len_p = unsafe { self.builder.gep(i8_ty, key_ptr_v, &[i64_ty.const_int(4, false)], &format!("{label}_klen_p")) };
+        let key_len_v = self.builder.load(i32_ty, key_len_p, &format!("{label}_klen")).into_int_value();
+        let key_data_p = unsafe { self.builder.gep(i8_ty, key_ptr_v, &[i64_ty.const_int(8, false)], &format!("{label}_kdata_p")) };
+        let key_len_i64 = self.builder.int_z_extend_or_bit_cast(key_len_v, i64_ty, &format!("{label}_klen64"));
+
+        // ── FNV-1a loop: h = fnv_init; for i in 0..key_len { h ^= key_data[i]; h *= fnv_mul }
+        // Loop structure: pre_b → hash_loop_h → hash_body_b / hash_exit_b
+        let pre_b       = self.context.append_basic_block(llvm_fn, &format!("{label}_pre"));
+        let hash_loop_b = self.context.append_basic_block(llvm_fn, &format!("{label}_hl"));
+        let hash_body_b = self.context.append_basic_block(llvm_fn, &format!("{label}_hb"));
+        let hash_exit_b = self.context.append_basic_block(llvm_fn, &format!("{label}_he"));
+        self.builder.unconditional_branch(pre_b);
+
+        // pre_b: check empty string (len == 0 → skip loop, hash = fnv_init which is nonzero → good)
+        self.builder.position_at_end(pre_b);
+        let is_zero_len = self.builder.int_compare(IntPredicate::EQ, key_len_i64, i64_ty.const_zero(), &format!("{label}_zlen"));
+        self.builder.conditional_branch(is_zero_len, hash_exit_b, hash_loop_b);
+
+        // hash_loop_b: header (phi for i, phi for h)
+        self.builder.position_at_end(hash_loop_b);
+        let phi_i = self.builder.phi(i64_ty, &format!("{label}_pi"));
+        let phi_h = self.builder.phi(i64_ty, &format!("{label}_ph"));
+
+        // hash_body_b: load byte, xor, multiply
+        self.builder.position_at_end(hash_body_b);
+        // byte_p = key_data_p + phi_i
+        let byte_p = unsafe { self.builder.gep(i8_ty, key_data_p, &[phi_i.as_basic_value().into_int_value()], &format!("{label}_bp")) };
+        let byte_v = self.builder.load(i8_ty, byte_p, &format!("{label}_bv")).into_int_value();
+        let byte_i64 = self.builder.int_z_extend_or_bit_cast(byte_v, i64_ty, &format!("{label}_bi64"));
+        let h_xor = self.builder.xor(phi_h.as_basic_value().into_int_value(), byte_i64, &format!("{label}_hxor"));
+        let h_mul = self.builder.int_mul(h_xor, i64_ty.const_int(fnv_mul, false), &format!("{label}_hmul"));
+        let next_i = self.builder.int_add(phi_i.as_basic_value().into_int_value(), i64_ty.const_int(1, false), &format!("{label}_ni"));
+        let done = self.builder.int_compare(IntPredicate::EQ, next_i, key_len_i64, &format!("{label}_done"));
+        self.builder.conditional_branch(done, hash_exit_b, hash_loop_b);
+        let body_exit = self.builder.get_insert_block().unwrap();
+
+        // Now wire the loop back-edges. hash_loop_b gets phi inputs from:
+        // - pre_b side: i=0, h=fnv_init (but pre_b branches to hash_loop_b OR hash_exit_b, and
+        //   if it goes to hash_loop_b it means len>0, so i=0, h=fnv_init)
+        // - hash_body_b: i=next_i, h=h_mul
+        // We need to add incoming BEFORE the phi is "sealed" by jumping forward,
+        // but inkwell adds incoming after the fact. Need to be back at the loop_b to add phi incoming.
+        // Correction: position DOES NOT matter for add_incoming in inkwell, it works on the phi node.
+        phi_i.add_incoming(&[
+            (&i64_ty.const_zero(), pre_b),
+            (&next_i, body_exit),
+        ]);
+        phi_h.add_incoming(&[
+            (&i64_ty.const_int(fnv_init, false), pre_b),
+            (&h_mul, body_exit),
+        ]);
+
+        // hash_exit_b: collect final hash (from pre_b → fnv_init if len==0, or from body_exit)
+        self.builder.position_at_end(hash_exit_b);
+        let phi_h_final = self.builder.phi(i64_ty, &format!("{label}_hf"));
+        phi_h_final.add_incoming(&[
+            (&i64_ty.const_int(fnv_init, false), pre_b),
+            (&h_mul, body_exit),
+        ]);
+        let h_final_pre = phi_h_final.as_basic_value().into_int_value();
+        // Normalize: if h == 0, replace with 1 (runtime does the same). FNV_INIT is nonzero and
+        // mul by nonzero stays nonzero on overflow, so this is purely a safety net.
+        let h_is_zero = self.builder.int_compare(IntPredicate::EQ, h_final_pre, i64_ty.const_zero(), &format!("{label}_hzero"));
+        let h_final = self.builder.select(h_is_zero, i64_ty.const_int(1, false), h_final_pre, &format!("{label}_hash")).into_int_value();
+
+        // hash_body_b connects back to hash_loop_b — emit the branch there
+        // (we deferred it to add phis first, but we already added the conditional_branch above in hash_body_b).
+        // Wait, we DID emit conditional_branch in hash_body_b already. But we need to go back and
+        // fix the branch target — we said "go to hash_loop_b" but we need to go back to hash_loop_b's
+        // BLOCK (phi header). The block was already created; we just need the body to branch there.
+        // Actually we already did: `self.builder.conditional_branch(done, hash_exit_b, hash_loop_b)`.
+        // This is correct! If NOT done → go back to hash_loop_b (the loop header).
+
+        // We need to make sure hash_body_b has its branch emitted properly.
+        // Actually the issue is: we need hash_loop_b to flow INTO hash_body_b.
+        // Let me look at the hash_loop_b block — we added the phi nodes but never emitted
+        // the unconditional branch to hash_body_b. Let me add that.
+        // (inkwell requires all blocks to be terminated)
+        let saved_bb = self.builder.get_insert_block().unwrap();
+        self.builder.position_at_end(hash_loop_b);
+        self.builder.unconditional_branch(hash_body_b);
+        self.builder.position_at_end(saved_bb);
+
+        // ── FIRST-SLOT PROBE ─────────────────────────────────────────────────────────────────────
+        // cap @ offset 8
+        let cap_p = unsafe { self.builder.gep(i8_ty, map_ptr_v, &[i64_ty.const_int(8, false)], &format!("{label}_cap_p")) };
+        let cap_v = self.builder.load(i32_ty, cap_p, &format!("{label}_cap")).into_int_value();
+        let cap_i64 = self.builder.int_z_extend_or_bit_cast(cap_v, i64_ty, &format!("{label}_cap64"));
+        // mask = cap - 1  (cap is a power-of-two, so mask & hash = first probe index)
+        let mask_v = self.builder.int_sub(cap_i64, i64_ty.const_int(1, false), &format!("{label}_mask"));
+        let slot_idx = self.builder.and(h_final, mask_v, &format!("{label}_sidx"));
+        // slot_ptr = slots + slot_idx * stride
+        let slot_off = self.builder.int_mul(slot_idx, stride_v, &format!("{label}_soff"));
+        let slot_ptr = unsafe { self.builder.gep(i8_ty, slots_v, &[slot_off], &format!("{label}_slot")) };
+        // slot_hash = *(u64*)(slot_ptr + 0)
+        let slot_hash_v = self.builder.load(i64_ty, slot_ptr, &format!("{label}_sh")).into_int_value();
+
+        // ── slot_hash == 0 → MISS → return null ─────────────────────────────────────────────────
+        let sh_zero = self.builder.int_compare(IntPredicate::EQ, slot_hash_v, i64_ty.const_zero(), &format!("{label}_shz"));
+        let miss_b  = self.context.append_basic_block(llvm_fn, &format!("{label}_miss"));
+        let chk_hash_b = self.context.append_basic_block(llvm_fn, &format!("{label}_ckhash"));
+        self.builder.conditional_branch(sh_zero, miss_b, chk_hash_b);
+
+        // miss_b: emit null result
+        self.builder.position_at_end(miss_b);
+        let miss_done_b = self.context.append_basic_block(llvm_fn, &format!("{label}_missok"));
+        self.builder.unconditional_branch(miss_done_b);
+
+        // ── slot_hash != 0: check hash equality ─────────────────────────────────────────────────
+        self.builder.position_at_end(chk_hash_b);
+        let hash_match = self.builder.int_compare(IntPredicate::EQ, slot_hash_v, h_final, &format!("{label}_hm"));
+        let key_eq_b  = self.context.append_basic_block(llvm_fn, &format!("{label}_keq"));
+        let hash_miss_b = self.context.append_basic_block(llvm_fn, &format!("{label}_hmiss"));
+        self.builder.conditional_branch(hash_match, key_eq_b, hash_miss_b);
+
+        // hash_miss_b → fallback (collision — runtime must probe further)
+        self.builder.position_at_end(hash_miss_b);
+        let fb4_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fb4"));
+        self.builder.unconditional_branch(fb4_b);
+
+        // ── key_eq_b: hash matched → verify key with lin_string_eq ──────────────────────────────
+        self.builder.position_at_end(key_eq_b);
+        // slot_key_ptr = *(u64*)(slot + 8) reinterpreted as *LinString
+        let slot_key_pp = unsafe { self.builder.gep(i8_ty, slot_ptr, &[i64_ty.const_int(8, false)], &format!("{label}_skpp")) };
+        let slot_key_v = self.builder.load(ptr_ty, slot_key_pp, &format!("{label}_sk")).into_pointer_value();
+        // lin_string_eq(key_ptr, slot_key_v) → bool (i8: 0=false 1=true)
+        let str_eq_result = self.builder.call(self.rt.string_eq, &[key_ptr_v.into(), slot_key_v.into()], &format!("{label}_seq"))
+            .try_as_basic_value().unwrap_basic().into_int_value();
+        let str_eq_bool = self.builder.int_truncate_or_bit_cast(str_eq_result, self.context.bool_type(), &format!("{label}_seqb"));
+        let hit_b      = self.context.append_basic_block(llvm_fn, &format!("{label}_hit"));
+        let str_miss_b = self.context.append_basic_block(llvm_fn, &format!("{label}_smiss"));
+        self.builder.conditional_branch(str_eq_bool, hit_b, str_miss_b);
+
+        // str_miss_b → fallback (hash collision with same hash, different string)
+        self.builder.position_at_end(str_miss_b);
+        let fb5_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fb5"));
+        self.builder.unconditional_branch(fb5_b);
+
+        // ── hit_b: key matched → return the slot's TaggedVal ────────────────────────────────────
+        // slot + 16 is the value region. For MIXED: a full TaggedVal { tag:u8, pad:7, payload:u64 }.
+        // For homogeneous: only an 8-byte payload; we reconstruct into an entry-block alloca.
+        self.builder.position_at_end(hit_b);
+        // Alloca a TaggedVal (16 bytes: {i8, [7 x i8], i64}) in the entry block, reused each call.
+        let tagged_ty = self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false);
+        let scratch = self.entry_block_alloca(tagged_ty, &format!("{label}_tv"));
+
+        // Detect MIXED vs homogeneous at runtime and load accordingly.
+        let val_p = unsafe { self.builder.gep(i8_ty, slot_ptr, &[i64_ty.const_int(16, false)], &format!("{label}_valp")) };
+        let hit_mixed_b  = self.context.append_basic_block(llvm_fn, &format!("{label}_hitmix"));
+        let hit_homo_b   = self.context.append_basic_block(llvm_fn, &format!("{label}_hithom"));
+        let hit_merge_b  = self.context.append_basic_block(llvm_fn, &format!("{label}_hitmrg"));
+        self.builder.conditional_branch(is_mixed, hit_mixed_b, hit_homo_b);
+
+        // MIXED: slot+16 IS a full TaggedVal — return pointer to it directly (interior pointer).
+        self.builder.position_at_end(hit_mixed_b);
+        // We return val_p directly (an interior slot pointer, borrowed). This matches the runtime.
+        let hitmix_exit = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(hit_merge_b);
+
+        // Homogeneous: slot+16 is an 8-byte payload; reconstruct {tag=vkind_u8, payload} into scratch.
+        self.builder.position_at_end(hit_homo_b);
+        let payload_v = self.builder.load(i64_ty, val_p, &format!("{label}_pl")).into_int_value();
+        let tag_u8 = self.builder.int_truncate_or_bit_cast(vkind_v, i8_ty, &format!("{label}_tagb"));
+        let tv_tag_p = self.builder.struct_gep(tagged_ty, scratch, 0, &format!("{label}_tvt"));
+        self.builder.store(tv_tag_p, tag_u8);
+        let tv_payload_p = self.builder.struct_gep(tagged_ty, scratch, 2, &format!("{label}_tvp"));
+        self.builder.store(tv_payload_p, payload_v);
+        let hithom_exit = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(hit_merge_b);
+
+        // hit_merge_b: phi the return pointer
+        self.builder.position_at_end(hit_merge_b);
+        let hit_ptr_phi = self.builder.phi(ptr_ty, &format!("{label}_hphi"));
+        let scratch_bv: BasicValueEnum<'ctx> = scratch.into();
+        hit_ptr_phi.add_incoming(&[(&val_p, hitmix_exit), (&scratch_bv, hithom_exit)]);
+        let hit_result: BasicValueEnum<'ctx> = hit_ptr_phi.as_basic_value();
+        let hit_done_b = self.context.append_basic_block(llvm_fn, &format!("{label}_hitok"));
+        self.builder.unconditional_branch(hit_done_b);
+
+        // ── Final merge ─────────────────────────────────────────────────────────────────────────
+        let merge_b = self.context.append_basic_block(llvm_fn, &format!("{label}_mrg"));
+
+        // miss path → null
+        self.builder.position_at_end(miss_done_b);
+        self.builder.unconditional_branch(merge_b);
+
+        // hit path
+        self.builder.position_at_end(hit_done_b);
+        self.builder.unconditional_branch(merge_b);
+
+        // ── Fallback blocks: merge all "call runtime" paths then branch to merge ────────────────
+        let fallback_b = self.context.append_basic_block(llvm_fn, &format!("{label}_fb"));
+        for stub in [null_fallback_b, fb1_b, fb3_b, fb4_b, fb5_b] {
+            self.builder.position_at_end(stub);
+            self.builder.unconditional_branch(fallback_b);
+        }
+        self.builder.position_at_end(fallback_b);
+        let rt_result = self.builder.call(self.rt.map_get, &[map_ptr.into(), key_ptr.into()], &format!("{label}_fbget"))
+            .try_as_basic_value().unwrap_basic();
+        self.builder.unconditional_branch(merge_b);
+        let fallback_exit = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(merge_b);
+        let result_phi = self.builder.phi(ptr_ty, &format!("{label}_res"));
+        result_phi.add_incoming(&[
+            (&null_ptr, miss_done_b),
+            (&hit_result, hit_done_b),
+            (&rt_result, fallback_exit),
+        ]);
+        result_phi.as_basic_value()
     }
 }
