@@ -118,7 +118,36 @@ pub(crate) fn lower_if(
     builder.push_scope();
     let (else_raw, else_eff_ty) = match try_lower_sum_literal(else_br, result_type, builder, ctx) {
         Some(t) => (t, result_type.clone()),
-        None => (lower_expr(else_br, builder, ctx), else_br.ty()),
+        None => {
+            // UNBOXED SUM TYPE (nested-if sum-type homogenization): when the outer `result_type`
+            // is a sum union AND the else branch is itself an `if` expression whose result type is
+            // ALSO a sum union (but a different/narrower sub-union), lower the inner if with the
+            // OUTER `result_type` so every SumNode construction in the chain uses the same sum
+            // type descriptor. Without this, the inner if's MakeObjects seed a different
+            // `Packed(SumNode{sub_union})` from the outer then-branch's `Packed(SumNode{outer})`,
+            // and the carry-class join of the two different SumNode seeds produces `Boxed(Opaque)`.
+            // Codegen then takes the boxed LinMap path for construction but the Coerce at the
+            // function return treats the union phi as a TaggedVal* → segfault.
+            //
+            // Propagating the outer type is sound: every sub-union variant IS a valid variant of
+            // the outer sum type (the type checker verified compatibility in check_branch_against),
+            // so `try_lower_sum_literal` with the outer type correctly identifies each inner literal's
+            // discriminant and constructs a properly-tagged SumNode.
+            if crate::repr::sum_type_eligible(result_type) {
+                if let TypedExpr::If { cond: inner_cond, then_br: inner_then, else_br: inner_else, result_type: inner_result_type, .. } = else_br {
+                    if crate::repr::sum_type_eligible(inner_result_type) && inner_result_type != result_type {
+                        let inner = lower_if(inner_cond, inner_then, inner_else, result_type, builder, ctx);
+                        (inner, result_type.clone())
+                    } else {
+                        (lower_expr(else_br, builder, ctx), else_br.ty())
+                    }
+                } else {
+                    (lower_expr(else_br, builder, ctx), else_br.ty())
+                }
+            } else {
+                (lower_expr(else_br, builder, ctx), else_br.ty())
+            }
+        }
     };
     let mut else_reassigned: Vec<(usize, Temp)> = Vec::new();
     let mut else_pred = builder.current_block;
