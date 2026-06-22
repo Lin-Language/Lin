@@ -56,6 +56,18 @@ fn definitely_is_tag(val: &Type, check_ty: &Type) -> bool {
     }
 }
 
+/// Sound gate for the NullableRecord `is T` pointer-null fast path. `val_ty` is `R | Null` where R
+/// is a sealed record; the fast path (non-null ⟺ matches) is correct ONLY when the check target
+/// `target` is exactly that inner record R — then every non-null value, statically R, is trivially
+/// a T. Conservative exact field-map match; any mismatch (e.g. `(Trip|Null) is Other`) returns false
+/// so the caller falls through to the correct boxed structural check.
+fn nullable_record_target_is_inner(val_ty: &Type, target: &Type) -> bool {
+    match (crate::repr::nullable_sealed_record(val_ty), target) {
+        (Some(inner), Type::Object { fields, .. }) => fields == inner,
+        _ => false,
+    }
+}
+
 /// If `ty` is a MAP type (`{ K: V }`), or a `V | Null` union whose sole non-null member is a map,
 /// return a reference to that map type. (`None` for record/array/scalar — not a map container.)
 fn as_map_ty(ty: &Type) -> Option<&Type> {
@@ -1574,15 +1586,15 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                 }
             }
             let raw = lower_expr(expr, builder, ctx);
-            // NullableRecord fast path: `T | Null` where T is a sealed record is physically a raw
-            // nullable pointer — null ⟺ Null, non-null ⟺ T. No boxing or schema walk needed;
-            // emit IsType directly on the raw value. Codegen dispatches on the NullableRecord repr
-            // and emits a pointer-null check (lines 2613-2627 of codegen/mod.rs). This avoids the
-            // lin_box_null/lin_box_record + lin_matches_schema round-trip on every `is T` test.
-            // SOUNDNESS: the type-checker guarantees the non-null branch IS a T (all fields
-            // type-checked at call sites); the only runtime information needed is null vs non-null.
-            if is_nullable_sealed_record(&val_ty) {
-                if let TypedPattern::TypeCheckDeep(target, _, _) = pattern {
+            // NullableRecord fast path: `R | Null` where R is a sealed record is physically a raw
+            // nullable pointer — null ⟺ Null, non-null ⟺ R. So `x is T` reduces to a pointer-null
+            // check ONLY when T is the inner record R itself (every non-null value, statically R,
+            // is then trivially a T). For a DIFFERENT target — e.g. `(Trip|Null) is Other` — a
+            // non-null Trip is NOT an Other, so we MUST fall through to the boxed structural check.
+            // (Without this gate the ptr-null check wrongly reports any non-null value as matching
+            // any target — a real soundness bug caught by differential testing.)
+            if let TypedPattern::TypeCheckDeep(target, _, _) = pattern {
+                if nullable_record_target_is_inner(&val_ty, target) {
                     let dst = builder.alloc_temp(Type::Bool);
                     builder.emit(Instruction::IsType { dst, val: raw, ty: (*target).clone() });
                     return dst;

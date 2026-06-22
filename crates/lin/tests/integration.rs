@@ -846,6 +846,26 @@ print(if r == null then "null" else "got ${ r["x"] }")
 // The fix emits IsType on the raw NullableRecord value directly; codegen emits `ptr != null`.
 // Test both the `if … is T` form and the `match … is T | is Null` form, found and not-found.
 #[test]
+fn test_nullable_record_is_mismatched_target_not_ptr_null() {
+    // REGRESSION (REC-CPR soundness): `x is T` on a `R | Null` NullableRecord must NOT reduce to a
+    // pure pointer-null check when T != R — a non-null R is not necessarily a T. An earlier version
+    // emitted the ptr-null fast path for ANY target, so `(Trip|Null) is Other` wrongly returned true
+    // for a non-null Trip (caught by differential testing; the suite was green). The fast path is now
+    // gated on target == the inner record; a mismatched target falls through to the structural check.
+    let out = run(r#"
+import { print } from "std/io"
+type Trip = { "id": Int32, "n": Int32 }
+type Other = { "id": Int32, "x": Int32 }
+val getTrip = (k: Int32): Trip | Null =>
+  if k > 0 then { "id": k, "n": k * 2 } else null
+val d: Trip | Null = getTrip(9)
+print(if d is Trip then "trip" else "no")
+print(if d is Other then "OTHER" else "notother")
+"#);
+    assert_eq!(out, vec!["trip", "notother"]);
+}
+
+#[test]
 fn test_nullable_record_is_check_if() {
     let output = run(r#"import { print } from "std/io"
 import { length } from "std/array"
