@@ -1009,6 +1009,7 @@ dependencies = [
  "lin-common",
  "lin-ir",
  "lin-parse",
+ "llvm-sys",
  "md5",
 ]
 

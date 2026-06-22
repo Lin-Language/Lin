@@ -281,6 +281,7 @@ fn compile_test(src: &PathBuf, coverage: bool, json: bool) -> Result<PathBuf, St
         optimize: false,
         coverage,
         debug: false,
+        pgo: lin_compile::PgoMode::None,
     };
 
     match compile(&opts) {

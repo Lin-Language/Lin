@@ -38,6 +38,16 @@ pub fn run(args: &BuildArgs) {
         )
     });
 
+    // Resolve PGO mode from environment. LIN_PGO_GEN=1 → instrument; LIN_PGO_USE=<path> → use.
+    // If both are set, USE takes precedence (generates a fully optimised binary from the profile).
+    let pgo = if let Ok(profdata) = std::env::var("LIN_PGO_USE") {
+        lin_compile::PgoMode::Use { path: profdata }
+    } else if std::env::var("LIN_PGO_GEN").is_ok() {
+        lin_compile::PgoMode::Generate
+    } else {
+        lin_compile::PgoMode::None
+    };
+
     let opts = CompileOptions {
         source_path: args.file.clone(),
         output_path: output.clone(),
@@ -46,6 +56,7 @@ pub fn run(args: &BuildArgs) {
         optimize: !(args.no_opt || args.debug || std::env::var("LIN_NO_OPT").is_ok()),
         coverage: false,
         debug: args.debug,
+        pgo,
     };
 
     let t = Instant::now();
