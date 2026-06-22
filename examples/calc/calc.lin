@@ -7,11 +7,9 @@ import { parse } from "./parser"
 import { evalAst } from "./eval"
 
 // The end-to-end result: { "type": "success", "value": <Int32> } on a valid
-// expression, or { "type": "failure", "error": <String> } otherwise. Typed as
-// a named union whose discriminant `type` is String (spec: literals are base-
-// typed, not singletons), matched by callers with `has { "type": ... }`.
-type Failure = { "type": String, "error": String }
-type Success = { "type": String, "value": Int32 }
+// expression, or { "type": "failure", "error": <String> } otherwise.
+type Failure = { "type": "failure", "error": String }
+type Success = { "type": "success", "value": Int32 }
 type CalcResult = Success | Failure
 
 export val calc = (src: String): CalcResult =>
