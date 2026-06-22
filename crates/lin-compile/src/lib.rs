@@ -390,6 +390,15 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         // stack allocation AND suppress their Retain/Release emission (see lin_ir::escape). Runs
         // after RC elision so it sees and removes the surviving Retain/Release on stack values.
         lin_ir::escape::analyze(&mut ir_module);
+        // Box/unbox cancellation peephole (RT.2b): cancel a scalar value that is
+        // boxed into a union slot and immediately unboxed back to the same scalar
+        // type. Runs after rc_elide and escape so the IR is in its final form
+        // (no RC pairs being re-added later). Safe to run before rc_verify: a
+        // cancelled pair leaves no dangling RC obligations (only scalars are
+        // cancelled — no heap retain/release involved). Canonicalises the pair to
+        // a single Copy, which is a no-op from the LLVM perspective and lets LLVM
+        // fold away any bookkeeping around the now-dead box temp.
+        lin_ir::box_unbox_elide::elide_box_unbox(&mut ir_module);
         // Static RC-balance verifier (Cluster 2) — VERIFICATION ONLY, gated on `LIN_VERIFY_RC=1`,
         // OFF by default so it can never affect a normal build. Runs on the FINAL lowered IR (after
         // RC insertion + rc_elide + escape stack-alloc) and reports per-path leak / over-release /
