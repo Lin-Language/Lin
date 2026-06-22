@@ -54,7 +54,7 @@ impl<'ctx> Codegen<'ctx> {
         let head = self.context.append_basic_block(llvm_fn, "nestarr_head");
         let body = self.context.append_basic_block(llvm_fn, "nestarr_body");
         let done = self.context.append_basic_block(llvm_fn, "nestarr_done");
-        let idx_slot = self.builder.alloca(i64_ty, "nestarr_i");
+        let idx_slot = self.entry_block_alloca(i64_ty, "nestarr_i");
         self.builder.store(idx_slot, i64_ty.const_zero());
         self.builder.unconditional_branch(head);
         self.builder.position_at_end(head);
@@ -133,7 +133,7 @@ impl<'ctx> Codegen<'ctx> {
         let head = self.context.append_basic_block(llvm_fn, "fwiden_head");
         let body = self.context.append_basic_block(llvm_fn, "fwiden_body");
         let done = self.context.append_basic_block(llvm_fn, "fwiden_done");
-        let idx_slot = self.builder.alloca(i64_ty, "fwiden_i");
+        let idx_slot = self.entry_block_alloca(i64_ty, "fwiden_i");
         self.builder.store(idx_slot, i64_ty.const_zero());
         self.builder.unconditional_branch(head);
         self.builder.position_at_end(head);
