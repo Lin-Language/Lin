@@ -23442,3 +23442,34 @@ print(toString(find(xs, x => x > threshold)))
 "#);
     assert_eq!(output, vec!["6", "null", "true", "false", "5"]);
 }
+
+#[test]
+fn test_litunion_filter_map_has_match_segfault() {
+    // Regression: a union of literal-discriminant records (sum-type-eligible) piped through
+    // `.filter(...)` then `.map(r => match r has { "type": "success", value } => value ...)`
+    // previously segfaulted. Root cause: the closure parameter `r: Parsed` was compiled with
+    // `Packed(SumNode)` repr (from `type_seed`), but the stdlib `std_iter_filter` callback ABI
+    // passes each element as a `TaggedVal*` (from `lin_array_get_tagged`). The boxed-ABI
+    // wrapper in `unbox_value` passed `Union` types through unchanged, so the body's
+    // `lin_summat(r)` read at offsets 16 and 24 of a 16-byte allocation — OOB → SIGSEGV.
+    // Fix: `unbox_value` now projects TaggedVal* → *SumNode for sum-type-eligible Union params.
+    let output = run(r#"import { print } from "std/io"
+import { map, filter, for } from "std/iter"
+type Rec = { "name": String, "score": Int32 }
+type Success = { "type": "success", "value": Rec }
+type Failure = { "type": "failure", "error": String }
+type Parsed = Success | Failure
+val rows: Parsed[] = [
+  { "type": "success", "value": { "name": "a", "score": 1 } },
+  { "type": "failure", "error": "bad" },
+  { "type": "success", "value": { "name": "b", "score": 2 } }
+]
+val ok = rows.filter(r => r["type"] == "success").map(r =>
+  match r
+    has { "type": "success", value } => value
+    else => { "name": "?", "score": 0 }
+)
+ok.for(v => print(v["name"]))
+"#);
+    assert_eq!(output, vec!["a", "b"]);
+}
