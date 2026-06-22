@@ -43,6 +43,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # GNU time (/usr/bin/time -v): peak RSS + wall-clock for the RAPTOR/perf benches
     # (the shell builtin `time` reports neither; the benches' memory budget is tracked via this)
     time \
+    # perf: sampling profiler for the RELEASE benches. NOTE: this container runs with
+    # kernel.perf_event_paranoid=4 and no writable sysctl, so perf only works as root and
+    # with a SOFTWARE event (e.g. `sudo perf record -e cpu-clock -g -- ./bin`); hardware PMU
+    # counters are unavailable. AVX-512 binaries are fine (perf samples, it doesn't decode).
+    linux-perf \
     && rm -rf /var/lib/apt/lists/*
 
 ENV LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
