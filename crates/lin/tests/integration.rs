@@ -19336,6 +19336,41 @@ print(eval(chain(10)).toString())
 }
 
 #[test]
+fn test_st2_litunion_record_nested_if_else() {
+    // Regression: a named record type whose discriminant field is a string-literal union
+    // (e.g. `"rpwm" | "lpwm" | "stop"`) used in a nested if/else chain previously panicked
+    // in the repr Stage-2 ORACLE with
+    //   "MakeObject(sumnode) on t6 — old predicate says Packed(SumNode), repr says Boxed(Opaque)"
+    // and then segfaulted after the oracle fix because the Coerce at function return treated
+    // the LinMap* produced for the sub-union branch as a TaggedVal*.
+    //
+    // Root cause: the outer if produces a 3-variant sum Union; the else branch's inner if
+    // produces a 2-variant sub-union — two different SumNode seeds in the same Phi carry class
+    // → join() → Boxed(Opaque) → codegen took the LinMap path → Coerce read LinMap* as TaggedVal*.
+    //
+    // Fix: lower_if propagates the outer result_type into a nested-if else branch when both are
+    // sum-eligible, ensuring all MakeObject sites share one SumNode descriptor.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type MotorCommand = { "channel": "rpwm" | "lpwm" | "stop", "duty": Int32 }
+val motorCommand = (speed: Float64): MotorCommand =>
+  if speed > 0.0 then { "channel": "rpwm", "duty": 1 }
+  else if speed < 0.0 then { "channel": "lpwm", "duty": 2 }
+  else { "channel": "stop", "duty": 0 }
+val fwd = motorCommand(0.5)
+val rev = motorCommand(-0.5)
+val stp = motorCommand(0.0)
+print(fwd["channel"])
+print(toString(fwd["duty"]))
+print(rev["channel"])
+print(toString(rev["duty"]))
+print(stp["channel"])
+print(toString(stp["duty"]))
+"#);
+    assert_eq!(out, vec!["rpwm", "1", "lpwm", "2", "stop", "0"]);
+}
+
+#[test]
 fn test_int64_return_width_literal() {
     // Regression: a suffixless integer literal returned from an `Int64`-declared function — bare,
     // or in an `if`/`match`/block tail — must adopt the declared width (Int64), not the Int32
