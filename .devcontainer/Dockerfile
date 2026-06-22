@@ -40,6 +40,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gdb \
     valgrind \
     rr \
+    # GNU time (/usr/bin/time -v): peak RSS + wall-clock for the RAPTOR/perf benches
+    # (the shell builtin `time` reports neither; the benches' memory budget is tracked via this)
+    time \
     && rm -rf /var/lib/apt/lists/*
 
 ENV LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
