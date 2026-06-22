@@ -361,6 +361,7 @@ pub(crate) fn lower_function_expr_with_id(
         escaping_cells: std::collections::HashSet::new(),
         escape_alias: HashMap::new(),
         nonneg_range_ivs: std::collections::HashSet::new(),
+        local_fn_exprs: HashMap::new(),
     };
 
     // Add entry block. Tag it with the function body's span so coverage records a

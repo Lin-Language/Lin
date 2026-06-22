@@ -425,6 +425,32 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     // break the line-table mapping. `opts.optimize` is already false in `--debug` (set by the CLI),
     // but guard here too so debug info is never run through the optimiser.
     if opts.optimize && !opts.debug {
+        // BL.1: bitcode-runtime merge (opt-in via LIN_BC_RUNTIME=1).
+        // Loads the runtime bitcode produced by
+        //   RUSTFLAGS="--emit=llvm-bc -C codegen-units=1 -C opt-level=2" cargo build -p lin-runtime
+        // and merges it into the user module before the O2 pass, so the
+        // inliner can see every runtime body and cancel box/unbox/RC pairs.
+        // Default build is unchanged; only the flag-on path differs.
+        if std::env::var_os("LIN_BC_RUNTIME").is_some() {
+            match find_runtime_bc() {
+                Some(bc_path) => {
+                    match std::fs::read(&bc_path) {
+                        Ok(bc_bytes) => {
+                            cg.merge_runtime_bitcode(&bc_bytes)
+                                .map_err(|e| CompileError::Codegen(format!("LIN_BC_RUNTIME merge failed: {e}")))?;
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: LIN_BC_RUNTIME set but could not read {:?}: {e}", bc_path);
+                        }
+                    }
+                }
+                None => {
+                    eprintln!("Warning: LIN_BC_RUNTIME set but no runtime bitcode found.");
+                    eprintln!("  Build it first:");
+                    eprintln!("  RUSTFLAGS=\"--emit=llvm-bc -C codegen-units=1 -C opt-level=2\" cargo build -p lin-runtime");
+                }
+            }
+        }
         cg.run_optimization_passes(&opts.pgo).map_err(CompileError::Codegen)?;
     }
 
@@ -2010,6 +2036,68 @@ fn find_runtime_lib() -> Option<PathBuf> {
                 if path.exists() {
                     return Some(path);
                 }
+            }
+        }
+    }
+
+    None
+}
+
+/// Find the runtime bitcode file produced by building lin-runtime with
+/// `RUSTFLAGS="--emit=llvm-bc -C codegen-units=1"`. The `.bc` file lands in
+/// `target/{profile}/deps/lin_runtime-<hash>.bc`. We glob for any file whose
+/// name starts with `lin_runtime` and ends with `.bc` in the standard deps dirs.
+fn find_runtime_bc() -> Option<PathBuf> {
+    // Explicit override takes priority.
+    if let Ok(p) = std::env::var("LIN_RUNTIME_BC") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let deps_dirs = [
+        "target/debug/deps",
+        "target/release/deps",
+        "../target/debug/deps",
+        "../target/release/deps",
+    ];
+
+    let search_dirs: Vec<PathBuf> = {
+        let mut dirs: Vec<PathBuf> = deps_dirs.iter().map(PathBuf::from).collect();
+        if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+            let base = Path::new(&manifest);
+            for d in &deps_dirs {
+                dirs.push(base.join(d));
+                if let Some(parent) = base.parent() {
+                    dirs.push(parent.join(d));
+                }
+            }
+        }
+        dirs
+    };
+
+    for dir in &search_dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut bc_file: Option<PathBuf> = None;
+            let mut bc_mtime = std::time::SystemTime::UNIX_EPOCH;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("lin_runtime") && name_str.ends_with(".bc") {
+                    // Pick the most-recently-modified .bc if multiple exist (stale CGU artefacts).
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(mt) = meta.modified() {
+                            if mt >= bc_mtime {
+                                bc_mtime = mt;
+                                bc_file = Some(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(p) = bc_file {
+                return Some(p);
             }
         }
     }

@@ -15,9 +15,9 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::types::{BasicType, FloatMathType, FunctionType, IntMathType, PointerMathType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue, BasicValueEnum, CallSiteValue, FloatMathValue,
-    FunctionValue, InstructionValue, IntMathValue, IntValue, PhiValue, PointerMathValue,
-    PointerValue,
+    AggregateValue, AggregateValueEnum, BasicMetadataValueEnum, BasicValue, BasicValueEnum,
+    CallSiteValue, FloatMathValue, FunctionValue, InstructionValue, IntMathValue, IntValue,
+    PhiValue, PointerMathValue, PointerValue,
 };
 use inkwell::{FloatPredicate, IntPredicate};
 
@@ -249,6 +249,21 @@ pub trait BuilderExt<'ctx> {
         condition: IntValue<'ctx>,
         then_value: BV,
         else_value: BV,
+        name: &str,
+    ) -> BasicValueEnum<'ctx>;
+
+    fn insert_value<AV: AggregateValue<'ctx>, BV: BasicValue<'ctx>>(
+        &self,
+        agg: AV,
+        value: BV,
+        index: u32,
+        name: &str,
+    ) -> AggregateValueEnum<'ctx>;
+
+    fn extract_value<AV: AggregateValue<'ctx>>(
+        &self,
+        agg: AV,
+        index: u32,
         name: &str,
     ) -> BasicValueEnum<'ctx>;
 }
@@ -603,5 +618,24 @@ impl<'ctx> BuilderExt<'ctx> for Builder<'ctx> {
         name: &str,
     ) -> BasicValueEnum<'ctx> {
         self.build_select(condition, then_value, else_value, name).unwrap()
+    }
+
+    fn insert_value<AV: AggregateValue<'ctx>, BV: BasicValue<'ctx>>(
+        &self,
+        agg: AV,
+        value: BV,
+        index: u32,
+        name: &str,
+    ) -> AggregateValueEnum<'ctx> {
+        self.build_insert_value(agg, value, index, name).unwrap()
+    }
+
+    fn extract_value<AV: AggregateValue<'ctx>>(
+        &self,
+        agg: AV,
+        index: u32,
+        name: &str,
+    ) -> BasicValueEnum<'ctx> {
+        self.build_extract_value(agg, index, name).unwrap()
     }
 }
