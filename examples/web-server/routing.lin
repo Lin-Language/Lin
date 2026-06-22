@@ -7,7 +7,7 @@
 // free of HTTP concerns (and behind a mockable std/fs read) so the whole
 // graph -> dijkstra -> path flow is unit-testable without a live server or disk.
 import { push, reverse, length } from "std/array"
-import { for } from "std/iter"
+import { for, range, reduce, filter, map } from "std/iter"
 import { readJson } from "std/fs"
 
 // --- graph shapes ---------------------------------------------------------
@@ -28,9 +28,9 @@ type PqEntry = { "node": String, "dist": Int32 }
 //   { "type": "ok",      "path": String[], "distance": Int32 } — a route was found
 //   { "type": "no-path" }                                       — target unreachable
 //   { "type": "error",   "message": String }                   — graph file unreadable
-export type RouteFound = { "type": String, "path": String[], "distance": Int32 }
-export type RouteNone = { "type": String }
-export type RouteError = { "type": String, "message": String }
+export type RouteFound = { "type": "ok", "path": String[], "distance": Int32 }
+export type RouteNone = { "type": "no-path" }
+export type RouteError = { "type": "error", "message": String }
 export type SolveResult = RouteFound | RouteNone | RouteError
 
 val UNREACHABLE = 999999999
@@ -69,22 +69,10 @@ export val reconstructPath = (prev: { String: String }, source: String, target: 
 
 // --- Dijkstra -------------------------------------------------------------
 val findMinIdx = (pq: PqEntry[]): Int32 =>
-  var minIdx = 0
-  var i = 0
-  pq.for(_ =>
-    if pq[i]["dist"] < pq[minIdx]["dist"] then minIdx = i
-    i = i + 1
-  )
-  minIdx
+  range(0, pq.length()).reduce(0, (best, i) => if pq[i]["dist"] < pq[best]["dist"] then i else best)
 
 val removeAt = (pq: PqEntry[], idx: Int32): PqEntry[] =>
-  var result: PqEntry[] = []
-  var i = 0
-  pq.for(_ =>
-    if i != idx then push(result, pq[i])
-    i = i + 1
-  )
-  result
+  range(0, pq.length()).filter(i => i != idx).map(i => pq[i])
 
 val processQueue = (pq: PqEntry[], adj: { String: Neighbor[] }, dist: { String: Int32 }, prev: { String: String }, visited: { String: Boolean }): Null =>
   if length(pq) > 0 then
@@ -94,19 +82,11 @@ val processQueue = (pq: PqEntry[], adj: { String: Neighbor[] }, dist: { String: 
     val u = current["node"]
     if visited[u] == null then
       visited[u] = true
-      val neighbors = match adj[u]
-        is Null => []
-        else => adj[u]
+      val neighbors = adj[u] ?? []
       neighbors.for(edge =>
         val v = edge["to"]
-        val distU = dist[u]
-        val du = match distU
-          is Int32 => distU
-          else => 0
-        val distV = dist[v]
-        val dv = match distV
-          is Int32 => distV
-          else => 0
+        val du = dist[u] ?? 0
+        val dv = dist[v] ?? 0
         val newDist = du + edge["weight"]
         if newDist < dv then
           dist[v] = newDist
@@ -134,11 +114,11 @@ export val solve = (graphPath: String, from: String, to: String): SolveResult =>
   val graphData = readJson(graphPath)
   match graphData
     is Error =>
-      { "type": "error", "message": graphData["message"] }
+      { "type": "error", "message": graphData["message"] ?? "" }
     else =>
       val adj = buildAdj(graphData["edges"])
       val result = dijkstra(adj, from, graphData["nodes"])
-      val d = result["dist"][to]
+      val d = result["dist"][to] ?? UNREACHABLE
       if d >= UNREACHABLE then
         { "type": "no-path" }
       else

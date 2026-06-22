@@ -32,11 +32,7 @@ export val tally = (records: Record[]): { String: Int32 } =>
   var counts: { String: Int32 } = {}
   records.for(r =>
     val b = band(r["score"])
-    val prev = counts[b]
-    val n = match prev
-      is Int32 => prev
-      else => 0
-    counts[b] = n + 1
+    counts[b] = (counts[b] ?? 0) + 1
   )
   counts
 

@@ -121,10 +121,10 @@ val s = suite("raspberry-controller integration", [
       "link": 7
     }
     val frame = encodeTelemetry(report)
-    val decoded = match decodeTelemetry(frame)
+    val tele = decodeTelemetry(frame)
+    val decoded = match tele
       is Error => report
-      else => decodeTelemetry(frame)
-    // unreachable on a valid frame; keeps the type concrete
+      else => tele
     [
       expect(leftCmd["channel"]).toBe("rpwm"), // left drives forward
       expect(decoded["leftDuty"]).toBe(leftCmd["duty"]), // duty survives the frame
