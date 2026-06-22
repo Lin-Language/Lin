@@ -578,7 +578,20 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.call(memcpy_fn, &[dst_payload.into(), payload_ptr.into(), i64_ty.const_int(stride as u64, false).into()], "");
         let retain_fn = self.get_or_declare_fn("retain_sealed_payload_fields",
             self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+        // Immortal early-out: if the source array is frozen (refcount >= IMMORTAL_RC), frozen()
+        // guarantees all element heap-field payloads are also immortal, so every per-field retain
+        // inside retain_sealed_payload_fields would be a no-op. Skip the call entirely.
+        let i32_ty = self.context.i32_type();
+        let arr_rc = self.builder.load(i32_ty, arr_ptr, "smat_fe_rc").into_int_value();
+        let immortal_val = i32_ty.const_int(0x8000_0000u64, false);
+        let arr_is_immortal = self.builder.int_compare(IntPredicate::UGE, arr_rc, immortal_val, "smat_fe_imm");
+        let retain_bb = self.context.append_basic_block(llvm_fn, "smat_fe_ret");
+        let after_retain_bb = self.context.append_basic_block(llvm_fn, "smat_fe_noret");
+        self.builder.conditional_branch(arr_is_immortal, after_retain_bb, retain_bb);
+        self.builder.position_at_end(retain_bb);
         self.builder.call(retain_fn, &[dst_payload.into(), heap_desc.into()], "");
+        self.builder.unconditional_branch(after_retain_bb);
+        self.builder.position_at_end(after_retain_bb);
         let fe_exit = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_b);
 
