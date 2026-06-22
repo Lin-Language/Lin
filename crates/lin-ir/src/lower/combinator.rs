@@ -2255,8 +2255,24 @@ pub(crate) fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &m
         return builder.const_temp(Const::Null);
     }
 
-    let body = lower_callback_in_safe_ctx(&args[1], builder, ctx);
+    // DEVIRTUALIZED FAST PATH (path-8-B generalized): a BARE statically-known predicate
+    // (`xs.while(isValid)`) — call it DIRECTLY per element, no closure shell/indirect dispatch.
     let elem_ty = read_elem_ty;
+    if let Some((target, native_params)) = bare_fn_call_target(&args[1], builder, ctx) {
+        emit_combinator_loop(iterable, &iterable_ty, ElemAccess::Materialize(&elem_ty), builder, ctx,
+            |i, elem, b, _| {
+                let idx = narrow_loop_index(i, b);
+                let keep = call_body_direct(
+                    target.clone(), &[(elem, elem_ty.clone()), (idx, Type::Int32)],
+                    &native_params, &Type::Bool, b);
+                free_combinator_elem_box_full(elem, &elem_ty, b);
+                free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
+                LoopFlow::ContinueIf(keep)
+            });
+        return builder.const_temp(Const::Null);
+    }
+
+    let body = lower_callback_in_safe_ctx(&args[1], builder, ctx);
     emit_combinator_loop(iterable, &iterable_ty, ElemAccess::Materialize(&elem_ty), builder, ctx,
         |i, elem, b, _| {
             // keep = body(elem, i) : Bool — continue only while true. `i` (the 0-based SOURCE index) is
@@ -3131,6 +3147,80 @@ pub(crate) fn lower_flatmap_terminal(
     if matches!(args[0].ty(), Type::Stream(_)) {
         return None;
     }
+
+    // DEVIRTUALIZED FAST PATH (path-8-B generalized): bare named fn callback —
+    // outer index loop calls fn directly to get the inner array, inner index loop pushes each
+    // element. No closure shell, no indirect dispatch, no intermediate eager-stdlib body call.
+    if let Some((target, native_params)) = bare_fn_call_target(&args[1], builder, ctx) {
+        let (_, fm_ret) = callback_signature(&args[1]);
+        let out_elem_ty = match result_type {
+            Type::Array(t) | Type::Iterator(t) => (**t).clone(),
+            _ => Type::TypeVar(u32::MAX),
+        };
+        let inner_elem_ty = iter_elem_type(&fm_ret);
+        // Only fuse when the inner element repr is reclaimable (same gate as the inline path).
+        if !matches!(inner_elem_ty, Type::Never) && !fuse_elem_repr_reclaimable(&inner_elem_ty) {
+            // Fallthrough to inline path or generic stdlib.
+        } else {
+            let source_ty = args[0].ty();
+            let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
+            let source = lower_expr(&args[0], builder, ctx);
+            let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+            let json = Type::TypeVar(u32::MAX);
+            // Outer loop: for each element of the source, call fn(elem) -> inner[].
+            emit_index_loop(source, &source_ty, &read_elem_ty, builder, ctx, |i, elem, b, _| {
+                let idx = narrow_loop_index(i, b);
+                let inner = call_body_direct(
+                    target.clone(), &[(elem, read_elem_ty.clone()), (idx, Type::Int32)],
+                    &native_params, &fm_ret, b);
+                free_combinator_elem_box(elem, &read_elem_ty, b);
+                free_combinator_sealed_elem(elem, &source_ty, &read_elem_ty, b);
+                // Inner loop: iterate the produced inner array and push each element.
+                let inner_len = emit_iterable_len(inner, &fm_ret, b);
+                let zero = b.const_temp(Const::Int(0, Type::Int64));
+                let j = b.alloc_temp(Type::Int64);
+                let j_next = b.alloc_temp(Type::Int64);
+                let inner_preheader = b.current_block;
+                let inner_header = b.alloc_block("flatmap_inner_header");
+                let inner_body = b.alloc_block("flatmap_inner_body");
+                let inner_exit = b.alloc_block("flatmap_inner_exit");
+                b.terminate(Terminator::Jump(inner_header));
+                b.switch_to(inner_header);
+                b.emit(Instruction::Phi {
+                    dst: j, ty: Type::Int64,
+                    incomings: vec![(zero, inner_preheader), (j_next, inner_body)],
+                });
+                let inner_cond = b.alloc_temp(Type::Bool);
+                b.emit(Instruction::Binary {
+                    dst: inner_cond, op: BinOp::Lt, lhs: j, rhs: inner_len,
+                    operand_ty: Type::Int64, ty: Type::Bool,
+                });
+                b.terminate(Terminator::CondJump {
+                    cond: inner_cond, then_block: inner_body, else_block: inner_exit,
+                });
+                b.switch_to(inner_body);
+                let inner_elem = b.alloc_temp(json.clone());
+                b.emit(Instruction::Index {
+                    dst: inner_elem, object: inner, key: j,
+                    obj_ty: fm_ret.clone(), key_ty: Type::Int64, result_ty: json.clone(),
+                });
+                let borrowed = is_borrowed_heap_elem(&inner_elem_ty);
+                push_output(out, flat, &out_elem_ty, inner_elem, &json, borrowed, b);
+                if !borrowed { fm_reclaim_elem(inner_elem, &json, b); }
+                let one = b.const_temp(Const::Int(1, Type::Int64));
+                b.emit(Instruction::Binary {
+                    dst: j_next, op: BinOp::Add, lhs: j, rhs: one,
+                    operand_ty: Type::Int64, ty: Type::Int64,
+                });
+                b.terminate(Terminator::Jump(inner_header));
+                b.switch_to(inner_exit);
+                // Release the inner array (we borrowed its elements; now done).
+                b.emit(Instruction::Release { val: inner, ty: fm_ret.clone() });
+            });
+            return Some(out);
+        }
+    }
+
     let (fm_params, fm_body) = inlinable_capturing_lambda(&args[1], builder, ctx)?;
     let fm_params = fm_params.to_vec();
     let fm_body = fm_body.clone();
@@ -3865,6 +3955,80 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
         }
     }
 
+    // DEVIRTUALIZED FAST PATH (path-8-B generalized): a BARE statically-known reducer
+    // (`xs.reduce(init, add)`) calls it DIRECTLY per element — no closure shell, no boxed-ABI
+    // wrapper, no indirect dispatch — so LLVM can inline the body. The accumulator phi uses the
+    // declared `result_type` when it is a scalar (unboxed); otherwise falls back to Json like the
+    // generic path below (a heap/union accumulator must ride a uniform boxed pointer through the phi).
+    if let Some((target, native_params)) = bare_fn_call_target(&args[2], builder, ctx) {
+        let native_ret = match args[2].ty() {
+            Type::Function { ret, .. } => *ret,
+            _ => result_type.clone(),
+        };
+        let acc_ty = if is_inline_scalar(result_type) { result_type.clone() } else { json.clone() };
+        let init_raw = lower_expr(&args[1], builder, ctx);
+        let init = coerce_arg_to_param_repr(init_raw, &init_ty, &acc_ty, builder);
+        let read_elem_ty = if is_inline_scalar(&elem_ty) { elem_ty.clone() } else { json.clone() };
+
+        let len = emit_iterable_len(iterable, &iterable_ty, builder);
+        let zero = builder.const_temp(Const::Int(0, Type::Int64));
+        let preheader = builder.current_block;
+        let header = builder.alloc_block("reduce_header");
+        let body_blk = builder.alloc_block("reduce_body");
+        let exit = builder.alloc_block("reduce_exit");
+        let i = builder.alloc_temp(Type::Int64);
+        let i_next = builder.alloc_temp(Type::Int64);
+        let acc = builder.alloc_temp(acc_ty.clone());
+        let acc_next = builder.alloc_temp(acc_ty.clone());
+        builder.terminate(Terminator::Jump(header));
+        builder.switch_to(header);
+        builder.emit(Instruction::Phi {
+            dst: i, ty: Type::Int64, incomings: vec![(zero, preheader), (i_next, body_blk)],
+        });
+        builder.emit(Instruction::Phi {
+            dst: acc, ty: acc_ty.clone(), incomings: vec![(init, preheader), (acc_next, body_blk)],
+        });
+        let cond = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Binary {
+            dst: cond, op: BinOp::Lt, lhs: i, rhs: len, operand_ty: Type::Int64, ty: Type::Bool,
+        });
+        builder.terminate(Terminator::CondJump { cond, then_block: body_blk, else_block: exit });
+        builder.switch_to(body_blk);
+        let elem = builder.alloc_temp(read_elem_ty.clone());
+        builder.emit(Instruction::Index {
+            dst: elem, object: iterable, key: i,
+            obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
+        });
+        let idx = narrow_loop_index(i, builder);
+        // Direct call: pass (acc, elem, idx) coerced to callee's native params. call_body_direct
+        // truncates to the declared arity so a 2-param reducer ignores the index arg.
+        let new_acc = call_body_direct(
+            target, &[(acc, acc_ty.clone()), (elem, read_elem_ty.clone()), (idx, Type::Int32)],
+            &native_params, &native_ret, builder);
+        // Coerce the direct-call result back to the phi's accumulator type.
+        let new_acc_coerced = coerce_arg_to_param_repr(new_acc, &native_ret, &acc_ty, builder);
+        builder.emit(Instruction::ReleaseIfDistinct { val: elem, other: new_acc_coerced });
+        let one = builder.const_temp(Const::Int(1, Type::Int64));
+        builder.emit(Instruction::Binary {
+            dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
+        });
+        let back_block = builder.current_block;
+        builder.terminate(Terminator::Jump(header));
+        builder.patch_phi_incoming(header, i, body_blk, back_block);
+        builder.patch_phi_incoming_value(header, acc, acc, new_acc_coerced, back_block);
+        builder.switch_to(exit);
+        let result = if is_union_ty(result_type) || acc_ty == *result_type {
+            acc
+        } else {
+            let out = builder.alloc_temp(result_type.clone());
+            builder.emit(Instruction::Coerce {
+                dst: out, src: acc, from_ty: acc_ty, to_ty: result_type.clone(),
+            });
+            out
+        };
+        return result;
+    }
+
     let init_raw = lower_expr(&args[1], builder, ctx);
     let init = box_to_json(init_raw, &init_ty, builder);
     let f = lower_callback_in_safe_ctx(&args[2], builder, ctx);
@@ -4251,13 +4415,91 @@ pub(crate) fn lower_entries_inline(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> Option<Temp> {
-    // Gate: 2-arg call, Map receiver, inlinable callback.
+    // Gate: 2-arg call, Map receiver, inlinable callback OR bare named fn.
     if args.len() != 2 {
         return None;
     }
     if !matches!(args[0].ty(), Type::Map { .. }) {
         return None;
     }
+
+    // DEVIRTUALIZED FAST PATH (path-8-B generalized): bare named fn callback — build the pair
+    // array exactly like the inline path, then call the fn directly (direct/named call, not a
+    // closure shell or indirect dispatch).
+    if let Some((target, native_params)) = bare_fn_call_target(&args[1], builder, ctx) {
+        let fn_ret_ty = match args[1].ty() {
+            Type::Function { ret, .. } => *ret,
+            _ => Type::Null,
+        };
+        let map = lower_expr(&args[0], builder, ctx);
+        let json = Type::TypeVar(u32::MAX);
+        let len = builder.alloc_temp(Type::Int64);
+        builder.emit(Instruction::Call {
+            dst: len,
+            callee: CallTarget::Named("lin_map_raw_len".to_string()),
+            args: vec![map],
+            ret_ty: Type::Int64,
+        });
+        let zero = builder.const_temp(Const::Int(0, Type::Int64));
+        let preheader = builder.current_block;
+        let header = builder.alloc_block("entries_header");
+        let body_blk = builder.alloc_block("entries_body");
+        let latch = builder.alloc_block("entries_latch");
+        let exit = builder.alloc_block("entries_exit");
+        let i = builder.alloc_temp(Type::Int64);
+        let i_next = builder.alloc_temp(Type::Int64);
+        builder.terminate(Terminator::Jump(header));
+        builder.switch_to(header);
+        builder.emit(Instruction::Phi {
+            dst: i, ty: Type::Int64,
+            incomings: vec![(zero, preheader), (i_next, latch)],
+        });
+        let cond = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Binary {
+            dst: cond, op: BinOp::Lt, lhs: i, rhs: len,
+            operand_ty: Type::Int64, ty: Type::Bool,
+        });
+        builder.terminate(Terminator::CondJump { cond, then_block: body_blk, else_block: exit });
+        builder.switch_to(body_blk);
+        let key_box = builder.alloc_temp(json.clone());
+        builder.emit(Instruction::Call {
+            dst: key_box, callee: CallTarget::Named("lin_map_raw_key_at".to_string()),
+            args: vec![map, i], ret_ty: json.clone(),
+        });
+        let val_box = builder.alloc_temp(json.clone());
+        builder.emit(Instruction::Call {
+            dst: val_box, callee: CallTarget::Named("lin_map_raw_value_at".to_string()),
+            args: vec![map, i], ret_ty: json.clone(),
+        });
+        let pair_ty = Type::Array(Box::new(json.clone()));
+        let pair = builder.alloc_temp(pair_ty.clone());
+        builder.emit(Instruction::MakeArray {
+            dst: pair, elements: vec![key_box, val_box], spreads: vec![],
+            elem_ty: json.clone(), inline: false, columnar: false,
+        });
+        let pair_box = builder.alloc_temp(json.clone());
+        builder.emit(Instruction::Coerce {
+            dst: pair_box, src: pair, from_ty: pair_ty, to_ty: json.clone(),
+        });
+        // Direct call to fn(pair_box): same pair_box ownership as the inline path.
+        let res = call_body_direct(
+            target, &[(pair_box, json.clone())], &native_params, &fn_ret_ty, builder);
+        builder.emit(Instruction::Release { val: res, ty: fn_ret_ty });
+        builder.emit(Instruction::Release { val: pair_box, ty: json.clone() });
+        if !builder.is_current_block_terminated() {
+            builder.terminate(Terminator::Jump(latch));
+        }
+        builder.switch_to(latch);
+        let one = builder.const_temp(Const::Int(1, Type::Int64));
+        builder.emit(Instruction::Binary {
+            dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
+            operand_ty: Type::Int64, ty: Type::Int64,
+        });
+        builder.terminate(Terminator::Jump(header));
+        builder.switch_to(exit);
+        return Some(builder.const_temp(Const::Null));
+    }
+
     let lam = inlinable_capturing_lambda(&args[1], builder, ctx)?;
     let lam_params = lam.0.to_vec();
     let lam_body = lam.1.clone();
