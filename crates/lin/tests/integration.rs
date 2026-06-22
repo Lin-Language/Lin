@@ -23251,6 +23251,29 @@ print(toString(sum_range(0, 5)))
 }
 
 #[test]
+fn test_is_elision_no_cross_numeric_widening() {
+    // REGRESSION (CK.2 `is`/null elision): `is T` elision must mirror the runtime TAG check
+    // (`lin_get_tag`), NOT assignment-compatibility. `is_compatible` returns true for numeric
+    // *widening* (Int32 -> Int64/Float64), but an `Int32` value carries TAG_INT32, so
+    // `(x: Int32) is Int64` is FALSE at runtime. An earlier version of the elision used
+    // `is_compatible` and folded it to `true` (the full suite still passed — the unsound path had
+    // no test). The fix requires exact tag identity in `definitely_is_tag`. The legitimate
+    // same-type elision (`a is Int32`) and genuine union narrowing must still behave correctly.
+    let out = run(r#"
+import { print } from "std/io"
+val a: Int32 = 5
+print(if a is Int32 then "a:yes" else "a:no")
+print(if a is Int64 then "a:is64" else "a:not64")
+print(if a is Float64 then "a:isf" else "a:notf")
+val b: Int32 | Null = 7
+print(if b is Int32 then "b:int" else "b:other")
+val c: Int32 | Null = null
+print(if c is Int32 then "c:int" else "c:other")
+"#);
+    assert_eq!(out, vec!["a:yes", "a:not64", "a:notf", "b:int", "c:other"]);
+}
+
+#[test]
 fn test_flat_producer_specs_read_flat_not_tagged() {
     // `is_provably_flat_producer` must recognise overloaded / monomorphized flat producers so a
     // downstream combinator reads their result with flat scalar reads (`lin_flat_array_get_*`), not
