@@ -42,5 +42,5 @@ val footerFor = (s: Summary): String =>
 
 // Render the full report: a line per task plus a summary footer.
 export val render = (results: TaskResult[]): String =>
-  val body = results.map(r => line(r)).join("\n")
+  val body = results.map(line).join("\n")
   "=== task run ===\n${body}\n${footerFor(summarize(results))}"
