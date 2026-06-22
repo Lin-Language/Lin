@@ -780,7 +780,7 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                             // seeds are in the same carry class and join to Boxed). Codegen
                             // handles Boxed correctly for this site (takes the LinMap path), so
                             // Boxed is an acceptable conservative outcome here.
-                            if !is_sumnode(r, sum_ty) && !matches!(r, Repr::Boxed(_)) {
+                            if !is_sumnode(r, sum_ty) {
                                 report(&mut bad, "MakeObject(sumnode)", *dst, "Packed(SumNode)", r);
                             }
                         }
