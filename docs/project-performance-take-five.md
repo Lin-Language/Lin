@@ -417,3 +417,52 @@ different backend (the JIT / whole-program specialization route in §5.8) — a 
 made on data rather than hope. **The parallel structure means the other tracks can be built and
 measured before that verdict is in**, so a wall-neutral CK.1 does not idle the team — and Point 4
 (value-axis ABI) and Point 5 (PGO) are independent enough to pay even if CK.1 does not.
+
+---
+
+## Measured outcome (2026-06-22) — the campaign ran, and the headline was a DEBUG-runtime artifact
+
+All 14 lanes were built (parallel Bedrock sonnet agents), verified (build + `cargo test --workspace`
++ `LIN_VERIFY_RC=1` + ASan + per-lane differential probes), and merged to `master` (through
+`d8d26228`), every step RAPTOR-digest-exact (`group=26203913 range=773022892 journeys=139`).
+
+**The critical mistake: all A/B was measured with the DEBUG runtime.** The orchestrator timed lanes
+with `target/debug/lin`, which links the *unoptimized* debug `liblin_runtime.a`. The debug runtime
+makes runtime-calls (the bounds `_oob` accessor, `lin_map_get`, RC ops, string ops) ~8× more
+expensive than release. So the lanes that **inline/elide runtime-calls** (RT.1 `alwaysinline`, RT.2a
+RC-inline, RT.2c map-get-inline) looked like large wins — wave-2 measured a stable, same-batch
+**−18% on RAPTOR**. But `benchmarks/compare/compare.sh` builds **release** (`target/release/lin` +
+`cargo build --release -p lin-runtime -p lin`, lines 75–82) — and in release those calls are already
+cheap, so the inlined code is pure cost. The debug A/B was internally consistent (both sides debug)
+but measured a cost profile that **does not exist in production**.
+
+**Measured RELEASE RAPTOR (`lin-manually-typed`, min wall, same-batch interleaved, stable):**
+
+| build | wall | Δ vs prev | note |
+|---|---:|---:|---|
+| pre-take5 (`40d93110`) | 80 s | — | |
+| batch-1 (`a537b8c8`) | **77 s** | **−4 %** | genuine release win (INT / DEVIRT / ENTRIES …) |
+| + wave-2 (`62f9914b`) | 81 s | **+5 %** | regression — wipes batch-1 (the inline/elide lanes) |
+| + other-agent fixes (`4be5ed7c`) | 81 s | ~0 | correctness fixes, perf-neutral |
+| + phase-2 (`d8d26228`) | 82 s | +1 % | LSS-v1 / scalar-CPR / bitcode (opt-in) |
+
+**Net pre→final: ≈ +2.5 % release regression.** Batch-1 is a real keeper; wave-2 + phase-2
+net-regress release. Likely-positive in release: CK.1 (bounds-elision, codegen-level) and CL.3
+(devirt). Likely-negative: RT.1, RT.2a, RT.2c, RT.2b (they optimized away debug-only costs).
+
+**Decision:** master left as-is (the +2.5 % is small and correctness/foundation are intact); a
+per-lane **release** bisect to keep CK.1/CL.3 and revert the inlining-losers + phase-2 is the tracked
+follow-up (goal: master ≥ batch-1's −4 %).
+
+**The durable lessons:**
+1. **ALL perf A/B must use RELEASE builds** (release compiler + release runtime, as `compare.sh`
+   does). Debug-runtime numbers invert the signal for any lane that touches runtime-call overhead.
+2. **Differential stdout probes** (compile+run the same program on master vs the lane, diff output)
+   caught a real soundness bug (NULLUNION's `is`-elision used `is_compatible`, which treats
+   `Int32→Int64`/`Float64` as widening-compatible, so `(x:Int32) is Int64` wrongly folded to `true`;
+   the 940-test suite + manual ASan were all green — the unsound path had no test). Fix: exact-tag
+   `definitely_is_tag`.
+3. **Build the integration**, never trust a clean cherry-pick — CK.1 added an IR `nonneg` field and
+   CL.3 added new Index sites; zero textual conflict, broken build.
+4. **Same-batch interleaved, min-of-≥3** — single A/B pairs at RAPTOR's ~7 % debug / ~1 % release
+   noise floor produced two false-regression alarms (cross-batch drift).
