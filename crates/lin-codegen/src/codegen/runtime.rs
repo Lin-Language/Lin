@@ -82,7 +82,6 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub unbox_bool: FunctionValue<'ctx>,
     pub unbox_ptr: FunctionValue<'ctx>,
     pub tagged_to_string: FunctionValue<'ctx>,
-    pub rc_retain: FunctionValue<'ctx>,
     pub string_release: FunctionValue<'ctx>,
     pub array_release: FunctionValue<'ctx>,
     pub closure_release: FunctionValue<'ctx>,
@@ -94,7 +93,6 @@ pub(crate) struct RuntimeFns<'ctx> {
     /// `lin_sealed_release(ptr, size: i64)` decrements its refcount and, on zero, releases each HEAP
     /// field per the descriptor then frees the struct.
     pub sealed_alloc: FunctionValue<'ctx>,
-    pub sealed_release: FunctionValue<'ctx>,
     /// Unboxed tagged sum type (unboxed-sumtype Stage 1): `lin_sumnode_alloc(size: i64, desc: ptr) ->
     /// ptr` allocates a zeroed, refcount-1 `SumNode` (header `[rc|size|desc|tag|pad]`, payload sized
     /// to the max variant); `lin_sumnode_release(ptr, size: i64)` decrements its refcount and frees on
@@ -114,6 +112,9 @@ pub(crate) struct RuntimeFns<'ctx> {
     /// Int-keyed map entry points (key_kind = 1).
     pub map_get_int: FunctionValue<'ctx>,
     pub map_set_int: FunctionValue<'ctx>,
+    /// Cold path for the inline sealed-release when rc hits zero: walks heap fields and frees.
+    /// `lin_sealed_drop_at_zero(ptr, size)`. Called after the inline dec reaches zero.
+    pub sealed_drop_at_zero: FunctionValue<'ctx>,
 }
 
 impl<'ctx> RuntimeFns<'ctx> {
@@ -224,13 +225,11 @@ impl<'ctx> RuntimeFns<'ctx> {
         // lin_tagged_to_string(tagged: ptr) -> ptr (LinString*)
         let tagged_to_string = module.add_function("lin_tagged_to_string", string_ptr_type.fn_type(&[ptr_type.into()], false), None);
         // Retain / release: adjust refcount, free if zero.
-        let rc_retain = module.add_function("lin_rc_retain", void_type.fn_type(&[ptr_type.into()], false), None);
         let string_release = module.add_function("lin_string_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let array_release = module.add_function("lin_array_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let closure_release = module.add_function("lin_closure_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let tagged_release = module.add_function("lin_tagged_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let sealed_alloc = module.add_function("lin_sealed_alloc", ptr_type.fn_type(&[i64_type.into(), ptr_type.into(), ptr_type.into()], false), None);
-        let sealed_release = module.add_function("lin_sealed_release", void_type.fn_type(&[ptr_type.into(), i64_type.into()], false), None);
         let sumnode_alloc = module.add_function("lin_sumnode_alloc", ptr_type.fn_type(&[i64_type.into(), ptr_type.into()], false), None);
         let sumnode_release = module.add_function("lin_sumnode_release", void_type.fn_type(&[ptr_type.into(), i64_type.into()], false), None);
         // Typed index-signature map (ADR-055 + numeric-key).
@@ -244,6 +243,13 @@ impl<'ctx> RuntimeFns<'ctx> {
         // Int-keyed map entry points: get(map, i64)->ptr, set(map, i64, val_ptr)->void
         let map_get_int = module.add_function("lin_map_get_int", ptr_type.fn_type(&[ptr_type.into(), i64_type.into()], false), None);
         let map_set_int = module.add_function("lin_map_set_int", void_type.fn_type(&[ptr_type.into(), i64_type.into(), ptr_type.into()], false), None);
+
+        // lin_sealed_drop_at_zero(ptr, size: i64) -> void — heap-field walk + free after dec→0
+        let sealed_drop_at_zero = module.add_function(
+            "lin_sealed_drop_at_zero",
+            void_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
 
         Self {
             string_length,
@@ -279,13 +285,11 @@ impl<'ctx> RuntimeFns<'ctx> {
             unbox_bool,
             unbox_ptr,
             tagged_to_string,
-            rc_retain,
             string_release,
             array_release,
             closure_release,
             tagged_release,
             sealed_alloc,
-            sealed_release,
             sumnode_alloc,
             sumnode_release,
             map_alloc,
@@ -296,6 +300,7 @@ impl<'ctx> RuntimeFns<'ctx> {
             map_eq,
             map_get_int,
             map_set_int,
+            sealed_drop_at_zero,
         }
     }
 }

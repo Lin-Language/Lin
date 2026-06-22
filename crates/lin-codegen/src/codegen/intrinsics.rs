@@ -43,7 +43,7 @@ impl<'ctx> Codegen<'ctx> {
             // saturate), so retaining a string literal is a no-op.
             Type::Str | Type::StrLit(_) => {
                 if val.is_pointer_value() {
-                    self.builder.call(self.rt.rc_retain, &[val.into()], "");
+                    self.emit_rc_retain_inline(val.into_pointer_value());
                 }
                 val
             }

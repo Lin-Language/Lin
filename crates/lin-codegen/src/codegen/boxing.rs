@@ -456,10 +456,10 @@ impl<'ctx> Codegen<'ctx> {
         let raw = self.builder.call(self.rt.unbox_ptr, &[val.into()], "kp_unbox")
             .try_as_basic_value().unwrap_basic();
         // Retain the packed buffer: the read-back temp is a fresh owner (+1) whose Release the pass
-        // schedules. `lin_rc_retain` increments the offset-0 refcount shared by LinArray and packed
+        // schedules. The inline retain increments the offset-0 refcount shared by LinArray and packed
         // sealed structs (both carry it at offset 0), so this is correct for either kind.
         if raw.is_pointer_value() {
-            self.builder.call(self.rt.rc_retain, &[raw.into()], "");
+            self.emit_rc_retain_inline(raw.into_pointer_value());
         }
         raw
     }

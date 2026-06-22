@@ -524,7 +524,7 @@ impl<'ctx> Codegen<'ctx> {
                 // (B) Retain if this is a heap-pointer result type.
                 if Self::result_is_heap_pointer(result_ty) {
                     if rec_unboxed.is_pointer_value() {
-                        self.builder.call(self.rt.rc_retain, &[rec_unboxed.into()], "");
+                        self.emit_rc_retain_inline(rec_unboxed.into_pointer_value());
                     }
                 }
                 // Release the owned box (after the retain, the inner's RC is +2 if non-null; release
@@ -1010,7 +1010,7 @@ impl<'ctx> Codegen<'ctx> {
             self.emit_release(old, &fld_ty);
             self.builder.store(p, stored);
             if !repr_change && stored.is_pointer_value() {
-                self.builder.call(self.rt.rc_retain, &[stored.into_pointer_value().into()], "sealed_set_retain");
+                self.emit_rc_retain_inline(stored.into_pointer_value());
             }
         } else {
             // Scalar field: a plain store (coerced to the field width above). No RC.

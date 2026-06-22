@@ -6,7 +6,127 @@ use lin_check::types::Type;
 use lin_ir::repr::Repr;
 use super::Codegen;
 
+// IMMORTAL_RC sentinel — mirrors `lin_runtime::string::IMMORTAL_RC = 0x8000_0000`.
+// Kept in lockstep: any change to the runtime constant requires a matching change here.
+const IMMORTAL_RC: u32 = 0x8000_0000;
+
 impl<'ctx> Codegen<'ctx> {
+    // ── Inline RC retain ───────────────────────────────────────────────────────────────────────────
+    //
+    // Emits the retain body inline (single-instruction inc + IMMORTAL guard) so that LLVM's
+    // `mem2reg` + `instcombine` can cancel non-escaping retain/release pairs after inlining.
+    // Semantics mirror `lin_rc_retain(ptr)` EXACTLY (field-offsets, guard, arithmetic) except
+    // for `LIN_RC_COUNT` instrumentation, which is a debug-only measurement and is intentionally
+    // omitted here (the hot path is the common case; the cold count path adds a branch for every
+    // retain, negating the gain).
+    //
+    // SAFETY INVARIANT: `ptr` must be null-safe — callers should pass non-null (codegen only emits
+    // Retain for live allocated values). A null pointer check is emitted defensively to match the
+    // original runtime behavior (the original `lin_rc_retain` null-guards unconditionally).
+    //
+    // NON-ATOMIC: by design (ADR-028). The Lin thread-transfer model deep-copies all heap values
+    // before handing them to a worker, so the refcount of any live value on the single-threaded
+    // hot path is only manipulated by one thread at a time. Objects that cross thread boundaries
+    // are deep-copied first; the original and copy each have a fresh rc=1 owned exclusively by
+    // their respective thread.
+
+    /// Emit an inline retain of `ptr` (the u32 at offset 0). Null-safe; IMMORTAL_RC-safe.
+    /// Replaces a call to `lin_rc_retain` — behaviorally identical on the correctness path.
+    pub(crate) fn emit_rc_retain_inline(&mut self, ptr: PointerValue<'ctx>) {
+        let i32_ty = self.context.i32_type();
+        let i64_ty = self.context.i64_type();
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+
+        // All paths merge here (null / immortal short-circuit, and post-inc).
+        let cont_bb = self.context.append_basic_block(llvm_fn, "rcret_cont");
+
+        // Null guard: if ptr == null, skip to cont.
+        let pi = self.builder.ptr_to_int(ptr, i64_ty, "rcret_pi");
+        let is_null = self.builder.int_compare(IntPredicate::EQ, pi, i64_ty.const_zero(), "rcret_isnull");
+        let check_bb = self.context.append_basic_block(llvm_fn, "rcret_check");
+        self.builder.conditional_branch(is_null, cont_bb, check_bb);
+
+        // Load rc @ offset 0, check IMMORTAL_RC.
+        self.builder.position_at_end(check_bb);
+        let rc = self.builder.load(i32_ty, ptr, "rcret_rc").into_int_value();
+        let imm = i32_ty.const_int(IMMORTAL_RC as u64, false);
+        let is_imm = self.builder.int_compare(IntPredicate::UGE, rc, imm, "rcret_isimm");
+        let inc_bb = self.context.append_basic_block(llvm_fn, "rcret_inc");
+        self.builder.conditional_branch(is_imm, cont_bb, inc_bb);
+
+        // Increment rc.
+        self.builder.position_at_end(inc_bb);
+        let one32 = i32_ty.const_int(1, false);
+        let new_rc = self.builder.int_add(rc, one32, "rcret_new");
+        self.builder.store(ptr, new_rc);
+        self.builder.unconditional_branch(cont_bb);
+
+        self.builder.position_at_end(cont_bb);
+    }
+
+    // ── Inline sealed-record release ───────────────────────────────────────────────────────────────
+    //
+    // Emits the sealed-release body inline: null guard + zero-rc guard + IMMORTAL guard + dec +
+    // conditional call to the cold path `lin_sealed_drop_at_zero(ptr, size)` on zero.
+    //
+    // The cold path (heap-field walk + dealloc) stays out-of-line so its call target is visible to
+    // LLVM as a call instruction — LLVM will not try to inline it, keeping code size bounded. The
+    // HOT path (dec > 0 → continue) is the plain LLVM instructions that mem2reg/instcombine can
+    // see and cancel against matching inline retains.
+    //
+    // Semantics mirror `lin_sealed_release(ptr, size)` EXACTLY.
+
+    /// Emit an inline sealed-record release of `ptr` with static `size`. Null-safe; IMMORTAL-safe.
+    /// Replaces a call to `lin_sealed_release(ptr, size)`.
+    pub(crate) fn emit_sealed_release_inline(&mut self, ptr: PointerValue<'ctx>, size: u64) {
+        let i32_ty = self.context.i32_type();
+        let i64_ty = self.context.i64_type();
+        let zero32 = i32_ty.const_zero();
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+
+        // All early-exit (null / zero-rc / immortal) and the post-dec path converge here.
+        let cont_bb = self.context.append_basic_block(llvm_fn, "srel_cont");
+
+        // Null guard.
+        let pi = self.builder.ptr_to_int(ptr, i64_ty, "srel_pi");
+        let is_null = self.builder.int_compare(IntPredicate::EQ, pi, i64_ty.const_zero(), "srel_isnull");
+        let rc_bb = self.context.append_basic_block(llvm_fn, "srel_rc");
+        self.builder.conditional_branch(is_null, cont_bb, rc_bb);
+
+        // Load rc @ offset 0.
+        self.builder.position_at_end(rc_bb);
+        let rc = self.builder.load(i32_ty, ptr, "srel_rc").into_int_value();
+
+        // Zero-rc guard (double-free protection, mirrors the runtime).
+        let is_zero = self.builder.int_compare(IntPredicate::EQ, rc, zero32, "srel_iszero");
+        let chkimm_bb = self.context.append_basic_block(llvm_fn, "srel_chkimm");
+        self.builder.conditional_branch(is_zero, cont_bb, chkimm_bb);
+
+        // IMMORTAL_RC guard.
+        self.builder.position_at_end(chkimm_bb);
+        let imm = i32_ty.const_int(IMMORTAL_RC as u64, false);
+        let is_imm = self.builder.int_compare(IntPredicate::UGE, rc, imm, "srel_isimm");
+        let dec_bb = self.context.append_basic_block(llvm_fn, "srel_dec");
+        self.builder.conditional_branch(is_imm, cont_bb, dec_bb);
+
+        // Decrement rc.
+        self.builder.position_at_end(dec_bb);
+        let one32 = i32_ty.const_int(1, false);
+        let new_rc = self.builder.int_sub(rc, one32, "srel_new");
+        self.builder.store(ptr, new_rc);
+        // If rc reached zero, call the cold drop path; otherwise skip to cont.
+        let at_zero_bb = self.context.append_basic_block(llvm_fn, "srel_atzero");
+        let now_zero = self.builder.int_compare(IntPredicate::EQ, new_rc, zero32, "srel_nowzero");
+        self.builder.conditional_branch(now_zero, at_zero_bb, cont_bb);
+
+        // Cold path: heap-field walk + free. Stays out-of-line so LLVM sees a call it can sink.
+        self.builder.position_at_end(at_zero_bb);
+        let size_val = i64_ty.const_int(size, false);
+        self.builder.call(self.rt.sealed_drop_at_zero, &[ptr.into(), size_val.into()], "");
+        self.builder.unconditional_branch(cont_bb);
+
+        self.builder.position_at_end(cont_bb);
+    }
     /// Release a TCO param slot's OLD value before the back-edge store overwrites it, guarded by:
     /// (1) `owns_flag` — a bool slot that is true only when the current slot value was produced by
     /// a PRIOR tail iteration (loop-owned), false for the borrowed caller-passed entry param; and
