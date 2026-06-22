@@ -797,6 +797,12 @@ pub(crate) fn lower_match_pattern(
         }
         TypedMatchPattern::Is(tp) => {
             let (check_ty, _) = pattern_type_check(tp);
+            // CK.2: when the scrutinee's static type already proves the `is T` test
+            // always succeeds, skip the IsType instruction entirely. Same soundness
+            // rule as the `TypedExpr::Is` site: both sides must be fully concrete.
+            if is_definitely_subtype(scrut_ty, &check_ty) {
+                return PatternTest::Always;
+            }
             let dst = builder.alloc_temp(Type::Bool);
             builder.emit(Instruction::IsType {
                 dst,
