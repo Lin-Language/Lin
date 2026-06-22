@@ -3313,15 +3313,15 @@ unsafe fn record_to_string_array(fields: &[Vec<u8>]) -> *mut u8 {
 /// dropped). Used by `recordRows`.
 unsafe fn record_to_object(header: &[Vec<u8>], row: &[Vec<u8>]) -> *mut u8 {
     use crate::map::{lin_map_alloc, lin_map_set};
-    use crate::string::lin_string_release;
+    use crate::string::{lin_string_from_bytes, lin_string_release};
     use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TaggedVal};
     let map = lin_map_alloc(header.len().max(1) as u32, 0);
     for (i, key_bytes) in header.iter().enumerate() {
         if i >= row.len() {
             break; // short row: omit the trailing keys
         }
-        let k = crate::fs::make_string(&String::from_utf8_lossy(key_bytes));
-        let v = crate::fs::make_string(&String::from_utf8_lossy(&row[i]));
+        let k = lin_string_from_bytes(key_bytes.as_ptr(), key_bytes.len() as u32);
+        let v = lin_string_from_bytes(row[i].as_ptr(), row[i].len() as u32);
         let mut tv: TaggedVal = std::mem::zeroed();
         tv.tag = TAG_STR;
         tv.payload = v as u64;
@@ -4888,6 +4888,140 @@ mod tests {
             assert_eq!(cc.load(Ordering::SeqCst), 0, "(i) parent not yet closed (handle still live)");
             crate::tagged::lin_tagged_release(handle);
             assert_eq!(cc.load(Ordering::SeqCst), 1, "(i) parent closed exactly once after all refs dropped");
+        }
+    }
+
+    // ── CSV recordRows: differential correctness ────────────────────────────────────────────────
+
+    /// Drive `lin_stream_csv_records` over `csv_bytes` and return every row as a
+    /// `Vec<(String,String)>` of (key,value) pairs (in insertion order of the header).
+    unsafe fn csv_records_to_vec(csv_bytes: &[u8]) -> Vec<Vec<(String, String)>> {
+        use crate::map::lin_map_get_bytes;
+        use crate::tagged::{lin_get_tag, lin_unbox_ptr, TAG_MAP, TAG_STR};
+
+        // Build a byte-stream source backed by the slice.
+        let src = make(vec![csv_bytes.to_vec()], Arc::new(AtomicUsize::new(0)), None);
+        let stream = lin_stream_csv_records(src as *const u8, b',' as i32);
+        crate::tagged::lin_tagged_release(src);
+
+        // Peek at the header by peeking the first row's keys — we need the header to extract
+        // values in order. Re-extract the header each row from the keys we already know.
+        // Actually: parse headers from the first data record's map keys. We need them sorted
+        // consistently; use the fixed header set derived from the CSV first row instead.
+        // Simpler: collect all rows into TaggedVal*, then read each map by known keys.
+
+        let mut rows: Vec<*mut u8> = Vec::new();
+        loop {
+            match pull_tagged(unwrap_stream(stream)) {
+                TaggedOutcome::Item(item) => rows.push(item),
+                TaggedOutcome::Eof => break,
+                TaggedOutcome::Err(e) => panic!("csv error: {e}"),
+            }
+        }
+        crate::tagged::lin_tagged_release(stream);
+
+        if rows.is_empty() {
+            return Vec::new();
+        }
+
+        // Extract key names from the first row's map.
+        let first = rows[0];
+        assert_eq!(lin_get_tag(first), TAG_MAP, "row must be a MAP");
+        let map0 = lin_unbox_ptr(first) as *const crate::map::LinMap;
+        let keys_arr = crate::map::lin_map_keys(map0);
+        let n_keys = crate::array::lin_array_length(keys_arr) as usize;
+
+        // Collect key strings.
+        let mut header: Vec<String> = Vec::new();
+        for ki in 0..n_keys {
+            let kt = crate::array::lin_array_get_tagged(keys_arr, ki as i64);
+            assert!(!kt.is_null() && (*kt).tag == TAG_STR);
+            let ks = (*kt).payload as *const crate::string::LinString;
+            let kb = std::slice::from_raw_parts((*ks).data.as_ptr(), (*ks).len as usize);
+            header.push(String::from_utf8_lossy(kb).into_owned());
+        }
+        // Release the keys array (lin_map_keys returns a fresh LinArray* owning retained key refs).
+        let keys_tagged = crate::tagged::alloc_tagged(crate::tagged::TAG_ARRAY, keys_arr as u64);
+        crate::tagged::lin_tagged_release(keys_tagged);
+
+        // For each row, look up every header key.
+        let mut result: Vec<Vec<(String, String)>> = Vec::new();
+        for row_ptr in &rows {
+            let map = lin_unbox_ptr(*row_ptr) as *const crate::map::LinMap;
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            for key in &header {
+                let tv = lin_map_get_bytes(map, key.as_ptr(), key.len() as u32);
+                let val = if tv.is_null() || (*tv).tag != TAG_STR {
+                    String::new()
+                } else {
+                    let s = (*tv).payload as *const crate::string::LinString;
+                    let b = std::slice::from_raw_parts((*s).data.as_ptr(), (*s).len as usize);
+                    String::from_utf8_lossy(b).into_owned()
+                };
+                pairs.push((key.clone(), val));
+            }
+            result.push(pairs);
+        }
+
+        for row_ptr in rows {
+            crate::tagged::lin_tagged_release(row_ptr);
+        }
+        result
+    }
+
+    /// Correctness gate for the UTF8-FAST lane: recordRows correctly handles
+    /// multi-byte UTF-8 fields, empty fields, and quoted fields.
+    #[test]
+    fn csv_record_rows_multibyte_empty_quoted() {
+        unsafe {
+            // Header: multi-byte UTF-8 key, ascii key, ascii key
+            // Row 1: multi-byte UTF-8 value, empty value, RFC-4180 quoted value with comma inside
+            // Row 2: ascii round-trip
+            let csv = "résumé,desc,note\ncafé,,\"hello, world\"\nsimple,plain,ok\n";
+            let rows = csv_records_to_vec(csv.as_bytes());
+            assert_eq!(rows.len(), 2, "expected 2 data rows");
+
+            // Row 0
+            let r0: std::collections::HashMap<_, _> = rows[0].iter().cloned().collect();
+            assert_eq!(r0["résumé"], "café", "multi-byte UTF-8 value under multi-byte UTF-8 key");
+            assert_eq!(r0["desc"], "", "empty field");
+            // RFC-4180 quoted field: outer quotes stripped, inner content preserved
+            assert_eq!(r0["note"], "hello, world", "quoted field with comma inside");
+
+            // Row 1
+            let r1: std::collections::HashMap<_, _> = rows[1].iter().cloned().collect();
+            assert_eq!(r1["résumé"], "simple");
+            assert_eq!(r1["desc"], "plain");
+            assert_eq!(r1["note"], "ok");
+        }
+    }
+
+    /// Wall-time smoke bench: parse a 10 k-row ASCII CSV 5 times; just confirms the fast path
+    /// doesn't regress throughput vs a timing floor. Not a hard assertion — just prints wall ms.
+    #[test]
+    fn csv_record_rows_wall_time_smoke() {
+        unsafe {
+            // Build a 10 000-row CSV (~700 KB) in memory.
+            let mut csv = String::from("stop_id,stop_name,stop_lat,stop_lon\n");
+            for i in 0..10_000u32 {
+                csv.push_str(&format!("{i},Station {i},51.{i},0.{i}\n"));
+            }
+            let csv_bytes = csv.into_bytes();
+
+            let t0 = std::time::Instant::now();
+            let reps = 5u32;
+            for _ in 0..reps {
+                let rows = csv_records_to_vec(&csv_bytes);
+                assert_eq!(rows.len(), 10_000);
+            }
+            let elapsed = t0.elapsed();
+            eprintln!(
+                "csv_record_rows wall: {}ms total, {}ms/rep ({} rows × {} reps)",
+                elapsed.as_millis(),
+                elapsed.as_millis() / reps as u128,
+                10_000,
+                reps
+            );
         }
     }
 }
