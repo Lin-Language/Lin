@@ -620,6 +620,13 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
                 // interior `*SumNode` whose repr is the child sum type's SumNode layout — so a chained
                 // `evalNode(node["left"])` reads the child as Packed(SumNode) and re-enters the switch.
                 set(seeds, *dst, Repr::Packed(Layout::SumNode { sum_ty: result_ty.clone() }));
+            } else if let Some(nrfields) = nullable_sealed_record(result_ty) {
+                // SEAL-FIELD NullableRecord: a sealed heap-field whose declared type is `T | Null`
+                // (e.g. `rec["addr"]` where `addr: Addr | Null`). The physical slot is a nullable
+                // `*T` pointer — same as the Map-index path. Seed it so a chained `rec["addr"]["x"]`
+                // correctly classifies `rec["addr"]` as Packed(NullableRecord) at the inner FieldGet,
+                // satisfying the repr oracle's NullableRecord exemption for the object operand.
+                set(seeds, *dst, Repr::Packed(Layout::NullableRecord { fields: nrfields.clone() }));
             } else if let Some(elem_fields) = sealed_array_elem(result_ty) {
                 // A nested sealed-record-ARRAY field (KIND_ARRAY) is stored as an 8-byte owned pointer
                 // to a packed `0xFE` element buffer; `sealed_field_get` loads that pointer and the
