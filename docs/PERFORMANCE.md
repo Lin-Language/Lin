@@ -59,6 +59,16 @@ There are two harnesses, deliberately separate:
   `records` (constant-offset struct field access — the typed-layout workload), and
   `async_io` (latency-bound bounded concurrency).
 
+> **⚠ Measure perf in RELEASE, never debug.** `compare.sh` builds `target/release/lin` +
+> `cargo build --release -p lin-runtime -p lin` (it forces a fresh *release* runtime archive). A/B
+> testing with `target/debug/lin` links the *unoptimized* debug `liblin_runtime.a`, where every
+> runtime-call (the bounds `_oob` accessor, `lin_map_get`, RC ops, string ops) is ~8× costlier than
+> release. That inverts the signal for any change that inlines/elides runtime-calls: it looks like a
+> large win in debug and is neutral-or-negative in release. The "take-five" campaign
+> (`docs/project-performance-take-five.md`) learned this the hard way — a debug-measured **−18 % on
+> RAPTOR turned into a +2.5 % release regression** once re-measured correctly. Always: release build,
+> release runtime, same-batch interleaved, min of ≥3.
+
 ### Cross-language results
 
 Measured on master (`benchmarks/compare/compare.sh`, RUNS=5, min wall-clock ms,
