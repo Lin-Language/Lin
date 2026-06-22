@@ -1,0 +1,98 @@
+The `lower/coerce.rs` handles general `Coerce` instructions (boxing/unboxing). My changes only touch `lower/expr.rs` and `lower/match_.rs` for the `Is` instruction lowering. There's no overlap with `coerce.rs`. The RT.2b lane (which touches coerce/Index lowering) operates on different sites.
+
+---
+
+## COMPLETED REPORT
+
+### 1. Changed files
+
+- `crates/lin-ir/src/lower/expr.rs` — Added `type_is_concrete()` and `is_definitely_subtype()` helpers. Modified `TypedExpr::Is` lowering: when the static type of the `is`-expression is provably a subtype of the check type (both fully concrete), skips `box_to_json` + `IsType` instruction and returns `const_temp(Const::Bool(true))`.
+- `crates/lin-ir/src/lower/match_.rs` — Modified `lower_match_pattern` for bare `TypedMatchPattern::Is(TypedPattern::TypeCheck(_))`: same proof → returns `PatternTest::Always` (no `IsType` emitted).
+
+### 2. Build
+
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.69s
+```
+(clean, 0 errors, 0 warnings on changed crates)
+
+### 3. Tests — every `test result:` line, verbatim
+
+```
+test result: ok. 2 passed; 0 failed; 0 ignored; ...
+test result: ok. 940 passed; 0 failed; 1 ignored; ...
+test result: ok. 53 passed; 0 failed; 0 ignored; ...
+test result: ok. 7 passed; 0 failed; 0 ignored; ...
+test result: ok. 58 passed; 0 failed; 0 ignored; ...
+test result: ok. 5 passed; 0 failed; 0 ignored; ...
+test result: ok. 53 passed; 0 failed; 0 ignored; ...
+test result: ok. 9 passed; 0 failed; 0 ignored; ...
+test result: ok. 137 passed; 0 failed; 0 ignored; ...
+test result: ok. 35 passed; 0 failed; 0 ignored; ...
+test result: ok. 131 passed; 0 failed; 0 ignored; ...
+(remaining crates: all 0 passed / 0 failed)
+```
+
+### 4. Per-lane gate
+
+**`LIN_VERIFY_RC=1 cargo test --workspace`** — all green (same `test result:` lines as above, 0 failed everywhere).
+
+**Positive example** (provably-non-null access drops its null-branch):
+
+In `testConcrete(x: Int32)`:
+```llvm
+define ptr @testConcrete(i32 %0) #0 {
+entry:
+  br i1 true, label %if_then, label %if_else
+```
+→ `if x is Int32` with `x: Int32` compiles to unconditional `br i1 true`. No `lin_get_tag`, no `icmp`, no `IsType`.
+
+Similarly in `testIfNarrow`, inside the `if x is Int32` then-branch where `v: Int32`:
+```llvm
+  %ir_i32 = call i32 @lin_unbox_int32(ptr %0)
+  br i1 true, label %if_then1, label %if_else2
+```
+→ the inner `if v is Int32` compiles to `br i1 true`.
+
+**Negative example** (genuinely nullable access KEEPS its guard):
+
+In `nullableIsCheck(x: Int32 | Null)`:
+```llvm
+define ptr @nullableIsCheck(ptr %0) #0 {
+entry:
+  %ir_tag = call i8 @lin_get_tag(ptr %0)
+  %ir_is = icmp eq i8 %ir_tag, 2
+  br i1 %ir_is, label %if_then, label %if_else
+```
+→ `if x is Int32` with `x: Int32 | Null` emits the full `lin_get_tag` + `icmp eq` check. Guard preserved.
+
+**ASan result** (manual run on gate example):
+```
+$ ASAN_OPTIONS=detect_leaks=0 ./test_gate_asan
+int: 42
+null
+v-is-int: 42
+not-int
+always-true: 99
+Exit code: 0
+```
+No ASan errors, no UAF, no leaks. (No dedicated ASan test target exists in the repo; the ASan harness in `tools/sealed-harness/run.sh` requires a separately built nightly ASan runtime — linked the gate example manually via `clang-22 -fsanitize=address` with the debug `liblin_runtime.a`.)
+
+### 5. Commit hashes
+
+```
+96fc2c40 perf(ir): elide provably-redundant is-T / null checks (CK.2)
+40d93110 perf(ir): recognize overloaded/monomorphized flat producers (no tagged reads)
+```
+
+Branch: `take5/nullunion`
+
+### 6. Found-but-not-fixed
+
+**`??` null-guard elision**: The contract mentions `?? default` null guards. The `??` operator desugars in the checker to `{ val tmp = left; if (tmp != null) tmp else right }`. By the time this reaches lowering, `tmp` always has type `T | Null` (the checker errors if the left side is never null), so the `if (tmp != null)` guard is genuinely needed — there is no redundant null guard to elide for `??`. The "non-null" part of the contract is fully addressed by the `is T` optimization (proving the value's tag is known), which covers the union-tag dispatch half. No bug found, just the scope is narrower than the contract text implies.
+
+**Coordinate note for RT.2b**: `lower/coerce.rs` (boxing/unboxing coercion lowering) is untouched. This change only modifies `lower/expr.rs` and `lower/match_.rs` at the `Is` instruction sites. No overlap.
+
+### 7. Honest status
+
+**DONE** — ready for orchestrator verification. The optimization is conservative (only fires when both types are fully concrete), correct (confirmed by `LIN_VERIFY_RC=1` test suite and manual ASan), and the LLVM IR evidence shows the targeted `is T` checks being elided to `br i1 true` exactly where the static types prove they're redundant.

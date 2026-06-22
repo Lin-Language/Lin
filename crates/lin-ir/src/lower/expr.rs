@@ -26,16 +26,34 @@ fn type_is_concrete(ty: &Type) -> bool {
 }
 
 /// True iff every possible runtime value of type `val` is guaranteed to satisfy an
-/// `is check_ty` test at runtime — i.e., `val` is a (strict or equal) subtype of
-/// `check_ty` and both sides are fully concrete (no `TypeVar`/`Named`).
+/// `is check_ty` test at runtime. The runtime `is` is a TAG check (`lin_get_tag`), so this
+/// must mirror tag identity — NOT assignment-compatibility. In particular numeric *widening*
+/// (`Int32` is assignable to `Int64`/`Float64`) must NOT count: an `Int32` value carries
+/// `TAG_INT32`, so `(x: Int32) is Int64` is FALSE at runtime. Using `is_compatible` here was
+/// unsound — it elided cross-numeric `is` to `true`. We instead require exact tag identity
+/// (with union expansion), which is what the runtime tag check enforces.
 ///
-/// Conservative: returns `false` whenever the proof cannot be established cheaply, so
-/// we NEVER incorrectly elide a check that could genuinely be false at runtime.
+/// Conservative: returns `false` whenever the proof cannot be established by exact match, so we
+/// NEVER incorrectly elide a check that could genuinely be false at runtime.
 pub(crate) fn is_definitely_subtype(val: &Type, check_ty: &Type) -> bool {
     if !type_is_concrete(val) || !type_is_concrete(check_ty) {
         return false;
     }
-    lin_check::compat::is_compatible(val, check_ty)
+    definitely_is_tag(val, check_ty)
+}
+
+/// Exact-tag definite-`is`: every runtime tag `val` can present is accepted by `is check_ty`.
+/// A union `val` must have ALL members match; a union `check_ty` is satisfied when some member is
+/// the exact `val` type. Only exact `Type` equality counts (no numeric/structural widening) —
+/// that is precisely what the runtime `lin_get_tag` comparison enforces.
+fn definitely_is_tag(val: &Type, check_ty: &Type) -> bool {
+    match val {
+        Type::Union(vs) => vs.iter().all(|v| definitely_is_tag(v, check_ty)),
+        _ => match check_ty {
+            Type::Union(cs) => cs.iter().any(|c| c == val),
+            _ => check_ty == val,
+        },
+    }
 }
 
 /// If `ty` is a MAP type (`{ K: V }`), or a `V | Null` union whose sole non-null member is a map,
