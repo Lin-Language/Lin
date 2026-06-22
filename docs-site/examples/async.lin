@@ -7,7 +7,7 @@ import { map } from "std/iter"
 val slow = (n: Int32): Int32 => n * n
 
 val p = async(() => slow(9))
-val result = await(p)            // Int32 | Error
+val result = await(p) // Int32 | Error
 
 match result
   is Error => print("task failed")

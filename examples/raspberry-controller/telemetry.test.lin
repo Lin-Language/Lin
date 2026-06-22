@@ -103,12 +103,14 @@ val s = suite("raspberry-telemetry", [
       "health": 15,
       "link": 15
     }
-    val c = match decodeTelemetry(encodeTelemetry(cold))
+    val cRes = decodeTelemetry(encodeTelemetry(cold))
+    val c = match cRes
       is Error => cold
-      else => decodeTelemetry(encodeTelemetry(cold))
-    val w = match decodeTelemetry(encodeTelemetry(warm))
+      else => cRes
+    val wRes = decodeTelemetry(encodeTelemetry(warm))
+    val w = match wRes
       is Error => warm
-      else => decodeTelemetry(encodeTelemetry(warm))
+      else => wRes
     [
       expect(c["tempC"]).toBe(0 - 1),
       expect(c["leftDuty"]).toBe(0),

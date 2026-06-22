@@ -102,15 +102,12 @@ val demo = (): Null =>
   }
   val frame = encodeTelemetry(snapshot)
   print("telemetry frame bytes: ${frame.length()}")
-  match decodeTelemetry(frame)
+  val decoded = decodeTelemetry(frame)
+  match decoded
     is Error => print("telemetry decode failed (checksum?)")
     else =>
-      val t = decodeTelemetry(frame)
-      match t
-        is Error => print("telemetry decode failed")
-        else =>
-          print(
-            "telemetry: battery=${toString(t["battery"])}% leftDuty=${toString(t["leftDuty"])} tempC=${toString(t["tempC"])} link=${toString(t["link"])}"
-          )
+      print(
+        "telemetry: battery=${toString(decoded["battery"])}% leftDuty=${toString(decoded["leftDuty"])} tempC=${toString(decoded["tempC"])} link=${toString(decoded["link"])}"
+      )
 
 demo()
