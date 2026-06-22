@@ -23330,3 +23330,26 @@ up.for(s => print(s))
 "#);
     assert_eq!(output, vec!["1", "4", "9", "16", "2", "4", "6", "AB", "CD"]);
 }
+
+#[test]
+fn test_wavec_find_some_every_direct_call() {
+    // Wave C lowerer extension: find/some/every with a BARE named no-capture predicate emit a
+    // DIRECT call to the predicate function, not an indirect closure call. Verifies both the
+    // IR shape (no %ir_fnp indirect dispatch in the devirted spec) and correct runtime output.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { find, some, every } from "std/iter"
+
+val isEven = (x: Int32) => x % 2 == 0
+val isBig = (x: Int32) => x > 100
+
+val xs = [1, 3, 5, 6, 7, 8]
+print(toString(find(xs, isEven)))
+print(toString(find(xs, isBig)))
+print(toString(some(xs, isEven)))
+print(toString(every(xs, isEven)))
+var threshold = 4
+print(toString(find(xs, x => x > threshold)))
+"#);
+    assert_eq!(output, vec!["6", "null", "true", "false", "5"]);
+}
