@@ -427,6 +427,200 @@ impl<'ctx> Codegen<'ctx> {
         self.module.verify().map_err(|e| e.to_string())
     }
 
+    /// Merge runtime bitcode into the user module so the O2 inliner can see
+    /// runtime function bodies (BL.1). After linking, all runtime functions
+    /// that still have definitions are demoted to `AvailableExternally` so they
+    /// are never emitted into the object file — the linker step resolves them
+    /// from `liblin_runtime.a` as usual. The inliner can still inline them;
+    /// any surviving (non-inlined) call simply falls through to the archive copy.
+    pub fn merge_runtime_bitcode(&self, bc_bytes: &[u8]) -> Result<(), String> {
+        use inkwell::module::{Linkage, Module};
+
+        // Build a MemoryBuffer that owns a copy of the bitcode.
+        // We go via llvm_sys directly because inkwell's MemoryBuffer helpers
+        // require the input to already end with a '\0' byte. The raw
+        // LLVMCreateMemoryBufferWithMemoryRangeCopy takes the length explicitly
+        // and appends its own null terminator — no caller-side null needed.
+        let buf = unsafe {
+            use llvm_sys::core::LLVMCreateMemoryBufferWithMemoryRangeCopy;
+            use inkwell::memory_buffer::MemoryBuffer;
+            use std::ffi::CString;
+
+            let name = CString::new("lin_runtime_bc").unwrap();
+            let raw = LLVMCreateMemoryBufferWithMemoryRangeCopy(
+                bc_bytes.as_ptr() as *const libc::c_char,
+                bc_bytes.len(),
+                name.as_ptr(),
+            );
+            if raw.is_null() {
+                return Err("LLVMCreateMemoryBufferWithMemoryRangeCopy failed".to_string());
+            }
+            // SAFETY: raw is a freshly-created, non-null buffer.
+            MemoryBuffer::new(raw)
+        };
+
+        // Use LLVMParseBitcodeInContext2 (the non-deprecated API) instead of
+        // inkwell's parse_bitcode_from_buffer which calls the deprecated
+        // LLVMParseBitcodeInContext and may fail on newer LLVM builds.
+        let rt_module = unsafe {
+            use llvm_sys::bit_reader::LLVMParseBitcodeInContext2;
+            use std::mem::MaybeUninit;
+
+            // The parsed module must share the same context as self.module so
+            // link_in_module can merge without a cross-context assertion.
+            let ctx_raw = llvm_sys::core::LLVMGetModuleContext(self.module.as_mut_ptr());
+
+            let mut out_module = MaybeUninit::uninit();
+            let ok = LLVMParseBitcodeInContext2(
+                ctx_raw,
+                buf.as_mut_ptr(),
+                out_module.as_mut_ptr(),
+            );
+            if ok != 0 {
+                return Err("LLVMParseBitcodeInContext2 failed: bitcode may be from a different LLVM version than this build".to_string());
+            }
+            // SAFETY: ok == 0 means out_module is initialised.
+            Module::new(out_module.assume_init())
+        };
+
+        // Strip debug info from the runtime module. We use it purely for
+        // inlining — debug metadata for a declaration (after body-stripping)
+        // causes a verifier error: "function declaration may only have a unique
+        // !dbg attachment". Stripping the whole module is safe because the
+        // archive's own debug info is still available for debuggers.
+        unsafe {
+            use llvm_sys::debuginfo::LLVMStripModuleDebugInfo;
+            LLVMStripModuleDebugInfo(rt_module.as_mut_ptr());
+        }
+
+        // Classify each symbol in the runtime module for safe inlining:
+        //
+        // A `#[no_mangle]` public API function is safe to offer as
+        // `AvailableExternally` (inline-eligible, not emitted in our .o) only if
+        // its body contains NO Rust-stdlib or Rust-mangled callees. Functions
+        // that call into `alloc::*`, `core::*`, or other Rust-stdlib symbols
+        // would produce undefined references at C-link time if inlined, so we
+        // leave those as declarations (External with no body).
+        //
+        // Rust-internal helpers (mangled names, Internal/Private linkage) are
+        // set to `Internal` so they ARE emitted into our .o and are reachable by
+        // any inlined callee that needs them. They are safe to duplicate: the
+        // archive's copies are scoped `internal` per archive-object and don't
+        // collide with ours.
+        //
+        // For globals, same rule: public exported globals → AvailableExternally;
+        // Rust-internal statics → Internal.
+
+        // Returns true if the name is a `#[no_mangle]` C-ABI symbol: plain
+        // C identifier with no Rust name-mangling.
+        let is_runtime_api_name = |name: &str| -> bool {
+            !name.contains('$') && !name.starts_with("_ZN") && !name.starts_with("_R")
+                && !name.starts_with("alloc_") // Rust alloc-internal constants
+        };
+
+        // Returns true if the function body contains any call/invoke to a
+        // Rust-stdlib symbol (mangled or alloc_* names) that would be undefined
+        // in a C-link context.
+        let body_has_rust_stdlib_callee = |fv: inkwell::values::FunctionValue<'_>| -> bool {
+            unsafe {
+                use llvm_sys::core::*;
+                use inkwell::values::AsValueRef;
+
+                let mut bb = LLVMGetFirstBasicBlock(fv.as_value_ref());
+                while !bb.is_null() {
+                    let mut inst = LLVMGetFirstInstruction(bb);
+                    while !inst.is_null() {
+                        // Check call and invoke instructions.
+                        let opcode = LLVMGetInstructionOpcode(inst);
+                        // LLVMCall = 55, LLVMInvoke = 57 in LLVM 22
+                        if opcode == llvm_sys::LLVMOpcode::LLVMCall
+                            || opcode == llvm_sys::LLVMOpcode::LLVMInvoke
+                        {
+                            let callee = LLVMGetCalledValue(inst);
+                            if !callee.is_null() {
+                                let mut len = 0usize;
+                                let ptr = LLVMGetValueName2(callee, &mut len as *mut usize);
+                                if !ptr.is_null() && len > 0 {
+                                    let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+                                    if let Ok(s) = std::str::from_utf8(bytes) {
+                                        // Rust stdlib: mangled names or alloc_* constants
+                                        if s.starts_with("_ZN") || s.starts_with("_R")
+                                            || s.starts_with("alloc_")
+                                        {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        inst = LLVMGetNextInstruction(inst);
+                    }
+                    bb = LLVMGetNextBasicBlock(bb);
+                }
+                false
+            }
+        };
+
+        // Strip a function down to a declaration by removing all its basic blocks.
+        // LLVMRemoveBasicBlockFromParent detaches each BB from the function
+        // without deleting it; the orphaned blocks live in the module allocator
+        // and are freed when rt_module is consumed by link_in_module.
+        // After stripping, count_basic_blocks()==0 → LLVM treats it as an
+        // external declaration, which is safe to merge with the user module.
+        let strip_body = |fv: inkwell::values::FunctionValue<'_>| {
+            unsafe {
+                use llvm_sys::core::*;
+                use inkwell::values::AsValueRef;
+                let mut bb = LLVMGetFirstBasicBlock(fv.as_value_ref());
+                while !bb.is_null() {
+                    let next = LLVMGetNextBasicBlock(bb);
+                    LLVMRemoveBasicBlockFromParent(bb);
+                    bb = next;
+                }
+            }
+        };
+
+        for f in rt_module.get_functions() {
+            if f.count_basic_blocks() == 0 {
+                continue; // already a declaration — leave as-is
+            }
+            let name = f.get_name().to_string_lossy().into_owned();
+            if is_runtime_api_name(&name) && !body_has_rust_stdlib_callee(f) {
+                // Clean public #[no_mangle] API: expose body for inlining.
+                // AvailableExternally = body visible to the inliner, NOT emitted
+                // in our .o (the canonical definition stays in liblin_runtime.a).
+                f.set_linkage(Linkage::AvailableExternally);
+            } else {
+                // Dirty API (calls Rust stdlib) OR Rust-internal mangled helper:
+                // strip body to a pure declaration. The body would either cause
+                // a duplicate-symbol conflict (External-with-body) or reference
+                // unresolvable Rust-stdlib symbols (Internal). As a declaration
+                // the function is simply provided by the archive at link time.
+                strip_body(f);
+            }
+        }
+        for g in rt_module.get_globals() {
+            if g.is_declaration() {
+                continue;
+            }
+            let name = g.get_name().to_string_lossy().into_owned();
+            if is_runtime_api_name(&name) {
+                // Exported public global: fold/use for optimisation, not emitted.
+                g.set_linkage(Linkage::AvailableExternally);
+            } else {
+                // Rust-internal static (e.g. `BOOL_CACHE`, `INT32_CACHE`):
+                // set Internal so it IS emitted in our .o. Inlined API functions
+                // reference these statics — they're `internal` in the archive
+                // (not exported by name), so we must provide our own copy.
+                // Duplicate-symbol conflicts can't occur because `internal`
+                // globals are scoped per translation unit.
+                g.set_linkage(Linkage::Internal);
+            }
+        }
+
+        self.module.link_in_module(rt_module).map_err(|e| e.to_string())
+    }
+
     // -------------------------------------------------------------------------
     // LLVM type mapping
     // -------------------------------------------------------------------------
