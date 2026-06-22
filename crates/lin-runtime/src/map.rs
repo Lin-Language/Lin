@@ -1046,6 +1046,49 @@ pub unsafe extern "C" fn lin_entries_any(p: *const u8) -> *mut crate::array::Lin
     }
 }
 
+/// Number of entries in `map` (raw `LinMap*`). Zero for null.
+/// Used by the IR entries/keys/values inline-loop path to drive the loop bound.
+#[no_mangle]
+pub unsafe extern "C" fn lin_map_raw_len(map: *const LinMap) -> i64 {
+    if map.is_null() { 0 } else { (*map).len as i64 }
+}
+
+/// Return a fresh OWNED `TaggedVal*` for the key at insertion-order index `i` in `map`.
+/// The caller must release this value when done. Returns a null TaggedVal* for out-of-range or null.
+/// String keys are retained (+1 refcount); integer keys are boxed inline.
+#[no_mangle]
+pub unsafe extern "C" fn lin_map_raw_key_at(map: *const LinMap, i: i64) -> *mut u8 {
+    if map.is_null() || i < 0 || i >= (*map).len as i64 || (*map).order.is_null() {
+        return crate::tagged::alloc_tagged(crate::tagged::TAG_NULL, 0);
+    }
+    let key = *(*map).order.add(i as usize);
+    if (*map).key_kind == KEY_KIND_INT {
+        crate::tagged::alloc_tagged(crate::tagged::TAG_INT64, key)
+    } else {
+        lin_string_inc_ref(key as *mut LinString);
+        crate::tagged::alloc_tagged(crate::tagged::TAG_STR, key)
+    }
+}
+
+/// Return a fresh OWNED `TaggedVal*` for the value at insertion-order index `i` in `map`.
+/// The caller must release this value when done. Returns a null TaggedVal* for out-of-range or null.
+#[no_mangle]
+pub unsafe extern "C" fn lin_map_raw_value_at(map: *const LinMap, i: i64) -> *mut u8 {
+    if map.is_null() || i < 0 || i >= (*map).len as i64 || (*map).order.is_null() {
+        return crate::tagged::alloc_tagged(crate::tagged::TAG_NULL, 0);
+    }
+    let key = *(*map).order.add(i as usize);
+    let v = if (*map).key_kind == KEY_KIND_INT {
+        let p = lin_map_get_int(map, key as i64);
+        if p.is_null() { crate::tagged::TaggedVal { tag: crate::tagged::TAG_NULL, _pad: [0; 7], payload: 0 } } else { *p }
+    } else {
+        let p = lin_map_get(map, key as *const LinString);
+        if p.is_null() { crate::tagged::TaggedVal { tag: crate::tagged::TAG_NULL, _pad: [0; 7], payload: 0 } } else { *p }
+    };
+    crate::tagged::retain_tagged_payload_pub(&v);
+    crate::tagged::alloc_tagged(v.tag, v.payload)
+}
+
 /// Coerce a (possibly boxed) value to a raw `LinMap*` for the Json/Object → `{ String: T }`
 /// boundary. See original docs — this is for String-keyed maps only.
 /// For Int-keyed maps, `{}` is the only allowed literal (handled directly in codegen).

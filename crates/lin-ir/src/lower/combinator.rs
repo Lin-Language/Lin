@@ -4182,6 +4182,186 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
     out
 }
 
+// ===========================================================================================
+// ENTRIES INLINE — `obj.entries(f)` over a typed `{ K: V }` map (Type::Map receiver)
+// ===========================================================================================
+//
+// When `std_object_entries` is called with 2 args (obj, f) and:
+//   (a) `obj` is a `Type::Map` receiver (a raw `LinMap*` in IR), AND
+//   (b) `f` is an inlinable capturing lambda
+//
+// …we bypass the stdlib body (which materializes a full entries array via `lin_entries_any`)
+// and emit a direct slot-walk loop instead:
+//
+//   len = lin_map_raw_len(map)
+//   for i in 0..len:
+//       key_box = lin_map_raw_key_at(map, i)   // owned TaggedVal* (+1)
+//       val_box = lin_map_raw_value_at(map, i)  // owned TaggedVal* (+1)
+//       pair    = [key_box, val_box]             // pair array; MakeArray MOVES key+val in
+//       body result = inline f(pair)             // lambda body runs inline, no closure alloc
+//       Release(result)                          // discard body result
+//       Release(pair as TypeVar(MAX))            // pair release walks + releases key/val inside
+//   return Null
+//
+// RC contract:
+//   - `lin_map_raw_key_at` / `lin_map_raw_value_at` return fresh OWNED TaggedVal* boxes (+1).
+//   - `MakeArray` copies tag+payload into the array slots via `lin_array_push_tagged` (no retain);
+//     ownership moves into the array. Do NOT release key_box/val_box separately.
+//   - `Coerce(pair, Array(TypeVar(MAX)) → TypeVar(MAX))` → `lin_box_array(pair)` → `pair_box`
+//     (TaggedVal*(TAG_ARRAY) shell, no extra retain on pair's refcount).
+//   - `Release(pair_box, TypeVar(MAX))` → `lin_tagged_release(pair_box)` → TAG_ARRAY →
+//     `lin_array_release(pair)` → rc=0 → free pair buffer, walk elements, release key+val.
+//   - `pair_box` and `pair` are LOCAL temporaries NOT registered scope-owned; released inline in
+//     the loop body before the back-edge (a scope-owned release would leak every iteration).
+
+/// Inline lowering for `std_object_entries(map, callback)` when `map` is a `Type::Map` receiver
+/// and `callback` is an inlinable capturing lambda. Falls through (`None`) otherwise.
+pub(crate) fn lower_entries_inline(
+    args: &[TypedExpr],
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    // Gate: 2-arg call, Map receiver, inlinable callback.
+    if args.len() != 2 {
+        return None;
+    }
+    if !matches!(args[0].ty(), Type::Map { .. }) {
+        return None;
+    }
+    let lam = inlinable_capturing_lambda(&args[1], builder, ctx)?;
+    let lam_params = lam.0.to_vec();
+    let lam_body = lam.1.clone();
+
+    let map = lower_expr(&args[0], builder, ctx);
+    let json = Type::TypeVar(u32::MAX);
+
+    // len = lin_map_raw_len(map)
+    let len = builder.alloc_temp(Type::Int64);
+    builder.emit(Instruction::Call {
+        dst: len,
+        callee: CallTarget::Named("lin_map_raw_len".to_string()),
+        args: vec![map],
+        ret_ty: Type::Int64,
+    });
+
+    let zero = builder.const_temp(Const::Int(0, Type::Int64));
+    let preheader = builder.current_block;
+    let header = builder.alloc_block("entries_header");
+    let body_blk = builder.alloc_block("entries_body");
+    let latch = builder.alloc_block("entries_latch");
+    let exit = builder.alloc_block("entries_exit");
+
+    let i = builder.alloc_temp(Type::Int64);
+    let i_next = builder.alloc_temp(Type::Int64);
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(header);
+    builder.emit(Instruction::Phi {
+        dst: i,
+        ty: Type::Int64,
+        incomings: vec![(zero, preheader), (i_next, latch)],
+    });
+    let cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary {
+        dst: cond,
+        op: BinOp::Lt,
+        lhs: i,
+        rhs: len,
+        operand_ty: Type::Int64,
+        ty: Type::Bool,
+    });
+    builder.terminate(Terminator::CondJump { cond, then_block: body_blk, else_block: exit });
+
+    builder.switch_to(body_blk);
+
+    // key_box = lin_map_raw_key_at(map, i)   owned TaggedVal*
+    let key_box = builder.alloc_temp(json.clone());
+    builder.emit(Instruction::Call {
+        dst: key_box,
+        callee: CallTarget::Named("lin_map_raw_key_at".to_string()),
+        args: vec![map, i],
+        ret_ty: json.clone(),
+    });
+    // val_box = lin_map_raw_value_at(map, i)  owned TaggedVal*
+    let val_box = builder.alloc_temp(json.clone());
+    builder.emit(Instruction::Call {
+        dst: val_box,
+        callee: CallTarget::Named("lin_map_raw_value_at".to_string()),
+        args: vec![map, i],
+        ret_ty: json.clone(),
+    });
+
+    // pair = [key_box, val_box] — MakeArray emits lin_array_alloc + lin_array_push_tagged for each
+    // element. MakeArray MOVES ownership: the elements' payloads transfer into the array slots
+    // (no retain); do NOT release key_box/val_box separately.
+    let pair_ty = Type::Array(Box::new(json.clone()));
+    let pair = builder.alloc_temp(pair_ty.clone());
+    builder.emit(Instruction::MakeArray {
+        dst: pair,
+        elements: vec![key_box, val_box],
+        spreads: vec![],
+        elem_ty: json.clone(),
+        inline: false,
+        columnar: false,
+    });
+
+    // Box pair (LinArray*) into a TaggedVal* shell so inline_lambda_body can pass it to the
+    // lambda param as AnyVal (TypeVar(MAX)) without a second boxing coerce happening inside
+    // coerce_arg_to_param_repr — that inner coerce would emit a SECOND lin_box_array on the
+    // raw LinArray* pointer, which lin_unbox_ptr would then correctly strip… but the ORIGINAL
+    // LinArray* would be double-owned and the lambda param's Index would still route through
+    // the boxed pointer correctly. More importantly: passing the RAW LinArray* with type
+    // TypeVar(MAX) misleads coerce_arg_to_param_repr into skipping the coerce (both sides
+    // appear to have union repr TypeVar), so the body's Index sees a raw LinArray* and calls
+    // lin_unbox_ptr on it → misaligned read → crash (observed). Box explicitly here so the
+    // LLVM sees: lin_box_array(pair) → pair_box (TaggedVal*(TAG_ARRAY)), then pass pair_box
+    // to the body. After the body, lin_tagged_release(pair_box) → reads TAG_ARRAY →
+    // lin_array_release(pair) → dec pair rc to 0 → free pair + walk elements (key/val reclaimed).
+    let pair_box = builder.alloc_temp(json.clone());
+    builder.emit(Instruction::Coerce {
+        dst: pair_box,
+        src: pair,
+        from_ty: pair_ty.clone(),
+        to_ty: json.clone(),
+    });
+
+    // Inline the lambda body with `pair_box` (TaggedVal*) as the argument.
+    // The body accesses pair_box[0]/pair_box[1] via Index { obj_ty: TypeVar(MAX) }:
+    //   lin_unbox_ptr(pair_box) → pair (LinArray*) → lin_array_get_tagged(pair, 0) ✓
+    let (res, res_ty) = inline_lambda_body(
+        &lam_params,
+        &lam_body,
+        &[(pair_box, json.clone())],
+        builder,
+        ctx,
+    );
+    // `entries` callback is side-effecting; discard the body result.
+    builder.emit(Instruction::Release { val: res, ty: res_ty });
+    // Release the pair box: lin_tagged_release(pair_box) → TAG_ARRAY → lin_array_release(pair)
+    // → rc=0 → free pair + walk elements → release key/val payloads inside.
+    builder.emit(Instruction::Release { val: pair_box, ty: json.clone() });
+
+    // Body may have switched blocks; jump to the latch from wherever we are.
+    if !builder.is_current_block_terminated() {
+        builder.terminate(Terminator::Jump(latch));
+    }
+
+    builder.switch_to(latch);
+    let one = builder.const_temp(Const::Int(1, Type::Int64));
+    builder.emit(Instruction::Binary {
+        dst: i_next,
+        op: BinOp::Add,
+        lhs: i,
+        rhs: one,
+        operand_ty: Type::Int64,
+        ty: Type::Int64,
+    });
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(exit);
+    Some(builder.const_temp(Const::Null))
+}
+
 /// `min(a, b)` over two Int64 temps via a select-style CondJump+phi. Used by `lower_sort` for the
 /// run-boundary clamps (`min(lo+width, n)`).
 pub(crate) fn emit_min_i64(a: Temp, b: Temp, builder: &mut FuncBuilder) -> Temp {
