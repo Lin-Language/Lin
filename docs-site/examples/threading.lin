@@ -7,9 +7,7 @@ import { map, range, for } from "std/iter"
 // the inner value in place — here each of 8 threads appends to the shared list.
 val collected = shared([])
 
-parallel(range(0, 8).map(i => () =>
-  withLock(collected, items => push(items, i * i))
-))
+parallel(range(0, 8).map(i => () => withLock(collected, items => push(items, i * i))))
 
 print("collected ${length(get(collected))} results")
 
@@ -17,8 +15,6 @@ print("collected ${length(get(collected))} results")
 // thread reads lock-free. Ideal for config or lookup tables a worker pool shares.
 val config = frozen({ "factor": 10, "labels": ["a", "b", "c"] })
 
-val scaled = parallel(range(0, 3).map(i => () =>
-  i * config["factor"]
-))
+val scaled = parallel(range(0, 3).map(i => () => i * config["factor"]))
 
 scaled.for(n => print("scaled = ${n}"))

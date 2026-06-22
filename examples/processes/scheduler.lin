@@ -26,7 +26,7 @@ val countOf = (progress: Shared): Int32 =>
   length(get(progress))
 
 // Narrow a single parallel result (the stdlib hands back a dynamic value) into the
-// precise TaskResult, accumulating with explicit push (the named-record-array idiom).
+// precise TaskResult, filtering and accumulating via push over the narrowed arm.
 val collect = (raw: AnyVal[]): TaskResult[] =>
   var out: TaskResult[] = []
   raw.for(x =>
