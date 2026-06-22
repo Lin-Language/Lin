@@ -130,6 +130,40 @@ impl<'ctx> Codegen<'ctx> {
         let boxed: BasicValueEnum<'ctx> = match named_ret_ty {
             Some(rt) => {
                 let rv = call.try_as_basic_value().basic().unwrap();
+                // VA.1 CPR: if the callee returns a flat-union struct `{ i1, i64 }`, unpack it
+                // and box the result so the wrapper can return a `ptr` like every other wrapper.
+                if rt.is_struct_type() && rv.is_struct_value() {
+                    let flat = rv.into_struct_value();
+                    let wf_llvm = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                    // Detect the scalar type from the known Lin return type.
+                    let scalar_ty: Type = match lin_ret_ty.and_then(|t| Self::flat_union_scalar_type(t)) {
+                        Some(s) => s,
+                        None => Type::Int64, // fallback: treat as i64 (safe for re-boxing)
+                    };
+                    // Branch: is_null = extractvalue 0
+                    let is_null = self.builder.extract_value(flat, 0, "wu_isnull").into_int_value();
+                    let null_bb  = self.context.append_basic_block(wf_llvm, "wu_null");
+                    let val_bb   = self.context.append_basic_block(wf_llvm, "wu_val");
+                    let mrg_bb   = self.context.append_basic_block(wf_llvm, "wu_mrg");
+                    self.builder.conditional_branch(is_null, null_bb, val_bb);
+                    // Null arm → lin_box_null()
+                    self.builder.position_at_end(null_bb);
+                    let null_box = self.builder.call(self.rt.box_null, &[], "wu_boxnull")
+                        .try_as_basic_value().unwrap_basic();
+                    let null_pred = self.builder.get_insert_block().unwrap();
+                    self.builder.unconditional_branch(mrg_bb);
+                    // Value arm → extract i64, narrow to scalar, box
+                    self.builder.position_at_end(val_bb);
+                    let scalar_val = self.flat_union_extract_scalar(flat, &scalar_ty);
+                    let scalar_box = self.box_value(scalar_val, &scalar_ty);
+                    let val_pred = self.builder.get_insert_block().unwrap();
+                    self.builder.unconditional_branch(mrg_bb);
+                    // Merge
+                    self.builder.position_at_end(mrg_bb);
+                    let phi = self.builder.phi(ptr_ty, "wu_box");
+                    phi.add_incoming(&[(&null_box, null_pred), (&scalar_box, val_pred)]);
+                    phi.as_basic_value()
+                } else {
                 let lin_ty = match lin_ret_ty {
                     // Known Lin return type: box exactly per that type (Str/Array/Object are raw
                     // pointers that MUST be boxed; union/Json values are already boxed).
@@ -146,6 +180,7 @@ impl<'ctx> Codegen<'ctx> {
                 // Union/Json/Named values arrive already boxed; pass through. Everything else
                 // (scalars, Str, Array, Object) is boxed into a TaggedVal*.
                 if Self::is_union_type(&lin_ty) { rv } else { self.box_value(rv, &lin_ty) }
+                }
             }
             None => ptr_ty.const_null().into(),
         };
