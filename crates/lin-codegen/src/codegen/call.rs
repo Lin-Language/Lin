@@ -179,29 +179,7 @@ impl<'ctx> Codegen<'ctx> {
                 };
                 // Union/Json/Named values arrive already boxed; pass through. Everything else
                 // (scalars, Str, Array, Object) is boxed into a TaggedVal*.
-                // Exception: sum-type unions (Packed(SumNode) repr) return a raw *SumNode, NOT a
-                // TaggedVal* — they MUST be materialized+boxed like any other concrete value.
-                // is_union_type is true for all Type::Union, but sum-type functions return *SumNode
-                // which is not a valid TaggedVal* — callers (e.g. std_iter_map's lin_push_dyn) expect
-                // a TaggedVal*. Mirror of the unbox fix in boxing.rs ~line 319.
-                if Self::is_union_type(&lin_ty) && !Self::is_sum_type(&lin_ty) {
-                    rv
-                } else {
-                    let boxed = self.box_value(rv, &lin_ty);
-                    // A sum-type return: box_value materialized *SumNode → fresh LinMap (borrows
-                    // the node). The SumNode owned ref from the callee is not consumed — release it
-                    // here so the wrapper doesn't leak the source SumNode.
-                    if Self::is_sum_type(&lin_ty) && rv.is_pointer_value() {
-                        let i64_ty = self.context.i64_type();
-                        let total = Self::sumnode_total_size(&lin_ty);
-                        self.builder.call(
-                            self.rt.sumnode_release,
-                            &[rv.into_pointer_value().into(), i64_ty.const_int(total, false).into()],
-                            "",
-                        );
-                    }
-                    boxed
-                }
+                if Self::is_union_type(&lin_ty) { rv } else { self.box_value(rv, &lin_ty) }
                 }
             }
             None => ptr_ty.const_null().into(),
