@@ -444,8 +444,11 @@ pub enum Instruction {
     /// 0xFE, but cache-line-efficient for single-field sequential scans). Always `false` unless
     /// `inline == true` AND `all_scalar_fields`. `false` → fall back to 0xFE/0xFD (safe default).
     MakeArray { dst: Temp, elements: Vec<Temp>, spreads: Vec<(usize, Temp)>, elem_ty: Type, inline: bool, columnar: bool },
-    /// result = object[key]  — safe field access (missing key → null temp)
-    Index { dst: Temp, object: Temp, key: Temp, obj_ty: Type, key_ty: Type, result_ty: Type },
+    /// result = object[key]  — safe field access (missing key → null temp).
+    /// `nonneg`: the key is provably >= 0 (e.g. a fused range-for IV starting at 0),
+    /// so the flat-array read path can skip the negative-wrap select and emit the
+    /// canonical `0 <= i < len` shape that LLVM IRCE recognises.
+    Index { dst: Temp, object: Temp, key: Temp, obj_ty: Type, key_ty: Type, result_ty: Type, nonneg: bool },
     /// object[key] = value  — in-place array/object element assignment (no result).
     IndexSet { object: Temp, key: Temp, value: Temp, obj_ty: Type, key_ty: Type, val_ty: Type },
     /// result = object.field  — known-shape field access

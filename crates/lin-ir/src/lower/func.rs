@@ -360,6 +360,7 @@ pub(crate) fn lower_function_expr_with_id(
         created_cells: Vec::new(),
         escaping_cells: std::collections::HashSet::new(),
         escape_alias: HashMap::new(),
+        nonneg_range_ivs: std::collections::HashSet::new(),
     };
 
     // Add entry block. Tag it with the function body's span so coverage records a

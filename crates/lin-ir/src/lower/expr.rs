@@ -172,6 +172,7 @@ fn lower_index_get_or_create(
         obj_ty: parent_obj_ty.clone(),
         key_ty: key.ty(),
         result_ty: read_ty.clone(),
+    nonneg: false,
     });
 
     // Null test: `cur == null`.
@@ -454,6 +455,7 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                     obj_ty: Type::Array(Box::new(elem_ty.clone())),
                     key_ty: Type::Int64,
                     result_ty: elem_ty.clone(),
+                nonneg: false,
                 });
                 builder.register_owned(dst, elem_ty.clone());
                 return dst;
@@ -1425,6 +1427,7 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                 crate::ownership_verify::index_result_convention(&obj_ty, &key_ty),
                 crate::ir::Convention::Own
             );
+            let nonneg = builder.nonneg_range_ivs.contains(&key_temp);
             builder.emit(Instruction::Index {
                 dst,
                 object: obj_temp,
@@ -1432,6 +1435,7 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                 obj_ty,
                 key_ty,
                 result_ty: result_type.clone(),
+                nonneg,
             });
             // A sealed record indexed by a NON-LITERAL key: codegen materializes the record to a
             // boxed object, looks the key up, clones the (borrowed) result into a FRESH owned box and

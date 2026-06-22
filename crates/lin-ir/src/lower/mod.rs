@@ -807,6 +807,11 @@ pub(crate) struct FuncBuilder {
     /// the keep-set through this map: keeping a result also keeps the literals it aliases,
     /// transferring ownership into the escaping value (its eventual owner does the release).
     escape_alias: HashMap<Temp, Vec<Temp>>,
+    /// Temps that are provably non-negative range induction variables (range-for IVs whose
+    /// start expression is a non-negative literal). `lower_expr` sets `nonneg: true` on any
+    /// `Instruction::Index` whose `key` temp is in this set, enabling the flat-array read
+    /// path to skip the negative-wrap select and emit the IRCE-eligible `0 <= idx < len` form.
+    pub(crate) nonneg_range_ivs: std::collections::HashSet<Temp>,
 }
 
 impl FuncBuilder {
@@ -855,6 +860,7 @@ impl FuncBuilder {
             created_cells: Vec::new(),
             escaping_cells: std::collections::HashSet::new(),
             escape_alias: HashMap::new(),
+            nonneg_range_ivs: std::collections::HashSet::new(),
         }
     }
 
@@ -892,6 +898,22 @@ impl FuncBuilder {
     fn current_block_mut(&mut self) -> &mut BasicBlock {
         let id = self.current_block;
         self.blocks.iter_mut().find(|b| b.id == id).unwrap()
+    }
+
+    /// Returns true when `t` was produced by a `Const::Int(v, _)` instruction with `v >= 0`,
+    /// found anywhere in the already-emitted instructions of the current function. Used by
+    /// `lower_range_for` to prove a range start is non-negative before marking its IV as such.
+    pub(crate) fn temp_is_nonneg_int_const(&self, t: Temp) -> bool {
+        for b in &self.blocks {
+            for instr in &b.instructions {
+                if let Instruction::Const { dst, val: Const::Int(v, _) } = instr {
+                    if *dst == t && *v >= 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn emit(&mut self, instr: Instruction) {

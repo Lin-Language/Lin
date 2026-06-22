@@ -349,11 +349,18 @@ impl<'ctx> Codegen<'ctx> {
             )
             .ok_or("Failed to create target machine for optimization")?;
 
+        // CK.1b: append IRCE (Inductive Range Check Elimination, experimental — not in default<O2>)
+        // + an extra LICM round after the standard O2 pipeline. IRCE recognises the canonical
+        // `0 <= i < len` unsigned UGE check emitted by the nonneg flat_array_get path (CK.1a)
+        // as dominated by the outer range-for loop bound and deletes the per-iteration branch.
+        // `function(loop-mssa(licm))` re-hoists invariants IRCE exposes; loop-mssa provides the
+        // MemorySSA analysis LICM requires in LLVM 22.
+        const IRCE_SUFFIX: &str = ",irce,function(loop-mssa(licm))";
         let pipeline = match pgo {
-            crate::PgoMode::None => "default<O2>".to_string(),
+            crate::PgoMode::None => format!("default<O2>{IRCE_SUFFIX}"),
             // pgo-instr-gen inserts llvm.instrprof.increment intrinsics; instrprof lowers them to
             // counter globals before the main optimisation pipeline runs on the instrumented IR.
-            crate::PgoMode::Generate => "pgo-instr-gen,instrprof,default<O2>".to_string(),
+            crate::PgoMode::Generate => format!("pgo-instr-gen,instrprof,default<O2>{IRCE_SUFFIX}"),
             // pgo-instr-use annotates branch weights from the merged profile, then optimises.
             // The profile path is communicated to the LLVM pass via the global LLVM cl option
             // `--pgo-test-profile-file` (the only stable mechanism exposed by the C API).
@@ -370,7 +377,7 @@ impl<'ctx> Codegen<'ctx> {
                         std::ptr::null(),
                     );
                 }
-                "pgo-instr-use,default<O2>".to_string()
+                format!("pgo-instr-use,default<O2>{IRCE_SUFFIX}")
             }
         };
 
@@ -2067,10 +2074,10 @@ impl<'ctx> Codegen<'ctx> {
                                 named_fn, None, Some(&ret_ty), Some(&param_tys));
                             temp_map.insert(*dst, cls);
                         }
-                        Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty } => {
+                        Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty, nonneg } => {
                             if let (Some(&obj_v), Some(&key_v)) = (temp_map.get(object), temp_map.get(key)) {
                                 let obj_repr = func.repr_of(*object);
-                                let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty, &obj_repr);
+                                let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty, &obj_repr, *nonneg);
                                 temp_map.insert(*dst, result);
                             }
                         }

@@ -104,7 +104,14 @@ impl<'ctx> Codegen<'ctx> {
     /// negative indexing (`idx < 0 → len + idx`) and an OOB runtime fault (spec §6.1). The cold OOB
     /// path defers to the runtime accessor so the fault message/behaviour stays identical and there
     /// is no new runtime symbol. LinArray layout (repr(C)): len @ byte 8 (u64), data ptr @ byte 24.
-    pub(crate) fn flat_array_get(&mut self, arr: BasicValueEnum<'ctx>, idx: inkwell::values::IntValue<'ctx>, elem_ty: &Type) -> BasicValueEnum<'ctx> {
+    ///
+    /// `nonneg`: when true the caller guarantees `idx >= 0` (e.g. a fused range-for IV starting at
+    /// a non-negative value). The negative-wrap `select` is elided, emitting the canonical
+    /// `0 <= idx < len` unsigned compare that LLVM's Inductive Range Check Elimination (IRCE)
+    /// recognises as a dominated check. The OOB semantics are IDENTICAL — an out-of-range index
+    /// still faults via the cold runtime path with the same message. Only the negative-wrap branch
+    /// is removed; the OOB branch is untouched.
+    pub(crate) fn flat_array_get(&mut self, arr: BasicValueEnum<'ctx>, idx: inkwell::values::IntValue<'ctx>, elem_ty: &Type, nonneg: bool) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
         let i64_ty = self.context.i64_type();
         let llvm_elem_ty = self.llvm_type(elem_ty);
@@ -122,15 +129,25 @@ impl<'ctx> Codegen<'ctx> {
         };
         let len = self.builder.load(i64_ty, len_ptr, "flat_len").into_int_value();
 
-        // actual = idx < 0 ? len + idx : idx   (matches the runtime's negative-index handling)
-        let zero = i64_ty.const_zero();
-        let is_neg = self.builder.int_compare(IntPredicate::SLT, idx, zero, "flat_idx_neg");
-        let wrapped = self.builder.int_add(len, idx, "flat_idx_wrap");
-        let actual = self.builder.select(is_neg, wrapped, idx, "flat_idx_actual").into_int_value();
+        // CK.1a: when the caller guarantees idx >= 0 (e.g. a fused range-for IV with non-negative
+        // start), skip the negative-wrap select entirely. The resulting check is the canonical
+        // `0 <= idx < len` unsigned compare (`UGE(idx, len)` catches both idx >= len and, if the
+        // invariant were violated, a negative idx reinterpreted as a huge unsigned — sound and
+        // IRCE-eligible). On the general path the negative-wrap select is still emitted.
+        let actual = if nonneg {
+            idx
+        } else {
+            // actual = idx < 0 ? len + idx : idx   (matches the runtime's negative-index handling)
+            let zero = i64_ty.const_zero();
+            let is_neg = self.builder.int_compare(IntPredicate::SLT, idx, zero, "flat_idx_neg");
+            let wrapped = self.builder.int_add(len, idx, "flat_idx_wrap");
+            self.builder.select(is_neg, wrapped, idx, "flat_idx_actual").into_int_value()
+        };
 
-        // Bounds check folded to a single UNSIGNED compare: `(u64)actual >= (u64)len` catches
-        // BOTH `actual < 0` (a still-negative wrap reads as a huge unsigned value ≥ len) and
-        // `actual >= len`. Equivalent to the runtime's two signed compares, one instruction.
+        // Bounds check: `(u64)actual >= (u64)len`.
+        // On the nonneg path this is the canonical IRCE shape: `0 <= idx < len` (unsigned UGE).
+        // On the general path it catches BOTH `actual < 0` (wrap reinterprets as huge u64) and
+        // `actual >= len` — equivalent to the runtime's two signed compares, one instruction.
         let oob = self.builder.int_compare(IntPredicate::UGE, actual, len, "flat_oob");
 
         let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
