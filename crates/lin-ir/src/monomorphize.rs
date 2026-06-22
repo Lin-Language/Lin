@@ -2706,13 +2706,27 @@ fn try_inline_combinator_wrapper(
     //
     // A stored/passed `Function` VALUE (the ⊤ callee — not a `TypedExpr::Function` node) still does
     // NOT match this arm and keeps the closure specialization path, exactly as before.
-    let mut lambda_args = 0;
+    //
+    // Additionally: a BARE fn-typed reference (`xs.map(square)` — a `LocalGet` whose type is a
+    // `Function`) is also inlinable. Routing through `lin_map` lets `lower_map`'s path-8-B
+    // devirtualization (`bare_fn_call_target`) emit a DIRECT call per element instead of the
+    // heap-closure + boxed-ABI indirect dispatch the separate `map$T_U` specialization emits.
+    // If the ref turns out to be a runtime closure value (a param/local, not a known fn),
+    // `lower_map` simply takes its closure fallback — identical correctness to the specialization,
+    // so this relaxation never miscompiles.
+    let mut callback_args = 0;
     for a in args.iter() {
-        if let TypedExpr::Function { .. } = a {
-            lambda_args += 1;
+        match a {
+            TypedExpr::Function { .. } => {
+                callback_args += 1;
+            }
+            TypedExpr::LocalGet { .. } if matches!(a.ty(), Type::Function { .. }) => {
+                callback_args += 1;
+            }
+            _ => {}
         }
     }
-    if lambda_args != 1 {
+    if callback_args != 1 {
         return false;
     }
 

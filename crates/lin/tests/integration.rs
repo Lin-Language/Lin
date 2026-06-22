@@ -23305,3 +23305,28 @@ print(toString(use_range_map(5) + use_alloc(5)))
         );
     }
 }
+
+#[test]
+fn test_bare_fn_combinator_callbacks() {
+    // Path-8-B devirtualization: a BARE statically-known fn passed to map/filter/for is called
+    // directly per element (no heap closure + boxed indirect dispatch). Covers a LOCAL fn val
+    // (Direct target) and an IMPORTED fn (Named target), plus a heap (String) element through map.
+    let output = run(r#"import { print } from "std/io"
+import { toString, toUpper } from "std/string"
+import { map, filter, for, reduce } from "std/iter"
+
+val square = (x: Int64): Int64 => x * x
+val isEven = (x: Int64): Boolean => x % 2 == 0
+
+val sq = [1, 2, 3, 4].map(square)
+sq.for(x => print(toString(x)))
+
+val ev = [1, 2, 3, 4, 5, 6].filter(isEven)
+ev.for(x => print(toString(x)))
+
+// imported bare fn (Named target) over heap String elements
+val up = ["ab", "cd"].map(toUpper)
+up.for(s => print(s))
+"#);
+    assert_eq!(output, vec!["1", "4", "9", "16", "2", "4", "6", "AB", "CD"]);
+}

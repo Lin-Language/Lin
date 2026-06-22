@@ -1798,6 +1798,75 @@ pub(crate) fn emit_flatmap_fused_loop<T>(
     fm_free_counters(&counters, builder);
 }
 
+/// Path-8-B devirtualization: when a combinator callback is a BARE reference to a statically-known
+/// function (a top-level `val f = (…) => …` or an imported export), resolve the DIRECT call target
+/// (`CallTarget::Direct(FuncId)` for a local fn, `CallTarget::Named(sym)` for an import) so the
+/// per-element call can be emitted as a direct/named call to the function's NATIVE signature —
+/// skipping the heap closure shell + boxed-ABI wrapper + indirect dispatch the closure path emits.
+///
+/// Returns `(target, param_tys)` where `param_tys` are the callee's DECLARED parameter types (its
+/// native signature), used to coerce the loop's element/index args to the native representation.
+/// Returns `None` for any non-bare callback (a literal lambda or a stored/passed `Function` value).
+fn bare_fn_call_target(
+    expr: &TypedExpr,
+    builder: &FuncBuilder,
+    ctx: &LowerCtx,
+) -> Option<(CallTarget, Vec<Type>)> {
+    let TypedExpr::LocalGet { slot, .. } = expr else { return None };
+    if builder.intrinsic_slots.contains_key(slot) {
+        return None;
+    }
+    let (params, _) = callback_signature(expr);
+    if let Some(&fid) = ctx.global_fn_slots.get(slot) {
+        return Some((CallTarget::Direct(fid), params));
+    }
+    if let Some((sym, param_tys)) = ctx.import_fn_slots.get(slot) {
+        let ptys = if param_tys.is_empty() { params } else { param_tys.clone() };
+        return Some((CallTarget::Named(sym.clone()), ptys));
+    }
+    None
+}
+
+/// Devirtualized per-element call to a statically-known function (`bare_fn_call_target`): coerce
+/// each supplied arg to the callee's native param representation and emit a DIRECT/NAMED `Call` —
+/// no closure alloc, no boxed-ABI indirect dispatch. Truncates surplus args beyond param_tys.len().
+fn call_body_direct(
+    target: CallTarget,
+    raw_args: &[(Temp, Type)],
+    param_tys: &[Type],
+    ret_ty: &Type,
+    builder: &mut FuncBuilder,
+) -> Temp {
+    let n = param_tys.len();
+    let mut arg_shell_boxes: Vec<Temp> = Vec::new();
+    let call_args: Vec<Temp> = raw_args
+        .iter()
+        .take(n)
+        .enumerate()
+        .map(|(i, (t, ty))| {
+            let arg = lower_coerce_arg(*t, ty, param_tys.get(i), builder);
+            let boxed_scalar = matches!(param_tys.get(i), Some(p) if is_union_ty(p))
+                && !is_union_ty(ty)
+                && !is_rc_type(ty);
+            if boxed_scalar {
+                arg_shell_boxes.push(arg);
+            }
+            arg
+        })
+        .collect();
+    let dst = builder.alloc_temp(ret_ty.clone());
+    builder.emit(Instruction::Call {
+        dst,
+        callee: target,
+        args: call_args,
+        ret_ty: ret_ty.clone(),
+    });
+    for shell in &arg_shell_boxes {
+        builder.emit(Instruction::FreeBoxShellIfDistinct { val: *shell, other: dst });
+    }
+    dst
+}
+
 /// `for(iterable, body)` → index loop calling `body(elem)` for side effects; returns Null.
 pub(crate) fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
@@ -1873,6 +1942,27 @@ pub(crate) fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut
     // mistyped as flat). See `combinator_read_elem_ty` (ADR-044).
     let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let iterable = lower_expr(&args[0], builder, ctx);
+
+    // DEVIRTUALIZED FAST PATH (path-8-B): a BARE statically-known fn body (`xs.for(printIt)`) is
+    // called DIRECTLY per element — no closure shell, no boxed-ABI wrapper, no per-element index
+    // box, no indirect dispatch. `call_body_direct` coerces the element arg to the callee's native
+    // param repr (the index arg too, when the callee declares it).
+    if let Some((target, native_params)) = bare_fn_call_target(&args[1], builder, ctx) {
+        let native_ret = match args[1].ty() {
+            Type::Function { ret, .. } => *ret,
+            _ => Type::Null,
+        };
+        let elem_ty = read_elem_ty.clone();
+        emit_index_loop(iterable, &iterable_ty, &read_elem_ty, builder, ctx, |i, elem, b, _| {
+            let idx = narrow_loop_index(i, b);
+            let res = call_body_direct(
+                target.clone(), &[(elem, elem_ty.clone()), (idx, Type::Int32)], &native_params, &native_ret, b);
+            b.emit(Instruction::Release { val: res, ty: native_ret.clone() });
+            free_combinator_elem_box_full(elem, &elem_ty, b);
+            free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
+        });
+        return builder.const_temp(Const::Null);
+    }
 
     // INLINE FAST PATH (capturing-closure inline): a literal side-effecting lambda — capturing OR not —
     // is spliced into the loop body, its param bound to the element, with no closure alloc and no
@@ -2916,6 +3006,23 @@ pub(crate) fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut Fu
 
     let iterable = lower_expr(&args[0], builder, ctx);
 
+    // DEVIRTUALIZED FAST PATH (path-8-B): a BARE statically-known fn callback (`xs.map(square)`)
+    // calls it DIRECTLY per element — no heap closure shell, no boxed-ABI wrapper, no indirect
+    // dispatch — so LLVM can inline the body across the call. Args are coerced to the callee's
+    // native param repr by `lower_coerce_arg` (same as any direct call).
+    if let Some((target, native_params)) = bare_fn_call_target(&args[1], builder, ctx) {
+        let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+        emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |i, elem, b, _| {
+            let idx = narrow_loop_index(i, b);
+            let mapped = call_body_direct(
+                target.clone(), &[(elem, elem_ty.clone()), (idx, Type::Int32)], &native_params, &cb_ret, b);
+            push_output(out, flat, &out_elem_ty, mapped, &cb_ret, false, b);
+            free_combinator_elem_box(elem, &elem_ty, b);
+            free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
+        });
+        return out;
+    }
+
     // INLINE FAST PATH (ADR-044 + capturing-closure inline): a literal lambda — capturing OR not — is
     // spliced directly into the loop, its param bound to the element temp and its body lowered inline,
     // with no closure alloc and no per-element box/unbox/indirect call. Captured slots resolve through
@@ -3063,6 +3170,32 @@ pub(crate) fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut
     }
 
     let iterable = lower_expr(&args[0], builder, ctx);
+
+    // DEVIRTUALIZED FAST PATH (path-8-B): a BARE statically-known predicate (`xs.filter(isEven)`)
+    // is called DIRECTLY per element — no closure shell / boxed-ABI / indirect dispatch. The
+    // predicate's native return is Bool (i1); `call_body_direct` coerces the element arg to the
+    // native param repr. The keep/skip split + element-box reclaim is byte-for-byte the closure path.
+    if let Some((target, native_params)) = bare_fn_call_target(&args[1], builder, ctx) {
+        let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+        emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |i, elem, b, _| {
+            let idx = narrow_loop_index(i, b);
+            let keep = call_body_direct(
+                target.clone(), &[(elem, elem_ty.clone()), (idx, Type::Int32)], &native_params, &Type::Bool, b);
+            let keep_block = b.alloc_block("filter_keep");
+            let drop_block = b.alloc_block("filter_drop");
+            let join_block = b.alloc_block("filter_skip");
+            b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
+            b.switch_to(keep_block);
+            push_output(out, flat, &out_elem_ty, elem, &elem_ty, true, b);
+            free_combinator_elem_box(elem, &elem_ty, b);
+            b.terminate(Terminator::Jump(join_block));
+            b.switch_to(drop_block);
+            free_combinator_elem_box_full(elem, &elem_ty, b);
+            b.terminate(Terminator::Jump(join_block));
+            b.switch_to(join_block);
+        });
+        return out;
+    }
 
     // INLINE FAST PATH (ADR-044 + capturing-closure inline): a literal predicate lambda — capturing
     // OR not — is spliced into the loop; its body's Bool result drives the keep/skip split directly —
