@@ -1073,6 +1073,42 @@ print(toString(o["s"]["days"]["mon"]))
     );
 }
 
+// SEAL-FIELD correctness regression: `m[k]["field"]` where `m: { String: SealedRecord }` returned
+// null instead of the field value. The root cause: `compile_ir_index` dispatched on a NullableRecord
+// value (`Pt | Null`) via the union tag-dispatch path, which called `lin_get_tag(obj)` where `obj`
+// is a raw sealed struct pointer — first byte = refcount, NOT a TaggedVal tag → always fell to the
+// "null" branch. Fix: IR lowering emits a null-guarded FieldGet (null check → phi) for NullableRecord
+// string-key index instead of materialising to a TaggedVal and calling lin_map_get. Also verifies
+// the bound-element case: `val e = arr[i]; e["field"]` where arr is a HeapFieldRecord array uses the
+// same offset-FieldGet path (e is already a NullableRecord).
+#[test]
+fn test_nullable_record_map_value_field_read() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push } from "std/array"
+
+type Pt = { "n": Int32, "x": Int32 }
+
+// Case 1: { String: SealedRecord } map — m[k]["field"] must return the field, not null.
+val m: { String: Pt } = { "a": { "n": 2, "x": 10 }, "b": { "n": 5, "x": 20 } }
+print(toString(m["a"]["n"]))
+print(toString(m["b"]["n"]))
+// Absent key returns null gracefully.
+val absent = m["z"]
+print(toString(absent == null))
+
+// Case 2: bound element — val e = arr[i]; e["field"] uses offset FieldGet.
+var arr: Pt[] = []
+push(arr, { "n": 7, "x": 30 })
+push(arr, { "n": 9, "x": 40 })
+val e0 = arr[0]
+val e1 = arr[1]
+print(toString(e0["n"]))
+print(toString(e1["n"]))
+"#);
+    assert_eq!(output, vec!["2", "5", "true", "7", "9"]);
+}
+
 // Regression (object/record holding a typed-map FIELD is fully released): `lin_object_release`'s
 // value-release loop was a hand-rolled copy that omitted TAG_MAP — so a `{ String: T }` map stored
 // as a record/object FIELD (e.g. `ScanResults.bestArrivals`) was never released when the record
