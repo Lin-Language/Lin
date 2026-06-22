@@ -8,7 +8,7 @@ import { expect, toBe, toSucceed, toFailWith, test, suite, run } from "std/test"
 import { evalAst } from "./eval"
 
 // AST + result builders. evalAst takes the parser's tagged result
-// ({ "type": "success", "value": <ast> } | failure) as dynamic AnyVal, so the
+// ({ "type": "success", "value": <ast> } | failure) as AnyVal, so the
 // fixtures are AnyVal builders mirroring the parser's node/result shapes.
 val numNode = (v: Int32): AnyVal => { "kind": "num", "value": v }
 val binop = (o: String, l: AnyVal, r: AnyVal): AnyVal => {
