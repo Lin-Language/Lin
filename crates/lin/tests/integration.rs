@@ -23549,24 +23549,14 @@ ok.for(v => print(v["name"]))
 
 #[test]
 fn test_sumunion_map_callback_return_segfault() {
-    // Regression: a function RETURNING a sum-eligible union (literal-discriminant records, compiled
-    // with Packed(SumNode) repr) used as a `.map(fn)` callback previously segfaulted.
-    //
-    // Two bug sites, both the same root cause:
-    //
-    // 1. Wrapper path: `__cls_wrapb_mk` (the boxed-ABI wrapper generated for `mk`) hit:
-    //      if Self::is_union_type(&lin_ty) { rv }  // returned raw *SumNode, not TaggedVal*
-    //    in `boxed_abi_wrapper_full`. `is_union_type` is true for all Union, but a sum-type
-    //    returns *SumNode — NOT an already-boxed TaggedVal*. std_iter_map's lin_push_dyn received
-    //    a raw *SumNode pointer as if it were a TaggedVal* → garbage tag read → SIGSEGV.
-    //
-    // 2. Inlined-loop path: the direct `mk` call inlined into the codegen map loop hit the same
-    //    wrong assumption in the Push intrinsic: `elem_is_fresh_box = !is_union_type(elem_ty)` was
-    //    false for sum-type unions, so the raw *SumNode was passed directly to lin_push_dyn.
-    //
-    // Fix: both sites now treat sum-type unions like concrete values: materialize *SumNode → fresh
-    // LinMap* (via sumnode_materialize), box as TAG_MAP, push/store, release the source SumNode.
-    // Mirror of the unbox fix in 6672c88c (param direction); this is the return/box direction.
+    // Regression: a function returning a sum-eligible union used as a `.map()` callback
+    // previously segfaulted. Root cause: the Push intrinsic's lin_push_dyn path treated
+    // sum-type union elements as already-boxed TaggedVal* (via is_union_type check), but a
+    // sum-type function returns a raw *SumNode — not a TaggedVal*. Passing the raw *SumNode
+    // to lin_push_dyn caused garbage tag reads → SIGSEGV.
+    // Fix: intrinsics.rs Push now boxes sum-type elements (materializes *SumNode → LinMap →
+    // TaggedVal*) before lin_push_dyn, then releases the fresh box. The SumNode itself is
+    // released by the IR's scope-exit Release (ContainerInsert::Nothing leaves it owned).
     let output = run(r#"import { print } from "std/io"
 import { map, for } from "std/iter"
 type Rec = { "name": String, "score": Int32 }
@@ -23582,20 +23572,26 @@ val mk = (s: String): Parsed =>
 }
 
 #[test]
-fn test_sumunion_map_callback_return_chain() {
-    // Extended regression: chain .map(fn-returning-sum).filter(...).map(extract) — exercises
-    // that the materialized TaggedVal* elements round-trip through filter and a second map
-    // correctly (both the wrapper and direct-call inlined paths).
+fn test_sumunion_generic_and_then_direct_return() {
+    // Regression: a generic andThen that returns f(value) (a sum-eligible union) through a
+    // boxed-ABI Function call must NOT release the SumNode in the wrapper. The reverted fix
+    // db634a79 added a lin_sumnode_release in boxed_abi_wrapper_full after materializing,
+    // which freed the SumNode while the caller still owned it → UAF → garbage value (e.g.
+    // out["value"] printed as "49" instead of "5").
+    // Fix: the wrapper is unchanged (no release added there). Only the Push store-site was
+    // fixed in intrinsics.rs.
     let output = run(r#"import { print } from "std/io"
-import { map, filter, for } from "std/iter"
-type Rec = { "name": String, "score": Int32 }
-type Success = { "type": "success", "value": Rec }
-type Failure = { "type": "failure", "error": String }
-type Parsed = Success | Failure
-val mk = (s: String): Parsed =>
-  if s == "" then { "type": "failure", "error": "e" }
-  else { "type": "success", "value": { "name": s, "score": 1 } }
-["a", "", "b"].map(mk).filter(r => r["type"] == "success").map(r => r["value"]["name"]).for(n => print(n))
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+val ok = <T, E>(v: T): Result<T, E> => { "type": "success", "value": v }
+val err = <T, E>(e: E): Result<T, E> => { "type": "failure", "error": e }
+val andThen = <T, U, E>(r: Result<T, E>, f: (T) => Result<U, E>): Result<U, E> =>
+  match r
+    has { "type": "success", value } => f(value)
+    else => err(r["error"])
+val checkPos = (n: Int32): Result<Int32, String> => if n > 0 then ok(n) else err("neg")
+val out: Result<Int32, String> = andThen(ok(5), checkPos)
+print(out["type"])
+print(out["value"])
 "#);
-    assert_eq!(output, vec!["a", "b"]);
+    assert_eq!(output, vec!["success", "5"]);
 }
