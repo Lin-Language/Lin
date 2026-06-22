@@ -23546,3 +23546,56 @@ ok.for(v => print(v["name"]))
 "#);
     assert_eq!(output, vec!["a", "b"]);
 }
+
+#[test]
+fn test_sumunion_map_callback_return_segfault() {
+    // Regression: a function RETURNING a sum-eligible union (literal-discriminant records, compiled
+    // with Packed(SumNode) repr) used as a `.map(fn)` callback previously segfaulted.
+    //
+    // Two bug sites, both the same root cause:
+    //
+    // 1. Wrapper path: `__cls_wrapb_mk` (the boxed-ABI wrapper generated for `mk`) hit:
+    //      if Self::is_union_type(&lin_ty) { rv }  // returned raw *SumNode, not TaggedVal*
+    //    in `boxed_abi_wrapper_full`. `is_union_type` is true for all Union, but a sum-type
+    //    returns *SumNode — NOT an already-boxed TaggedVal*. std_iter_map's lin_push_dyn received
+    //    a raw *SumNode pointer as if it were a TaggedVal* → garbage tag read → SIGSEGV.
+    //
+    // 2. Inlined-loop path: the direct `mk` call inlined into the codegen map loop hit the same
+    //    wrong assumption in the Push intrinsic: `elem_is_fresh_box = !is_union_type(elem_ty)` was
+    //    false for sum-type unions, so the raw *SumNode was passed directly to lin_push_dyn.
+    //
+    // Fix: both sites now treat sum-type unions like concrete values: materialize *SumNode → fresh
+    // LinMap* (via sumnode_materialize), box as TAG_MAP, push/store, release the source SumNode.
+    // Mirror of the unbox fix in 6672c88c (param direction); this is the return/box direction.
+    let output = run(r#"import { print } from "std/io"
+import { map, for } from "std/iter"
+type Rec = { "name": String, "score": Int32 }
+type Success = { "type": "success", "value": Rec }
+type Failure = { "type": "failure", "error": String }
+type Parsed = Success | Failure
+val mk = (s: String): Parsed =>
+  if s == "" then { "type": "failure", "error": "e" }
+  else { "type": "success", "value": { "name": s, "score": 1 } }
+["a", ""].map(mk).for(r => print(r["type"]))
+"#);
+    assert_eq!(output, vec!["success", "failure"]);
+}
+
+#[test]
+fn test_sumunion_map_callback_return_chain() {
+    // Extended regression: chain .map(fn-returning-sum).filter(...).map(extract) — exercises
+    // that the materialized TaggedVal* elements round-trip through filter and a second map
+    // correctly (both the wrapper and direct-call inlined paths).
+    let output = run(r#"import { print } from "std/io"
+import { map, filter, for } from "std/iter"
+type Rec = { "name": String, "score": Int32 }
+type Success = { "type": "success", "value": Rec }
+type Failure = { "type": "failure", "error": String }
+type Parsed = Success | Failure
+val mk = (s: String): Parsed =>
+  if s == "" then { "type": "failure", "error": "e" }
+  else { "type": "success", "value": { "name": s, "score": 1 } }
+["a", "", "b"].map(mk).filter(r => r["type"] == "success").map(r => r["value"]["name"]).for(n => print(n))
+"#);
+    assert_eq!(output, vec!["a", "b"]);
+}
