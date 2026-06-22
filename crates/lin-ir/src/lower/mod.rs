@@ -100,6 +100,14 @@ pub fn lower_module_with_imports(
                         ctx.combinator_spec_slots.insert(*slot, base);
                     }
                 }
+                // Tag a monomorphized flat-producer spec (`arrayAllocateFilled$Int32`, …) so
+                // `is_provably_flat_producer` recognises its result as a flat buffer. Gate on a
+                // trusted std/iter|std/array origin so a user fn named `range` is never tagged.
+                if is_flat_producer_spec_name(n)
+                    && module.spec_origins.get(slot).map(|o| o == "std/iter" || o == "std/array").unwrap_or(false)
+                {
+                    ctx.flat_producer_spec_slots.insert(*slot);
+                }
             }
         }
     }
@@ -339,6 +347,12 @@ pub fn lower_import_module_with_imports(
                 if is_stdlib_spec {
                     ctx.combinator_spec_slots.insert(*slot, base);
                 }
+            }
+            // See `lower_module`: tag a monomorphized flat-producer spec so its result reads flat.
+            if is_flat_producer_spec_name(name)
+                && module.spec_origins.get(slot).map(|o| o == "std/iter" || o == "std/array").unwrap_or(false)
+            {
+                ctx.flat_producer_spec_slots.insert(*slot);
             }
         }
     }
@@ -637,6 +651,12 @@ pub(crate) struct LowerCtx {
     /// is recognised by the fusion engine (Wave D). Populated in the top-level pre-scan by matching
     /// the spec's `name` against the `std_iter_flatMap`/`flatMap$…` shape.
     combinator_spec_slots: HashMap<usize, &'static str>,
+    /// Slots of monomorphized FLAT-PRODUCER specs (`range`/`map`/`filter`/`arrayAllocate`/
+    /// `arrayAllocateFilled`) that resolve via `global_fn_slots` (rehomed local specs, e.g.
+    /// `arrayAllocateFilled$Int32`). `is_provably_flat_producer` consults this so a combinator
+    /// reading such a producer's result uses flat scalar reads, not tagged get + unbox. Populated
+    /// in the pre-scan, gated on a trusted std/iter|std/array origin + a flat-producer base name.
+    flat_producer_spec_slots: std::collections::HashSet<usize>,
     /// >0 while lowering an expression that is a SYNCHRONOUS, non-retained callback argument
     /// to a known consuming combinator (for/while/map/filter/reduce). A closure literal
     /// (`MakeClosure`) lowered while this is >0 is PROVABLY consumed-and-discarded by the
@@ -715,6 +735,7 @@ impl LowerCtx {
             default_descriptors: HashMap::new(),
             safe_combinator_slots: HashMap::new(),
             combinator_spec_slots: HashMap::new(),
+            flat_producer_spec_slots: std::collections::HashSet::new(),
             safe_callback_depth: 0,
             packed_elem_slots: HashMap::new(),
             import_var_init_prologue: None,

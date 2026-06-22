@@ -86,11 +86,18 @@ pub(crate) fn is_provably_flat_producer(expr: &TypedExpr, builder: &FuncBuilder,
                     return is_flat_producer_name(intr);
                 }
                 if let Some((sym, _)) = ctx.import_fn_slots.get(slot) {
-                    // Imported export symbol is `{module_key}_{name}`; match on the trailing name.
-                    return sym.rsplit('_').next().map(is_flat_producer_export).unwrap_or(false);
+                    // Imported export symbol is `{module_key}_{name}`, possibly with an ADR-074
+                    // overload / monomorph suffix (`std_iter_range$Int32_Int32_84`). Strip the `$…`
+                    // before matching the trailing export name — else an overloaded producer
+                    // (`range`, the 3-arg rangeStep) is missed and its result reads tagged, not flat.
+                    let base = sym.split('$').next().unwrap_or(sym);
+                    return base.rsplit('_').next().map(is_flat_producer_export).unwrap_or(false);
                 }
-                if let Some(&fid) = ctx.global_fn_slots.get(slot) {
-                    let _ = fid; // local sibling: not a flat producer we trust here.
+                if ctx.flat_producer_spec_slots.contains(slot) {
+                    // A monomorphized flat-producer (e.g. `arrayAllocateFilled$Int32`) rehomed as a
+                    // local spec resolves via `global_fn_slots`; tagged at module pre-scan (gated on
+                    // a trusted std/iter|std/array origin + a flat-producer base name).
+                    return true;
                 }
             }
             false
@@ -156,6 +163,17 @@ pub(crate) fn is_flat_producer_name(name: &str) -> bool {
 pub(crate) fn is_flat_producer_export(name: &str) -> bool {
     matches!(name,
         "range" | "map" | "filter" | "arrayAllocate" | "arrayAllocateFilled")
+}
+
+/// True when a (possibly overload/monomorph-mangled) function NAME demangles to a flat-producer
+/// export. Strips the `$…` (ADR-074 overload / monomorph) suffix and the leading `module_` prefix
+/// before matching. Used to recognise a flat-producer specialization that resolves through
+/// `global_fn_slots` — e.g. a monomorphized `arrayAllocateFilled$Int32` rehomed as a local spec,
+/// which neither `intrinsic_slots` nor `import_fn_slots` holds.
+pub(crate) fn is_flat_producer_spec_name(name: &str) -> bool {
+    let base = name.split('$').next().unwrap_or(name);
+    let base = base.rsplit('_').next().unwrap_or(base);
+    is_flat_producer_export(base)
 }
 
 
@@ -1262,7 +1280,10 @@ pub(crate) fn combinator_callee_name(expr: &TypedExpr, builder: &FuncBuilder, ct
     let trailing = if let Some(intr) = builder.intrinsic_slots.get(slot) {
         intr.strip_prefix("lin_").unwrap_or(intr)
     } else if let Some((sym, _)) = ctx.import_fn_slots.get(slot) {
-        sym.rsplit('_').next()?
+        // Strip the ADR-074 overload / monomorph suffix (`$Int32_…`) before the trailing-name
+        // match, else an overloaded combinator import (`range`, `while`) is missed and its
+        // fusion-chain stage is not recognised.
+        sym.split('$').next().unwrap_or(sym).rsplit('_').next()?
     } else {
         return None;
     };

@@ -23249,3 +23249,36 @@ print(toString(sum_range(0, 5)))
         "expected a fused range_for_header block in sum_range:\n{func}"
     );
 }
+
+#[test]
+fn test_flat_producer_specs_read_flat_not_tagged() {
+    // `is_provably_flat_producer` must recognise overloaded / monomorphized flat producers so a
+    // downstream combinator reads their result with flat scalar reads (`lin_flat_array_get_*`), not
+    // `lin_array_get_tagged` + unbox. Two distinct resolution paths, both previously missed:
+    //  - `range().map()`: the `range` base is an ADR-074 overload whose `import_fn_slots` symbol
+    //    carries a `$Int32_Int32_NN` suffix — the trailing-name match must strip `$…` first.
+    //  - `arrayAllocateFilled()`: a monomorphized `std/array` generic that resolves via
+    //    `global_fn_slots` (rehomed local spec) — tagged as a flat-producer spec at module pre-scan.
+    let ir = build_ir(r#"
+import { range, map, for } from "std/iter"
+import { arrayAllocateFilled } from "std/array"
+import { toString } from "std/string"
+import { print } from "std/io"
+val use_range_map = (n: Int32): Int32 =>
+  val acc = [0]
+  range(0, n).map(i => i * 2).for(i => acc[0] = acc[0] + i)
+  acc[0]
+val use_alloc = (n: Int32): Int32 =>
+  val acc = [0]
+  arrayAllocateFilled(n, 1).for(i => acc[0] = acc[0] + i)
+  acc[0]
+print(toString(use_range_map(5) + use_alloc(5)))
+"#);
+    for f in ["use_range_map", "use_alloc"] {
+        let func = ir_function(&ir, f);
+        assert!(
+            !func.contains("@lin_array_get_tagged"),
+            "{f}: a flat-producer result must read flat, not via lin_array_get_tagged:\n{func}"
+        );
+    }
+}
