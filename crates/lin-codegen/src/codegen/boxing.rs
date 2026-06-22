@@ -312,6 +312,14 @@ impl<'ctx> Codegen<'ctx> {
                 let sum_ty = Self::sum_member_of_nullable_union(target_ty).unwrap();
                 self.sumnode_box_readback_to_object_box(ptr, &sum_ty)
             }
+            // Sum-type-eligible Union: the body compiled with Packed(SumNode) repr, so the
+            // incoming TaggedVal* (from the stdlib closure-call ABI) must be projected to
+            // a *SumNode before forwarding. sumnode_project_from_boxed tag-dispatches:
+            // TAG_SUMNODE → unwrap+retain (zero copy); TAG_MAP → run the per-type projector.
+            Type::Union(_) if Self::is_sum_type(target_ty) => {
+                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                self.sumnode_project_from_boxed(ptr, target_ty, target_ty, llvm_fn)
+            }
             // Already tagged — return as-is.
             Type::Union(_) | Type::TypeVar(_) => ptr,
             // Opaque handle types: their runtime value IS the tagged box pointer.

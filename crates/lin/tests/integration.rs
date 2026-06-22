@@ -20007,6 +20007,79 @@ main()
     assert_eq!(output, vec!["4"]);
 }
 
+// ---------------------------------------------------------------------------
+// CL.4 LSS: stored capturing-lambda callbacks inlined at combinator call sites.
+// A lambda bound to a local `val` that captures an outer binding must be inlined by
+// `inlinable_local_fn` when passed to a combinator, not dispatched via the boxed-closure
+// indirect call. Regression gate: output must be correct (no UAF / double-free from RC).
+
+// `map` with a stored capturing lambda: val cb = (x) => x + offset; nums.map(cb).
+// The inlined body accesses `offset` directly via the enclosing function's slot, not via
+// an env pointer — equivalent to an inline lambda, zero per-element closure calls.
+#[test]
+fn test_cl4_lss_stored_capturing_lambda_map() {
+    let output = run(r#"import { print } from "std/io"
+import { map } from "std/iter"
+
+val processWithOffset = (nums: Int32[], offset: Int32): Int32[] =>
+  val addOffset = (x: Int32) => x + offset
+  nums.map(addOffset)
+
+val result = processWithOffset([10, 20, 30], 5)
+print(result)
+"#);
+    assert_eq!(output, vec!["[15, 25, 35]"]);
+}
+
+// `for` with a stored capturing lambda that mutates a captured var accumulator.
+#[test]
+fn test_cl4_lss_stored_capturing_lambda_for_var() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/iter"
+
+val sumWithBase = (nums: Int32[], base: Int32): Int32 =>
+  var total: Int32 = base
+  val accumulate = (x: Int32) => total = total + x
+  nums.for(accumulate)
+  total
+
+print(toString(sumWithBase([1, 2, 3, 4, 5], 100)))
+"#);
+    assert_eq!(output, vec!["115"]);
+}
+
+// `filter` with a stored capturing predicate lambda.
+#[test]
+fn test_cl4_lss_stored_capturing_lambda_filter() {
+    let output = run(r#"import { print } from "std/io"
+import { filter } from "std/iter"
+
+val keepAbove = (nums: Int32[], threshold: Int32): Int32[] =>
+  val isAbove = (x: Int32) => x > threshold
+  nums.filter(isAbove)
+
+print(keepAbove([1, 5, 3, 8, 2, 7], 4))
+"#);
+    assert_eq!(output, vec!["[5, 8, 7]"]);
+}
+
+// Negative: a Function PARAMETER (unknown lambda set) must stay on the indirect boxed path.
+// `applyFn(f)` receives `f` as a parameter — its lambda set is Top (unknown) — so the combinator
+// must dispatch through the closure struct, not inline.
+#[test]
+fn test_cl4_lss_unknown_function_param_stays_indirect() {
+    let output = run(r#"import { print } from "std/io"
+import { map } from "std/iter"
+
+val applyFn = (nums: Int32[], f: (Int32) => Int32): Int32[] =>
+  nums.map(f)
+
+print(applyFn([10, 20, 30], (x: Int32) => x * 2))
+"#);
+    assert_eq!(output, vec!["[20, 40, 60]"]);
+}
+
 // Regression (Path 0): a `T | Null` value (T a record with a NESTED heap field) threaded through a
 // self-tail-recursive parameter must not be a use-after-free. The `else => scan(.., trip, ..)`
 // pass-through and the `if new != null then scan(.., new, ..)` arms both re-box a match-narrowed
@@ -23441,4 +23514,35 @@ var threshold = 4
 print(toString(find(xs, x => x > threshold)))
 "#);
     assert_eq!(output, vec!["6", "null", "true", "false", "5"]);
+}
+
+#[test]
+fn test_litunion_filter_map_has_match_segfault() {
+    // Regression: a union of literal-discriminant records (sum-type-eligible) piped through
+    // `.filter(...)` then `.map(r => match r has { "type": "success", value } => value ...)`
+    // previously segfaulted. Root cause: the closure parameter `r: Parsed` was compiled with
+    // `Packed(SumNode)` repr (from `type_seed`), but the stdlib `std_iter_filter` callback ABI
+    // passes each element as a `TaggedVal*` (from `lin_array_get_tagged`). The boxed-ABI
+    // wrapper in `unbox_value` passed `Union` types through unchanged, so the body's
+    // `lin_summat(r)` read at offsets 16 and 24 of a 16-byte allocation — OOB → SIGSEGV.
+    // Fix: `unbox_value` now projects TaggedVal* → *SumNode for sum-type-eligible Union params.
+    let output = run(r#"import { print } from "std/io"
+import { map, filter, for } from "std/iter"
+type Rec = { "name": String, "score": Int32 }
+type Success = { "type": "success", "value": Rec }
+type Failure = { "type": "failure", "error": String }
+type Parsed = Success | Failure
+val rows: Parsed[] = [
+  { "type": "success", "value": { "name": "a", "score": 1 } },
+  { "type": "failure", "error": "bad" },
+  { "type": "success", "value": { "name": "b", "score": 2 } }
+]
+val ok = rows.filter(r => r["type"] == "success").map(r =>
+  match r
+    has { "type": "success", value } => value
+    else => { "name": "?", "score": 0 }
+)
+ok.for(v => print(v["name"]))
+"#);
+    assert_eq!(output, vec!["a", "b"]);
 }

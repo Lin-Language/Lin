@@ -11,6 +11,7 @@ lin-check = { path = "../lin-check" }
 lin-ir = { path = "../lin-ir" }
 inkwell = { version = "0.9", features = ["llvm22-1"] }
 llvm-sys = "221"
+libc = "0.2"
 indexmap = { workspace = true }
 md5 = "0.7"
 flate2 = "1"
