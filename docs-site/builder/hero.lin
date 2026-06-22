@@ -16,9 +16,6 @@ val escapeHtml = (text: String): String =>
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
 
-val fileContent = (v: AnyVal): String =>
-  if v != null && v["type"] == "error" then "" else v
-
 // The feature list — the canonical positioning, one <li> per capability.
 val featureList = (): String =>
   val items = [
@@ -40,7 +37,8 @@ val tabButton = (id: String, label: String, active: Boolean): String =>
 
 // One tab panel wrapping an example file's (escaped) source.
 val tabPanel = (id: String, exampleFile: String, active: Boolean): String =>
-  val raw = fileContent(readFile("docs-site/examples/${exampleFile}"))
+  val readResult = readFile("docs-site/examples/${exampleFile}")
+  val raw: String = if readResult is Error then "" else readResult
   val code = escapeHtml(raw)
   val cls = if active then "hero-panel active" else "hero-panel"
   "<div class=\"${cls}\" data-panel=\"${id}\"><pre><code class=\"language-lin\">${code}</code></pre></div>\n"

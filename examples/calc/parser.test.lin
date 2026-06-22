@@ -4,7 +4,8 @@
 // parser alone: precedence in the produced AST, paren grouping, full-stream
 // consumption, and the failure results for malformed / trailing / bad input.
 import { expect, toBe, toSucceed, toFail, test, suite, run } from "std/test"
-import { parse, Token } from "./parser"
+import { parse } from "./parser"
+import { Token } from "./lexer"
 
 // Token builders — typed so the fixture arrays are Token[] (a AnyVal[] literal
 // would not coerce). lparen/rparen carry an empty text (structurally a Token).
