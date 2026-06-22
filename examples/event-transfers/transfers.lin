@@ -5,7 +5,7 @@
 import { for } from "std/iter"
 import { split } from "std/string"
 import { parseInt32 } from "std/number"
-import { push, length } from "std/array"
+import { push } from "std/array"
 import { emitter, send, drain, stop } from "std/event"
 
 // A footpath transfer between two DISTINCT stops (origin == dest is an interchange, not a footpath).
