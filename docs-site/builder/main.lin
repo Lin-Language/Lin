@@ -1,9 +1,9 @@
 import { print } from "std/io"
 import { readFile, writeFile, readJson, ls, mkdir, cp } from "std/fs"
-import { join } from "std/path"
+import { join, dirname } from "std/path"
 import { split, startsWith, contains, trim, substring, indexOf, replaceAll } from "std/string"
 import { push, length } from "std/array"
-import { for, filter } from "std/iter"
+import { for, filter, find } from "std/iter"
 import { render } from "std/template"
 import { getEnv } from "std/env"
 
@@ -32,14 +32,8 @@ val headingText = (line: String): String =>
 
 // Extract the first H1 heading from markdown source, or fall back to the default
 val extractTitle = (source: String): String =>
-  var title = "Lin Documentation"
-  var found = false
-  val lines = split(source, "\n")
-  lines.for(line =>
-    if found == false && startsWith(line, "# ") then title = headingText(line)
-    if found == false && startsWith(line, "# ") then found = true
-  )
-  title
+  val heading = split(source, "\n").find(line => startsWith(line, "# "))
+  if heading == null then "Lin Documentation" else headingText(heading)
 
 // Convert a content file path to its output HTML path
 // e.g. "docs-site/content/tutorials/01-hello.md" -> "docs-site/output/tutorials/01-hello.html"
@@ -70,92 +64,64 @@ val contentPathToUrl = (path: String): String =>
     relative
   if noExt == "index" then "/" else "/${noExt}"
 
-// Get the directory portion of a file path
-val dirName = (filePath: String): String =>
-  val parts = split(filePath, "/")
-  val n = length(parts)
-  var dirParts: String[] = []
-  var k = 0
-  parts.for(part =>
-    if k < n - 1 then dirParts.push(part)
-    k = k + 1
-  )
-  join(dirParts)
-
-// Check if a AnyVal value is a stdlib Error value
-val isError = (v: AnyVal): Boolean =>
-  v != null && v["type"] == "error"
-
-// Get file content string from readFile result (returns "" on error)
-val fileContent = (v: AnyVal): String =>
-  if isError(v) then
-    ""
-  else
-    v
-
-// Get error message from an Error value
-val errorMsg = (v: AnyVal): String =>
-  if v == null then
-    "unknown error"
-  else if v["message"] == null then
-    "unknown error"
-  else
-    v["message"]
-
 // Process a single markdown file, returning Null
 val processFile = (filePath: String, navEntries: AnyVal): Null =>
-  val sourceJson = readFile(filePath)
-  if isError(sourceJson) then
-    print("Error reading ${filePath}: ${errorMsg(sourceJson)}")
-  else
-    val source = fileContent(sourceJson)
-    val title = extractTitle(source)
-    val rawHtml = markdownToHtml(source)
-    // Prefix root-relative links (href="/...") authored in the Markdown with the
-    // deployment base path. No-op when basePath is "" (local/root deployment).
-    val htmlContent = replaceAll(rawHtml, "href=\"/", "href=\"${basePath}/")
-    val urlPath = contentPathToUrl(filePath)
-    val navHtml = buildNav(navEntries, urlPath, basePath)
-    val outputPath = contentPathToOutput(filePath)
-    val isHome = urlPath == "/"
-    val templatePath = if isHome then homeTemplate else pageTemplate
-    // The home page gets the two-column feature/code-tabs hero above its content.
-    val hero = if isHome then buildHero(basePath) else ""
-    // render() loads the template by path so `{% extends "base.jinja" %}` resolves
-    // against templates/ — page.jinja and home.jinja share the base.jinja layout.
-    val rendered = render(templatePath, {
-      "title": title,
-      "nav": navHtml,
-      "content": htmlContent,
-      "base": basePath,
-      "hero": hero
-    })
-    if rendered is Error then
-      print("Error rendering ${templatePath}: ${errorMsg(rendered)}")
-    else
-      val outDir = dirName(outputPath)
-      mkdir(outDir, { "parents": true })
-      val writeResult = writeFile(outputPath, rendered)
-      if isError(writeResult) then
-        print("Error writing ${outputPath}: ${errorMsg(writeResult)}")
-      else
-        print("  ${outputPath}")
+  val sourceResult = readFile(filePath)
+  match sourceResult
+    is Error =>
+      print("Error reading ${filePath}: ${sourceResult["message"]}")
+    else =>
+      val source: String = sourceResult
+      val title = extractTitle(source)
+      val rawHtml = markdownToHtml(source)
+      // Prefix root-relative links (href="/...") authored in the Markdown with the
+      // deployment base path. No-op when basePath is "" (local/root deployment).
+      val htmlContent = replaceAll(rawHtml, "href=\"/", "href=\"${basePath}/")
+      val urlPath = contentPathToUrl(filePath)
+      val navHtml = buildNav(navEntries, urlPath, basePath)
+      val outputPath = contentPathToOutput(filePath)
+      val isHome = urlPath == "/"
+      val templatePath = if isHome then homeTemplate else pageTemplate
+      // The home page gets the two-column feature/code-tabs hero above its content.
+      val hero = if isHome then buildHero(basePath) else ""
+      // render() loads the template by path so `{% extends "base.jinja" %}` resolves
+      // against templates/ — page.jinja and home.jinja share the base.jinja layout.
+      val rendered = render(templatePath, {
+        "title": title,
+        "nav": navHtml,
+        "content": htmlContent,
+        "base": basePath,
+        "hero": hero
+      })
+      match rendered
+        is Error =>
+          print("Error rendering ${templatePath}: ${rendered["message"]}")
+        else =>
+          val outDir = dirname(outputPath)
+          mkdir(outDir, { "parents": true })
+          val writeResult = writeFile(outputPath, rendered)
+          match writeResult
+            is Error =>
+              print("Error writing ${outputPath}: ${writeResult["message"]}")
+            else =>
+              print("  ${outputPath}")
 
 // Copy static assets to output/static/
 val copyStatic = (): Null =>
   val outStaticDir = "${outputDir}/static"
   mkdir(outStaticDir, { "parents": true })
-  val filesJson = ls(staticDir, {})
-  if filesJson is Error then
-    print("Error listing static dir: ${errorMsg(filesJson)}")
-  else
-    filesJson.for(filename =>
-      val srcPath = "${staticDir}/${filename}"
-      val dstPath = "${outStaticDir}/${filename}"
-      val copyResult = cp(srcPath, dstPath)
-      if isError(copyResult) then
-        print("Error copying ${filename}: ${errorMsg(copyResult)}")
-    )
+  val filesResult = ls(staticDir, {})
+  match filesResult
+    is Error =>
+      print("Error listing static dir: ${filesResult["message"]}")
+    else =>
+      filesResult.for(filename =>
+        val srcPath = "${staticDir}/${filename}"
+        val dstPath = "${outStaticDir}/${filename}"
+        val copyResult = cp(srcPath, dstPath)
+        if copyResult is Error then
+          print("Error copying ${filename}: ${copyResult["message"]}")
+      )
 
 // Main entry point
 val navResult = readJson("${contentDir}/nav.json")

@@ -20,6 +20,7 @@
 import { push, length } from "std/array"
 import { u16FromBe } from "std/bytes"
 import { toInt32, toFloat64 } from "std/number"
+import { range, for } from "std/iter"
 
 // One TLV field: a tag byte (0..255) plus its raw value bytes. The value is a
 // flat byte list; decode rebuilds these from slices of the packed buffer.
@@ -27,10 +28,8 @@ export type Field = { "tag": Int32, "bytes": Int32[] }
 
 // Append every byte of `src` onto the UInt8[] accumulator `buf`. `push` coerces
 // each Int32 element down to a byte at runtime.
-val appendBytes = (buf: UInt8[], src: Int32[], i: Int32): Null =>
-  if i < length(src) then
-    push(buf, src[i])
-    appendBytes(buf, src, i + 1)
+val appendBytes = (buf: UInt8[], src: Int32[]): Null =>
+  range(0, length(src)).for(i => push(buf, src[i]))
 
 // Append one field's TLV encoding onto the UInt8[] accumulator `buf`:
 // [tag] ++ u16be(len) ++ value-bytes. `push` coerces each Int32 down to a byte;
@@ -42,18 +41,12 @@ val encodeField = (buf: UInt8[], field: Field): Null =>
   val len = length(field["bytes"])
   push(buf, (len >> 8) & 0xFF)
   push(buf, len & 0xFF)
-  appendBytes(buf, field["bytes"], 0)
-
-// Encode each field in turn into the shared accumulator (recursion threads the index).
-val encodeInto = (buf: UInt8[], fields: Field[], i: Int32): Null =>
-  if i < length(fields) then
-    encodeField(buf, fields[i])
-    encodeInto(buf, fields, i + 1)
+  appendBytes(buf, field["bytes"])
 
 // Public: list of { tag, bytes } -> packed UInt8[].
 export val encode = (fields: Field[]): UInt8[] =>
   var buf: UInt8[] = []
-  encodeInto(buf, fields, 0)
+  range(0, length(fields)).for(i => encodeField(buf, fields[i]))
   buf
 
 // Copy the byte window [lo, hi) of a flat UInt8[] into a fresh Int32[] value

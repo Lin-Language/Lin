@@ -24,7 +24,7 @@ export type Stats = { "count": Int32, "total": Int32, "average": Int32, "top": S
 // `filter`, but keeps the match total.
 export val validRecords = (lines: String[]): Record[] =>
   lines
-    .map(line => parseRow(line))
+    .map(parseRow)
     .filter(r => r["type"] == "success")
     .map(r =>
       match r
@@ -41,10 +41,7 @@ export val uniqueRecords = (records: Record[]): Record[] =>
   var out: Record[] = []
   records.for(r =>
     val key = hash(r)
-    val isNew = match seen[key]
-      is Boolean => false
-      else => true
-    if isNew then
+    if !(seen[key] ?? false) then
       seen[key] = true
       out.push(r)
   )
@@ -54,7 +51,7 @@ export val uniqueRecords = (records: Record[]): Record[] =>
 // discipline applied inline in the `map` callback.
 export val parseErrors = (lines: String[]): String[] =>
   lines
-    .map(line => parseRow(line))
+    .map(parseRow)
     .filter(r => r["type"] == "failure")
     .map(r =>
       match r

@@ -9,7 +9,7 @@
 // outcome, never a crash.
 import { exec, ExecResult } from "std/process"
 import { trim } from "std/string"
-import { push, length } from "std/array"
+import { map } from "std/iter"
 
 export type Task = { "name": String, "command": String, "args": String[] }
 
@@ -44,14 +44,5 @@ export val runTask = (t: Task): TaskResult =>
     is ExecResult => classify(t["name"], r)
     else => launchError(t["name"], "unknown error")
 
-// Run a list of tasks in order, collecting their results. Named-record arrays are built
-// with explicit push recursion here (see the compiler-bug note in README), not `.map`.
-val runFrom = (tasks: Task[], i: Int32, acc: TaskResult[]): TaskResult[] =>
-  if i >= length(tasks) then
-    acc
-  else
-    push(acc, runTask(tasks[i]))
-    runFrom(tasks, i + 1, acc)
-
 export val runAll = (tasks: Task[]): TaskResult[] =>
-  runFrom(tasks, 0, [])
+  tasks.map(t => runTask(t))
