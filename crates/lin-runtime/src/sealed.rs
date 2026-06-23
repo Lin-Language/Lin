@@ -885,135 +885,157 @@ pub unsafe fn alloc_sealed_struct_from_map(
     sptr
 }
 
-/// Stage 6a: look up one field by name in a TAG_RECORD sealed struct and return an OWNED +1
-/// TaggedVal* for that field (or null for a missing/null field). Used by `compile_ir_index` in the
-/// union/Json string-key path when the runtime value is a TAG_RECORD (sealed struct wrapped as a
-/// dynamic value). The named descriptor pointer is read from offset 16 of the sealed struct header
-/// (the 3rd 8-byte slot, after [rc@0|size@4|heap_desc@8|named_desc@16|...]).
-/// The named descriptor was emitted by `Codegen::sealed_named_descriptor`.
+/// Box one field of a sealed struct (identified by its struct-relative `offset`, `nkind`, and
+/// `nested` named-desc pointer) into a fresh +1-owned TaggedVal*. The caller OWNS the returned
+/// box and must `lin_tagged_release` it.
 ///
-/// Returns null for a null sealed pointer, a null named descriptor, or a field not in the
-/// descriptor. The returned TaggedVal* is a fresh +1-owned box — the caller must `lin_tagged_release` it.
+/// `sealed` is the struct base pointer (WITH header, struct-relative offsets).
+/// This is the same per-nkind boxing that was previously inlined in `lin_record_get_field`, now
+/// extracted so both the field-lookup and the descriptor-walk view paths can share it.
 ///
-/// RC contract per field kind:
-///  - Scalar kinds (Int32/Int64/UInt64/Float64/Bool): the scalar value is copied into a fresh box;
-///    no inner heap payload → release is a no-op on the inner (just frees the box shell).
-///  - String/Array/Map: the slot holds an owned pointer; we RETAIN it before boxing (the struct keeps
-///    its own +1; the caller's +1 release is balanced by this retain). Mirrors `box_named_heap_field`.
-///  - Sealed (nested struct): recurse materialize to a LinMap, box as TAG_MAP. Same contract
-///    as `box_named_heap_field(NKIND_SEALED)`.
-#[no_mangle]
-pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const crate::string::LinString) -> *mut u8 {
+/// RC contract:
+///  - Scalars: value copied into a fresh box; no inner heap payload.
+///  - String/Array/Map: slot pointer RETAINED before boxing (+1 for the caller; struct keeps its +1).
+///  - Sealed (nested struct): `lin_box_record` retains (+1); Stage-3 lazy (no intermediate LinMap).
+///  - SumNode: materialized → fresh LinMap → TAG_MAP.
+///  - Null slot (heap kinds): returns null_mut() (caller treats as absent/null field).
+pub(crate) unsafe fn box_field_value(
+    sealed: *const u8,
+    offset: u32,
+    nkind: u32,
+    nested: *const u8,
+) -> *mut u8 {
     use crate::tagged::{TAG_INT32, TAG_INT64, TAG_UINT64, TAG_FLOAT64, TAG_BOOL, TAG_MAP, alloc_tagged};
-    if sealed.is_null() || key.is_null() {
-        return std::ptr::null_mut();
+    let slot = sealed.add(offset as usize);
+    let _ = nested; // carried for API symmetry; NKIND_SEALED uses lin_box_record (reads desc from struct header)
+    match nkind {
+        NKIND_INT32 => {
+            let v = *(slot as *const i32);
+            alloc_tagged(TAG_INT32, v as i64 as u64)
+        }
+        NKIND_INT16 => {
+            let v = *(slot as *const i16) as i32;
+            alloc_tagged(TAG_INT32, v as i64 as u64)
+        }
+        NKIND_INT8 => {
+            let v = *(slot as *const i8) as i32;
+            alloc_tagged(TAG_INT32, v as i64 as u64)
+        }
+        NKIND_INT64 => {
+            let v = *(slot as *const i64);
+            alloc_tagged(TAG_INT64, v as u64)
+        }
+        NKIND_UINT32 => {
+            let v = *(slot as *const u32) as u64;
+            alloc_tagged(TAG_INT64, v)
+        }
+        NKIND_UINT16 => {
+            let v = *(slot as *const u16) as u64;
+            alloc_tagged(TAG_INT64, v)
+        }
+        NKIND_UINT8 => {
+            let v = *(slot as *const u8) as u64;
+            alloc_tagged(TAG_INT64, v)
+        }
+        NKIND_UINT64 => {
+            let v = *(slot as *const u64);
+            alloc_tagged(TAG_UINT64, v)
+        }
+        NKIND_FLOAT64 => {
+            let v = *(slot as *const f64);
+            alloc_tagged(TAG_FLOAT64, v.to_bits())
+        }
+        NKIND_FLOAT32 => {
+            let v = *(slot as *const f32) as f64;
+            alloc_tagged(TAG_FLOAT64, v.to_bits())
+        }
+        NKIND_BOOL => {
+            let v = *(slot as *const u8);
+            alloc_tagged(TAG_BOOL, (v != 0) as u64)
+        }
+        NKIND_STRING => {
+            let p = *(slot as *const *mut u8);
+            if p.is_null() { return std::ptr::null_mut(); }
+            crate::memory::lin_rc_retain(p as *mut u32);
+            crate::tagged::lin_box_str(p)
+        }
+        NKIND_ARRAY => {
+            let p = *(slot as *const *mut u8);
+            if p.is_null() { return std::ptr::null_mut(); }
+            crate::memory::lin_rc_retain(p as *mut u32);
+            crate::tagged::lin_box_array(p)
+        }
+        NKIND_MAP => {
+            let p = *(slot as *const *mut u8);
+            if p.is_null() { return std::ptr::null_mut(); }
+            crate::memory::lin_rc_retain(p as *mut u32);
+            crate::tagged::lin_box_map(p)
+        }
+        NKIND_SEALED => {
+            let p = *(slot as *const *mut u8);
+            if p.is_null() { return std::ptr::null_mut(); }
+            crate::tagged::lin_box_record(p)
+        }
+        NKIND_SUMNODE => {
+            let p = *(slot as *const *mut u8);
+            if p.is_null() { return std::ptr::null_mut(); }
+            let sum_map = crate::sumnode::lin_sumnode_materialize(p);
+            if sum_map.is_null() { return std::ptr::null_mut(); }
+            alloc_tagged(TAG_MAP, sum_map as u64)
+        }
+        _ => std::ptr::null_mut(),
     }
-    // Stage 6a: the named descriptor is at offset 16 in the sealed struct header (see SEALED_HEADER).
-    let named_desc = *((sealed.add(16)) as *const *const u8);
+}
+
+/// Walk every field in a named descriptor, invoking `f(name_bytes, offset, nkind, nested_desc)`
+/// once per field in descriptor order. `named_desc` may be NULL (→ no iterations).
+///
+/// The descriptor blob layout (see SEALED_HEADER docs):
+///   `[u32 count | u32 pad | {u32 offset, u32 nkind, u64 nested_ptr, u16 name_len, name_bytes,
+///     pad-to-8} * count]`
+///
+/// `offset` is struct-relative (includes the SEALED_HEADER), matching the convention of
+/// `lin_record_get_field` and `materialize_named_payload_to_map`.
+pub(crate) unsafe fn record_walk_fields(
+    named_desc: *const u8,
+    mut f: impl FnMut(&[u8], u32, u32, *const u8),
+) {
     if named_desc.is_null() {
-        return std::ptr::null_mut();
+        return;
     }
     let field_count = u32::from_le_bytes([
         *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
     ]) as usize;
-    let key_bytes = std::slice::from_raw_parts((*key).data.as_ptr(), (*key).len as usize);
-    let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
+    let mut cur = 8usize;
     for _ in 0..field_count {
-        let (offset, nkind, _nested, name, next) = read_named_field(named_desc, cur);
+        let (offset, nkind, nested, name, next) = read_named_field(named_desc, cur);
         cur = next;
-        if name.as_bytes() != key_bytes {
-            continue;
-        }
-        // Found the field. Box its value.
-        let slot = sealed.add(offset as usize);
-        let box_val = match nkind {
-            NKIND_INT32 => {
-                let v = *(slot as *const i32);
-                alloc_tagged(TAG_INT32, v as i64 as u64)
-            }
-            // Narrow signed ints — sign-extend to i32, box as TAG_INT32 (matching box_value).
-            NKIND_INT16 => {
-                let v = *(slot as *const i16) as i32;
-                alloc_tagged(TAG_INT32, v as i64 as u64)
-            }
-            NKIND_INT8 => {
-                let v = *(slot as *const i8) as i32;
-                alloc_tagged(TAG_INT32, v as i64 as u64)
-            }
-            NKIND_INT64 => {
-                let v = *(slot as *const i64);
-                alloc_tagged(TAG_INT64, v as u64)
-            }
-            // Narrow unsigned ints — zero-extend to u64, box as TAG_INT64 (matching box_value for UInt8/16/32).
-            NKIND_UINT32 => {
-                let v = *(slot as *const u32) as u64;
-                alloc_tagged(TAG_INT64, v)
-            }
-            NKIND_UINT16 => {
-                let v = *(slot as *const u16) as u64;
-                alloc_tagged(TAG_INT64, v)
-            }
-            NKIND_UINT8 => {
-                let v = *(slot as *const u8) as u64;
-                alloc_tagged(TAG_INT64, v)
-            }
-            NKIND_UINT64 => {
-                let v = *(slot as *const u64);
-                alloc_tagged(TAG_UINT64, v)
-            }
-            NKIND_FLOAT64 => {
-                let v = *(slot as *const f64);
-                alloc_tagged(TAG_FLOAT64, v.to_bits())
-            }
-            NKIND_FLOAT32 => {
-                // Physical slot is 4-byte f32; box as TAG_FLOAT64 via fpext (mirrors box_value).
-                let v = *(slot as *const f32) as f64;
-                alloc_tagged(TAG_FLOAT64, v.to_bits())
-            }
-            NKIND_BOOL => {
-                let v = *(slot as *const u8);
-                alloc_tagged(TAG_BOOL, (v != 0) as u64)
-            }
-            NKIND_STRING => {
-                let p = *(slot as *const *mut u8);
-                if p.is_null() { return std::ptr::null_mut(); }
-                crate::memory::lin_rc_retain(p as *mut u32);
-                crate::tagged::lin_box_str(p)
-            }
-            NKIND_ARRAY => {
-                let p = *(slot as *const *mut u8);
-                if p.is_null() { return std::ptr::null_mut(); }
-                crate::memory::lin_rc_retain(p as *mut u32);
-                crate::tagged::lin_box_array(p)
-            }
-            NKIND_MAP => {
-                let p = *(slot as *const *mut u8);
-                if p.is_null() { return std::ptr::null_mut(); }
-                crate::memory::lin_rc_retain(p as *mut u32);
-                crate::tagged::lin_box_map(p)
-            }
-            NKIND_SEALED => {
-                // Nested sealed struct: box as TAG_RECORD (lazy, no materialization).
-                // lin_box_record retains the struct (+1); lin_tagged_release on TAG_RECORD calls
-                // lin_sealed_release_self to balance.
-                let p = *(slot as *const *mut u8);
-                if p.is_null() { return std::ptr::null_mut(); }
-                crate::tagged::lin_box_record(p)
-            }
-            NKIND_SUMNODE => {
-                // SumNode field: materialize via the per-type fn-ptr → fresh LinMap → TAG_MAP.
-                let p = *(slot as *const *mut u8);
-                if p.is_null() { return std::ptr::null_mut(); }
-                let sum_map = crate::sumnode::lin_sumnode_materialize(p);
-                if sum_map.is_null() { return std::ptr::null_mut(); }
-                alloc_tagged(TAG_MAP, sum_map as u64)
-            }
-            _ => return std::ptr::null_mut(),
-        };
-        return box_val;
+        f(name.as_bytes(), offset, nkind, nested);
     }
-    // Field not found.
-    std::ptr::null_mut()
+}
+
+/// Stage 6a: look up one field by name in a TAG_RECORD sealed struct and return an OWNED +1
+/// TaggedVal* for that field (or null for a missing/null field).
+#[no_mangle]
+pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const crate::string::LinString) -> *mut u8 {
+    if sealed.is_null() || key.is_null() {
+        return std::ptr::null_mut();
+    }
+    let named_desc = *((sealed.add(16)) as *const *const u8);
+    if named_desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let key_bytes = std::slice::from_raw_parts((*key).data.as_ptr(), (*key).len as usize);
+    let mut result: *mut u8 = std::ptr::null_mut();
+    let mut found = false;
+    record_walk_fields(named_desc, |name, offset, nkind, nested| {
+        if found || name != key_bytes {
+            return;
+        }
+        found = true;
+        result = box_field_value(sealed, offset, nkind, nested);
+    });
+    result
 }
 
 #[cfg(test)]
