@@ -69,6 +69,22 @@ val streamRecordsPairs = (path: String): String =>
     is Error => "ERR: ${outcome["message"]}"
     else => outcome
 
+// Projection: recordRows({ columns: [...] }) must materialize ONLY the named columns.
+// A column NOT in the projection reads back as null (absent), not its value. (Regression:
+// the cols arg was decoded as a boxed TaggedVal instead of the raw LinArray it actually is,
+// so projection silently never applied and every column was materialized.)
+val streamProjected = (path: String): String =>
+  val outcome = readStream(path)
+    .recordRows({ "columns": ["a", "c"] })
+    .reduce("", (acc, rec) =>
+      val b = rec["b"]
+      val pair = "a=${rec["a"]} b=${if b == null then "ABSENT" else b} c=${rec["c"]}"
+      if acc == "" then pair else "${acc} :: ${pair}"
+    )
+  match outcome
+    is Error => "ERR: ${outcome["message"]}"
+    else => outcome
+
 val streamErr = (path: String): String =>
   val outcome = readStream(path)
     .csvRows()
@@ -284,6 +300,13 @@ val s = suite("std/csv", [
     writeFile("/tmp/lin_csv_test_bad.csv", "a,\"oops\n")
     [
       expect(streamErr("/tmp/lin_csv_test_bad.csv")).toBe("ERR")
+    ]
+  ),
+
+  test("recordRows columns projection materializes ONLY the named columns", () =>
+    writeFile("/tmp/lin_csv_test_proj.csv", "a,b,c,d\n1,2,3,4\n5,6,7,8\n")
+    [
+      expect(streamProjected("/tmp/lin_csv_test_proj.csv")).toBe("a=1 b=ABSENT c=3 :: a=5 b=ABSENT c=7")
     ]
   )
 ])

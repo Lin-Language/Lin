@@ -3612,13 +3612,15 @@ pub unsafe extern "C" fn lin_stream_csv_records_projected(
     let wanted: Option<Vec<Vec<u8>>> = if cols.is_null() {
         None
     } else {
-        use crate::tagged::{TAG_ARRAY, TAG_STR};
+        use crate::tagged::TAG_STR;
         use crate::string::LinString;
-        let tv = &*(cols as *const crate::tagged::TaggedVal);
-        if tv.tag != TAG_ARRAY {
-            None
-        } else {
-            let arr = tv.payload as *const crate::array::LinArray;
+        // `cols` IS the raw `*const LinArray` — Lin's codegen passes a `String[]` argument to a
+        // foreign function UNBOXED (the LLVM IR for `(Stream, Int32, String[])` shows the array
+        // arriving as a bare `ptr`, not a boxed `TaggedVal*`). The previous code read it as a
+        // `TaggedVal`, so `tv.tag` was the LinArray header (never `TAG_ARRAY`) → this branch always
+        // produced `None` → column projection was silently a no-op (every column materialized).
+        {
+            let arr = cols as *const crate::array::LinArray;
             if arr.is_null() {
                 None
             } else {
