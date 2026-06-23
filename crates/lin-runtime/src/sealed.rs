@@ -867,7 +867,7 @@ mod named_desc_tests {
     /// `[u32 count | u32 pad | { u32 offset, u32 nkind, u64 nested_ptr, u16 name_len, name_bytes,
     ///   pad-to-8 } * count]`. The 8-byte header + per-row pad-to-8 keep every `nested_ptr` 8-aligned
     /// (macOS ld64 requires it); the runtime walks the blob byte-by-byte, rounding each row up to 8.
-    fn build_named_desc(fields: &[(&str, u32, u32, *const u8)]) -> Vec<u8> {
+    pub(super) fn build_named_desc(fields: &[(&str, u32, u32, *const u8)]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&(fields.len() as u32).to_le_bytes());
         b.extend_from_slice(&0u32.to_le_bytes()); // header pad → 8-byte header
@@ -1185,6 +1185,164 @@ mod named_desc_tests {
             assert_eq!((*s).refcount, 1);
             // Array drop walks the heap desc: string rc -> 0, freed exactly once.
             crate::array::lin_array_release(arr);
+        }
+    }
+}
+
+#[cfg(test)]
+mod repr_invariant_tests {
+    //! INVARIANT (ADR-088): a sealed record is never represented as a string-keyed LinMap.
+    //! If any test here fails, someone re-introduced record→TAG_MAP storage — fix the producer,
+    //! do not change the assertion.
+    //!
+    //! These tests run under `cargo test` and ASan in CI. Any regression that boxes a sealed
+    //! record as TAG_MAP will fail CI here and be caught loudly.
+
+    use super::*;
+    use super::named_desc_tests::build_named_desc;
+    use crate::array::SEALED_ARRAY_TAG;
+    use crate::tagged::TAG_RECORD;
+
+    /// Build a named descriptor for a { s: String, n: Int32 } record:
+    /// header 24, s@24 (8-byte ptr, NKIND_STRING), n@32 (4-byte i32, NKIND_INT32). stride = 16.
+    fn heap_string_named_desc() -> Vec<u8> {
+        build_named_desc(&[
+            ("s", 24, NKIND_STRING, std::ptr::null()),
+            ("n", 32, NKIND_INT32, std::ptr::null()),
+        ])
+    }
+
+    /// Build a heap descriptor for { s: String } (one KIND_STRING field at offset 24).
+    fn heap_string_desc() -> Vec<u8> {
+        let mut hd = Vec::new();
+        hd.extend_from_slice(&1u32.to_le_bytes()); // count
+        hd.extend_from_slice(&24u32.to_le_bytes()); // offset
+        hd.extend_from_slice(&KIND_STRING.to_le_bytes()); // kind
+        hd
+    }
+
+    // Helper: allocate a standalone { s: String, n: Int32 } sealed struct with rc=1.
+    unsafe fn make_string_int_struct(s: *mut crate::string::LinString, n: i32,
+                                     heap_desc: *const u8, named_desc: *const u8) -> *mut u8 {
+        let stride: usize = 16;
+        let st = lin_sealed_alloc(SEALED_HEADER + stride, heap_desc, named_desc);
+        crate::memory::lin_rc_retain(s as *mut u32); // struct takes +1 on the string
+        *((st.add(24)) as *mut *mut u8) = s as *mut u8;
+        *((st.add(32)) as *mut i32) = n;
+        st
+    }
+
+    /// 0xFD pointer-backed array: lin_sealed_ptr_array_to_tagged must produce TAG_RECORD elements.
+    #[test]
+    fn ptr_array_to_tagged_is_tag_record() {
+        unsafe {
+            let named = heap_string_named_desc();
+            let hd = heap_string_desc();
+            let s = crate::string::lin_string_from_bytes(b"abc".as_ptr(), 3);
+            let st = make_string_int_struct(s, 7, hd.as_ptr(), named.as_ptr());
+            // 0xFD array (lin_sealed_ptr_array_alloc takes cap + named_desc).
+            let arr = crate::array::lin_sealed_ptr_array_alloc(4, named.as_ptr());
+            // lin_sealed_ptr_array_push RETAINS (+1 on the struct): st rc stays at 1, array adds 1.
+            crate::array::lin_sealed_ptr_array_push(arr, st);
+            lin_sealed_release_self(st); // drop our construction ref; array holds the sole +1
+
+            let tagged_arr = crate::array::lin_sealed_ptr_array_to_tagged(arr);
+            assert_eq!((*tagged_arr).len, 1);
+            let slot = (*tagged_arr).data.add(0);
+            assert_eq!((*slot).tag, TAG_RECORD,
+                "0xFD element must be TAG_RECORD — not TAG_MAP (ADR-088 invariant)");
+
+            // RC-balance: release tagged output (drops TAG_RECORD box + sealed struct) then source.
+            crate::array::lin_array_release(tagged_arr);
+            crate::array::lin_array_release(arr);
+            crate::string::lin_string_release(s);
+        }
+    }
+
+    /// 0xFE inline array: lin_sealed_any_to_tagged must produce TAG_RECORD elements.
+    #[test]
+    fn inline_any_to_tagged_is_tag_record() {
+        unsafe {
+            let named = heap_string_named_desc();
+            let hd = heap_string_desc();
+            let s = crate::string::lin_string_from_bytes(b"xyz".as_ptr(), 3);
+            // stride = 16 (8-byte String ptr + 4-byte i32, padded to 8)
+            let stride: u64 = 16;
+            let arr = crate::array::lin_sealed_array_alloc(4, stride, hd.as_ptr(), named.as_ptr());
+            let st = make_string_int_struct(s, 42, hd.as_ptr(), named.as_ptr());
+            // BORROWED push: array retains each heap field; string rc -> 2.
+            crate::array::lin_sealed_array_push_struct_retaining(arr, st);
+            lin_sealed_release_self(st); // drop our ref; array owns string now
+
+            // lin_sealed_any_to_tagged dispatches on 0xFE
+            assert_eq!((*arr).elem_tag, SEALED_ARRAY_TAG);
+            let tagged_arr = crate::array::lin_sealed_any_to_tagged(arr);
+            assert_eq!((*tagged_arr).len, 1);
+            let slot = (*tagged_arr).data.add(0);
+            assert_eq!((*slot).tag, TAG_RECORD,
+                "0xFE element must be TAG_RECORD — not TAG_MAP (ADR-088 invariant)");
+
+            // lin_array_get_tagged on a 0xFE element must also yield TAG_RECORD.
+            let tv = crate::array::lin_array_get_tagged(arr, 0);
+            assert_eq!((*tv).tag, TAG_RECORD,
+                "lin_array_get_tagged(0xFE) must be TAG_RECORD — not TAG_MAP (ADR-088 invariant)");
+            crate::tagged::lin_tagged_release(tv as *mut u8);
+
+            // RC-balance.
+            crate::array::lin_array_release(tagged_arr);
+            crate::array::lin_array_release(arr);
+            crate::string::lin_string_release(s);
+        }
+    }
+
+    /// Nested record field: lin_record_get_field on a TAG_RECORD with a nested sealed record field
+    /// must return TAG_RECORD for the nested field — it is NOT materialized into TAG_MAP.
+    #[test]
+    fn nested_record_field_is_tag_record() {
+        unsafe {
+            // Inner record: { n: Int32 } — scalar only, no heap desc.
+            let inner_named = build_named_desc(&[("n", 24, NKIND_INT32, std::ptr::null())]);
+            // inner_st rc=1 from lin_sealed_alloc.
+            let inner_st = lin_sealed_alloc(SEALED_HEADER + 4, std::ptr::null(), inner_named.as_ptr());
+            *((inner_st.add(24)) as *mut i32) = 99;
+
+            // Outer record: { inner: <sealed> } — one KIND_SEALED heap field at offset 24.
+            let mut outer_hd = Vec::new();
+            outer_hd.extend_from_slice(&1u32.to_le_bytes()); // count
+            outer_hd.extend_from_slice(&24u32.to_le_bytes()); // offset
+            outer_hd.extend_from_slice(&KIND_SEALED.to_le_bytes()); // kind
+            let outer_named = build_named_desc(&[
+                ("inner", 24, NKIND_SEALED, inner_named.as_ptr()),
+            ]);
+            // outer_st rc=1 from lin_sealed_alloc.
+            let outer_st = lin_sealed_alloc(SEALED_HEADER + 8, outer_hd.as_ptr(), outer_named.as_ptr());
+            // outer_st owns inner_st: retain inner_st (+1 → rc=2) and store pointer.
+            crate::memory::lin_rc_retain(inner_st as *mut u32);
+            *((outer_st.add(24)) as *mut *mut u8) = inner_st;
+            // Drop our direct construction ref on inner_st — outer_st is the sole owner now.
+            lin_sealed_release_self(inner_st); // inner_st rc=1
+
+            // lin_box_record retains outer_st (+1 → rc=2). outer_tv is the box (shell).
+            let outer_tv = crate::tagged::lin_box_record(outer_st) as *const crate::tagged::TaggedVal;
+            // Drop our direct construction ref on outer_st — outer_tv box is the sole owner now.
+            lin_sealed_release_self(outer_st); // outer_st rc=1
+
+            // Look up the nested field by name — must return TAG_RECORD, not TAG_MAP.
+            // lin_record_get_field → box_field_value(NKIND_SEALED) → lin_box_record(inner_st) → inner_st rc=2.
+            let k = crate::string::lin_string_from_bytes(b"inner".as_ptr(), 5);
+            let field_tv = lin_record_get_field((*outer_tv).payload as *const u8, k)
+                as *const crate::tagged::TaggedVal;
+            assert!(!field_tv.is_null());
+            assert_eq!((*field_tv).tag, TAG_RECORD,
+                "nested sealed record field must be TAG_RECORD — not TAG_MAP (ADR-088 invariant)");
+
+            // RC-balance cleanup.
+            // Release field box: lin_sealed_release_self(inner_st) → inner_st rc=1.
+            crate::tagged::lin_tagged_release(field_tv as *mut u8);
+            crate::string::lin_string_release(k);
+            // Release outer_tv box: lin_sealed_release_self(outer_st) → outer_st rc=0, freed.
+            // outer_st drop walks heap desc → lin_sealed_release_self(inner_st) → inner_st rc=0, freed.
+            crate::tagged::lin_tagged_release(outer_tv as *mut u8);
         }
     }
 }
