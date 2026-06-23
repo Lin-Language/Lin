@@ -944,6 +944,10 @@ impl<'ctx> Codegen<'ctx> {
     /// no `lin_map_get` call / hash lookup / unbox. `obj` is the struct ptr. For a HEAP field the
     /// loaded value is the BORROWED heap pointer (the struct owns it); the IR `FieldGet`/`Index`
     /// lowering emits the owning `Retain` separately (same contract as a boxed-object field read).
+    ///
+    /// For a **pure-IntLit-union** field (e.g. `DayOfWeek = 0|1|…|6`) the physical slot is an
+    /// i32 scalar. This method returns the raw i32 — callers that need a `TaggedVal*` (e.g.
+    /// `sealed_materialize_to_map` → `box_value`, or `compile_ir_field_get`) must box it.
     pub(crate) fn sealed_field_get(
         &mut self,
         obj: BasicValueEnum<'ctx>,
@@ -955,13 +959,21 @@ impl<'ctx> Codegen<'ctx> {
         let i64_ty = self.context.i64_type();
         let base = obj.into_pointer_value();
         let fld_ty = fields.get(field).cloned().unwrap_or(Type::Null);
-        let llvm_fld = self.llvm_type(&fld_ty);
+        // Pure-IntLit-union: physical slot is i32 (4 bytes); do NOT call llvm_type which would
+        // return ptr (8 bytes). Load as i32; callers that need a TaggedVal* must box explicitly.
+        let llvm_fld = if fld_ty.is_pure_int_lit_union() {
+            self.context.i32_type().into()
+        } else {
+            self.llvm_type(&fld_ty)
+        };
         let p = unsafe {
             self.builder.gep(self.context.i8_type(), base, &[i64_ty.const_int(offset, false)], "sealed_fld_p")
         };
         let loaded = self.builder.load(llvm_fld, p, "sealed_fld");
         // The declared result_ty may be a wider numeric than the stored field (e.g. field Int32
         // read into an Int64 slot); reconcile via the standard coerce.
+        // For pure-IntLit-union: fld_ty == result_ty (both Union) so coerce is skipped — raw i32
+        // returned. compile_ir_field_get boxes it to TaggedVal*(TAG_INT32).
         if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
     }
 
@@ -999,6 +1011,14 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.gep(self.context.i8_type(), base, &[i64_ty.const_int(offset, false)], "sealed_set_fld_p")
         };
         let is_heap = Self::sealed_field_kind(&fld_ty).is_some();
+        // Pure IntLit-union: physical slot is i32, but the incoming value is a TaggedVal* (pointer).
+        // Unbox to i32 before the scalar store path.
+        if fld_ty.is_pure_int_lit_union() && value.is_pointer_value() {
+            let i32_val = self.builder.call(self.rt.unbox_int32, &[value.into()], "ilu_set_unbox")
+                .try_as_basic_value().unwrap_basic();
+            self.builder.store(p, i32_val);
+            return;
+        }
         // Coerce a representation-mismatched source into the field's layout (a narrower/wider scalar,
         // or an unsealed `{...}` / Json projected into a nested sealed field). A repr-changing coerce
         // yields a FRESH +1 we then own (and must NOT additionally retain below).
@@ -1340,7 +1360,14 @@ impl<'ctx> Codegen<'ctx> {
                 return self.null_value_for(result_ty);
             }
             if obj.is_pointer_value() {
-                return self.sealed_field_get(obj, field, fields, result_ty);
+                let raw = self.sealed_field_get(obj, field, fields, result_ty);
+                // Pure IntLit-union fields are stored as i32; box to TaggedVal*(TAG_INT32) so the
+                // result matches the Union type callers expect (a heap pointer).
+                if fields.get(field).map(|t| t.is_pure_int_lit_union()).unwrap_or(false) && raw.is_int_value() {
+                    let i32v = self.builder.int_s_extend_or_bit_cast(raw.into_int_value(), self.context.i32_type(), "ilu_fg_i32");
+                    return self.builder.call(self.rt.box_int32, &[i32v.into()], "ilu_fg_box").try_as_basic_value().unwrap_basic();
+                }
+                return raw;
             }
             return ptr_ty.const_null().into();
         }
@@ -1359,7 +1386,13 @@ impl<'ctx> Codegen<'ctx> {
                 return self.null_value_for(result_ty);
             }
             if obj.is_pointer_value() {
-                return self.sealed_field_get(obj, field, fields, result_ty);
+                let raw = self.sealed_field_get(obj, field, fields, result_ty);
+                // Pure IntLit-union fields are stored as i32; box to TaggedVal*(TAG_INT32).
+                if fields.get(field).map(|t| t.is_pure_int_lit_union()).unwrap_or(false) && raw.is_int_value() {
+                    let i32v = self.builder.int_s_extend_or_bit_cast(raw.into_int_value(), self.context.i32_type(), "ilu_fg_i32");
+                    return self.builder.call(self.rt.box_int32, &[i32v.into()], "ilu_fg_box").try_as_basic_value().unwrap_basic();
+                }
+                return raw;
             }
             return ptr_ty.const_null().into();
         }

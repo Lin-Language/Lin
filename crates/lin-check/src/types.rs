@@ -544,10 +544,26 @@ impl Type {
     //   - `lin_ir::monomorphize` and `lin_ir::escape` already call
     //     `Type::is_sealed_array_field_packable` (which lives here).
 
+    /// True when `self` is a pure integer-literal union: a `Union` whose every member is an
+    /// `IntLit`. Examples: `DayOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6`. At runtime, stored as a
+    /// 32-bit scalar (i32) — the same physical representation as `Int32` / `IntLit`. This is the
+    /// sealed-scalar gate for integer-enum types: a pure-IntLit-union field in a sealed record
+    /// stores inline as i32, eliminating the heap `TaggedVal*` slot that would otherwise block
+    /// sealing of the whole record.
+    pub fn is_pure_int_lit_union(&self) -> bool {
+        match self {
+            Type::Union(variants) if !variants.is_empty() => {
+                variants.iter().all(|v| matches!(v, Type::IntLit(_)))
+            }
+            _ => false,
+        }
+    }
+
     /// True when `ty` is an unboxed scalar field of a sealed record: a fixed-width numeric,
-    /// `Bool`, or `IntLit` (Int32 at runtime). Stored inline; no per-field RC.
+    /// `Bool`, `IntLit` (Int32 at runtime), or a pure-IntLit union (i32 at runtime).
+    /// Stored inline; no per-field RC.
     pub fn is_sealed_scalar_field(&self) -> bool {
-        self.is_flat_scalar() || matches!(self, Type::Bool | Type::IntLit(_))
+        self.is_flat_scalar() || matches!(self, Type::Bool | Type::IntLit(_)) || self.is_pure_int_lit_union()
     }
 
     /// True when `ty` is an eligible HEAP field of a sealed record (String/StrLit, Array/FixedArray,

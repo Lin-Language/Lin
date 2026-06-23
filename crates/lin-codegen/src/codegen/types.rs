@@ -591,6 +591,9 @@ impl<'ctx> Codegen<'ctx> {
             Type::Int8 => Some(Self::NKIND_INT8),
             Type::Int16 => Some(Self::NKIND_INT16),
             Type::Int32 | Type::IntLit(_) => Some(Self::NKIND_INT32),
+            // Pure IntLit-union: stored as i32 in the sealed slot, boxed as TAG_INT32 on
+            // materialize — same runtime kind as Int32/IntLit.
+            Type::Union(_) if ty.is_pure_int_lit_union() => Some(Self::NKIND_INT32),
             Type::Int64 => Some(Self::NKIND_INT64),
             // UInt8/UInt16/UInt32 occupy 1/2/4-byte slots in the packed struct (native unsigned widths).
             // The dynamic boxing path zero-extends to i64 and uses TAG_INT64 (matching type_tag /
@@ -630,6 +633,9 @@ impl<'ctx> Codegen<'ctx> {
     /// Byte width of a field SLOT in a sealed record. A scalar occupies its natural width (1/2/4/8);
     /// a HEAP field occupies an 8-byte pointer slot. Used by both layout and size.
     fn sealed_slot_size(fty: &Type) -> u64 {
+        // Pure IntLit-union: stored as i32 (4 bytes). bit_width() returns None for Union, so
+        // we must special-case it before the fallback to avoid a wrong 1-byte slot.
+        if fty.is_pure_int_lit_union() { return 4; }
         if Self::sealed_field_kind(fty).is_some() {
             8 // heap field: pointer slot
         } else {
