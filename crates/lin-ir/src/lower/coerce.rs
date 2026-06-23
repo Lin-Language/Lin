@@ -694,14 +694,21 @@ pub(crate) fn try_lower_sealed_array_field(
     if !is_sealed_scalar_array(&arr_ty) {
         return None;
     }
-    // The element field must be a scalar (the only sound, RC-free fused read). A heap-field element
-    // record is not a sealed-scalar-array anyway (gated above), so this is belt-and-braces.
-    let elem_field_scalar = match &arr_ty {
-        Type::Array(elem) => matches!(elem.as_ref(), Type::Object { fields, .. }
-            if fields.get(field).map(|f| f.is_flat_scalar() || matches!(f, Type::Bool)).unwrap_or(false)),
-        _ => false,
+    // Determine whether the field is a scalar or a heap pointer. Scalars are RC-free;
+    // heap fields (String, Array, FixedArray, Map, nested sealed record) are BORROWED interior
+    // pointers — the caller must Retain them into an owned reference. Non-field keys and
+    // non-sealed-heap-field types fall back to the generic (materialization) path.
+    let concrete_field_ty = match &arr_ty {
+        Type::Array(elem) => match elem.as_ref() {
+            Type::Object { fields, .. } => fields.get(field).cloned(),
+            _ => None,
+        },
+        _ => None,
     };
-    if !elem_field_scalar {
+    let concrete_field_ty = concrete_field_ty?;
+    let scalar = concrete_field_ty.is_flat_scalar() || matches!(concrete_field_ty, Type::Bool);
+    let heap_field = concrete_field_ty.is_sealed_heap_field();
+    if !(scalar || heap_field) {
         return None;
     }
     // Lower the index, then the (borrowed where possible) array base last — mirrors the Index
@@ -716,16 +723,29 @@ pub(crate) fn try_lower_sealed_array_field(
         let index_temp = lower_expr(key, builder, ctx);
         (array_temp, index_temp)
     };
-    let dst = builder.alloc_temp(result_ty.clone());
+    // Emit the SealedArrayFieldGet at the CONCRETE field type (a raw scalar or raw interior
+    // pointer). If result_ty differs (e.g. a coercion target), we coerce after the read.
+    let raw = builder.alloc_temp(concrete_field_ty.clone());
     builder.emit(Instruction::SealedArrayFieldGet {
-        dst,
+        dst: raw,
         array: array_temp,
         index: index_temp,
         field: field.to_string(),
         arr_ty,
-        result_ty: result_ty.clone(),
+        result_ty: concrete_field_ty.clone(),
     });
-    Some(dst)
+    // Heap field: the load yields a BORROWED interior pointer owned by the packed buffer.
+    // Retain it so the caller holds an independent +1 (snapshot semantics — same as FieldGet).
+    if heap_field {
+        builder.emit(Instruction::Retain { val: raw, ty: concrete_field_ty.clone() });
+        builder.register_owned(raw, concrete_field_ty.clone());
+    }
+    // Coerce to result_ty if needed (e.g. widening, boxing). When they match, this is a no-op.
+    let coerced = coerce_to_slot_type(raw, &concrete_field_ty, result_ty, builder);
+    if coerced != raw && is_union_ty(result_ty) {
+        builder.register_owned(coerced, result_ty.clone());
+    }
+    Some(coerced)
 }
 
 /// PATH-1 in-place packed iteration: a `param["field"]` / `param.field` read where `param` is a
