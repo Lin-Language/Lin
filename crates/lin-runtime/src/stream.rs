@@ -3405,13 +3405,23 @@ impl StreamSource for CsvRowsSource {
 /// `recordRows(s)`: like `rows`, but consumes the first record as the header and yields one
 /// `{ String: String }` per subsequent data row (last-wins dup headers, lenient ragged rows).
 /// Header key LinStrings are interned once and reused across all rows to avoid per-row reallocation.
+///
+/// Optional projection: when `wanted` is `Some(names)`, only columns whose header name is in
+/// `names` are interned and materialized per row. All other columns are never allocated. The
+/// projected slot list (`proj`) maps each kept column to its original row-field index.
 struct CsvRecordsSource {
     inner: CsvRowsSource,
     header: Option<Vec<Vec<u8>>>,
-    /// Pre-built LinString pointers for the header keys, one per column. Built once when the header
-    /// is first pulled. Each pointer holds a persistent ref (refcount 1); `lin_map_set` takes its
-    /// own additional ref on each fresh insert, so we must NOT release these until the source drops.
+    /// Pre-built LinString pointers for the header keys, one per column (full path).
+    /// Each pointer holds a persistent ref (refcount 1); `lin_map_set` takes its own additional
+    /// ref on each fresh insert, so we must NOT release these until the source drops.
+    /// In the projected path this vec is EMPTY — `proj` holds the kept keys instead.
     header_keys: Vec<*mut crate::string::LinString>,
+    /// Projected path: each entry is (row_field_index, interned_key). Built once from the header
+    /// when `wanted` is `Some`. Empty when running the full (non-projected) path.
+    proj: Vec<(usize, *mut crate::string::LinString)>,
+    /// Requested column names for projection. `None` = all columns (default, full path).
+    wanted: Option<Vec<Vec<u8>>>,
     /// True once the header has been pulled (it may legitimately be absent for an empty stream).
     header_done: bool,
 }
@@ -3429,18 +3439,25 @@ impl CsvRecordsSource {
 
 impl Drop for CsvRecordsSource {
     fn drop(&mut self) {
-        // Release the persistent ref on each cached header-key LinString.
+        // Release the persistent ref on each cached header-key LinString (full path).
         for &k in &self.header_keys {
             if !k.is_null() {
                 unsafe { crate::string::lin_string_release(k); }
             }
         }
         self.header_keys.clear();
+        // Release the persistent ref on each projected key (projected path).
+        for &(_, k) in &self.proj {
+            if !k.is_null() {
+                unsafe { crate::string::lin_string_release(k); }
+            }
+        }
+        self.proj.clear();
     }
 }
 
 // SAFETY: CsvRecordsSource is only accessed from a single stream-driver thread; the raw
-// LinString pointers in header_keys are owned by this struct and not shared.
+// LinString pointers in header_keys/proj are owned by this struct and not shared.
 unsafe impl Send for CsvRecordsSource {}
 
 /// Build a `{ String: String }` LinMap using pre-interned key LinStrings. Each key pointer already
@@ -3467,6 +3484,28 @@ unsafe fn record_to_object_cached(keys: &[*mut crate::string::LinString], row: &
     alloc_tagged(TAG_MAP, map as u64)
 }
 
+/// Build a projected `{ String: String }` LinMap from `(row_index, interned_key)` pairs.
+/// Only the selected columns are materialized; others are never allocated.
+unsafe fn record_to_object_projected(proj: &[(usize, *mut crate::string::LinString)], row: &[Vec<u8>]) -> *mut u8 {
+    use crate::map::{lin_map_alloc, lin_map_set};
+    use crate::string::{lin_string_from_bytes, lin_string_release};
+    use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TaggedVal};
+    let map = lin_map_alloc(proj.len().max(1) as u32, 0);
+    for &(row_idx, k) in proj {
+        if row_idx >= row.len() {
+            continue; // ragged row: this column is absent, skip
+        }
+        let v = lin_string_from_bytes(row[row_idx].as_ptr(), row[row_idx].len() as u32);
+        let mut tv: TaggedVal = std::mem::zeroed();
+        tv.tag = TAG_STR;
+        tv.payload = v as u64;
+        lin_map_set(map, k, &tv);
+        lin_string_release(v);
+        // key NOT released here — source's persistent ref outlives all rows
+    }
+    alloc_tagged(TAG_MAP, map as u64)
+}
+
 impl StreamSource for CsvRecordsSource {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
         if !self.header_done {
@@ -3475,13 +3514,31 @@ impl StreamSource for CsvRecordsSource {
                 Err(m) => return TaggedOutcome::Err(m),
                 Ok(None) => return TaggedOutcome::Eof, // empty stream: no header, no rows
                 Ok(Some(h)) => {
-                    // Build the cached key LinStrings once from the header columns.
-                    self.header_keys = h
-                        .iter()
-                        .map(|col| {
-                            crate::string::lin_string_from_bytes(col.as_ptr(), col.len() as u32)
-                        })
-                        .collect();
+                    match &self.wanted {
+                        None => {
+                            // Full path: intern every header column.
+                            self.header_keys = h
+                                .iter()
+                                .map(|col| {
+                                    crate::string::lin_string_from_bytes(col.as_ptr(), col.len() as u32)
+                                })
+                                .collect();
+                        }
+                        Some(names) => {
+                            // Projected path: only intern and remember columns in `names`.
+                            // A wanted name absent from the header simply contributes no slot (lenient).
+                            let mut proj = Vec::with_capacity(names.len());
+                            for (col_idx, col_bytes) in h.iter().enumerate() {
+                                if names.iter().any(|n| n == col_bytes) {
+                                    let k = crate::string::lin_string_from_bytes(
+                                        col_bytes.as_ptr(), col_bytes.len() as u32,
+                                    );
+                                    proj.push((col_idx, k));
+                                }
+                            }
+                            self.proj = proj;
+                        }
+                    }
                     self.header = Some(h);
                 }
             }
@@ -3494,7 +3551,11 @@ impl StreamSource for CsvRecordsSource {
             Err(m) => TaggedOutcome::Err(m),
             Ok(None) => TaggedOutcome::Eof,
             Ok(Some(row)) => {
-                TaggedOutcome::Item(record_to_object_cached(&self.header_keys, &row))
+                if self.wanted.is_none() {
+                    TaggedOutcome::Item(record_to_object_cached(&self.header_keys, &row))
+                } else {
+                    TaggedOutcome::Item(record_to_object_projected(&self.proj, &row))
+                }
             }
         }
     }
@@ -3531,6 +3592,66 @@ pub unsafe extern "C" fn lin_stream_csv_records(s: *const u8, delim: i32) -> *mu
         inner,
         header: None,
         header_keys: Vec::new(),
+        proj: Vec::new(),
+        wanted: None,
+        header_done: false,
+    }))
+}
+
+/// `recordRows(s, delim, cols)` → like `lin_stream_csv_records` but only materializes the columns
+/// named in `cols` (a boxed `String[]`). Columns not in `cols` are never allocated per row.
+/// `cols` is borrowed (caller retains ownership); pass NULL for no projection (all columns).
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_csv_records_projected(
+    s: *const u8, delim: i32, cols: *const u8,
+) -> *mut u8 {
+    // Decode the `cols` String[] argument into a Vec<Vec<u8>> of wanted column names.
+    // We read from the boxed array but do NOT free it (caller owns it).
+    let wanted: Option<Vec<Vec<u8>>> = if cols.is_null() {
+        None
+    } else {
+        use crate::tagged::{TAG_ARRAY, TAG_STR};
+        use crate::string::LinString;
+        let tv = &*(cols as *const crate::tagged::TaggedVal);
+        if tv.tag != TAG_ARRAY {
+            None
+        } else {
+            let arr = tv.payload as *const crate::array::LinArray;
+            if arr.is_null() {
+                None
+            } else {
+                let n = crate::array::lin_array_length(arr) as usize;
+                let mut names: Vec<Vec<u8>> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let elem = crate::array::lin_array_get_tagged(arr, i as i64);
+                    if !elem.is_null() && (*elem).tag == TAG_STR {
+                        let sp = (*elem).payload as *const LinString;
+                        let bytes = std::slice::from_raw_parts((*sp).data.as_ptr(), (*sp).len as usize);
+                        names.push(bytes.to_vec());
+                    }
+                    // Release the +1 ref returned by lin_array_get_tagged.
+                    if !elem.is_null() {
+                        crate::tagged::lin_tagged_release(elem as *mut u8);
+                    }
+                }
+                if names.is_empty() { None } else { Some(names) }
+            }
+        }
+    };
+    let up = own_upstream(s);
+    let inner = CsvRowsSource {
+        up,
+        asm: CsvAssembler::new(delim as u8),
+        queue: std::collections::VecDeque::new(),
+        upstream_done: false,
+        flushed: false,
+    };
+    StreamBox::new_boxed(Box::new(CsvRecordsSource {
+        inner,
+        header: None,
+        header_keys: Vec::new(),
+        proj: Vec::new(),
+        wanted,
         header_done: false,
     }))
 }
