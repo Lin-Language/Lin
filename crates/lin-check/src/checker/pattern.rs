@@ -213,23 +213,34 @@ impl Checker {
                 // target object type + the resolved bodies of every reachable Named type (so IR
                 // lowering can build the recursive schema descriptor without a type env). An
                 // empty object type `{}` keeps the cheap bare tag check (nothing to validate).
-                if let Type::Object { ref fields, .. } = ty {
-                    if !fields.is_empty() {
-                        let mut named_defs: Vec<(String, Type)> = Vec::new();
-                        let mut seen: std::collections::HashSet<String> =
-                            std::collections::HashSet::new();
-                        self.collect_named_defs(&ty, &mut seen, &mut named_defs);
-                        // Also collect the named-type bodies reachable from the
-                        // SCRUTINEE type (e.g. the `Ast = Num | BinOp` alias and its
-                        // variants). IR lowering uses these to recognise a closed
-                        // concrete union scrutinee and take the cheap discriminator
-                        // fast path instead of the recursive `MatchesSchema`. These
-                        // extra entries are a pure lookup table — they never change
-                        // the schema descriptor (built from `target` only), so adding
-                        // them is behaviour-preserving for the fallback path.
-                        self.collect_named_defs(scrutinee_ty, &mut seen, &mut named_defs);
-                        return Ok(TypedPattern::TypeCheckDeep(ty, named_defs, *span));
-                    }
+                let needs_deep = match &ty {
+                    Type::Object { ref fields, .. } => !fields.is_empty(),
+                    // `is <UnionAlias>` where the alias resolves to a union whose members include
+                    // at least one non-empty record: a bare tag check matches ANY record for ANY
+                    // record member, so `square is (Circle | Int32)` returns true. Route through
+                    // `MatchesSchema` (the structural deep-check) whenever any union member is a
+                    // non-empty object — `DescEncoder` encodes `KIND_UNION` correctly for the
+                    // runtime validator, so the existing path handles scalar members too.
+                    Type::Union(ref members) => members.iter().any(|m| {
+                        matches!(m, Type::Object { fields, .. } if !fields.is_empty())
+                    }),
+                    _ => false,
+                };
+                if needs_deep {
+                    let mut named_defs: Vec<(String, Type)> = Vec::new();
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    self.collect_named_defs(&ty, &mut seen, &mut named_defs);
+                    // Also collect the named-type bodies reachable from the
+                    // SCRUTINEE type (e.g. the `Ast = Num | BinOp` alias and its
+                    // variants). IR lowering uses these to recognise a closed
+                    // concrete union scrutinee and take the cheap discriminator
+                    // fast path instead of the recursive `MatchesSchema`. These
+                    // extra entries are a pure lookup table — they never change
+                    // the schema descriptor (built from `target` only), so adding
+                    // them is behaviour-preserving for the fallback path.
+                    self.collect_named_defs(scrutinee_ty, &mut seen, &mut named_defs);
+                    return Ok(TypedPattern::TypeCheckDeep(ty, named_defs, *span));
                 }
                 Ok(TypedPattern::TypeCheck(ty, *span))
             }
