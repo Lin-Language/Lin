@@ -2,7 +2,7 @@
 use crate::fs::{make_string, resolve_lin_str};
 use crate::map::{lin_map_alloc, lin_map_set};
 use crate::string::lin_string_release;
-use crate::tagged::{TAG_INT32, TAG_STR, TAG_MAP, TAG_RECORD, alloc_tagged};
+use crate::tagged::{TAG_INT32, TAG_STR, TAG_MAP, alloc_tagged};
 use crate::tagged::TaggedVal;
 
 unsafe fn map_set_str(map: *mut crate::map::LinMap, key: &str, val: &str) {
@@ -79,60 +79,70 @@ pub unsafe extern "C" fn lin_http_fetch_with(url: *const u8, opts: *const u8) ->
         None => return make_error_object("invalid URL"),
     };
 
-    // Read opts fields from the options object. Phase 3: an open object is TAG_MAP; a typed
-    // (sealed) options record is TAG_RECORD and must be materialised to a LinMap first, otherwise
-    // method/body would be silently dropped. `opts_map_owned` = we allocated the map and must
-    // release it before returning.
-    let (opts_map, opts_map_owned): (*const crate::map::LinMap, bool) = if opts.is_null() {
-        (std::ptr::null(), false)
-    } else {
-        let tv = opts as *const TaggedVal;
+    // Read opts fields from the options object via descriptor-walk (no intermediate LinMap).
+    // TAG_MAP: use lin_map_get_bytes. TAG_RECORD: use lin_record_get_field (box_field_value walk).
+    // Helper: read a TAG_STR field from opts by name. Returns owned box (must lin_tagged_release)
+    // or null.
+    unsafe fn opts_get_str_field(
+        tv: *const TaggedVal,
+        key_bytes: &[u8],
+    ) -> *mut u8 {
+        use crate::tagged::{TAG_MAP, TAG_RECORD, TAG_STR};
+        if tv.is_null() { return std::ptr::null_mut(); }
         match (*tv).tag {
-            TAG_MAP => ((*tv).payload as *const crate::map::LinMap, false),
-            TAG_RECORD => {
-                let sealed = (*tv).payload as *mut u8;
-                if sealed.is_null() {
-                    (std::ptr::null(), false)
-                } else {
-                    let named_desc = *((sealed.add(16)) as *const *const u8);
-                    let map = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
-                    (map as *const crate::map::LinMap, !map.is_null())
-                }
+            TAG_MAP => {
+                let map = (*tv).payload as *const crate::map::LinMap;
+                if map.is_null() { return std::ptr::null_mut(); }
+                let got = crate::map::lin_map_get_bytes(map, key_bytes.as_ptr(), key_bytes.len() as u32);
+                if got.is_null() || (*got).tag != TAG_STR { return std::ptr::null_mut(); }
+                // Borrow-intern: retain the string and build an owned box so caller can release uniformly.
+                let s = (*got).payload as *mut u8;
+                crate::memory::lin_rc_retain(s as *mut u32);
+                crate::tagged::alloc_tagged(TAG_STR, s as u64)
             }
-            _ => (std::ptr::null(), false),
+            TAG_RECORD => {
+                let sealed = (*tv).payload as *const u8;
+                if sealed.is_null() { return std::ptr::null_mut(); }
+                let k = crate::string::lin_string_literal(key_bytes.as_ptr(), key_bytes.len() as u32);
+                let boxed = crate::sealed::lin_record_get_field(sealed, k);
+                if boxed.is_null() { return std::ptr::null_mut(); }
+                if (*(boxed as *const TaggedVal)).tag != TAG_STR {
+                    crate::tagged::lin_tagged_release(boxed);
+                    return std::ptr::null_mut();
+                }
+                boxed
+            }
+            _ => std::ptr::null_mut(),
         }
-    };
+    }
 
-    let method = if opts_map.is_null() {
-        "GET".to_string()
-    } else {
-        let tv = crate::map::lin_map_get_bytes(opts_map, b"method".as_ptr(), 6);
-        if tv.is_null() || (*tv).tag != TAG_STR {
+    let opts_tv: *const TaggedVal = if opts.is_null() { std::ptr::null() } else { opts as *const TaggedVal };
+
+    let method = {
+        let boxed = opts_get_str_field(opts_tv, b"method");
+        if boxed.is_null() {
             "GET".to_string()
         } else {
-            let vs = (*tv).payload as *const crate::string::LinString;
+            let vs = (*(boxed as *const TaggedVal)).payload as *const crate::string::LinString;
             let vs_slice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
-            std::str::from_utf8(vs_slice).unwrap_or("GET").to_uppercase()
+            let s = std::str::from_utf8(vs_slice).unwrap_or("GET").to_uppercase();
+            crate::tagged::lin_tagged_release(boxed);
+            s
         }
     };
 
-    let body_str: Option<String> = if opts_map.is_null() {
-        None
-    } else {
-        let tv = crate::map::lin_map_get_bytes(opts_map, b"body".as_ptr(), 4);
-        if tv.is_null() || (*tv).tag != TAG_STR {
+    let body_str: Option<String> = {
+        let boxed = opts_get_str_field(opts_tv, b"body");
+        if boxed.is_null() {
             None
         } else {
-            let vs = (*tv).payload as *const crate::string::LinString;
+            let vs = (*(boxed as *const TaggedVal)).payload as *const crate::string::LinString;
             let vs_slice = std::slice::from_raw_parts((*vs).data.as_ptr(), (*vs).len as usize);
-            std::str::from_utf8(vs_slice).ok().map(|s| s.to_string())
+            let s = std::str::from_utf8(vs_slice).ok().map(|x| x.to_string());
+            crate::tagged::lin_tagged_release(boxed);
+            s
         }
     };
-
-    // All fields read out; release the materialised options map if we own it.
-    if opts_map_owned {
-        crate::map::lin_map_release(opts_map as *mut crate::map::LinMap);
-    }
 
     let req = ureq::request(&method, &url_str);
     let result = if let Some(b) = body_str {

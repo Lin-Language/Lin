@@ -47,23 +47,18 @@ unsafe fn clone_string(s: *const LinString) -> *mut LinString {
 /// +1 per entry. Frozen/immortal maps are shared read-only (zero-copy), mirroring clone_array.
 /// Deep-clone ONE tagged value for cross-thread transfer, returning a fully independent
 /// `(tag, payload)` that shares NO pointer with `src` (the transfer invariant, ADR-028).
-/// Phase 3: a `TAG_RECORD` (packed sealed struct) or `TAG_SUMNODE` (kept-packed sum node) transfers
-/// as a fresh `TAG_MAP` (dynamic objects are map-backed); every other tag keeps its tag with a
-/// deep-cloned payload via `transfer_payload` (scalars verbatim; string/array/map deep-copy;
-/// Shared/TarEntry retained). Used by `clone_map`, `clone_array`, and the CAP_OBJECT env clone so
-/// they share one correct implementation — previously the CAP_OBJECT path used bare
-/// `transfer_payload`, which aliased a nested object/record field across the thread boundary (UAF).
+/// TAG_RECORD transfers as a fresh deep-copied sealed struct (TAG_RECORD) via clone_sealed (no
+/// intermediate LinMap). TAG_SUMNODE materialises to a fresh LinMap and transfers as TAG_MAP.
+/// Every other tag keeps its tag with a deep-cloned payload via `transfer_payload` (scalars
+/// verbatim; string/array/map deep-copy; Shared/TarEntry retained). Used by `clone_map`,
+/// `clone_array`, and the CAP_OBJECT env clone so they share one correct implementation.
 unsafe fn transfer_clone_value(src: &TaggedVal) -> TaggedVal {
     use crate::tagged::{TAG_MAP, TAG_RECORD, TAG_SUMNODE};
     if src.tag == TAG_RECORD {
-        let sealed = src.payload as *const u8;
-        let named_desc = if sealed.is_null() { std::ptr::null() } else {
-            *((sealed.add(16)) as *const *const u8)
-        };
-        let map = crate::sealed::materialize_sealed_to_map_pub(src.payload as *mut u8, named_desc);
-        let cloned = clone_map(map as *const crate::map::LinMap);
-        if !map.is_null() { crate::map::lin_map_release(map); }
-        TaggedVal { tag: TAG_MAP, _pad: [0; 7], payload: cloned as u64 }
+        // Deep-copy the sealed struct directly via clone_sealed (descriptor-walk, no intermediate LinMap).
+        // The clone is a fresh TAG_RECORD owned by the worker thread — no aliasing with the source.
+        let cloned = clone_sealed(src.payload as *const u8);
+        TaggedVal { tag: TAG_RECORD, _pad: [0; 7], payload: cloned as u64 }
     } else if src.tag == TAG_SUMNODE {
         // KEEP-PACKED-THROUGH-RECORD-FIELDS thread-transfer: a kept-packed `*SumNode` value MUST
         // NOT cross the thread boundary by pointer (it would alias → cross-thread double-free).
@@ -370,8 +365,7 @@ pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
 /// Transfer one tagged payload (the 8-byte field) by kind: scalars copy verbatim; heap
 /// pointers are deep-copied.
 /// NOTE: TAG_RECORD and TAG_SUMNODE are NOT handled here — `transfer_clone_value` handles them
-/// directly (materialise to LinMap, deep-clone, emit TAG_MAP) to avoid the tag-mismatch problem of
-/// returning a LinMap ptr under the original tag.
+/// directly (TAG_RECORD via clone_sealed → fresh TAG_RECORD; TAG_SUMNODE via materialize → TAG_MAP).
 unsafe fn transfer_payload(tag: u8, payload: u64) -> u64 {
     use crate::tagged::{TAG_SHARED, TAG_MAP, TAG_TAR_ENTRY, TAG_BIGNUM, TAG_DECIMAL};
     match tag {

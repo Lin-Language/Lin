@@ -436,27 +436,18 @@ pub unsafe fn tagged_to_json(tv: *const u8) -> serde_json::Value {
             serde_json::Value::Object(smap)
         }
         crate::tagged::TAG_RECORD => {
-            // Materialize the sealed struct to a LinMap and serialize from it.
-            let sealed = (*t).payload as *mut u8;
+            // Walk the descriptor directly — no intermediate LinMap.
+            let sealed = (*t).payload as *const u8;
             if sealed.is_null() { return serde_json::Value::Null; }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let lmap = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
-            if lmap.is_null() { return serde_json::Value::Null; }
             let mut smap = serde_json::Map::new();
-            if !(*lmap).order.is_null() {
-                let len = (*lmap).len as usize;
-                for i in 0..len {
-                    let key_bits = *(*lmap).order.add(i);
-                    let key_s = key_bits as *const LinString;
-                    if key_s.is_null() { continue; }
-                    let kslice = std::slice::from_raw_parts((*key_s).data.as_ptr(), (*key_s).len as usize);
-                    let key_str = std::str::from_utf8_unchecked(kslice).to_owned();
-                    let val = crate::map::lin_map_get(lmap, key_s);
-                    let val_ptr = if val.is_null() { std::ptr::null() } else { val as *const u8 };
-                    smap.insert(key_str, tagged_to_json(val_ptr));
-                }
-            }
-            crate::map::lin_map_release(lmap);
+            crate::sealed::record_walk_fields(named_desc, |name_bytes, offset, nkind, nested| {
+                let key_str = std::str::from_utf8_unchecked(name_bytes).to_owned();
+                let boxed = crate::sealed::box_field_value(sealed, offset, nkind, nested);
+                let val = tagged_to_json(boxed as *const u8);
+                if !boxed.is_null() { crate::tagged::lin_tagged_release(boxed); }
+                smap.insert(key_str, val);
+            });
             serde_json::Value::Object(smap)
         }
         _ => serde_json::Value::Null,
