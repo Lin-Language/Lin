@@ -464,25 +464,20 @@ unsafe fn is_error_value(v: *mut u8) -> bool {
             if g.is_null() { None } else { Some(g) }
         }
         crate::tagged::TAG_RECORD => {
-            // Sealed struct in a dynamic slot: materialize to map and look up "type".
-            let sealed = tv.payload as *mut u8;
+            // Sealed struct: look up "type" field via lin_record_get_field (descriptor-walk, no LinMap).
+            let sealed = tv.payload as *const u8;
             if sealed.is_null() { return false; }
-            let named_desc = *((sealed.add(16)) as *const *const u8);
-            let lmap = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
-            if lmap.is_null() { return false; }
-            let g = crate::map::lin_map_get_bytes(lmap, b"type".as_ptr(), 4);
-            let result = if g.is_null() { None } else { Some(g as *const TaggedVal) };
-            // Evaluate before releasing the map since g is a borrow from it.
-            let is_err = match result {
-                None => false,
-                Some(got) => {
-                    if (*got).tag != TAG_STR { false } else {
-                        let s = (*got).payload as *const crate::string::LinString;
-                        !s.is_null() && (*s).as_str() == "error"
-                    }
+            let k = crate::string::lin_string_literal(b"type".as_ptr(), 4);
+            let field_box = crate::sealed::lin_record_get_field(sealed, k);
+            if field_box.is_null() { return false; }
+            let is_err = {
+                let got = &*(field_box as *const TaggedVal);
+                if got.tag != TAG_STR { false } else {
+                    let s = got.payload as *const crate::string::LinString;
+                    !s.is_null() && (*s).as_str() == "error"
                 }
             };
-            crate::map::lin_map_release(lmap);
+            crate::tagged::lin_tagged_release(field_box);
             return is_err;
         }
         _ => return false,
