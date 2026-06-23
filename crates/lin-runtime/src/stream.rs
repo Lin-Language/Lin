@@ -3308,28 +3308,12 @@ unsafe fn record_to_string_array(fields: &[Vec<u8>]) -> *mut u8 {
     alloc_tagged(TAG_ARRAY, arr as u64)
 }
 
-/// Build a boxed `{ String: String }` LinMap from a header + a data row, last-wins on
-/// duplicate header names, lenient on ragged rows (short row -> omit trailing keys; surplus fields
-/// dropped). Used by `recordRows`.
-unsafe fn record_to_object(header: &[Vec<u8>], row: &[Vec<u8>]) -> *mut u8 {
-    use crate::map::{lin_map_alloc, lin_map_set};
-    use crate::string::{lin_string_from_bytes, lin_string_release};
-    use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TaggedVal};
-    let map = lin_map_alloc(header.len().max(1) as u32, 0);
-    for (i, key_bytes) in header.iter().enumerate() {
-        if i >= row.len() {
-            break; // short row: omit the trailing keys
-        }
-        let k = lin_string_from_bytes(key_bytes.as_ptr(), key_bytes.len() as u32);
-        let v = lin_string_from_bytes(row[i].as_ptr(), row[i].len() as u32);
-        let mut tv: TaggedVal = std::mem::zeroed();
-        tv.tag = TAG_STR;
-        tv.payload = v as u64;
-        lin_map_set(map, k, &tv); // last-wins: a repeated key overwrites
-        lin_string_release(k);
-        lin_string_release(v);
-    }
-    alloc_tagged(TAG_MAP, map as u64)
+/// Raw record outcome from `CsvRowsSource::next_raw` — bypasses the boxed-String[] round-trip
+/// used by `rows()`, letting `CsvRecordsSource` work directly with byte vectors.
+enum RawRecord {
+    Eof,
+    Err(String),
+    Item(Vec<Vec<u8>>),
 }
 
 /// `rows(s)`: a `Stream<String[]>` over a byte stream, quote-aware (see CsvAssembler). Buffers only
@@ -3364,42 +3348,53 @@ impl CsvRowsSource {
         }
         Ok(())
     }
-}
 
-impl StreamSource for CsvRowsSource {
-    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+    /// Pull one raw record (no boxing) from the assembler/queue, threading EOF/Err.
+    /// `CsvRowsSource::read_tagged` wraps this into a boxed String[]; `CsvRecordsSource` calls
+    /// this directly to avoid building and immediately tearing down that box.
+    unsafe fn next_raw(&mut self) -> RawRecord {
         loop {
             if let Some(rec) = self.queue.pop_front() {
-                return TaggedOutcome::Item(record_to_string_array(&rec));
+                return RawRecord::Item(rec);
             }
             if self.upstream_done {
                 if self.flushed {
-                    return TaggedOutcome::Eof;
+                    return RawRecord::Eof;
                 }
                 self.flushed = true;
                 // EOF inside a quoted field (or a dangling `""` open) is the unterminated-quote Error.
                 if self.asm.in_quotes {
-                    return TaggedOutcome::Err(
+                    return RawRecord::Err(
                         "csv: unterminated quoted field at end of input".to_string(),
                     );
                 }
                 if let Some(rec) = self.asm.finish() {
-                    return TaggedOutcome::Item(record_to_string_array(&rec));
+                    return RawRecord::Item(rec);
                 }
-                return TaggedOutcome::Eof;
+                return RawRecord::Eof;
             }
             match self.up.pull() {
                 TaggedOutcome::Eof => self.upstream_done = true,
-                TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
+                TaggedOutcome::Err(m) => return RawRecord::Err(m),
                 TaggedOutcome::Item(item) => {
                     let mut bytes: Vec<u8> = Vec::new();
                     append_u8_array_to(&mut bytes, item);
                     crate::tagged::lin_tagged_release(item);
                     if let Err(m) = self.feed(&bytes) {
-                        return TaggedOutcome::Err(m);
+                        return RawRecord::Err(m);
                     }
                 }
             }
+        }
+    }
+}
+
+impl StreamSource for CsvRowsSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        match self.next_raw() {
+            RawRecord::Eof => TaggedOutcome::Eof,
+            RawRecord::Err(m) => TaggedOutcome::Err(m),
+            RawRecord::Item(rec) => TaggedOutcome::Item(record_to_string_array(&rec)),
         }
     }
     fn close(&mut self) {
@@ -3409,9 +3404,14 @@ impl StreamSource for CsvRowsSource {
 
 /// `recordRows(s)`: like `rows`, but consumes the first record as the header and yields one
 /// `{ String: String }` per subsequent data row (last-wins dup headers, lenient ragged rows).
+/// Header key LinStrings are interned once and reused across all rows to avoid per-row reallocation.
 struct CsvRecordsSource {
     inner: CsvRowsSource,
     header: Option<Vec<Vec<u8>>>,
+    /// Pre-built LinString pointers for the header keys, one per column. Built once when the header
+    /// is first pulled. Each pointer holds a persistent ref (refcount 1); `lin_map_set` takes its
+    /// own additional ref on each fresh insert, so we must NOT release these until the source drops.
+    header_keys: Vec<*mut crate::string::LinString>,
     /// True once the header has been pulled (it may legitimately be absent for an empty stream).
     header_done: bool,
 }
@@ -3419,17 +3419,52 @@ struct CsvRecordsSource {
 impl CsvRecordsSource {
     /// Pull one raw record from the inner rows source, threading EOF/Err.
     unsafe fn pull_record(&mut self) -> Result<Option<Vec<Vec<u8>>>, String> {
-        match self.inner.read_tagged() {
-            TaggedOutcome::Eof => Ok(None),
-            TaggedOutcome::Err(m) => Err(m),
-            TaggedOutcome::Item(item) => {
-                // Decode the just-built String[] box back into byte-vector fields, then release it.
-                let rec = string_array_to_fields(item);
-                crate::tagged::lin_tagged_release(item);
-                Ok(Some(rec))
-            }
+        match self.inner.next_raw() {
+            RawRecord::Eof => Ok(None),
+            RawRecord::Err(m) => Err(m),
+            RawRecord::Item(rec) => Ok(Some(rec)),
         }
     }
+}
+
+impl Drop for CsvRecordsSource {
+    fn drop(&mut self) {
+        // Release the persistent ref on each cached header-key LinString.
+        for &k in &self.header_keys {
+            if !k.is_null() {
+                unsafe { crate::string::lin_string_release(k); }
+            }
+        }
+        self.header_keys.clear();
+    }
+}
+
+// SAFETY: CsvRecordsSource is only accessed from a single stream-driver thread; the raw
+// LinString pointers in header_keys are owned by this struct and not shared.
+unsafe impl Send for CsvRecordsSource {}
+
+/// Build a `{ String: String }` LinMap using pre-interned key LinStrings. Each key pointer already
+/// has a persistent ref owned by `CsvRecordsSource`; `lin_map_set` takes an additional ref per
+/// fresh insert, so we do NOT release keys here. Values are allocated fresh per row and released
+/// after the map takes its own ref via `lin_map_set`.
+unsafe fn record_to_object_cached(keys: &[*mut crate::string::LinString], row: &[Vec<u8>]) -> *mut u8 {
+    use crate::map::{lin_map_alloc, lin_map_set};
+    use crate::string::{lin_string_from_bytes, lin_string_release};
+    use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TaggedVal};
+    let map = lin_map_alloc(keys.len().max(1) as u32, 0);
+    for (i, &k) in keys.iter().enumerate() {
+        if i >= row.len() {
+            break; // short row: omit the trailing keys
+        }
+        let v = lin_string_from_bytes(row[i].as_ptr(), row[i].len() as u32);
+        let mut tv: TaggedVal = std::mem::zeroed();
+        tv.tag = TAG_STR;
+        tv.payload = v as u64;
+        lin_map_set(map, k, &tv); // last-wins on dup header names; map takes its own key ref
+        lin_string_release(v);    // map has retained v; drop our ref
+        // key NOT released here — source's persistent ref outlives all rows
+    }
+    alloc_tagged(TAG_MAP, map as u64)
 }
 
 impl StreamSource for CsvRecordsSource {
@@ -3439,50 +3474,33 @@ impl StreamSource for CsvRecordsSource {
             match self.pull_record() {
                 Err(m) => return TaggedOutcome::Err(m),
                 Ok(None) => return TaggedOutcome::Eof, // empty stream: no header, no rows
-                Ok(Some(h)) => self.header = Some(h),
+                Ok(Some(h)) => {
+                    // Build the cached key LinStrings once from the header columns.
+                    self.header_keys = h
+                        .iter()
+                        .map(|col| {
+                            crate::string::lin_string_from_bytes(col.as_ptr(), col.len() as u32)
+                        })
+                        .collect();
+                    self.header = Some(h);
+                }
             }
         }
         // No header (e.g. an empty stream that ended before yielding one) => Eof.
         if self.header.is_none() {
             return TaggedOutcome::Eof;
         }
-        // Pull the row FIRST (needs &mut self), THEN borrow self.header (needs &self) for
-        // record_to_object. The two borrows no longer overlap, so the per-row header clone
-        // that previously only existed to bridge them is gone.
         match self.pull_record() {
             Err(m) => TaggedOutcome::Err(m),
             Ok(None) => TaggedOutcome::Eof,
             Ok(Some(row)) => {
-                let header = self.header.as_deref().unwrap();
-                TaggedOutcome::Item(record_to_object(header, &row))
+                TaggedOutcome::Item(record_to_object_cached(&self.header_keys, &row))
             }
         }
     }
     fn close(&mut self) {
         self.inner.close();
     }
-}
-
-/// Decode a boxed `String[]` (TAG_ARRAY of TAG_STR) back into byte-vector fields.
-unsafe fn string_array_to_fields(item: *mut u8) -> Vec<Vec<u8>> {
-    use crate::tagged::{lin_get_tag, lin_unbox_ptr, TAG_ARRAY, TAG_STR};
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    if lin_get_tag(item) != TAG_ARRAY {
-        return out;
-    }
-    let arr = lin_unbox_ptr(item) as *const crate::array::LinArray;
-    let n = crate::array::lin_array_length(arr);
-    for i in 0..n {
-        let elem = crate::array::lin_array_get_tagged(arr, i);
-        if !elem.is_null() && (*elem).tag == TAG_STR {
-            let s = (*elem).payload as *const crate::string::LinString;
-            let bytes = std::slice::from_raw_parts((*s).data.as_ptr(), (*s).len as usize);
-            out.push(bytes.to_vec());
-        } else {
-            out.push(Vec::new());
-        }
-    }
-    out
 }
 
 /// `rows(s, delim)` → a `Stream<String[]>` of parsed CSV rows over the byte stream `s`.
@@ -3509,7 +3527,12 @@ pub unsafe extern "C" fn lin_stream_csv_records(s: *const u8, delim: i32) -> *mu
         upstream_done: false,
         flushed: false,
     };
-    StreamBox::new_boxed(Box::new(CsvRecordsSource { inner, header: None, header_done: false }))
+    StreamBox::new_boxed(Box::new(CsvRecordsSource {
+        inner,
+        header: None,
+        header_keys: Vec::new(),
+        header_done: false,
+    }))
 }
 
 #[cfg(test)]
