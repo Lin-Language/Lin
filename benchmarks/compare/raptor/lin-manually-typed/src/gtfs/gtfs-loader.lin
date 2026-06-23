@@ -31,25 +31,24 @@ export val loadGtfs = (path: String): GtfsData =>
 
   val processZip = () =>
     readStream(path).gunzip().entries().for(e =>
-      val rows = e.body().recordRows()
       val file = e.header()["name"]
 
       if file == "links.txt" then
-        rows.for(addLink)
+        e.body().recordRows({ "columns": ["from_stop_id", "to_stop_id", "duration", "start_time", "end_time"] }).for(addLink)
       else if file == "calendar.txt" then
-        rows.for(addCalendar)
+        e.body().recordRows({ "columns": ["service_id", "start_date", "end_date", "sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] }).for(addCalendar)
       else if file == "calendar_dates.txt" then
-        rows.for(addDate)
+        e.body().recordRows({ "columns": ["service_id", "date", "exception_type"] }).for(addDate)
       else if file == "trips.txt" then
-        rows.for(addTrip)
+        e.body().recordRows({ "columns": ["service_id", "trip_id"] }).for(addTrip)
       else if file == "stop_times.txt" then
-        rows.for(addStopTimes)
+        e.body().recordRows({ "columns": ["trip_id", "arrival_time", "departure_time", "stop_id", "pickup_type", "drop_off_type"] }).for(addStopTimes)
       else if file == "transfers.txt" then
-        rows.for(addTransfer)
+        e.body().recordRows({ "columns": ["from_stop_id", "to_stop_id", "min_transfer_time"] }).for(addTransfer)
       else if file == "stops.txt" then
-        rows.for(addStop)
+        e.body().recordRows({ "columns": ["stop_id", "stop_code", "stop_name", "stop_desc", "stop_lat", "stop_lon", "zone_id"] }).for(addStop)
       else
-        rows.drain()
+        e.body().drain()
     )
 
   val addLink = (row: AnyVal) =>
