@@ -811,6 +811,72 @@ pub unsafe extern "C" fn lin_string_join(arr: *const crate::array::LinArray, sep
     lin_string_from_bytes(result.as_ptr(), result.len() as u32)
 }
 
+/// Walk a named descriptor (STANDALONE struct, struct-relative offsets) and push each field as
+/// `"name": value` (display format) into `out`. No intermediate LinMap is built.
+/// `sealed` must be the struct base pointer (WITH header); descriptor offsets are struct-relative.
+unsafe fn push_display_sealed_struct(out: &mut String, sealed: *const u8, named_desc: *const u8) {
+    if named_desc.is_null() { out.push_str("{}"); return; }
+    out.push('{');
+    let mut first = true;
+    crate::sealed::record_walk_fields(named_desc, |name_bytes, offset, nkind, nested| {
+        if !first { out.push_str(", "); }
+        first = false;
+        // Key (unescaped display format, matches push_display_map)
+        out.push('"');
+        out.push_str(std::str::from_utf8_unchecked(name_bytes));
+        out.push_str("\": ");
+        // Box the field value, recurse push_display_value, then release the box.
+        let boxed = crate::sealed::box_field_value(sealed, offset, nkind, nested);
+        if boxed.is_null() {
+            out.push_str("null");
+        } else {
+            push_display_value(out, boxed as *const TaggedVal);
+            crate::tagged::lin_tagged_release(boxed);
+        }
+    });
+    out.push('}');
+}
+
+/// Walk a named descriptor (PAYLOAD-relative, header-less element) and push display format.
+/// `payload` is header-less (a sealed-record array element); offsets are struct-relative so we
+/// add SEALED_HEADER to the slot address (i.e. treat payload as if it were `sealed + SEALED_HEADER`,
+/// so `sealed = payload - SEALED_HEADER`). Descriptor offsets include the header, so the slot is
+/// `(payload - SEALED_HEADER) + offset = payload + (offset - SEALED_HEADER)`.
+unsafe fn push_display_sealed_payload(out: &mut String, payload: *const u8, named_desc: *const u8) {
+    use crate::sealed::SEALED_HEADER;
+    // Treat as a struct starting SEALED_HEADER bytes before the payload.
+    let pseudo_sealed = payload.sub(SEALED_HEADER);
+    push_display_sealed_struct(out, pseudo_sealed, named_desc);
+}
+
+/// Same as push_display_sealed_struct but emits strict JSON (keys+strings escaped, no trailing space).
+unsafe fn push_json_sealed_struct(out: &mut String, sealed: *const u8, named_desc: *const u8) {
+    if named_desc.is_null() { out.push_str("{}"); return; }
+    out.push('{');
+    let mut first = true;
+    crate::sealed::record_walk_fields(named_desc, |name_bytes, offset, nkind, nested| {
+        if !first { out.push(','); }
+        first = false;
+        push_json_escaped(out, std::str::from_utf8_unchecked(name_bytes));
+        out.push(':');
+        let boxed = crate::sealed::box_field_value(sealed, offset, nkind, nested);
+        if boxed.is_null() {
+            out.push_str("null");
+        } else {
+            push_json_value(out, boxed as *const TaggedVal);
+            crate::tagged::lin_tagged_release(boxed);
+        }
+    });
+    out.push('}');
+}
+
+/// Same as push_display_sealed_payload but emits strict JSON.
+unsafe fn push_json_sealed_payload(out: &mut String, payload: *const u8, named_desc: *const u8) {
+    use crate::sealed::SEALED_HEADER;
+    let pseudo_sealed = payload.sub(SEALED_HEADER);
+    push_json_sealed_struct(out, pseudo_sealed, named_desc);
+}
+
 /// Recursively convert a TaggedVal to its (lossy, display) JSON string representation.
 /// Used for toString(obj), toString(arr), and string interpolation of complex values.
 ///
@@ -899,10 +965,7 @@ unsafe fn push_display_value(out: &mut String, tagged: *const TaggedVal) {
         let named_desc = if sealed.is_null() { std::ptr::null() } else {
             *((sealed.add(16)) as *const *const u8)
         };
-        let map = crate::sealed::materialize_sealed_to_map_pub(payload as *mut u8, named_desc);
-        if map.is_null() { out.push_str("{}"); return; }
-        push_display_map(out, map as *const crate::map::LinMap);
-        crate::map::lin_map_release(map);
+        push_display_sealed_struct(out, sealed, named_desc);
         return;
     }
     out.push_str("[object]");
@@ -943,23 +1006,16 @@ unsafe fn push_display_array(out: &mut String, arr: *const crate::array::LinArra
             TAG_UINT32 => { let _ = write!(out, "{}", *((*arr).data as *const u32).add(i)); }
             TAG_UINT64 => { let _ = write!(out, "{}", *((*arr).data as *const u64).add(i)); }
             SEALED_ARRAY_TAG => {
-                // 0xFE inline packed sealed-record element: materialize to a LinMap, display, release.
+                // 0xFE inline packed element: walk descriptor directly, no intermediate LinMap.
                 let payload = ((*arr).data as *const u8).add(i * (*arr).elem_stride as usize);
-                let map = crate::sealed::materialize_sealed_to_map_pub(payload as *mut u8, (*arr).elem_named_desc);
-                if map.is_null() { out.push_str("{}"); } else {
-                    push_display_map(out, map);
-                    crate::map::lin_map_release(map);
-                }
+                push_display_sealed_payload(out, payload, (*arr).elem_named_desc);
             }
             SEALED_PTR_ARRAY_TAG => {
-                // 0xFD pointer-backed sealed-record element: load the struct pointer, materialize, display, release.
+                // 0xFD pointer-backed element: walk struct descriptor directly.
                 let sptr = *(((*arr).data as *const *mut u8).add(i));
                 if sptr.is_null() { out.push_str("null"); } else {
-                    let map = crate::sealed::materialize_sealed_to_map_pub(sptr, (*arr).elem_named_desc);
-                    if map.is_null() { out.push_str("{}"); } else {
-                        push_display_map(out, map);
-                        crate::map::lin_map_release(map);
-                    }
+                    let named_desc = *((sptr.add(16)) as *const *const u8);
+                    push_display_sealed_struct(out, sptr as *const u8, named_desc);
                 }
             }
             _ => out.push_str("null"),
@@ -1088,27 +1144,20 @@ unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
                     TAG_UINT32 => format!("I:{}", *((*arr).data as *const u32).add(i) as u64),
                     TAG_UINT64 => format!("U:{}", *((*arr).data as *const u64).add(i)),
                     crate::array::SEALED_ARRAY_TAG => {
-                        // 0xFE inline sealed-record: materialize to map, key-stringify, release.
+                        // 0xFE inline sealed-record: walk descriptor directly for key-stringify.
                         let payload = ((*arr).data as *const u8).add(i * (*arr).elem_stride as usize);
-                        let map = crate::sealed::materialize_sealed_to_map_pub(payload as *mut u8, (*arr).elem_named_desc);
-                        if map.is_null() { "o:{}".to_string() } else {
-                            let tv = crate::tagged::TaggedVal { tag: crate::tagged::TAG_MAP, _pad: [0;7], payload: map as u64 };
-                            let s = tagged_to_key_string(&tv as *const crate::tagged::TaggedVal);
-                            crate::map::lin_map_release(map);
-                            s
-                        }
+                        let mut s = String::new();
+                        push_display_sealed_payload(&mut s, payload, (*arr).elem_named_desc);
+                        format!("o:{s}")
                     }
                     crate::array::SEALED_PTR_ARRAY_TAG => {
-                        // 0xFD pointer-backed sealed-record: materialize to map, key-stringify, release.
+                        // 0xFD pointer-backed sealed-record: walk struct descriptor directly.
                         let sptr = *(((*arr).data as *const *mut u8).add(i));
                         if sptr.is_null() { "N".to_string() } else {
-                            let map = crate::sealed::materialize_sealed_to_map_pub(sptr, (*arr).elem_named_desc);
-                            if map.is_null() { "o:{}".to_string() } else {
-                                let tv = crate::tagged::TaggedVal { tag: crate::tagged::TAG_MAP, _pad: [0;7], payload: map as u64 };
-                                let s = tagged_to_key_string(&tv as *const crate::tagged::TaggedVal);
-                                crate::map::lin_map_release(map);
-                                s
-                            }
+                            let named_desc = *((sptr.add(16)) as *const *const u8);
+                            let mut s = String::new();
+                            push_display_sealed_struct(&mut s, sptr as *const u8, named_desc);
+                            format!("o:{s}")
                         }
                     }
                     _ => "N".to_string(),
@@ -1260,13 +1309,9 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
         let named_desc = if sealed.is_null() { std::ptr::null() } else {
             *((sealed.add(16)) as *const *const u8)
         };
-        let map = crate::sealed::materialize_sealed_to_map_pub(payload as *mut u8, named_desc);
-        if map.is_null() {
-            return lin_string_from_bytes(b"{}".as_ptr(), 2);
-        }
-        let s = lin_map_to_string(map as *const crate::map::LinMap);
-        crate::map::lin_map_release(map);
-        s
+        let mut out = String::new();
+        push_display_sealed_struct(&mut out, sealed, named_desc);
+        lin_string_from_bytes(out.as_ptr(), out.len() as u32)
     } else if tag == crate::tagged::TAG_BIGNUM {
         // Opaque BigInt handle: render its exact base-10 form (so accidental interpolation shows
         // the value rather than `[object]`; the canonical entry point is still std/bignum.toString).
@@ -1335,13 +1380,7 @@ unsafe fn push_json_value(out: &mut String, tagged: *const TaggedVal) {
             let named_desc = if sealed.is_null() { std::ptr::null() } else {
                 *((sealed.add(16)) as *const *const u8)
             };
-            let map = crate::sealed::materialize_sealed_to_map_pub(payload as *mut u8, named_desc);
-            if map.is_null() {
-                out.push_str("{}");
-            } else {
-                push_json_map(out, map as *const crate::map::LinMap);
-                crate::map::lin_map_release(map);
-            }
+            push_json_sealed_struct(out, sealed, named_desc);
         }
         // Functions/iterators and any unknown tag are not JSON values → null.
         _ => out.push_str("null"),
@@ -1394,23 +1433,16 @@ unsafe fn push_json_array(out: &mut String, arr: *const crate::array::LinArray) 
             TAG_UINT32 => out.push_str(&(*((*arr).data as *const u32).add(i)).to_string()),
             TAG_UINT64 => out.push_str(&(*((*arr).data as *const u64).add(i)).to_string()),
             SEALED_ARRAY_TAG => {
-                // 0xFE inline packed sealed-record element: materialize to a LinMap, emit as JSON, release.
+                // 0xFE inline packed element: walk descriptor directly, no intermediate LinMap.
                 let payload = ((*arr).data as *const u8).add(i * (*arr).elem_stride as usize);
-                let map = crate::sealed::materialize_sealed_to_map_pub(payload as *mut u8, (*arr).elem_named_desc);
-                if map.is_null() { out.push_str("{}"); } else {
-                    push_json_map(out, map);
-                    crate::map::lin_map_release(map);
-                }
+                push_json_sealed_payload(out, payload, (*arr).elem_named_desc);
             }
             SEALED_PTR_ARRAY_TAG => {
-                // 0xFD pointer-backed sealed-record element: load struct pointer, materialize, emit as JSON, release.
+                // 0xFD pointer-backed element: walk struct descriptor directly.
                 let sptr = *(((*arr).data as *const *mut u8).add(i));
                 if sptr.is_null() { out.push_str("null"); } else {
-                    let map = crate::sealed::materialize_sealed_to_map_pub(sptr, (*arr).elem_named_desc);
-                    if map.is_null() { out.push_str("{}"); } else {
-                        push_json_map(out, map);
-                        crate::map::lin_map_release(map);
-                    }
+                    let named_desc = *((sptr.add(16)) as *const *const u8);
+                    push_json_sealed_struct(out, sptr as *const u8, named_desc);
                 }
             }
             _ => out.push_str("null"),
