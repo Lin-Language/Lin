@@ -3462,23 +3462,25 @@ unsafe impl Send for CsvRecordsSource {}
 
 /// Build a `{ String: String }` LinMap using pre-interned key LinStrings. Each key pointer already
 /// has a persistent ref owned by `CsvRecordsSource`; `lin_map_set` takes an additional ref per
-/// fresh insert, so we do NOT release keys here. Values are allocated fresh per row and released
-/// after the map takes its own ref via `lin_map_set`.
+/// fresh insert, so we do NOT release keys here. Values are interned via `intern_csv_field_bytes`
+/// so equal byte sequences share ONE immortal LinString (pointer-identity key compare in map gets).
 unsafe fn record_to_object_cached(keys: &[*mut crate::string::LinString], row: &[Vec<u8>]) -> *mut u8 {
     use crate::map::{lin_map_alloc, lin_map_set};
-    use crate::string::{lin_string_from_bytes, lin_string_release};
+    use crate::string::intern_csv_field_bytes;
     use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TaggedVal};
     let map = lin_map_alloc(keys.len().max(1) as u32, 0);
     for (i, &k) in keys.iter().enumerate() {
         if i >= row.len() {
             break; // short row: omit the trailing keys
         }
-        let v = lin_string_from_bytes(row[i].as_ptr(), row[i].len() as u32);
+        // Intern the value so equal strings (StopId, RouteId, …) share one immortal pointer.
+        // lin_map_set retains the value; lin_string_release is a no-op for immortal strings.
+        let v = intern_csv_field_bytes(row[i].as_ptr(), row[i].len() as u32);
         let mut tv: TaggedVal = std::mem::zeroed();
         tv.tag = TAG_STR;
         tv.payload = v as u64;
-        lin_map_set(map, k, &tv); // last-wins on dup header names; map takes its own key ref
-        lin_string_release(v);    // map has retained v; drop our ref
+        lin_map_set(map, k, &tv); // map retains key + value
+        crate::string::lin_string_release(v); // no-op for immortal; safe for non-immortal
         // key NOT released here — source's persistent ref outlives all rows
     }
     alloc_tagged(TAG_MAP, map as u64)
@@ -3488,19 +3490,19 @@ unsafe fn record_to_object_cached(keys: &[*mut crate::string::LinString], row: &
 /// Only the selected columns are materialized; others are never allocated.
 unsafe fn record_to_object_projected(proj: &[(usize, *mut crate::string::LinString)], row: &[Vec<u8>]) -> *mut u8 {
     use crate::map::{lin_map_alloc, lin_map_set};
-    use crate::string::{lin_string_from_bytes, lin_string_release};
+    use crate::string::intern_csv_field_bytes;
     use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TaggedVal};
     let map = lin_map_alloc(proj.len().max(1) as u32, 0);
     for &(row_idx, k) in proj {
         if row_idx >= row.len() {
             continue; // ragged row: this column is absent, skip
         }
-        let v = lin_string_from_bytes(row[row_idx].as_ptr(), row[row_idx].len() as u32);
+        let v = intern_csv_field_bytes(row[row_idx].as_ptr(), row[row_idx].len() as u32);
         let mut tv: TaggedVal = std::mem::zeroed();
         tv.tag = TAG_STR;
         tv.payload = v as u64;
         lin_map_set(map, k, &tv);
-        lin_string_release(v);
+        crate::string::lin_string_release(v); // no-op for immortal; safe for non-immortal
         // key NOT released here — source's persistent ref outlives all rows
     }
     alloc_tagged(TAG_MAP, map as u64)
