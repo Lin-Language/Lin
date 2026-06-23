@@ -681,6 +681,76 @@ string-keyed maps too, so the cached-hash win is like-for-like.)
 
 ---
 
+### 5.10 The 2026-06-23 session — records aren't maps; the wall is reference-record memory latency
+
+Continuing §5.9's RAPTOR work (which ended at 54 s), this session merged one more real lever
+(RC-ELIDE, −9 %), a batch of correctness + general-quality changes, and — driven by the question
+"*why* is Lin still ~2.5× Go" — produced the **definitive structural diagnosis** of the residual gap.
+
+**Merged (master, release-verified, digest-exact `26203913/773022892/139`):**
+
+| change | effect | mechanism |
+|---|--:|---|
+| **RC-ELIDE** | **−9 %** (54→49 s) | de-materialize *view-only* sealed-array element binds (`val s = arr[i]` used only for field reads → borrowed const-offset reads, no `lin_sealed_alloc`/`retain_sealed_payload_fields`). The one real perf win — removes *serializing work*, like §5.9's STR-KEY. |
+| SwissTable | general; RAPTOR-neutral | control-byte (h2) probe for `LinMap`, Go-grade map quality. ~17 % on a hot small-map microbench; **0 % on RAPTOR** (cold random-slot miss, not probe length). |
+| utf8-fast | ~2 % LOAD | drop the per-CSV-field `from_utf8_lossy` double-alloc (2→1 alloc/field). |
+| SEAL-FIELD | **correctness** | `m[k]["field"]` on `{String:Record}` returned **null** (NullableRecord map-value field read mis-lowered) → offset `FieldGet`. |
+| coerce-fin | **correctness** | `coerce_if_branch` concrete-concrete arm leaked a ref on narrowed-union `if`-branch results (`owned=false` → orphaned retain → u32 wrap → UAF at scale). |
+| BOUND-ELEM | neutral, cleaner | escaping sealed-array element field reads → offset (getTrip `map_get` 48→28). |
+| FROZEN-RC | neutral, sound | immortal early-out in `retain_sealed_payload_fields` — skip the deep RC walk for frozen graphs. |
+| stride-spec | general | fused `arr[i]["heapField"]` → inlined `SealedArrayFieldGet` instead of materialize. |
+
+**The structural diagnosis (the session's real output).** The recurring question — *are records secretly
+maps?* — was **answered no, by direct IR probing.** Typed-record field access compiles to a constant-offset
+load for **direct, param, fused, and view-only** binds (all 0 `map_get`). The `map_get` fallbacks were two
+**narrow boundary cases** — a record retrieved from a map (`m[k]["f"]`) and an *escaping* bound element
+(`val e=arr[i]; …; saved=e`) — both now fixed. Records and maps share `Type::Object{sealed}` at the type
+level, but the *representation* is already right: sealed records are packed structs with offset access; the
+remaining `map_get`s in RAPTOR are *genuine collection lookups* (`{StopId:V}` maps).
+
+**So the Go gap is the DATA LAYOUT, not the access mechanism.** Records are **reference types stored as
+0xFD pointer-spines** — a `Trip[]` is an array of pointers to separately-heap-allocated `Trip`s scattered
+across the heap; Go uses inline value structs (`[]Trip`, contiguous). getTrip's backward scan pointer-chases
+a cache-missing struct per element. `frozen()` **does** de-scatter at runtime (measured:
+`repacked_0xfd_arrays=242744`, `freed_struct_shells=2372709` — the trip data physically becomes 0xFE
+contiguous) — **but codegen can't exploit it**: `repr.rs:599/638/654` stamp every map-/field-read array
+`inline:false`, so element access is a **per-element runtime call** (`lin_sealed_array_elem_ptr` /
+`lin_array_get_tagged`), not an inlined `base + i*elem_stride` loop the CPU can stride/prefetch.
+
+**Every access-mechanism lever is wall-neutral — proof, from ~8 angles.** SwissTable, INTERN, typed-get,
+SEAL-FIELD, BOUND-ELEM (getTrip 48→28 `map_get`), reduce-devirt, getTrip-hoist, FROZEN-RC, stride-spec are
+**all wall-neutral on RAPTOR.** Eliminating 20 `map_get`s from the hottest function moved the clock **0 %**.
+The `map_get`/RC machinery is *overlapped* with the cache-miss load of the scattered data; the load is the
+cost. The only levers that ever moved the wall (RC-ELIDE here, STR-KEY/CLOS combo in §5.9) removed
+*serializing work + allocations*. This **refines §5.8/§5.9**: not "data layer exhausted" (§5.8, wrong) nor
+"string-key hashing" alone (§5.9), but specifically **memory latency on heap-scattered reference records** —
+the layout, the one axis left untouched.
+
+**The lever that hits it — and why it's hard.** `lazy-materialize-at-escape`: keep an escaping bound element
+a *borrowed view* (offset reads), materialize the copy only at the escape site (N reads + 1 copy, not N
+copies). A microbench isolates it: an escaping scan = 4 s, the same scan view-only = ~0 s; a port proxy
+(store the *index*, re-read once) gave RAPTOR **GROUP −4.3 %, digest-exact** — RC-ELIDE-shaped, the first
+non-neutral signal since RC-ELIDE. **But the sound compiler realization is a UAF minefield** — two agent
+attempts (a `bench.lin` build-panic, then a runtime segfault in PREP): borrowing array elements across a
+loop with conditional escape is exactly the use-after-free class. **The safe form needs
+records-as-value-types-stored-inline** (the §5.6 representation-reset direction), not a point
+borrow-across-escape pass. Shelved on `take5/lazymat*`.
+
+**Conclusion / the fork.** The per-op levers are exhausted (all neutral); the next real RAPTOR gain is the
+**value-struct inline layout** — `frozen()` already produces the contiguous runtime buffer; what's missing
+is codegen *striding* it (a static `frozen`/0xFE type so the scan emits an inlined `base+i*stride` loop, not
+per-element calls). That is the reset campaign (records = value types), a deliberate larger effort — or
+accept the **~2.5× Go floor** as the cost of reference-record semantics. Either way the point-lever well for
+RAPTOR is dry. Arc across §5.9+§5.10: **~80 s → ~46–49 s; 4.1×→~2.5× Go, 2.6×→~1.6× Node.**
+
+**Process lesson (now a gate).** **Seven** lanes this session passed their full unit gate (`cargo test` +
+`LIN_VERIFY_RC` + ASan on small repros) but **failed on RAPTOR** — neutral-ineffective, build-panic, or
+runtime-segfault. The cheap catch: **`lin build <raptor>/bench.lin` (build-only, no run)** is now a
+mandatory gate for any codegen/lowering lane — it caught the lazy-mat codegen panic the unit suite missed.
+(Reinforces §5.7/§5.9: "tests pass" is necessary, not sufficient; RAPTOR is the oracle.)
+
+---
+
 ## 6. Guidance for writing fast Lin
 
 1. **Prefer typed records and `&`-composed named types over `AnyVal`.** This is the
