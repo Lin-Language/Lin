@@ -390,6 +390,10 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         // stack allocation AND suppress their Retain/Release emission (see lin_ir::escape). Runs
         // after RC elision so it sees and removes the surviving Retain/Release on stack values.
         lin_ir::escape::analyze(&mut ir_module);
+        // Redundant-read elimination (CSE): replace repeated Index/FieldGet on the same
+        // object+key within a basic block with a Copy of the first result, when no
+        // intervening mutation or call could have changed the slot value (escape-gated).
+        lin_ir::redundant_read::run(&mut ir_module);
         // Box/unbox cancellation peephole (RT.2b): cancel a scalar value that is
         // boxed into a union slot and immediately unboxed back to the same scalar
         // type. Runs after rc_elide and escape so the IR is in its final form

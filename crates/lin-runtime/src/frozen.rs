@@ -98,16 +98,45 @@ pub(crate) unsafe fn freeze_array(arr: *mut LinArray) {
         // array EXCLUSIVELY owns those shells. A shared record (the same shell referenced by another
         // live array — e.g. RAPTOR's `Trip` shared across `trips`/`sortedTrips`/`tripsByRoute`, or a
         // `Transfer` shared between `transfers` and `usefulTransfers`) would be use-after-freed →
-        // heap corruption. Detect sharing via the shells' refcounts (the array holds one ref each, so
-        // an exclusively-owned shell has rc == 1) and, when any element is shared, immortalize the
-        // pointer-backed array IN PLACE instead — keeps the RC-suppression win, skips only the
-        // inline-packing memory win, and frees nothing.
+        // heap corruption.
+        //
+        // EXCLUSIVITY PROOF (soundness of rc == 1):
+        //   The array holds one ref per element (via `lin_sealed_ptr_array_push`'s `lin_rc_retain`).
+        //   A shell's rc == 1 means the array is the SOLE owner — no other array, closure, or live
+        //   register holds a reference. Two optimizations that read element fields WITHOUT bumping RC
+        //   (BOUND-ELEM/SealedArrayFieldGet and RC-ELIDE) cannot invalidate this:
+        //     - BOUND-ELEM: `SealedArrayFieldGet` computes the shell pointer as a transient GEP+load
+        //       (pure LLVM-IR intermediate with no runtime RC bump). The shell pointer is dead after
+        //       the load; it cannot be live at a subsequent `lin_freeze` call-site entry.
+        //     - RC-ELIDE: removes retain/release PAIRS (net-zero on RC); never produces unbounded
+        //       aliases. An elided pair means the value was used and released without a net RC change.
+        //   Therefore rc == 1 is a true sole-owner proof, not just an approximation.
+        //
+        // SIZE UNIFORMITY GUARD: `repack_ptr_array_to_inline` reads `struct_size` from element 0
+        // and applies it to ALL elements (for `copy_nonoverlapping` and `dealloc` Layout). A
+        // heterogeneous-size 0xFD array — theoretically possible if elements were created with
+        // different `lin_sealed_alloc(struct_size, …)` calls — would cause over-read + wrong-Layout
+        // dealloc → allocator corruption. Guard: only repack when all non-null elements share the
+        // same struct_size as element 0. If they differ, fall back to in-place freeze.
         let len = (*arr).len as usize;
         let slots = (*arr).data as *const *mut u8;
         let mut exclusive = true;
+        // Determine struct_size from the first non-null element for the uniformity check.
+        let mut first_struct_size: usize = 0;
         for i in 0..len {
             let sptr = *slots.add(i);
-            if !sptr.is_null() && *(sptr as *const u32) > 1 {
+            if sptr.is_null() { continue; }
+            // Exclusivity: the array holds one ref; rc == 1 means sole owner (see proof above).
+            if *(sptr as *const u32) > 1 {
+                exclusive = false;
+                break;
+            }
+            // Size uniformity: struct_size at header offset 4.
+            let sz = *((sptr.add(4)) as *const u32) as usize;
+            if first_struct_size == 0 {
+                first_struct_size = sz;
+            } else if sz != first_struct_size {
+                // Heterogeneous element sizes — cannot repack safely; fall back to in-place freeze.
                 exclusive = false;
                 break;
             }
@@ -721,6 +750,143 @@ mod tests {
             // Wait — src_live owns a ref to s_live via the slot. When lin_sealed_release_self is called,
             // it will call release_heap_fields which calls lin_string_release(s_live). At that point
             // s_live rc is 1 → it goes to 0 and is freed. Don't access s_live after this point.
+        }
+    }
+
+    // ── B3 gate tests (frozen repack soundness) ──────────────────────────────────────────────────
+
+    /// Gate (a): a borrowed/read-only view of a 0xFD array before AND after freeze does not
+    /// produce a UAF. Simulates the BOUND-ELEM code pattern:
+    ///   - read element field (borrowed interior pointer) BEFORE freeze
+    ///   - call frozen(arr)  → repack 0xFD → 0xFE, shells freed
+    ///   - read same element field AFTER freeze (now via the 0xFE inline buffer)
+    /// Under ASan this verifies no access of freed memory.
+    #[test]
+    fn frozen_0xfd_borrow_before_and_after_no_uaf() {
+        unsafe {
+            let named = scalar_named_desc();
+            let arr = lin_sealed_ptr_array_alloc(4, named.as_ptr());
+            // Build 3 elements.
+            for i in 0i32..3 {
+                let sptr = lin_sealed_alloc(SEALED_HEADER + 8, std::ptr::null(), named.as_ptr());
+                *(sptr.add(24) as *mut i32) = i * 11;
+                *(sptr.add(28) as *mut i32) = i * 22;
+                lin_sealed_ptr_array_push(arr, sptr);
+                lin_sealed_release_self(sptr);
+            }
+            // BEFORE freeze: borrow-style read via raw spine (no RC bump — mirrors SealedArrayFieldGet).
+            let slots = (*arr).data as *const *mut u8;
+            let sptr0 = *slots.add(0);
+            let x0_before = *(sptr0.add(24) as *const i32);
+            let sptr1 = *slots.add(1);
+            let x1_before = *(sptr1.add(24) as *const i32);
+            assert_eq!(x0_before, 0);
+            assert_eq!(x1_before, 11);
+
+            // FREEZE: repacks 0xFD → 0xFE, frees all shells (rc==1 sole-owner proof holds).
+            let boxed = alloc_tagged(TAG_ARRAY, arr as u64);
+            lin_freeze(boxed);
+            assert_eq!((*arr).elem_tag, SEALED_ARRAY_TAG, "must be 0xFE after freeze");
+            assert!((*arr).refcount >= IMMORTAL_RC);
+
+            // AFTER freeze: read the same elements through the 0xFE inline path.
+            let elem0 = lin_sealed_array_elem_ptr(arr, 0);
+            let x0_after = *(elem0 as *const i32);
+            assert_eq!(x0_after, 0, "elem[0].x must survive freeze");
+            let elem1 = lin_sealed_array_elem_ptr(arr, 1);
+            let x1_after = *(elem1 as *const i32);
+            assert_eq!(x1_after, 11, "elem[1].x must survive freeze");
+            let elem2 = lin_sealed_array_elem_ptr(arr, 2);
+            let x2_after = *(elem2 as *const i32);
+            assert_eq!(x2_after, 22, "elem[2].x must survive freeze");
+
+            crate::tagged::lin_tagged_free_box(boxed);
+        }
+    }
+
+    /// Gate (b): a 0xFD array whose elements have TWO different struct sizes (heterogeneous) must
+    /// NOT be repacked — the uniformity guard detects the mismatch and falls back to in-place freeze.
+    /// Verifies:
+    ///   - elem_tag stays SEALED_PTR_ARRAY_TAG (0xFD) after freeze (no repack)
+    ///   - both shells are IMMORTAL (in-place freeze applied)
+    ///   - no allocator corruption (would ASan-fault without the guard)
+    #[test]
+    fn frozen_0xfd_heterogeneous_sizes_no_repack() {
+        unsafe {
+            use crate::sealed::NKIND_INT32;
+            // Build a named desc for the SMALL record: S { x: Int32 } — struct size = SEALED_HEADER + 4.
+            let named_small = {
+                let mut b = Vec::new();
+                b.extend_from_slice(&1u32.to_le_bytes()); // field count
+                b.extend_from_slice(&0u32.to_le_bytes()); // header pad
+                let name = "x";
+                b.extend_from_slice(&24u32.to_le_bytes()); // field offset
+                b.extend_from_slice(&NKIND_INT32.to_le_bytes());
+                b.extend_from_slice(&0u64.to_le_bytes()); // nested_ptr
+                b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                b.extend_from_slice(name.as_bytes());
+                let row_len = 18 + name.len();
+                let pad = (8 - (row_len % 8)) % 8;
+                b.extend(std::iter::repeat(0u8).take(pad));
+                b
+            };
+            // Build a named desc for the LARGE record: L { x: Int32, y: Int32, z: Int32 } —
+            // struct size = SEALED_HEADER + 12.
+            let named_large = {
+                let mut b = Vec::new();
+                b.extend_from_slice(&3u32.to_le_bytes()); // field count
+                b.extend_from_slice(&0u32.to_le_bytes()); // header pad
+                for (name, off) in [("x", 24u32), ("y", 28u32), ("z", 32u32)] {
+                    b.extend_from_slice(&off.to_le_bytes());
+                    b.extend_from_slice(&NKIND_INT32.to_le_bytes());
+                    b.extend_from_slice(&0u64.to_le_bytes());
+                    b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                    b.extend_from_slice(name.as_bytes());
+                    let row_len = 18 + name.len();
+                    let pad = (8 - (row_len % 8)) % 8;
+                    b.extend(std::iter::repeat(0u8).take(pad));
+                }
+                b
+            };
+
+            // Allocate a 0xFD array using the small desc (the array's named_desc drives its own
+            // identity, but we'll push elements with different struct_sizes directly).
+            let arr = lin_sealed_ptr_array_alloc(4, named_small.as_ptr());
+
+            // Push one SMALL struct (size = SEALED_HEADER + 4 = 28 bytes).
+            let small_sz = SEALED_HEADER + 4;
+            let sptr_small = lin_sealed_alloc(small_sz, std::ptr::null(), named_small.as_ptr());
+            *(sptr_small.add(24) as *mut i32) = 1;
+            lin_sealed_ptr_array_push(arr, sptr_small);
+            lin_sealed_release_self(sptr_small); // array owns it now
+
+            // Push one LARGE struct (size = SEALED_HEADER + 12 = 36 bytes).
+            let large_sz = SEALED_HEADER + 12;
+            let sptr_large = lin_sealed_alloc(large_sz, std::ptr::null(), named_large.as_ptr());
+            *(sptr_large.add(24) as *mut i32) = 2;
+            *(sptr_large.add(28) as *mut i32) = 3;
+            *(sptr_large.add(32) as *mut i32) = 4;
+            lin_sealed_ptr_array_push(arr, sptr_large);
+            lin_sealed_release_self(sptr_large);
+
+            // Freeze: the uniformity guard detects small_sz != large_sz → no repack → in-place.
+            let boxed = alloc_tagged(TAG_ARRAY, arr as u64);
+            lin_freeze(boxed);
+
+            // Must still be 0xFD (not repacked).
+            assert_eq!((*arr).elem_tag, SEALED_PTR_ARRAY_TAG,
+                "heterogeneous sizes must NOT be repacked; elem_tag must stay 0xFD");
+            assert!((*arr).refcount >= IMMORTAL_RC, "array itself must be immortal");
+
+            // Both shells must be immortal (in-place freeze applied each one).
+            let slots = (*arr).data as *const *mut u8;
+            let s0 = *slots.add(0);
+            let s1 = *slots.add(1);
+            assert!(*(s0 as *const u32) >= IMMORTAL_RC, "small shell must be immortal");
+            assert!(*(s1 as *const u32) >= IMMORTAL_RC, "large shell must be immortal");
+
+            crate::tagged::lin_tagged_free_box(boxed);
+            // Shells are IMMORTAL — not freed (program-lifetime semantics for frozen graphs).
         }
     }
 }

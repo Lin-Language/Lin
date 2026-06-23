@@ -873,15 +873,18 @@ pub(crate) fn iter_elem_type(iterable_ty: &Type) -> Type {
                     _ => None,
                 };
                 match (arm_elem, &agreed) {
+                    // KEEP: a non-iterable arm (e.g. Null in T[]|Null) means element type is unknowable.
                     (None, _) => return Type::TypeVar(u32::MAX), // non-iterable arm → can't agree
                     (Some(e), None) => agreed = Some(e),
                     (Some(e), Some(prev)) if e == *prev => {} // arms agree
+                    // KEEP: union arms have different element types → dynamic dispatch needed at runtime.
                     _ => return Type::TypeVar(u32::MAX), // arms disagree
                 }
             }
+            // KEEP: empty union (degenerate) → no element type to agree on; AnyVal is safe fallback.
             agreed.unwrap_or(Type::TypeVar(u32::MAX))
         }
-        // Json/union iterables yield dynamically-typed (boxed) elements.
+        // KEEP: AnyVal/String/Object/Map iterables yield dynamically-typed boxed elements at runtime.
         _ => Type::TypeVar(u32::MAX),
     }
 }

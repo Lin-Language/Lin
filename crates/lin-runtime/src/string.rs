@@ -351,7 +351,9 @@ pub unsafe extern "C" fn lin_string_from_bytes(data: *const u8, len: u32) -> *mu
 pub unsafe extern "C" fn lin_string_concat(a: *const LinString, b: *const LinString) -> *mut LinString {
     let a_len = (*a).len;
     let b_len = (*b).len;
-    let new_len = a_len + b_len;
+    let new_len = a_len.checked_add(b_len).unwrap_or_else(|| {
+        crate::fault::runtime_fault("string concatenation overflow: combined length exceeds 4 GB")
+    });
     let ptr = lin_string_alloc(new_len);
     let dst = (*ptr).data.as_mut_ptr();
     std::ptr::copy_nonoverlapping((*a).data.as_ptr(), dst, a_len as usize);
@@ -364,7 +366,9 @@ pub unsafe extern "C" fn lin_string_concat(a: *const LinString, b: *const LinStr
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_build_n(parts: *const *const LinString, n: u32) -> *mut LinString {
     let parts = std::slice::from_raw_parts(parts, n as usize);
-    let total_len: u32 = parts.iter().map(|&s| (*s).len).sum();
+    let total_len: u32 = parts.iter().try_fold(0u32, |acc, &s| acc.checked_add((*s).len)).unwrap_or_else(|| {
+        crate::fault::runtime_fault("string build_n overflow: combined length exceeds 4 GB")
+    });
     let ptr = lin_string_alloc(total_len);
     let mut dst = (*ptr).data.as_mut_ptr();
     for &s in parts {
@@ -420,16 +424,23 @@ pub unsafe extern "C" fn lin_string_slice(
     ptr
 }
 
+/// Return the single-character string at Unicode code-point index `index`.
+/// A negative `index` counts from the end (codepoint-wise): -1 is the last codepoint.
+/// Returns "" for out-of-range indices. O(n) — walks the UTF-8 string from the start.
+/// Matches the codepoint indexing of `lin_string_char_code` / `std/string.charCode`.
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_char_at(s: *const LinString, index: i32) -> *mut LinString {
-    let len = (*s).len as i32;
-    if index < 0 || index >= len {
-        return lin_string_alloc(0);
+    let st = (*s).as_str();
+    let idx = if index < 0 { index + st.chars().count() as i32 } else { index };
+    if idx < 0 { return lin_string_alloc(0); }
+    match st.chars().nth(idx as usize) {
+        None => lin_string_alloc(0),
+        Some(c) => {
+            let mut buf = [0u8; 4];
+            let encoded = c.encode_utf8(&mut buf);
+            lin_string_from_bytes(encoded.as_ptr(), encoded.len() as u32)
+        }
     }
-    let byte = *(*s).data.as_ptr().add(index as usize);
-    let ptr = lin_string_alloc(1);
-    *(*ptr).data.as_mut_ptr() = byte;
-    ptr
 }
 
 /// Return the Unicode code point at CHAR index `index`. Returns -1 if OOB.
@@ -1218,7 +1229,10 @@ pub unsafe extern "C" fn lin_string_join_arr(arr: *const crate::array::LinArray,
     // Compute total length in one pass.
     let total_len: usize = strs.iter().map(|s| s.len()).sum::<usize>()
         + sep_len * (n - 1);
-    let result = lin_string_alloc(total_len as u32);
+    let total_len_u32 = u32::try_from(total_len).unwrap_or_else(|_| {
+        crate::fault::runtime_fault("string join overflow: combined length exceeds 4 GB")
+    });
+    let result = lin_string_alloc(total_len_u32);
     let mut dst = (*result).data.as_mut_ptr();
     for (idx, s) in strs.iter().enumerate() {
         std::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());

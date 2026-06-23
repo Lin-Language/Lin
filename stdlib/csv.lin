@@ -16,10 +16,11 @@ val CR = 13    // \r
 val LF = 10    // \n
 
 // ── options ───────────────────────────────────────────────────────────────
-// Parser/serialiser options; both keys optional (an omitted key reads as `Null`, taking the
+// Parser/serialiser options; all keys optional (an omitted key reads as `Null`, taking the
 // default). `delimiter` must be a single ASCII byte that is not `"`/CR/LF; `trim` strips ASCII
-// space/tab from unquoted fields.
-export type CsvOptions = { "delimiter": String | Null, "trim": Boolean | Null }
+// space/tab from unquoted fields. `columns`, when present, limits `recordRows` to only the
+// named columns (others are never allocated).
+export type CsvOptions = { "delimiter": String | Null, "trim": Boolean | Null, "columns": String[] | Null }
 
 // We read the delimiter's first byte once (validated to be a single ASCII byte that is not `"`/CR/LF).
 val optDelimByte = (opts: CsvOptions): Int32 =>
@@ -437,13 +438,22 @@ export val rows = (src: Stream<UInt8[]>, opts: CsvOptions = {  }): Stream<String
   lin_stream_csv_rows(src, optDelimByte(opts))
 
 import foreign "lin-runtime"
-  val lin_stream_csv_records: (Stream, Int32) => Stream
+  val lin_stream_csv_records: (Stream, Int32) => Stream<{ String: String }>
+
+import foreign "lin-runtime"
+  val lin_stream_csv_records_projected: (Stream, Int32, String[]) => Stream<{ String: String }>
 
 // Lazily parse a byte stream into a stream of keyed records, using the first row as the header.
 // Each subsequent row becomes a record keyed by the header columns. The header is consumed on the
 // first pull and held for the life of the pipeline.
-// @param src  the source byte stream.
-// @param opts  accepts `{ delimiter, trim }`; the delimiter defaults to ",".
+// @param src   the source byte stream.
+// @param opts  accepts `{ delimiter, trim, columns }`; the delimiter defaults to ",". When
+//              `columns` is provided, only those header columns are materialized per row (others
+//              are never allocated), which reduces memory for files with many unused columns.
 // @returns a `Stream` yielding `{ String: String }` records.
-export val recordRows = (src: Stream<UInt8[]>, opts: CsvOptions = {  }): Stream =>
-  lin_stream_csv_records(src, optDelimByte(opts))
+export val recordRows = (src: Stream<UInt8[]>, opts: CsvOptions = {  }): Stream<{ String: String }> =>
+  val cols = opts["columns"]
+  if cols != null && length(cols) > 0 then
+    lin_stream_csv_records_projected(src, optDelimByte(opts), cols)
+  else
+    lin_stream_csv_records(src, optDelimByte(opts))
