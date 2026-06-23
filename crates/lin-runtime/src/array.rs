@@ -519,6 +519,7 @@ pub unsafe extern "C" fn lin_sealed_ptr_array_set(arr: *mut LinArray, idx: i64, 
 /// fresh +1-owned tagged array. The source array is BORROWED (not consumed).
 #[no_mangle]
 pub unsafe extern "C" fn lin_sealed_ptr_array_to_tagged(arr: *const LinArray) -> *mut LinArray {
+    crate::repr_verify::repr_note("lin_sealed_ptr_array_to_tagged");
     use crate::tagged::*;
     if arr.is_null() { return lin_array_alloc(4); }
     let len = (*arr).len;
@@ -554,6 +555,7 @@ pub unsafe extern "C" fn lin_sealed_array_to_tagged(
     arr: *const LinArray,
     mat: extern "C" fn(*const u8) -> *mut u8,
 ) -> *mut LinArray {
+    crate::repr_verify::repr_note("lin_sealed_array_to_tagged");
     use crate::tagged::*;
     if arr.is_null() { return lin_array_alloc(4); }
     let len = (*arr).len;
@@ -576,6 +578,7 @@ pub unsafe extern "C" fn lin_sealed_array_to_tagged(
 /// Used by codegen's `sealed_array_to_tagged` for container-sourced arrays whose repr is unknown.
 #[no_mangle]
 pub unsafe extern "C" fn lin_sealed_any_to_tagged(arr: *const LinArray) -> *mut LinArray {
+    crate::repr_verify::repr_note("lin_sealed_any_to_tagged");
     if arr.is_null() { return lin_array_alloc(4); }
     match (*arr).elem_tag {
         SEALED_ARRAY_TAG => {

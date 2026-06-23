@@ -44,5 +44,6 @@ pub mod decimal;
 pub mod os;
 pub mod random;
 pub mod regex;
+pub mod repr_verify;
 pub mod url;
 pub mod yaml;

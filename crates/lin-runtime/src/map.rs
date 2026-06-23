@@ -1202,6 +1202,7 @@ pub unsafe extern "C" fn lin_map_copy_except(
 
 /// Normalize ANY dynamic-object representation to a fresh owned `LinMap` (+1).
 pub(crate) unsafe fn dynamic_to_map(tv: *const TaggedVal) -> *mut LinMap {
+    crate::repr_verify::repr_note("dynamic_to_map");
     if tv.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
     match (*tv).tag {
         TAG_MAP => {
@@ -1228,6 +1229,7 @@ pub(crate) unsafe fn dynamic_to_map(tv: *const TaggedVal) -> *mut LinMap {
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_union_force_to_map(tv: *const u8) -> *mut LinMap {
+    crate::repr_verify::repr_note("lin_union_force_to_map");
     dynamic_to_map(tv as *const TaggedVal)
 }
 

@@ -396,6 +396,7 @@ unsafe fn box_named_heap_field(p: *mut u8, nkind: u32, nested: *const u8) -> *mu
 /// Mirrors `materialize_named_payload` but builds a LinMap instead of a LinObject.
 /// RC contract: each heap field is RETAINED into the map; the packed buffer keeps its own +1.
 unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *const u8) -> *mut crate::map::LinMap {
+    crate::repr_verify::repr_note("materialize_named_payload_to_map");
     use crate::tagged::{TaggedVal, TAG_INT32, TAG_INT64, TAG_UINT64, TAG_FLOAT64, TAG_BOOL};
     if named_desc.is_null() {
         return crate::map::lin_map_alloc(0, crate::map::KEY_KIND_STRING);
@@ -532,12 +533,14 @@ unsafe fn materialize_named_payload_to_map(payload: *const u8, named_desc: *cons
 /// Materialize a STANDALONE sealed struct `ptr` (header + payload) into a fresh +1-owned `LinMap`.
 /// `ptr` is the struct base WITH SEALED_HEADER; this adjusts to a header-less payload pointer.
 unsafe fn materialize_sealed_struct_to_map(ptr: *const u8, named_desc: *const u8) -> *mut crate::map::LinMap {
+    crate::repr_verify::repr_note("materialize_sealed_struct_to_map");
     materialize_named_payload_to_map(ptr.add(SEALED_HEADER), named_desc)
 }
 
 /// Public wrapper: materialize a sealed struct into a fresh +1 `LinMap`. Replaces the LinObject
 /// version for all AnyVal-boundary consumers (keys/values/eq/string/json/transfer).
 pub unsafe fn materialize_sealed_to_map_pub(ptr: *mut u8, named_desc: *const u8) -> *mut crate::map::LinMap {
+    crate::repr_verify::repr_note("materialize_sealed_to_map_pub");
     materialize_sealed_struct_to_map(ptr as *const u8, named_desc)
 }
 
@@ -554,6 +557,7 @@ pub unsafe fn materialize_sealed_elem_boxed(payload: *const u8, named_desc: *con
 
 /// Public wrapper — called from `lin_sealed_any_to_tagged` in array.rs.
 pub(crate) unsafe fn materialize_named_payload_to_map_pub(payload: *const u8, named_desc: *const u8) -> *mut crate::map::LinMap {
+    crate::repr_verify::repr_note("materialize_named_payload_to_map_pub");
     materialize_named_payload_to_map(payload, named_desc)
 }
 
