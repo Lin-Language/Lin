@@ -1587,6 +1587,11 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                     if is_rc_type(result_type) {
                         builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
                         builder.register_owned(dst, result_type.clone());
+                    } else if result_type.is_pure_int_lit_union() {
+                        // A pure-IntLit-union sealed field is read as i32 and BOXED to a fresh
+                        // +1 TaggedVal*(TAG_INT32) by codegen. Register it owned so the scope-exit
+                        // release (lin_tagged_release) is emitted. No Retain: the box is fresh.
+                        builder.register_owned(dst, result_type.clone());
                     }
                     return dst;
                 }

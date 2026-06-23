@@ -194,6 +194,14 @@ impl<'ctx> Codegen<'ctx> {
             // Union type — if value is a pointer, box as object (most common case).
             // If it's already a tagged pointer, return as-is.
             Type::Union(variants) => {
+                // Pure IntLit-union: physical representation is i32 (not a heap pointer). Box as
+                // TAG_INT32 so the result is a valid TaggedVal* for all dynamic consumers.
+                if variants.iter().all(|v| matches!(v, Type::IntLit(_))) && !variants.is_empty() && val.is_int_value() {
+                    let i32_ty = self.context.i32_type();
+                    let i32v = self.builder.int_s_extend_or_bit_cast(val.into_int_value(), i32_ty, "ilu_bv_i32");
+                    return self.builder.call(self.rt.box_int32, &[i32v.into()], "ilu_bv_box")
+                        .try_as_basic_value().unwrap_basic();
+                }
                 if val.is_pointer_value() {
                     // If all variants are Object types, they are now LinMap* (Phase 2).
                     let all_objects = variants.iter().all(|v| matches!(v, Type::Object { .. }));

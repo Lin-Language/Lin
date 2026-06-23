@@ -463,10 +463,19 @@ impl<'ctx> Codegen<'ctx> {
                 continue;
             }
             let (offset, _) = Self::sealed_field_layout(fields, name);
+            let fld_ty = fields.get(name).cloned().unwrap_or(Type::Null);
             let p = unsafe {
                 self.builder.gep(i8_ty, obj, &[i64_ty.const_int(offset, false)], "sealed_stk_set_p")
             };
-            self.builder.store(p, *val);
+            // Pure IntLit-union: incoming value may be a TaggedVal* (pointer) from Union context;
+            // unbox to i32 for the i32 scalar slot.
+            if fld_ty.is_pure_int_lit_union() && val.is_pointer_value() {
+                let i32_val = self.builder.call(self.rt.unbox_int32, &[(*val).into()], "ilu_stk_unbox")
+                    .try_as_basic_value().unwrap_basic();
+                self.builder.store(p, i32_val);
+            } else {
+                self.builder.store(p, *val);
+            }
         }
         obj.into()
     }
@@ -510,6 +519,15 @@ impl<'ctx> Codegen<'ctx> {
             let p = unsafe {
                 self.builder.gep(self.context.i8_type(), obj, &[i64_ty.const_int(offset, false)], "sealed_set_p")
             };
+            // Pure IntLit-union: physical slot is i32. The incoming value may be a TaggedVal*
+            // (pointer) from a Union context — unbox to i32 before storing.
+            if fld_ty.is_pure_int_lit_union() && stored.is_pointer_value() {
+                let i32_val = self.builder.call(self.rt.unbox_int32, &[stored.into()], "ilu_con_unbox")
+                    .try_as_basic_value().unwrap_basic();
+                self.builder.store(p, i32_val);
+                // Skip the retain check below (scalar slot, no RC).
+                continue;
+            }
             self.builder.store(p, stored);
             // A representation-changing coerce USUALLY produces a FRESH +1-owned value — a sealed
             // record/array PROJECTION (allocates), a flat-array WIDEN (fresh buffer), or a Json→Map
@@ -653,6 +671,14 @@ impl<'ctx> Codegen<'ctx> {
                 vals.push((k.clone(), packed, fty, true));
                 continue;
             }
+            // Pure IntLit-union: the map holds a boxed TAG_INT32 value; unbox to raw i32 for
+            // direct storage into the i32 sealed field slot (no RC — scalar).
+            if fty.is_pure_int_lit_union() && tagged.is_pointer_value() {
+                let i32_val = self.builder.call(self.rt.unbox_int32, &[tagged.into()], "ilu_proj_i32")
+                    .try_as_basic_value().unwrap_basic();
+                vals.push((k.clone(), i32_val, fty, false));
+                continue;
+            }
             let v = self.unbox_tagged_val_to_type(tagged, &fty);
             let owned = matches!(fty, Type::Object { .. }) && Self::sealed_fields(&fty).is_some();
             vals.push((k.clone(), v, fty, owned));
@@ -728,6 +754,13 @@ impl<'ctx> Codegen<'ctx> {
                     let packed = self.sealed_array_project_owned(rec_box, &Type::TypeVar(u32::MAX), &fty);
                     self.builder.call(self.rt.tagged_release, &[rec_box.into()], "");
                     rec_vals.push((k.clone(), packed, fty, true));
+                } else if fty.is_pure_int_lit_union() && rec_box.is_pointer_value() {
+                    // Pure IntLit-union: lin_record_get_field returned a fresh +1 TAG_INT32 box;
+                    // unbox to i32 for direct storage in the sealed slot, then release the box.
+                    let i32_val = self.builder.call(self.rt.unbox_int32, &[rec_box.into()], "ilu_rec_i32")
+                        .try_as_basic_value().unwrap_basic();
+                    self.builder.call(self.rt.tagged_release, &[rec_box.into()], "");
+                    rec_vals.push((k.clone(), i32_val, fty, false));
                 } else {
                     let v = self.unbox_tagged_val_to_type(rec_box, &fty);
                     if Self::result_is_heap_pointer(&fty) && v.is_pointer_value() {
@@ -767,6 +800,13 @@ impl<'ctx> Codegen<'ctx> {
             if Self::sealed_array_elem(&fty).is_some() {
                 let packed = self.sealed_array_project_owned(tagged, &Type::TypeVar(u32::MAX), &fty);
                 vals.push((k.clone(), packed, fty, true));
+                continue;
+            }
+            // Pure IntLit-union: map holds a borrowed TAG_INT32 box; unbox to raw i32.
+            if fty.is_pure_int_lit_union() && tagged.is_pointer_value() {
+                let i32_val = self.builder.call(self.rt.unbox_int32, &[tagged.into()], "ilu_mproj_i32")
+                    .try_as_basic_value().unwrap_basic();
+                vals.push((k.clone(), i32_val, fty, false));
                 continue;
             }
             let v = self.unbox_tagged_val_to_type(tagged, &fty);
