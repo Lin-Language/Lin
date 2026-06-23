@@ -14154,6 +14154,72 @@ main()
     assert_eq!(out, vec!["ok:Ada", "err"]);
 }
 
+#[test]
+fn test_is_union_alias_of_records_structural_check() {
+    // Soundness regression: when a named type alias resolves to a Union whose members include
+    // non-empty Object types, `is <Alias>` must use structural field-type validation (MatchesSchema)
+    // per member, not a bare tag check. The bare-tag path (master) made every record match every
+    // Object member of the union, so:
+    //   - `squareVal is Shape` → true (correct, it is a Shape)
+    //   - an unrelated record `is Shape` → true (WRONG — bare tag == any record)
+    //   - `intVal is CircleOrInt32` → true (WRONG — bare tag matches record member even for Int)
+    //
+    // Cases exercised:
+    //   1. `is <UnionAlias>` (pattern = union-alias name): a value that IS a member matches; an
+    //      unrelated record does NOT match; a scalar does not match the record alias.
+    //   2. match arm dispatch with individual record arms (A|B union scrutinee): correct arm fires.
+    //   3. Narrowed field-read after a successful `is` check is sound.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type Circle = { "kind": String, "radius": Int32 }
+type Square = { "kind": String, "side": Int32 }
+type Rect = { "w": Int32, "h": Int32 }
+type Shape = Circle | Square
+type CircleOrInt32 = Circle | Int32
+
+// `is Shape` (union alias as pattern): Circle matches, Square matches,
+// but an unrelated record (Rect, no "kind"/"radius"/"side") must NOT match.
+val c: AnyVal = { "kind": "circle", "radius": 5 }
+val s: AnyVal = { "kind": "square", "side": 10 }
+val r: AnyVal = { "w": 3, "h": 4 }
+print(if c is Shape then "c-is-shape" else "WRONG-c-not-shape")
+print(if s is Shape then "s-is-shape" else "WRONG-s-not-shape")
+print(if r is Shape then "WRONG-r-is-shape" else "r-not-shape")
+
+// match arm dispatch on an A|B union: correct arm fires for each record member
+val circleVal: Shape = { "kind": "circle", "radius": 5 }
+val squareVal: Shape = { "kind": "square", "side": 10 }
+val describeShape = (v: Shape): Null =>
+  match v
+    is Circle => print("circle:r=${toString(v["radius"])}")
+    is Square => print("square:side=${toString(v["side"])}")
+describeShape(circleVal)
+describeShape(squareVal)
+
+// A|Int32: scalar does not match the record alias
+val intVal: CircleOrInt32 = 42
+val recVal: CircleOrInt32 = { "kind": "circle", "radius": 7 }
+print(if intVal is Circle then "WRONG-int-matched-circle" else "int-not-circle")
+print(if recVal is Circle then "circle-matched" else "WRONG-circle-not-matched")
+
+// narrowed field read after is must be sound
+val narrow = (v: CircleOrInt32): Null =>
+  if v is Circle then print("narrowed-radius=${toString(v["radius"])}") else print("not-circle")
+narrow(recVal)
+narrow(intVal)
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "c-is-shape", "s-is-shape", "r-not-shape", // union-alias is check
+            "circle:r=5", "square:side=10",             // match arm dispatch
+            "int-not-circle", "circle-matched",         // A|Int32 discrimination
+            "narrowed-radius=7", "not-circle",          // narrowed field read
+        ]
+    );
+}
+
 // ── singleton string-literal types (ADR-034) ──────────────────────────────────
 
 #[test]
