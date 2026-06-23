@@ -595,12 +595,36 @@ impl<'ctx> Codegen<'ctx> {
         let fe_exit = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_b);
 
-        // ── 0xFD branch: load struct pointer + retain ─────────────────────────────────────────────
+        // ── 0xFD branch: inline bounds-check + pointer-spine load + retain ───────────────────────
+        // Inlined equivalent of lin_sealed_ptr_array_get_ptr (eliminates the call overhead on the
+        // hot routeTrips[i] path — ~7% RANGE self-time at profile). LinArray layout: len u64 @ 8,
+        // data ptr @ 24. Spine is an array of 8-byte struct pointers: data[actual] is the Trip ptr.
         self.builder.position_at_end(fd_b);
+        // len @ arr+8 (already loaded for the fe_b etag dispatch above, but in a different block —
+        // re-load here; LLVM CSE will hoist it).
+        let fd_len_p = unsafe { self.builder.gep(i8_ty, arr_ptr, &[i64_ty.const_int(8, false)], "smat_fd_lenp") };
+        let fd_len = self.builder.load(i64_ty, fd_len_p, "smat_fd_len").into_int_value();
+        let zero64 = i64_ty.const_zero();
+        let fd_neg = self.builder.int_compare(IntPredicate::SLT, idx, zero64, "smat_fd_neg");
+        let fd_wrap = self.builder.int_add(fd_len, idx, "smat_fd_wrap");
+        let fd_actual = self.builder.select(fd_neg, fd_wrap, idx, "smat_fd_act").into_int_value();
+        // OOB cold path: delegate to the runtime for the fault message (same as 0xFE path above).
+        let fd_oob = self.builder.int_compare(IntPredicate::UGE, fd_actual, fd_len, "smat_fd_oob");
+        let fd_ok_b  = self.context.append_basic_block(llvm_fn, "smat_fd_ok");
+        let fd_oob_b = self.context.append_basic_block(llvm_fn, "smat_fd_oob");
+        self.builder.conditional_branch(fd_oob, fd_oob_b, fd_ok_b);
+        self.builder.position_at_end(fd_oob_b);
         let get_fn = self.get_or_declare_fn("lin_sealed_ptr_array_get_ptr",
             ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
-        let sptr = self.builder.call(get_fn, &[arr_ptr.into(), idx.into()], "smat_fd_sp")
-            .try_as_basic_value().unwrap_basic();
+        self.builder.call(get_fn, &[arr_ptr.into(), idx.into()], "smat_fd_oobcall");
+        self.builder.unreachable();
+        // Fast (in-bounds) path: load the struct pointer from data[actual * 8].
+        self.builder.position_at_end(fd_ok_b);
+        let fd_data_pp = unsafe { self.builder.gep(i8_ty, arr_ptr, &[i64_ty.const_int(24, false)], "smat_fd_dpp") };
+        let fd_data = self.builder.load(ptr_ty, fd_data_pp, "smat_fd_data").into_pointer_value();
+        let fd_slot_off = self.builder.int_mul(fd_actual, i64_ty.const_int(8, false), "smat_fd_soff");
+        let fd_slot_p = unsafe { self.builder.gep(i8_ty, fd_data, &[fd_slot_off], "smat_fd_sp") };
+        let sptr = self.builder.load(ptr_ty, fd_slot_p, "smat_fd_sptr");
         self.emit_rc_retain_inline(sptr.into_pointer_value());
         let fd_exit = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_b);
