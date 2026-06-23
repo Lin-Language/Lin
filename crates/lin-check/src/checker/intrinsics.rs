@@ -479,8 +479,12 @@ impl Checker {
         // arrayAllocate(n) => AnyVal[] — null-filled tagged array of length n
         self.define_intrinsic("lin_array_allocate", Type::func(vec![Type::Int32], Type::Array(Box::new(Type::TypeVar(u32::MAX)))));
 
-        // arrayAllocateFilled(n, val) => T[] — flat scalar array of length n filled with val
-        // Uses TypeVar(u32::MAX) for val so any scalar can be passed; returns AnyVal[] (TypeVar).
-        self.define_intrinsic("lin_array_allocate_filled", Type::func(vec![Type::Int32, Type::TypeVar(u32::MAX)], Type::Array(Box::new(Type::TypeVar(u32::MAX)))));
+        // arrayAllocateFilled(n, fill) => T[] — flat scalar array of length n filled with `fill`.
+        // Uses a proper TypeVar(9201) for the fill value so the element type `T` is preserved
+        // through the intrinsic boundary: the substitution `T = <fill-type>` flows into
+        // `collect_type_subs` and the return `T[]` resolves to the concrete element type.
+        // This lets monomorphization emit a flat allocation (e.g. `Int32[]`) rather than a tagged
+        // one, matching the flat reader codegen emits for `T[]`-typed variables.
+        self.define_intrinsic("lin_array_allocate_filled", Type::func(vec![Type::Int32, Type::TypeVar(9201)], Type::Array(Box::new(Type::TypeVar(9201)))));
     }
 }
