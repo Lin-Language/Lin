@@ -262,10 +262,11 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
 /// still produces the flat `$Int32` specialization.
 fn erase_nonconcrete_typevars(ty: &Type) -> Type {
     match ty {
-        // Leftover/unsolved inference var (below the quantified-generic range): erase to Json.
+        // KEEP: leftover/unsolved inference var (below the quantified-generic range): erase to Json
+        // so the specialization uses the safe uniform tagged repr rather than a bogus concrete type.
         Type::TypeVar(id) if *id < GENERIC_TV_BASE => Type::TypeVar(u32::MAX),
-        // A `Never` binding is a DEGENERATE empty-collection element pin (`[]` literal flowing into
-        // a generic param fixes `T = Never`), carrying no usable runtime representation — just like
+        // KEEP: a `Never` binding is a DEGENERATE empty-collection element pin (`[]` literal flowing
+        // into a generic param fixes `T = Never`), carrying no usable runtime representation — just like
         // an unbound inference var. A native specialization keyed on `Never` (e.g. `push$Never`)
         // emits a malformed call (an `i8`/`ptr` element slot that mismatches the boxed value the
         // empty array actually stores). Erase it to the `Json` wildcard so the call monomorphizes at

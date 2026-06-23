@@ -3239,6 +3239,8 @@ pub(crate) fn lower_flatmap_terminal(
         let (_, fm_ret) = callback_signature(&args[1]);
         let out_elem_ty = match result_type {
             Type::Array(t) | Type::Iterator(t) => (**t).clone(),
+            // KEEP: result_type is the checker's declared return (always Array(T) for lin_flatMap, but
+            // AnyVal is the correct safe fallback if for any reason it isn't — the caller decides repr).
             _ => Type::TypeVar(u32::MAX),
         };
         let inner_elem_ty = iter_elem_type(&fm_ret);
@@ -3328,6 +3330,8 @@ pub(crate) fn lower_flatmap_terminal(
     let read_elem_ty = combinator_read_elem_ty(base, builder, ctx);
     let out_elem_ty = match result_type {
         Type::Array(t) | Type::Iterator(t) => (**t).clone(),
+        // KEEP: same defensive fallback as the bare-fn path above — the checker always produces
+        // Array(T) for flatMap, but AnyVal is safe if the declared type is unexpectedly dynamic.
         _ => Type::TypeVar(u32::MAX),
     };
     let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
@@ -3352,6 +3356,8 @@ pub(crate) fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut Fu
     // Output element type per the map's declared result type; storage matches it.
     let out_elem_ty = match result_type {
         Type::Array(t) | Type::Iterator(t) => (**t).clone(),
+        // KEEP: lin_map always returns Array(U) per the checker; AnyVal fallback is defensive for
+        // any future call site where result_type is unexpectedly a stream/union/dynamic type.
         _ => Type::TypeVar(u32::MAX),
     };
     // Read at the source's PROVABLE representation: a flat scalar only for a provably-flat producer
@@ -3497,6 +3503,8 @@ pub(crate) fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut
     // filter preserves the element type; storage matches it.
     let out_elem_ty = match result_type {
         Type::Array(t) | Type::Iterator(t) => (**t).clone(),
+        // KEEP: lin_filter always returns Array(T) per the checker; AnyVal fallback is defensive for
+        // any future call site where result_type is unexpectedly a stream/union/dynamic type.
         _ => Type::TypeVar(u32::MAX),
     };
     // Read at the source's PROVABLE representation (ADR-044): flat scalar for a provably-flat

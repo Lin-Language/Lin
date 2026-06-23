@@ -277,7 +277,11 @@ impl Checker {
                     }).unwrap_or_default();
                     let field_ty = if let Type::Object { fields: ref obj_fields, .. } = value_ty {
                         obj_fields.get(&key).cloned().unwrap_or(Type::Null)
-                    } else { Type::TypeVar(u32::MAX) };
+                    } else {
+                        // KEEP: param type is AnyVal/union/generic — field type is dynamically unknowable;
+                        // AnyVal is the correct static type for a field destructured from a dynamic record.
+                        Type::TypeVar(u32::MAX)
+                    };
                     let fslot = match &f.pattern {
                         Pattern::Ident(fname, name_span) => {
                             self.check_shadowing(fname, *name_span);
@@ -294,6 +298,8 @@ impl Checker {
                 }
                 let rest_slot = obj_rest.as_ref().map(|rest_name| {
                     self.check_shadowing(rest_name, span);
+                    // KEEP: the rest `...x` of an object destructure collects all remaining fields
+                    // as an open record whose shape is statically unknown → AnyVal is correct here.
                     self.env.define(rest_name.clone(), Type::TypeVar(u32::MAX), false)
                 });
                 out.push(TypedStmt::Destructure {
@@ -315,6 +321,8 @@ impl Checker {
                     match value_ty {
                         Type::FixedArray(types) => types.get(i).cloned().unwrap_or(Type::Null),
                         Type::Array(inner) => (**inner).clone(),
+                        // KEEP: param type is AnyVal/union/generic — element type is dynamically
+                        // unknowable; AnyVal is the correct static type for the destructured element.
                         _ => Type::TypeVar(u32::MAX),
                     }
                 };
