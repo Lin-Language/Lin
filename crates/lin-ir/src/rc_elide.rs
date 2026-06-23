@@ -1031,6 +1031,7 @@ fn substitute_temp_in_instr(instr: &mut Instruction, old: Temp, new: Temp) {
         Instruction::FreeBoxShell { val } => { sub!(val); }
         Instruction::FreeBoxShellIfDistinct { val, other } => { sub!(val); sub!(other); }
         Instruction::ReleaseIfDistinct { val, other } => { sub!(val); sub!(other); }
+        Instruction::ReleaseRawIfDistinct { val, other, .. } => { sub!(val); sub!(other); }
         Instruction::IsType { val, .. } => { sub!(val); }
         Instruction::SumTagEq { val, .. } => { sub!(val); }
         Instruction::HasPattern { val, .. } => { sub!(val); }

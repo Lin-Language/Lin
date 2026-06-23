@@ -448,10 +448,10 @@ fn run_block(
             Instruction::Release { val, .. } => {
                 release(&mut st, *val, func, block, out, collect, instr);
             }
-            // ReleaseIfDistinct frees the value conditionally (only when distinct from `other`). It
-            // is NOT an unconditional decrement we can balance-track, and reading `other` is a guard
-            // compare, not a deref — treat as neutral (do not flag, do not decrement). Documented skip.
-            Instruction::ReleaseIfDistinct { .. } => {}
+            // ReleaseIfDistinct / ReleaseRawIfDistinct free the value conditionally (only when
+            // distinct from `other`). NOT unconditional decrements we can balance-track; treat as
+            // neutral (do not flag, do not decrement). Documented skip.
+            Instruction::ReleaseIfDistinct { .. } | Instruction::ReleaseRawIfDistinct { .. } => {}
 
             // FreeCell releases the cell's owned VALUE then frees the cell. The cell pointer is its
             // own lifecycle (a MakeCell result), not the boxed heap values we track; neutral.

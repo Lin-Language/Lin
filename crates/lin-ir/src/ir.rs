@@ -547,6 +547,13 @@ pub enum Instruction {
     /// whose separate full release already reclaimed it. Maps to `lin_tagged_release_if_distinct`.
     /// Null/cached-box safe. A flat-scalar element box has no inner, so this degrades to a shell free.
     ReleaseIfDistinct { val: Temp, other: Temp },
+    /// Release a RAW (non-tagged) heap value `val` with type `ty`, but ONLY when `val` and `other`
+    /// are different pointers. Used by the heap-accumulator reduce inline path to release the old
+    /// accumulator when the body produces a new one, without double-freeing for identity reducers
+    /// (where body returns the same pointer). Dispatches `emit_release(val, ty)` — the correct
+    /// type-aware release fn (lin_map_release, lin_sealed_release, etc.) — guarded by a raw pointer
+    /// comparison (icmp eq). NOT safe for `TaggedVal*` — use `ReleaseIfDistinct` for those.
+    ReleaseRawIfDistinct { val: Temp, other: Temp, ty: Type },
     /// result = val is type_tag? (returns bool)
     IsType { dst: Temp, val: Temp, ty: Type },
     /// UNBOXED SUM TYPE (unboxed-sumtype Stage 1): `result = (val's inline tag == the tag of the
