@@ -420,16 +420,23 @@ pub unsafe extern "C" fn lin_string_slice(
     ptr
 }
 
+/// Return the single-character string at Unicode code-point index `index`.
+/// A negative `index` counts from the end (codepoint-wise): -1 is the last codepoint.
+/// Returns "" for out-of-range indices. O(n) — walks the UTF-8 string from the start.
+/// Matches the codepoint indexing of `lin_string_char_code` / `std/string.charCode`.
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_char_at(s: *const LinString, index: i32) -> *mut LinString {
-    let len = (*s).len as i32;
-    if index < 0 || index >= len {
-        return lin_string_alloc(0);
+    let st = (*s).as_str();
+    let idx = if index < 0 { index + st.chars().count() as i32 } else { index };
+    if idx < 0 { return lin_string_alloc(0); }
+    match st.chars().nth(idx as usize) {
+        None => lin_string_alloc(0),
+        Some(c) => {
+            let mut buf = [0u8; 4];
+            let encoded = c.encode_utf8(&mut buf);
+            lin_string_from_bytes(encoded.as_ptr(), encoded.len() as u32)
+        }
     }
-    let byte = *(*s).data.as_ptr().add(index as usize);
-    let ptr = lin_string_alloc(1);
-    *(*ptr).data.as_mut_ptr() = byte;
-    ptr
 }
 
 /// Return the Unicode code point at CHAR index `index`. Returns -1 if OOB.
