@@ -55,7 +55,11 @@ use crate::ir::*;
 use crate::liveness::instr_use_def;
 
 /// Run redundant-read elimination on all functions in the module.
+/// Set `LIN_NO_CSE=1` to disable this pass for A/B comparison (same binary).
 pub fn run(module: &mut LinModule) {
+    if std::env::var("LIN_NO_CSE").is_ok() {
+        return;
+    }
     for func in &mut module.functions {
         run_fn(func);
     }
@@ -103,24 +107,50 @@ fn run_fn(func: &mut LinFunction) {
     // We collect first, then apply, to avoid borrow conflicts.
     let mut replacements: Vec<(usize, usize, Temp, Temp)> = Vec::new(); // (bi, ii, old_dst, new_src)
 
+    // Pre-scan all blocks for Const::Str instructions so classify_key can recognise
+    // a string-literal key temp (whose runtime type is `Str`, not `StrLit`) as a
+    // canonical ReadKey::Field. Two `Const { val: Str("k"), .. }` temps in the same
+    // block have the same key value and should CSE-match each other.
+    let mut str_consts: HashMap<Temp, String> = HashMap::new();
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            if let Instruction::Const { dst, val: Const::Str(s) } = instr {
+                str_consts.insert(*dst, s.clone());
+            }
+        }
+    }
+
     for (bi, block) in func.blocks.iter().enumerate() {
         let mut avail: AvailMap = HashMap::new();
         // alias_map: temp → canonical alias root (tracks Copy/Bind/Coerce aliases within block)
         let mut alias_map: HashMap<Temp, Temp> = HashMap::new();
         // Track which temps have "escaped" (passed to a call or container store earlier in block).
         let mut escaped: HashSet<Temp> = HashSet::new();
+        // source_map: temp → (container_root, key) where this temp was loaded FROM.
+        // Used to detect aliasing through containers: if T1 and T2 were both loaded from the
+        // same (container, key), a write through T2 must also invalidate reads on T1.
+        let mut source_map: HashMap<Temp, (Temp, ReadKey)> = HashMap::new();
+        // gvget_canon: slot → the first GVGet temp seen for that slot in this block (for
+        // immutable slots) or the most-recent-since-last-write (for mutable slots).
+        // Two GVGet temps canonicalized to the same root make the container alias-tracking
+        // work: if m1 and m2 are both loaded from `outer["a"]`, we need the two GVGet(outer)
+        // temps to have the same alias root so the source_map entries match.
+        let mut gvget_canon: HashMap<usize, Temp> = HashMap::new();
 
         for (ii, instr) in block.instructions.iter().enumerate() {
             match instr {
                 Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty, .. } => {
                     let obj_root = alias_root(*object, &alias_map);
-                    let read_key = classify_key(*key, key_ty, &func.temp_types);
+                    let read_key = classify_key(*key, key_ty, &func.temp_types, &str_consts);
                     if let Some(read_key) = read_key {
                         let repr = result_repr(result_ty);
                         let map_key = (obj_root, read_key.clone(), repr);
                         if let Some(avail_read) = avail.get(&map_key) {
                             // Redundant read: schedule replacement.
                             replacements.push((bi, ii, *dst, avail_read.dst));
+                            // Alias dst → avail_read.dst so that writes through dst also
+                            // invalidate reads on the original avail_read.dst root.
+                            alias_map.insert(*dst, alias_root(avail_read.dst, &alias_map));
                         } else {
                             // First read: add to available set.
                             // Only CSE on Map (string-key) and non-array types — array indexing
@@ -130,12 +160,20 @@ fn run_fn(func: &mut LinFunction) {
                             // as long as the map/object isn't mutated.
                             if !is_array_like(obj_ty) {
                                 let _ = key_ty;
-                                avail.insert(map_key, AvailRead { dst: *dst, obj: *object, key: read_key });
+                                avail.insert(map_key, AvailRead { dst: *dst, obj: *object, key: read_key.clone() });
+                                // Record this temp's origin for aliasing (container, key).
+                                source_map.insert(*dst, (obj_root, read_key));
+                            } else {
+                                alias_map.insert(*dst, *dst);
+                                continue; // array-like: no CSE, no source tracking
                             }
                         }
+                    } else {
+                        alias_map.insert(*dst, *dst);
+                        continue;
                     }
-                    // The dst is a new definition: update alias_map.
-                    alias_map.insert(*dst, *dst);
+                    // The dst is a new definition (or aliased above for CSE case): insert if not already set.
+                    alias_map.entry(*dst).or_insert(*dst);
                 }
 
                 Instruction::FieldGet { dst, object, field, result_ty, .. } => {
@@ -145,16 +183,30 @@ fn run_fn(func: &mut LinFunction) {
                     let map_key = (obj_root, read_key.clone(), repr);
                     if let Some(avail_read) = avail.get(&map_key) {
                         replacements.push((bi, ii, *dst, avail_read.dst));
+                        alias_map.insert(*dst, alias_root(avail_read.dst, &alias_map));
                     } else {
-                        avail.insert(map_key, AvailRead { dst: *dst, obj: *object, key: read_key });
+                        avail.insert(map_key, AvailRead { dst: *dst, obj: *object, key: read_key.clone() });
+                        source_map.insert(*dst, (obj_root, read_key));
+                        alias_map.insert(*dst, *dst);
                     }
-                    alias_map.insert(*dst, *dst);
                 }
 
                 // Alias-propagating instructions: Copy/Bind alias src → dst (same object).
                 Instruction::Copy { dst, src } | Instruction::Bind { dst, src, .. } => {
                     let root = alias_root(*src, &alias_map);
                     alias_map.insert(*dst, root);
+                    // Propagate source tracking through aliases.
+                    if let Some(src_origin) = source_map.get(&root).cloned() {
+                        source_map.insert(*dst, src_origin);
+                    }
+                }
+                // CloneBox creates a new owned reference to the same object — same source.
+                Instruction::CloneBox { dst, src, .. } => {
+                    alias_map.insert(*dst, *dst); // different RC, treat as new root for CSE
+                    let src_root = alias_root(*src, &alias_map);
+                    if let Some(src_origin) = source_map.get(&src_root).cloned() {
+                        source_map.insert(*dst, src_origin);
+                    }
                 }
                 Instruction::Coerce { dst, src, .. } => {
                     // A coerce may change representation; conservatively NOT an alias.
@@ -171,13 +223,17 @@ fn run_fn(func: &mut LinFunction) {
                 // FieldSet: invalidate available reads on the object (and its aliases).
                 Instruction::FieldSet { object, .. } => {
                     let obj_root = alias_root(*object, &alias_map);
-                    invalidate_by_obj(&mut avail, obj_root, &escaped);
+                    // Also invalidate reads on any temp that was loaded from the SAME container slot
+                    // as `object` — they are aliases of `object` through the container path.
+                    invalidate_by_obj_and_source(&mut avail, obj_root, &escaped, &source_map, &alias_map);
                 }
 
                 // IndexSet: invalidate available reads on the object (and its aliases).
                 Instruction::IndexSet { object, .. } => {
                     let obj_root = alias_root(*object, &alias_map);
-                    invalidate_by_obj(&mut avail, obj_root, &escaped);
+                    // Also invalidate reads on any temp that was loaded from the SAME container slot
+                    // as `object` — they are aliases of `object` through the container path.
+                    invalidate_by_obj_and_source(&mut avail, obj_root, &escaped, &source_map, &alias_map);
                 }
 
                 // Calls: conservatively invalidate all reads whose obj was passed to the call,
@@ -231,6 +287,30 @@ fn run_fn(func: &mut LinFunction) {
                     escaped.insert(alias_root(*value, &alias_map));
                 }
 
+                // GlobalValGet: alias repeated reads of the same slot (within the block,
+                // with no intervening write) to the same canonical root. This allows
+                // source_map to correctly recognise two loads from `container["k"]` as
+                // the same object when `container` is a global variable read twice.
+                Instruction::GlobalValGet { dst, slot, .. } => {
+                    if let Some(&canon) = gvget_canon.get(slot) {
+                        alias_map.insert(*dst, canon);
+                        if let Some(origin) = source_map.get(&canon).cloned() {
+                            source_map.insert(*dst, origin);
+                        }
+                    } else {
+                        gvget_canon.insert(*slot, *dst);
+                        alias_map.insert(*dst, *dst);
+                    }
+                }
+
+                // GlobalValSet: invalidate available reads on the slot's canonical temp
+                // (the value stored there may have changed), and reset the canon entry.
+                Instruction::GlobalValSet { slot, .. } => {
+                    if let Some(canon) = gvget_canon.remove(slot) {
+                        invalidate_by_obj_exact(&mut avail, canon);
+                    }
+                }
+
                 // Any other instruction that defines temps: add to alias_map as new definitions.
                 other => {
                     let (_uses, defs) = instr_use_def(other);
@@ -244,11 +324,11 @@ fn run_fn(func: &mut LinFunction) {
             // REDEFINED by this instruction, invalidate it.
             let (_uses, defs) = instr_use_def(instr);
             for def in &defs {
-                let def_root = *def; // a new definition means this temp gets a fresh alias root
                 // Invalidate any available read whose obj is this defined temp.
                 invalidate_by_obj_exact(&mut avail, *def);
-                // Also update the alias_map entry for this temp to itself (new def).
-                alias_map.insert(*def, def_root);
+                // Update alias_map only if the match arm above did NOT already set an
+                // explicit alias (e.g. GVGet canonicalization, CSE Copy alias).
+                alias_map.entry(*def).or_insert(*def);
             }
         }
     }
@@ -285,16 +365,20 @@ fn alias_root(t: Temp, alias_map: &HashMap<Temp, Temp>) -> Temp {
 
 /// Classify the key of an Index into a canonical ReadKey, or return None if
 /// the key is not a constant string (in which case we can't CSE this read).
-fn classify_key(key: Temp, key_ty: &lin_check::types::Type, temp_types: &HashMap<Temp, lin_check::types::Type>) -> Option<ReadKey> {
-    // Check if the key's type is a string literal (StrLit) — a constant.
-    match temp_types.get(&key).unwrap_or(key_ty) {
-        lin_check::types::Type::StrLit(s) => Some(ReadKey::Field(s.clone())),
-        _ => {
-            // Non-constant key: use TempKey for CSE (same temp means same key value,
-            // as long as the key temp hasn't been redefined).
-            Some(ReadKey::TempKey(key))
-        }
+fn classify_key(key: Temp, key_ty: &lin_check::types::Type, temp_types: &HashMap<Temp, lin_check::types::Type>, str_consts: &HashMap<Temp, String>) -> Option<ReadKey> {
+    // 1. StrLit type: compile-time string singleton (used in union discriminants).
+    if let lin_check::types::Type::StrLit(s) = temp_types.get(&key).unwrap_or(key_ty) {
+        return Some(ReadKey::Field(s.clone()));
     }
+    // 2. Const::Str temp: a string-literal constant lowered to a `Str` runtime temp.
+    //    Two `Const { val: Str("k") }` temps in the same function carry identical
+    //    pointer values (interned string globals) — treat them as the same field key.
+    if let Some(s) = str_consts.get(&key) {
+        return Some(ReadKey::Field(s.clone()));
+    }
+    // Non-constant key: use TempKey for CSE (same temp means same key value,
+    // as long as the key temp hasn't been redefined).
+    Some(ReadKey::TempKey(key))
 }
 
 /// Classify the result type of an Index/FieldGet into a coarse representation.
@@ -315,12 +399,49 @@ fn is_array_like(ty: &lin_check::types::Type) -> bool {
     matches!(ty, lin_check::types::Type::Array(_) | lin_check::types::Type::FixedArray(_))
 }
 
-/// Invalidate all available reads whose `obj` root matches `obj_root`,
-/// accounting for escape: if an available read's obj has escaped, it is also vulnerable
-/// to aliased writes (but since we track by root, an alias of the same root already
-/// covers that).
-fn invalidate_by_obj(avail: &mut AvailMap, obj_root: Temp, _escaped: &HashSet<Temp>) {
-    avail.retain(|(o, _, _), _| *o != obj_root);
+/// Like `invalidate_by_obj` but additionally evicts reads on any temp that was loaded
+/// FROM THE SAME CONTAINER as `obj_root` (same container_root, any key).
+///
+/// This handles two aliasing patterns:
+///
+/// Pattern 1 — same key:
+///   m1 = container["k"]   m2 = container["k"]   (same object, different temps via alias)
+///   x = m1["field"]       (cached under m1_root)
+///   m2["field"] = Y        (write through m2 — m2_root may equal m1_root if CSE'd)
+///
+/// Pattern 2 — different keys but same object:
+///   shared = {}; outer["a"] = shared; outer["b"] = shared
+///   ma = outer["a"]; mb = outer["b"]   (same object, different keys)
+///   x = ma["field"]       (cached under ma_root)
+///   mb["field"] = Y        (write through mb — obj_source: (outer, "b") ≠ (outer, "a"))
+///
+/// For pattern 2, we conservatively evict ALL cached reads on objects loaded from the
+/// same container_root (regardless of which key they were loaded from), because we cannot
+/// prove that two loads from the same container are distinct objects.
+fn invalidate_by_obj_and_source(
+    avail: &mut AvailMap,
+    obj_root: Temp,
+    escaped: &HashSet<Temp>,
+    source_map: &HashMap<Temp, (Temp, ReadKey)>,
+    alias_map: &HashMap<Temp, Temp>,
+) {
+    // Get the container_root that obj_root was loaded from (if any).
+    let obj_container_root = source_map.get(&obj_root).map(|(c, _)| *c);
+    avail.retain(|(o, _, _), r| {
+        // Evict if direct match.
+        if *o == obj_root { return false; }
+        // Evict if escaped.
+        if escaped.contains(o) || escaped.contains(&r.obj) { return false; }
+        // Evict if obj_root and r.obj were both loaded from the SAME container
+        // (same container_root, any key) — they might alias the same object.
+        if let Some(wc) = obj_container_root {
+            let r_obj_root = alias_root(r.obj, alias_map);
+            if let Some((rc, _)) = source_map.get(&r_obj_root) {
+                if *rc == wc { return false; }
+            }
+        }
+        true
+    });
 }
 
 /// Invalidate available reads whose `obj` temp is exactly `t` (raw temp, not alias root).
