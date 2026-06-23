@@ -115,6 +115,10 @@ pub(crate) struct RuntimeFns<'ctx> {
     /// Cold path for the inline sealed-release when rc hits zero: walks heap fields and frees.
     /// `lin_sealed_drop_at_zero(ptr, size)`. Called after the inline dec reaches zero.
     pub sealed_drop_at_zero: FunctionValue<'ctx>,
+    /// Stage 2: `lin_record_get_field(sealed_ptr: ptr, key: ptr) -> ptr`
+    /// Read one field by name from a TAG_RECORD sealed struct. Returns an OWNED +1 TaggedVal*
+    /// (heap box; caller must `lin_tagged_release` it). Null when field absent or ptr is null.
+    pub record_get_field: FunctionValue<'ctx>,
 }
 
 impl<'ctx> RuntimeFns<'ctx> {
@@ -251,6 +255,13 @@ impl<'ctx> RuntimeFns<'ctx> {
             None,
         );
 
+        // lin_record_get_field(sealed_ptr: ptr, key: ptr) -> ptr — owned +1 TaggedVal* for one field
+        let record_get_field = module.add_function(
+            "lin_record_get_field",
+            ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+            None,
+        );
+
         Self {
             string_length,
             string_eq,
@@ -301,6 +312,7 @@ impl<'ctx> RuntimeFns<'ctx> {
             map_get_int,
             map_set_int,
             sealed_drop_at_zero,
+            record_get_field,
         }
     }
 }

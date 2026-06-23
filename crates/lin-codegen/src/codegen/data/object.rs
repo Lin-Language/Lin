@@ -684,13 +684,78 @@ impl<'ctx> Codegen<'ctx> {
         let mut vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> = Vec::with_capacity(target_keys.len());
 
         if Self::is_union_type(src_ty) {
-            // All union sources (TAG_MAP / TAG_RECORD / TAG_SUMNODE) are normalised to a LinMap*
-            // by lin_union_force_to_map: TAG_MAP → O(1) retain; TAG_RECORD/TAG_SUMNODE → materialise.
+            // Stage 2: dispatch on the runtime tag of `src` to avoid materialising TAG_RECORD to a
+            // LinMap when the source is already a packed sealed struct. Two arms:
+            //   TAG_RECORD → const-offset field reads via lin_record_get_field (no map alloc).
+            //   TAG_MAP / TAG_SUMNODE / anything else → lin_union_force_to_map + map_get (existing path).
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+            let i8t = self.context.i8_type();
+            let src_tag = self.builder.call(self.rt.get_tag, &[src.into()], "sproj_tag")
+                .try_as_basic_value().unwrap_basic().into_int_value();
+            let is_record = self.builder.int_compare(
+                inkwell::IntPredicate::EQ, src_tag,
+                i8t.const_int(lin_common::tags::TAG_RECORD as u64, false), "sproj_is_rec");
+            let rec_bb = self.context.append_basic_block(llvm_fn, "sproj_rec");
+            let map_bb = self.context.append_basic_block(llvm_fn, "sproj_map");
+            let merge_bb = self.context.append_basic_block(llvm_fn, "sproj_merge");
+            self.builder.conditional_branch(is_record, rec_bb, map_bb);
+
+            // TAG_RECORD arm: read fields directly from the packed sealed struct via
+            // lin_record_get_field (const-offset, no map allocation).
+            // RC contract per field (lin_record_get_field returns an OWNED +1 TaggedVal*):
+            //   sealed_array field: sealed_array_project_owned unboxes+retains the array ptr (+2
+            //     total), then we release the box (−1) → net +1 owned; pass already_owned=true.
+            //   heap ptr field (Str/Object/Map/…): unbox raw ptr (borrowed from box), retain inline
+            //     (+2 total), release box (−1) → net +1 owned; pass already_owned=true.
+            //   scalar field: unbox scalar (no heap), release box (no inner rc change); pass
+            //     already_owned=false (sealed_construct does nothing for scalars anyway).
+            self.builder.position_at_end(rec_bb);
+            let sealed_ptr = self.builder.call(self.rt.unbox_ptr, &[src.into()], "sproj_rec_sptr")
+                .try_as_basic_value().unwrap_basic();
+            let mut rec_vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> =
+                Vec::with_capacity(target_fields.len());
+            for (k, fty0) in target_fields.iter() {
+                let fty = fty0.clone();
+                let key_str = self.compile_string_lit(k).into_pointer_value();
+                let rec_box = self.builder.call(
+                    self.rt.record_get_field,
+                    &[sealed_ptr.into(), key_str.into()],
+                    "sproj_rgf",
+                ).try_as_basic_value().unwrap_basic();
+                if Self::sealed_array_elem(&fty).is_some() {
+                    // owned box → sealed_array_project_owned unboxes+retains; then release box.
+                    let packed = self.sealed_array_project_owned(rec_box, &Type::TypeVar(u32::MAX), &fty);
+                    self.builder.call(self.rt.tagged_release, &[rec_box.into()], "");
+                    rec_vals.push((k.clone(), packed, fty, true));
+                } else {
+                    let v = self.unbox_tagged_val_to_type(rec_box, &fty);
+                    if Self::result_is_heap_pointer(&fty) && v.is_pointer_value() {
+                        self.emit_rc_retain_inline(v.into_pointer_value());
+                    }
+                    self.builder.call(self.rt.tagged_release, &[rec_box.into()], "");
+                    let owned = Self::result_is_heap_pointer(&fty);
+                    rec_vals.push((k.clone(), v, fty, owned));
+                }
+            }
+            let rec_result = self.sealed_construct(target_fields, &rec_vals);
+            let rec_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_bb);
+
+            // TAG_MAP / TAG_SUMNODE / anything else: normalise to LinMap* via force_to_map.
+            self.builder.position_at_end(map_bb);
             let cmap = self.builder.call(self.rt.map_force, &[src.into()], "sproj_cmap")
                 .try_as_basic_value().unwrap_basic();
-            let result = self.emit_sealed_proj_loop(cmap, self.rt.map_get, target_fields);
+            let map_result = self.emit_sealed_proj_loop(cmap, self.rt.map_get, target_fields);
             self.builder.call(self.rt.map_release, &[cmap.into()], "");
-            return result;
+            let map_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_bb);
+
+            // Merge: both arms produced a ptr (sealed struct).
+            self.builder.position_at_end(merge_bb);
+            let phi = self.builder.phi(ptr_ty, "sproj_phi");
+            phi.add_incoming(&[(&rec_result, rec_exit), (&map_result, map_exit)]);
+            return phi.as_basic_value();
         }
 
         // Non-union source: a concrete raw `LinMap*`. Borrowed per-field reads, no copy, no release.
