@@ -3121,7 +3121,7 @@ RFC 4180 CSV parse and stringify — eager (`parse`/`parseWithHeader`/`stringify
 ### recordRows
 
 ```txt
-val recordRows: (src: Stream<UInt8[]>, opts: CsvOptions = {}) -> Stream
+val recordRows: (src: Stream<UInt8[]>, opts: CsvOptions = {}) -> Stream<{String:String}>
 ```
 
 Lazily parses a byte stream into a stream of keyed records, treating the first row as the header. Each subsequent row becomes a `{ String: String }` map keyed by the header columns. `CsvOptions` accepts `delimiter` (defaults to `,`), `trim` (strip ASCII whitespace from unquoted fields), and `columns` (a `String[]` of column names to materialise; when provided, only the listed columns are allocated per row — all other columns are skipped). Omitting `columns` (or passing an empty array) preserves the default all-columns behaviour.
