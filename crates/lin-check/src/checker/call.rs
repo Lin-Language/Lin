@@ -334,6 +334,8 @@ impl Checker {
                 let elem = match &array_ret {
                     Type::Array(inner) => (**inner).clone(),
                     Type::Stream(inner) => (**inner).clone(),
+                    // KEEP: array_ret is already AnyVal (the pure-Lin std/iter wrappers declare Json);
+                    // element type is legitimately dynamic — wrapping it in Stream<AnyVal> is correct.
                     _ => Type::TypeVar(u32::MAX),
                 };
                 Type::Stream(Box::new(elem))

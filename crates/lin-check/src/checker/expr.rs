@@ -3084,6 +3084,8 @@ fn join_arm_lambda_sets(result: Type, arm_types: &[Type]) -> Type {
 /// `[String, T][]` param, so the empty container monomorphizes instead of leaving `T` unsolved.
 pub(crate) fn erase_generic_type_vars(ty: &Type) -> Type {
     match ty {
+        // KEEP: intentional erasure of unsolved generic params to AnyVal so that an empty-container
+        // monomorphizes as $Json (safe tagged repr) rather than at a bogus concrete element type.
         Type::TypeVar(id) if *id != u32::MAX => Type::TypeVar(u32::MAX),
         Type::Array(t) => Type::Array(Box::new(erase_generic_type_vars(t))),
         Type::Iterator(t) => Type::Iterator(Box::new(erase_generic_type_vars(t))),

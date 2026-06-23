@@ -962,6 +962,8 @@ pub(crate) fn lower_typed_pattern_bindings(
             // the value, and is effectively always true. Unbox via Coerce when the
             // scrutinee is boxed but the binding is concrete; a plain Bind (alias) is
             // correct when types already match (e.g. a Json scrutinee bound to Json).
+            // KEEP: if the scrutinee temp has no recorded type (internal invariant violation), treat it
+            // as AnyVal so Coerce/Bind proceeds safely rather than panicking on a missing entry.
             let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
             let t = builder.alloc_temp(ty.clone());
             if is_union_ty(&scrut_ty) && !is_union_ty(ty) {
@@ -986,6 +988,8 @@ pub(crate) fn lower_typed_pattern_bindings(
             builder.slots.insert(*slot, t);
         }
         TypedPattern::Object { fields, .. } => {
+            // KEEP: same defensive fallback — the scrutinee type drives FieldGet dispatch; AnyVal
+            // causes a tagged lin_map_get path which is safe even if slower.
             let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
             for field in fields {
                 if let Some(slot) = field.binding_slot {
@@ -1004,6 +1008,7 @@ pub(crate) fn lower_typed_pattern_bindings(
         TypedPattern::Array { elements, rest, .. } => {
             // The scrutinee's static type (often Json/union for match arms) drives whether
             // codegen must unbox it before indexing.
+            // KEEP: same defensive fallback — AnyVal causes tagged Index path which is safe.
             let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
             for (i, elem_pat) in elements.iter().enumerate() {
                 let idx_temp = builder.const_temp(Const::Int(i as i64, Type::Int64));
@@ -1023,6 +1028,8 @@ pub(crate) fn lower_typed_pattern_bindings(
             }
             // `...rest` binds the remaining elements as a new array (slice from N onward).
             if let Some(rest_slot) = rest {
+                // KEEP: the rest slice type is AnyVal[] because the match scrutinee is a boxed Json
+                // array; the individual element types are determined by the pattern, not the slice.
                 let rest_ty = Type::Array(Box::new(Type::TypeVar(u32::MAX)));
                 let start = builder.const_temp(Const::Int(elements.len() as i64, Type::Int64));
                 // scrut is a boxed Json array; unbox to a raw array for length + slicing.
