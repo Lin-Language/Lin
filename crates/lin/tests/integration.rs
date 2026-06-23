@@ -14154,6 +14154,72 @@ main()
     assert_eq!(out, vec!["ok:Ada", "err"]);
 }
 
+#[test]
+fn test_is_union_alias_of_records_structural_check() {
+    // Soundness regression: when a named type alias resolves to a Union whose members include
+    // non-empty Object types, `is <Alias>` must use structural field-type validation (MatchesSchema)
+    // per member, not a bare tag check. The bare-tag path (master) made every record match every
+    // Object member of the union, so:
+    //   - `squareVal is Shape` → true (correct, it is a Shape)
+    //   - an unrelated record `is Shape` → true (WRONG — bare tag == any record)
+    //   - `intVal is CircleOrInt32` → true (WRONG — bare tag matches record member even for Int)
+    //
+    // Cases exercised:
+    //   1. `is <UnionAlias>` (pattern = union-alias name): a value that IS a member matches; an
+    //      unrelated record does NOT match; a scalar does not match the record alias.
+    //   2. match arm dispatch with individual record arms (A|B union scrutinee): correct arm fires.
+    //   3. Narrowed field-read after a successful `is` check is sound.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type Circle = { "kind": String, "radius": Int32 }
+type Square = { "kind": String, "side": Int32 }
+type Rect = { "w": Int32, "h": Int32 }
+type Shape = Circle | Square
+type CircleOrInt32 = Circle | Int32
+
+// `is Shape` (union alias as pattern): Circle matches, Square matches,
+// but an unrelated record (Rect, no "kind"/"radius"/"side") must NOT match.
+val c: AnyVal = { "kind": "circle", "radius": 5 }
+val s: AnyVal = { "kind": "square", "side": 10 }
+val r: AnyVal = { "w": 3, "h": 4 }
+print(if c is Shape then "c-is-shape" else "WRONG-c-not-shape")
+print(if s is Shape then "s-is-shape" else "WRONG-s-not-shape")
+print(if r is Shape then "WRONG-r-is-shape" else "r-not-shape")
+
+// match arm dispatch on an A|B union: correct arm fires for each record member
+val circleVal: Shape = { "kind": "circle", "radius": 5 }
+val squareVal: Shape = { "kind": "square", "side": 10 }
+val describeShape = (v: Shape): Null =>
+  match v
+    is Circle => print("circle:r=${toString(v["radius"])}")
+    is Square => print("square:side=${toString(v["side"])}")
+describeShape(circleVal)
+describeShape(squareVal)
+
+// A|Int32: scalar does not match the record alias
+val intVal: CircleOrInt32 = 42
+val recVal: CircleOrInt32 = { "kind": "circle", "radius": 7 }
+print(if intVal is Circle then "WRONG-int-matched-circle" else "int-not-circle")
+print(if recVal is Circle then "circle-matched" else "WRONG-circle-not-matched")
+
+// narrowed field read after is must be sound
+val narrow = (v: CircleOrInt32): Null =>
+  if v is Circle then print("narrowed-radius=${toString(v["radius"])}") else print("not-circle")
+narrow(recVal)
+narrow(intVal)
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "c-is-shape", "s-is-shape", "r-not-shape", // union-alias is check
+            "circle:r=5", "square:side=10",             // match arm dispatch
+            "int-not-circle", "circle-matched",         // A|Int32 discrimination
+            "narrowed-radius=7", "not-circle",          // narrowed field read
+        ]
+    );
+}
+
 // ── singleton string-literal types (ADR-034) ──────────────────────────────────
 
 #[test]
@@ -21132,6 +21198,46 @@ print(show(b))
     assert_eq!(out, vec!["R:fire=1", "G:grass=2", "B:sky=3"]);
 }
 
+
+// Regression: sealed record with a SumNode (sum-type) field overwritten in a loop.
+// Prior to the fix, `compile_ir_field_set` called `emit_release(old, &fld_ty)` where
+// `fld_ty` was a Union (sum type) — routing the release through `lin_tagged_release`,
+// which reads offset-0 of the raw `*SumNode` as a TaggedVal tag byte → wrong-size
+// dealloc → UAF/heap corruption. Fix: detect KIND_SUMNODE_FIELD and use
+// `emit_release_repr` with `Packed(SumNode)`, bypassing the type-dispatch.
+#[test]
+fn test_sealed_record_sum_field_overwrite_no_uaf() {
+    let out = run(r#"import { print } from "std/io"
+import { range, for } from "std/iter"
+import { toString } from "std/string"
+
+type Leaf = { "kind": "leaf", "value": Int32 }
+type Node = { "kind": "node", "left": Tree, "right": Tree }
+type Tree = Leaf | Node
+type Cursor = { "tree": Tree, "depth": Int32 }
+
+val leaf = (v: Int32): Tree => { "kind": "leaf", "value": v }
+val node = (l: Tree, r: Tree): Tree => { "kind": "node", "left": l, "right": r }
+
+val sumTree = (t: Tree): Int32 =>
+  match t
+    is Leaf => t["value"]
+    is Node => sumTree(t["left"]) + sumTree(t["right"])
+
+val main = () =>
+  var cur: Cursor = { "tree": leaf(0), "depth": 0 }
+  range(0, 50).for(i =>
+    cur["tree"] = node(leaf(i), leaf(i + 1))
+    cur["depth"] = i
+  )
+  print(sumTree(cur["tree"]).toString())
+  print(cur["depth"].toString())
+
+main()
+"#);
+    // Last iter: i=49 → node(leaf(49), leaf(50)) → 49+50 = 99; depth = 49.
+    assert_eq!(out, vec!["99", "49"]);
+}
 
 // ============================================================================
 // REPRESENTATION-RESET Stage-0 behaviour pins (docs/project-actually-improve-performance.md §6).
