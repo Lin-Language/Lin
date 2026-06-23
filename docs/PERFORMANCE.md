@@ -841,14 +841,32 @@ high but sit off the critical path. This is §5.10's self-time≠wall-time, now 
 > before scoping. My "LOAD+PREP are 57% of the wall" was wrong on both counts (stale *and* gdb-inflated);
 > the truth is RANGE ≈ 60% (query-bound), as it always was.
 
-**What's left (both bigger than a spike; both started as lanes this session).** getTrip is now ~32% of
-RANGE and it is **record-field access still lowering to `lin_map_get`**, not offset loads (the keys are
-`RouteScanner`/`StopTime`/`Service` field names). That is the record-representation frontier (§5.11, the
-repr-agent's domain — `perf/recoffset` is diagnosing why these specific records don't seal/offset). The
-other is the **inner-array pointer-chase** (§5.10): `routeTrips`/`stopTimes` are 0xFD pointer-spine arrays
-(cache-miss per element), needing contiguous-inline storage / fixed-length `T[N]` arrays — a layout/language
-change (`perf/tn` is prototyping it). The cheap independent levers are exhausted; these two structural
-efforts are the path to Go parity.
+**Two structural lanes — and both paid off.** getTrip was ~32% of RANGE, dominated by record-field reads
+still lowering to `lin_map_get` instead of offset loads (keys: `RouteScanner`/`StopTime`/`Service` field
+names). A diagnosis lane (`recoffset`) split the cause cleanly:
+
+- **`RouteScanner` wouldn't seal** because its `dow: DayOfWeek` field is a **pure-IntLit union** (`0|…|6`),
+  and union fields are stored as heap `TaggedVal*`, which forces the whole record unsealed → ~24 of
+  getTrip's `map_get`s were scanner fields. The fix (`Type::IntUnion` — represent a small pure-IntLit union
+  as an **i32 sealed scalar**, boxing to `TaggedVal*` only at generic-Union call boundaries) makes
+  `RouteScanner` seal (`dow@36` becomes a 4-byte i32 slot) and turns those reads into const-offset GEPs.
+  **−12% GROUP** (6139→5414, digest-exact). Contained to the type/codegen layers; the one excluded-file
+  touch (`boxing.rs`) is a clean *additive* IntLit-union→`TAG_INT32` guard (flagged for repr-agent merge).
+  *Map-typed fields like `tripsByRoute` were never the blocker — they seal fine as a heap ptr slot.* The
+  `StopTime`/`Service` field reads are a **separate** cause (frozen-array element materialization) and
+  remain the repr-agent's domain (§5.11).
+- **The inner-array pointer-chase** (§5.10): `routeTrips` is a 0xFD pointer-spine array (cache-miss per
+  element via a `lin_sealed_ptr_array_get_ptr` *call*). Full 0xFE inline repack is **blocked — by shared
+  ownership, not heterogeneity** (`Trip` is uniform 56 B): after `frozen(tripsByRoute)`, `trips[]` +
+  `sortedTrips` (from `.sort()`) still hold refs, so the rc==1 exclusivity check fails and it stays 0xFD;
+  repacking would need cross-call liveness-driven RC elision. *And* a 0xFE `val trip = arr[i]` would flip a
+  1-bump retain-ptr into alloc+memcpy+4-field-retain — possibly slower for a heap-heavy struct. But the
+  cheap part paid: **inlining the 0xFD pointer-spine load** (kill the per-element *call*) is **−3.3% GROUP**
+  (digest-exact) — the call overhead was serializing on the hot path.
+
+So the record-offset path is partly unlocked (scanner fields now offset; the rest awaits the repr-agent),
+and the full value-layout (fixed-length `T[N]` / contiguous inline) remains the deeper open lever, gated on
+the ownership-at-`frozen()` problem above. End-of-session RAPTOR ≈ **30-31 s** (~1.6× Go, ≈ Node parity).
 
 ---
 
