@@ -188,3 +188,29 @@ The 5 read-only audit agents (2026-06-23), verbatim severity:
   (guarded by callers) — excluded.
 - **stdlib:** C1 (`unique` per-element format!), C2 (`sliding` O(n) mem), C3 (`at` byte/codepoint). Most
   historic cliffs already fixed.
+
+---
+
+## 5. Outcome (executed 2026-06-23, master 34e0cfc1)
+
+All WS-A/B/C lanes + WS-D (D0-D2) merged; master green (961 tests + LIN_VERIFY_RC + RAPTOR digest-exact).
+
+- **A1** ✅ union `is`/match record-member soundness — fixed (differential-proven: master returned wrong
+  `is`/match results; now correct).
+- **B2** ✅ codegen `emit_release` SumNode UAF + `index.rs:1046` panic-guard.
+- **B1** ✅ salvaged — columnar IMMORTAL_RC guard + string `checked_add` overflow + sumnode/map KIND.
+  **DROPPED the `tagged_release` TAG_FUNCTION arm**: bisected to a double-free SIGSEGV on RAPTOR — the
+  audit's "leak" was a **FALSE POSITIVE** (callers borrow the boxed function; the asymmetry is intentional).
+  Caught only by the **bench-RUN gate** (961 unit tests + RC-verify passed) — the campaign's key process win.
+- **C** ✅ `unique` scalar int-key fast path, `sliding` O(w) buffer, `string.at` codepoint consistency.
+- **B3** ✅ frozen repack size-uniformity guard + documented `rc==1` sole-owner proof (validated empirically
+  under RAPTOR's heavy `frozen`+borrow load).
+- **D — AnyVal verdict:** prevalence is **justified-by-design**, not gratuitous. D1 removed the one true
+  placeholder (`arrayAllocateFilled`→generic); D2 audited all 16 inference fallbacks → **all legitimate**
+  (genuinely-dynamic / mono-boundary / defensive), now documented for auditability. No mass elimination
+  exists. **D3** (retire the `TypeVar(u32::MAX)` sentinel for a real `Type::AnyVal` variant — a robustness
+  refactor) is **deferred to coordinate with the record-representation agent** (heavy overlap).
+
+**Deferred / handed off:** D3 (above); B4 `shared.rs` poison-panic (FFI edge, low-pri); B4 `sealed.rs`
+NKIND_SUMNODE descriptor leak → handed to the repr agent (their file). Audit-finding **B** (the
+materialization class + `is_union_ty` repr/type-kind conflation) is owned by the repr agent's Pillars 1-5.
