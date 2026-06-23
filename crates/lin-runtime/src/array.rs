@@ -513,10 +513,9 @@ pub unsafe extern "C" fn lin_sealed_ptr_array_set(arr: *mut LinArray, idx: i64, 
     *slot = new_sptr;
 }
 
-/// Materialize a pointer-backed sealed-record array (0xFD) into a TAGGED `LinArray` (Json `Object[]`):
-/// each struct pointer is materialized into a fresh boxed `LinObject` via the NAMED descriptor on the
-/// array. Used at the Json boundary where the generic reader can't process struct pointers. Returns a
-/// fresh +1-owned tagged array. The source array is BORROWED (not consumed).
+/// Convert a pointer-backed sealed-record array (0xFD) into a TAGGED `LinArray` (TAG_RECORD[]):
+/// each struct pointer is boxed lazily as TAG_RECORD (retain + box) — no materialization.
+/// Returns a fresh +1-owned tagged array. The source array is BORROWED (not consumed).
 #[no_mangle]
 pub unsafe extern "C" fn lin_sealed_ptr_array_to_tagged(arr: *const LinArray) -> *mut LinArray {
     crate::repr_verify::repr_note("lin_sealed_ptr_array_to_tagged");
@@ -524,23 +523,19 @@ pub unsafe extern "C" fn lin_sealed_ptr_array_to_tagged(arr: *const LinArray) ->
     if arr.is_null() { return lin_array_alloc(4); }
     let len = (*arr).len;
     let out = lin_array_alloc(len.max(4));
-    let named_desc = (*arr).elem_named_desc;
     for i in 0..len {
         let sptr = *(((*arr).data as *const *mut u8).add(i as usize));
-        let map = if sptr.is_null() {
-            std::ptr::null_mut()
-        } else {
-            crate::sealed::materialize_sealed_to_map_pub(sptr, named_desc)
-        };
         let slot = (*out).data.add(i as usize);
-        if map.is_null() {
+        if sptr.is_null() {
             (*slot).tag = TAG_NULL;
             (*slot)._pad = [0; 7];
             (*slot).payload = 0;
         } else {
-            (*slot).tag = TAG_MAP;
+            // Retain (+1) so the slot owns an independent reference.
+            crate::memory::lin_rc_retain(sptr as *mut u32);
+            (*slot).tag = TAG_RECORD;
             (*slot)._pad = [0; 7];
-            (*slot).payload = map as u64;
+            (*slot).payload = sptr as u64;
         }
     }
     (*out).len = len;
@@ -1071,8 +1066,8 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
             return; // non-record value — silent no-op (spec §6.1)
         }
     } else if elem_tag == SEALED_PTR_ARRAY_TAG {
-        // Pointer-backed (0xFD): the `tagged` is a TAG_MAP wrapping a LinMap* (materialized
-        // by `lin_array_get_tagged`). Project it into a fresh sealed struct and store that.
+        // Pointer-backed (0xFD): `tagged` is a TAG_RECORD (since Stage 3) or TAG_MAP.
+        // Project it into a fresh sealed struct and store that.
         // Contract: lin_array_set does NOT consume `tagged` — the caller retains it and will
         // release it separately. We borrow `obj` from tagged, pack into a new sealed struct,
         // and store the struct. No release of obj or tagged here.
@@ -1263,20 +1258,16 @@ pub unsafe extern "C-unwind" fn lin_array_get_tagged(arr: *const LinArray, idx: 
             return crate::sealed::materialize_sealed_elem_boxed(payload, (*arr).elem_named_desc);
         }
         SEALED_PTR_ARRAY_TAG => {
-            // Pointer-backed sealed-record array (Stage 1): each slot is a `*mut u8` struct pointer.
-            // Load the struct pointer, then materialize a fresh LinObject via the named descriptor.
-            // The materialized object retains each field (for scalar fields there's nothing to retain;
-            // for heap fields the object takes its own +1). The struct keeps its own +1 untouched.
-            // Return the caller's owned +1 box, matching the get_tagged contract.
+            // Pointer-backed sealed-record array (0xFD): each slot is a `*mut u8` struct pointer.
+            // Return the struct lazily as TAG_RECORD (retain + box) — no materialization.
+            // lin_tagged_release on TAG_RECORD calls lin_sealed_release_self to balance.
             dealloc(tv as *mut u8, tv_layout);
             let sptr = *(((*arr).data as *const *mut u8).add(idx as usize));
             if sptr.is_null() {
                 return crate::tagged::lin_box_null() as *mut TaggedVal;
             }
-            // Materialize the sealed struct to a fresh +1 LinMap. Wrap in a TAG_MAP box for the caller.
-            use crate::tagged::{TAG_MAP, alloc_tagged};
-            let map = crate::sealed::materialize_sealed_to_map_pub(sptr, (*arr).elem_named_desc);
-            return alloc_tagged(TAG_MAP, map as u64) as *mut TaggedVal;
+            // lin_box_record retains (+1 for the caller's owned box).
+            return crate::tagged::lin_box_record(sptr) as *mut TaggedVal;
         }
         _ => {
             // Tagged array: elem is already a LinArrayElem (16 bytes) = TaggedVal layout.

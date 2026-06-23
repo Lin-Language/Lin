@@ -919,7 +919,7 @@ pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const cra
     let key_bytes = std::slice::from_raw_parts((*key).data.as_ptr(), (*key).len as usize);
     let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
-        let (offset, nkind, nested, name, next) = read_named_field(named_desc, cur);
+        let (offset, nkind, _nested, name, next) = read_named_field(named_desc, cur);
         cur = next;
         if name.as_bytes() != key_bytes {
             continue;
@@ -993,12 +993,12 @@ pub unsafe extern "C" fn lin_record_get_field(sealed: *const u8, key: *const cra
                 crate::tagged::lin_box_map(p)
             }
             NKIND_SEALED => {
-                // Nested sealed struct: recurse materialize → fresh LinMap → box as TAG_MAP.
-                let p = *(slot as *const *mut u8) as *const u8;
+                // Nested sealed struct: box as TAG_RECORD (lazy, no materialization).
+                // lin_box_record retains the struct (+1); lin_tagged_release on TAG_RECORD calls
+                // lin_sealed_release_self to balance.
+                let p = *(slot as *const *mut u8);
                 if p.is_null() { return std::ptr::null_mut(); }
-                let nested_map = materialize_sealed_struct_to_map(p, nested);
-                if nested_map.is_null() { return std::ptr::null_mut(); }
-                alloc_tagged(TAG_MAP, nested_map as u64)
+                crate::tagged::lin_box_record(p)
             }
             NKIND_SUMNODE => {
                 // SumNode field: materialize via the per-type fn-ptr → fresh LinMap → TAG_MAP.
