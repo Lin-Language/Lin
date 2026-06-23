@@ -185,6 +185,18 @@ val s = suite("std/string", [
     expect("hello".at(-1)).toBe("o")
   ]),
 
+  // Multi-byte codepoint: `at` must be codepoint-indexed, not byte-indexed.
+  // "café" is 4 codepoints (5 UTF-8 bytes); -1 must yield "é", not a garbage byte.
+  test("at on multi-byte string returns codepoint not byte", () => [
+    expect("café".at(3)).toBe("é"),
+    expect("café".at(-1)).toBe("é")
+  ]),
+
+  test("at on multi-byte string consistent with charCode", () => [
+    expect("café".charCode(3)).toBe(233),
+    expect("café".at(3)).toBe("é")
+  ]),
+
   test("lines splits on newline", () =>
     val parts = "a\nb\nc".lines()
     [

@@ -2437,6 +2437,136 @@ pub unsafe extern "C" fn lin_flat_to_tagged_u64(flat: *const LinArray) -> *mut L
     tagged
 }
 
+/// Return a new array with duplicate elements removed, keeping the first occurrence in source order.
+///
+/// For flat INT32/INT64/UINT32/UINT64 arrays the seen-set is an int-keyed LinMap — zero per-element
+/// `format!` allocations. For all other arrays we fall back to the generic `lin_value_key` string
+/// key path.
+///
+/// Called from `std/array.unique` as `(AnyVal) => AnyVal` via a `lin-runtime` FFI import.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_unique(arr_box: *const u8) -> *mut u8 {
+    use crate::tagged::*;
+    use crate::map::{lin_map_alloc, lin_map_get_int, lin_map_set_int, lin_map_release, KEY_KIND_INT, KEY_KIND_STRING};
+    use crate::string::lin_value_key;
+
+    if arr_box.is_null() {
+        let out = lin_array_alloc(4);
+        return alloc_tagged(TAG_ARRAY, out as u64);
+    }
+    let tv = arr_box as *const TaggedVal;
+    if (*tv).tag != TAG_ARRAY {
+        // Non-array: return empty tagged array.
+        let out = lin_array_alloc(4);
+        return alloc_tagged(TAG_ARRAY, out as u64);
+    }
+    let arr = (*tv).payload as *const LinArray;
+    if arr.is_null() {
+        let out = lin_array_alloc(4);
+        return alloc_tagged(TAG_ARRAY, out as u64);
+    }
+
+    let len = (*arr).len;
+    let et = (*arr).elem_tag;
+
+    // ── Scalar integer fast path (INT32 / INT64 / UINT32 / UINT64) ──────────────────────────
+    // Key each element directly as i64 in an int-keyed LinMap — no format! alloc per element.
+    let is_int_flat = matches!(et, TAG_INT32 | TAG_INT64 | TAG_UINT32 | TAG_UINT64);
+    if is_int_flat {
+        let seen = lin_map_alloc(len as u32, KEY_KIND_INT);
+        let out = alloc_like(arr, 0);
+        let true_tv = TaggedVal { tag: TAG_BOOL, _pad: [0; 7], payload: 1 };
+
+        match et {
+            TAG_INT32 => {
+                let data = (*arr).data as *const i32;
+                for i in 0..len as usize {
+                    let v = *data.add(i) as i64;
+                    if lin_map_get_int(seen, v).is_null() {
+                        lin_map_set_int(seen, v, &true_tv);
+                        lin_flat_array_push_i32(out, v as i32);
+                    }
+                }
+            }
+            TAG_INT64 => {
+                let data = (*arr).data as *const i64;
+                for i in 0..len as usize {
+                    let v = *data.add(i);
+                    if lin_map_get_int(seen, v).is_null() {
+                        lin_map_set_int(seen, v, &true_tv);
+                        lin_flat_array_push_i64(out, v);
+                    }
+                }
+            }
+            TAG_UINT32 => {
+                let data = (*arr).data as *const u32;
+                for i in 0..len as usize {
+                    let v = *data.add(i) as i64;
+                    if lin_map_get_int(seen, v).is_null() {
+                        lin_map_set_int(seen, v, &true_tv);
+                        lin_flat_array_push_u32(out, v as u32);
+                    }
+                }
+            }
+            TAG_UINT64 => {
+                let data = (*arr).data as *const u64;
+                for i in 0..len as usize {
+                    let v = *data.add(i) as i64;
+                    if lin_map_get_int(seen, v).is_null() {
+                        lin_map_set_int(seen, v, &true_tv);
+                        lin_flat_array_push_u64(out, *data.add(i));
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        lin_map_release(seen);
+        return alloc_tagged(TAG_ARRAY, out as u64);
+    }
+
+    // ── Generic fallback: string-keyed seen map via lin_value_key ────────────────────────────
+    let seen = lin_map_alloc(len as u32, KEY_KIND_STRING);
+    let out = if et == 0xFF { lin_array_alloc(len.max(4)) } else { alloc_like(arr, 0) };
+    let true_tv = TaggedVal { tag: TAG_BOOL, _pad: [0; 7], payload: 1 };
+
+    if et == 0xFF {
+        // Tagged array: each element is a TaggedVal at data[i].
+        for i in 0..len as usize {
+            let elem = (*arr).data.add(i) as *const TaggedVal;
+            let key = lin_value_key(elem); // rc=1
+            if crate::map::lin_map_get(seen, key).is_null() {
+                crate::map::lin_map_set(seen, key, &true_tv); // map retains key → rc=2
+                lin_array_push_tagged(out, elem as *const u8);
+            }
+            // Release caller's rc regardless; map holds its own ref if inserted.
+            crate::string::lin_string_release(key); // rc: 2→1 if inserted, 1→0 if dup
+        }
+    } else {
+        // Non-integer flat array (float32/float64/small-int/…): materialize each element to
+        // TaggedVal for keying, then push the raw value into the same-typed output flat array.
+        for i in 0..len as usize {
+            let elem_tv = array_elem_as_tagged(arr, i);
+            let key = lin_value_key(&elem_tv); // rc=1
+            if crate::map::lin_map_get(seen, key).is_null() {
+                crate::map::lin_map_set(seen, key, &true_tv); // map retains key → rc=2
+                match et {
+                    TAG_FLOAT32 => lin_flat_array_push_f32(out, *((*arr).data as *const f32).add(i)),
+                    TAG_FLOAT64 => lin_flat_array_push_f64(out, *((*arr).data as *const f64).add(i)),
+                    TAG_UINT8   => lin_flat_array_push_u8(out,  *((*arr).data as *const u8).add(i)),
+                    TAG_INT8    => lin_flat_array_push_i8(out,  *((*arr).data as *const i8).add(i)),
+                    TAG_UINT16  => lin_flat_array_push_u16(out, *((*arr).data as *const u16).add(i)),
+                    TAG_INT16   => lin_flat_array_push_i16(out, *((*arr).data as *const i16).add(i)),
+                    _ => {} // Unknown flat tag — shouldn't happen.
+                }
+            }
+            // Release caller's rc regardless; map holds its own ref if inserted.
+            crate::string::lin_string_release(key); // rc: 2→1 if inserted, 1→0 if dup
+        }
+    }
+    lin_map_release(seen);
+    alloc_tagged(TAG_ARRAY, out as u64)
+}
+
 #[cfg(test)]
 mod free_layout_tests {
     use super::*;
