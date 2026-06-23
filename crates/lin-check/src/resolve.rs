@@ -632,6 +632,8 @@ fn resolve_named_cycle(
         // Promise without a type argument: Promise<Json>. The opaque async-result handle; the only
         // operation is `await` (which yields `T | Error`). Same opacity as Shared/Stream.
         "Promise" => Ok(Type::Promise(Box::new(any_val_type()))),
+        // Frozen without a type argument: Frozen<Json>. Transparent immutability proof wrapper.
+        "Frozen" => Ok(Type::Frozen(Box::new(any_val_type()))),
         // Opaque handle registry — names that map to Type::Opaque(name) rather than a
         // struct-expansion. Each name identifies a distinct runtime TaggedVal* box.
         //   "TarEntry"  — TAG_TAR_ENTRY: generation-stamped archive entry; non-transferable.
@@ -750,6 +752,12 @@ fn resolve_generic(
                 return Err("Promise takes exactly 1 type argument".to_string());
             }
             Ok(Type::Promise(Box::new(args[0].clone())))
+        }
+        "Frozen" => {
+            if args.len() != 1 {
+                return Err("Frozen takes exactly 1 type argument".to_string());
+            }
+            Ok(Type::Frozen(Box::new(args[0].clone())))
         }
         _ => {
             if let Some(decl) = env.lookup_type(name) {

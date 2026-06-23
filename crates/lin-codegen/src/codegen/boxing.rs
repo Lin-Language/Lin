@@ -248,6 +248,8 @@ impl<'ctx> Codegen<'ctx> {
             // site that doesn't guard.
             Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::Opaque(_)
             | Type::Named(_) | Type::Never => val,
+            // Frozen<T> is transparent at runtime — same physical repr as T.
+            Type::Frozen(inner) => return self.box_value(val, inner),
             // Any Type variant that reaches here was not expected to be boxed. In a release build
             // the old fall-through behaviour is preserved (return val unchanged) so existing
             // behaviour is not regressed; in debug/test builds this fires as a panic so the corpus
@@ -333,6 +335,8 @@ impl<'ctx> Codegen<'ctx> {
             // Opaque handle types: their runtime value IS the tagged box pointer.
             Type::Shared(_) | Type::Stream(_) | Type::Promise(_) | Type::Opaque(_)
             | Type::Named(_) | Type::Never | Type::Iterator(_) => ptr,
+            // Frozen<T> is transparent at runtime — unbox to the inner type.
+            Type::Frozen(inner) => return self.unbox_value(ptr, inner),
             // Sum type: project from the boxed LinMap back to a fresh *SumNode.
             _ if Self::is_sum_type(target_ty) => {
                 let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
@@ -617,6 +621,8 @@ impl<'ctx> Codegen<'ctx> {
             // unboxing to the raw pointer falls through here when Iterator is the stated target
             // type. Pass through unchanged — the pointer IS the value.
             Type::Iterator(_) => tagged,
+            // Frozen<T> is transparent at runtime — same physical repr as T.
+            Type::Frozen(inner) => return self.unbox_tagged_val_to_type(tagged, inner),
             // Any Type variant that reaches here was not expected to be unboxed via this entry
             // point. Preserve old fall-through in release builds; panic in debug/test so the
             // corpus gate catches the gap immediately.
