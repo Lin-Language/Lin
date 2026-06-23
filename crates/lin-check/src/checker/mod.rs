@@ -537,7 +537,8 @@ impl Checker {
     fn collect_typevar_ids(ty: &Type, out: &mut std::collections::HashSet<u32>) {
         match ty {
             Type::TypeVar(id) => { out.insert(*id); }
-            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Promise(t) => Self::collect_typevar_ids(t, out),
+            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t)
+            | Type::Promise(t) | Type::Frozen(t) => Self::collect_typevar_ids(t, out),
             Type::FixedArray(ts) => { for t in ts { Self::collect_typevar_ids(t, out); } }
             Type::Union(ts) => { for t in ts { Self::collect_typevar_ids(t, out); } }
             Type::Function { params, ret, .. } => {

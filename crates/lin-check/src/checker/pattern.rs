@@ -491,8 +491,10 @@ impl Checker {
     pub(crate) fn collect_and_save_subs(&mut self, pattern: &Type, actual: &Type, local: &mut std::collections::HashMap<u32, Type>) {
         collect_type_subs(pattern, actual, local);
         for (id, ty) in local.iter() {
-            // Intrinsic TypeVars (≥ 9000) are generic slots — don't solve them globally.
-            // Protected TypeVars come from imported module signatures — never solve them either.
+            // TypeVars in the intrinsic/generic-slot range (9000+) must never be globally solved:
+            // they are fixed generic slots in built-in function signatures and in user-defined
+            // Number-bounded generic params. Protected TypeVars from imported module signatures are
+            // also excluded. Only plain inference vars (id < 9000) are saved for zonking.
             if *id < 9000 && !self.protected_type_vars.contains(id) {
                 self.solved_type_vars.entry(*id).or_insert_with(|| ty.clone());
             }

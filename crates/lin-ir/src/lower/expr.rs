@@ -1345,7 +1345,7 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
         }
 
         TypedExpr::Index { object, key, result_type, .. } => {
-            let obj_ty = object.ty();
+            let obj_ty = object.ty().strip_frozen();
             let key_ty = key.ty();
             // FUSED `arr[i]["field"]` over a sealed-record array (Stage 3): same constant-offset
             // scalar load as `arr[i].field`. `object` is an Index of the array; `key` is a literal.

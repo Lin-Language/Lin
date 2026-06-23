@@ -175,6 +175,14 @@ pub enum Type {
     /// `T | Error`). Covariant in `T`. Spellable in source as `Promise<T>` / bare `Promise`
     /// (= `Promise<Json>`); see `resolve.rs`.
     Promise(Box<Type>),
+    /// `Frozen<T>` — an immutability-proof wrapper produced exclusively by the `frozen()` intrinsic.
+    /// At runtime it is IDENTICAL to `T` (no boxing, no tag, no extra allocation); the only difference
+    /// is that `frozen()` has deep-immortalized the value and repacked any 0xFD sealed-record arrays
+    /// to 0xFE contiguous buffers. `Frozen<T>` is therefore a TRANSPARENT SUBTYPE of `T`:
+    /// `Frozen<T> ≤ T` in compatibility (one-way coercion; the plain-T direction keeps its existing
+    /// behavior). Reads propagate the frozen annotation so that `frozenArr[i]["f"]` can be emitted as
+    /// a pure stride load (no 0xFD/0xFE runtime dispatch). Not spellable in source annotations.
+    Frozen(Box<Type>),
     /// `Opaque(name)` — a named opaque handle type backed at runtime by a `TaggedVal*` box whose
     /// inner tag uniquely identifies the handle kind. Opaque handles are nominal (name-equality,
     /// not structural), non-generic (no type parameter), and non-transferable across threads when
@@ -240,6 +248,7 @@ impl PartialEq for Type {
             (Shared(a), Shared(b)) => a == b,
             (Stream(a), Stream(b)) => a == b,
             (Promise(a), Promise(b)) => a == b,
+            (Frozen(a), Frozen(b)) => a == b,
             (Opaque(a), Opaque(b)) => a == b,
             (TypeVar(a), TypeVar(b)) => a == b,
             (Named(a), Named(b)) => a == b,
@@ -290,6 +299,7 @@ impl Type {
             Type::Stream(t) => Type::Stream(Box::new(t.erase_lambda_sets())),
             Type::Shared(t) => Type::Shared(Box::new(t.erase_lambda_sets())),
             Type::Promise(t) => Type::Promise(Box::new(t.erase_lambda_sets())),
+            Type::Frozen(t) => Type::Frozen(Box::new(t.erase_lambda_sets())),
             Type::Map { key, value, .. } => Type::Map { key: Box::new(key.erase_lambda_sets()), value: Box::new(value.erase_lambda_sets()), name: None },
             Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| t.erase_lambda_sets()).collect()),
             Type::Union(ts) => Type::Union(ts.iter().map(|t| t.erase_lambda_sets()).collect()),
@@ -304,6 +314,14 @@ impl Type {
                 required: *required,
                 lset: LambdaSet::Top,
             },
+            other => other.clone(),
+        }
+    }
+
+    /// Strip a single Frozen wrapper if present; otherwise return self.
+    pub fn strip_frozen(&self) -> Type {
+        match self {
+            Type::Frozen(inner) => (**inner).clone(),
             other => other.clone(),
         }
     }
@@ -443,6 +461,26 @@ impl Type {
         }
     }
 
+    /// True if this type contains `TypeVar(id)` anywhere in its structure.
+    /// Used as an occurs-check guard before saving a TypeVar substitution to
+    /// `solved_type_vars`: if T contains TypeVar(N), saving N→T would create a
+    /// self-referential substitution that loops during zonking.
+    pub fn contains_typevar_id(&self, id: u32) -> bool {
+        match self {
+            Type::TypeVar(v) => *v == id,
+            Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner)
+            | Type::Shared(inner) | Type::Promise(inner) | Type::Frozen(inner) => inner.contains_typevar_id(id),
+            Type::FixedArray(elems) => elems.iter().any(|t| t.contains_typevar_id(id)),
+            Type::Union(variants) => variants.iter().any(|t| t.contains_typevar_id(id)),
+            Type::Object { fields, .. } => fields.values().any(|t| t.contains_typevar_id(id)),
+            Type::Map { key, value, .. } => key.contains_typevar_id(id) || value.contains_typevar_id(id),
+            Type::Function { params, ret, .. } => {
+                params.iter().any(|t| t.contains_typevar_id(id)) || ret.contains_typevar_id(id)
+            }
+            _ => false,
+        }
+    }
+
     /// True if this type contains any `TypeVar` anywhere in its structure
     /// (including the Json marker `TypeVar(u32::MAX)`, generic params, and fresh
     /// inference vars). A type with no TypeVar is "fully concrete" — the only
@@ -450,7 +488,7 @@ impl Type {
     pub fn contains_type_var(&self) -> bool {
         match self {
             Type::TypeVar(_) => true,
-            Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) | Type::Shared(inner) | Type::Promise(inner) => inner.contains_type_var(),
+            Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) | Type::Shared(inner) | Type::Promise(inner) | Type::Frozen(inner) => inner.contains_type_var(),
             Type::FixedArray(elems) => elems.iter().any(|t| t.contains_type_var()),
             Type::Union(variants) => variants.iter().any(|t| t.contains_type_var()),
             Type::Object { fields, .. } => fields.values().any(|t| t.contains_type_var()),
@@ -597,7 +635,13 @@ impl Type {
 
     /// THE sealed-record-ARRAY gate. `Some(elem_fields)` iff `ty` is `Array(elem)` whose element
     /// is a sealed record with all fields packable. FAIL SAFE: `None` → boxed/flat array path.
+    /// `Frozen<Array(elem)>` is transparently handled: Frozen is stripped before the check so that
+    /// a frozen sealed-record array qualifies just like its non-frozen counterpart.
     pub fn sealed_array_elem(ty: &Type) -> Option<&IndexMap<String, Type>> {
+        let ty = match ty {
+            Type::Frozen(inner) => inner.as_ref(),
+            other => other,
+        };
         let elem = match ty {
             Type::Array(e) => e.as_ref(),
             _ => return None,
@@ -797,6 +841,7 @@ impl fmt::Display for Type {
             Type::Shared(inner) => write!(f, "Shared<{}>", inner),
             Type::Stream(inner) => write!(f, "Stream<{}>", inner),
             Type::Promise(inner) => write!(f, "Promise<{}>", inner),
+            Type::Frozen(inner) => write!(f, "Frozen<{}>", inner),
             Type::Opaque(name) => write!(f, "{}", name),
             // `TypeVar(u32::MAX)` is the dynamic `AnyVal` marker — render it as `AnyVal` (the former
             // `Json`; reset §2.5), not a raw id. Other ids are unresolved generic/inference variables;
