@@ -1199,19 +1199,17 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                     Type::Object { fields, .. } => Type::object(fields.clone()),
                     _ => unreachable!(),
                 },
-                // UNBOXED SUM TYPE (unboxed-sumtype Stage 1): a `Shape[]` is a BOXED `Object[]` (the
-                // union element representation). Lower the element slot type to the dynamic Json
+                // KEEP: UNBOXED SUM TYPE (unboxed-sumtype Stage 1): a `Shape[]` is a BOXED `Object[]`
+                // (the union element representation). Lower the element slot type to the dynamic Json
                 // wildcard so each element (a SumNode) is MATERIALIZED to a boxed `LinObject` by
                 // `coerce_to_slot_type` (the codegen Coerce reads the SumNode repr and materializes).
                 // The read-back (`compile_ir_index`, sum result) projects each boxed element back into
                 // a fresh SumNode, keeping the repr consistent end-to-end.
                 Type::Array(inner) if crate::repr::sum_type_eligible(inner) => Type::TypeVar(u32::MAX),
                 Type::Array(inner) => *inner.clone(),
-                // A fixed-length array (`[T1, T2, ...]`, §5.3) has heterogeneous positional
-                // types, so it is stored as a TAGGED (Json) array — each element boxes to a
-                // TaggedVal* via coerce_to_slot_type below, and Index reads unbox per the
-                // positional result type. Without this the slot type defaulted to Null and
-                // every element was coerced away to null.
+                // KEEP: a fixed-length array (`[T1, T2, ...]`, §5.3) has heterogeneous positional types,
+                // so it is stored as a TAGGED (Json) array — each element boxes to TaggedVal* uniformly.
+                // Index reads unbox per the positional result type. AnyVal slot lets every element coerce.
                 Type::FixedArray(_) => Type::TypeVar(u32::MAX),
                 _ => Type::Null,
             };
