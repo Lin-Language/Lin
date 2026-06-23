@@ -83,6 +83,70 @@ impl std::hash::Hasher for FastHasher {
 pub(crate) type FastBuildHasher = std::hash::BuildHasherDefault<FastHasher>;
 
 thread_local! {
+    /// Intern table for CSV field strings (scope: feed-load only — CSV record values).
+    ///
+    /// Equal byte sequences share ONE immortal `LinString`. On a cache hit the stored pointer is
+    /// returned directly (no alloc, no copy, pointer-identity key compare in `lin_string_eq`).
+    /// On a miss the bytes are allocated IMMORTAL (refcount = IMMORTAL_RC) and stored. Immortal
+    /// strings are never freed — sound for feed data (load-once, lives the whole run).
+    ///
+    /// The table is keyed by the exact bytes (`Box<[u8]>`) using the fast FNV-style hasher, so
+    /// there are no false collisions. One `Box<[u8]>` allocation per DISTINCT string, amortized
+    /// over all rows that share that value.
+    ///
+    /// Thread-local (no locking): each thread builds its own table. Immortal pointers from one
+    /// thread are safe to pass to another (retain/release no-op on them).
+    static CSV_INTERN_TABLE: RefCell<HashMap<Box<[u8]>, *mut LinString, FastBuildHasher>> =
+        RefCell::new(HashMap::default());
+
+    /// Counters for the intern table: (hits, misses). Reported on request via
+    /// `lin_csv_intern_stats`. `thread_local!` so no atomic overhead on the hot path.
+    static CSV_INTERN_HITS: RefCell<u64> = RefCell::new(0);
+    static CSV_INTERN_MISSES: RefCell<u64> = RefCell::new(0);
+}
+
+/// Intern `data[..len]` as an immortal `LinString`, returning the shared pointer. Called from the
+/// CSV record-to-object builder for every field value so equal strings are pointer-identical.
+///
+/// SAFETY: `data` must point to `len` valid bytes (the CSV assembler's field byte vector satisfies
+/// this). The returned pointer is an immortal `LinString` (refcount = IMMORTAL_RC); callers MUST
+/// NOT call `lin_string_release` on it (or, if they do, the immortal guard makes it a no-op).
+#[inline]
+pub(crate) unsafe fn intern_csv_field_bytes(data: *const u8, len: u32) -> *mut LinString {
+    let bytes = std::slice::from_raw_parts(data, len as usize);
+    CSV_INTERN_TABLE.with(|tbl| {
+        let mut map = tbl.borrow_mut();
+        if let Some(&ptr) = map.get(bytes) {
+            CSV_INTERN_HITS.with(|h| *h.borrow_mut() += 1);
+            return ptr;
+        }
+        CSV_INTERN_MISSES.with(|m| *m.borrow_mut() += 1);
+        // Allocate an immortal LinString and cache it.
+        let ptr = lin_string_alloc(len);
+        (*ptr).refcount = IMMORTAL_RC;
+        if len > 0 {
+            std::ptr::copy_nonoverlapping(data, (*ptr).data.as_mut_ptr(), len as usize);
+        }
+        (*ptr).hash = fnv1a_bytes_str(bytes);
+        map.insert(bytes.to_vec().into_boxed_slice(), ptr);
+        ptr
+    })
+}
+
+/// Read out the CSV intern stats (hits, misses, distinct count) for a given thread and print them
+/// to stderr. Used by the bench/gate to validate the intern mechanism is firing.
+#[no_mangle]
+pub extern "C" fn lin_csv_intern_report() {
+    let (hits, misses, distinct) = CSV_INTERN_TABLE.with(|tbl| {
+        let h = CSV_INTERN_HITS.with(|h| *h.borrow());
+        let m = CSV_INTERN_MISSES.with(|m| *m.borrow());
+        let d = tbl.borrow().len();
+        (h, m, d)
+    });
+    eprintln!("[csv-intern] hits={hits} misses={misses} distinct_strings={distinct}");
+}
+
+thread_local! {
     /// Interning cache for string literals, keyed by the literal's global data pointer.
     ///
     /// Each distinct string literal in the program has a unique, stable `@str_data` global; codegen
