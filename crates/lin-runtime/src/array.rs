@@ -386,7 +386,11 @@ pub unsafe extern "C" fn lin_sealed_array_push_struct_retaining(arr: *mut LinArr
     let desc = (*arr).elem_desc;
     let slot = lin_sealed_array_push_slot(arr);
     std::ptr::copy_nonoverlapping(obj.add(crate::sealed::SEALED_HEADER), slot, stride as usize);
-    crate::sealed::retain_sealed_payload_fields(slot, desc);
+    // Immortal early-out: if the source struct is frozen (IMMORTAL_RC), frozen() guarantees all
+    // descendants are also immortal, so every per-field retain would be a no-op. Skip the walk.
+    if *(obj as *const u32) < crate::string::IMMORTAL_RC {
+        crate::sealed::retain_sealed_payload_fields(slot, desc);
+    }
 }
 
 /// `arr[idx] = record`: overwrite element `idx`'s payload with `stride` bytes from standalone sealed
@@ -406,7 +410,11 @@ pub unsafe extern "C" fn lin_sealed_array_set(arr: *mut LinArray, idx: i64, obj:
     // Release the OLD element's heap fields before overwriting (no-op for a scalar-only record).
     crate::sealed::release_payload_fields_pub(slot, desc);
     std::ptr::copy_nonoverlapping(obj.add(crate::sealed::SEALED_HEADER), slot, stride as usize);
-    crate::sealed::retain_sealed_payload_fields(slot, desc);
+    // Immortal early-out: if the source struct is frozen, all its heap-field payloads are also
+    // immortal (frozen() is deep), so every per-field retain would be a no-op. Skip the walk.
+    if *(obj as *const u32) < crate::string::IMMORTAL_RC {
+        crate::sealed::retain_sealed_payload_fields(slot, desc);
+    }
 }
 
 // -------------------------------------------------------------------------
