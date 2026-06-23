@@ -8,6 +8,7 @@ pub mod monomorphize;
 pub mod ownership_verify;
 pub mod rc_elide;
 pub mod rc_verify;
+pub mod redundant_read;
 pub mod repr;
 
 pub use ir::*;
