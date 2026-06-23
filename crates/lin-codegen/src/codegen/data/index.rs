@@ -1009,7 +1009,16 @@ impl<'ctx> Codegen<'ctx> {
             // +1), then store and take a fresh +1 for the struct. A repr-changing coerce already
             // produced an owned +1, so only retain when the source was stored verbatim (borrowed).
             let old = self.builder.load(self.context.ptr_type(AddressSpace::default()), p, "sealed_set_old");
-            self.emit_release(old, &fld_ty);
+            // A SumNode field (`KIND_SUMNODE_FIELD`) stores a raw `*SumNode`, NOT a `*TaggedVal`.
+            // Routing it through `emit_release` with a Union/TypeVar type would call
+            // `lin_tagged_release`, which reads offset-0 as a tag byte → wrong-tag dealloc → UAF.
+            // Derive the field's physical repr and call the repr-aware release.
+            let fld_repr = if Self::sealed_field_kind(&fld_ty) == Some(Self::KIND_SUMNODE_FIELD) {
+                lin_ir::repr::Repr::Packed(lin_ir::repr::Layout::SumNode { sum_ty: fld_ty.clone() })
+            } else {
+                lin_ir::repr::Repr::boxed_opaque()
+            };
+            self.emit_release_repr(old, &fld_ty, &fld_repr);
             self.builder.store(p, stored);
             if !repr_change && stored.is_pointer_value() {
                 self.emit_rc_retain_inline(stored.into_pointer_value());
@@ -1043,6 +1052,9 @@ impl<'ctx> Codegen<'ctx> {
         let _ = arr_ty;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
+        if !arr.is_pointer_value() {
+            return ptr_ty.const_null().into();
+        }
         let arr_ptr = arr.into_pointer_value();
 
         // ── 0xFC Columnar fast path (BEFORE the PackedSealedArray early-return guard) ─────────
