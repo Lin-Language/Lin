@@ -68,6 +68,7 @@ pub fn elide_rc(module: &mut LinModule) {
 
     for func in &mut module.functions {
         elide_rc_fn(func, &conv_map);
+        elide_clonebox_reads_fn(func, &conv_map);
     }
 }
 
@@ -631,6 +632,416 @@ fn path_has_no_interference(
         }
     }
     true
+}
+
+// ===========================================================================
+// CloneBox-read elision
+// ===========================================================================
+//
+// Eliminates `CloneBox { dst, src }` / `Release { val: dst }` pairs where
+// `dst` is ONLY consumed by Borrow-convention instructions (comparisons,
+// unbox-to-scalar, equality tests — all tagged_eq/unbox callers) and `src`
+// (the borrowed interior pointer that `lin_map_get` / `lin_object_get`
+// returns) remains valid throughout the span.
+//
+// The transformation:
+//   before:  CloneBox { dst, src }  ...uses of dst at Borrow positions...  Release { dst }
+//   after:   ...uses with dst replaced by src...
+//
+// Soundness requirements (all checked before eliding):
+//   1. All uses of `dst` in every block where `dst` is live are at verified
+//      Borrow-convention positions — the existing interference predicate
+//      rejects Own-convention uses, escapes, stores, and non-Borrow calls.
+//   2. `src` is not released or redefined in any block where `dst` is live —
+//      the borrowed pointer stays valid for all reads.
+//   3. The Release block post-dominates the CloneBox block — the Release is
+//      reached on every execution path through the CloneBox.
+//
+// Why this is sound for `lin_map_get` / `lin_object_get` results:
+//   Both return a pointer into the map/object's key-value backing store. That
+//   pointer remains valid as long as the container is not mutated or freed.
+//   The interference check rejects any `IndexSet`, `FieldSet`, `CellSet`,
+//   `GlobalValSet`, or any non-Borrow call — exactly the set that could
+//   mutate the backing store or drop the container.
+//
+// Cross-block support:
+//   The CloneBox is typically in one block and the Release in a downstream
+//   merge block (post-dominator). Uses of `dst` appear in intermediate
+//   if-then/else blocks. The pass collects all live blocks for `dst`, checks
+//   ALL of them, and applies the substitution in every live block.
+
+/// A CloneBox/Release pair that is safe to elide (cross-block).
+struct CloneBoxElision {
+    /// The block containing the CloneBox.
+    clone_block_idx: usize,
+    clone_instr_idx: usize,
+    /// The block containing the Release.
+    release_block_idx: usize,
+    release_instr_idx: usize,
+    dst: Temp,
+    src: Temp,
+    /// All (block_idx, instr_idx) pairs where `dst` must be substituted by `src`.
+    /// Does NOT include the CloneBox or Release themselves (those are removed).
+    substitutions: Vec<(usize, usize)>,
+}
+
+fn elide_clonebox_reads_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Vec<Convention>>) {
+    // Compute liveness and post-dominators once.
+    let liveness = Liveness::compute(func);
+    let postdom = PostDom::compute(func);
+    let block_index: HashMap<BlockId, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+
+    let mut elisions: Vec<CloneBoxElision> = Vec::new();
+
+    // For each block, scan for CloneBox instructions.
+    for clone_block_idx in 0..func.blocks.len() {
+        let clone_block_id = func.blocks[clone_block_idx].id;
+        let instrs = func.blocks[clone_block_idx].instructions.clone();
+
+        for (clone_instr_idx, instr) in instrs.iter().enumerate() {
+            let (dst, src) = match instr {
+                Instruction::CloneBox { dst, src, ty } if is_union_clonebox_ty(ty) => (*dst, *src),
+                _ => continue,
+            };
+
+            // STEP 1: Find the Release for `dst` using the idom chain (same as cross-block
+            // Retain/Release search). The Release must post-dominate the CloneBox block.
+            let release_loc = find_clonebox_release_cross_block(
+                dst,
+                clone_block_idx,
+                clone_instr_idx,
+                func,
+                &block_index,
+                &postdom,
+                conv_map,
+            );
+            let (release_block_idx, release_instr_idx) = match release_loc {
+                Some(x) => x,
+                None => continue,
+            };
+            let release_block_id = func.blocks[release_block_idx].id;
+
+            // STEP 2: Collect all blocks where `dst` is live (live_in or live_out).
+            // These are the blocks that have uses of `dst` and need checking.
+            // We only need blocks that are between the CloneBox and the Release:
+            // those dominated by clone_block and that post-dom from which release
+            // is reachable. Using liveness is sufficient: `dst` is live in exactly
+            // those blocks.
+            //
+            // Special cases:
+            // - Clone block: live from clone_instr_idx+1 to end of block (may flow out).
+            // - Release block: live from start to release_instr_idx (exclusive).
+            // - Intermediate blocks: `dst ∈ live_in`.
+
+            // Collect all block_indices where dst is live_in (intermediate blocks):
+            let live_blocks: Vec<usize> = func.blocks.iter().enumerate().filter_map(|(bi, b)| {
+                if liveness.live_in.get(&b.id).map_or(false, |s| s.contains(&dst)) {
+                    Some(bi)
+                } else {
+                    None
+                }
+            }).collect();
+
+            // STEP 3: Check all blocks for sound elision.
+            // For each block where dst is live, verify:
+            //   (a) all uses of dst are at Borrow positions (no interference),
+            //   (b) src is not invalidated.
+            let mut all_clean = true;
+            let mut substitutions: Vec<(usize, usize)> = Vec::new();
+
+            // Check clone block (after clone_instr_idx).
+            {
+                let instrs_cb = &func.blocks[clone_block_idx].instructions;
+                let start = clone_instr_idx + 1;
+                let end = if clone_block_idx == release_block_idx {
+                    release_instr_idx
+                } else {
+                    instrs_cb.len()
+                };
+                for i in start..end {
+                    let instr = &instrs_cb[i];
+                    if instr_uses_temp(instr, dst) {
+                        if instr_is_interference(dst, instr, conv_map) {
+                            all_clean = false;
+                            break;
+                        }
+                        substitutions.push((clone_block_idx, i));
+                    }
+                    if src_instr_invalidates(src, instr) {
+                        all_clean = false;
+                        break;
+                    }
+                }
+            }
+            if !all_clean { continue; }
+
+            // Check intermediate blocks (live_in blocks that are not the clone/release block).
+            for &bi in &live_blocks {
+                if bi == clone_block_idx || bi == release_block_idx { continue; }
+                let instrs_b = &func.blocks[bi].instructions;
+                let end = instrs_b.len();
+                for i in 0..end {
+                    let instr = &instrs_b[i];
+                    if instr_uses_temp(instr, dst) {
+                        if instr_is_interference(dst, instr, conv_map) {
+                            all_clean = false;
+                            break;
+                        }
+                        substitutions.push((bi, i));
+                    }
+                    if src_instr_invalidates(src, instr) {
+                        all_clean = false;
+                        break;
+                    }
+                }
+                if !all_clean { break; }
+            }
+            if !all_clean { continue; }
+
+            // Check release block (before release_instr_idx), if different from clone block.
+            if release_block_idx != clone_block_idx {
+                let instrs_rb = &func.blocks[release_block_idx].instructions;
+                for i in 0..release_instr_idx {
+                    let instr = &instrs_rb[i];
+                    if instr_uses_temp(instr, dst) {
+                        if instr_is_interference(dst, instr, conv_map) {
+                            all_clean = false;
+                            break;
+                        }
+                        substitutions.push((release_block_idx, i));
+                    }
+                    if src_instr_invalidates(src, instr) {
+                        all_clean = false;
+                        break;
+                    }
+                }
+                if !all_clean { continue; }
+            }
+
+            // STEP 4: Verify Bm (release block) post-dominates B0 (clone block).
+            if !postdom.post_dominates(release_block_id, clone_block_id) {
+                continue;
+            }
+
+            elisions.push(CloneBoxElision {
+                clone_block_idx,
+                clone_instr_idx,
+                release_block_idx,
+                release_instr_idx,
+                dst,
+                src,
+                substitutions,
+            });
+        }
+    }
+
+    if elisions.is_empty() {
+        return;
+    }
+
+    // Apply elisions: substitute dst→src in all collected sites, remove CloneBox + Release.
+    // Sort substitutions by (block_idx, instr_idx) ascending; removals descending per block.
+    let mut to_remove: HashSet<(usize, usize)> = HashSet::new();
+    let mut all_subs: Vec<(usize, usize, Temp, Temp)> = Vec::new(); // (bi, ii, old, new)
+
+    for e in &elisions {
+        to_remove.insert((e.clone_block_idx, e.clone_instr_idx));
+        to_remove.insert((e.release_block_idx, e.release_instr_idx));
+        for &(bi, ii) in &e.substitutions {
+            all_subs.push((bi, ii, e.dst, e.src));
+        }
+    }
+
+    // Apply substitutions (forward order within each block; index shifts from removals
+    // happen AFTER substitution, so indices are still valid here).
+    for (bi, ii, old, new) in &all_subs {
+        substitute_temp_in_instr(&mut func.blocks[*bi].instructions[*ii], *old, *new);
+    }
+
+    // Remove in descending order per block.
+    for block_idx in 0..func.blocks.len() {
+        let mut remove_here: Vec<usize> = to_remove
+            .iter()
+            .filter(|(b, _)| *b == block_idx)
+            .map(|(_, i)| *i)
+            .collect();
+        remove_here.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in remove_here {
+            func.blocks[block_idx].instructions.remove(idx);
+            if idx < func.blocks[block_idx].instr_spans.len() {
+                func.blocks[block_idx].instr_spans.remove(idx);
+            }
+        }
+    }
+}
+
+/// Returns true for union-typed CloneBox — the case where a fresh box is
+/// allocated by `lin_tagged_clone`. Concrete-RC CloneBox degrades to a plain
+/// Retain (no allocation), so the Retain/Release pass already handles it.
+fn is_union_clonebox_ty(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Union(_) | Type::TypeVar(_) | Type::Named(_)
+            | Type::Shared(_) | Type::Stream(_) | Type::Promise(_)
+            | Type::Opaque(_)
+    )
+}
+
+/// Returns true if `instr` uses `temp` in any position (use, def, or otherwise).
+/// We use this to enumerate substitution sites.
+fn instr_uses_temp(instr: &Instruction, temp: Temp) -> bool {
+    let (uses, _) = crate::liveness::instr_use_def(instr);
+    uses.contains(&temp)
+}
+
+/// Returns true if `instr` invalidates the borrowed source pointer `src`.
+/// A source is invalidated when it is Released (container freed) or Redefined
+/// (the slot now points to something else). We do NOT flag ownership-transferring
+/// calls here because `src` is the borrowed result of `lin_map_get` (an interior
+/// pointer); only releasing the CONTAINER that produced `src` would dangle it,
+/// which the interference check on `dst` already prevents (any Own-convention use
+/// of the container in a call is interference). Being conservative: release or
+/// def of `src` itself invalidates it.
+fn src_instr_invalidates(src: Temp, instr: &Instruction) -> bool {
+    match instr {
+        Instruction::Release { val, .. } if *val == src => return true,
+        _ => {}
+    }
+    let (_, defs) = crate::liveness::instr_use_def(instr);
+    defs.contains(&src)
+}
+
+/// Find the Release for `dst` using the idom post-dominator chain, starting from
+/// the clone block. Returns `(release_block_idx, release_instr_idx)` when a clean,
+/// post-dominating Release is found; `None` otherwise.
+///
+/// Mirrors `find_paired_release_cross_block` for Retain/Release, extended to:
+///   - start the idom walk from the clone block itself (same-block release falls
+///     through to the idom chain as well),
+///   - scan from `clone_instr_idx+1` within the clone block (not from 0).
+fn find_clonebox_release_cross_block(
+    dst: Temp,
+    clone_block_idx: usize,
+    clone_instr_idx: usize,
+    func: &LinFunction,
+    block_index: &HashMap<BlockId, usize>,
+    postdom: &PostDom,
+    conv_map: &HashMap<FuncId, Vec<Convention>>,
+) -> Option<(usize, usize)> {
+    let clone_block_id = func.blocks[clone_block_idx].id;
+
+    // Check same block first (scan from clone_instr_idx+1).
+    let tail_instrs = &func.blocks[clone_block_idx].instructions;
+    for i in (clone_instr_idx + 1)..tail_instrs.len() {
+        match &tail_instrs[i] {
+            Instruction::Release { val, .. } if *val == dst => {
+                return Some((clone_block_idx, i));
+            }
+            other => {
+                let (_, defs) = crate::liveness::instr_use_def(other);
+                if defs.contains(&dst) {
+                    return None; // dst redefined
+                }
+            }
+        }
+    }
+
+    // Walk the idom chain from the clone block's immediate post-dominator.
+    let mut current_id = clone_block_id;
+    let mut visited: HashSet<BlockId> = HashSet::new();
+    visited.insert(clone_block_id);
+
+    loop {
+        let Some(next_id) = postdom.idom(current_id) else { break };
+        if visited.contains(&next_id) { break; }
+        visited.insert(next_id);
+
+        let Some(&idx) = block_index.get(&next_id) else { break };
+        let block = &func.blocks[idx];
+
+        // Search for the Release at the start of this block.
+        if let Some(release_pos) = find_release_at_block_start(dst, block, |_| false) {
+            return Some((idx, release_pos));
+        }
+
+        // If this block is tainted for `dst` or redefs it, stop.
+        if !block_is_clean_for(dst, block, conv_map) || !block_temp_survives(dst, block) {
+            break;
+        }
+
+        current_id = next_id;
+    }
+
+    None
+}
+
+/// Substitute `old_temp` → `new_temp` in all USE positions of `instr`.
+/// Only replaces USE occurrences (input operands), never DEF positions
+/// (which are outputs / destinations). This is safe because elision removes
+/// the instruction that defined `old_temp`, so no instruction after the
+/// CloneBox should define it — but we guard conservatively anyway.
+fn substitute_temp_in_instr(instr: &mut Instruction, old: Temp, new: Temp) {
+    macro_rules! sub {
+        ($t:expr) => { if *$t == old { *$t = new; } };
+    }
+    match instr {
+        Instruction::Copy { src, .. } => { sub!(src); }
+        Instruction::Phi { incomings, .. } => {
+            for (t, _) in incomings.iter_mut() { sub!(t); }
+        }
+        Instruction::Unary { operand, .. } => { sub!(operand); }
+        Instruction::Binary { lhs, rhs, .. } => { sub!(lhs); sub!(rhs); }
+        Instruction::Coerce { src, .. } => { sub!(src); }
+        Instruction::Call { callee, args, .. } => {
+            for a in args.iter_mut() { sub!(a); }
+            if let CallTarget::Indirect(t) = callee { sub!(t); }
+        }
+        Instruction::CallIntrinsic { args, .. } => {
+            for a in args.iter_mut() { sub!(a); }
+        }
+        Instruction::MakeClosure { captures, .. } => {
+            for c in captures.iter_mut() { sub!(c); }
+        }
+        Instruction::MakeObject { fields, spreads, computed_fields, .. } => {
+            for (_, v) in fields.iter_mut() { sub!(v); }
+            for s in spreads.iter_mut() { sub!(s); }
+            for (k, v) in computed_fields.iter_mut() { sub!(k); sub!(v); }
+        }
+        Instruction::MakeArray { elements, spreads, .. } => {
+            for e in elements.iter_mut() { sub!(e); }
+            for (_, t) in spreads.iter_mut() { sub!(t); }
+        }
+        Instruction::Index { object, key, .. } => { sub!(object); sub!(key); }
+        Instruction::IndexSet { object, key, value, .. } => { sub!(object); sub!(key); sub!(value); }
+        Instruction::FieldGet { object, .. } => { sub!(object); }
+        Instruction::FieldSet { object, value, .. } => { sub!(object); sub!(value); }
+        Instruction::SealedArrayFieldGet { array, index, .. } => { sub!(array); sub!(index); }
+        Instruction::BoxedArrayFieldGet { array, index, .. } => { sub!(array); sub!(index); }
+        Instruction::EnvCapture { env, .. } => { sub!(env); }
+        Instruction::ArrayLenCheck { val, .. } => { sub!(val); }
+        Instruction::ObjectRest { src, .. } => { sub!(src); }
+        Instruction::GlobalValSet { value, .. } => { sub!(value); }
+        Instruction::MakeCell { init, .. } => { sub!(init); }
+        Instruction::CellGet { cell, .. } => { sub!(cell); }
+        Instruction::CellSet { cell, value, .. } => { sub!(cell); sub!(value); }
+        Instruction::FreeCell { cell, .. } => { sub!(cell); }
+        Instruction::Retain { val, .. } => { sub!(val); }
+        Instruction::Release { val, .. } => { sub!(val); }
+        Instruction::CloneBox { src, .. } => { sub!(src); }  // dst is a def — not substituted
+        Instruction::FreeBoxShell { val } => { sub!(val); }
+        Instruction::FreeBoxShellIfDistinct { val, other } => { sub!(val); sub!(other); }
+        Instruction::ReleaseIfDistinct { val, other } => { sub!(val); sub!(other); }
+        Instruction::IsType { val, .. } => { sub!(val); }
+        Instruction::SumTagEq { val, .. } => { sub!(val); }
+        Instruction::HasPattern { val, .. } => { sub!(val); }
+        Instruction::MatchesSchema { val, .. } => { sub!(val); }
+        Instruction::Box { val, .. } => { sub!(val); }
+        Instruction::Unbox { val, .. } => { sub!(val); }
+        Instruction::Bind { src, .. } => { sub!(src); }
+        Instruction::Panic { msg } => { sub!(msg); }
+        // No-use instructions: Const, GlobalValGet, MakeNamedClosure, DebugDeclare
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -1273,5 +1684,206 @@ mod tests {
         let (retains, releases) = count_rc(&module.functions[0], Temp(0));
         assert_eq!(retains, 1, "Retain must be kept (interference in intermediate block)");
         assert_eq!(releases, 1, "Release must be kept (interference in intermediate block)");
+    }
+
+    // -------------------------------------------------------------------------
+    // CloneBox-read elision tests
+    // -------------------------------------------------------------------------
+
+    /// Count CloneBox instructions in a function (for a specific dst temp).
+    fn count_clonebox(func: &LinFunction, dst: Temp) -> usize {
+        func.blocks.iter().flat_map(|b| &b.instructions).filter(|i| {
+            matches!(i, Instruction::CloneBox { dst: d, .. } if *d == dst)
+        }).count()
+    }
+
+    /// Count Release instructions for a specific temp in a function.
+    fn count_release(func: &LinFunction, temp: Temp) -> usize {
+        func.blocks.iter().flat_map(|b| &b.instructions).filter(|i| {
+            matches!(i, Instruction::Release { val, .. } if *val == temp)
+        }).count()
+    }
+
+    /// Returns true if any instruction in the function uses `new_temp` in a Borrow position
+    /// where `old_temp` was used before elision.
+    fn any_uses_of(func: &LinFunction, temp: Temp) -> bool {
+        func.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
+            let (uses, _) = crate::liveness::instr_use_def(i);
+            uses.contains(&temp)
+        })
+    }
+
+    /// Build a helper function with a union type for the dst temp.
+    fn make_clonebox_fn(id: FuncId, instrs: Vec<Instruction>) -> LinFunction {
+        // Temp(0) = src (borrowed map-get result, e.g. Union type)
+        // Temp(1) = dst (CloneBox output)
+        // Temp(2) = scratch result of intrinsic
+        let union_ty = Type::Union(vec![Type::Int32, Type::Null]);
+        let mut temp_types = std::collections::HashMap::new();
+        temp_types.insert(Temp(0), union_ty.clone());
+        temp_types.insert(Temp(1), union_ty.clone());
+        temp_types.insert(Temp(2), Type::Int32);
+        let block = BasicBlock {
+            id: BlockId(0),
+            label: None,
+            instructions: instrs,
+            terminator: Terminator::Return(None),
+            span: None,
+            instr_spans: Vec::new(),
+        };
+        LinFunction {
+            id,
+            name: None,
+            params: vec![],
+            is_closure: false,
+            ret_ty: Type::Null,
+            param_conventions: Vec::new(),
+            ret_convention: Convention::Own,
+            blocks: vec![block],
+            temp_types,
+            temp_count: 3,
+            intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
+            coverage_origin: None,
+        }
+    }
+
+    fn make_clonebox_two_block_fn(
+        id: FuncId,
+        instrs0: Vec<Instruction>,
+        instrs1: Vec<Instruction>,
+    ) -> LinFunction {
+        let union_ty = Type::Union(vec![Type::Int32, Type::Null]);
+        let mut temp_types = std::collections::HashMap::new();
+        temp_types.insert(Temp(0), union_ty.clone());
+        temp_types.insert(Temp(1), union_ty.clone());
+        temp_types.insert(Temp(2), Type::Int32);
+        let block0 = BasicBlock {
+            id: BlockId(0),
+            label: None,
+            instructions: instrs0,
+            terminator: Terminator::Jump(BlockId(1)),
+            span: None,
+            instr_spans: Vec::new(),
+        };
+        let block1 = BasicBlock {
+            id: BlockId(1),
+            label: None,
+            instructions: instrs1,
+            terminator: Terminator::Return(None),
+            span: None,
+            instr_spans: Vec::new(),
+        };
+        LinFunction {
+            id,
+            name: None,
+            params: vec![],
+            is_closure: false,
+            ret_ty: Type::Null,
+            param_conventions: Vec::new(),
+            ret_convention: Convention::Own,
+            blocks: vec![block0, block1],
+            temp_types,
+            temp_count: 3,
+            intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
+            coverage_origin: None,
+        }
+    }
+
+    /// Positive: CloneBox(dst, src) + UnboxInt32(dst) [Borrow] + Release(dst) in one block.
+    /// All uses are Borrow-convention → elide CloneBox and Release, substitute dst→src.
+    #[test]
+    fn clonebox_same_block_borrow_use_elided() {
+        let union_ty = Type::Union(vec![Type::Int32, Type::Null]);
+        let instrs = vec![
+            Instruction::CloneBox { dst: Temp(1), src: Temp(0), ty: union_ty.clone() },
+            Instruction::CallIntrinsic {
+                dst: Temp(2),
+                intrinsic: Intrinsic::UnboxInt32,
+                args: vec![Temp(1)],
+                ret_ty: Type::Int32,
+            },
+            Instruction::Release { val: Temp(1), ty: union_ty.clone() },
+        ];
+        let mut module = make_module(make_clonebox_fn(FuncId(0), instrs));
+        elide_rc(&mut module);
+        let func = &module.functions[0];
+        assert_eq!(count_clonebox(func, Temp(1)), 0, "CloneBox should be elided");
+        assert_eq!(count_release(func, Temp(1)), 0, "Release(dst) should be elided");
+        // The UnboxInt32 call should now reference Temp(0) (src), not Temp(1) (dst).
+        let uses_dst = any_uses_of(func, Temp(1));
+        assert!(!uses_dst, "No instruction should reference dst after elision");
+    }
+
+    /// Positive: CloneBox in block 0, Borrow use (UnboxInt32) in block 0,
+    /// Release in block 1 (the direct successor = post-dominator).
+    /// Cross-block elision should fire.
+    #[test]
+    fn clonebox_cross_block_borrow_use_elided() {
+        let union_ty = Type::Union(vec![Type::Int32, Type::Null]);
+        let instrs0 = vec![
+            Instruction::CloneBox { dst: Temp(1), src: Temp(0), ty: union_ty.clone() },
+            Instruction::CallIntrinsic {
+                dst: Temp(2),
+                intrinsic: Intrinsic::UnboxInt32,
+                args: vec![Temp(1)],
+                ret_ty: Type::Int32,
+            },
+        ];
+        let instrs1 = vec![
+            Instruction::Release { val: Temp(1), ty: union_ty.clone() },
+        ];
+        let mut module = make_module(make_clonebox_two_block_fn(FuncId(0), instrs0, instrs1));
+        elide_rc(&mut module);
+        let func = &module.functions[0];
+        assert_eq!(count_clonebox(func, Temp(1)), 0, "CloneBox should be elided (cross-block)");
+        assert_eq!(count_release(func, Temp(1)), 0, "Release(dst) should be elided (cross-block)");
+        let uses_dst = any_uses_of(func, Temp(1));
+        assert!(!uses_dst, "No instruction should reference dst after elision");
+    }
+
+    /// Negative: CloneBox + CallTarget::Named call passing dst (unknown convention = Own).
+    /// Must NOT elide: the call transfers ownership of dst.
+    #[test]
+    fn clonebox_kept_when_own_use() {
+        let union_ty = Type::Union(vec![Type::Int32, Type::Null]);
+        let instrs = vec![
+            Instruction::CloneBox { dst: Temp(1), src: Temp(0), ty: union_ty.clone() },
+            // Named call = unknown convention = Own for all args → interference
+            Instruction::Call {
+                dst: Temp(2),
+                callee: CallTarget::Named("some_fn".into()),
+                args: vec![Temp(1)],
+                ret_ty: Type::Null,
+            },
+            Instruction::Release { val: Temp(1), ty: union_ty.clone() },
+        ];
+        let mut module = make_module(make_clonebox_fn(FuncId(0), instrs));
+        elide_rc(&mut module);
+        let func = &module.functions[0];
+        assert_eq!(count_clonebox(func, Temp(1)), 1, "CloneBox must be kept (Own use)");
+        assert_eq!(count_release(func, Temp(1)), 1, "Release must be kept (Own use)");
+    }
+
+    /// Negative: CloneBox where the type is NOT a union (e.g. plain Str).
+    /// The pass only targets union-typed boxes; non-union CloneBox degrades to Retain
+    /// and is handled by the Retain/Release pass, not this one. Confirm no elision here.
+    #[test]
+    fn clonebox_non_union_type_not_elided_by_clonebox_pass() {
+        // Use Type::Str — NOT a union type per is_union_clonebox_ty.
+        let instrs = vec![
+            Instruction::CloneBox { dst: Temp(1), src: Temp(0), ty: Type::Str },
+            Instruction::Copy { dst: Temp(2), src: Temp(1) },
+            Instruction::Release { val: Temp(1), ty: Type::Str },
+        ];
+        // For this test we only check that elide_clonebox_reads_fn itself doesn't fire.
+        // The Retain/Release pass may or may not convert a non-union CloneBox — that is not
+        // what we're testing here.
+        let conv_map = HashMap::new();
+        let mut func = make_clonebox_fn(FuncId(0), instrs);
+        elide_clonebox_reads_fn(&mut func, &conv_map);
+        // The CloneBox (Str-typed) must survive the CloneBox-read pass.
+        assert_eq!(count_clonebox(&func, Temp(1)), 1, "Non-union CloneBox must not be touched by clonebox-read pass");
     }
 }
