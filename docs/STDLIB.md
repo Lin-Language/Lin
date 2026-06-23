@@ -3106,6 +3106,34 @@ jqFirst(data, ".users[] | select(false)")   // null
 
 ---
 
+## std/csv
+
+Import:
+
+```txt
+import { parse, parseWithHeader, stringify, stringifyRecords, rows, recordRows } from "std/csv"
+```
+
+RFC 4180 CSV parse and stringify — eager (`parse`/`parseWithHeader`/`stringify`/`stringifyRecords`) and streaming (`rows`/`recordRows`).
+
+---
+
+### recordRows
+
+```txt
+val recordRows: (src: Stream<UInt8[]>, opts: CsvOptions = {}) -> Stream
+```
+
+Lazily parses a byte stream into a stream of keyed records, treating the first row as the header. Each subsequent row becomes a `{ String: String }` map keyed by the header columns. `CsvOptions` accepts `delimiter` (defaults to `,`), `trim` (strip ASCII whitespace from unquoted fields), and `columns` (a `String[]` of column names to materialise; when provided, only the listed columns are allocated per row — all other columns are skipped). Omitting `columns` (or passing an empty array) preserves the default all-columns behaviour.
+
+```txt
+readStream("stops.txt")
+  .recordRows({ "columns": ["stop_id", "stop_name", "stop_lat", "stop_lon"] })
+  .for(row => ...)
+```
+
+---
+
 ## std/fs
 
 Import:
