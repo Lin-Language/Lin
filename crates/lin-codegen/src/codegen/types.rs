@@ -587,7 +587,7 @@ impl<'ctx> Codegen<'ctx> {
             // Int8/Int16 occupy 1/2-byte slots in the packed struct (physical i8/i16). The dynamic
             // boxing path sign-extends to i32 and uses TAG_INT32 (matching type_tag / box_value).
             // Distinct from NKIND_INT32 so nkind_size_align returns (1,1)/(2,2) and
-            // struct_size_from_named_desc / materialize_named_payload_to_map use the correct slot size.
+            // struct_size_from_named_desc / sealed_elem_payload_to_record_box use the correct slot size.
             Type::Int8 => Some(Self::NKIND_INT8),
             Type::Int16 => Some(Self::NKIND_INT16),
             Type::Int32 | Type::IntLit(_) => Some(Self::NKIND_INT32),

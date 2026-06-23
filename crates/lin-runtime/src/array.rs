@@ -1325,16 +1325,16 @@ pub unsafe extern "C-unwind" fn lin_array_get_tagged(arr: *const LinArray, idx: 
             (*tv).payload = v;
         }
         SEALED_ARRAY_TAG => {
-            // ADR-063 Stage 3b mechanism (i): a 0xFE element is a packed HEADER-LESS sealed-record
-            // payload of `elem_stride` bytes — NOT a TaggedVal. The default arm below would misread
-            // its first 16 bytes as a `{tag, payload}` box (a scalar misread; a heap-field deref
-            // crash). Instead MATERIALIZE a fresh keyed `LinObject` view from the packed element via
-            // the NAMED full-field descriptor, materialize to a LinMap, box as TAG_MAP, and return
-            // it as the caller's owned +1 (matching the get_tagged contract). Heap fields are
-            // RETAINED into the materialized map; the packed buffer keeps its own reference.
+            // Stage 4c: a 0xFE element is a packed HEADER-LESS sealed-record payload of
+            // `elem_stride` bytes. Allocate a fresh standalone sealed struct, copy the payload in,
+            // retain heap fields, and return as TAG_RECORD — no intermediate LinMap.
             dealloc(tv as *mut u8, tv_layout);
             let payload = ((*arr).data as *const u8).add((idx as u64 * (*arr).elem_stride) as usize);
-            return crate::sealed::materialize_sealed_elem_boxed(payload, (*arr).elem_named_desc);
+            return crate::sealed::sealed_elem_payload_to_record_box(
+                payload,
+                (*arr).elem_named_desc,
+                (*arr).elem_stride as u32,
+            );
         }
         SEALED_PTR_ARRAY_TAG => {
             // Pointer-backed sealed-record array (0xFD): each slot is a `*mut u8` struct pointer.
