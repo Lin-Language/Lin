@@ -226,8 +226,9 @@ unsafe fn map_get_i32(map: *const LinMap, key: &str) -> Option<i32> {
 
 /// Extract the LinMap from a TaggedVal that may be TAG_MAP or TAG_RECORD (sealed struct).
 /// Returns (map ptr, owned: bool) where owned=true means caller must call lin_map_release.
+/// TAG_RECORD: builds the map inline via record_walk_fields + lin_map_set (no generic materialize).
 unsafe fn response_to_map(tv: *const TaggedVal) -> Option<(*const LinMap, bool)> {
-    use crate::tagged::TAG_RECORD;
+    use crate::tagged::{TAG_RECORD, TAG_MAP};
     if tv.is_null() { return None; }
     match (*tv).tag {
         TAG_MAP => {
@@ -235,11 +236,30 @@ unsafe fn response_to_map(tv: *const TaggedVal) -> Option<(*const LinMap, bool)>
             if map.is_null() { None } else { Some((map, false)) }
         }
         TAG_RECORD => {
-            let sealed = (*tv).payload as *mut u8;
+            let sealed = (*tv).payload as *const u8;
             if sealed.is_null() { return None; }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let map = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
-            if map.is_null() { None } else { Some((map as *const LinMap, true)) }
+            if named_desc.is_null() {
+                // No named descriptor — empty record.
+                let map = lin_map_alloc(0, crate::map::KEY_KIND_STRING);
+                return Some((map as *const LinMap, true));
+            }
+            // Count fields for the capacity hint.
+            let field_count = u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)]) as u32;
+            let map = crate::map::lin_map_alloc_mixed(field_count, crate::map::KEY_KIND_STRING);
+            crate::sealed::record_walk_fields(named_desc, |name_bytes, offset, nkind, nested| {
+                let key = crate::string::lin_string_literal(name_bytes.as_ptr(), name_bytes.len() as u32);
+                let boxed = crate::sealed::box_field_value(sealed, offset, nkind, nested);
+                if boxed.is_null() {
+                    use crate::tagged::{TaggedVal, TAG_NULL};
+                    let tv_null = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
+                    lin_map_set(map, key, &tv_null);
+                } else {
+                    lin_map_set(map, key, boxed as *const TaggedVal);
+                    crate::tagged::lin_tagged_release(boxed);
+                }
+            });
+            Some((map as *const LinMap, true))
         }
         _ => None,
     }

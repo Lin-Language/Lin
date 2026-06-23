@@ -254,64 +254,43 @@ unsafe fn validate(
                     Ok(())
                 })();
             }
-            // Normalize any object-shaped value to a LinMap for uniform field lookup.
-            let (map, map_owned) = if tag == TAG_MAP {
-                let m = (*(value as *const TaggedVal)).payload as *const crate::map::LinMap;
-                (m, false)
-            } else if tag == TAG_RECORD {
-                let sealed = (*(value as *const TaggedVal)).payload as *mut u8;
+            // TAG_RECORD: walk schema fields via lin_record_get_field (descriptor-walk, no LinMap).
+            if tag == TAG_RECORD {
+                let sealed = (*(value as *const TaggedVal)).payload as *const u8;
                 if sealed.is_null() {
                     return Err(format!("expected an object at {}", path));
                 }
-                let named_desc = *((sealed.add(16)) as *const *const u8);
-                let m = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
-                if m.is_null() {
-                    return Err(format!("expected an object at {}", path));
-                }
-                (m as *const crate::map::LinMap, true)
-            } else {
-                return Err(format!("expected an object at {}", path));
-            };
-            let nfields = desc.u32_at(node + 1) as usize;
-            // Walk the variable-length field rows.
-            let mut cur = node + 5;
-            let result = (|| -> Result<(), String> {
-                for _ in 0..nfields {
-                    let klen = desc.u16_at(cur) as usize;
-                    let key = desc.str_at(cur + 2, klen);
-                    let nullable = desc.u8_at(cur + 2 + klen) != 0;
-                    let val_off = desc.u32_at(cur + 2 + klen + 1) as usize;
-                    cur += 2 + klen + 1 + 4;
-
-                    // Look up by raw key bytes — no temp LinString malloc/free per field.
-                    let field = if map.is_null() {
-                        std::ptr::null()
-                    } else {
-                        crate::map::lin_map_get_bytes(map, key.as_ptr(), key.len() as u32)
-                    };
-
-                    let field_present = !field.is_null() && (*(field as *const TaggedVal)).tag != TAG_NULL;
-                    if !field_present {
-                        if nullable {
-                            continue;
+                let nfields = desc.u32_at(node + 1) as usize;
+                let mut cur = node + 5;
+                return (|| -> Result<(), String> {
+                    for _ in 0..nfields {
+                        let klen = desc.u16_at(cur) as usize;
+                        let key = desc.str_at(cur + 2, klen);
+                        let nullable = desc.u8_at(cur + 2 + klen) != 0;
+                        let val_off = desc.u32_at(cur + 2 + klen + 1) as usize;
+                        cur += 2 + klen + 1 + 4;
+                        // lin_record_get_field returns OWNED +1 box (or null for missing/null field).
+                        let k = crate::string::lin_string_literal(key.as_ptr(), key.len() as u32);
+                        let field_box = crate::sealed::lin_record_get_field(sealed, k);
+                        let field_present = !field_box.is_null()
+                            && (*(field_box as *const TaggedVal)).tag != TAG_NULL;
+                        if !field_present {
+                            if !field_box.is_null() { crate::tagged::lin_tagged_release(field_box); }
+                            if nullable { continue; }
+                            return Err(format!("missing required field \"{}\" at {}", key, path));
                         }
-                        return Err(format!("missing required field \"{}\" at {}", key, path));
+                        let base_len = path.len();
+                        path.push('.');
+                        path.push_str(key);
+                        let r = validate(field_box as *const u8, desc, val_off, path);
+                        crate::tagged::lin_tagged_release(field_box);
+                        if r.is_ok() { path.truncate(base_len); }
+                        r?;
                     }
-                    let base_len = path.len();
-                    path.push('.');
-                    path.push_str(key);
-                    let r = validate(field as *const u8, desc, val_off, path);
-                    if r.is_ok() {
-                        path.truncate(base_len);
-                    }
-                    r?;
-                }
-                Ok(())
-            })();
-            if map_owned {
-                crate::map::lin_map_release(map as *mut crate::map::LinMap);
+                    Ok(())
+                })();
             }
-            result
+            return Err(format!("expected an object at {}", path))
         }
         KIND_UNION => {
             let nvariants = desc.u32_at(node + 1) as usize;
