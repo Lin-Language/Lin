@@ -577,15 +577,34 @@ pub unsafe extern "C" fn lin_sealed_any_to_tagged(arr: *const LinArray) -> *mut 
     if arr.is_null() { return lin_array_alloc(4); }
     match (*arr).elem_tag {
         SEALED_ARRAY_TAG => {
-            // 0xFE inline: materialize each packed payload via named descriptor into a fresh map.
+            // 0xFE inline: build each element's LinMap directly via descriptor-walk (no materialize
+            // helper). Mirror push_display_sealed_payload from Stage 4a: payload is header-less so
+            // treat it as sealed = payload - SEALED_HEADER for struct-relative offset arithmetic.
             use crate::tagged::*;
+            use crate::sealed::SEALED_HEADER;
             let len = (*arr).len;
             let out = lin_array_alloc(len.max(4));
             let named_desc = (*arr).elem_named_desc;
             let stride = (*arr).elem_stride;
             for i in 0..len {
                 let payload = ((*arr).data as *const u8).add((i * stride) as usize);
-                let map = crate::sealed::materialize_named_payload_to_map_pub(payload, named_desc);
+                // Build the map inline: walk the named descriptor, box each field, set into map.
+                let field_count = if named_desc.is_null() { 0u32 } else {
+                    u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)])
+                };
+                let map = crate::map::lin_map_alloc_mixed(field_count, crate::map::KEY_KIND_STRING);
+                let pseudo_sealed = payload.sub(SEALED_HEADER);
+                crate::sealed::record_walk_fields(named_desc, |name_bytes, offset, nkind, nested| {
+                    let key = crate::string::lin_string_literal(name_bytes.as_ptr(), name_bytes.len() as u32);
+                    let boxed = crate::sealed::box_field_value(pseudo_sealed, offset, nkind, nested);
+                    if boxed.is_null() {
+                        let tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
+                        crate::map::lin_map_set(map, key, &tv);
+                    } else {
+                        crate::map::lin_map_set(map, key, boxed as *const TaggedVal);
+                        crate::tagged::lin_tagged_release(boxed);
+                    }
+                });
                 let slot = (*out).data.add(i as usize);
                 (*slot).tag = TAG_MAP;
                 (*slot)._pad = [0; 7];
@@ -788,8 +807,23 @@ pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::
         } else if (*tagged).tag == crate::tagged::TAG_RECORD {
             let sealed = (*tagged).payload as *mut u8;
             if sealed.is_null() { crate::fault::runtime_fault("Runtime error: cannot push null record into sealed array"); }
+            // Build the projection LinMap via descriptor-walk (no materialize helper).
             let named_desc_ptr = *((sealed.add(16)) as *const *const u8);
-            let lmap = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc_ptr);
+            let field_count = if named_desc_ptr.is_null() { 0u32 } else {
+                u32::from_le_bytes([*named_desc_ptr, *named_desc_ptr.add(1), *named_desc_ptr.add(2), *named_desc_ptr.add(3)])
+            };
+            let lmap = crate::map::lin_map_alloc_mixed(field_count, crate::map::KEY_KIND_STRING);
+            crate::sealed::record_walk_fields(named_desc_ptr, |name_bytes, offset, nkind, nested| {
+                let key = crate::string::lin_string_literal(name_bytes.as_ptr(), name_bytes.len() as u32);
+                let boxed = crate::sealed::box_field_value(sealed, offset, nkind, nested);
+                if boxed.is_null() {
+                    let tv = crate::tagged::TaggedVal { tag: crate::tagged::TAG_NULL, _pad: [0; 7], payload: 0 };
+                    crate::map::lin_map_set(lmap, key, &tv);
+                } else {
+                    crate::map::lin_map_set(lmap, key, boxed as *const crate::tagged::TaggedVal);
+                    crate::tagged::lin_tagged_release(boxed);
+                }
+            });
             crate::sealed::pack_named_payload_from_map(slot, lmap, named);
             crate::map::lin_map_release(lmap);
         } else {
@@ -822,8 +856,23 @@ pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::
         } else if (*tagged).tag == crate::tagged::TAG_RECORD {
             let sealed = (*tagged).payload as *mut u8;
             if sealed.is_null() { crate::fault::runtime_fault("Runtime error: cannot push null record into sealed-ptr array"); }
+            // Build the projection LinMap via descriptor-walk (no materialize helper).
             let named_desc_ptr = *((sealed.add(16)) as *const *const u8);
-            let lmap = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc_ptr);
+            let field_count = if named_desc_ptr.is_null() { 0u32 } else {
+                u32::from_le_bytes([*named_desc_ptr, *named_desc_ptr.add(1), *named_desc_ptr.add(2), *named_desc_ptr.add(3)])
+            };
+            let lmap = crate::map::lin_map_alloc_mixed(field_count, crate::map::KEY_KIND_STRING);
+            crate::sealed::record_walk_fields(named_desc_ptr, |name_bytes, offset, nkind, nested| {
+                let key = crate::string::lin_string_literal(name_bytes.as_ptr(), name_bytes.len() as u32);
+                let boxed = crate::sealed::box_field_value(sealed, offset, nkind, nested);
+                if boxed.is_null() {
+                    let tv = crate::tagged::TaggedVal { tag: crate::tagged::TAG_NULL, _pad: [0; 7], payload: 0 };
+                    crate::map::lin_map_set(lmap, key, &tv);
+                } else {
+                    crate::map::lin_map_set(lmap, key, boxed as *const crate::tagged::TaggedVal);
+                    crate::tagged::lin_tagged_release(boxed);
+                }
+            });
             let sptr = crate::sealed::alloc_sealed_struct_from_map(lmap, named, heap_desc);
             lin_sealed_ptr_array_push(arr, sptr); // retains: sptr rc goes 1→2
             crate::sealed::lin_sealed_release_self(sptr); // release our alloc ref: rc goes 2→1
@@ -1056,8 +1105,23 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
         } else if (*tagged).tag == crate::tagged::TAG_RECORD {
             let sealed = (*tagged).payload as *mut u8;
             if !sealed.is_null() {
+                // Build the projection LinMap via descriptor-walk (no materialize helper).
                 let named_desc_ptr = *((sealed.add(16)) as *const *const u8);
-                let lmap = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc_ptr);
+                let field_count = if named_desc_ptr.is_null() { 0u32 } else {
+                    u32::from_le_bytes([*named_desc_ptr, *named_desc_ptr.add(1), *named_desc_ptr.add(2), *named_desc_ptr.add(3)])
+                };
+                let lmap = crate::map::lin_map_alloc_mixed(field_count, crate::map::KEY_KIND_STRING);
+                crate::sealed::record_walk_fields(named_desc_ptr, |name_bytes, offset, nkind, nested| {
+                    let key = crate::string::lin_string_literal(name_bytes.as_ptr(), name_bytes.len() as u32);
+                    let boxed = crate::sealed::box_field_value(sealed, offset, nkind, nested);
+                    if boxed.is_null() {
+                        let tv = crate::tagged::TaggedVal { tag: crate::tagged::TAG_NULL, _pad: [0; 7], payload: 0 };
+                        crate::map::lin_map_set(lmap, key, &tv);
+                    } else {
+                        crate::map::lin_map_set(lmap, key, boxed as *const crate::tagged::TaggedVal);
+                        crate::tagged::lin_tagged_release(boxed);
+                    }
+                });
                 crate::sealed::pack_named_payload_from_map(slot, lmap, (*arr).elem_named_desc);
                 crate::map::lin_map_release(lmap);
             }
@@ -1083,8 +1147,23 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
         } else if (*tagged).tag == crate::tagged::TAG_RECORD {
             let sealed = (*tagged).payload as *mut u8;
             if sealed.is_null() { return; }
+            // Build the projection LinMap via descriptor-walk (no materialize helper).
             let named_desc_ptr = *((sealed.add(16)) as *const *const u8);
-            let lmap = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc_ptr);
+            let field_count = if named_desc_ptr.is_null() { 0u32 } else {
+                u32::from_le_bytes([*named_desc_ptr, *named_desc_ptr.add(1), *named_desc_ptr.add(2), *named_desc_ptr.add(3)])
+            };
+            let lmap = crate::map::lin_map_alloc_mixed(field_count, crate::map::KEY_KIND_STRING);
+            crate::sealed::record_walk_fields(named_desc_ptr, |name_bytes, offset, nkind, nested| {
+                let key = crate::string::lin_string_literal(name_bytes.as_ptr(), name_bytes.len() as u32);
+                let boxed = crate::sealed::box_field_value(sealed, offset, nkind, nested);
+                if boxed.is_null() {
+                    let tv = crate::tagged::TaggedVal { tag: crate::tagged::TAG_NULL, _pad: [0; 7], payload: 0 };
+                    crate::map::lin_map_set(lmap, key, &tv);
+                } else {
+                    crate::map::lin_map_set(lmap, key, boxed as *const crate::tagged::TaggedVal);
+                    crate::tagged::lin_tagged_release(boxed);
+                }
+            });
             let sptr = crate::sealed::alloc_sealed_struct_from_map(lmap, named, heap_desc);
             crate::map::lin_map_release(lmap);
             sptr
