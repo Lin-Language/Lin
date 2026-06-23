@@ -339,6 +339,9 @@ pub unsafe extern "C" fn lin_columnar_array_release(arr: *mut LinArray) {
         return;
     }
     let rc = (*arr).refcount;
+    if rc >= crate::string::IMMORTAL_RC {
+        return;
+    }
     if rc == 0 {
         // Already freed — caller bug, but don't double-free.
         return;

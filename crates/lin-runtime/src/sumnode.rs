@@ -29,7 +29,8 @@
 //! SumDesc     = [ u32 variant_count | VariantDesc * variant_count ]
 //! VariantDesc = [ u32 heap_field_count | { u32 byte_offset, u32 kind } * heap_field_count ]
 //! ```
-//! `kind` extends the sealed `KIND_*` set; a recursive child (Stage 2) would be `KIND_SUMNODE`.
+//! `kind` extends the sealed `KIND_*` set; a recursive child (Stage 2) uses `KIND_SUMNODE`
+//! (= `sealed::KIND_MAP` = 4 — same value, disjoint descriptor namespace).
 //! Drop reads `tag@16`, indexes into `SumDesc` to get that variant's heap-field list, releases each,
 //! then frees. For Stage 1 (scalar-only) every per-variant list is empty.
 
@@ -43,10 +44,20 @@ pub const SUMNODE_HEADER: usize = 24;
 /// `Codegen::SUMNODE_TAG_OFFSET`.
 pub const SUMNODE_TAG_OFFSET: usize = 16;
 
-// A recursive-child kind (Stage 2). Reserved here so the descriptor format is forward-compatible;
-// Stage 1 never emits it (scalar-only).
+// A recursive-child kind (Stage 2). Reuses the same numeric value as `sealed::KIND_MAP` (4)
+// because the two live in DISJOINT descriptor namespaces: sealed descriptors are walked by
+// `sealed::release_field`, sumnode descriptors by `sumnode::release_field` — neither function
+// is ever called on the other's descriptor. Reusing the constant avoids a redundant definition
+// while keeping the single source of truth in `sealed.rs`.
+//
+// HAZARD: if the namespace invariant is ever violated (a SumNode variant descriptor is walked
+// by `sealed::release_field` or vice versa), `KIND_SUMNODE=4` would be misread as `KIND_MAP`
+// and the payload treated as a `*LinMap` instead of a `*SumNode`, causing a wild free. The
+// `debug_assert` in `release_field` below catches this in debug builds if a MAP kind somehow
+// reaches the sumnode walk.
 /// A recursive `*SumNode` child field → `lin_sumnode_release_self` on drop. (Stage 2.)
-pub const KIND_SUMNODE: u32 = 4;
+/// Numeric alias of `sealed::KIND_MAP`; safe because the two descriptor namespaces are disjoint.
+pub const KIND_SUMNODE: u32 = crate::sealed::KIND_MAP;
 
 /// Byte offset of the heap-field drop table within a SumDesc. The descriptor begins with an 8-byte
 /// MATERIALIZER fn-ptr (`*SumNode -> *LinObject`, the keep-packed-through-record-fields boundary
@@ -125,6 +136,18 @@ unsafe fn release_field(payload: *mut u8, kind: u32) {
     if payload.is_null() {
         return;
     }
+    // HAZARD guard: `KIND_SUMNODE == sealed::KIND_MAP == 4`. A sumnode descriptor must NEVER
+    // carry `KIND_SUMNODE_FIELD(5)` or `KIND_MAP` — those only appear in sealed descriptors.
+    // If a sealed descriptor were ever walked here by mistake, kind=4 would call
+    // `lin_sumnode_release_self` on a `*LinMap` → wild free. The disjoint-namespace invariant
+    // prevents this at construction time; this assert fires in debug builds if it breaks.
+    debug_assert!(
+        kind == crate::sealed::KIND_STRING
+            || kind == crate::sealed::KIND_ARRAY
+            || kind == crate::sealed::KIND_SEALED
+            || kind == KIND_SUMNODE,
+        "sumnode::release_field: unknown kind {kind} — possible namespace violation"
+    );
     match kind {
         crate::sealed::KIND_STRING => {
             crate::string::lin_string_release(payload as *mut crate::string::LinString)

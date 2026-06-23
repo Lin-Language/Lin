@@ -438,10 +438,10 @@ export val rows = (src: Stream<UInt8[]>, opts: CsvOptions = {  }): Stream<String
   lin_stream_csv_rows(src, optDelimByte(opts))
 
 import foreign "lin-runtime"
-  val lin_stream_csv_records: (Stream, Int32) => Stream
+  val lin_stream_csv_records: (Stream, Int32) => Stream<{ String: String }>
 
 import foreign "lin-runtime"
-  val lin_stream_csv_records_projected: (Stream, Int32, String[]) => Stream
+  val lin_stream_csv_records_projected: (Stream, Int32, String[]) => Stream<{ String: String }>
 
 // Lazily parse a byte stream into a stream of keyed records, using the first row as the header.
 // Each subsequent row becomes a record keyed by the header columns. The header is consumed on the
@@ -451,7 +451,7 @@ import foreign "lin-runtime"
 //              `columns` is provided, only those header columns are materialized per row (others
 //              are never allocated), which reduces memory for files with many unused columns.
 // @returns a `Stream` yielding `{ String: String }` records.
-export val recordRows = (src: Stream<UInt8[]>, opts: CsvOptions = {  }): Stream =>
+export val recordRows = (src: Stream<UInt8[]>, opts: CsvOptions = {  }): Stream<{ String: String }> =>
   val cols = opts["columns"]
   if cols != null && length(cols) > 0 then
     lin_stream_csv_records_projected(src, optDelimByte(opts), cols)
