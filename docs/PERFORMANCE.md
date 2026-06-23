@@ -789,6 +789,69 @@ The remaining 2.4 M conversions are legitimate: `dynamic_to_map` and `lin_union_
 
 ---
 
+### 5.12 The 2026-06-23 (pm) session — string keys aren't the problem, *our strings* were (RAPTOR −33%)
+
+This session reopened the RAPTOR gap with one question: **Go and Node both key their maps by string and are
+fast — so "string maps are slow" is wrong. Why are *their* string lookups fast and ours weren't?** The
+answer, and the three levers that followed, took the manually-typed RAPTOR bench from ~46 s → ~33 s
+(**~1.76× Go, ~1.1× Node**, from 2.5×/1.6× at session start; ~80 s → ~33 s ≈ **−59%** cumulative across the
+whole effort). All numbers are release, digest-exact `26203913/773022892/139`, same-batch interleaved A/B.
+
+**The keystone — data-string interning (−22%).** Per-lookup, the three runtimes do very different work on
+the *key*:
+- **Go**: `string` is a weightless value `{ptr,len}` — no header, no refcount; the map hashes bytes + `memcmp`s, but carrying the key costs nothing.
+- **V8**: strings are **interned** — equal strings are the *same object*, so a lookup is cached-hash + **pointer-identity** key compare (no `memcmp`), and no per-use allocation.
+- **Lin (before)**: `LinString` is a heap-allocated, **refcounted, non-interned** object (literals were interned; CSV-parsed feed strings each got a fresh `lin_string_alloc`). So the map's stored key and the lookup key were *different objects with the same bytes* → `lin_string_eq`'s `a == b` fast-path missed → a **`memcmp` on every probe** (`LIN_MAP_PROFILE`: `key_eq_calls ≈ 273 M`, all matching), plus a header cache-miss and refcount traffic per use.
+
+The fix interns feed strings at CSV-parse time (a lock-free `thread_local` table; interned entries are
+immortal) so equal `StopId`/`RouteId`s become *the same object*. Then `lin_string_eq` short-circuits on
+pointer identity → the 273 M `memcmp`s vanish; `string_eq`/`memcmp` left the profile entirely (was ~17% of
+RANGE). **Faithful — string keys stay string keys.** GROUP 9302→7077 ms.
+
+> **Lesson — a parked "negative" can be an implementation artifact.** A prior `experiment/string-intern`
+> measured only ~3-4% and was shelved; I nearly trusted that and skipped the spike. It used a **global
+> Mutex** (a lock per intern lookup) that ate the win. The lock-free `thread_local` version on the live
+> baseline pays **−22%**. Re-measure shelved ideas on the current head, with a clean implementation.
+
+**Read-only RC elision (−8-12%).** With the string cost gone, RC became the biggest RANGE category (~25%).
+Extending RC-ELIDE's borrow analysis to **map-get / call results consumed read-only** (compare/arith,
+non-escaping) elides the owning `CloneBox`/`Release` — keep the borrow (`lin_map_get` already returns a
+borrowed `*TaggedVal`). RAPTOR clones 211→99 (−53%). GROUP 6971→6124 ms. Same UAF discipline as RC-ELIDE
+(digest-exact + ASan + `LIN_VERIFY_RC`); elide only when provably read-before-mutation + non-escaping.
+
+**Closure-devirt of reduce-into-map (−3.5%).** `getQueue`'s `markedStops.reduce({}, …)` dispatched its body
+through a boxed closure per element. Inlining it (raw-ptr accumulator through a phi loop, identity-aware
+`ReleaseRawIfDistinct` for the per-iteration RC) removed the indirect dispatch. **This is the same shape
+that heap-corrupted RAPTOR in an earlier reduce-devirt attempt** — done soundly this time by handling the
+accumulator's ownership across iterations; bench-RUN + valgrind clean.
+
+**The grind convergence — serializing vs overlapped (the definitive cut line).** After the three wins, a
+fan-out of spikes on every remaining residual returned **five straight neutrals**: per-query map seeding
+(`fromKeys` fusion), LOAD (column-skip — already merged by another agent), PREP (sort-by-key — phase already
+~2.8 s), box/unbox at null-check sites (§5.8), and the scan's map-writes / `map_keys` iteration. The rule is
+now sharp and predictive: **a lever moves the wall iff it removes *serializing* work on the hot path**
+(string `memcmp`, owning clones, indirect dispatch — all merged). **Overlapped work is wall-neutral no
+matter its self-time** — allocation (~17% self-time), boxing, per-query setup, map-iteration all profile
+high but sit off the critical path. This is §5.10's self-time≠wall-time, now with a clean mechanism test.
+
+> **Measurement gotchas banked this session.** (1) The `sudo gdb` phase sampler *inflates* per-phase
+> wall-ms ~2-3× (it pauses the process per sample) — its phase *ms* are unusable for phase-share claims;
+> only its sample *distribution* is valid. Use un-sampled clean runs for phase shares. (2) Master moves
+> under you (many concurrent agents) — a profile goes stale in minutes; re-profile on the true current head
+> before scoping. My "LOAD+PREP are 57% of the wall" was wrong on both counts (stale *and* gdb-inflated);
+> the truth is RANGE ≈ 60% (query-bound), as it always was.
+
+**What's left (both bigger than a spike; both started as lanes this session).** getTrip is now ~32% of
+RANGE and it is **record-field access still lowering to `lin_map_get`**, not offset loads (the keys are
+`RouteScanner`/`StopTime`/`Service` field names). That is the record-representation frontier (§5.11, the
+repr-agent's domain — `perf/recoffset` is diagnosing why these specific records don't seal/offset). The
+other is the **inner-array pointer-chase** (§5.10): `routeTrips`/`stopTimes` are 0xFD pointer-spine arrays
+(cache-miss per element), needing contiguous-inline storage / fixed-length `T[N]` arrays — a layout/language
+change (`perf/tn` is prototyping it). The cheap independent levers are exhausted; these two structural
+efforts are the path to Go parity.
+
+---
+
 ## 6. Guidance for writing fast Lin
 
 1. **Prefer typed records and `&`-composed named types over `AnyVal`.** This is the
