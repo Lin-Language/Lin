@@ -180,15 +180,16 @@ export val replaceAll = (s: String, pattern: String, replacement: String): Strin
 export val repeat = (s: String, count: Int32): String =>
   lin_string_repeat(s, count)
 
-// Get the character at `index`. A negative `index` counts back from the end.
+// Get the character at codepoint `index`. A negative `index` counts back from the end
+// (codepoint-wise, consistent with `charCode`/`codePointAt`).
 // @param s      the source string.
-// @param index  the character index; negative counts from the end.
-// @returns the single-character string at the (resolved) index.
+// @param index  the codepoint index; negative counts from the end.
+// @returns the single-character string at the (resolved) index, or "" if out of range.
 // @example at("hello", 0)    // "h"
 // @example at("hello", -1)   // "o"
+// @example at("café", -1)    // "é"   (last codepoint, not last byte)
 export val at = (s: String, index: Int32): String =>
-  val i = if index < 0 then _length(s) + index else index
-  lin_string_char_at(s, i)
+  lin_string_char_at(s, index)
 
 // Get the numeric Unicode code point at character index `index` (alias of `codePointAt`). A negative
 // index counts from the end codepoint-wise (`-1` is the last codepoint); an out-of-range index returns
