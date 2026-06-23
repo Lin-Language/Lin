@@ -669,6 +669,7 @@ pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
         TAG_BIGNUM => crate::bignum::lin_bignum_release_box(payload as *const u8),
         TAG_DECIMAL => crate::decimal::lin_decimal_release_box(payload as *const u8),
         TAG_TAR_ENTRY => crate::stream::lin_tar_entry_release_box(payload as *const u8),
+        TAG_FUNCTION => crate::memory::lin_closure_release(payload as *mut u8),
         _ => {} // Scalars (null, bool, int, float) have no heap payload.
     }
     // Cached scalar boxes (small ints, bools) are immutable statics — never free them.
