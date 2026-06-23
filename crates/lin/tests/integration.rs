@@ -21133,6 +21133,46 @@ print(show(b))
 }
 
 
+// Regression: sealed record with a SumNode (sum-type) field overwritten in a loop.
+// Prior to the fix, `compile_ir_field_set` called `emit_release(old, &fld_ty)` where
+// `fld_ty` was a Union (sum type) — routing the release through `lin_tagged_release`,
+// which reads offset-0 of the raw `*SumNode` as a TaggedVal tag byte → wrong-size
+// dealloc → UAF/heap corruption. Fix: detect KIND_SUMNODE_FIELD and use
+// `emit_release_repr` with `Packed(SumNode)`, bypassing the type-dispatch.
+#[test]
+fn test_sealed_record_sum_field_overwrite_no_uaf() {
+    let out = run(r#"import { print } from "std/io"
+import { range, for } from "std/iter"
+import { toString } from "std/string"
+
+type Leaf = { "kind": "leaf", "value": Int32 }
+type Node = { "kind": "node", "left": Tree, "right": Tree }
+type Tree = Leaf | Node
+type Cursor = { "tree": Tree, "depth": Int32 }
+
+val leaf = (v: Int32): Tree => { "kind": "leaf", "value": v }
+val node = (l: Tree, r: Tree): Tree => { "kind": "node", "left": l, "right": r }
+
+val sumTree = (t: Tree): Int32 =>
+  match t
+    is Leaf => t["value"]
+    is Node => sumTree(t["left"]) + sumTree(t["right"])
+
+val main = () =>
+  var cur: Cursor = { "tree": leaf(0), "depth": 0 }
+  range(0, 50).for(i =>
+    cur["tree"] = node(leaf(i), leaf(i + 1))
+    cur["depth"] = i
+  )
+  print(sumTree(cur["tree"]).toString())
+  print(cur["depth"].toString())
+
+main()
+"#);
+    // Last iter: i=49 → node(leaf(49), leaf(50)) → 49+50 = 99; depth = 49.
+    assert_eq!(out, vec!["99", "49"]);
+}
+
 // ============================================================================
 // REPRESENTATION-RESET Stage-0 behaviour pins (docs/project-actually-improve-performance.md §6).
 //
