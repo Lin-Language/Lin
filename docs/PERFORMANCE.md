@@ -749,6 +749,33 @@ runtime-segfault. The cheap catch: **`lin build <raptor>/bench.lin` (build-only,
 mandatory gate for any codegen/lowering lane — it caught the lazy-mat codegen panic the unit suite missed.
 (Reinforces §5.7/§5.9: "tests pass" is necessary, not sufficient; RAPTOR is the oracle.)
 
+### 5.11 Stage 5 — locking the record-never-a-map invariant (2026-06-23)
+
+**What was fixed.** The representation-reset campaign (Stages 1–4c, see §5.6) made it *structurally impossible* to represent a sealed record as a string-keyed `LinMap` for most call sites — but one leaf remained: `lin_sealed_any_to_tagged`'s 0xFE inline arm still built a `LinMap` per element via descriptor-walk, then stored it as `TAG_MAP`. Stage 5 fixed this last site (delegate to `sealed_elem_payload_to_record_box`, same as `lin_array_get_tagged`'s 0xFE arm) and added enforcement so no future change can silently regress.
+
+**What changed in measured terms.** On the manually-typed RAPTOR bench (release, digest-exact `26203913/773022892/139`), `LIN_VERIFY_REPR` conversion counts show:
+
+| site | before | after |
+|---|--:|--:|
+| `lin_sealed_ptr_array_to_tagged` | ~28 M | ~0 |
+| `lin_sealed_any_to_tagged` | ~23 M | ~0 |
+| `dynamic_to_map` + `lin_union_force_to_map` | ~0.4 M | ~2.4 M |
+| **TOTAL** | **~51.9 M** | **~2.4 M (~95% reduction)** |
+
+Wall-clock impact (release, medians):
+
+| phase | before | after | change |
+|---|--:|--:|--:|
+| PREP | ~6.9 s | ~6.0 s | **−13 %** |
+| GROUP | ~9.9 s | ~9.0 s | **−9 %** |
+| RANGE | ~27.5 s | ~26.3 s | **−4 %** |
+
+**Honest reconciliation with §5.10.** Section 5.10 predicted that access-mechanism fixes would be wall-neutral. This *was* a real, if modest, lever — but it belongs to a different cost class. The cost removed is *materialization allocation*: per-record `LinMap` builds (alloc + key-intern + field-insert per element). This is the same alloc-elimination class as RC-ELIDE (§5.10) and STR-KEY (§5.9), not pure access-mechanism. PREP (the construction-heavy phase) benefits most because it iterates the entire dataset and builds collections. RANGE benefits least because its bottleneck is the pointer-chasing scatter load (§5.10), not allocations.
+
+The remaining 2.4 M conversions are legitimate: `dynamic_to_map` and `lin_union_force_to_map` are called on genuine `{String:T}` map values and `AnyVal` blobs (union display/json paths), not on records.
+
+**The design win, independent of perf.** "A record is sometimes a map at runtime" is now impossible by construction. The type-system invariant (sealed record ↔ TAG_RECORD, dictionary ↔ TAG_MAP) is enforced at three layers: the structural fix (the last TAG_MAP-producing leaf eliminated), `debug_assert` guards in every array-converter arm (fires in debug/ASan on any regression), and the `repr_invariant_tests` CI gate (three tests covering 0xFD, 0xFE, and nested-record paths — verified live by sabotage). See ADR-088.
+
 ---
 
 ## 6. Guidance for writing fast Lin

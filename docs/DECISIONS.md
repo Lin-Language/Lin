@@ -3435,3 +3435,25 @@ The obstacle: a `<K, V>(m: { K: V }): K[]` signature was thought unspellable bec
 **Decision**: add a `Type::Map { value, .. } => (*value).clone()` arm to the single-variant-union match in `infer_index`. The `Null` is re-added by the existing `flatten_union(vec![inner, Null])` wrap below, so the chained read resolves to `V | Null`, IDENTICAL to the bound-intermediate path. The change is conservative: single-index, array-index, string-index, `obj.field`, multi-variant-union index, and Null-propagation through index chains are all untouched (only the previously-`fresh_type_var()` single-variant-Map case changes).
 
 **Consequences**: `idx[a][b]` over a nested map names the inner value type, so chained reads narrow and read fields correctly (the motivating RAPTOR connection-index shape). Verified by build+run that a chained read narrowed to a union variant reads its field back.
+
+## ADR-088: Records are never represented as string-keyed maps
+
+**Status**: Accepted.
+
+**Context**: For most of the compiler's history, records and JSON objects shared a single runtime representation: a `LinObject` (later `LinMap`) string-keyed hash map. A sealed record in a dynamic slot was "materialized" into a `LinMap` on first access via the `materialize_*_to_map` family of helpers. This meant that a sealed record and a `{String:T}` dictionary were, at runtime, indistinguishable: both were `TAG_MAP`.
+
+The representation-reset campaign (Stages 1–6) dissolved this fusion. Records are now laid out as packed structs with a fixed header (`[u32 refcount | u32 size | u64 heap_desc_ptr | u64 named_desc_ptr | fields…]`) and tagged `TAG_RECORD`. `TAG_MAP` is reserved exclusively for `{String:T}` index-signature dictionaries and `AnyVal`/JSON blobs. The `materialize_*_to_map` family was deleted in Stage 4c; view consumers (toString, JSON serialization, equality, thread transfer, HTTP) walk the record's named descriptor directly (`record_walk_fields` / `box_field_value` in `sealed.rs`). The array converters (`lin_sealed_ptr_array_to_tagged`, `lin_sealed_any_to_tagged`) and element reads (`lin_array_get_tagged` sealed arms) now produce `TAG_RECORD`, not `TAG_MAP`.
+
+**Decision (Stage 5 — this ADR)**: formalise the invariant as a hard, enforced rule.
+
+1. **Structural guarantee**: `lin_sealed_any_to_tagged`'s 0xFE inline arm was the last site producing `TAG_MAP` from a record; it now delegates to `sealed_elem_payload_to_record_box` (alloc + memcpy + retain heap fields), matching the 0xFE arm of `lin_array_get_tagged`. No code path from a sealed record (0xFD or 0xFE array, standalone struct, nested field) can produce `TAG_MAP`.
+
+2. **Runtime debug guards**: `lin_sealed_ptr_array_to_tagged`, `lin_sealed_any_to_tagged` (0xFE arm), and `lin_array_get_tagged`'s SEALED_PTR/SEALED_ARRAY arms all carry `debug_assert!(out_tag == TAG_RECORD || out_tag == TAG_NULL, "record element must be TAG_RECORD, never TAG_MAP (ADR-088)")`. Zero cost in release; fires immediately in debug/ASan builds if a producer regresses.
+
+3. **CI regression gate**: `sealed::repr_invariant_tests` (in `lin-runtime/src/sealed.rs`) builds 0xFD and 0xFE arrays with heap-field records, calls the converters and `lin_array_get_tagged`, and asserts every output tag is `TAG_RECORD`. A third test calls `lin_record_get_field` on a record with a nested sealed record field and asserts the result tag is `TAG_RECORD`. The invariant test is provably live: replacing `TAG_RECORD` with `TAG_MAP` in `lin_sealed_ptr_array_to_tagged` triggers a debug_assert abort and the `ptr_array_to_tagged_is_tag_record` assertion.
+
+**Representation summary**: a sealed record at any dynamic slot is always `TAG_RECORD`; its payload is a raw `*sealed-struct` pointer. The named descriptor (at offset 16 in the struct header) enables field access by name without a string-keyed lookup. `TAG_MAP` means a genuine `{String:T}` dictionary or `AnyVal` JSON object; these two populations are now type-determined and non-overlapping at runtime.
+
+**Supersedes**: the materialization-on-read approach used before Stage 4c, and any prior guidance to call `materialize_*_to_map` on a sealed record.
+
+**Related**: ADR-069 (NullableRecord repr), ADR-063 (sealed-record arrays), ADR-083 (packed record at union static type), ADR-057 (sealed records design).

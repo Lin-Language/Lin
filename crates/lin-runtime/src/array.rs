@@ -537,6 +537,10 @@ pub unsafe extern "C" fn lin_sealed_ptr_array_to_tagged(arr: *const LinArray) ->
             (*slot)._pad = [0; 7];
             (*slot).payload = sptr as u64;
         }
+        debug_assert!(
+            (*slot).tag == TAG_RECORD || (*slot).tag == TAG_NULL,
+            "record element must be TAG_RECORD, never TAG_MAP (ADR-088)"
+        );
     }
     (*out).len = len;
     out
@@ -568,47 +572,36 @@ pub unsafe extern "C" fn lin_sealed_array_to_tagged(
     out
 }
 
-/// Materialize a sealed-record array (0xFE inline OR 0xFD pointer-backed) to a tagged `Object[]`.
-/// Dispatches on `elem_tag` at runtime — safe to call on either representation.
+/// Convert a sealed-record array (0xFE inline OR 0xFD pointer-backed) into a TAGGED `LinArray`
+/// (TAG_RECORD[]). Dispatches on `elem_tag` at runtime — safe to call on either representation.
 /// Used by codegen's `sealed_array_to_tagged` for container-sourced arrays whose repr is unknown.
+///
+/// INVARIANT (ADR-088): every element of the output array carries TAG_RECORD, never TAG_MAP.
 #[no_mangle]
 pub unsafe extern "C" fn lin_sealed_any_to_tagged(arr: *const LinArray) -> *mut LinArray {
     crate::repr_verify::repr_note("lin_sealed_any_to_tagged");
     if arr.is_null() { return lin_array_alloc(4); }
     match (*arr).elem_tag {
         SEALED_ARRAY_TAG => {
-            // 0xFE inline: build each element's LinMap directly via descriptor-walk (no materialize
-            // helper). Mirror push_display_sealed_payload from Stage 4a: payload is header-less so
-            // treat it as sealed = payload - SEALED_HEADER for struct-relative offset arithmetic.
-            use crate::tagged::*;
-            use crate::sealed::SEALED_HEADER;
+            // 0xFE inline: allocate a fresh standalone sealed struct per element (header + copied
+            // payload + retained heap fields) and box as TAG_RECORD. Mirror lin_array_get_tagged's
+            // SEALED_ARRAY_TAG arm (sealed_elem_payload_to_record_box) applied to each element.
             let len = (*arr).len;
             let out = lin_array_alloc(len.max(4));
             let named_desc = (*arr).elem_named_desc;
             let stride = (*arr).elem_stride;
             for i in 0..len {
                 let payload = ((*arr).data as *const u8).add((i * stride) as usize);
-                // Build the map inline: walk the named descriptor, box each field, set into map.
-                let field_count = if named_desc.is_null() { 0u32 } else {
-                    u32::from_le_bytes([*named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3)])
-                };
-                let map = crate::map::lin_map_alloc_mixed(field_count, crate::map::KEY_KIND_STRING);
-                let pseudo_sealed = payload.sub(SEALED_HEADER);
-                crate::sealed::record_walk_fields(named_desc, |name_bytes, offset, nkind, nested| {
-                    let key = crate::string::lin_string_literal(name_bytes.as_ptr(), name_bytes.len() as u32);
-                    let boxed = crate::sealed::box_field_value(pseudo_sealed, offset, nkind, nested);
-                    if boxed.is_null() {
-                        let tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
-                        crate::map::lin_map_set(map, key, &tv);
-                    } else {
-                        crate::map::lin_map_set(map, key, boxed as *const TaggedVal);
-                        crate::tagged::lin_tagged_release(boxed);
-                    }
-                });
+                let tv = crate::sealed::sealed_elem_payload_to_record_box(payload, named_desc, stride as u32);
                 let slot = (*out).data.add(i as usize);
-                (*slot).tag = TAG_MAP;
-                (*slot)._pad = [0; 7];
-                (*slot).payload = map as u64;
+                debug_assert!(
+                    (*tv).tag == crate::tagged::TAG_RECORD || (*tv).tag == crate::tagged::TAG_NULL,
+                    "record element must be TAG_RECORD, never TAG_MAP (ADR-088)"
+                );
+                std::ptr::copy_nonoverlapping(tv as *const u8, slot as *mut u8, std::mem::size_of::<crate::tagged::TaggedVal>());
+                // Free the box shell — the 16 bytes were copied into the slot; the inner ref
+                // (the sealed-struct +1) now lives in the slot. lin_tagged_free_box is cached-box-safe.
+                crate::tagged::lin_tagged_free_box(tv as *mut u8);
             }
             (*out).len = len;
             out
@@ -1330,11 +1323,16 @@ pub unsafe extern "C-unwind" fn lin_array_get_tagged(arr: *const LinArray, idx: 
             // retain heap fields, and return as TAG_RECORD — no intermediate LinMap.
             dealloc(tv as *mut u8, tv_layout);
             let payload = ((*arr).data as *const u8).add((idx as u64 * (*arr).elem_stride) as usize);
-            return crate::sealed::sealed_elem_payload_to_record_box(
+            let out_tv = crate::sealed::sealed_elem_payload_to_record_box(
                 payload,
                 (*arr).elem_named_desc,
                 (*arr).elem_stride as u32,
             );
+            debug_assert!(
+                (*out_tv).tag == TAG_RECORD || (*out_tv).tag == TAG_NULL,
+                "record element must be TAG_RECORD, never TAG_MAP (ADR-088)"
+            );
+            return out_tv;
         }
         SEALED_PTR_ARRAY_TAG => {
             // Pointer-backed sealed-record array (0xFD): each slot is a `*mut u8` struct pointer.
@@ -1346,7 +1344,12 @@ pub unsafe extern "C-unwind" fn lin_array_get_tagged(arr: *const LinArray, idx: 
                 return crate::tagged::lin_box_null() as *mut TaggedVal;
             }
             // lin_box_record retains (+1 for the caller's owned box).
-            return crate::tagged::lin_box_record(sptr) as *mut TaggedVal;
+            let out_tv = crate::tagged::lin_box_record(sptr) as *mut TaggedVal;
+            debug_assert!(
+                (*out_tv).tag == TAG_RECORD || (*out_tv).tag == TAG_NULL,
+                "record element must be TAG_RECORD, never TAG_MAP (ADR-088)"
+            );
+            return out_tv;
         }
         _ => {
             // Tagged array: elem is already a LinArrayElem (16 bytes) = TaggedVal layout.
