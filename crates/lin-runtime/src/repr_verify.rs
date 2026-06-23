@@ -11,12 +11,8 @@ static REPR_VERIFY_ENABLED: AtomicBool = AtomicBool::new(false);
 static REPR_VERIFY_CHECKED: AtomicBool = AtomicBool::new(false);
 
 // Fixed site table — one counter per instrumented function.
-// Order: sealed.rs × 4, array.rs × 3, map.rs × 2.
+// Order: array.rs × 3, map.rs × 2.
 const SITES: &[&str] = &[
-    "materialize_named_payload_to_map",
-    "materialize_sealed_struct_to_map",
-    "materialize_sealed_to_map_pub",
-    "materialize_named_payload_to_map_pub",
     "lin_sealed_ptr_array_to_tagged",
     "lin_sealed_array_to_tagged",
     "lin_sealed_any_to_tagged",
@@ -24,12 +20,8 @@ const SITES: &[&str] = &[
     "lin_union_force_to_map",
 ];
 
-const N: usize = 9;
+const N: usize = 5;
 static COUNTERS: [AtomicU64; N] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
