@@ -56,6 +56,30 @@ fn definitely_is_tag(val: &Type, check_ty: &Type) -> bool {
     }
 }
 
+/// Returns true when `expr` is guaranteed to produce a RAW NullableRecord pointer (not a boxed
+/// TaggedVal). The repr analysis seeds `Packed(NullableRecord)` for exactly these cases; this
+/// predicate mirrors that logic at lowering time so the NullableRecord FieldGet path only fires
+/// when the physical value is actually a nullable `*T` pointer.
+///
+/// Cases that produce a raw pointer:
+/// - `LocalGet` with NullableRecord type: params/vars are type-seeded `Packed(NullableRecord)`.
+/// - `Index` on a `{String: T}` Map container: `lin_map_get` returns a raw `T*` or null.
+///
+/// Everything else (e.g. `lin_object_get` on an unsealed Object) returns a `TaggedVal*` (boxed
+/// union); those must fall through to the existing materialize → lin_map_get path.
+fn is_raw_nullable_ptr_expr(expr: &TypedExpr) -> bool {
+    if crate::repr::nullable_sealed_record(&expr.ty()).is_none() {
+        return false;
+    }
+    match expr {
+        TypedExpr::LocalGet { .. } => true,
+        TypedExpr::Index { object: container, .. } => {
+            matches!(container.ty(), Type::Map { .. })
+        }
+        _ => false,
+    }
+}
+
 /// Sound gate for the NullableRecord `is T` pointer-null fast path. `val_ty` is `R | Null` where R
 /// is a sealed record; the fast path (non-null ⟺ matches) is correct ONLY when the check target
 /// `target` is exactly that inner record R — then every non-null value, statically R, is trivially
@@ -1427,6 +1451,112 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                         return dst;
                     }
                 }
+            }
+            // NULLABLE SEALED RECORD + string-literal key: `(T | Null)["field"]`.
+            //
+            // Physical repr is a raw `*T` or null pointer (NullableRecord) ONLY when the producer
+            // expression is a {String:T} Map index (lin_map_get → raw ptr) or a local variable/
+            // parameter with NullableRecord type (type-seeded Packed(NullableRecord)). A general
+            // lin_object_get on an unsealed Object returns a TaggedVal* (boxed union), NOT a raw
+            // pointer — that case must fall through to the existing lin_map_get path.
+            //
+            // The union tag-dispatch in compile_ir_index reads the first byte as a tag — but for
+            // a raw NullableRecord pointer the first byte is the sealed struct's refcount, NOT a
+            // TaggedVal tag → always falls to null (correctness bug). Fix: emit a null-guarded
+            // offset FieldGet for the raw-pointer cases only.
+            //
+            // Only when key is a StringLit (compile-time-known field name). A dynamic key on a
+            // NullableRecord falls through to the general Index path (materialize → map_get).
+            if let Some(inner_fields) = crate::repr::nullable_sealed_record(&obj_ty) {
+                if is_raw_nullable_ptr_expr(object) {
+                if let TypedExpr::StringLit(name, _, _) = key.as_ref() {
+                    let present = inner_fields.contains_key(name.as_str());
+                    let obj_temp = lower_expr(object, builder, ctx);
+                    if !present {
+                        // Side effects already run; absent field → Null.
+                        return builder.const_temp(Const::Null);
+                    }
+                    let field_ty = inner_fields.get(name.as_str()).cloned().unwrap_or(Type::Null);
+                    // The inner (non-Null) sealed record type for FieldGet's obj_ty.
+                    let inner_ty = match &obj_ty {
+                        Type::Union(vs) => vs.iter()
+                            .find(|v| !matches!(v, Type::Null))
+                            .cloned()
+                            .unwrap_or_else(|| obj_ty.clone()),
+                        _ => obj_ty.clone(),
+                    };
+                    // Emit a null check: is obj_temp == null?
+                    let null_c = builder.const_temp(Const::Null);
+                    let is_null_t = builder.alloc_temp(Type::Bool);
+                    builder.emit(Instruction::Binary {
+                        dst: is_null_t,
+                        op: BinOp::Eq,
+                        lhs: obj_temp,
+                        rhs: null_c,
+                        operand_ty: obj_ty.clone(),
+                        ty: Type::Bool,
+                    });
+                    let null_bb = builder.alloc_block("nr_fld_null");
+                    let hit_bb = builder.alloc_block("nr_fld_hit");
+                    let merge_bb = builder.alloc_block("nr_fld_mrg");
+                    builder.terminate(Terminator::CondJump {
+                        cond: is_null_t,
+                        then_block: null_bb,
+                        else_block: hit_bb,
+                    });
+                    let result_dst = builder.alloc_temp(result_type.clone());
+                    let mut incomings: Vec<(Temp, BlockId)> = Vec::new();
+
+                    // Null branch: field of a null record is Null.
+                    builder.switch_to(null_bb);
+                    builder.push_scope();
+                    let null_val = builder.const_temp(Const::Null);
+                    let (null_out, null_keep, _null_owned) =
+                        coerce_if_branch(null_val, &Type::Null, result_type, builder);
+                    builder.pop_scope_releasing_keep(&null_keep);
+                    incomings.push((null_out, builder.current_block));
+                    builder.terminate(Terminator::Jump(merge_bb));
+
+                    // Hit branch: obj_temp is non-null; read field by constant offset.
+                    builder.switch_to(hit_bb);
+                    builder.push_scope();
+                    // Read at the concrete field type first so codegen uses the precise offset.
+                    let field_dst = builder.alloc_temp(field_ty.clone());
+                    builder.emit(Instruction::FieldGet {
+                        dst: field_dst,
+                        object: obj_temp,
+                        field: name.clone(),
+                        obj_ty: inner_ty,
+                        result_ty: field_ty.clone(),
+                    });
+                    // RC: a heap-field read (String/Array/nested-record) is a BORROWED interior
+                    // pointer. Retain so the caller owns an independent +1 that survives the parent
+                    // struct's release at scope exit.
+                    if is_rc_type(&field_ty) {
+                        builder.emit(Instruction::Retain { val: field_dst, ty: field_ty.clone() });
+                        builder.register_owned(field_dst, field_ty.clone());
+                    }
+                    // coerce_if_branch handles boxing (e.g. Int32 → Int32|Null via lin_box_int32)
+                    // and transfers ownership across the scope boundary correctly, mirroring lower_if.
+                    let (hit_out, hit_keep, merge_owned) =
+                        coerce_if_branch(field_dst, &field_ty, result_type, builder);
+                    builder.pop_scope_releasing_keep(&hit_keep);
+                    incomings.push((hit_out, builder.current_block));
+                    builder.terminate(Terminator::Jump(merge_bb));
+
+                    // Merge: phi the two results.
+                    builder.switch_to(merge_bb);
+                    builder.emit(Instruction::Phi {
+                        dst: result_dst,
+                        ty: result_type.clone(),
+                        incomings,
+                    });
+                    if merge_owned {
+                        builder.register_owned(result_dst, result_type.clone());
+                    }
+                    return result_dst;
+                }
+                } // closes is_raw_nullable_ptr_expr
             }
             // Sealed scalar record + a compile-time-known string key `x["f"]` → constant-offset
             // FieldGet (same as `x.f`). Routes to the unboxed load path rather than the dynamic

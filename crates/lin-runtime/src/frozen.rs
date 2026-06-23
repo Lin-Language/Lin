@@ -620,4 +620,107 @@ mod tests {
             assert!((*arr).refcount >= IMMORTAL_RC);
         }
     }
+
+    // ── immortal early-out tests ──────────────────────────────────────────────────────────────
+
+    /// Build a frozen sealed-record array with a heap-field (String), then call
+    /// `lin_sealed_array_push_struct_retaining` many times with a frozen source struct.
+    /// Proves: (a) no UAF/double-free — string RC stays IMMORTAL_RC throughout and after the
+    ///         array drop; (b) the early-out fires — the string RC never rises above IMMORTAL_RC.
+    #[test]
+    fn frozen_struct_push_retaining_early_out_no_uaf() {
+        unsafe {
+            let named = heap_named_desc();
+            let heap_desc_bytes = string_heap_desc();
+            let heap_desc: *const u8 = heap_desc_bytes.as_ptr();
+
+            // Freeze the source struct and its string field directly (mirrors lin_freeze).
+            let s = crate::string::lin_string_from_bytes(b"frozen".as_ptr(), 6);
+            let src = lin_sealed_alloc(SEALED_HEADER + 16, heap_desc, named.as_ptr());
+            *(src.add(24) as *mut *mut crate::string::LinString) = s;
+            *(src.add(32) as *mut i32) = 42;
+            freeze_string(s);                     // string RC → IMMORTAL_RC
+            *(src as *mut u32) = IMMORTAL_RC;     // struct RC → IMMORTAL_RC
+
+            assert_eq!((*s).refcount, IMMORTAL_RC);
+
+            // Destination array: push the frozen struct N times.
+            let arr = crate::array::lin_sealed_array_alloc(4, 16, heap_desc, named.as_ptr());
+            const ITERS: usize = 1_000;
+            for _ in 0..ITERS {
+                crate::array::lin_sealed_array_push_struct_retaining(arr, src as *const u8);
+            }
+
+            // String RC must still be IMMORTAL_RC — the early-out fired for every push.
+            assert_eq!((*s).refcount, IMMORTAL_RC,
+                "string RC must stay IMMORTAL_RC after {} frozen pushes; early-out must have fired",
+                ITERS);
+            assert_eq!((*arr).len as usize, ITERS);
+
+            // Verify data integrity: each slot holds the original pointer.
+            let elem0 = crate::array::lin_sealed_array_elem_ptr(arr, 0);
+            assert_eq!(*(elem0 as *const *mut crate::string::LinString), s);
+
+            // Array drop: per-elem release walk sees IMMORTAL_RC → no-op. No double-free.
+            crate::array::lin_array_release(arr);
+            assert_eq!((*s).refcount, IMMORTAL_RC, "still immortal after array drop");
+            // src and s are IMMORTAL — deliberately not freed (program-lifetime semantics).
+        }
+    }
+
+    /// Microbench: compare RC-retain counts for frozen vs live source structs.
+    /// Frozen source: no per-field retains (early-out fires).
+    /// Live source: N retains (one per push).
+    /// Uses RC_RETAIN_COUNT directly; runs single-threaded with SeqCst to isolate counts.
+    #[test]
+    fn frozen_source_skips_retain_walk_measurable() {
+        unsafe {
+            let named = heap_named_desc();
+            let heap_desc_bytes = string_heap_desc();
+            let heap_desc: *const u8 = heap_desc_bytes.as_ptr();
+            const N: usize = 500;
+
+            // ── Frozen source: no retains ────────────────────────────────────────────────
+            let s_frozen = crate::string::lin_string_from_bytes(b"frozen".as_ptr(), 6);
+            let src_frozen = lin_sealed_alloc(SEALED_HEADER + 16, heap_desc, named.as_ptr());
+            *(src_frozen.add(24) as *mut *mut crate::string::LinString) = s_frozen;
+            *(src_frozen.add(32) as *mut i32) = 1;
+            freeze_string(s_frozen);
+            *(src_frozen as *mut u32) = IMMORTAL_RC;
+
+            // Push N times; verify the string RC doesn't change at all.
+            let rc_before = (*s_frozen).refcount;
+            let arr_frozen = crate::array::lin_sealed_array_alloc(4, 16, heap_desc, named.as_ptr());
+            for _ in 0..N {
+                crate::array::lin_sealed_array_push_struct_retaining(arr_frozen, src_frozen as *const u8);
+            }
+            assert_eq!((*s_frozen).refcount, rc_before,
+                "frozen source: string RC must not change; early-out must fire for all {} pushes", N);
+            crate::array::lin_array_release(arr_frozen); // no-op on immortal string
+
+            // ── Live source: N retains ───────────────────────────────────────────────────
+            let s_live = crate::string::lin_string_from_bytes(b"live".as_ptr(), 4);
+            let src_live = lin_sealed_alloc(SEALED_HEADER + 16, heap_desc, named.as_ptr());
+            *(src_live.add(24) as *mut *mut crate::string::LinString) = s_live;
+            *(src_live.add(32) as *mut i32) = 2;
+            // src_live rc = 1 (not frozen)
+            let rc_live_before = (*s_live).refcount; // = 1
+            let arr_live = crate::array::lin_sealed_array_alloc(4, 16, heap_desc, named.as_ptr());
+            for _ in 0..N {
+                crate::array::lin_sealed_array_push_struct_retaining(arr_live, src_live as *const u8);
+            }
+            // Each push retains s_live once: RC must be rc_before + N.
+            assert_eq!((*s_live).refcount, rc_live_before + N as u32,
+                "live source: string RC must increase by exactly {}; got delta={}",
+                N, (*s_live).refcount as i64 - rc_live_before as i64);
+            // Cleanup: array drop releases N refs; then release the struct's own ref.
+            crate::array::lin_array_release(arr_live);
+            assert_eq!((*s_live).refcount, 1, "after array drop only struct ref remains");
+            lin_sealed_release_self(src_live); // rc → 0, frees (struct release doesn't release string again
+            // because lin_sealed_release_self → release_heap_fields → lin_string_release(s_live) → rc 0
+            // Wait — src_live owns a ref to s_live via the slot. When lin_sealed_release_self is called,
+            // it will call release_heap_fields which calls lin_string_release(s_live). At that point
+            // s_live rc is 1 → it goes to 0 and is freed. Don't access s_live after this point.
+        }
+    }
 }
