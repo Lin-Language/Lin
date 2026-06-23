@@ -30,6 +30,7 @@
 // function.
 import foreign "lin-runtime"
   val lin_array_concat_dyn: (AnyVal, AnyVal) => AnyVal
+  val lin_array_slice_dyn: (AnyVal, Int32, Int32) => AnyVal
   val lin_stream_count: (Int32, Int32) => Stream
   val lin_stream_repeat: (AnyVal, Int32) => Stream
   val lin_stream_cycle: (AnyVal) => Stream
@@ -305,15 +306,17 @@ export val flatten = <T>(arr: T[][]): T[] =>
 export val sliding = <T>(src: T[] | Iterator | Stream, size: Int32): T[][] =>
   val w = if size < 1 then 1 else size
   val result: T[][] = []
-  // Buffer the items as we pull them, emitting a window each time the trailing
-  // `w` items are available. Reuses the eager `for` driver + `push` primitives.
-  val buf: T[] = []
+  // Buffer at most `w` items: push each new item then drop the oldest once buf exceeds `w`.
+  // This keeps memory O(w) instead of O(n) for long sources.
+  var buf: T[] = []
   src.for(item =>
     push(buf, item)
+    if length(buf) > w then
+      buf = lin_array_slice_dyn(buf, 1, length(buf))
     if length(buf) >= w then
-      // Build the window from the trailing `w` slots of `buf`.
+      // Build the window from the `w` slots of `buf`.
       val window: T[] = []
-      rangeFill(window, buf, length(buf) - w, w)
+      rangeFill(window, buf, 0, w)
       push(result, window)
   )
   result

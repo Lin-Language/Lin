@@ -411,6 +411,23 @@ val s = suite("std/array", [
     ]
   ),
 
+  // Scalar Int fast path: uses int-keyed LinMap (no format! alloc per element).
+  test("unique on scalar Int32 array deduplicates correctly", () =>
+    val result = [5, 3, 5, 1, 3, 7].unique()
+    [
+      expect(result.toString()).toBe("[5, 3, 1, 7]"),
+      expect(result.length()).toBe(4)
+    ]
+  ),
+
+  test("unique on scalar Int32 array all-distinct is identity", () =>
+    val xs: Int32[] = [10, 20, 30, 40]
+    val result = xs.unique()
+    [
+      expect(result.toString()).toBe("[10, 20, 30, 40]")
+    ]
+  ),
+
   test("take returns first n elements", () =>
     val result = [1, 2, 3, 4, 5].take(3)
     [
