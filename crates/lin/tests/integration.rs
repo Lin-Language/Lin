@@ -23936,3 +23936,55 @@ print(count)
         String::from_utf8_lossy(&compile.stderr),
     );
 }
+
+// ---------------------------------------------------------------------------
+// CLOS2: heap-accumulator reduce inline path (ReleaseRawIfDistinct RC gate)
+// ---------------------------------------------------------------------------
+
+/// Identity reducer: body returns the same accumulator pointer each iteration.
+/// `ReleaseRawIfDistinct` must be a no-op (same ptr) — no double-free.
+#[test]
+fn test_heap_acc_reduce_identity_no_double_free() {
+    let output = run(r#"import { print } from "std/io"
+import { reduce } from "std/iter"
+type Q = { String: Int32 }
+val stops: String[] = ["stop1", "stop2", "stop3"]
+val result: Q = stops.reduce({}, (queue: Q, stop: String): Q => queue)
+if result["stop1"] == null then print("null-ok") else print("unexpected")
+"#);
+    assert_eq!(output, vec!["null-ok"]);
+}
+
+/// Non-identity reducer: body creates a new map each iteration via spread.
+/// `ReleaseRawIfDistinct` must release the old map exactly once per iteration — no UAF, no leak.
+#[test]
+fn test_heap_acc_reduce_nonidentity_spread() {
+    let output = run(r#"import { print } from "std/io"
+import { reduce } from "std/iter"
+type M = { String: Int32 }
+val keys = ["alpha", "beta", "gamma"]
+val result: M = keys.reduce({}, (acc: M, x: String): M => { ...acc, [x]: 1 })
+print("${result["alpha"] ?? -1}")
+print("${result["beta"] ?? -1}")
+print("${result["gamma"] ?? -1}")
+print("${result["missing"] ?? -1}")
+"#);
+    assert_eq!(output, vec!["1", "1", "1", "-1"]);
+}
+
+/// Capturing reducer: closure captures an outer val.
+/// Confirms captured slots resolve correctly through the inlined body scope.
+#[test]
+fn test_heap_acc_reduce_capturing_outer_val() {
+    let output = run(r#"import { print } from "std/io"
+import { reduce } from "std/iter"
+type M = { String: Int32 }
+val weight = 5
+val keys = ["a", "b", "c"]
+val result: M = keys.reduce({}, (acc: M, x: String): M => { ...acc, [x]: weight })
+print("${result["a"] ?? -1}")
+print("${result["b"] ?? -1}")
+print("${result["c"] ?? -1}")
+"#);
+    assert_eq!(output, vec!["5", "5", "5"]);
+}

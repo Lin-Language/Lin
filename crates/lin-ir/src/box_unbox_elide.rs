@@ -157,7 +157,9 @@ fn uses_of(instr: &Instruction, t: Temp) -> usize {
         Instruction::Retain { val, .. } | Instruction::Release { val, .. } => usize::from(*val == t),
         Instruction::CloneBox { src, .. } => usize::from(*src == t),
         Instruction::FreeBoxShell { val } => usize::from(*val == t),
-        Instruction::FreeBoxShellIfDistinct { val, other } | Instruction::ReleaseIfDistinct { val, other } => {
+        Instruction::FreeBoxShellIfDistinct { val, other }
+        | Instruction::ReleaseIfDistinct { val, other }
+        | Instruction::ReleaseRawIfDistinct { val, other, .. } => {
             usize::from(*val == t) + usize::from(*other == t)
         }
         Instruction::IsType { val, .. } => usize::from(*val == t),
@@ -354,7 +356,9 @@ fn all_uses(instr: &Instruction) -> Vec<Temp> {
         Instruction::Retain { val, .. } | Instruction::Release { val, .. } => uses.push(*val),
         Instruction::CloneBox { src, .. } => uses.push(*src),
         Instruction::FreeBoxShell { val } => uses.push(*val),
-        Instruction::FreeBoxShellIfDistinct { val, other } | Instruction::ReleaseIfDistinct { val, other } => {
+        Instruction::FreeBoxShellIfDistinct { val, other }
+        | Instruction::ReleaseIfDistinct { val, other }
+        | Instruction::ReleaseRawIfDistinct { val, other, .. } => {
             uses.push(*val); uses.push(*other);
         }
         Instruction::IsType { val, .. } => uses.push(*val),

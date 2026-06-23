@@ -4048,6 +4048,108 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
         }
     }
 
+    // HEAP-ACCUMULATOR INLINE PATH (CLOS2): a capturing/literal reducer lambda whose accumulator
+    // is a raw heap type (Map, open Object, sealed record) — NOT a scalar and NOT a union/Json box.
+    // Carries the accumulator as a raw pointer through the phi; inlines the body with no closure
+    // alloc and no boxed-ABI indirect dispatch. RC management:
+    //   - init is lowered raw (no boxing) → phi starts at init (owned +1)
+    //   - body is inlined; the accumulator param binds to `acc` (borrowed)
+    //   - body result `acc_next` is the new accumulator (same ptr → identity; new ptr → +1)
+    //   - `ReleaseRawIfDistinct { val: acc, other: acc_next, ty: acc_ty }` releases the old
+    //     accumulator ONLY when distinct from the new one (correct for both identity and
+    //     non-identity reducers)
+    //
+    // Gate: `result_type` is a CONCRETE non-union heap type (Map or non-sealed open Object); a
+    // sealed record accumulator would need a projection coerce not covered here; a union/Json
+    // accumulator must use the generic boxed-phi path. The body must be inlinable.
+    //
+    // RAPTOR `getQueue`: `markedStops.reduce({}, (queue, stop) => ...; queue)` — the reducer
+    // mutates `queue` in-place and returns it unchanged (identity). This eliminates the per-call
+    // closure alloc + env alloc + per-stop indirect call that profiled at ~6% of RANGE time.
+    let acc_is_raw_heap = matches!(result_type,
+        Type::Map { .. } | Type::Object { .. }
+    ) && !is_union_ty(result_type) && !is_inline_scalar(result_type)
+        && !is_sealed_scalar_repr(result_type);
+    if acc_is_raw_heap {
+        if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[2], builder, ctx) {
+            let lam_params = lam_params.to_vec();
+            let lam_body = lam_body.clone();
+            let acc_ty = result_type.clone();
+            let init_raw = lower_expr(&args[1], builder, ctx);
+            // Coerce init to acc_ty representation (no-op when already matching).
+            let init = coerce_arg_to_param_repr(init_raw, &init_ty, &acc_ty, builder);
+            // The init value's ownership is transferred to the accumulator phi. Unregister it
+            // from the enclosing scope so the scope-exit Release does NOT double-free it. The phi
+            // carries exactly one +1: either the final accumulator is released by the caller
+            // (function scope exit), or by `ReleaseRawIfDistinct` each non-identity iteration.
+            builder.unregister_owned(init);
+            if init != init_raw { builder.unregister_owned(init_raw); }
+
+            let len = emit_iterable_len(iterable, &iterable_ty, builder);
+            let zero = builder.const_temp(Const::Int(0, Type::Int64));
+            let preheader = builder.current_block;
+            let header = builder.alloc_block("hreduce_header");
+            let body = builder.alloc_block("hreduce_body");
+            let exit = builder.alloc_block("hreduce_exit");
+
+            let i = builder.alloc_temp(Type::Int64);
+            let i_next = builder.alloc_temp(Type::Int64);
+            let acc = builder.alloc_temp(acc_ty.clone());
+            builder.terminate(Terminator::Jump(header));
+
+            builder.switch_to(header);
+            builder.emit(Instruction::Phi {
+                dst: i, ty: Type::Int64, incomings: vec![(zero, preheader), (i_next, body)],
+            });
+            // Accumulator phi: carries raw heap pointer; back-edge filled after body is lowered.
+            builder.emit(Instruction::Phi {
+                dst: acc, ty: acc_ty.clone(), incomings: vec![(init, preheader), (acc, body)],
+            });
+            let cond = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary {
+                dst: cond, op: BinOp::Lt, lhs: i, rhs: len, operand_ty: Type::Int64, ty: Type::Bool,
+            });
+            builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+
+            builder.switch_to(body);
+            let elem = builder.alloc_temp(elem_ty.clone());
+            builder.emit(Instruction::Index {
+                dst: elem, object: iterable, key: i,
+                obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+                nonneg: false,
+            });
+            let idx = narrow_loop_index(i, builder);
+            // Inline body: (acc, elem, idx) → acc_next_raw. The body may switch blocks.
+            let (acc_next_raw, acc_next_ty) = inline_lambda_body(
+                &lam_params, &lam_body,
+                &[(acc, acc_ty.clone()), (elem, elem_ty.clone()), (idx, Type::Int32)],
+                builder, ctx,
+            );
+            let acc_next = coerce_arg_to_param_repr(acc_next_raw, &acc_next_ty, &acc_ty, builder);
+            // Release per-iteration element: union/Json elements are fully released; sealed-struct
+            // elements from a packed source get their materialized-copy released. No-op for concrete
+            // raw elements that are borrowed refs (e.g. a concrete Map* from a typed array).
+            free_combinator_elem_box_full(elem, &elem_ty, builder);
+            free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, builder);
+            // Release the OLD accumulator raw ptr only when the body returned a NEW one. For an
+            // identity reducer (body returns acc unchanged) this is a no-op. For a non-identity
+            // reducer, this frees the old accumulator via the correct type-dispatched release fn.
+            builder.emit(Instruction::ReleaseRawIfDistinct { val: acc, other: acc_next, ty: acc_ty.clone() });
+            let one = builder.const_temp(Const::Int(1, Type::Int64));
+            builder.emit(Instruction::Binary {
+                dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
+            });
+            // Patch back-edges: i and acc.
+            let back_block = builder.current_block;
+            builder.terminate(Terminator::Jump(header));
+            builder.patch_phi_incoming(header, i, body, back_block);
+            builder.patch_phi_incoming_value(header, acc, acc, acc_next, back_block);
+
+            builder.switch_to(exit);
+            return acc;
+        }
+    }
+
     // DEVIRTUALIZED FAST PATH (path-8-B generalized): a BARE statically-known reducer
     // (`xs.reduce(init, add)`) calls it DIRECTLY per element — no closure shell, no boxed-ABI
     // wrapper, no indirect dispatch — so LLVM can inline the body. The accumulator phi uses the

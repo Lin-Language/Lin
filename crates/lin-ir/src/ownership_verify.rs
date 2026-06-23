@@ -846,7 +846,7 @@ fn classify_uses(instr: &Instruction, mark: &mut impl FnMut(Temp, UseKind)) {
         Unbox { val, .. } => mark(*val, UseKind::Read),
         // A Release is the value's death (a drop) — not an escape and not a mutation.
         Release { .. } | FreeBoxShell { .. } | FreeBoxShellIfDistinct { .. }
-        | ReleaseIfDistinct { .. } | FreeCell { .. } => {}
+        | ReleaseIfDistinct { .. } | ReleaseRawIfDistinct { .. } | FreeCell { .. } => {}
 
         // ---- In-place mutation: receiver is Inout, stored value escapes ----
         IndexSet { object, value, .. } => {
@@ -1048,7 +1048,9 @@ fn verify_fn(func: &LinFunction, out: &mut Vec<Violation>) {
         }
         for instr in &block.instructions {
             match instr {
-                Instruction::Release { val, .. } | Instruction::ReleaseIfDistinct { val, .. } => {
+                Instruction::Release { val, .. }
+                | Instruction::ReleaseIfDistinct { val, .. }
+                | Instruction::ReleaseRawIfDistinct { val, .. } => {
                     reachable_released.insert(*val);
                 }
                 Instruction::FreeCell { cell, .. } => {
@@ -1080,7 +1082,9 @@ fn verify_fn(func: &LinFunction, out: &mut Vec<Violation>) {
         }
         for instr in &block.instructions {
             let released_temp = match instr {
-                Instruction::Release { val, .. } | Instruction::ReleaseIfDistinct { val, .. } => Some(*val),
+                Instruction::Release { val, .. }
+                | Instruction::ReleaseIfDistinct { val, .. }
+                | Instruction::ReleaseRawIfDistinct { val, .. } => Some(*val),
                 Instruction::FreeCell { cell, .. } => Some(*cell),
                 _ => None,
             };
@@ -1136,7 +1140,9 @@ fn verify_fn(func: &LinFunction, out: &mut Vec<Violation>) {
                         *b += 1;
                     }
                 }
-                Instruction::Release { val, .. } | Instruction::ReleaseIfDistinct { val, .. } => {
+                Instruction::Release { val, .. }
+                | Instruction::ReleaseIfDistinct { val, .. }
+                | Instruction::ReleaseRawIfDistinct { val, .. } => {
                     if let Some(b) = balance.get_mut(val) {
                         *b -= 1;
                         if *b < 0 {

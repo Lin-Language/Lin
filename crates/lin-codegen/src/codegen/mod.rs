@@ -1518,6 +1518,31 @@ impl<'ctx> Codegen<'ctx> {
                                 }
                             }
                         }
+                        Instruction::ReleaseRawIfDistinct { val, other, ty } => {
+                            // Heap-accumulator reduce inline: release `val` (a raw non-tagged heap
+                            // pointer, e.g. LinMap*) only when it is a different address from `other`.
+                            // Emits an inline pointer comparison + conditional branch, then dispatches
+                            // `emit_release(val, ty)` on the taken branch. This is the type-aware
+                            // counterpart of ReleaseIfDistinct which uses lin_tagged_release_if_distinct.
+                            if let (Some(&v), Some(&o)) = (temp_map.get(val), temp_map.get(other)) {
+                                if v.is_pointer_value() && o.is_pointer_value() {
+                                    let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                                    let rel_bb = self.context.append_basic_block(llvm_fn, "rridcont");
+                                    let skip_bb = self.context.append_basic_block(llvm_fn, "rridskip");
+                                    let vp = v.into_pointer_value();
+                                    let op = o.into_pointer_value();
+                                    let vi = self.builder.ptr_to_int(vp, i64_ty, "rrid_vi");
+                                    let oi = self.builder.ptr_to_int(op, i64_ty, "rrid_oi");
+                                    let same = self.builder.int_compare(
+                                        inkwell::IntPredicate::EQ, vi, oi, "rrid_same");
+                                    self.builder.conditional_branch(same, skip_bb, rel_bb);
+                                    self.builder.position_at_end(rel_bb);
+                                    self.emit_release(v, ty);
+                                    self.builder.unconditional_branch(skip_bb);
+                                    self.builder.position_at_end(skip_bb);
+                                }
+                            }
+                        }
                         Instruction::Call { dst, callee, args, ret_ty } => {
                             // VA.1 CPR: if any argument is a flat-union struct `{ i1, i64 }`,
                             // materialize it to a `TaggedVal*` before the call — the callee (for a
