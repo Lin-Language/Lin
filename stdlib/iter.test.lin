@@ -50,6 +50,12 @@ val s = suite("std/iter combinators", [
     expect([1, 2, 3].sliding(2).toString()).toBe("[[1, 2], [2, 3]]")
   ]),
 
+  // Buffer trim: sliding(width=2) over n elements must produce windows with the correct values
+  // even over long inputs (regression: buf was O(n) before the trim fix).
+  test("sliding over longer input produces correct windows", () => [
+    expect(sliding([1, 2, 3, 4, 5, 6], 3).toString()).toBe("[[1, 2, 3], [2, 3, 4], [3, 4, 5], [4, 5, 6]]")
+  ]),
+
   // ---- pairwise (eager) ----
   test("pairwise adjacent pairs", () => [
     expect(pairwise([1, 2, 3, 4]).toString()).toBe("[[1, 2], [2, 3], [3, 4]]")

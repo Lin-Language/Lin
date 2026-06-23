@@ -16,6 +16,7 @@ import foreign "lin-runtime"
   val lin_array_append_dyn: (AnyVal, AnyVal) => AnyVal
   val lin_array_prepend_dyn: (AnyVal, AnyVal) => AnyVal
   val lin_map_get_or_insert_array: (AnyVal, String) => AnyVal
+  val lin_array_unique: (AnyVal) => AnyVal
 
 // Iterable combinators moved to std/iter (Stage 1 of the std/iter unification). The array-shaped
 // functions below that need them internally (reverse/partition/zip/unique/chunk/sort/scan/groupBy/
@@ -177,18 +178,11 @@ export val zip = <A, B>(a: A[], b: B[]): [A, B][] =>
 
 // Return a new array with duplicate elements removed, keeping the first occurrence of each in
 // source order. Elements are compared by deep structural value.
+// Scalar integer arrays (Int32, Int64, UInt64) use an int-keyed seen set (zero format! allocs).
 // @param arr  the source array.
 // @returns a new `T[]` of the distinct elements, in first-seen order.
 export val unique = <T>(arr: T[]): T[] =>
-  val seen: { String: Boolean } = {}
-  val result: T[] = []
-  arr.for(item =>
-    val key = lin_value_key(item)
-    if seen[key] == null then
-      push(result, item)
-      seen[key] = true
-  )
-  result
+  lin_array_unique(arr)
 
 // Split `arr` into consecutive sub-arrays of at most `size` elements (the last may be shorter).
 // @param arr   the source array.
