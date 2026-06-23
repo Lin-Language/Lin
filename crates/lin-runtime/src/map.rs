@@ -998,11 +998,20 @@ pub unsafe extern "C" fn lin_keys_any(p: *const u8) -> *mut crate::array::LinArr
             let sealed = tv.payload as *mut u8;
             if sealed.is_null() { return crate::array::lin_array_alloc(0); }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
-            if mat.is_null() { return crate::array::lin_array_alloc(0); }
-            let arr = lin_map_keys(mat as *const LinMap);
-            stringify_int_keys(arr);
-            lin_map_release(mat);
+            if named_desc.is_null() { return crate::array::lin_array_alloc(0); }
+            let field_count = u32::from_le_bytes([
+                *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
+            ]) as u64;
+            let arr = crate::array::lin_array_alloc(field_count);
+            (*arr).len = field_count;
+            let mut i = 0usize;
+            crate::sealed::record_walk_fields(named_desc, |name_bytes, _offset, _nkind, _nested| {
+                let ls = crate::string::lin_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
+                let dst = (*arr).data.add(i) as *mut TaggedVal;
+                (*dst).tag = crate::tagged::TAG_STR;
+                (*dst).payload = ls as u64;
+                i += 1;
+            });
             arr
         }
         _ => crate::array::lin_array_alloc(0),
@@ -1030,10 +1039,30 @@ pub unsafe extern "C" fn lin_values_any(p: *const u8) -> *mut crate::array::LinA
             let sealed = tv.payload as *mut u8;
             if sealed.is_null() { return crate::array::lin_array_alloc(0); }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
-            if mat.is_null() { return crate::array::lin_array_alloc(0); }
-            let arr = lin_map_values(mat as *const LinMap);
-            lin_map_release(mat);
+            if named_desc.is_null() { return crate::array::lin_array_alloc(0); }
+            let field_count = u32::from_le_bytes([
+                *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
+            ]) as u64;
+            let arr = crate::array::lin_array_alloc(field_count);
+            (*arr).len = field_count;
+            let mut i = 0usize;
+            crate::sealed::record_walk_fields(named_desc, |_name_bytes, offset, nkind, nested| {
+                let boxed = crate::sealed::box_field_value(sealed, offset, nkind, nested);
+                let dst = (*arr).data.add(i) as *mut TaggedVal;
+                if boxed.is_null() {
+                    (*dst).tag = crate::tagged::TAG_NULL;
+                    (*dst).payload = 0;
+                } else {
+                    let tv_box = boxed as *const TaggedVal;
+                    (*dst).tag = (*tv_box).tag;
+                    (*dst).payload = (*tv_box).payload;
+                    // Retain: the box's payload is +1; we copy tag+payload into the array slot
+                    // (which owns a +1 via retain_tagged_payload_pub), then release the box shell.
+                    crate::tagged::retain_tagged_payload_pub(&*tv_box);
+                    crate::tagged::lin_tagged_release(boxed);
+                }
+                i += 1;
+            });
             arr
         }
         _ => crate::array::lin_array_alloc(0),
@@ -1056,12 +1085,38 @@ pub unsafe extern "C" fn lin_entries_any(p: *const u8) -> *mut crate::array::Lin
             let sealed = tv.payload as *mut u8;
             if sealed.is_null() { return crate::array::lin_array_alloc(0); }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
-            if mat.is_null() { return crate::array::lin_array_alloc(0); }
-            let arr = lin_map_entries(mat as *const LinMap);
-            stringify_int_entry_keys(arr);
-            lin_map_release(mat);
-            arr
+            if named_desc.is_null() { return crate::array::lin_array_alloc(0); }
+            let field_count = u32::from_le_bytes([
+                *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
+            ]) as u64;
+            let out = crate::array::lin_array_alloc(field_count);
+            (*out).len = field_count;
+            let mut i = 0usize;
+            crate::sealed::record_walk_fields(named_desc, |name_bytes, offset, nkind, nested| {
+                let pair = crate::array::lin_array_alloc(2);
+                (*pair).len = 2;
+                let key_str = crate::string::lin_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
+                let k_slot = (*pair).data.add(0) as *mut TaggedVal;
+                (*k_slot).tag = crate::tagged::TAG_STR;
+                (*k_slot).payload = key_str as u64;
+                let boxed = crate::sealed::box_field_value(sealed, offset, nkind, nested);
+                let v_slot = (*pair).data.add(1) as *mut TaggedVal;
+                if boxed.is_null() {
+                    (*v_slot).tag = crate::tagged::TAG_NULL;
+                    (*v_slot).payload = 0;
+                } else {
+                    let tv_box = boxed as *const TaggedVal;
+                    (*v_slot).tag = (*tv_box).tag;
+                    (*v_slot).payload = (*tv_box).payload;
+                    crate::tagged::retain_tagged_payload_pub(&*tv_box);
+                    crate::tagged::lin_tagged_release(boxed);
+                }
+                let dst = (*out).data.add(i) as *mut TaggedVal;
+                (*dst).tag = crate::tagged::TAG_ARRAY;
+                (*dst).payload = pair as u64;
+                i += 1;
+            });
+            out
         }
         _ => crate::array::lin_array_alloc(0),
     }
@@ -1214,8 +1269,23 @@ pub(crate) unsafe fn dynamic_to_map(tv: *const TaggedVal) -> *mut LinMap {
             let sealed = (*tv).payload as *mut u8;
             if sealed.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let m = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
-            if m.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
+            if named_desc.is_null() { return lin_map_alloc(0, KEY_KIND_STRING); }
+            let field_count = u32::from_le_bytes([
+                *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
+            ]);
+            let m = lin_map_alloc(field_count, KEY_KIND_STRING);
+            crate::sealed::record_walk_fields(named_desc, |name_bytes, offset, nkind, nested| {
+                // RC: lin_string_from_bytes → rc=1 (ours). lin_map_set inc_refs key → map owns +1.
+                let key_str = crate::string::lin_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
+                // RC: box_field_value → OWNED +1 TaggedVal*. lin_map_set retains payload → +2.
+                // lin_tagged_release → releases payload -1 + frees box shell → map owns +1.
+                let boxed = crate::sealed::box_field_value(sealed, offset, nkind, nested);
+                let null_tv = TaggedVal { tag: crate::tagged::TAG_NULL, _pad: [0; 7], payload: 0 };
+                let tv_val: &TaggedVal = if boxed.is_null() { &null_tv } else { &*(boxed as *const TaggedVal) };
+                lin_map_set(m, key_str as *mut crate::string::LinString, tv_val);
+                if !boxed.is_null() { crate::tagged::lin_tagged_release(boxed); }
+                crate::string::lin_string_release(key_str);
+            });
             m
         }
         t if t == crate::tagged::TAG_SUMNODE => {

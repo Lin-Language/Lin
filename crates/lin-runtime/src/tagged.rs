@@ -804,9 +804,22 @@ pub unsafe extern "C" fn lin_tagged_keys(tv: *const u8) -> *mut crate::array::Li
                 return crate::array::lin_array_alloc(0);
             }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
-            let arr = crate::map::lin_map_keys(mat as *const crate::map::LinMap);
-            crate::map::lin_map_release(mat);
+            if named_desc.is_null() {
+                return crate::array::lin_array_alloc(0);
+            }
+            let field_count = u32::from_le_bytes([
+                *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
+            ]) as u64;
+            let arr = crate::array::lin_array_alloc(field_count);
+            (*arr).len = field_count;
+            let mut i = 0usize;
+            crate::sealed::record_walk_fields(named_desc, |name_bytes, _offset, _nkind, _nested| {
+                let ls = crate::string::lin_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
+                let dst = (*arr).data.add(i) as *mut TaggedVal;
+                (*dst).tag = TAG_STR;
+                (*dst).payload = ls as u64;
+                i += 1;
+            });
             arr
         }
         _ => crate::array::lin_array_alloc(0),
@@ -814,7 +827,7 @@ pub unsafe extern "C" fn lin_tagged_keys(tv: *const u8) -> *mut crate::array::Li
 }
 
 /// Check if a boxed value (TaggedVal*) has a given string key. Returns 0/1.
-/// Dispatches: TAG_MAP → `lin_map_has`, TAG_RECORD → materialize + check, else 0.
+/// Dispatches: TAG_MAP → `lin_map_has`, TAG_RECORD → walk descriptor, else 0.
 #[no_mangle]
 pub unsafe extern "C" fn lin_value_has_field(tagged: *const u8, key: *const crate::string::LinString) -> u8 {
     if tagged.is_null() { return 0; }
@@ -828,10 +841,16 @@ pub unsafe extern "C" fn lin_value_has_field(tagged: *const u8, key: *const crat
             let sealed = (*tv).payload as *mut u8;
             if sealed.is_null() { return 0; }
             let named_desc = *((sealed.add(16)) as *const *const u8);
-            let mat = crate::sealed::materialize_sealed_to_map_pub(sealed, named_desc);
-            let result = if mat.is_null() { 0 } else { crate::map::lin_map_has(mat, key) };
-            crate::map::lin_map_release(mat);
-            result
+            if named_desc.is_null() { return 0; }
+            if key.is_null() { return 0; }
+            let key_bytes = std::slice::from_raw_parts((*key).data.as_ptr(), (*key).len as usize);
+            let mut found = false;
+            crate::sealed::record_walk_fields(named_desc, |name_bytes, _offset, _nkind, _nested| {
+                if !found && name_bytes == key_bytes {
+                    found = true;
+                }
+            });
+            found as u8
         }
         _ => 0,
     }
