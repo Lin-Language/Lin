@@ -18,10 +18,14 @@ workload (`map`/`filter`/`reduce`) **beats Rust ~4×** (25 ms vs 100 ms) because
 chain fuses to a single zero-allocation loop.
 
 Lin is **slow exactly where the program leans on its dynamic escape hatch**:
-`AnyVal`-typed field access is a string-keyed O(n) linear scan that is an LLVM
-optimization barrier — measured **~4× slower** than the equivalent typed record
-on the `records` workload, and ~70× slower on heavily `AnyVal`-read-bound code
-(RAPTOR). The other structural cost is the **call boundary**: a polymorphic
+`AnyVal`-typed field access lowers to a **runtime tag-dispatch + an O(1) hashed
+`lin_map_get`** (or, for a `TAG_RECORD` value, a descriptor field read) and is an LLVM
+**optimization barrier** — the type is unknown at compile time, so the read can't fold
+to a constant-offset load, hoist, or elide — measured **~4× slower** than the
+equivalent typed record on the `records` workload, and ~70× slower on heavily
+`AnyVal`-read-bound code (RAPTOR). (The cost is the per-access dispatch + barrier,
+**not** an O(n) association-list scan — that `LinObject` representation was deleted in
+the reset, §5.6.) The other structural cost is the **call boundary**: a polymorphic
 combinator calling a non-devirtualizable closure boxes each element and unboxes
 the result across an opaque indirect call. The one-line story: **Lin is a
 fast native language when you give it types, and a slow dynamic one when you
@@ -41,7 +45,7 @@ There are two harnesses, deliberately separate:
   |------|--------------------|
   | `recursion` | call/return overhead, TCO loop transform, non-tail self-recursion (`fib`); mostly unboxed `Int32` so isolates call + branch |
   | `array_pipeline` | `map`/`filter`/`reduce` over a range: indirect closure calls, Int32 box/unbox through the `AnyVal` element slot, RC on intermediates |
-  | `object_access` | object construction + the O(n) linear-scan field lookup; chained reads multiply the scan |
+  | `object_access` | object construction + dynamic field lookup (tag-dispatch + O(1) hashed `map_get`); chained reads multiply the per-access dispatch + optimization barrier |
   | `string_build` | string allocation (historically no SSO), interpolation/concat, string RC |
   | `map_flat_scalar` | packed scalar array + `{String:T}` map store in a hot loop |
   | `async_await` / `worker_roundtrip` | **latency** — per-op round-trip (thread spawn, env deep-copy, mailbox) |
@@ -223,13 +227,20 @@ preserve.
 
 ## 4. Where it struggles
 
-- **`AnyVal`-read-bound code is the cliff.** `AnyVal` field access is a string-keyed
-  O(n) linear scan over the object's entries *and* an LLVM optimization barrier —
-  the compiler can't elide, hoist, or fold it the way it does a typed record's
-  constant-offset slot. Measured ~4× on `records`, ~70× on RAPTOR-class code.
-  `AnyVal` is a genuine escape hatch (untyped wire data, recursive ASTs), not a
-  default. The fix is *userland*: type the data (§6), not a codegen tweak — see
-  the path-9 closed-negative in §5.
+- **`AnyVal`-read-bound code is the cliff.** `AnyVal` field access lowers to a
+  **runtime tag-dispatch** (unbox → load tag → branch, `codegen/data/index.rs`) that
+  routes to an **O(1) hashed `lin_map_get`** for a `TAG_MAP` value or a
+  descriptor-driven field read (`lin_record_get_field`) for a `TAG_RECORD`, *and* it is
+  an LLVM optimization barrier — the type is unknown at compile time, so the compiler
+  can't elide, hoist, or fold the read the way it does a typed record's constant-offset
+  slot. Measured ~4× on `records`, ~70× on RAPTOR-class code. **NB — not an O(n)
+  scan:** the per-access cost is the tag-dispatch + barrier (+ the hashed probe / a
+  small descriptor walk), **not** an association-list scan over the object's entries.
+  That O(n) `LinObject`/`TAG_OBJECT` representation was *deleted* in the representation
+  reset (§5.6); dynamic string-keyed data is now an O(1) `LinMap`. Don't re-describe
+  `AnyVal` access as "O(n) field lookup." `AnyVal` is a genuine escape hatch (untyped
+  wire data, recursive ASTs), not a default. The fix is *userland*: type the data
+  (§6), not a codegen tweak — see the path-9 closed-negative in §5.
 - **The non-devirtualizable call boundary.** A polymorphic combinator (or any
   stored closure) calls its callback through a uniform all-ptr boxed-closure ABI:
   it boxes each element argument and unboxes the boxed result across an opaque
@@ -755,8 +766,9 @@ mandatory gate for any codegen/lowering lane — it caught the lazy-mat codegen 
 
 1. **Prefer typed records and `&`-composed named types over `AnyVal`.** This is the
    single biggest lever — a typed record field read is a constant-offset load;
-   `AnyVal` field access is an O(n) scan and an optimization barrier (~4–70× slower).
-   `AnyVal` is for genuinely unknowable shapes only.
+   `AnyVal` field access is a runtime tag-dispatch + an O(1) hashed `map_get` and an
+   optimization barrier the compiler can't fold to a constant-offset load (~4–70×
+   slower) — not an O(n) scan (§4). `AnyVal` is for genuinely unknowable shapes only.
 2. **Use `{String:T}` for dictionary data**, not an open object. It's an O(1)
    hashed `LinMap`, not an O(n) association list.
 3. **Use the fusable eager combinators** (`map`/`filter`/`reduce`/`for`) in chains
