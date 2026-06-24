@@ -24050,3 +24050,20 @@ print(last)
     // last should be "T" (the final character)
     assert_eq!(output, vec!["T"]);
 }
+
+#[test]
+fn test_substr_fuse_soundness_value_use_disqualifies() {
+    // Soundness regression: a substring STORED AS A MAP VALUE (not a key) must NOT be
+    // fused — the materialized LinString is what gets stored. The original pass only
+    // checked the KEY operand of IndexSet, so `m[k] = substring(...)` mis-fused the value
+    // and stored an empty/undefined string. This locks that fix.
+    let output = run(r#"import { print } from "std/io"
+import { substring } from "std/string"
+val s = "HELLOWORLD"
+var m: { String: String } = {}
+m["k"] = substring(s, 0, 5)
+val got = m["k"]
+print(got)
+"#);
+    assert_eq!(output, vec!["HELLO"]);
+}
