@@ -572,12 +572,24 @@ impl<'ctx> Codegen<'ctx> {
                 None => true, // unsealed/boxed/Json source → project
             };
         }
+        // `to` is a NullableRecord (T|Null or Named("T")|Null): the slot holds a raw `*sealed_T`
+        // pointer (or 0x0 for null). A sealed-record `from`, a Named-alias nullable `from`, or a
+        // `Null` from all map verbatim to the pointer slot — no coerce. Only a boxed/union source
+        // requires a coerce (project to the inner sealed struct or null-guard).
+        if Self::nullable_sealed_record_type(to).is_some() || Self::is_named_nullable_union(to) {
+            if matches!(from, Type::Null) { return false; }
+            if Self::sealed_fields(from).is_some() { return false; }
+            if Self::is_named_nullable_union(from) { return false; }
+            if Self::nullable_sealed_record_type(from).is_some() { return false; }
+            return true; // boxed/union source needs coerce
+        }
         if from.is_string_ish() && to.is_string_ish() { return false; }
         if matches!(from, Type::Array(_) | Type::FixedArray(_)) && matches!(to, Type::Array(_) | Type::FixedArray(_)) {
             return false;
         }
         from != to
     }
+
 
     /// Materialize a sealed record into a fresh `LinMap` (TAG_MAP): the universal Json
     /// representation. Used at the sealed→Json/unsealed boundary so all the existing dynamic object
