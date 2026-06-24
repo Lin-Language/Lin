@@ -1017,6 +1017,14 @@ impl<'ctx> Codegen<'ctx> {
             // the (data_ptr, key_len_i32) LLVM values produced inline from the source string,
             // skipping the actual lin_string_slice heap allocation.
             let mut slice_byte_map: StdMap<lir::Temp, (BasicValueEnum<'ctx>, inkwell::values::IntValue<'ctx>)> = StdMap::new();
+            // Get-set fusion (getset_map_fuse pass): for each fused Index, stores the raw slot
+            // pointer and `is_new` alloca produced by the upsert call at Index-emit time.
+            // Used at IndexSet-emit time to write the new value directly into the already-located slot.
+            // Key = Index.key temp, Value = (Index.dst, slot_ptr, is_new_alloca).
+            // Cross-block case: Index.object and IndexSet.object may be different temps (both
+            // GlobalValGet of the same slot); the IR pass has already validated soundness, so
+            // matching on key_temp alone is sufficient.
+            let mut upsert_slot_map: StdMap<lir::Temp, (lir::Temp, inkwell::values::PointerValue<'ctx>, inkwell::values::PointerValue<'ctx>)> = StdMap::new();
 
             // Self-tail-call (TCO) support: if any block ends in TailCall, route params
             // through stack allocas so a tail call can update them and branch back to the
@@ -2530,9 +2538,21 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty, nonneg, proven_inbounds } => {
                             if let Some(&obj_v) = temp_map.get(object) {
-                                // Substring-key fusion: if key is a fused slice temp, use the
+                                // Get-set fusion: if this Index is part of a get-set pair, emit
+                                // lin_map_upsert_slot_bytes now and defer the actual value read;
+                                // the IndexSet emitter will write the new value to the slot directly.
+                                if func.getset_fuse.contains(dst) {
+                                    if let Some(&(data_ptr, key_len)) = slice_byte_map.get(key) {
+                                        let result = self.emit_upsert_index(
+                                            obj_v, data_ptr, key_len, obj_ty, result_ty,
+                                            *key, &mut upsert_slot_map, *dst,
+                                        );
+                                        temp_map.insert(*dst, result);
+                                    }
+                                }
+                                // Substring-key fusion (non-getset): if key is a fused slice temp, use the
                                 // byte-keyed map get (lin_map_get_bytes) instead of the normal string path.
-                                if let Some(&(data_ptr, key_len)) = slice_byte_map.get(key) {
+                                else if let Some(&(data_ptr, key_len)) = slice_byte_map.get(key) {
                                     let result = self.emit_map_get_bytes_fused(obj_v, data_ptr, key_len, obj_ty, result_ty);
                                     temp_map.insert(*dst, result);
                                 } else if let Some(&key_v) = temp_map.get(key) {
@@ -2546,9 +2566,17 @@ impl<'ctx> Codegen<'ctx> {
                             if let (Some(&obj_v), Some(&val_v)) =
                                 (temp_map.get(object), temp_map.get(value))
                             {
-                                // Substring-key fusion: if key is a fused slice temp, use
+                                // Get-set fusion: if a prior Index on the same key emitted
+                                // a upsert_slot, write the new value directly to the slot.
+                                // upsert_slot_map is keyed by key_temp (the Index's key temp).
+                                let fused_slot = upsert_slot_map.get(key).map(|&(_, slot_ptr, _)| slot_ptr);
+                                if let Some(slot_ptr) = fused_slot {
+                                    let val_repr = func.repr_of(*value);
+                                    self.emit_upsert_index_set(slot_ptr, val_v, obj_ty, val_ty, &val_repr);
+                                }
+                                // Substring-key fusion (non-getset): if key is a fused slice temp, use
                                 // lin_map_set_bytes to avoid a per-iteration string allocation.
-                                if let Some(&(data_ptr, key_len)) = slice_byte_map.get(key) {
+                                else if let Some(&(data_ptr, key_len)) = slice_byte_map.get(key) {
                                     let val_repr = func.repr_of(*value);
                                     self.emit_map_set_bytes_fused(obj_v, data_ptr, key_len, val_v, obj_ty, val_ty, &val_repr);
                                 } else if let Some(&key_v) = temp_map.get(key) {

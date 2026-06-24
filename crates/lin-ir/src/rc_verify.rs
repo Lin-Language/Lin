@@ -704,6 +704,7 @@ mod tests {
             repr: Vec::new(),
             coverage_origin: None,
             substr_fuse: std::collections::HashMap::new(),
+            getset_fuse: std::collections::HashSet::new(),
         }
     }
 

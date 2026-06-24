@@ -172,7 +172,7 @@ fn is_string_map(ty: &Type) -> bool {
 }
 
 /// Collect all temp operands referenced by an instruction (excluding dst).
-fn temps_used(instr: &Instruction) -> Vec<Temp> {
+pub fn temps_used(instr: &Instruction) -> Vec<Temp> {
     let mut out = Vec::new();
     match instr {
         Instruction::Const { .. } => {}

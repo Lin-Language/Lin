@@ -13,6 +13,7 @@ pub mod redundant_read;
 pub mod repr;
 pub mod sink_pure_val;
 pub mod substr_map_fuse;
+pub mod getset_map_fuse;
 
 pub use ir::*;
 pub use lower::{
