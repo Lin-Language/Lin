@@ -182,14 +182,7 @@ impl<'ctx> Codegen<'ctx> {
                 };
                 let i32_ty = self.context.i32_type();
                 let i64_ty = self.context.i64_type();
-                let arg_ty_raw = arg_tys.first().cloned().unwrap_or(Type::Null);
-                // Strip Frozen: Frozen<T> has the same runtime repr as T, so all length-dispatch
-                // arms below work identically. Without stripping, Frozen<Trip[]> falls to the
-                // dynamic lin_length_dyn arm which reads the pointer as a TaggedVal* → garbage len.
-                let arg_ty = match &arg_ty_raw {
-                    Type::Frozen(inner) => (**inner).clone(),
-                    _ => arg_ty_raw.clone(),
-                };
+                let arg_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
                 // Dispatch on the argument's STATIC type, mirroring the AST `lin_length`:
                 // string→lin_string_length, array→lin_array_length, object→lin_object_length,
                 // Json/union→lin_length_dyn (runtime tag dispatch). Calling lin_array_length on

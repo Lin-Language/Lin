@@ -256,16 +256,6 @@ fn join(a: &Repr, b: &Repr) -> Repr {
                     (Layout::PackedSealedArray { elem_layout: e1, .. }, Layout::ColumnarArray { elem_layout: e2 }) if e1 == e2 => {
                         Packed(Layout::ColumnarArray { elem_layout: e2.clone() })
                     }
-                    // Inline (0xFE) and pointer-backed (0xFD) sealed arrays with the same element
-                    // layout: both are valid packed sealed arrays; join to the pointer-backed (0xFD)
-                    // form which is the more conservative. This fires when a Frozen<T[]>-seeded Coerce
-                    // result (inline:true) meets a MakeArray result (inline:false) in a phi, e.g. the
-                    // `??`-else empty-array literal path that feeds the same `routeTrips` as the
-                    // `??`-then non-null sealed-array path. Without this arm the join demoted to Boxed,
-                    // causing `routeTrips[i]` to use the slow unbox path (~13% regression on RAPTOR).
-                    (Layout::PackedSealedArray { elem_layout: e1, inline: i1 }, Layout::PackedSealedArray { elem_layout: e2, inline: i2 }) if e1 == e2 => {
-                        Packed(Layout::PackedSealedArray { elem_layout: e1.clone(), inline: *i1 && *i2 })
-                    }
                     _ => Repr::boxed_opaque()
                 }
             }

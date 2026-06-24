@@ -12,14 +12,14 @@ export type RouteScanPosition = { RouteId: Int32 }
 // Returns trips for specific routes. Caches the last trip position found per route to reduce plan time.
 //
 export type RouteScanner = {
-  "tripsByRoute": Frozen<TripsIndexedByRoute>,
+  "tripsByRoute": TripsIndexedByRoute,
   "date": DateNumber,
   "dow": DayOfWeek,
   "routeScanPosition": RouteScanPosition
 }
 
 export val createRouteScanner = (
-  tripsByRoute: Frozen<TripsIndexedByRoute>,
+  tripsByRoute: TripsIndexedByRoute,
   date: DateNumber,
   dow: DayOfWeek
 ): RouteScanner =>
@@ -71,9 +71,9 @@ export val getTrip = (scanner: RouteScanner, routeId: RouteId, stopIndex: Int32,
 //
 // Create RouteScanners from GTFS trips indexed by route.
 //
-export type RouteScannerFactory = { "tripsByRoute": Frozen<TripsIndexedByRoute> }
+export type RouteScannerFactory = { "tripsByRoute": TripsIndexedByRoute }
 
-export val createRouteScannerFactory = (tripsByRoute: Frozen<TripsIndexedByRoute>): RouteScannerFactory =>
+export val createRouteScannerFactory = (tripsByRoute: TripsIndexedByRoute): RouteScannerFactory =>
   { "tripsByRoute": tripsByRoute }
 
 export val create = (factory: RouteScannerFactory, date: DateNumber, dow: DayOfWeek): RouteScanner =>
