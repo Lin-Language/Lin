@@ -1081,6 +1081,7 @@ impl FuncBuilder {
             intrinsic_slots: self.intrinsic_slots.clone(),
             repr: Vec::new(),
             coverage_origin: None,
+            substr_fuse: HashMap::new(),
         }
     }
 

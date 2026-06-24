@@ -755,7 +755,8 @@ pub unsafe extern "C" fn lin_map_get_int(map: *const LinMap, key: i64) -> *const
 }
 
 /// Lookup by raw UTF-8 key bytes — avoids allocating a temporary `LinString`.
-pub(crate) unsafe fn lin_map_get_bytes(
+#[no_mangle]
+pub unsafe extern "C" fn lin_map_get_bytes(
     map: *const LinMap,
     key_ptr: *const u8,
     key_len: u32,
@@ -792,6 +793,76 @@ pub(crate) unsafe fn lin_map_get_bytes(
         idx = (idx + 1) & mask;
     }
     std::ptr::null()
+}
+
+/// Upsert by raw UTF-8 key bytes — avoids allocating a temporary `LinString` on hit.
+/// On a NEW key (miss): materialises a `LinString` via `lin_string_from_bytes` (rc=1),
+/// stores it as the slot key, and retains the value (matching `lin_map_set` RC contract).
+/// On an EXISTING key (hit): overwrites the value only, no string allocation.
+/// RC contract mirrors `lin_map_set` exactly: the value's inner payload is RETAINED (+1).
+/// `key_ptr` / `key_len` must remain valid until this call returns (the source string
+/// stays alive for the duration of the get+set window, which is the caller's guarantee).
+#[no_mangle]
+pub unsafe extern "C" fn lin_map_set_bytes(
+    map: *mut LinMap,
+    key_ptr: *const u8,
+    key_len: u32,
+    val: *const TaggedVal,
+) {
+    if map.is_null() { return; }
+    let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
+    let val_ref: &TaggedVal = if val.is_null() { &null_tv } else { &*val };
+    note_value_tag(map, val_ref.tag);
+    ensure_capacity(map);
+    let bytes = std::slice::from_raw_parts(key_ptr, key_len as usize);
+    let khash = fnv1a_bytes(bytes);
+    let h2 = h2_of(khash);
+    let vk = (*map).value_kind;
+    let stride = slot_stride(vk);
+    let cap = (*map).cap as usize;
+    let mask = cap - 1;
+    let mut idx = (khash as usize) & mask;
+    for _ in 0..cap {
+        let ctrl_byte = (*map).ctrl.add(idx);
+        let c = *ctrl_byte;
+        if c == CTRL_EMPTY {
+            // New key: materialise the LinString and insert.
+            let key_str = crate::string::lin_string_from_bytes(key_ptr, key_len);
+            // Store the cached hash so subsequent lin_map_get fast-paths can reuse it.
+            (*key_str).hash = khash;
+            order_push(map, key_str as u64);
+            *ctrl_byte = h2;
+            set_slot_key(slot_at((*map).slots, idx, stride), key_str as u64);
+            store_slot_value(slot_at((*map).slots, idx, stride), vk, val_ref);
+            crate::tagged::retain_tagged_payload_pub(val_ref);
+            (*map).len += 1;
+            return;
+        }
+        if c == h2 {
+            let slot = slot_at((*map).slots, idx, stride);
+            let slot_key_ptr = slot_key(slot) as *const LinString;
+            let kl = (*slot_key_ptr).len as usize;
+            if kl == bytes.len() {
+                let kb = std::slice::from_raw_parts((*slot_key_ptr).data.as_ptr(), kl);
+                if kb == bytes {
+                    // Hit: overwrite value, no string alloc.
+                    let old = slot_value_owned(slot, vk);
+                    crate::tagged::release_tagged_payload_pub(&old);
+                    store_slot_value(slot, vk, val_ref);
+                    crate::tagged::retain_tagged_payload_pub(val_ref);
+                    return;
+                }
+            }
+        }
+        idx = (idx + 1) & mask;
+    }
+    // Table is full (should be unreachable after ensure_capacity), fall back to inserting.
+    let key_str = crate::string::lin_string_from_bytes(key_ptr, key_len);
+    (*key_str).hash = khash;
+    let key_lin = key_str as *mut LinString;
+    lin_map_set(map, key_lin, val);
+    // lin_map_set inc_refs the key; the construction +1 from from_bytes is our temp — release it.
+    lin_string_release(key_lin);
 }
 
 #[no_mangle]

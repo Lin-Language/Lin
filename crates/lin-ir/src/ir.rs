@@ -712,6 +712,13 @@ pub struct LinFunction {
     /// (so an imported generic exercised by tests reports real coverage instead of 0%). `None` for
     /// ordinary functions, whose spans belong to the module currently being compiled.
     pub coverage_origin: Option<String>,
+    /// Substring-key fusion map (populated by `substr_map_fuse::run`). Maps a temp `t` that was
+    /// produced by a `Call { Named("lin_string_slice"), args: [src, start, end] }` — and whose
+    /// ONLY uses are as map-key operands (Index/IndexSet on `{String:_}`) — to `[src, start, end]`.
+    /// Codegen skips the `lin_string_slice` call for such temps and emits byte-keyed map ops
+    /// (`lin_map_get_bytes` / `lin_map_set_bytes`) directly, eliminating the per-iteration alloc.
+    /// Empty by default; the pass is a no-op when the pattern is absent.
+    pub substr_fuse: HashMap<Temp, [Temp; 3]>,
 }
 
 impl LinFunction {
