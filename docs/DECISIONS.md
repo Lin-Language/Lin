@@ -370,7 +370,7 @@ Implementation:
 
 ## ADR-028: Async concurrency — copy-by-default RC, catchable faults at the thread boundary
 
-**Decision**: Turning the synchronous async stub into real OS-thread concurrency (spec §24) is gated on three model decisions, locked in here (see `docs/ASYNC_DESIGN.md` for the full plan):
+**Decision**: Turning the synchronous async stub into real OS-thread concurrency (spec §24) is gated on three model decisions, locked in here (the as-built surface and semantics are specified in `docs/SPECIFICATION.md` §24):
 
 1. **RC under threads = Option C (transfer by deep copy) by default, plus two opt-in shared types `Shared<T>` and `Frozen<T>`.** Refcounts stay non-atomic on the single-threaded hot path. Values crossing a thread boundary (a thunk's captured env, and the transferable result returned through a promise) are **deep-copied** so each thread owns a private, disjoint object graph — nothing is shared, so non-atomic RC is sound. The set of boundary-crossing values is exactly the transferable types (JSON-shaped, acyclic, no `Function`/`Iterator`/cycles — already enforced by the checker), so a deep copy is total and bounded. `Shared<T>` (atomic-RC box + `RwLock`, accessor-only, copy in/out) is the escape hatch for shared *mutable* state; `Frozen<T>` (immortal deep-frozen graph, zero-copy lock-free reads via mutation-inference coercion) for shared *read-only* state. Atomic-RC-everywhere (Option A) and dynamic shared-flag RC (Option D) and COW are rejected (§2.3, §2.3.3) — they tax the non-threaded hot path we just optimised.
 
