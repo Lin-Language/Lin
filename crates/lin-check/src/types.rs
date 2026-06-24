@@ -622,13 +622,7 @@ impl Type {
 
     /// THE sealed-record gate. `Some(fields)` iff `ty` is a `Type::Object { sealed: true }` whose
     /// fields are all sealed-eligible. FAIL SAFE: `None` → boxed path.
-    /// `Frozen<T>` is transparently handled: the Frozen wrapper is stripped so a frozen sealed
-    /// record qualifies exactly like its non-frozen counterpart (same runtime layout).
     pub fn sealed_fields(ty: &Type) -> Option<&IndexMap<String, Type>> {
-        let ty = match ty {
-            Type::Frozen(inner) => inner.as_ref(),
-            other => other,
-        };
         match ty {
             Type::Object { fields, sealed: true, .. }
                 if !fields.is_empty() && fields.values().all(|f| f.is_sealed_field()) =>

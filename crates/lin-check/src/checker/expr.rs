@@ -244,17 +244,7 @@ impl Checker {
         // integer literals adopt the correct width (and so the produced MakeArray carries the
         // expected element representation, matching the slot type at codegen). Mirrors the
         // per-element literal-coercion above for nested literals.
-        // Strip Frozen from the expected type: `Frozen<T[]>` and `T[]` have the same element
-        // type for literal-refinement purposes (Frozen is a read-only view invariant, not a
-        // structural change). Without stripping, `[] ?? []` with a `Frozen<Trip[]>` context
-        // would miss the Type::Array arm below, keeping the literal as `Array(Never)` instead
-        // of `Trip[]`, which later forces an expensive sealed_array_project_owned on the empty
-        // literal in the `??` else branch (benchmarked -13% on RAPTOR GROUP/RANGE).
-        let expected_for_array = match expected {
-            Type::Frozen(inner) => inner.as_ref(),
-            other => other,
-        };
-        if let (Expr::Array(elements, span, _), Type::Array(expected_elem)) = (expr, expected_for_array) {
+        if let (Expr::Array(elements, span, _), Type::Array(expected_elem)) = (expr, expected) {
             let mut typed_elements: Vec<TypedExpr> = Vec::new();
             let mut typed_spreads: Vec<(usize, TypedExpr)> = Vec::new();
             for elem in elements {
@@ -836,22 +826,10 @@ impl Checker {
             }
             let inner_ty = (**inner).clone();
             return self.infer_index_into(typed_obj, typed_key, &inner_ty, span).map(|mut e| {
-                // Re-wrap the result type in Frozen ONLY when the result is a type that
-                // benefits from striding: an Array (sealed-array element reads) or a Union /
-                // Null-union whose non-null arm is an Array (the `??` coalesce path).
-                // Scalars (Int32, String, Bool, …), plain Object records, and other concrete
-                // types do NOT gain from Frozen and wrapping them causes extra coerce/sarrpo
-                // overhead in codegen (the RAPTOR -13% regression).
+                // Re-wrap the result type in Frozen so the frozen annotation propagates.
                 if let TypedExpr::Index { ref mut result_type, .. } = e {
                     let rt = result_type.clone();
-                    let benefits = matches!(&rt,
-                        Type::Array(_) | Type::Frozen(_) | Type::Map { .. }
-                    ) || matches!(&rt, Type::Union(vs)
-                        if vs.iter().any(|v| matches!(v, Type::Array(_) | Type::Frozen(_) | Type::Map { .. }))
-                    );
-                    if benefits {
-                        *result_type = Type::Frozen(Box::new(rt));
-                    }
+                    *result_type = Type::Frozen(Box::new(rt));
                 }
                 e
             });
@@ -1769,21 +1747,12 @@ impl Checker {
         let typed_left = self.infer_expr(left)?;
         let left_ty = typed_left.ty();
 
-        // `Frozen<T | Null>` is transparently null-capable: strip the Frozen wrapper for the
-        // null-analysis below, then re-wrap the non-null contribution in Frozen so that strided
-        // reads propagate through `frozenArr[k] ?? []` without losing the Frozen annotation.
-        let (eff_left_ty, frozen_outer) = if let Type::Frozen(inner) = &left_ty {
-            ((**inner).clone(), true)
-        } else {
-            (left_ty.clone(), false)
-        };
-
         // The left type must be able to be Null. `Json` is dynamically nullable; a bare `Null` is
         // allowed (then the value is always null and the result is just `right`'s type); a union is
         // null-inclusive iff it has a `Null` member.
-        let is_bare_null = eff_left_ty == Type::Null;
-        let union_has_null = matches!(&eff_left_ty, Type::Union(vs) if vs.iter().any(|v| *v == Type::Null));
-        let left_is_json = is_any_val(&eff_left_ty);
+        let is_bare_null = left_ty == Type::Null;
+        let union_has_null = matches!(&left_ty, Type::Union(vs) if vs.iter().any(|v| *v == Type::Null));
+        let left_is_json = is_any_val(&left_ty);
         if !is_bare_null && !union_has_null && !left_is_json {
             return Err(Diagnostic::error(
                 left.span(),
@@ -1798,19 +1767,12 @@ impl Checker {
         // subsumes Null and is its own normalisation below); for a `T | Null` union it is the union
         // with `Null` removed (`without_null`); for a bare `Null` left there is nothing left, so the
         // then-branch is dead and the result is purely `right`'s type — model that as `Never`.
-        // When Frozen was stripped above, re-wrap the non-null inner in Frozen so that downstream
-        // index reads on the result (e.g. `routeTrips[i]`) keep the striding annotation.
         let stripped = if left_is_json {
             left_ty.clone()
         } else if is_bare_null {
             Type::Never
         } else {
-            let inner_stripped = eff_left_ty.without_null().unwrap_or(Type::Never);
-            if frozen_outer && inner_stripped != Type::Never {
-                Type::Frozen(Box::new(inner_stripped))
-            } else {
-                inner_stripped
-            }
+            left_ty.without_null().unwrap_or(Type::Never)
         };
 
         // When the stripped left type is a concrete pushable type (not Never, not Json), try to
@@ -1859,17 +1821,13 @@ impl Checker {
         // --- desugar to `{ val tmp = left; if tmp != null then tmp else right }` ---
         // Bind `left` to a fresh anonymous slot so it is evaluated exactly once. The synthetic name
         // can never collide with a user binding (it is not a valid identifier).
-        // Use `eff_left_ty` (Frozen stripped) for the slot and null-test so the IR lowering sees
-        // the underlying union type (`T | Null`) and handles ownership/unboxing correctly. Frozen
-        // is transparent at runtime — `Frozen<T | Null>` has the same physical repr as `T | Null`.
-        let slot_ty = eff_left_ty.clone();
-        let tmp_slot = self.env.define("$coalesce".to_string(), slot_ty.clone(), false);
+        let tmp_slot = self.env.define("$coalesce".to_string(), left_ty.clone(), false);
         // The then-branch reads the slot at its NON-NULL (stripped) type — mirroring how the real
         // `if x != null then x` narrows `x` inside the then-branch. For a bare-`Null`/Json left this
         // is `Never`/`Json` respectively; lowering coerces the branch to `result_type` regardless.
         let then_get = TypedExpr::LocalGet { slot: tmp_slot, ty: stripped.clone(), span };
         let cond = TypedExpr::BinaryOp {
-            left: Box::new(TypedExpr::LocalGet { slot: tmp_slot, ty: slot_ty.clone(), span }),
+            left: Box::new(TypedExpr::LocalGet { slot: tmp_slot, ty: left_ty.clone(), span }),
             op: BinOp::NotEq,
             right: Box::new(TypedExpr::NullLit(span)),
             result_type: Type::Bool,
@@ -1887,7 +1845,7 @@ impl Checker {
                 slot: tmp_slot,
                 name: None,
                 value: typed_left,
-                ty: slot_ty,
+                ty: left_ty,
                 span,
             }],
             expr: Box::new(if_expr),
