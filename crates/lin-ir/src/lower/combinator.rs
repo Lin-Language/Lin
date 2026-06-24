@@ -4526,32 +4526,28 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
     }
 }
 
-/// `sort(arr, cmp)` over a flat NUMERIC scalar array with a CAPTURE-LESS literal comparator → an
-/// inline, STABLE, bottom-up merge sort over the UNBOXED flat buffer with the comparator body spliced
-/// directly into the single comparison site (no per-comparison box/unbox/closure indirection — the
-/// zero-box sort win). Routed here from monomorphize's `try_inline_scalar_sort`; every other `sort`
-/// (non-scalar array, capturing/stored comparator, the `Json` `_sortJ` path) keeps the generic boxed
-/// merge-sort, so this is a TIGHTLY-gated fast path that fails safe.
+/// `sort(arr, cmp)` over a flat NUMERIC scalar array OR sealed-record (struct-pointer) array with a
+/// CAPTURE-LESS literal comparator → an inline, STABLE, bottom-up merge sort with the comparator body
+/// spliced directly into the single comparison site (no per-comparison box/unbox/closure indirection).
+/// Routed here from monomorphize's `try_inline_scalar_sort`; every other `sort` (capturing/stored
+/// comparator, non-inlinable element, the `Json` `_sortJ` path) keeps the generic boxed merge-sort.
 ///
 /// Semantics are byte-identical to the pure-Lin `stdlib/array.lin` sort: a bottom-up merge of runs of
 /// doubling width, taking the LEFT run first on a tie (`cmp(a,b) <= 0`) → STABLE. We ping-pong by
 /// merging `out -> work` each pass then copying `work` back into `out`, so the result always lives in
-/// `out` (one extra O(n) copy per pass — O(n log n) total, negligible against the comparisons). The
-/// buffers are FLAT scalar arrays (sound for a numeric scalar element); the comparator reads them via
-/// the inlined flat getter. The copy-IN from `arr` uses the representation-agnostic tagged `Index`
-/// (sound even for a `[]`+push array statically typed flat).
+/// `out` (one extra O(n) copy per pass — O(n log n) total, negligible against the comparisons).
+///
+/// For scalar elements: flat buffers (`FlatArrayAlloc` + `FlatArrayPush`).
+/// For sealed-record elements: sealed-ptr buffers (`ArrayAllocateFilled` seeded from `arr[0]`,
+/// then overwritten element-by-element via `IndexSet`; merge and copy-back use `Index`/`IndexSet`
+/// which call `lin_sealed_ptr_array_set` — retain-before-release, RC-safe even when src == dst).
 pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let arr_ty = args[0].ty();
-    // Element type to STORE (the buffers' flat scalar repr) — from the array's static element type.
+    // Element type — from the array's static element type.
     let elem_ty = match result_type {
         Type::Array(t) | Type::Iterator(t) => (**t).clone(),
         _ => iter_elem_type(&arr_ty),
     };
-    let flat = FlatElemKind::from_type(&elem_ty)
-        .expect("lower_sort gated on a flat scalar element by try_inline_scalar_sort");
-    // Read elements FROM the input array at its provable representation (tagged unless provably flat),
-    // matching `for`/`map` — sound for a `[]`+push array statically typed `Int32[]`.
-    let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
 
     let (lam_params, lam_body) = inlinable_lambda(&args[1])
         .expect("lower_sort gated on a capture-less literal comparator by try_inline_scalar_sort");
@@ -4561,64 +4557,116 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
     let arr = lower_expr(&args[0], builder, ctx);
     let n = emit_iterable_len(arr, &arr_ty, builder); // Int64
 
-    // out / work: two flat scalar buffers, both of length n (work's contents are overwritten in the
-    // first pass). `out` is the array we ultimately return.
-    let out = builder.alloc_temp(result_type.clone());
-    builder.emit(Instruction::CallIntrinsic {
-        dst: out, intrinsic: Intrinsic::FlatArrayAlloc(flat), args: vec![], ret_ty: result_type.clone(),
-    });
-    builder.register_owned(out, result_type.clone());
-    let work = builder.alloc_temp(result_type.clone());
-    builder.emit(Instruction::CallIntrinsic {
-        dst: work, intrinsic: Intrinsic::FlatArrayAlloc(flat), args: vec![], ret_ty: result_type.clone(),
-    });
-    builder.register_owned(work, result_type.clone());
-
     let zero = builder.const_temp(Const::Int(0, Type::Int64));
     let one = builder.const_temp(Const::Int(1, Type::Int64));
 
-    // ---- COPY-IN: out[i] = work[i] = arr[i] for i in 0..n (gives both buffers length n) ----
-    {
-        let pre = builder.current_block;
-        let header = builder.alloc_block("sort_copy_hdr");
-        let body = builder.alloc_block("sort_copy_body");
-        let exit = builder.alloc_block("sort_copy_exit");
-        let i = builder.alloc_temp(Type::Int64);
-        let i_next = builder.alloc_temp(Type::Int64);
-        builder.terminate(Terminator::Jump(header));
-        builder.switch_to(header);
-        builder.emit(Instruction::Phi { dst: i, ty: Type::Int64, incomings: vec![(zero, pre), (i_next, body)] });
-        let cond = builder.alloc_temp(Type::Bool);
-        builder.emit(Instruction::Binary { dst: cond, op: BinOp::Lt, lhs: i, rhs: n, operand_ty: Type::Int64, ty: Type::Bool });
-        builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
-        builder.switch_to(body);
-        // elem = arr[i] (tagged-safe read), coerced to the flat scalar repr.
-        let elem_raw = builder.alloc_temp(read_elem_ty.clone());
-        builder.emit(Instruction::Index {
-            dst: elem_raw, object: arr, key: i,
-            obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
-        nonneg: false,
+    // Route to scalar-flat or sealed-record buffer allocation.
+    let (out, work) = if let Some(flat) = FlatElemKind::from_type(&elem_ty) {
+        // ---- SCALAR PATH: flat buffers ----
+        let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
+        let out = builder.alloc_temp(result_type.clone());
+        builder.emit(Instruction::CallIntrinsic {
+            dst: out, intrinsic: Intrinsic::FlatArrayAlloc(flat), args: vec![], ret_ty: result_type.clone(),
         });
-        let elem = coerce_arg_to_param_repr(elem_raw, &read_elem_ty, &elem_ty, builder);
-        // When the source is read via the tagged path (`read_elem_ty` is the boxed wildcard —
-        // a `[]`+push array not provably flat), `Index` → `lin_array_get_tagged` returns a FRESH
-        // +1 box that the `Coerce` above unboxes to the flat scalar `elem`. That box is then dead;
-        // reclaim its shell (mirrors `lower_for`'s per-iteration element-box reclaim) or it leaks
-        // one box PER ELEMENT, PER SORT (the ~16 B/elem `sort` result leak). `lower_sort` is gated
-        // to flat-scalar elements, so the box has no heap inner — freeing the shell fully reclaims
-        // it and is a documented no-op on cached small-int/bool boxes. Guarded `IfDistinct` so a
-        // no-op coerce (already-flat read, `elem == elem_raw`) never double-frees a live value.
-        if is_union_ty(&read_elem_ty) {
-            builder.emit(Instruction::FreeBoxShellIfDistinct { val: elem_raw, other: elem });
+        builder.register_owned(out, result_type.clone());
+        let work = builder.alloc_temp(result_type.clone());
+        builder.emit(Instruction::CallIntrinsic {
+            dst: work, intrinsic: Intrinsic::FlatArrayAlloc(flat), args: vec![], ret_ty: result_type.clone(),
+        });
+        builder.register_owned(work, result_type.clone());
+
+        // COPY-IN: out[i] = work[i] = arr[i] for i in 0..n
+        {
+            let pre = builder.current_block;
+            let header = builder.alloc_block("sort_copy_hdr");
+            let body = builder.alloc_block("sort_copy_body");
+            let exit = builder.alloc_block("sort_copy_exit");
+            let i = builder.alloc_temp(Type::Int64);
+            let i_next = builder.alloc_temp(Type::Int64);
+            builder.terminate(Terminator::Jump(header));
+            builder.switch_to(header);
+            builder.emit(Instruction::Phi { dst: i, ty: Type::Int64, incomings: vec![(zero, pre), (i_next, body)] });
+            let cond = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary { dst: cond, op: BinOp::Lt, lhs: i, rhs: n, operand_ty: Type::Int64, ty: Type::Bool });
+            builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+            builder.switch_to(body);
+            let elem_raw = builder.alloc_temp(read_elem_ty.clone());
+            builder.emit(Instruction::Index {
+                dst: elem_raw, object: arr, key: i,
+                obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
+            nonneg: false,
+            });
+            let elem = coerce_arg_to_param_repr(elem_raw, &read_elem_ty, &elem_ty, builder);
+            // Reclaim tagged-read shell (see `lower_for` for the analogous reclaim).
+            if is_union_ty(&read_elem_ty) {
+                builder.emit(Instruction::FreeBoxShellIfDistinct { val: elem_raw, other: elem });
+            }
+            let pd1 = builder.alloc_temp(Type::Null);
+            builder.emit(Instruction::CallIntrinsic { dst: pd1, intrinsic: Intrinsic::FlatArrayPush(flat), args: vec![out, elem], ret_ty: Type::Null });
+            let pd2 = builder.alloc_temp(Type::Null);
+            builder.emit(Instruction::CallIntrinsic { dst: pd2, intrinsic: Intrinsic::FlatArrayPush(flat), args: vec![work, elem], ret_ty: Type::Null });
+            builder.emit(Instruction::Binary { dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
+            builder.terminate(Terminator::Jump(header));
+            builder.switch_to(exit);
         }
-        let pd1 = builder.alloc_temp(Type::Null);
-        builder.emit(Instruction::CallIntrinsic { dst: pd1, intrinsic: Intrinsic::FlatArrayPush(flat), args: vec![out, elem], ret_ty: Type::Null });
-        let pd2 = builder.alloc_temp(Type::Null);
-        builder.emit(Instruction::CallIntrinsic { dst: pd2, intrinsic: Intrinsic::FlatArrayPush(flat), args: vec![work, elem], ret_ty: Type::Null });
-        builder.emit(Instruction::Binary { dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
-        builder.terminate(Terminator::Jump(header));
-        builder.switch_to(exit);
-    }
+        (out, work)
+    } else {
+        // ---- SEALED-RECORD PATH: pointer-backed buffers ----
+        // Allocate via ArrayAllocateFilled(n, arr[0]) — seeds each slot with arr[0], RC-retained.
+        // Then overwrite each slot with the correct element from arr via IndexSet (retain + release).
+        // RC invariant: IndexSet → lin_sealed_ptr_array_set retains new BEFORE releasing old, so
+        // retain(arr[i]) then release(arr[0]) per slot is safe for all i (including i==0).
+        let n_i32 = narrow_loop_index(n, builder); // Int64 → Int32
+        let fill = builder.alloc_temp(elem_ty.clone());
+        let zero_i64 = builder.const_temp(Const::Int(0, Type::Int64));
+        builder.emit(Instruction::Index {
+            dst: fill, object: arr, key: zero_i64,
+            obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+        nonneg: true,
+        });
+        let out = builder.alloc_temp(result_type.clone());
+        builder.emit(Instruction::CallIntrinsic {
+            dst: out, intrinsic: Intrinsic::ArrayAllocateFilled,
+            args: vec![n_i32, fill], ret_ty: result_type.clone(),
+        });
+        builder.register_owned(out, result_type.clone());
+        let work = builder.alloc_temp(result_type.clone());
+        builder.emit(Instruction::CallIntrinsic {
+            dst: work, intrinsic: Intrinsic::ArrayAllocateFilled,
+            args: vec![n_i32, fill], ret_ty: result_type.clone(),
+        });
+        builder.register_owned(work, result_type.clone());
+
+        // COPY-IN: out[i] = arr[i] and work[i] = arr[i] for i in 0..n.
+        // IndexSet retains arr[i] and releases the fill value previously at that slot.
+        {
+            let pre = builder.current_block;
+            let header = builder.alloc_block("sort_copy_hdr");
+            let body = builder.alloc_block("sort_copy_body");
+            let exit = builder.alloc_block("sort_copy_exit");
+            let i = builder.alloc_temp(Type::Int64);
+            let i_next = builder.alloc_temp(Type::Int64);
+            builder.terminate(Terminator::Jump(header));
+            builder.switch_to(header);
+            builder.emit(Instruction::Phi { dst: i, ty: Type::Int64, incomings: vec![(zero, pre), (i_next, body)] });
+            let cond = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary { dst: cond, op: BinOp::Lt, lhs: i, rhs: n, operand_ty: Type::Int64, ty: Type::Bool });
+            builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+            builder.switch_to(body);
+            let elem = builder.alloc_temp(elem_ty.clone());
+            builder.emit(Instruction::Index {
+                dst: elem, object: arr, key: i,
+                obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+            nonneg: false,
+            });
+            builder.emit(Instruction::IndexSet { object: out, key: i, value: elem, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+            builder.emit(Instruction::IndexSet { object: work, key: i, value: elem, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+            builder.emit(Instruction::Binary { dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
+            builder.terminate(Terminator::Jump(header));
+            builder.switch_to(exit);
+        }
+        (out, work)
+    };
 
     // ---- WIDTH loop: width = 1; while width < n; width *= 2 ----
     let w_pre = builder.current_block;
