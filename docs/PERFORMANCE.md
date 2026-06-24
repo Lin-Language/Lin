@@ -870,6 +870,56 @@ the ownership-at-`frozen()` problem above. End-of-session RAPTOR ≈ **30-31 s**
 
 ---
 
+### 5.13 nbody — the float/global-array workload: 1319→358 ms (3.7×), then a memory-latency wall
+
+The `nbody` cross-language cell (`benchmarks/compare/nbody/`, 5M-step symplectic integrator over 7
+parallel global `Float64[]` arrays) started at **Lin 1319 ms vs Rust 138 / Go 210 / Node 297** — 4.4× node.
+Instruction-level profiling (gdb stack-sampler, `perf` unavailable in-container) showed the hot fn
+`advancePairs` was **~80 % overhead, not float math**: per pair iteration **36 RC-retain + 32 release + 28
+bounds-check + 20 global-reload + 6 `set()` calls** versus only 31 float ops. The float work itself is
+identical across languages (the bench binds every product to a `val` to forbid FMA), so the whole gap is
+per-access overhead.
+
+**Two general, sound wins shipped (merged to master, nbody digest `RESULT=-171605325` + RAPTOR digest
+exact, `LIN_VERIFY_RC` clean):**
+
+| change | nbody | mechanism |
+|---|--:|---|
+| **RC-elide read-only global array reads** | 1319→779 | a top-level immutable `val` global (in `global_val_slots`, not `global_var_slots`) holds a permanent reference; borrowing it for an element read needs no retain/release. `lower_container_base_borrowed` now emits a bare `GlobalValGet{immutable:true}` for it. Killed 36 retains/pair. |
+| **`sqrt`→`llvm.sqrt.f64` intrinsic** | (−5 %) | direct calls to `lin_math_sqrt`/`abs_f64`/`floor`/`ceil` lower to the IEEE-exact LLVM intrinsic (single `sqrtsd`), not an opaque libm call — bit-identical digest, but pure/hoistable/inlinable. |
+| **borrow non-escaping array args** | 779→**358** | the keystone. `set(arr,i,v)`'s `arr` param is inferred `Convention::Inout` (in-place store, never escapes); treating `Inout` as non-interfering in `rc_elide` (alongside `Borrow`) drops the retain/release on the array argument. `infer_conventions` assigns `Inout` *only* when the param provably does not escape (`escapes ⇒ Own`), so this is sound — and `rc_verify` already grouped `Borrow|Inout`. Killed the remaining 18 retains/pair. |
+
+**Then a hard wall — four experiments, all negative, do NOT re-try on this workload:**
+
+- **Bounds-check elision** (a real `tco_nonneg` range-analysis pass proving TCO `Int32` indices ≥0, on
+  branch `nbody-bounds`): sound but **wall-neutral**. Deleting the OOB branch *entirely* made nbody
+  **slower** (358→415 ms) — twice, reproducibly.
+- **`!invariant.load` on global pointer loads:** LLVM **already** hoists them via LICM (the internal
+  linkage suffices); redundant, neutral.
+- **Header-load hoist (TBAA / `invariant.load` on the `len`@8 / data-ptr@24 reloads):** only **−5.6 %**
+  ceiling (357→337). The arrays' header reloads profile hot but barely move the wall.
+- **Hand-unrolling** the fixed 10-pair loop into constant-index straight-line code: **slower** (358→535) —
+  the TCO loop is small and I-cache-friendly; unrolling just bloats code without folding the heap-array
+  accesses.
+
+**The diagnosis (definitive): the residual 358-vs-138 ms gap is MEMORY LATENCY, not removable overhead.**
+The PC sits on the bounds/header instructions because they are *stalled waiting on the element loads*
+(textbook self-time≠wall-time, cf. §5.9/§5.10) — which is why removing them is neutral-to-negative. Lin's 7
+arrays are **module-global heap buffers**, so every element access is an L1 load (~34/pair × 5M); Rust keeps
+the 35 doubles in **registers** (0 loads, fully unrolled), Node JITs typed-arrays. **Closing it needs
+register/value residency of the arrays — but they are global mutable `val`s, so SROA/register-promotion
+can't reach them.** The data-layer well for nbody is dry at ~358 ms (1.2× node, down from 4.4×); the only
+lever left is the **value/inline-array representation frontier** (§5.10/§5.12) — the same one RAPTOR is
+gated on, and a deliberate larger effort, not a point fix. `set()`-bounds / cmov-removal / header-TBAA each
+stack to at most ~325-330 ms (still > node) and are not worth their complexity for this cell alone.
+
+**Process note:** the differential ceiling-probe discipline (an unsound env-gated "skip the work" hack,
+measured before tasking an agent) caught all four negatives cheaply and prevented building a sound TBAA
+pass / bounds-elision for a neutral lever. The two wins that shipped both removed *serializing* work (RC
+retain/release on the hot path); everything that only touched *overlapped* work was neutral.
+
+---
+
 ## 6. Guidance for writing fast Lin
 
 1. **Prefer typed records and `&`-composed named types over `AnyVal`.** This is the

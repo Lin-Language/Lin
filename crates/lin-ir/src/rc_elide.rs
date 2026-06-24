@@ -388,18 +388,23 @@ fn instr_is_interference(
 ) -> bool {
     match instr {
         // CallIntrinsic: use the hand-audited intrinsic convention table. If temp
-        // only appears at Borrow positions, this call doesn't create a new owner.
+        // only appears at Borrow or Inout positions, this call doesn't create a new owner.
+        // Inout is safe here: the callee mutates the value in-place but does not retain,
+        // store, return, or otherwise extend its lifetime — no independent owner is created.
         Instruction::CallIntrinsic { intrinsic, args, .. } => {
             if let Some(ic) = intrinsic_conventions(intrinsic) {
                 // For each position where temp appears, check the convention.
-                // If ALL such positions are Borrow, no interference.
-                let all_borrow = args.iter().enumerate().all(|(i, &a)| {
+                // If ALL such positions are Borrow or Inout, no interference.
+                let all_non_escaping = args.iter().enumerate().all(|(i, &a)| {
                     if a != temp {
                         return true; // irrelevant arg — not interference for THIS temp
                     }
-                    ic.params.get(i).copied().unwrap_or(Convention::Own) == Convention::Borrow
+                    matches!(
+                        ic.params.get(i).copied().unwrap_or(Convention::Own),
+                        Convention::Borrow | Convention::Inout
+                    )
                 });
-                if all_borrow {
+                if all_non_escaping {
                     return false;
                 }
             }
@@ -409,13 +414,19 @@ fn instr_is_interference(
         // Named/Indirect calls remain interference (unknown conventions).
         Instruction::Call { callee: CallTarget::Direct(fid), args, .. } => {
             if let Some(convs) = conv_map.get(fid) {
-                let all_borrow = args.iter().enumerate().all(|(i, &a)| {
+                // Borrow or Inout positions do not create an independent owner: the callee
+                // only reads (Borrow) or mutates in-place (Inout) the value; it cannot retain,
+                // store, return, or escape it. Either convention is safe to elide around.
+                let all_non_escaping = args.iter().enumerate().all(|(i, &a)| {
                     if a != temp {
                         return true;
                     }
-                    convs.get(i).copied().unwrap_or(Convention::Own) == Convention::Borrow
+                    matches!(
+                        convs.get(i).copied().unwrap_or(Convention::Own),
+                        Convention::Borrow | Convention::Inout
+                    )
                 });
-                if all_borrow {
+                if all_non_escaping {
                     return false;
                 }
             }
