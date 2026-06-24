@@ -1,59 +1,75 @@
-// dijkstra.js — linear-scan priority-queue Dijkstra (O(V^2)) over graph.json.
-// Reads + parses the graph INSIDE the timed region. Prints exactly one stdout
-// line "RESULT=<int>"; everything else to stderr. BigInt for the 64-bit math.
 'use strict';
-const fs = require('fs');
-const path = require('path');
-
+// dijkstra.js — linear-scan priority-queue Dijkstra (O(V^2)) over an in-code graph.
+// Graph generated in memory by a portable deterministic generator (no file I/O).
+// Prints exactly one stdout line "RESULT=<int>". Generator: Park-Miller MINSTD.
+const N = 30000;
 const INF = 1000000000;
-const graphPath = path.join(__dirname, '..', 'data', 'graph.json');
 
 function main() {
-  const graph = JSON.parse(fs.readFileSync(graphPath, 'utf8'));
-  const nodes = graph.nodes;
-  const source = 'n0';
-  const target = nodes[nodes.length - 1];
-
-  const adj = new Map();
-  for (const e of graph.edges) {
-    if (!adj.has(e.from)) adj.set(e.from, []);
-    adj.get(e.from).push([e.to, e.weight]);
-  }
-
-  const dist = new Map();
-  for (const n of nodes) dist.set(n, INF);
-  dist.set(source, 0);
-  const visited = new Set();
-
-  // Linear-scan priority queue: an array of [node, dist] entries.
-  let pq = [[source, 0]];
-  while (pq.length > 0) {
-    let minIdx = 0;
-    for (let i = 0; i < pq.length; i++) {
-      if (pq[i][1] < pq[minIdx][1]) minIdx = i;
+  let state = 1234;
+  const adj = new Array(N);
+  for (let i = 0; i < N; i++) adj[i] = [];
+  for (let i = 0; i < N; i++) {
+    for (let d = 1; d <= 8; d++) {
+      const j = i + d;
+      if (j < N) {
+        state = (state * 16807) % 2147483647;
+        const w = state % 100 + 1;
+        adj[i].push([j, w]);
+      }
     }
-    const [u] = pq[minIdx];
-    pq.splice(minIdx, 1);
-    if (visited.has(u)) continue;
-    visited.add(u);
-    const neighbors = adj.get(u) || [];
-    for (const [v, w] of neighbors) {
-      const nd = dist.get(u) + w;
-      if (nd < dist.get(v)) {
-        dist.set(v, nd);
-        pq.push([v, nd]);
+    if (i + 1 < N) {
+      state = (state * 16807) % 2147483647;
+      if (state % 10 < 3) {
+        const span = N - (i + 1);
+        state = (state * 16807) % 2147483647;
+        const j = (i + 1) + (state % span);
+        state = (state * 16807) % 2147483647;
+        const w = state % 100 + 1;
+        adj[i].push([j, w]);
       }
     }
   }
 
-  let total = 0n;
-  for (const n of nodes) {
-    const d = dist.get(n);
-    if (d < INF) total += BigInt(d);
+  const dist = new Array(N).fill(INF);
+  const visited = new Array(N).fill(false);
+  dist[0] = 0;
+  const cap = N * 9 + 1;
+  const pqn = new Array(cap).fill(0);
+  const pqd = new Array(cap).fill(0);
+  let pql = 1;
+  while (pql > 0) {
+    let mi = 0;
+    for (let j = 1; j < pql; j++) {
+      if (pqd[j] < pqd[mi]) mi = j;
+    }
+    const u = pqn[mi];
+    const last = pql - 1;
+    pqn[mi] = pqn[last];
+    pqd[mi] = pqd[last];
+    pql = last;
+    if (!visited[u]) {
+      visited[u] = true;
+      const du = dist[u];
+      const nb = adj[u];
+      for (let e = 0; e < nb.length; e++) {
+        const v = nb[e][0];
+        const nd = du + nb[e][1];
+        if (nd < dist[v]) {
+          dist[v] = nd;
+          pqn[pql] = v;
+          pqd[pql] = nd;
+          pql++;
+        }
+      }
+    }
   }
-  const result = BigInt(dist.get(target)) * 1000003n + (total % 1000000000n);
-  process.stderr.write(`dist[${target}]=${dist.get(target)} sumFinite=${total}\n`);
-  console.log(`RESULT=${result}`);
+  let total = 0n;
+  for (let k = 0; k < N; k++) {
+    if (dist[k] < INF) total += BigInt(dist[k]);
+  }
+  const chk = BigInt(dist[N - 1]) * 1000003n + (total % 1000000000n);
+  console.log(`RESULT=${chk}`);
 }
 
 main();
