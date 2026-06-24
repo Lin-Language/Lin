@@ -547,10 +547,22 @@ impl Checker {
                             // type → is_union_ty = true → boxing coerce → TaggedVal* passed as
                             // LinMap* → heap-buffer-overflow. Only promote Named(...) params —
                             // leave TypeVars in place so unannotated-param inference is not disrupted.
+                            //
+                            // Also promote Union([Named("T"), Null]) — a nullable union whose record
+                            // type was still a placeholder at forward_declare time. The resolver
+                            // leaves these as Named-alias unions; by the time the body runs the real
+                            // type is available in `tp.ty`. Leaving them unreplaced causes downstream
+                            // IR lowering to produce Coerce instructions with `to_ty = Union([Named, Null])`,
+                            // which `repr::is_named_nullable_union` then treats as NullableRecord
+                            // regardless of whether the Named type is actually a sealed record.
                             let promoted_params: Vec<Type> = params.iter()
                                 .zip(typed_params.iter())
                                 .map(|(old, tp)| {
-                                    if matches!(old, Type::Named(_)) { tp.ty.clone() } else { old.clone() }
+                                    if matches!(old, Type::Named(_)) || is_named_nullable_union_ty(old) {
+                                        tp.ty.clone()
+                                    } else {
+                                        old.clone()
+                                    }
                                 })
                                 .collect();
                             self.env.update_type(name, Type::Function {
@@ -575,7 +587,11 @@ impl Checker {
                         let promoted_params: Vec<Type> = params.iter()
                             .zip(typed_params.iter())
                             .map(|(old, tp)| {
-                                if matches!(old, Type::Named(_)) { tp.ty.clone() } else { old.clone() }
+                                if matches!(old, Type::Named(_)) || is_named_nullable_union_ty(old) {
+                                    tp.ty.clone()
+                                } else {
+                                    old.clone()
+                                }
                             })
                             .collect();
                         self.env.update_type(name, Type::Function {
@@ -1130,4 +1146,20 @@ impl Checker {
             lambda_id,
         })
     }
+}
+
+/// True iff `ty` is `Union([Named("T"), Null])` — a nullable-alias union whose record type
+/// was still a Named placeholder at forward_declare time. Used to gate the env-promotion
+/// step that replaces such stale placeholders with the actual resolved param types.
+fn is_named_nullable_union_ty(ty: &Type) -> bool {
+    let Type::Union(members) = ty else { return false };
+    let mut has_named = false;
+    for m in members {
+        match m {
+            Type::Null => {}
+            Type::Named(_) => { has_named = true; }
+            _ => return false,
+        }
+    }
+    has_named
 }
