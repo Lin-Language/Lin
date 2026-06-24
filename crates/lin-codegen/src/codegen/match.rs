@@ -242,7 +242,7 @@ impl<'ctx> Codegen<'ctx> {
                         let null_pred = self.builder.get_insert_block().unwrap();
                         self.builder.unconditional_branch(merge_bb);
                         self.builder.position_at_end(nn_bb);
-                        let proj = self.sealed_project_from(val, from_ty, &tf);
+                        let proj = self.sealed_project_from_hint(val, from_ty, &tf, Some(&tf));
                         let nn_pred = self.builder.get_insert_block().unwrap();
                         self.builder.unconditional_branch(merge_bb);
                         self.builder.position_at_end(merge_bb);
@@ -384,7 +384,10 @@ impl<'ctx> Codegen<'ctx> {
             if let Some(target_fields) = Self::sealed_scalar_fields(to_ty) {
                 // Clone so the borrow checker is happy (target_fields borrows self via to_ty).
                 let tf = target_fields.clone();
-                return self.sealed_project_from(val, from_ty, &tf);
+                // If source hits the TAG_RECORD arm, type safety guarantees it has the SAME
+                // sealed layout as to_ty — pass as hint to use const-offset GEP instead of
+                // descriptor walk. (The TAG_MAP arm is unaffected by the hint.)
+                return self.sealed_project_from_hint(val, from_ty, &tf, Some(&tf));
             }
         }
         if from_sealed {
