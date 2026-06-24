@@ -2445,7 +2445,7 @@ A runtime error inside a message handler kills the worker. The current `request`
 
 Lin's concurrency is **share-nothing by default**. A value that crosses a thread boundary — a thunk's captured `val` environment, and the transferable result returned through a promise — is **deep-copied**, so each thread owns a private, disjoint object graph. Nothing is shared, which is what keeps reference counting non-atomic and the single-threaded hot path free (ADR-028, "Option C"). The set of boundary-crossing values is exactly the transferable types (§24.2): JSON-shaped, acyclic, with no `Function`/`Iterator`/cycles, so a deep copy is total and bounded.
 
-There is **no** mutex/atomics primitive. When share-nothing is the wrong fit — many threads reading or updating one large structure — Lin offers two **opt-in shared boxes** instead, each paying its cost only where used: `Shared<T>` for shared *mutable* state (§24.7.1) and `frozen` for shared *read-only* state (§24.7.2). Mutable state that has behaviour or a lifecycle is better modelled with a `Worker` that owns it and serialises access through its message queue (§24.7.3, ADR-039).
+There is **no** mutex/atomics primitive. When share-nothing is the wrong fit — many threads reading or updating one large structure — Lin offers two **opt-in shared boxes** instead, each paying its cost only where used: `Shared<T>` for shared *mutable* state (§24.7.1) and `frozen` for shared *read-only* state (§24.7.2). Mutable state that has behaviour or a lifecycle is better modelled with a `Worker` that owns it and serialises access through its message queue (§24.7.3, ADR-028).
 
 #### 24.7.1 `Shared<T>` — opt-in shared mutable state
 
