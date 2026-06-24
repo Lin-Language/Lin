@@ -1,0 +1,7 @@
+// Keep the Evens — return only the even numbers from the list, in original order.
+// TODO: implement solve to filter out odd numbers.
+import { filter } from "std/iter"
+
+export val solve = (xs: Int32[]): Int32[] =>
+  val r: Int32[] = []
+  r

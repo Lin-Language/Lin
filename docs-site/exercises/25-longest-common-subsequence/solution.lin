@@ -1,0 +1,23 @@
+// Longest Common Subsequence — reference solution.
+import { length, arrayAllocateFilled, set } from "std/array"
+import { at } from "std/string"
+import { range, for } from "std/iter"
+
+export val solve = (a: String, b: String): Int32 =>
+  val m = length(a)
+  val n = length(b)
+  val dp: Int32[] = arrayAllocateFilled((m + 1) * (n + 1), 0)
+  range(1, m + 1).for(i =>
+    range(1, n + 1).for(j =>
+      val ai = a.at(i - 1)
+      val bj = b.at(j - 1)
+      if ai == bj then
+        set(dp, i * (n + 1) + j, dp[(i - 1) * (n + 1) + (j - 1)] + 1)
+      else
+        val left = dp[i * (n + 1) + (j - 1)]
+        val up = dp[(i - 1) * (n + 1) + j]
+        val best = if left > up then left else up
+        set(dp, i * (n + 1) + j, best)
+    )
+  )
+  dp[m * (n + 1) + n]

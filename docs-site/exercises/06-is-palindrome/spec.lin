@@ -1,0 +1,14 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (String) => Boolean): AnyVal =>
+  suite("06-is-palindrome", [
+    test("racecar is a palindrome", () => [expect(solve("racecar")).toBe(true)]),
+
+    test("hello is not a palindrome", () => [expect(solve("hello")).toBe(false)]),
+
+    test("empty string is a palindrome", () => [expect(solve("")).toBe(true)]),
+
+    test("single char is a palindrome", () => [expect(solve("a")).toBe(true)]),
+
+    test("ab is not a palindrome", () => [expect(solve("ab")).toBe(false)])
+  ])

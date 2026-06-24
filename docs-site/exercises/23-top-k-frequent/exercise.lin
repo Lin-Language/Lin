@@ -1,0 +1,6 @@
+// Top K Frequent Elements — return the k most frequent values, by frequency descending, ties broken by value ascending.
+// TODO: count frequencies, collect distinct values, sort by (-freq, value), take k.
+
+export val solve = (xs: Int32[], k: Int32): Int32[] =>
+  val r: Int32[] = []
+  r

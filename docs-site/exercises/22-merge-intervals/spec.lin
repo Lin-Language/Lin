@@ -1,0 +1,18 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (Int32[][]) => Int32[][]): AnyVal =>
+  suite("22-merge-intervals", [
+    test("overlapping intervals merged", () => [
+      expect(solve([[1, 3], [2, 6], [8, 10], [15, 18]])).toBe([[1, 6], [8, 10], [15, 18]])
+    ]),
+
+    test("touching intervals merged", () => [
+      expect(solve([[1, 4], [4, 5]])).toBe([[1, 5]])
+    ]),
+
+    test("empty input", () => [expect(solve([])).toBe([])]),
+
+    test("one fully contained", () => [
+      expect(solve([[1, 4], [2, 3]])).toBe([[1, 4]])
+    ])
+  ])

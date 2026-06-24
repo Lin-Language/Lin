@@ -1,0 +1,48 @@
+// Shortest Paths (Dijkstra) — reference solution.
+import { length, arrayAllocateFilled, push, set } from "std/array"
+import { range, for } from "std/iter"
+
+export val solve = (n: Int32, edges: Int32[][], src: Int32): Int32[] =>
+  val inf = 1000000000
+  val dist: Int32[] = arrayAllocateFilled(n, inf)
+  val done: Boolean[] = arrayAllocateFilled(n, false)
+  set(dist, src, 0)
+  var adj: { Int32: Int32[][] } = {}
+  edges.for(e =>
+    val u = e[0]
+    val v = e[1]
+    val w = e[2]
+    val uAdj = adj[u] ?? []
+    uAdj.push([v, w])
+    adj[u] = uAdj
+    val vAdj = adj[v] ?? []
+    vAdj.push([u, w])
+    adj[v] = vAdj
+  )
+  range(0, n).for(_ =>
+    var u = -1
+    var best = inf
+    range(0, n).for(i =>
+      if done[i] != true && dist[i] < best then
+        best = dist[i]
+        u = i
+    )
+    if u >= 0 then
+      set(done, u, true)
+      val neighbors = adj[u] ?? []
+      neighbors.for(edge =>
+        val v = edge[0]
+        val w = edge[1]
+        val nd = dist[u] + w
+        if nd < dist[v] then
+          set(dist, v, nd)
+      )
+  )
+  val result: Int32[] = arrayAllocateFilled(n, 0)
+  range(0, n).for(i =>
+    if dist[i] >= inf then
+      set(result, i, -1)
+    else
+      set(result, i, dist[i])
+  )
+  result

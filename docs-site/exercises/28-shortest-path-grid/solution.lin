@@ -1,0 +1,53 @@
+// Shortest Path in a Grid — reference solution.
+import { length, push } from "std/array"
+import { while } from "std/iter"
+
+export val solve = (grid: Int32[][]): Int32 =>
+  val rows = grid.length()
+  if rows == 0 then
+    -1
+  else
+    val cols = grid[0].length()
+    if grid[0][0] == 1 then
+      -1
+    else if grid[rows - 1][cols - 1] == 1 then
+      -1
+    else
+      val queue: Int32[][] = [[0, 0, 1]]
+      var head = 0
+      var visited: { Int32: Boolean } = {}
+      visited[0] = true
+      var result = -1
+      while(() =>
+        if head >= queue.length() then
+          false
+        else
+          val item = queue[head]
+          head = head + 1
+          val r = item[0]
+          val c = item[1]
+          val d = item[2]
+          if r == rows - 1 && c == cols - 1 then
+            result = d
+            false
+          else
+            val drs = [-1, 1, 0, 0]
+            val dcs = [0, 0, -1, 1]
+            var di = 0
+            while(() =>
+              if di >= 4 then
+                false
+              else
+                val nr = r + drs[di]
+                val nc = c + dcs[di]
+                di = di + 1
+                if nr >= 0 && nr < rows && nc >= 0 && nc < cols && grid[nr][nc] == 0 then
+                  val key = nr * cols + nc
+                  if visited[key] != true then
+                    visited[key] = true
+                    queue.push([nr, nc, d + 1])
+                true
+            )
+            true
+      )
+      result

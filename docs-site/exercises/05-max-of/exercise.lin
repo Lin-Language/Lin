@@ -1,0 +1,5 @@
+// Largest in the List — return the maximum element, or null if the list is empty.
+// TODO: implement solve to find the maximum element.
+
+export val solve = (xs: Int32[]): Int32 | Null =>
+  null

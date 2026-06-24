@@ -1767,3 +1767,20 @@ pub unsafe extern "C" fn lin_strbuf_finish(buf: *mut LinStrBuf) -> *mut LinStrin
     let b = Box::from_raw(buf);
     lin_string_from_bytes(b.bytes.as_ptr(), b.bytes.len() as u32)
 }
+
+/// Append the decimal representation of `n` directly into `buf` — no intermediate `LinString`.
+/// Used by the interp-join fusion to avoid a per-fragment alloc for integer interpolation parts.
+#[no_mangle]
+pub unsafe extern "C" fn lin_strbuf_push_i64(buf: *mut LinStrBuf, n: i64) {
+    use std::fmt::Write as _;
+    let mut tmp = StackBuf::new();
+    let _ = write!(tmp, "{}", n);
+    (*buf).bytes.extend_from_slice(tmp.as_bytes());
+}
+
+/// Append the `"true"` or `"false"` representation of `b` directly into `buf`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_strbuf_push_bool(buf: *mut LinStrBuf, b: bool) {
+    let s = if b { b"true" as &[u8] } else { b"false" as &[u8] };
+    (*buf).bytes.extend_from_slice(s);
+}

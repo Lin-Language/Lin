@@ -1,0 +1,7 @@
+// Palindrome Check — return true if s reads the same forwards and backwards.
+// TODO: implement solve to check whether s is a palindrome.
+import { split, join } from "std/string"
+import { reverse } from "std/array"
+
+export val solve = (s: String): Boolean =>
+  false

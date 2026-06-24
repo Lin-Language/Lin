@@ -1,0 +1,8 @@
+// Count the Vowels — count how many vowels (a, e, i, o, u, upper or lower) are in s.
+// TODO: implement solve to count vowels in the string.
+import { split } from "std/string"
+import { filter } from "std/iter"
+import { length } from "std/array"
+
+export val solve = (s: String): Int32 =>
+  0

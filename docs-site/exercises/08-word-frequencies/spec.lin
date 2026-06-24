@@ -1,0 +1,24 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (String[]) => { String: Int32 }): AnyVal =>
+  suite("08-word-frequencies", [
+    test("counts repeated words", () =>
+      [expect(solve(["a", "b", "a"])).toBe({ "a": 2, "b": 1 })]
+    ),
+
+    test("empty list returns empty map", () =>
+      [expect(solve([])).toBe({  })]
+    ),
+
+    test("single word appears once", () =>
+      [expect(solve(["x"])).toBe({ "x": 1 })]
+    ),
+
+    test("all same word", () =>
+      [expect(solve(["hi", "hi", "hi"])).toBe({ "hi": 3 })]
+    ),
+
+    test("no duplicates", () =>
+      [expect(solve(["p", "q", "r"])).toBe({ "p": 1, "q": 1, "r": 1 })]
+    )
+  ])

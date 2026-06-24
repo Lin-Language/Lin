@@ -1,0 +1,20 @@
+// Top K Frequent Elements — reference solution.
+import { length, push, sort, slice } from "std/array"
+import { keys } from "std/object"
+import { for } from "std/iter"
+
+export val solve = (xs: Int32[], k: Int32): Int32[] =>
+  var freq: { Int32: Int32 } = {}
+  xs.for(x =>
+    freq[x] = (freq[x] ?? 0) + 1
+  )
+  val distinct = keys(freq)
+  val sorted = distinct.sort((a, b) =>
+    val fa = freq[a] ?? 0
+    val fb = freq[b] ?? 0
+    if fb != fa then
+      fb - fa
+    else
+      a - b
+  )
+  sorted.slice(0, k)

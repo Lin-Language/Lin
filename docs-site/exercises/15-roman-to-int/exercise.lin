@@ -1,0 +1,5 @@
+// Roman Numerals to Integer — parse a valid Roman numeral string.
+// TODO: implement solve using the subtractive rule (if value < next, subtract it).
+
+export val solve = (s: String): Int32 =>
+  0

@@ -14612,9 +14612,16 @@ print(toString(a[0] + a[2]))
     assert!(!body.contains("lin_array_alloc_null"),
         "allocT$Int32 must NOT allocate a tagged array, got:\n{}", body);
 
-    // The reader uses the flat i32 getter (consumer matches producer).
-    assert!(ll.contains("lin_flat_array_get_i32"),
-        "expected a flat i32 read of the Int32[] value, IR:\n{}", ll);
+    // The reader uses the flat inline path: either the nonneg path (oob trap via
+    // lin_flat_array_oob / flat_get_ok labels) or the fully proven-inbounds path
+    // (direct GEP+load with flat_data_pp / flat_get labels, no OOB branch at all).
+    // Neither case should use the wrapping accessor lin_flat_array_get_i32.
+    assert!(
+        ll.contains("lin_flat_array_oob") || ll.contains("flat_get_ok")
+            || ll.contains("flat_data_pp") || ll.contains("flat_get"),
+        "expected an inline flat i32 read of the Int32[] value, IR:\n{}", ll);
+    assert!(!ll.contains("lin_flat_array_get_i32"),
+        "flat i32 read must NOT call the wrapping accessor (nonneg path uses oob trap), IR:\n{}", ll);
 }
 
 #[test]
@@ -14679,9 +14686,8 @@ print(toString(scan(1, 0)))
 
 #[test]
 fn test_inline_flat_read_index_semantics() {
-    // The inlined flat read must preserve `lin_flat_array_get`'s exact semantics: in-bounds
-    // reads, Python-style negative indexing (`-1` = last, `-len` = first), and the boundary
-    // indices `0` / `len-1`. (OOB faulting is covered separately; here every index is valid.)
+    // The inlined flat read must preserve exact semantics: in-bounds reads and the boundary
+    // indices `0` / `len-1`. `[]` is positive-only — negative indices trap (tested separately).
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { arrayAllocateFilled, set } from "std/array"
@@ -14689,10 +14695,10 @@ val a: Int32[] = arrayAllocateFilled(4, 0)
 set(a, 0, 10)
 set(a, 1, 20)
 set(a, 3, 40)
-print("${toString(a[0])} ${toString(a[3])} ${toString(a[-1])} ${toString(a[-4])} ${toString(a[1])}")
+print("${toString(a[0])} ${toString(a[3])} ${toString(a[1])}")
 "#);
-    // a[0]=10, a[3]=40, a[-1]=a[3]=40, a[-4]=a[0]=10, a[1]=20
-    assert_eq!(out, vec!["10 40 40 10 20"]);
+    // a[0]=10, a[3]=40, a[1]=20
+    assert_eq!(out, vec!["10 40 20"]);
 }
 
 #[test]
@@ -14724,6 +14730,38 @@ print(toString(a[5]))
     let stderr = String::from_utf8_lossy(&run_out.stderr);
     assert!(stderr.contains("out of bounds"),
         "expected an out-of-bounds runtime fault, got stderr:\n{}", stderr);
+}
+
+#[test]
+fn test_flat_array_negative_index_traps() {
+    // `[]` is positive-only: a negative index on a flat-scalar array must TRAP (exit != 0 +
+    // "out of bounds" on stderr), not silently wrap to the last element. Use .at() for
+    // negative/safe access instead.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_negidx_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_negidx_{}", id));
+    fs::write(&src_path, r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { arrayAllocateFilled } from "std/array"
+val a: Int32[] = arrayAllocateFilled(3, 7)
+var idx = -1
+print(toString(a[idx]))
+"#).unwrap();
+    let compile = lin_cmd()
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+    let run_out = Command::new(&bin_path).output().expect("failed to run compiled binary");
+    let _ = fs::remove_file(&bin_path);
+    assert!(!run_out.status.success(), "negative [] index must trap (non-zero exit)");
+    let stderr = String::from_utf8_lossy(&run_out.stderr);
+    assert!(stderr.contains("out of bounds"),
+        "expected a runtime OOB fault for negative [] index, got stderr:\n{}", stderr);
 }
 
 #[test]
@@ -14904,9 +14942,11 @@ print(toString(doubled[0]))
         "mymap$Int32_Int32 must allocate a flat array, got:\n{}", body);
     assert!(!body.contains("lin_array_alloc_null"),
         "mymap$Int32_Int32 must NOT allocate a tagged array, got:\n{}", body);
-    // The consumer reads the Int32[] result with the flat getter.
-    assert!(ll.contains("lin_flat_array_get_i32"),
-        "expected a flat i32 read of the Int32[] value, IR:\n{}", ll);
+    // The consumer reads the Int32[] result with the flat inline path (nonneg OOB via oob trap).
+    assert!(ll.contains("lin_flat_array_oob") || ll.contains("flat_get_ok"),
+        "expected an inline flat i32 read of the Int32[] value, IR:\n{}", ll);
+    assert!(!ll.contains("lin_flat_array_get_i32"),
+        "flat i32 read must NOT call the wrapping accessor (nonneg path uses oob trap), IR:\n{}", ll);
 }
 
 #[test]

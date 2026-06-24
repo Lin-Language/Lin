@@ -1,0 +1,8 @@
+// Group Anagrams — group words that are anagrams of each other.
+// TODO: implement solve. Key = sorted characters of each word.
+
+import { split, join } from "std/string"
+import { sort, push, length } from "std/array"
+
+export val solve = (words: String[]): String[][] =>
+  []

@@ -1,0 +1,5 @@
+// Word Break — can s be segmented into a sequence of dictionary words?
+// TODO: DP over prefix lengths; dp[i] = true if s[0..i) can be segmented.
+
+export val solve = (s: String, dict: String[]): Boolean =>
+  false

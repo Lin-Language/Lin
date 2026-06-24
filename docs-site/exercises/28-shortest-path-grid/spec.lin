@@ -1,0 +1,14 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (Int32[][]) => Int32): AnyVal =>
+  suite("28-shortest-path-grid", [
+    test("3x3 with center wall gives 5", () => [
+      expect(solve([[0, 0, 0], [0, 1, 0], [0, 0, 0]])).toBe(5)
+    ]),
+
+    test("2x2 blocked gives -1", () => [expect(solve([[0, 1], [1, 0]])).toBe(-1)]),
+
+    test("2x2 open gives 3", () => [expect(solve([[0, 0], [0, 0]])).toBe(3)]),
+
+    test("1x1 open gives 1", () => [expect(solve([[0]])).toBe(1)])
+  ])
