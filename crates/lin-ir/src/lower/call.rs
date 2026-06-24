@@ -255,6 +255,15 @@ pub(crate) fn lower_call(
             if let Some(intr) = concrete_array_shortcircuit_intrinsic_name(&sym, args) {
                 return lower_intrinsic_call(intr, args, result_type, builder, ctx);
             }
+            // FUSED MAP→JOIN (R3-B): `xs.map(f).join(sep)` where `f` is an inlinable literal
+            // lambda returning String.  Eliminates the intermediate String[] by building the
+            // joined result directly into a growable buffer, one element at a time.
+            // Falls through to the split Named-call path when the gate doesn't fire.
+            if sym.starts_with("std_string_join") && args.len() == 2 {
+                if let Some(out) = lower_map_join(args, builder, ctx) {
+                    return out;
+                }
+            }
             let mut shell_boxes: Vec<Temp> = Vec::new();
             // Fully-owned arg boxes (sealed-record array materialized to Json) released right after
             // the call.
