@@ -368,6 +368,20 @@ pub(crate) fn lower_container_base_borrowed(
         builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty, immutable: false });
         return Some(dst);
     }
+    // Module-level immutable `val` (global): program-lifetime heap value written once at module
+    // init and never reassigned. Borrowing it is always safe — the global holds a permanent
+    // reference that outlives any element read. No retain needed; LLVM can hoist the global load
+    // out of inner loops once the RC clobber is gone.
+    if let Some(gty) = ctx.global_val_slots.get(slot).cloned() {
+        // Reject union/Json globals: those use CloneBox ownership, not in-place Retain, so the
+        // borrowed-read model does not apply (the reader must own its own box).
+        if is_union_ty(&gty) {
+            return None;
+        }
+        let dst = builder.alloc_temp(gty.clone());
+        builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty, immutable: true });
+        return Some(dst);
+    }
     // Mutably-captured `var` (heap cell): plain load through the cell, no owning clone.
     if let Some(cell_ty) = builder.cell_slots.get(slot).cloned() {
         if is_union_ty(&cell_ty) {
@@ -402,6 +416,10 @@ pub(crate) fn lower_container_base_borrowed_check(object: &TypedExpr, ctx: &Lowe
     }
     if ctx.global_var_slots.contains(slot) {
         let gty = ctx.global_val_slots.get(slot).unwrap_or(ty);
+        return !is_union_ty(gty);
+    }
+    // Immutable `val` global: always borrowable (non-union concrete).
+    if let Some(gty) = ctx.global_val_slots.get(slot) {
         return !is_union_ty(gty);
     }
     // Cell or plain-local container: eligible unless its stored representation is a union/Json.
