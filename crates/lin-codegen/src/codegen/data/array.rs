@@ -111,7 +111,16 @@ impl<'ctx> Codegen<'ctx> {
     /// recognises as a dominated check. The OOB semantics are IDENTICAL — an out-of-range index
     /// still faults via the cold runtime path with the same message. Only the negative-wrap branch
     /// is removed; the OOB branch is untouched.
-    pub(crate) fn flat_array_get(&mut self, arr: BasicValueEnum<'ctx>, idx: inkwell::values::IntValue<'ctx>, elem_ty: &Type, nonneg: bool) -> BasicValueEnum<'ctx> {
+    /// Load a scalar element from a flat unboxed array.
+    ///
+    /// `proven_inbounds`: when true the bounds-elide pass has proved `0 <= idx < len`
+    /// for this specific site.  The OOB dispatch block is omitted entirely — only the
+    /// unchecked GEP + load is emitted (identical to what the fast-path would have
+    /// executed anyway).  SAFETY: must only be set when the IR-level analysis has
+    /// proved both `idx >= 0` AND `idx < len`; a wrong `true` is silent OOB memory
+    /// corruption.  The pass never sets it unless certain; callers that don't have IR
+    /// proof must pass `false`.
+    pub(crate) fn flat_array_get(&mut self, arr: BasicValueEnum<'ctx>, idx: inkwell::values::IntValue<'ctx>, elem_ty: &Type, nonneg: bool, proven_inbounds: bool) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
         let i64_ty = self.context.i64_type();
         let llvm_elem_ty = self.llvm_type(elem_ty);
@@ -122,6 +131,20 @@ impl<'ctx> Codegen<'ctx> {
         } else {
             self.builder.int_s_extend(idx, i64_ty, "flat_idx64")
         };
+
+        // Unchecked fast path: IR analysis proved 0 <= idx < len.
+        // Skip the length load, the negative-wrap select, and the OOB branch entirely.
+        // The data pointer is at byte 24 of the LinArray header.
+        if proven_inbounds {
+            let data_ptr_ptr = unsafe {
+                self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(24, false)], "flat_data_pp")
+            };
+            let data_ptr = self.builder.load(ptr_ty, data_ptr_ptr, "flat_data").into_pointer_value();
+            let elem_ptr = unsafe {
+                self.builder.in_bounds_gep(llvm_elem_ty, data_ptr, &[idx], "flat_elem_p")
+            };
+            return self.builder.load(llvm_elem_ty, elem_ptr, "flat_get");
+        }
 
         // len = *(u64*)(arr + 8)
         let len_ptr = unsafe {

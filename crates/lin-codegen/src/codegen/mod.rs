@@ -2444,10 +2444,10 @@ impl<'ctx> Codegen<'ctx> {
                                 named_fn, None, Some(&ret_ty), Some(&param_tys));
                             temp_map.insert(*dst, cls);
                         }
-                        Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty, nonneg } => {
+                        Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty, nonneg, proven_inbounds } => {
                             if let (Some(&obj_v), Some(&key_v)) = (temp_map.get(object), temp_map.get(key)) {
                                 let obj_repr = func.repr_of(*object);
-                                let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty, &obj_repr, *nonneg);
+                                let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty, &obj_repr, *nonneg, *proven_inbounds);
                                 temp_map.insert(*dst, result);
                             }
                         }

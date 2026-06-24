@@ -1247,6 +1247,7 @@ pub(crate) fn emit_combinator_loop<F>(
                 dst: elem, object: iterable, key: i,
                 obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
             nonneg: false,
+                proven_inbounds: false,
             });
             elem
         }
@@ -2528,6 +2529,7 @@ pub(crate) fn lower_some(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mu
             dst: elem, object: iterable, key: i,
             obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
         nonneg: false,
+                proven_inbounds: false,
         });
         let idx = narrow_loop_index(i, builder);
         let pred = call_body_direct(target, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &native_params, &Type::Bool, builder);
@@ -2687,6 +2689,7 @@ pub(crate) fn lower_some(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mu
             dst: elem, object: iterable, key: i,
             obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
         nonneg: false,
+                proven_inbounds: false,
         });
         let idx = narrow_loop_index(i, builder);
         let (pred_raw, pred_ty) =
@@ -2807,6 +2810,7 @@ pub(crate) fn lower_every(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &m
             dst: elem, object: iterable, key: i,
             obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
         nonneg: false,
+                proven_inbounds: false,
         });
         let idx = narrow_loop_index(i, builder);
         let pred = call_body_direct(target, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &native_params, &Type::Bool, builder);
@@ -2947,6 +2951,7 @@ pub(crate) fn lower_every(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &m
             dst: elem, object: iterable, key: i,
             obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
         nonneg: false,
+                proven_inbounds: false,
         });
         let idx = narrow_loop_index(i, builder);
         let (pred_raw, pred_ty) =
@@ -3072,6 +3077,7 @@ pub(crate) fn lower_find(args: &[TypedExpr], result_type: &Type, builder: &mut F
             dst: elem, object: iterable, key: i,
             obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
         nonneg: false,
+                proven_inbounds: false,
         });
         let idx = narrow_loop_index(i, builder);
         let pred = call_body_direct(target, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &native_params, &Type::Bool, builder);
@@ -3175,6 +3181,7 @@ pub(crate) fn lower_find(args: &[TypedExpr], result_type: &Type, builder: &mut F
             dst: elem, object: iterable, key: i,
             obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
         nonneg: false,
+                proven_inbounds: false,
         });
         let idx = narrow_loop_index(i, builder);
         let (pred_raw, pred_ty) =
@@ -3303,6 +3310,7 @@ pub(crate) fn lower_find(args: &[TypedExpr], result_type: &Type, builder: &mut F
         dst: elem2, object: iterable, key: i2,
         obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: ni_elem_ty.clone(),
     nonneg: false,
+                proven_inbounds: false,
     });
     let idx2 = narrow_loop_index(i2, builder);
     // Call the closure with (elem, idx): elem is already union so it's passed directly;
@@ -3534,6 +3542,7 @@ pub(crate) fn lower_flatmap_terminal(
                     dst: inner_elem, object: inner, key: j,
                     obj_ty: fm_ret.clone(), key_ty: Type::Int64, result_ty: json.clone(),
                     nonneg: false,
+                proven_inbounds: false,
                 });
                 let borrowed = is_borrowed_heap_elem(&inner_elem_ty);
                 push_output(out, flat, &out_elem_ty, inner_elem, &json, borrowed, b);
@@ -4040,6 +4049,7 @@ pub(crate) fn lower_fused_reduce(
         dst: elem, object: iterable, key: i,
         obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
     nonneg: false,
+                proven_inbounds: false,
     });
     let idx = narrow_loop_index(i, builder);
     // Every latch predecessor contributes (acc value, predecessor): a SKIPPED element carries the
@@ -4262,6 +4272,7 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
                     dst: elem, object: iterable, key: i,
                     obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
                 nonneg: false,
+                proven_inbounds: false,
                 });
                 // acc_next = <lambda body>(acc, elem, i), inlined. The reducer params are (acc, elem)
                 // plus the OPTIONAL 0-based SOURCE index `i` (narrowed Int64→Int32). A 2-param
@@ -4361,6 +4372,7 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
                 dst: elem, object: iterable, key: i,
                 obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
                 nonneg: false,
+                proven_inbounds: false,
             });
             let idx = narrow_loop_index(i, builder);
             // Inline body: (acc, elem, idx) → acc_next_raw. The body may switch blocks.
@@ -4438,6 +4450,7 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
             dst: elem, object: iterable, key: i,
             obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
             nonneg: false,
+                proven_inbounds: false,
         });
         let idx = narrow_loop_index(i, builder);
         // Direct call: pass (acc, elem, idx) coerced to callee's native params. call_body_direct
@@ -4516,6 +4529,7 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
         dst: elem, object: iterable, key: i,
         obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
     nonneg: false,
+                proven_inbounds: false,
     });
     // acc_next = f(acc, elem[, i]). acc is carried as Json; coerce both args to the reducer's
     // declared param types. A 3-param reducer `(acc, item, i) => …` also receives the OPTIONAL
@@ -4628,6 +4642,7 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
                 dst: elem_raw, object: arr, key: i,
                 obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
             nonneg: false,
+                proven_inbounds: false,
             });
             let elem = coerce_arg_to_param_repr(elem_raw, &read_elem_ty, &elem_ty, builder);
             // Reclaim tagged-read shell (see `lower_for` for the analogous reclaim).
@@ -4656,6 +4671,7 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
             dst: fill, object: arr, key: zero_i64,
             obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
         nonneg: true,
+        proven_inbounds: false,
         });
         let out = builder.alloc_temp(result_type.clone());
         builder.emit(Instruction::CallIntrinsic {
@@ -4691,6 +4707,7 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
                 dst: elem, object: arr, key: i,
                 obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
             nonneg: false,
+                proven_inbounds: false,
             });
             builder.emit(Instruction::IndexSet { object: out, key: i, value: elem, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
             builder.emit(Instruction::IndexSet { object: work, key: i, value: elem, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
@@ -4782,9 +4799,9 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
     // m_cmp: cmp(out[i], out[j]) <= 0 → take left (stable), else take right. Comparator inlined.
     builder.switch_to(m_cmp);
     let a_val = builder.alloc_temp(elem_ty.clone());
-    builder.emit(Instruction::Index { dst: a_val, object: out, key: mi, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false});
+    builder.emit(Instruction::Index { dst: a_val, object: out, key: mi, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false, proven_inbounds: false});
     let b_val = builder.alloc_temp(elem_ty.clone());
-    builder.emit(Instruction::Index { dst: b_val, object: out, key: mj, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false});
+    builder.emit(Instruction::Index { dst: b_val, object: out, key: mj, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false, proven_inbounds: false});
     let (cmp_raw, cmp_ty) = inline_lambda_body(&lam_params, &lam_body, &[(a_val, elem_ty.clone()), (b_val, elem_ty.clone())], builder, ctx);
     // The comparator returns an Int32 cmp value; coerce a boxed/widened result to a concrete Int32.
     let cmp_i32 = coerce_arg_to_param_repr(cmp_raw, &cmp_ty, &Type::Int32, builder);
@@ -4796,7 +4813,7 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
     // m_take_l: work[k] = out[i]; i += 1
     builder.switch_to(m_take_l);
     let lv = builder.alloc_temp(elem_ty.clone());
-    builder.emit(Instruction::Index { dst: lv, object: out, key: mi, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false});
+    builder.emit(Instruction::Index { dst: lv, object: out, key: mi, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false, proven_inbounds: false});
     builder.emit(Instruction::IndexSet { object: work, key: mk, value: lv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
     let mi_inc = builder.alloc_temp(Type::Int64);
     builder.emit(Instruction::Binary { dst: mi_inc, op: BinOp::Add, lhs: mi, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
@@ -4806,7 +4823,7 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
     // m_take_r: work[k] = out[j]; j += 1
     builder.switch_to(m_take_r);
     let rv = builder.alloc_temp(elem_ty.clone());
-    builder.emit(Instruction::Index { dst: rv, object: out, key: mj, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false});
+    builder.emit(Instruction::Index { dst: rv, object: out, key: mj, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false, proven_inbounds: false});
     builder.emit(Instruction::IndexSet { object: work, key: mk, value: rv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
     let mj_inc = builder.alloc_temp(Type::Int64);
     builder.emit(Instruction::Binary { dst: mj_inc, op: BinOp::Add, lhs: mj, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
@@ -4846,7 +4863,7 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
         builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
         builder.switch_to(body);
         let wv = builder.alloc_temp(elem_ty.clone());
-        builder.emit(Instruction::Index { dst: wv, object: work, key: i, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false});
+        builder.emit(Instruction::Index { dst: wv, object: work, key: i, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false, proven_inbounds: false});
         builder.emit(Instruction::IndexSet { object: out, key: i, value: wv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
         builder.emit(Instruction::Binary { dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
         builder.terminate(Terminator::Jump(header));
