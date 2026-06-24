@@ -582,6 +582,7 @@ pub(crate) fn emit_discriminator(
                 key_ty: Type::Str,
                 result_ty: Type::TypeVar(u32::MAX),
             nonneg: false,
+                proven_inbounds: false,
             });
             // lit = box("value")
             let lit_raw = builder.const_temp(Const::Str(value.clone()));
@@ -913,6 +914,7 @@ pub(crate) fn lower_object_pattern_test(
                     dst: got, object: actual_scrut, key: key_temp,
                     obj_ty: obj_ty.clone(), key_ty: Type::Str, result_ty: json_ty.clone(),
                 nonneg: false,
+                proven_inbounds: false,
                 });
                 let eq = builder.alloc_temp(Type::Bool);
                 builder.emit(Instruction::Binary {
@@ -1023,6 +1025,7 @@ pub(crate) fn lower_typed_pattern_bindings(
                     key_ty: Type::Int64,
                     result_ty: elem_ty,
                 nonneg: false,
+                proven_inbounds: false,
                 });
                 lower_typed_pattern_bindings(elem_pat, elem_t, builder);
             }

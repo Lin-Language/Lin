@@ -209,6 +209,7 @@ fn lower_index_get_or_create(
         key_ty: key.ty(),
         result_ty: read_ty.clone(),
     nonneg: false,
+                proven_inbounds: false,
     });
 
     // Null test: `cur == null`.
@@ -546,6 +547,7 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                     key_ty: Type::Int64,
                     result_ty: elem_ty.clone(),
                 nonneg: false,
+                proven_inbounds: false,
                 });
                 builder.register_owned(dst, elem_ty.clone());
                 return dst;
@@ -1641,6 +1643,7 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                 key_ty,
                 result_ty: result_type.clone(),
                 nonneg,
+                proven_inbounds: false,
             });
             // A sealed record indexed by a NON-LITERAL key: codegen materializes the record to a
             // boxed object, looks the key up, clones the (borrowed) result into a FRESH owned box and
