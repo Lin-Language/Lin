@@ -191,14 +191,25 @@ impl<'ctx> Codegen<'ctx> {
         let oob_b = self.context.append_basic_block(llvm_fn, "flat_get_oob");
         self.builder.conditional_branch(oob, oob_b, ok_b);
 
-        // Cold OOB path: call the runtime accessor with the ORIGINAL index so its fault message
-        // ("array index {idx} out of bounds") is byte-identical. It does not return.
+        // Cold OOB path. On the nonneg path the runtime accessor still wraps negative indices,
+        // so calling it with a negative idx would return normally — violating the noreturn
+        // contract. Use `lin_flat_array_oob` (which is unconditionally a fault, never returns)
+        // on the nonneg path. On the general path use the type-specific accessor so it can also
+        // perform its own wrap+check (byte-identical fault message either way).
         self.builder.position_at_end(oob_b);
-        let suffix = Self::flat_suffix(elem_ty);
-        let get_fn = self.get_or_declare_fn(&format!("lin_flat_array_get_{}", suffix),
-            llvm_elem_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
-        self.add_fn_attrs(get_fn, &["noreturn"]);
-        self.builder.call(get_fn, &[arr_ptr.into(), idx.into()], "flat_get_oob");
+        let void_ty = self.context.void_type();
+        if nonneg {
+            let oob_fn = self.get_or_declare_fn("lin_flat_array_oob",
+                void_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+            self.add_fn_attrs(oob_fn, &["noreturn"]);
+            self.builder.call(oob_fn, &[arr_ptr.into(), idx.into()], "flat_oob_call");
+        } else {
+            let suffix = Self::flat_suffix(elem_ty);
+            let get_fn = self.get_or_declare_fn(&format!("lin_flat_array_get_{}", suffix),
+                llvm_elem_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+            self.add_fn_attrs(get_fn, &["noreturn"]);
+            self.builder.call(get_fn, &[arr_ptr.into(), idx.into()], "flat_get_oob");
+        }
         self.builder.unreachable();
 
         // Fast path: data = *(ptr*)(arr + 24); return data[actual]
