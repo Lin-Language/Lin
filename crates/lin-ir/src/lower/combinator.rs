@@ -106,43 +106,65 @@ pub(crate) fn is_provably_flat_producer(expr: &TypedExpr, builder: &FuncBuilder,
     }
 }
 
-/// When `iterable` is a direct `range(start, end)` call (resolving to the `lin_range` intrinsic —
-/// either via an intrinsic slot or an imported `range` export), return its two bound expressions.
-/// Used to FUSE `range(a, b).for(f)` into a counted i32 loop that drives the callback directly,
-/// skipping the materialized range array entirely (no array alloc, no N pushes, no N index reads).
+/// When `iterable` is a direct `range(...)` call, return its bounds and optional step.
+/// Used to FUSE `range(a, b[, step]).for(f)` into a counted i32 loop that drives the callback
+/// directly, skipping the materialized range array entirely (no array alloc, no N pushes, no N
+/// index reads). Returns `(start, end, step)` where `step` is `None` for the 2-arg (step=1) form.
 ///
-/// Conservatively requires EXACTLY the two `lin_range` args. `range` is always eager + array-shaped,
-/// so the fused loop preserves `for` semantics exactly (the only observable effect of a `for` body is
-/// its side effects, executed once per element in order — identical here).
+/// Recognised callee forms:
+/// - Intrinsic slot resolving to `lin_range` (2-arg, step=1).
+/// - Import slot whose symbol's trailing name is `range` (2-arg import or step-overload import).
+/// - `global_fn_slots` spec tagged in `range2_spec_slots` (monomorphized 2-arg spec, step=1).
+/// - `global_fn_slots` spec tagged in `range3_spec_slots` (monomorphized 3-arg step spec).
+///
+/// `range` is always eager + array-shaped, so the fused loop preserves `for` semantics exactly
+/// (the only observable effect of a `for` body is its side effects, executed once per element in
+/// order — identical here).
 pub(crate) fn range_for_bounds<'a>(
     iterable: &'a TypedExpr,
     builder: &FuncBuilder,
     ctx: &LowerCtx,
-) -> Option<(&'a TypedExpr, &'a TypedExpr)> {
+) -> Option<(&'a TypedExpr, &'a TypedExpr, Option<&'a TypedExpr>)> {
     if let TypedExpr::Call { func, args, .. } = iterable {
-        if args.len() != 2 {
-            return None;
-        }
         if let TypedExpr::LocalGet { slot, .. } = func.as_ref() {
-            let is_range = builder
-                .intrinsic_slots
-                .get(slot)
-                .map(|intr| intr == "lin_range")
-                .unwrap_or(false)
-                || ctx
+            // 2-arg `range` via intrinsic slot (lin_range) or 2-arg import.
+            let is_2arg_range = args.len() == 2
+                && (builder
+                    .intrinsic_slots
+                    .get(slot)
+                    .map(|intr| intr == "lin_range")
+                    .unwrap_or(false)
+                    || ctx
+                        .import_fn_slots
+                        .get(slot)
+                        .map(|(sym, _)| {
+                            // Strip the overload-disambiguation suffix (`$Int32_Int32_84`) added by
+                            // ADR-074 before extracting the trailing export name; without this,
+                            // `std_iter_range$Int32_Int32_84`.rsplit('_').next() returns "84", not
+                            // "range", and fusion never fires for the 2-arg overload.
+                            let base = sym.split('$').next().unwrap_or(sym);
+                            base.rsplit('_').next() == Some("range")
+                        })
+                        .unwrap_or(false)
+                    // 2-arg `range` spec rehomed to global_fn_slots after monomorphization.
+                    || ctx.range2_spec_slots.contains(slot));
+            if is_2arg_range {
+                return Some((&args[0], &args[1], None));
+            }
+            // 3-arg `range(start, end, step)` via import slot or global_fn_slots spec.
+            if args.len() == 3 {
+                let is_3arg_range = ctx
                     .import_fn_slots
                     .get(slot)
                     .map(|(sym, _)| {
-                        // Strip the overload-disambiguation suffix (`$Int32_Int32_84`) added by
-                        // ADR-074 before extracting the trailing export name; without this,
-                        // `std_iter_range$Int32_Int32_84`.rsplit('_').next() returns "84", not
-                        // "range", and fusion never fires for the 2-arg overload.
                         let base = sym.split('$').next().unwrap_or(sym);
                         base.rsplit('_').next() == Some("range")
                     })
-                    .unwrap_or(false);
-            if is_range {
-                return Some((&args[0], &args[1]));
+                    .unwrap_or(false)
+                    || ctx.range3_spec_slots.contains(slot);
+                if is_3arg_range {
+                    return Some((&args[0], &args[1], Some(&args[2])));
+                }
             }
         }
     }
@@ -174,6 +196,14 @@ pub(crate) fn is_flat_producer_spec_name(name: &str) -> bool {
     let base = name.split('$').next().unwrap_or(name);
     let base = base.rsplit('_').next().unwrap_or(base);
     is_flat_producer_export(base)
+}
+
+/// True when a spec name (possibly overload/monomorph-mangled) demangles to `range`.
+/// Used to tag range-spec slots for `range_for_bounds` fusion detection.
+pub(crate) fn is_range_spec_name(name: &str) -> bool {
+    let base = name.split('$').next().unwrap_or(name);
+    let base = base.rsplit('_').next().unwrap_or(base);
+    base == "range"
 }
 
 
@@ -1929,8 +1959,8 @@ pub(crate) fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut
     // identical to iterating the array. The callback ABI / box-release sequence is UNCHANGED from
     // the generic path below (same boxed element, same return-box release, same shell reclaim), so
     // captured-`var` mutation and any callback return value behave exactly as before.
-    if let Some((start_e, end_e)) = range_for_bounds(&args[0], builder, ctx) {
-        return lower_range_for(start_e, end_e, &args[1], &param_tys, builder, ctx);
+    if let Some((start_e, end_e, step_e)) = range_for_bounds(&args[0], builder, ctx) {
+        return lower_range_for(start_e, end_e, step_e, &args[1], &param_tys, builder, ctx);
     }
     // FUSED CHAIN (path-6 6a): base.map/filter chain into the `for` loop (no intermediate array).
     // Requires an inlinable side-effecting body lambda and at least one fusible stage; bails otherwise.
@@ -2109,16 +2139,21 @@ pub(crate) fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut
 pub(crate) fn lower_range_for(
     start_e: &TypedExpr,
     end_e: &TypedExpr,
+    step_e: Option<&TypedExpr>,
     callback: &TypedExpr,
     param_tys: &[Type],
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> Temp {
-    // Bounds drive a native i32 counter, so they must be concrete i32 (mirrors `lower_range`).
+    // Bounds (and optional step) drive a native i32 counter; coerce to Int32 (mirrors `lower_range`).
     let start_raw = lower_expr(start_e, builder, ctx);
     let end_raw = lower_expr(end_e, builder, ctx);
     let start = coerce_to_slot_type(start_raw, &start_e.ty(), &Type::Int32, builder);
     let end = coerce_to_slot_type(end_raw, &end_e.ty(), &Type::Int32, builder);
+    let step = step_e.map(|se| {
+        let step_raw = lower_expr(se, builder, ctx);
+        coerce_to_slot_type(step_raw, &se.ty(), &Type::Int32, builder)
+    });
 
     let elem_ty = Type::Int32;
     let boxed = Type::TypeVar(u32::MAX);
@@ -2161,10 +2196,36 @@ pub(crate) fn lower_range_for(
         incomings: vec![(start, preheader), (i_next, body_block)],
     });
     let cond = builder.alloc_temp(Type::Bool);
-    builder.emit(Instruction::Binary {
-        dst: cond, op: BinOp::Lt, lhs: i, rhs: end,
-        operand_ty: Type::Int32, ty: Type::Bool,
-    });
+    match step {
+        // 2-arg range (step=1 implicit): i < end.
+        None => {
+            builder.emit(Instruction::Binary {
+                dst: cond, op: BinOp::Lt, lhs: i, rhs: end,
+                operand_ty: Type::Int32, ty: Type::Bool,
+            });
+        }
+        // 3-arg range with general step: continue while (end - i) and step have the same sign,
+        // i.e. (end - i) * step > 0. This is equivalent to the stdlib's direction-switch logic
+        // (step > 0 → i < end, step < 0 → i > end, step == 0 → never), is a single comparison
+        // in the loop header, and LLVM simplifies it to `i < end` for a constant step=1.
+        Some(step_val) => {
+            let diff = builder.alloc_temp(Type::Int32);
+            builder.emit(Instruction::Binary {
+                dst: diff, op: BinOp::Sub, lhs: end, rhs: i,
+                operand_ty: Type::Int32, ty: Type::Int32,
+            });
+            let prod = builder.alloc_temp(Type::Int32);
+            builder.emit(Instruction::Binary {
+                dst: prod, op: BinOp::Mul, lhs: diff, rhs: step_val,
+                operand_ty: Type::Int32, ty: Type::Int32,
+            });
+            let zero = builder.const_temp(Const::Int(0, Type::Int32));
+            builder.emit(Instruction::Binary {
+                dst: cond, op: BinOp::Gt, lhs: prod, rhs: zero,
+                operand_ty: Type::Int32, ty: Type::Bool,
+            });
+        }
+    }
     builder.terminate(Terminator::CondJump { cond, then_block: body_block, else_block: exit });
 
     builder.switch_to(body_block);
@@ -2225,9 +2286,12 @@ pub(crate) fn lower_range_for(
     // the increment + back-edge must originate from the CURRENT block (the true loop latch), and the
     // header phi's back-edge predecessor patched to it so SSA dominance holds (the spike's hang bug).
     let latch = builder.current_block;
-    let one = builder.const_temp(Const::Int(1, Type::Int32));
+    let increment = match step {
+        None => builder.const_temp(Const::Int(1, Type::Int32)),
+        Some(step_val) => step_val,
+    };
     builder.emit(Instruction::Binary {
-        dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
+        dst: i_next, op: BinOp::Add, lhs: i, rhs: increment,
         operand_ty: Type::Int32, ty: Type::Int32,
     });
     builder.terminate(Terminator::Jump(header));
