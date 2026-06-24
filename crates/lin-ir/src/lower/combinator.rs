@@ -5108,3 +5108,142 @@ pub(crate) fn emit_min_i64(a: Temp, b: Temp, builder: &mut FuncBuilder) -> Temp 
     out
 }
 
+// ===========================================================================================
+// FUSED MAP→JOIN (R3-B)
+//
+// `xs.map(elemFn).join(sep)` where `elemFn` is an inlinable literal lambda returning `Str`.
+//
+// Eliminates the intermediate `String[]` that the un-fused path builds:
+//   map:  alloc String[] → per-element { inline_fn(elem) → push into array }
+//   join: walk String[] → concatenate into result → free String[]
+//
+// Fused path: alloc LinStrBuf → per-element { inline_fn(elem) → push_owned into buf } →
+//             finish buf → result String.  One alloc + one pass, no intermediate array.
+//
+// GATE (conservative, falls through to the split path on any miss):
+//   - callee symbol starts with "std_string_join" and has 2 args
+//   - args[0] is a call to `lin_map` / `std_iter_map` / `std_array_map` with 2 args
+//   - args[0].args[1] is an inlinable literal lambda returning `Type::Str` (or StrLit)
+//   - source receiver is not a Stream
+//
+// RC discipline:
+//   - Each per-element lambda result is a fresh owned (+1) LinString.
+//     `lin_strbuf_push_owned` appends its bytes and releases it — no leak.
+//   - The source element (elem) is reclaimed by the standard combinator helpers after the push.
+//   - `lin_strbuf_finish` transfers ownership of the accumulated bytes into a fresh LinString* (+1).
+//     The caller (or scope-exit release) will decrement it.
+//   - `sep` is BORROWED throughout; `lin_strbuf_push_borrow` does not release it.
+// ===========================================================================================
+
+/// True when `ty` is a string type (Str or a StrLit singleton — same runtime representation).
+fn is_str_type(ty: &Type) -> bool {
+    matches!(ty, Type::Str | Type::StrLit(_))
+}
+
+/// Attempt to fuse `join(map(xs, f), sep)` into a single buffer-build pass.
+/// Returns `Some(result_temp)` on success, `None` to fall through to the split path.
+///
+/// `join_args` = the two arguments of the `std_string_join` call: `[map_expr, sep_expr]`.
+pub(crate) fn lower_map_join(
+    join_args: &[TypedExpr],
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    if join_args.len() != 2 { return None; }
+    let map_expr  = &join_args[0];
+    let sep_expr  = &join_args[1];
+
+    // Confirm map_expr is a map call with an inlinable lambda.
+    let name = combinator_callee_name(map_expr, builder, ctx)?;
+    if name != "map" { return None; }
+    let TypedExpr::Call { args: map_args, .. } = map_expr else { return None };
+    if map_args.len() != 2 { return None; }
+    // Do not fuse over a Stream receiver (streams are lazy; a materialized String[] isn't produced).
+    if matches!(map_args[0].ty(), Type::Stream(_)) { return None; }
+
+    let (lam_params, lam_body) = inlinable_local_fn(&map_args[1], builder, ctx)?;
+    // The lambda must return a Str (or StrLit — same runtime repr). Any other return type means the
+    // caller will boxed-concat strings and is handled correctly by the split path.
+    let (_, cb_ret) = callback_signature(&map_args[1]);
+    if !is_str_type(&cb_ret) { return None; }
+
+    let lam_params = lam_params.to_vec();
+    let lam_body   = lam_body.clone();
+
+    // Lower the source array and separator.  Both are fully owned by the caller's scope; we borrow
+    // sep for the duration of the loop and release it normally at the caller's scope exit.
+    let iterable    = lower_expr(&map_args[0], builder, ctx);
+    let iterable_ty = map_args[0].ty();
+    let elem_ty     = combinator_read_elem_ty(&map_args[0], builder, ctx);
+    let sep         = lower_expr(sep_expr, builder, ctx);
+
+    // Allocate a growable string buffer.  We type the buf temp as `Str` so codegen emits
+    // `ptr` (NOT `void`/const_null) for the call result, without registering it owned (no
+    // scope-exit release — lin_strbuf_finish consumes and frees the buffer itself).
+    let buf_ty = Type::Str;
+    let buf = builder.alloc_temp(buf_ty.clone());
+    builder.emit(Instruction::Call {
+        dst: buf,
+        callee: CallTarget::Named("lin_strbuf_new".to_string()),
+        args: vec![],
+        ret_ty: buf_ty.clone(),
+    });
+
+    // Loop over the source array.
+    emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |i, elem, b, c| {
+        let idx = narrow_loop_index(i, b);
+
+        // Inline the map lambda: elem → s (owned +1 LinString).
+        let (s, _) = inline_lambda_body(&lam_params, &lam_body,
+            &[(elem, elem_ty.clone()), (idx, Type::Int32)], b, c);
+
+        // Append separator BEFORE every element except the first.
+        let zero64     = b.const_temp(Const::Int(0, Type::Int64));
+        let is_first   = b.alloc_temp(Type::Bool);
+        b.emit(Instruction::Binary {
+            dst: is_first, op: BinOp::Eq,
+            lhs: i, rhs: zero64,
+            operand_ty: Type::Int64, ty: Type::Bool,
+        });
+        let sep_block  = b.alloc_block("mj_sep");
+        let cont_block = b.alloc_block("mj_cont");
+        b.terminate(Terminator::CondJump { cond: is_first, then_block: cont_block, else_block: sep_block });
+        b.switch_to(sep_block);
+        // lin_strbuf_push_borrow is void: use Type::Null so codegen emits a void call
+        // (see the const_null path — we don't use the dst, so const_null is fine here).
+        let void0 = b.alloc_temp(Type::Null);
+        b.emit(Instruction::Call {
+            dst: void0,
+            callee: CallTarget::Named("lin_strbuf_push_borrow".to_string()),
+            args: vec![buf, sep],
+            ret_ty: Type::Null,
+        });
+        b.terminate(Terminator::Jump(cont_block));
+        b.switch_to(cont_block);
+
+        // Append the element string; lin_strbuf_push_owned releases it — transfer ownership.
+        b.unregister_owned(s);
+        let void1 = b.alloc_temp(Type::Null);
+        b.emit(Instruction::Call {
+            dst: void1,
+            callee: CallTarget::Named("lin_strbuf_push_owned".to_string()),
+            args: vec![buf, s],
+            ret_ty: Type::Null,
+        });
+
+        // Reclaim the source element box (mirrors map's elem-release discipline).
+        free_combinator_elem_box(elem, &elem_ty, b);
+        free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
+    });
+
+    // Materialise the buffer into a fresh owned LinString.
+    let result = builder.alloc_temp(Type::Str);
+    builder.emit(Instruction::Call {
+        dst: result,
+        callee: CallTarget::Named("lin_strbuf_finish".to_string()),
+        args: vec![buf],
+        ret_ty: Type::Str,
+    });
+    builder.register_owned(result, Type::Str);
+    Some(result)
+}

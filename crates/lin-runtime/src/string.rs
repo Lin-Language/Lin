@@ -1720,3 +1720,50 @@ pub unsafe extern "C" fn lin_to_json(tagged: *const TaggedVal) -> *mut LinString
     push_json_value(&mut out, tagged);
     lin_string_from_bytes(out.as_ptr(), out.len() as u32)
 }
+
+// ---------------------------------------------------------------------------
+// Growable string builder — used by the fused map→join lowering to accumulate
+// the joined result in a single amortized buffer (no intermediate String[]).
+// The opaque pointer is a heap-allocated Vec<u8> behind a thin wrapper.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct LinStrBuf {
+    bytes: Vec<u8>,
+}
+
+/// Allocate a new growable string buffer.  Returns an opaque pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lin_strbuf_new() -> *mut LinStrBuf {
+    let b = Box::new(LinStrBuf { bytes: Vec::with_capacity(64) });
+    Box::into_raw(b)
+}
+
+/// Append the bytes of `s` into `buf`, then release `s` (dec refcount, free if zero).
+/// `s` must be a valid, OWNED (+1) LinString pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lin_strbuf_push_owned(buf: *mut LinStrBuf, s: *mut LinString) {
+    if !s.is_null() {
+        let bytes = std::slice::from_raw_parts((*s).data.as_ptr(), (*s).len as usize);
+        (*buf).bytes.extend_from_slice(bytes);
+        lin_string_release(s);
+    }
+}
+
+/// Append bytes from a BORROWED LinString into `buf` (no release — caller owns `s`).
+/// Used for the separator between elements.
+#[no_mangle]
+pub unsafe extern "C" fn lin_strbuf_push_borrow(buf: *mut LinStrBuf, s: *const LinString) {
+    if !s.is_null() && (*s).len > 0 {
+        let bytes = std::slice::from_raw_parts((*s).data.as_ptr(), (*s).len as usize);
+        (*buf).bytes.extend_from_slice(bytes);
+    }
+}
+
+/// Materialise the buffer into a fresh owned (+1) LinString, then free the buffer.
+/// Returns a null pointer for an empty buffer (represents "").
+#[no_mangle]
+pub unsafe extern "C" fn lin_strbuf_finish(buf: *mut LinStrBuf) -> *mut LinString {
+    let b = Box::from_raw(buf);
+    lin_string_from_bytes(b.bytes.as_ptr(), b.bytes.len() as u32)
+}
