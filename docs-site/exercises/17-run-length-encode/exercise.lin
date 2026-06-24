@@ -1,0 +1,5 @@
+// Run-Length Encoding — encode runs of equal characters as <char><count>.
+// TODO: implement solve. Example: "aaabbc" -> "a3b2c1".
+
+export val solve = (s: String): String =>
+  ""

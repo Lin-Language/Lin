@@ -1,0 +1,16 @@
+import { expect, toBe, toBeNull, test, suite } from "std/test"
+
+export val tests = (solve: (Int32[]) => Int32 | Null): AnyVal =>
+  suite("05-max-of", [
+    test("finds max in mixed list", () => [expect(solve([3, 1, 4, 1, 5])).toBe(5)]),
+
+    test("finds max in all-negative list", () => [
+      expect(solve([-3, -7, -2])).toBe(-2)
+    ]),
+
+    test("empty list returns null", () => [expect(solve([])).toBeNull()]),
+
+    test("single element returns that element", () => [expect(solve([9])).toBe(9)]),
+
+    test("all same value", () => [expect(solve([4, 4, 4])).toBe(4)])
+  ])

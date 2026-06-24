@@ -1,0 +1,23 @@
+// Run-Length Encoding — reference solution.
+import { length } from "std/array"
+import { at, toString } from "std/string"
+import { range, for } from "std/iter"
+
+export val solve = (s: String): String =>
+  val n = length(s)
+  if n == 0 then
+    ""
+  else
+    var result = ""
+    var cur = at(s, 0)
+    var count = 1
+    range(1, n).for(i =>
+      val c = at(s, i)
+      if c == cur then
+        count = count + 1
+      else
+        result = "${result}${cur}${toString(count)}"
+        cur = c
+        count = 1
+    )
+    "${result}${cur}${toString(count)}"

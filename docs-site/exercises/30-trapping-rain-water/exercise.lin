@@ -1,0 +1,5 @@
+// Trapping Rain Water — compute units of water trapped between bars.
+// TODO: use two pointers (left/right) tracking the running max on each side.
+
+export val solve = (heights: Int32[]): Int32 =>
+  0

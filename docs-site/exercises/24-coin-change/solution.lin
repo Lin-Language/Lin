@@ -1,0 +1,20 @@
+// Coin Change — reference solution.
+import { length, arrayAllocateFilled, set } from "std/array"
+import { range, for } from "std/iter"
+
+export val solve = (coins: Int32[], amount: Int32): Int32 =>
+  val inf = amount + 1
+  val dp: Int32[] = arrayAllocateFilled(amount + 1, inf)
+  set(dp, 0, 0)
+  range(1, amount + 1).for(i =>
+    coins.for(c =>
+      if c <= i then
+        val prev = dp[i - c]
+        if prev + 1 < dp[i] then
+          set(dp, i, prev + 1)
+    )
+  )
+  if dp[amount] > amount then
+    -1
+  else
+    dp[amount]

@@ -1,0 +1,5 @@
+// Two Sum — find indices of two numbers that add up to target.
+// TODO: implement solve using a hash map from value → index (one pass).
+
+export val solve = (xs: Int32[], target: Int32): Int32[] =>
+  []

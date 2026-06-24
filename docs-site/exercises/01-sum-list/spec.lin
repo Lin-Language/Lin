@@ -1,0 +1,14 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (Int32[]) => Int32): AnyVal =>
+  suite("01-sum-list", [
+    test("sums a normal list", () => [expect(solve([1, 2, 3, 4])).toBe(10)]),
+
+    test("empty list returns 0", () => [expect(solve([])).toBe(0)]),
+
+    test("negatives cancel positives", () => [expect(solve([-5, 5])).toBe(0)]),
+
+    test("single element", () => [expect(solve([42])).toBe(42)]),
+
+    test("all negatives", () => [expect(solve([-1, -2, -3])).toBe(-6)])
+  ])

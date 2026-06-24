@@ -1,0 +1,6 @@
+// Factorial — compute n! using a loop (0! = 1, assume 0 ≤ n ≤ 12).
+// TODO: implement solve to compute the factorial of n.
+import { range } from "std/iter"
+
+export val solve = (n: Int32): Int32 =>
+  1

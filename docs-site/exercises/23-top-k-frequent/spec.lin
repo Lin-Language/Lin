@@ -1,0 +1,14 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (Int32[], Int32) => Int32[]): AnyVal =>
+  suite("23-top-k-frequent", [
+    test("basic top-2", () => [expect(solve([1, 1, 1, 2, 2, 3], 2)).toBe([1, 2])]),
+
+    test("tie break by value ascending", () => [
+      expect(solve([4, 4, 5, 5, 6], 2)).toBe([4, 5])
+    ]),
+
+    test("single element", () => [expect(solve([7], 1)).toBe([7])]),
+
+    test("two-way tie", () => [expect(solve([1, 2, 2, 3, 3], 2)).toBe([2, 3])])
+  ])

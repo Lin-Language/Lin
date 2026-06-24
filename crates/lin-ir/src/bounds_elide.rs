@@ -43,7 +43,8 @@ pub fn elide_bounds(module: &mut LinModule) {
         return;
     }
 
-    let slot_lengths = collect_global_array_lengths(module);
+    let global_const_vals = collect_global_const_int_vals(module);
+    let slot_lengths = collect_global_array_lengths_with_globals(module, &global_const_vals);
     let initial_nonneg_params = collect_initial_nonneg_params(module);
 
     if std::env::var("LIN_DEBUG_BOUNDS").is_ok() {
@@ -63,9 +64,12 @@ pub fn elide_bounds(module: &mut LinModule) {
             let const_vals = collect_const_int_vals(func);
             for block in &func.blocks {
                 for instr in &block.instructions {
-                    if let Instruction::Call { callee: CallTarget::Direct(fid), args, .. } = instr {
-                        let nn: Vec<bool> = args.iter().map(|a| is_nonneg_const(*a, &const_vals)).collect();
-                        eprintln!("[bounds_elide] Direct call from {:?} to {:?}, arg_nonneg: {:?}", func.id, fid, nn);
+                    match instr {
+                        Instruction::Call { callee: CallTarget::Direct(fid), args, .. } => {
+                            let nn: Vec<bool> = args.iter().map(|a| is_nonneg_const(*a, &const_vals)).collect();
+                            eprintln!("[bounds_elide] Direct call from {:?} to {:?}, arg_nonneg: {:?}", func.id, fid, nn);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -77,7 +81,7 @@ pub fn elide_bounds(module: &mut LinModule) {
         let before: usize = func.blocks.iter().flat_map(|b| b.instructions.iter())
             .filter(|i| matches!(i, Instruction::Index { proven_inbounds: true, .. }))
             .count();
-        annotate_function(func, &slot_lengths, &initial_nonneg_params);
+        annotate_function(func, &slot_lengths, &initial_nonneg_params, &global_const_vals);
         let after: usize = func.blocks.iter().flat_map(|b| b.instructions.iter())
             .filter(|i| matches!(i, Instruction::Index { proven_inbounds: true, .. }))
             .count();
@@ -98,16 +102,139 @@ pub fn elide_bounds(module: &mut LinModule) {
 // Phase 1: global array lengths
 // ---------------------------------------------------------------------------
 
-fn collect_global_array_lengths(module: &LinModule) -> HashMap<usize, usize> {
-    // Temp → MakeArray length (no spreads).
-    let mut temp_len: HashMap<(FuncId, Temp), usize> = HashMap::new();
-    for func in &module.functions {
+/// Return the set of FuncIds that are "alloc wrappers": functions whose return value is
+/// produced by `CallIntrinsic { ArrayAllocateFilled | ArrayAllocate }` where the size
+/// argument is parameter 0 (possibly copied through temps).  Calls to these functions
+/// with a compile-time-constant first argument have a known array length.
+fn collect_alloc_wrapper_fns(module: &LinModule) -> HashSet<FuncId> {
+    let mut wrappers = HashSet::new();
+    'outer: for func in &module.functions {
+        // The wrapper must have a parameter 0 that flows as the size arg.
+        let Some(&(param0, _)) = func.params.first() else { continue };
+
+        // Walk all blocks: find a CallIntrinsic ArrayAllocateFilled/ArrayAllocate whose
+        // first arg traces back to param0 (possibly through Copy chains).
+        // Also find the returned temp.
+        let mut copies: HashMap<Temp, Temp> = HashMap::new(); // dst → src
+        let mut alloc_dst: Option<Temp> = None;
+        let mut alloc_size_temp: Option<Temp> = None;
+
         for block in &func.blocks {
             for instr in &block.instructions {
-                if let Instruction::MakeArray { dst, elements, spreads, .. } = instr {
-                    if spreads.is_empty() {
-                        temp_len.insert((func.id, *dst), elements.len());
+                match instr {
+                    Instruction::Copy { dst, src, .. } => { copies.insert(*dst, *src); }
+                    Instruction::CallIntrinsic {
+                        dst,
+                        intrinsic: Intrinsic::ArrayAllocateFilled | Intrinsic::ArrayAllocate,
+                        args, ..
+                    } => {
+                        if let Some(&size_temp) = args.first() {
+                            alloc_dst = Some(*dst);
+                            alloc_size_temp = Some(size_temp);
+                        }
                     }
+                    _ => {}
+                }
+            }
+        }
+
+        let (Some(alloc_dst), Some(size_temp)) = (alloc_dst, alloc_size_temp) else { continue };
+
+        // Check size_temp traces to param0.
+        let mut t = size_temp;
+        loop {
+            if t == param0 {
+                break; // confirmed
+            }
+            if let Some(&src) = copies.get(&t) {
+                t = src;
+            } else {
+                continue 'outer; // can't trace to param0
+            }
+        }
+
+        // Check that alloc_dst is the return value in at least one Return terminator.
+        let returned = func.blocks.iter().any(|b| {
+            matches!(&b.terminator, Terminator::Return(Some(ret)) if *ret == alloc_dst)
+        });
+        if returned {
+            wrappers.insert(func.id);
+        }
+    }
+    wrappers
+}
+
+/// Collect immutable integer global slots that hold a compile-time constant value.
+/// Returns slot → constant i64 value.
+fn collect_global_const_int_vals(module: &LinModule) -> HashMap<usize, i64> {
+    let mut slot_vals: HashMap<usize, i64> = HashMap::new();
+    for func in &module.functions {
+        let const_vals = collect_const_int_vals(func);
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                if let Instruction::GlobalValSet { slot, value, immutable: true, .. } = instr {
+                    if let Some(&v) = const_vals.get(value) {
+                        slot_vals.insert(*slot, v);
+                    }
+                }
+            }
+        }
+    }
+    slot_vals
+}
+
+fn collect_global_array_lengths_with_globals(
+    module: &LinModule,
+    global_const_vals: &HashMap<usize, i64>,
+) -> HashMap<usize, usize> {
+    // Identify alloc-wrapper functions (e.g. the monomorphized arrayAllocateFilled$T stdlib wrapper).
+    let alloc_wrappers = collect_alloc_wrapper_fns(module);
+
+    // Temp → known array length.
+    let mut temp_len: HashMap<(FuncId, Temp), usize> = HashMap::new();
+    for func in &module.functions {
+        let const_vals = collect_const_int_vals_with_globals(func, global_const_vals);
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                match instr {
+                    Instruction::MakeArray { dst, elements, spreads, .. } => {
+                        if spreads.is_empty() {
+                            temp_len.insert((func.id, *dst), elements.len());
+                        }
+                    }
+                    // Direct CallIntrinsic: arrayAllocateFilled(n, fill) / arrayAllocate(n).
+                    Instruction::CallIntrinsic {
+                        dst,
+                        intrinsic: Intrinsic::ArrayAllocateFilled | Intrinsic::ArrayAllocate,
+                        args,
+                        ..
+                    } => {
+                        if let Some(&n_temp) = args.first() {
+                            if let Some(&n) = const_vals.get(&n_temp) {
+                                if n > 0 {
+                                    temp_len.insert((func.id, *dst), n as usize);
+                                }
+                            }
+                        }
+                    }
+                    // Direct call to an alloc-wrapper function with a constant size arg.
+                    Instruction::Call {
+                        dst,
+                        callee: CallTarget::Direct(callee_fid),
+                        args,
+                        ..
+                    } => {
+                        if alloc_wrappers.contains(callee_fid) {
+                            if let Some(&n_temp) = args.first() {
+                                if let Some(&n) = const_vals.get(&n_temp) {
+                                    if n > 0 {
+                                        temp_len.insert((func.id, *dst), n as usize);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -214,6 +341,25 @@ fn collect_const_int_vals(func: &LinFunction) -> HashMap<Temp, i64> {
     m
 }
 
+/// Like `collect_const_int_vals` but also folds in temps produced by `GlobalValGet` of
+/// immutable integer globals whose value is compile-time known.
+fn collect_const_int_vals_with_globals(
+    func: &LinFunction,
+    global_const_vals: &HashMap<usize, i64>,
+) -> HashMap<Temp, i64> {
+    let mut m = collect_const_int_vals(func);
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            if let Instruction::GlobalValGet { dst, slot, immutable: true, .. } = instr {
+                if let Some(&v) = global_const_vals.get(slot) {
+                    m.insert(*dst, v);
+                }
+            }
+        }
+    }
+    m
+}
+
 fn is_nonneg_const(t: Temp, const_vals: &HashMap<Temp, i64>) -> bool {
     const_vals.get(&t).map_or(false, |&v| v >= 0)
 }
@@ -241,8 +387,9 @@ fn annotate_function(
     func: &mut LinFunction,
     slot_lengths: &HashMap<usize, usize>,
     initial_nonneg_params: &HashMap<FuncId, Vec<bool>>,
+    global_const_vals: &HashMap<usize, i64>,
 ) {
-    let const_vals = collect_const_int_vals(func);
+    let const_vals = collect_const_int_vals_with_globals(func, global_const_vals);
 
     // Build CFG.
     let successors = build_successors(func);
@@ -672,7 +819,7 @@ fn build_predecessors(func: &LinFunction, succs: &HashMap<BlockId, Vec<BlockId>>
 // Type helpers
 // ---------------------------------------------------------------------------
 
-fn is_flat_scalar_array_ty(ty: &lin_check::types::Type) -> bool {
+pub(crate) fn is_flat_scalar_array_ty(ty: &lin_check::types::Type) -> bool {
     use lin_check::types::Type;
     matches!(ty,
         Type::Array(elem) if matches!(

@@ -5190,6 +5190,133 @@ fn is_str_type(ty: &Type) -> bool {
     matches!(ty, Type::Str | Type::StrLit(_))
 }
 
+/// If `body` IS a `StringInterp`, or is a zero-statement `Block` whose tail expression IS a
+/// `StringInterp`, return its parts. Returns `None` otherwise.
+///
+/// We only peel one level of Block here because: (a) the lambda body from a simple interpolation
+/// like `s => "${s["stop"]}…"` compiles to a bare `StringInterp` in the checker; (b) a block
+/// with statements must not be silently inlined — the statements may have side-effects that must
+/// run before the parts, which `emit_interp_parts_into_buf` would not preserve. Limiting to a
+/// block with no statements (i.e. a parenthesised bare interp) is safe.
+fn extract_interp_parts(body: &TypedExpr) -> Option<&[TypedStringPart]> {
+    match body {
+        TypedExpr::StringInterp { parts, .. } => Some(parts),
+        TypedExpr::Block { stmts, expr, .. } if stmts.is_empty() => {
+            if let TypedExpr::StringInterp { parts, .. } = expr.as_ref() {
+                Some(parts)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether `ty` is an integer or bool type that can be formatted directly into a `LinStrBuf`
+/// via `lin_strbuf_push_i64`/`lin_strbuf_push_bool` without allocating an intermediate `LinString`.
+fn is_direct_buf_numeric(ty: &Type) -> bool {
+    matches!(ty,
+        Type::Int8 | Type::UInt8 | Type::Int16 | Type::UInt16 |
+        Type::Int32 | Type::UInt32 | Type::Int64 | Type::UInt64 |
+        Type::Bool
+    )
+}
+
+/// Emit each part of a string interpolation DIRECTLY into `buf` (a `LinStrBuf*` temp), without
+/// materialising an intermediate fragment `LinString`.
+///
+/// RC discipline:
+///   - `Literal` parts: emitted as immortal const-string temps → `lin_strbuf_push_borrow` (no
+///     retain/release).
+///   - `Expr` parts typed as `Str`/`StrLit`: lowered, then `Intrinsic::ToString` is called
+///     (which RETAINS the string, returning an owned +1 copy), then `lin_strbuf_push_owned`
+///     (copies bytes and releases the +1 copy).
+///   - `Expr` parts typed as integer/bool: lowered to their flat scalar, then
+///     `lin_strbuf_push_i64` or `lin_strbuf_push_bool` (no `LinString` alloc at all).
+///   - `Expr` parts of any other type: lowered, then `Intrinsic::ToString` → `push_owned`.
+///
+/// The params of the enclosing lambda must already be bound in `builder.slots` before this is
+/// called (done by `inline_lambda_body` or equivalent). `builder` is responsible for scope
+/// management; callers must have already pushed a scope.
+fn emit_interp_parts_into_buf(
+    parts: &[TypedStringPart],
+    buf: Temp,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) {
+    for part in parts {
+        match part {
+            TypedStringPart::Literal(s) => {
+                let lit = builder.const_temp(Const::Str(s.clone()));
+                let void = builder.alloc_temp(Type::Null);
+                builder.emit(Instruction::Call {
+                    dst: void,
+                    callee: CallTarget::Named("lin_strbuf_push_borrow".to_string()),
+                    args: vec![buf, lit],
+                    ret_ty: Type::Null,
+                });
+            }
+            TypedStringPart::Expr(e) => {
+                let val = lower_expr(e, builder, ctx);
+                let ty = builder.temp_types.get(&val).cloned().unwrap_or_else(|| e.ty());
+                if ty == Type::Bool {
+                    let void = builder.alloc_temp(Type::Null);
+                    builder.emit(Instruction::Call {
+                        dst: void,
+                        callee: CallTarget::Named("lin_strbuf_push_bool".to_string()),
+                        args: vec![buf, val],
+                        ret_ty: Type::Null,
+                    });
+                } else if is_direct_buf_numeric(&ty) {
+                    // Widen to i64 for lin_strbuf_push_i64 via a ToString + push_owned path, but
+                    // skip the alloc: emit an IntToString then push_owned. Actually, for the
+                    // direct-push path, we emit lin_strbuf_push_i64 which takes an i64 arg. Since
+                    // IR lowering at this level doesn't emit LLVM directly, we need the runtime to
+                    // accept the unwidened int, or we widen here. We model the widen as a Coerce in
+                    // the IR; codegen handles integer-narrowing/widening via sign/zero-extend.
+                    // Emit a Coerce from the concrete int type to Int64 so codegen can sign-extend:
+                    let i64_val = if matches!(ty, Type::Int64) {
+                        val
+                    } else {
+                        let dst = builder.alloc_temp(Type::Int64);
+                        builder.emit(Instruction::Coerce {
+                            dst,
+                            src: val,
+                            from_ty: ty.clone(),
+                            to_ty: Type::Int64,
+                        });
+                        dst
+                    };
+                    let void = builder.alloc_temp(Type::Null);
+                    builder.emit(Instruction::Call {
+                        dst: void,
+                        callee: CallTarget::Named("lin_strbuf_push_i64".to_string()),
+                        args: vec![buf, i64_val],
+                        ret_ty: Type::Null,
+                    });
+                } else {
+                    // General path: ToString produces an owned +1 string; push_owned copies+releases.
+                    let str_temp = builder.alloc_temp(Type::Str);
+                    builder.emit(Instruction::CallIntrinsic {
+                        dst: str_temp,
+                        intrinsic: Intrinsic::ToString,
+                        args: vec![val],
+                        ret_ty: Type::Str,
+                    });
+                    builder.unregister_owned(str_temp);
+                    let void = builder.alloc_temp(Type::Null);
+                    builder.emit(Instruction::Call {
+                        dst: void,
+                        callee: CallTarget::Named("lin_strbuf_push_owned".to_string()),
+                        args: vec![buf, str_temp],
+                        ret_ty: Type::Null,
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Attempt to fuse `join(map(xs, f), sep)` into a single buffer-build pass.
 /// Returns `Some(result_temp)` on success, `None` to fall through to the split path.
 ///
@@ -5272,6 +5399,34 @@ pub(crate) fn lower_map_join(
         });
     };
 
+    // Helper: emit only the separator (no element push — used by interp-fuse path).
+    let mj_sep = |i: Temp, buf: Temp, sep: Temp, b: &mut FuncBuilder| {
+        let zero64     = b.const_temp(Const::Int(0, Type::Int64));
+        let is_first   = b.alloc_temp(Type::Bool);
+        b.emit(Instruction::Binary {
+            dst: is_first, op: BinOp::Eq,
+            lhs: i, rhs: zero64,
+            operand_ty: Type::Int64, ty: Type::Bool,
+        });
+        let sep_block  = b.alloc_block("ij_sep");
+        let cont_block = b.alloc_block("ij_cont");
+        b.terminate(Terminator::CondJump { cond: is_first, then_block: cont_block, else_block: sep_block });
+        b.switch_to(sep_block);
+        let void0 = b.alloc_temp(Type::Null);
+        b.emit(Instruction::Call {
+            dst: void0,
+            callee: CallTarget::Named("lin_strbuf_push_borrow".to_string()),
+            args: vec![buf, sep],
+            ret_ty: Type::Null,
+        });
+        b.terminate(Terminator::Jump(cont_block));
+        b.switch_to(cont_block);
+    };
+
+    // Check whether the lambda body is a StringInterp — if so, fuse the parts directly into the
+    // buffer (R6: interp-join fusion), eliminating the per-element fragment string allocation.
+    let interp_parts = extract_interp_parts(&lam_body).map(|p| p.to_vec());
+
     // PACKED-VIEW fast path: a sealed-scalar-array source whose lambda uses the element ONLY for
     // scalar field reads — bind a borrowed (array, index) view instead of materializing a fresh
     // struct per element. No `lin_sealed_alloc` + memcpy + RC per iteration.
@@ -5280,12 +5435,60 @@ pub(crate) fn lower_map_join(
         && lam_params.first().map(|p| elem_used_only_for_scalar_fields(p.slot, &lam_body)).unwrap_or(false)
     {
         let static_elem = iter_elem_type(&iterable_ty);
-        emit_packed_index_loop(iterable, &iterable_ty, builder, ctx, |i, array, b, c| {
+        if let Some(ref parts) = interp_parts {
+            let parts = parts.clone();
+            emit_packed_index_loop(iterable, &iterable_ty, builder, ctx, |i, array, b, c| {
+                let idx = narrow_loop_index(i, b);
+                // Bind params (packed-view style) and emit interp parts directly into buf.
+                b.push_scope();
+                let elem_slot = lam_params.first().map(|p| p.slot);
+                if let Some(slot) = elem_slot {
+                    c.packed_elem_slots.insert(slot, (array, i, static_elem.clone()));
+                }
+                if let Some(p) = lam_params.get(1) {
+                    let bound = coerce_arg_to_param_repr(idx, &Type::Int32, &p.ty, b);
+                    b.slots.insert(p.slot, bound);
+                }
+                mj_sep(i, buf, sep, b);
+                emit_interp_parts_into_buf(&parts, buf, b, c);
+                b.pop_scope_releasing_keep(&[]);
+                if let Some(slot) = elem_slot {
+                    c.packed_elem_slots.remove(&slot);
+                }
+                // No element box to reclaim — the packed view never allocated a struct.
+            });
+        } else {
+            emit_packed_index_loop(iterable, &iterable_ty, builder, ctx, |i, array, b, c| {
+                let idx = narrow_loop_index(i, b);
+                let (s, _) = inline_lambda_body_packed_view(
+                    &lam_params, &lam_body, array, i, &static_elem, idx, b, c);
+                mj_push(i, s, buf, sep, b);
+                // No element box to reclaim — the packed view never allocated a struct.
+            });
+        }
+    } else if let Some(ref parts) = interp_parts {
+        // Interp-fuse generic path: inline params normally, emit interp parts into buf.
+        let parts = parts.clone();
+        emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |i, elem, b, c| {
             let idx = narrow_loop_index(i, b);
-            let (s, _) = inline_lambda_body_packed_view(
-                &lam_params, &lam_body, array, i, &static_elem, idx, b, c);
-            mj_push(i, s, buf, sep, b);
-            // No element box to reclaim — the packed view never allocated a struct.
+            // Push scope + bind params (mirrors inline_lambda_body_tracking_elem_boxes).
+            b.push_scope();
+            for (pi, param) in lam_params.iter().enumerate() {
+                let arg_pair = match pi {
+                    0 => Some((elem, elem_ty.clone())),
+                    1 => Some((idx, Type::Int32)),
+                    _ => None,
+                };
+                if let Some((t, arg_ty)) = arg_pair {
+                    let bound = coerce_arg_to_param_repr(t, &arg_ty, &param.ty, b);
+                    b.slots.insert(param.slot, bound);
+                }
+            }
+            mj_sep(i, buf, sep, b);
+            emit_interp_parts_into_buf(&parts, buf, b, c);
+            b.pop_scope_releasing_keep(&[]);
+            free_combinator_elem_box(elem, &elem_ty, b);
+            free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
         });
     } else {
         // Generic path: materialize each element, inline the lambda, reclaim the element box.

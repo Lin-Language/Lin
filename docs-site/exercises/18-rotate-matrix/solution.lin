@@ -1,0 +1,18 @@
+// Rotate a Matrix — reference solution.
+import { length, push } from "std/array"
+import { range, for } from "std/iter"
+
+export val solve = (m: Int32[][]): Int32[][] =>
+  val n = length(m)
+  if n == 0 then
+    []
+  else
+    var result: Int32[][] = []
+    range(0, n).for(c =>
+      var row: Int32[] = []
+      range(0, n).for(r =>
+        row.push(m[n - 1 - r][c])
+      )
+      result.push(row)
+    )
+    result

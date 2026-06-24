@@ -1,0 +1,25 @@
+// Valid Parentheses — reference solution.
+import { length, push, slice } from "std/array"
+import { at } from "std/string"
+import { range, for } from "std/iter"
+
+export val solve = (s: String): Boolean =>
+  var stack: String[] = []
+  var valid = true
+  range(0, length(s)).for(i =>
+    val c = at(s, i)
+    if c == "(" || c == "[" || c == "{" then
+      stack.push(c)
+    else
+      val n = length(stack)
+      if n == 0 then
+        valid = false
+      else
+        val top = stack[n - 1]
+        val matches = c == ")" && top == "(" || (c == "]" && top == "[") || (c == "}" && top == "{")
+        if matches then
+          stack = stack.slice(0, n - 1)
+        else
+          valid = false
+  )
+  valid && length(stack) == 0

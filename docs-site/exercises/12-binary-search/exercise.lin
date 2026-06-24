@@ -1,0 +1,5 @@
+// Binary Search — find the index of target in a sorted array.
+// TODO: implement solve using a lo/hi loop (not linear scan).
+
+export val solve = (xs: Int32[], target: Int32): Int32 =>
+  -1

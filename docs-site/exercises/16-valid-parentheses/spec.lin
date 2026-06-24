@@ -1,0 +1,32 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (String) => Boolean): AnyVal =>
+  suite("16-valid-parentheses", [
+    test("simple parens", () =>
+      [expect(solve("()")).toBe(true)]
+    ),
+
+    test("mixed brackets", () =>
+      [expect(solve("()[]{}")).toBe(true)]
+    ),
+
+    test("mismatched", () =>
+      [expect(solve("(]")).toBe(false)]
+    ),
+
+    test("interleaved brackets", () =>
+      [expect(solve("([)]")).toBe(false)]
+    ),
+
+    test("nested brackets", () =>
+      [expect(solve("{[]}")).toBe(true)]
+    ),
+
+    test("empty string", () =>
+      [expect(solve("")).toBe(true)]
+    ),
+
+    test("unclosed", () =>
+      [expect(solve("(")).toBe(false)]
+    )
+  ])

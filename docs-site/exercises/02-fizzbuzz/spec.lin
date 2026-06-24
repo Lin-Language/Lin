@@ -1,0 +1,38 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (Int32) => String[]): AnyVal =>
+  suite("02-fizzbuzz", [
+    test("n=5 produces first five entries", () =>
+      [expect(solve(5)).toBe(["1", "2", "Fizz", "4", "Buzz"])]
+    ),
+
+    test("n=0 returns empty array", () => [expect(solve(0)).toBe([])]),
+
+    test("n=1 returns just '1'", () => [expect(solve(1)).toBe(["1"])]),
+
+    test("n=15 ends with FizzBuzz", () =>
+      [
+        expect(solve(15)).toBe([
+          "1",
+          "2",
+          "Fizz",
+          "4",
+          "Buzz",
+          "Fizz",
+          "7",
+          "8",
+          "Fizz",
+          "Buzz",
+          "11",
+          "Fizz",
+          "13",
+          "14",
+          "FizzBuzz"
+        ])
+      ]
+    ),
+
+    test("n=3 last element is Fizz", () =>
+      [expect(solve(3)).toBe(["1", "2", "Fizz"])]
+    )
+  ])

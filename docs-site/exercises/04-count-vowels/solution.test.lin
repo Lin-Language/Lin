@@ -1,0 +1,5 @@
+import { solve } from "./solution"
+import { tests } from "./spec"
+import { run } from "std/test"
+
+run(tests(solve))

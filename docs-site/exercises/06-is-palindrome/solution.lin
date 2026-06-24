@@ -1,0 +1,10 @@
+// Palindrome Check — reference solution.
+import { split, join } from "std/string"
+import { reverse } from "std/array"
+
+export val solve = (s: String): Boolean =>
+  val rev = s
+    .split("")
+    .reverse()
+    .join("")
+  s == rev

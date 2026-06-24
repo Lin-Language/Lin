@@ -1,0 +1,24 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (Int32[], Int32[]) => Int32[]): AnyVal =>
+  suite("13-merge-sorted", [
+    test("merges two disjoint arrays", () =>
+      [expect(solve([1, 3, 5], [2, 4, 6])).toBe([1, 2, 3, 4, 5, 6])]
+    ),
+
+    test("first array empty", () =>
+      [expect(solve([], [1, 2])).toBe([1, 2])]
+    ),
+
+    test("second array empty", () =>
+      [expect(solve([5], [])).toBe([5])]
+    ),
+
+    test("keeps duplicates", () =>
+      [expect(solve([1, 1], [1])).toBe([1, 1, 1])]
+    ),
+
+    test("overlapping ranges", () =>
+      [expect(solve([1, 3, 5], [2, 3, 4])).toBe([1, 2, 3, 3, 4, 5])]
+    )
+  ])

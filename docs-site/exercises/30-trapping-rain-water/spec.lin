@@ -1,0 +1,14 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (Int32[]) => Int32): AnyVal =>
+  suite("30-trapping-rain-water", [
+    test("classic 12-bar example gives 6", () => [
+      expect(solve([0, 1, 0, 2, 1, 0, 1, 3, 2, 1, 2, 1])).toBe(6)
+    ]),
+
+    test("6-bar example gives 9", () => [expect(solve([4, 2, 0, 3, 2, 5])).toBe(9)]),
+
+    test("empty array gives 0", () => [expect(solve([])).toBe(0)]),
+
+    test("monotone ascending traps 0", () => [expect(solve([1, 2, 3])).toBe(0)])
+  ])

@@ -1,0 +1,30 @@
+// Merge Intervals — reference solution.
+import { length, push, sortBy } from "std/array"
+import { range, for } from "std/iter"
+
+export val solve = (intervals: Int32[][]): Int32[][] =>
+  val n = intervals.length()
+  if n == 0 then
+    val r: Int32[][] = []
+    r
+  else
+    val sorted = intervals.sortBy(iv => iv[0])
+    val result: Int32[][] = []
+    var curStart = sorted[0][0]
+    var curEnd = sorted[0][1]
+    range(1, n).for(i =>
+      val iv = sorted[i]
+      val s = iv[0]
+      val e = iv[1]
+      if s <= curEnd then
+        if e > curEnd then
+          curEnd = e
+        else
+          null
+      else
+        result.push([curStart, curEnd])
+        curStart = s
+        curEnd = e
+    )
+    result.push([curStart, curEnd])
+    result

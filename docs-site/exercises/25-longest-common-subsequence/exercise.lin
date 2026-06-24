@@ -1,0 +1,5 @@
+// Longest Common Subsequence — length of the LCS of two strings.
+// TODO: fill a 2-D DP table, dp[i][j] = LCS length for a[0..i) and b[0..j).
+
+export val solve = (a: String, b: String): Int32 =>
+  0

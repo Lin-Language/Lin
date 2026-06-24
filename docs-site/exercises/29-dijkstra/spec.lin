@@ -1,0 +1,14 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (Int32, Int32[][], Int32) => Int32[]): AnyVal =>
+  suite("29-dijkstra", [
+    test("4 nodes basic", () => [
+      expect(solve(4, [[0, 1, 1], [1, 2, 2], [0, 2, 4], [2, 3, 1]], 0)).toBe([0, 1, 3, 4])
+    ]),
+
+    test("disconnected node gives -1", () => [
+      expect(solve(3, [[0, 1, 5]], 0)).toBe([0, 5, -1])
+    ]),
+
+    test("single node", () => [expect(solve(1, [], 0)).toBe([0])])
+  ])

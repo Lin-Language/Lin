@@ -1,0 +1,30 @@
+// Roman Numerals to Integer — reference solution.
+import { length } from "std/array"
+import { at } from "std/string"
+import { range, reduce } from "std/iter"
+
+val romanValue = (c: String): Int32 =>
+  if c == "I" then
+    1
+  else if c == "V" then
+    5
+  else if c == "X" then
+    10
+  else if c == "L" then
+    50
+  else if c == "C" then
+    100
+  else if c == "D" then
+    500
+  else if c == "M" then
+    1000
+  else
+    0
+
+export val solve = (s: String): Int32 =>
+  val n = length(s)
+  range(0, n).reduce(0, (acc, i) =>
+    val v = romanValue(at(s, i))
+    val next = if i + 1 < n then romanValue(at(s, i + 1)) else 0
+    if v < next then acc - v else acc + v
+  )

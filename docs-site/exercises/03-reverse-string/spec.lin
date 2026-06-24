@@ -1,0 +1,14 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (String) => String): AnyVal =>
+  suite("03-reverse-string", [
+    test("reverses a word", () => [expect(solve("hello")).toBe("olleh")]),
+
+    test("empty string stays empty", () => [expect(solve("")).toBe("")]),
+
+    test("single character unchanged", () => [expect(solve("a")).toBe("a")]),
+
+    test("reverses abc", () => [expect(solve("abc")).toBe("cba")]),
+
+    test("palindrome unchanged", () => [expect(solve("racecar")).toBe("racecar")])
+  ])

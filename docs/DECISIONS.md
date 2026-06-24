@@ -1,11 +1,15 @@
 # Architecture Decision Records
 
-> **Numbering note (2026 consolidation):** the ADRs were consolidated in a single pass —
-> records that were later reversed, that duplicated another record's topic, or that were
-> not about the Lin language itself were removed or folded into the survivor that owns
-> their topic (each survivor carries a "Supersedes/absorbs" note). The remaining records
-> were then **renumbered contiguously**, so `ADR-001 … ADR-041` is a gapless sequence and
-> every number resolves to exactly one record.
+> **Numbering note.** ADRs run **ADR-001 … ADR-088**, assigned in rough chronological
+> order; the numbering is **not** contiguous by topic and a few records appear out of
+> sequence (ADR-076/077/079). A 2026 rationalisation removed the bodies of records whose
+> decisions were later **reversed or abandoned** and folded same-topic records into the
+> survivor that owns the topic (each survivor carries a "Supersedes/absorbs" note). To keep
+> the many existing cross-references resolving — code comments, the spec, and other ADRs all
+> cite these numbers — each removed record is retained as a **one-line tombstone** pointing
+> to its survivor rather than deleted outright: ADR-020 → ADR-028, ADR-039 → ADR-028/029/030,
+> ADR-047 → ADR-052, ADR-056 → ADR-055, ADR-062 → ADR-069, ADR-063 → ADR-069,
+> ADR-073 → ADR-075.
 
 ## ADR-001: Static typing via lin-check
 
@@ -292,15 +296,15 @@ historical `triple$AnyVal` codegen crash), and the call site re-coerces (boxes) 
 
 **Consequence**: `range(0, n).for(i => ...)` and `arr.for(x => ...)` compile to native loops. The `iter` intrinsic is supported but `map`/`filter`/`reduce` are not yet compiled (runtime panic). Bidirectional type checking was extended (`check_expr` now guides function argument inference using expected parameter types from the call site).
 
-## ADR-020: Concurrency via OS threads
+## ADR-020: Concurrency via OS threads — *folded into ADR-028*
 
-**Decision**: `async(thunk)` spawns a real OS thread. Results are communicated back via `Arc<Mutex<PromiseState>>`. `await` blocks the caller thread until the promise resolves. `ThreadPool` uses `mpsc::channel` with a fixed set of worker threads. `Worker` uses `mpsc::sync_channel` for backpressure.
-
-**Rationale**: OS threads are heavyweight but correct: each thread runs independently with no shared mutable state between concurrent thunks. A true async executor (tokio) would require pervasive `async/await` in the runtime.
-
-**Consequence**: `async` thunks run on true OS threads. `await` blocks the caller thread (not a coroutine yield). Values must be JSON-serializable to cross thread boundaries (spec §24.4).
-
-**Absorbs the cross-thread transfer + thunk-array work.** (1) Cross-thread value transfer uses a JSON bridge: values crossing a thread boundary are serialized to a `JsonValue` enum (`Clone + Send`, no `Rc`/`RefCell`, mirroring Lin's data shapes) and deserialized on the receiving thread, because `Value`'s `Rc<RefCell<…>>` arrays/objects cannot cross threads. `Value::to_json_value()` returns `Err` for non-serializable types, enforcing spec §24.4: functions, iterators, promises, workers, and thread pools cannot cross a boundary. Transfer is O(size) deep copy, the correct cost given the `Rc`-based representation. (2) `async` also accepts an array of thunks `(() => T)[]` — spawning one thread per element and returning an array of promises in input order — so `await(async([t1, t2, …]))` is the natural fork-join idiom.
+> **Folded into ADR-028 (2026 rationalisation).** This recorded the original
+> interpreter-era thread model (`Arc<Mutex<PromiseState>>` promises and a JSON
+> bridge that deep-copied `Value`'s `Rc<RefCell<…>>` graphs across threads). That
+> interpreter no longer exists. The current model — real OS threads, blocking
+> `await`, transferable-only boundary values, and copy-by-default RC — is
+> **ADR-028**; the surface semantics are specified in `SPECIFICATION.md` §24
+> (array-of-thunks fork/join is §24.3 `parallel`).
 
 ## ADR-021: FFI via `import foreign` and LLVM `declare`
 
@@ -336,7 +340,7 @@ Implementation:
 
 ## ADR-024: Memory management — deterministic reference counting, cycles are user responsibility
 
-**Decision**: Lin uses deterministic reference counting (RC) for all heap-allocated values (strings, arrays, objects, closures). RC operations are inserted by the compiler; the runtime provides `lin_string_release`, `lin_array_release`, `lin_object_release`, and `lin_closure_release`. Release functions recurse into heap-typed elements/values so that nested structures are freed correctly. Reference cycles between heap objects are **not** detected and will leak — this is a documented limitation.
+**Decision**: Lin uses deterministic reference counting (RC) for all heap-allocated values (strings, arrays, records, maps, closures). RC operations are inserted by the compiler; the runtime provides `lin_string_release`, `lin_array_release`, `lin_map_release` (open objects/maps), the sealed-record and sum-node releasers, and `lin_closure_release`. Release functions recurse into heap-typed elements/values so that nested structures are freed correctly. Reference cycles between heap objects are **not** detected and will leak — this is a documented limitation. (See `docs/MEMORY_MANAGEMENT.md` for the current heap representations and releasers; the original `LinObject`/`lin_object_release` were removed in the representation reset, ADR-069.)
 
 **Rationale**: RC is deterministic (no GC pauses), predictable, and systems-friendly. The Perceus approach (Reinking et al., PLDI 2021, used in Koka and Lean 4) shows that compile-time linearity analysis can elide most RC operations, making the overhead negligible for common functional-style code. Cycle detection requires either programmer annotations (`Weak<T>`, as in Swift/Rust) or a runtime trial-deletion pass (as in Nim ORC). Both add complexity. Cycles are uncommon in the data pipeline / request handler patterns Lin targets. The tradeoff is acceptable: correctness for acyclic data (the common case), documentation for the cycle edge case.
 
@@ -370,7 +374,7 @@ Implementation:
 
 ## ADR-028: Async concurrency — copy-by-default RC, catchable faults at the thread boundary
 
-**Decision**: Turning the synchronous async stub into real OS-thread concurrency (spec §24) is gated on three model decisions, locked in here (see `docs/ASYNC_DESIGN.md` for the full plan):
+**Decision**: Turning the synchronous async stub into real OS-thread concurrency (spec §24) is gated on three model decisions, locked in here (the as-built surface and semantics are specified in `docs/SPECIFICATION.md` §24):
 
 1. **RC under threads = Option C (transfer by deep copy) by default, plus two opt-in shared types `Shared<T>` and `Frozen<T>`.** Refcounts stay non-atomic on the single-threaded hot path. Values crossing a thread boundary (a thunk's captured env, and the transferable result returned through a promise) are **deep-copied** so each thread owns a private, disjoint object graph — nothing is shared, so non-atomic RC is sound. The set of boundary-crossing values is exactly the transferable types (JSON-shaped, acyclic, no `Function`/`Iterator`/cycles — already enforced by the checker), so a deep copy is total and bounded. `Shared<T>` (atomic-RC box + `RwLock`, accessor-only, copy in/out) is the escape hatch for shared *mutable* state; `Frozen<T>` (immortal deep-frozen graph, zero-copy lock-free reads via mutation-inference coercion) for shared *read-only* state. Atomic-RC-everywhere (Option A) and dynamic shared-flag RC (Option D) and COW are rejected (§2.3, §2.3.3) — they tax the non-threaded hot path we just optimised.
 
@@ -392,7 +396,7 @@ Implementation:
 
 ## ADR-030: `Frozen<T>` — opt-in shared read-only state via deep immortal seal (coercion deferred)
 
-**Decision**: `Frozen<T>` (ADR-028 §2.3.2) is implemented as a deep, transitive **immortal seal**. `frozen(v)` (runtime `lin_freeze`, exported by `std/async`) walks the transferable graph rooted at `v` and saturates every heap node's refcount to `IMMORTAL_RC` (string/array/object, recursively). The existing immortal guard on strings is extended to arrays and objects: `lin_array_release`/`lin_object_release` and the array/object arms of `retain_tagged_payload` (and `lin_rc_retain`, already guarded) become **no-ops** when a node's refcount is `>= IMMORTAL_RC`. The thread-transfer copy path shares an immortal array/object by reference (zero-copy), never deep-copies through it. `frozen(v)` returns `v` (now frozen) — the value keeps its plain type, so readers use it transparently.
+**Decision**: `Frozen<T>` (ADR-028 §2.3.2) is implemented as a deep, transitive **immortal seal**. `frozen(v)` (runtime `lin_freeze`, exported by `std/async`) walks the transferable graph rooted at `v` and saturates every heap node's refcount to `IMMORTAL_RC` (string/array/map/record, recursively). The existing immortal guard on strings is extended to the other heap kinds: `lin_array_release`/`lin_map_release` (and the sealed-record/sum-node releasers) and the corresponding arms of `retain_tagged_payload` (and `lin_rc_retain`, already guarded) become **no-ops** when a node's refcount is `>= IMMORTAL_RC`. The thread-transfer copy path shares an immortal array/object by reference (zero-copy), never deep-copies through it. `frozen(v)` returns `v` (now frozen) — the value keeps its plain type, so readers use it transparently.
 
 **Rationale**: The trap with shared read-only data is that a read-only function compiled once against `T` does **non-atomic** `retain`/`release` on its parameter; run on N threads sharing one value, those refcount writes race even though the contents are never written. Making the graph immortal turns retain/release into guarded no-ops that only *read* the sentinel — and a race needs a writer, so concurrent reads of the count are race-free. Therefore the read-only function's existing non-atomic RC runs correctly on a shared frozen value **with no recompilation, no lock, and no atomics**. This is the interned-string immortality trick (already shipped) generalized from one string to a whole graph. Validated by a multi-threaded test (a frozen array read concurrently by N threads) under ASan.
 
@@ -691,26 +695,16 @@ the wrong integer) is not caught by the type system, consistent with the deliber
 the low-level layer. The `Int32`/`Int64` split is pragmatic: fds fit in 32 bits, process handles use 64
 to match the platform child representation.
 
-## ADR-039: Share-nothing concurrency — no Mutex/atomics primitive
+## ADR-039: Share-nothing concurrency — no Mutex/atomics primitive — *superseded*
 
-**Decision**: Lin provides **no** shared-memory concurrency primitives (mutexes, atomics,
-cross-thread shared mutable cells). Cross-thread mutable state is modelled exclusively with a
-`Worker<Msg, Reply>` (§24.6) that owns the state and serialises all access through its single-threaded
-message queue. Spec §27.10 records this as a deliberate absence.
-
-**Rationale**: The concurrency model is share-nothing (§24): `async` thunks and `parallel` may not
-capture `var` bindings (compile-time error, ADR-022), and transferred values must be JSON-compatible. A
-`Worker` owning its state and processing messages one at a time preserves that invariant — there is no
-concurrent access to the worker's closed-over `var`, so no data race is possible without ever
-introducing a lock. Adding a `Mutex`/atomic primitive would reintroduce exactly the data-race surface
-the model is designed to exclude, and would need a new opaque runtime kind plus a poisoning/lifetime
-story.
-
-**Consequence**: Patterns that would use `Arc<Mutex<T>>` in Rust (a shared counter, a connection pool,
-a discovered-peer-address cache) are expressed as a `Worker` whose `onMessage` handler closes over the
-state (§24.6.4). This is more message-passing boilerplate than a shared cell, accepted as the price of
-guaranteed freedom from data races. Single-threaded mutation via `var` is unaffected; the restriction
-applies only across thread boundaries.
+> **Superseded by ADR-028/029/030 (2026 rationalisation).** This recorded a
+> strict "no shared-memory primitives; cross-thread mutable state only via a
+> `Worker`" stance. That absence was reversed: `Shared<T>` (ADR-029) is exactly an
+> opt-in cross-thread shared **mutable** cell (atomic-refcounted `RwLock` box) and
+> `Frozen` (ADR-030) is opt-in shared **read-only** state. Share-nothing remains
+> the *default* (copy-by-default transfer, ADR-028); the `Shared`/`Frozen` boxes
+> are the deliberate, narrow opt-in escapes, and a `Worker` is still the right tool
+> when the state has behaviour or a lifecycle (`SPECIFICATION.md` §24.7).
 
 ## ADR-040: Flat unboxed arrays for scalar element types
 
@@ -1083,41 +1077,14 @@ test-only + intrinsic/unused diagnostics).
   documented in docs/SPECIFICATION.md §22.8–22.9, docs/STDLIB.md (std/test), and the doc-site
   Testing tutorial.
 
-## ADR-047: Circular imports are a compile-time error (DFS visiting-stack)
+## ADR-047: Circular imports are a compile-time error — *folded into ADR-052*
 
-> **Superseded in part by ADR-052**: cyclic *function* references are now supported via SCC
-> type-checking. The stack-overflow protection and the value-init rejection described here remain
-> in force (the value cycle is now reported as `a <-> b (… reads an imported VALUE …)`).
-
-**Decision**: A circular import is rejected at compile time with a
-`CompileError::ImportCycle` carrying the cycle as a readable chain
-(`circular import detected: a -> b -> a`). Import resolution
-(`pre_resolve_imports_inner` in `lin-compile`) threads a `visiting: Vec<String>`
-DFS stack of module *identities*; before descending into an import it checks
-whether that identity is already on the stack and, if so, returns the cycle chain
-instead of recursing. A module's identity is its canonicalised absolute file path
-(so `../a` and `a` are one module) or, for stdlib, the `std/...` path. The
-entry-point module seeds the stack so a cycle that loops back to the entry is also
-caught. Each module is popped on the success paths (cache-hit and
-checked-and-cached), so a **diamond** — one module reached by two independent
-paths — is resolved once and is *not* flagged (the second visit hits the
-`cache.contains_key` guard).
-
-**Rationale**: Resolution recurses into each import *before* inserting it into the
-cache, so the pre-existing `cache.contains_key` guard could never break a cycle —
-`a -> b -> a` recursed forever and **overflowed the stack** (SIGABRT), a crash with
-no diagnostic. The spec originally called for *lazy* initialisation with a
-*runtime* cycle error, but the implementation resolves eagerly at compile time, so
-catching the cycle during resolution (earlier, with a clean message) is both
-simpler and stricter than the original design. A visiting-stack DFS is the standard
-cycle-detection shape and yields the chain for free.
-
-**Consequence**: A cyclic import fails `lin build`/`lin run` with
-`circular import detected: <chain>` and a non-zero exit, never a stack overflow.
-Diamonds and ordinary deep import graphs are unaffected. Spec §22.5/§20.1 and
-decision-list #29 updated to "circular import is a compile-time error." Regressions:
-`test_circular_import_is_diagnosed_not_stack_overflow` and
-`test_diamond_imports_are_not_false_cycles` in `crates/lin/tests/integration.rs`.
+> **Folded into ADR-052 (2026 rationalisation).** The hard "any import cycle is a
+> compile-time error" rule was reversed for the common case: cyclic *function*
+> imports now compile as written via SCC type-checking (**ADR-052**). The parts
+> that remain in force are restated there: a genuine **value-init** cycle is still
+> rejected (`CompileError::ImportCycle`), and resolution still fails closed with a
+> readable chain instead of overflowing the stack.
 
 ## ADR-048: `std/template` delegates to minijinja (Jinja syntax; layouts; undefined→empty; render errors→Error)
 
@@ -1734,15 +1701,13 @@ runtime container is untouched — the change is entirely in **codegen**:
   finding (a `var`-local map not released at recursive-function scope exit) is **pre-existing and
   representation-independent**, not introduced by unboxing.
 
-**Relationship to `hashed-json-object.md` / ADR-056 (#4b).** #4b *did* land independently as
-**ADR-056** (a lazy O(1) hash side-index on large generic `AnyVal` objects). The two are
-**complementary, not redundant**, and operate at different layers: ADR-056 makes the *untyped* `{}`
-/ `AnyVal` dictionary O(1) at runtime with zero surface-language change, while this ADR adds a *typed*
-`{ String: T }` surface form (fidelity + a value type that flows through the stdlib) backed by its
-own `LinMap`. Code that wants a typed dictionary uses `{ String: T }` and gets O(1) by construction
-and an unboxed scalar payload; code that stays on dynamic `AnyVal` still gets O(1) lookup from ADR-056.
-The earlier draft of this ADR (written before ADR-056 merged) claimed to *supersede* #4b on the
-assumption it would be left unimplemented — that is no longer accurate: both shipped and coexist.
+**Dynamic vs typed dictionaries.** This ADR adds the *typed* `{ String: T }` surface form (fidelity +
+a value type that flows through the stdlib), backed by `LinMap`. The *untyped* `{}` / `AnyVal`
+dictionary is also O(1): after the representation reset (ADR-069) open objects are themselves backed
+by `LinMap` (a SwissTable), so dynamic-key lookup is O(1) by construction. (An earlier intermediate
+step, ADR-056, bolted a lazy hash side-index onto the old association-list `LinObject`; that struct
+and its side-index were removed in the reset — ADR-056 is superseded.) Code that wants a typed
+dictionary uses `{ String: T }` and additionally gets an unboxed scalar payload.
 
 **Stdlib.** `std/object`'s `keys`/`values`/`entries` are made **tag-aware** (new runtime bridges
 `lin_keys_any`/`lin_values_any`/`lin_entries_any` dispatch on the boxed value's tag — TAG_OBJECT →
@@ -1795,56 +1760,16 @@ insertion-order. A `var`-local map that goes out of scope inside a recursive fun
 at scope exit (a **pre-existing**, representation-independent IR-lowering gap — reproduces on the
 boxed String-valued path too; unrelated to unboxing).
 
-## ADR-056: Large `AnyVal` objects get a lazy O(1) hash side-index (RAPTOR #4b)
+## ADR-056: Large `AnyVal` objects get a lazy O(1) hash side-index — *superseded*
 
-**Decision**: `AnyVal` objects keep their association-list `entries` buffer as the source of truth, but
-gain an **optional, lazily-built open-addressing hash side-index** for O(1)-average key lookup once an
-object grows past a threshold (`HASH_INDEX_THRESHOLD = 16` entries). The change lives entirely in
-`crates/lin-runtime/src/object.rs`; no codegen change was required.
-
-- **Layout**: three fields are *appended* to `LinObject` at byte offsets ≥ 24 — `index: *mut u32`
-  (@24, open-addressing table of `entry_slot + 1`; `0` = empty cell, `null` = no table yet),
-  `index_cap: u32` (@32, power-of-two table size or 0), `index_dirty: u32` (@36). The existing header
-  fields are **untouched**: `refcount`@0, `len`@4, `cap`@8, `flags`@12, `entries`@16, and the 24-byte
-  `LinObjectEntry` stride. This preserves the ABI contract codegen's `MakeObject` inline-literal path
-  depends on (it does direct GEP at those hardcoded offsets and reads only `len`@4 / `entries`@16 / the
-  24-byte entries — audited on HEAD, never touches ≥ 24).
-- **Lazy build + probe**: `lin_object_get` / `lin_object_has` build the table on first access when
-  `len >= THRESHOLD` and (`index.is_null() || index_dirty != 0`), then probe in O(1) average. Below the
-  threshold the linear scan is kept — faster for tiny N and allocation-free, and small objects stay
-  byte-for-byte unchanged. The lazy trigger **must** key off `index == null || index_dirty` because the
-  codegen inline-literal path builds large literals **without** calling `lin_object_set`, so no
-  constructor can be assumed to have maintained the index.
-- **Maintenance**: `lin_object_set`'s append branch inserts the new slot in O(1) when a table exists
-  (entry *slot indices* are stable across an `entries` realloc — only the buffer base moves — so the
-  table survives a grow); the overwrite branch is a no-op for the index (same key, same slot). When an
-  append would push the load factor past ~0.7, the table is marked `index_dirty` for a larger rebuild on
-  next lookup. `lin_object_merge` / `lin_object_copy_except` route through `lin_object_set`, so they are
-  maintained automatically. `lin_object_release` frees the table before the header.
-- **Hash**: FNV-1a over the key bytes; linear probing on a power-of-two table.
-
-**Why a side-index over the alternatives** (full write-up was in the now-deleted
-`docs/proposals/hashed-json-object.md`): it removes the O(n²) wall for the language's *existing,
-discoverable* `{}` type with zero surface-language change, no small-object perf change, and no codegen
-ABI change. A dedicated `Map<K,V>` runtime/stdlib type (proposal option b) was rejected as the *first*
-move because users reach for `{}` first and would keep hitting the wall; it remains a possible additive
-follow-up for non-string keys. (See ADR-055 for the typed-map `{ String: T }` *surface syntax*
-direction, which is orthogonal to this runtime representation.)
-
-**Correctness/safety**: the index stores **only `u32` slot indices — never refcounted pointers** — so a
-bug here is structurally outside the UAF/double-free class that `object.rs` is otherwise prone to; the
-worst a stale index can do is point at the wrong slot, which is defended against by reconfirming **every
-probe hit** with `lin_string_key_eq`. Proven by a Rust fuzz/oracle test
-(`crates/lin-runtime/tests/object_index_fuzz.rs`): for N = 0,1,15,16,17,64,1000 it interleaves
-set/overwrite/merge/copy_except/release and asserts `get`/`has`/`keys` agree with a linear-scan oracle on
-every key including absent ones, validated under ASan for leaks/UAF.
-
-**Consequence**: building an N-key dictionary by repeated `set`/`get` drops from O(n²) to O(n)
-(microbench: 16k-key build 142ms → 0.7ms). The motivating RAPTOR port's index-build (`PREP`) phase fell
-from ~145s to ~27s with the cross-language correctness digest unchanged
-(`group=26203913 range=773022892 journeys=139`). The RAPTOR loader's sorted-array `bsearch` /
-contiguous-run grouping workarounds (adopted to avoid big object maps) are now unnecessary and could be
-simplified back to plain `{}` maps — a follow-up, not part of this change.
+> **Superseded by ADR-055/ADR-069 (2026 rationalisation).** This added a lazily
+> built open-addressing hash *side-index* bolted onto the old association-list
+> `LinObject` (fields appended at byte offsets ≥ 24; `lin_object_get`/`_set`/
+> `_release`). The representation reset (ADR-069) **deleted `LinObject`/`TAG_OBJECT`
+> entirely**; open objects and `{ String: T }` are now backed by `LinMap`, a
+> SwissTable that is O(1) by construction (ADR-055). The side-index mechanism no
+> longer exists; its goal — O(1) dynamic-dictionary lookup with no surface change —
+> is now intrinsic to the map representation.
 
 ## ADR-057: Sealed records — unboxed struct layout for named record types
 
@@ -2144,254 +2069,26 @@ Restriction is documented: intersection is record-only in this first cut (no fie
 intersection, no `&` with unions/scalars). A richer "intersect the field types" semantics is left
 for later; the clean sound rule for records is "fields must agree or error".
 
-## ADR-062: Representation-inference pass (packed-vs-boxed as a dataflow fact, not a Type attribute)
+## ADR-062: Representation-inference pass (packed-vs-boxed dataflow) — *superseded*
 
-**Status**: **SUPERSEDED by ADR-069** (the representation reset, 2026-06-14). The flow-sensitive
-packed-vs-boxed inference + `verify()` lattice + boxed-shadow this ADR introduced were the origin of
-the "path-9" dead ends; the reset makes representation **type-determined** (a record is *always* a flat
-packed struct; the dynamic case is the runtime-tagged `TAG_RECORD`/`AnyVal`), deletes the flow inference
-and the boxed shadow, and collapses `repr.rs` to a pure layout calculator. Retained below for history.
+> **Superseded by ADR-069 (the representation reset).** This made a record's
+> representation a flow-sensitive dataflow fact (a packed-vs-boxed lattice with a
+> `verify()` pass, a boxed shadow, and `BoxKeepPacked` opcodes) — the origin of the
+> "path-9" dead ends. ADR-069 makes representation **type-determined** (a record is
+> *always* a flat packed struct; the dynamic case is the runtime-tagged
+> `TAG_RECORD`/`AnyVal`), deletes the flow inference and the boxed shadow, and
+> collapses `repr.rs` to a pure layout calculator. See ADR-069 and
+> `PERFORMANCE.md` §5.6.
 
-> Original status: Accepted (single-owner direction landed incrementally; `verify()` now covers every
-repr-consuming opcode; the producer/consumer literal-drift prerequisite is fixed; heap-field array
-packing characterized as a sound partial with one whole-program blocker — see Consequences).
+## ADR-063: Stage 3b — whole-program record-representation consistency — *abandoned*
 
-> **Updated (2026-06-11).** Two corrections after the path-9 close-out and a dead-code sweep:
-> 1. **The `BoxKeepPacked`/`UnboxKeepPacked` *IR opcodes* described below were deleted** (`22a769b0`):
->    they had **zero construction sites** workspace-wide (the Stage-4 keep-packed-through-containers
->    machinery was never emitted on the live path). The *codegen helpers* `compile_ir_box_keep_packed`/
->    `compile_ir_unbox_keep_packed` survive and are still called directly from `emit_map_set` /
->    `compile_ir_index` for the `{String: Sealed[]}` map-value keep-packed store/read — so the zero-copy
->    box/unbox-by-pointer behaviour the lattice relies on is intact; only the never-fired IR-instruction
->    wrappers are gone. Concurrently `Inner::WrapsPacked(Layout)` (its only consumer treated it as
->    `Opaque`, and it was producible only via the dead seed) and the unread `PackedSealedArray.on_heap`
->    field were removed. `Inner` is kept as an enum (just `Opaque`) for cheap re-land.
-> 2. **Heap-field record-array packing is now CLOSED-NEGATIVE, not "a sound partial pending one
->    blocker."** The "remaining whole-program blocker" framing in Consequences was the *capability*
->    question; the *value* question was answered by path-9 (see `docs/PERFORMANCE.md` §5 and the ADR-063
->    update): fully packing heap-field record graphs end-to-end through generic boundaries measured
->    **~1.8–3.5× SLOWER** (RAPTOR), because the cost is representation-boundary **materialization**, not
->    the field read. The gate therefore stays scalar-only **by decision, not by missing engineering**.
->    The all-scalar sealed-record path (the part that *did* pay — ADR-057, the `records` win) is
->    unaffected. This ADR's machinery (the lattice, the single-owner direction, the verify/oracle gates)
->    remains the live representation pass; only the heap-field *extension* is abandoned.
-
-**Context**: Sealed records (ADR-057) and sealed-record arrays are laid out as a *packed* physical
-representation — a header-less `[rc|size|desc|fields…]` struct, and a contiguous `elem_tag == 0xFE`
-`LinArray` of such payloads — that the dynamic `LinObject`/`TaggedVal` machinery cannot read. Whether
-a given value is in the packed form or the boxed form is a *physical* fact, NOT something the static
-`Type` can express: the same static type (e.g. `Neighbor[]`) is *packed* in a just-constructed temp
-but *boxed-wrapping-a-still-packed-buffer* in a temp read back from a `{String: Neighbor[]}` map slot
-(map values are always `TaggedVal`). Historically the packed-vs-boxed decision was REPLICATED across
-three type-driven predicate families — `Codegen::sealed_array_elem`/`sealed_fields`/`is_flat_scalar`,
-`lin_ir::lower::is_sealed_scalar_array` (+ the `lower_coerce_arg` coercion triggers), and
-`lin_ir::monomorphize::field_packed_scalar`/`mentions_sealed` — that had to be kept byte-for-byte in
-lockstep. Any drift was a silent boxed-vs-packed mismatch: a UAF or a wrong-shaped release that
-`cargo test` does not catch (only ASan does).
-
-**Decision**: Introduce a per-function representation-inference pass (`crates/lin-ir/src/repr.rs`,
-run immediately before `rc_elide`) that computes a per-temp representation lattice and stores it on
-`LinFunction.repr`, indexed by `Temp.0`. Codegen reads `func.repr[t]` at the decide/assume sites
-instead of re-deriving from `Type`.
-
-- **Lattice** (per-temp, flow-sensitive): `Repr ::= Unknown(TOP) | Packed(Layout) | Boxed(Inner) |
-  FlatScalar(ScalarTy) | Bottom`, where `Layout` is `PackedStruct{fields}` or
-  `PackedSealedArray{elem_layout, on_heap}`, and `Inner` is `Opaque` or **`WrapsPacked(Layout)`** —
-  the key refinement: a boxed `TaggedVal`/`LinObject` slot whose payload pointer is a STILL-PACKED
-  buffer (keep-packed-by-pointer, zero-copy). `WrapsPacked` is **unspeakable in the type system**, which
-  is precisely why representation lives on a side table, not on `Type`. FAIL-SAFE: anything not proven
-  is `Boxed(Opaque)`; a `Packed` label is only ever assigned by proof from a definite packed producer
-  carried along representation-preserving edges (shared union-find carry classes, `carry.rs`).
-- **Single-owner principle**: representation is decided in ONE place. The layout computers
-  (`sealed_fields`/`sealed_array_elem`) survive only as repr.rs's seed-time oracle — the LAST place a
-  `Type` predicate runs — and the bridge helpers (`sealed_array_to_tagged`/`sealed_project_from`/
-  `sealed_array_materialize_elem`/`emit_sealed_release`) survive as the *lowered form* of pass-decided
-  coercions, no longer called from type-guessing arms.
-- **Keep-packed-by-pointer** (Stage 4): `BoxKeepPacked`/`UnboxKeepPacked` IR ops wrap/unwrap a packed
-  pointer into/out of a `TaggedVal` in O(1) without materializing. A `{String: Sealed[]}` map store is
-  one 16-byte tagged write over the existing `0xFE` buffer; the read-back is a tag-checked pointer load
-  feeding a packed reader directly — no per-access O(n) materialize (the dijkstra map hot-loop fix).
-- **Boundary catalogue**: an *island* (a carry class with no boxed seed and no conflict edge) stays
-  byte-for-byte the current packed codegen — so the constant-offset typed loads / contiguous pushes /
-  packed `sealed_eq` of a static loop kernel (the ~87x speedups) are preserved by construction. The
-  pass only acts at boundaries: container stores (keep-packed), genuinely-dynamic consumers
-  (toString/keys/spread/AnyVal/FFI/equality → materialize once), union membership (box), and
-  cross-representation call args.
-- **Soundness gates**: a debug-only `verify(func)` walks every instruction and asserts the repr each
-  opcode REQUIRES of each operand equals `func.repr[operand]` — a silent mismatch becomes a
-  compile-time panic, the formal statement of "representation mismatch is inexpressible". `verify`
-  covers EVERY repr-consuming site: the READ assume sites `FieldGet`/`SealedArrayFieldGet`/`Index`
-  (packed constant-offset load) AND the WRITE/CONSUME sites `Push` (array operand + the standalone
-  Packed-struct element from `push$T`) and the sealed-array `IndexSet` (array operand). The
-  RHS-value of an IndexSet/store and a map/object store are NOT asserted — they decide storage from
-  the container and COERCE the value at the slot (`sealed_project_from` projects a boxed
-  `arr[i] = { … }` literal in), so legitimately carry a Boxed repr. A Stage-2 `oracle_check` asserts
-  the new analysis agrees with the old type predicate at every decide site, so each swap is provably
-  a conservative no-op. Both run as `debug_assert!` in `repr::run`, exercised by the full `cargo
-  test` corpus — so the producer/consumer drift class (a boxed array reaching a packed Push/Index)
-  is now a debug-build compile panic, not an ASan-only-catchable runtime UAF.
-
-**Consequences / current boundary**:
-- Two representation-DECIDE sites are read from `func.repr` (single-owner): the sealed-array IndexSet
-  RHS project-vs-verbatim decision (`val_repr.packed_struct_fields()`), and the `Release` instruction's
-  release SHAPE (`emit_release_repr` — the wrong-release-after-divergence fix). Both verified
-  byte-identical on the corpus and ASan-clean (incl. dijkstra).
-- Codegen's `sealed_repr_differs` is no longer a representation-decide predicate (only an internal
-  `sealed_construct` field-coercion helper); equality (`emit_eq`) materializes both operands by design
-  (the boundary catalogue's materialize-both dynamic consumer).
-- **Producer/consumer LITERAL drift — FIXED (prerequisite for any heap-field ungate).** An inferred
-  empty array literal `[]` infers bottom-up to `Array(Never)` and lowers to a BOXED buffer; a concrete
-  packed/flat-scalar `T[]` param's callee does packed stride-N push/get → a representation DRIFT
-  (the calc-lexer `scan(.., [])` / `[].fill()` shape — a latent packed-array UAF, ASan-only). The
-  prefix `infer_call` already routed an array-literal ARGUMENT through expected-type checking against a
-  concrete array param; `infer_dot_call` did NOT — neither for its arguments NOR for the empty-literal
-  RECEIVER. Both now adopt the concrete param's RESOLVED element representation (a `Named` record alias
-  and its `Object{sealed}` body resolve identically — the alias is expanded at annotation time by
-  `resolve_named_cycle`/`expand_named_body` — so producer and consumer agree, no silent boundary). The
-  extended `verify()` makes any residual drift a debug panic. This fix stands alone (it corrects the
-  latent SCALAR packed-array UAF) and is the precondition the heap-field ungate needed.
-- **Heap-field record arrays stay BOXED (fail-safe), one remaining blocker.** The per-element
-  heap-field RC machinery and the dynamic-consumer boundaries (materializer, whole-element read,
-  out-of-shape→Null) are heap-field-complete and ASan-clean on single-module `Person[]`/`Line[]`
-  lifecycle fixtures. The two historically-cited blockers are now CLOSED: (a) FIELD OMISSION is a
-  compile error (`omits_required_field`), so a packed element can never store a NULL heap pointer; (b)
-  the LITERAL drift above is fixed. The ONE remaining blocker is **whole-program record
-  representation consistency for a record reachable as a `{String: T[]}` MAP-VALUE element** (the
-  dijkstra `{String: Neighbor[]}` shape). A `{String: T[]}` map is pervasively read into a `T[]|Null`
-  UNION (`match adj[u] is Null => [] else => …`) and then BOTH mutated in place (`push(it, x)`) AND
-  iterated by the generic boxed `for`. In-place mutation REQUIRES keep-packed-by-pointer (a shared
-  `0xFE` buffer); the boxed `for`/`lin_array_get_tagged` reader REQUIRES a boxed `Object[]` (it reads a
-  `0xFE` buffer's packed structs as `TaggedVal`s → garbage: the `0x07` heap-field deref crash, or — for
-  SCALARS — a silent misread that is LATENT on master since no scalar `{String: P[]}`-iterated test
-  exists). The two are irreconcilable at one map-value representation UNLESS either (i)
-  `lin_array_get_tagged` materializes a packed element to a keyed `LinObject` via a NAMED full-field
-  descriptor (a runtime LinArray-layout change — today's heap-only `elem_desc` lacks field names), OR
-  (ii) the record is boxed CONSISTENTLY everywhere it is reachable from the map (a CROSS-MODULE
-  record-taint pass — a record type is packed-everywhere or boxed-everywhere, never per-occurrence,
-  else the read-back drifts). Either is larger than a local gate. Until one lands, heap-field element
-  arrays stay scalar-only — sound, not maximal. (`Codegen::sealed_array_elem_field_packable` + its
-  lower.rs/monomorphize/repr mirrors; the gate note there has the re-enable recipe.)
-- The lower.rs/monomorphize coercion-insertion triggers (`lower_coerce_arg`, `type_repr_differs`,
-  `mentions_sealed`, `combinator_unsound_over_sealed`) are NOT yet deleted: they remain the emitters of
-  the boundary coercions until a repr.rs STEP-4 coercion-insertion pass relocates them. That relocation
-  is the remaining single-owner work; the lattice, side table, keep-packed ops, and the two swapped
-  decide sites are the parts that landed.
-
-## ADR-063: Stage 3b — whole-program record-representation consistency (the heap-field-array packing unlock)
-
-**Status**: ~~Proposed~~ **ABANDONED — CLOSED-NEGATIVE (2026-06-11).** Stage 3b's premise — that
-packing heap-field record graphs end-to-end would move RAPTOR's query phase toward Go/Node — was
-**built and measured, and is false.** Three independent agents produced digest-correct end-to-end
-typed RAPTOR; it ran **~1.8–3.5× SLOWER** (PREP 7.7 s→27.2 s, GROUP 19.9 s→36.2 s, RANGE 59.4 s→105.3 s).
-The dominant cost is **representation-boundary materialization**, not the field read this ADR set out
-to make constant-offset: functional code threads records through many generic boundaries (worker
-boundary → nested-record gate → TCO param leak → `Trip|Null` union boxing → map-value
-materialize-per-access), and each is a materialize-or-leak seam — "fix-for-a-fix all the way down."
-The full record + mechanism is in `docs/PERFORMANCE.md` §5 (path-9). **Do not re-attempt heap-field
-end-to-end packing for perf.** The orthogonal win that *did* pay (typing RAPTOR's dictionaries off
-`AnyVal` → O(1) `LinMap`, ~5.6× PREP) shipped separately (ADR-055). The all-scalar sealed-record packing
-(ADR-057) is unaffected and remains Lin's headline strength. The design below is retained as the
-record of what was tried and why it was closed, **not as a roadmap.**
-
-**End goal (do not lose sight of this).** The point of Stage 3b is NOT "pack heap-field record
-arrays" for its own sake. It is to let real typed-record-heavy programs — the RAPTOR benchmark being
-the yardstick — keep their hot-path values (`Trip`, `StopTime`, `tripsByRoute: {String: Trip[]}`,
-`trip["stopTimes"][pi]["arrivalTime"]`) in the *packed* representation end-to-end, so field access is
-a constant-offset load and LLVM can optimise across it. Profiling (ADR-062 / [[project_raptor_perf_frontier]])
-measured the gap: a packed typed-record field read is ~70x an `AnyVal` `lin_object_get`, AND the packed
-value is transparent to LLVM (hoist/fold/SROA/dead-elim) whereas `AnyVal` is a total optimisation
-barrier. **Success metric: RAPTOR GROUP/RANGE wall-clock moves materially toward Go/Node (~16s query
-vs Lin's ~390s), with the cross-language digest gate (`group=26203913 range=773022892 journeys=139`)
-byte-identical.** Stage 3b is the enabling representational work; the conversion of the RAPTOR port to
-typed trips + the rebench is the deliverable that proves it.
-
-**Context — this is NOT a from-scratch design; it is the final materialisation of ADR-062.** The
-packed-vs-boxed machinery is already built and coherent: the `Repr` lattice (`crates/lin-ir/src/repr.rs`),
-the per-element-per-field RC primitives and descriptor-driven release (`lin-runtime/src/sealed.rs`,
-`release_sealed_array_elems`, `lin_sealed_array_set`/`_push_struct_retaining`, `sealed_array_materialize_elem`),
-the `BoxKeepPacked`/`UnboxKeepPacked` IR ops (zero-copy box/unbox of a still-packed pointer through a
-`TaggedVal`, already in `ir.rs` + codegen), and the debug-only `verify`/`oracle_check` soundness gates.
-The per-element heap-field RC is ALREADY heap-field-complete and ASan-clean on single-module
-`Person[]`/`Line[]` fixtures (construct/push/field-read/index-set/drop/transfer/`==`/toString/filter/
-map/sortBy). The two historically-cited blockers (field omission; producer/consumer literal drift) are
-CLOSED. So the gate `sealed_array_elem_field_packable` stays scalar-only for exactly ONE reason:
-
-**The remaining blocker (precisely).** WHOLE-PROGRAM record-representation consistency for a record
-reachable as a `{String: T[]}` MAP-VALUE element (the dijkstra `{String: Neighbor[]}` shape, and
-RAPTOR's `tripsByRoute: {String: Trip[]}`). Such a map value is pervasively read into a `T[]|Null`
-union (`match adj[u] is Null => [] else => …`) and then BOTH (a) mutated in place (`push(it, x)` —
-REQUIRES keep-packed-by-pointer, a shared `0xFE` buffer) AND (b) iterated by the generic boxed `for` /
-`lin_array_get_tagged` (REQUIRES a boxed `Object[]`; it reads a `0xFE` buffer's packed structs as
-`TaggedVal`s → heap-field deref crash, or for scalars a silent misread — latent on master). These are
-irreconcilable at ONE map-value representation. The session of 2026-06-07 confirmed the per-op RC is
-sound (8 surrounding RC/correctness bugs found+fixed by exhaustive ASan probing) — the blocker is
-genuinely this representation-consistency question, not RC discipline.
-
-**Decision.**
-1. **Resolve the blocker via mechanism (i): named-full-field-descriptor materialisation in the boxed
-   reader, NOT (ii) a cross-module record-taint pass.** When `lin_array_get_tagged` (and the generic
-   boxed `for`) reads an element out of a `0xFE` packed buffer whose element layout carries a NAMED
-   full-field descriptor, it materialises a keyed `LinObject` view on demand (the descriptor gains
-   field names; today's `elem_desc` is heap-only/nameless). This keeps the map value in ONE packed
-   representation that BOTH in-place mutation (keep-packed) and the boxed reader (materialise-on-read)
-   can consume. Rationale for (i) over (ii): (i) is LOCAL (a runtime LinArray-layout extension +
-   the boxed-reader materialise path — no new whole-program pass, no cross-module type-taint
-   inference, which would be a large new analysis with its own soundness surface and would pessimise
-   any record that touches a map anywhere); (i) composes with the existing `WrapsPacked`/`BoxKeepPacked`
-   machinery the lattice already has; (i) degrades gracefully (a boxed read just pays one materialise,
-   exactly as an `AnyVal` read does today — never a crash). (ii) is reserved as a fallback only if (i)
-   proves to have an unfixable hot-path cost.
-2. **The gate stays a SINGLE source of truth, and Stage 3b lands by DIALING THE GATE, not by adding
-   implementation special-cases.** Consolidate the 4 lockstep mirrors
-   (`Codegen::sealed_array_elem_field_packable` + `lower::is_sealed_array_elem_field_packable` +
-   `monomorphize::field_packed_scalar` + `repr::sealed_array_elem_field_packable`) so three derive from
-   one (with a unit test asserting agreement). The per-shape staging (scalar → +String → +nested
-   record-array) is expressed PURELY as widening that one predicate as the harness proves each shape
-   clean — the descriptor-driven primitives handle every heap-field kind uniformly; there are NO
-   per-shape branches in the RC implementation. This is the line between "incremental landing of a
-   uniform design" and "a million patches".
-3. **The verification harness (below) is built and green BEFORE any representation change, and is the
-   merge gate for every gate-widening step.**
-
-**The verification harness (Phase 1 — build first, independent value).** A generated, exhaustive
-differential + ASan matrix over the cross-product that the hand-written 48 sealed tests only sampled:
-{operation} × {value position} × {field shape}.
-- OPERATIONS: build-literal, factory-return, field-read (scalar + heap), whole-element read (`arr[i]`),
-  index-set, push, array-drop, sort/sortBy/map/filter/reduce/find, pass-by-value arg, **tail-call
-  thread** (the scanRouteAt shape), store-as-map-value, read-from-map-value-then-iterate, nest.
-- POSITIONS: val-binding, call-arg, array-literal element, return expr, push-arg, map-value, union
-  member (`T|Null`), tail-recursive param.
-- FIELD SHAPES: all-scalar, +String, +scalar-array, +record-array (the `Trip{stopTimes:StopTime[]}`
-  shape), +nested-scalar-record, +nested-record-array.
-Each generated program runs in a build/drop LOOP and is checked under ASan **both** `detect_leaks=1`
-(a per-iteration leak SCALES with the loop count; a constant residual is the string-intern cache and
-is fine) **AND** `detect_leaks=0` (no UAF/double-free), PLUS a **run-equivalence** check that the
-packed result equals the boxed-fallback result (force-boxed via a sibling build with the gate off).
-This harness would have caught all 8 bugs fixed on 2026-06-07; it converts "probe and hope" into
-mechanical, terminating coverage and is the standing regression net for the ownership contract below.
-
-**The ownership contract (the invariant the whole representation maintains).** An element slot of a
-packed sealed-record array owns exactly +1 of each heap field. EVERY operation maintains it via ~5
-descriptor-driven primitives — element-construct (retain each heap field), element-read-into-owned
-(retain on materialise/escape; a pure in-place scalar/heap field READ takes none), element-overwrite
-(release-old-fields then retain-new), element-drop / array-drop (`release_sealed_array_elems` walks
-the descriptor), and the keep-packed box/unbox (`BoxKeepPacked`/`UnboxKeepPacked`, RC-neutral pointer
-wrap). No operation hand-codes per-field RC; they all route through these. The remaining
-scanRouteAt-projection TCO-release leak ([[project_raptor_perf_frontier]]) is subsumed here: it is the
-element-read-into-owned + tail-call-thread cell of the matrix, fixed by the same primitive, not a
-separate patch.
-
-**Consequences.**
-- Builds strictly on ADR-062 (the lattice, keep-packed ops, single-owner direction); does not
-  re-decide any of it. The new work is: the named-descriptor runtime extension (i), the boxed-reader
-  materialise-on-read path, the gate consolidation, and the harness.
-- Incremental + safe: the gate is widened one field-shape at a time, each gated on the harness being
-  green for that shape under full ASan + run-equivalence + the corpus staying ≥ its current count
-  (the 72→55 regression of the naive full ungate is structurally prevented — you cannot widen a shape
-  the harness hasn't cleared).
-- If (i)'s on-read materialise proves too costly on a measured hot path, fall back to (ii)
-  (cross-module record-taint) for the specific record, OR keep that record boxed (today's behaviour) —
-  never a correctness compromise.
+> **Abandoned (closed-negative), folded into ADR-069.** The premise — that packing
+> heap-field record graphs end-to-end would move RAPTOR's query phase toward
+> Go/Node — was built, measured, and shown false (digest-correct typed RAPTOR ran
+> ~1.8–3.5× *slower*; the dominant cost is representation-boundary materialisation,
+> not the field read this set out to make constant-offset). Never shipped as its own
+> direction; the surviving packed-record machinery lives under the unified model of
+> **ADR-069**.
 
 ## ADR-064: Unboxed tagged sum types (`SumNode`) + keep-packed-through-containers via a runtime tag
 
@@ -2850,48 +2547,27 @@ still follows each *source* operand's signedness (an unsigned UInt32 4e9 widens 
 Regression guard: `test_mixed_integer_width_arithmetic_widens_to_result` in
 `crates/lin/tests/integration.rs`. Full workspace + stdlib/examples suites stay green.
 
-**Record-field types — resolved as: keep `Int64`** (see ADR-073). `weekday` returns the
+**Record-field types — resolved as: keep `Int64`** (the `std/datetime` field-width decision, see ADR-075). `weekday` returns the
 numeric-literal-union `Weekday = 0 | … | 6` (the `match` narrows the wide intermediate to the small
 type, which lowers to i32). The `Date`/`Time` record *fields* stay `Int64` rather than `UInt8`/`UInt16`,
 because reading a narrow field back into the civil-date math silently overflows (§21: a suffixless
 literal adopts the narrow operand's width, so `153 * month` runs at `UInt8` width). The explicit
-`narrowTo*` family (ADR-073) is the boundary tool for storing a wide result into a narrow field, not a
+`to*` integer-narrowing family (the `Int64`-input overloads, ADR-075) is the boundary tool for storing a wide result into a narrow field, not a
 licence to make hot-path numeric fields narrow.
 
-## ADR-073: `narrowTo*` — explicit `Int64 → fixed-width` narrowing casts
+## ADR-073: `narrowTo*` — explicit `Int64 → fixed-width` narrowing casts — *folded into ADR-075*
 
-**Status**: Accepted.
-
-**Context**: `std/number`'s `to*` integer-narrowing family (`toUInt8`/`toInt8`/…/`toUInt64`) takes
-`UInt64`, so only an already-*unsigned* (or masked) value reaches it (§21). A value **computed in
-`Int64`** — the result of arithmetic, or anything signed — cannot: `Int64 → UInt64` is not an implicit
-coercion (it could wrap a negative; the rule in `compat.rs::is_numeric_compatible` is deliberate). And
-`toInt32` takes a `Float64`, so there was no integer→`Int32` narrowing at all. Surfaced by `std/datetime`,
-whose civil-date math is all `Int64` but whose natural field types are small.
-
-**Decision**: Add a parallel `narrowTo*` family taking a signed `Int64`:
-`narrowToUInt8`/`narrowToInt8`/`narrowToUInt16`/`narrowToInt16`/`narrowToUInt32`/`narrowToInt32`/
-`narrowToUInt64`. Each truncates to the named width with two's-complement (`as`-cast) semantics —
-identical low-bits behaviour to the `to*` family, the only difference being the accepted input type.
-Backed by seven trivial `lin_narrow_*` runtime symbols (`crates/lin-runtime/src/number.rs`) declared
-as FFI in `stdlib/number.lin` — no codegen/RuntimeFns change, exactly like the `to*` family. The
-implicit-coercion rule is left untouched (signed→unsigned stays non-implicit); this is purely an
-*explicit* escape hatch.
-
-**Decision (datetime fields): keep `Int64`.** With the narrowing path available, `std/datetime` could
-have moved its record fields to `UInt8`/`UInt16`/`Int32`. It deliberately does NOT: reading a narrow
-field back into the civil-date arithmetic silently overflows, because per §21 a suffixless integer
-literal adopts the *narrow operand's* width — `153 * month` with `month: UInt8` computes at `UInt8`
-width (`153 * 2 = 306 → 50`). Right-sizing the fields would force an explicit `val m: Int64 = …` widen
-at every field read in `toEpochDay`/`fromEpochDay`/`addMonths`/…, where a single missed widen is a
-silent wrong answer. The hot-path numeric fields therefore stay `Int64`; `narrowTo*` is used only where
-a value genuinely crosses into a narrow type (and `weekday`'s `Weekday` return is narrowed via `match`,
-which sidesteps the issue entirely). A future change to §21's literal-in-narrow-arithmetic rule could
-revisit this.
-
-**Consequences**: A computed `Int64` can now be stored into any fixed-width integer. Regression guards
-in `stdlib/number.test.lin` (in-range, out-of-range-truncation, negative-`Int32`, signed→unsigned
-reinterpret). Spec §21 and STDLIB.md document the family and the read-back-overflow caution.
+> **Folded into ADR-075 (2026 rationalisation).** The separate `narrowTo*` family
+> was reversed: it is folded into the `to*` family as `Int64`-input overloads
+> (resolved by the numeric-conversion tie-break of **ADR-075**) — `toUInt8(v: Int64)`,
+> `toInt32(v: Int64)`, etc. The truncation semantics (two's-complement `as`-cast)
+> are unchanged; only the spelling collapsed from two name families to one.
+>
+> The accompanying decision still stands: **`std/datetime` keeps `Int64` record
+> fields.** Right-sizing them would be unsafe because, per §21, a suffixless integer
+> literal adopts the *narrow operand's* width, so a narrow field read back into
+> civil-date arithmetic silently overflows (`153 * month` at `UInt8` width). See
+> ADR-072 for the mixed-width arithmetic rule this rests on.
 
 ## ADR-074: Function overloading — statically-resolved, type-directed, all-arguments dispatch
 

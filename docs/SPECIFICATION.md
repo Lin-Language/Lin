@@ -896,14 +896,16 @@ Dot syntax is not used for JSON field access.
 
 ### 7.1 Runtime Semantics
 
-| Operand kind          | Access                                  | Result                          |
-| ---                   | ---                                     | ---                             |
-| Object, key present   | `obj["k"]`                              | the stored value                |
-| Object, key missing   | `obj["k"]`                              | `Null`                          |
-| `Null`                | `null["k"]`                             | `Null`                          |
-| Array, index in range | `arr[i]`                                | the element                     |
-| Array, index OOB      | `arr[i]`                                | runtime error                   |
-| `Null`                | `null[i]`                               | `Null`                          |
+| Operand kind              | Access                                  | Result                          |
+| ---                       | ---                                     | ---                             |
+| Object, key present       | `obj["k"]`                              | the stored value                |
+| Object, key missing       | `obj["k"]`                              | `Null`                          |
+| `Null`                    | `null["k"]`                             | `Null`                          |
+| Array, index in range     | `arr[i]`   (i ≥ 0)                      | the element                     |
+| Array, index OOB or < 0   | `arr[i]`                                | runtime error                   |
+| `Null`                    | `null[i]`                               | `Null`                          |
+
+**`[]` array indexing is positive-only.** A negative index `arr[-1]` is a runtime out-of-bounds error, not a wrap-around. Use `std/array`'s `at(arr, -1)` for safe negative/wraparound access (e.g. `arr.at(-1)` returns the last element, `arr.at(-5, default)` returns the default when out of range).
 
 Because `Null` propagates, you may chain accesses through unknown structures without intermediate checks:
 
@@ -2337,16 +2339,21 @@ threadPool: (Int32) => ThreadPool
 ```
 
 ```txt
+poolAsync: <T>(pool, () => T) => Promise<T>
+```
+
+```txt
 val pool = threadPool(8)
 
 // Single thunk on the pool
-val p = pool.async(() => work())
+val p = poolAsync(pool, () => work())
+val p = pool.poolAsync(() => work())     // dot form
 
 // Array of thunks distributed across the pool
-val results = await(pool.async([() => work(1), () => work(2), () => work(3)]))
+val results = await([() => work(1), () => work(2), () => work(3)].map(f => poolAsync(pool, f)))
 ```
 
-`pool.async` has the same two overloads as the top-level `async`: single thunk `() => T` and array of thunks `(() => T)[]`. The same `var`-capture restriction applies (§24.2.1).
+`poolAsync` submits one thunk `() => T` to the pool and returns a `Promise<T>`; distribute an array of thunks by mapping over it (as above). The same `var`-capture restriction as `async` applies (§24.2.1).
 
 A thread pool is an opaque runtime value. It is not transferable across async boundaries.
 
@@ -2436,7 +2443,98 @@ A runtime error inside a message handler kills the worker. The current `request`
 
 ### 24.7 Shared State
 
-Lin's concurrency is share-nothing: thunks may not capture `var` (§24.2.1) and transferred values are deep-copied. For genuine shared mutable state, `std/async` provides an opt-in `Shared<T>` box accessed only through `shared`/`get`/`set`/`withLock` (ADR-029); for shared read-only state, `frozen` (ADR-030). There is **no** mutex/atomics primitive — cross-thread mutable state is otherwise modelled with a `Worker` that owns the state and serialises access through its message queue (ADR-039).
+Lin's concurrency is **share-nothing by default**. A value that crosses a thread boundary — a thunk's captured `val` environment, and the transferable result returned through a promise — is **deep-copied**, so each thread owns a private, disjoint object graph. Nothing is shared, which is what keeps reference counting non-atomic and the single-threaded hot path free (ADR-028, "Option C"). The set of boundary-crossing values is exactly the transferable types (§24.2): JSON-shaped, acyclic, with no `Function`/`Iterator`/cycles, so a deep copy is total and bounded.
+
+There is **no** mutex/atomics primitive. When share-nothing is the wrong fit — many threads reading or updating one large structure — Lin offers two **opt-in shared boxes** instead, each paying its cost only where used: `Shared<T>` for shared *mutable* state (§24.7.1) and `frozen` for shared *read-only* state (§24.7.2). Mutable state that has behaviour or a lifecycle is better modelled with a `Worker` that owns it and serialises access through its message queue (§24.7.3, ADR-028).
+
+#### 24.7.1 `Shared<T>` — opt-in shared mutable state
+
+`Shared<T>` is an opaque box holding a transferable value behind a reader-writer lock. It is created and accessed only through four built-ins exported by `std/async` (ADR-029):
+
+```txt
+shared:   <T>(T) => Shared<T>                 // box a value (copies it in)
+get:      <T>(Shared<T>) => T                 // read lock; copies a snapshot out
+set:      <T>(Shared<T>, T) => Null           // write lock; copies the new value in
+withLock: <T, R>(Shared<T>, (T) => R) => R    // write lock held across f; copies f's result out
+```
+
+```txt
+val s = shared([4, 5, 6])                 // Shared<Int32[]>
+
+val snap = s.get()                        // snapshot copy; many get()s run concurrently
+s.set([7, 8, 9])                          // replace the value wholesale
+
+withLock(s, arr => push(arr, 7))          // atomic read-modify-write, in place
+val n = withLock(s, arr => length(arr))   // read one derived value out
+```
+
+Read versus write is chosen by *which operation you call*, not by inspecting a closure body:
+
+| op | lock mode | hands you | runs concurrently with |
+| --- | --- | --- | --- |
+| `get(s)` | read (shared) | a deep copy (snapshot) | other `get`s |
+| `set(s, v)` | write (exclusive) | — | nothing |
+| `withLock(s, f)` | write (exclusive) | the inner value, mutable, in place | nothing |
+
+A read-heavy lookup table thus lets all reader threads run in parallel; only writers serialise.
+
+**Two safety properties hold together so that "mutate a shared value without the lock" is unrepresentable, not merely detected:**
+
+1. **`Shared<T>` is opaque; the four accessors are the *only* operations on it.** A dedicated `Type::Shared(Box<Type>)` is threaded through the checker, IR, and codegen; `Shared<T>` is **invariant** (compatible only with another `Shared<U>` whose inner type matches) and does **not** widen to `AnyVal`, so it cannot silently flow into an `AnyVal` slot and lose the guard. Any non-accessor operation on a `Shared` value — `push(s, 7)`, indexing, auto-unwrap — is a compile-time type error. (This enforcement resolves imported names, so it is visible under `lin build`/`lin run`; a bare `lin check` does not resolve imports and sees the imported names as `AnyVal`.)
+
+2. **Every value entering the box is copied in; every value leaving is copied out.** `shared`/`set` deep-copy the value they store; `get` deep-copies the snapshot it returns; `withLock` deep-copies whatever `f` returns. So no live reference into the inner graph can escape the lock:
+
+   ```txt
+   val leaked = withLock(s, arr => arr)  // returns a COPY, not the inner array
+   push(leaked, 7)                       // harmless — mutates the copy, not s
+   ```
+
+**Atomicity.** Each accessor takes its lock for its own duration only; the lock is *not* held between a `get` and a later `set`. So `get` → modify → `set` is the tool for "snapshot, do slow work unlocked, publish result" and accepts last-writer-wins:
+
+```txt
+val snap = s.get()    // lock held only for the copy
+// ... long work / IO / await — NO lock held ...
+s.set(result)         // lock held only for the store
+```
+
+For an atomic read-modify-write (a counter, "increment if present"), hold the lock across the read and write with `withLock`, whose lock spans the whole of `f` — keep `f` short and do no IO inside it. Note that `withLock` mutates the inner value *in place*: a scalar accumulator (`withLock(s, n => n + 1)`) does not persist the new scalar, because there is nothing to mutate in place; use a one-element array, or `get`/`set`.
+
+**Runtime representation & nesting.** A `Shared<T>` box has an **atomic** refcount and an `RwLock` over the inner value; only the box's refcount is atomic and only `Shared` operations take a lock. The **inner** object graph keeps ordinary non-atomic RC, because it is reachable only while a lock is held (all access serialised; `get`s only read, copying out). When the thread-transfer copy path (§24.7) meets a `Shared` box embedded in a larger value, it does **not** copy *through* it — it bumps the box's atomic refcount and shares the box. The `Shared` box is the marker that says "stop copying, start sharing."
+
+**Constraints.** `shared(v)` requires `v` transferable (same rule as crossing a boundary); `shared(aFunction)` is a compile-time error. `Shared<T>` makes reference cycles reachable and Lin's RC has no cycle collector (ADR-024) — a documented hazard. `withLock` reintroduces deadlock potential (Lin has no cancellation): keep critical sections short, do not re-enter a lock, and do not block or `await` while holding one. When both `std/async` and `std/array` are imported their `set` exports collide by name — alias one.
+
+#### 24.7.2 `frozen` — opt-in shared read-only state (zero-copy, lock-free)
+
+The dominant shared case is a large structure built once and **only read** by many threads — a timetable, a routing table, a config, a parsed grammar — where concurrent reads should be zero-copy and lock-free, written in ordinary syntax. `frozen` is for that (ADR-030):
+
+```txt
+frozen: <T>(T) => T
+```
+
+```txt
+val timetable = frozen(loadTimetable())     // the only ceremony — type is unchanged
+
+val results = parallel(
+  journeys.map(j => () => planJourney(timetable, j))   // shared by reference, not copied
+)
+```
+
+`frozen(v)` performs a deep, one-time, transitive **immortal seal**: it walks the transferable graph rooted at `v` and saturates every heap node's refcount to an immortal sentinel. Retain/release on an immortal node become guarded no-ops that only *read* the sentinel, so a read-only function's existing **non-atomic** refcount code runs correctly on the shared frozen value with **no recompilation, no lock, and no atomics** — concurrent reads are race-free because the contents are never written and the refcount is never written. (This generalises the immortal-interned-string trick to a whole object graph.)
+
+**`frozen(v)` returns the plain type `T`, so readers are oblivious to freezing** — the frozen value is passed wherever a `T` is expected and indexing into it (`timetable["WAT"]["routes"][3]`) is plain pointer-chasing into the shared graph, no lock, no copy.
+
+**Read-only-ness is by lifetime, not yet by the type system.** The design's compile-time *read-only coercion* — accepting a `Frozen<T>` in a `T` slot only if the callee provably does not mutate it, via an interprocedural mutation-inference pass — is **deferred** (it needs a dedicated `Type::Frozen` variant; ADR-030). Today `frozen(v): T` keeps the plain type, so reads "just work", but *mutating* a frozen value is **not** a compile error: the mutation is silently a no-op on the immortal node (and is lost) rather than diagnosed. Treat frozen data as read-only by convention.
+
+**Lifetime — immortal ⇒ never freed.** `frozen` is for load-once, program-lifetime reference data: one O(size) seal at startup, then free for the program's life. A `frozen()` value created-and-discarded in a loop **leaks**. `frozen(v)` requires `v` transferable/acyclic, same as `shared`. A frozen graph is acyclic and immutable, so unlike `Shared<T>` it adds no deadlock and no new cycle hazard.
+
+#### 24.7.3 `Shared<T>` vs `Worker`
+
+Both give safe shared mutable state across threads; they differ in ergonomics, and Lin keeps both:
+
+- **`Worker`** — state is *owned* by one thread; other threads **send messages** and the owner serialises access (§24.6). No shared memory (messages are copied). Best when the state has behaviour or a lifecycle, or when you want a queue. Every request serialises on the one owner thread.
+- **`Shared<T>`** — state is a *passive* structure that many threads **lock and touch** directly. Best for a plain shared table/counter/cache where an owner thread plus a message protocol is overkill. Its `RwLock` gives **concurrent reads** (`get`), which a single-owner `Worker` cannot.
+
+Rule of thumb: reach for `Worker` when the state has logic or a lifecycle; `Shared<T>` (read-heavy) or `frozen` (read-only) when it's just data several threads must touch.
 
 ### 24.8 `print` Ordering
 
@@ -2452,10 +2550,13 @@ All workers and async thunks share a single stdout. `print` is line-atomic: a fu
 | `race(ps)` | First result wins | No (until `await`) | `T \| Error` |
 | `timeout(p, ms)` | Bound wait time | No (until `await`) | `T \| Error \| Null` |
 | `retry(f, n)` | Retry on runtime error | No (until `await`) | `T \| Error` |
-| `threadPool(n).async(...)` | High-fan-out work, bounded threads | No (until `await`) | `T \| Error` |
+| `poolAsync(threadPool(n), f)` | High-fan-out work, bounded threads | No (until `await`) | `T \| Error` |
 | `worker(onMsg, onShutdown)` | Long-lived stateful thread | No | — |
 | `w.message(x)` | Fire-and-forget message | No | `Null` |
 | `w.request(x)` | Synchronous request/reply | Yes | `Reply` |
+| `shared(v)` | Opt-in shared *mutable* state | No | — |
+| `get(s)` / `set(s, v)` / `withLock(s, f)` | Read / replace / atomic update a `Shared<T>` | Yes (briefly, under lock) | `T` / `Null` / `R` |
+| `frozen(v)` | Opt-in shared *read-only* state (load-once) | No | — |
 
 ---
 

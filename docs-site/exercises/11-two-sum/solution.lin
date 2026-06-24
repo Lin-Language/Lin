@@ -1,0 +1,24 @@
+// Two Sum — reference solution.
+import { length } from "std/array"
+import { while } from "std/iter"
+
+export val solve = (xs: Int32[], target: Int32): Int32[] =>
+  var seen: { Int32: Int32 } = {}
+  var result: Int32[] = []
+  var i = 0
+  while(() =>
+    if i >= length(xs) then
+      false
+    else
+      val x = xs[i]
+      val complement = target - x
+      val j = seen[complement]
+      if j != null then
+        result = [j, i]
+        false
+      else
+        seen[x] = i
+        i = i + 1
+        true
+  )
+  result
