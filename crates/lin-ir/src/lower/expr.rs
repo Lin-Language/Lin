@@ -1646,7 +1646,12 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                 crate::ownership_verify::index_result_convention(&obj_ty, &key_ty),
                 crate::ir::Convention::Own
             );
-            let nonneg = builder.nonneg_range_ivs.contains(&key_temp);
+            // `[]` is positive-only: flat-scalar arrays no longer support negative-index wrap
+            // (`arr[-1]` traps as OOB). Set nonneg so codegen skips the cmovs; a negative value
+            // reinterpreted as a huge unsigned still fails the UGE bounds check → runtime trap.
+            // Use `.at(arr, -1)` from std/array for negative/safe access.
+            let nonneg = builder.nonneg_range_ivs.contains(&key_temp)
+                || crate::bounds_elide::is_flat_scalar_array_ty(&obj_ty);
             builder.emit(Instruction::Index {
                 dst,
                 object: obj_temp,

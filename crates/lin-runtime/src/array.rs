@@ -1850,6 +1850,15 @@ pub unsafe extern "C" fn lin_flat_array_eq_i64(a: *const LinArray, b: *const Lin
 // elem_tag stores TAG_INT32/TAG_INT64/TAG_FLOAT32/TAG_FLOAT64 so the equality
 // function can dispatch to the right comparison without extra type info.
 
+// Unconditional OOB trap for the positive-only `[]` path: called by codegen when a bounds check
+// fires on an index that was declared nonneg (so the runtime's negative-wrap path must not run).
+// Always calls runtime_fault — never returns.
+#[no_mangle]
+pub unsafe extern "C-unwind" fn lin_flat_array_oob(arr: *const LinArray, idx: i64) -> ! {
+    let len = (*arr).len as i64;
+    crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
+}
+
 // --- i32 ---
 
 #[no_mangle]

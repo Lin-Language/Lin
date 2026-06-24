@@ -672,7 +672,7 @@ fn build_predecessors(func: &LinFunction, succs: &HashMap<BlockId, Vec<BlockId>>
 // Type helpers
 // ---------------------------------------------------------------------------
 
-fn is_flat_scalar_array_ty(ty: &lin_check::types::Type) -> bool {
+pub(crate) fn is_flat_scalar_array_ty(ty: &lin_check::types::Type) -> bool {
     use lin_check::types::Type;
     matches!(ty,
         Type::Array(elem) if matches!(
