@@ -143,7 +143,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(body);
         // Read the element at the SOURCE element type (its native stride), convert to the DEST
         // scalar (numeric widen/convert), and push at the DEST stride.
-        let elem = self.flat_array_get(src_raw, i, from_elem, false);
+        let elem = self.flat_array_get(src_raw, i, from_elem, false, false);
         let conv = self.compile_ir_coerce(elem, from_elem, to_elem);
         self.flat_array_push(out, conv, to_elem);
         let next = self.builder.int_add(i, i64_ty.const_int(1, false), "fwiden_next");
