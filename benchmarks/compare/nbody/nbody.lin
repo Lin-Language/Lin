@@ -1,0 +1,193 @@
+// nbody.lin — floating-point numerics (Computer Language Benchmarks Game "n-body").
+// Symplectic-integrator simulation of the Jovian planets + Sun: N timesteps over
+// all 10 body-pairs, each step a dozen Float64 multiplies/adds plus a sqrt. This is
+// the suite's only float-dominant workload — it measures Lin's Float64 codegen
+// (unboxed flat arrays, libm sqrt) against the other native/JIT backends, the axis
+// every other cross-language suite leads with (n-body / mandelbrot / spectral-norm).
+//
+// All hot loops are tail-recursive so the compiler turns them into TCO loops (a
+// jump, not a closure call or stack frame) — the same idiom `records`/`recursion`
+// use — so this times float arithmetic, not loop-driver overhead.
+//
+// DETERMINISM: bodies are 7 parallel flat Float64 arrays (0=sun..4=neptune). Every
+// product is bound to a `val` BEFORE any add/subtract, so no backend can contract a
+// multiply-add into an FMA (which would change the last bit and break cross-language
+// agreement); and the tail-recursive traversal visits pairs in the SAME order as the
+// other languages' nested i<j loops, so the (non-associative) float sums match
+// bit-for-bit. RESULT = toInt32(energy * 1e9) (truncate toward zero).
+// Parameters (identical across all languages): N=5000000, dt=0.01.
+import { print } from "std/io"
+import { toString } from "std/string"
+import { set } from "std/array"
+import { sqrt } from "std/math"
+import { toInt32 } from "std/number"
+
+val N = 5000000
+val PI = 3.141592653589793
+val SOLAR_MASS = 4.0 * PI * PI
+val DAYS_PER_YEAR = 365.24
+
+// Parallel arrays, indexed 0=sun 1=jupiter 2=saturn 3=uranus 4=neptune.
+val x: Float64[] = [
+  0.0,
+  4.841431442464721,
+  8.34336671824458,
+  12.894369562139131,
+  15.379697114850917
+]
+val y: Float64[] = [
+  0.0,
+  -1.1603200440274284,
+  4.124798564124305,
+  -15.111151401698631,
+  -25.919314609987964
+]
+val z: Float64[] = [
+  0.0,
+  -0.10362204447112311,
+  -0.4035234171143214,
+  -0.22330757889265573,
+  0.17925877295037118
+]
+val vx: Float64[] = [
+  0.0,
+  0.001660076642744037 * DAYS_PER_YEAR,
+  -0.002767425107268624 * DAYS_PER_YEAR,
+  0.002964601375647616 * DAYS_PER_YEAR,
+  0.0026806777249038932 * DAYS_PER_YEAR
+]
+val vy: Float64[] = [
+  0.0,
+  0.007699011184197404 * DAYS_PER_YEAR,
+  0.004998528012349172 * DAYS_PER_YEAR,
+  0.0023784717395948095 * DAYS_PER_YEAR,
+  0.001628241700382423 * DAYS_PER_YEAR
+]
+val vz: Float64[] = [
+  0.0,
+  -0.0000690460016972063 * DAYS_PER_YEAR,
+  0.000023041729757376393 * DAYS_PER_YEAR,
+  -0.000029658956854023756 * DAYS_PER_YEAR,
+  -0.00009515922545197159 * DAYS_PER_YEAR
+]
+val mass: Float64[] = [
+  SOLAR_MASS,
+  0.0009547919384243266 * SOLAR_MASS,
+  0.0002858859806661308 * SOLAR_MASS,
+  0.00004366244043351563 * SOLAR_MASS,
+  0.00015139432214512214 * SOLAR_MASS
+]
+
+// --- one-time: pin the Sun's velocity so total momentum is zero ---
+val sumMomentum = (i: Int32, px: Float64, py: Float64, pz: Float64): { "x": Float64, "y": Float64, "z": Float64 } =>
+  if i >= 5 then
+    {
+      "x": px,
+      "y": py,
+      "z": pz
+    }
+  else
+    val mvx = vx[i] * mass[i]
+    val mvy = vy[i] * mass[i]
+    val mvz = vz[i] * mass[i]
+    sumMomentum(i + 1, px + mvx, py + mvy, pz + mvz)
+
+// --- advance: pairwise velocity kicks (i<j order), then position drift ---
+val advancePairs = (i: Int32, j: Int32, dt: Float64): Null =>
+  if i >= 4 then
+    null
+  else if j >= 5 then
+    advancePairs(i + 1, i + 2, dt)
+  else
+    val dx = x[i] - x[j]
+    val dy = y[i] - y[j]
+    val dz = z[i] - z[j]
+    val sx = dx * dx
+    val sy = dy * dy
+    val sz = dz * dz
+    val d2 = sx + sy + sz
+    val dist = sqrt(d2)
+    val d2dist = d2 * dist
+    val mag = dt / d2dist
+    val mj = mass[j] * mag
+    val dxj = dx * mj
+    val dyj = dy * mj
+    val dzj = dz * mj
+    set(vx, i, vx[i] - dxj)
+    set(vy, i, vy[i] - dyj)
+    set(vz, i, vz[i] - dzj)
+    val mi = mass[i] * mag
+    val dxi = dx * mi
+    val dyi = dy * mi
+    val dzi = dz * mi
+    set(vx, j, vx[j] + dxi)
+    set(vy, j, vy[j] + dyi)
+    set(vz, j, vz[j] + dzi)
+    advancePairs(i, j + 1, dt)
+
+val advancePos = (k: Int32, dt: Float64): Null =>
+  if k >= 5 then
+    null
+  else
+    val px = dt * vx[k]
+    val py = dt * vy[k]
+    val pz = dt * vz[k]
+    set(x, k, x[k] + px)
+    set(y, k, y[k] + py)
+    set(z, k, z[k] + pz)
+    advancePos(k + 1, dt)
+
+val advance = (dt: Float64): Null =>
+  val ig = advancePairs(0, 1, dt)
+  advancePos(0, dt)
+
+// --- energy: kinetic per body interleaved with potential per pair (i<j order),
+//     threaded through one accumulator so the float-sum order matches exactly ---
+val energyInner = (i: Int32, j: Int32, acc: Float64): Float64 =>
+  if j >= 5 then
+    acc
+  else
+    val dx = x[i] - x[j]
+    val dy = y[i] - y[j]
+    val dz = z[i] - z[j]
+    val sxx = dx * dx
+    val syy = dy * dy
+    val szz = dz * dz
+    val d2 = sxx + syy + szz
+    val dist = sqrt(d2)
+    val mm = mass[i] * mass[j]
+    val pe = mm / dist
+    energyInner(i, j + 1, acc - pe)
+
+val energyOuter = (i: Int32, acc: Float64): Float64 =>
+  if i >= 5 then
+    acc
+  else
+    val sx = vx[i] * vx[i]
+    val sy = vy[i] * vy[i]
+    val sz = vz[i] * vz[i]
+    val v2 = sx + sy + sz
+    val half = 0.5 * mass[i]
+    val ke = half * v2
+    val acc2 = acc + ke
+    val acc3 = energyInner(i, i + 1, acc2)
+    energyOuter(i + 1, acc3)
+
+// --- N-step driver (tail-recursive -> TCO loop) ---
+val run = (step: Int32): Null =>
+  if step >= N then
+    null
+  else
+    val ig = advance(0.01)
+    run(step + 1)
+
+val p = sumMomentum(0, 0.0, 0.0, 0.0)
+set(vx, 0, (0 - p["x"]) / SOLAR_MASS)
+set(vy, 0, (0 - p["y"]) / SOLAR_MASS)
+set(vz, 0, (0 - p["z"]) / SOLAR_MASS)
+
+val ig1 = run(0)
+
+val e1 = energyOuter(0, 0.0)
+val result = toInt32(e1 * 1000000000.0)
+print("RESULT=${toString(result)}")
