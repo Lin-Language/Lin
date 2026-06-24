@@ -79,7 +79,7 @@ pub fn lower_module_with_imports(
     for stmt in &module.statements {
         if let TypedStmt::Val {
             slot,
-            value: TypedExpr::Function { name, .. },
+            value: TypedExpr::Function { name, params, .. },
             ..
         } = stmt
         {
@@ -107,6 +107,18 @@ pub fn lower_module_with_imports(
                     && module.spec_origins.get(slot).map(|o| o == "std/iter" || o == "std/array").unwrap_or(false)
                 {
                     ctx.flat_producer_spec_slots.insert(*slot);
+                }
+                // Tag monomorphized `range` specs so `range_for_bounds` can fuse a
+                // `range(…).for(f)` call whose receiver is a global-fn-slots spec rather than
+                // an intrinsic or import slot. Arity distinguishes 2-arg (no step) from 3-arg.
+                if is_range_spec_name(n)
+                    && module.spec_origins.get(slot).map(|o| o == "std/iter").unwrap_or(false)
+                {
+                    match params.len() {
+                        2 => { ctx.range2_spec_slots.insert(*slot); }
+                        3 => { ctx.range3_spec_slots.insert(*slot); }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -353,6 +365,20 @@ pub fn lower_import_module_with_imports(
                 && module.spec_origins.get(slot).map(|o| o == "std/iter" || o == "std/array").unwrap_or(false)
             {
                 ctx.flat_producer_spec_slots.insert(*slot);
+            }
+            // Tag monomorphized `range` specs (mirrors lower_module's population).
+            if is_range_spec_name(name)
+                && module.spec_origins.get(slot).map(|o| o == "std/iter").unwrap_or(false)
+            {
+                let param_count = match ty {
+                    Type::Function { params, .. } => params.len(),
+                    _ => 0,
+                };
+                match param_count {
+                    2 => { ctx.range2_spec_slots.insert(*slot); }
+                    3 => { ctx.range3_spec_slots.insert(*slot); }
+                    _ => {}
+                }
             }
         }
     }
@@ -657,6 +683,13 @@ pub(crate) struct LowerCtx {
     /// reading such a producer's result uses flat scalar reads, not tagged get + unbox. Populated
     /// in the pre-scan, gated on a trusted std/iter|std/array origin + a flat-producer base name.
     flat_producer_spec_slots: std::collections::HashSet<usize>,
+    /// Slots of monomorphized 2-arg `range$Int32_Int32_…` specs (origin std/iter) that resolve
+    /// via `global_fn_slots`. `range_for_bounds` consults this so a `.for` whose receiver is
+    /// such a spec is recognised and fused to a native i32 counter loop (no array materialization).
+    range2_spec_slots: std::collections::HashSet<usize>,
+    /// Slots of monomorphized 3-arg `range$Int32_Int32_Int32_…` specs (origin std/iter) that
+    /// resolve via `global_fn_slots`. Like `range2_spec_slots` but for the step variant.
+    range3_spec_slots: std::collections::HashSet<usize>,
     /// >0 while lowering an expression that is a SYNCHRONOUS, non-retained callback argument
     /// to a known consuming combinator (for/while/map/filter/reduce). A closure literal
     /// (`MakeClosure`) lowered while this is >0 is PROVABLY consumed-and-discarded by the
@@ -736,6 +769,8 @@ impl LowerCtx {
             safe_combinator_slots: HashMap::new(),
             combinator_spec_slots: HashMap::new(),
             flat_producer_spec_slots: std::collections::HashSet::new(),
+            range2_spec_slots: std::collections::HashSet::new(),
+            range3_spec_slots: std::collections::HashSet::new(),
             safe_callback_depth: 0,
             packed_elem_slots: HashMap::new(),
             import_var_init_prologue: None,
