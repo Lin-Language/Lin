@@ -53,8 +53,6 @@ impl<'ctx> Codegen<'ctx> {
             Type::Stream(_) => self.context.ptr_type(AddressSpace::default()).into(),
             // Promise<T> is a boxed TaggedVal*(TAG_PROMISE) at runtime — an opaque pointer.
             Type::Promise(_) => self.context.ptr_type(AddressSpace::default()).into(),
-            // Frozen<T> has the SAME runtime representation as T — it's purely a type-system marker.
-            Type::Frozen(inner) => self.llvm_type(inner),
             // Opaque handles (e.g. TarEntry) are all boxed TaggedVal* pointers at runtime.
             Type::Opaque(_) => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Never => self.context.i8_type().into(), // unreachable

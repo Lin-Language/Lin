@@ -151,5 +151,5 @@ export val withLock = <T, R>(s: Shared<T>, f: (T) => R): R =>
 // @returns an immutable, lock-free-readable value that any thread can share without copying.
 //   A frozen value is read-only; readers use the plain type.
 // @example val config = frozen({ "retries": 3, "timeout": 5000 })
-export val frozen = <T>(v: T): Frozen<T> =>
+export val frozen = <T>(v: T): T =>
   lin_freeze(v)

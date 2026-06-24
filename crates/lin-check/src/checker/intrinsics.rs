@@ -289,11 +289,9 @@ impl Checker {
                 Type::Shared(Box::new(shared_t())),
                 Type::func(vec![shared_t()], Type::TypeVar(9138)),
             ], Type::TypeVar(9138)));
-        // frozen: <T>(T) => Frozen<T>  (deep immortal seal + 0xFD→0xFE repack). Frozen<T> is a
-        // transparent subtype of T (one-way coercion: Frozen<T> ≤ T in compat.rs) so all existing
-        // callers that use the result as T continue to type-check. The repr oracle stamps
-        // Frozen<Array(sealed)> → inline:true so element reads stride without a runtime 0xFE/0xFD check.
-        self.define_intrinsic("lin_freeze", Type::func(vec![Type::TypeVar(9140)], Type::Frozen(Box::new(Type::TypeVar(9140)))));
+        // frozen: <T>(T) => T  (deep immortal seal; the value keeps its plain type so readers use
+        // it transparently). Frozen<T> read-only coercion / mutation-inference is deferred (ADR-030).
+        self.define_intrinsic("lin_freeze", Type::func(vec![Type::TypeVar(9140)], Type::TypeVar(9140)));
         // worker: ((Msg) => Reply, () => Null) => Worker
         self.define_intrinsic("lin_worker", Type::func(vec![
                 Type::func(vec![Type::TypeVar(9107)], Type::TypeVar(9108)),

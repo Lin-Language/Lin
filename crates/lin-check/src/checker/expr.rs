@@ -809,31 +809,6 @@ impl Checker {
             });
         }
         let obj_ty = typed_obj.ty();
-        // Frozen<T> is transparent: index into the inner type, then re-wrap the result in Frozen
-        // so field reads on the element can also stride (Frozen<Elem>[i]["f"] → stride).
-        if let Type::Frozen(inner) = &obj_ty {
-            // When inner is still a TypeVar (not yet resolved), treat like a bare TypeVar index:
-            // return a fresh TypeVar without Frozen wrapping so the unresolved case is handled
-            // gracefully before zonking. After zonking Frozen<Array(T)> propagates correctly.
-            if matches!(inner.as_ref(), Type::TypeVar(_)) {
-                let result_type = self.env.fresh_type_var();
-                return Ok(TypedExpr::Index {
-                    object: Box::new(typed_obj),
-                    key: Box::new(typed_key),
-                    result_type,
-                    span,
-                });
-            }
-            let inner_ty = (**inner).clone();
-            return self.infer_index_into(typed_obj, typed_key, &inner_ty, span).map(|mut e| {
-                // Re-wrap the result type in Frozen so the frozen annotation propagates.
-                if let TypedExpr::Index { ref mut result_type, .. } = e {
-                    let rt = result_type.clone();
-                    *result_type = Type::Frozen(Box::new(rt));
-                }
-                e
-            });
-        }
         let result_type = match &obj_ty {
             Type::Array(elem) => *elem.clone(),
             Type::FixedArray(elems) => {

@@ -369,14 +369,11 @@ fn type_seed(ty: &Type) -> Repr {
         return Repr::Packed(Layout::NullableRecord { fields: fields.clone() });
     }
     if let Some(elem_fields) = sealed_array_elem(ty) {
-        // Type-seed: inline flag is true when the type is Frozen<Array(...)> — frozen() has
-        // deep-immortalized and repacked the buffer to 0xFE, so all element reads can stride
-        // without a runtime 0xFD/0xFE dispatch. Otherwise default to false (0xFD pointer-backed).
-        // The MakeArray DECIDE site overrides this for locally-allocated arrays.
-        let inline = matches!(ty, Type::Frozen(_));
+        // Type-seed: inline flag unknown statically; default to false (0xFD pointer-backed).
+        // The MakeArray DECIDE site overrides this with the correct inline flag from the instruction.
         return Repr::Packed(Layout::PackedSealedArray {
             elem_layout: elem_fields.clone(),
-            inline,
+            inline: false,
         });
     }
     if let Some(fields) = sealed_fields(ty) {
@@ -568,12 +565,6 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
         // fresh packed struct (boxing.rs:365 -> sealed_project_from). So the discriminator is the
         // RESULT type, not the array repr. A flat element is FlatScalar.
         Instruction::Index { dst, obj_ty, result_ty, .. } => {
-            // Strip Frozen wrapper for repr seeding — Frozen<T> has the same runtime layout as T.
-            let result_ty_inner: &Type = match result_ty {
-                Type::Frozen(inner) => inner.as_ref(),
-                other => other,
-            };
-            let result_ty = result_ty_inner;
             if sum_type_eligible(result_ty) {
                 // UNBOXED SUM TYPE (Stage 3): an `obj[k]` / `arr[i]` whose RESULT is a sum type is
                 // PROJECTED back into a fresh `*SumNode` by codegen — both the array arm
@@ -622,12 +613,6 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
         // loads that pointer and the result is itself a Packed struct (e.g. `line["a"]` : Pt). Seed both
         // so a chained `line["a"]["x"]` reads t10 (the inner Pt) as Packed at the second FieldGet.
         Instruction::FieldGet { dst, result_ty, .. } => {
-            // Strip Frozen wrapper for repr seeding — Frozen<T> has the same runtime layout as T.
-            let result_ty_inner: &Type = match result_ty {
-                Type::Frozen(inner) => inner.as_ref(),
-                other => other,
-            };
-            let result_ty = result_ty_inner;
             if let Some(s) = ScalarTy::from_type(result_ty) {
                 set(seeds, *dst, Repr::FlatScalar(s));
             } else if sum_type_eligible(result_ty) {
@@ -659,12 +644,6 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
             }
         }
         Instruction::SealedArrayFieldGet { dst, result_ty, .. } => {
-            // Strip Frozen wrapper for repr seeding — Frozen<T> has the same runtime layout as T.
-            let result_ty_inner: &Type = match result_ty {
-                Type::Frozen(inner) => inner.as_ref(),
-                other => other,
-            };
-            let result_ty = result_ty_inner;
             if let Some(s) = ScalarTy::from_type(result_ty) {
                 set(seeds, *dst, Repr::FlatScalar(s));
             } else if let Some(elem_fields) = sealed_array_elem(result_ty) {
@@ -927,21 +906,14 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                 // check both directions for each (packed-array and packed-struct).
                 Instruction::Index { object, obj_ty, .. } => {
                     let r = &repr[object.0 as usize];
-                    // Strip Frozen for oracle checks — Frozen is transparent at the IR level; the
-                    // repr of a Frozen<Array(sealed)> is identical to Array(sealed).
-                    let bare_obj_ty = obj_ty.strip_frozen();
-                    match sealed_array_elem(&bare_obj_ty) {
+                    match sealed_array_elem(obj_ty) {
                         Some(ef) => {
                             if !is_packed_sealed_array(r, ef) {
                                 report(&mut bad, "Index(object packed array)", *object, "Packed(sealed array)", r);
                             }
                         }
                         None => {
-                            // A TypeVar obj_ty (unresolved inference var) is unknown — trust the repr
-                            // rather than firing a false alarm.
-                            if r.packed_sealed_array_layout().is_some()
-                                && !matches!(bare_obj_ty, Type::TypeVar(_))
-                            {
+                            if r.packed_sealed_array_layout().is_some() {
                                 report(&mut bad, "Index(object NOT predicate-packed-array)", *object, "non-Packed-array", r);
                             }
                         }
@@ -949,16 +921,14 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                     // The sealed-record (dynamic non-literal key) gate: codegen reads
                     // `obj_repr.packed_struct_fields()`. Verify repr Packed-struct iff the type is a
                     // sealed record. (A sealed-record obj reaching Index is the `p[k]` runtime-key case.)
-                    match sealed_fields(&bare_obj_ty) {
+                    match sealed_fields(obj_ty) {
                         Some(f) => {
                             if !is_packed_struct(r, f) {
                                 report(&mut bad, "Index(object packed struct)", *object, "Packed(struct)", r);
                             }
                         }
                         None => {
-                            if r.packed_struct_fields().is_some()
-                                && !matches!(bare_obj_ty, Type::TypeVar(_))
-                            {
+                            if r.packed_struct_fields().is_some() {
                                 report(&mut bad, "Index(object NOT predicate-packed-struct)", *object, "non-Packed-struct", r);
                             }
                         }

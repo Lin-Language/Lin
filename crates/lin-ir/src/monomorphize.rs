@@ -194,7 +194,6 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
         Type::Shared(t) => Type::Shared(Box::new(subst_type(t, subs))),
         Type::Stream(t) => Type::Stream(Box::new(subst_type(t, subs))),
         Type::Promise(t) => Type::Promise(Box::new(subst_type(t, subs))),
-        Type::Frozen(t) => Type::Frozen(Box::new(subst_type(t, subs))),
         Type::Map { key, value, .. } => Type::Map { key: Box::new(subst_type(key, subs)), value: Box::new(subst_type(value, subs)), name: None },
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| subst_type(t, subs)).collect()),
         Type::Union(ts) => {
@@ -596,7 +595,6 @@ fn subst_anon_type(ty: &Type, anon_subs: &HashMap<String, Type>) -> Type {
         Type::Shared(t) => Type::Shared(Box::new(subst_anon_type(t, anon_subs))),
         Type::Stream(t) => Type::Stream(Box::new(subst_anon_type(t, anon_subs))),
         Type::Promise(t) => Type::Promise(Box::new(subst_anon_type(t, anon_subs))),
-        Type::Frozen(t) => Type::Frozen(Box::new(subst_anon_type(t, anon_subs))),
         Type::Map { key, value, .. } => Type::Map { key: Box::new(subst_anon_type(key, anon_subs)), value: Box::new(subst_anon_type(value, anon_subs)), name: None },
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| subst_anon_type(t, anon_subs)).collect()),
         Type::Union(ts) => Type::Union(ts.iter().map(|t| subst_anon_type(t, anon_subs)).collect()),

@@ -101,8 +101,8 @@ impl Checker {
             _ => {}
         }
 
-        let left_ty = typed_left.ty().strip_frozen();
-        let right_ty = typed_right.ty().strip_frozen();
+        let left_ty = typed_left.ty();
+        let right_ty = typed_right.ty();
 
         // A `Number`-bounded generic TypeVar operand (ADR-014, reversed) drives an arithmetic op's
         // result type so it FLOWS THROUGH monomorphization: `x % 2` where `x: <T:numeric>` must yield
