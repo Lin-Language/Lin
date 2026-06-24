@@ -308,7 +308,10 @@ impl<'ctx> Codegen<'ctx> {
             }
             Type::Object { .. } if Self::sealed_scalar_fields(target_ty).is_some() => {
                 let fields = Self::sealed_scalar_fields(target_ty).unwrap().clone();
-                self.sealed_project_from(ptr, &Type::TypeVar(u32::MAX), &fields)
+                // Source was boxed FROM the same sealed type (TAG_RECORD roundtrip through the
+                // stdlib combinator boxed ABI), so source layout == target layout — pass as hint
+                // so the TAG_RECORD arm uses const-offset GEP instead of descriptor walk.
+                self.sealed_project_from_hint(ptr, &Type::TypeVar(u32::MAX), &fields, Some(&fields))
             }
             Type::Object { .. } | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } | Type::Map { .. } => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "uptr")
@@ -565,9 +568,10 @@ impl<'ctx> Codegen<'ctx> {
             // handled correctly (it unboxes a union box to the raw LinMap internally).
             Type::Object { .. } if Self::sealed_scalar_fields(ty).is_some() => {
                 let fields = Self::sealed_scalar_fields(ty).unwrap().clone();
-                // The incoming `tagged` is a boxed value (Json). Use the union-typed projection
-                // path: sealed_project_from unboxes a union source to the raw LinMap itself.
-                self.sealed_project_from(tagged, &Type::TypeVar(u32::MAX), &fields)
+                // Source was boxed FROM the same sealed type (TAG_RECORD roundtrip through the
+                // stdlib combinator boxed ABI), so source layout == target layout — pass as hint
+                // so the TAG_RECORD arm uses const-offset GEP instead of descriptor walk.
+                self.sealed_project_from_hint(tagged, &Type::TypeVar(u32::MAX), &fields, Some(&fields))
             }
             // Typed index-signature map (`{ String: T }`, ADR-055): a `m[k]` whose value type is
             // itself a Map is boxed as TAG_MAP. Unbox the payload back to the raw `LinMap*` so a
