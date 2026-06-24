@@ -1,0 +1,66 @@
+// revcomp.lin — byte-buffer throughput (Computer Language Benchmarks Game
+// "reverse-complement", in checksum form). A deterministic Park-Miller MINSTD
+// generator fills an N-base ACGT buffer; the buffer is reverse-complemented
+// (A<->T, C<->G, read back-to-front) into a second buffer; then a rolling checksum
+// is folded over the result. This is large contiguous-buffer allocate + write-pass
+// + read-pass — a memory-bandwidth / flat-array workload distinct from the small-
+// object churn of `binarytrees`. Prints exactly one stdout line "RESULT=<int>".
+//
+// RESULT = fold h = (h*31 + code) mod 1000000007 over the reverse-complement, in
+// order (h < 1e9 so h*31 stays < 2^53 — bit-identical across all languages).
+// Parameters (identical across all languages): N=20000000.
+import { print } from "std/io"
+import { toString } from "std/string"
+import { set, arrayAllocateFilled } from "std/array"
+import { while } from "std/iter"
+import { toInt32 } from "std/number"
+
+val N = 20000000
+
+// ACGT code points, indexed by (state % 4).
+val codeOf = [65, 67, 71, 84]
+
+// complement lookup indexed by ASCII code: A(65)<->T(84), C(67)<->G(71).
+val comp: Int32[] = arrayAllocateFilled(128, 0)
+set(comp, 65, 84)
+set(comp, 84, 65)
+set(comp, 67, 71)
+set(comp, 71, 67)
+
+// Fill the source buffer with generated bases. Tail-recursive (TCO -> loop).
+val gen = (i: Int32, state: Int64, arr: Int32[]): Null =>
+  if i >= N then
+    null
+  else
+    val ns = (state * 16807i64) % 2147483647i64
+    set(arr, i, codeOf[toInt32(ns % 4i64)])
+    gen(i + 1, ns, arr)
+
+val seq: Int32[] = arrayAllocateFilled(N, 0)
+val ignore = gen(0, 42i64, seq)
+
+// Write pass: out[i] = complement(seq[N-1-i]).
+val out: Int32[] = arrayAllocateFilled(N, 0)
+var i = 0
+while(() =>
+  if i >= N then
+    false
+  else
+    set(out, i, comp[seq[N - 1 - i]])
+    i = i + 1
+    true
+)
+
+// Read pass: rolling checksum over the reverse-complement.
+var h = 0i64
+var j = 0
+while(() =>
+  if j >= N then
+    false
+  else
+    h = (h * 31i64 + out[j]) % 1000000007i64
+    j = j + 1
+    true
+)
+
+print("RESULT=${toString(h)}")
