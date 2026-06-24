@@ -58,14 +58,21 @@ pub fn lower_module_with_imports(
     // uses a generic function (its own or an imported one); ordinary modules skip it entirely and
     // lower byte-for-byte as before.
     let mut diagnostics = Vec::new();
-    let owned: Option<TypedModule> = if crate::monomorphize::module_uses_generic(module, imports) {
+    // Build a mutable owned copy: either the monomorphized version (if the module uses generics)
+    // or a fresh clone (for the sinking pass below). We always need a mutable copy.
+    let mut owned: TypedModule = if crate::monomorphize::module_uses_generic(module, imports) {
         let mut m = module.clone();
         diagnostics = crate::monomorphize::monomorphize_with_imports(&mut m, imports);
-        Some(m)
+        m
     } else {
-        None
+        module.clone()
     };
-    let module: &TypedModule = owned.as_ref().unwrap_or(module);
+    // Val-sinking pass (R3-C): move pure `val` bindings that are only used in one branch of an
+    // immediately-following `if` into that branch, so they are not computed on the other path.
+    // Runs after monomorphization (slot numbering is stable) and before lowering, so the lowerer
+    // emits allocation+RC only when the branch is taken.
+    crate::sink_pure_val::run(&mut owned);
+    let module: &TypedModule = &owned;
 
     let mut ctx = LowerCtx::new();
     ctx.intrinsics = module.intrinsics.clone();
@@ -298,14 +305,17 @@ pub fn lower_import_module_with_imports(
     // from the checker but lowers to the boxed generic symbol — a representation mismatch that
     // crashes codegen. Generic originals are all KEPT (external importers may issue a boxed `Named`
     // call to them). No-op for a module that neither defines nor uses a generic (byte-identical).
-    let owned: Option<TypedModule> = if crate::monomorphize::module_uses_generic(module, imports) {
+    let mut owned: TypedModule = if crate::monomorphize::module_uses_generic(module, imports) {
         let mut m = module.clone();
         let _ = crate::monomorphize::monomorphize_import_with_imports(&mut m, imports);
-        Some(m)
+        m
     } else {
-        None
+        module.clone()
     };
-    let module: &TypedModule = owned.as_ref().unwrap_or(module);
+    // Val-sinking pass: same pass applied to imported modules so the optimization fires in
+    // imported module bodies (e.g. raptor-algorithm-factory's sortedTrips.for callback).
+    crate::sink_pure_val::run(&mut owned);
+    let module: &TypedModule = &owned;
 
     let mut ctx = LowerCtx::new();
     ctx.intrinsics = module.intrinsics.clone();
