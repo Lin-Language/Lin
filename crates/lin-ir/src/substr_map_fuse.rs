@@ -76,16 +76,29 @@ fn run_fn(func: &mut LinFunction) {
             };
             match instr {
                 // Acceptable uses: key operand of Index/IndexSet on a String-keyed map.
-                Instruction::Index { key, obj_ty, .. } => {
+                Instruction::Index { object, key, obj_ty, .. } => {
                     if disq_if_slice(*key) && !is_string_map(obj_ty) {
                         disqualified.insert(*key);
                     }
-                    // Non-key operands of Index: object could hold a slice temp too (e.g. nested)
-                    // but we only care about the slice temps as keys here — object is fine.
+                    // A slice temp used as the OBJECT (not key) needs a materialized LinString;
+                    // disqualify it (else codegen skips its materialization and the object reads
+                    // undefined).
+                    if disq_if_slice(*object) {
+                        disqualified.insert(*object);
+                    }
                 }
-                Instruction::IndexSet { key, obj_ty, .. } => {
+                Instruction::IndexSet { object, key, value, obj_ty, .. } => {
                     if disq_if_slice(*key) && !is_string_map(obj_ty) {
                         disqualified.insert(*key);
+                    }
+                    // A slice temp used as the OBJECT, or STORED as the VALUE, is a non-key use
+                    // that must be materialized. (The original soundness hole: `m[k] = substring(...)`
+                    // mis-fused the stored value, dropping its allocation → corrupted/empty value.)
+                    if disq_if_slice(*object) {
+                        disqualified.insert(*object);
+                    }
+                    if disq_if_slice(*value) {
+                        disqualified.insert(*value);
                     }
                 }
                 // Acceptable: Retain/Release are both skipped in codegen for fused temps
