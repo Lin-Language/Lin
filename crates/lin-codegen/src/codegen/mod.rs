@@ -1639,6 +1639,58 @@ impl<'ctx> Codegen<'ctx> {
                                         self.builder.call(f, &arg_vals, "call_n").try_as_basic_value().unwrap_basic()
                                     }
                                 }
+                                CallTarget::Named(name)
+                                    if arg_vals.len() == 1
+                                        && matches!(
+                                            name.as_str(),
+                                            "lin_math_sqrt"
+                                                | "lin_math_abs_f64"
+                                                | "lin_math_floor"
+                                                | "lin_math_ceil"
+                                        ) =>
+                                {
+                                    // Lower these pure f64→f64 math calls to LLVM intrinsics.
+                                    // llvm.sqrt / llvm.fabs / llvm.floor / llvm.ceil are all
+                                    // IEEE-exact (same result as libm on every conforming target),
+                                    // so the numeric digest of any benchmark that uses them is
+                                    // preserved. The intrinsic form is a single hardware instruction
+                                    // (sqrtsd / andpd / roundsd) with no call overhead, and because
+                                    // LLVM knows it is pure it can hoist/vectorise/inline it freely.
+                                    // If the argument is not already an f64 value fall through to
+                                    // the opaque named call (partial-application / boxed path).
+                                    let llvm_name = match name.as_str() {
+                                        "lin_math_sqrt" => "llvm.sqrt.f64",
+                                        "lin_math_abs_f64" => "llvm.fabs.f64",
+                                        "lin_math_floor" => "llvm.floor.f64",
+                                        "lin_math_ceil" => "llvm.ceil.f64",
+                                        _ => unreachable!(),
+                                    };
+                                    let arg = arg_vals[0];
+                                    if arg.is_float_value() {
+                                        let f64_ty = self.context.f64_type();
+                                        let intr = inkwell::intrinsics::Intrinsic::find(llvm_name)
+                                            .expect("llvm math intrinsic must exist");
+                                        let decl = intr
+                                            .get_declaration(&self.module, &[f64_ty.into()])
+                                            .expect("overloaded llvm math intrinsic declaration");
+                                        self.builder
+                                            .call(decl, &[arg.into()], "math_intr")
+                                            .try_as_basic_value()
+                                            .unwrap_basic()
+                                    } else {
+                                        // Boxed / indirect path — fall back to the opaque call.
+                                        let callee_fn = self.get_or_declare_fn(
+                                            name,
+                                            self.context
+                                                .f64_type()
+                                                .fn_type(&[self.context.f64_type().into()], false),
+                                        );
+                                        self.builder
+                                            .call(callee_fn, &arg_vals, "call_n")
+                                            .try_as_basic_value()
+                                            .unwrap_basic()
+                                    }
+                                }
                                 CallTarget::Named(name) => {
                                     // Resolve the callee; if it's an undeclared runtime symbol
                                     // (e.g. lin_array_slice_tagged), declare it from the actual
