@@ -686,6 +686,36 @@ impl<'ctx> Codegen<'ctx> {
         self.sealed_construct(target_fields, &vals)
     }
 
+    /// Convert a raw i64 (from `lin_record_read_i64`) to the correct LLVM value for a sealed
+    /// record field slot of type `fty`. Mirrors `flat_union_extract_scalar` but takes IntValue
+    /// directly rather than extracting from a flat-union struct.
+    fn i64_to_sealed_field_llvm(
+        &mut self,
+        raw: inkwell::values::IntValue<'ctx>,
+        fty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        use inkwell::IntPredicate;
+        let _ = IntPredicate::EQ;
+        match fty {
+            Type::Bool => self.builder.int_truncate_or_bit_cast(raw, self.context.bool_type(), "rri_bool").into(),
+            Type::Int8  => self.builder.int_truncate_or_bit_cast(raw, self.context.i8_type(),   "rri_i8").into(),
+            Type::Int16 => self.builder.int_truncate_or_bit_cast(raw, self.context.i16_type(),  "rri_i16").into(),
+            Type::Int32 | Type::IntLit(_) =>
+                self.builder.int_truncate_or_bit_cast(raw, self.context.i32_type(), "rri_i32").into(),
+            Type::UInt8  => self.builder.int_truncate_or_bit_cast(raw, self.context.i8_type(),   "rri_u8").into(),
+            Type::UInt16 => self.builder.int_truncate_or_bit_cast(raw, self.context.i16_type(),  "rri_u16").into(),
+            Type::UInt32 => self.builder.int_truncate_or_bit_cast(raw, self.context.i32_type(),  "rri_u32").into(),
+            Type::Int64 | Type::UInt64 => raw.into(),
+            Type::Float32 => {
+                let f64_ty = self.context.f64_type();
+                let f64v = self.builder.bit_cast(raw, f64_ty, "rri_bitf64").into_float_value();
+                self.builder.float_trunc(f64v, self.context.f32_type(), "rri_f32").into()
+            }
+            Type::Float64 => self.builder.bit_cast(raw, self.context.f64_type(), "rri_f64").into(),
+            _ => raw.into(),
+        }
+    }
+
     pub(crate) fn sealed_project_from(
         &mut self,
         src: BasicValueEnum<'ctx>,
@@ -727,15 +757,15 @@ impl<'ctx> Codegen<'ctx> {
             let merge_bb = self.context.append_basic_block(llvm_fn, "sproj_merge");
             self.builder.conditional_branch(is_record, rec_bb, map_bb);
 
-            // TAG_RECORD arm: read fields directly from the packed sealed struct via
-            // lin_record_get_field (const-offset, no map allocation).
-            // RC contract per field (lin_record_get_field returns an OWNED +1 TaggedVal*):
-            //   sealed_array field: sealed_array_project_owned unboxes+retains the array ptr (+2
-            //     total), then we release the box (−1) → net +1 owned; pass already_owned=true.
-            //   heap ptr field (Str/Object/Map/…): unbox raw ptr (borrowed from box), retain inline
-            //     (+2 total), release box (−1) → net +1 owned; pass already_owned=true.
-            //   scalar field: unbox scalar (no heap), release box (no inner rc change); pass
-            //     already_owned=false (sealed_construct does nothing for scalars anyway).
+            // TAG_RECORD arm: read fields directly from the packed sealed struct.
+            // RC contract for the new unboxed helpers:
+            //   sealed_array field: use record_get_field (keeps existing box→project→release path).
+            //   SumNode field: use record_get_field (complex materialise path).
+            //   scalar field (Int*/UInt*/Float*/Bool): use lin_record_read_i64 — no heap alloc.
+            //     Returns raw i64 bits (sign/zero-ext integers; bit-pattern floats; 0/1 for bool).
+            //     already_owned=false (scalar, sealed_construct ignores it).
+            //   heap ptr field (Str/Array/Map/Sealed): use lin_record_read_ptr_retain — no TaggedVal
+            //     box. Returns raw owned (+1) pointer. already_owned=true.
             self.builder.position_at_end(rec_bb);
             let sealed_ptr = self.builder.call(self.rt.unbox_ptr, &[src.into()], "sproj_rec_sptr")
                 .try_as_basic_value().unwrap_basic();
@@ -744,31 +774,54 @@ impl<'ctx> Codegen<'ctx> {
             for (k, fty0) in target_fields.iter() {
                 let fty = fty0.clone();
                 let key_str = self.compile_string_lit(k).into_pointer_value();
-                let rec_box = self.builder.call(
-                    self.rt.record_get_field,
-                    &[sealed_ptr.into(), key_str.into()],
-                    "sproj_rgf",
-                ).try_as_basic_value().unwrap_basic();
                 if Self::sealed_array_elem(&fty).is_some() {
-                    // owned box → sealed_array_project_owned unboxes+retains; then release box.
+                    // Sealed-array: keep existing record_get_field + project path.
+                    let rec_box = self.builder.call(
+                        self.rt.record_get_field,
+                        &[sealed_ptr.into(), key_str.into()],
+                        "sproj_rgf",
+                    ).try_as_basic_value().unwrap_basic();
                     let packed = self.sealed_array_project_owned(rec_box, &Type::TypeVar(u32::MAX), &fty);
                     self.builder.call(self.rt.tagged_release, &[rec_box.into()], "");
                     rec_vals.push((k.clone(), packed, fty, true));
-                } else if fty.is_pure_int_lit_union() && rec_box.is_pointer_value() {
-                    // Pure IntLit-union: lin_record_get_field returned a fresh +1 TAG_INT32 box;
-                    // unbox to i32 for direct storage in the sealed slot, then release the box.
-                    let i32_val = self.builder.call(self.rt.unbox_int32, &[rec_box.into()], "ilu_rec_i32")
-                        .try_as_basic_value().unwrap_basic();
-                    self.builder.call(self.rt.tagged_release, &[rec_box.into()], "");
-                    rec_vals.push((k.clone(), i32_val, fty, false));
-                } else {
+                } else if Self::sealed_field_kind(&fty) == Some(Self::KIND_SUMNODE_FIELD) {
+                    // SumNode: materialise via record_get_field (rare; complex runtime path).
+                    let rec_box = self.builder.call(
+                        self.rt.record_get_field,
+                        &[sealed_ptr.into(), key_str.into()],
+                        "sproj_rgf",
+                    ).try_as_basic_value().unwrap_basic();
                     let v = self.unbox_tagged_val_to_type(rec_box, &fty);
-                    if Self::result_is_heap_pointer(&fty) && v.is_pointer_value() {
-                        self.emit_rc_retain_inline(v.into_pointer_value());
-                    }
                     self.builder.call(self.rt.tagged_release, &[rec_box.into()], "");
-                    let owned = Self::result_is_heap_pointer(&fty);
-                    rec_vals.push((k.clone(), v, fty, owned));
+                    rec_vals.push((k.clone(), v, fty, false));
+                } else if fty.is_pure_int_lit_union() {
+                    // Pure IntLit-union: lin_record_read_i64 returns the raw i32 value as i64;
+                    // truncate to i32 for the sealed slot.
+                    let raw_i64 = self.builder.call(
+                        self.rt.record_read_i64,
+                        &[sealed_ptr.into(), key_str.into()],
+                        "sproj_ri64",
+                    ).try_as_basic_value().unwrap_basic().into_int_value();
+                    let i32_val = self.builder.int_truncate_or_bit_cast(raw_i64, self.context.i32_type(), "sproj_ilu_i32").into();
+                    rec_vals.push((k.clone(), i32_val, fty, false));
+                } else if Self::sealed_field_kind(&fty).is_none() {
+                    // Scalar field (Int*/UInt*/Float*/Bool): use lin_record_read_i64 — no alloc.
+                    let raw_i64 = self.builder.call(
+                        self.rt.record_read_i64,
+                        &[sealed_ptr.into(), key_str.into()],
+                        "sproj_ri64",
+                    ).try_as_basic_value().unwrap_basic().into_int_value();
+                    let v = self.i64_to_sealed_field_llvm(raw_i64, &fty);
+                    rec_vals.push((k.clone(), v, fty, false));
+                } else {
+                    // Heap pointer field (Str/Array/Map/Sealed): use lin_record_read_ptr_retain.
+                    // Returns an owned (+1) raw pointer — no TaggedVal box allocated.
+                    let raw_ptr = self.builder.call(
+                        self.rt.record_read_ptr_retain,
+                        &[sealed_ptr.into(), key_str.into()],
+                        "sproj_rptr",
+                    ).try_as_basic_value().unwrap_basic();
+                    rec_vals.push((k.clone(), raw_ptr, fty, true));
                 }
             }
             let rec_result = self.sealed_construct(target_fields, &rec_vals);
