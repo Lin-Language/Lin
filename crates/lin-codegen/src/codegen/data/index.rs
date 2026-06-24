@@ -34,7 +34,7 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    pub(crate) fn compile_ir_index(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, result_ty: &Type, obj_repr: &lin_ir::repr::Repr, nonneg: bool) -> BasicValueEnum<'ctx> {
+    pub(crate) fn compile_ir_index(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, result_ty: &Type, obj_repr: &lin_ir::repr::Repr, nonneg: bool, proven_inbounds: bool) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         if !obj.is_pointer_value() {
             return ptr_ty.const_null().into();
@@ -355,7 +355,7 @@ impl<'ctx> Codegen<'ctx> {
             // slot is a TaggedVal*, not raw bytes. Skip the flat shortcut and take the tagged
             // read + unbox path below; reading it as flat would return garbage.
             if Self::is_flat_scalar(result_ty) && !matches!(obj_ty, Type::FixedArray(_)) {
-                return self.flat_array_get(container, idx, result_ty, nonneg);
+                return self.flat_array_get(container, idx, result_ty, nonneg, proven_inbounds);
             }
             // UNBOXED SUM TYPE: a `Shape[]` element was stored MATERIALIZED (a boxed LinObject). Read
             // it back and PROJECT into a fresh SumNode so the consumer sees the packed repr the type
@@ -1408,7 +1408,7 @@ impl<'ctx> Codegen<'ctx> {
             // those Index branches correctly skip.
             if Self::is_union_type(obj_ty) {
                 let key_str = self.compile_string_lit(field);
-                return self.compile_ir_index(obj, key_str, obj_ty, &Type::Str, result_ty, obj_repr, false);
+                return self.compile_ir_index(obj, key_str, obj_ty, &Type::Str, result_ty, obj_repr, false, false);
             }
             let key_str = self.compile_string_lit(field).into_pointer_value();
             // Stage 6b Phase 2: concrete (non-union) open-object container is a LinMap*; use map_get.

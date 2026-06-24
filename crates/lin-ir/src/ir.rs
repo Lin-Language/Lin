@@ -451,7 +451,11 @@ pub enum Instruction {
     /// `nonneg`: the key is provably >= 0 (e.g. a fused range-for IV starting at 0),
     /// so the flat-array read path can skip the negative-wrap select and emit the
     /// canonical `0 <= i < len` shape that LLVM IRCE recognises.
-    Index { dst: Temp, object: Temp, key: Temp, obj_ty: Type, key_ty: Type, result_ty: Type, nonneg: bool },
+    /// `proven_inbounds`: the bounds-elide pass has proved BOTH `key >= 0` AND
+    /// `key < len` for this specific array.  When true, codegen skips the OOB
+    /// dispatch entirely.  Set ONLY when the analysis is certain; `false` keeps the
+    /// normal checked path (always safe to be conservative).
+    Index { dst: Temp, object: Temp, key: Temp, obj_ty: Type, key_ty: Type, result_ty: Type, nonneg: bool, proven_inbounds: bool },
     /// object[key] = value  — in-place array/object element assignment (no result).
     IndexSet { object: Temp, key: Temp, value: Temp, obj_ty: Type, key_ty: Type, val_ty: Type },
     /// result = object.field  — known-shape field access
