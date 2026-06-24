@@ -241,6 +241,14 @@ fn join(a: &Repr, b: &Repr) -> Repr {
         // MUST come before the generic (Packed, Packed) arm (which would otherwise demote to Boxed).
         (Packed(Layout::NullableRecord { fields: f1 }), Packed(Layout::PackedStruct { fields: f2 })) if f1 == f2 => a.clone(),
         (Packed(Layout::PackedStruct { fields: f1 }), Packed(Layout::NullableRecord { fields: f2 })) if f1 == f2 => b.clone(),
+        // Named-alias NullableRecord (empty fields, from `Named("T")|Null`) joined with any
+        // NullableRecord or PackedStruct: the empty form is a subsumed representation of the same
+        // physical pointer. Use the more specific form when known, else keep the empty NullableRecord.
+        (Packed(Layout::NullableRecord { fields: f1 }), Packed(Layout::NullableRecord { fields: f2 })) if f1.is_empty() => b.clone(),
+        (Packed(Layout::NullableRecord { fields: f1 }), Packed(Layout::NullableRecord { .. })) if f1.is_empty() => b.clone(),
+        (Packed(Layout::NullableRecord { .. }), Packed(Layout::NullableRecord { fields: f2 })) if f2.is_empty() => a.clone(),
+        (Packed(Layout::NullableRecord { fields: f1 }), Packed(Layout::PackedStruct { .. })) if f1.is_empty() => a.clone(),
+        (Packed(Layout::PackedStruct { .. }), Packed(Layout::NullableRecord { fields: f2 })) if f2.is_empty() => b.clone(),
         (Packed(l1), Packed(l2)) => {
             if l1 == l2 {
                 Packed(l1.clone())
@@ -335,6 +343,25 @@ pub fn nullable_sealed_record(ty: &Type) -> Option<&IndexMap<String, Type>> {
     Type::nullable_sealed_record(ty)
 }
 
+/// True when `ty` is a self-recursive named-alias nullable union: `Union([Named(n), Null])`.
+/// This form appears in recursive type fields (`type Tree = { l: Tree|Null }`): the inner Tree
+/// resolves to `Named("Tree")` as a cycle-breaking opaque ref, not a full `Object{sealed:true}`.
+/// By construction, Named("T")|Null in a sealed record field IS a nullable sealed pointer; we
+/// accept it eagerly here (mirrors `is_nullable_record_param` in `lower/rc.rs`).
+pub(crate) fn is_named_nullable_union(ty: &Type) -> bool {
+    let Type::Union(members) = ty else { return false };
+    if Type::sum_type_eligible(ty) { return false; }
+    let mut has_named = false;
+    for m in members {
+        match m {
+            Type::Null => {}
+            Type::Named(_) => { has_named = true; }
+            _ => return false,
+        }
+    }
+    has_named
+}
+
 /// THE sealed-record-ARRAY gate. Delegates to `Type::sealed_array_elem`.
 fn sealed_array_elem(ty: &Type) -> Option<&IndexMap<String, Type>> {
     Type::sealed_array_elem(ty)
@@ -367,6 +394,14 @@ fn type_seed(ty: &Type) -> Repr {
     // Stage 3: a `T | Null` union where T is a sealed record → nullable pointer repr.
     if let Some(fields) = nullable_sealed_record(ty) {
         return Repr::Packed(Layout::NullableRecord { fields: fields.clone() });
+    }
+    // Stage 3 (Named-alias form): `Union([Named("T"), Null])` — a self-recursive named-alias where
+    // `Named("T")` is the cycle-breaking opaque ref. By construction this IS a nullable sealed
+    // pointer (the outer sealed Object seals only when all fields pass `is_sealed_heap_field`, which
+    // accepts Named-alias nullables). Use empty fields since the physical value is a raw *sealed_T
+    // pointer; callers that need the actual fields (field access) must handle Named separately.
+    if is_named_nullable_union(ty) {
+        return Repr::Packed(Layout::NullableRecord { fields: IndexMap::new() });
     }
     if let Some(elem_fields) = sealed_array_elem(ty) {
         // Type-seed: inline flag unknown statically; default to false (0xFD pointer-backed).
@@ -485,9 +520,12 @@ pub fn analyze(func: &LinFunction) -> Vec<Repr> {
                     let param_seed = type_seed(param_ty);
                     let repr_compat = match (&arg_seed, &param_seed) {
                         (Repr::Packed(Layout::PackedStruct { fields: f1 }),
-                         Repr::Packed(Layout::NullableRecord { fields: f2 })) => f1 == f2,
+                         Repr::Packed(Layout::NullableRecord { fields: f2 })) => f1 == f2 || f2.is_empty(),
                         (Repr::Packed(Layout::NullableRecord { fields: f1 }),
-                         Repr::Packed(Layout::PackedStruct { fields: f2 })) => f1 == f2,
+                         Repr::Packed(Layout::PackedStruct { fields: f2 })) => f1 == f2 || f1.is_empty(),
+                        // Two NullableRecord reprs: compatible if either has empty fields (Named alias).
+                        (Repr::Packed(Layout::NullableRecord { fields: f1 }),
+                         Repr::Packed(Layout::NullableRecord { fields: f2 })) => f1 == f2 || f1.is_empty() || f2.is_empty(),
                         _ => false,
                     };
                     if !repr_compat {
@@ -627,6 +665,10 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
                 // correctly classifies `rec["addr"]` as Packed(NullableRecord) at the inner FieldGet,
                 // satisfying the repr oracle's NullableRecord exemption for the object operand.
                 set(seeds, *dst, Repr::Packed(Layout::NullableRecord { fields: nrfields.clone() }));
+            } else if is_named_nullable_union(result_ty) {
+                // Named-alias nullable (self-recursive): `Named("Tree") | Null`. Physically a raw
+                // nullable `*sealed_T` pointer. Use empty fields (same as type_seed for this form).
+                set(seeds, *dst, Repr::Packed(Layout::NullableRecord { fields: IndexMap::new() }));
             } else if let Some(elem_fields) = sealed_array_elem(result_ty) {
                 // A nested sealed-record-ARRAY field (KIND_ARRAY) is stored as an 8-byte owned pointer
                 // to a packed `0xFE` element buffer; `sealed_field_get` loads that pointer and the

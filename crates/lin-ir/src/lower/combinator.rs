@@ -844,6 +844,39 @@ pub(crate) fn type_repr_differs(from: &Type, to: &Type) -> bool {
         // Both NullableRecord: same repr, no coerce (equal types short-circuit before we get here).
         return false;
     }
+    // Named-alias NullableRecord boundary: `Union([Named("T"), Null])` where `Named("T")` is the
+    // cycle-breaking opaque ref for a self-recursive sealed record type. Physically this IS a raw
+    // nullable sealed-struct pointer — same physical representation as the resolved NullableRecord
+    // and as the sealed struct itself. `is_union_ty` returns true for any `Union`, so without this
+    // guard the union arm below would fire for `Tree → Union([Named("Tree"),Null])` and wrap the
+    // sealed struct in a boxed map — a UAF/segfault on field access or RC.
+    //   sealed(T) → Named-alias-nullable : identity (same ptr)
+    //   Null       → Named-alias-nullable : identity (null ptr)
+    //   Named-alias-nullable → Named-alias-nullable : identity
+    //   Named-alias-nullable → sealed(T) : identity
+    //   Named-alias-nullable → Null      : identity
+    //   Named-alias-nullable → union/Json/boxed : needs coerce (box with null-guard)
+    //   boxed/union → Named-alias-nullable       : needs coerce (project/materialize)
+    if crate::repr::is_named_nullable_union(from) || crate::repr::is_named_nullable_union(to) {
+        let from_nan = crate::repr::is_named_nullable_union(from);
+        let to_nan = crate::repr::is_named_nullable_union(to);
+        if from_nan && !to_nan {
+            // Named-alias-nullable → sealed T or Null: identity.
+            if is_sealed_scalar_repr(to) || matches!(to, Type::Null) { return false; }
+            if is_nullable_sealed_record(to) { return false; }
+            // → union/boxed: coerce.
+            return true;
+        }
+        if !from_nan && to_nan {
+            // sealed T → Named-alias-nullable: identity.
+            if is_sealed_scalar_repr(from) || matches!(from, Type::Null) { return false; }
+            if is_nullable_sealed_record(from) { return false; }
+            // boxed/union → Named-alias-nullable: coerce.
+            return true;
+        }
+        // Both Named-alias-nullable: same repr.
+        return false;
+    }
     // The union/Json box boundary.
     if is_union_ty(from) != is_union_ty(to) {
         return true;

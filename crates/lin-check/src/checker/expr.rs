@@ -2595,8 +2595,22 @@ impl Checker {
                     // check above already enforced that), and codegen's `sealed_construct` emits a
                     // `compile_ir_coerce(val, from=variant_obj, to=Expr)` → `sumnode_project_from_boxed`
                     // to project the variant into the correct *SumNode layout.
+                    // Also use the expected field type when building a sealed literal (`sealed=true`)
+                    // and the expected field type is a sealed heap pointer (e.g. `Tree|Null` or a
+                    // nested sealed record): the inferred value type may be narrower (e.g. `Null`
+                    // for a null literal, or an unsealed object for a record literal) but the field
+                    // slot IS a heap pointer and must be recorded as such so `all_fields_sealed`
+                    // below can confirm the parent record is sealable. Without this, a `Null` literal
+                    // for a `Tree|Null` field produces `field_ty = Null` → `all_fields_sealed = false`
+                    // → the parent record is not sealed, triggering an unnecessary map allocation.
                     let field_ty = match expected_fields.get(key) {
                         Some(ft) if Type::sum_type_eligible(ft)
+                            && self.types_compatible(&typed_val.ty(), ft) =>
+                        {
+                            ft.clone()
+                        }
+                        Some(ft) if sealed
+                            && ft.is_sealed_heap_field()
                             && self.types_compatible(&typed_val.ty(), ft) =>
                         {
                             ft.clone()
