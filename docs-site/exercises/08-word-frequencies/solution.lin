@@ -1,0 +1,7 @@
+// Word Frequencies — reference solution.
+import { for } from "std/iter"
+
+export val solve = (words: String[]): { String: Int32 } =>
+  var counts: { String: Int32 } = {}
+  words.for(w => counts[w] = (counts[w] ?? 0) + 1)
+  counts

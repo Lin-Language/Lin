@@ -1,0 +1,6 @@
+// Merge Intervals — merge all overlapping intervals and return them sorted by start.
+// TODO: sort by start, then sweep and merge touching/overlapping intervals.
+
+export val solve = (intervals: Int32[][]): Int32[][] =>
+  val r: Int32[][] = []
+  r

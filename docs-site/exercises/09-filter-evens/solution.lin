@@ -1,0 +1,5 @@
+// Keep the Evens — reference solution.
+import { filter } from "std/iter"
+
+export val solve = (xs: Int32[]): Int32[] =>
+  xs.filter(x => x % 2 == 0)

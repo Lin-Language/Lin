@@ -1,0 +1,14 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (String) => Int32): AnyVal =>
+  suite("04-count-vowels", [
+    test("counts vowels in hello", () => [expect(solve("hello")).toBe(2)]),
+
+    test("counts uppercase vowels", () => [expect(solve("AEIOU")).toBe(5)]),
+
+    test("no vowels returns 0", () => [expect(solve("xyz")).toBe(0)]),
+
+    test("empty string returns 0", () => [expect(solve("")).toBe(0)]),
+
+    test("mixed case", () => [expect(solve("Hello World")).toBe(3)])
+  ])

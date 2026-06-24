@@ -1,0 +1,9 @@
+// Largest in the List — reference solution.
+import { length } from "std/array"
+import { reduce } from "std/iter"
+
+export val solve = (xs: Int32[]): Int32 | Null =>
+  if length(xs) == 0 then
+    null
+  else
+    xs.reduce(xs[0], (best, x) => if x > best then x else best)

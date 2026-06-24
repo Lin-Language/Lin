@@ -1,0 +1,16 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (String, String) => Int32): AnyVal =>
+  suite("25-longest-common-subsequence", [
+    test("abcde vs ace gives 3", () => [expect(solve("abcde", "ace")).toBe(3)]),
+
+    test("abc vs abc gives 3", () => [expect(solve("abc", "abc")).toBe(3)]),
+
+    test("no common chars gives 0", () => [expect(solve("abc", "def")).toBe(0)]),
+
+    test("empty string gives 0", () => [expect(solve("", "x")).toBe(0)]),
+
+    test("AGGTAB vs GXTXAYB gives 4", () => [
+      expect(solve("AGGTAB", "GXTXAYB")).toBe(4)
+    ])
+  ])

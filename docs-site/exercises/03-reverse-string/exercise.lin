@@ -1,0 +1,7 @@
+// Reverse a String — return the characters of s in reverse order.
+// TODO: implement solve to reverse the input string.
+import { split, join } from "std/string"
+import { reverse } from "std/array"
+
+export val solve = (s: String): String =>
+  ""

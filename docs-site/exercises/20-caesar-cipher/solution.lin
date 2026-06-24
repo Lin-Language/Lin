@@ -1,0 +1,18 @@
+// Caesar Cipher — reference solution.
+import { length } from "std/array"
+import { byteAt, fromCharCode } from "std/string"
+import { range, reduce } from "std/iter"
+
+export val solve = (s: String, shift: Int32): String =>
+  val n = length(s)
+  val realShift = shift % 26
+  range(0, n).reduce("", (acc, i) =>
+    val b = byteAt(s, i)
+    val c = if b >= 65 && b <= 90 then
+      fromCharCode((b - 65 + realShift) % 26 + 65)
+    else if b >= 97 && b <= 122 then
+      fromCharCode((b - 97 + realShift) % 26 + 97)
+    else
+      fromCharCode(b)
+    "${acc}${c}"
+  )

@@ -1,0 +1,5 @@
+// Shortest Path in a Grid — BFS from [0][0] to bottom-right; return cells on shortest path or -1.
+// TODO: BFS with a queue (array + head index); visited keyed by r*cols+c.
+
+export val solve = (grid: Int32[][]): Int32 =>
+  -1

@@ -1,0 +1,26 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (String[]) => String[][]): AnyVal =>
+  suite("14-group-anagrams", [
+    test("classic example", () =>
+      [
+        expect(solve(["eat", "tea", "tan", "ate", "nat", "bat"])).toBe([["eat", "tea", "ate"], ["tan", "nat"], ["bat"]])
+      ]
+    ),
+
+    test("empty input", () =>
+      [expect(solve([])).toBe([])]
+    ),
+
+    test("single word", () =>
+      [expect(solve(["x"])).toBe([["x"]])]
+    ),
+
+    test("no anagrams among words", () =>
+      [expect(solve(["abc", "def"])).toBe([["abc"], ["def"]])]
+    ),
+
+    test("all same group", () =>
+      [expect(solve(["ab", "ba", "ab"])).toBe([["ab", "ba", "ab"]])]
+    )
+  ])

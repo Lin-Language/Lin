@@ -1,0 +1,5 @@
+// Caesar Cipher — shift each ASCII letter by shift positions, wrapping within its case.
+// TODO: implement solve. Non-letters are unchanged. shift may be >= 26.
+
+export val solve = (s: String, shift: Int32): String =>
+  ""

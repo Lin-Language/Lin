@@ -1,0 +1,28 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (String, Int32) => String): AnyVal =>
+  suite("20-caesar-cipher", [
+    test("shift by 1", () =>
+      [expect(solve("abc", 1)).toBe("bcd")]
+    ),
+
+    test("wraps at z", () =>
+      [expect(solve("xyz", 3)).toBe("abc")]
+    ),
+
+    test("mixed case and punctuation", () =>
+      [expect(solve("Hello, World!", 5)).toBe("Mjqqt, Btwqi!")]
+    ),
+
+    test("zero shift", () =>
+      [expect(solve("abc", 0)).toBe("abc")]
+    ),
+
+    test("shift >= 26", () =>
+      [expect(solve("abc", 26)).toBe("abc")]
+    ),
+
+    test("empty string", () =>
+      [expect(solve("", 3)).toBe("")]
+    )
+  ])

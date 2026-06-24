@@ -1,0 +1,7 @@
+// Factorial — reference solution.
+import { range, for } from "std/iter"
+
+export val solve = (n: Int32): Int32 =>
+  var result = 1
+  range(2, n + 1).for(i => result = result * i)
+  result

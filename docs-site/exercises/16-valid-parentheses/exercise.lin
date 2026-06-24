@@ -1,0 +1,5 @@
+// Valid Parentheses — check if bracket pairs are properly nested.
+// TODO: implement solve using an array as a stack.
+
+export val solve = (s: String): Boolean =>
+  false

@@ -1,0 +1,18 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (String, String[]) => Boolean): AnyVal =>
+  suite("27-word-break", [
+    test("leetcode with leet+code", () => [
+      expect(solve("leetcode", ["leet", "code"])).toBe(true)
+    ]),
+
+    test("applepenapple with apple+pen", () => [
+      expect(solve("applepenapple", ["apple", "pen"])).toBe(true)
+    ]),
+
+    test("catsandog impossible", () => [
+      expect(solve("catsandog", ["cats", "dog", "sand", "and", "cat"])).toBe(false)
+    ]),
+
+    test("empty string is always true", () => [expect(solve("", ["a"])).toBe(true)])
+  ])

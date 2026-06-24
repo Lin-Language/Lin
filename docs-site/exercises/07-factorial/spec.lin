@@ -1,0 +1,14 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (Int32) => Int32): AnyVal =>
+  suite("07-factorial", [
+    test("0! = 1", () => [expect(solve(0)).toBe(1)]),
+
+    test("1! = 1", () => [expect(solve(1)).toBe(1)]),
+
+    test("5! = 120", () => [expect(solve(5)).toBe(120)]),
+
+    test("7! = 5040", () => [expect(solve(7)).toBe(5040)]),
+
+    test("10! = 3628800", () => [expect(solve(10)).toBe(3628800)])
+  ])

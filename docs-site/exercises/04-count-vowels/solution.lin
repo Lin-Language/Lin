@@ -1,0 +1,15 @@
+// Count the Vowels — reference solution.
+import { split, toLower } from "std/string"
+import { filter } from "std/iter"
+import { length } from "std/array"
+
+export val solve = (s: String): Int32 =>
+  val vowels = [
+    "a",
+    "e",
+    "i",
+    "o",
+    "u"
+  ]
+  val chars = s.toLower().split("")
+  length(chars.filter(c => vowels.filter(v => v == c).length() > 0))

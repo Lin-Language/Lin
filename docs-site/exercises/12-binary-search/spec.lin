@@ -1,0 +1,28 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (Int32[], Int32) => Int32): AnyVal =>
+  suite("12-binary-search", [
+    test("finds middle element", () =>
+      [expect(solve([1, 3, 5, 7, 9], 5)).toBe(2)]
+    ),
+
+    test("absent element returns -1", () =>
+      [expect(solve([1, 3, 5, 7, 9], 6)).toBe(-1)]
+    ),
+
+    test("empty array returns -1", () =>
+      [expect(solve([], 1)).toBe(-1)]
+    ),
+
+    test("single-element array found", () =>
+      [expect(solve([4], 4)).toBe(0)]
+    ),
+
+    test("first element", () =>
+      [expect(solve([1, 3, 5, 7, 9], 1)).toBe(0)]
+    ),
+
+    test("last element", () =>
+      [expect(solve([1, 3, 5, 7, 9], 9)).toBe(4)]
+    )
+  ])

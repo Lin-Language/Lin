@@ -1,0 +1,5 @@
+// Climbing Stairs — count distinct ways to climb n steps (1 or 2 at a time).
+// TODO: implement solve using a DP loop (this is Fibonacci). solve(0) = 1.
+
+export val solve = (n: Int32): Int32 =>
+  1

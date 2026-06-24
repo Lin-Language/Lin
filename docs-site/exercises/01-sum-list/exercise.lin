@@ -1,0 +1,6 @@
+// Sum a List — return the sum of all elements in the array.
+// TODO: implement solve so it sums every element (empty list → 0).
+import { reduce } from "std/iter"
+
+export val solve = (xs: Int32[]): Int32 =>
+  0

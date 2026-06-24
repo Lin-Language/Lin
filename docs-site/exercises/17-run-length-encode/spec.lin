@@ -1,0 +1,24 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (String) => String): AnyVal =>
+  suite("17-run-length-encode", [
+    test("mixed runs", () =>
+      [expect(solve("aaabbc")).toBe("a3b2c1")]
+    ),
+
+    test("all singletons", () =>
+      [expect(solve("abc")).toBe("a1b1c1")]
+    ),
+
+    test("empty string", () =>
+      [expect(solve("")).toBe("")]
+    ),
+
+    test("single run", () =>
+      [expect(solve("aaaa")).toBe("a4")]
+    ),
+
+    test("longer mixed", () =>
+      [expect(solve("aabbcc")).toBe("a2b2c2")]
+    )
+  ])
