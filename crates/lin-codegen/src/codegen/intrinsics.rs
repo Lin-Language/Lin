@@ -381,6 +381,42 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.call(rt_concat, &[a.into(), b.into()], "ir_cat").try_as_basic_value().unwrap_basic()
                 } else { ptr_ty.const_null().into() }
             }
+            Intrinsic::StringBuildN => {
+                // lin_string_build_n(parts: *const *const LinString, n: u32) -> *mut LinString
+                // Stack-allocate a [ptr; N] array, store each part, pass its address + count.
+                let n = args.len() as u32;
+                if n == 0 {
+                    // Empty interpolation: produce an empty string literal.
+                    let rt_build = self.get_or_declare_fn("lin_string_build_n",
+                        ptr_ty.fn_type(&[ptr_ty.into(), self.context.i32_type().into()], false));
+                    let nil = ptr_ty.const_null();
+                    self.builder.call(rt_build, &[nil.into(), self.context.i32_type().const_zero().into()], "ir_bld0")
+                        .try_as_basic_value().unwrap_basic()
+                } else {
+                    let arr_ty = ptr_ty.array_type(n);
+                    let slot = self.builder.alloca(arr_ty, "bldn_parts");
+                    for (i, &part) in args.iter().enumerate() {
+                        // GEP: index into arr_ty at element i.
+                        let elem_ptr = unsafe {
+                            self.builder.in_bounds_gep(
+                                arr_ty,
+                                slot,
+                                &[
+                                    self.context.i32_type().const_zero(),
+                                    self.context.i32_type().const_int(i as u64, false),
+                                ],
+                                &format!("bldn_slot{i}"),
+                            )
+                        };
+                        self.builder.store(elem_ptr, part);
+                    }
+                    let rt_build = self.get_or_declare_fn("lin_string_build_n",
+                        ptr_ty.fn_type(&[ptr_ty.into(), self.context.i32_type().into()], false));
+                    let n_val = self.context.i32_type().const_int(n as u64, false);
+                    self.builder.call(rt_build, &[slot.into(), n_val.into()], "ir_bldn")
+                        .try_as_basic_value().unwrap_basic()
+                }
+            }
             Intrinsic::Async => {
                 // async(thunk): hand the UNEVALUATED thunk closure to the runtime, which spawns
                 // an OS thread, deep-copies the captured env (Option C), runs the thunk inside a
