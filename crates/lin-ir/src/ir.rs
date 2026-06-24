@@ -43,6 +43,9 @@ pub enum Intrinsic {
     Push,
     Concat,
     StringConcat,
+    /// Single-allocation multi-part string build: `lin_string_build_n(parts_ptr, n)`.
+    /// All `n` input parts are BORROWED (read-only). Returns a fresh +1 string.
+    StringBuildN,
     StringLength,
     StringEq,
     StringRelease,
