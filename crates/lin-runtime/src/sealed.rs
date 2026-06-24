@@ -828,6 +828,94 @@ pub(crate) unsafe fn record_walk_fields(
     }
 }
 
+/// Unboxed scalar read: look up one field by name in a TAG_RECORD sealed struct and return its
+/// value as a raw i64 (zero-extended for unsigned integers; reinterpreted bits for Float64/Float32).
+/// Returns 0 for missing/null fields. No heap allocation — faster than `lin_record_get_field` +
+/// `lin_unbox_*` + `lin_tagged_release` for scalar fields.
+#[no_mangle]
+pub unsafe extern "C" fn lin_record_read_i64(
+    sealed: *const u8,
+    key: *const crate::string::LinString,
+) -> i64 {
+    if sealed.is_null() || key.is_null() {
+        return 0;
+    }
+    let named_desc = *((sealed.add(16)) as *const *const u8);
+    if named_desc.is_null() {
+        return 0;
+    }
+    let key_bytes = std::slice::from_raw_parts((*key).data.as_ptr(), (*key).len as usize);
+    let mut result: i64 = 0;
+    let mut found = false;
+    record_walk_fields(named_desc, |name, offset, nkind, _nested| {
+        if found || name != key_bytes {
+            return;
+        }
+        found = true;
+        let slot = sealed.add(offset as usize);
+        result = match nkind {
+            NKIND_INT32  => *(slot as *const i32) as i64,
+            NKIND_INT64  => *(slot as *const i64),
+            NKIND_UINT64 => *(slot as *const u64) as i64,
+            NKIND_UINT32 => *(slot as *const u32) as i64,
+            NKIND_UINT16 => *(slot as *const u16) as i64,
+            NKIND_UINT8  => *(slot as *const u8) as i64,
+            NKIND_INT16  => *(slot as *const i16) as i64,
+            NKIND_INT8   => *(slot as *const i8) as i64,
+            NKIND_FLOAT64 => (*(slot as *const f64)).to_bits() as i64,
+            NKIND_FLOAT32 => ((*(slot as *const f32)) as f64).to_bits() as i64,
+            NKIND_BOOL   => *(slot as *const u8) as i64,
+            _ => 0,
+        };
+    });
+    result
+}
+
+/// Unboxed pointer read: look up one heap-pointer field by name in a TAG_RECORD sealed struct,
+/// RETAIN the inner pointer (+1 rc), and return the raw pointer. Returns null for missing/null
+/// fields. No TaggedVal box is allocated — faster than `lin_record_get_field` + `lin_unbox_ptr`
+/// + `lin_rc_retain` + `lin_tagged_release` for String/Array/Map/Sealed fields.
+#[no_mangle]
+pub unsafe extern "C" fn lin_record_read_ptr_retain(
+    sealed: *const u8,
+    key: *const crate::string::LinString,
+) -> *mut u8 {
+    if sealed.is_null() || key.is_null() {
+        return std::ptr::null_mut();
+    }
+    let named_desc = *((sealed.add(16)) as *const *const u8);
+    if named_desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let key_bytes = std::slice::from_raw_parts((*key).data.as_ptr(), (*key).len as usize);
+    let mut result: *mut u8 = std::ptr::null_mut();
+    let mut found = false;
+    record_walk_fields(named_desc, |name, offset, nkind, _nested| {
+        if found || name != key_bytes {
+            return;
+        }
+        found = true;
+        let slot = sealed.add(offset as usize);
+        let p = *(slot as *const *mut u8);
+        if p.is_null() {
+            return;
+        }
+        match nkind {
+            NKIND_STRING | NKIND_ARRAY | NKIND_MAP | NKIND_SEALED => {
+                crate::memory::lin_rc_retain(p as *mut u32);
+                result = p;
+            }
+            NKIND_SUMNODE => {
+                // SumNode: materialize to a LinMap* for the caller (same as box_field_value).
+                let sum_map = crate::sumnode::lin_sumnode_materialize(p);
+                result = sum_map;
+            }
+            _ => {}
+        }
+    });
+    result
+}
+
 /// Stage 6a: look up one field by name in a TAG_RECORD sealed struct and return an OWNED +1
 /// TaggedVal* for that field (or null for a missing/null field).
 #[no_mangle]
