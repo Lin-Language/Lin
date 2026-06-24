@@ -225,6 +225,7 @@ fn intrinsic_ret_is_heap(intr: &Intrinsic) -> bool {
     matches!(
         intr,
         StringConcat
+            | StringBuildN
             | Concat
             | ArrayAlloc
             | ObjectAlloc

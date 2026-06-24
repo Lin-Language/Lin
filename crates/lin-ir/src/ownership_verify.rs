@@ -54,11 +54,17 @@ use crate::liveness::instr_use_def;
 pub struct IntrinsicConv {
     pub params: Vec<Convention>,
     pub ret: Convention,
+    /// Convention for args beyond `params.len()` (varadic trailing position).
+    /// `None` → fall back to the existing `unwrap_or(Own)` default.
+    pub vararg: Option<Convention>,
 }
 
 impl IntrinsicConv {
     fn new(params: Vec<Convention>, ret: Convention) -> Self {
-        IntrinsicConv { params, ret }
+        IntrinsicConv { params, ret, vararg: None }
+    }
+    fn new_varargs(trailing: Convention, ret: Convention) -> Self {
+        IntrinsicConv { params: vec![], ret, vararg: Some(trailing) }
     }
 }
 
@@ -124,6 +130,9 @@ pub fn intrinsic_conventions(intr: &Intrinsic) -> Option<IntrinsicConv> {
         // lin_string_concat / lin_array concat: read inputs, return a FRESH heap value. The inputs
         // are NOT consumed (the runtime copies). CONFIDENT borrow-in / own-out.
         StringConcat => IntrinsicConv::new(vec![Borrow, Borrow], Own),
+        // lin_string_build_n(parts_ptr, n): all N parts are borrowed, returns a fresh +1 string.
+        // Varargs in practice but IR passes a fixed Vec; verifier sees each part as Borrow.
+        StringBuildN => IntrinsicConv::new_varargs(Borrow, Own),
         Concat => IntrinsicConv::new(vec![Borrow, Borrow], Own),
         // lin_array_alloc(cap) / lin_object_alloc(cap) / lin_map_alloc(cap): scalar in, fresh +1 out.
         ArrayAlloc | ObjectAlloc => IntrinsicConv::new(vec![Own], Own),
@@ -876,7 +885,9 @@ fn classify_uses(instr: &Instruction, mark: &mut impl FnMut(Temp, UseKind)) {
             match intrinsic_conventions(intrinsic) {
                 Some(conv) => {
                     for (i, a) in args.iter().enumerate() {
-                        let c = conv.params.get(i).copied().unwrap_or(Convention::Own);
+                        let c = conv.params.get(i).copied()
+                            .or(conv.vararg)
+                            .unwrap_or(Convention::Own);
                         let kind = match c {
                             Convention::Borrow => UseKind::Read,
                             Convention::Inout => UseKind::InPlace,
