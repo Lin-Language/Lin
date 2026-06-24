@@ -1093,6 +1093,7 @@ mod tests {
             repr: Vec::new(),
             coverage_origin: None,
             substr_fuse: std::collections::HashMap::new(),
+            getset_fuse: std::collections::HashSet::new(),
         }
     }
 
@@ -1139,6 +1140,7 @@ mod tests {
             repr: Vec::new(),
             coverage_origin: None,
             substr_fuse: std::collections::HashMap::new(),
+            getset_fuse: std::collections::HashSet::new(),
         }
     }
 
@@ -1195,6 +1197,7 @@ mod tests {
             repr: Vec::new(),
             coverage_origin: None,
             substr_fuse: std::collections::HashMap::new(),
+            getset_fuse: std::collections::HashSet::new(),
         }
     }
 
@@ -1551,6 +1554,7 @@ mod tests {
             repr: Vec::new(),
             coverage_origin: None,
             substr_fuse: std::collections::HashMap::new(),
+            getset_fuse: std::collections::HashSet::new(),
         };
         let mut module = make_module(func);
         elide_rc(&mut module);
@@ -1624,6 +1628,7 @@ mod tests {
             repr: Vec::new(),
             coverage_origin: None,
             substr_fuse: std::collections::HashMap::new(),
+            getset_fuse: std::collections::HashSet::new(),
         }
     }
 
@@ -1696,6 +1701,7 @@ mod tests {
             repr: Vec::new(),
             coverage_origin: None,
             substr_fuse: std::collections::HashMap::new(),
+            getset_fuse: std::collections::HashSet::new(),
         };
         let mut module = make_module(func);
         elide_rc(&mut module);
@@ -1764,6 +1770,7 @@ mod tests {
             repr: Vec::new(),
             coverage_origin: None,
             substr_fuse: std::collections::HashMap::new(),
+            getset_fuse: std::collections::HashSet::new(),
         }
     }
 
@@ -1808,6 +1815,7 @@ mod tests {
             repr: Vec::new(),
             coverage_origin: None,
             substr_fuse: std::collections::HashMap::new(),
+            getset_fuse: std::collections::HashSet::new(),
         }
     }
 

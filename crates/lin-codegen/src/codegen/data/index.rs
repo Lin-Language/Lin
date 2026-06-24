@@ -691,6 +691,183 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Get-set fusion: emit `lin_map_upsert_slot_bytes` for the Index half of a fused pair.
+    ///
+    /// Called at Index-emit time when `dst ∈ func.getset_fuse` AND the key is a byte-slice temp.
+    /// Emits ONE probe that finds-or-inserts the slot and returns the old value as a `TaggedVal*`.
+    /// Stores `(object, key, slot_ptr, is_new_alloca)` in `upsert_slot_map` for the matching IndexSet.
+    ///
+    /// The returned value is what `cur = counts[key]` sees:
+    ///   - `null` pointer (TAG_NULL sentinel) when the key was absent (new slot).
+    ///   - Pointer to an entry-block TaggedVal alloca holding `{tag: value_tag, payload: old_payload}`
+    ///     when the key already existed.
+    ///
+    /// Only safe when `is_flat_scalar_map(obj_ty)` (guaranteed by the IR pass).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_upsert_index(
+        &mut self,
+        map_v: BasicValueEnum<'ctx>,
+        data_ptr: BasicValueEnum<'ctx>,
+        key_len: inkwell::values::IntValue<'ctx>,
+        obj_ty: &lin_check::types::Type,
+        result_ty: &lin_check::types::Type,
+        key_temp: lin_ir::Temp,
+        upsert_slot_map: &mut std::collections::HashMap<lin_ir::Temp, (lin_ir::Temp, inkwell::values::PointerValue<'ctx>, inkwell::values::PointerValue<'ctx>)>,
+        dst: lin_ir::Temp,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+        let i8_ty  = self.context.i8_type();
+        let i64_ty = self.context.i64_type();
+
+        // Resolve the map element type to determine the value_tag.
+        let elem_ty: lin_check::types::Type = match obj_ty {
+            lin_check::types::Type::Map { value: v, .. } => (**v).clone(),
+            lin_check::types::Type::Union(ms) => ms.iter().find_map(|m| match m {
+                lin_check::types::Type::Map { value: v, .. } => Some((**v).clone()),
+                _ => None,
+            }).unwrap_or(lin_check::types::Type::TypeVar(u32::MAX)),
+            _ => lin_check::types::Type::TypeVar(u32::MAX),
+        };
+        let value_tag = Self::type_tag(&elem_ty);
+
+        // Unbox the map pointer if the container is union-typed.
+        let map_ptr = if Self::is_union_type(obj_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[map_v.into()], "gs_unbox").try_as_basic_value().unwrap_basic()
+        } else {
+            map_v
+        };
+
+        // Entry-block allocas for is_new and the old TaggedVal reconstruction.
+        let is_new_alloca = self.entry_block_alloca(i8_ty, "gs_isnew");
+        // The old_tv alloca holds a `{tag: i8, _pad: [0;7], payload: i64}` = 16 bytes.
+        // We use two adjacent stores: tag@+0, payload@+8.
+        let old_tv_alloca: inkwell::values::PointerValue<'ctx> = self.entry_block_alloca(
+            self.context.i8_type().array_type(16), "gs_old_tv");
+
+        // Emit the single probe.
+        let slot_ptr = self.builder.call(
+            self.rt.map_upsert_slot_bytes,
+            &[map_ptr.into(), data_ptr.into(), key_len.into(),
+              i8_ty.const_int(value_tag as u64, false).into(),
+              is_new_alloca.into()],
+            "gs_slot",
+        ).try_as_basic_value().unwrap_basic().into_pointer_value();
+
+        // Store keyed by key_temp: the IndexSet will look up by its own key temp.
+        upsert_slot_map.insert(key_temp, (dst, slot_ptr, is_new_alloca));
+
+        // Build the `cur` result: null ptr when is_new==1, else a TaggedVal pointing to old_tv_alloca.
+        let is_new_val = self.builder.load(i8_ty, is_new_alloca, "gs_isnewv").into_int_value();
+        let is_new_bool = self.builder.int_compare(
+            IntPredicate::NE, is_new_val, i8_ty.const_zero(), "gs_isnew_bool");
+
+        // Load old payload from slot+SLOT_VAL_OFF (8 bytes).
+        let slot_val_p = unsafe {
+            self.builder.gep(i8_ty, slot_ptr, &[i64_ty.const_int(8, false)], "gs_slot_vp")
+        };
+        let old_payload = self.builder.load(i64_ty, slot_val_p, "gs_old_pl").into_int_value();
+
+        // Write {tag, payload} into old_tv_alloca (tag @+0 as i8, payload @+8 as i64).
+        let tv_tag_p = unsafe {
+            self.builder.gep(i8_ty, old_tv_alloca, &[i64_ty.const_zero()], "gs_tvtag_p")
+        };
+        self.builder.store(tv_tag_p, i8_ty.const_int(value_tag as u64, false));
+        let tv_pay_p = unsafe {
+            self.builder.gep(i8_ty, old_tv_alloca, &[i64_ty.const_int(8, false)], "gs_tvpay_p")
+        };
+        self.builder.store(tv_pay_p, old_payload);
+
+        // Select: if is_new → null ptr (caller sees TAG_NULL / absent key); else → &old_tv_alloca.
+        let null_ptr_v: BasicValueEnum<'ctx> = ptr_ty.const_null().into();
+        let old_tv_ptr: BasicValueEnum<'ctx> = old_tv_alloca.into();
+        let cur_tv = self.builder.select(is_new_bool, null_ptr_v, old_tv_ptr, "gs_cur_tv");
+
+        // Return the TaggedVal* (union result) or unbox to concrete type.
+        if Self::is_union_type(result_ty) {
+            cur_tv
+        } else {
+            self.unbox_tagged_val_to_type(cur_tv, result_ty)
+        }
+    }
+
+    /// Get-set fusion: emit the write half of a fused pair at IndexSet time.
+    ///
+    /// Uses the `slot_ptr` obtained from the upsert at Index time to write `val_v` directly
+    /// to the slot's value region, avoiding a second probe. Only valid for flat-scalar value
+    /// types (no RC needed).
+    pub(crate) fn emit_upsert_index_set(
+        &mut self,
+        slot_ptr: inkwell::values::PointerValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        obj_ty: &lin_check::types::Type,
+        val_ty: &lin_check::types::Type,
+        val_repr: &lin_ir::repr::Repr,
+    ) {
+        let i8_ty  = self.context.i8_type();
+        let i64_ty = self.context.i64_type();
+
+        // Resolve element type for coercion.
+        let elem_ty: lin_check::types::Type = match obj_ty {
+            lin_check::types::Type::Map { value: v, .. } => (**v).clone(),
+            lin_check::types::Type::Union(ms) => ms.iter().find_map(|m| match m {
+                lin_check::types::Type::Map { value: v, .. } => Some((**v).clone()),
+                _ => None,
+            }).unwrap_or(lin_check::types::Type::TypeVar(u32::MAX)),
+            _ => lin_check::types::Type::TypeVar(u32::MAX),
+        };
+
+        let _ = val_repr;
+
+        // Coerce value to elem_ty if needed (e.g. Int32 → Int64 widening).
+        let coerced = if val_ty == &elem_ty {
+            value
+        } else {
+            self.compile_ir_coerce(value, val_ty, &elem_ty)
+        };
+
+        // For flat scalar: the slot's value region is 8 bytes at slot+SLOT_VAL_OFF.
+        // Store the scalar payload directly. `build_tagged_val_alloca` would give us a
+        // TaggedVal*; here we skip boxing entirely and write just the payload word.
+        let slot_val_p = unsafe {
+            self.builder.gep(i8_ty, slot_ptr, &[i64_ty.const_int(8, false)], "gs_setval_p")
+        };
+        // Normalise to i64 payload: sign/zero-extend scalars, reinterpret floats.
+        let payload = self.scalar_to_slot_payload(coerced, &elem_ty);
+        self.builder.store(slot_val_p, payload);
+    }
+
+    /// Coerce a flat-scalar value to the i64 slot payload representation used by homogeneous maps.
+    fn scalar_to_slot_payload(
+        &mut self,
+        val: BasicValueEnum<'ctx>,
+        ty: &lin_check::types::Type,
+    ) -> BasicValueEnum<'ctx> {
+        let i64_ty = self.context.i64_type();
+        match ty {
+            lin_check::types::Type::Int8 | lin_check::types::Type::Int16 |
+            lin_check::types::Type::Int32 | lin_check::types::Type::IntLit(_) => {
+                // Sign-extend to i64 to match box_int32/box_int64 payload format.
+                let iv = if val.is_int_value() { val.into_int_value() } else { return val; };
+                self.builder.int_s_extend_or_bit_cast(iv, i64_ty, "gs_pay_i64").into()
+            }
+            lin_check::types::Type::UInt8 | lin_check::types::Type::UInt16 |
+            lin_check::types::Type::UInt32 | lin_check::types::Type::UInt64 |
+            lin_check::types::Type::Int64 => {
+                let iv = if val.is_int_value() { val.into_int_value() } else { return val; };
+                self.builder.int_z_extend_or_bit_cast(iv, i64_ty, "gs_pay_i64").into()
+            }
+            lin_check::types::Type::Float32 | lin_check::types::Type::Float64 => {
+                // Floats are stored as f64 bit-cast to u64 in the slot payload.
+                let fv = if val.is_float_value() { val.into_float_value() } else { return val; };
+                let f64v = if ty == &lin_check::types::Type::Float32 {
+                    self.builder.float_ext(fv, self.context.f64_type(), "gs_pay_f64")
+                } else { fv };
+                self.builder.bit_cast(f64v, i64_ty, "gs_pay_f64bits").into()
+            }
+            _ => val,
+        }
+    }
+
     /// `object[key] = value` for the IR path. Mirrors the AST `compile_index_set`:
     /// dispatch on the object's static type; for Json/union objects, dispatch at
     /// runtime on the key's tag (int key ⇒ array set, string key ⇒ map set),

@@ -408,6 +408,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         // Runs last (after all other passes) so it sees the final IR state.
         lin_ir::bounds_elide::elide_bounds(&mut ir_module);
         lin_ir::substr_map_fuse::run(&mut ir_module);
+        lin_ir::getset_map_fuse::run(&mut ir_module);
         // Static RC-balance verifier (Cluster 2) — VERIFICATION ONLY, gated on `LIN_VERIFY_RC=1`,
         // OFF by default so it can never affect a normal build. Runs on the FINAL lowered IR (after
         // RC insertion + rc_elide + escape stack-alloc) and reports per-path leak / over-release /

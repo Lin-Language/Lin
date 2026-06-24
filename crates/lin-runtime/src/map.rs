@@ -78,7 +78,7 @@ const VKIND_MIXED: u32 = u32::MAX - 1;
 
 // Slot byte offsets (SwissTable layout — no hash in slot).
 const SLOT_KEY_OFF: usize = 0;
-const SLOT_VAL_OFF: usize = 8;
+pub const SLOT_VAL_OFF: usize = 8;
 
 // Control-byte sentinels.
 const CTRL_EMPTY: u8 = 0x00;
@@ -863,6 +863,79 @@ pub unsafe extern "C" fn lin_map_set_bytes(
     lin_map_set(map, key_lin, val);
     // lin_map_set inc_refs the key; the construction +1 from from_bytes is our temp — release it.
     lin_string_release(key_lin);
+}
+
+/// Get-or-insert a slot by raw UTF-8 key bytes.  Returns a raw pointer to the slot
+/// (`key:u64 @ +0, value @ SLOT_VAL_OFF`) and writes `1` into `*is_new_out` when the
+/// slot was freshly inserted (caller should treat old value as TAG_NULL), or `0` when
+/// the slot already existed.
+///
+/// Guarantees:
+///   - `note_value_tag(map, value_tag)` is called first to establish `value_kind`.
+///   - `ensure_capacity(map)` is called next — no grow can happen until the next map
+///     mutation, so the returned slot pointer is stable for the caller's RMW window.
+///   - New slot: ctrl byte set, key string materialised and stored, value region zeroed.
+///   - Hit slot: returned as-is.
+///
+/// `key_ptr` / `key_len` must stay valid until this call returns.
+/// `is_new_out` must be a valid non-null `*mut u8`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_map_upsert_slot_bytes(
+    map: *mut LinMap,
+    key_ptr: *const u8,
+    key_len: u32,
+    value_tag: u8,
+    is_new_out: *mut u8,
+) -> *mut u8 {
+    if map.is_null() {
+        *is_new_out = 0;
+        return std::ptr::null_mut();
+    }
+    note_value_tag(map, value_tag);
+    ensure_capacity(map);
+    let bytes = std::slice::from_raw_parts(key_ptr, key_len as usize);
+    let khash = fnv1a_bytes(bytes);
+    let h2 = h2_of(khash);
+    let vk = (*map).value_kind;
+    let stride = slot_stride(vk);
+    let val_bytes = value_bytes(vk);
+    let cap = (*map).cap as usize;
+    let mask = cap - 1;
+    let mut idx = (khash as usize) & mask;
+    for _ in 0..cap {
+        let ctrl_byte = (*map).ctrl.add(idx);
+        let c = *ctrl_byte;
+        if c == CTRL_EMPTY {
+            // New key: materialise the LinString, insert the slot.
+            let key_str = crate::string::lin_string_from_bytes(key_ptr, key_len);
+            (*key_str).hash = khash;
+            order_push(map, key_str as u64);
+            *ctrl_byte = h2;
+            let slot = slot_at((*map).slots, idx, stride);
+            set_slot_key(slot, key_str as u64);
+            // Zero the value region so the caller sees TAG_NULL (0) on payload read.
+            std::ptr::write_bytes(slot.add(SLOT_VAL_OFF), 0, val_bytes);
+            (*map).len += 1;
+            *is_new_out = 1;
+            return slot;
+        }
+        if c == h2 {
+            let slot = slot_at((*map).slots, idx, stride);
+            let slot_key_ptr = slot_key(slot) as *const LinString;
+            let kl = (*slot_key_ptr).len as usize;
+            if kl == bytes.len() {
+                let kb = std::slice::from_raw_parts((*slot_key_ptr).data.as_ptr(), kl);
+                if kb == bytes {
+                    *is_new_out = 0;
+                    return slot;
+                }
+            }
+        }
+        idx = (idx + 1) & mask;
+    }
+    // Full table (unreachable after ensure_capacity).
+    *is_new_out = 0;
+    std::ptr::null_mut()
 }
 
 #[no_mangle]
