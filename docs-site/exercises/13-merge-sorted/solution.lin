@@ -1,0 +1,39 @@
+// Merge Two Sorted Arrays — reference solution.
+import { length, push } from "std/array"
+import { while } from "std/iter"
+
+export val solve = (a: Int32[], b: Int32[]): Int32[] =>
+  var result: Int32[] = []
+  var i = 0
+  var j = 0
+  val na = length(a)
+  val nb = length(b)
+  while(() =>
+    if i < na && j < nb then
+      if a[i] <= b[j] then
+        result.push(a[i])
+        i = i + 1
+      else
+        result.push(b[j])
+        j = j + 1
+      true
+    else
+      false
+  )
+  while(() =>
+    if i >= na then
+      false
+    else
+      result.push(a[i])
+      i = i + 1
+      true
+  )
+  while(() =>
+    if j >= nb then
+      false
+    else
+      result.push(b[j])
+      j = j + 1
+      true
+  )
+  result

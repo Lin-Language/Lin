@@ -1,0 +1,20 @@
+// Word Break — reference solution.
+import { length, arrayAllocateFilled, set } from "std/array"
+import { substring } from "std/string"
+import { range, for } from "std/iter"
+
+export val solve = (s: String, dict: String[]): Boolean =>
+  val n = length(s)
+  var wordSet: { String: Boolean } = {}
+  dict.for(w => wordSet[w] = true)
+  val dp: Boolean[] = arrayAllocateFilled(n + 1, false)
+  set(dp, 0, true)
+  range(1, n + 1).for(i =>
+    range(0, i).for(j =>
+      if dp[j] then
+        val word = substring(s, j, i)
+        if wordSet[word] == true then
+          set(dp, i, true)
+    )
+  )
+  dp[n]

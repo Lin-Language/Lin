@@ -1,0 +1,32 @@
+// Group Anagrams — reference solution.
+import { split, join } from "std/string"
+import { sort, push, length } from "std/array"
+import { for } from "std/iter"
+
+val sortedKey = (w: String): String =>
+  w
+    .split("")
+    .sort((a, b) => if a < b then -1 else if a > b then 1 else 0)
+    .join("")
+
+export val solve = (words: String[]): String[][] =>
+  var groups: { String: String[] } = {}
+  var keys: String[] = []
+  words.for(w =>
+    val k = sortedKey(w)
+    val existing = groups[k]
+    if existing == null then
+      val g: String[] = []
+      g.push(w)
+      groups[k] = g
+      keys.push(k)
+    else
+      existing.push(w)
+  )
+  var result: String[][] = []
+  keys.for(k =>
+    val g = groups[k]
+    if g != null then
+      result.push(g)
+  )
+  result

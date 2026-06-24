@@ -1,0 +1,9 @@
+// Reverse a String — reference solution.
+import { split, join } from "std/string"
+import { reverse } from "std/array"
+
+export val solve = (s: String): String =>
+  s
+    .split("")
+    .reverse()
+    .join("")

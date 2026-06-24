@@ -1,0 +1,24 @@
+// Longest Substring Without Repeating Characters — reference solution.
+import { length } from "std/array"
+import { at } from "std/string"
+import { range, for } from "std/iter"
+
+export val solve = (s: String): Int32 =>
+  val n = length(s)
+  var best = 0
+  var left = 0
+  var seen: { String: Int32 } = {}
+  range(0, n).for(i =>
+    val c = s.at(i)
+    val prev = seen[c]
+    if prev != null then
+      if prev >= left then
+        left = prev + 1
+      else
+        null
+    seen[c] = i
+    val w = i - left + 1
+    if w > best then
+      best = w
+  )
+  best

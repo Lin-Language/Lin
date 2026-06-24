@@ -1,0 +1,5 @@
+// Coin Change — fewest coins summing to amount, or -1 if impossible.
+// TODO: DP array dp[0..amount], dp[i] = min coins to make i.
+
+export val solve = (coins: Int32[], amount: Int32): Int32 =>
+  -1

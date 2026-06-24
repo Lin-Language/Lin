@@ -1,0 +1,16 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (Int32[], Int32) => Int32): AnyVal =>
+  suite("24-coin-change", [
+    test("coins [1,2,5] amount 11 gives 3", () => [
+      expect(solve([1, 2, 5], 11)).toBe(3)
+    ]),
+
+    test("impossible gives -1", () => [expect(solve([2], 3)).toBe(-1)]),
+
+    test("amount 0 gives 0", () => [expect(solve([1], 0)).toBe(0)]),
+
+    test("coins [1,5,10,25] amount 30 gives 2", () => [
+      expect(solve([1, 5, 10, 25], 30)).toBe(2)
+    ])
+  ])

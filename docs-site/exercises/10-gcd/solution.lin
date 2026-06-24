@@ -1,0 +1,16 @@
+// Greatest Common Divisor — reference solution using Euclid's algorithm.
+import { while } from "std/iter"
+
+export val solve = (a: Int32, b: Int32): Int32 =>
+  var x = a
+  var y = b
+  while(() =>
+    if y == 0 then
+      false
+    else
+      val t = y
+      y = x % y
+      x = t
+      true
+  )
+  x

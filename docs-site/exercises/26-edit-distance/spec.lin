@@ -1,0 +1,14 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (String, String) => Int32): AnyVal =>
+  suite("26-edit-distance", [
+    test("horse to ros is 3", () => [expect(solve("horse", "ros")).toBe(3)]),
+
+    test("intention to execution is 5", () => [
+      expect(solve("intention", "execution")).toBe(5)
+    ]),
+
+    test("empty to abc is 3", () => [expect(solve("", "abc")).toBe(3)]),
+
+    test("identical strings is 0", () => [expect(solve("abc", "abc")).toBe(0)])
+  ])

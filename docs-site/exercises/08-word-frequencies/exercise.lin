@@ -1,0 +1,6 @@
+// Word Frequencies — count how many times each word appears in the list.
+// TODO: implement solve to return a map from word to its count.
+
+export val solve = (words: String[]): { String: Int32 } =>
+  val r: { String: Int32 } = {}
+  r

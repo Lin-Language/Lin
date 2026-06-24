@@ -1,0 +1,5 @@
+// Sum a List — reference solution.
+import { reduce } from "std/iter"
+
+export val solve = (xs: Int32[]): Int32 =>
+  xs.reduce(0, (acc, x) => acc + x)

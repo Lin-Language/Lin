@@ -1,0 +1,15 @@
+// FizzBuzz — reference solution.
+import { range, map } from "std/iter"
+import { toString } from "std/string"
+
+export val solve = (n: Int32): String[] =>
+  range(1, n + 1).map(i =>
+    if i % 15 == 0 then
+      "FizzBuzz"
+    else if i % 3 == 0 then
+      "Fizz"
+    else if i % 5 == 0 then
+      "Buzz"
+    else
+      toString(i)
+  )

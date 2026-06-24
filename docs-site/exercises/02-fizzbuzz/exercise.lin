@@ -1,0 +1,9 @@
+// FizzBuzz — produce the classic FizzBuzz sequence of length n.
+// TODO: implement solve to return the array of n FizzBuzz strings.
+import { map } from "std/iter"
+import { range } from "std/iter"
+import { toString } from "std/string"
+
+export val solve = (n: Int32): String[] =>
+  val r: String[] = []
+  r

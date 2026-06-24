@@ -1,0 +1,28 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (String) => Int32): AnyVal =>
+  suite("15-roman-to-int", [
+    test("III = 3", () =>
+      [expect(solve("III")).toBe(3)]
+    ),
+
+    test("IV = 4", () =>
+      [expect(solve("IV")).toBe(4)]
+    ),
+
+    test("IX = 9", () =>
+      [expect(solve("IX")).toBe(9)]
+    ),
+
+    test("LVIII = 58", () =>
+      [expect(solve("LVIII")).toBe(58)]
+    ),
+
+    test("MCMXCIV = 1994", () =>
+      [expect(solve("MCMXCIV")).toBe(1994)]
+    ),
+
+    test("single symbol M = 1000", () =>
+      [expect(solve("M")).toBe(1000)]
+    )
+  ])

@@ -1,0 +1,8 @@
+// Climbing Stairs — reference solution.
+import { range, reduce } from "std/iter"
+
+export val solve = (n: Int32): Int32 =>
+  if n <= 1 then
+    1
+  else
+    range(2, n + 1).reduce({ "a": 1, "b": 1 }, (s, _) => { "a": s["b"], "b": s["a"] + s["b"] })["b"]

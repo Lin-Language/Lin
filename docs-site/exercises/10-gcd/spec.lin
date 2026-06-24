@@ -1,0 +1,14 @@
+import { expect, toBe, test, suite } from "std/test"
+
+export val tests = (solve: (Int32, Int32) => Int32): AnyVal =>
+  suite("10-gcd", [
+    test("gcd(12, 8) = 4", () => [expect(solve(12, 8)).toBe(4)]),
+
+    test("gcd(17, 5) = 1 (coprime)", () => [expect(solve(17, 5)).toBe(1)]),
+
+    test("gcd(0, 9) = 9", () => [expect(solve(0, 9)).toBe(9)]),
+
+    test("gcd(100, 10) = 10", () => [expect(solve(100, 10)).toBe(10)]),
+
+    test("gcd(a, a) = a", () => [expect(solve(7, 7)).toBe(7)])
+  ])

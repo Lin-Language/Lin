@@ -1,0 +1,25 @@
+// Binary Search — reference solution.
+import { length } from "std/array"
+import { while } from "std/iter"
+
+export val solve = (xs: Int32[], target: Int32): Int32 =>
+  var lo = 0
+  var hi = length(xs) - 1
+  var result = -1
+  while(() =>
+    if lo > hi then
+      false
+    else
+      val mid = (lo + hi) / 2
+      val v = xs[mid]
+      if v == target then
+        result = mid
+        false
+      else if v < target then
+        lo = mid + 1
+        true
+      else
+        hi = mid - 1
+        true
+  )
+  result

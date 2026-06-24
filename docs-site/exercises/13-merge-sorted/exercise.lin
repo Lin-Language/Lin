@@ -1,0 +1,5 @@
+// Merge Two Sorted Arrays — merge two ascending arrays into one ascending array.
+// TODO: implement solve using a two-pointer approach.
+
+export val solve = (a: Int32[], b: Int32[]): Int32[] =>
+  []

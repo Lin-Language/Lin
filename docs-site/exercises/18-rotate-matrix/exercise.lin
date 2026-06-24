@@ -1,0 +1,5 @@
+// Rotate a Matrix — rotate an N×N matrix 90° clockwise.
+// TODO: implement solve. For element at [r][c], it goes to [c][N-1-r] in the rotated matrix.
+
+export val solve = (m: Int32[][]): Int32[][] =>
+  []
