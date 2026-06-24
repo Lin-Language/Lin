@@ -870,7 +870,7 @@ the ownership-at-`frozen()` problem above. End-of-session RAPTOR ≈ **30-31 s**
 
 ---
 
-### 5.13 nbody — the float/global-array workload: 1319→358 ms (3.7×), then a memory-latency wall
+### 5.13 nbody — the float/global-array workload: 1319→358→319 ms (4.1×), then a memory-latency wall
 
 The `nbody` cross-language cell (`benchmarks/compare/nbody/`, 5M-step symplectic integrator over 7
 parallel global `Float64[]` arrays) started at **Lin 1319 ms vs Rust 138 / Go 210 / Node 297** — 4.4× node.
@@ -891,13 +891,21 @@ exact, `LIN_VERIFY_RC` clean):**
 
 **Then a hard wall — four experiments, all negative, do NOT re-try on this workload:**
 
-- **Bounds-check elision** (a real `tco_nonneg` range-analysis pass proving TCO `Int32` indices ≥0, on
-  branch `nbody-bounds`): sound but **wall-neutral**. Deleting the OOB branch *entirely* made nbody
-  **slower** (358→415 ms) — twice, reproducibly.
+- **Bounds-check elision — CRUDE probe negative, SOUND pass POSITIVE (important nuance).** A crude
+  "skip the OOB branch" env-probe made nbody **slower** (358→415 ms, twice) — the probe leaves the
+  load structure that LLVM then schedules worse. But a *sound* forward-dataflow `bounds_elide.rs`
+  pass (proves the index in-bounds, emits a clean GEP+load with no branch) landed from a **parallel
+  session** (`fd6ab802` / `59123235` / `8f64f27d`) and pays **−10 %** (358→322 ms). Lesson: a crude
+  probe that just deletes a branch ≠ a sound pass that proves the access and lets LLVM re-codegen.
+  Don't trust a "remove the work" probe as the ceiling for a *transform* — only as the ceiling for a
+  pure *deletion*.
 - **`!invariant.load` on global pointer loads:** LLVM **already** hoists them via LICM (the internal
   linkage suffices); redundant, neutral.
 - **Header-load hoist (TBAA / `invariant.load` on the `len`@8 / data-ptr@24 reloads):** only **−5.6 %**
-  ceiling (357→337). The arrays' header reloads profile hot but barely move the wall.
+  ceiling at the 358 base; and at the post-bounds-elision **319 ms base the data-ptr hoist is
+  wall-NEUTRAL** — a careful **interleaved** A/B reads 319=319 (a sloppy cross-batch probe had shown a
+  false −11 %, pure concurrent-load noise — the §5.9 trap, again). The header reloads profile hot but
+  are stalled on the element loads, not serializing.
 - **Hand-unrolling** the fixed 10-pair loop into constant-index straight-line code: **slower** (358→535) —
   the TCO loop is small and I-cache-friendly; unrolling just bloats code without folding the heap-array
   accesses.
@@ -908,10 +916,14 @@ The PC sits on the bounds/header instructions because they are *stalled waiting 
 arrays are **module-global heap buffers**, so every element access is an L1 load (~34/pair × 5M); Rust keeps
 the 35 doubles in **registers** (0 loads, fully unrolled), Node JITs typed-arrays. **Closing it needs
 register/value residency of the arrays — but they are global mutable `val`s, so SROA/register-promotion
-can't reach them.** The data-layer well for nbody is dry at ~358 ms (1.2× node, down from 4.4×); the only
-lever left is the **value/inline-array representation frontier** (§5.10/§5.12) — the same one RAPTOR is
-gated on, and a deliberate larger effort, not a point fix. `set()`-bounds / cmov-removal / header-TBAA each
-stack to at most ~325-330 ms (still > node) and are not worth their complexity for this cell alone.
+can't reach them.** With the parallel session's sound bounds-elision landed, master nbody is **~319 ms
+(4.1× from the 1319 start, 1.07× node — 22 ms away)**, and at that base *every* remaining per-access lever
+(data-ptr hoist, header hoist, `!invariant.load`, unrolling) re-confirms wall-neutral by interleaved A/B.
+The only lever left is the **value/inline-array representation frontier** (§5.10/§5.12) — the same one
+RAPTOR is gated on, a deliberate larger effort, not a point fix. The 22 ms gap is float-op throughput +
+load latency in the dependency chain, all overlapped. Decision: **accepted at ~319 ms** rather than take on
+the representation rewrite (which parallel `nbody-res-*` sessions are already exploring — that line is what
+landed the bounds-elision).
 
 **Process note:** the differential ceiling-probe discipline (an unsound env-gated "skip the work" hack,
 measured before tasking an agent) caught all four negatives cheaply and prevented building a sound TBAA
