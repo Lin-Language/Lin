@@ -53,14 +53,19 @@ impl<'ctx> Codegen<'ctx> {
         let arr_ptr = arr.into_pointer_value();
 
         // len = *(u64*)(arr + 8); cap = *(u64*)(arr + 16)
+        // TBAA: header-field loads.
         let len_ptr = unsafe {
             self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(8, false)], "fpush_len_p")
         };
-        let len = self.builder.load(i64_ty, len_ptr, "fpush_len").into_int_value();
+        let len_raw = self.builder.load(i64_ty, len_ptr, "fpush_len");
+        self.tbaa_tag_hdr(len_raw);
+        let len = len_raw.into_int_value();
         let cap_ptr = unsafe {
             self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(16, false)], "fpush_cap_p")
         };
-        let cap = self.builder.load(i64_ty, cap_ptr, "fpush_cap").into_int_value();
+        let cap_raw = self.builder.load(i64_ty, cap_ptr, "fpush_cap");
+        self.tbaa_tag_hdr(cap_raw);
+        let cap = cap_raw.into_int_value();
         let full = self.builder.int_compare(IntPredicate::EQ, len, cap, "fpush_full");
 
         let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
@@ -75,17 +80,22 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.unconditional_branch(cont_b);
 
         // Fast path: data = *(ptr*)(arr + 24); data[len] = val; len = len + 1
+        // TBAA: data-ptr load is header; element store and new-len store get their own tags.
         self.builder.position_at_end(fast_b);
         let data_ptr_ptr = unsafe {
             self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(24, false)], "fpush_data_pp")
         };
-        let data_ptr = self.builder.load(ptr_ty, data_ptr_ptr, "fpush_data").into_pointer_value();
+        let data_raw = self.builder.load(ptr_ty, data_ptr_ptr, "fpush_data");
+        self.tbaa_tag_hdr(data_raw);
+        let data_ptr = data_raw.into_pointer_value();
         let elem_ptr = unsafe {
             self.builder.in_bounds_gep(llvm_elem_ty, data_ptr, &[len], "fpush_elem_p")
         };
-        self.builder.store(elem_ptr, val);
+        let elem_store = self.builder.store(elem_ptr, val);
+        self.tbaa_tag_elem_instr(elem_store, elem_ty);
         let new_len = self.builder.int_add(len, i64_ty.const_int(1, false), "fpush_newlen");
-        self.builder.store(len_ptr, new_len);
+        let len_store = self.builder.store(len_ptr, new_len);
+        self.tbaa_tag_hdr_instr(len_store);
         self.builder.unconditional_branch(cont_b);
 
         self.builder.position_at_end(cont_b);
@@ -124,10 +134,13 @@ impl<'ctx> Codegen<'ctx> {
         };
 
         // len = *(u64*)(arr + 8)
+        // TBAA: mark as header-field load so LLVM's LICM can hoist it past element stores.
         let len_ptr = unsafe {
             self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(8, false)], "flat_len_p")
         };
-        let len = self.builder.load(i64_ty, len_ptr, "flat_len").into_int_value();
+        let len_raw = self.builder.load(i64_ty, len_ptr, "flat_len");
+        self.tbaa_tag_hdr(len_raw);
+        let len = len_raw.into_int_value();
 
         // CK.1a: when the caller guarantees idx >= 0 (e.g. a fused range-for IV with non-negative
         // start), skip the negative-wrap select entirely. The resulting check is the canonical
@@ -161,19 +174,25 @@ impl<'ctx> Codegen<'ctx> {
         let suffix = Self::flat_suffix(elem_ty);
         let get_fn = self.get_or_declare_fn(&format!("lin_flat_array_get_{}", suffix),
             llvm_elem_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+        self.add_fn_attrs(get_fn, &["noreturn"]);
         self.builder.call(get_fn, &[arr_ptr.into(), idx.into()], "flat_get_oob");
         self.builder.unreachable();
 
         // Fast path: data = *(ptr*)(arr + 24); return data[actual]
+        // TBAA: both the data-ptr load (header field) and the element load get their own tags.
         self.builder.position_at_end(ok_b);
         let data_ptr_ptr = unsafe {
             self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(24, false)], "flat_data_pp")
         };
-        let data_ptr = self.builder.load(ptr_ty, data_ptr_ptr, "flat_data").into_pointer_value();
+        let data_raw = self.builder.load(ptr_ty, data_ptr_ptr, "flat_data");
+        self.tbaa_tag_hdr(data_raw);
+        let data_ptr = data_raw.into_pointer_value();
         let elem_ptr = unsafe {
             self.builder.in_bounds_gep(llvm_elem_ty, data_ptr, &[actual], "flat_elem_p")
         };
-        self.builder.load(llvm_elem_ty, elem_ptr, "flat_get")
+        let elem = self.builder.load(llvm_elem_ty, elem_ptr, "flat_get");
+        self.tbaa_tag_elem(elem, elem_ty);
+        elem
     }
 
     /// Push a dynamically-typed value (TypeVar or Union) into a tagged LinArray*.
@@ -289,10 +308,13 @@ impl<'ctx> Codegen<'ctx> {
         };
 
         // len = *(u64*)(arr + 8)
+        // TBAA: header-field load doesn't alias element stores — LICM can hoist it.
         let len_ptr = unsafe {
             self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(8, false)], "fset_len_p")
         };
-        let len = self.builder.load(i64_ty, len_ptr, "fset_len").into_int_value();
+        let len_raw = self.builder.load(i64_ty, len_ptr, "fset_len");
+        self.tbaa_tag_hdr(len_raw);
+        let len = len_raw.into_int_value();
 
         // actual = idx < 0 ? len + idx : idx  (matches lin_array_set negative-index handling)
         let zero = i64_ty.const_zero();
@@ -308,25 +330,28 @@ impl<'ctx> Codegen<'ctx> {
         let cont_b = self.context.append_basic_block(llvm_fn, "fset_cont");
         self.builder.conditional_branch(oob, oob_b, ok_b);
 
-        // Cold OOB path: defer to the runtime set with the ORIGINAL index (silent no-op on OOB),
-        // so out-of-range writes behave byte-identically to the generic path.
+        // Cold OOB path: silent no-op (spec §6.1 — array set never faults). Fall through to
+        // cont_b with NO memory writes or calls. An empty block with no side effects lets LLVM
+        // treat it as dead for alias analysis: LICM can hoist the flat_len load past element
+        // stores because the OOB path doesn't touch any memory (unlike the old lin_array_set
+        // call that could grow the array and modify header fields).
         self.builder.position_at_end(oob_b);
-        let stack_tagged = self.build_tagged_val_alloca(&value, elem_ty);
-        let set_fn = self.get_or_declare_fn("lin_array_set",
-            self.context.void_type().fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
-        self.builder.call(set_fn, &[arr_ptr.into(), idx.into(), stack_tagged.into()], "");
         self.builder.unconditional_branch(cont_b);
 
         // Fast path: data = *(ptr*)(arr + 24); data[actual] = value
+        // TBAA: data-ptr load is a header-field access; element store is an elem access.
         self.builder.position_at_end(ok_b);
         let data_ptr_ptr = unsafe {
             self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(24, false)], "fset_data_pp")
         };
-        let data_ptr = self.builder.load(ptr_ty, data_ptr_ptr, "fset_data").into_pointer_value();
+        let data_raw = self.builder.load(ptr_ty, data_ptr_ptr, "fset_data");
+        self.tbaa_tag_hdr(data_raw);
+        let data_ptr = data_raw.into_pointer_value();
         let elem_ptr = unsafe {
             self.builder.in_bounds_gep(llvm_elem_ty, data_ptr, &[actual], "fset_elem_p")
         };
-        self.builder.store(elem_ptr, value);
+        let store_iv = self.builder.store(elem_ptr, value);
+        self.tbaa_tag_elem_instr(store_iv, elem_ty);
         self.builder.unconditional_branch(cont_b);
 
         self.builder.position_at_end(cont_b);

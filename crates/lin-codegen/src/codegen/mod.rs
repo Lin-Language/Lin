@@ -7,7 +7,7 @@ use inkwell::targets::{
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue,
+    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, MetadataValue, PointerValue,
 };
 use inkwell::attributes::AttributeLoc;
 use inkwell::{AddressSpace, OptimizationLevel};
@@ -36,6 +36,67 @@ mod r#match;
 mod debug_info;
 
 use debug_info::DebugInfoState;
+
+/// Pre-built TBAA metadata nodes for flat-array accesses.
+///
+/// TBAA lets LLVM's LICM prove that length-field loads (`arr+8`) don't alias
+/// data-element stores (`*(arr+24) + i*stride`). Without TBAA, LLVM is conservative
+/// and reloads the length on every iteration; with it, LICM hoists the load out of the
+/// TCO loop body, giving IRCE a loop-invariant length to reason against the index bound.
+///
+/// Two distinct type hierarchies under a common root:
+/// - `hdr`  : accesses to the LinArray struct header (rc, elem_tag, len, cap, data_ptr).
+/// - `*_elem`: accesses THROUGH the data pointer to element bytes.
+/// Since `hdr` and `f64_elem` / `i64_elem` / `i32_elem` / `bool_elem` are separate nodes
+/// under the same root, LLVM knows they never alias each other (a store to a data element
+/// can never modify the header len field, and vice-versa).
+struct TbaaNodes<'ctx> {
+    /// LLVM metadata kind ID for "tbaa" (always 1 in LLVM).
+    kind_id: u32,
+    /// TBAA access tag for header-field reads/writes (len, cap, data_ptr).
+    hdr: MetadataValue<'ctx>,
+    /// TBAA access tag for Float64 element reads/writes through the data pointer.
+    f64_elem: MetadataValue<'ctx>,
+    /// TBAA access tag for Int64 element reads/writes through the data pointer.
+    i64_elem: MetadataValue<'ctx>,
+    /// TBAA access tag for Int32 element reads/writes through the data pointer.
+    i32_elem: MetadataValue<'ctx>,
+    /// TBAA access tag for Bool element reads/writes through the data pointer.
+    bool_elem: MetadataValue<'ctx>,
+}
+
+impl<'ctx> TbaaNodes<'ctx> {
+    fn new(context: &'ctx Context) -> Self {
+        let i64_ty = context.i64_type();
+        let zero = i64_ty.const_zero();
+        // Root node: MDNode { MDString("lin-lang") }
+        let root_str = context.metadata_string("lin-lang");
+        let root = context.metadata_node(&[root_str.into()]);
+        // Header type node: MDNode { MDString("linarray_hdr"), root_node, i64(0) }
+        let mk_type = |name: &str| {
+            let s = context.metadata_string(name);
+            context.metadata_node(&[s.into(), root.into(), zero.into()])
+        };
+        let hdr_type  = mk_type("linarray_hdr");
+        let f64_type  = mk_type("linarray_f64");
+        let i64_type  = mk_type("linarray_i64");
+        let i32_type  = mk_type("linarray_i32");
+        let bool_type = mk_type("linarray_bool");
+        // Access tags: MDNode { base_type, access_type, offset }
+        let mk_tag = |ty: MetadataValue<'ctx>| {
+            context.metadata_node(&[ty.into(), ty.into(), zero.into()])
+        };
+        let kind_id = context.get_kind_id("tbaa");
+        TbaaNodes {
+            kind_id,
+            hdr:       mk_tag(hdr_type),
+            f64_elem:  mk_tag(f64_type),
+            i64_elem:  mk_tag(i64_type),
+            i32_elem:  mk_tag(i32_type),
+            bool_elem: mk_tag(bool_type),
+        }
+    }
+}
 
 pub struct Codegen<'ctx> {
     context: &'ctx Context,
@@ -111,6 +172,9 @@ pub struct Codegen<'ctx> {
     /// instead of a heap-allocated `TaggedVal*`. Direct call sites unpack the struct in registers;
     /// the boxed-ABI wrapper boxes the struct result for indirect/closure callers.
     flat_union_return_fns: HashSet<lir::FuncId>,
+    /// Pre-built TBAA metadata nodes for flat-array accesses. Attached to header-field loads
+    /// and data-element stores so LLVM's LICM can hoist the length load out of inner loops.
+    tbaa: TbaaNodes<'ctx>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -153,7 +217,48 @@ impl<'ctx> Codegen<'ctx> {
             debug_info: None,
             str_literal_globals: std::cell::RefCell::new(HashMap::new()),
             flat_union_return_fns: HashSet::new(),
+            tbaa: TbaaNodes::new(context),
         }
+    }
+
+    /// Attach the TBAA header-field access tag to a load or store instruction value.
+    /// Use on: length load (`arr+8`), cap load (`arr+16`), data-ptr load (`arr+24`).
+    pub(crate) fn tbaa_tag_hdr(&self, instr: BasicValueEnum<'ctx>) {
+        if let Some(iv) = instr.as_instruction_value() {
+            let _ = iv.set_metadata(self.tbaa.hdr, self.tbaa.kind_id);
+        }
+    }
+
+    /// Attach the TBAA element access tag to a load or store instruction value.
+    /// Use on: element loads/stores through the data pointer (`flat_data + i*stride`).
+    pub(crate) fn tbaa_tag_elem(&self, instr: BasicValueEnum<'ctx>, elem_ty: &lin_check::types::Type) {
+        let tag = match elem_ty {
+            lin_check::types::Type::Float64 => self.tbaa.f64_elem,
+            lin_check::types::Type::Int64   => self.tbaa.i64_elem,
+            lin_check::types::Type::Int32   => self.tbaa.i32_elem,
+            lin_check::types::Type::Bool    => self.tbaa.bool_elem,
+            _ => return,
+        };
+        if let Some(iv) = instr.as_instruction_value() {
+            let _ = iv.set_metadata(tag, self.tbaa.kind_id);
+        }
+    }
+
+    /// Attach TBAA header tag to an `InstructionValue` store (for `fset_len_store` in push).
+    pub(crate) fn tbaa_tag_hdr_instr(&self, iv: inkwell::values::InstructionValue<'ctx>) {
+        let _ = iv.set_metadata(self.tbaa.hdr, self.tbaa.kind_id);
+    }
+
+    /// Attach TBAA element tag to an `InstructionValue` store (for `flat_array_set`).
+    pub(crate) fn tbaa_tag_elem_instr(&self, iv: inkwell::values::InstructionValue<'ctx>, elem_ty: &lin_check::types::Type) {
+        let tag = match elem_ty {
+            lin_check::types::Type::Float64 => self.tbaa.f64_elem,
+            lin_check::types::Type::Int64   => self.tbaa.i64_elem,
+            lin_check::types::Type::Int32   => self.tbaa.i32_elem,
+            lin_check::types::Type::Bool    => self.tbaa.bool_elem,
+            _ => return,
+        };
+        let _ = iv.set_metadata(tag, self.tbaa.kind_id);
     }
 
     /// Initialise DWARF debug info for the main module (no-op unless `--debug`). Must be called
