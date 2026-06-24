@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # compare.sh — cross-language benchmark comparison runner.
 #
-# Compiles/runs six identical workloads (dijkstra, interp, parallel, recursion,
-# pipeline, records) across Lin, Rust, Go, Python and Node.js, then prints a
-# single table of min wall-clock ms (lower = faster). Each implementation prints
+# Compiles/runs ten identical workloads (dijkstra, interp, parallel, recursion,
+# pipeline, records, nbody, knucleotide, binarytrees, revcomp) across Lin, Rust,
+# Go, Python and Node.js, then prints a single table of min wall-clock ms
+# (lower = faster). Each implementation prints
 # exactly one stdout line "RESULT=<int>"; the runner uses that to verify every
 # language computed the SAME answer per workload (a correctness gate), and skips
 # any toolchain that isn't installed — it never hard-fails on a missing one.
@@ -44,7 +45,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 mkdir -p "$OUTDIR"
 
 # The fixed workload order (also the row order in the table). Filtered by $1.
-ALL_WORKLOADS=(dijkstra interp parallel recursion pipeline records)
+ALL_WORKLOADS=(dijkstra interp parallel recursion pipeline records nbody knucleotide binarytrees revcomp)
 # The fixed language/column order, regardless of LANGS filtering — absent or
 # unselected columns render as "--".
 ALL_LANGS=(lin rs go py js)

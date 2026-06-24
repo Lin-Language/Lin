@@ -1,0 +1,71 @@
+// knucleotide.lin — k-mer frequency count: string-keyed map throughput + per-window
+// substring allocation.
+//
+// A deterministic Park-Miller MINSTD generator builds an N-base ACGT sequence; a
+// sliding K-wide window is counted into a `{ String: Int64 }` map. The per-window
+// substring + hash-map insert is the work under test — this is the counterpart to
+// `records` (which measures the sealed-struct const-offset fast path): knucleotide
+// exercises the string-keyed `lin_map_get` hashing path that `records` deliberately
+// avoids. Prints exactly one stdout line "RESULT=<int>".
+//
+// RESULT = (sum over keys of count^2) + (number of distinct keys) — order-independent,
+// so it does not depend on map iteration order. Parameters (identical across all
+// languages): N=4000000, K=8. The generator is Park-Miller MINSTD
+// (state = state*16807 mod 2147483647, seed 42); every intermediate stays < 2^53 so
+// it is bit-identical across i64 / int64 / Python-int / JS Number.
+import { print } from "std/io"
+import { toString, substring, fromCodePoints } from "std/string"
+import { keys } from "std/object"
+import { set, arrayAllocateFilled } from "std/array"
+import { while, for } from "std/iter"
+import { toInt32 } from "std/number"
+
+val N = 4000000
+val K = 8
+
+// ACGT code points, indexed by (state % 4).
+val codeOf = [65, 67, 71, 84]
+
+// Build the N-base sequence as a String (codes -> fromCodePoints). Tail-recursive
+// fill (TCO -> loop), so the only per-base cost is the generator step + array store.
+val gen = (i: Int32, state: Int64, arr: Int32[]): Null =>
+  if i >= N then
+    null
+  else
+    val ns = (state * 16807i64) % 2147483647i64
+    set(arr, i, codeOf[toInt32(ns % 4i64)])
+    gen(i + 1, ns, arr)
+
+val codes: Int32[] = arrayAllocateFilled(N, 0)
+val ignore = gen(0, 42i64, codes)
+val seq = fromCodePoints(codes)
+
+// Slide a K-window over the sequence, counting each k-mer in a string-keyed map.
+var counts: { String: Int64 } = {}
+val end = N - K + 1
+var i = 0
+while(() =>
+  if i >= end then
+    false
+  else
+    val key = substring(seq, i, i + K)
+    val cur = counts[key]
+    counts[key] = if cur == null then 1i64 else cur + 1i64
+    i = i + 1
+    true
+)
+
+// Order-independent checksum over the count map.
+var sumsq = 0i64
+var distinct = 0i64
+keys(counts).for(key =>
+  val v = counts[key]
+  if v != null then
+    sumsq = sumsq + v * v
+    distinct = distinct + 1i64
+  else
+    null
+)
+
+val result = sumsq + distinct
+print("RESULT=${toString(result)}")

@@ -1,8 +1,15 @@
 # Lin cross-language comparison suite
 
 A self-contained suite that compares **Lin** against **Go, Rust, Python and
-Node.js** on seven identical workloads, and prints a single table of min
+Node.js** on eleven identical workloads, and prints a single table of min
 wall-clock milliseconds (lower = faster).
+
+The first seven (`dijkstra`…`async_io`) are macro/realistic + concurrency
+workloads; the last four (`nbody`, `knucleotide`, `binarytrees`, `revcomp`) are
+ports of the classic numeric/string/hash/allocation micro-benchmarks that every
+standard cross-language suite (Computer Language Benchmarks Game, Are-We-Fast-Yet,
+kostya) treats as table stakes, added so the set covers the float, string,
+hash-map and GC/refcount axes the original seven did not.
 
 This is **indicative, not authoritative**. It measures whole-process wall-clock
 on one machine — it is *not* a definitive cross-language ranking. See
@@ -26,7 +33,7 @@ factored out.
 Lin and Rust binaries are built once per run and timed; Go is built with
 `go build`; Python and Node run their scripts directly.
 
-## The seven workloads
+## The eleven workloads
 
 Every implementation prints **exactly one** stdout line `RESULT=<int>` (all
 other logging goes to stderr); the runner uses that value as a correctness gate
@@ -42,6 +49,10 @@ all languages and are the single source of truth:
 | `pipeline` | Eager `map`/`filter`/`reduce`, materializing each stage | N=20000000 | `133333326666666` |
 | `records`  | Record-access-bound: thread one struct through field-read + reconstruct cycles (constant-offset struct-layout field access) | N=50000000, MOD=2147483647 | `1298599827` |
 | `async_io` | I/O-bound bounded concurrency (latency/overlap, not runtime speed) | TASKS=200, SLEEP_MS=50, CONCURRENCY=50 | `40000` |
+| `nbody`    | Floating-point numerics: symplectic n-body integrator (Float64 mul/add + sqrt over body pairs) | N=5000000 steps, dt=0.01, 5 bodies | `-171605325` |
+| `knucleotide` | String-keyed hash-map throughput + per-window substring allocation (k-mer frequency count) | N=4000000 bases, K=8 | `248211949` |
+| `binarytrees` | Allocation / refcount-vs-GC churn: bottom-up allocate + traverse + reclaim many 2-pointer nodes | MIN_DEPTH=4, MAX_DEPTH=16 | `14985902` |
+| `revcomp`  | Byte-buffer throughput: generate + reverse-complement + checksum a large contiguous buffer | N=20000000 bases | `452296230` |
 
 Workload sizes are chosen so each runs long enough that fixed overhead (process
 start, thread spawn) is a small fraction and the cross-language ratio is stable —
@@ -85,6 +96,41 @@ Per-workload checksum definitions:
   latency-bound — every language pins to the `ceil(TASKS/CONCURRENCY)*SLEEP_MS`
   sleep floor, so it tests concurrency *overlap*, not runtime speed (see the source
   comment in `async_io.lin`).
+- **nbody**: the Computer Language Benchmarks Game "n-body" — a symplectic-integrator
+  simulation of the Sun + four Jovian planets, N=5000000 timesteps of `dt=0.01` over
+  all 10 body-pairs, in Float64. This is the suite's only **float-dominant** workload
+  (the axis CLBG/Are-We-Fast-Yet/kostya all lead with). `RESULT = trunc(energy * 1e9)`
+  after the run → `-171605325`. **FP determinism:** every product is bound to a local
+  *before* any add/subtract, so no backend contracts a multiply-add into an FMA (which
+  would change the last bit); all five run the identical f64 op sequence in the same
+  pair order, so the (non-associative) energy sum is bit-identical and the truncated
+  checksum agrees. Lin uses 7 parallel flat `Float64[]` arrays and writes hot loops as
+  tail-recursive (TCO) loops so the number reflects float arithmetic, not loop-driver
+  overhead.
+- **knucleotide**: a k-mer frequency count — a deterministic Park-Miller MINSTD
+  generator (`state = state*16807 mod 2147483647`, seed 42; every intermediate < 2^53
+  so it is bit-identical across i64/int64/Python-int/JS Number) builds an N=4000000-base
+  ACGT sequence; a sliding K=8 window is counted into a string-keyed map. This exercises
+  the **string-keyed hash + per-window substring** path — the counterpart to `records`,
+  which deliberately measures the sealed-struct const-offset *fast* path; knucleotide
+  measures the `lin_map_get`-style hashing path `records` avoids. `RESULT = (sum over
+  keys of count²) + (distinct key count)` (order-independent) → `248211949`.
+- **binarytrees**: the Computer Language Benchmarks Game "binary-trees" — bottom-up
+  allocate many short-lived 2-pointer tree nodes, traverse each to a node-count
+  checksum, and reclaim them, for even depths `MIN_DEPTH=4..MAX_DEPTH=16`. There is
+  almost no arithmetic: the workload **is** allocate + traverse + reclaim, so it measures
+  Lin's reference-counting allocator against Go's and Node's tracing GCs (a node is a
+  named record with two optional children). `RESULT = stretchCheck + (sum of all
+  iteration checks) + longLivedCheck` (the long-lived tree is referenced after the churn
+  loop so it stays alive across it) → `14985902`.
+- **revcomp**: a checksum form of the Computer Language Benchmarks Game
+  "reverse-complement" — the same Park-Miller generator fills an N=20000000-base ACGT
+  buffer; it is reverse-complemented (`A<->T`, `C<->G`, read back-to-front) into a second
+  buffer; then a rolling checksum `h = (h*31 + code) mod 1000000007` is folded over the
+  result (`h < 1e9` keeps `h*31 < 2^53`, so it is bit-identical across all languages).
+  This is large contiguous-buffer **allocate + write-pass + read-pass** — a memory-
+  bandwidth / flat-array workload distinct from `binarytrees`' small-object churn
+  (Lin uses flat scalar `Int32[]` buffers, its strong path) → `452296230`.
 
 ## How to run
 

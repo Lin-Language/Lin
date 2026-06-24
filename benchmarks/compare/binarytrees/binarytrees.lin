@@ -1,0 +1,56 @@
+// binarytrees.lin — allocation / refcount churn. The classic Computer Language
+// Benchmarks Game "binary-trees": bottom-up allocate many short-lived 2-pointer
+// tree nodes, traverse each to a checksum (node count), and free them. There is
+// almost no arithmetic — the workload IS allocate + traverse + reclaim, so it
+// measures Lin's reference-counting allocator/Perceus path against Go's and
+// Node's tracing GCs. Prints exactly one stdout line "RESULT=<int>".
+//
+// A node is a named record with two optional children; a leaf has both null.
+// RESULT = stretchCheck + (sum of all iteration checks) + longLivedCheck — the
+// long-lived tree is referenced after the churn loop so it stays alive across it.
+// Parameters (identical across all languages): MIN_DEPTH=4, MAX_DEPTH=16.
+import { print } from "std/io"
+import { toString } from "std/string"
+import { for, range, reduce } from "std/iter"
+
+val MIN_DEPTH = 4
+val MAX_DEPTH = 16
+
+type Tree = { "l": Tree | Null, "r": Tree | Null }
+
+// Bottom-up allocate a perfect tree of the given depth (depth 0 == leaf).
+val make = (d: Int32): Tree =>
+  if d == 0 then
+    { "l": null, "r": null }
+  else
+    { "l": make(d - 1), "r": make(d - 1) }
+
+// Recursive node count: 1 for a leaf, else 1 + both subtrees.
+val check = (t: Tree): Int64 =>
+  val l = t["l"]
+  val r = t["r"]
+  if l == null then
+    1i64
+  else if r == null then
+    1i64
+  else
+    1i64 + check(l) + check(r)
+
+val pow2 = (k: Int32): Int32 =>
+  if k == 0 then 1 else 2 * pow2(k - 1)
+
+val maxDepth = if MAX_DEPTH > MIN_DEPTH + 2 then MAX_DEPTH else MIN_DEPTH + 2
+
+val stretchCheck = check(make(maxDepth + 1))
+val longLived = make(maxDepth)
+
+// Churn: for each even depth, allocate `iterations` trees and sum their checks.
+var total = stretchCheck
+range(MIN_DEPTH, maxDepth + 1, 2).for(depth =>
+  val iterations = pow2(maxDepth - depth + MIN_DEPTH)
+  total = total + range(0, iterations).reduce(0i64, (acc, i) => acc + check(make(depth)))
+)
+
+// Last use of longLived is here, so it is retained across the churn loop above.
+val result = total + check(longLived)
+print("RESULT=${toString(result)}")
