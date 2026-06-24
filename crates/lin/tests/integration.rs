@@ -24067,3 +24067,29 @@ print(got)
 "#);
     assert_eq!(output, vec!["HELLO"]);
 }
+
+#[test]
+fn test_getset_fuse_soundness_call_in_window_disqualifies() {
+    // Soundness regression: get-set fusion holds the raw upsert slot pointer across the
+    // get→set window. A CALL in that window can grow/realloc the same map, dangling the
+    // pointer. `grow` here inserts 2000 keys (several reallocs) BETWEEN the get and the set
+    // on key "HELLO"; fusion must be disqualified (call guard) so the final write lands in
+    // the live slot. Correct result is 101 (100 + 1); a dangling write would lose it.
+    let output = run(r#"import { print } from "std/io"
+import { toString, substring } from "std/string"
+var m: { String: Int64 } = {}
+val grow = (n: Int32): Null =>
+  if n <= 0 then null
+  else
+    m[toString(n)] = 7i64
+    grow(n - 1)
+val seq = "HELLOWORLD"
+val key = substring(seq, 0, 5)
+m[key] = 100i64
+val cur = m[key]
+val ig = grow(2000)
+m[key] = if cur == null then 1i64 else cur + 1i64
+print(toString(m[key]))
+"#);
+    assert_eq!(output, vec!["101"]);
+}

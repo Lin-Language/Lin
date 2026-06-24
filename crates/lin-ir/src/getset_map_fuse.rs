@@ -171,14 +171,25 @@ fn run_fn(func: &mut LinFunction) {
     }
 }
 
-/// Returns true if `instr` writes to slot_s (GlobalValSet) or is an IndexSet on an object
-/// that loads from slot_s. Used to detect concurrent map mutations.
+/// Returns true if `instr` could invalidate the held upsert slot pointer across the
+/// get→set window: a write to slot_s (GlobalValSet), an IndexSet on slot_s, OR ANY CALL.
+///
+/// The Call guard is load-bearing for SOUNDNESS: the fused codegen holds the raw slot
+/// pointer returned by `lin_map_upsert_slot_bytes` (obtained at the get) and writes through
+/// it at the set. A call in the window that inserts into the SAME map can trigger a
+/// SwissTable grow → the slots array is reallocated and freed → the held pointer dangles
+/// (use-after-free at the set). A callee can reach the map via the global slot even when
+/// it is not visible as an IndexSet in this function's CFG, so we cannot prove a call is
+/// map-free here. Conservatively disqualify the fusion whenever the window contains a call.
+/// (knucleotide's window is pure null-check + i64 add, so it still fuses.)
 fn check_map_write(slot_s: usize, instr: &Instruction, gvg_slot: &HashMap<Temp, usize>) -> bool {
     match instr {
         Instruction::GlobalValSet { slot, .. } => *slot == slot_s,
         Instruction::IndexSet { object: m2, .. } => {
             gvg_slot.get(m2).copied() == Some(slot_s)
         }
+        // Any call may grow/reallocate the map (directly or transitively) → dangling slot.
+        Instruction::Call { .. } | Instruction::CallIntrinsic { .. } => true,
         _ => false,
     }
 }
