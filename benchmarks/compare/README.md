@@ -25,7 +25,7 @@ For each (workload, language) the runner does one un-timed warm-up run, then
 `RUNS` timed runs of the **whole process**, and reports the **min** (most
 reproducible for CPU-bound work) and computes the **median** over the runs. The
 timed region is the entire process: it **includes process startup, interpreter
-launch / JIT warm-up, and (for Dijkstra) input parsing**. That startup cost is a
+launch / JIT warm-up**. That startup cost is a
 real, interesting difference between a compiled native binary (Lin, Rust, Go)
 and an interpreter/VM (Python, Node), so it is deliberately included rather than
 factored out.
@@ -42,7 +42,7 @@ all languages and are the single source of truth:
 
 | Workload   | What it exercises | Fixed parameters | Pinned `RESULT` |
 |------------|-------------------|------------------|-----------------|
-| `dijkstra` | Graph build + linear-scan-PQ shortest path + input parsing | N=4000 nodes, ~33163 edges, source `n0`, target `n3999` | `121789671` |
+| `dijkstra` | In-code graph generation + linear-scan-PQ shortest path (pure algorithm, no file I/O) | N=30000 nodes, ~249k edges, source `n0`, target `n29999` | `236325976` |
 | `interp`   | Expression interpreter: tokenize → recursive-descent parse → tree-walk eval | REPS=10000 over 8 fixed exprs | `10460000` |
 | `parallel` | CPU-bound fan-out across threads/processes | START=27, ITERS=300000000, CHUNKS=8 | `2173714077200` |
 | `recursion`| Recursive call overhead (`fib`) + iterative loop (`sumTo`) | FIB_N=42, SUM_N=50000000 | `269164297900400072` |
@@ -61,9 +61,13 @@ startup cost (see the scaling notes in `## Caveats`).
 
 Per-workload checksum definitions:
 
-- **dijkstra**: `dist[n3999] * 1000003 + (sum of all finite dist values mod 1e9)`,
-  in 64-bit. "Finite" means `dist < 1000000000` (the infinity sentinel). For the
-  committed graph: `dist[n3999]=121`, `sumFinite=789308` → `121789671`.
+- **dijkstra**: `dist[target] * 1000003 + (sum of all finite dist values mod 1e9)`,
+  in 64-bit, where `target` is node `N-1`. "Finite" means `dist < 1000000000` (the
+  infinity sentinel). The graph is generated IN CODE (no file read) by a portable
+  Park-Miller MINSTD generator (`state = state*16807 mod 2147483647`, seed 1234; every
+  intermediate `< 2^53`, so it is bit-identical across i64/int64/Python-int/JS Number),
+  so every language builds the identical graph in memory and the timed region is the
+  algorithm itself — not file I/O or parsing. For N=30000 → `236325976`.
 - **interp**: a faithful port of `examples/calc/` — a tokenizer → recursive-descent
   parser (`expr = term (('+'|'-') term)*`, standard precedence) → tree-walking
   evaluator, run over 8 fixed integer expressions REPS=10000 times. Every
@@ -218,11 +222,12 @@ cell `MISMATCH` and adds a line to the correctness footer
    `threadPool(50)` + `poolAsync`. These idiom differences are honest and
    intended.
 8. **Warm-up** before every timed run.
-9. **Dijkstra's graph read is inside the timed region for every language** — it
-   covers each language's input parsing, a real and interesting difference.
-   JSON-native languages (Lin/Python/Node) read `data/graph.json`; Go/Rust read
-   the derived `data/graph.txt`. Both files encode the identical graph (written
-   from the same in-memory edge list).
+9. **Dijkstra generates its graph in code, identically in every language** — a
+   portable deterministic generator (Park-Miller MINSTD, seed 1234) builds the same
+   in-memory adjacency in all five, so there is NO file read or parse in the timed
+   region. This isolates the O(V²) algorithm itself (an earlier version read a
+   `graph.json`/`graph.txt` from disk, which charged the JSON-native languages a
+   parse cost the plain-text readers never paid — a format asymmetry, removed here).
 10. **Same machine / same session only.**
 
 ## Missing-toolchain behaviour
@@ -261,30 +266,21 @@ it and pass `USE_HYPERFINE=1`.
   (`async_io` is the exception — it is latency-bound by `sleep`, so no size makes
   it reflect runtime speed; it stays as an overlap-correctness check.)
 
-## How the Dijkstra graph was generated
+## How the Dijkstra graph is generated
 
-`data/graph.json` and `data/graph.txt` are committed, generated once (NOT in the
-timed path) by `data/gen_graph.py` from a hardcoded seed:
+There is no committed graph file — each implementation builds the graph in memory
+at the start of the timed region, identically, from a portable deterministic
+generator (so the number reflects the algorithm, not parsing). The generator is a
+Park-Miller MINSTD LCG, `state = state*16807 mod 2147483647`, seed `1234` (every
+intermediate stays `< 2^53`, so the sequence — and therefore the graph and the
+checksum — is bit-identical across Lin/Go/Rust i64, Python int, and JS Number).
 
-```bash
-python3 benchmarks/compare/data/gen_graph.py
-```
-
-It writes both files from the *same* in-memory edge list, so they always encode
-the identical graph:
-
-- `graph.json` — `{"nodes":["n0",...],"edges":[{"from","to","weight"},...]}`
-  (read by Lin/Python/Node).
-- `graph.txt` — line 1 is `<num_nodes> <source> <target>` (e.g. `4000 n0 n3999`),
-  then one `from to weight` line per edge (e.g. `n0 n1 7`), in the same order as
-  the JSON (read by Go/Rust, so they need no JSON library and stay a single-file
-  build).
-
-Graph shape (seed `1234`, fully reproducible): 4000 nodes `n0..n3999`; for each
-`i`, edges `i -> i+1 .. i+8` (skipping out-of-range), which guarantees `n0`
-reaches `n3999`; plus an occasional long forward "skip" edge (each `i` with
-probability ~0.3 gets one extra edge to a random `j > i`); weights are random
-ints in `[1, 100]`; ~33163 edges total.
+Graph shape (N=30000 nodes `n0..n29999`): for each node `i`, a forward edge to each
+of `i+1 .. i+8` that is in range (weight `nxt%100 + 1`), which guarantees `n0`
+reaches `n29999`; then with probability ~0.3 (`nxt%10 < 3`) one extra forward
+"skip" edge to a random `j` in `(i, N)` (weight `nxt%100 + 1`). The order of `nxt()`
+calls is the single source of truth and is identical in every implementation
+(`benchmarks/compare/dijkstra/dijkstra.{lin,py,js,go,rs}`); ~249k edges total.
 
 ## Relationship to the Lin-only harness
 
