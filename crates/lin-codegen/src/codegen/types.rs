@@ -537,6 +537,22 @@ impl<'ctx> Codegen<'ctx> {
             Type::Object { .. } if Self::sealed_fields(ty).is_some() => Some(Self::KIND_SEALED),
             // A sum-type union: runtime value is a `*SumNode` owned pointer slot.
             Type::Union(_) if Self::is_sum_type(ty) => Some(Self::KIND_SUMNODE_FIELD),
+            // A NullableRecord `T | Null` where T is a sealed record: physically a nullable
+            // `*sealed_T` pointer. Uses KIND_SEALED — `release_field` and `lin_sealed_release_self`
+            // are both null-safe, so a null pointer in the slot is a drop no-op. The retain path
+            // (`emit_rc_retain_inline`) is already null-safe. Comes AFTER sum-type check so a
+            // discriminated union with Null variants stays a SumNode, not a NullableRecord.
+            Type::Union(_) if Self::nullable_sealed_record_type(ty).is_some() => Some(Self::KIND_SEALED),
+            // Named-alias nullable form: `Union([Named(n), Null])` — a self-recursive type alias where
+            // `Named("Tree")` is the opaque cycle-breaking ref. By construction the named type seals; we
+            // accept it eagerly here (same reasoning as `is_nullable_record_param` in lin-ir). The IR
+            // repr pass has already assigned a NullableRecord layout to this position.
+            Type::Union(members) if {
+                let mut has_named = false;
+                let mut ok = true;
+                for m in members { match m { Type::Null => {} Type::Named(_) => { has_named = true; } _ => { ok = false; break; } } }
+                has_named && ok
+            } => Some(Self::KIND_SEALED),
             _ => None,
         }
     }
@@ -615,6 +631,19 @@ impl<'ctx> Codegen<'ctx> {
             Type::Object { .. } if Self::sealed_fields(ty).is_some() => Some(Self::NKIND_SEALED),
             // A sum-type union stored as a `*SumNode` pointer slot.
             Type::Union(_) if Self::is_sum_type(ty) => Some(Self::NKIND_SUMNODE),
+            // A NullableRecord `T | Null` where T is a sealed record: physically a nullable
+            // `*sealed_T` pointer — same NKIND as a non-null nested sealed record. `box_field_value`
+            // handles a null pointer for NKIND_SEALED by returning null_mut() (the null field case).
+            // Comes AFTER sum-type check so a discriminated union with Null is still NKIND_SUMNODE.
+            Type::Union(_) if Self::nullable_sealed_record_type(ty).is_some() => Some(Self::NKIND_SEALED),
+            // Named-alias nullable form: `Union([Named(n), Null])` — self-recursive cycle-breaking alias.
+            // Same physical representation as a non-null sealed pointer but nullable. See `sealed_field_kind`.
+            Type::Union(members) if {
+                let mut has_named = false;
+                let mut ok = true;
+                for m in members { match m { Type::Null => {} Type::Named(_) => { has_named = true; } _ => { ok = false; break; } } }
+                has_named && ok
+            } => Some(Self::NKIND_SEALED),
             _ => None,
         }
     }

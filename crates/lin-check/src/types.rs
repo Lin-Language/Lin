@@ -1,4 +1,6 @@
 use indexmap::IndexMap;
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt;
 
 /// The set of syntactic lambda identities that can inhabit a `Type::Function` (Path-11 Leg 2,
@@ -567,14 +569,61 @@ impl Type {
     }
 
     /// True when `ty` is an eligible HEAP field of a sealed record (String/StrLit, Array/FixedArray,
-    /// Map, nested sealed record, or a single-pointer union — a sum type whose runtime value is a
-    /// `*SumNode`). Stored as an 8-byte owned pointer slot.
+    /// Map, nested sealed record, a single-pointer union — a sum type whose runtime value is a
+    /// `*SumNode` — or a NullableRecord `T|Null` where T is a sealed record, stored as a nullable
+    /// 8-byte pointer with null-safe RC). Stored as an 8-byte owned pointer slot.
+    ///
+    /// Uses a thread-local visited set to break the infinite recursion that arises with recursive
+    /// types like `Tree = { l: Tree|Null, r: Tree|Null }`: checking `Tree|Null` via
+    /// `nullable_sealed_record` calls `sealed_fields(Tree)` which calls `is_sealed_field(Tree|Null)`
+    /// which calls back here. When re-entered for the same union Display key, we return `true`
+    /// optimistically — the type IS a valid nullable pointer field by construction.
     pub fn is_sealed_heap_field(&self) -> bool {
-        self.is_string_ish()
+        if self.is_string_ish()
             || matches!(self, Type::Array(_) | Type::FixedArray(_))
             || matches!(self, Type::Map { .. })
             || (matches!(self, Type::Object { .. }) && Type::sealed_fields(self).is_some())
             || Type::sum_type_eligible(self)
+        {
+            return true;
+        }
+        // Named-alias union form: `Union([Named(n), Null])` — a self-recursive type alias reference
+        // like `Tree | Null` where `Tree` is defined as a sealed record. The `Named` wrapper is the
+        // cycle-breaking opaque ref the checker emits for self-recursive types; by construction the
+        // named type IS a sealed record (if it weren't, the outer Object would not seal). Accept it
+        // eagerly here; the IR repr pass will validate via `is_nullable_record_param`.
+        if let Type::Union(members) = self {
+            if !Type::sum_type_eligible(self) {
+                let mut has_named = false;
+                let mut only_named_or_null = true;
+                for m in members {
+                    match m {
+                        Type::Null => {}
+                        Type::Named(_) => { has_named = true; }
+                        _ => { only_named_or_null = false; break; }
+                    }
+                }
+                if has_named && only_named_or_null {
+                    return true;
+                }
+            }
+        }
+        // NullableRecord gate with recursion guard: `T | Null` where T is a sealed record.
+        // Guard against the cycle `nullable_sealed_record(T|Null)` → `sealed_fields(T)` →
+        // `is_sealed_field(T|Null)` → here. When we're already evaluating this exact union, return
+        // true (we're mid-proof that it IS a valid nullable sealed pointer field).
+        thread_local! {
+            static NR_VISITING: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+        }
+        let key = format!("{}", self);
+        let already_visiting = NR_VISITING.with(|v| v.borrow().contains(&key));
+        if already_visiting {
+            return true;
+        }
+        NR_VISITING.with(|v| v.borrow_mut().insert(key.clone()));
+        let result = Type::nullable_sealed_record(self).is_some();
+        NR_VISITING.with(|v| v.borrow_mut().remove(&key));
+        result
     }
 
     /// True when `ty` is a permissible field of a sealed record: scalar or eligible heap field.
