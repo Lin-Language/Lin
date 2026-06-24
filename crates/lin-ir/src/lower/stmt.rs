@@ -233,6 +233,7 @@ pub(crate) fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut 
                     key_ty: Type::Int64,
                     result_ty: field_ty.clone(),
                 nonneg: false,
+                proven_inbounds: false,
                 });
                 builder.slots.insert(*binding_slot, dst);
             }

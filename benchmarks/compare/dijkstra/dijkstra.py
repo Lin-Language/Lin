@@ -1,60 +1,65 @@
-# dijkstra.py — linear-scan priority-queue Dijkstra (O(V^2)), reads graph.json.
+# dijkstra.py — linear-scan priority-queue Dijkstra (O(V^2)) over an in-code graph.
 #
-# Reads the graph INSIDE the timed region (JSON parsing counts). Computes the
-# checksum and prints exactly one stdout line "RESULT=<int>"; everything else
-# goes to stderr.
-import json
-import os
-import sys
-
-INF = 1000000000  # sentinel for "infinity"; finite means dist < INF
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-GRAPH = os.path.join(HERE, "..", "data", "graph.json")
+# The graph is GENERATED IN MEMORY by a portable deterministic generator (identical
+# across all languages), not loaded from a file — so the timed region is the
+# algorithm itself plus a fast O(N+E) build, with no file I/O or parse cost. Prints
+# exactly one stdout line "RESULT=<int>".
+#
+# Generator: Park-Miller MINSTD state = state*16807 mod 2147483647 (seed 1234).
+N = 30000
+INF = 1000000000
 
 
 def main():
-    with open(GRAPH) as f:
-        graph = json.load(f)
+    state = 1234
+    adj = [[] for _ in range(N)]
+    for i in range(N):
+        for d in range(1, 9):
+            j = i + d
+            if j < N:
+                state = (state * 16807) % 2147483647
+                w = state % 100 + 1
+                adj[i].append((j, w))
+        if i + 1 < N:
+            state = (state * 16807) % 2147483647
+            if state % 10 < 3:
+                span = N - (i + 1)
+                state = (state * 16807) % 2147483647
+                j = (i + 1) + (state % span)
+                state = (state * 16807) % 2147483647
+                w = state % 100 + 1
+                adj[i].append((j, w))
 
-    nodes = graph["nodes"]
-    source = "n0"
-    target = nodes[-1]
-
-    # adjacency: node -> list of (to, weight)
-    adj = {}
-    for e in graph["edges"]:
-        adj.setdefault(e["from"], []).append((e["to"], e["weight"]))
-
-    dist = {n: INF for n in nodes}
-    dist[source] = 0
-    visited = {}
-
-    # Linear-scan priority queue: a list of (node, dist) entries.
-    pq = [(source, 0)]
-    while pq:
-        # Find the entry with the minimum tentative distance (linear scan).
-        min_idx = 0
-        for i in range(len(pq)):
-            if pq[i][1] < pq[min_idx][1]:
-                min_idx = i
-        u, _ = pq.pop(min_idx)
-        if u in visited:
-            continue
-        visited[u] = True
-        for (v, w) in adj.get(u, []):
-            nd = dist[u] + w
-            if nd < dist[v]:
-                dist[v] = nd
-                pq.append((v, nd))
-
-    total = 0
-    for n in nodes:
-        if dist[n] < INF:
-            total += dist[n]
-    result = (dist[target] * 1000003 + (total % 1000000000)) % (1 << 63)
-    sys.stderr.write(f"dist[{target}]={dist[target]} sumFinite={total}\n")
-    print(f"RESULT={result}")
+    dist = [INF] * N
+    visited = [False] * N
+    dist[0] = 0
+    cap = N * 9 + 1
+    pqn = [0] * cap
+    pqd = [0] * cap
+    pql = 1
+    while pql > 0:
+        mi = 0
+        for j in range(1, pql):
+            if pqd[j] < pqd[mi]:
+                mi = j
+        u = pqn[mi]
+        last = pql - 1
+        pqn[mi] = pqn[last]
+        pqd[mi] = pqd[last]
+        pql = last
+        if not visited[u]:
+            visited[u] = True
+            du = dist[u]
+            for (v, w) in adj[u]:
+                nd = du + w
+                if nd < dist[v]:
+                    dist[v] = nd
+                    pqn[pql] = v
+                    pqd[pql] = nd
+                    pql += 1
+    total = sum(d for d in dist if d < INF)
+    chk = dist[N - 1] * 1000003 + (total % 1000000000)
+    print(f"RESULT={chk}")
 
 
 if __name__ == "__main__":

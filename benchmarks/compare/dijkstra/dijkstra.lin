@@ -1,66 +1,87 @@
-// dijkstra.lin — linear-scan priority-queue Dijkstra (O(V^2)) over graph.json.
+// dijkstra.lin — linear-scan priority-queue Dijkstra (O(V^2)) over an in-code graph.
 //
-// Matches the algorithm AND the data-structure choices of the other languages:
-// node names "n<k>" are interned to the integer index k, and dist/visited/adj are
-// integer-indexed arrays (O(1) access), exactly like dijkstra.rs / dijkstra.go.
-// The PQ is two parallel pre-allocated arrays (node, dist) with a manual length
-// counter, so removal is an O(1) swap-remove — mirroring Rust's `Vec<(usize,i64)>`
-// + `swap_remove` — and the min-scan never reallocates.
-// (The earlier version reused the examples/dijkstra string-keyed AnyVal maps, whose
-// field lookup is an O(n) linear scan, and rebuilt the PQ array on every pop via
-// slice() — together an O(V*E*V) handicap. Switching to integer-indexed arrays
-// cut this benchmark ~5x. The remaining gap to Rust/Go is Lin's boxed-scalar
-// array reads, an honest language characteristic, not an algorithmic handicap.)
+// The graph is GENERATED IN MEMORY by a portable deterministic generator (identical
+// across all languages), not loaded from a file — so the timed region is the
+// algorithm itself plus a fast O(N+E) build, with no file I/O or parse cost to
+// confound the comparison. Like-for-like: every language runs the same generator,
+// the same data structures (node index k, integer-indexed dist/visited/adj arrays,
+// PQ as two parallel arrays with O(1) swap-remove), and the same O(V^2) algorithm.
 //
-// The graph read + parse happens inside the timed region (std/fs readJson). Prints
-// exactly one stdout line "RESULT=<int>".
+// Generator: Park-Miller MINSTD `state = state*16807 mod 2147483647` (seed 1234;
+// every intermediate < 2^53 so it is bit-identical across i64/int64/Python-int/JS
+// Number). For each node i: a forward edge to i+1..i+8 (when in range, weight
+// nxt%100+1), then with probability 0.3 one extra forward "skip" edge to a random
+// j>i. Prints exactly one stdout line "RESULT=<int>".
 import { print } from "std/io"
-import { toString, substring } from "std/string"
-import { parseInt32 } from "std/number"
-import { readJson } from "std/fs"
-import { length, arrayAllocate, arrayAllocateFilled, set, push } from "std/array"
-import { for } from "std/iter"
-// "infinity" sentinel; finite distances are < INF.
+import { toString } from "std/string"
+import { toInt32 } from "std/number"
+import { arrayAllocate, arrayAllocateFilled, set, push, length } from "std/array"
+import { for, range } from "std/iter"
+
+val N = 30000
 val INF = 1000000000
 
-// "n427" -> 427. Node names are "n" followed by the integer index.
-val idOf = (name: String): Int32 =>
-  parseInt32(substring(name, 1, length(name)))
-
-val graph = readJson("benchmarks/compare/data/graph.json")
-val nodes = graph["nodes"]
-val edges = graph["edges"]
-val n = length(nodes)
-
-// adj[u] = array of { "to": Int32, "w": Int32 }. Each slot gets its OWN array
-// (arrayAllocateFilled(n, []) would alias one array into every slot).
-var adj = arrayAllocate(n)
-var ai = 0
-nodes.for(_ =>
-  set(adj, ai, [])
-  ai = ai + 1
-)
-edges.for(e =>
-  push(adj[idOf(e["from"])], { "to": idOf(e["to"]), "w": e["weight"] })
+// adj[u] = array of { "to": Int32, "w": Int32 }. Each slot gets its OWN array.
+var adj = arrayAllocate(N)
+range(0, N).for(i =>
+  set(adj, i, [])
 )
 
-var dist = arrayAllocateFilled(n, INF)
-var visited = arrayAllocateFilled(n, false)
-val source = idOf("n0")
-set(dist, source, 0)
+// Forward edges i -> i+1 .. i+8 (only those in range consume a random weight),
+// threading the LCG state functionally (TCO -> loop).
+val genFwd = (i: Int32, d: Int32, state: Int64): Int64 =>
+  if d > 8 then
+    state
+  else
+    val j = i + d
+    if j >= N then
+      genFwd(i, d + 1, state)
+    else
+      val s = (state * 16807i64) % 2147483647i64
+      val w = toInt32(s % 100i64) + 1
+      push(adj[i], { "to": j, "w": w })
+      genFwd(i, d + 1, s)
+
+// With probability 0.3, one extra "skip" edge i -> j (i < j < N).
+val genSkip = (i: Int32, state: Int64): Int64 =>
+  if i + 1 >= N then
+    state
+  else
+    val s1 = (state * 16807i64) % 2147483647i64
+    if s1 % 10i64 < 3i64 then
+      val span: Int64 = N - (i + 1)
+      val s2 = (s1 * 16807i64) % 2147483647i64
+      val j = (i + 1) + toInt32(s2 % span)
+      val s3 = (s2 * 16807i64) % 2147483647i64
+      val w = toInt32(s3 % 100i64) + 1
+      push(adj[i], { "to": j, "w": w })
+      s3
+    else
+      s1
+
+val genAll = (i: Int32, state: Int64): Null =>
+  if i >= N then
+    null
+  else
+    val s = genFwd(i, 1, state)
+    val s2 = genSkip(i, s)
+    genAll(i + 1, s2)
+
+val ig = genAll(0, 1234i64)
+
+var dist = arrayAllocateFilled(N, INF)
+var visited = arrayAllocateFilled(N, false)
+set(dist, 0, 0)
 
 // Linear-scan priority queue as two parallel Int32 arrays + a length counter.
-// Capacity = one slot per edge relaxation plus the initial entry; each edge pushes
-// at most once, so length(edges)+1 never overflows.
-val cap = length(edges) + 1
+// Capacity bound: each edge relaxes at most once, plus the initial entry.
+val cap = N * 9 + 1
 var pqNode = arrayAllocateFilled(cap, 0)
 var pqDist = arrayAllocateFilled(cap, 0)
-set(pqNode, 0, source)
+set(pqNode, 0, 0)
 set(pqDist, 0, 0)
 var pqLen = 1
 
-// Tail-recursive min-scan over pq[j .. pqLen) — TCO turns it into a loop with no
-// per-pop allocation (range().for would allocate a fresh range array each pop).
 val minFrom = (j: Int32, best: Int32): Int32 =>
   if j >= pqLen then
     best
@@ -73,7 +94,6 @@ val step = (): Null =>
   if pqLen > 0 then
     val minIdx = minFrom(1, 0)
     val u = pqNode[minIdx]
-    // swap-remove: move the last live entry into minIdx, shrink by one.
     val last = pqLen - 1
     set(pqNode, minIdx, pqNode[last])
     set(pqDist, minIdx, pqDist[last])
@@ -94,14 +114,12 @@ val step = (): Null =>
 step()
 
 var total = 0i64
-var k = 0
-nodes.for(_ =>
+range(0, N).for(k =>
   val d = dist[k]
   if d < INF then total = total + d
-  k = k + 1
 )
 
-val targetDist: Int64 = dist[n - 1]
+val targetDist: Int64 = dist[N - 1]
 val checksum = targetDist * 1000003i64 + (total - (total / 1000000000i64) * 1000000000i64)
 
 print("RESULT=${toString(checksum)}")

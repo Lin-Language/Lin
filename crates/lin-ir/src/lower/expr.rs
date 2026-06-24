@@ -209,6 +209,7 @@ fn lower_index_get_or_create(
         key_ty: key.ty(),
         result_ty: read_ty.clone(),
     nonneg: false,
+                proven_inbounds: false,
     });
 
     // Null test: `cur == null`.
@@ -546,6 +547,7 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                     key_ty: Type::Int64,
                     result_ty: elem_ty.clone(),
                 nonneg: false,
+                proven_inbounds: false,
                 });
                 builder.register_owned(dst, elem_ty.clone());
                 return dst;
@@ -1101,6 +1103,18 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
         }
 
         TypedExpr::MakeObject { fields, spreads, computed_fields, ty, .. } => {
+            // Fast path: when `ty` is a sealed record and the literal has no spreads or computed
+            // fields, construct the packed struct directly via `try_lower_sealed_literal`.
+            // This handles MakeObject nodes that the checker produced WITHOUT a wrapping Coerce
+            // (e.g. a recursive named-type literal `{l: make(d-1), r: make(d-1)}` whose type
+            // `Tree` resolves as sealed). Without this intercept the GENERAL path below would
+            // materialise each sealed field VALUE to a boxed LinMap — the wrong representation
+            // for a NullableRecord slot.
+            if spreads.is_empty() && computed_fields.is_empty() {
+                if let Some(t) = try_lower_sealed_literal(expr, ty, builder, ctx) {
+                    return t;
+                }
+            }
             // This is the GENERAL (boxed) MakeObject path — a sealed scalar-record TARGET is
             // constructed directly as a packed struct elsewhere (`try_lower_sealed_literal`), so
             // here `ty` is always a boxed object/Json. A field VALUE that is itself a sealed scalar
@@ -1641,6 +1655,7 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                 key_ty,
                 result_ty: result_type.clone(),
                 nonneg,
+                proven_inbounds: false,
             });
             // A sealed record indexed by a NON-LITERAL key: codegen materializes the record to a
             // boxed object, looks the key up, clones the (borrowed) result into a FRESH owned box and
