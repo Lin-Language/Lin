@@ -1013,6 +1013,10 @@ impl<'ctx> Codegen<'ctx> {
 
             // Map Temp → LLVM value (populated as we emit instructions)
             let mut temp_map: StdMap<lir::Temp, BasicValueEnum<'ctx>> = StdMap::new();
+            // Substring-key fusion (substr_map_fuse pass): for each fused slice temp, store
+            // the (data_ptr, key_len_i32) LLVM values produced inline from the source string,
+            // skipping the actual lin_string_slice heap allocation.
+            let mut slice_byte_map: StdMap<lir::Temp, (BasicValueEnum<'ctx>, inkwell::values::IntValue<'ctx>)> = StdMap::new();
 
             // Self-tail-call (TCO) support: if any block ends in TailCall, route params
             // through stack allocas so a tail call can update them and branch back to the
@@ -1326,6 +1330,8 @@ impl<'ctx> Codegen<'ctx> {
                             temp_map.insert(*dst, result);
                         }
                         Instruction::Retain { val, ty } => {
+                            // Substring-key fusion: the fused temp is a null placeholder — never retain it.
+                            if slice_byte_map.contains_key(val) { continue; }
                             if let Some(&v) = temp_map.get(val) {
                                 // VA.1 CPR: a flat-union struct `{ i1, i64 }` has no heap allocation — no-op.
                                 if v.is_struct_value() { continue; }
@@ -1359,7 +1365,10 @@ impl<'ctx> Codegen<'ctx> {
                             }
                         }
                         Instruction::Release { val, ty } => {
-                            if let Some(&v) = temp_map.get(val) {
+                            // Substring-key fusion: the fused temp was never heap-allocated,
+                            // so there is no string to release. Skip entirely.
+                            if slice_byte_map.contains_key(val) { /* no-op */ }
+                            else if let Some(&v) = temp_map.get(val) {
                                 // PART C: release shape from the pass-proven representation, not Type.
                                 let repr = func.repr_of(*val).clone();
                                 self.emit_release_repr(v, ty, &repr);
@@ -1544,6 +1553,81 @@ impl<'ctx> Codegen<'ctx> {
                             }
                         }
                         Instruction::Call { dst, callee, args, ret_ty } => {
+                            // Substring-key fusion: when this call is `lin_string_slice` and the
+                            // dst temp is a fused key (only used as map key operands), skip the
+                            // heap allocation — compute (data_ptr, len) inline from the source
+                            // string and store them in `slice_byte_map[dst]`. The real LLVM result
+                            // placeholder is a null ptr (the temp is never used directly).
+                            if let CallTarget::Named(name) = callee {
+                                if (name == "lin_string_slice"
+                                    || name == "std_string_substring"
+                                    || name == "std_string__substring")
+                                    && args.len() == 3
+                                    && func.substr_fuse.contains_key(dst)
+                                {
+                                    let i8_ty = self.context.i8_type();
+                                    let i32_ty = self.context.i32_type();
+                                    let i64_ty = self.context.i64_type();
+                                    // args: [src_str_ptr, start_i32, end_i32]
+                                    let src_val = args[0];
+                                    let start_val = args[1];
+                                    let end_val = args[2];
+                                    if let (Some(&src), Some(&start), Some(&end)) = (
+                                        temp_map.get(&src_val),
+                                        temp_map.get(&start_val),
+                                        temp_map.get(&end_val),
+                                    ) {
+                                        // Compute (clamped) data_ptr = src->data + start.
+                                        // LinString layout: rc@0(u32), len@4(u32), hash@8(u64), data@16([u8]).
+                                        let sp = src.into_pointer_value();
+                                        let len_p = unsafe { self.builder.gep(i8_ty, sp, &[i64_ty.const_int(4, false)], "kf_slen_p") };
+                                        let str_len = self.builder.load(i32_ty, len_p, "kf_slen").into_int_value();
+                                        // Clamp start/end to [0, str_len] — mirrors lin_string_slice.
+                                        let start_i32 = if start.is_int_value() {
+                                            start.into_int_value()
+                                        } else if start.is_pointer_value() {
+                                            self.builder.call(self.rt.unbox_int32, &[start.into()], "kf_s_unbox").try_as_basic_value().unwrap_basic().into_int_value()
+                                        } else { i32_ty.const_zero() };
+                                        let end_i32 = if end.is_int_value() {
+                                            end.into_int_value()
+                                        } else if end.is_pointer_value() {
+                                            self.builder.call(self.rt.unbox_int32, &[end.into()], "kf_e_unbox").try_as_basic_value().unwrap_basic().into_int_value()
+                                        } else { str_len };
+                                        // clamp to [0, str_len]
+                                        let zero_i32 = i32_ty.const_zero();
+                                        let s_clamped = {
+                                            let pos = self.builder.int_compare(inkwell::IntPredicate::SGT, zero_i32, start_i32, "kf_s_neg");
+                                            self.builder.select(pos, zero_i32, start_i32, "kf_s0").into_int_value()
+                                        };
+                                        let s_clamped2 = {
+                                            let over = self.builder.int_compare(inkwell::IntPredicate::SGT, s_clamped, str_len, "kf_s_over");
+                                            self.builder.select(over, str_len, s_clamped, "kf_sc").into_int_value()
+                                        };
+                                        let e_clamped = {
+                                            let pos = self.builder.int_compare(inkwell::IntPredicate::SGT, zero_i32, end_i32, "kf_e_neg");
+                                            self.builder.select(pos, zero_i32, end_i32, "kf_e0").into_int_value()
+                                        };
+                                        let e_clamped2 = {
+                                            let over = self.builder.int_compare(inkwell::IntPredicate::SGT, e_clamped, str_len, "kf_e_over");
+                                            self.builder.select(over, str_len, e_clamped, "kf_ec").into_int_value()
+                                        };
+                                        let e_final = {
+                                            let lt = self.builder.int_compare(inkwell::IntPredicate::SLT, e_clamped2, s_clamped2, "kf_elt_s");
+                                            self.builder.select(lt, s_clamped2, e_clamped2, "kf_ef").into_int_value()
+                                        };
+                                        // slice length = e_final - s_clamped2
+                                        let slice_len = self.builder.int_sub(e_final, s_clamped2, "kf_sllen");
+                                        // data_ptr = src->data + s_clamped2  (data is at byte offset 16)
+                                        let data_base = unsafe { self.builder.gep(i8_ty, sp, &[i64_ty.const_int(16, false)], "kf_dbase") };
+                                        let s_ext = self.builder.int_s_extend_or_bit_cast(s_clamped2, i64_ty, "kf_s64");
+                                        let data_ptr = unsafe { self.builder.in_bounds_gep(i8_ty, data_base, &[s_ext], "kf_dptr") };
+                                        slice_byte_map.insert(*dst, (data_ptr.into(), slice_len));
+                                    }
+                                    // Store a null placeholder so any accidental use has a value.
+                                    temp_map.insert(*dst, ptr_ty.const_null().into());
+                                    continue;
+                                }
+                            }
                             // VA.1 CPR: if any argument is a flat-union struct `{ i1, i64 }`,
                             // materialize it to a `TaggedVal*` before the call — the callee (for a
                             // non-flat-union Direct or any Named/Indirect call) expects a boxed ptr.
@@ -2445,18 +2529,32 @@ impl<'ctx> Codegen<'ctx> {
                             temp_map.insert(*dst, cls);
                         }
                         Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty, nonneg, proven_inbounds } => {
-                            if let (Some(&obj_v), Some(&key_v)) = (temp_map.get(object), temp_map.get(key)) {
-                                let obj_repr = func.repr_of(*object);
-                                let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty, &obj_repr, *nonneg, *proven_inbounds);
-                                temp_map.insert(*dst, result);
+                            if let Some(&obj_v) = temp_map.get(object) {
+                                // Substring-key fusion: if key is a fused slice temp, use the
+                                // byte-keyed map get (lin_map_get_bytes) instead of the normal string path.
+                                if let Some(&(data_ptr, key_len)) = slice_byte_map.get(key) {
+                                    let result = self.emit_map_get_bytes_fused(obj_v, data_ptr, key_len, obj_ty, result_ty);
+                                    temp_map.insert(*dst, result);
+                                } else if let Some(&key_v) = temp_map.get(key) {
+                                    let obj_repr = func.repr_of(*object);
+                                    let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty, &obj_repr, *nonneg, *proven_inbounds);
+                                    temp_map.insert(*dst, result);
+                                }
                             }
                         }
                         Instruction::IndexSet { object, key, value, obj_ty, key_ty, val_ty } => {
-                            if let (Some(&obj_v), Some(&key_v), Some(&val_v)) =
-                                (temp_map.get(object), temp_map.get(key), temp_map.get(value))
+                            if let (Some(&obj_v), Some(&val_v)) =
+                                (temp_map.get(object), temp_map.get(value))
                             {
-                                let val_repr = func.repr_of(*value);
-                                self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty, &val_repr);
+                                // Substring-key fusion: if key is a fused slice temp, use
+                                // lin_map_set_bytes to avoid a per-iteration string allocation.
+                                if let Some(&(data_ptr, key_len)) = slice_byte_map.get(key) {
+                                    let val_repr = func.repr_of(*value);
+                                    self.emit_map_set_bytes_fused(obj_v, data_ptr, key_len, val_v, obj_ty, val_ty, &val_repr);
+                                } else if let Some(&key_v) = temp_map.get(key) {
+                                    let val_repr = func.repr_of(*value);
+                                    self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty, &val_repr);
+                                }
                             }
                         }
                         Instruction::FieldGet { dst, object, field, obj_ty, result_ty } => {

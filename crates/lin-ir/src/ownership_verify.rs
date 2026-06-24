@@ -1268,6 +1268,7 @@ mod tests {
             intrinsic_slots: HashMap::new(),
             repr: Vec::new(),
             coverage_origin: None,
+            substr_fuse: HashMap::new(),
         }
     }
 

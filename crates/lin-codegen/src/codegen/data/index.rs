@@ -1744,4 +1744,96 @@ impl<'ctx> Codegen<'ctx> {
         ]);
         result_phi.as_basic_value()
     }
+
+    /// Substring-key fusion: look up a string-keyed map by RAW BYTES (data_ptr + key_len)
+    /// via `lin_map_get_bytes`, avoiding the heap allocation of a temporary `LinString`.
+    /// Called when the key temp was proven to only escape as a map key (substr_map_fuse pass).
+    /// Returns the borrowed `TaggedVal*` result (null on miss), same contract as `compile_ir_index`.
+    pub(crate) fn emit_map_get_bytes_fused(
+        &mut self,
+        map_v: inkwell::values::BasicValueEnum<'ctx>,
+        data_ptr: inkwell::values::BasicValueEnum<'ctx>,
+        key_len: inkwell::values::IntValue<'ctx>,
+        obj_ty: &lin_check::types::Type,
+        result_ty: &lin_check::types::Type,
+    ) -> inkwell::values::BasicValueEnum<'ctx> {
+        // Unbox the map pointer if needed (union container).
+        let container = if Self::is_union_type(obj_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[map_v.into()], "kf_get_unbox").try_as_basic_value().unwrap_basic()
+        } else {
+            map_v
+        };
+        let tagged = self.builder.call(
+            self.rt.map_get_bytes,
+            &[container.into(), data_ptr.into(), key_len.into()],
+            "kf_get",
+        ).try_as_basic_value().unwrap_basic();
+        if Self::is_union_type(result_ty) {
+            tagged
+        } else {
+            self.unbox_tagged_val_to_type(tagged, result_ty)
+        }
+    }
+
+    /// Substring-key fusion: upsert a string-keyed map by RAW BYTES (data_ptr + key_len)
+    /// via `lin_map_set_bytes`. Only materialises a `LinString` when inserting a NEW key.
+    /// RC contract mirrors `emit_map_set` exactly.
+    pub(crate) fn emit_map_set_bytes_fused(
+        &mut self,
+        map_v: inkwell::values::BasicValueEnum<'ctx>,
+        data_ptr: inkwell::values::BasicValueEnum<'ctx>,
+        key_len: inkwell::values::IntValue<'ctx>,
+        value: inkwell::values::BasicValueEnum<'ctx>,
+        obj_ty: &lin_check::types::Type,
+        val_ty: &lin_check::types::Type,
+        val_repr: &lin_ir::repr::Repr,
+    ) {
+        // Unbox the map pointer if needed.
+        let map_ptr = if Self::is_union_type(obj_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[map_v.into()], "kf_set_unbox").try_as_basic_value().unwrap_basic()
+        } else {
+            map_v
+        };
+        // Determine the map's element type from obj_ty.
+        let elem_ty: lin_check::types::Type = match obj_ty {
+            lin_check::types::Type::Map { value: v, .. } => (**v).clone(),
+            lin_check::types::Type::Union(members) => {
+                members.iter().find_map(|m| match m {
+                    lin_check::types::Type::Map { value: v, .. } => Some((**v).clone()),
+                    _ => None,
+                }).unwrap_or(lin_check::types::Type::TypeVar(u32::MAX))
+            }
+            _ => lin_check::types::Type::TypeVar(u32::MAX),
+        };
+        // Box the value the same way emit_map_set does.
+        if Self::is_flat_scalar(&elem_ty) {
+            let coerced = if val_ty == &elem_ty {
+                value
+            } else {
+                self.compile_ir_coerce(value, val_ty, &elem_ty)
+            };
+            let stack_tagged = self.build_tagged_val_alloca(&coerced, &elem_ty);
+            self.builder.call(
+                self.rt.map_set_bytes,
+                &[map_ptr.into(), data_ptr.into(), key_len.into(), stack_tagged.into()],
+                "",
+            );
+            return;
+        }
+        let _ = val_repr;
+        let val_is_fresh_box = !Self::is_union_type(val_ty);
+        let val_tagged = if val_is_fresh_box {
+            self.box_value(value, val_ty)
+        } else {
+            value
+        };
+        self.builder.call(
+            self.rt.map_set_bytes,
+            &[map_ptr.into(), data_ptr.into(), key_len.into(), val_tagged.into()],
+            "",
+        );
+        if val_is_fresh_box && val_tagged.is_pointer_value() {
+            self.builder.call(self.rt.tagged_release, &[val_tagged.into()], "");
+        }
+    }
 }

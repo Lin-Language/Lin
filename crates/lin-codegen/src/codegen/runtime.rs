@@ -204,6 +204,11 @@ pub(crate) struct RuntimeFns<'ctx> {
     /// Int-keyed map entry points (key_kind = 1).
     pub map_get_int: FunctionValue<'ctx>,
     pub map_set_int: FunctionValue<'ctx>,
+    /// Byte-slice keyed map ops for substring-key fusion: avoids heap-allocating a temporary
+    /// `LinString` when the substring is used only as a map key.
+    /// `lin_map_get_bytes(map, key_ptr, key_len)` / `lin_map_set_bytes(map, key_ptr, key_len, val)`
+    pub map_get_bytes: FunctionValue<'ctx>,
+    pub map_set_bytes: FunctionValue<'ctx>,
     /// Cold path for the inline sealed-release when rc hits zero: walks heap fields and frees.
     /// `lin_sealed_drop_at_zero(ptr, size)`. Called after the inline dec reaches zero.
     pub sealed_drop_at_zero: FunctionValue<'ctx>,
@@ -460,6 +465,15 @@ impl<'ctx> RuntimeFns<'ctx> {
             "lin_map_get_int", ptr_type.fn_type(&[ptr_type.into(), i64_type.into()], false), None);
         let map_set_int = decl("lin_map_set_int", MemClass::Writer, module.add_function(
             "lin_map_set_int", void_type.fn_type(&[ptr_type.into(), i64_type.into(), ptr_type.into()], false), None));
+        // lin_map_get_bytes / lin_map_set_bytes: byte-slice keyed variants for substring-fusion.
+        // get_bytes: reads TLS scratch ring (homogeneous value_kind) → Opaque.
+        let map_get_bytes = module.add_function(
+            "lin_map_get_bytes",
+            ptr_type.fn_type(&[ptr_type.into(), ptr_type.into(), i32_type.into()], false), None);
+        // set_bytes: Writer (mutates map slots; may alloc new LinString on insert).
+        let map_set_bytes = decl("lin_map_set_bytes", MemClass::Writer, module.add_function(
+            "lin_map_set_bytes",
+            void_type.fn_type(&[ptr_type.into(), ptr_type.into(), i32_type.into(), ptr_type.into()], false), None));
 
         // lin_sealed_drop_at_zero(ptr, size: i64) -> void — heap-field walk + free after dec→0
         let sealed_drop_at_zero = decl("lin_sealed_drop_at_zero", MemClass::RC, module.add_function(
@@ -538,6 +552,8 @@ impl<'ctx> RuntimeFns<'ctx> {
             map_eq,
             map_get_int,
             map_set_int,
+            map_get_bytes,
+            map_set_bytes,
             sealed_drop_at_zero,
             record_get_field,
             record_read_i64,

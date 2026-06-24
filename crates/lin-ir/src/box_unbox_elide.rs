@@ -424,6 +424,7 @@ mod tests {
             intrinsic_slots: std::collections::HashMap::new(),
             repr: vec![],
             coverage_origin: None,
+            substr_fuse: std::collections::HashMap::new(),
         }
     }
 
