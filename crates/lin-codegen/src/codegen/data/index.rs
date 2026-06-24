@@ -260,7 +260,8 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.conditional_branch(is_null, merge_bb, hit_bb);
                 let miss_pred = self.builder.get_insert_block().unwrap();
                 self.builder.position_at_end(hit_bb);
-                let projected = self.sealed_project_from(tagged, &Type::TypeVar(u32::MAX), &fields);
+                // If source hits the TAG_RECORD arm, type safety guarantees same layout as fields.
+                let projected = self.sealed_project_from_hint(tagged, &Type::TypeVar(u32::MAX), &fields, Some(&fields));
                 let hit_pred = self.builder.get_insert_block().unwrap();
                 self.builder.unconditional_branch(merge_bb);
                 self.builder.position_at_end(merge_bb);

@@ -480,8 +480,11 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.conditional_branch(cond, body, done);
         self.builder.position_at_end(body);
         let elem_box = self.builder.call(get_tagged, &[src_raw.into(), i.into()], "sarrp_get").try_as_basic_value().unwrap_basic();
-        // Project the boxed element (a Json TaggedVal*) into the element record's struct layout.
-        let proj = self.sealed_project_from(elem_box, &Type::TypeVar(u32::MAX), &fields);
+        // Project the boxed element into the element record's struct layout.
+        // Source layout == target layout (rebuilding same element type), so pass hint for
+        // const-offset GEP reads in the TAG_RECORD arm (no descriptor walk).
+        let fields_ref = &fields;
+        let proj = self.sealed_project_from_hint(elem_box, &Type::TypeVar(u32::MAX), &fields, Some(fields_ref));
         // push retains the struct (+1), so struct rc: 1 (from sealed_project_from) → 2 after push.
         self.builder.call(push_fn, &[out.into(), proj.into()], "");
         // Release our alloc ref to the projected struct (push holds it now).

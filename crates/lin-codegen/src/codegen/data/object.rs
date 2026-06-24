@@ -722,6 +722,22 @@ impl<'ctx> Codegen<'ctx> {
         src_ty: &Type,
         target_fields: &indexmap::IndexMap<String, Type>,
     ) -> BasicValueEnum<'ctx> {
+        self.sealed_project_from_hint(src, src_ty, target_fields, None)
+    }
+
+    /// Like `sealed_project_from`, but when `src_fields_hint` is `Some(sf)` and the source turns
+    /// out to be a TAG_RECORD at runtime, the TAG_RECORD arm reads fields via const-offset GEP
+    /// (`sealed_field_get`) instead of the by-name descriptor-walk helpers
+    /// (`lin_record_read_i64` / `lin_record_read_ptr_retain`). The hint is sound iff every target
+    /// field name exists in `sf` with a compatible type — the caller is responsible for verifying
+    /// this (passing `None` always falls back to the safe by-name walk).
+    pub(crate) fn sealed_project_from_hint(
+        &mut self,
+        src: BasicValueEnum<'ctx>,
+        src_ty: &Type,
+        target_fields: &indexmap::IndexMap<String, Type>,
+        src_fields_hint: Option<&indexmap::IndexMap<String, Type>>,
+    ) -> BasicValueEnum<'ctx> {
         // Source already a sealed record of (possibly) a different shape: copy fields by offset.
         // Every field value `sealed_field_get` returns is BORROWED from the source struct (the
         // source is non-mutating and keeps its own ownership) — including a nested-sealed pointer —
@@ -742,7 +758,7 @@ impl<'ctx> Codegen<'ctx> {
         if Self::is_union_type(src_ty) {
             // Stage 2: dispatch on the runtime tag of `src` to avoid materialising TAG_RECORD to a
             // LinMap when the source is already a packed sealed struct. Two arms:
-            //   TAG_RECORD → const-offset field reads via lin_record_get_field (no map alloc).
+            //   TAG_RECORD → const-offset field reads (no map alloc).
             //   TAG_MAP / TAG_SUMNODE / anything else → lin_union_force_to_map + map_get (existing path).
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
             let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
@@ -758,70 +774,90 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.conditional_branch(is_record, rec_bb, map_bb);
 
             // TAG_RECORD arm: read fields directly from the packed sealed struct.
-            // RC contract for the new unboxed helpers:
-            //   sealed_array field: use record_get_field (keeps existing box→project→release path).
-            //   SumNode field: use record_get_field (complex materialise path).
-            //   scalar field (Int*/UInt*/Float*/Bool): use lin_record_read_i64 — no heap alloc.
-            //     Returns raw i64 bits (sign/zero-ext integers; bit-pattern floats; 0/1 for bool).
-            //     already_owned=false (scalar, sealed_construct ignores it).
-            //   heap ptr field (Str/Array/Map/Sealed): use lin_record_read_ptr_retain — no TaggedVal
-            //     box. Returns raw owned (+1) pointer. already_owned=true.
+            // When src_fields_hint is available and covers all target fields, use sealed_field_get
+            // (const-offset GEP — zero runtime descriptor walk). Otherwise fall back to the
+            // by-name helper path (lin_record_read_i64 / lin_record_read_ptr_retain).
+            //
+            // RC contract:
+            //   const-offset path: sealed_field_get returns BORROWED; heap fields retained by
+            //     sealed_construct (already_owned=false). Matches the known-sealed fast path above.
+            //   by-name path (fallback): scalar fields — no alloc, already_owned=false;
+            //     heap fields — lin_record_read_ptr_retain returns owned (+1), already_owned=true.
             self.builder.position_at_end(rec_bb);
             let sealed_ptr = self.builder.call(self.rt.unbox_ptr, &[src.into()], "sproj_rec_sptr")
                 .try_as_basic_value().unwrap_basic();
             let mut rec_vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> =
                 Vec::with_capacity(target_fields.len());
-            for (k, fty0) in target_fields.iter() {
-                let fty = fty0.clone();
-                let key_str = self.compile_string_lit(k).into_pointer_value();
-                if Self::sealed_array_elem(&fty).is_some() {
-                    // Sealed-array: keep existing record_get_field + project path.
-                    let rec_box = self.builder.call(
-                        self.rt.record_get_field,
-                        &[sealed_ptr.into(), key_str.into()],
-                        "sproj_rgf",
-                    ).try_as_basic_value().unwrap_basic();
-                    let packed = self.sealed_array_project_owned(rec_box, &Type::TypeVar(u32::MAX), &fty);
-                    self.builder.call(self.rt.tagged_release, &[rec_box.into()], "");
-                    rec_vals.push((k.clone(), packed, fty, true));
-                } else if Self::sealed_field_kind(&fty) == Some(Self::KIND_SUMNODE_FIELD) {
-                    // SumNode: materialise via record_get_field (rare; complex runtime path).
-                    let rec_box = self.builder.call(
-                        self.rt.record_get_field,
-                        &[sealed_ptr.into(), key_str.into()],
-                        "sproj_rgf",
-                    ).try_as_basic_value().unwrap_basic();
-                    let v = self.unbox_tagged_val_to_type(rec_box, &fty);
-                    self.builder.call(self.rt.tagged_release, &[rec_box.into()], "");
+
+            // Check whether the hint covers every target field (all names present in src_fields).
+            let use_offset_path = src_fields_hint
+                .map(|sf| target_fields.keys().all(|k| sf.contains_key(k.as_str())))
+                .unwrap_or(false);
+
+            if use_offset_path {
+                // FAST PATH: all target fields are statically known in the source — emit
+                // const-offset GEP loads (identical to the known-sealed-source path above).
+                // sealed_field_get returns BORROWED; sealed_construct retains heap fields.
+                let sf = src_fields_hint.unwrap();
+                for (k, fty0) in target_fields.iter() {
+                    let fty = fty0.clone();
+                    let v = self.sealed_field_get(sealed_ptr, k, sf, &fty);
                     rec_vals.push((k.clone(), v, fty, false));
-                } else if fty.is_pure_int_lit_union() {
-                    // Pure IntLit-union: lin_record_read_i64 returns the raw i32 value as i64;
-                    // truncate to i32 for the sealed slot.
-                    let raw_i64 = self.builder.call(
-                        self.rt.record_read_i64,
-                        &[sealed_ptr.into(), key_str.into()],
-                        "sproj_ri64",
-                    ).try_as_basic_value().unwrap_basic().into_int_value();
-                    let i32_val = self.builder.int_truncate_or_bit_cast(raw_i64, self.context.i32_type(), "sproj_ilu_i32").into();
-                    rec_vals.push((k.clone(), i32_val, fty, false));
-                } else if Self::sealed_field_kind(&fty).is_none() {
-                    // Scalar field (Int*/UInt*/Float*/Bool): use lin_record_read_i64 — no alloc.
-                    let raw_i64 = self.builder.call(
-                        self.rt.record_read_i64,
-                        &[sealed_ptr.into(), key_str.into()],
-                        "sproj_ri64",
-                    ).try_as_basic_value().unwrap_basic().into_int_value();
-                    let v = self.i64_to_sealed_field_llvm(raw_i64, &fty);
-                    rec_vals.push((k.clone(), v, fty, false));
-                } else {
-                    // Heap pointer field (Str/Array/Map/Sealed): use lin_record_read_ptr_retain.
-                    // Returns an owned (+1) raw pointer — no TaggedVal box allocated.
-                    let raw_ptr = self.builder.call(
-                        self.rt.record_read_ptr_retain,
-                        &[sealed_ptr.into(), key_str.into()],
-                        "sproj_rptr",
-                    ).try_as_basic_value().unwrap_basic();
-                    rec_vals.push((k.clone(), raw_ptr, fty, true));
+                }
+            } else {
+                // FALLBACK PATH: by-name descriptor walk via runtime helpers.
+                for (k, fty0) in target_fields.iter() {
+                    let fty = fty0.clone();
+                    let key_str = self.compile_string_lit(k).into_pointer_value();
+                    if Self::sealed_array_elem(&fty).is_some() {
+                        // Sealed-array: keep existing record_get_field + project path.
+                        let rec_box = self.builder.call(
+                            self.rt.record_get_field,
+                            &[sealed_ptr.into(), key_str.into()],
+                            "sproj_rgf",
+                        ).try_as_basic_value().unwrap_basic();
+                        let packed = self.sealed_array_project_owned(rec_box, &Type::TypeVar(u32::MAX), &fty);
+                        self.builder.call(self.rt.tagged_release, &[rec_box.into()], "");
+                        rec_vals.push((k.clone(), packed, fty, true));
+                    } else if Self::sealed_field_kind(&fty) == Some(Self::KIND_SUMNODE_FIELD) {
+                        // SumNode: materialise via record_get_field (rare; complex runtime path).
+                        let rec_box = self.builder.call(
+                            self.rt.record_get_field,
+                            &[sealed_ptr.into(), key_str.into()],
+                            "sproj_rgf",
+                        ).try_as_basic_value().unwrap_basic();
+                        let v = self.unbox_tagged_val_to_type(rec_box, &fty);
+                        self.builder.call(self.rt.tagged_release, &[rec_box.into()], "");
+                        rec_vals.push((k.clone(), v, fty, false));
+                    } else if fty.is_pure_int_lit_union() {
+                        // Pure IntLit-union: lin_record_read_i64 returns the raw i32 value as i64;
+                        // truncate to i32 for the sealed slot.
+                        let raw_i64 = self.builder.call(
+                            self.rt.record_read_i64,
+                            &[sealed_ptr.into(), key_str.into()],
+                            "sproj_ri64",
+                        ).try_as_basic_value().unwrap_basic().into_int_value();
+                        let i32_val = self.builder.int_truncate_or_bit_cast(raw_i64, self.context.i32_type(), "sproj_ilu_i32").into();
+                        rec_vals.push((k.clone(), i32_val, fty, false));
+                    } else if Self::sealed_field_kind(&fty).is_none() {
+                        // Scalar field (Int*/UInt*/Float*/Bool): use lin_record_read_i64 — no alloc.
+                        let raw_i64 = self.builder.call(
+                            self.rt.record_read_i64,
+                            &[sealed_ptr.into(), key_str.into()],
+                            "sproj_ri64",
+                        ).try_as_basic_value().unwrap_basic().into_int_value();
+                        let v = self.i64_to_sealed_field_llvm(raw_i64, &fty);
+                        rec_vals.push((k.clone(), v, fty, false));
+                    } else {
+                        // Heap pointer field (Str/Array/Map/Sealed): use lin_record_read_ptr_retain.
+                        // Returns an owned (+1) raw pointer — no TaggedVal box allocated.
+                        let raw_ptr = self.builder.call(
+                            self.rt.record_read_ptr_retain,
+                            &[sealed_ptr.into(), key_str.into()],
+                            "sproj_rptr",
+                        ).try_as_basic_value().unwrap_basic();
+                        rec_vals.push((k.clone(), raw_ptr, fty, true));
+                    }
                 }
             }
             let rec_result = self.sealed_construct(target_fields, &rec_vals);
