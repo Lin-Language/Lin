@@ -845,21 +845,19 @@ pub(crate) fn lower_string_interp(
         return builder.const_temp(Const::Str(String::new()));
     }
 
-    // Start with an empty accumulator.
-    let mut acc = builder.const_temp(Const::Str(String::new()));
-    // True once `acc` holds a heap-allocated concat result (a +1 we own) rather than the initial
-    // empty-string literal. Only then must the final `acc` be registered owned (a bare literal is
-    // immortal — registering/releasing it is a harmless no-op, but we keep the bookkeeping honest).
-    let mut acc_is_owned = false;
+    // Collect all parts as string temps. Literal parts produce immortal const temps (not owned);
+    // Expr parts go through ToString and produce fresh +1 owned strings.
+    let mut part_temps: Vec<Temp> = Vec::with_capacity(parts.len());
+    let mut owned_parts: Vec<Temp> = Vec::new(); // owned per-part temps to release after build_n
 
     for part in parts {
-        let (part_temp, part_is_owned) = match part {
-            TypedStringPart::Literal(s) => (builder.const_temp(Const::Str(s.clone())), false),
+        match part {
+            TypedStringPart::Literal(s) => {
+                part_temps.push(builder.const_temp(Const::Str(s.clone())));
+            }
             TypedStringPart::Expr(expr) => {
                 let val = lower_expr(expr, builder, ctx);
-                // Convert to string. `ToString` now returns an OWNED (+1) string for EVERY input
-                // type (the codegen Str arm retains; numeric/bool/json arms allocate fresh), so the
-                // per-part temp is always a +1 we must release after the concat below.
+                // ToString returns OWNED (+1) for every input type.
                 let dst = builder.alloc_temp(Type::Str);
                 builder.emit(Instruction::CallIntrinsic {
                     dst,
@@ -867,45 +865,36 @@ pub(crate) fn lower_string_interp(
                     args: vec![val],
                     ret_ty: Type::Str,
                 });
-                (dst, true)
+                part_temps.push(dst);
+                owned_parts.push(dst);
             }
-        };
-        // Concatenate with accumulator. `lin_string_concat` BORROWS both args (copies bytes,
-        // returns a fresh +1), so each owned operand must be released afterwards.
-        let new_acc = builder.alloc_temp(Type::Str);
-        builder.emit(Instruction::CallIntrinsic {
-            dst: new_acc,
-            intrinsic: Intrinsic::StringConcat,
-            args: vec![acc, part_temp],
-            ret_ty: Type::Str,
-        });
-        // Release the consumed per-part `ToString` temp (now uniformly +1; immortal-literal-safe).
-        if part_is_owned && acc != part_temp {
-            builder.emit(Instruction::Release { val: part_temp, ty: Type::Str });
         }
-        // Release the consumed old accumulator (a prior concat result we owned).
-        if acc_is_owned && acc != part_temp {
-            builder.emit(Instruction::Release { val: acc, ty: Type::Str });
-        }
-        acc = new_acc;
-        acc_is_owned = true;
     }
 
-    // The final interpolation result is a fresh +1 string. Register it owned so the surrounding
-    // lowering treats it exactly like any other fresh allocation (MakeArray / call result):
-    //   - TRANSIENT use (an index-write KEY `obj["${k}"] = v`, a comparison operand, an unused
-    //     `val`) → released at scope exit. This is the leak this fix closes (the runtime container
-    //     `set` RETAINS the key, so the interp string's original +1 was never reclaimed).
-    //   - MOVE into a consumer (val binding kept, `return`, stored map VALUE) → the existing
-    //     transfer/escape machinery (`transfer_into_container`, the function-return keep-set,
-    //     `expr_is_fresh_alloc(StringInterp) == true`) transfers this single +1 and unregisters it,
-    //     so scope exit does not double-release. Registering here was previously feared to
-    //     double-free, but interp results were in fact NEVER registered, so they leaked in EVERY
-    //     case (not just transient). Registering makes them uniform with all other owned temps.
-    if acc_is_owned {
-        builder.register_owned(acc, Type::Str);
+    // If there is only one part and it was a plain literal, return it directly (immortal const).
+    if part_temps.len() == 1 && owned_parts.is_empty() {
+        return part_temps[0];
     }
-    acc
+
+    // Emit a single StringBuildN call: borrows all parts, returns one fresh +1 string.
+    // lin_string_build_n(parts_ptr: *const *const LinString, n: u32) -> *mut LinString
+    // codegen will stack-allocate the parts array and pass its pointer + count.
+    let dst = builder.alloc_temp(Type::Str);
+    builder.emit(Instruction::CallIntrinsic {
+        dst,
+        intrinsic: Intrinsic::StringBuildN,
+        args: part_temps,
+        ret_ty: Type::Str,
+    });
+
+    // Release the owned per-part ToString temps (now all borrowed by build_n; build_n copied them).
+    for pt in owned_parts {
+        builder.emit(Instruction::Release { val: pt, ty: Type::Str });
+    }
+
+    // The final result is a fresh +1 string. Register it owned identically to the old path.
+    builder.register_owned(dst, Type::Str);
+    dst
 }
 
 // -------------------------------------------------------------------------
