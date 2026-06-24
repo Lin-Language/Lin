@@ -403,6 +403,10 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         // a single Copy, which is a no-op from the LLVM perspective and lets LLVM
         // fold away any bookkeeping around the now-dead box temp.
         lin_ir::box_unbox_elide::elide_box_unbox(&mut ir_module);
+        // Bounds-check elision: mark flat-scalar-array Index instructions as
+        // `proven_inbounds` when the IR-level analysis proves `0 <= key < len`.
+        // Runs last (after all other passes) so it sees the final IR state.
+        lin_ir::bounds_elide::elide_bounds(&mut ir_module);
         // Static RC-balance verifier (Cluster 2) — VERIFICATION ONLY, gated on `LIN_VERIFY_RC=1`,
         // OFF by default so it can never affect a normal build. Runs on the FINAL lowered IR (after
         // RC insertion + rc_elide + escape stack-alloc) and reports per-path leak / over-release /
