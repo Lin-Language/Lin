@@ -14612,9 +14612,13 @@ print(toString(a[0] + a[2]))
     assert!(!body.contains("lin_array_alloc_null"),
         "allocT$Int32 must NOT allocate a tagged array, got:\n{}", body);
 
-    // The reader uses the flat inline path (nonneg OOB traps via lin_flat_array_oob, not the
-    // wrapping accessor). Neither the slow accessor nor a tagged getter should appear.
-    assert!(ll.contains("lin_flat_array_oob") || ll.contains("flat_get_ok"),
+    // The reader uses the flat inline path: either the nonneg path (oob trap via
+    // lin_flat_array_oob / flat_get_ok labels) or the fully proven-inbounds path
+    // (direct GEP+load with flat_data_pp / flat_get labels, no OOB branch at all).
+    // Neither case should use the wrapping accessor lin_flat_array_get_i32.
+    assert!(
+        ll.contains("lin_flat_array_oob") || ll.contains("flat_get_ok")
+            || ll.contains("flat_data_pp") || ll.contains("flat_get"),
         "expected an inline flat i32 read of the Int32[] value, IR:\n{}", ll);
     assert!(!ll.contains("lin_flat_array_get_i32"),
         "flat i32 read must NOT call the wrapping accessor (nonneg path uses oob trap), IR:\n{}", ll);
