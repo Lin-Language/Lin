@@ -10,6 +10,7 @@ pub mod rc_elide;
 pub mod rc_verify;
 pub mod redundant_read;
 pub mod repr;
+pub mod sink_pure_val;
 
 pub use ir::*;
 pub use lower::{
