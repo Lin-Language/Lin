@@ -5189,15 +5189,8 @@ pub(crate) fn lower_map_join(
         ret_ty: buf_ty.clone(),
     });
 
-    // Loop over the source array.
-    emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |i, elem, b, c| {
-        let idx = narrow_loop_index(i, b);
-
-        // Inline the map lambda: elem → s (owned +1 LinString).
-        let (s, _) = inline_lambda_body(&lam_params, &lam_body,
-            &[(elem, elem_ty.clone()), (idx, Type::Int32)], b, c);
-
-        // Append separator BEFORE every element except the first.
+    // Helper closure: shared separator + strbuf push logic, independent of how `s` was obtained.
+    let mj_push = |i: Temp, s: Temp, buf: Temp, sep: Temp, b: &mut FuncBuilder| {
         let zero64     = b.const_temp(Const::Int(0, Type::Int64));
         let is_first   = b.alloc_temp(Type::Bool);
         b.emit(Instruction::Binary {
@@ -5209,8 +5202,7 @@ pub(crate) fn lower_map_join(
         let cont_block = b.alloc_block("mj_cont");
         b.terminate(Terminator::CondJump { cond: is_first, then_block: cont_block, else_block: sep_block });
         b.switch_to(sep_block);
-        // lin_strbuf_push_borrow is void: use Type::Null so codegen emits a void call
-        // (see the const_null path — we don't use the dst, so const_null is fine here).
+        // lin_strbuf_push_borrow is void: use Type::Null so codegen emits a void call.
         let void0 = b.alloc_temp(Type::Null);
         b.emit(Instruction::Call {
             dst: void0,
@@ -5220,8 +5212,6 @@ pub(crate) fn lower_map_join(
         });
         b.terminate(Terminator::Jump(cont_block));
         b.switch_to(cont_block);
-
-        // Append the element string; lin_strbuf_push_owned releases it — transfer ownership.
         b.unregister_owned(s);
         let void1 = b.alloc_temp(Type::Null);
         b.emit(Instruction::Call {
@@ -5230,11 +5220,34 @@ pub(crate) fn lower_map_join(
             args: vec![buf, s],
             ret_ty: Type::Null,
         });
+    };
 
-        // Reclaim the source element box (mirrors map's elem-release discipline).
-        free_combinator_elem_box(elem, &elem_ty, b);
-        free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
-    });
+    // PACKED-VIEW fast path: a sealed-scalar-array source whose lambda uses the element ONLY for
+    // scalar field reads — bind a borrowed (array, index) view instead of materializing a fresh
+    // struct per element. No `lin_sealed_alloc` + memcpy + RC per iteration.
+    // Gated identically to the packed-view paths in `lower_map` and `lower_for`.
+    if is_sealed_scalar_array(&iterable_ty)
+        && lam_params.first().map(|p| elem_used_only_for_scalar_fields(p.slot, &lam_body)).unwrap_or(false)
+    {
+        let static_elem = iter_elem_type(&iterable_ty);
+        emit_packed_index_loop(iterable, &iterable_ty, builder, ctx, |i, array, b, c| {
+            let idx = narrow_loop_index(i, b);
+            let (s, _) = inline_lambda_body_packed_view(
+                &lam_params, &lam_body, array, i, &static_elem, idx, b, c);
+            mj_push(i, s, buf, sep, b);
+            // No element box to reclaim — the packed view never allocated a struct.
+        });
+    } else {
+        // Generic path: materialize each element, inline the lambda, reclaim the element box.
+        emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |i, elem, b, c| {
+            let idx = narrow_loop_index(i, b);
+            let (s, _) = inline_lambda_body(&lam_params, &lam_body,
+                &[(elem, elem_ty.clone()), (idx, Type::Int32)], b, c);
+            mj_push(i, s, buf, sep, b);
+            free_combinator_elem_box(elem, &elem_ty, b);
+            free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
+        });
+    }
 
     // Materialise the buffer into a fresh owned LinString.
     let result = builder.alloc_temp(Type::Str);
