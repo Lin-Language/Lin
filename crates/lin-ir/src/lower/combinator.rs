@@ -2461,6 +2461,85 @@ pub(crate) fn lower_some(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mu
     if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[1], builder, ctx) {
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
+
+        // PATH-1 in-place packed iteration: a packed sealed-scalar array source — the predicate
+        // uses the element ONLY for field reads (`elem_used_only_for_scalar_fields`) — iterates
+        // over the contiguous buffer with NO per-element materialize. The element param is bound
+        // to a borrowed `(array, index)` view; `p["field"]` reads lower to const-offset
+        // `SealedArrayFieldGet` loads. Falls back to the generic materialize path when the
+        // predicate uses the element as a whole value (passing it, storing it, etc.).
+        if is_sealed_scalar_array(&iterable_ty)
+            && lam_params.first().map(|p| elem_used_only_for_scalar_fields(p.slot, &lam_body)).unwrap_or(false)
+        {
+            let static_elem = iter_elem_type(&iterable_ty);
+            let len = emit_iterable_len(iterable, &iterable_ty, builder);
+            let zero = builder.const_temp(Const::Int(0, Type::Int64));
+            let false_val = builder.const_temp(Const::Bool(false));
+            let preheader = builder.current_block;
+            let header = builder.alloc_block("some_header");
+            let body_block = builder.alloc_block("some_body");
+            let latch = builder.alloc_block("some_latch");
+            let exit = builder.alloc_block("some_exit");
+            let i = builder.alloc_temp(Type::Int64);
+            let i_next = builder.alloc_temp(Type::Int64);
+            let found = builder.alloc_temp(Type::Bool);
+            let found_next = builder.alloc_temp(Type::Bool);
+            builder.terminate(Terminator::Jump(header));
+            builder.switch_to(header);
+            builder.emit(Instruction::Phi {
+                dst: i, ty: Type::Int64, incomings: vec![(zero, preheader), (i_next, latch)],
+            });
+            builder.emit(Instruction::Phi {
+                dst: found, ty: Type::Bool, incomings: vec![(false_val, preheader), (found_next, latch)],
+            });
+            let cond_len = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary {
+                dst: cond_len, op: BinOp::Lt, lhs: i, rhs: len,
+                operand_ty: Type::Int64, ty: Type::Bool,
+            });
+            let not_found = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Unary {
+                dst: not_found, op: UnaryOp::Not, operand: found, ty: Type::Bool,
+            });
+            let cond = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary {
+                dst: cond, op: BinOp::And, lhs: cond_len, rhs: not_found,
+                operand_ty: Type::Bool, ty: Type::Bool,
+            });
+            builder.terminate(Terminator::CondJump { cond, then_block: body_block, else_block: exit });
+            builder.switch_to(body_block);
+            let idx = narrow_loop_index(i, builder);
+            // Bind element as packed view (no materialize). Any p["field"] inside the body lowers
+            // to a const-offset SealedArrayFieldGet; whole-value uses fall back to Index.
+            let (pred_raw, pred_ty) = inline_lambda_body_packed_view(
+                &lam_params, &lam_body, iterable, i, &static_elem, idx, builder, ctx);
+            let pred = if matches!(pred_ty, Type::Bool) {
+                pred_raw
+            } else {
+                let d = builder.alloc_temp(Type::Bool);
+                builder.emit(Instruction::Coerce { dst: d, src: pred_raw, from_ty: pred_ty, to_ty: Type::Bool });
+                d
+            };
+            // No element box to reclaim — the packed view never allocated a struct.
+            builder.emit(Instruction::Binary {
+                dst: found_next, op: BinOp::Or, lhs: found, rhs: pred,
+                operand_ty: Type::Bool, ty: Type::Bool,
+            });
+            let back_block = builder.current_block;
+            builder.terminate(Terminator::Jump(latch));
+            builder.switch_to(latch);
+            let one = builder.const_temp(Const::Int(1, Type::Int64));
+            builder.emit(Instruction::Binary {
+                dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
+                operand_ty: Type::Int64, ty: Type::Int64,
+            });
+            builder.terminate(Terminator::Jump(header));
+            builder.patch_phi_incoming(header, i, body_block, back_block);
+            builder.patch_phi_incoming(header, found, body_block, back_block);
+            builder.switch_to(exit);
+            return found;
+        }
+
         let elem_ty = read_elem_ty.clone();
 
         // Explicit loop structure so we can carry the Bool result through a phi.
@@ -2658,6 +2737,74 @@ pub(crate) fn lower_every(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &m
     if let Some((lam_params, lam_body)) = inlinable_local_fn(&args[1], builder, ctx) {
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
+
+        // PATH-1 in-place packed iteration: mirrors lower_some's packed path but tracks `all_match`
+        // (starts true, set to false on first failing element). No per-element materialize.
+        if is_sealed_scalar_array(&iterable_ty)
+            && lam_params.first().map(|p| elem_used_only_for_scalar_fields(p.slot, &lam_body)).unwrap_or(false)
+        {
+            let static_elem = iter_elem_type(&iterable_ty);
+            let len = emit_iterable_len(iterable, &iterable_ty, builder);
+            let zero = builder.const_temp(Const::Int(0, Type::Int64));
+            let true_val = builder.const_temp(Const::Bool(true));
+            let preheader = builder.current_block;
+            let header = builder.alloc_block("every_header");
+            let body_block = builder.alloc_block("every_body");
+            let latch = builder.alloc_block("every_latch");
+            let exit = builder.alloc_block("every_exit");
+            let i = builder.alloc_temp(Type::Int64);
+            let i_next = builder.alloc_temp(Type::Int64);
+            let all_match = builder.alloc_temp(Type::Bool);
+            let all_match_next = builder.alloc_temp(Type::Bool);
+            builder.terminate(Terminator::Jump(header));
+            builder.switch_to(header);
+            builder.emit(Instruction::Phi {
+                dst: i, ty: Type::Int64, incomings: vec![(zero, preheader), (i_next, latch)],
+            });
+            builder.emit(Instruction::Phi {
+                dst: all_match, ty: Type::Bool, incomings: vec![(true_val, preheader), (all_match_next, latch)],
+            });
+            let cond_len = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary {
+                dst: cond_len, op: BinOp::Lt, lhs: i, rhs: len,
+                operand_ty: Type::Int64, ty: Type::Bool,
+            });
+            let cond = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary {
+                dst: cond, op: BinOp::And, lhs: cond_len, rhs: all_match,
+                operand_ty: Type::Bool, ty: Type::Bool,
+            });
+            builder.terminate(Terminator::CondJump { cond, then_block: body_block, else_block: exit });
+            builder.switch_to(body_block);
+            let idx = narrow_loop_index(i, builder);
+            let (pred_raw, pred_ty) = inline_lambda_body_packed_view(
+                &lam_params, &lam_body, iterable, i, &static_elem, idx, builder, ctx);
+            let pred = if matches!(pred_ty, Type::Bool) {
+                pred_raw
+            } else {
+                let d = builder.alloc_temp(Type::Bool);
+                builder.emit(Instruction::Coerce { dst: d, src: pred_raw, from_ty: pred_ty, to_ty: Type::Bool });
+                d
+            };
+            builder.emit(Instruction::Binary {
+                dst: all_match_next, op: BinOp::And, lhs: all_match, rhs: pred,
+                operand_ty: Type::Bool, ty: Type::Bool,
+            });
+            let back_block = builder.current_block;
+            builder.terminate(Terminator::Jump(latch));
+            builder.switch_to(latch);
+            let one = builder.const_temp(Const::Int(1, Type::Int64));
+            builder.emit(Instruction::Binary {
+                dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
+                operand_ty: Type::Int64, ty: Type::Int64,
+            });
+            builder.terminate(Terminator::Jump(header));
+            builder.patch_phi_incoming(header, i, body_block, back_block);
+            builder.patch_phi_incoming(header, all_match, body_block, back_block);
+            builder.switch_to(exit);
+            return all_match;
+        }
+
         let elem_ty = read_elem_ty.clone();
 
         let len = emit_iterable_len(iterable, &iterable_ty, builder);
