@@ -690,15 +690,10 @@ pub(crate) fn try_lower_sealed_array_field(
     ctx: &mut LowerCtx,
 ) -> Option<Temp> {
     let TypedExpr::Index { object: array, key, .. } = object else { return None };
-    let arr_ty_raw = array.ty();
-    if !is_sealed_scalar_array(&arr_ty_raw) {
+    let arr_ty = array.ty();
+    if !is_sealed_scalar_array(&arr_ty) {
         return None;
     }
-    // Strip Frozen wrapper for layout lookups — Frozen<R[]> has the same layout as R[].
-    let arr_ty = match &arr_ty_raw {
-        Type::Frozen(inner) => (**inner).clone(),
-        other => other.clone(),
-    };
     // Determine whether the field is a scalar or a heap pointer. Scalars are RC-free;
     // heap fields (String, Array, FixedArray, Map, nested sealed record) are BORROWED interior
     // pointers — the caller must Retain them into an owned reference. Non-field keys and

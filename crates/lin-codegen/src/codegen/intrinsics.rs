@@ -1656,9 +1656,6 @@ impl<'a> DescEncoder<'a> {
                     self.put_u8(KIND_JSON);
                 }
             }
-            // Frozen<T> is transparent: encode the inner type unchanged (no JSON decode target;
-            // if somehow reached, treat as accept-any for safety).
-            Type::Frozen(inner) => self.write_node(inner),
         }
     }
 }

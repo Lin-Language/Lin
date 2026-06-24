@@ -860,8 +860,6 @@ pub(crate) fn lower_intrinsic_call(
 pub(crate) fn iter_elem_type(iterable_ty: &Type) -> Type {
     match iterable_ty {
         Type::Array(t) | Type::Iterator(t) => (**t).clone(),
-        // Frozen<T[]> iterates the same element type as T[].
-        Type::Frozen(inner) => iter_elem_type(inner),
         Type::FixedArray(ts) => ts.first().cloned().unwrap_or(Type::Null),
         // Union of iterable types (e.g. T[] | Iterator<T> | Stream<T> from a generic combinator
         // signature): if ALL arms agree on the same concrete element type, use that type. This

@@ -61,15 +61,6 @@ pub fn is_compatible_env(
     }
 
     match (value_type, target_type) {
-        // `Frozen<T>` is a transparent subtype of `T` (one-way coercion: Frozen<T> ≤ T).
-        // At runtime Frozen<T> IS T (no boxing); callers that use a frozen result as T are fine.
-        // Two Frozen types are compatible when their inner types are. A Frozen value flowing into
-        // a TypeVar sink (generic/inference) is also fine — the inner arm covers that. We strip
-        // Frozen from the value side only (not target) so `T -> Frozen<T>` is still rejected
-        // (you can't manufacture a Frozen annotation without calling frozen()).
-        (Type::Frozen(inner), target) => return is_compatible_env(inner, target, env, lenient_json, depth),
-        (_, Type::Frozen(inner)) => return is_compatible_env(value_type, inner, env, lenient_json, depth),
-
         // Never is the bottom type: assignable to anything (kept ahead of the Shared arms so
         // `Never -> Shared<T>` stays compatible).
         (Type::Never, _) => true,
