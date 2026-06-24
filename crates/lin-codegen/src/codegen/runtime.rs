@@ -211,6 +211,14 @@ pub(crate) struct RuntimeFns<'ctx> {
     /// Read one field by name from a TAG_RECORD sealed struct. Returns an OWNED +1 TaggedVal*
     /// (heap box; caller must `lin_tagged_release` it). Null when field absent or ptr is null.
     pub record_get_field: FunctionValue<'ctx>,
+    /// `lin_record_read_i64(sealed_ptr: ptr, key: ptr) -> i64`
+    /// Unboxed scalar read: descriptor walk, returns raw i64 (zero/sign-extended for integers,
+    /// reinterpreted bits for floats). No heap allocation. Use for Int*/UInt*/Float*/Bool fields.
+    pub record_read_i64: FunctionValue<'ctx>,
+    /// `lin_record_read_ptr_retain(sealed_ptr: ptr, key: ptr) -> ptr`
+    /// Unboxed pointer read: descriptor walk, retains inner ptr (+1 rc), returns raw pointer.
+    /// No TaggedVal box allocated. Use for String/Array/Map/Sealed fields.
+    pub record_read_ptr_retain: FunctionValue<'ctx>,
 }
 
 impl<'ctx> RuntimeFns<'ctx> {
@@ -467,6 +475,20 @@ impl<'ctx> RuntimeFns<'ctx> {
             None,
         );
 
+        // lin_record_read_i64(sealed_ptr: ptr, key: ptr) -> i64 — unboxed scalar read, no alloc
+        let record_read_i64 = module.add_function(
+            "lin_record_read_i64",
+            i64_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+            None,
+        );
+
+        // lin_record_read_ptr_retain(sealed_ptr: ptr, key: ptr) -> ptr — unboxed ptr read, retains
+        let record_read_ptr_retain = module.add_function(
+            "lin_record_read_ptr_retain",
+            ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+            None,
+        );
+
         Self {
             string_length,
             string_eq,
@@ -518,6 +540,8 @@ impl<'ctx> RuntimeFns<'ctx> {
             map_set_int,
             sealed_drop_at_zero,
             record_get_field,
+            record_read_i64,
+            record_read_ptr_retain,
         }
     }
 }
