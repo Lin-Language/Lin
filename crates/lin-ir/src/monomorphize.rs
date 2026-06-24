@@ -2789,9 +2789,10 @@ fn try_inline_scalar_sort(
     if args.len() != 2 {
         return false;
     }
-    // arg0: a statically-known flat NUMERIC scalar array element type.
+    // arg0: a statically-known flat NUMERIC scalar array OR sealed-record array element type.
+    // Sealed-record elements are stored as struct pointers; `lower_sort` handles both paths.
     let elem_ok = match args[0].ty() {
-        Type::Array(t) | Type::Iterator(t) => t.is_flat_scalar(),
+        Type::Array(t) | Type::Iterator(t) => t.is_flat_scalar() || Type::sealed_fields(&t).is_some(),
         _ => false,
     };
     if !elem_ok {
