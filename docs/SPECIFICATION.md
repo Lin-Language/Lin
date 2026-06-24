@@ -896,14 +896,16 @@ Dot syntax is not used for JSON field access.
 
 ### 7.1 Runtime Semantics
 
-| Operand kind          | Access                                  | Result                          |
-| ---                   | ---                                     | ---                             |
-| Object, key present   | `obj["k"]`                              | the stored value                |
-| Object, key missing   | `obj["k"]`                              | `Null`                          |
-| `Null`                | `null["k"]`                             | `Null`                          |
-| Array, index in range | `arr[i]`                                | the element                     |
-| Array, index OOB      | `arr[i]`                                | runtime error                   |
-| `Null`                | `null[i]`                               | `Null`                          |
+| Operand kind              | Access                                  | Result                          |
+| ---                       | ---                                     | ---                             |
+| Object, key present       | `obj["k"]`                              | the stored value                |
+| Object, key missing       | `obj["k"]`                              | `Null`                          |
+| `Null`                    | `null["k"]`                             | `Null`                          |
+| Array, index in range     | `arr[i]`   (i ≥ 0)                      | the element                     |
+| Array, index OOB or < 0   | `arr[i]`                                | runtime error                   |
+| `Null`                    | `null[i]`                               | `Null`                          |
+
+**`[]` array indexing is positive-only.** A negative index `arr[-1]` is a runtime out-of-bounds error, not a wrap-around. Use `std/array`'s `at(arr, -1)` for safe negative/wraparound access (e.g. `arr.at(-1)` returns the last element, `arr.at(-5, default)` returns the default when out of range).
 
 Because `Null` propagates, you may chain accesses through unknown structures without intermediate checks:
 
