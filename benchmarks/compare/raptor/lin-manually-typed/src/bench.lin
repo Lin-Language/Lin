@@ -18,6 +18,7 @@ import { loadGtfs } from "./gtfs/gtfs-loader"
 import { GroupStationDepartAfterQuery, createGroupStationDepartAfterQuery, plan as groupPlan } from "./query/group-station-depart-after-query"
 import { Date } from "std/datetime"
 import { now } from "std/time"
+import { frozen } from "std/async"
 import { print } from "std/io"
 import { toString } from "std/string"
 import { length, push, slice, sort, min } from "std/array"
@@ -118,11 +119,17 @@ val nextN = (
 val main = () =>
   val t0 = now()
   val [trips, transfers, interchange, stops] = loadGtfs(DATA_DIR)
+  // Freeze the load-once, read-only index inputs (trips + transfers) as part of loading: they are
+  // never mutated downstream (only `interchange` is, inside `create`), so freezing deep-immortalises
+  // them — `create`'s sort/group/build then runs with zero refcount traffic on the trip graph, and
+  // its own `frozen(tripsByRoute)` skips the already-immortal trips (PERFORMANCE.md guidance #9).
+  val ftrips = frozen(trips)
+  val ftransfers = frozen(transfers)
   val loadMs = now() - t0
   print("LOAD ms=${ toString(loadMs) }")
 
   val t1 = now()
-  val raptor = create(trips, transfers, interchange)
+  val raptor = create(ftrips, ftransfers, interchange)
   val prepMs = now() - t1
   print("PREP ms=${ toString(prepMs) }")
 
