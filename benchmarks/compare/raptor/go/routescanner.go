@@ -3,62 +3,56 @@ package raptor
 // TripsIndexedByRoute maps a route to its trips (sorted by first departure).
 type TripsIndexedByRoute = map[RouteID][]*Trip
 
-// RouteScanner returns the earliest reachable trip for a route, maintaining a
-// stateful backward-scan position memo across calls within a single scan.
-type RouteScanner struct {
-	tripsByRoute      TripsIndexedByRoute
-	date              DateNumber
-	dow               DayOfWeek
-	routeScanPosition map[RouteID]int
-	scanPosSet        map[RouteID]bool
+// RouteFlatDeps holds the flat departure-time matrix for a single route.
+type RouteFlatDeps struct {
+	Stride int    // number of stops (stride for row-major indexing)
+	Deps   []Time // row-major: tripIndex*Stride + stopIndex
 }
 
-// GetTrip returns the earliest trip stop times possible on the given route at
-// or after the given time, scanning backward from the last found position.
-func (s *RouteScanner) GetTrip(routeId RouteID, stopIndex int, time Time) *Trip {
-	if !s.scanPosSet[routeId] {
-		s.routeScanPosition[routeId] = len(s.tripsByRoute[routeId]) - 1
-		s.scanPosSet[routeId] = true
+// RouteDepartures maps a route to its flat departure-time matrix.
+type RouteDepartures = map[RouteID]*RouteFlatDeps
+
+// FlatRouteScanner returns the earliest reachable trip index for a route
+// using the global integer-indexed flat arrays. Maintains a stateful
+// backward-scan position per route across calls within a single scan.
+type FlatRouteScanner struct {
+	idx          *FlatIndex
+	date         DateNumber
+	dow          DayOfWeek
+	scanPosition []int32 // per route: current scan position (trip index), -1 = unset
+	scanPosSet   []bool
+}
+
+// GetTrip returns the index of the earliest trip on route ri at stopIndex
+// departing at or after `time` (uint32 seconds). Returns -1 if none found.
+func (s *FlatRouteScanner) GetTrip(ri uint32, stopIndex uint32, time uint32) int32 {
+	if !s.scanPosSet[ri] {
+		s.scanPosition[ri] = int32(s.idx.routes[ri].NumTrips) - 1
+		s.scanPosSet[ri] = true
 	}
 
-	var lastFound *Trip
-	routeTrips := s.tripsByRoute[routeId]
+	re := s.idx.routes[ri]
+	numStops := re.NumStops
+	departures := s.idx.departures
+	trips := s.idx.routeTrips[ri]
+	date := s.date
+	dow := s.dow
 
-	for i := s.routeScanPosition[routeId]; i >= 0; i-- {
-		trip := routeTrips[i]
-		stopTime := trip.StopTimes[stopIndex]
+	var lastFound int32 = -1
 
-		if stopTime.DepartureTime < time {
+	for i := s.scanPosition[ri]; i >= 0; i-- {
+		dep := departures[re.StopTimesBase+uint32(i)*numStops+stopIndex]
+		if dep < time {
 			break
-		} else if trip.Service.RunsOn(s.date, s.dow) {
-			lastFound = trip
 		}
-
-		if lastFound == nil || lastFound == trip {
-			s.routeScanPosition[routeId] = i
+		trip := trips[i]
+		if trip.Service.RunsOn(date, dow) {
+			lastFound = i
+		}
+		if lastFound < 0 || lastFound == i {
+			s.scanPosition[ri] = i
 		}
 	}
 
 	return lastFound
-}
-
-// RouteScannerFactory creates a fresh RouteScanner per scan (per day).
-type RouteScannerFactory struct {
-	tripsByRoute TripsIndexedByRoute
-}
-
-// NewRouteScannerFactory constructs the factory.
-func NewRouteScannerFactory(tripsByRoute TripsIndexedByRoute) *RouteScannerFactory {
-	return &RouteScannerFactory{tripsByRoute: tripsByRoute}
-}
-
-// Create builds a RouteScanner for a specific date / day-of-week.
-func (f *RouteScannerFactory) Create(date DateNumber, dow DayOfWeek) *RouteScanner {
-	return &RouteScanner{
-		tripsByRoute:      f.tripsByRoute,
-		date:              date,
-		dow:               dow,
-		routeScanPosition: map[RouteID]int{},
-		scanPosSet:        map[RouteID]bool{},
-	}
 }

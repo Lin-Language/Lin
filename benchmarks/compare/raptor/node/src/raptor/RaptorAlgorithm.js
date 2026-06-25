@@ -1,24 +1,62 @@
 /**
- * Implementation of the Raptor journey planning algorithm
+ * Implementation of the Raptor journey planning algorithm.
+ * Uses integer-indexed global typed arrays throughout the hot path.
  */
 export class RaptorAlgorithm {
-  constructor(routeStopIndex, routePath, transfers, interchange, scanResultsFactory, queueFactory, routeScannerFactory) {
-    this.routeStopIndex = routeStopIndex;
-    this.routePath = routePath;
-    this.transfers = transfers;
+  constructor(
+    numStops,
+    numRoutes,
+    stopIndexOf,
+    stopNames,
+    routes,
+    routeStops,
+    arrivals,
+    departures,
+    routeTrips,
+    routeStopPos,
+    stopRoutes,
+    stopRoutesBase,
+    stopRoutesCount,
+    interchange,
+    transfers,
+    scanResultsFactory,
+    queueFactory,
+    routeScannerFactory,
+  ) {
+    this.numStops = numStops;
+    this.numRoutes = numRoutes;
+    this.stopIndexOf = stopIndexOf;
+    this.stopNames = stopNames;
+    this.routes = routes;
+    this.routeStops = routeStops;
+    this.arrivals = arrivals;
+    this.departures = departures;
+    this.routeTrips = routeTrips;
+    this.routeStopPos = routeStopPos;
+    this.stopRoutes = stopRoutes;
+    this.stopRoutesBase = stopRoutesBase;
+    this.stopRoutesCount = stopRoutesCount;
     this.interchange = interchange;
+    this.transfers = transfers;
     this.scanResultsFactory = scanResultsFactory;
     this.queueFactory = queueFactory;
     this.routeScannerFactory = routeScannerFactory;
   }
 
   /**
-   * Perform a plan of the routes at a given time and return the resulting kConnections index
+   * Perform a plan of the routes at a given time and return the resulting kConnections index.
+   * Origins is a map: string stopId -> departure time.
    */
   scan(origins, date, dow) {
     const routeScanner = this.routeScannerFactory.create(date, dow);
     const results = this.scanResultsFactory.create(origins);
-    let markedStops = Object.keys(origins);
+
+    // Convert string origins to integer marked stops list
+    let markedStops = [];
+    for (const stopId of Object.keys(origins)) {
+      const idx = this.stopIndexOf.get(stopId);
+      if (idx !== undefined) markedStops.push(idx);
+    }
 
     while (markedStops.length > 0) {
       results.addRound();
@@ -34,38 +72,42 @@ export class RaptorAlgorithm {
 
   scanRoutes(results, routeScanner, markedStops) {
     const queue = this.queueFactory.getQueue(markedStops);
+    // queue is a Map<routeIdx (int), stopPos (int in route)>
 
-    for (const [routeId, stopP] of Object.entries(queue)) {
+    const routeStops = this.routeStops;
+    const interchange = this.interchange;
+    const arrivals = this.arrivals;
+
+    for (const [routeIdx, startPos] of queue) {
       let boardingPoint = -1;
-      let trip;
-      const routePath = this.routePath[routeId];
-      const routePathLength = routePath.length;
+      let trip = null;
+      let tripBase = -1;  // index into global arrivals/departures for current trip
 
-      for (let pi = this.routeStopIndex[routeId][stopP]; pi < routePathLength; pi++) {
-        const stopPi = routePath[pi];
-        const previousArrival = results.previousArrival(stopPi);
+      const { stopTimesBase, numStops, numTrips, routeStopsBase } = this.routes[routeIdx];
 
-        if (trip) {
-          const i = this.interchange[stopPi];
-          const stopTime = trip.stopTimes[pi];
+      for (let pi = startPos; pi < numStops; pi++) {
+        const stopIdx = routeStops[routeStopsBase + pi];
+        const previousArrival = results.previousArrival(stopIdx);
 
-          if (stopTime.dropOff && stopTime.arrivalTime + i < results.bestArrival(stopPi)) {
-            results.setTrip(trip, boardingPoint, pi, i);
-          }
-          else if (previousArrival && previousArrival < stopTime.arrivalTime + i) {
-            const newTrip = routeScanner.getTrip(routeId, pi, previousArrival);
+        if (trip !== null) {
+          const iVal = interchange[stopIdx];
+          const arrTime = arrivals[tripBase + pi] + iVal;
 
-            if (newTrip) {
+          if (trip.stopTimes[pi].dropOff && arrTime < results.bestArrival(stopIdx)) {
+            results.setTrip(trip, boardingPoint, pi, iVal, stopIdx, arrivals[tripBase + pi]);
+          } else if (previousArrival !== -1 && previousArrival < arrivals[tripBase + pi] + iVal) {
+            const [newTrip, newBase] = routeScanner.getTrip(routeIdx, pi, previousArrival, stopTimesBase, numStops, numTrips);
+            if (newTrip !== null) {
               trip = newTrip;
+              tripBase = newBase;
               boardingPoint = pi;
             }
           }
-        }
-        else if (previousArrival) {
-          const newTrip = routeScanner.getTrip(routeId, pi, previousArrival);
-
-          if (newTrip) {
+        } else if (previousArrival !== -1) {
+          const [newTrip, newBase] = routeScanner.getTrip(routeIdx, pi, previousArrival, stopTimesBase, numStops, numTrips);
+          if (newTrip !== null) {
             trip = newTrip;
+            tripBase = newBase;
             boardingPoint = pi;
           }
         }
@@ -74,13 +116,21 @@ export class RaptorAlgorithm {
   }
 
   scanTransfers(results, markedStops) {
-    for (const stopP of markedStops) {
-      for (const transfer of this.transfers[stopP] || []) {
-        const stopPi = transfer.destination;
-        const arrival = results.previousArrival(stopP) + transfer.duration + this.interchange[stopPi];
+    const transfers = this.transfers;
+    const interchange = this.interchange;
 
-        if (transfer.startTime <= arrival && transfer.endTime >= arrival && arrival < results.bestArrival(stopPi)) {
-          results.setTransfer(transfer, arrival);
+    for (const stopIdx of markedStops) {
+      const xfers = transfers[stopIdx];
+      if (xfers.length === 0) continue;
+      const prevArr = results.previousArrival(stopIdx);
+      if (prevArr === -1) continue;
+
+      for (const transfer of xfers) {
+        const destIdx = transfer.destIdx;
+        const arrival = prevArr + transfer.duration + interchange[destIdx];
+
+        if (transfer.startTime <= arrival && transfer.endTime >= arrival && arrival < results.bestArrival(destIdx)) {
+          results.setTransfer(transfer, arrival, destIdx);
         }
       }
     }
