@@ -1,6 +1,9 @@
 import { StopId, Time, Transfer, Trip } from "../gtfs/gtfs"
-import { keys } from "std/object"
+import { StopTimes } from "./raptor-algorithm"
+import { MAX_TIME } from "../gtfs/date" 
+import { keys, fromEntries } from "std/object"
 import { push } from "std/array"
+import { map } from "std/iter"
 
 export type ScanResults = { 
   "bestArrivals": Arrivals, 
@@ -9,17 +12,28 @@ export type ScanResults = {
   "k": UInt8 
 }
 
-export val createScanResults = (
-  bestArrivals: Arrivals,
-  kArrivals: ArrivalsByNumChanges,
-  kConnections: ConnectionIndex,
-  k: UInt8 = 0
-): ScanResults =>
+//
+// Builds the initial ScanResults for a query: every served stop seeded with its origin departure
+// time (or MAX_TIME if it is not an origin), the same seed as round 0's arrivals, and an empty
+// connection map per stop.
+//
+export val createScanResults = (stops: StopId[], origins: StopTimes): ScanResults =>
+  // TODO we're iterating stops 3 times here, perhaps a single run?
+  val bestArrivals: Arrivals =
+    stops.map(stop => [stop, origins[stop] ?? MAX_TIME]).fromEntries()
+
+  val kArrivals: ArrivalsByNumChanges = [
+    stops.map(stop => [stop, origins[stop] ?? MAX_TIME]).fromEntries()
+  ]
+
+  val kConnections: ConnectionIndex =
+    stops.map(stop => [stop, {}]).fromEntries()
+
   {
     "bestArrivals": bestArrivals,
     "kArrivals": kArrivals,
     "kConnections": kConnections,
-    "k": k
+    "k": 0
   }
 
 export val addRound = (results: ScanResults): Null =>
