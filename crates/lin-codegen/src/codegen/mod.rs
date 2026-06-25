@@ -950,14 +950,6 @@ impl<'ctx> Codegen<'ctx> {
         let i64_ty = self.context.i64_type();
         let void_ty = self.context.void_type();
 
-        // `flat_union_return_fns` is keyed by `FuncId`, which each module numbers from 0 — so a
-        // flat-union FuncId recorded while compiling one module would otherwise collide with a
-        // same-numbered (but `ptr`-returning) FuncId in the next module, making its body emit the
-        // `{ i1, i64 }` ABI under a `ptr` signature (LLVM verifier error). The signature pass below
-        // repopulates this set for THIS module, and the only reader is this module's own body pass,
-        // so reset it per module-compile (imports route through here too, via compile_import_from_ir).
-        self.flat_union_return_fns.clear();
-
         // ---- Pass 1: pre-declare all LLVM functions (so cross-calls work) ----
         let mut ir_fn_to_llvm: StdMap<lir::FuncId, FunctionValue<'ctx>> = StdMap::new();
         // Exact emitted symbol name per FuncId, used by coverage to name its globals.
@@ -1909,17 +1901,23 @@ impl<'ctx> Codegen<'ctx> {
                                                     self.llvm_param_type(&ty)
                                                 })
                                                 .collect();
+                                            // Mirror Pass-1's signature logic for LIN functions: a
+                                            // scalar-nullable union return uses the flat `{ i1, i64 }`
+                                            // ABI (VA.1 CPR). Without this, a cross-module call site
+                                            // that forward-declares a not-yet-defined flat-union Lin
+                                            // callee (e.g. a cyclic import where the caller compiles
+                                            // first) would declare it `ptr`-returning; the later
+                                            // definition reuses that decl via `get_function` but emits
+                                            // a `{ i1, i64 }` body → "return type does not match".
+                                            // EXCLUDE `lin_*` runtime intrinsics: those use their
+                                            // native Rust ABI (a nullable scalar is returned BOXED as a
+                                            // `ptr`, e.g. `lin_try_parse_uint32: *mut u8`), NOT the
+                                            // Lin-internal flat-union convention.
                                             let fn_ty = if matches!(ret_ty, Type::Null | Type::Never) {
                                                 void_ty.fn_type(&param_types, false)
-                                            } else if !name.starts_with("lin_")
-                                                && Self::flat_union_scalar_type(ret_ty).is_some()
+                                            } else if Self::flat_union_scalar_type(ret_ty).is_some()
+                                                && !name.starts_with("lin_")
                                             {
-                                                // A user function returning `scalar | Null` uses the flat
-                                                // `{ i1, i64 }` return ABI (VA.1 CPR). When such a callee is
-                                                // forward-declared HERE (referenced before its own definition
-                                                // is compiled) we must match that ABI — otherwise the real
-                                                // definition reuses this stale `ptr` symbol while emitting a
-                                                // `{ i1, i64 }` body, and LLVM's verifier rejects the mismatch.
                                                 self.flat_union_struct_type().fn_type(&param_types, false)
                                             } else {
                                                 self.llvm_type(ret_ty).fn_type(&param_types, false)

@@ -2,7 +2,7 @@ import { expect, toBe, toBeNull, test, suite, run } from "std/test"
 import { Trip } from "../gtfs/gtfs"
 import { Service } from "../gtfs/service"
 import { DayOfWeek } from "../gtfs/date"
-import { createRouteScanner, createRouteScannerFactory, create, getTrip } from "./route-scanner"
+import { createRouteScanner, getTrip, RouteScannerFactory } from "./route-scanner"
 import { toUInt32 } from "std/number"
 import { length, push } from "std/array"
 import { for } from "std/iter"
@@ -90,8 +90,8 @@ val s = suite("raptor/route-scanner", [
   test("the factory creates a scanner", () =>
     val trips = [trip("t1000", 1000, running)]
     val [routes, st, rt] = makeTimetable(trips)
-    val f = createRouteScannerFactory()
-    val sc = f.create(20180615, friday)
+    val f: RouteScannerFactory = createRouteScanner
+    val sc = f(20180615, friday)
     [
       expect((getTrip(sc, routes, st, rt, routeId0, 0, 1000) ?? none)["tripId"]).toBe("t1000")
     ]

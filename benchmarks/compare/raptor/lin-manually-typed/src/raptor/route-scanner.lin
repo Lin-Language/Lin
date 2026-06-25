@@ -6,7 +6,7 @@ import { while } from "std/iter"
 import { toInt32 } from "std/number"
 
 // Per-route mutable scan position (one Int32 per route id, keyed by dense int route id).
-export type RouteScanPosition = { UInt32: Int32 }
+export type RouteScanPosition = { RouteIntId: Int32 }
 
 //
 // RouteScanner holds the mutable scan-position cursor used during one RAPTOR round.
@@ -28,6 +28,12 @@ export val createRouteScanner = (
     "dow": dow,
     "routeScanPosition": {}
   }
+
+//
+// A RouteScannerFactory is just `createRouteScanner` partially applied — `(date, dow) => RouteScanner`.
+// (The global timetable arrays no longer live on the scanner, so no per-scan state needs binding.)
+//
+export type RouteScannerFactory = (DateNumber, DayOfWeek) => RouteScanner
 
 //
 // Return the earliest reachable trip on the given route, scanning backwards from the last position
@@ -53,7 +59,7 @@ export val getTrip = (
 
   // first scan of this route starts at the last trip; later scans resume from the cached position
   var i: Int32 = scanner["routeScanPosition"][routeId] ?? (numTrips.toInt32() - 1)
-  scanner["routeScanPosition"][routeId] = i
+  var lastFoundPosition = i
   var lastFound: Trip | Null = null
 
   // walk backwards from the cached position, recording the latest reachable+running trip. Only
@@ -74,22 +80,13 @@ export val getTrip = (
         val foundHere = trip["service"].runsOn(scanner["date"], scanner["dow"])
         if foundHere then
           lastFound = trip
+        // only advance the cached resume point while no trip is locked on yet — a reachable but
+        // non-running service before the last found trip must not move the resume point back.
         if foundHere || lastFound == null then
-          scanner["routeScanPosition"][routeId] = i
+          lastFoundPosition = i
         i = i - 1
         true
   )
 
+  scanner["routeScanPosition"][routeId] = lastFoundPosition
   lastFound
-
-//
-// Factory: stateless now — global arrays live on RaptorAlgorithm.
-// Kept for the create(factory, date, dow) calling convention.
-//
-export type RouteScannerFactory = { "placeholder": Boolean }
-
-export val createRouteScannerFactory = (): RouteScannerFactory =>
-  { "placeholder": true }
-
-export val create = (factory: RouteScannerFactory, date: DateNumber, dow: DayOfWeek): RouteScanner =>
-  createRouteScanner(date, dow)

@@ -13,7 +13,7 @@ import {
 } from "./raptor-algorithm"
 import { RouteIntId, StopTime2, Route } from "./timetable"
 import { RoutesIndexedByStop, createQueueFactory } from "./queue-factory"
-import { createRouteScannerFactory } from "./route-scanner"
+import { createRouteScanner } from "./route-scanner"
 import { frozen } from "std/async"
 import { keys } from "std/object"
 import { join } from "std/string"
@@ -216,7 +216,7 @@ export val create = (
     frozenTransfers,
     frozenInterchange,
     createQueueFactory(frozenStopRoutes, frozenStopRoutesBase, frozenRouteStopIndex),
-    createRouteScannerFactory(),
+    createRouteScanner,
     frozenStopIndexOf,
     frozenStopNames
   )
