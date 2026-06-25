@@ -4776,6 +4776,62 @@ fn test_missing_relative_import_gives_module_not_found_with_tried_path() {
 }
 
 #[test]
+fn test_parse_error_in_imported_module_points_at_imported_file() {
+    // Regression: parse errors from an imported `.lin` module were previously rendered against
+    // the ENTRY file's path (file: None → fell back to entry), with a byte offset that pointed
+    // at a nonsensical location (e.g. inside the import-path string). The fix tags parse-error
+    // diagnostics with the imported file's absolute path, so the renderer uses that file's source.
+    //
+    // Layout: main.lin has two stdlib imports before the relative import so that the line of
+    // `import … from "./broken"` is NOT line 1 — this makes the test more sensitive to the
+    // wrong-offset mis-attribution that the bug produced.
+    let dir = std::env::temp_dir().join(format!("lin_parse_err_loc_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    // broken.lin has a genuine syntax error on line 1: a function-type annotation written with
+    // a colon instead of an arrow (`(a: Int32): Int32` is a value-returning function call
+    // annotation that triggers "expected Arrow, got Colon" from the type parser).
+    std::fs::write(
+        dir.join("broken.lin"),
+        "type T = (a: Int32): Int32\nexport val x = 42\n",
+    )
+    .unwrap();
+
+    // main.lin: two stdlib imports above the relative import so the broken import is on line 3,
+    // not line 1 — making the wrong-offset attribution visibly wrong.
+    std::fs::write(
+        dir.join("main.lin"),
+        "import { print } from \"std/io\"\nimport { toString } from \"std/string\"\nimport { x } from \"./broken\"\nprint(toString(x))\n",
+    )
+    .unwrap();
+
+    let out = lin_cmd()
+        .args(["check", dir.join("main.lin").to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let combined = format!("{stderr}{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!out.status.success(), "expected check failure, got success: {combined}");
+    // The diagnostic must name broken.lin — not main.lin.
+    assert!(
+        combined.contains("broken.lin"),
+        "expected 'broken.lin' in error output, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("main.lin"),
+        "error must NOT point at main.lin (wrong file attribution), got:\n{combined}"
+    );
+    // The error text from the parser must be visible.
+    assert!(
+        combined.contains("expected Arrow"),
+        "expected parse error text 'expected Arrow' in output, got:\n{combined}"
+    );
+}
+
+#[test]
 fn test_import_unknown_export_is_compile_error_with_cross_module_hint() {
     // `std/stream` exists and is resolved, but does NOT export `gunzip` (that lives in
     // `std/compress`). The checker must reject this at TYPE-CHECK time with an actionable
