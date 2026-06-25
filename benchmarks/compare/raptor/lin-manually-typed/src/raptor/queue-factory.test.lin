@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { createQueueFactory, getQueue } from "./queue-factory"
-import { RouteStopIndex } from "./raptor-algorithm"
+import { RouteStopIndex } from "./timetable"
 
 // Stop indices (dense UInt32).
 val stopA: UInt32 = 0u32

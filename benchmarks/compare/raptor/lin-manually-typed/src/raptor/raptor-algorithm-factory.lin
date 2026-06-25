@@ -3,15 +3,8 @@ import { Interchange as GtfsInterchange, TransfersByOrigin as GtfsTransfersByOri
 import { runsOn } from "../gtfs/service"
 import { Date, weekday } from "std/datetime"
 import { getDateNumber } from "../query/date-util"
-import {
-  RaptorAlgorithm,
-  StopIndex,
-  RouteStopIndex,
-  TransfersByOrigin,
-  Interchange,
-  createRaptorAlgorithm
-} from "./raptor-algorithm"
-import { RouteIntId, StopTime2, Route } from "./timetable"
+import { RaptorAlgorithm, createRaptorAlgorithm } from "./raptor-algorithm"
+import { RouteIntId, StopTimeEntry, Route, Timetable, StopIndex, RouteStopIndex, Interchange, TransfersByOrigin } from "./timetable"
 import { RoutesIndexedByStop, createQueueFactory } from "./queue-factory"
 import { createRouteScanner } from "./route-scanner"
 import { frozen } from "std/async"
@@ -30,10 +23,11 @@ val DEFAULT_INTERCHANGE_TIME: Time = 0
 //   Pass 1: group trips by route (assigning dense int route ids), build routeStopIndex,
 //           routesAtStopTemp, routePaths, and collect trips per route in insertion order.
 //   Pass 2: for each route in id order, lay down all its trips into the global flat arrays
-//           (routes[], routeStops[], stopTimes[]) contiguously.
+//           (routes[], routeStops[], stopTimes[], trips[]) contiguously.
 // This ensures that for route r, trip t, stop s:
 //   stopTimes[routes[r].stopTimesBase + t * routes[r].numStops + s]
-// is always valid and correctly indexed.
+//   trips[routes[r].tripsBase + t]
+// are always valid and correctly indexed.
 //
 export val create = (
   trips: Trip[],
@@ -143,8 +137,8 @@ export val create = (
   val numRoutes = routePathsTemp.keys().length().toUInt32()
   val routes: Route[] = []
   val routeStops: StopIndex[] = []
-  val stopTimes: StopTime2[] = []
-  val routeTrips: Trip[][] = []
+  val stopTimes: StopTimeEntry[] = []
+  val flatTrips: Trip[] = []
 
   range(0, numRoutes.toInt32()).for(ri =>
     val routeId = ri.toUInt32()
@@ -155,26 +149,26 @@ export val create = (
     val numTripsR = rTrips.length().toUInt32()
     val stBase = stopTimes.length().toUInt32()
     val rsBase = routeStops.length().toUInt32()
+    val tBase = flatTrips.length().toUInt32()
 
     routes.push({
       "stopTimesBase": stBase,
+      "routeStopsBase": rsBase,
+      "tripsBase": tBase,
       "numStops": numStops,
-      "numTrips": numTripsR,
-      "routeStopsBase": rsBase
+      "numTrips": numTripsR
     })
 
     // Append this route's stop sequence to routeStops
     path.for(stop => routeStops.push(stop))
 
-    // Append all trips' stop-times in trip-major order
+    // Append all trips' stop-times in trip-major order and the Trip records
     rTrips.for(trip =>
       trip["stopTimes"].for(s =>
         stopTimes.push({ "arrival": s["arrivalTime"], "departure": s["departureTime"] })
       )
+      flatTrips.push(trip)
     )
-
-    // Preserve the Trip records for journey reconstruction and calendar checks
-    routeTrips.push(rTrips)
   )
 
   // ── Build stopRoutes / stopRoutesBase ─────────────────────────────────────
@@ -197,26 +191,30 @@ export val create = (
   val frozenRoutes = frozen(routes)
   val frozenRouteStops = frozen(routeStops)
   val frozenStopTimes = frozen(stopTimes)
+  val frozenFlatTrips = frozen(flatTrips)
   val frozenStopRoutes = frozen(stopRoutes)
   val frozenStopRoutesBase = frozen(stopRoutesBase)
-  val frozenRouteTrips = frozen(routeTrips)
   val frozenTransfers = frozen(usefulTransfers)
   val frozenInterchange = frozen(intInterchange)
   val frozenStopIndexOf = frozen(stopIndexOf)
   val frozenStopNames = frozen(stopNames)
 
+  val timetable: Timetable = {
+    "routes": frozenRoutes,
+    "routeStops": frozenRouteStops,
+    "stopTimes": frozenStopTimes,
+    "trips": frozenFlatTrips,
+    "stopRoutes": frozenStopRoutes,
+    "stopRoutesBase": frozenStopRoutesBase,
+    "routeStopIndex": frozenRouteStopIndex,
+    "interchange": frozenInterchange,
+    "transfers": frozenTransfers,
+    "stopIndexOf": frozenStopIndexOf,
+    "stopNames": frozenStopNames
+  }
+
   createRaptorAlgorithm(
-    frozenRouteStopIndex,
-    frozenRoutes,
-    frozenRouteStops,
-    frozenStopTimes,
-    frozenStopRoutes,
-    frozenStopRoutesBase,
-    frozenRouteTrips,
-    frozenTransfers,
-    frozenInterchange,
+    timetable,
     createQueueFactory(frozenStopRoutes, frozenStopRoutesBase, frozenRouteStopIndex),
-    createRouteScanner,
-    frozenStopIndexOf,
-    frozenStopNames
+    createRouteScanner
   )

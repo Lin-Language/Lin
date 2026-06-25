@@ -1,5 +1,4 @@
-import { StopIndex, RouteIntId } from "./timetable"
-import { RouteStopIndex } from "./raptor-algorithm"
+import { StopIndex, RouteIntId, RouteStopIndex } from "./timetable"
 import { for, range } from "std/iter"
 import { toInt32, toUInt32 } from "std/number"
 
