@@ -932,6 +932,48 @@ retain/release on the hot path); everything that only touched *overlapped* work 
 
 ---
 
+### 5.14 knucleotide — string-keyed map throughput: 216→115 ms (−47%) via map-key fusion
+
+The `knucleotide` cell (`benchmarks/compare/knucleotide/`, slide a K=8 window over a 4 M-base DNA string,
+counting each k-mer into a `{String:Int64}` map) is the deliberate counterpart to `records`: it exercises
+the **string-keyed `lin_map_get` hashing path** that `records` avoids. It started at **Lin 216 ms vs
+Rust 116 / Go 73 / Node 549 / Python 676** (Lin already beat the interpreters). Goal: under 150 ms.
+
+The hot loop is `key = substring(seq,i,i+K); cur = counts[key]; counts[key] = cur==null ? 1 : cur+1`. gdb
+profiling showed **~50 % is the per-window substring allocate→copy→hash→free churn** (`lin_string_free` 24 %,
+`lin_string_alloc` 17 %, memcpy/release) — and with only 4^8 = 65536 distinct keys, after warmup ~99 % of
+windows allocate a substring whose key already lives in the map, then free it. The remaining ~26 % is the
+two map probes (get then set). **Kept the `.lin` faithful** (the header comment says the workload tests the
+string-map path; int-packing the key would be cheating) — the wins are all compiler/runtime.
+
+**Two fusion passes shipped (merged to master, `RESULT=248211949` + RAPTOR digest exact, valgrind-clean):**
+
+| change | knucleotide | mechanism |
+|---|--:|---|
+| **substring→byte-slice map-key fusion** (`substr_map_fuse.rs`) | 216→159 | a substring (`lin_string_slice`) used ONLY as a `{String:_}` map key, non-escaping, is never materialized — the get/set take the source bytes directly via `lin_map_get_bytes` / `lin_map_set_bytes` (key LinString allocated only on insert). Eliminates the ~50 % alloc churn. |
+| **get-then-set fusion** (`getset_map_fuse.rs`) | 159→**115** | `cur=m[k]; m[k]=f(cur)` on the same key lowers to ONE `lin_map_upsert_slot_bytes` probe (find-or-insert slot, read old, write new) instead of two hash+probes. A CFG window analysis pairs the cross-block Index/IndexSet; only flat-scalar-value maps (no RC on the value). |
+
+**Three soundness bugs caught in review that the agents' green suites + RC-verify all missed** (each now a
+regression test) — the map-lowering "silent corruption" class:
+1. The substring pass only checked the `key` operand of Index/IndexSet — a substring stored as a map
+   **value** (`m[k]=substring(...)`) was mis-fused (materialization skipped → empty/garbage value). Fix:
+   disqualify slice temps used as object/value.
+2. The get-set pass holds the **raw upsert slot pointer** across the get→set window and writes through it at
+   the set; a **call** in that window can grow/realloc the same map → dangling slot → UAF. It was only
+   *incidentally* safe (how the map temp is represented across a call); fix: an explicit call-guard in the
+   window scan (knucleotide's window is pure null-check + i64 add, so it still fuses).
+3. Both agents **skipped the RAPTOR gate** (ran the broken `lin/`+`lin-typed/` variants, not
+   `lin-manually-typed`) — the soundness oracle for string-keyed maps. Verified independently + with valgrind.
+
+**Why it worked where nbody hit a wall:** unlike nbody (irreducible memory latency on register-resident
+data), knucleotide's dominant cost was *removable allocation + a redundant probe* — serializing work on the
+hot path, the class that always moves the wall (§5.9/§5.10). Lin now lands between Rust and Go on this cell.
+**Process note:** the agent self-report-untrusted discipline paid for itself three times here — every "all
+gates pass" report had a real hole (a missed gate or a latent UAF) that only the orchestrator's independent
+RAPTOR + adversarial + valgrind re-verification caught.
+
+---
+
 ## 6. Guidance for writing fast Lin
 
 1. **Prefer typed records and `&`-composed named types over `AnyVal`.** This is the
