@@ -42,7 +42,7 @@ export val plan = (
   date: Date,
   time: Time
 ): Journey[] =>
-  val stopIndexOf = query["raptor"]["stopIndexOf"]
+  val stopIndexOf = query["raptor"]["timetable"]["stopIndexOf"]
 
   // Intern origin stop codes to integer ids and set each one's departure time. Stops that are
   // not in the feed (no such stop id) are skipped — they can never be an origin/destination.
@@ -109,7 +109,7 @@ val getJourneysFromConnections = (
   prevConnections: ConnectionIndex[],
   destinations: StopIndex[]
 ): Journey[] =>
-  val stopIndexOf = query["raptor"]["stopIndexOf"]
+  val stopIndexOf = query["raptor"]["timetable"]["stopIndexOf"]
   val initialResults = destinations
     .filter(d => (kConnections[d] ?? {}).keys().length() > 0)
     .flatMap(d => query["resultsFactory"](kConnections, d, stopIndexOf))
@@ -128,7 +128,7 @@ val completeJourneys = (
   results: Journey[],
   kConnections: ConnectionIndex
 ): Journey[] =>
-  val stopIndexOf = query["raptor"]["stopIndexOf"]
+  val stopIndexOf = query["raptor"]["timetable"]["stopIndexOf"]
   // for every result we have so far
   results.flatMap(journeyB =>
     // find some results to the origin of that result and merge them together

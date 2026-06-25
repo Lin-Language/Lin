@@ -1,4 +1,4 @@
-import { Time } from "../gtfs/gtfs"
+import { Time, Trip, Transfer } from "../gtfs/gtfs"
 
 // Dense integer stop id: each distinct stop string is assigned a UInt32 in 0..numStops-1
 // during factory construction. Shared base module — no circular imports.
@@ -9,11 +9,31 @@ export type StopIndex = UInt32
 export type RouteIntId = UInt32
 
 // Per-stop-time entry in the global trip-major flat array (sealed all-scalar for inline storage).
-export type StopTime2 = { "arrival": Time, "departure": Time }
+export type StopTimeEntry = { "arrival": Time, "departure": Time }
 
 // Descriptor for one route in the global arrays:
 //   stopTimesBase:  offset into the global stopTimes[] where this route's data starts
+//   tripsBase:      offset into the global trips[] where this route's trips start
 //   numStops:       stop count per trip on this route (constant across trips)
 //   numTrips:       number of trips on this route
 //   routeStopsBase: offset into routeStops[] for this route's stop sequence
-export type Route = { "stopTimesBase": UInt32, "numStops": UInt32, "numTrips": UInt32, "routeStopsBase": UInt32 }
+export type Route = { "stopTimesBase": UInt32, "routeStopsBase": UInt32, "tripsBase": UInt32, "numStops": UInt32, "numTrips": UInt32 }
+
+// RouteStopIndex: int route id → (int stop id → position-within-route as UInt8)
+export type RouteStopIndex = { UInt32: { StopIndex: UInt8 } }
+export type Interchange = { StopIndex: Time }
+export type TransfersByOrigin = { StopIndex: Transfer[] }
+
+export type Timetable = {
+  "routes": Route[],
+  "routeStops": StopIndex[],
+  "stopTimes": StopTimeEntry[],
+  "trips": Trip[],
+  "stopRoutes": RouteIntId[],
+  "stopRoutesBase": UInt32[],
+  "routeStopIndex": RouteStopIndex,
+  "interchange": Interchange,
+  "transfers": TransfersByOrigin,
+  "stopIndexOf": { String: StopIndex },
+  "stopNames": String[]
+}
