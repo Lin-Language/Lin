@@ -1,10 +1,10 @@
-import { StopIndex, RouteIntId, RouteStopIndex } from "./timetable"
+import { StopIndex, RouteIntId, RouteStopIndex, Offset } from "./timetable"
 import { for, range } from "std/iter"
 import { toInt32, toUInt32 } from "std/number"
 
 export type QueueFactory = {
   "stopRoutes": RouteIntId[],
-  "stopRoutesBase": UInt32[],
+  "stopRoutesBase": Offset[],
   "routeStopIndex": RouteStopIndex
 }
 
@@ -22,7 +22,7 @@ export type RoutesIndexedByStop = { StopIndex: RouteIntId[] }
 //
 export val createQueueFactory = (
   stopRoutes: RouteIntId[],
-  stopRoutesBase: UInt32[],
+  stopRoutesBase: Offset[],
   routeStopIndex: RouteStopIndex
 ): QueueFactory => {
   stopRoutes,
