@@ -58,8 +58,10 @@ export val getTrip = (
   val tripsBase = route["tripsBase"]
   val numTrips = route["numTrips"]
 
-  // first scan of this route starts at the last trip; later scans resume from the cached position
-  var i: Int32 = scanner["routeScanPosition"][routeId] ?? (numTrips.toInt32() - 1)
+  // first scan of this route starts at the last trip; later scans resume from the cached position.
+  // `i` is Int32 (inferred) — the backward walk runs it down to -1 to terminate, and `numTrips`
+  // (UInt32 count) is widened to Int32 so an empty route yields a -1 start.
+  var i = scanner["routeScanPosition"][routeId] ?? (numTrips.toInt32() - 1)
   var lastFoundPosition = i
   var lastFound: Trip | Null = null
 
@@ -77,7 +79,7 @@ export val getTrip = (
       if departureTime < time then
         false
       else
-        val trip = trips[tripsBase.toInt32() + i]
+        val trip = trips[tripsBase + i]
         val foundHere = trip["service"].runsOn(scanner["date"], scanner["dow"])
         if foundHere then
           lastFound = trip

@@ -7,7 +7,7 @@ import { RouteIntId, StopTimeEntry, Route, Timetable } from "./timetable"
 import { keys, entries } from "std/object"
 import { length } from "std/array"
 import { while, range, for } from "std/iter"
-import { toInt32, toUInt32 } from "std/number"
+import { toInt32 } from "std/number"
 
 // `StopIndex` is re-exported here (a trivial UInt32 id alias) for the modules that import it from
 // the algorithm. The structural index types (RouteStopIndex/Interchange/TransfersByOrigin) live in
@@ -71,16 +71,18 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
 
   // queue is { RouteIntId: StopIndex } — iterate its integer keys directly (no stringify/parse).
   queue.entries([routeId, stopP] =>
-    var boardingPoint: Int32 = -1
+    var boardingPoint = -1
     var trip: Trip | Null = null
     val route = gRoutes[routeId]
-    val numStops: Int32 = route["numStops"].toInt32()
+    // `range` (stdlib) is Int32-only, so the loop bounds are Int32; the route's UInt32 numStops /
+    // base offsets coerce into the index arithmetic below without per-iteration conversions.
+    val numStops = route["numStops"].toInt32()
     val routeStopsBase = route["routeStopsBase"]
     val stopIndexMap = tt["routeStopIndex"][routeId]
-    val boardingPointIndex: Int32 = if stopIndexMap != null then stopIndexMap[stopP] ?? 0 else 0
+    val boardingPointIndex = if stopIndexMap != null then stopIndexMap[stopP] ?? 0 else 0
 
     range(boardingPointIndex, numStops).for(pi =>
-      val stopPi = gRouteStops[routeStopsBase + pi.toUInt32()]
+      val stopPi = gRouteStops[routeStopsBase + pi]
       val prevArrival = results.previousArrival(stopPi)
 
       if trip != null then
