@@ -24276,3 +24276,75 @@ print(toString(m[key]))
 "#);
     assert_eq!(output, vec!["101"]);
 }
+
+// ── Nullable array index: compile-time rejection ──────────────────────────────
+//
+// Indexing an Array or FixedArray with an index whose static type includes Null must be a
+// compile-time type error. Previously the checker let it through and codegen produced an
+// unchecked lin_unbox_int64 on a null TaggedVal → SEGFAULT at runtime.
+
+#[test]
+fn test_nullable_array_index_is_type_error() {
+    // The canonical repro: map lookup returns `Int32 | Null`, then used as array index.
+    let (ok, output) = check_source(
+        r#"import { print } from "std/io"
+val f = (xs: Int32[], m: { String: Int32 }, k: String) =>
+  val j = m[k]
+  xs[j]
+print(f([10, 20, 30], {}, "missing"))
+"#,
+    );
+    assert!(
+        !ok,
+        "expected `lin check` to reject a nullable array index, but it passed:\n{}",
+        output
+    );
+    assert!(
+        output.contains("array index may be `Null`"),
+        "expected the error to mention `array index may be `Null``, got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_nullable_array_index_narrowed_with_coalesce_ok() {
+    // Narrowing the index with `?? 0` makes it `Int32` — must type-check and run.
+    let output = run(
+        r#"import { print } from "std/io"
+val f = (xs: Int32[], m: { String: Int32 }, k: String): Int32 =>
+  val j = m[k]
+  xs[j ?? 0]
+print(f([10, 20, 30], {}, "missing"))
+"#,
+    );
+    assert_eq!(output, vec!["10"]);
+}
+
+#[test]
+fn test_nullable_array_index_narrowed_with_if_guard_ok() {
+    // Guarding with `if j != null then arr[j]` narrows j to Int32 — must type-check and run.
+    let output = run(
+        r#"import { print } from "std/io"
+val f = (xs: Int32[], m: { String: Int32 }, k: String): Int32 =>
+  val j = m[k]
+  if j != null then xs[j] else 99
+print(f([10, 20, 30], {}, "missing"))
+print(f([10, 20, 30], { "x": 2 }, "x"))
+"#,
+    );
+    assert_eq!(output, vec!["99", "30"]);
+}
+
+#[test]
+fn test_non_null_int_array_index_still_works() {
+    // Plain Int32 literal and a non-null Int32 binding must continue to work unaffected.
+    let output = run(
+        r#"import { print } from "std/io"
+val xs: Int32[] = [10, 20, 30]
+val i: Int32 = 1
+print(xs[0])
+print(xs[i])
+"#,
+    );
+    assert_eq!(output, vec!["10", "20"]);
+}
