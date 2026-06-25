@@ -65,21 +65,18 @@ export val scan = (
 
 val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: RouteScanner, markedStops: StopIndex[], tt: Timetable) =>
   val queue = raptor["queueFactory"].getQueue(markedStops)
-  val routes = tt["routes"]
-  val routeStops = tt["routeStops"]
 
-  // queue is { RouteIntId: StopIndex } — iterate its integer keys directly (no stringify/parse).
   queue.entries([routeId, stopP] =>
     var boardingPoint = -1
     var trip: Trip | Null = null
-    val route = routes[routeId]
+    val route = tt["routes"][routeId]
     val numStops = route["numStops"].toInt32()
     val routeStopsBase = route["routeStopsBase"]
     val stopIndexMap = tt["routeStopIndex"][routeId] ?? {}
     val boardingPointIndex = stopIndexMap[stopP] ?? 0
 
     range(boardingPointIndex, numStops).for(pi =>
-      val stopPi = routeStops[routeStopsBase + pi]
+      val stopPi = tt["routeStops"][routeStopsBase + pi]
       val prevArrival = results.previousArrival(stopPi)
 
       if trip != null then
