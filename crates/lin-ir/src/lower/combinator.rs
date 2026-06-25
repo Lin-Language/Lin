@@ -4665,14 +4665,43 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
         // RC invariant: IndexSet → lin_sealed_ptr_array_set retains new BEFORE releasing old, so
         // retain(arr[i]) then release(arr[0]) per slot is safe for all i (including i==0).
         let n_i32 = narrow_loop_index(n, builder); // Int64 → Int32
+        // EMPTY GUARD: the buffers are seeded from `arr[0]`, which faults on an EMPTY sealed array
+        // (`array index 0 out of bounds (len 0)`). The fill VALUE only populates slots — the sealed
+        // descriptor is derived statically from `elem_ty`'s representation, NOT from the fill — and
+        // for `n == 0` there are zero slots, so the fill is never read. Read `arr[0]` only when the
+        // array is non-empty, feeding a typed null placeholder when empty. Downstream (copy-in,
+        // width/lo/merge/copy-back loops) is a no-op for n == 0, so `out` returns as an empty,
+        // correctly-descriptored sealed array — matching stdlib's `if n <= 1 then concat(arr, [])`.
         let fill = builder.alloc_temp(elem_ty.clone());
-        let zero_i64 = builder.const_temp(Const::Int(0, Type::Int64));
-        builder.emit(Instruction::Index {
-            dst: fill, object: arr, key: zero_i64,
-            obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
-        nonneg: true,
-        proven_inbounds: false,
-        });
+        {
+            let read_blk = builder.alloc_block("sort_fill_read");
+            let empty_blk = builder.alloc_block("sort_fill_empty");
+            let cont_blk = builder.alloc_block("sort_fill_cont");
+            let has_elems = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary { dst: has_elems, op: BinOp::Gt, lhs: n, rhs: zero, operand_ty: Type::Int64, ty: Type::Bool });
+            builder.terminate(Terminator::CondJump { cond: has_elems, then_block: read_blk, else_block: empty_blk });
+
+            builder.switch_to(read_blk);
+            let fill_read = builder.alloc_temp(elem_ty.clone());
+            let zero_i64 = builder.const_temp(Const::Int(0, Type::Int64));
+            builder.emit(Instruction::Index {
+                dst: fill_read, object: arr, key: zero_i64,
+                obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+                nonneg: true,
+                proven_inbounds: false,
+            });
+            let read_end = builder.current_block;
+            builder.terminate(Terminator::Jump(cont_blk));
+
+            builder.switch_to(empty_blk);
+            let fill_null = builder.alloc_temp(elem_ty.clone());
+            builder.emit(Instruction::Const { dst: fill_null, val: Const::Null });
+            let empty_end = builder.current_block;
+            builder.terminate(Terminator::Jump(cont_blk));
+
+            builder.switch_to(cont_blk);
+            builder.emit(Instruction::Phi { dst: fill, ty: elem_ty.clone(), incomings: vec![(fill_read, read_end), (fill_null, empty_end)] });
+        }
         let out = builder.alloc_temp(result_type.clone());
         builder.emit(Instruction::CallIntrinsic {
             dst: out, intrinsic: Intrinsic::ArrayAllocateFilled,

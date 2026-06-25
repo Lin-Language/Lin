@@ -1,7 +1,7 @@
 import { StopId, Time, Transfer, Trip } from "../gtfs/gtfs"
 import { DayOfWeek, DateNumber } from "../gtfs/date"
 import { QueueFactory, getQueue } from "./queue-factory"
-import { RouteScanner, RouteScannerFactory, create, getTrip } from "./route-scanner"
+import { RouteScanner, RouteScannerFactory, getTrip } from "./route-scanner"
 import { Arrivals, ConnectionIndex, ScanResults, createScanResults, addRound, previousArrival, setTrip, setTransfer, bestArrival, getMarkedStops, finalize } from "./scan-results"
 import { StopIndex, RouteIntId, StopTime2, Route } from "./timetable"
 import { keys, entries } from "std/object"
@@ -70,7 +70,7 @@ export val scan = (
   date: DateNumber,
   dow: DayOfWeek
 ): [ConnectionIndex, Arrivals] =>
-  val routeScanner = raptor["routeScannerFactory"].create(date, dow)
+  val routeScanner = raptor["routeScannerFactory"](date, dow)
   val results = createScanResults(raptor["stopNames"].length(), origins)
   var markedStops = origins.keys()
 

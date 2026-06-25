@@ -2,7 +2,7 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { createRaptorAlgorithm, RouteStopIndex, Interchange, TransfersByOrigin } from "./raptor-algorithm"
 import { Route, RouteIntId, StopTime2 } from "./timetable"
 import { QueueFactory } from "./queue-factory"
-import { RouteScannerFactory } from "./route-scanner"
+import { RouteScannerFactory, createRouteScanner } from "./route-scanner"
 import { Trip } from "../gtfs/gtfs"
 
 // Only the constructor shape is unit-tested here. `scan` is integration-level (drives the
@@ -19,7 +19,7 @@ val s = suite("raptor/raptor-algorithm", [
     val transfers: TransfersByOrigin = {}
     val interchange: Interchange = {}
     val queueFactory: QueueFactory = { "stopRoutes": [], "stopRoutesBase": [], "routeStopIndex": {} }
-    val routeScannerFactory: RouteScannerFactory = { "placeholder": true }
+    val routeScannerFactory: RouteScannerFactory = createRouteScanner
     val stopIndexOf: { String: UInt32 } = {}
     val stopNames: String[] = []
 

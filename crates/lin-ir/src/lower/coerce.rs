@@ -1121,14 +1121,6 @@ pub(crate) fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty:
     // reference (released by its own scope). Unlike the union-box case the source is NOT consumed,
     // so leave `t` registered; just register the fresh result so the binding's scope releases it.
     let made_fresh_array = flat_scalar_array_repr_differs(value_ty, slot_ty);
-    // A SEALED-RECORD ARRAY boxed into a Json/union slot does NOT consume the source: codegen's
-    // `box_value` MATERIALIZES a fresh tagged `Object[]` view (`sealed_array_to_tagged`) and boxes
-    // THAT, leaving the original packed `P[]` (`t`) fully owned and still live. So unlike the
-    // ordinary concrete-heap→union box (where the box wraps `t`'s inner and takes its +1), here the
-    // box owns ONLY the fresh materialized array. Both the box AND the source sealed array are
-    // independently owned and must each be released at scope exit — so DON'T `unregister_owned(t)`
-    // (that orphaned the packed source array, leaking its header + element buffer per binding).
-    let sealed_array_materialized = made_fresh_box && is_sealed_scalar_array(value_ty);
     // A BOXED-element array (a combinator result `pts.map(...)` whose lambda returns an unsealed
     // object literal, runtime repr = `Object[]` of boxed `LinObject`s) bound to a packed
     // sealed-scalar-array slot (`Pt[]`). `type_repr_differs`'s new sealed-array arm emits a `Coerce`
@@ -1141,12 +1133,10 @@ pub(crate) fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty:
     let sealed_array_reprojected =
         param_elem_is_boxed_repr(value_ty) && is_sealed_scalar_array(slot_ty);
     let coerced = coerce_to_slot_type(t, value_ty, slot_ty, builder);
-    if sealed_array_reprojected || sealed_array_materialized {
-        // Both directions produce a FRESH +1-owned array that does NOT consume the source: the
-        // reproject builds a new packed buffer, the materialize a new tagged `Object[]` view (which
-        // a union slot then boxes). The source (`t`) keeps its own +1 (released by its own scope), so
-        // register only the fresh result for scope-exit release — DON'T `unregister_owned(t)` (that
-        // would orphan the source array, leaking its header + element buffer per binding).
+    if sealed_array_reprojected {
+        // The reproject builds a new packed buffer that does NOT consume the source: the source
+        // array (`t`) keeps its own +1 (released by its own scope), so register only the fresh
+        // result for scope-exit release.
         if coerced != t {
             builder.register_owned(coerced, slot_ty.clone());
         }
