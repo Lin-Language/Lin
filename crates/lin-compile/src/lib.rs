@@ -969,6 +969,10 @@ fn build_import_graph(
 
         let (ast, src_text, imported_base, abs_path, is_stdlib) =
             if let Some(src) = stdlib_source(path.as_str()) {
+                // Stdlib sources are embedded strings (not on disk), so we leave parse-error
+                // diagnostics untagged (file: None). The renderer will fall back to the entry
+                // file, which is harmless: stdlib parse errors don't occur in practice because
+                // CI type-checks stdlib on every push.
                 let ast = parse_source(src).map_err(CompileError::TypeCheck)?;
                 (ast, src.to_string(), base_dir.to_path_buf(), None, true)
             } else {
@@ -995,7 +999,12 @@ fn build_import_graph(
                         CompileError::Io(e)
                     }
                 })?;
-                let ast = parse_source(&src).map_err(CompileError::TypeCheck)?;
+                // Tag parse-error diagnostics with the imported file's absolute path so the
+                // renderer points at the right file and offset (not the entry file).
+                let ast = parse_source(&src).map_err(|diags| {
+                    let abs = file_path.canonicalize().unwrap_or_else(|_| file_path.clone());
+                    CompileError::TypeCheck(tag_diagnostics(diags, Some(&abs.to_string_lossy())))
+                })?;
                 let imported_base = file_path.parent().unwrap_or(base_dir).to_path_buf();
                 let abs = file_path.canonicalize().unwrap_or(file_path);
                 (ast, src, imported_base, Some(abs.to_string_lossy().to_string()), false)
