@@ -4399,6 +4399,61 @@ fn test_circular_import_function_reference_compiles_not_stack_overflow() {
 }
 
 #[test]
+fn test_cross_module_flat_union_return_call_signature_matches() {
+    // Regression (codegen): a function returning a scalar-nullable union (`T | Null`) uses the flat
+    // `{ i1, i64 }` return ABI (VA.1 CPR). When such a function is CALLED across a module boundary
+    // and the caller's module compiles BEFORE the callee's definition (e.g. inside an import cycle),
+    // the call site forward-declares the callee. That forward declaration must use the SAME flat
+    // `{ i1, i64 }` signature as the definition — otherwise it declared the callee `ptr`-returning,
+    // the definition reused the decl via `get_function`, and emitted a `{ i1, i64 }` body, tripping
+    // LLVM's verifier: "Function return type does not match operand type of return inst". Surfaced by
+    // the manually-typed RAPTOR scan-results ↔ raptor-algorithm cycle (`bestArrival: Time | Null`).
+    // Three modules with a `defs ↔ algo` cycle. `defs` DEFINES the flat-union-return `lookup`;
+    // `algo` CALLS it; `defs` imports a type from `algo` (closing the cycle). `main` imports `defs`
+    // FIRST, so the post-order-DFS compile order registers the CALLER (`algo`) before the DEFINER
+    // (`defs`) — the order that makes `algo`'s call site forward-declare `lookup` before `defs`
+    // emits its body. This mirrors RAPTOR's scan-results ↔ raptor-algorithm cycle.
+    let dir = std::env::temp_dir().join(format!("lin_fu_cycle_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("defs.lin"),
+        "import { Ctx } from \"algo\"\n\
+         export type M = { String: Int32 }\n\
+         export val lookup = (m: M, k: String): Int32 | Null => m[k]\n").unwrap();
+    std::fs::write(dir.join("algo.lin"),
+        "import { lookup, M } from \"defs\"\n\
+         export type Ctx = { \"m\": M }\n\
+         export val best = (c: Ctx, k: String): Int32 | Null => lookup(c[\"m\"], k)\n").unwrap();
+    std::fs::write(dir.join("main.lin"),
+        "import { print } from \"std/io\"\n\
+         import { toString } from \"std/string\"\n\
+         import { M } from \"defs\"\n\
+         import { best, Ctx } from \"algo\"\n\
+         var m: M = {  }\n\
+         m[\"x\"] = 42\n\
+         val c: Ctx = { \"m\": m }\n\
+         print(toString(best(c, \"x\")))\n\
+         print(toString(best(c, \"missing\")))\n").unwrap();
+
+    let bin_path = dir.join("main.out");
+    let compile = lin_cmd()
+        .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let combined = format!("{}{}",
+        String::from_utf8_lossy(&compile.stderr), String::from_utf8_lossy(&compile.stdout));
+    assert!(compile.status.success(),
+        "expected the cross-module flat-union return to compile, got: {combined}");
+
+    let run_out = Command::new(&bin_path).output().expect("failed to run compiled binary");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(run_out.status.success(),
+        "expected clean run, got stderr: {}", String::from_utf8_lossy(&run_out.stderr));
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines, vec!["42", "null"], "present key → 42, missing key → null");
+}
+
+#[test]
 fn test_diamond_imports_are_not_false_cycles() {
     // A module imported by two different paths (a diamond) is NOT a cycle. Resolution
     // pops each module from the visiting stack when done, so the shared dependency is
@@ -4717,6 +4772,62 @@ fn test_missing_relative_import_gives_module_not_found_with_tried_path() {
     assert!(
         !combined.contains("not a built-in stdlib module"),
         "non-std import should not get the stdlib note, got: {combined}"
+    );
+}
+
+#[test]
+fn test_parse_error_in_imported_module_points_at_imported_file() {
+    // Regression: parse errors from an imported `.lin` module were previously rendered against
+    // the ENTRY file's path (file: None → fell back to entry), with a byte offset that pointed
+    // at a nonsensical location (e.g. inside the import-path string). The fix tags parse-error
+    // diagnostics with the imported file's absolute path, so the renderer uses that file's source.
+    //
+    // Layout: main.lin has two stdlib imports before the relative import so that the line of
+    // `import … from "./broken"` is NOT line 1 — this makes the test more sensitive to the
+    // wrong-offset mis-attribution that the bug produced.
+    let dir = std::env::temp_dir().join(format!("lin_parse_err_loc_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    // broken.lin has a genuine syntax error on line 1: a function-type annotation written with
+    // a colon instead of an arrow (`(a: Int32): Int32` is a value-returning function call
+    // annotation that triggers "expected Arrow, got Colon" from the type parser).
+    std::fs::write(
+        dir.join("broken.lin"),
+        "type T = (a: Int32): Int32\nexport val x = 42\n",
+    )
+    .unwrap();
+
+    // main.lin: two stdlib imports above the relative import so the broken import is on line 3,
+    // not line 1 — making the wrong-offset attribution visibly wrong.
+    std::fs::write(
+        dir.join("main.lin"),
+        "import { print } from \"std/io\"\nimport { toString } from \"std/string\"\nimport { x } from \"./broken\"\nprint(toString(x))\n",
+    )
+    .unwrap();
+
+    let out = lin_cmd()
+        .args(["check", dir.join("main.lin").to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let combined = format!("{stderr}{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!out.status.success(), "expected check failure, got success: {combined}");
+    // The diagnostic must name broken.lin — not main.lin.
+    assert!(
+        combined.contains("broken.lin"),
+        "expected 'broken.lin' in error output, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("main.lin"),
+        "error must NOT point at main.lin (wrong file attribution), got:\n{combined}"
+    );
+    // The error text from the parser must be visible.
+    assert!(
+        combined.contains("expected Arrow"),
+        "expected parse error text 'expected Arrow' in output, got:\n{combined}"
     );
 }
 
@@ -24164,4 +24275,76 @@ m[key] = if cur == null then 1i64 else cur + 1i64
 print(toString(m[key]))
 "#);
     assert_eq!(output, vec!["101"]);
+}
+
+// ── Nullable array index: compile-time rejection ──────────────────────────────
+//
+// Indexing an Array or FixedArray with an index whose static type includes Null must be a
+// compile-time type error. Previously the checker let it through and codegen produced an
+// unchecked lin_unbox_int64 on a null TaggedVal → SEGFAULT at runtime.
+
+#[test]
+fn test_nullable_array_index_is_type_error() {
+    // The canonical repro: map lookup returns `Int32 | Null`, then used as array index.
+    let (ok, output) = check_source(
+        r#"import { print } from "std/io"
+val f = (xs: Int32[], m: { String: Int32 }, k: String) =>
+  val j = m[k]
+  xs[j]
+print(f([10, 20, 30], {}, "missing"))
+"#,
+    );
+    assert!(
+        !ok,
+        "expected `lin check` to reject a nullable array index, but it passed:\n{}",
+        output
+    );
+    assert!(
+        output.contains("array index may be `Null`"),
+        "expected the error to mention `array index may be `Null``, got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_nullable_array_index_narrowed_with_coalesce_ok() {
+    // Narrowing the index with `?? 0` makes it `Int32` — must type-check and run.
+    let output = run(
+        r#"import { print } from "std/io"
+val f = (xs: Int32[], m: { String: Int32 }, k: String): Int32 =>
+  val j = m[k]
+  xs[j ?? 0]
+print(f([10, 20, 30], {}, "missing"))
+"#,
+    );
+    assert_eq!(output, vec!["10"]);
+}
+
+#[test]
+fn test_nullable_array_index_narrowed_with_if_guard_ok() {
+    // Guarding with `if j != null then arr[j]` narrows j to Int32 — must type-check and run.
+    let output = run(
+        r#"import { print } from "std/io"
+val f = (xs: Int32[], m: { String: Int32 }, k: String): Int32 =>
+  val j = m[k]
+  if j != null then xs[j] else 99
+print(f([10, 20, 30], {}, "missing"))
+print(f([10, 20, 30], { "x": 2 }, "x"))
+"#,
+    );
+    assert_eq!(output, vec!["99", "30"]);
+}
+
+#[test]
+fn test_non_null_int_array_index_still_works() {
+    // Plain Int32 literal and a non-null Int32 binding must continue to work unaffected.
+    let output = run(
+        r#"import { print } from "std/io"
+val xs: Int32[] = [10, 20, 30]
+val i: Int32 = 1
+print(xs[0])
+print(xs[i])
+"#,
+    );
+    assert_eq!(output, vec!["10", "20"]);
 }

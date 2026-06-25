@@ -31,6 +31,11 @@ export val createRouteScanner = (
   }
 
 //
+// Partially applied RouterScanner
+//  
+export type RouteScannerFactory = (DateNumber, DayOfWeek) => RouteScanner
+
+//
 // Return the earliest reachable trip on the given route, scanning backwards from the last position
 // found. The cached scan position only advances while no trip has been locked onto yet (a reachable
 // but non-running service before the last found trip must not move the resume point back).
@@ -40,7 +45,7 @@ export val getTrip = (scanner: RouteScanner, routeId: RouteId, stopIndex: Int32,
 
   // first scan of this route starts at the last trip; later scans resume from the cached position
   var i = scanner["routeScanPosition"][routeId] ?? routeTrips.length() - 1
-  scanner["routeScanPosition"][routeId] = i
+  var lastFoundPosition = i
   var lastFound: Trip | Null = null
 
   // walk backwards from the cached position, recording the latest reachable+running trip. Only
@@ -60,21 +65,14 @@ export val getTrip = (scanner: RouteScanner, routeId: RouteId, stopIndex: Int32,
         val foundHere = trip["service"].runsOn(scanner["date"], scanner["dow"])
         if foundHere then
           lastFound = trip
+
+        // we only updated the cached scan position when we have got to a valid point (or there were no previous valid points)
+        // because the scanning needs to continue from the last valid point on the next run (not anything before it).
         if foundHere || lastFound == null then
-          scanner["routeScanPosition"][routeId] = i
+          lastFoundPosition = i 
         i = i - 1
         true
   )
 
   lastFound
 
-//
-// Create RouteScanners from GTFS trips indexed by route.
-//
-export type RouteScannerFactory = { "tripsByRoute": TripsIndexedByRoute }
-
-export val createRouteScannerFactory = (tripsByRoute: TripsIndexedByRoute): RouteScannerFactory =>
-  { "tripsByRoute": tripsByRoute }
-
-export val create = (factory: RouteScannerFactory, date: DateNumber, dow: DayOfWeek): RouteScanner =>
-  createRouteScanner(factory["tripsByRoute"], date, dow)

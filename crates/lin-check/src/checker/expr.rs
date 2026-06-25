@@ -809,6 +809,17 @@ impl Checker {
             });
         }
         let obj_ty = typed_obj.ty();
+        // Indexing an Array or FixedArray with a possibly-null index would silently produce a
+        // null-pointer dereference in codegen (lin_unbox_int64 on a null TaggedVal). Reject it
+        // now so the user is forced to narrow the index first, e.g. `arr[i ?? 0]`.
+        if matches!(obj_ty, Type::Array(_) | Type::FixedArray(_)) && type_mentions_null(&typed_key.ty()) {
+            return Err(Diagnostic::error(
+                span,
+                "array index may be `Null`",
+            ).with_help(
+                "an array index must be a non-null integer — narrow it first, e.g. `arr[i ?? 0]` or guard with `if i != null then arr[i] …`",
+            ));
+        }
         let result_type = match &obj_ty {
             Type::Array(elem) => *elem.clone(),
             Type::FixedArray(elems) => {
@@ -1165,6 +1176,16 @@ impl Checker {
         obj_ty: &Type,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
+        // Mirror the guard in `infer_index`: a Named alias that resolves to Array/FixedArray must
+        // also reject a nullable index. The caller already typed the key, so inspect it here.
+        if matches!(obj_ty, Type::Array(_) | Type::FixedArray(_)) && type_mentions_null(&typed_key.ty()) {
+            return Err(Diagnostic::error(
+                span,
+                "array index may be `Null`",
+            ).with_help(
+                "an array index must be a non-null integer — narrow it first, e.g. `arr[i ?? 0]` or guard with `if i != null then arr[i] …`",
+            ));
+        }
         let result_type = match obj_ty {
             Type::Array(elem) => *elem.clone(),
             Type::FixedArray(elems) => {
