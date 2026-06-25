@@ -4399,6 +4399,61 @@ fn test_circular_import_function_reference_compiles_not_stack_overflow() {
 }
 
 #[test]
+fn test_cross_module_flat_union_return_call_signature_matches() {
+    // Regression (codegen): a function returning a scalar-nullable union (`T | Null`) uses the flat
+    // `{ i1, i64 }` return ABI (VA.1 CPR). When such a function is CALLED across a module boundary
+    // and the caller's module compiles BEFORE the callee's definition (e.g. inside an import cycle),
+    // the call site forward-declares the callee. That forward declaration must use the SAME flat
+    // `{ i1, i64 }` signature as the definition — otherwise it declared the callee `ptr`-returning,
+    // the definition reused the decl via `get_function`, and emitted a `{ i1, i64 }` body, tripping
+    // LLVM's verifier: "Function return type does not match operand type of return inst". Surfaced by
+    // the manually-typed RAPTOR scan-results ↔ raptor-algorithm cycle (`bestArrival: Time | Null`).
+    // Three modules with a `defs ↔ algo` cycle. `defs` DEFINES the flat-union-return `lookup`;
+    // `algo` CALLS it; `defs` imports a type from `algo` (closing the cycle). `main` imports `defs`
+    // FIRST, so the post-order-DFS compile order registers the CALLER (`algo`) before the DEFINER
+    // (`defs`) — the order that makes `algo`'s call site forward-declare `lookup` before `defs`
+    // emits its body. This mirrors RAPTOR's scan-results ↔ raptor-algorithm cycle.
+    let dir = std::env::temp_dir().join(format!("lin_fu_cycle_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("defs.lin"),
+        "import { Ctx } from \"algo\"\n\
+         export type M = { String: Int32 }\n\
+         export val lookup = (m: M, k: String): Int32 | Null => m[k]\n").unwrap();
+    std::fs::write(dir.join("algo.lin"),
+        "import { lookup, M } from \"defs\"\n\
+         export type Ctx = { \"m\": M }\n\
+         export val best = (c: Ctx, k: String): Int32 | Null => lookup(c[\"m\"], k)\n").unwrap();
+    std::fs::write(dir.join("main.lin"),
+        "import { print } from \"std/io\"\n\
+         import { toString } from \"std/string\"\n\
+         import { M } from \"defs\"\n\
+         import { best, Ctx } from \"algo\"\n\
+         var m: M = {  }\n\
+         m[\"x\"] = 42\n\
+         val c: Ctx = { \"m\": m }\n\
+         print(toString(best(c, \"x\")))\n\
+         print(toString(best(c, \"missing\")))\n").unwrap();
+
+    let bin_path = dir.join("main.out");
+    let compile = lin_cmd()
+        .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let combined = format!("{}{}",
+        String::from_utf8_lossy(&compile.stderr), String::from_utf8_lossy(&compile.stdout));
+    assert!(compile.status.success(),
+        "expected the cross-module flat-union return to compile, got: {combined}");
+
+    let run_out = Command::new(&bin_path).output().expect("failed to run compiled binary");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(run_out.status.success(),
+        "expected clean run, got stderr: {}", String::from_utf8_lossy(&run_out.stderr));
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines, vec!["42", "null"], "present key → 42, missing key → null");
+}
+
+#[test]
 fn test_diamond_imports_are_not_false_cycles() {
     // A module imported by two different paths (a diamond) is NOT a cycle. Resolution
     // pops each module from the visiting stack when done, so the shared dependency is
