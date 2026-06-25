@@ -3466,23 +3466,26 @@ unsafe impl Send for CsvRecordsSource {}
 /// so equal byte sequences share ONE immortal LinString (pointer-identity key compare in map gets).
 unsafe fn record_to_object_cached(keys: &[*mut crate::string::LinString], row: &[Vec<u8>]) -> *mut u8 {
     use crate::map::{lin_map_alloc, lin_map_set};
-    use crate::string::intern_csv_field_bytes;
+    use crate::string::{intern_csv_field_in, with_csv_intern_table};
     use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TaggedVal};
     let map = lin_map_alloc(keys.len().max(1) as u32, 0);
-    for (i, &k) in keys.iter().enumerate() {
-        if i >= row.len() {
-            break; // short row: omit the trailing keys
+    // Borrow the intern table ONCE for the whole row, not once per field.
+    with_csv_intern_table(|tbl| {
+        for (i, &k) in keys.iter().enumerate() {
+            if i >= row.len() {
+                break; // short row: omit the trailing keys
+            }
+            // Intern the value so equal strings (StopId, RouteId, …) share one immortal pointer.
+            // lin_map_set retains the value; lin_string_release is a no-op for immortal strings.
+            let v = intern_csv_field_in(tbl, row[i].as_ptr(), row[i].len() as u32);
+            let mut tv: TaggedVal = std::mem::zeroed();
+            tv.tag = TAG_STR;
+            tv.payload = v as u64;
+            lin_map_set(map, k, &tv); // map retains key + value
+            crate::string::lin_string_release(v); // no-op for immortal; safe for non-immortal
+            // key NOT released here — source's persistent ref outlives all rows
         }
-        // Intern the value so equal strings (StopId, RouteId, …) share one immortal pointer.
-        // lin_map_set retains the value; lin_string_release is a no-op for immortal strings.
-        let v = intern_csv_field_bytes(row[i].as_ptr(), row[i].len() as u32);
-        let mut tv: TaggedVal = std::mem::zeroed();
-        tv.tag = TAG_STR;
-        tv.payload = v as u64;
-        lin_map_set(map, k, &tv); // map retains key + value
-        crate::string::lin_string_release(v); // no-op for immortal; safe for non-immortal
-        // key NOT released here — source's persistent ref outlives all rows
-    }
+    });
     alloc_tagged(TAG_MAP, map as u64)
 }
 
@@ -3490,21 +3493,24 @@ unsafe fn record_to_object_cached(keys: &[*mut crate::string::LinString], row: &
 /// Only the selected columns are materialized; others are never allocated.
 unsafe fn record_to_object_projected(proj: &[(usize, *mut crate::string::LinString)], row: &[Vec<u8>]) -> *mut u8 {
     use crate::map::{lin_map_alloc, lin_map_set};
-    use crate::string::intern_csv_field_bytes;
+    use crate::string::{intern_csv_field_in, with_csv_intern_table};
     use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TaggedVal};
     let map = lin_map_alloc(proj.len().max(1) as u32, 0);
-    for &(row_idx, k) in proj {
-        if row_idx >= row.len() {
-            continue; // ragged row: this column is absent, skip
+    // Borrow the intern table ONCE for the whole row, not once per field.
+    with_csv_intern_table(|tbl| {
+        for &(row_idx, k) in proj {
+            if row_idx >= row.len() {
+                continue; // ragged row: this column is absent, skip
+            }
+            let v = intern_csv_field_in(tbl, row[row_idx].as_ptr(), row[row_idx].len() as u32);
+            let mut tv: TaggedVal = std::mem::zeroed();
+            tv.tag = TAG_STR;
+            tv.payload = v as u64;
+            lin_map_set(map, k, &tv);
+            crate::string::lin_string_release(v); // no-op for immortal; safe for non-immortal
+            // key NOT released here — source's persistent ref outlives all rows
         }
-        let v = intern_csv_field_bytes(row[row_idx].as_ptr(), row[row_idx].len() as u32);
-        let mut tv: TaggedVal = std::mem::zeroed();
-        tv.tag = TAG_STR;
-        tv.payload = v as u64;
-        lin_map_set(map, k, &tv);
-        crate::string::lin_string_release(v); // no-op for immortal; safe for non-immortal
-        // key NOT released here — source's persistent ref outlives all rows
-    }
+    });
     alloc_tagged(TAG_MAP, map as u64)
 }
 
