@@ -1,44 +1,73 @@
 import { Trip, StopId, Transfer, Time } from "../gtfs/gtfs"
+import { Interchange as GtfsInterchange, TransfersByOrigin as GtfsTransfersByOrigin } from "../gtfs/gtfs-loader"
 import { runsOn } from "../gtfs/service"
 import { Date, weekday } from "std/datetime"
 import { getDateNumber } from "../query/date-util"
 import {
   RaptorAlgorithm,
+  StopIndex,
   RouteStopIndex,
-  RoutePaths,
   TransfersByOrigin,
   Interchange,
   createRaptorAlgorithm
 } from "./raptor-algorithm"
-import { RouteId, TripsIndexedByRoute, createRouteScannerFactory } from "./route-scanner"
+import { RouteIntId, StopTime2, Route } from "./timetable"
 import { RoutesIndexedByStop, createQueueFactory } from "./queue-factory"
+import { createRouteScannerFactory } from "./route-scanner"
 import { frozen } from "std/async"
 import { keys } from "std/object"
 import { join } from "std/string"
 import { length, push, sort } from "std/array"
 import { for, range, filter, some, map } from "std/iter"
-import { toUInt8 } from "std/number"
+import { toUInt8, toUInt32, toInt32 } from "std/number"
 
 // Default interchange (transfer) time at a stop, in seconds.
 val DEFAULT_INTERCHANGE_TIME: Time = 0
 
 //
-// Set up the indexes the Raptor algorithm needs from the loaded GTFS data: group trips into routes,
-// record each route's stop order (routeStopIndex / routePath), the routes passing through each stop
-// (routesAtStop), the trips on each route (tripsByRoute), and the transfers/interchange that are
-// actually reachable. If a date is supplied, trips are pre-filtered to those running on that date.
+// Set up the indexes the Raptor algorithm needs from the loaded GTFS data.
+// Uses a two-pass build:
+//   Pass 1: group trips by route (assigning dense int route ids), build routeStopIndex,
+//           routesAtStopTemp, routePaths, and collect trips per route in insertion order.
+//   Pass 2: for each route in id order, lay down all its trips into the global flat arrays
+//           (routes[], routeStops[], stopTimes[]) contiguously.
+// This ensures that for route r, trip t, stop s:
+//   stopTimes[routes[r].stopTimesBase + t * routes[r].numStops + s]
+// is always valid and correctly indexed.
 //
 export val create = (
   trips: Trip[],
-  transfers: TransfersByOrigin,
-  interchange: Interchange,
+  transfers: GtfsTransfersByOrigin,
+  interchange: GtfsInterchange,
   date: Date | Null = null
 ): RaptorAlgorithm =>
-  val routesAtStop: RoutesIndexedByStop = {  }
-  val tripsByRoute: TripsIndexedByRoute = {  }
-  val routeStopIndex: RouteStopIndex = {  }
-  val routePath: RoutePaths = {  }
-  val usefulTransfers: TransfersByOrigin = {  }
+  // Intern table: string stop → UInt32 id
+  val stopIndexOf: { String: StopIndex } = {}
+  val stopNames: String[] = []
+
+  val internStop = (stop: StopId): StopIndex =>
+    val existing = stopIndexOf[stop]
+    if existing != null then
+      existing
+    else
+      val idx = stopNames.length().toUInt32()
+      stopIndexOf[stop] = idx
+      stopNames.push(stop)
+      idx
+
+  // Route dedup: string key → dense int route id
+  val routeIndexOf: { String: RouteIntId } = {}
+
+  // Per-route temp structures (pass 1 output)
+  val tripsByRoute: { UInt32: Trip[] } = {}    // int routeId → trips in sorted order
+  val routeStopIndex: RouteStopIndex = {}       // int routeId → stop → position
+  val routePathsTemp: { UInt32: StopIndex[] } = {}   // int routeId → stop sequence
+
+  // Inverse index per stop (for building stopRoutes/stopRoutesBase)
+  val routesAtStopTemp: RoutesIndexedByStop = {}
+
+  val usefulTransfers: TransfersByOrigin = {}
+  val intInterchange: Interchange = {}
 
   val activeTrips =
     if date == null then
@@ -54,70 +83,140 @@ export val create = (
     if da < db then -1 else if da > db then 1 else 0
   )
 
+  // ── PASS 1: group trips by route, build auxiliary indexes ────────────────
   sortedTrips.for(trip =>
-    val path = trip["stopTimes"].map(s => s["stop"])
-    val routeId = getRouteId(trip, tripsByRoute)
+    // Intern each stop on this trip to get the integer path
+    val path = trip["stopTimes"].map(s => internStop(s["stop"]))
 
-    if routeStopIndex[routeId] == null then
-      val stopIndex: { StopId: UInt8 } = {  }
+    // Compute the route string signature (stop + pickUp + dropOff flags)
+    val routeKey = trip["stopTimes"]
+      .map(s => "${ s["stop"] }${ if s["pickUp"] then 1 else 0 }${ if s["dropOff"] then 1 else 0 }")
+      .join(",")
+
+    val lastArrivalA = trip["stopTimes"][trip["stopTimes"].length() - 1]["arrivalTime"]
+
+    // Check for overtaking: if this trip arrives earlier at the final stop than any existing
+    // trip on the base route, it goes on a distinct "overtakes" route.
+    val existingId = routeIndexOf[routeKey]
+    val finalKey =
+      if existingId != null then
+        val existingTrips = tripsByRoute[existingId] ?? []
+        val overtakes = existingTrips.some(t =>
+          lastArrivalA < t["stopTimes"][t["stopTimes"].length() - 1]["arrivalTime"]
+        )
+        if overtakes then "${ routeKey }overtakes" else routeKey
+      else
+        routeKey
+
+    if routeIndexOf[finalKey] == null then
+      // New route: allocate an int id and build its auxiliary structures
+      val routeId = routePathsTemp.keys().length().toUInt32()
+      routeIndexOf[finalKey] = routeId
       tripsByRoute[routeId] = []
-      routePath[routeId] = path
+      routePathsTemp[routeId] = path
+
+      val stopIndex: { StopIndex: UInt8 } = {}
+      routeStopIndex[routeId] = stopIndex
 
       range(path.length() - 1, -1, -1).for(i =>
         val stop = path[i]
+        val stopStr = trip["stopTimes"][i]["stop"]
         stopIndex[stop] = i.toUInt8()
-        usefulTransfers[stop] = transfers[stop] ?? []
-        interchange[stop] = interchange[stop] ?? DEFAULT_INTERCHANGE_TIME
 
-        val stopRoutes = routesAtStop[stop] ?? []
+        val strTransfers = transfers[stopStr] ?? []
+        usefulTransfers[stop] = strTransfers
+        intInterchange[stop] = interchange[stopStr] ?? DEFAULT_INTERCHANGE_TIME
+
+        val stopRoutesList = routesAtStopTemp[stop] ?? []
         if trip["stopTimes"][i]["pickUp"] then
-          stopRoutes.push(routeId)
-        routesAtStop[stop] = stopRoutes
+          stopRoutesList.push(routeId)
+        routesAtStopTemp[stop] = stopRoutesList
       )
 
-      routeStopIndex[routeId] = stopIndex
-
-    val routeTrips = tripsByRoute[routeId] ?? []
-    routeTrips.push(trip)
-    tripsByRoute[routeId] = routeTrips
+    val routeId = routeIndexOf[finalKey] ?? 0u32
+    val rTripsForPush = tripsByRoute[routeId] ?? []
+    rTripsForPush.push(trip)
+    tripsByRoute[routeId] = rTripsForPush
   )
 
-  // Freeze the load-once index graphs: they are fully built above and read-only for the rest of the
-  // program (the scan never mutates them — getTrip's mutable cursor lives in a per-scan
-  // RouteScanPosition map, not in tripsByRoute). `frozen` deep-immortalises the graph (retain/release
-  // become no-ops) and repacks 0xFD pointer-spine record arrays to compact 0xFE inline — the
-  // load-once-data lever from docs/PERFORMANCE.md §5.7 (guidance #9).
+  // ── PASS 2: lay down global flat arrays in route-major order ─────────────
+  val numRoutes = routePathsTemp.keys().length().toUInt32()
+  val routes: Route[] = []
+  val routeStops: StopIndex[] = []
+  val stopTimes: StopTime2[] = []
+  val routeTrips: Trip[][] = []
+
+  range(0, numRoutes.toInt32()).for(ri =>
+    val routeId = ri.toUInt32()
+    val path = routePathsTemp[routeId] ?? []
+    val rTrips = tripsByRoute[routeId] ?? []
+
+    val numStops = path.length().toUInt32()
+    val numTripsR = rTrips.length().toUInt32()
+    val stBase = stopTimes.length().toUInt32()
+    val rsBase = routeStops.length().toUInt32()
+
+    routes.push({
+      "stopTimesBase": stBase,
+      "numStops": numStops,
+      "numTrips": numTripsR,
+      "routeStopsBase": rsBase
+    })
+
+    // Append this route's stop sequence to routeStops
+    path.for(stop => routeStops.push(stop))
+
+    // Append all trips' stop-times in trip-major order
+    rTrips.for(trip =>
+      trip["stopTimes"].for(s =>
+        stopTimes.push({ "arrival": s["arrivalTime"], "departure": s["departureTime"] })
+      )
+    )
+
+    // Preserve the Trip records for journey reconstruction and calendar checks
+    routeTrips.push(rTrips)
+  )
+
+  // ── Build stopRoutes / stopRoutesBase ─────────────────────────────────────
+  val numStopCount = stopNames.length()
+  val stopRoutes: RouteIntId[] = []
+  val stopRoutesBase: UInt32[] = []
+  var srOffset: UInt32 = 0u32
+
+  range(0, numStopCount).for(si =>
+    val sIdx = si.toUInt32()
+    stopRoutesBase.push(srOffset)
+    val sRoutes = routesAtStopTemp[sIdx] ?? []
+    sRoutes.for(r => stopRoutes.push(r))
+    srOffset = srOffset + sRoutes.length().toUInt32()
+  )
+  stopRoutesBase.push(srOffset)  // sentinel
+
+  // ── Freeze all load-once read-only structures ─────────────────────────────
   val frozenRouteStopIndex = frozen(routeStopIndex)
-  val frozenRoutePath = frozen(routePath)
+  val frozenRoutes = frozen(routes)
+  val frozenRouteStops = frozen(routeStops)
+  val frozenStopTimes = frozen(stopTimes)
+  val frozenStopRoutes = frozen(stopRoutes)
+  val frozenStopRoutesBase = frozen(stopRoutesBase)
+  val frozenRouteTrips = frozen(routeTrips)
   val frozenTransfers = frozen(usefulTransfers)
-  val frozenInterchange = frozen(interchange)
-  val frozenRoutesAtStop = frozen(routesAtStop)
-  val frozenTripsByRoute = frozen(tripsByRoute)
+  val frozenInterchange = frozen(intInterchange)
+  val frozenStopIndexOf = frozen(stopIndexOf)
+  val frozenStopNames = frozen(stopNames)
 
   createRaptorAlgorithm(
     frozenRouteStopIndex,
-    frozenRoutePath,
+    frozenRoutes,
+    frozenRouteStops,
+    frozenStopTimes,
+    frozenStopRoutes,
+    frozenStopRoutesBase,
+    frozenRouteTrips,
     frozenTransfers,
     frozenInterchange,
-    createQueueFactory(frozenRoutesAtStop, frozenRouteStopIndex),
-    createRouteScannerFactory(frozenTripsByRoute)
+    createQueueFactory(frozenStopRoutes, frozenStopRoutesBase, frozenRouteStopIndex),
+    createRouteScannerFactory(),
+    frozenStopIndexOf,
+    frozenStopNames
   )
-
-
-//
-// A route is the sequence of (stop, pickUp, dropOff) along a trip. A trip that reaches its final
-// stop earlier than an existing trip already on that route "overtakes" it; such trips are pushed
-// onto a distinct route so each route's trips stay in a consistent arrival order for the scanner.
-//
-val getRouteId = (trip: Trip, tripsByRoute: TripsIndexedByRoute): RouteId =>
-  val routeId = trip["stopTimes"]
-    .map(s => "${ s["stop"] }${ if s["pickUp"] then 1 else 0 }${ if s["dropOff"] then 1 else 0 }")
-    .join(",")
-
-  val lastArrivalA = trip["stopTimes"][trip["stopTimes"].length() - 1]["arrivalTime"]
-  val existing = tripsByRoute[routeId] ?? []
-  val overtakes = existing.some(t =>
-    lastArrivalA < t["stopTimes"][t["stopTimes"].length() - 1]["arrivalTime"]
-  )
-
-  if overtakes then "${ routeId }overtakes" else routeId

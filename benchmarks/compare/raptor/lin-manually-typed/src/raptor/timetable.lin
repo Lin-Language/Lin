@@ -1,0 +1,19 @@
+import { Time } from "../gtfs/gtfs"
+
+// Dense integer stop id: each distinct stop string is assigned a UInt32 in 0..numStops-1
+// during factory construction. Shared base module — no circular imports.
+export type StopIndex = UInt32
+
+// Dense integer route id: each distinct route (stop-sequence signature) is assigned a UInt32
+// in 0..numRoutes-1 during factory construction.
+export type RouteIntId = UInt32
+
+// Per-stop-time entry in the global trip-major flat array (sealed all-scalar for inline storage).
+export type StopTime2 = { "arrival": Time, "departure": Time }
+
+// Descriptor for one route in the global arrays:
+//   stopTimesBase:  offset into the global stopTimes[] where this route's data starts
+//   numStops:       stop count per trip on this route (constant across trips)
+//   numTrips:       number of trips on this route
+//   routeStopsBase: offset into routeStops[] for this route's stop sequence
+export type Route = { "stopTimesBase": UInt32, "numStops": UInt32, "numTrips": UInt32, "routeStopsBase": UInt32 }
