@@ -12120,6 +12120,38 @@ print(toString(length(sorted)))
     assert_eq!(out, vec!["[1, 2, 3, 5, 8, 9]", "6"]);
 }
 
+// Regression: the inline sealed-record merge-sort (`lower_sort`, sealed-pointer-buffer path) seeded
+// its work buffers from `arr[0]`, which faulted (`array index 0 out of bounds (len 0)`) on an EMPTY
+// sealed-record array — the scalar-flat path was empty-safe but the sealed path was not, and neither
+// was the generic stdlib `if n <= 1 then concat(arr, [])` short-circuit reachable once monomorphize
+// inlined the specialized sort. Sorting an empty (and a single-element) typed-record array must
+// return it unchanged, not crash. Surfaced by the manually-typed RAPTOR "range query with no trips"
+// test. The empty guard reads `arr[0]` only when `n > 0`; the sealed descriptor is derived from the
+// element type statically, so the empty result is still a correctly-shaped sealed array.
+#[test]
+fn test_sort_empty_and_singleton_sealed_record_array() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { sort, length } from "std/array"
+
+type T = { "k": Int32, "tag": String }
+
+val empty: T[] = []
+val sortedEmpty = sort(empty, (a, b) => a["k"] - b["k"])
+print(toString(length(sortedEmpty)))
+
+val one: T[] = [{ "k": 7, "tag": "x" }]
+val sortedOne = sort(one, (a, b) => a["k"] - b["k"])
+print(toString(length(sortedOne)))
+print(sortedOne[0]["tag"])
+
+val many: T[] = [{ "k": 3, "tag": "c" }, { "k": 1, "tag": "a" }, { "k": 2, "tag": "b" }]
+val sortedMany = sort(many, (a, b) => a["k"] - b["k"])
+print("${ sortedMany[0]["tag"] }${ sortedMany[1]["tag"] }${ sortedMany[2]["tag"] }")
+"#);
+    assert_eq!(out, vec!["0", "1", "x", "abc"]);
+}
+
 // Regression (sealed-record combinator element leak): `map` over a sealed-record array whose
 // callback returns a SCALAR FIELD (`x => x["a"]`) reads each element via the `Index` op, which
 // materialises a FRESH +1 sealed struct per element (packed-array `sealed_array_materialize_elem`
