@@ -3350,7 +3350,36 @@ impl CsvRowsSource {
     /// Feed a chunk's bytes through the assembler, enqueueing every completed record. Returns an
     /// Err message on a stray-quote fault or a buffer-cap overflow.
     fn feed(&mut self, chunk: &[u8]) -> Result<(), String> {
-        for &b in chunk {
+        let delim = self.asm.delim;
+        let mut pos = 0;
+        while pos < chunk.len() {
+            // Fast path: when NOT inside quotes, NOT after_quote, and NOT skip_next_lf, bulk-copy
+            // runs of plain (non-special) bytes with a single extend_from_slice instead of
+            // per-byte dispatch.
+            if !self.asm.in_quotes && !self.asm.after_quote && !self.asm.skip_next_lf {
+                let rest = &chunk[pos..];
+                // Scan for the first interesting byte: delimiter, quote, CR, or LF.
+                let span = rest
+                    .iter()
+                    .position(|&b| b == delim || b == b'"' || b == b'\r' || b == b'\n')
+                    .unwrap_or(rest.len());
+                if span > 0 {
+                    self.asm.field.extend_from_slice(&rest[..span]);
+                    self.asm.buffered += span;
+                    self.asm.record_started = true;
+                    pos += span;
+                    if self.asm.buffered > MAX_CSV_RECORD_BYTES {
+                        return Err(format!(
+                            "csv: a single record exceeded {} bytes without a terminator — refusing to buffer unbounded input",
+                            MAX_CSV_RECORD_BYTES
+                        ));
+                    }
+                    continue;
+                }
+            }
+            // Slow path: one special (or state-gated) byte through the existing state machine.
+            let b = chunk[pos];
+            pos += 1;
             if let Some(rec) = self.asm.push_byte(b) {
                 self.queue.push_back(rec);
             }
