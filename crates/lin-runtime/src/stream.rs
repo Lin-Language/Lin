@@ -478,10 +478,13 @@ impl LinFn {
         let a0 = arg0 as usize;
         let a1 = arg1 as usize;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let f = LinFn { closure: closure_addr as *mut u8 };
-            let r = f.call2(a0 as *mut u8, a1 as *mut u8, index);
-            std::mem::forget(f); // do not release the borrowed closure here
-            r
+            // ManuallyDrop: this is a BORROWED alias of `self` (no retain was done), so its
+            // destructor must never fire — not on success, and not on the unwind path if the
+            // closure faults. The old code used `std::mem::forget(f)` on the success branch, but
+            // forget is unreachable when a panic unwinds past it, causing a spurious extra release
+            // (double-free) on the fault path. ManuallyDrop suppresses drop unconditionally.
+            let f = std::mem::ManuallyDrop::new(LinFn { closure: closure_addr as *mut u8 });
+            f.call2(a0 as *mut u8, a1 as *mut u8, index)
         }));
         match result {
             Ok(v) => Ok(v),
@@ -497,17 +500,19 @@ impl LinFn {
     /// rather than surface as the awaited `Error`. The closure call itself is `extern "C-unwind"`,
     /// so the panic unwinds INTO this Rust frame, where `catch_unwind` can intercept it.
     unsafe fn call_caught(&self, arg: *mut u8, index: i64) -> Result<*mut u8, String> {
-        let this = self.closure;
+        let closure_addr = self.closure as usize;
         let arg_addr = arg as usize;
         // `AssertUnwindSafe`: the closure pointer + arg are raw and not Rust-UnwindSafe, but a
         // caught fault leaves them in a defined (already-released-by-the-caller) state — we do not
         // re-touch `arg` after a catch (the caller releases it), so this is sound here.
-        let closure_addr = this as usize;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let f = LinFn { closure: closure_addr as *mut u8 };
-            let r = f.call(arg_addr as *mut u8, index);
-            std::mem::forget(f); // do not drop (release) the borrowed closure here
-            r
+            // ManuallyDrop: this is a BORROWED alias of `self` (no retain was done), so its
+            // destructor must never fire — not on success, and not on the unwind path if the
+            // closure faults. The old code used `std::mem::forget(f)` on the success branch, but
+            // forget is unreachable when a panic unwinds past it, causing a spurious extra release
+            // (double-free) on the fault path. ManuallyDrop suppresses drop unconditionally.
+            let f = std::mem::ManuallyDrop::new(LinFn { closure: closure_addr as *mut u8 });
+            f.call(arg_addr as *mut u8, index)
         }));
         match result {
             Ok(v) => Ok(v),
