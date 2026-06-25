@@ -24028,3 +24028,108 @@ print("${result["c"] ?? -1}")
 "#);
     assert_eq!(output, vec!["5", "5", "5"]);
 }
+
+// Substring map-key fusion: when substring() result is ONLY used as a string-map key,
+// we skip the heap LinString and pass raw bytes to lin_map_get_bytes/lin_map_set_bytes.
+// These tests verify correctness (RESULT matches), not just that it compiles.
+
+#[test]
+fn test_substr_fuse_map_key_only_counts_correctly() {
+    // Hot-path: substring used ONLY as a map key (get + set) — fusion must fire and
+    // produce the correct counts. This is the minimal kernel of knucleotide.
+    let output = run(r#"import { print } from "std/io"
+import { substring, toString } from "std/string"
+import { while } from "std/iter"
+import { toInt32 } from "std/number"
+val seq = "ACGTACGTACGT"
+var counts: { String: Int64 } = {}
+var i = 0
+while(() =>
+  if i >= 8 then
+    false
+  else
+    val key = substring(seq, i, i + 4)
+    val cur = counts[key]
+    counts[key] = if cur == null then 1i64 else cur + 1i64
+    i = i + 1
+    true
+)
+val ac = counts["ACGT"]
+val cg = counts["CGTA"]
+print("ac=${toString(ac ?? 0i64)}")
+print("cg=${toString(cg ?? 0i64)}")
+"#);
+    // seq="ACGTACGTACGT", K=4, i=0..7:
+    // ACGT: i=0,4 => 2; CGTA: i=1,5 => 2; GTAC: i=2,6 => 2; TACG: i=3,7 => 2
+    assert_eq!(output, vec!["ac=2", "cg=2"]);
+}
+
+#[test]
+fn test_substr_fuse_soundness_escape_disqualifies() {
+    // Soundness: if the substring result ESCAPES (used outside map-key positions),
+    // fusion must NOT fire — the full LinString must be preserved and printed correctly.
+    let output = run(r#"import { print } from "std/io"
+import { substring } from "std/string"
+import { while } from "std/iter"
+var counts: { String: Int64 } = {}
+var i = 0
+var last = ""
+while(() =>
+  if i >= 4 then
+    false
+  else
+    val key = substring("ACGT", i, i + 1)
+    last = key
+    val cur = counts[key]
+    counts[key] = if cur == null then 1i64 else cur + 1i64
+    i = i + 1
+    true
+)
+print(last)
+"#);
+    // last should be "T" (the final character)
+    assert_eq!(output, vec!["T"]);
+}
+
+#[test]
+fn test_substr_fuse_soundness_value_use_disqualifies() {
+    // Soundness regression: a substring STORED AS A MAP VALUE (not a key) must NOT be
+    // fused — the materialized LinString is what gets stored. The original pass only
+    // checked the KEY operand of IndexSet, so `m[k] = substring(...)` mis-fused the value
+    // and stored an empty/undefined string. This locks that fix.
+    let output = run(r#"import { print } from "std/io"
+import { substring } from "std/string"
+val s = "HELLOWORLD"
+var m: { String: String } = {}
+m["k"] = substring(s, 0, 5)
+val got = m["k"]
+print(got)
+"#);
+    assert_eq!(output, vec!["HELLO"]);
+}
+
+#[test]
+fn test_getset_fuse_soundness_call_in_window_disqualifies() {
+    // Soundness regression: get-set fusion holds the raw upsert slot pointer across the
+    // get→set window. A CALL in that window can grow/realloc the same map, dangling the
+    // pointer. `grow` here inserts 2000 keys (several reallocs) BETWEEN the get and the set
+    // on key "HELLO"; fusion must be disqualified (call guard) so the final write lands in
+    // the live slot. Correct result is 101 (100 + 1); a dangling write would lose it.
+    let output = run(r#"import { print } from "std/io"
+import { toString, substring } from "std/string"
+var m: { String: Int64 } = {}
+val grow = (n: Int32): Null =>
+  if n <= 0 then null
+  else
+    m[toString(n)] = 7i64
+    grow(n - 1)
+val seq = "HELLOWORLD"
+val key = substring(seq, 0, 5)
+m[key] = 100i64
+val cur = m[key]
+val ig = grow(2000)
+m[key] = if cur == null then 1i64 else cur + 1i64
+print(toString(m[key]))
+"#);
+    assert_eq!(output, vec!["101"]);
+}
