@@ -117,10 +117,8 @@ pub(crate) unsafe fn intern_csv_field_bytes(data: *const u8, len: u32) -> *mut L
     CSV_INTERN_TABLE.with(|tbl| {
         let mut map = tbl.borrow_mut();
         if let Some(&ptr) = map.get(bytes) {
-            CSV_INTERN_HITS.with(|h| *h.borrow_mut() += 1);
             return ptr;
         }
-        CSV_INTERN_MISSES.with(|m| *m.borrow_mut() += 1);
         // Allocate an immortal LinString and cache it.
         let ptr = lin_string_alloc(len);
         (*ptr).refcount = IMMORTAL_RC;
