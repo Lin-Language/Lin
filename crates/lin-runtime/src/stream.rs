@@ -3156,6 +3156,9 @@ struct CsvAssembler {
     field: Vec<u8>,
     /// Fields accumulated so far for the in-flight record.
     record: Vec<Vec<u8>>,
+    /// Free-list of cleared `Vec<u8>` buffers recycled from consumed records. Popped in
+    /// `end_field` so the next field reuses existing capacity instead of allocating fresh.
+    pool: Vec<Vec<u8>>,
     /// True while the scanner is INSIDE a quoted field (a newline here is field content).
     in_quotes: bool,
     /// True just after a closing quote of a quoted field — a following `"` is an escaped quote;
@@ -3182,6 +3185,7 @@ impl CsvAssembler {
             delim: d,
             field: Vec::new(),
             record: Vec::new(),
+            pool: Vec::new(),
             in_quotes: false,
             after_quote: false,
             field_quoted: false,
@@ -3192,11 +3196,25 @@ impl CsvAssembler {
         }
     }
 
-    /// Finish the current field, pushing it onto the in-flight record.
+    /// Finish the current field, pushing it onto the in-flight record, and install a recycled
+    /// (or fresh) buffer as the next `self.field` so the next field has preallocated capacity.
     fn end_field(&mut self) {
-        self.record.push(std::mem::take(&mut self.field));
+        // Swap in a recycled buffer as the new `self.field`; take the old one for the record.
+        let next = self.pool.pop().unwrap_or_default();
+        let done = std::mem::replace(&mut self.field, next);
+        self.record.push(done);
         self.field_quoted = false;
         self.after_quote = false;
+    }
+
+    /// Return a completed record's inner Vecs to the pool so their capacity is reused.
+    /// Call this immediately after `record_to_object_*` has consumed the record (borrowed it).
+    fn recycle_record(&mut self, mut rec: Vec<Vec<u8>>) {
+        for mut v in rec.drain(..) {
+            v.clear();
+            self.pool.push(v);
+        }
+        // rec itself (the outer Vec) is dropped here; only the inner Vecs are pooled.
     }
 
     /// Finish the current record, returning its fields. Resets per-record state.
@@ -3394,7 +3412,12 @@ impl StreamSource for CsvRowsSource {
         match self.next_raw() {
             RawRecord::Eof => TaggedOutcome::Eof,
             RawRecord::Err(m) => TaggedOutcome::Err(m),
-            RawRecord::Item(rec) => TaggedOutcome::Item(record_to_string_array(&rec)),
+            RawRecord::Item(rec) => {
+                let item = record_to_string_array(&rec);
+                // Recycle the field Vecs back into the assembler's pool.
+                self.asm.recycle_record(rec);
+                TaggedOutcome::Item(item)
+            }
         }
     }
     fn close(&mut self) {
@@ -3559,11 +3582,14 @@ impl StreamSource for CsvRecordsSource {
             Err(m) => TaggedOutcome::Err(m),
             Ok(None) => TaggedOutcome::Eof,
             Ok(Some(row)) => {
-                if self.wanted.is_none() {
-                    TaggedOutcome::Item(record_to_object_cached(&self.header_keys, &row))
+                let item = if self.wanted.is_none() {
+                    record_to_object_cached(&self.header_keys, &row)
                 } else {
-                    TaggedOutcome::Item(record_to_object_projected(&self.proj, &row))
-                }
+                    record_to_object_projected(&self.proj, &row)
+                };
+                // Recycle the field Vecs back into the assembler's pool.
+                self.inner.asm.recycle_record(row);
+                TaggedOutcome::Item(item)
             }
         }
     }
