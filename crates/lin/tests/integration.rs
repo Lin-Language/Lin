@@ -18976,6 +18976,42 @@ main()
 }
 
 #[test]
+fn test_sealed_array_element_captured_into_closure_field_read() {
+    // REGRESSION (packed-elem-view capture): `val route = routes[rid]` over an array of sealed
+    // records is a VIRTUAL packed-element view — no materialized slot (reads re-emit a const-offset
+    // field load). Capturing `route` into a closure (the `while` body) read its (empty) slot and
+    // captured an UNINITIALIZED temp, and `route["n"]` inside the closure re-emitted
+    // SealedArrayFieldGet off the OUTER function's temps → codegen produced `ptr null` and `int_mul`
+    // panicked. Fix (func.rs): materialize the view at the capture site, and make `packed_elem_slots`
+    // function-scoped so the closure body uses the generic field read on the captured env value.
+    let out = run(r#"
+import { print } from "std/io"
+import { toInt32 } from "std/number"
+import { while } from "std/iter"
+type Rt = { "n": UInt32, "nt": UInt32 }
+val routes: Rt[] = [{ "n": 1u32, "nt": 2u32 }]
+val arr: Int32[] = [10, 20, 30, 40]
+val f = (rid: UInt32): Int32 =>
+  val route = routes[rid]
+  var i = route["nt"].toInt32() - 1
+  var acc = 0
+  while(() =>
+    if i < 0 then false
+    else
+      acc = acc + arr[i * route["n"]]
+      i = i - 1
+      true
+  )
+  acc
+val main = () =>
+  print("${f(0u32)}")
+main()
+"#);
+    // i runs 1 then 0: arr[1*1]=20, arr[0*1]=10 → 30. Previously panicked in codegen.
+    assert_eq!(out, vec!["30"]);
+}
+
+#[test]
 fn test_sealed_array_index_set_in_callee() {
     // REGRESSION: `arr[i] = { .. }` over a SCALAR sealed-record array, performed inside a CALLEE
     // (recursive overwrite loop). In a callee context the RHS structural literal is typed as an

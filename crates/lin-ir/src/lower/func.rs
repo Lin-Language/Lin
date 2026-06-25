@@ -478,6 +478,13 @@ pub(crate) fn lower_function_expr_with_id(
     // memory → garbage tag → "non-exhaustive match". This makes a TAIL-RETURN sum literal lower
     // identically to a `val n: <Sum> = {…}; n` binding (which already routes through
     // `lower_value_into_slot` → `try_lower_sum_literal`), closing the tail-return pushdown gap.
+    // Make `packed_elem_slots` function-scoped while lowering THIS body. A packed-array-element
+    // VIEW recorded in an OUTER function (`val r = arr[i]`) carries (array,index) TEMPS valid only
+    // there; a nested closure must NOT re-emit `SealedArrayFieldGet` off them (codegen → `ptr null`
+    // → arith panic). Hide them during body lowering — captured uses fall to the generic FieldGet
+    // on the env value — and restore before the MakeClosure capture-reads (below), which run in the
+    // outer builder and DO need the view to materialize a captured element by value.
+    let saved_packed_elem_slots = std::mem::take(&mut ctx.packed_elem_slots);
     let raw_ret = if crate::repr::sum_type_eligible(&effective_ret_pre) {
         match try_lower_sum_literal(body, &effective_ret_pre, &mut inner_builder, ctx) {
             Some(t) => t,
@@ -730,6 +737,9 @@ pub(crate) fn lower_function_expr_with_id(
     inner_builder.ret_ty = effective_ret;
     let inner_fn = inner_builder.finish();
     ctx.pending_functions.push(inner_fn);
+    // Restore the outer function's packed-elem views before the capture-reads below — they run in
+    // the outer builder and consult `packed_elem_slots` to materialize a captured element view.
+    ctx.packed_elem_slots = saved_packed_elem_slots;
 
     // In the outer function, emit a MakeClosure instruction.
     //
@@ -751,7 +761,29 @@ pub(crate) fn lower_function_expr_with_id(
     let mut capture_kinds: Vec<CaptureRelease> = Vec::with_capacity(captures.len());
     for cap in captures {
         let base = builder.slots.get(&cap.outer_slot).copied().unwrap_or_else(|| {
-            builder.alloc_temp(cap.ty.clone())
+            // A packed-array-element VIEW (`val r = arr[i]`) is VIRTUAL — no materialized slot
+            // (reads re-emit a const-offset field load), so the slot lookup above MISSES. Capturing
+            // it would otherwise allocate an UNINITIALIZED temp → `r` reads as null inside the
+            // closure. Materialize the whole element here (the fresh +1 sealed struct the generic
+            // `Index` path yields — same as expr.rs's whole-value PATH-1) and own it for scope-exit
+            // release; the owning-capture logic below then Retains it into the env.
+            if let Some((array, index, elem_ty)) = ctx.packed_elem_slots.get(&cap.outer_slot).cloned() {
+                let mat = builder.alloc_temp(elem_ty.clone());
+                builder.emit(Instruction::Index {
+                    dst: mat,
+                    object: array,
+                    key: index,
+                    obj_ty: Type::Array(Box::new(elem_ty.clone())),
+                    key_ty: Type::Int64,
+                    result_ty: elem_ty.clone(),
+                    nonneg: false,
+                    proven_inbounds: false,
+                });
+                builder.register_owned(mat, elem_ty.clone());
+                mat
+            } else {
+                builder.alloc_temp(cap.ty.clone())
+            }
         });
         // Mutable-cell captures (the var-by-reference cell pointer) stay borrow-only — the cell
         // has its own MakeCell/FreeCell/escaping-cell lifecycle, so the env must NOT own it.
