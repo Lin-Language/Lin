@@ -113,22 +113,46 @@ thread_local! {
 /// NOT call `lin_string_release` on it (or, if they do, the immortal guard makes it a no-op).
 #[inline]
 pub(crate) unsafe fn intern_csv_field_bytes(data: *const u8, len: u32) -> *mut LinString {
+    CSV_INTERN_TABLE.with(|tbl| intern_csv_field_in(&mut tbl.borrow_mut(), data, len))
+}
+
+/// The concrete CSV intern-table type, exposed so the CSV row builder can borrow it ONCE per row
+/// and intern every field under that single borrow (instead of one `thread_local` access + borrow
+/// per field — ~6× thread_local accesses on a wide row like `stop_times`). The `LocalKey::with`
+/// per-field lookup profiled as the #1 LOAD self-time symbol post-mimalloc; this hoists it.
+pub(crate) type CsvInternTable = HashMap<Box<[u8]>, *mut LinString, FastBuildHasher>;
+
+/// Borrow the CSV intern table once and run `f` against it. Safe to hold across a whole row's
+/// fields because nothing in the row-build path (`lin_map_set`, `lin_string_release`,
+/// `lin_string_alloc`) re-enters `CSV_INTERN_TABLE`, so there is no `RefCell` reentrancy.
+#[inline]
+pub(crate) fn with_csv_intern_table<R>(f: impl FnOnce(&mut CsvInternTable) -> R) -> R {
+    CSV_INTERN_TABLE.with(|tbl| f(&mut tbl.borrow_mut()))
+}
+
+/// Intern one field into an already-borrowed table (batch path). Same semantics as
+/// `intern_csv_field_bytes` (immortal shared LinString, pointer-identity for equal bytes).
+///
+/// SAFETY: `data` must point to `len` valid bytes; returned pointer is immortal — do not release.
+#[inline]
+pub(crate) unsafe fn intern_csv_field_in(
+    map: &mut CsvInternTable,
+    data: *const u8,
+    len: u32,
+) -> *mut LinString {
     let bytes = std::slice::from_raw_parts(data, len as usize);
-    CSV_INTERN_TABLE.with(|tbl| {
-        let mut map = tbl.borrow_mut();
-        if let Some(&ptr) = map.get(bytes) {
-            return ptr;
-        }
-        // Allocate an immortal LinString and cache it.
-        let ptr = lin_string_alloc(len);
-        (*ptr).refcount = IMMORTAL_RC;
-        if len > 0 {
-            std::ptr::copy_nonoverlapping(data, (*ptr).data.as_mut_ptr(), len as usize);
-        }
-        (*ptr).hash = fnv1a_bytes_str(bytes);
-        map.insert(bytes.to_vec().into_boxed_slice(), ptr);
-        ptr
-    })
+    if let Some(&ptr) = map.get(bytes) {
+        return ptr;
+    }
+    // Allocate an immortal LinString and cache it.
+    let ptr = lin_string_alloc(len);
+    (*ptr).refcount = IMMORTAL_RC;
+    if len > 0 {
+        std::ptr::copy_nonoverlapping(data, (*ptr).data.as_mut_ptr(), len as usize);
+    }
+    (*ptr).hash = fnv1a_bytes_str(bytes);
+    map.insert(bytes.to_vec().into_boxed_slice(), ptr);
+    ptr
 }
 
 /// Read out the CSV intern stats (hits, misses, distinct count) for a given thread and print them
