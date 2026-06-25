@@ -4,7 +4,7 @@ import { runsOn } from "../gtfs/service"
 import { Date, weekday } from "std/datetime"
 import { getDateNumber } from "../query/date-util"
 import { RaptorAlgorithm, createRaptorAlgorithm } from "./raptor-algorithm"
-import { RouteIntId, StopTimeEntry, Route, Timetable, StopIndex, RouteStopIndex, Interchange, TransfersByOrigin } from "./timetable"
+import { RouteIntId, StopTimeEntry, Route, Timetable, StopIndex, RouteStopIndex, Interchange, TransfersByOrigin, Offset, RoutePosition } from "./timetable"
 import { RoutesIndexedByStop, createQueueFactory } from "./queue-factory"
 import { createRouteScanner } from "./route-scanner"
 import { frozen } from "std/async"
@@ -109,7 +109,7 @@ export val create = (
       tripsByRoute[routeId] = []
       routePathsTemp[routeId] = path
 
-      val stopIndex: { StopIndex: UInt8 } = {}
+      val stopIndex: { StopIndex: RoutePosition } = {}
       routeStopIndex[routeId] = stopIndex
 
       range(path.length() - 1, -1, -1).for(i =>
@@ -174,7 +174,7 @@ export val create = (
   // ── Build stopRoutes / stopRoutesBase ─────────────────────────────────────
   val numStopCount = stopNames.length()
   val stopRoutes: RouteIntId[] = []
-  val stopRoutesBase: UInt32[] = []
+  val stopRoutesBase: Offset[] = []
   var srOffset: UInt32 = 0u32
 
   range(0, numStopCount).for(si =>
