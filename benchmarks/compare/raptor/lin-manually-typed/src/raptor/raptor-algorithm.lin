@@ -74,8 +74,6 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
     var boardingPoint = -1
     var trip: Trip | Null = null
     val route = gRoutes[routeId]
-    // `range` (stdlib) is Int32-only, so the loop bounds are Int32; the route's UInt32 numStops /
-    // base offsets coerce into the index arithmetic below without per-iteration conversions.
     val numStops = route["numStops"].toInt32()
     val routeStopsBase = route["routeStopsBase"]
     val stopIndexMap = tt["routeStopIndex"][routeId]
