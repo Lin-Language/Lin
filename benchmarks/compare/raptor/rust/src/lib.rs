@@ -4,6 +4,7 @@
 
 pub mod date_util;
 pub mod filter;
+pub mod flat_index;
 pub mod gtfs;
 pub mod gtfs_loader;
 pub mod journey;

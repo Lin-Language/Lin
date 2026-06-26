@@ -1,78 +1,89 @@
 import { DayOfWeek, DateNumber } from "../gtfs/date"
 import { Time, Trip } from "../gtfs/gtfs"
 import { runsOn } from "../gtfs/service"
-import { length } from "std/array"
+import { StopIndex, RouteIntId, StopTimeEntry, Route, Timetable } from "./timetable"
 import { while } from "std/iter"
+import { toInt32 } from "std/number"
 
-export type RouteId = String
-export type TripsIndexedByRoute = { RouteId: Trip[] }
-export type RouteScanPosition = { RouteId: Int32 }
+// Per-route mutable scan position (one Int32 per route id, keyed by dense int route id).
+export type RouteScanPosition = { RouteIntId: Int32 }
 
 //
-// Returns trips for specific routes. Caches the last trip position found per route to reduce plan time.
+// RouteScanner holds the mutable scan-position cursor used during one RAPTOR round.
+// The global timetable is passed to getTrip on each call rather than stored here,
+// keeping the scanner light and avoiding capturing large frozen graphs.
 //
 export type RouteScanner = {
-  "tripsByRoute": TripsIndexedByRoute,
   "date": DateNumber,
   "dow": DayOfWeek,
   "routeScanPosition": RouteScanPosition
 }
 
 export val createRouteScanner = (
-  tripsByRoute: TripsIndexedByRoute,
   date: DateNumber,
   dow: DayOfWeek
 ): RouteScanner =>
   {
-    "tripsByRoute": tripsByRoute,
     "date": date,
     "dow": dow,
     "routeScanPosition": {}
   }
 
 //
-// Partially applied RouterScanner
-//  
+// A RouteScannerFactory is just `createRouteScanner` partially applied — `(date, dow) => RouteScanner`.
+//
 export type RouteScannerFactory = (DateNumber, DayOfWeek) => RouteScanner
 
 //
 // Return the earliest reachable trip on the given route, scanning backwards from the last position
 // found. The cached scan position only advances while no trip has been locked onto yet (a reachable
 // but non-running service before the last found trip must not move the resume point back).
+// Reads departure times from the global trip-major stopTimes flat array:
+//   departure of trip t at stop s on route r = stopTimes[routes[r].stopTimesBase + t*numStops + s].departure
+// The trip record itself is at trips[routes[r].tripsBase + t].
 //
-export val getTrip = (scanner: RouteScanner, routeId: RouteId, stopIndex: Int32, time: Time): Trip | Null =>
-  val routeTrips = scanner["tripsByRoute"][routeId] ?? []
+export val getTrip = (
+  scanner: RouteScanner,
+  timetable: Timetable,
+  routeId: RouteIntId,
+  stopIndex: Int32,
+  time: Time
+): Trip | Null =>
+  val route = timetable["routes"][routeId]
 
-  // first scan of this route starts at the last trip; later scans resume from the cached position
-  var i = scanner["routeScanPosition"][routeId] ?? routeTrips.length() - 1
+  // first scan of this route starts at the last trip; later scans resume from the cached position.
+  // `i` is Int32 (inferred) — the backward walk runs it down to -1 to terminate, and the route's
+  // trip count is widened to Int32 so an empty route yields a -1 start.
+  var i = scanner["routeScanPosition"][routeId] ?? (route["numTrips"].toInt32() - 1)
   var lastFoundPosition = i
   var lastFound: Trip | Null = null
 
   // walk backwards from the cached position, recording the latest reachable+running trip. Only
   // advance the cached position while no trip has been locked onto yet — an earlier reachable but
-  // non-running service must not move the resume point back past the last found trip.
+  // non-running service must not move the resume point back past the last found trip. The reach
+  // test reads the FLAT global departure matrix; the trip record itself is only touched once a
+  // trip is reachable (for the calendar check and the return value).
   while(() =>
     if i < 0 then
       false
     else
-      val trip = routeTrips[i]
-      val stopTime = trip["stopTimes"][stopIndex]
+      val departureTime = timetable["stopTimes"][route["stopTimesBase"] + i * route["numStops"] + stopIndex]["departure"]
 
-      if stopTime["departureTime"] < time then
-        // unreachable from here back — stop
+      if departureTime < time then
         false
       else
+        val trip = timetable["trips"][route["tripsBase"] + i]
         val foundHere = trip["service"].runsOn(scanner["date"], scanner["dow"])
         if foundHere then
           lastFound = trip
 
-        // we only updated the cached scan position when we have got to a valid point (or there were no previous valid points)
-        // because the scanning needs to continue from the last valid point on the next run (not anything before it).
+        // only advance the cached resume point while no trip is locked on yet — a reachable but
+        // non-running service before the last found trip must not move the resume point back.
         if foundHere || lastFound == null then
-          lastFoundPosition = i 
+          lastFoundPosition = i
         i = i - 1
         true
   )
 
+  scanner["routeScanPosition"][routeId] = lastFoundPosition
   lastFound
-

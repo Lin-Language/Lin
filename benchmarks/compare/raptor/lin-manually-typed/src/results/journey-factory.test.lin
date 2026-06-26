@@ -2,7 +2,14 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { length } from "std/array"
 import { Trip, Transfer } from "../gtfs/gtfs"
 import { Connection, ConnectionIndex } from "../raptor/scan-results"
+import { StopIndex } from "../raptor/raptor-algorithm"
 import { getResults } from "./journey-factory"
+
+// Stop index for destination "B": 1
+val destB: StopIndex = 1u32
+
+// A simple intern table for tests: "A"->0, "B"->1
+val stopIndexOf: { String: StopIndex } = { "A": 0u32, "B": 1u32 }
 
 // A trip A -> B: departs A at 900, arrives B at 1000.
 val trip: Trip = {
@@ -12,7 +19,7 @@ val trip: Trip = {
     "startDate": 20180101,
     "endDate": 20991231,
     "days": { 0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true },
-    "dates": {  }
+    "dates": {}
   },
   "stopTimes": [
     { "stop": "A", "arrivalTime": 850, "departureTime": 900, "pickUp": true, "dropOff": true },
@@ -35,13 +42,16 @@ val s = suite("results/journey-factory", [
   test("returns no journeys when the destination is unreached", () =>
     val kConnections: ConnectionIndex = {}
     [
-      expect(getResults(kConnections, "B").length()).toBe(0)
+      expect(getResults(kConnections, destB, stopIndexOf).length()).toBe(0)
     ]
   ),
 
   test("builds a single timetable-leg journey with departure/arrival from the trip", () =>
-    val kConnections: ConnectionIndex = { "B": { 1: tripConnection } }
-    val journeys = getResults(kConnections, "B")
+    val inner: { UInt8: Connection | Transfer } = {}
+    inner[1u8] = tripConnection
+    val kConnections: ConnectionIndex = {}
+    kConnections[destB] = inner
+    val journeys = getResults(kConnections, destB, stopIndexOf)
     [
       expect(journeys.length()).toBe(1),
       expect(journeys[0]["legs"].length()).toBe(1),
@@ -51,8 +61,11 @@ val s = suite("results/journey-factory", [
   ),
 
   test("builds a transfer leg for a transfer connection", () =>
-    val kConnections: ConnectionIndex = { "B": { 1: transfer } }
-    val journeys = getResults(kConnections, "B")
+    val inner: { UInt8: Connection | Transfer } = {}
+    inner[1u8] = transfer
+    val kConnections: ConnectionIndex = {}
+    kConnections[destB] = inner
+    val journeys = getResults(kConnections, destB, stopIndexOf)
     [
       expect(journeys.length()).toBe(1),
       expect(journeys[0]["legs"].length()).toBe(1)

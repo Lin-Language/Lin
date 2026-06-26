@@ -18976,6 +18976,75 @@ main()
 }
 
 #[test]
+fn test_sealed_array_element_captured_into_closure_field_read() {
+    // REGRESSION (packed-elem-view capture): `val route = routes[rid]` over an array of sealed
+    // records is a VIRTUAL packed-element view — no materialized slot (reads re-emit a const-offset
+    // field load). Capturing `route` into a closure (the `while` body) read its (empty) slot and
+    // captured an UNINITIALIZED temp, and `route["n"]` inside the closure re-emitted
+    // SealedArrayFieldGet off the OUTER function's temps → codegen produced `ptr null` and `int_mul`
+    // panicked. Fix (func.rs): materialize the view at the capture site, and make `packed_elem_slots`
+    // function-scoped so the closure body uses the generic field read on the captured env value.
+    let out = run(r#"
+import { print } from "std/io"
+import { toInt32 } from "std/number"
+import { while } from "std/iter"
+type Rt = { "n": UInt32, "nt": UInt32 }
+val routes: Rt[] = [{ "n": 1u32, "nt": 2u32 }]
+val arr: Int32[] = [10, 20, 30, 40]
+val f = (rid: UInt32): Int32 =>
+  val route = routes[rid]
+  var i = route["nt"].toInt32() - 1
+  var acc = 0
+  while(() =>
+    if i < 0 then false
+    else
+      acc = acc + arr[i * route["n"]]
+      i = i - 1
+      true
+  )
+  acc
+val main = () =>
+  print("${f(0u32)}")
+main()
+"#);
+    // i runs 1 then 0: arr[1*1]=20, arr[0*1]=10 → 30. Previously panicked in codegen.
+    assert_eq!(out, vec!["30"]);
+}
+
+#[test]
+fn test_chained_int_map_index_boxed_key_in_closure() {
+    // REGRESSION: a chained int-keyed map index `m[a][b]` where the keys are BOXED runtime values —
+    // here destructured `.entries` params (typed AnyVal on the callback ABI) inside a closure. The
+    // inner `m[a]` yields a `Map | Null` union; the outer `[b]` with a boxed key took the dynamic
+    // key-tag dispatch whose int-branch array-gets the container — but it's a MAP, so the array-get
+    // returned Null (→ `?? 0` gave 0). Fix (data/index.rs): the dynamic dispatch only fires when the
+    // object could actually be an array; a concrete map-only union falls through to the typed
+    // int-keyed-map path, which now also accepts a boxed (pointer) key. Literal keys / outside-closure
+    // worked already (unboxed int constant). This is the RAPTOR `routeStopIndex[routeId][stopP]` crash.
+    let out = run(r#"
+import { print } from "std/io"
+import { entries } from "std/object"
+type Inner = { UInt32: UInt8 }
+type TT = { "idx": { UInt32: Inner } }
+type Queue = { UInt32: UInt32 }
+val main = () =>
+  val inner: Inner = {}
+  inner[5u32] = 2u8
+  val outer: { UInt32: Inner } = {}
+  outer[1u32] = inner
+  val tt: TT = { "idx": outer }
+  val q: Queue = {}
+  q[1u32] = 5u32
+  q.entries([routeId, stopP] =>
+    print("${tt["idx"][routeId][stopP] ?? 0}")
+  )
+main()
+"#);
+    // tt.idx[1][5] = 2; the chained index with boxed entries-keys previously returned Null → 0.
+    assert_eq!(out, vec!["2"]);
+}
+
+#[test]
 fn test_sealed_array_index_set_in_callee() {
     // REGRESSION: `arr[i] = { .. }` over a SCALAR sealed-record array, performed inside a CALLEE
     // (recursive overwrite loop). In a callee context the RHS structural literal is typed as an
