@@ -433,6 +433,14 @@ pub fn index_result_convention(obj_ty: &Type, key_ty: &Type) -> Convention {
     }
     if matches!(obj_ty, Type::Array(_) | Type::FixedArray(_)) || key_ty.is_numeric() {
         Own
+    } else if crate::lower::is_union_ty(obj_ty) && matches!(key_ty, Type::Str | Type::StrLit(_)) {
+        // Union/AnyVal/TypeVar object indexed by a string key: `compile_ir_index` tag-dispatches
+        // at runtime. The TAG_RECORD arm returns an OWNED +1 TaggedVal* from `lin_record_get_field`.
+        // The TAG_MAP arm returns a BORROWED interior pointer, BUT `compile_ir_index` normalises
+        // both to OWNED by cloning the MAP result when result_ty is union (see index.rs union arm).
+        // Declaring Own here eliminates the outer CloneBox the IR would otherwise emit (which would
+        // double-clone the already-owned RECORD result, leaking the original box).
+        Own
     } else {
         Borrow
     }

@@ -1121,14 +1121,6 @@ pub(crate) fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty:
     // reference (released by its own scope). Unlike the union-box case the source is NOT consumed,
     // so leave `t` registered; just register the fresh result so the binding's scope releases it.
     let made_fresh_array = flat_scalar_array_repr_differs(value_ty, slot_ty);
-    // A SEALED-RECORD ARRAY boxed into a Json/union slot does NOT consume the source: codegen's
-    // `box_value` MATERIALIZES a fresh tagged `Object[]` view (`sealed_array_to_tagged`) and boxes
-    // THAT, leaving the original packed `P[]` (`t`) fully owned and still live. So unlike the
-    // ordinary concrete-heap→union box (where the box wraps `t`'s inner and takes its +1), here the
-    // box owns ONLY the fresh materialized array. Both the box AND the source sealed array are
-    // independently owned and must each be released at scope exit — so DON'T `unregister_owned(t)`
-    // (that orphaned the packed source array, leaking its header + element buffer per binding).
-    let sealed_array_materialized = made_fresh_box && is_sealed_scalar_array(value_ty);
     // A BOXED-element array (a combinator result `pts.map(...)` whose lambda returns an unsealed
     // object literal, runtime repr = `Object[]` of boxed `LinObject`s) bound to a packed
     // sealed-scalar-array slot (`Pt[]`). `type_repr_differs`'s new sealed-array arm emits a `Coerce`
@@ -1140,13 +1132,33 @@ pub(crate) fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty:
     // scope releases it. Mirrors the explicit-`TypedExpr::Coerce` sealed-array arm (lower_expr ~3337).
     let sealed_array_reprojected =
         param_elem_is_boxed_repr(value_ty) && is_sealed_scalar_array(slot_ty);
+    // A KEEP-PACKED sealed array (P[]) boxed into a union/AnyVal slot: codegen's `lin_box_array`
+    // produces a 16-byte shell that BORROWS the source pointer (no rc bump). The source (`t`) is
+    // already registered owned and will be released separately. The box shell must be freed via
+    // FreeBoxShell only — NOT lin_tagged_release (which would also release the inner, causing a
+    // spurious extra release → double-free). Register the box for shell-only reclaim.
+    let keep_packed_arr_shell = made_fresh_box && is_sealed_scalar_array(value_ty);
+    // A KEEP-PACKED sealed record (P) boxed into a union/AnyVal slot: codegen's `lin_box_record`
+    // RETAINS the inner (+1), so the box is truly owned (shell + inner retain). The source (`t`)
+    // keeps all its own registrations (alloc rc + own_for_read retain); the box adds one MORE owned
+    // reference that must be released via lin_tagged_release (decrement inner + free shell).
+    // Do NOT unregister_owned(t) — the source's registrations still balance its references.
+    let keep_packed_rec_owned = made_fresh_box && is_sealed_scalar_repr(value_ty);
     let coerced = coerce_to_slot_type(t, value_ty, slot_ty, builder);
-    if sealed_array_reprojected || sealed_array_materialized {
-        // Both directions produce a FRESH +1-owned array that does NOT consume the source: the
-        // reproject builds a new packed buffer, the materialize a new tagged `Object[]` view (which
-        // a union slot then boxes). The source (`t`) keeps its own +1 (released by its own scope), so
-        // register only the fresh result for scope-exit release — DON'T `unregister_owned(t)` (that
-        // would orphan the source array, leaking its header + element buffer per binding).
+    if sealed_array_reprojected {
+        // The reproject builds a new packed buffer that does NOT consume the source: the source
+        // array (`t`) keeps its own +1 (released by its own scope), so register only the fresh
+        // result for scope-exit release.
+        if coerced != t {
+            builder.register_owned(coerced, slot_ty.clone());
+        }
+    } else if keep_packed_arr_shell {
+        // Shell-only box: the source (`t`) remains registered; only free the box shell at scope exit.
+        if coerced != t {
+            builder.register_box_shell(coerced);
+        }
+    } else if keep_packed_rec_owned {
+        // Owned box (lin_box_record retains): register for full lin_tagged_release; source stays registered.
         if coerced != t {
             builder.register_owned(coerced, slot_ty.clone());
         }

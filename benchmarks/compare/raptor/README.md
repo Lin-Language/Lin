@@ -39,7 +39,7 @@ nonzero on failure.
 | Go       | `go/`     | `go test ./...` | 48 |
 | Rust     | `rust/`   | `cargo test` | 51¹ |
 | Python   | `python/` | `python3 -m unittest discover` | 51¹ |
-| Lin      | repo root | `target/debug/lin test benchmarks/compare/raptor/lin/` | 48 |
+| Lin      | repo root | `target/debug/lin test benchmarks/compare/raptor/lin-manually-typed/` | 13 |
 
 ¹ Rust and Python add a few extra date-arithmetic sanity tests (`getDateNumber`,
 day-of-week, month/year rollover); all 48 reference `it()` cases are covered in every

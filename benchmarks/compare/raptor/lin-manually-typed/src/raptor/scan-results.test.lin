@@ -3,20 +3,24 @@ import { Transfer, Trip } from "../gtfs/gtfs"
 import { length } from "std/array"
 import { Connection } from "./scan-results"
 import { createScanResults, addRound, previousArrival, setTrip, setTransfer, bestArrival, getMarkedStops, finalize } from "./scan-results"
+import { StopTimes } from "./raptor-algorithm"
 
-// No TypeScript spec exists. `kArrivals` is `ArrivalsByNumChanges` (an Arrivals[] array, one
-// entry per round), so round 0 is seeded as `[{}]` — a one-element array holding an empty
-// arrivals map — not a `{ 0: {} }` sparse-map mock.
+// createScanResults(numStops: Int32, origins: StopTimes)
+// Dense arrays of length numStops; stop id IS the array index.
+// MAX_TIME fills every unset slot in round 0 and bestArrivals; later rounds are zero-filled.
+val numStops = 5  // enough for stop indices 0..4
+
 val freshResults = () =>
-  createScanResults({}, [{  }], {}, 0)
+  createScanResults(numStops, {})
+
+val freshResultsWithOrigins = (origins: StopTimes) =>
+  createScanResults(numStops, origins)
 
 val s = suite("raptor/scan-results", [
-  test("createScanResults seeds the round counter and maps", () =>
-    val r = createScanResults({}, [{  }], {}, 0)
+  test("createScanResults seeds the round counter", () =>
+    val r = createScanResults(0, {})
     [
-      expect(r["k"]).toBe(0),
-      expect(r["bestArrivals"]).toBe({  }),
-      expect(r["kConnections"]).toBe({  })
+      expect(r["k"]).toBe(0)
     ]
   ),
 
@@ -28,11 +32,11 @@ val s = suite("raptor/scan-results", [
     ]
   ),
 
-  test("addRound seeds a fresh empty arrivals map for the new round", () =>
+  test("addRound seeds a fresh zero-filled arrivals array for the new round", () =>
     val r = freshResults()
     r.addRound()
     [
-      expect(r["kArrivals"][r["k"]]).toBe({  })
+      expect(r["kArrivals"][r["k"]].length()).toBe(numStops)
     ]
   ),
 
@@ -46,11 +50,12 @@ val s = suite("raptor/scan-results", [
       "startTime": 0,
       "endTime": 86400
     }
-    r.setTransfer(transfer, 500)
+    val stop2: UInt32 = 2u32
+    r.setTransfer(stop2, transfer, 500)
     [
-      expect(r["bestArrivals"]["StopB"]).toBe(500),
-      expect(r["kArrivals"][r["k"]]["StopB"]).toBe(500),
-      expect(r["kConnections"]["StopB"][r["k"]]).toBe(transfer)
+      expect(r["bestArrivals"][stop2]).toBe(500),
+      expect(r["kArrivals"][r["k"]][stop2]).toBe(500),
+      expect(r["kConnections"][stop2][r["k"]]).toBe(transfer)
     ]
   ),
 
@@ -64,20 +69,21 @@ val s = suite("raptor/scan-results", [
         "startDate": 20180101,
         "endDate": 20991231,
         "days": { 0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true },
-        "dates": {  }
+        "dates": {}
       },
       "stopTimes": [
         { "stop": "StopA", "arrivalTime": 100, "departureTime": 100, "pickUp": true, "dropOff": true },
         { "stop": "StopB", "arrivalTime": 300, "departureTime": 300, "pickUp": true, "dropOff": true }
       ]
     }
-    // arrival = stopTimes[1].arrivalTime (300) + interchange (5) = 305 at StopB
-    r.setTrip(trip, 0, 1, 5)
+    // arrival = stopTimes[1].arrivalTime (300) + interchange (5) = 305 at stop index 2
+    val stop2: UInt32 = 2u32
+    r.setTrip(stop2, trip, 0, 1, 5)
     val expectedConn: Connection = [trip, 0, 1]
     [
-      expect(r["bestArrivals"]["StopB"]).toBe(305),
-      expect(r["kArrivals"][r["k"]]["StopB"]).toBe(305),
-      expect(r["kConnections"]["StopB"][r["k"]]).toBe(expectedConn)
+      expect(r["bestArrivals"][stop2]).toBe(305),
+      expect(r["kArrivals"][r["k"]][stop2]).toBe(305),
+      expect(r["kConnections"][stop2][r["k"]]).toBe(expectedConn)
     ]
   ),
 
@@ -91,15 +97,16 @@ val s = suite("raptor/scan-results", [
       "startTime": 0,
       "endTime": 86400
     }
-    r.setTransfer(transfer, 777)
+    val stop2: UInt32 = 2u32
+    r.setTransfer(stop2, transfer, 777)
     [
-      expect(r.bestArrival("StopB")).toBe(777)
+      expect(r.bestArrival(stop2)).toBe(777)
     ]
   ),
 
   test("previousArrival reads the prior round's arrival", () =>
     val r = freshResults()
-    // Round 1: record an arrival at StopB.
+    // Round 1: record an arrival at stop 2.
     r.addRound()
     val transfer: Transfer = {
       "origin": "StopA",
@@ -108,11 +115,12 @@ val s = suite("raptor/scan-results", [
       "startTime": 0,
       "endTime": 86400
     }
-    r.setTransfer(transfer, 250)
-    // Round 2: previousArrival should now see round-1's StopB arrival.
+    val stop2: UInt32 = 2u32
+    r.setTransfer(stop2, transfer, 250)
+    // Round 2: previousArrival should now see round-1's stop-2 arrival.
     r.addRound()
     [
-      expect(r.previousArrival("StopB")).toBe(250)
+      expect(r.previousArrival(stop2)).toBe(250)
     ]
   ),
 
@@ -133,8 +141,10 @@ val s = suite("raptor/scan-results", [
       "startTime": 0,
       "endTime": 86400
     }
-    r.setTransfer(tA, 10)
-    r.setTransfer(tB, 20)
+    val stop1: UInt32 = 1u32
+    val stop2: UInt32 = 2u32
+    r.setTransfer(stop1, tA, 10)
+    r.setTransfer(stop2, tB, 20)
     [
       expect(r.getMarkedStops().length()).toBe(2)
     ]
@@ -158,12 +168,13 @@ val s = suite("raptor/scan-results", [
       "startTime": 0,
       "endTime": 86400
     }
-    r.setTransfer(transfer, 400)
+    val stop2: UInt32 = 2u32
+    r.setTransfer(stop2, transfer, 400)
     val out = r.finalize()
     [
       expect(out[0]).toBe(r["kConnections"]),
       expect(out[1]).toBe(r["bestArrivals"]),
-      expect(out[1]["StopB"]).toBe(400)
+      expect(out[1][stop2]).toBe(400)
     ]
   )
 ])

@@ -69,7 +69,7 @@ run_lang() {
       go)     out=$(cd "$HERE/go" && go run ./cmd/bench "$DATA" 2>/dev/null) ;;
       rust)   out=$(cd "$HERE/rust" && cargo run --release --quiet --bin bench -- "$DATA" 2>/dev/null) ;;
       python) out=$(cd "$HERE/python" && python3 bench.py "$DATA" 2>/dev/null) ;;
-      lin)    out=$("$REPO/target/debug/lin" run "$HERE/lin/bench.lin" 2>/dev/null) ;;
+      lin)    out=$("$REPO/target/debug/lin" run "$HERE/lin-manually-typed/src/bench.lin" 2>/dev/null) ;;
     esac
     parse_out "$out"
     keepmin "$lang:LOAD" "$load"; keepmin "$lang:PREP" "$prep"
