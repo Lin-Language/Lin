@@ -2683,7 +2683,7 @@ impl<'ctx> Codegen<'ctx> {
                                 }
                             }
                         }
-                        Instruction::IndexSet { object, key, value, obj_ty, key_ty, val_ty } => {
+                        Instruction::IndexSet { object, key, value, obj_ty, key_ty, val_ty, nonneg, proven_inbounds } => {
                             if let (Some(&obj_v), Some(&val_v)) =
                                 (temp_map.get(object), temp_map.get(value))
                             {
@@ -2702,7 +2702,7 @@ impl<'ctx> Codegen<'ctx> {
                                     self.emit_map_set_bytes_fused(obj_v, data_ptr, key_len, val_v, obj_ty, val_ty, &val_repr);
                                 } else if let Some(&key_v) = temp_map.get(key) {
                                     let val_repr = func.repr_of(*value);
-                                    self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty, &val_repr);
+                                    self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty, &val_repr, *nonneg, *proven_inbounds);
                                 }
                             }
                         }

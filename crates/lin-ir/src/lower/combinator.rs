@@ -4738,8 +4738,8 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
             nonneg: false,
                 proven_inbounds: false,
             });
-            builder.emit(Instruction::IndexSet { object: out, key: i, value: elem, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
-            builder.emit(Instruction::IndexSet { object: work, key: i, value: elem, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+            builder.emit(Instruction::IndexSet { object: out, key: i, value: elem, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone(), nonneg: false, proven_inbounds: false });
+            builder.emit(Instruction::IndexSet { object: work, key: i, value: elem, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone(), nonneg: false, proven_inbounds: false });
             builder.emit(Instruction::Binary { dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
             builder.terminate(Terminator::Jump(header));
             builder.switch_to(exit);
@@ -4843,7 +4843,7 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
     builder.switch_to(m_take_l);
     let lv = builder.alloc_temp(elem_ty.clone());
     builder.emit(Instruction::Index { dst: lv, object: out, key: mi, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false, proven_inbounds: false});
-    builder.emit(Instruction::IndexSet { object: work, key: mk, value: lv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+    builder.emit(Instruction::IndexSet { object: work, key: mk, value: lv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone(), nonneg: false, proven_inbounds: false });
     let mi_inc = builder.alloc_temp(Type::Int64);
     builder.emit(Instruction::Binary { dst: mi_inc, op: BinOp::Add, lhs: mi, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
     builder.terminate(Terminator::Jump(m_advance));
@@ -4853,7 +4853,7 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
     builder.switch_to(m_take_r);
     let rv = builder.alloc_temp(elem_ty.clone());
     builder.emit(Instruction::Index { dst: rv, object: out, key: mj, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false, proven_inbounds: false});
-    builder.emit(Instruction::IndexSet { object: work, key: mk, value: rv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+    builder.emit(Instruction::IndexSet { object: work, key: mk, value: rv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone(), nonneg: false, proven_inbounds: false });
     let mj_inc = builder.alloc_temp(Type::Int64);
     builder.emit(Instruction::Binary { dst: mj_inc, op: BinOp::Add, lhs: mj, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
     builder.terminate(Terminator::Jump(m_advance));
@@ -4893,7 +4893,7 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
         builder.switch_to(body);
         let wv = builder.alloc_temp(elem_ty.clone());
         builder.emit(Instruction::Index { dst: wv, object: work, key: i, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false, proven_inbounds: false});
-        builder.emit(Instruction::IndexSet { object: out, key: i, value: wv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+        builder.emit(Instruction::IndexSet { object: out, key: i, value: wv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone(), nonneg: false, proven_inbounds: false });
         builder.emit(Instruction::Binary { dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
         builder.terminate(Terminator::Jump(header));
         builder.switch_to(exit);

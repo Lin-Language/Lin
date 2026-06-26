@@ -149,11 +149,15 @@ impl<'ctx> Codegen<'ctx> {
             let data_ptr_ptr = unsafe {
                 self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(24, false)], "flat_data_pp")
             };
-            let data_ptr = self.builder.load(ptr_ty, data_ptr_ptr, "flat_data").into_pointer_value();
+            let data_raw = self.builder.load(ptr_ty, data_ptr_ptr, "flat_data");
+            self.tbaa_tag_hdr(data_raw); // TBAA: header field — doesn't alias element stores → LICM-hoistable
+            let data_ptr = data_raw.into_pointer_value();
             let elem_ptr = unsafe {
                 self.builder.in_bounds_gep(llvm_elem_ty, data_ptr, &[idx], "flat_elem_p")
             };
-            return self.builder.load(llvm_elem_ty, elem_ptr, "flat_get");
+            let elem = self.builder.load(llvm_elem_ty, elem_ptr, "flat_get");
+            self.tbaa_tag_elem(elem, elem_ty);
+            return elem;
         }
 
         // len = *(u64*)(arr + 8)
@@ -330,7 +334,7 @@ impl<'ctx> Codegen<'ctx> {
     /// Only valid when the value's static type equals the flat element type (no widening/narrowing
     /// conversion needed); the caller guarantees this. LinArray layout: len u64 @ byte 8, data ptr
     /// @ byte 24 (in sync with `flat_array_get`/`flat_array_push`).
-    pub(crate) fn flat_array_set(&mut self, arr_ptr: BasicValueEnum<'ctx>, idx_i64: inkwell::values::IntValue<'ctx>, value: BasicValueEnum<'ctx>, elem_ty: &Type) {
+    pub(crate) fn flat_array_set(&mut self, arr_ptr: BasicValueEnum<'ctx>, idx_i64: inkwell::values::IntValue<'ctx>, value: BasicValueEnum<'ctx>, elem_ty: &Type, nonneg: bool, proven_inbounds: bool) {
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
         let i64_ty = self.context.i64_type();
         let llvm_elem_ty = self.llvm_type(elem_ty);
@@ -341,6 +345,24 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.int_s_extend(idx_i64, i64_ty, "fset_idx64")
         };
 
+        // Unchecked fast path: IR analysis proved 0 <= idx < len.
+        // Skip the length load, negative-wrap select, and OOB branch entirely.
+        // Mirrors the proven_inbounds path in flat_array_get.
+        if proven_inbounds {
+            let data_ptr_ptr = unsafe {
+                self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(24, false)], "fset_data_pp")
+            };
+            let data_raw = self.builder.load(ptr_ty, data_ptr_ptr, "fset_data");
+            self.tbaa_tag_hdr(data_raw); // TBAA: header field — doesn't alias element stores → LICM-hoistable
+            let data_ptr = data_raw.into_pointer_value();
+            let elem_ptr = unsafe {
+                self.builder.in_bounds_gep(llvm_elem_ty, data_ptr, &[idx], "fset_elem_p")
+            };
+            let store_iv = self.builder.store(elem_ptr, value);
+            self.tbaa_tag_elem_instr(store_iv, elem_ty);
+            return;
+        }
+
         // len = *(u64*)(arr + 8)
         // TBAA: header-field load doesn't alias element stores — LICM can hoist it.
         let len_ptr = unsafe {
@@ -350,11 +372,17 @@ impl<'ctx> Codegen<'ctx> {
         self.tbaa_tag_hdr(len_raw);
         let len = len_raw.into_int_value();
 
-        // actual = idx < 0 ? len + idx : idx  (matches lin_array_set negative-index handling)
-        let zero = i64_ty.const_zero();
-        let is_neg = self.builder.int_compare(IntPredicate::SLT, idx, zero, "fset_idx_neg");
-        let wrapped = self.builder.int_add(len, idx, "fset_idx_wrap");
-        let actual = self.builder.select(is_neg, wrapped, idx, "fset_idx_actual").into_int_value();
+        // CK.1a write-side: when nonneg, skip the negative-wrap select entirely.
+        // The unsigned UGE check catches both idx >= len and (if invariant violated) a
+        // negative idx reinterpreted as huge unsigned — same as the read-side nonneg path.
+        let actual = if nonneg {
+            idx
+        } else {
+            let zero = i64_ty.const_zero();
+            let is_neg = self.builder.int_compare(IntPredicate::SLT, idx, zero, "fset_idx_neg");
+            let wrapped = self.builder.int_add(len, idx, "fset_idx_wrap");
+            self.builder.select(is_neg, wrapped, idx, "fset_idx_actual").into_int_value()
+        };
         // Single unsigned compare catches both a still-negative wrap and actual >= len.
         let oob = self.builder.int_compare(IntPredicate::UGE, actual, len, "fset_oob");
 
