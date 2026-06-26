@@ -1,6 +1,7 @@
-import { StopId } from "../gtfs/gtfs"
+import { StopIndex } from "../raptor/raptor-algorithm"
 import { ConnectionIndex } from "../raptor/scan-results"
 import { Journey } from "./journey"
 
-export type ResultsFactory = (ConnectionIndex, StopId) => Journey[]
-
+// A results factory takes a connection index keyed by integer StopIndex plus the intern
+// table, and returns the journeys found for a given (integer) destination stop.
+export type ResultsFactory = (ConnectionIndex, StopIndex, { String: StopIndex }) => Journey[]
