@@ -14,8 +14,6 @@ val s = suite("raptor/raptor-algorithm", [
     val routeStops: UInt32[] = []
     val gStopTimes: StopTimeEntry[] = []
     val flatTrips: Trip[] = []
-    val stopRoutes: UInt32[] = []
-    val stopRoutesBase: UInt32[] = []
     val transfers: TransfersByOrigin = {}
     val interchange: Interchange = {}
     val queueFactory: QueueFactory = { "stopRoutes": [], "stopRoutesBase": [], "routeStopIndex": {} }
@@ -28,8 +26,6 @@ val s = suite("raptor/raptor-algorithm", [
       "routeStops": routeStops,
       "stopTimes": gStopTimes,
       "trips": flatTrips,
-      "stopRoutes": stopRoutes,
-      "stopRoutesBase": stopRoutesBase,
       "routeStopIndex": routeStopIndex,
       "interchange": interchange,
       "transfers": transfers,

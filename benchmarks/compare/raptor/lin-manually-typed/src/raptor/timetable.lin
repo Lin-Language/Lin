@@ -45,8 +45,8 @@ export type Timetable = {
   "routeStops": StopIndex[],      // each route's stop sequence, concatenated (slice at routeStopsBase)
   "stopTimes": StopTimeEntry[],   // GLOBAL, trip-major: stopTimesBase + t*numStops + s
   "trips": Trip[],                // GLOBAL, route-major: tripsBase + t
-  "stopRoutes": RouteIntId[],     // inverse index: routes serving each stop, concatenated
-  "stopRoutesBase": Offset[],     // indexed by StopIndex → start offset of that stop's routes in stopRoutes (len numStops+1)
+  // (the stop→routes inverse index — stopRoutes/stopRoutesBase — lives in the QueueFactory, the
+  //  only thing that reads it, so it is NOT duplicated here)
   "routeStopIndex": RouteStopIndex,
   "interchange": Interchange,
   "transfers": TransfersByOrigin,

@@ -204,8 +204,6 @@ export val create = (
     "routeStops": frozenRouteStops,
     "stopTimes": frozenStopTimes,
     "trips": frozenFlatTrips,
-    "stopRoutes": frozenStopRoutes,
-    "stopRoutesBase": frozenStopRoutesBase,
     "routeStopIndex": frozenRouteStopIndex,
     "interchange": frozenInterchange,
     "transfers": frozenTransfers,
