@@ -8,7 +8,6 @@ import { RouteIntId, StopTimeEntry, Route, Timetable, StopIndex, RouteStopIndex,
 import { RoutesIndexedByStop, createQueueFactory } from "./queue-factory"
 import { createRouteScanner } from "./route-scanner"
 import { frozen } from "std/async"
-import { keys } from "std/object"
 import { join } from "std/string"
 import { length, push, sort } from "std/array"
 import { for, range, filter, some, map } from "std/iter"
@@ -49,8 +48,9 @@ export val create = (
       stopNames.push(stop)
       idx
 
-  // Route dedup: string key → dense int route id
+  // Route dedup: string key → dense int route id, assigned sequentially from nextRouteId
   val routeIndexOf: { String: RouteIntId } = {}
+  var nextRouteId: UInt32 = 0u32
 
   // Per-route temp structures (pass 1 output)
   val tripsByRoute: { UInt32: Trip[] } = {}    // int routeId → trips in sorted order
@@ -79,15 +79,16 @@ export val create = (
 
   // ── PASS 1: group trips by route, build auxiliary indexes ────────────────
   sortedTrips.for(trip =>
+    val tripStops = trip["stopTimes"]
     // Intern each stop on this trip to get the integer path
-    val path = trip["stopTimes"].map(s => internStop(s["stop"]))
+    val path = tripStops.map(s => internStop(s["stop"]))
 
     // Compute the route string signature (stop + pickUp + dropOff flags)
-    val routeKey = trip["stopTimes"]
+    val routeKey = tripStops
       .map(s => "${ s["stop"] }${ if s["pickUp"] then 1 else 0 }${ if s["dropOff"] then 1 else 0 }")
       .join(",")
 
-    val lastArrivalA = trip["stopTimes"][trip["stopTimes"].length() - 1]["arrivalTime"]
+    val lastArrivalA = tripStops[tripStops.length() - 1]["arrivalTime"]
 
     // Check for overtaking: if this trip arrives earlier at the final stop than any existing
     // trip on the base route, it goes on a distinct "overtakes" route.
@@ -103,8 +104,9 @@ export val create = (
         routeKey
 
     if routeIndexOf[finalKey] == null then
-      // New route: allocate an int id and build its auxiliary structures
-      val routeId = routePathsTemp.keys().length().toUInt32()
+      // New route: allocate the next int id and build its auxiliary structures
+      val routeId = nextRouteId
+      nextRouteId = nextRouteId + 1u32
       routeIndexOf[finalKey] = routeId
       tripsByRoute[routeId] = []
       routePathsTemp[routeId] = path
@@ -112,17 +114,19 @@ export val create = (
       val stopIndex: { StopIndex: RoutePosition } = {}
       routeStopIndex[routeId] = stopIndex
 
-      range(path.length() - 1, -1, -1).for(i =>
+      // If a stop repeats on the route, its FIRST position wins (the `== null` guard preserves the
+      // old reverse scan, where the lowest index was written last).
+      range(0, path.length()).for(i =>
         val stop = path[i]
-        val stopStr = trip["stopTimes"][i]["stop"]
-        stopIndex[stop] = i.toUInt8()
+        val stopStr = tripStops[i]["stop"]
+        if stopIndex[stop] == null then
+          stopIndex[stop] = i.toUInt8()
 
-        val strTransfers = transfers[stopStr] ?? []
-        usefulTransfers[stop] = strTransfers
+        usefulTransfers[stop] = transfers[stopStr] ?? []
         intInterchange[stop] = interchange[stopStr] ?? DEFAULT_INTERCHANGE_TIME
 
         val stopRoutesList = routesAtStopTemp[stop] ?? []
-        if trip["stopTimes"][i]["pickUp"] then
+        if tripStops[i]["pickUp"] then
           stopRoutesList.push(routeId)
         routesAtStopTemp[stop] = stopRoutesList
       )
@@ -134,7 +138,7 @@ export val create = (
   )
 
   // ── PASS 2: lay down global flat arrays in route-major order ─────────────
-  val numRoutes = routePathsTemp.keys().length().toUInt32()
+  val numRoutes = nextRouteId
   val routes: Route[] = []
   val routeStops: StopIndex[] = []
   val stopTimes: StopTimeEntry[] = []
@@ -186,33 +190,25 @@ export val create = (
   )
   stopRoutesBase.push(srOffset)  // sentinel
 
-  // ── Freeze all load-once read-only structures ─────────────────────────────
+  // Freeze each load-once structure into an immortal read-only value as it's handed off.
+  // routeStopIndex is read by BOTH the timetable (scanRoutes) and the queue factory, so freeze it
+  // once and share; every other structure has a single consumer and is frozen inline at that site.
   val frozenRouteStopIndex = frozen(routeStopIndex)
-  val frozenRoutes = frozen(routes)
-  val frozenRouteStops = frozen(routeStops)
-  val frozenStopTimes = frozen(stopTimes)
-  val frozenFlatTrips = frozen(flatTrips)
-  val frozenStopRoutes = frozen(stopRoutes)
-  val frozenStopRoutesBase = frozen(stopRoutesBase)
-  val frozenTransfers = frozen(usefulTransfers)
-  val frozenInterchange = frozen(intInterchange)
-  val frozenStopIndexOf = frozen(stopIndexOf)
-  val frozenStopNames = frozen(stopNames)
 
   val timetable: Timetable = {
-    "routes": frozenRoutes,
-    "routeStops": frozenRouteStops,
-    "stopTimes": frozenStopTimes,
-    "trips": frozenFlatTrips,
+    "routes": frozen(routes),
+    "routeStops": frozen(routeStops),
+    "stopTimes": frozen(stopTimes),
+    "trips": frozen(flatTrips),
     "routeStopIndex": frozenRouteStopIndex,
-    "interchange": frozenInterchange,
-    "transfers": frozenTransfers,
-    "stopIndexOf": frozenStopIndexOf,
-    "stopNames": frozenStopNames
+    "interchange": frozen(intInterchange),
+    "transfers": frozen(usefulTransfers),
+    "stopIndexOf": frozen(stopIndexOf),
+    "stopNames": frozen(stopNames)
   }
 
   createRaptorAlgorithm(
     timetable,
-    createQueueFactory(frozenStopRoutes, frozenStopRoutesBase, frozenRouteStopIndex),
+    createQueueFactory(frozen(stopRoutes), frozen(stopRoutesBase), frozenRouteStopIndex),
     createRouteScanner
   )
