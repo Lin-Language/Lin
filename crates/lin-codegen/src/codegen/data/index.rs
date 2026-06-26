@@ -79,9 +79,19 @@ impl<'ctx> Codegen<'ctx> {
         // int → array get, otherwise → object get. The static `is_array_access` test below
         // would misclassify this as object access and a runtime array would return null.
         // Mirrors the AST compile_index pointer-key runtime dispatch.
+        // ...but ONLY when the object could DYNAMICALLY be an array — the int-key branch below
+        // assumes array indexing (`lin_array_get_tagged`). A CONCRETE map-only union (e.g.
+        // `{UInt32: V} | Null`, the inner result of a chained `m[a][b]`) must NOT take this path:
+        // array-getting a map returns Null (the chained-index-in-closure bug). It falls through to
+        // the typed int-keyed-map path below instead. Genuine `AnyVal`/Json (or a union that really
+        // includes an array variant) still dispatches here.
+        let obj_could_be_array = obj_ty.is_any_val()
+            || matches!(obj_ty, Type::Union(vs)
+                if vs.iter().any(|v| matches!(v, Type::Array(_) | Type::FixedArray(_)) || v.is_any_val()));
         if Self::is_union_type(obj_ty)
             && Self::is_union_type(key_ty)
             && key.is_pointer_value()
+            && obj_could_be_array
         {
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
             let k_tag = self.builder.call(self.rt.get_tag, &[key.into()], "ir_idxk_tag").try_as_basic_value().unwrap_basic().into_int_value();
@@ -139,7 +149,12 @@ impl<'ctx> Codegen<'ctx> {
         //   `{ UInt8: Int32 } | Null` (union), so the inner `[1]` hits this path.
         //
         // `container` at this point is already the unboxed raw `LinMap*` (line 71-75 above).
-        if Self::is_union_type(obj_ty) && (key_ty.is_numeric() || key.is_int_value()) {
+        // The key may arrive BOXED (a `*TaggedVal`) even for an int-keyed map: e.g. a chained index
+        // `m[a][b]` inside a closure whose `b` is a destructured `.entries` param typed `AnyVal`, so
+        // `key_ty.is_numeric()` is false AND `key.is_int_value()` is false (it's a pointer). The key
+        // extraction below already unboxes a pointer key, but without `key.is_pointer_value()` here
+        // the whole path was skipped and the outer index fell through to a wrong accessor → Null.
+        if Self::is_union_type(obj_ty) && (key_ty.is_numeric() || key.is_int_value() || key.is_pointer_value()) {
             let int_map_variant: Option<()> = match obj_ty {
                 Type::Union(vs) => vs.iter().find_map(|v| match v {
                     Type::Map { key: k, .. } if k.is_integer() => Some(()),
