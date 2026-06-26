@@ -72,8 +72,7 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
     val route = tt["routes"][routeId]
     val numStops = route["numStops"].toInt32()
     val routeStopsBase = route["routeStopsBase"]
-    val stopIndexMap = tt["routeStopIndex"][routeId] ?? {}
-    val boardingPointIndex = stopIndexMap[stopP] ?? 0
+    val boardingPointIndex = tt["routeStopIndex"][routeId][stopP] ?? 0
 
     range(boardingPointIndex, numStops).for(pi =>
       val stopPi = tt["routeStops"][routeStopsBase + pi]
@@ -81,11 +80,10 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
 
       if trip != null then
         val i = tt["interchange"][stopPi] ?? 0
-        val tripRec = trip
-        val stopTimeRec = tripRec["stopTimes"][pi]
+        val stopTimeRec = trip["stopTimes"][pi]
 
         if stopTimeRec["dropOff"] && stopTimeRec["arrivalTime"] + i < results.bestArrival(stopPi) then
-          results.setTrip(stopPi, tripRec, boardingPoint, pi, i)
+          results.setTrip(stopPi, trip, boardingPoint, pi, i)
         else if prevArrival != 0 && prevArrival < stopTimeRec["arrivalTime"] + i then
           val newTrip = routeScanner.getTrip(tt, routeId, pi, prevArrival)
 
