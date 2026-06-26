@@ -19012,6 +19012,39 @@ main()
 }
 
 #[test]
+fn test_chained_int_map_index_boxed_key_in_closure() {
+    // REGRESSION: a chained int-keyed map index `m[a][b]` where the keys are BOXED runtime values —
+    // here destructured `.entries` params (typed AnyVal on the callback ABI) inside a closure. The
+    // inner `m[a]` yields a `Map | Null` union; the outer `[b]` with a boxed key took the dynamic
+    // key-tag dispatch whose int-branch array-gets the container — but it's a MAP, so the array-get
+    // returned Null (→ `?? 0` gave 0). Fix (data/index.rs): the dynamic dispatch only fires when the
+    // object could actually be an array; a concrete map-only union falls through to the typed
+    // int-keyed-map path, which now also accepts a boxed (pointer) key. Literal keys / outside-closure
+    // worked already (unboxed int constant). This is the RAPTOR `routeStopIndex[routeId][stopP]` crash.
+    let out = run(r#"
+import { print } from "std/io"
+import { entries } from "std/object"
+type Inner = { UInt32: UInt8 }
+type TT = { "idx": { UInt32: Inner } }
+type Queue = { UInt32: UInt32 }
+val main = () =>
+  val inner: Inner = {}
+  inner[5u32] = 2u8
+  val outer: { UInt32: Inner } = {}
+  outer[1u32] = inner
+  val tt: TT = { "idx": outer }
+  val q: Queue = {}
+  q[1u32] = 5u32
+  q.entries([routeId, stopP] =>
+    print("${tt["idx"][routeId][stopP] ?? 0}")
+  )
+main()
+"#);
+    // tt.idx[1][5] = 2; the chained index with boxed entries-keys previously returned Null → 0.
+    assert_eq!(out, vec!["2"]);
+}
+
+#[test]
 fn test_sealed_array_index_set_in_callee() {
     // REGRESSION: `arr[i] = { .. }` over a SCALAR sealed-record array, performed inside a CALLEE
     // (recursive overwrite loop). In a callee context the RHS structural literal is typed as an
