@@ -316,6 +316,14 @@ pub(crate) fn capture_resolvable(cap: &Capture, builder: &FuncBuilder, ctx: &Low
         let stored = builder.temp_types.get(&t).unwrap_or(&cap.ty);
         return !type_repr_differs(&cap.ty, stored);
     }
+    // A packed-array-element VIEW (`val r = arr[i]`) is virtual — no materialized slot — so the
+    // checks above miss it. It is still resolvable for the INLINE path: inlining splices the body
+    // into THIS function, where the view's recorded (array,index) temps are live, so a re-emitted
+    // `r["field"]` resolves via the same SealedArrayFieldGet path. (A real closure captures the view
+    // across a function boundary and is handled separately by materialization in func.rs.)
+    if ctx.packed_elem_slots.contains_key(&slot) {
+        return true;
+    }
     false
 }
 
