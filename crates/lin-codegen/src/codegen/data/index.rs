@@ -894,7 +894,7 @@ impl<'ctx> Codegen<'ctx> {
     /// `emit_array_set` helpers so the boxing/retain/release sequence is IDENTICAL to the
     /// `lin_map_set`/`lin_array_set` intrinsics; the matching IR-level ownership transfer
     /// is emitted in `IndexSet` lowering (`lin-ir`).
-    pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, val_ty: &Type, val_repr: &lin_ir::repr::Repr) {
+    pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, val_ty: &Type, val_repr: &lin_ir::repr::Repr, nonneg: bool, proven_inbounds: bool) {
         // Resolve an object key to a raw `LinString*`. A string key that is a callback param
         // arrives boxed (a `TaggedVal*`); unbox it, or `lin_map_set` reads the box as a
         // LinString and corrupts the key.
@@ -982,7 +982,7 @@ impl<'ctx> Codegen<'ctx> {
                 // A differing scalar width/kind would need the runtime's value conversion, so fall
                 // back. A FixedArray is always stored tagged (heterogeneous slots) — handled below.
                 else if Self::is_flat_scalar(elem) && elem.as_ref() == val_ty {
-                    self.flat_array_set(obj, idx, value, val_ty);
+                    self.flat_array_set(obj, idx, value, val_ty, nonneg, proven_inbounds);
                 } else {
                     self.emit_array_set(obj, idx, value, val_ty);
                 }
