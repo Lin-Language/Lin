@@ -485,6 +485,24 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.conditional_branch(is_map, map_b, chk_rec);
             self.builder.position_at_end(map_b);
             let map_entry = self.inline_map_get_str(container, key_str, "ir_mget_u");
+            // OWNERSHIP NORMALISATION: when result_ty is union/AnyVal, the TAG_RECORD arm below
+            // returns an OWNED +1 TaggedVal* (from `lin_record_get_field`). To make the phi hold
+            // uniformly OWNED values from all arms, clone the borrowed MAP interior pointer here.
+            // `lin_tagged_clone` on a null/interior pointer is always safe (null payload → null
+            // clone). The TAG_MAP arm's borrowed interior is NOT released — it is an interior
+            // slice pointer into the container, not heap-allocated separately. Net: both live paths
+            // (TAG_MAP and TAG_RECORD) exit `inner_mrg` / the phi with exactly +1 owned reference.
+            // For concrete result_ty the borrow unbox path is fine (scalar extracted before inner_mrg).
+            let map_result = if Self::is_union_type(result_ty) {
+                let clone_fn = self.get_or_declare_fn(
+                    "lin_tagged_clone",
+                    ptr_ty.fn_type(&[ptr_ty.into()], false),
+                );
+                self.builder.call(clone_fn, &[map_entry.into()], "ir_mget_u_own")
+                    .try_as_basic_value().unwrap_basic()
+            } else {
+                map_entry
+            };
             let map_exit = self.builder.get_insert_block().unwrap();
             self.builder.unconditional_branch(inner_mrg);
             self.builder.position_at_end(chk_rec);
@@ -492,10 +510,11 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.position_at_end(no);
             let null_res = ptr_ty.const_null();
             self.builder.unconditional_branch(inner_mrg);
-            // inner_mrg: collect borrowed TaggedVal* from map/null paths, unbox, branch to final.
+            // inner_mrg: collect owned TaggedVal* (union result) or borrowed (concrete result)
+            // from map/null paths, unbox, branch to final.
             self.builder.position_at_end(inner_mrg);
             let inner_phi = self.builder.phi(ptr_ty, "ir_idx_inner_phi");
-            inner_phi.add_incoming(&[(&map_entry, map_exit), (&null_res, no)]);
+            inner_phi.add_incoming(&[(&map_result, map_exit), (&null_res, no)]);
             let inner_result_ptr = inner_phi.as_basic_value();
             let inner_unboxed = self.unbox_tagged_val_to_type(inner_result_ptr, result_ty);
             // inner_unboxed may be a pointer or a scalar. For the phi we need a uniform type; we use
