@@ -8,7 +8,7 @@ import { getResults } from "../results/journey-factory"
 import { ResultsFactory } from "../results/results-factory"
 import { createMultipleCriteriaFilter } from "../results/filter/journey-filter"
 import { Trip } from "../gtfs/gtfs"
-import { TransfersByOrigin } from "../raptor/raptor-algorithm"
+import { TransfersByOrigin } from "../gtfs/gtfs-loader"
 import { Journey } from "../results/journey"
 import { length } from "std/array"
 

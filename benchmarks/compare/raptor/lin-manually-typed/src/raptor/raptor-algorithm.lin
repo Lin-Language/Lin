@@ -1,58 +1,60 @@
 import { StopId, Time, Transfer, Trip } from "../gtfs/gtfs"
-import { DayOfWeek, DateNumber, MAX_TIME } from "../gtfs/date"
+import { DayOfWeek, DateNumber } from "../gtfs/date"
 import { QueueFactory, getQueue } from "./queue-factory"
-import { RouteId, RouteScanner, RouteScannerFactory, getTrip } from "./route-scanner"
+import { RouteScanner, RouteScannerFactory, getTrip } from "./route-scanner"
 import { Arrivals, ConnectionIndex, ScanResults, createScanResults, addRound, previousArrival, setTrip, setTransfer, bestArrival, getMarkedStops, finalize } from "./scan-results"
+import { RouteIntId, StopTimeEntry, Route, Timetable } from "./timetable"
 import { keys, entries } from "std/object"
 import { length } from "std/array"
 import { while, range, for } from "std/iter"
+import { toInt32 } from "std/number"
+
+// `StopIndex` is re-exported here (a trivial UInt32 id alias) for the modules that import it from
+// the algorithm. The structural index types (RouteStopIndex/Interchange/TransfersByOrigin) live in
+// timetable.lin — the single source of truth.
+export type StopIndex = UInt32
+
+// `StopTimes` (origin stop id → departure time) is a query-construction input, local to the algorithm.
+export type StopTimes = { StopIndex: UInt32 }
 
 export type RaptorAlgorithm = {
-  "routeStopIndex": RouteStopIndex,
-  "routePath": RoutePaths,
-  "transfers": TransfersByOrigin,
-  "interchange": Interchange,
+  "timetable": Timetable,
   "queueFactory": QueueFactory,
   "routeScannerFactory": RouteScannerFactory
 }
 
-// 
+//
 // Implementation of the Raptor journey planning algorithm
-// 
+//
 export val createRaptorAlgorithm = (
-  routeStopIndex: RouteStopIndex,
-  routePath: RoutePaths,
-  transfers: TransfersByOrigin,
-  interchange: Interchange,
+  timetable: Timetable,
   queueFactory: QueueFactory,
   routeScannerFactory: RouteScannerFactory
 ) => {
-  routeStopIndex,
-  routePath,
-  transfers,
-  interchange,
+  timetable,
   queueFactory,
   routeScannerFactory
 }
 
-// 
+//
 // Perform a plan of the routes at a given time and return the resulting kConnections index
-// 
+//
 export val scan = (
-  raptor: RaptorAlgorithm, 
-  origins: StopTimes, 
-  date: DateNumber, 
+  raptor: RaptorAlgorithm,
+  origins: StopTimes,
+  date: DateNumber,
   dow: DayOfWeek
 ): [ConnectionIndex, Arrivals] =>
   val routeScanner = raptor["routeScannerFactory"](date, dow)
-  val results = createScanResults(raptor["transfers"].keys(), origins)
+  val tt = raptor["timetable"]
+  val results = createScanResults(tt["stopNames"].length(), origins)
   var markedStops = origins.keys()
 
   while(() =>
     results.addRound()
 
-    raptor.scanRoutes(results, routeScanner, markedStops)
-    raptor.scanTransfers(results, markedStops)
+    raptor.scanRoutes(results, routeScanner, markedStops, tt)
+    raptor.scanTransfers(results, markedStops, tt)
 
     markedStops = results.getMarkedStops()
     markedStops.length() > 0
@@ -61,34 +63,35 @@ export val scan = (
   results.finalize()
 
 
-val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: RouteScanner, markedStops: StopId[]) =>
+val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: RouteScanner, markedStops: StopIndex[], tt: Timetable) =>
   val queue = raptor["queueFactory"].getQueue(markedStops)
 
   queue.entries([routeId, stopP] =>
     var boardingPoint = -1
     var trip: Trip | Null = null
-    val routePath = raptor["routePath"][routeId] ?? []
-    val routePathLength = routePath.length()
-    val boardingPointIndex = raptor["routeStopIndex"][routeId][stopP] ?? 0
+    val route = tt["routes"][routeId]
+    val numStops = route["numStops"].toInt32()
+    val routeStopsBase = route["routeStopsBase"]
+    val boardingPointIndex = tt["routeStopIndex"][routeId][stopP] ?? 0
 
-    range(boardingPointIndex, routePathLength).for(pi => 
-      val stopPi = routePath[pi]
+    range(boardingPointIndex, numStops).for(pi =>
+      val stopPi = tt["routeStops"][routeStopsBase + pi]
       val prevArrival = results.previousArrival(stopPi)
 
       if trip != null then
-        val i = raptor["interchange"][stopPi] ?? 0
-        val stopTime = trip["stopTimes"][pi]
+        val i = tt["interchange"][stopPi] ?? 0
+        val stopTimeRec = trip["stopTimes"][pi]
 
-        if stopTime["dropOff"] && stopTime["arrivalTime"] + i < results.bestArrival(stopPi) then
-          results.setTrip(trip, boardingPoint, pi, i)
-        else if prevArrival != 0 && prevArrival < stopTime["arrivalTime"] + i then
-          val newTrip = routeScanner.getTrip(routeId, pi, prevArrival)
+        if stopTimeRec["dropOff"] && stopTimeRec["arrivalTime"] + i < results.bestArrival(stopPi) then
+          results.setTrip(stopPi, trip, boardingPoint, pi, i)
+        else if prevArrival != 0 && prevArrival < stopTimeRec["arrivalTime"] + i then
+          val newTrip = routeScanner.getTrip(tt, routeId, pi, prevArrival)
 
           if newTrip != null then
             trip = newTrip
             boardingPoint = pi
       else if prevArrival != 0 then
-        val newTrip = routeScanner.getTrip(routeId, pi, prevArrival)
+        val newTrip = routeScanner.getTrip(tt, routeId, pi, prevArrival)
 
         if newTrip != null then
           trip = newTrip
@@ -97,19 +100,17 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
   )
 
 
-val scanTransfers = (raptor: RaptorAlgorithm, results: ScanResults, markedStops: StopId[]) =>
-  markedStops.for(stopP =>
-    raptor["transfers"][stopP].for(transfer =>
-      val stopPi = transfer["destination"]
-      val arrival = results.previousArrival(stopP) + transfer["duration"] + (raptor["interchange"][stopPi] ?? 0)
+val scanTransfers = (raptor: RaptorAlgorithm, results: ScanResults, markedStops: StopIndex[], tt: Timetable) =>
+  val stopIndexOf = tt["stopIndexOf"]
 
-      if transfer["startTime"] <= arrival && transfer["endTime"] >= arrival && arrival < results.bestArrival(stopPi) then
-        results.setTransfer(transfer, arrival) 
+  markedStops.for(stopP =>
+    tt["transfers"][stopP].for(transfer =>
+      val stopPiOrNull = stopIndexOf[transfer["destination"]]
+      if stopPiOrNull != null then
+        val stopPi = stopPiOrNull
+        val arrival = results.previousArrival(stopP) + transfer["duration"] + (tt["interchange"][stopPi] ?? 0)
+
+        if transfer["startTime"] <= arrival && transfer["endTime"] >= arrival && arrival < results.bestArrival(stopPi) then
+          results.setTransfer(stopPi, transfer, arrival)
     )
   )
-
-export type RouteStopIndex = { RouteId: { StopId: UInt8 } }
-export type RoutePaths = { RouteId: StopId[] }
-export type Interchange = { StopId: Time }
-export type TransfersByOrigin = { StopId: Transfer[] }
-export type StopTimes = { StopId: UInt32 }
