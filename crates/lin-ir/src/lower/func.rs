@@ -355,6 +355,7 @@ pub(crate) fn lower_function_expr_with_id(
         slots: slot_to_temp,
         intrinsic_slots: builder.intrinsic_slots.clone(),
         scope_owned: Vec::new(),
+        scope_box_shells: Vec::new(),
         diverged_blocks: std::collections::HashSet::new(),
         cell_slots: HashMap::new(),
         created_cells: Vec::new(),
