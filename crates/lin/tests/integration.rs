@@ -16019,6 +16019,83 @@ val m: { Bad: Int32 } = {}
 }
 
 #[test]
+fn test_index_sig_bare_record_hint_comma_separated() {
+    // HINT B (comma form): `{ a: UInt32, b: UInt8 }` looks like a TypeScript record with bare
+    // keys. The parser should emit the helpful "multiple entries look like a record" diagnostic
+    // (not the raw "expected RBrace") and suggest quoting the keys.
+    let (ok, output) = check_source(
+        r#"export type T = { a: UInt32, b: UInt8 }
+val x = 1
+"#,
+    );
+    assert!(!ok, "expected a type error for bare-keyed record, but it passed");
+    assert!(
+        output.contains("index-signature type has exactly one entry"),
+        "expected the index-sig / record-quoting hint, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("expected RBrace"),
+        "got raw 'expected RBrace' instead of the hint:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_index_sig_bare_record_hint_newline_separated() {
+    // HINT B (newline form): bare keys separated by newlines (no commas) also triggered the raw
+    // "expected RBrace" error instead of the helpful quoting hint. Regression test.
+    let (ok, output) = check_source(
+        "export type T = {\n  a: UInt32\n  b: UInt8\n}\nval x = 1\n",
+    );
+    assert!(!ok, "expected a type error for bare-keyed newline record, but it passed");
+    assert!(
+        output.contains("index-signature type has exactly one entry"),
+        "expected the index-sig / record-quoting hint for newline-separated bare keys, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("expected RBrace"),
+        "got raw 'expected RBrace' instead of the hint:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_index_sig_single_entry_still_valid() {
+    // A genuine single-entry index-signature `{ StopID: Value }` must NOT trigger the hint.
+    let (ok, output) = check_source(
+        r#"type StopID = String
+type M = { StopID: UInt32 }
+val m: M = {}
+"#,
+    );
+    assert!(
+        ok,
+        "expected a single-entry index-sig to parse cleanly, but got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_index_sig_nested_value_still_valid() {
+    // A nested index-sig value `{ A: { B: C } }` must NOT trigger the hint — the inner brace is
+    // the value type, not a second bare-keyed field.
+    let (ok, output) = check_source(
+        r#"type A = String
+type B = String
+type M = { A: { B: UInt32 } }
+val m: M = {}
+"#,
+    );
+    assert!(
+        ok,
+        "expected a nested index-sig type to parse cleanly, but got:\n{}",
+        output
+    );
+}
+
+#[test]
 fn test_int_map_basic_operations() {
     // Smoke test for { Int32: String } maps: insert, read hit, read miss, overwrite.
     let output = run(r#"import { print } from "std/io"
