@@ -24417,3 +24417,31 @@ print(xs[i])
     );
     assert_eq!(output, vec!["10", "20"]);
 }
+
+#[test]
+fn test_sealed_seq_int_key_direct_load() {
+    // Regression: `{ IntLitUnion: V }` records indexed by a runtime integer-literal-union
+    // value must be a direct byte-offset GEP load, NOT a map-materialise + int_to_string + map_get.
+    // This shape arises in RAPTOR's `service["days"][dow]` (ServiceDays = { DayOfWeek: Boolean }).
+    let output = run(
+        r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type Day = 0 | 1 | 2 | 3 | 4 | 5 | 6
+type Schedule = { Day: Boolean }
+
+val isOpen = (s: Schedule, d: Day): Boolean => s[d]
+
+val sched: Schedule = { 0: false, 1: true, 2: true, 3: true, 4: true, 5: false, 6: false }
+val d0: Day = 0
+val d1: Day = 1
+val d5: Day = 5
+val d6: Day = 6
+print(toString(isOpen(sched, d0)))
+print(toString(isOpen(sched, d1)))
+print(toString(isOpen(sched, d5)))
+print(toString(isOpen(sched, d6)))
+"#,
+    );
+    assert_eq!(output, vec!["false", "true", "false", "false"]);
+}
