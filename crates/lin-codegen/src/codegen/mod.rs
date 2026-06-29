@@ -2126,7 +2126,12 @@ impl<'ctx> Codegen<'ctx> {
                             // MakeObject for spread-free literals (incl. the common empty `{}`).
                             if let Type::Map { key: map_key_ty, value: elem_ty, .. } = ty {
                                 let cap = i32_ty.const_int((fields.len() + computed_fields.len()).max(1) as u64, false);
-                                let key_kind_val = i32_ty.const_int(if map_key_ty.is_int_map_key() { 1 } else { 0 }, false);
+                                let key_kind_val = i32_ty.const_int(
+                                    if map_key_ty.is_dense_int_key() { 2 }
+                                    else if map_key_ty.is_int_map_key() { 1 }
+                                    else { 0 },
+                                    false,
+                                );
                                 let map_ptr = self.builder
                                     .call(self.rt.map_alloc, &[cap.into(), key_kind_val.into()], "ir_map")
                                     .try_as_basic_value().unwrap_basic().into_pointer_value();

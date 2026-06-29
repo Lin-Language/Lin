@@ -1266,13 +1266,14 @@ unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
         TAG_MAP => {
             let map = payload as *const crate::map::LinMap;
             if map.is_null() { return "o:{}".to_string(); }
+            let is_int = !map.is_null() && ((*map).key_kind == crate::map::KEY_KIND_INT || (*map).key_kind == crate::map::KEY_KIND_DENSE);
             let mut pairs: Vec<(String, String)> = Vec::new();
             crate::map::map_for_each_slot(map, |key_bits, val| {
-                let key_ptr = key_bits as *const crate::string::LinString;
-                let key_str = if key_ptr.is_null() {
-                    String::new()
+                let key_str = if is_int {
+                    format!("{}", key_bits as i64)
                 } else {
-                    (*key_ptr).as_str().to_string()
+                    let key_ptr = key_bits as *const crate::string::LinString;
+                    if key_ptr.is_null() { String::new() } else { (*key_ptr).as_str().to_string() }
                 };
                 let val_str = tagged_to_key_string(&val as *const TaggedVal);
                 pairs.push((key_str, val_str));
