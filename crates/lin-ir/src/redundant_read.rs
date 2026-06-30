@@ -153,19 +153,33 @@ fn run_fn(func: &mut LinFunction) {
                             alias_map.insert(*dst, alias_root(avail_read.dst, &alias_map));
                         } else {
                             // First read: add to available set.
-                            // Only CSE on Map (string-key) and non-array types — array indexing
-                            // returns a fresh owned box per element (numeric key → Own convention)
-                            // and can change each access; don't CSE array reads by default.
-                            // For Map (Borrow convention) and FieldGet the slot pointer is stable
-                            // as long as the map/object isn't mutated.
-                            if !is_array_like(obj_ty) {
+                            // Only CSE when the result is a BORROWED interior pointer (Borrow
+                            // convention), not a fresh owned box (Own convention):
+                            //   - Array indexing (numeric key → Own): excluded, results change per access.
+                            //   - Union/TypeVar obj + string key (Own): excluded, compile_ir_index
+                            //     returns a freshly cloned +1 box from lin_tagged_clone (MAP path)
+                            //     or lin_record_get_field (RECORD path) — NOT a stable interior ptr.
+                            //     Replacing the second Index with a bare Copy aliases the first result
+                            //     without adding a retain, so the Release for the second use double-
+                            //     frees the first (RC corruption).
+                            // For Map-typed obj (Borrow) and FieldGet the slot pointer is stable.
+                            // Gate CSE on the ownership convention: only Borrow-result reads are
+                            // safe to share (the second Read aliases the first result without adding
+                            // a retain). Own-result reads produce a fresh +1 box per call; aliasing
+                            // via Copy would double-release. This subsumes the is_array_like guard
+                            // (array numeric-key reads also have Own convention).
+                            let result_is_own = matches!(
+                                crate::ownership_verify::index_result_convention(obj_ty, key_ty),
+                                crate::ir::Convention::Own
+                            );
+                            if !result_is_own {
                                 let _ = key_ty;
                                 avail.insert(map_key, AvailRead { dst: *dst, obj: *object, key: read_key.clone() });
                                 // Record this temp's origin for aliasing (container, key).
                                 source_map.insert(*dst, (obj_root, read_key));
                             } else {
                                 alias_map.insert(*dst, *dst);
-                                continue; // array-like: no CSE, no source tracking
+                                continue; // Own-result read: no CSE, no source tracking
                             }
                         }
                     } else {

@@ -432,6 +432,9 @@ impl<'ctx> Codegen<'ctx> {
         // Sealed-records Stage 4: stack-allocate non-escaping all-scalar sealed records and suppress
         // their Retain/Release emission (imports get the same analysis as the main module).
         lin_ir::escape::analyze(&mut ir_module);
+        // Stack-allocate non-escaping `var` cells (entry-block alloca instead of lin_alloc) so
+        // mem2reg/LICM/bounds_elide are not defeated by an opaque heap pointer in hot loops.
+        lin_ir::escape::analyze_cells(&mut ir_module);
         // Static RC-balance verifier (Cluster 2) — VERIFICATION ONLY, gated on `LIN_VERIFY_RC=1`,
         // OFF by default. Runs over each IMPORTED module's final lowered IR too (so the corpus run
         // covers std/* + example imports). Never mutates the IR.
@@ -1948,8 +1951,24 @@ impl<'ctx> Codegen<'ctx> {
                                                     self.llvm_param_type(&ty)
                                                 })
                                                 .collect();
+                                            // Mirror Pass-1's signature logic for LIN functions: a
+                                            // scalar-nullable union return uses the flat `{ i1, i64 }`
+                                            // ABI (VA.1 CPR). Without this, a cross-module call site
+                                            // that forward-declares a not-yet-defined flat-union Lin
+                                            // callee (e.g. a cyclic import where the caller compiles
+                                            // first) would declare it `ptr`-returning; the later
+                                            // definition reuses that decl via `get_function` but emits
+                                            // a `{ i1, i64 }` body → "return type does not match".
+                                            // EXCLUDE `lin_*` runtime intrinsics: those use their
+                                            // native Rust ABI (a nullable scalar is returned BOXED as a
+                                            // `ptr`, e.g. `lin_try_parse_uint32: *mut u8`), NOT the
+                                            // Lin-internal flat-union convention.
                                             let fn_ty = if matches!(ret_ty, Type::Null | Type::Never) {
                                                 void_ty.fn_type(&param_types, false)
+                                            } else if Self::flat_union_scalar_type(ret_ty).is_some()
+                                                && !name.starts_with("lin_")
+                                            {
+                                                self.flat_union_struct_type().fn_type(&param_types, false)
                                             } else {
                                                 self.llvm_type(ret_ty).fn_type(&param_types, false)
                                             };
@@ -2157,7 +2176,12 @@ impl<'ctx> Codegen<'ctx> {
                             // MakeObject for spread-free literals (incl. the common empty `{}`).
                             if let Type::Map { key: map_key_ty, value: elem_ty, .. } = ty {
                                 let cap = i32_ty.const_int((fields.len() + computed_fields.len()).max(1) as u64, false);
-                                let key_kind_val = i32_ty.const_int(if map_key_ty.is_int_map_key() { 1 } else { 0 }, false);
+                                let key_kind_val = i32_ty.const_int(
+                                    if map_key_ty.is_dense_int_key() { 2 }
+                                    else if map_key_ty.is_int_map_key() { 1 }
+                                    else { 0 },
+                                    false,
+                                );
                                 let map_ptr = self.builder
                                     .call(self.rt.map_alloc, &[cap.into(), key_kind_val.into()], "ir_map")
                                     .try_as_basic_value().unwrap_basic().into_pointer_value();
@@ -2714,7 +2738,7 @@ impl<'ctx> Codegen<'ctx> {
                                 }
                             }
                         }
-                        Instruction::IndexSet { object, key, value, obj_ty, key_ty, val_ty } => {
+                        Instruction::IndexSet { object, key, value, obj_ty, key_ty, val_ty, nonneg, proven_inbounds } => {
                             if let (Some(&obj_v), Some(&val_v)) =
                                 (temp_map.get(object), temp_map.get(value))
                             {
@@ -2733,7 +2757,7 @@ impl<'ctx> Codegen<'ctx> {
                                     self.emit_map_set_bytes_fused(obj_v, data_ptr, key_len, val_v, obj_ty, val_ty, &val_repr);
                                 } else if let Some(&key_v) = temp_map.get(key) {
                                     let val_repr = func.repr_of(*value);
-                                    self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty, &val_repr);
+                                    self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty, &val_repr, *nonneg, *proven_inbounds);
                                 }
                             }
                         }
@@ -2852,7 +2876,7 @@ impl<'ctx> Codegen<'ctx> {
                             let v = self.builder.load(llvm_ty, glob.as_pointer_value(), "ir_gvget");
                             temp_map.insert(*dst, v);
                         }
-                        Instruction::MakeCell { dst, init, ty } => {
+                        Instruction::MakeCell { dst, init, ty, stack } => {
                             if let Some(&v) = temp_map.get(init) {
                                 // VA.1 CPR: cells always hold boxed ptrs, not flat-union structs.
                                 // If the initial value is a flat-union struct, materialize it first.
@@ -2860,9 +2884,32 @@ impl<'ctx> Codegen<'ctx> {
                                     self.materialize_flat_union_if_needed(v, ty, llvm_fn)
                                 } else { v };
                                 let llvm_ty = self.llvm_type(ty);
-                                let size = llvm_ty.size_of().unwrap();
-                                let size_i64 = self.builder.int_z_extend_or_bit_cast(size, i64_ty, "cell_sz");
-                                let cell = self.builder.call(self.rt.alloc, &[size_i64.into()], "ir_cell").try_as_basic_value().unwrap_basic().into_pointer_value();
+                                let cell = if *stack {
+                                    // Non-escaping cell (escape::analyze_cells proved it never leaves
+                                    // this frame): use an ENTRY-BLOCK alloca instead of a heap
+                                    // `lin_alloc`. The alloca holds the SAME boxed-ptr/scalar the heap
+                                    // cell did, so CellGet/CellSet are unchanged (load/store through
+                                    // the pointer). Placing it in the entry block (the standard LLVM
+                                    // idiom) allocates it ONCE per call — never per loop iteration —
+                                    // and lets mem2reg/SROA promote it to an SSA register so LICM and
+                                    // bounds_elide are no longer defeated by the opaque heap pointer.
+                                    let saved = self.builder.get_insert_block();
+                                    let entry = llvm_fn.get_first_basic_block()
+                                        .expect("function has an entry block");
+                                    match entry.get_first_instruction() {
+                                        Some(first) => self.builder.position_before(&first),
+                                        None => self.builder.position_at_end(entry),
+                                    }
+                                    let slot = self.builder.alloca(llvm_ty, "ir_cell_stack");
+                                    if let Some(bb) = saved {
+                                        self.builder.position_at_end(bb);
+                                    }
+                                    slot
+                                } else {
+                                    let size = llvm_ty.size_of().unwrap();
+                                    let size_i64 = self.builder.int_z_extend_or_bit_cast(size, i64_ty, "cell_sz");
+                                    self.builder.call(self.rt.alloc, &[size_i64.into()], "ir_cell").try_as_basic_value().unwrap_basic().into_pointer_value()
+                                };
                                 self.builder.store(cell, store_v);
                                 temp_map.insert(*dst, cell.into());
                             }
@@ -2905,7 +2952,7 @@ impl<'ctx> Codegen<'ctx> {
                                 }
                             }
                         }
-                        Instruction::FreeCell { cell, ty } => {
+                        Instruction::FreeCell { cell, ty, stack } => {
                             if let Some(&c) = temp_map.get(cell) {
                                 if c.is_pointer_value() {
                                     // Release the cell's CURRENT owned value, then free the cell
@@ -2921,15 +2968,21 @@ impl<'ctx> Codegen<'ctx> {
                                             .load(llvm_ty, c.into_pointer_value(), "ir_cell_final");
                                         self.emit_release(old, ty);
                                     }
-                                    // Free the raw cell allocation (no refcount header). Size
-                                    // matches MakeCell's `lin_alloc(size_of ty)`.
-                                    let size = llvm_ty.size_of().unwrap();
-                                    let size_i64 = self.builder.int_z_extend_or_bit_cast(size, i64_ty, "cell_free_sz");
-                                    let free_fn = self.get_or_declare_fn(
-                                        "lin_cell_free",
-                                        self.context.void_type().fn_type(&[ptr_ty.into(), i64_ty.into()], false),
-                                    );
-                                    self.builder.call(free_fn, &[c.into_pointer_value().into(), size_i64.into()], "");
+                                    // A stack (alloca) cell has no heap allocation — the
+                                    // contents-release above is still required (the cell owned one
+                                    // reference to its value), but there is nothing to `lin_cell_free`.
+                                    // The alloca is reclaimed automatically when the frame returns.
+                                    if !*stack {
+                                        // Free the raw cell allocation (no refcount header). Size
+                                        // matches MakeCell's `lin_alloc(size_of ty)`.
+                                        let size = llvm_ty.size_of().unwrap();
+                                        let size_i64 = self.builder.int_z_extend_or_bit_cast(size, i64_ty, "cell_free_sz");
+                                        let free_fn = self.get_or_declare_fn(
+                                            "lin_cell_free",
+                                            self.context.void_type().fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+                                        );
+                                        self.builder.call(free_fn, &[c.into_pointer_value().into(), size_i64.into()], "");
+                                    }
                                 }
                             }
                         }

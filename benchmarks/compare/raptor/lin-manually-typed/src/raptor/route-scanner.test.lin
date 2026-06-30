@@ -2,24 +2,28 @@ import { expect, toBe, toBeNull, test, suite, run } from "std/test"
 import { Trip } from "../gtfs/gtfs"
 import { Service } from "../gtfs/service"
 import { DayOfWeek } from "../gtfs/date"
-import { createRouteScanner, createRouteScannerFactory, create, getTrip } from "./route-scanner"
+import { createRouteScanner, getTrip, RouteScannerFactory } from "./route-scanner"
+import { toUInt32 } from "std/number"
+import { length, push } from "std/array"
+import { for } from "std/iter"
+import { Route, StopTimeEntry, Timetable } from "./timetable"
 
 // A service that runs every day, and one that never runs on the scan day (Friday = 5).
 val running: Service = {
   "startDate": 20180101,
   "endDate": 20991231,
   "days": { 0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true },
-  "dates": {  }
+  "dates": {}
 }
 
 val notRunning: Service = {
   "startDate": 20180101,
   "endDate": 20991231,
   "days": { 0: true, 1: true, 2: true, 3: true, 4: true, 5: false, 6: true },
-  "dates": {  }
+  "dates": {}
 }
 
-// A single-stop trip on the route departing at `dep`.
+// A single-stop trip departing at `dep`.
 val trip = (id: String, dep: UInt32, svc: Service): Trip =>
   {
     "tripId": id,
@@ -28,50 +32,79 @@ val trip = (id: String, dep: UInt32, svc: Service): Trip =>
     "stopTimes": [{ "stop": "A", "arrivalTime": dep, "departureTime": dep, "pickUp": true, "dropOff": true }]
   }
 
-// A fresh scanner over a route's trips, scanning on a Friday. Each test uses its own scanner so the
-// per-route cached scan position doesn't carry between cases.
 val friday: DayOfWeek = 5
+val routeId0: UInt32 = 0u32
 
-val scanner = (trips: Trip[]) =>
-  createRouteScanner({ "R1": trips }, 20180615, friday)
+// Build a single-route timetable from an ordered array of trips (one stop per trip).
+val makeTimetable = (trips: Trip[]): Timetable =>
+  val numStops: UInt32 = 1u32
+  val numTrips = trips.length().toUInt32()
+  val tripsBase: UInt32 = 0u32
+  val route: Route = { "stopTimesBase": 0u32, "routeStopsBase": 0u32, "tripsBase": tripsBase, "numStops": numStops, "numTrips": numTrips }
+  val st: StopTimeEntry[] = []
+  trips.for(t =>
+    val dep = t["stopTimes"][0]["departureTime"]
+    st.push({ "arrival": dep, "departure": dep })
+  )
+  {
+    "routes": [route],
+    "routeStops": [0u32],
+    "stopTimes": st,
+    "trips": trips,
+    "routeStopIndex": {},
+    "interchange": {},
+    "transfers": {},
+    "stopIndexOf": {},
+    "stopNames": ["A"]
+  }
 
 // Sentinel so a missing trip surfaces as a failed field assertion rather than a crash.
 val none: Trip = trip("none", 0, running)
 
 val s = suite("raptor/route-scanner", [
   test("returns the earliest reachable trip", () =>
-    val sc = scanner([trip("t1000", 1000, running), trip("t1100", 1100, running), trip("t1200", 1200, running)])
+    val trips = [trip("t1000", 1000, running), trip("t1100", 1100, running), trip("t1200", 1200, running)]
+    val tt = makeTimetable(trips)
+    val sc = createRouteScanner(20180615, friday)
     [
-      expect((getTrip(sc, "R1", 0, 1000) ?? none)["tripId"]).toBe("t1000")
+      expect((getTrip(sc, tt, routeId0, 0, 1000) ?? none)["tripId"]).toBe("t1000")
     ]
   ),
 
   test("skips trips that depart before the requested time", () =>
-    val sc = scanner([trip("t1000", 1000, running), trip("t1100", 1100, running), trip("t1200", 1200, running)])
+    val trips = [trip("t1000", 1000, running), trip("t1100", 1100, running), trip("t1200", 1200, running)]
+    val tt = makeTimetable(trips)
+    val sc = createRouteScanner(20180615, friday)
     [
-      expect((getTrip(sc, "R1", 0, 1150) ?? none)["tripId"]).toBe("t1200")
+      expect((getTrip(sc, tt, routeId0, 0, 1150) ?? none)["tripId"]).toBe("t1200")
     ]
   ),
 
   test("returns null when no trip is reachable", () =>
-    val sc = scanner([trip("t1000", 1000, running), trip("t1200", 1200, running)])
+    val trips = [trip("t1000", 1000, running), trip("t1200", 1200, running)]
+    val tt = makeTimetable(trips)
+    val sc = createRouteScanner(20180615, friday)
     [
-      expect(getTrip(sc, "R1", 0, 2000)).toBeNull()
+      expect(getTrip(sc, tt, routeId0, 0, 2000)).toBeNull()
     ]
   ),
 
   test("skips a service that is not running that day", () =>
-    val sc = scanner([trip("t1000", 1000, notRunning), trip("t1100", 1100, running)])
+    val trips = [trip("t1000", 1000, notRunning), trip("t1100", 1100, running)]
+    val tt = makeTimetable(trips)
+    val sc = createRouteScanner(20180615, friday)
     [
-      expect((getTrip(sc, "R1", 0, 1000) ?? none)["tripId"]).toBe("t1100")
+      expect((getTrip(sc, tt, routeId0, 0, 1000) ?? none)["tripId"]).toBe("t1100")
     ]
   ),
 
-  test("the factory creates a scanner over its trips", () =>
-    val f = createRouteScannerFactory({ "R1": [trip("t1000", 1000, running)] })
-    val sc = f.create(20180615, friday)
+  test("the factory creates a scanner", () =>
+    val trips = [trip("t1000", 1000, running)]
+    val tt = makeTimetable(trips)
+    val f: RouteScannerFactory = createRouteScanner
+    val sc = f(20180615, friday)
     [
-      expect((getTrip(sc, "R1", 0, 1000) ?? none)["tripId"]).toBe("t1000")
+      expect((getTrip(sc, tt, routeId0, 0, 1000) ?? none)["tripId"]).toBe("t1000")
     ]
   )
 ])

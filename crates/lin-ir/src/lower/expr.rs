@@ -267,6 +267,8 @@ fn lower_index_get_or_create(
         obj_ty: parent_obj_ty.clone(),
         key_ty: key.ty(),
         val_ty: level_map_ty.clone(),
+        nonneg: false,
+        proven_inbounds: false,
     });
     // Box the fresh map into this level's `Map | Null` representation. The concrete→union Coerce
     // (codegen `lin_box_map`) MOVES `fresh`'s pointer into the box WITHOUT a retain, so the box owns
@@ -2024,6 +2026,10 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
             let free_shell = op_consumes_union
                 && is_union_ty(&val_ty)
                 && expr_is_fresh_alloc(value);
+            // Unlike the read path (which is positive-only since ADR-XXX), writes preserve
+            // negative-index wrap semantics: `arr[-1] = x` stores to the last element.
+            // Only set nonneg when the key is a provably-nonneg range IV — never unconditionally.
+            let set_nonneg = builder.nonneg_range_ivs.contains(&key_temp);
             builder.emit(Instruction::IndexSet {
                 object: obj_temp,
                 key: key_temp,
@@ -2031,6 +2037,8 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                 obj_ty: obj_ty.clone(),
                 key_ty,
                 val_ty: val_ty.clone(),
+                nonneg: set_nonneg,
+                proven_inbounds: false,
             });
             // The assignment EXPRESSION evaluates to the assigned value (spec §8 / §27 rule 8).
             // The container now owns ONE reference to the value (supplied by `transfer_into_container`

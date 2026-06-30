@@ -1,73 +1,96 @@
-import { StopId, Time, Transfer, Trip } from "../gtfs/gtfs"
-import { StopTimes } from "./raptor-algorithm"
-import { MAX_TIME } from "../gtfs/date" 
-import { keys, fromEntries } from "std/object"
-import { push } from "std/array"
-import { map } from "std/iter"
+import { Time, Transfer, Trip } from "../gtfs/gtfs"
+import { StopIndex, StopTimes } from "./raptor-algorithm"
+import { MAX_TIME } from "../gtfs/date"
+import { keys } from "std/object"
+import { push, arrayAllocateFilled } from "std/array"
+import { for } from "std/iter"
 
-export type ScanResults = { 
-  "bestArrivals": Arrivals, 
-  "kArrivals": ArrivalsByNumChanges, 
-  "kConnections": ConnectionIndex, 
-  "k": UInt8 
+// Dense per-stop arrivals (the paper's τ array): indexed directly by StopIndex, length numStops.
+// No hashing — a stop id IS the array offset. `kArrivals[k][stop]` is 0 when stop was not improved
+// in round k (rounds >= 1 start zero-filled), which is how `previousArrival` recovers the old
+// sparse `?? 0` semantics. Round 0 is MAX_TIME-filled (origins overwritten with their departure).
+export type Arrivals = Time[]
+export type ArrivalsByNumChanges = Arrivals[]
+export type Connection = [Trip, Int32, Int32]
+export type ConnectionIndex = { StopIndex: { UInt8: Connection | Transfer } }
+
+export type ScanResults = {
+  "bestArrivals": Arrivals,
+  "kArrivals": ArrivalsByNumChanges,
+  "kConnections": ConnectionIndex,
+  "marked": StopIndex[],
+  "numStops": Int32,
+  "k": UInt8
 }
 
 //
-// Builds the initial ScanResults for a query: every served stop seeded with its origin departure
-// time (or MAX_TIME if it is not an origin), the same seed as round 0's arrivals, and an empty
-// connection map per stop.
+// Builds the initial ScanResults for a query: dense arrival arrays seeded with each origin's
+// departure (MAX_TIME elsewhere), round 0 the same, and an empty connection index. The explicit
+// `marked` queue (the paper's marked-stops set) replaces reading the sparse round map's keys.
 //
-export val createScanResults = (stops: StopId[], origins: StopTimes): ScanResults =>
-  // TODO we're iterating stops 3 times here, perhaps a single run?
-  val bestArrivals: Arrivals =
-    stops.map(stop => [stop, origins[stop] ?? MAX_TIME]).fromEntries()
+export val createScanResults = (numStops: Int32, origins: StopTimes): ScanResults =>
+  val bestArrivals: Arrivals = arrayAllocateFilled(numStops, MAX_TIME)
+  val round0: Arrivals = arrayAllocateFilled(numStops, MAX_TIME)
 
-  val kArrivals: ArrivalsByNumChanges = [
-    stops.map(stop => [stop, origins[stop] ?? MAX_TIME]).fromEntries()
-  ]
-
-  val kConnections: ConnectionIndex =
-    stops.map(stop => [stop, {}]).fromEntries()
+  origins.keys().for(stop =>
+    val t = origins[stop] ?? MAX_TIME
+    bestArrivals[stop] = t
+    round0[stop] = t
+  )
 
   {
     "bestArrivals": bestArrivals,
-    "kArrivals": kArrivals,
-    "kConnections": kConnections,
+    "kArrivals": [round0],
+    "kConnections": {},
+    "marked": [],
+    "numStops": numStops,
     "k": 0
   }
 
 export val addRound = (results: ScanResults): Null =>
+  val zero: Time = 0
   results["k"] = results["k"] + 1
-  results["kArrivals"].push({ })
+  results["kArrivals"].push(arrayAllocateFilled(results["numStops"], zero))
+  results["marked"] = []
 
-export val previousArrival = (results: ScanResults, stopPi: StopId): Time =>
-  results["kArrivals"][results["k"] - 1][stopPi] ?? 0 // TODO should it be 0 or MAX time number
+export val previousArrival = (results: ScanResults, stopPi: StopIndex): Time =>
+  results["kArrivals"][results["k"] - 1][stopPi]
 
-export val setTrip = (results: ScanResults, trip: Trip, startIndex: Int32, endIndex: Int32, interchange: Time): Null =>
+// Record a stop as improved this round, exactly once. The round's dense array is 0 until a stop
+// is first written, so a 0 there means "not yet marked this round" (arrival times are always > 0).
+val mark = (results: ScanResults, stopPi: StopIndex): Null =>
+  if results["kArrivals"][results["k"]][stopPi] == 0 then
+    results["marked"].push(stopPi)
+
+// The caller (scanRoutes) already knows the int stopPi (from routePath[pi]), so we receive it
+// directly rather than re-deriving it from trip.stopTimes[endIndex].stop (a string).
+export val setTrip = (results: ScanResults, stopPi: StopIndex, trip: Trip, startIndex: Int32, endIndex: Int32, interchange: Time): Null =>
   val time = trip["stopTimes"][endIndex]["arrivalTime"] + interchange
-  val stopPi = trip["stopTimes"][endIndex]["stop"]
+  val k = results["k"]
 
-  results["kArrivals"][results["k"]][stopPi] = time
+  results.mark(stopPi)
+  results["kArrivals"][k][stopPi] = time
   results["bestArrivals"][stopPi] = time
-  results["kConnections"][stopPi][results["k"]] = [trip, startIndex, endIndex]
+  if results["kConnections"][stopPi] == null then
+    results["kConnections"][stopPi] = {}
+  results["kConnections"][stopPi][k] = [trip, startIndex, endIndex]
 
-export val setTransfer = (results: ScanResults, transfer: Transfer, time: Time): Null =>
-  val stopPi = transfer["destination"]
+// The caller (scanTransfers) already interned the destination stop to an int.
+export val setTransfer = (results: ScanResults, stopPi: StopIndex, transfer: Transfer, time: Time): Null =>
+  val k = results["k"]
 
-  results["kArrivals"][results["k"]][stopPi] = time
+  results.mark(stopPi)
+  results["kArrivals"][k][stopPi] = time
   results["bestArrivals"][stopPi] = time
-  results["kConnections"][stopPi][results["k"]] = transfer
+  if results["kConnections"][stopPi] == null then
+    results["kConnections"][stopPi] = {}
+  results["kConnections"][stopPi][k] = transfer
 
-export val bestArrival = (results: ScanResults, stopPi: StopId): Time | Null =>
+export val bestArrival = (results: ScanResults, stopPi: StopIndex): Time =>
   results["bestArrivals"][stopPi]
 
-export val getMarkedStops = (results: ScanResults): StopId[] =>
-  results["kArrivals"][results["k"]].keys()
+export val getMarkedStops = (results: ScanResults): StopIndex[] =>
+  results["marked"]
 
 export val finalize = (results: ScanResults): [ConnectionIndex, Arrivals] =>
-  [results["kConnections"], results["bestArrivals"]] // TODO: any perf benefit from a freeze?
-
-export type Arrivals = { StopId: Time }
-export type ArrivalsByNumChanges = Arrivals[]
-export type Connection = [Trip, Int32, Int32]
-export type ConnectionIndex = { StopId: { UInt8: Connection | Transfer } } // TODO: (Connection | Transfer)[]
+  [results["kConnections"], results["bestArrivals"]]
