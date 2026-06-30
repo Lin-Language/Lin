@@ -1,10 +1,14 @@
-import { Time, Trip, Transfer, StopId } from "../gtfs/gtfs"
+import { Time, Transfer, StopId, TripId } from "../gtfs/gtfs"
+import { Service } from "../gtfs/service"
 
 // Dense integer stop id — each distinct stop string is interned to a UInt32 in 0..numStops-1.
 export type StopIntId = UInt32
 
 // Dense integer route id — each distinct route (stop-sequence signature) gets a UInt32 in 0..numRoutes-1.
 export type RouteIntId = UInt32
+
+// Dense integer service id — each distinct service (calendar) gets a UInt32 into `services`.
+export type ServiceIntId = UInt32
 
 // A start index into one of the global flat arrays (stopTimes / routeStops / trips / stopRoutes).
 export type Offset = UInt32
@@ -55,7 +59,11 @@ export type Timetable = {
   "routes": Route[],              // indexed by RouteIntId
   "routeStops": StopIntId[],      // each route's stop sequence, concatenated (slice at routeStopsBase)
   "stopTimes": StopTimeEntry[],   // GLOBAL, trip-major: stopTimesBase + t*numStops + s
-  "trips": Trip[],                // GLOBAL, route-major: tripsBase + t
+  // Per-trip data as flat parallel arrays (GLOBAL, route-major: tripsBase + t) — the paper has no
+  // Trip object; a trip is just the integer (routeId, t). `services` is deduped by calendar.
+  "tripServiceId": ServiceIntId[], // → services[]; the runsOn calendar lookup reads this
+  "services": Service[],           // deduped services, indexed by ServiceIntId
+  "tripIds": String[],             // trip id strings — journey output only (cold)
   // (the stop→routes inverse index — stopRoutes/stopRoutesBase — lives in the QueueFactory, the
   //  only thing that reads it, so it is NOT duplicated here)
   "routeStopIndex": RouteStopIndex,

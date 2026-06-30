@@ -1,7 +1,9 @@
 import { StopIndex } from "../raptor/raptor-algorithm"
 import { ConnectionIndex } from "../raptor/scan-results"
+import { Timetable } from "../raptor/timetable"
 import { Journey } from "./journey"
 
-// A results factory takes a connection index keyed by integer StopIndex plus the intern
-// table, and returns the journeys found for a given (integer) destination stop.
-export type ResultsFactory = (ConnectionIndex, StopIndex, { String: StopIndex }) => Journey[]
+// A results factory takes the timetable plus a connection index keyed by integer StopIndex, and
+// returns the journeys found for a given (integer) destination stop. Journey legs are reconstructed
+// from the flat timetable arrays by the (routeId, tripIndex) integers stored in each connection.
+export type ResultsFactory = (Timetable, ConnectionIndex, StopIndex) => Journey[]

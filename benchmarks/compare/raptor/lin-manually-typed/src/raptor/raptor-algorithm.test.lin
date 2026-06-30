@@ -3,7 +3,7 @@ import { createRaptorAlgorithm } from "./raptor-algorithm"
 import { Route, RouteIntId, StopTimeEntry, Timetable, RouteStopIndex, Interchange, TransfersByOrigin } from "./timetable"
 import { QueueFactory } from "./queue-factory"
 import { RouteScannerFactory, createRouteScanner } from "./route-scanner"
-import { Trip } from "../gtfs/gtfs"
+import { Service } from "../gtfs/service"
 
 // Only the constructor shape is unit-tested here. `scan` is integration-level (drives the
 // RouteScanner / ScanResultsFactory) and is covered by the query specs.
@@ -13,7 +13,9 @@ val s = suite("raptor/raptor-algorithm", [
     val routes: Route[] = []
     val routeStops: UInt32[] = []
     val gStopTimes: StopTimeEntry[] = []
-    val flatTrips: Trip[] = []
+    val services: Service[] = []
+    val tripServiceId: UInt32[] = []
+    val tripIds: String[] = []
     val transfers: TransfersByOrigin = {}
     val interchange: Interchange = {}
     val queueFactory: QueueFactory = { "stopRoutes": [], "stopRoutesBase": [], "routeStopIndex": {} }
@@ -25,7 +27,9 @@ val s = suite("raptor/raptor-algorithm", [
       "routes": routes,
       "routeStops": routeStops,
       "stopTimes": gStopTimes,
-      "trips": flatTrips,
+      "tripServiceId": tripServiceId,
+      "services": services,
+      "tripIds": tripIds,
       "routeStopIndex": routeStopIndex,
       "interchange": interchange,
       "transfers": transfers,

@@ -1,6 +1,6 @@
 import { Trip, StopId, StopTime, Transfer, Time } from "../gtfs/gtfs"
 import { Interchange as GtfsInterchange, TransfersByOrigin as GtfsTransfersByOrigin } from "../gtfs/gtfs-loader"
-import { runsOn } from "../gtfs/service"
+import { runsOn, Service } from "../gtfs/service"
 import { Date, weekday } from "std/datetime"
 import { getDateNumber } from "../query/date-util"
 import { RaptorAlgorithm, createRaptorAlgorithm } from "./raptor-algorithm"
@@ -146,7 +146,12 @@ export val create = (
   val routes: Route[] = []
   val routeStops: StopIntId[] = []
   val stopTimes: StopTimeEntry[] = []
-  val flatTrips: Trip[] = []
+  // Per-trip data as flat parallel arrays (no Trip object): service id + trip id, trip-major.
+  // `services` is deduped by the trip's calendar serviceId string.
+  val services: Service[] = []
+  val serviceIntIdOf: { String: UInt32 } = {}
+  val tripServiceId: UInt32[] = []
+  val tripIds: String[] = []
 
   range(0, numRoutes.toInt32()).for(ri =>
     val routeId = ri.toUInt32()
@@ -157,7 +162,7 @@ export val create = (
     val numTripsR = rTrips.length().toUInt32()
     val stBase = stopTimes.length().toUInt32()
     val rsBase = routeStops.length().toUInt32()
-    val tBase = flatTrips.length().toUInt32()
+    val tBase = tripIds.length().toUInt32()
 
     routes.push({
       "stopTimesBase": stBase,
@@ -170,7 +175,7 @@ export val create = (
     // Append this route's stop sequence to routeStops
     path.for(stop => routeStops.push(stop))
 
-    // Append all trips' stop-times in trip-major order and the Trip records
+    // Append all trips' stop-times in trip-major order, plus the flat per-trip service id + trip id.
     rTrips.for(trip =>
       trip["stopTimes"].for(s =>
         stopTimes.push({
@@ -178,7 +183,12 @@ export val create = (
           "departure": packDeparture(s["departureTime"], s["pickUp"])
         })
       )
-      flatTrips.push(trip)
+      val sid = trip["serviceId"]
+      if serviceIntIdOf[sid] == null then
+        serviceIntIdOf[sid] = services.length().toUInt32()
+        services.push(trip["service"])
+      tripServiceId.push(serviceIntIdOf[sid] ?? 0u32)
+      tripIds.push(trip["tripId"])
     )
   )
 
@@ -206,7 +216,9 @@ export val create = (
     "routes": frozen(routes),
     "routeStops": frozen(routeStops),
     "stopTimes": frozen(stopTimes),
-    "trips": frozen(flatTrips),
+    "tripServiceId": frozen(tripServiceId),
+    "services": frozen(services),
+    "tripIds": frozen(tripIds),
     "routeStopIndex": frozenRouteStopIndex,
     "interchange": frozen(intInterchange),
     "transfers": frozen(usefulTransfers),
