@@ -13,6 +13,10 @@ export type ServiceIntId = UInt32
 // A start index into one of the global flat arrays (stopTimes / routeStops / trips / stopRoutes).
 export type Offset = UInt32
 
+// A trip's index within its route's trip list (0..numTrips-1); locates the trip's row in the
+// global flat arrays as `…Base + tripIndex`.
+export type TripIndex = UInt32
+
 // A stop's position within a route's stop sequence (0..numStops-1). Small, so UInt8.
 export type RoutePosition = UInt8
 

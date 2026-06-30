@@ -1,7 +1,7 @@
 import { DayOfWeek, DateNumber } from "../gtfs/date"
 import { Time } from "../gtfs/gtfs"
 import { runsOn } from "../gtfs/service"
-import { StopIntId, RouteIntId, StopTimeEntry, Route, Timetable } from "./timetable"
+import { StopIntId, RouteIntId, RoutePosition, StopTimeEntry, Route, Timetable, departureOf } from "./timetable"
 import { while } from "std/iter"
 import { toInt32 } from "std/number"
 
@@ -46,14 +46,15 @@ export val getTrip = (
   scanner: RouteScanner,
   timetable: Timetable,
   routeId: RouteIntId,
-  stopIndex: Int32,
+  stopIndex: RoutePosition,
   time: Time
 ): Int32 =>
   val route = timetable["routes"][routeId]
 
   // first scan of this route starts at the last trip; later scans resume from the cached position.
-  // `i` is Int32 (inferred) — the backward walk runs it down to -1 to terminate, and the route's
-  // trip count is widened to Int32 so an empty route yields a -1 start.
+  // `i` is the backward-walk cursor: it runs down to -1 to terminate, so the route's trip count is
+  // widened to Int32 to give an empty route a -1 start. The RESULT is the found trip's index, or
+  // -1 when no reachable+running trip exists (caller treats <0 as "no trip").
   var i = scanner["routeScanPosition"][routeId] ?? (route["numTrips"].toInt32() - 1)
   var lastFoundPosition = i
   var lastFound: Int32 = -1
@@ -67,7 +68,7 @@ export val getTrip = (
     if i < 0 then
       false
     else
-      val departureTime = timetable["stopTimes"][route["stopTimesBase"] + i * route["numStops"] + stopIndex]["departure"] & 0x7FFFFFFFu32
+      val departureTime = departureOf(timetable["stopTimes"][route["stopTimesBase"] + i * route["numStops"] + stopIndex])
 
       if departureTime < time then
         false

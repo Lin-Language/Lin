@@ -1,6 +1,6 @@
 import { Time, Transfer } from "../gtfs/gtfs"
 import { StopIndex, StopTimes } from "./raptor-algorithm"
-import { RouteIntId } from "./timetable"
+import { RouteIntId, TripIndex, RoutePosition } from "./timetable"
 import { MAX_TIME } from "../gtfs/date"
 import { keys } from "std/object"
 import { push, arrayAllocateFilled } from "std/array"
@@ -14,7 +14,7 @@ export type Arrivals = Time[]
 export type ArrivalsByNumChanges = Arrivals[]
 // A boarded trip leg: (routeId, tripIndex, boarding position, alighting position). The journey
 // factory reconstructs stops/times/tripId from the flat timetable arrays by these integers.
-export type Connection = [RouteIntId, Int32, Int32, Int32]
+export type Connection = [RouteIntId, TripIndex, RoutePosition, RoutePosition]
 export type ConnectionIndex = { StopIndex: { UInt8: Connection | Transfer } }
 
 export type ScanResults = {
@@ -68,7 +68,7 @@ val mark = (results: ScanResults, stopPi: StopIndex): Null =>
 // The caller (scanRoutes) already knows the int stopPi and the arrival `time` (= flat arrival +
 // interchange), so we store the (routeId, tripIndex, boarding, alighting) integer connection
 // directly — no Trip object, no stop-times read.
-export val setTrip = (results: ScanResults, stopPi: StopIndex, time: Time, routeId: RouteIntId, tripIndex: Int32, startIndex: Int32, endIndex: Int32): Null =>
+export val setTrip = (results: ScanResults, stopPi: StopIndex, time: Time, routeId: RouteIntId, tripIndex: TripIndex, startIndex: RoutePosition, endIndex: RoutePosition): Null =>
   val k = results["k"]
 
   results.mark(stopPi)
