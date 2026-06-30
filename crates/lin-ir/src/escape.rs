@@ -90,6 +90,140 @@ pub fn analyze(module: &mut LinModule) {
     }
 }
 
+/// Stack-allocate non-escaping `var` cells (`MakeCell`).
+///
+/// # What this pass does
+///
+/// A `var` mutably captured by a closure lowers to `MakeCell` — a heap `lin_alloc` (ADR-012: a
+/// `var` is captured BY REFERENCE, a shared heap slot). A heap pointer is OPAQUE to LLVM's alias
+/// analysis, so in a hot fused loop (`range(0,N).for(i => sum = sum + arr[i])`) the cell defeats
+/// LICM, mem2reg, and bounds_elide: every iteration redundantly stores `sum` and reloads `arr`'s
+/// base, keeping the bounds-check + repr-tag branches live. This pass marks a cell `stack = true`
+/// (codegen → entry-block `alloca`, mem2reg-promotable) IFF it PROVABLY never escapes its frame.
+///
+/// # Soundness (the absolute rule)
+///
+/// A cell pointer escapes its frame iff a surviving closure captures it (ADR-012). That is the ONLY
+/// escape route in normal lowering — cell pointers are never returned or stored into containers;
+/// only their VALUE is read via `CellGet`. Stack-allocating a cell that actually escapes is a
+/// use-after-return (a silent corruption class `cargo test` does NOT catch — only ASan). So the
+/// rule is: stack-allocate ONLY when PROVABLY non-escaping; on ANY doubt, heap. Fail SAFE.
+///
+/// We require BOTH independent signals to AGREE; if either is unsure, heap:
+///
+///   1. **FreeCell signal (the lowerer's own proof).** `lower/func.rs` emits a scope-exit
+///      `FreeCell` for a cell ONLY when every closure capturing it was lowered as a synchronous,
+///      non-retained combinator callback (`escaping_cells` is otherwise set and no FreeCell is
+///      emitted). So a cell WITH a matching `FreeCell` in its function is already lowerer-proven
+///      non-escaping. A cell WITHOUT one (escaping, or created outside the entry block) stays heap.
+///
+///   2. **Direct local-use scan (independent confirmation).** Every USE of the cell pointer temp
+///      must be exactly `CellGet{cell}` / `CellSet{cell}` / `FreeCell{cell}` — i.e. a local
+///      load/store/teardown through the pointer. ANY other use (a `MakeClosure` capture, a `Copy`/
+///      `Phi`/`Bind` alias, a `Return`, a container store, a call arg, use as another cell's init
+///      or stored value, or use by a terminator) means the pointer might be aliased out or outlive
+///      the frame → heap. This is deliberately stricter than (1): a non-inlined safe-combinator
+///      callback DOES capture the cell via `MakeClosure` (borrow-only) yet still gets a `FreeCell`,
+///      so the two signals DISAGREE there — and per the fail-safe rule we keep that cell heap.
+///      The fully-inlined hot-loop case (the whole point) has no `MakeClosure` for the cell, so
+///      both signals agree and it goes to the stack.
+pub fn analyze_cells(module: &mut LinModule) {
+    for func in &mut module.functions {
+        analyze_cells_fn(func);
+    }
+}
+
+fn analyze_cells_fn(func: &mut LinFunction) {
+    // Collect (block, instr) of every MakeCell, and the set of cell temps that have a matching
+    // FreeCell somewhere in this function (signal 1).
+    let mut make_sites: Vec<(usize, usize, Temp)> = Vec::new();
+    let mut freed_cells: std::collections::HashSet<Temp> = std::collections::HashSet::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, instr) in block.instructions.iter().enumerate() {
+            match instr {
+                Instruction::MakeCell { dst, .. } => make_sites.push((bi, ii, *dst)),
+                Instruction::FreeCell { cell, .. } => {
+                    freed_cells.insert(*cell);
+                }
+                _ => {}
+            }
+        }
+    }
+    if make_sites.is_empty() {
+        return;
+    }
+
+    // For each candidate cell, decide stack-eligibility: it must be FreeCell-proven (signal 1) AND
+    // every use of its pointer temp must be a local CellGet/CellSet/FreeCell on THAT cell (signal 2).
+    let mut stack_cells: std::collections::HashSet<Temp> = std::collections::HashSet::new();
+    for (_, _, cell) in &make_sites {
+        if !freed_cells.contains(cell) {
+            continue; // signal 1 says heap (escaping, or no entry-block FreeCell)
+        }
+        if cell_pointer_is_local(&func.blocks, *cell) {
+            stack_cells.insert(*cell);
+        }
+    }
+    if stack_cells.is_empty() {
+        return;
+    }
+
+    // Apply: set `stack = true` on the proven MakeCell and FreeCell sites.
+    for block in &mut func.blocks {
+        for instr in &mut block.instructions {
+            match instr {
+                Instruction::MakeCell { dst, stack, .. } if stack_cells.contains(dst) => {
+                    *stack = true;
+                }
+                Instruction::FreeCell { cell, stack, .. } if stack_cells.contains(cell) => {
+                    *stack = true;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Signal 2: true iff EVERY use of the cell-pointer temp `c` in this function is a local read/write/
+/// teardown through the pointer — `CellGet{cell:c}`, `CellSet{cell:c}`, or `FreeCell{cell:c}`. Any
+/// other appearance of `c` (a closure capture, a Copy/Phi/Bind alias, a Return, a container store, a
+/// call arg, use as another cell's `init`/`value`, or any terminator use) means the pointer could be
+/// aliased out of the frame or outlive it → NOT local. Fail-safe: returns false on the first doubt.
+fn cell_pointer_is_local(blocks: &[crate::ir::BasicBlock], c: Temp) -> bool {
+    for block in blocks {
+        for instr in &block.instructions {
+            // The defining MakeCell does not USE `c` (it DEFINES it), so it never appears in `uses`.
+            let uses = crate::liveness::instr_use_def(instr).0;
+            if !uses.contains(&c) {
+                continue;
+            }
+            let ok = match instr {
+                Instruction::CellGet { cell, .. } => *cell == c,
+                // `value == c` would mean the cell pointer is being STORED as another cell's value
+                // (escape); that case has `cell != c` here, so the `cell == c` test rejects it.
+                Instruction::CellSet { cell, value, .. } => *cell == c && *value != c,
+                Instruction::FreeCell { cell, .. } => *cell == c,
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        // A cell pointer must never reach a terminator (Return/TailCall arg/CondJump/Switch).
+        let term_uses: Vec<Temp> = match &block.terminator {
+            Terminator::Return(Some(v)) => vec![*v],
+            Terminator::TailCall { args } => args.clone(),
+            Terminator::CondJump { cond, .. } => vec![*cond],
+            Terminator::Switch { val, .. } => vec![*val],
+            _ => vec![],
+        };
+        if term_uses.contains(&c) {
+            return false;
+        }
+    }
+    true
+}
+
 /// True iff `ty` is a sealed record whose fields are ALL unboxed scalars (Int*/UInt*/Float*/Bool).
 /// This is the Stage-4 scope: heap-field sealed records are NEVER stack-allocated here (their stack
 /// drop would have to release heap fields — deferred). Mirrors codegen's `sealed_fields` gate plus

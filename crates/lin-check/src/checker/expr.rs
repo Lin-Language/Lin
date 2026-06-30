@@ -240,6 +240,24 @@ impl Checker {
             }
         }
 
+        // Array literal against an expected UNION that has a fixed-length tuple member of matching
+        // arity: check the literal against THAT tuple member so it adopts the tuple representation.
+        // Without this the literal infers to a homogeneous array (e.g. `Int64[]`, elements widened
+        // to i64 at i64 stride), whose flat representation mismatches the tuple member's (i32-element)
+        // representation when the value is stored into the union slot and read back as the tuple —
+        // silent element corruption (the all-scalar-tuple-in-union-map bug). Picking the tuple member
+        // also surfaces a proper per-position type error if an element's type is wrong.
+        if let (Expr::Array(elements, _, _), Type::Union(variants)) = (expr, expected) {
+            let plain_count = elements.iter().filter(|e| matches!(e, ArrayElement::Expr(_))).count();
+            if let Some(member) = variants
+                .iter()
+                .find(|v| matches!(v, Type::FixedArray(ts) if ts.len() == plain_count))
+                .cloned()
+            {
+                return self.check_expr(expr, &member);
+            }
+        }
+
         // Array literals: push the expected element type into each element so suffixless
         // integer literals adopt the correct width (and so the produced MakeArray carries the
         // expected element representation, matching the slot type at codegen). Mirrors the
@@ -2819,6 +2837,21 @@ impl Checker {
             self.clear_index_narrowings_for(root);
         }
         let obj_ty = typed_obj.ty();
+        // A nullable map/object slot reached via a (safe) nested index — e.g. `m[k]` typed
+        // `Map | Null` from `outer[i]` — is still a writable map/object. Strip the `Null` so the
+        // value is checked against the real slot value type (driving tuple/width coercion), rather
+        // than falling into the lenient `Union => infer_expr` arm which loses the expected type and
+        // mis-represents an array literal as `Int64[]` (the all-scalar-tuple-in-union-map bug).
+        let obj_ty = match &obj_ty {
+            Type::Union(vs) if vs.iter().any(|t| matches!(t, Type::Null)) => {
+                let non_null: Vec<Type> = vs.iter().filter(|t| !matches!(t, Type::Null)).cloned().collect();
+                match non_null.len() {
+                    1 => non_null.into_iter().next().unwrap(),
+                    _ => Type::Union(non_null),
+                }
+            }
+            _ => obj_ty,
+        };
         let typed_value = match &obj_ty {
             Type::Object { fields, .. } => {
                 if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
