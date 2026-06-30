@@ -109,10 +109,10 @@ val getJourneysFromConnections = (
   prevConnections: ConnectionIndex[],
   destinations: StopIndex[]
 ): Journey[] =>
-  val stopIndexOf = query["raptor"]["timetable"]["stopIds"]
+  val tt = query["raptor"]["timetable"]
   val initialResults = destinations
     .filter(d => (kConnections[d] ?? {}).keys().length() > 0)
-    .flatMap(d => query["resultsFactory"](kConnections, d, stopIndexOf))
+    .flatMap(d => query["resultsFactory"](tt, kConnections, d))
 
   // reverse the previous connections and then work back through each day pre-pending journeys
   prevConnections
@@ -128,13 +128,14 @@ val completeJourneys = (
   results: Journey[],
   kConnections: ConnectionIndex
 ): Journey[] =>
-  val stopIndexOf = query["raptor"]["timetable"]["stopIds"]
+  val tt = query["raptor"]["timetable"]
+  val stopIndexOf = tt["stopIds"]
   // for every result we have so far
   results.flatMap(journeyB =>
     // find some results to the origin of that result and merge them together
     val originStr = journeyB["legs"][0]["origin"] ?? ""
     val originIdx = stopIndexOf[originStr] ?? 0u32
-    query["resultsFactory"](kConnections, originIdx, stopIndexOf)
+    query["resultsFactory"](tt, kConnections, originIdx)
       .map(journeyA => {
         "legs": flatten([journeyA["legs"], journeyB["legs"]]),
         "departureTime": journeyA["departureTime"],

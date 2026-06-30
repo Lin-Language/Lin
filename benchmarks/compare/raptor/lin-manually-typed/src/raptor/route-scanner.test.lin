@@ -42,15 +42,25 @@ val makeTimetable = (trips: Trip[]): Timetable =>
   val tripsBase: UInt32 = 0u32
   val route: Route = { "stopTimesBase": 0u32, "routeStopsBase": 0u32, "tripsBase": tripsBase, "numStops": numStops, "numTrips": numTrips }
   val st: StopTimeEntry[] = []
+  // One service slot per trip (no dedup): this fixture reuses serviceId "1" across distinct
+  // service calendars, so per-trip slots keep them distinct.
+  val services: Service[] = []
+  val tripServiceId: UInt32[] = []
+  val tripIds: String[] = []
   trips.for(t =>
     val dep = t["stopTimes"][0]["departureTime"]
     st.push({ "arrival": dep, "departure": dep })
+    tripServiceId.push(services.length().toUInt32())
+    services.push(t["service"])
+    tripIds.push(t["tripId"])
   )
   {
     "routes": [route],
     "routeStops": [0u32],
     "stopTimes": st,
-    "trips": trips,
+    "tripServiceId": tripServiceId,
+    "services": services,
+    "tripIds": tripIds,
     "routeStopIndex": {},
     "interchange": {},
     "transfers": {},
@@ -65,7 +75,7 @@ val s = suite("raptor/route-scanner", [
     val sc = createRouteScanner(20180615, friday)
     val idx = getTrip(sc, tt, routeId0, 0, 1000)
     [
-      expect(tt["trips"][idx]["tripId"]).toBe("t1000")
+      expect(tt["tripIds"][idx]).toBe("t1000")
     ]
   ),
 
@@ -75,7 +85,7 @@ val s = suite("raptor/route-scanner", [
     val sc = createRouteScanner(20180615, friday)
     val idx = getTrip(sc, tt, routeId0, 0, 1150)
     [
-      expect(tt["trips"][idx]["tripId"]).toBe("t1200")
+      expect(tt["tripIds"][idx]).toBe("t1200")
     ]
   ),
 
@@ -94,7 +104,7 @@ val s = suite("raptor/route-scanner", [
     val sc = createRouteScanner(20180615, friday)
     val idx = getTrip(sc, tt, routeId0, 0, 1000)
     [
-      expect(tt["trips"][idx]["tripId"]).toBe("t1100")
+      expect(tt["tripIds"][idx]).toBe("t1100")
     ]
   ),
 
@@ -105,7 +115,7 @@ val s = suite("raptor/route-scanner", [
     val sc = f(20180615, friday)
     val idx = getTrip(sc, tt, routeId0, 0, 1000)
     [
-      expect(tt["trips"][idx]["tripId"]).toBe("t1000")
+      expect(tt["tripIds"][idx]).toBe("t1000")
     ]
   )
 ])

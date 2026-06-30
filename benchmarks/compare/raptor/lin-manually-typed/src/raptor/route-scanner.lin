@@ -1,7 +1,7 @@
 import { DayOfWeek, DateNumber } from "../gtfs/date"
 import { Time } from "../gtfs/gtfs"
 import { runsOn } from "../gtfs/service"
-import { StopIntId, RouteIntId, StopTimeEntry, Route, Timetable, departureOf } from "./timetable"
+import { StopIntId, RouteIntId, StopTimeEntry, Route, Timetable } from "./timetable"
 import { while } from "std/iter"
 import { toInt32 } from "std/number"
 
@@ -67,13 +67,12 @@ export val getTrip = (
     if i < 0 then
       false
     else
-      val departureTime = departureOf(timetable["stopTimes"][route["stopTimesBase"] + i * route["numStops"] + stopIndex])
+      val departureTime = timetable["stopTimes"][route["stopTimesBase"] + i * route["numStops"] + stopIndex]["departure"] & 0x7FFFFFFFu32
 
       if departureTime < time then
         false
       else
-        val trip = timetable["trips"][route["tripsBase"] + i]
-        val foundHere = trip["service"].runsOn(scanner["date"], scanner["dow"])
+        val foundHere = timetable["services"][timetable["tripServiceId"][route["tripsBase"] + i]].runsOn(scanner["date"], scanner["dow"])
         if foundHere then
           lastFound = i
 

@@ -40,7 +40,7 @@ export type Leg = {
 // 
 export type TimetableLeg = Leg & {
   "stopTimes": StopTime[],
-  "trip": Trip
+  "tripId": TripId
 }
 
 // 

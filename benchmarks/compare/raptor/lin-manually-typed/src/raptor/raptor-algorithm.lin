@@ -1,13 +1,13 @@
-import { StopId, Time, Transfer, Trip } from "../gtfs/gtfs"
+import { Time, Transfer } from "../gtfs/gtfs"
 import { DayOfWeek, DateNumber } from "../gtfs/date"
 import { QueueFactory, getQueue } from "./queue-factory"
 import { RouteScanner, RouteScannerFactory, getTrip } from "./route-scanner"
 import { Arrivals, ConnectionIndex, ScanResults, createScanResults, addRound, previousArrival, setTrip, setTransfer, bestArrival, getMarkedStops, finalize } from "./scan-results"
-import { RouteIntId, StopTimeEntry, Route, Timetable, isDropOff, arrivalOf } from "./timetable"
+import { RouteIntId, StopTimeEntry, Route, Timetable } from "./timetable"
 import { keys, entries } from "std/object"
 import { length } from "std/array"
 import { while, range, for } from "std/iter"
-import { toInt32, toUInt32 } from "std/number"
+import { toInt32 } from "std/number"
 
 // `StopIndex` is re-exported here (a trivial UInt32 id alias) for the modules that import it from
 // the algorithm. The structural index types (RouteStopIndex/Interchange/TransfersByOrigin) live in
@@ -80,12 +80,11 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
 
       if tripIdx >= 0 then
         val i = tt["interchange"][stopPi] ?? 0
-        val e = tt["stopTimes"][route["stopTimesBase"] + tripIdx * route["numStops"] + pi]
-        val arr = e.arrivalOf()
+        val sti = route["stopTimesBase"] + tripIdx * route["numStops"] + pi
+        val arr = tt["stopTimes"][sti]["arrival"] & 0x7FFFFFFFu32
 
-        if e.isDropOff() && arr + i < results.bestArrival(stopPi) then
-          val trip = tt["trips"][route["tripsBase"] + tripIdx.toUInt32()]
-          results.setTrip(stopPi, trip, boardingPoint, pi, i)
+        if (tt["stopTimes"][sti]["arrival"] & 0x80000000u32) != 0u32 && arr + i < results.bestArrival(stopPi) then
+          results.setTrip(stopPi, arr + i, routeId, tripIdx, boardingPoint, pi)
         else if prevArrival != 0 && prevArrival < arr + i then
           val newIdx = routeScanner.getTrip(tt, routeId, pi, prevArrival)
           if newIdx >= 0 then

@@ -36,7 +36,9 @@ export val t = (stopTimes: StopTime[]): Trip =>
   {
     "tripId": "trip${id}",
     "stopTimes": stopTimes,
-    "serviceId": "1",
+    // Unique serviceId per trip: the timetable builder dedupes services BY serviceId (the real GTFS
+    // invariant), so tests that give a trip its own (possibly mutated) calendar must not share an id.
+    "serviceId": "svc${id}",
     "service": service1
   }
 
@@ -108,7 +110,7 @@ export val j = (legArgs: LegArg[]): Journey =>
           "stopTimes": arg,
           "origin": arg[0]["stop"],
           "destination": arg[length(arg) - 1]["stop"],
-          "trip": defaultTrip
+          "tripId": "1"
         }
         push(legs, leg)
   )
@@ -118,14 +120,14 @@ export val j = (legArgs: LegArg[]): Journey =>
     "legs": legs
   }
 
-// setDefaultTrip: overwrite each timetable leg's trip with defaultTrip so journey
+// setDefaultTrip: overwrite each timetable leg's tripId with the default so journey
 // equality ignores trip identity. Mutates in place.
 export val setDefaultTrip = (results: Journey[]): Null =>
   results.for(journey =>
     journey["legs"].for(leg =>
       match leg
         is TimetableLeg =>
-          leg["trip"] = defaultTrip
+          leg["tripId"] = "1"
         else =>
           null
     )

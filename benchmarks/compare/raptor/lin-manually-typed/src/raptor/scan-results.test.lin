@@ -1,5 +1,5 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { Transfer, Trip } from "../gtfs/gtfs"
+import { Transfer } from "../gtfs/gtfs"
 import { length } from "std/array"
 import { Connection } from "./scan-results"
 import { createScanResults, addRound, previousArrival, setTrip, setTransfer, bestArrival, getMarkedStops, finalize } from "./scan-results"
@@ -62,24 +62,11 @@ val s = suite("raptor/scan-results", [
   test("setTrip records arrival and the trip connection", () =>
     val r = freshResults()
     r.addRound()
-    val trip: Trip = {
-      "tripId": "trip1",
-      "serviceId": "1",
-      "service": {
-        "startDate": 20180101,
-        "endDate": 20991231,
-        "days": { 0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true },
-        "dates": {}
-      },
-      "stopTimes": [
-        { "stop": "StopA", "arrivalTime": 100, "departureTime": 100, "pickUp": true, "dropOff": true },
-        { "stop": "StopB", "arrivalTime": 300, "departureTime": 300, "pickUp": true, "dropOff": true }
-      ]
-    }
-    // arrival = stopTimes[1].arrivalTime (300) + interchange (5) = 305 at stop index 2
+    // setTrip now receives the precomputed arrival time (305) and the integer connection
+    // (routeId 7, tripIndex 3, boarding pos 0, alighting pos 1) — no Trip object.
     val stop2: UInt32 = 2u32
-    r.setTrip(stop2, trip, 0, 1, 5)
-    val expectedConn: Connection = [trip, 0, 1]
+    r.setTrip(stop2, 305, 7u32, 3, 0, 1)
+    val expectedConn: Connection = { "routeId": 7u32, "tripIndex": 3, "start": 0, "end": 1 }
     [
       expect(r["bestArrivals"][stop2]).toBe(305),
       expect(r["kArrivals"][r["k"]][stop2]).toBe(305),

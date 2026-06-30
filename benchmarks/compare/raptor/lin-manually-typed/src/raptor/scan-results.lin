@@ -1,5 +1,6 @@
-import { Time, Transfer, Trip } from "../gtfs/gtfs"
+import { Time, Transfer } from "../gtfs/gtfs"
 import { StopIndex, StopTimes } from "./raptor-algorithm"
+import { RouteIntId } from "./timetable"
 import { MAX_TIME } from "../gtfs/date"
 import { keys } from "std/object"
 import { push, arrayAllocateFilled } from "std/array"
@@ -11,7 +12,9 @@ import { for } from "std/iter"
 // sparse `?? 0` semantics. Round 0 is MAX_TIME-filled (origins overwritten with their departure).
 export type Arrivals = Time[]
 export type ArrivalsByNumChanges = Arrivals[]
-export type Connection = [Trip, Int32, Int32]
+// A boarded trip leg: routeId + tripIndex + boarding/alighting positions. The journey factory
+// reconstructs stops/times/tripId from the flat timetable arrays by these integers.
+export type Connection = { "routeId": RouteIntId, "tripIndex": Int32, "start": Int32, "end": Int32 }
 export type ConnectionIndex = { StopIndex: { UInt8: Connection | Transfer } }
 
 export type ScanResults = {
@@ -62,10 +65,10 @@ val mark = (results: ScanResults, stopPi: StopIndex): Null =>
   if results["kArrivals"][results["k"]][stopPi] == 0 then
     results["marked"].push(stopPi)
 
-// The caller (scanRoutes) already knows the int stopPi (from routePath[pi]), so we receive it
-// directly rather than re-deriving it from trip.stopTimes[endIndex].stop (a string).
-export val setTrip = (results: ScanResults, stopPi: StopIndex, trip: Trip, startIndex: Int32, endIndex: Int32, interchange: Time): Null =>
-  val time = trip["stopTimes"][endIndex]["arrivalTime"] + interchange
+// The caller (scanRoutes) already knows the int stopPi and the arrival `time` (= flat arrival +
+// interchange), so we store the (routeId, tripIndex, boarding, alighting) integer connection
+// directly — no Trip object, no stop-times read.
+export val setTrip = (results: ScanResults, stopPi: StopIndex, time: Time, routeId: RouteIntId, tripIndex: Int32, startIndex: Int32, endIndex: Int32): Null =>
   val k = results["k"]
 
   results.mark(stopPi)
@@ -73,7 +76,7 @@ export val setTrip = (results: ScanResults, stopPi: StopIndex, trip: Trip, start
   results["bestArrivals"][stopPi] = time
   if results["kConnections"][stopPi] == null then
     results["kConnections"][stopPi] = {}
-  results["kConnections"][stopPi][k] = [trip, startIndex, endIndex]
+  results["kConnections"][stopPi][k] = { "routeId": routeId, "tripIndex": tripIndex, "start": startIndex, "end": endIndex }
 
 // The caller (scanTransfers) already interned the destination stop to an int.
 export val setTransfer = (results: ScanResults, stopPi: StopIndex, transfer: Transfer, time: Time): Null =>

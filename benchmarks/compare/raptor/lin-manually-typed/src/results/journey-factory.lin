@@ -1,21 +1,22 @@
-import { StopId, Time, TimetableLeg, Transfer } from "../gtfs/gtfs"
+import { Time, TimetableLeg, Transfer } from "../gtfs/gtfs"
 import { StopIndex } from "../raptor/raptor-algorithm"
 import { ConnectionIndex } from "../raptor/scan-results"
+import { Timetable, arrivalOf, departureOf, isPickUp, isDropOff } from "../raptor/timetable"
 import { AnyLeg, Journey } from "./journey"
 import { keys } from "std/object"
 import { map, range, for, while } from "std/iter"
-import { length, slice, reverse, push } from "std/array"
+import { length, reverse, push } from "std/array"
 
 //
 // Take the best result of each round for the given destination and turn it into a journey.
 // `destination` is a dense StopIndex (UInt32); `stopIndexOf` maps string stop codes to indices
 // for the backwards reconstruction walk.
 //
-export val getResults = (kConnections: ConnectionIndex, destination: StopIndex, stopIndexOf: { String: StopIndex }): Journey[] =>
+export val getResults = (tt: Timetable, kConnections: ConnectionIndex, destination: StopIndex): Journey[] =>
   val rounds = (kConnections[destination] ?? {}).keys()
 
   rounds.map(k =>
-    val legs = getJourneyLegs(kConnections, k, destination, stopIndexOf)
+    val legs = getJourneyLegs(tt, kConnections, k, destination)
     {
       "legs": legs,
       "departureTime": getDepartureTime(legs),
@@ -29,7 +30,7 @@ export val getResults = (kConnections: ConnectionIndex, destination: StopIndex, 
 // The destination cursor is a StopIndex (int). String stops are read from GTFS records only
 // for building the output legs; to continue walking kConnections we intern them back to int.
 //
-val getJourneyLegs = (kConnections: ConnectionIndex, k: UInt8, finalDestination: StopIndex, stopIndexOf: { String: StopIndex }): AnyLeg[] =>
+val getJourneyLegs = (tt: Timetable, kConnections: ConnectionIndex, k: UInt8, finalDestination: StopIndex): AnyLeg[] =>
   val legs: AnyLeg[] = []
   var destination = finalDestination
 
@@ -38,16 +39,35 @@ val getJourneyLegs = (kConnections: ConnectionIndex, k: UInt8, finalDestination:
     if connection is Transfer then
       legs.push(connection)
       // Transfer.origin is a string stop code — intern it to continue the int walk
-      destination = stopIndexOf[connection["origin"]] ?? 0u32
+      destination = tt["stopIds"][connection["origin"]] ?? 0u32
     else if connection != null then
-      val [trip, start, end] = connection
-      val stopTimes = trip["stopTimes"].slice(start, end + 1)
+      // Connection is [routeId, tripIndex, boardingPos, alightingPos]. Reconstruct the leg's
+      // stop sequence + times from the flat timetable arrays (cold path — helpers are fine here).
+      val routeId = connection["routeId"]
+      val t = connection["tripIndex"]
+      val start = connection["start"]
+      val end = connection["end"]
+      val route = tt["routes"][routeId]
+      val rsBase = route["routeStopsBase"]
+      val stBase = route["stopTimesBase"]
+      val nStops = route["numStops"]
+
+      val stopTimes = range(start, end + 1).map(pos =>
+        val e = tt["stopTimes"][stBase + t * nStops + pos]
+        {
+          "stop": tt["stopNames"][tt["routeStops"][rsBase + pos]],
+          "arrivalTime": e.arrivalOf(),
+          "departureTime": e.departureOf(),
+          "pickUp": e.isPickUp(),
+          "dropOff": e.isDropOff()
+        }
+      )
       val origin = stopTimes[0]["stop"]
-      // The destination string comes from the trip record (stopTimes[end].stop)
-      val destinationStr = trip["stopTimes"][end]["stop"]
-      legs.push({ "stopTimes": stopTimes, "origin": origin, "destination": destinationStr, "trip": trip })
-      // Intern origin string to continue the int walk
-      destination = stopIndexOf[origin] ?? 0u32
+      val destinationStr = stopTimes[stopTimes.length() - 1]["stop"]
+      val tripId = tt["tripIds"][route["tripsBase"] + t]
+      legs.push({ "stopTimes": stopTimes, "origin": origin, "destination": destinationStr, "tripId": tripId })
+      // The boarding stop (position `start`) is the next cursor — read its int id directly
+      destination = tt["routeStops"][rsBase + start]
   )
 
   legs.reverse()

@@ -1,34 +1,41 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { length } from "std/array"
-import { Trip, Transfer } from "../gtfs/gtfs"
+import { Transfer } from "../gtfs/gtfs"
+import { Service } from "../gtfs/service"
 import { Connection, ConnectionIndex } from "../raptor/scan-results"
 import { StopIndex } from "../raptor/raptor-algorithm"
+import { Timetable, Route } from "../raptor/timetable"
 import { getResults } from "./journey-factory"
 
 // Stop index for destination "B": 1
 val destB: StopIndex = 1u32
 
-// A simple intern table for tests: "A"->0, "B"->1
-val stopIndexOf: { String: StopIndex } = { "A": 0u32, "B": 1u32 }
-
-// A trip A -> B: departs A at 900, arrives B at 1000.
-val trip: Trip = {
-  "tripId": "t1",
-  "serviceId": "1",
-  "service": {
-    "startDate": 20180101,
-    "endDate": 20991231,
-    "days": { 0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true },
-    "dates": {}
-  },
-  "stopTimes": [
-    { "stop": "A", "arrivalTime": 850, "departureTime": 900, "pickUp": true, "dropOff": true },
-    { "stop": "B", "arrivalTime": 1000, "departureTime": 1010, "pickUp": true, "dropOff": true }
-  ]
+val service1: Service = {
+  "startDate": 20180101,
+  "endDate": 20991231,
+  "days": { 0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true },
+  "dates": {}
 }
 
-// The connection that reached B: trip, boarding at stopTime 0 (A), alighting at stopTime 1 (B).
-val tripConnection: Connection = [trip, 0, 1]
+// A flat timetable with one route A->B (2 stops) and one trip: A dep 900 (arr 850), B arr 1000.
+// The journey factory reconstructs legs from these flat arrays by the connection's integers.
+val route0: Route = { "stopTimesBase": 0u32, "routeStopsBase": 0u32, "tripsBase": 0u32, "numStops": 2u32, "numTrips": 1u32 }
+val tt: Timetable = {
+  "routes": [route0],
+  "routeStops": [0u32, 1u32],
+  "stopTimes": [{ "arrival": 850, "departure": 900 }, { "arrival": 1000, "departure": 1010 }],
+  "tripServiceId": [0u32],
+  "services": [service1],
+  "tripIds": ["t1"],
+  "routeStopIndex": {},
+  "interchange": {},
+  "transfers": {},
+  "stopIds": { "A": 0u32, "B": 1u32 },
+  "stopNames": ["A", "B"]
+}
+
+// The connection that reached B: route 0, trip 0, boarding pos 0 (A), alighting pos 1 (B).
+val tripConnection: Connection = { "routeId": 0u32, "tripIndex": 0, "start": 0, "end": 1 }
 
 val transfer: Transfer = {
   "origin": "A",
@@ -42,7 +49,7 @@ val s = suite("results/journey-factory", [
   test("returns no journeys when the destination is unreached", () =>
     val kConnections: ConnectionIndex = {}
     [
-      expect(getResults(kConnections, destB, stopIndexOf).length()).toBe(0)
+      expect(getResults(tt, kConnections, destB).length()).toBe(0)
     ]
   ),
 
@@ -51,7 +58,7 @@ val s = suite("results/journey-factory", [
     inner[1u8] = tripConnection
     val kConnections: ConnectionIndex = {}
     kConnections[destB] = inner
-    val journeys = getResults(kConnections, destB, stopIndexOf)
+    val journeys = getResults(tt, kConnections, destB)
     [
       expect(journeys.length()).toBe(1),
       expect(journeys[0]["legs"].length()).toBe(1),
@@ -65,7 +72,7 @@ val s = suite("results/journey-factory", [
     inner[1u8] = transfer
     val kConnections: ConnectionIndex = {}
     kConnections[destB] = inner
-    val journeys = getResults(kConnections, destB, stopIndexOf)
+    val journeys = getResults(tt, kConnections, destB)
     [
       expect(journeys.length()).toBe(1),
       expect(journeys[0]["legs"].length()).toBe(1)
