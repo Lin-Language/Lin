@@ -308,7 +308,43 @@ val s = suite("std/csv", [
     [
       expect(streamProjected("/tmp/lin_csv_test_proj.csv")).toBe("a=1 b=ABSENT c=3 :: a=5 b=ABSENT c=7")
     ]
-  )
+  ),
+
+  // ── fast-path regression: quoted field with embedded delimiter ────────────────────────────────
+  // Bulk-scan must stop at `"` and hand off to the slow path; the quoted field must be read intact.
+  test("fast-path: quoted field containing the delimiter is preserved", () => [
+    expect(rowsStr(parse("a,\"b,c\",d\n"))).toBe("[[\"a\", \"b,c\", \"d\"]]")
+  ]),
+
+  // ── fast-path regression: escaped "" inside a quoted field ───────────────────────────────────
+  // After the bulk-scan bulk-copies the prefix, the slow path must handle the two-quote escape.
+  test("fast-path: escaped double-quote inside quoted field is preserved", () => [
+    expect(rowsStr(parse("x,\"say \"\"hi\"\"\",z\n"))).toBe("[[\"x\", \"say \"hi\"\", \"z\"]]")
+  ]),
+
+  // ── fast-path regression: CRLF line endings ──────────────────────────────────────────────────
+  // The bulk-scan stops at CR (interesting byte); the slow path emits the record and latches
+  // skip_next_lf; the subsequent LF must be swallowed, not produce a spurious empty row.
+  test("fast-path: CRLF line endings yield no spurious empty rows", () => [
+    expect(rowsStr(parse("a,b\r\nc,d\r\n"))).toBe("[[\"a\", \"b\"], [\"c\", \"d\"]]"),
+    expect(recCount(parse("a,b\r\nc,d\r\n"))).toBe(2)
+  ]),
+
+  // ── fast-path regression: ragged rows ────────────────────────────────────────────────────────
+  // A short row has fewer fields than the first row; extra fields beyond the header are kept.
+  test("fast-path: ragged rows preserved (short and long)", () => [
+    expect(rowsStr(parse("a,b,c\n1,2\n3,4,5,6\n"))).toBe("[[\"a\", \"b\", \"c\"], [\"1\", \"2\"], [\"3\", \"4\", \"5\", \"6\"]]")
+  ]),
+
+  // ── fast-path regression: empty fields ───────────────────────────────────────────────────────
+  // Empty fields appear when two delimiters are adjacent or a field is the empty quoted string.
+  test("fast-path: adjacent delimiters produce empty fields", () => [
+    expect(rowsStr(parse("a,,c\n"))).toBe("[[\"a\", \"\", \"c\"]]")
+  ]),
+
+  test("fast-path: empty quoted field is preserved", () => [
+    expect(rowsStr(parse("a,\"\",c\n"))).toBe("[[\"a\", \"\", \"c\"]]")
+  ])
 ])
 
 run(s)

@@ -301,6 +301,49 @@ print(toString(m))
 }
 
 #[test]
+fn test_tuple_in_union_map_slot_roundtrips() {
+    // Regression: an all-scalar tuple stored as a value in a union-typed map slot must round-trip
+    // intact. The literal `[a, b, c, d]` was inferred as a homogeneous `Int64[]` (elements widened
+    // to i64 at i64 stride) instead of being coerced to the union's tuple member
+    // (`[UInt32,Int32,Int32,Int32]`, i32 stride). The store wrote i64-stride bytes; the read used
+    // the declared tuple's i32 stride -> elements 2-3 came back as garbage. (Surfaced in the RAPTOR
+    // port: `kConnections[stop][round] = [routeId, tripIndex, start, end]`.)
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type Rec = { "name": String, "dur": Int32 }
+type Tup = [UInt32, Int32, Int32, Int32]
+
+val main = () =>
+  // (a) direct assignment into a union-typed map slot (this previously failed to type-check).
+  val m: { UInt8: Tup | Rec } = {}
+  val a: UInt32 = 7u32
+  m[1u8] = [a, 3, 486, 586]
+  val v = m[1u8]
+  if v is Rec then
+    print("WRONG-A")
+  else
+    val [w, x, y, z] = v
+    print("${ toString(w) } ${ toString(x) } ${ toString(y) } ${ toString(z) }")
+
+  // (b) assignment through a nullable nested map slot (the RAPTOR shape).
+  val outer: { UInt32: { UInt8: Tup | Rec } } = {}
+  if outer[5u32] == null then
+    outer[5u32] = {}
+  outer[5u32][2u8] = [a, 9, 100, 200]
+  val v2 = outer[5u32][2u8]
+  if v2 is Rec then
+    print("WRONG-B")
+  else
+    val [w2, x2, y2, z2] = v2
+    print("${ toString(w2) } ${ toString(x2) } ${ toString(y2) } ${ toString(z2) }")
+
+main()
+"#);
+    assert_eq!(output, vec!["7 3 486 586", "7 9 100 200"]);
+}
+
+#[test]
 fn test_string_interpolation() {
     let output = run(r#"import { print } from "std/io"
 
@@ -487,6 +530,48 @@ print(toString(c()))
 print(toString(c()))
 "#);
     assert_eq!(output, vec!["1", "2", "3"]);
+}
+
+// Regression for stack-allocated non-escaping `var` cells (escape::analyze_cells). A `var`
+// accumulator mutated inside a `range().for()` callback is a heap cell PROVEN non-escaping (it has
+// a scope-exit FreeCell and its pointer is never captured by a surviving closure), so the pass
+// lowers it to an entry-block alloca. This pins that the stack path computes the SAME sum as the
+// heap path. The SECOND half exercises the ESCAPING case in the SAME program: a `makeCounter`
+// factory whose `var count` IS captured by a returned closure that outlives the frame MUST stay
+// heap (the direct-use scan sees the MakeClosure capture and refuses the stack alloca). Two
+// independent counters must not share state — a use-after-return or aliased stack cell would
+// corrupt one of them.
+#[test]
+fn test_var_cell_stack_accumulator_and_escaping_counter() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+// Non-escaping accumulator -> stack alloca path.
+val sumRange = (n: Int32) =>
+  var sum = 0
+  range(0, n).for(i =>
+    sum = sum + i
+  )
+  sum
+
+// Escaping captured var -> must stay heap.
+val makeCounter = () =>
+  var count = 0
+  () =>
+    count = count + 1
+    count
+
+print(toString(sumRange(1000)))
+val c = makeCounter()
+val d = makeCounter()
+print(toString(c()))
+print(toString(c()))
+print(toString(d()))
+print(toString(c()))
+"#);
+    // sum 0..999 = 499500; c counts 1,2,_,3 ; d counts independently 1.
+    assert_eq!(output, vec!["499500", "1", "2", "1", "3"]);
 }
 
 // Regression: a closure-local `var` (NOT captured by any inner closure) reassigned inside an
@@ -4399,6 +4484,61 @@ fn test_circular_import_function_reference_compiles_not_stack_overflow() {
 }
 
 #[test]
+fn test_cross_module_flat_union_return_call_signature_matches() {
+    // Regression (codegen): a function returning a scalar-nullable union (`T | Null`) uses the flat
+    // `{ i1, i64 }` return ABI (VA.1 CPR). When such a function is CALLED across a module boundary
+    // and the caller's module compiles BEFORE the callee's definition (e.g. inside an import cycle),
+    // the call site forward-declares the callee. That forward declaration must use the SAME flat
+    // `{ i1, i64 }` signature as the definition — otherwise it declared the callee `ptr`-returning,
+    // the definition reused the decl via `get_function`, and emitted a `{ i1, i64 }` body, tripping
+    // LLVM's verifier: "Function return type does not match operand type of return inst". Surfaced by
+    // the manually-typed RAPTOR scan-results ↔ raptor-algorithm cycle (`bestArrival: Time | Null`).
+    // Three modules with a `defs ↔ algo` cycle. `defs` DEFINES the flat-union-return `lookup`;
+    // `algo` CALLS it; `defs` imports a type from `algo` (closing the cycle). `main` imports `defs`
+    // FIRST, so the post-order-DFS compile order registers the CALLER (`algo`) before the DEFINER
+    // (`defs`) — the order that makes `algo`'s call site forward-declare `lookup` before `defs`
+    // emits its body. This mirrors RAPTOR's scan-results ↔ raptor-algorithm cycle.
+    let dir = std::env::temp_dir().join(format!("lin_fu_cycle_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("defs.lin"),
+        "import { Ctx } from \"algo\"\n\
+         export type M = { String: Int32 }\n\
+         export val lookup = (m: M, k: String): Int32 | Null => m[k]\n").unwrap();
+    std::fs::write(dir.join("algo.lin"),
+        "import { lookup, M } from \"defs\"\n\
+         export type Ctx = { \"m\": M }\n\
+         export val best = (c: Ctx, k: String): Int32 | Null => lookup(c[\"m\"], k)\n").unwrap();
+    std::fs::write(dir.join("main.lin"),
+        "import { print } from \"std/io\"\n\
+         import { toString } from \"std/string\"\n\
+         import { M } from \"defs\"\n\
+         import { best, Ctx } from \"algo\"\n\
+         var m: M = {  }\n\
+         m[\"x\"] = 42\n\
+         val c: Ctx = { \"m\": m }\n\
+         print(toString(best(c, \"x\")))\n\
+         print(toString(best(c, \"missing\")))\n").unwrap();
+
+    let bin_path = dir.join("main.out");
+    let compile = lin_cmd()
+        .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let combined = format!("{}{}",
+        String::from_utf8_lossy(&compile.stderr), String::from_utf8_lossy(&compile.stdout));
+    assert!(compile.status.success(),
+        "expected the cross-module flat-union return to compile, got: {combined}");
+
+    let run_out = Command::new(&bin_path).output().expect("failed to run compiled binary");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(run_out.status.success(),
+        "expected clean run, got stderr: {}", String::from_utf8_lossy(&run_out.stderr));
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines, vec!["42", "null"], "present key → 42, missing key → null");
+}
+
+#[test]
 fn test_diamond_imports_are_not_false_cycles() {
     // A module imported by two different paths (a diamond) is NOT a cycle. Resolution
     // pops each module from the visiting stack when done, so the shared dependency is
@@ -4717,6 +4857,62 @@ fn test_missing_relative_import_gives_module_not_found_with_tried_path() {
     assert!(
         !combined.contains("not a built-in stdlib module"),
         "non-std import should not get the stdlib note, got: {combined}"
+    );
+}
+
+#[test]
+fn test_parse_error_in_imported_module_points_at_imported_file() {
+    // Regression: parse errors from an imported `.lin` module were previously rendered against
+    // the ENTRY file's path (file: None → fell back to entry), with a byte offset that pointed
+    // at a nonsensical location (e.g. inside the import-path string). The fix tags parse-error
+    // diagnostics with the imported file's absolute path, so the renderer uses that file's source.
+    //
+    // Layout: main.lin has two stdlib imports before the relative import so that the line of
+    // `import … from "./broken"` is NOT line 1 — this makes the test more sensitive to the
+    // wrong-offset mis-attribution that the bug produced.
+    let dir = std::env::temp_dir().join(format!("lin_parse_err_loc_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    // broken.lin has a genuine syntax error on line 1: a function-type annotation written with
+    // a colon instead of an arrow (`(a: Int32): Int32` is a value-returning function call
+    // annotation that triggers "expected Arrow, got Colon" from the type parser).
+    std::fs::write(
+        dir.join("broken.lin"),
+        "type T = (a: Int32): Int32\nexport val x = 42\n",
+    )
+    .unwrap();
+
+    // main.lin: two stdlib imports above the relative import so the broken import is on line 3,
+    // not line 1 — making the wrong-offset attribution visibly wrong.
+    std::fs::write(
+        dir.join("main.lin"),
+        "import { print } from \"std/io\"\nimport { toString } from \"std/string\"\nimport { x } from \"./broken\"\nprint(toString(x))\n",
+    )
+    .unwrap();
+
+    let out = lin_cmd()
+        .args(["check", dir.join("main.lin").to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let combined = format!("{stderr}{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!out.status.success(), "expected check failure, got success: {combined}");
+    // The diagnostic must name broken.lin — not main.lin.
+    assert!(
+        combined.contains("broken.lin"),
+        "expected 'broken.lin' in error output, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("main.lin"),
+        "error must NOT point at main.lin (wrong file attribution), got:\n{combined}"
+    );
+    // The error text from the parser must be visible.
+    assert!(
+        combined.contains("expected Arrow"),
+        "expected parse error text 'expected Arrow' in output, got:\n{combined}"
     );
 }
 
@@ -12120,6 +12316,38 @@ print(toString(length(sorted)))
     assert_eq!(out, vec!["[1, 2, 3, 5, 8, 9]", "6"]);
 }
 
+// Regression: the inline sealed-record merge-sort (`lower_sort`, sealed-pointer-buffer path) seeded
+// its work buffers from `arr[0]`, which faulted (`array index 0 out of bounds (len 0)`) on an EMPTY
+// sealed-record array — the scalar-flat path was empty-safe but the sealed path was not, and neither
+// was the generic stdlib `if n <= 1 then concat(arr, [])` short-circuit reachable once monomorphize
+// inlined the specialized sort. Sorting an empty (and a single-element) typed-record array must
+// return it unchanged, not crash. Surfaced by the manually-typed RAPTOR "range query with no trips"
+// test. The empty guard reads `arr[0]` only when `n > 0`; the sealed descriptor is derived from the
+// element type statically, so the empty result is still a correctly-shaped sealed array.
+#[test]
+fn test_sort_empty_and_singleton_sealed_record_array() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { sort, length } from "std/array"
+
+type T = { "k": Int32, "tag": String }
+
+val empty: T[] = []
+val sortedEmpty = sort(empty, (a, b) => a["k"] - b["k"])
+print(toString(length(sortedEmpty)))
+
+val one: T[] = [{ "k": 7, "tag": "x" }]
+val sortedOne = sort(one, (a, b) => a["k"] - b["k"])
+print(toString(length(sortedOne)))
+print(sortedOne[0]["tag"])
+
+val many: T[] = [{ "k": 3, "tag": "c" }, { "k": 1, "tag": "a" }, { "k": 2, "tag": "b" }]
+val sortedMany = sort(many, (a, b) => a["k"] - b["k"])
+print("${ sortedMany[0]["tag"] }${ sortedMany[1]["tag"] }${ sortedMany[2]["tag"] }")
+"#);
+    assert_eq!(out, vec!["0", "1", "x", "abc"]);
+}
+
 // Regression (sealed-record combinator element leak): `map` over a sealed-record array whose
 // callback returns a SCALAR FIELD (`x => x["a"]`) reads each element via the `Index` op, which
 // materialises a FRESH +1 sealed struct per element (packed-array `sealed_array_materialize_elem`
@@ -15876,6 +16104,83 @@ val m: { Bad: Int32 } = {}
 }
 
 #[test]
+fn test_index_sig_bare_record_hint_comma_separated() {
+    // HINT B (comma form): `{ a: UInt32, b: UInt8 }` looks like a TypeScript record with bare
+    // keys. The parser should emit the helpful "multiple entries look like a record" diagnostic
+    // (not the raw "expected RBrace") and suggest quoting the keys.
+    let (ok, output) = check_source(
+        r#"export type T = { a: UInt32, b: UInt8 }
+val x = 1
+"#,
+    );
+    assert!(!ok, "expected a type error for bare-keyed record, but it passed");
+    assert!(
+        output.contains("index-signature type has exactly one entry"),
+        "expected the index-sig / record-quoting hint, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("expected RBrace"),
+        "got raw 'expected RBrace' instead of the hint:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_index_sig_bare_record_hint_newline_separated() {
+    // HINT B (newline form): bare keys separated by newlines (no commas) also triggered the raw
+    // "expected RBrace" error instead of the helpful quoting hint. Regression test.
+    let (ok, output) = check_source(
+        "export type T = {\n  a: UInt32\n  b: UInt8\n}\nval x = 1\n",
+    );
+    assert!(!ok, "expected a type error for bare-keyed newline record, but it passed");
+    assert!(
+        output.contains("index-signature type has exactly one entry"),
+        "expected the index-sig / record-quoting hint for newline-separated bare keys, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("expected RBrace"),
+        "got raw 'expected RBrace' instead of the hint:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_index_sig_single_entry_still_valid() {
+    // A genuine single-entry index-signature `{ StopID: Value }` must NOT trigger the hint.
+    let (ok, output) = check_source(
+        r#"type StopID = String
+type M = { StopID: UInt32 }
+val m: M = {}
+"#,
+    );
+    assert!(
+        ok,
+        "expected a single-entry index-sig to parse cleanly, but got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_index_sig_nested_value_still_valid() {
+    // A nested index-sig value `{ A: { B: C } }` must NOT trigger the hint — the inner brace is
+    // the value type, not a second bare-keyed field.
+    let (ok, output) = check_source(
+        r#"type A = String
+type B = String
+type M = { A: { B: UInt32 } }
+val m: M = {}
+"#,
+    );
+    assert!(
+        ok,
+        "expected a nested index-sig type to parse cleanly, but got:\n{}",
+        output
+    );
+}
+
+#[test]
 fn test_int_map_basic_operations() {
     // Smoke test for { Int32: String } maps: insert, read hit, read miss, overwrite.
     let output = run(r#"import { print } from "std/io"
@@ -18830,6 +19135,75 @@ main()
 "#);
     // All three aliases share the same backing P[]; the push through `inner` is visible to all.
     assert_eq!(out, vec!["arr_len=5", "nest_len=5", "inner_len=5"]);
+}
+
+#[test]
+fn test_sealed_array_element_captured_into_closure_field_read() {
+    // REGRESSION (packed-elem-view capture): `val route = routes[rid]` over an array of sealed
+    // records is a VIRTUAL packed-element view — no materialized slot (reads re-emit a const-offset
+    // field load). Capturing `route` into a closure (the `while` body) read its (empty) slot and
+    // captured an UNINITIALIZED temp, and `route["n"]` inside the closure re-emitted
+    // SealedArrayFieldGet off the OUTER function's temps → codegen produced `ptr null` and `int_mul`
+    // panicked. Fix (func.rs): materialize the view at the capture site, and make `packed_elem_slots`
+    // function-scoped so the closure body uses the generic field read on the captured env value.
+    let out = run(r#"
+import { print } from "std/io"
+import { toInt32 } from "std/number"
+import { while } from "std/iter"
+type Rt = { "n": UInt32, "nt": UInt32 }
+val routes: Rt[] = [{ "n": 1u32, "nt": 2u32 }]
+val arr: Int32[] = [10, 20, 30, 40]
+val f = (rid: UInt32): Int32 =>
+  val route = routes[rid]
+  var i = route["nt"].toInt32() - 1
+  var acc = 0
+  while(() =>
+    if i < 0 then false
+    else
+      acc = acc + arr[i * route["n"]]
+      i = i - 1
+      true
+  )
+  acc
+val main = () =>
+  print("${f(0u32)}")
+main()
+"#);
+    // i runs 1 then 0: arr[1*1]=20, arr[0*1]=10 → 30. Previously panicked in codegen.
+    assert_eq!(out, vec!["30"]);
+}
+
+#[test]
+fn test_chained_int_map_index_boxed_key_in_closure() {
+    // REGRESSION: a chained int-keyed map index `m[a][b]` where the keys are BOXED runtime values —
+    // here destructured `.entries` params (typed AnyVal on the callback ABI) inside a closure. The
+    // inner `m[a]` yields a `Map | Null` union; the outer `[b]` with a boxed key took the dynamic
+    // key-tag dispatch whose int-branch array-gets the container — but it's a MAP, so the array-get
+    // returned Null (→ `?? 0` gave 0). Fix (data/index.rs): the dynamic dispatch only fires when the
+    // object could actually be an array; a concrete map-only union falls through to the typed
+    // int-keyed-map path, which now also accepts a boxed (pointer) key. Literal keys / outside-closure
+    // worked already (unboxed int constant). This is the RAPTOR `routeStopIndex[routeId][stopP]` crash.
+    let out = run(r#"
+import { print } from "std/io"
+import { entries } from "std/object"
+type Inner = { UInt32: UInt8 }
+type TT = { "idx": { UInt32: Inner } }
+type Queue = { UInt32: UInt32 }
+val main = () =>
+  val inner: Inner = {}
+  inner[5u32] = 2u8
+  val outer: { UInt32: Inner } = {}
+  outer[1u32] = inner
+  val tt: TT = { "idx": outer }
+  val q: Queue = {}
+  q[1u32] = 5u32
+  q.entries([routeId, stopP] =>
+    print("${tt["idx"][routeId][stopP] ?? 0}")
+  )
+main()
+"#);
+    // tt.idx[1][5] = 2; the chained index with boxed entries-keys previously returned Null → 0.
+    assert_eq!(out, vec!["2"]);
 }
 
 #[test]
@@ -24132,4 +24506,104 @@ m[key] = if cur == null then 1i64 else cur + 1i64
 print(toString(m[key]))
 "#);
     assert_eq!(output, vec!["101"]);
+}
+
+// ── Nullable array index: compile-time rejection ──────────────────────────────
+//
+// Indexing an Array or FixedArray with an index whose static type includes Null must be a
+// compile-time type error. Previously the checker let it through and codegen produced an
+// unchecked lin_unbox_int64 on a null TaggedVal → SEGFAULT at runtime.
+
+#[test]
+fn test_nullable_array_index_is_type_error() {
+    // The canonical repro: map lookup returns `Int32 | Null`, then used as array index.
+    let (ok, output) = check_source(
+        r#"import { print } from "std/io"
+val f = (xs: Int32[], m: { String: Int32 }, k: String) =>
+  val j = m[k]
+  xs[j]
+print(f([10, 20, 30], {}, "missing"))
+"#,
+    );
+    assert!(
+        !ok,
+        "expected `lin check` to reject a nullable array index, but it passed:\n{}",
+        output
+    );
+    assert!(
+        output.contains("array index may be `Null`"),
+        "expected the error to mention `array index may be `Null``, got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_nullable_array_index_narrowed_with_coalesce_ok() {
+    // Narrowing the index with `?? 0` makes it `Int32` — must type-check and run.
+    let output = run(
+        r#"import { print } from "std/io"
+val f = (xs: Int32[], m: { String: Int32 }, k: String): Int32 =>
+  val j = m[k]
+  xs[j ?? 0]
+print(f([10, 20, 30], {}, "missing"))
+"#,
+    );
+    assert_eq!(output, vec!["10"]);
+}
+
+#[test]
+fn test_nullable_array_index_narrowed_with_if_guard_ok() {
+    // Guarding with `if j != null then arr[j]` narrows j to Int32 — must type-check and run.
+    let output = run(
+        r#"import { print } from "std/io"
+val f = (xs: Int32[], m: { String: Int32 }, k: String): Int32 =>
+  val j = m[k]
+  if j != null then xs[j] else 99
+print(f([10, 20, 30], {}, "missing"))
+print(f([10, 20, 30], { "x": 2 }, "x"))
+"#,
+    );
+    assert_eq!(output, vec!["99", "30"]);
+}
+
+#[test]
+fn test_non_null_int_array_index_still_works() {
+    // Plain Int32 literal and a non-null Int32 binding must continue to work unaffected.
+    let output = run(
+        r#"import { print } from "std/io"
+val xs: Int32[] = [10, 20, 30]
+val i: Int32 = 1
+print(xs[0])
+print(xs[i])
+"#,
+    );
+    assert_eq!(output, vec!["10", "20"]);
+}
+
+#[test]
+fn test_sealed_seq_int_key_direct_load() {
+    // Regression: `{ IntLitUnion: V }` records indexed by a runtime integer-literal-union
+    // value must be a direct byte-offset GEP load, NOT a map-materialise + int_to_string + map_get.
+    // This shape arises in RAPTOR's `service["days"][dow]` (ServiceDays = { DayOfWeek: Boolean }).
+    let output = run(
+        r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type Day = 0 | 1 | 2 | 3 | 4 | 5 | 6
+type Schedule = { Day: Boolean }
+
+val isOpen = (s: Schedule, d: Day): Boolean => s[d]
+
+val sched: Schedule = { 0: false, 1: true, 2: true, 3: true, 4: true, 5: false, 6: false }
+val d0: Day = 0
+val d1: Day = 1
+val d5: Day = 5
+val d6: Day = 6
+print(toString(isOpen(sched, d0)))
+print(toString(isOpen(sched, d1)))
+print(toString(isOpen(sched, d5)))
+print(toString(isOpen(sched, d6)))
+"#,
+    );
+    assert_eq!(output, vec!["false", "true", "false", "false"]);
 }

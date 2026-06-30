@@ -143,18 +143,20 @@ impl Parser {
                     self.expect(TokenKind::Colon);
                     let val_ty = self.parse_type_expr();
                     self.skip_newlines();
-                    // HINT B: if a comma follows the single `Key: Value` entry, this is almost
-                    // certainly a TypeScript-style record with bare (unquoted) field keys, e.g.
-                    // `{ bestArrivals: Arrivals, k: UInt8 }`.  Emit ONE clear diagnostic with a
-                    // quoting hint, recover by skipping to the matching `}`, and return an empty
-                    // placeholder record so downstream checking doesn't pile on more errors.
-                    if self.check(TokenKind::Comma) {
-                        let comma_span = self.current_span();
+                    // HINT B: if a comma OR another bare identifier follows the single `Key: Value`
+                    // entry, this is almost certainly a TypeScript-style record with bare
+                    // (unquoted) field keys, e.g. `{ bestArrivals: Arrivals, k: UInt8 }` or
+                    // (newline-separated) `{ a: UInt32\n  b: UInt8 }`.  Emit ONE clear diagnostic
+                    // with a quoting hint, recover by skipping to the matching `}`, and return an
+                    // empty placeholder record so downstream checking doesn't pile on more errors.
+                    let next_is_bare_field = matches!(self.peek_kind(), TokenKind::Ident(_));
+                    if self.check(TokenKind::Comma) || next_is_bare_field {
+                        let hint_span = self.current_span();
                         self.diagnostics.push(
                             Diagnostic::error(
-                                comma_span,
+                                hint_span,
                                 "a `{ Key: Value }` index-signature type has exactly one entry; \
-                                 multiple comma-separated entries look like a record",
+                                 multiple entries look like a record",
                             )
                             .with_help(
                                 "for a record type, quote each field key, e.g. \

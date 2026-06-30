@@ -10,7 +10,7 @@ import { createDepartAfterQuery, plan } from "./depart-after-query"
 import { getResults } from "../results/journey-factory"
 import { ResultsFactory } from "../results/results-factory"
 import { Journey } from "../results/journey"
-import { TransfersByOrigin, Interchange } from "../raptor/raptor-algorithm"
+import { TransfersByOrigin, Interchange } from "../gtfs/gtfs-loader"
 import { length } from "std/array"
 
 val jf: ResultsFactory = getResults
