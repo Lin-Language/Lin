@@ -301,6 +301,49 @@ print(toString(m))
 }
 
 #[test]
+fn test_tuple_in_union_map_slot_roundtrips() {
+    // Regression: an all-scalar tuple stored as a value in a union-typed map slot must round-trip
+    // intact. The literal `[a, b, c, d]` was inferred as a homogeneous `Int64[]` (elements widened
+    // to i64 at i64 stride) instead of being coerced to the union's tuple member
+    // (`[UInt32,Int32,Int32,Int32]`, i32 stride). The store wrote i64-stride bytes; the read used
+    // the declared tuple's i32 stride -> elements 2-3 came back as garbage. (Surfaced in the RAPTOR
+    // port: `kConnections[stop][round] = [routeId, tripIndex, start, end]`.)
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type Rec = { "name": String, "dur": Int32 }
+type Tup = [UInt32, Int32, Int32, Int32]
+
+val main = () =>
+  // (a) direct assignment into a union-typed map slot (this previously failed to type-check).
+  val m: { UInt8: Tup | Rec } = {}
+  val a: UInt32 = 7u32
+  m[1u8] = [a, 3, 486, 586]
+  val v = m[1u8]
+  if v is Rec then
+    print("WRONG-A")
+  else
+    val [w, x, y, z] = v
+    print("${ toString(w) } ${ toString(x) } ${ toString(y) } ${ toString(z) }")
+
+  // (b) assignment through a nullable nested map slot (the RAPTOR shape).
+  val outer: { UInt32: { UInt8: Tup | Rec } } = {}
+  if outer[5u32] == null then
+    outer[5u32] = {}
+  outer[5u32][2u8] = [a, 9, 100, 200]
+  val v2 = outer[5u32][2u8]
+  if v2 is Rec then
+    print("WRONG-B")
+  else
+    val [w2, x2, y2, z2] = v2
+    print("${ toString(w2) } ${ toString(x2) } ${ toString(y2) } ${ toString(z2) }")
+
+main()
+"#);
+    assert_eq!(output, vec!["7 3 486 586", "7 9 100 200"]);
+}
+
+#[test]
 fn test_string_interpolation() {
     let output = run(r#"import { print } from "std/io"
 
@@ -487,6 +530,48 @@ print(toString(c()))
 print(toString(c()))
 "#);
     assert_eq!(output, vec!["1", "2", "3"]);
+}
+
+// Regression for stack-allocated non-escaping `var` cells (escape::analyze_cells). A `var`
+// accumulator mutated inside a `range().for()` callback is a heap cell PROVEN non-escaping (it has
+// a scope-exit FreeCell and its pointer is never captured by a surviving closure), so the pass
+// lowers it to an entry-block alloca. This pins that the stack path computes the SAME sum as the
+// heap path. The SECOND half exercises the ESCAPING case in the SAME program: a `makeCounter`
+// factory whose `var count` IS captured by a returned closure that outlives the frame MUST stay
+// heap (the direct-use scan sees the MakeClosure capture and refuses the stack alloca). Two
+// independent counters must not share state — a use-after-return or aliased stack cell would
+// corrupt one of them.
+#[test]
+fn test_var_cell_stack_accumulator_and_escaping_counter() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+// Non-escaping accumulator -> stack alloca path.
+val sumRange = (n: Int32) =>
+  var sum = 0
+  range(0, n).for(i =>
+    sum = sum + i
+  )
+  sum
+
+// Escaping captured var -> must stay heap.
+val makeCounter = () =>
+  var count = 0
+  () =>
+    count = count + 1
+    count
+
+print(toString(sumRange(1000)))
+val c = makeCounter()
+val d = makeCounter()
+print(toString(c()))
+print(toString(c()))
+print(toString(d()))
+print(toString(c()))
+"#);
+    // sum 0..999 = 499500; c counts 1,2,_,3 ; d counts independently 1.
+    assert_eq!(output, vec!["499500", "1", "2", "1", "3"]);
 }
 
 // Regression: a closure-local `var` (NOT captured by any inner closure) reassigned inside an

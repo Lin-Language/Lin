@@ -707,7 +707,7 @@ pub(crate) fn lower_function_expr_with_id(
             .map(|(c, ty, _)| (*c, ty.clone()))
             .collect();
         for (cell, ty) in to_free {
-            inner_builder.emit(Instruction::FreeCell { cell, ty });
+            inner_builder.emit(Instruction::FreeCell { cell, ty, stack: false });
         }
     }
     // Release owned temps in body scope except the return value AND the raw pre-coercion
