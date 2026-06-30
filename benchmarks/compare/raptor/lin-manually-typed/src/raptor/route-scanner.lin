@@ -1,7 +1,7 @@
 import { DayOfWeek, DateNumber } from "../gtfs/date"
-import { Time, Trip } from "../gtfs/gtfs"
+import { Time } from "../gtfs/gtfs"
 import { runsOn } from "../gtfs/service"
-import { StopIndex, RouteIntId, StopTimeEntry, Route, Timetable } from "./timetable"
+import { StopIntId, RouteIntId, StopTimeEntry, Route, Timetable, departureOf } from "./timetable"
 import { while } from "std/iter"
 import { toInt32 } from "std/number"
 
@@ -48,7 +48,7 @@ export val getTrip = (
   routeId: RouteIntId,
   stopIndex: Int32,
   time: Time
-): Trip | Null =>
+): Int32 =>
   val route = timetable["routes"][routeId]
 
   // first scan of this route starts at the last trip; later scans resume from the cached position.
@@ -56,7 +56,7 @@ export val getTrip = (
   // trip count is widened to Int32 so an empty route yields a -1 start.
   var i = scanner["routeScanPosition"][routeId] ?? (route["numTrips"].toInt32() - 1)
   var lastFoundPosition = i
-  var lastFound: Trip | Null = null
+  var lastFound: Int32 = -1
 
   // walk backwards from the cached position, recording the latest reachable+running trip. Only
   // advance the cached position while no trip has been locked onto yet — an earlier reachable but
@@ -67,7 +67,7 @@ export val getTrip = (
     if i < 0 then
       false
     else
-      val departureTime = timetable["stopTimes"][route["stopTimesBase"] + i * route["numStops"] + stopIndex]["departure"]
+      val departureTime = departureOf(timetable["stopTimes"][route["stopTimesBase"] + i * route["numStops"] + stopIndex])
 
       if departureTime < time then
         false
@@ -75,11 +75,11 @@ export val getTrip = (
         val trip = timetable["trips"][route["tripsBase"] + i]
         val foundHere = trip["service"].runsOn(scanner["date"], scanner["dow"])
         if foundHere then
-          lastFound = trip
+          lastFound = i
 
         // only advance the cached resume point while no trip is locked on yet — a reachable but
         // non-running service before the last found trip must not move the resume point back.
-        if foundHere || lastFound == null then
+        if foundHere || lastFound == -1 then
           lastFoundPosition = i
         i = i - 1
         true

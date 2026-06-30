@@ -1,4 +1,4 @@
-import { StopIndex, RouteIntId, RouteStopIndex, Offset } from "./timetable"
+import { StopIntId, RouteIntId, RouteStopIndex, Offset } from "./timetable"
 import { for, range } from "std/iter"
 import { toInt32, toUInt32 } from "std/number"
 
@@ -11,10 +11,10 @@ export type QueueFactory = {
 // The route queue maps an integer route id to the earliest marked stop on that route. It is
 // iterated via `.keys()` (which yields integer keys for an int-keyed map), so no stringify/parse
 // round-trip is needed.
-export type RouteQueue = { RouteIntId: StopIndex }
+export type RouteQueue = { RouteIntId: StopIntId }
 
 // Inverse-index type: kept as a named alias for factory construction in raptor-algorithm-factory.
-export type RoutesIndexedByStop = { StopIndex: RouteIntId[] }
+export type RoutesIndexedByStop = { StopIntId: RouteIntId[] }
 
 
 //
@@ -36,7 +36,7 @@ export val createQueueFactory = (
 // For each marked stop, the routes serving it are in stopRoutes[stopRoutesBase[stop]..stopRoutesBase[stop+1]].
 // Route ids are stored as their string form (since object.entries/keys give string keys).
 //
-export val getQueue = (factory: QueueFactory, markedStops: StopIndex[]): RouteQueue =>
+export val getQueue = (factory: QueueFactory, markedStops: StopIntId[]): RouteQueue =>
   val queue: RouteQueue = {}
   markedStops.for(stop =>
     val base = factory["stopRoutesBase"][stop]
@@ -55,7 +55,7 @@ export val getQueue = (factory: QueueFactory, markedStops: StopIndex[]): RouteQu
   queue
 
 
-val isStopBefore = (factory: QueueFactory, routeId: RouteIntId, stopA: StopIndex, stopB: StopIndex): Boolean =>
+val isStopBefore = (factory: QueueFactory, routeId: RouteIntId, stopA: StopIntId, stopB: StopIntId): Boolean =>
   val rsi = factory["routeStopIndex"][routeId]
   if rsi == null then
     false

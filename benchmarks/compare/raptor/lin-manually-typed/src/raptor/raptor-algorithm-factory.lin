@@ -4,7 +4,7 @@ import { runsOn } from "../gtfs/service"
 import { Date, weekday } from "std/datetime"
 import { getDateNumber } from "../query/date-util"
 import { RaptorAlgorithm, createRaptorAlgorithm } from "./raptor-algorithm"
-import { RouteIntId, StopTimeEntry, Route, Timetable, StopIndex, RouteStopIndex, Interchange, TransfersByOrigin, Offset, RoutePosition } from "./timetable"
+import { RouteIntId, StopTimeEntry, Route, Timetable, StopIntId, RouteStopIndex, Interchange, TransfersByOrigin, Offset, RoutePosition, packArrival, packDeparture } from "./timetable"
 import { RoutesIndexedByStop, createQueueFactory } from "./queue-factory"
 import { createRouteScanner } from "./route-scanner"
 import { frozen } from "std/async"
@@ -35,10 +35,10 @@ export val create = (
   date: Date | Null = null
 ): RaptorAlgorithm =>
   // Intern table: string stop → UInt32 id
-  val stopIndexOf: { String: StopIndex } = {}
+  val stopIndexOf: { String: StopIntId } = {}
   val stopNames: String[] = []
 
-  val internStop = (stop: StopId): StopIndex =>
+  val internStop = (stop: StopId): StopIntId =>
     val existing = stopIndexOf[stop]
     if existing != null then
       existing
@@ -55,7 +55,7 @@ export val create = (
   // Per-route temp structures (pass 1 output)
   val tripsByRoute: { UInt32: Trip[] } = {}    // int routeId → trips in sorted order
   val routeStopIndex: RouteStopIndex = {}       // int routeId → stop → position
-  val routePathsTemp: { UInt32: StopIndex[] } = {}   // int routeId → stop sequence
+  val routePathsTemp: { UInt32: StopIntId[] } = {}   // int routeId → stop sequence
 
   // Inverse index per stop (for building stopRoutes/stopRoutesBase)
   val routesAtStopTemp: RoutesIndexedByStop = {}
@@ -102,8 +102,8 @@ export val create = (
 
   // Build a fresh route's auxiliary indexes: stop→position (first position wins if a stop repeats),
   // each stop's transfers/interchange, and the stop→routes inverse index.
-  val buildRouteIndexes = (routeId: RouteIntId, path: StopIndex[], stopTimes: StopTime[]) =>
-    val stopIndex: { StopIndex: RoutePosition } = {}
+  val buildRouteIndexes = (routeId: RouteIntId, path: StopIntId[], stopTimes: StopTime[]) =>
+    val stopIndex: { StopIntId: RoutePosition } = {}
     routeStopIndex[routeId] = stopIndex
 
     range(0, path.length()).for(i =>
@@ -144,7 +144,7 @@ export val create = (
   // ── PASS 2: lay down global flat arrays in route-major order ─────────────
   val numRoutes = nextRouteId
   val routes: Route[] = []
-  val routeStops: StopIndex[] = []
+  val routeStops: StopIntId[] = []
   val stopTimes: StopTimeEntry[] = []
   val flatTrips: Trip[] = []
 
@@ -173,7 +173,10 @@ export val create = (
     // Append all trips' stop-times in trip-major order and the Trip records
     rTrips.for(trip =>
       trip["stopTimes"].for(s =>
-        stopTimes.push({ "arrival": s["arrivalTime"], "departure": s["departureTime"] })
+        stopTimes.push({
+          "arrival": packArrival(s["arrivalTime"], s["dropOff"]),
+          "departure": packDeparture(s["departureTime"], s["pickUp"])
+        })
       )
       flatTrips.push(trip)
     )
@@ -207,7 +210,7 @@ export val create = (
     "routeStopIndex": frozenRouteStopIndex,
     "interchange": frozen(intInterchange),
     "transfers": frozen(usefulTransfers),
-    "stopIndexOf": frozen(stopIndexOf),
+    "stopIds": frozen(stopIndexOf),
     "stopNames": frozen(stopNames)
   }
 

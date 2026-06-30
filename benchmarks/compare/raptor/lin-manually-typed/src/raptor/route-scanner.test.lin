@@ -1,4 +1,4 @@
-import { expect, toBe, toBeNull, test, suite, run } from "std/test"
+import { expect, toBe, test, suite, run } from "std/test"
 import { Trip } from "../gtfs/gtfs"
 import { Service } from "../gtfs/service"
 import { DayOfWeek } from "../gtfs/date"
@@ -54,20 +54,18 @@ val makeTimetable = (trips: Trip[]): Timetable =>
     "routeStopIndex": {},
     "interchange": {},
     "transfers": {},
-    "stopIndexOf": {},
+    "stopIds": {},
     "stopNames": ["A"]
   }
-
-// Sentinel so a missing trip surfaces as a failed field assertion rather than a crash.
-val none: Trip = trip("none", 0, running)
 
 val s = suite("raptor/route-scanner", [
   test("returns the earliest reachable trip", () =>
     val trips = [trip("t1000", 1000, running), trip("t1100", 1100, running), trip("t1200", 1200, running)]
     val tt = makeTimetable(trips)
     val sc = createRouteScanner(20180615, friday)
+    val idx = getTrip(sc, tt, routeId0, 0, 1000)
     [
-      expect((getTrip(sc, tt, routeId0, 0, 1000) ?? none)["tripId"]).toBe("t1000")
+      expect(tt["trips"][idx]["tripId"]).toBe("t1000")
     ]
   ),
 
@@ -75,17 +73,18 @@ val s = suite("raptor/route-scanner", [
     val trips = [trip("t1000", 1000, running), trip("t1100", 1100, running), trip("t1200", 1200, running)]
     val tt = makeTimetable(trips)
     val sc = createRouteScanner(20180615, friday)
+    val idx = getTrip(sc, tt, routeId0, 0, 1150)
     [
-      expect((getTrip(sc, tt, routeId0, 0, 1150) ?? none)["tripId"]).toBe("t1200")
+      expect(tt["trips"][idx]["tripId"]).toBe("t1200")
     ]
   ),
 
-  test("returns null when no trip is reachable", () =>
+  test("returns -1 when no trip is reachable", () =>
     val trips = [trip("t1000", 1000, running), trip("t1200", 1200, running)]
     val tt = makeTimetable(trips)
     val sc = createRouteScanner(20180615, friday)
     [
-      expect(getTrip(sc, tt, routeId0, 0, 2000)).toBeNull()
+      expect(getTrip(sc, tt, routeId0, 0, 2000)).toBe(-1)
     ]
   ),
 
@@ -93,8 +92,9 @@ val s = suite("raptor/route-scanner", [
     val trips = [trip("t1000", 1000, notRunning), trip("t1100", 1100, running)]
     val tt = makeTimetable(trips)
     val sc = createRouteScanner(20180615, friday)
+    val idx = getTrip(sc, tt, routeId0, 0, 1000)
     [
-      expect((getTrip(sc, tt, routeId0, 0, 1000) ?? none)["tripId"]).toBe("t1100")
+      expect(tt["trips"][idx]["tripId"]).toBe("t1100")
     ]
   ),
 
@@ -103,8 +103,9 @@ val s = suite("raptor/route-scanner", [
     val tt = makeTimetable(trips)
     val f: RouteScannerFactory = createRouteScanner
     val sc = f(20180615, friday)
+    val idx = getTrip(sc, tt, routeId0, 0, 1000)
     [
-      expect((getTrip(sc, tt, routeId0, 0, 1000) ?? none)["tripId"]).toBe("t1000")
+      expect(tt["trips"][idx]["tripId"]).toBe("t1000")
     ]
   )
 ])

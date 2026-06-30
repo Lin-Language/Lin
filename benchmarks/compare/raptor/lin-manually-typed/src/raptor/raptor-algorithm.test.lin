@@ -29,7 +29,7 @@ val s = suite("raptor/raptor-algorithm", [
       "routeStopIndex": routeStopIndex,
       "interchange": interchange,
       "transfers": transfers,
-      "stopIndexOf": stopIndexOf,
+      "stopIds": stopIndexOf,
       "stopNames": stopNames
     }
 
