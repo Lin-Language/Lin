@@ -435,7 +435,7 @@ fn sink_into_then_branch(if_expr: &mut TypedExpr, mut sinkable: Vec<TypedStmt>) 
 ///
 /// We DO NOT try to prove purity of arbitrary imported functions — only pure combinators passed
 /// a pure callback.
-fn is_pure_expr(expr: &TypedExpr) -> bool {
+pub(crate) fn is_pure_expr(expr: &TypedExpr) -> bool {
     match expr {
         TypedExpr::IntLit(..)
         | TypedExpr::FloatLit(..)
