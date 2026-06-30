@@ -1,12 +1,7 @@
-import { Time, Trip, Transfer } from "../gtfs/gtfs"
-
-// ─── Semantic id/offset aliases (all UInt32/UInt8 underneath — zero runtime cost) ───
-// Use these wherever a value *is* one of these things, rather than a bare UInt32, so the
-// types document intent. (Lin arrays can't carry an index type, so "indexed by StopIndex"
-// is noted in comments; the element type still says what the values ARE.)
+import { Time, Trip, Transfer, StopId } from "../gtfs/gtfs"
 
 // Dense integer stop id — each distinct stop string is interned to a UInt32 in 0..numStops-1.
-export type StopIndex = UInt32
+export type StopIntId = UInt32
 
 // Dense integer route id — each distinct route (stop-sequence signature) gets a UInt32 in 0..numRoutes-1.
 export type RouteIntId = UInt32
@@ -18,7 +13,23 @@ export type Offset = UInt32
 export type RoutePosition = UInt8
 
 // One (arrival, departure) pair in the global trip-major stopTimes array (sealed all-scalar → inline 8B).
+// Bit 31 of arrival = dropOff flag; bit 31 of departure = pickUp flag. Real times need ≤18 bits so
+// bit 31 is free. Use arrivalOf/departureOf to read times; isDropOff/isPickUp for the flags.
 export type StopTimeEntry = { "arrival": Time, "departure": Time }
+
+// arrival/departure carry a stolen flag bit (bit 31): dropOff in arrival, pickUp in
+// departure. Real times need ≤18 bits, so bit 31 is free — StopTimeEntry stays sealed
+// all-scalar (8B). Reads mask it off; the builder ORs it in. Helpers are tiny so the
+// compiler inlines them.
+val FLAG_BIT: UInt32 = 0x80000000u32
+val TIME_MASK: UInt32 = 0x7FFFFFFFu32
+
+export val isDropOff = (e: StopTimeEntry): Boolean => (e["arrival"] & FLAG_BIT) != 0u32
+export val isPickUp = (e: StopTimeEntry): Boolean => (e["departure"] & FLAG_BIT) != 0u32
+export val arrivalOf = (e: StopTimeEntry): Time => e["arrival"] & TIME_MASK
+export val departureOf = (e: StopTimeEntry): Time => e["departure"] & TIME_MASK
+export val packArrival = (t: Time, dropOff: Boolean): Time => if dropOff then t | FLAG_BIT else t
+export val packDeparture = (t: Time, pickUp: Boolean): Time => if pickUp then t | FLAG_BIT else t
 
 // Descriptor for one route — where its data lives in the global flat arrays, plus its dimensions.
 // (`numStops` is constant across the route's trips; trip t's data starts at the *Base offsets + t*…)
@@ -31,18 +42,18 @@ export type Route = {
 }
 
 // route id → (stop id → that stop's position on the route)
-export type RouteStopIndex = { RouteIntId: { StopIndex: RoutePosition } }
+export type RouteStopIndex = { RouteIntId: { StopIntId: RoutePosition } }
 
 // stop id → interchange (transfer) time in seconds
-export type Interchange = { StopIndex: Time }
+export type Interchange = { StopIntId: Time }
 
 // origin stop id → footpaths leaving it
-export type TransfersByOrigin = { StopIndex: Transfer[] }
+export type TransfersByOrigin = { StopIntId: Transfer[] }
 
-// THE timetable: a handful of integer-indexed flat arrays (the paper's representation).
+// Timetable as per Raptor paper's design (int packed arrays)
 export type Timetable = {
   "routes": Route[],              // indexed by RouteIntId
-  "routeStops": StopIndex[],      // each route's stop sequence, concatenated (slice at routeStopsBase)
+  "routeStops": StopIntId[],      // each route's stop sequence, concatenated (slice at routeStopsBase)
   "stopTimes": StopTimeEntry[],   // GLOBAL, trip-major: stopTimesBase + t*numStops + s
   "trips": Trip[],                // GLOBAL, route-major: tripsBase + t
   // (the stop→routes inverse index — stopRoutes/stopRoutesBase — lives in the QueueFactory, the
@@ -50,6 +61,6 @@ export type Timetable = {
   "routeStopIndex": RouteStopIndex,
   "interchange": Interchange,
   "transfers": TransfersByOrigin,
-  "stopIndexOf": { String: StopIndex },  // intern:   stop code → id
+  "stopIds": { StopId: StopIntId },       // intern:   stop code → id
   "stopNames": String[]                  // de-intern: id (index) → stop code
 }
