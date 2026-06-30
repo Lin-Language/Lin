@@ -3,7 +3,7 @@ import { DayOfWeek, DateNumber } from "../gtfs/date"
 import { QueueFactory, getQueue } from "./queue-factory"
 import { RouteScanner, RouteScannerFactory, getTrip } from "./route-scanner"
 import { Arrivals, ConnectionIndex, ScanResults, createScanResults, addRound, previousArrival, setTrip, setTransfer, bestArrival, getMarkedStops, finalize } from "./scan-results"
-import { RouteIntId, RoutePosition, StopTimeEntry, Route, Timetable, arrivalOf, isDropOff } from "./timetable"
+import { RouteIntId, RoutePosition, StopTimeEntry, Route, Timetable, stopTimeIndexOf, arrivalTime, isDropOff } from "./timetable"
 import { keys, entries } from "std/object"
 import { length } from "std/array"
 import { while, range, for } from "std/iter"
@@ -81,10 +81,10 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
 
       if tripIdx >= 0 then
         val interchange = tt["interchange"][stopPi] ?? 0
-        val e = tt["stopTimes"][route["stopTimesBase"] + tripIdx * route["numStops"] + pi]
-        val arrival = e.arrivalOf() + interchange
+        val sti = route.stopTimeIndexOf(tripIdx.toUInt32(), pos)
+        val arrival = tt["stopTimes"].arrivalTime(sti) + interchange
 
-        if e.isDropOff() && arrival < results.bestArrival(stopPi) then
+        if tt["stopTimes"].isDropOff(sti) && arrival < results.bestArrival(stopPi) then
           results.setTrip(stopPi, arrival, routeId, tripIdx.toUInt32(), boardingPoint, pos)
         else if prevArrival != 0 && prevArrival < arrival then
           val newIdx = routeScanner.getTrip(tt, routeId, pos, prevArrival)

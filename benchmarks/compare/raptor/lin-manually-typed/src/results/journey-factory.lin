@@ -1,11 +1,12 @@
 import { Time, TimetableLeg, Transfer } from "../gtfs/gtfs"
 import { StopIndex } from "../raptor/raptor-algorithm"
 import { ConnectionIndex } from "../raptor/scan-results"
-import { Timetable, arrivalOf, departureOf, isPickUp, isDropOff } from "../raptor/timetable"
+import { Timetable, stopTimeIndexOf, arrivalTime, departureTime, isPickUp, isDropOff } from "../raptor/timetable"
 import { AnyLeg, Journey } from "./journey"
 import { keys } from "std/object"
 import { map, range, for, while } from "std/iter"
 import { length, reverse, push } from "std/array"
+import { toUInt8 } from "std/number"
 
 //
 // Take the best result of each round for the given destination and turn it into a journey.
@@ -46,17 +47,15 @@ val getJourneyLegs = (tt: Timetable, kConnections: ConnectionIndex, k: UInt8, fi
       val [routeId, t, start, end] = connection
       val route = tt["routes"][routeId]
       val rsBase = route["routeStopsBase"]
-      val stBase = route["stopTimesBase"]
-      val nStops = route["numStops"]
 
       val stopTimes = range(start, end + 1).map(pos =>
-        val e = tt["stopTimes"][stBase + t * nStops + pos]
+        val sti = route.stopTimeIndexOf(t, pos.toUInt8())
         {
           "stop": tt["stopNames"][tt["routeStops"][rsBase + pos]],
-          "arrivalTime": e.arrivalOf(),
-          "departureTime": e.departureOf(),
-          "pickUp": e.isPickUp(),
-          "dropOff": e.isDropOff()
+          "arrivalTime": tt["stopTimes"].arrivalTime(sti),
+          "departureTime": tt["stopTimes"].departureTime(sti),
+          "pickUp": tt["stopTimes"].isPickUp(sti),
+          "dropOff": tt["stopTimes"].isDropOff(sti)
         }
       )
       val origin = stopTimes[0]["stop"]
