@@ -1,9 +1,9 @@
 import { DayOfWeek, DateNumber } from "../gtfs/date"
 import { Time } from "../gtfs/gtfs"
 import { runsOn } from "../gtfs/service"
-import { StopIntId, RouteIntId, RoutePosition, StopTimeEntry, Route, Timetable, departureOf } from "./timetable"
+import { StopIntId, RouteIntId, RoutePosition, StopTimeEntry, Route, Timetable, stopTimeIndexOf, departureTime } from "./timetable"
 import { while } from "std/iter"
-import { toInt32 } from "std/number"
+import { toInt32, toUInt32 } from "std/number"
 
 // Per-route mutable scan position (one Int32 per route id, keyed by dense int route id).
 export type RouteScanPosition = { RouteIntId: Int32 }
@@ -68,9 +68,9 @@ export val getTrip = (
     if i < 0 then
       false
     else
-      val departureTime = departureOf(timetable["stopTimes"][route["stopTimesBase"] + i * route["numStops"] + stopIndex])
+      val dep = timetable["stopTimes"].departureTime(route.stopTimeIndexOf(i.toUInt32(), stopIndex))
 
-      if departureTime < time then
+      if dep < time then
         false
       else
         val foundHere = timetable["services"][timetable["tripServiceId"][route["tripsBase"] + i]].runsOn(scanner["date"], scanner["dow"])

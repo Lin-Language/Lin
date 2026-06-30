@@ -32,10 +32,14 @@ export type StopTimeEntry = { "arrival": Time, "departure": Time }
 val FLAG_BIT: UInt32 = 0x80000000u32
 val TIME_MASK: UInt32 = 0x7FFFFFFFu32
 
-export val isDropOff = (e: StopTimeEntry): Boolean => (e["arrival"] & FLAG_BIT) != 0u32
-export val isPickUp = (e: StopTimeEntry): Boolean => (e["departure"] & FLAG_BIT) != 0u32
-export val arrivalOf = (e: StopTimeEntry): Time => e["arrival"] & TIME_MASK
-export val departureOf = (e: StopTimeEntry): Time => e["departure"] & TIME_MASK
+// Read a stop-time's masked time / flag by (array, index). Taking the array + index rather than a
+// `StopTimeEntry` value lets the field read fuse to a direct load — passing a sealed inline element
+// by value would heap-copy the 8-byte entry on every read.
+export val arrivalTime = (stopTimes: StopTimeEntry[], i: Offset): Time => stopTimes[i]["arrival"] & TIME_MASK
+export val departureTime = (stopTimes: StopTimeEntry[], i: Offset): Time => stopTimes[i]["departure"] & TIME_MASK
+export val isDropOff = (stopTimes: StopTimeEntry[], i: Offset): Boolean => (stopTimes[i]["arrival"] & FLAG_BIT) != 0u32
+export val isPickUp = (stopTimes: StopTimeEntry[], i: Offset): Boolean => (stopTimes[i]["departure"] & FLAG_BIT) != 0u32
+// Build-side: OR the flag into a raw time when laying down the flat array.
 export val packArrival = (t: Time, dropOff: Boolean): Time => if dropOff then t | FLAG_BIT else t
 export val packDeparture = (t: Time, pickUp: Boolean): Time => if pickUp then t | FLAG_BIT else t
 
@@ -44,10 +48,15 @@ export val packDeparture = (t: Time, pickUp: Boolean): Time => if pickUp then t 
 export type Route = {
   "stopTimesBase": Offset,   // → stopTimes[]
   "routeStopsBase": Offset,  // → routeStops[]
-  "tripsBase": Offset,       // → trips[]
+  "tripsBase": Offset,       // → tripServiceId[] / tripIds[]
   "numStops": UInt32,        // stops per trip on this route
   "numTrips": UInt32         // trips on this route
 }
+
+// Index into the global trip-major `stopTimes` array for this route's trip `tripIndex` at stop
+// position `stopPos`: `stopTimesBase + tripIndex*numStops + stopPos`.
+export val stopTimeIndexOf = (route: Route, tripIndex: TripIndex, stopPos: RoutePosition): Offset =>
+  route["stopTimesBase"] + tripIndex * route["numStops"] + stopPos
 
 // route id → (stop id → that stop's position on the route)
 export type RouteStopIndex = { RouteIntId: { StopIntId: RoutePosition } }
