@@ -22,5 +22,4 @@ pub use lower::{
 };
 pub use monomorphize::{
     monomorphize, monomorphize_import_with_imports, monomorphize_with_imports,
-    module_calls_inlinable_import,
 };
