@@ -43,10 +43,7 @@ val getJourneyLegs = (tt: Timetable, kConnections: ConnectionIndex, k: UInt8, fi
     else if connection != null then
       // Connection is [routeId, tripIndex, boardingPos, alightingPos]. Reconstruct the leg's
       // stop sequence + times from the flat timetable arrays (cold path — helpers are fine here).
-      val routeId = connection["routeId"]
-      val t = connection["tripIndex"]
-      val start = connection["start"]
-      val end = connection["end"]
+      val [routeId, t, start, end] = connection
       val route = tt["routes"][routeId]
       val rsBase = route["routeStopsBase"]
       val stBase = route["stopTimesBase"]
