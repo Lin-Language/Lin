@@ -85,7 +85,7 @@ pub(crate) fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut 
                 // its own TaggedVal* (and free the transient coercion box shell).
                 let t = coerce_and_own_store(raw, &value.ty(), &cell_ty, builder);
                 let cell = builder.alloc_temp(Type::TypeVar(u32::MAX));
-                builder.emit(Instruction::MakeCell { dst: cell, init: t, ty: cell_ty.clone() });
+                builder.emit(Instruction::MakeCell { dst: cell, init: t, ty: cell_ty.clone(), stack: false });
                 builder.cell_slots.insert(*slot, cell_ty.clone());
                 builder.slots.insert(*slot, cell);
                 // Track this cell for the captured-cell escape analysis: it becomes a
