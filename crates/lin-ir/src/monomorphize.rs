@@ -52,6 +52,10 @@ fn specialization_budget() -> usize {
 /// `next_generic_tv` base; 9000 itself is the intrinsic array/iterator slot).
 const GENERIC_TV_BASE: u32 = 9001;
 
+/// Maximum AST node count for a function body eligible for cross-module inlining.
+/// Bodies larger than this are left as-is (the LLVM inliner's own budget would reject them anyway).
+const INLINE_NODE_BUDGET: usize = 32;
+
 /// True if `ty` mentions any quantified generic TypeVar (≥ `GENERIC_TV_BASE`, excluding the
 /// `u32::MAX` Json wildcard). Such a type is unresolved-polymorphic and must be specialized.
 fn mentions_generic_tv(ty: &Type) -> bool {
@@ -556,6 +560,23 @@ struct AnonFn {
     origin: Option<String>,
 }
 
+/// A non-generic, trivially-pure imported function eligible for cross-module inlining.
+/// Keyed by the importing module's binding slot in `inline_fns`/`inline_specs`.
+struct InlineFn {
+    name: String,
+    func: TypedExpr,
+    origin: String,
+}
+
+/// Info about an already-minted inline-fn local copy (one per import-binding slot).
+#[derive(Clone)]
+struct InlineSpecInfo {
+    /// The fresh local slot allocated for the cloned function body.
+    slot: usize,
+    /// The name of the cloned function, e.g. `"departureOf$xinl123"`.
+    name: String,
+}
+
 /// Canonical hashable key for an anon-layout specialisation: function slot + per-(param-index,
 /// concrete-arg-type-debug-string) pairs, sorted by param index.
 type AnonLayoutKey = (usize, Vec<(usize, String)>);
@@ -970,7 +991,36 @@ fn monomorphize_inner(
             }
         }
     }
-    if generics.is_empty() && anon_fns.is_empty() {
+    // 1b-inline: Discover trivially-inlinable imported functions (non-generic, pure, small).
+    // Keyed by the importing module's binding slot so `rewrite_expr` can repoint calls.
+    let mut inline_fns: HashMap<usize, InlineFn> = HashMap::new();
+    if std::env::var("LIN_NO_INLINE").is_err() {
+        for stmt in &module.statements {
+            if let TypedStmt::Import { path, bindings, .. } = stmt {
+                let Some(origin) = imports.get(path) else { continue };
+                for b in bindings {
+                    if !matches!(&b.ty, Type::Function { .. }) {
+                        continue;
+                    }
+                    // Skip if already registered as a generic or anon-fn (those have their own path).
+                    if generics.contains_key(&b.slot) || anon_fns.contains_key(&b.slot) {
+                        continue;
+                    }
+                    if let Some(func) = find_exported_fn(origin, &b.name, b.symbol.as_deref()) {
+                        if is_trivially_inlinable_import(&func, origin) {
+                            inline_fns.insert(b.slot, InlineFn {
+                                name: b.name.clone(),
+                                func,
+                                origin: path.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if generics.is_empty() && anon_fns.is_empty() && inline_fns.is_empty() {
         return Vec::new(); // No-op for ordinary modules.
     }
 
@@ -998,6 +1048,12 @@ fn monomorphize_inner(
             next_slot = next_slot.max(m + 1);
         }
     }
+    // Inline axis: bump for imported inline-fn bodies.
+    for ifn in inline_fns.values() {
+        let mut m = 0usize;
+        max_slot_expr(&ifn.func, &mut m);
+        next_slot = next_slot.max(m + 1);
+    }
 
     let direct_callable_fn_slots = collect_direct_callable_fn_slots(module);
     let no_capture_fn_slots = collect_no_capture_fn_slots(module);
@@ -1024,6 +1080,9 @@ fn monomorphize_inner(
         anon_specs: HashMap::new(),
         anon_worklist: Vec::new(),
         anon_per_fn_count: HashMap::new(),
+        inline_fns,
+        inline_specs: HashMap::new(),
+        inline_worklist: Vec::new(),
     };
 
     // 2. Walk the whole module, rewriting calls to generic functions and queuing specializations.
@@ -1147,6 +1206,43 @@ fn monomorphize_inner(
         });
     }
 
+    // 3b-inline: Drain the cross-module inline worklist: clone each inlinable imported function
+    // body, re-home it into the importing module's slot space (exactly like generic specs), rename
+    // inner closures to avoid LLVM symbol collisions, and re-run the call rewriter so any nested
+    // generic or further inline calls inside the body are also handled. The fixpoint loop handles
+    // transitive inline deps (an inlinable fn that itself calls another inlinable import).
+    while let Some(binding_slot) = state.inline_worklist.pop() {
+        let (spec_slot, spec_name, origin_path, func_clone) = {
+            let spec_slot = state.inline_specs[&binding_slot].slot;
+            let spec_name = state.inline_specs[&binding_slot].name.clone();
+            let origin_path = state.inline_fns[&binding_slot].origin.clone();
+            let func_clone = state.inline_fns[&binding_slot].func.clone();
+            (spec_slot, spec_name, origin_path, func_clone)
+        };
+        let mut func = func_clone;
+        let span = func.span();
+        if let TypedExpr::Function { name, body, .. } = &mut func {
+            *name = Some(spec_name.clone());
+            // Rename inner named closures so each inlined copy gets distinct LLVM symbols.
+            let inner_suffix = spec_name.trim_start_matches(|c: char| c != '$');
+            rename_inner_fns(body, inner_suffix);
+        }
+        // Re-home: remap origin-module slots to fresh importer slots; rewrite free references to
+        // sibling/intrinsic/import bindings into importer-side Named import / intrinsic entries.
+        rehome_imported_body(&mut func, &origin_path, &mut state);
+        // Re-run the call rewriter so generic calls and further inline refs inside the body are
+        // handled (worklist fixpoint).
+        rewrite_expr(&mut func, &mut state);
+        let ty = func.ty();
+        materialized.push(TypedStmt::Val {
+            slot: spec_slot,
+            name: Some(spec_name),
+            value: func,
+            ty,
+            span,
+        });
+    }
+
     // Deterministic order so codegen/IR output is stable across runs.
     materialized.sort_by_key(|s| if let TypedStmt::Val { slot, .. } = s { *slot } else { 0 });
 
@@ -1247,6 +1343,94 @@ fn find_exported_fn(module: &TypedModule, name: &str, exact_symbol: Option<&str>
 }
 
 // ---------------------------------------------------------------------------
+// Cross-module inline helpers
+// ---------------------------------------------------------------------------
+
+/// Count the total number of AST nodes in `expr` (each variant = 1). Used to gate
+/// cross-module inlining: bodies with more than `INLINE_NODE_BUDGET` nodes are skipped.
+fn count_nodes(expr: &TypedExpr) -> usize {
+    let mut n = 1usize;
+    for_each_child(expr, &mut |c| n += count_nodes(c));
+    n
+}
+
+/// True if an imported function body is trivially inlinable: non-generic, pure, small, and
+/// does not reference origin-module global `var`s (those can't be re-homed into the importer).
+fn is_trivially_inlinable_import(
+    func: &TypedExpr,
+    origin: &TypedModule,
+) -> bool {
+    let TypedExpr::Function { params, ret_type, body, .. } = func else { return false };
+    // Non-generic: no quantified TypeVar params or return.
+    if params.iter().any(|p| mentions_generic_tv(&p.ty)) || mentions_generic_tv(ret_type) {
+        return false;
+    }
+    // No impure return types (Stream/Promise/Shared/Opaque imply side effects).
+    if matches!(ret_type, Type::Promise(_) | Type::Stream(_) | Type::Shared(_) | Type::Opaque(_)) {
+        return false;
+    }
+    // Don't inline Iterator-returning functions. The `range`-`for` fusion pattern in
+    // `lower/combinator.rs` identifies `range(a,b)` by recognising the callee slot in
+    // `import_fn_slots` / `intrinsic_slots` / `range{2,3}_spec_slots`. If we inline `range`
+    // the callee becomes a local-function slot not in any of those maps, so the counter-loop
+    // fusion silently falls back to the tagged-element array path and the
+    // `test_range_for_fusion_no_tagged_array` / `test_flat_producer_specs_read_flat_not_tagged`
+    // assertions fire.
+    if matches!(ret_type, Type::Iterator(_)) {
+        return false;
+    }
+    // Pure body (no mutation, no I/O, no unknown calls).
+    if !crate::sink_pure_val::is_pure_expr(body) {
+        return false;
+    }
+    // Small enough to fit within the inline budget.
+    if count_nodes(body) > INLINE_NODE_BUDGET {
+        return false;
+    }
+    // No references to origin-module global `var`s (those are not re-homeable).
+    if body_refs_origin_global_var(body, origin) {
+        return false;
+    }
+    // No calls to origin-module IMPORT bindings (functions imported from a third module).
+    // Such references can't be safely re-homed: the synthesized Import has `symbol: None`, which
+    // generates the un-mangled base symbol name — undefined for ADR-074 overloaded functions
+    // (e.g. `std_number_toUInt16` doesn't exist, only `std_number_toUInt16$UInt64_94` does).
+    if body_calls_origin_import(body, origin) {
+        return false;
+    }
+    true
+}
+
+/// Cheap pre-check: does this module import any trivially-inlinable function from one of the
+/// given import modules? Used as the gate in `lower_module_with_imports` / `lower_import_module_with_imports`
+/// to avoid running the monomorphizer on modules that don't need it.
+pub fn module_calls_inlinable_import(
+    module: &TypedModule,
+    imports: &HashMap<String, TypedModule>,
+) -> bool {
+    if std::env::var("LIN_NO_INLINE").is_ok() {
+        return false;
+    }
+    for stmt in &module.statements {
+        if let TypedStmt::Import { path, bindings, .. } = stmt {
+            let Some(origin) = imports.get(path) else { continue };
+            for b in bindings {
+                // Only function-typed bindings.
+                if !matches!(&b.ty, Type::Function { .. }) {
+                    continue;
+                }
+                if let Some(func) = find_exported_fn(origin, &b.name, b.symbol.as_deref()) {
+                    if is_trivially_inlinable_import(&func, origin) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Cross-module body re-homing
 // ---------------------------------------------------------------------------
 
@@ -1303,6 +1487,47 @@ fn body_refs_origin_global_var(body: &TypedExpr, origin: &TypedModule) -> bool {
     let mut found = false;
     walk_local_slot_refs(body, &mut |slot| {
         if origin_var_slots.contains(&slot) && !locals.contains(&slot) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// True if a cross-module inline candidate's body has any FREE reference to an import binding of
+/// its origin module (a function or value imported from a third module).  Such a free reference
+/// cannot be safely re-homed: `classify_origin_slot` would fall through to `OriginRef::Sibling`
+/// with `symbol: None`, generating `@{key}_{name}` — the base (un-mangled) symbol name — which
+/// doesn't exist when the third module uses ADR-074 overloaded symbols (e.g.
+/// `std_number_toUInt16` vs `std_number_toUInt16$UInt64_94`).
+///
+/// Functions in this category include any function that itself CALLS another imported function
+/// (e.g. `u16FromLe` calls `toUInt16`; `toUInt16 = (v: UInt64) => lin_to_uint16(v)` calls the
+/// foreign-runtime `lin_to_uint16`).  Only functions whose free refs are all INTRINSICS (slots in
+/// `origin.intrinsics`) are safe to re-home.  Pure arithmetic/field-access helpers (the RAPTOR
+/// hot-path targets) have no free refs beyond their params and pass this check.
+fn body_calls_origin_import(body: &TypedExpr, origin: &TypedModule) -> bool {
+    // Collect all import binding slots in the origin module (both regular and foreign imports).
+    let mut import_slots = std::collections::HashSet::new();
+    for stmt in &origin.statements {
+        match stmt {
+            TypedStmt::Import { bindings, .. } => {
+                for b in bindings { import_slots.insert(b.slot); }
+            }
+            TypedStmt::ForeignImport { bindings, .. } => {
+                for b in bindings { import_slots.insert(b.slot); }
+            }
+            _ => {}
+        }
+    }
+    if import_slots.is_empty() {
+        return false;
+    }
+    // Slots bound locally inside the body (params/vals/vars) are not origin imports.
+    let mut locals = std::collections::HashSet::new();
+    collect_local_slots(body, &mut locals);
+    let mut found = false;
+    walk_local_slot_refs(body, &mut |slot| {
+        if import_slots.contains(&slot) && !locals.contains(&slot) {
             found = true;
         }
     });
@@ -1825,6 +2050,14 @@ struct MonoState<'a> {
     anon_worklist: Vec<AnonLayoutKey>,
     /// Per-anon-fn specialization count (shares the same SPECIALIZATION_BUDGET).
     anon_per_fn_count: HashMap<usize, usize>,
+
+    // Cross-module inline axis fields ----------------------------------------
+    /// Imported functions eligible for cross-module inlining, keyed by the importer's binding slot.
+    inline_fns: HashMap<usize, InlineFn>,
+    /// Already-minted inline copies, keyed by the import-binding slot.
+    inline_specs: HashMap<usize, InlineSpecInfo>,
+    /// Binding slots pending materialization (worklist so nested inline bodies are also processed).
+    inline_worklist: Vec<usize>,
 }
 
 struct SpecInfo {
@@ -2516,6 +2749,31 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                     }
                 }
             }
+        }
+    }
+
+    // CROSS-MODULE INLINE: rewrite any `LocalGet` whose slot is a registered inlinable import
+    // to the fresh local copy, so LLVM's single-module O2 inliner can inline it. A new copy is
+    // minted on first encounter (worklist) and reused on subsequent occurrences.
+    if let TypedExpr::LocalGet { slot, ty, .. } = expr {
+        if let Some(ifn) = state.inline_fns.get(slot) {
+            let spec_slot = if let Some(s) = state.inline_specs.get(slot) {
+                s.slot
+            } else {
+                let new_slot = state.next_slot;
+                state.next_slot += 1;
+                let name = format!("{}$xinl{}", ifn.name, new_slot);
+                let binding_slot = *slot;
+                state.inline_specs.insert(binding_slot, InlineSpecInfo {
+                    slot: new_slot,
+                    name,
+                });
+                state.inline_worklist.push(binding_slot);
+                new_slot
+            };
+            *slot = spec_slot;
+            // Keep the type as-is: the cloned function has the same signature.
+            let _ = ty;
         }
     }
 }
