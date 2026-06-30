@@ -361,6 +361,23 @@ impl Type {
         }
     }
 
+    /// True when a map with this KEY type qualifies for the dense (flat-array) representation.
+    /// Requires a provably non-negative bounded integer: UInt8, UInt16, or UInt32.
+    /// UInt64 is excluded (would require a 16GB flat array for max-key). Int* types are excluded
+    /// (can be negative). IntLit unions that are all non-negative and fit in u32 also qualify.
+    pub fn is_dense_int_key(&self) -> bool {
+        match self {
+            Type::UInt8 | Type::UInt16 | Type::UInt32 => true,
+            Type::Union(variants) if !variants.is_empty() => {
+                variants.iter().all(|v| match v {
+                    Type::IntLit(n) => *n >= 0 && *n <= u32::MAX as i64,
+                    t => t.is_dense_int_key(),
+                })
+            }
+            _ => false,
+        }
+    }
+
     /// True when this element type maps to a FLAT unboxed scalar array (a concrete
     /// fixed-width numeric). Mirrors codegen's `Codegen::is_flat_scalar` — the two MUST
     /// agree, since the checker decides when to refine an `arrayAllocate` result to a

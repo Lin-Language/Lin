@@ -826,6 +826,12 @@ pub(crate) struct FuncBuilder {
     /// Each frame holds (temp, type) pairs for freshly-allocated heap values
     /// introduced in the current scope that must be released on exit.
     scope_owned: Vec<Vec<(Temp, Type)>>,
+    /// Stack of box-shell frames for scope-exit shell-only free (FreeBoxShell).
+    /// Used for shell-only (keep-packed) boxes whose inner is owned by a SEPARATE temp in
+    /// `scope_owned` (e.g. a sealed-scalar-array or sealed-record boxed into an AnyVal/union
+    /// slot: the source keeps its own scope ownership; the box wrapping it is a SHELL-ONLY
+    /// that must be freed without touching the inner).
+    scope_box_shells: Vec<Vec<Temp>>,
     /// Blocks that are dead continuations after a diverging TailCall. They carry a fresh
     /// temp so `lower_expr` can return one, but control never reaches them; they must not
     /// become phi predecessors of an enclosing if/match merge.
@@ -910,6 +916,7 @@ impl FuncBuilder {
             slots: HashMap::new(),
             intrinsic_slots,
             scope_owned: Vec::new(),
+            scope_box_shells: Vec::new(),
             diverged_blocks: std::collections::HashSet::new(),
             cell_slots: HashMap::new(),
             created_cells: Vec::new(),
@@ -1101,6 +1108,16 @@ impl FuncBuilder {
     /// Push a new ownership scope frame.
     fn push_scope(&mut self) {
         self.scope_owned.push(Vec::new());
+        self.scope_box_shells.push(Vec::new());
+    }
+
+    /// Register a temp for shell-only reclaim (FreeBoxShell) at scope exit.
+    /// Used for keep-packed boxes (sealed-scalar-array or sealed-record → AnyVal/union) whose
+    /// inner is owned separately: only the 16-byte shell is freed, NOT the inner payload.
+    pub(crate) fn register_box_shell(&mut self, t: Temp) {
+        if let Some(frame) = self.scope_box_shells.last_mut() {
+            frame.push(t);
+        }
     }
 
     /// Register an owned temp in the current scope frame.
@@ -1243,6 +1260,12 @@ impl FuncBuilder {
                 self.register_owned(t, ty);
             }
         }
+        // Box shells are always freed at pop (never kept — the inner is owned separately).
+        if let Some(shells) = self.scope_box_shells.pop() {
+            for t in shells {
+                self.emit(Instruction::FreeBoxShell { val: t });
+            }
+        }
     }
 
     /// Record that the call result `dst` aliases the payload of the raw fresh-alloc literal
@@ -1298,6 +1321,12 @@ impl FuncBuilder {
                 }
             }
         }
+        // Box shells are always freed at pop (never kept — the inner is owned separately).
+        if let Some(shells) = self.scope_box_shells.pop() {
+            for t in shells {
+                self.emit(Instruction::FreeBoxShell { val: t });
+            }
+        }
     }
 
     /// Pop the current ownership scope without emitting releases. Used when the block
@@ -1305,6 +1334,7 @@ impl FuncBuilder {
     /// would be unreachable / handled by the terminating construct.
     fn discard_scope(&mut self) {
         self.scope_owned.pop();
+        self.scope_box_shells.pop();
     }
 
     /// Release every owned temp live in ANY scope frame, EXCEPT the temps passed as
@@ -1440,6 +1470,12 @@ impl FuncBuilder {
                 non_arg_seen.push(t);
             }
             self.emit(Instruction::Release { val: t, ty });
+        }
+        // Box shells are freed here too (shell-only, safe at tail-call pre-release site). The
+        // frames themselves are left in place (discard_scope will pop them into the dead post block).
+        let shells: Vec<Temp> = self.scope_box_shells.iter().flat_map(|f| f.iter().copied()).collect();
+        for t in shells {
+            self.emit(Instruction::FreeBoxShell { val: t });
         }
     }
 

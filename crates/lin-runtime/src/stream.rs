@@ -478,10 +478,13 @@ impl LinFn {
         let a0 = arg0 as usize;
         let a1 = arg1 as usize;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let f = LinFn { closure: closure_addr as *mut u8 };
-            let r = f.call2(a0 as *mut u8, a1 as *mut u8, index);
-            std::mem::forget(f); // do not release the borrowed closure here
-            r
+            // ManuallyDrop: this is a BORROWED alias of `self` (no retain was done), so its
+            // destructor must never fire — not on success, and not on the unwind path if the
+            // closure faults. The old code used `std::mem::forget(f)` on the success branch, but
+            // forget is unreachable when a panic unwinds past it, causing a spurious extra release
+            // (double-free) on the fault path. ManuallyDrop suppresses drop unconditionally.
+            let f = std::mem::ManuallyDrop::new(LinFn { closure: closure_addr as *mut u8 });
+            f.call2(a0 as *mut u8, a1 as *mut u8, index)
         }));
         match result {
             Ok(v) => Ok(v),
@@ -497,17 +500,19 @@ impl LinFn {
     /// rather than surface as the awaited `Error`. The closure call itself is `extern "C-unwind"`,
     /// so the panic unwinds INTO this Rust frame, where `catch_unwind` can intercept it.
     unsafe fn call_caught(&self, arg: *mut u8, index: i64) -> Result<*mut u8, String> {
-        let this = self.closure;
+        let closure_addr = self.closure as usize;
         let arg_addr = arg as usize;
         // `AssertUnwindSafe`: the closure pointer + arg are raw and not Rust-UnwindSafe, but a
         // caught fault leaves them in a defined (already-released-by-the-caller) state — we do not
         // re-touch `arg` after a catch (the caller releases it), so this is sound here.
-        let closure_addr = this as usize;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let f = LinFn { closure: closure_addr as *mut u8 };
-            let r = f.call(arg_addr as *mut u8, index);
-            std::mem::forget(f); // do not drop (release) the borrowed closure here
-            r
+            // ManuallyDrop: this is a BORROWED alias of `self` (no retain was done), so its
+            // destructor must never fire — not on success, and not on the unwind path if the
+            // closure faults. The old code used `std::mem::forget(f)` on the success branch, but
+            // forget is unreachable when a panic unwinds past it, causing a spurious extra release
+            // (double-free) on the fault path. ManuallyDrop suppresses drop unconditionally.
+            let f = std::mem::ManuallyDrop::new(LinFn { closure: closure_addr as *mut u8 });
+            f.call(arg_addr as *mut u8, index)
         }));
         match result {
             Ok(v) => Ok(v),
@@ -3156,6 +3161,9 @@ struct CsvAssembler {
     field: Vec<u8>,
     /// Fields accumulated so far for the in-flight record.
     record: Vec<Vec<u8>>,
+    /// Free-list of cleared `Vec<u8>` buffers recycled from consumed records. Popped in
+    /// `end_field` so the next field reuses existing capacity instead of allocating fresh.
+    pool: Vec<Vec<u8>>,
     /// True while the scanner is INSIDE a quoted field (a newline here is field content).
     in_quotes: bool,
     /// True just after a closing quote of a quoted field — a following `"` is an escaped quote;
@@ -3182,6 +3190,7 @@ impl CsvAssembler {
             delim: d,
             field: Vec::new(),
             record: Vec::new(),
+            pool: Vec::new(),
             in_quotes: false,
             after_quote: false,
             field_quoted: false,
@@ -3192,11 +3201,25 @@ impl CsvAssembler {
         }
     }
 
-    /// Finish the current field, pushing it onto the in-flight record.
+    /// Finish the current field, pushing it onto the in-flight record, and install a recycled
+    /// (or fresh) buffer as the next `self.field` so the next field has preallocated capacity.
     fn end_field(&mut self) {
-        self.record.push(std::mem::take(&mut self.field));
+        // Swap in a recycled buffer as the new `self.field`; take the old one for the record.
+        let next = self.pool.pop().unwrap_or_default();
+        let done = std::mem::replace(&mut self.field, next);
+        self.record.push(done);
         self.field_quoted = false;
         self.after_quote = false;
+    }
+
+    /// Return a completed record's inner Vecs to the pool so their capacity is reused.
+    /// Call this immediately after `record_to_object_*` has consumed the record (borrowed it).
+    fn recycle_record(&mut self, mut rec: Vec<Vec<u8>>) {
+        for mut v in rec.drain(..) {
+            v.clear();
+            self.pool.push(v);
+        }
+        // rec itself (the outer Vec) is dropped here; only the inner Vecs are pooled.
     }
 
     /// Finish the current record, returning its fields. Resets per-record state.
@@ -3332,7 +3355,36 @@ impl CsvRowsSource {
     /// Feed a chunk's bytes through the assembler, enqueueing every completed record. Returns an
     /// Err message on a stray-quote fault or a buffer-cap overflow.
     fn feed(&mut self, chunk: &[u8]) -> Result<(), String> {
-        for &b in chunk {
+        let delim = self.asm.delim;
+        let mut pos = 0;
+        while pos < chunk.len() {
+            // Fast path: when NOT inside quotes, NOT after_quote, and NOT skip_next_lf, bulk-copy
+            // runs of plain (non-special) bytes with a single extend_from_slice instead of
+            // per-byte dispatch.
+            if !self.asm.in_quotes && !self.asm.after_quote && !self.asm.skip_next_lf {
+                let rest = &chunk[pos..];
+                // Scan for the first interesting byte: delimiter, quote, CR, or LF.
+                let span = rest
+                    .iter()
+                    .position(|&b| b == delim || b == b'"' || b == b'\r' || b == b'\n')
+                    .unwrap_or(rest.len());
+                if span > 0 {
+                    self.asm.field.extend_from_slice(&rest[..span]);
+                    self.asm.buffered += span;
+                    self.asm.record_started = true;
+                    pos += span;
+                    if self.asm.buffered > MAX_CSV_RECORD_BYTES {
+                        return Err(format!(
+                            "csv: a single record exceeded {} bytes without a terminator — refusing to buffer unbounded input",
+                            MAX_CSV_RECORD_BYTES
+                        ));
+                    }
+                    continue;
+                }
+            }
+            // Slow path: one special (or state-gated) byte through the existing state machine.
+            let b = chunk[pos];
+            pos += 1;
             if let Some(rec) = self.asm.push_byte(b) {
                 self.queue.push_back(rec);
             }
@@ -3394,7 +3446,12 @@ impl StreamSource for CsvRowsSource {
         match self.next_raw() {
             RawRecord::Eof => TaggedOutcome::Eof,
             RawRecord::Err(m) => TaggedOutcome::Err(m),
-            RawRecord::Item(rec) => TaggedOutcome::Item(record_to_string_array(&rec)),
+            RawRecord::Item(rec) => {
+                let item = record_to_string_array(&rec);
+                // Recycle the field Vecs back into the assembler's pool.
+                self.asm.recycle_record(rec);
+                TaggedOutcome::Item(item)
+            }
         }
     }
     fn close(&mut self) {
@@ -3466,23 +3523,26 @@ unsafe impl Send for CsvRecordsSource {}
 /// so equal byte sequences share ONE immortal LinString (pointer-identity key compare in map gets).
 unsafe fn record_to_object_cached(keys: &[*mut crate::string::LinString], row: &[Vec<u8>]) -> *mut u8 {
     use crate::map::{lin_map_alloc, lin_map_set};
-    use crate::string::intern_csv_field_bytes;
+    use crate::string::{intern_csv_field_in, with_csv_intern_table};
     use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TaggedVal};
     let map = lin_map_alloc(keys.len().max(1) as u32, 0);
-    for (i, &k) in keys.iter().enumerate() {
-        if i >= row.len() {
-            break; // short row: omit the trailing keys
+    // Borrow the intern table ONCE for the whole row, not once per field.
+    with_csv_intern_table(|tbl| {
+        for (i, &k) in keys.iter().enumerate() {
+            if i >= row.len() {
+                break; // short row: omit the trailing keys
+            }
+            // Intern the value so equal strings (StopId, RouteId, …) share one immortal pointer.
+            // lin_map_set retains the value; lin_string_release is a no-op for immortal strings.
+            let v = intern_csv_field_in(tbl, row[i].as_ptr(), row[i].len() as u32);
+            let mut tv: TaggedVal = std::mem::zeroed();
+            tv.tag = TAG_STR;
+            tv.payload = v as u64;
+            lin_map_set(map, k, &tv); // map retains key + value
+            crate::string::lin_string_release(v); // no-op for immortal; safe for non-immortal
+            // key NOT released here — source's persistent ref outlives all rows
         }
-        // Intern the value so equal strings (StopId, RouteId, …) share one immortal pointer.
-        // lin_map_set retains the value; lin_string_release is a no-op for immortal strings.
-        let v = intern_csv_field_bytes(row[i].as_ptr(), row[i].len() as u32);
-        let mut tv: TaggedVal = std::mem::zeroed();
-        tv.tag = TAG_STR;
-        tv.payload = v as u64;
-        lin_map_set(map, k, &tv); // map retains key + value
-        crate::string::lin_string_release(v); // no-op for immortal; safe for non-immortal
-        // key NOT released here — source's persistent ref outlives all rows
-    }
+    });
     alloc_tagged(TAG_MAP, map as u64)
 }
 
@@ -3490,21 +3550,24 @@ unsafe fn record_to_object_cached(keys: &[*mut crate::string::LinString], row: &
 /// Only the selected columns are materialized; others are never allocated.
 unsafe fn record_to_object_projected(proj: &[(usize, *mut crate::string::LinString)], row: &[Vec<u8>]) -> *mut u8 {
     use crate::map::{lin_map_alloc, lin_map_set};
-    use crate::string::intern_csv_field_bytes;
+    use crate::string::{intern_csv_field_in, with_csv_intern_table};
     use crate::tagged::{alloc_tagged, TAG_MAP, TAG_STR, TaggedVal};
     let map = lin_map_alloc(proj.len().max(1) as u32, 0);
-    for &(row_idx, k) in proj {
-        if row_idx >= row.len() {
-            continue; // ragged row: this column is absent, skip
+    // Borrow the intern table ONCE for the whole row, not once per field.
+    with_csv_intern_table(|tbl| {
+        for &(row_idx, k) in proj {
+            if row_idx >= row.len() {
+                continue; // ragged row: this column is absent, skip
+            }
+            let v = intern_csv_field_in(tbl, row[row_idx].as_ptr(), row[row_idx].len() as u32);
+            let mut tv: TaggedVal = std::mem::zeroed();
+            tv.tag = TAG_STR;
+            tv.payload = v as u64;
+            lin_map_set(map, k, &tv);
+            crate::string::lin_string_release(v); // no-op for immortal; safe for non-immortal
+            // key NOT released here — source's persistent ref outlives all rows
         }
-        let v = intern_csv_field_bytes(row[row_idx].as_ptr(), row[row_idx].len() as u32);
-        let mut tv: TaggedVal = std::mem::zeroed();
-        tv.tag = TAG_STR;
-        tv.payload = v as u64;
-        lin_map_set(map, k, &tv);
-        crate::string::lin_string_release(v); // no-op for immortal; safe for non-immortal
-        // key NOT released here — source's persistent ref outlives all rows
-    }
+    });
     alloc_tagged(TAG_MAP, map as u64)
 }
 
@@ -3553,11 +3616,14 @@ impl StreamSource for CsvRecordsSource {
             Err(m) => TaggedOutcome::Err(m),
             Ok(None) => TaggedOutcome::Eof,
             Ok(Some(row)) => {
-                if self.wanted.is_none() {
-                    TaggedOutcome::Item(record_to_object_cached(&self.header_keys, &row))
+                let item = if self.wanted.is_none() {
+                    record_to_object_cached(&self.header_keys, &row)
                 } else {
-                    TaggedOutcome::Item(record_to_object_projected(&self.proj, &row))
-                }
+                    record_to_object_projected(&self.proj, &row)
+                };
+                // Recycle the field Vecs back into the assembler's pool.
+                self.inner.asm.recycle_record(row);
+                TaggedOutcome::Item(item)
             }
         }
     }

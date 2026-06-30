@@ -1901,8 +1901,24 @@ impl<'ctx> Codegen<'ctx> {
                                                     self.llvm_param_type(&ty)
                                                 })
                                                 .collect();
+                                            // Mirror Pass-1's signature logic for LIN functions: a
+                                            // scalar-nullable union return uses the flat `{ i1, i64 }`
+                                            // ABI (VA.1 CPR). Without this, a cross-module call site
+                                            // that forward-declares a not-yet-defined flat-union Lin
+                                            // callee (e.g. a cyclic import where the caller compiles
+                                            // first) would declare it `ptr`-returning; the later
+                                            // definition reuses that decl via `get_function` but emits
+                                            // a `{ i1, i64 }` body → "return type does not match".
+                                            // EXCLUDE `lin_*` runtime intrinsics: those use their
+                                            // native Rust ABI (a nullable scalar is returned BOXED as a
+                                            // `ptr`, e.g. `lin_try_parse_uint32: *mut u8`), NOT the
+                                            // Lin-internal flat-union convention.
                                             let fn_ty = if matches!(ret_ty, Type::Null | Type::Never) {
                                                 void_ty.fn_type(&param_types, false)
+                                            } else if Self::flat_union_scalar_type(ret_ty).is_some()
+                                                && !name.starts_with("lin_")
+                                            {
+                                                self.flat_union_struct_type().fn_type(&param_types, false)
                                             } else {
                                                 self.llvm_type(ret_ty).fn_type(&param_types, false)
                                             };
@@ -2110,7 +2126,12 @@ impl<'ctx> Codegen<'ctx> {
                             // MakeObject for spread-free literals (incl. the common empty `{}`).
                             if let Type::Map { key: map_key_ty, value: elem_ty, .. } = ty {
                                 let cap = i32_ty.const_int((fields.len() + computed_fields.len()).max(1) as u64, false);
-                                let key_kind_val = i32_ty.const_int(if map_key_ty.is_int_map_key() { 1 } else { 0 }, false);
+                                let key_kind_val = i32_ty.const_int(
+                                    if map_key_ty.is_dense_int_key() { 2 }
+                                    else if map_key_ty.is_int_map_key() { 1 }
+                                    else { 0 },
+                                    false,
+                                );
                                 let map_ptr = self.builder
                                     .call(self.rt.map_alloc, &[cap.into(), key_kind_val.into()], "ir_map")
                                     .try_as_basic_value().unwrap_basic().into_pointer_value();
@@ -2667,7 +2688,7 @@ impl<'ctx> Codegen<'ctx> {
                                 }
                             }
                         }
-                        Instruction::IndexSet { object, key, value, obj_ty, key_ty, val_ty } => {
+                        Instruction::IndexSet { object, key, value, obj_ty, key_ty, val_ty, nonneg, proven_inbounds } => {
                             if let (Some(&obj_v), Some(&val_v)) =
                                 (temp_map.get(object), temp_map.get(value))
                             {
@@ -2686,7 +2707,7 @@ impl<'ctx> Codegen<'ctx> {
                                     self.emit_map_set_bytes_fused(obj_v, data_ptr, key_len, val_v, obj_ty, val_ty, &val_repr);
                                 } else if let Some(&key_v) = temp_map.get(key) {
                                     let val_repr = func.repr_of(*value);
-                                    self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty, &val_repr);
+                                    self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty, &val_repr, *nonneg, *proven_inbounds);
                                 }
                             }
                         }

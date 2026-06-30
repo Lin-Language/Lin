@@ -1,4 +1,5 @@
 import { StopId, Time } from "../gtfs/gtfs"
+import { StopIndex } from "../raptor/raptor-algorithm"
 import { Journey } from "../results/journey"
 import { ResultsFactory } from "../results/results-factory"
 import { JourneyFilter, apply } from "../results/filter/journey-filter"
@@ -6,8 +7,8 @@ import { Arrivals, ConnectionIndex } from "../raptor/scan-results"
 import { RaptorAlgorithm, StopTimes, scan } from "../raptor/raptor-algorithm"
 import { Date, addDays, weekday } from "std/datetime"
 import { getDateNumber } from "./date-util"
-import { filter, map, reduce, flatMap, flatten } from "std/iter"
-import { keys, fromEntries } from "std/object"
+import { filter, map, reduce, flatMap, flatten, for } from "std/iter"
+import { keys } from "std/object"
 import { length, push, reverse } from "std/array"
 
 export type GroupStationDepartAfterQuery = {
@@ -18,8 +19,8 @@ export type GroupStationDepartAfterQuery = {
 }
 
 export val createGroupStationDepartAfterQuery = (
-  raptor: RaptorAlgorithm, 
-  resultsFactory: ResultsFactory, 
+  raptor: RaptorAlgorithm,
+  resultsFactory: ResultsFactory,
   maxSearchDays: UInt8 = 3,
   filters: JourneyFilter[] = []
 ) => {
@@ -30,34 +31,50 @@ export val createGroupStationDepartAfterQuery = (
 }
 
 
-// 
-// Plan a journey between the origin and destination set of stops on the given date and time. If there are 
+//
+// Plan a journey between the origin and destination set of stops on the given date and time. If there are
 // no complete journeys, incremented the day and continue searching until maxDays is reached.
-// 
+//
 export val plan = (
-  query: GroupStationDepartAfterQuery, 
-  origins: StopId[], 
-  destinations: StopId[], 
-  date: Date, 
+  query: GroupStationDepartAfterQuery,
+  origins: StopId[],
+  destinations: StopId[],
+  date: Date,
   time: Time
 ): Journey[] =>
-  // set the departure time for each origin
-  val originTimes: StopTimes = origins.map(origin => [origin, time]).fromEntries()
+  val stopIndexOf = query["raptor"]["timetable"]["stopIndexOf"]
+
+  // Intern origin stop codes to integer ids and set each one's departure time. Stops that are
+  // not in the feed (no such stop id) are skipped — they can never be an origin/destination.
+  val originTimes: StopTimes = {}
+  origins.for(origin =>
+    val idx = stopIndexOf[origin]
+    if idx != null then
+      originTimes[idx] = time
+  )
+
+  // Intern destination stop codes to integer ids, skipping any not in the feed.
+  val destIndices: StopIndex[] = []
+  destinations.for(d =>
+    val idx = stopIndexOf[d]
+    if idx != null then
+      destIndices.push(idx)
+  )
 
   // get results for every destination and flatten into a single array
-  val results = query.getJourneys(originTimes, destinations, date)
+  val results = query.getJourneys(originTimes, destIndices, date)
 
   // apply each filter to the results
   query["filters"].reduce(results, (rs, f) => f.apply(rs))
 
-// 
+//
 // Find journeys using the raptor object, if no results are found then increment the day and keep
 // searching until results have been found or the maximum number of days has been reached
-//   
+//
 val getJourneys = (
-  query: GroupStationDepartAfterQuery, 
-  originTimes: StopTimes, 
-  destinations: StopId[], 
+  query: GroupStationDepartAfterQuery,
+  originTimes: StopTimes,
+  destinations: StopIndex[],
   startDate: Date
 ): Journey[] =>
   val connectionIndexes: ConnectionIndex[] = []
@@ -68,12 +85,12 @@ val getJourneys = (
     val dateNumber = date.getDateNumber()
     val dayOfWeek = date.weekday()
     val [kConnections, bestArrivals] = query["raptor"].scan(origins, dateNumber, dayOfWeek)
-    
+
     val results = query.getJourneysFromConnections(kConnections, connectionIndexes, destinations)
 
     if results.length() > 0 || query["maxSearchDays"] <= i + 1 then
       results
-    else    
+    else
       // reset the origin departure times, and increment the day by one
       origins = getFoundStations(kConnections, bestArrivals)
       connectionIndexes.push(kConnections)
@@ -82,19 +99,20 @@ val getJourneys = (
   searchDay(0)
 
 
-// 
+//
 // Create journeys that may span multiple days by stitching together multiple kConnection results
 // into individual journeys.
-// 
+//
 val getJourneysFromConnections = (
-  query: GroupStationDepartAfterQuery, 
+  query: GroupStationDepartAfterQuery,
   kConnections: ConnectionIndex,
   prevConnections: ConnectionIndex[],
-  destinations: StopId[]
+  destinations: StopIndex[]
 ): Journey[] =>
+  val stopIndexOf = query["raptor"]["timetable"]["stopIndexOf"]
   val initialResults = destinations
     .filter(d => (kConnections[d] ?? {}).keys().length() > 0)
-    .flatMap(d => query["resultsFactory"](kConnections, d))
+    .flatMap(d => query["resultsFactory"](kConnections, d, stopIndexOf))
 
   // reverse the previous connections and then work back through each day pre-pending journeys
   prevConnections
@@ -102,18 +120,21 @@ val getJourneysFromConnections = (
     .reduce(initialResults, (journeys, connections) => completeJourneys(query, journeys, connections))
 
 
-// 
+//
 // Reducer that takes the current list of journeys and prepends results based on the given kConnections
-// 
+//
 val completeJourneys = (
-  query: GroupStationDepartAfterQuery, 
-  results: Journey[], 
+  query: GroupStationDepartAfterQuery,
+  results: Journey[],
   kConnections: ConnectionIndex
-): Journey[] => 
+): Journey[] =>
+  val stopIndexOf = query["raptor"]["timetable"]["stopIndexOf"]
   // for every result we have so far
   results.flatMap(journeyB =>
     // find some results to the origin of that result and merge them together
-    query["resultsFactory"](kConnections, journeyB["legs"][0]["origin"] ?? "")
+    val originStr = journeyB["legs"][0]["origin"] ?? ""
+    val originIdx = stopIndexOf[originStr] ?? 0u32
+    query["resultsFactory"](kConnections, originIdx, stopIndexOf)
       .map(journeyA => {
         "legs": flatten([journeyA["legs"], journeyB["legs"]]),
         "departureTime": journeyA["departureTime"],
@@ -123,23 +144,21 @@ val completeJourneys = (
 
 
 
-// 
+//
 // Take all the stops we've visited and set the departure time for the next day as the best arrival time at that
 // stop minus 1 day. This prevents invalid departures where the arrival time at a stop is greater than 24 hours
 // e.g. arriving at 28:30 but departing at 04:00 the next day.
-// 
+//
 val getFoundStations = (
-  kConnections: ConnectionIndex, 
+  kConnections: ConnectionIndex,
   bestArrivals: Arrivals
 ): StopTimes =>
-  val empty: StopTimes = {  }
+  val result: StopTimes = {}
 
-  kConnections
-    .keys()                                            // get stopIds
-    .filter(s => (kConnections[s] ?? {  }).keys().length() > 0)  // check stopId has result
-    .reduce(empty, (acc, stopId) => {                  // create the origin departure times by subtracting 1 day from the best arrival time
-      ...acc,
-      [stopId]: if (bestArrivals[stopId] ?? 0u32) > 86400 then (bestArrivals[stopId] ?? 0u32) - 86400 else 1u32
-    })
+  kConnections.keys().for(s =>
+    if (kConnections[s] ?? {}).keys().length() > 0 then
+      val best = bestArrivals[s]
+      result[s] = if best > 86400 then best - 86400 else 1u32
+  )
 
-
+  result

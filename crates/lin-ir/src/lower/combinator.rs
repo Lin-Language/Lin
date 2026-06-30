@@ -316,6 +316,14 @@ pub(crate) fn capture_resolvable(cap: &Capture, builder: &FuncBuilder, ctx: &Low
         let stored = builder.temp_types.get(&t).unwrap_or(&cap.ty);
         return !type_repr_differs(&cap.ty, stored);
     }
+    // A packed-array-element VIEW (`val r = arr[i]`) is virtual — no materialized slot — so the
+    // checks above miss it. It is still resolvable for the INLINE path: inlining splices the body
+    // into THIS function, where the view's recorded (array,index) temps are live, so a re-emitted
+    // `r["field"]` resolves via the same SealedArrayFieldGet path. (A real closure captures the view
+    // across a function boundary and is handled separately by materialization in func.rs.)
+    if ctx.packed_elem_slots.contains_key(&slot) {
+        return true;
+    }
     false
 }
 
@@ -4665,14 +4673,43 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
         // RC invariant: IndexSet → lin_sealed_ptr_array_set retains new BEFORE releasing old, so
         // retain(arr[i]) then release(arr[0]) per slot is safe for all i (including i==0).
         let n_i32 = narrow_loop_index(n, builder); // Int64 → Int32
+        // EMPTY GUARD: the buffers are seeded from `arr[0]`, which faults on an EMPTY sealed array
+        // (`array index 0 out of bounds (len 0)`). The fill VALUE only populates slots — the sealed
+        // descriptor is derived statically from `elem_ty`'s representation, NOT from the fill — and
+        // for `n == 0` there are zero slots, so the fill is never read. Read `arr[0]` only when the
+        // array is non-empty, feeding a typed null placeholder when empty. Downstream (copy-in,
+        // width/lo/merge/copy-back loops) is a no-op for n == 0, so `out` returns as an empty,
+        // correctly-descriptored sealed array — matching stdlib's `if n <= 1 then concat(arr, [])`.
         let fill = builder.alloc_temp(elem_ty.clone());
-        let zero_i64 = builder.const_temp(Const::Int(0, Type::Int64));
-        builder.emit(Instruction::Index {
-            dst: fill, object: arr, key: zero_i64,
-            obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
-        nonneg: true,
-        proven_inbounds: false,
-        });
+        {
+            let read_blk = builder.alloc_block("sort_fill_read");
+            let empty_blk = builder.alloc_block("sort_fill_empty");
+            let cont_blk = builder.alloc_block("sort_fill_cont");
+            let has_elems = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary { dst: has_elems, op: BinOp::Gt, lhs: n, rhs: zero, operand_ty: Type::Int64, ty: Type::Bool });
+            builder.terminate(Terminator::CondJump { cond: has_elems, then_block: read_blk, else_block: empty_blk });
+
+            builder.switch_to(read_blk);
+            let fill_read = builder.alloc_temp(elem_ty.clone());
+            let zero_i64 = builder.const_temp(Const::Int(0, Type::Int64));
+            builder.emit(Instruction::Index {
+                dst: fill_read, object: arr, key: zero_i64,
+                obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+                nonneg: true,
+                proven_inbounds: false,
+            });
+            let read_end = builder.current_block;
+            builder.terminate(Terminator::Jump(cont_blk));
+
+            builder.switch_to(empty_blk);
+            let fill_null = builder.alloc_temp(elem_ty.clone());
+            builder.emit(Instruction::Const { dst: fill_null, val: Const::Null });
+            let empty_end = builder.current_block;
+            builder.terminate(Terminator::Jump(cont_blk));
+
+            builder.switch_to(cont_blk);
+            builder.emit(Instruction::Phi { dst: fill, ty: elem_ty.clone(), incomings: vec![(fill_read, read_end), (fill_null, empty_end)] });
+        }
         let out = builder.alloc_temp(result_type.clone());
         builder.emit(Instruction::CallIntrinsic {
             dst: out, intrinsic: Intrinsic::ArrayAllocateFilled,
@@ -4709,8 +4746,8 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
             nonneg: false,
                 proven_inbounds: false,
             });
-            builder.emit(Instruction::IndexSet { object: out, key: i, value: elem, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
-            builder.emit(Instruction::IndexSet { object: work, key: i, value: elem, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+            builder.emit(Instruction::IndexSet { object: out, key: i, value: elem, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone(), nonneg: false, proven_inbounds: false });
+            builder.emit(Instruction::IndexSet { object: work, key: i, value: elem, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone(), nonneg: false, proven_inbounds: false });
             builder.emit(Instruction::Binary { dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
             builder.terminate(Terminator::Jump(header));
             builder.switch_to(exit);
@@ -4814,7 +4851,7 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
     builder.switch_to(m_take_l);
     let lv = builder.alloc_temp(elem_ty.clone());
     builder.emit(Instruction::Index { dst: lv, object: out, key: mi, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false, proven_inbounds: false});
-    builder.emit(Instruction::IndexSet { object: work, key: mk, value: lv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+    builder.emit(Instruction::IndexSet { object: work, key: mk, value: lv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone(), nonneg: false, proven_inbounds: false });
     let mi_inc = builder.alloc_temp(Type::Int64);
     builder.emit(Instruction::Binary { dst: mi_inc, op: BinOp::Add, lhs: mi, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
     builder.terminate(Terminator::Jump(m_advance));
@@ -4824,7 +4861,7 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
     builder.switch_to(m_take_r);
     let rv = builder.alloc_temp(elem_ty.clone());
     builder.emit(Instruction::Index { dst: rv, object: out, key: mj, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false, proven_inbounds: false});
-    builder.emit(Instruction::IndexSet { object: work, key: mk, value: rv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+    builder.emit(Instruction::IndexSet { object: work, key: mk, value: rv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone(), nonneg: false, proven_inbounds: false });
     let mj_inc = builder.alloc_temp(Type::Int64);
     builder.emit(Instruction::Binary { dst: mj_inc, op: BinOp::Add, lhs: mj, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
     builder.terminate(Terminator::Jump(m_advance));
@@ -4864,7 +4901,7 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
         builder.switch_to(body);
         let wv = builder.alloc_temp(elem_ty.clone());
         builder.emit(Instruction::Index { dst: wv, object: work, key: i, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() , nonneg: false, proven_inbounds: false});
-        builder.emit(Instruction::IndexSet { object: out, key: i, value: wv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+        builder.emit(Instruction::IndexSet { object: out, key: i, value: wv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone(), nonneg: false, proven_inbounds: false });
         builder.emit(Instruction::Binary { dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
         builder.terminate(Terminator::Jump(header));
         builder.switch_to(exit);
@@ -4879,6 +4916,108 @@ pub(crate) fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut F
     // ---- done: `out` holds the fully-sorted result. ----
     builder.switch_to(w_exit);
     out
+}
+
+// ===========================================================================================
+// PAIR-ELIDE helper: detect `([k, v] => body)` destructuring lambdas
+// ===========================================================================================
+
+/// If `lam_params` is a single-param lambda and `lam_body` is a `Block` whose first statement
+/// is an `ArrayDestructure` of exactly that param into two elements (and no rest), return
+/// `(arr_slot, elem0_slot, elem0_ty, elem1_slot, elem1_ty, actual_body_expr)` so the caller
+/// can skip building the intermediate `[key, val]` pair array and bind key/val directly into
+/// the element slots at their concrete types (avoiding per-use unboxing in the body).
+///
+/// Conservatively returns `None` if `arr_slot` appears in `actual_body` (rare, but guards against
+/// code that reads the whole pair after destructuring it).
+fn try_extract_pair_destructure_body<'a>(
+    lam_params: &[TypedParam],
+    lam_body: &'a TypedExpr,
+) -> Option<(usize, usize, Type, usize, Type, &'a TypedExpr)> {
+    // Require exactly one lambda parameter.
+    if lam_params.len() != 1 {
+        return None;
+    }
+    let param_slot = lam_params[0].slot;
+    // Body must be a Block whose first statement is an ArrayDestructure of the param slot.
+    let TypedExpr::Block { stmts, expr: actual_body, .. } = lam_body else { return None };
+    if stmts.is_empty() {
+        return None;
+    }
+    let TypedStmt::ArrayDestructure {
+        arr_slot,
+        value,
+        elements,
+        rest,
+        ..
+    } = &stmts[0] else { return None };
+    // The value being destructured must be LocalGet of the param slot.
+    let TypedExpr::LocalGet { slot: vs, .. } = value else { return None };
+    if *vs != param_slot { return None; }
+    // Must destructure exactly two elements, no rest.
+    if elements.len() != 2 || rest.is_some() { return None; }
+    let elem0_slot = elements[0].1;
+    let elem0_ty  = elements[0].2.clone();
+    let elem1_slot = elements[1].1;
+    let elem1_ty  = elements[1].2.clone();
+    // Only fire when stmts has exactly ONE statement (the destructure) so `actual_body` covers
+    // all the remaining work. Most `([k,v] => ...)` patterns have no extra stmts between the
+    // destructure and the body expression.
+    if stmts.len() != 1 {
+        return None;
+    }
+    // Guard: arr_slot must NOT appear in actual_body (would need the whole pair materialized).
+    if expr_uses_slot(*arr_slot, actual_body) {
+        return None;
+    }
+    Some((*arr_slot, elem0_slot, elem0_ty, elem1_slot, elem1_ty, actual_body.as_ref()))
+}
+
+/// True if `slot` appears as a `LocalGet` or `LocalSet` anywhere in `expr`.
+fn expr_uses_slot(slot: usize, expr: &TypedExpr) -> bool {
+    match expr {
+        TypedExpr::LocalGet { slot: s, .. } | TypedExpr::LocalSet { slot: s, .. } => *s == slot,
+        TypedExpr::Block { stmts, expr, .. } =>
+            stmts.iter().any(|s| stmt_uses_slot(slot, s)) || expr_uses_slot(slot, expr),
+        TypedExpr::BinaryOp { left, right, .. } => expr_uses_slot(slot, left) || expr_uses_slot(slot, right),
+        TypedExpr::UnaryOp { operand, .. } => expr_uses_slot(slot, operand),
+        TypedExpr::Coerce { expr: e, .. } => expr_uses_slot(slot, e),
+        TypedExpr::Call { func, args, .. } => expr_uses_slot(slot, func) || args.iter().any(|a| expr_uses_slot(slot, a)),
+        TypedExpr::If { cond, then_br, else_br, .. } =>
+            expr_uses_slot(slot, cond) || expr_uses_slot(slot, then_br) || expr_uses_slot(slot, else_br),
+        TypedExpr::Match { scrutinee, arms, .. } =>
+            expr_uses_slot(slot, scrutinee) || arms.iter().any(|a| {
+                a.guard.as_ref().is_some_and(|g| expr_uses_slot(slot, g)) || expr_uses_slot(slot, &a.body)
+            }),
+        TypedExpr::MakeObject { fields, spreads, computed_fields, .. } =>
+            fields.iter().any(|(_, v)| expr_uses_slot(slot, v))
+                || spreads.iter().any(|s| expr_uses_slot(slot, s))
+                || computed_fields.iter().any(|(k, v)| expr_uses_slot(slot, k) || expr_uses_slot(slot, v)),
+        TypedExpr::MakeArray { elements, .. } => elements.iter().any(|e| expr_uses_slot(slot, e)),
+        TypedExpr::FieldGet { object, .. } => expr_uses_slot(slot, object),
+        TypedExpr::Index { object, key, .. } => expr_uses_slot(slot, object) || expr_uses_slot(slot, key),
+        TypedExpr::IndexSet { object, key, value, .. } =>
+            expr_uses_slot(slot, object) || expr_uses_slot(slot, key) || expr_uses_slot(slot, value),
+        TypedExpr::StringInterp { parts, .. } => parts.iter().any(|p| match p {
+            TypedStringPart::Expr(e) => expr_uses_slot(slot, e),
+            TypedStringPart::Literal(_) => false,
+        }),
+        TypedExpr::Is { expr: e, .. } | TypedExpr::Has { expr: e, .. } | TypedExpr::FromJson { value: e, .. } =>
+            expr_uses_slot(slot, e),
+        TypedExpr::Function { body, .. } => expr_uses_slot(slot, body),
+        TypedExpr::IntLit(..) | TypedExpr::FloatLit(..) | TypedExpr::StringLit(..)
+        | TypedExpr::BoolLit(..) | TypedExpr::NullLit(..) => false,
+    }
+}
+
+fn stmt_uses_slot(slot: usize, stmt: &TypedStmt) -> bool {
+    match stmt {
+        TypedStmt::Val { value, .. } | TypedStmt::Var { value, .. } | TypedStmt::Expr(value) =>
+            expr_uses_slot(slot, value),
+        TypedStmt::Destructure { value, .. } | TypedStmt::ArrayDestructure { value, .. } =>
+            expr_uses_slot(slot, value),
+        TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. } => false,
+    }
 }
 
 // ===========================================================================================
@@ -5068,6 +5207,55 @@ pub(crate) fn lower_entries_inline(
         ret_ty: json.clone(),
     });
 
+    // PAIR-ELIDE FAST PATH: when the callback is `([k, v] => body)` — a lambda whose ENTIRE
+    // parameter is immediately destructured into exactly two slots — skip building the
+    // `[key_box, val_box]` pair array altogether.  Instead, bind key_box and val_box DIRECTLY
+    // into the destructured slots and inline `body` straight.  This removes per-iteration:
+    //   lin_array_alloc(4) + 2x lin_array_push_tagged + lin_box_array
+    //   + 2x lin_unbox_ptr + 2x lin_array_get_tagged + lin_tagged_release(pair_box)
+    //
+    // RC contract:
+    //   - key_box and val_box are owned (RC=1 each) from lin_map_raw_key_at/value_at.
+    //   - We bind them directly into the pair-element slots (NOT registered owned in body scope).
+    //   - The inlined body's LocalGet of an RC-typed slot emits Retain + register_owned, so
+    //     any RC read inside the body increments RC and scope-exit releases it.
+    //   - After the body we release key_box and val_box explicitly (RC->0->freed).
+    if let Some((arr_slot, elem0_slot, elem0_ty, elem1_slot, elem1_ty, actual_body)) =
+        try_extract_pair_destructure_body(&lam_params, &lam_body)
+    {
+        // Coerce key_box/val_box from TypeVar(MAX) to concrete types so body uses see the
+        // concrete representation and avoid per-use unboxing.  (For a plain TypeVar(MAX) param
+        // `coerce_arg_to_param_repr` is a no-op; for a concrete type it unboxes once upfront.)
+        let key_bound = coerce_arg_to_param_repr(key_box, &json, &elem0_ty, builder);
+        let val_bound = coerce_arg_to_param_repr(val_box, &json, &elem1_ty, builder);
+        // Pre-insert the element slots so `lower_expr(actual_body)` inside inline_lambda_body
+        // finds them without us having to construct TypedParam values.
+        // arr_slot is bound to key_box as a placeholder (guards against accidental whole-pair reads).
+        builder.slots.insert(arr_slot, key_box);
+        builder.slots.insert(elem0_slot, key_bound);
+        builder.slots.insert(elem1_slot, val_bound);
+        // Use inline_lambda_body with an empty params list — the slots are already bound above.
+        // This gives us the FreeCell / pop_scope machinery for any `var` cells created in the body.
+        let (res, res_ty) = inline_lambda_body(&[], actual_body, &[], builder, ctx);
+        builder.emit(Instruction::Release { val: res, ty: res_ty });
+        // Release our owned key_box and val_box now that the body is done with them.
+        builder.emit(Instruction::Release { val: key_box, ty: json.clone() });
+        builder.emit(Instruction::Release { val: val_box, ty: json.clone() });
+        if !builder.is_current_block_terminated() {
+            builder.terminate(Terminator::Jump(latch));
+        }
+        builder.switch_to(latch);
+        let one = builder.const_temp(Const::Int(1, Type::Int64));
+        builder.emit(Instruction::Binary {
+            dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
+            operand_ty: Type::Int64, ty: Type::Int64,
+        });
+        builder.terminate(Terminator::Jump(header));
+        builder.switch_to(exit);
+        return Some(builder.const_temp(Const::Null));
+    }
+
+    // STANDARD PATH: build the pair array and pass it to the callback.
     // pair = [key_box, val_box] — MakeArray emits lin_array_alloc + lin_array_push_tagged for each
     // element. MakeArray MOVES ownership: the elements' payloads transfer into the array slots
     // (no retain); do NOT release key_box/val_box separately.

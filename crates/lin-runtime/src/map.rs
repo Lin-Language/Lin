@@ -68,6 +68,21 @@ use crate::tagged::{TaggedVal, TAG_NULL};
 // Key-kind constants.
 pub const KEY_KIND_STRING: u32 = 0;
 pub const KEY_KIND_INT: u32 = 1;
+/// Dense integer map: flat value array indexed directly by key.
+/// `slots` = flat value array of `cap * value_bytes(value_kind)` bytes (index = key).
+/// `ctrl`  = presence bitmap: `cap` bits packed into `(cap+63)/64` u64 words, zeroed = absent.
+/// `cap`   = current flat-array capacity (grows as needed).
+/// `order` = insertion-order key list (same semantics as KEY_KIND_INT).
+/// Only valid for non-negative keys (UInt8/UInt16/UInt32). Negative keys fall back to SwissTable.
+pub const KEY_KIND_DENSE: u32 = 2;
+
+/// Maximum flat-array capacity a dense map may grow to. A dense map's value array is indexed
+/// directly by key, so a single large/sparse key (e.g. a `UInt32` used as a timestamp/id/hash)
+/// would otherwise force a multi-GB allocation. When a key would exceed this, the map spills to a
+/// SwissTable (`KEY_KIND_INT`) instead. RAPTOR's stop/route id domains are far below this, so the
+/// dense fast path is preserved for the workloads that motivated it; only genuinely sparse
+/// large-integer maps fall back. 1<<20 entries ⇒ ≤16 MB flat array (MIXED) / 8 MB (homogeneous).
+pub const MAX_DENSE_CAP: u64 = 1 << 20;
 
 // ── Value-kind (the per-map value tag selector) ─────────────────────────────────────────────────
 // A real tag is a small u8 (widened to u32). Two sentinels live above the u8 range:
@@ -250,7 +265,28 @@ unsafe fn slot_value_ptr(vk: u32, s: *mut u8) -> *const TaggedVal {
 
 /// Iterate every occupied slot as `(key_bits, owned TaggedVal)`.
 pub(crate) unsafe fn map_for_each_slot(map: *const LinMap, mut f: impl FnMut(u64, TaggedVal)) {
-    if map.is_null() || (*map).ctrl.is_null() {
+    if map.is_null() { return; }
+    // Dense map: iterate via insertion-order list.
+    if (*map).key_kind == KEY_KIND_DENSE {
+        let len = (*map).len as usize;
+        if len == 0 || (*map).order.is_null() { return; }
+        let cap = (*map).cap;
+        let vk = (*map).value_kind;
+        for i in 0..len {
+            let key = *(*map).order.add(i);
+            if key >= cap as u64 { continue; }
+            if !dense_is_present((*map).ctrl, key) { continue; }
+            let tv = if vk == VKIND_MIXED {
+                std::ptr::read(((*map).slots as *const TaggedVal).add(key as usize))
+            } else {
+                let payload = *((*map).slots.add(key as usize * 8) as *const u64);
+                TaggedVal { tag: vk as u8, _pad: [0; 7], payload }
+            };
+            f(key, tv);
+        }
+        return;
+    }
+    if (*map).ctrl.is_null() {
         return;
     }
     let cap = (*map).cap as usize;
@@ -266,6 +302,317 @@ pub(crate) unsafe fn map_for_each_slot(map: *const LinMap, mut f: impl FnMut(u64
         f(slot_key(s), slot_value_owned(s, vk));
     }
 }
+
+// ── Dense integer-keyed map helpers ──────────────────────────────────────────────────────────────
+// For KEY_KIND_DENSE:
+//   slots: flat value array indexed by key; each slot is `value_bytes(value_kind)` bytes.
+//   ctrl:  presence bitmap; `cap` bits packed into u64 words, 1 = present.
+//   cap:   flat array length (keys 0..cap are valid once allocated).
+
+#[inline(always)]
+unsafe fn dense_is_present(ctrl: *const u8, key: u64) -> bool {
+    let word_idx = (key >> 6) as usize;
+    let bit_idx = (key & 63) as u32;
+    let word = (ctrl as *const u64).add(word_idx).read_unaligned();
+    (word >> bit_idx) & 1 == 1
+}
+
+#[inline(always)]
+unsafe fn dense_set_present(ctrl: *mut u8, key: u64) {
+    let word_idx = (key >> 6) as usize;
+    let bit_idx = (key & 63) as u32;
+    let ptr = (ctrl as *mut u64).add(word_idx);
+    ptr.write_unaligned(ptr.read_unaligned() | (1u64 << bit_idx));
+}
+
+/// Number of u64 words needed for the presence bitmap of `cap` entries.
+#[inline(always)]
+const fn dense_bitmap_words(cap: u32) -> usize {
+    ((cap as usize) + 63) / 64
+}
+
+unsafe fn dense_bitmap_layout(cap: u32) -> Layout {
+    Layout::from_size_align_unchecked(dense_bitmap_words(cap) * 8, 8)
+}
+
+unsafe fn dense_vals_layout(cap: u32, vk: u32) -> Layout {
+    Layout::from_size_align_unchecked(cap as usize * value_bytes(vk), 8)
+}
+
+/// Ensure a dense map can hold key `key` (grow if needed).
+unsafe fn dense_ensure_cap(map: *mut LinMap, key: u64) {
+    let vk = (*map).value_kind;
+    let new_cap = {
+        let needed = key + 1;
+        let cur = (*map).cap as u64;
+        if needed <= cur { return; }
+        // Grow to next power of two >= needed, min 8.
+        let mut c = cur.max(8);
+        while c < needed { c *= 2; }
+        c as u32
+    };
+    let old_cap = (*map).cap;
+
+    // Allocate new bitmap (zeroed = absent).
+    let new_bitmap = alloc_zeroed(dense_bitmap_layout(new_cap));
+    // Copy old bitmap words (zero-extended for new entries).
+    if old_cap > 0 && !(*map).ctrl.is_null() {
+        let old_words = dense_bitmap_words(old_cap);
+        std::ptr::copy_nonoverlapping((*map).ctrl, new_bitmap, old_words * 8);
+    }
+
+    // Allocate new flat value array (zeroed = TAG_NULL payload / missing).
+    let new_vals = alloc_zeroed(dense_vals_layout(new_cap, vk));
+    // Copy old values.
+    if old_cap > 0 && !(*map).slots.is_null() {
+        let copy_bytes = old_cap as usize * value_bytes(vk);
+        std::ptr::copy_nonoverlapping((*map).slots, new_vals, copy_bytes);
+    }
+
+    // Free old.
+    if old_cap > 0 {
+        if !(*map).ctrl.is_null() {
+            dealloc((*map).ctrl, dense_bitmap_layout(old_cap));
+        }
+        if !(*map).slots.is_null() {
+            dealloc((*map).slots, dense_vals_layout(old_cap, vk));
+        }
+    }
+
+    (*map).ctrl = new_bitmap;
+    (*map).slots = new_vals;
+    (*map).cap = new_cap;
+}
+
+/// Initialize a dense map's backing arrays for the first insert (value_kind now known).
+unsafe fn dense_init_first(map: *mut LinMap, vk: u32, key: u64) {
+    let cap = {
+        let needed = key + 1;
+        let mut c = 8u64;
+        while c < needed { c *= 2; }
+        c as u32
+    };
+    (*map).ctrl = alloc_zeroed(dense_bitmap_layout(cap));
+    (*map).slots = alloc_zeroed(dense_vals_layout(cap, vk));
+    (*map).cap = cap;
+}
+
+/// Get a borrowed `*const TaggedVal` for key in a dense map. Returns null if absent.
+unsafe fn dense_get(map: *const LinMap, key: u64) -> *const TaggedVal {
+    let cap = (*map).cap;
+    if cap == 0 || (*map).ctrl.is_null() || key >= cap as u64 {
+        return std::ptr::null();
+    }
+    if !dense_is_present((*map).ctrl, key) {
+        return std::ptr::null();
+    }
+    let vk = (*map).value_kind;
+    if vk == VKIND_MIXED {
+        ((*map).slots as *const TaggedVal).add(key as usize)
+    } else {
+        // Reconstruct from 8-byte payload into scratch ring.
+        let payload = *((*map).slots.add(key as usize * 8) as *const u64);
+        GET_SCRATCH.with(|ring| {
+            let idx = GET_SCRATCH_IDX.with(|c| {
+                let n = (c.get() + 1) & 7;
+                c.set(n);
+                n
+            });
+            let p = (*ring.get()).as_mut_ptr().add(idx);
+            (*p).tag = vk as u8;
+            (*p).payload = payload;
+            p as *const TaggedVal
+        })
+    }
+}
+
+/// Upgrade a dense map's flat array from homogeneous (8-byte payloads) to MIXED (16-byte TaggedVal).
+unsafe fn dense_convert_to_mixed(map: *mut LinMap) {
+    let old_vk = (*map).value_kind;
+    if old_vk == VKIND_MIXED { return; }
+    let cap = (*map).cap;
+    if (*map).slots.is_null() {
+        // Nothing allocated yet — just record MIXED; alloc will use 16-byte stride.
+        (*map).value_kind = VKIND_MIXED;
+        return;
+    }
+    // Allocate new 16-byte-per-slot flat array.
+    let new_slots = alloc_zeroed(dense_vals_layout(cap, VKIND_MIXED));
+    // Widen old 8-byte payloads into full TaggedVals with the old (homogeneous) tag.
+    let old_tag = old_vk as u8;
+    for i in 0..cap as usize {
+        // Only need to copy the bits; presence bitmap guards actual reads.
+        let old_payload = *((*map).slots.add(i * 8) as *const u64);
+        let dst = (new_slots as *mut TaggedVal).add(i);
+        std::ptr::write(dst, TaggedVal { tag: old_tag, _pad: [0; 7], payload: old_payload });
+    }
+    dealloc((*map).slots, dense_vals_layout(cap, old_vk));
+    (*map).slots = new_slots;
+    (*map).value_kind = VKIND_MIXED;
+}
+
+/// Insert/overwrite key in a dense map (retains value, manages order list).
+unsafe fn dense_set(map: *mut LinMap, key: u64, val: &TaggedVal) {
+    // Determine/upgrade value_kind without calling the SwissTable-specific note_value_tag.
+    let vk = (*map).value_kind;
+    let vtag = val.tag;
+    let vk = if vk == VKIND_UNINIT {
+        if vkind_stats_on() {
+            VK_FIRST[(vtag as usize).min(39)].fetch_add(1, Ordering::Relaxed);
+        }
+        (*map).value_kind = vtag as u32;
+        vtag as u32
+    } else if vk != VKIND_MIXED && vk != vtag as u32 {
+        if vkind_stats_on() {
+            VK_MIXED_CONV.fetch_add(1, Ordering::Relaxed);
+        }
+        dense_convert_to_mixed(map);
+        VKIND_MIXED
+    } else {
+        vk
+    };
+
+    if (*map).ctrl.is_null() {
+        dense_init_first(map, vk, key);
+    } else {
+        dense_ensure_cap(map, key);
+    }
+    // After dense_ensure_cap, vk may be stale only if we called dense_convert_to_mixed above
+    // (which already updated (*map).value_kind). Re-read for the slot writes.
+    let vk = (*map).value_kind;
+    let is_new = !dense_is_present((*map).ctrl, key);
+    if is_new {
+        order_push(map, key);
+        dense_set_present((*map).ctrl, key);
+        if vk == VKIND_MIXED {
+            let slot = ((*map).slots as *mut TaggedVal).add(key as usize);
+            std::ptr::write(slot, TaggedVal { tag: val.tag, _pad: [0; 7], payload: val.payload });
+        } else {
+            let slot = (*map).slots.add(key as usize * 8) as *mut u64;
+            *slot = val.payload;
+        }
+        crate::tagged::retain_tagged_payload_pub(val);
+        (*map).len += 1;
+    } else {
+        // Overwrite: release old, store new.
+        if vk == VKIND_MIXED {
+            let slot = ((*map).slots as *mut TaggedVal).add(key as usize);
+            let old = std::ptr::read(slot);
+            crate::tagged::release_tagged_payload_pub(&old);
+            std::ptr::write(slot, TaggedVal { tag: val.tag, _pad: [0; 7], payload: val.payload });
+        } else {
+            let slot = (*map).slots.add(key as usize * 8) as *mut u64;
+            let old_tv = TaggedVal { tag: vk as u8, _pad: [0; 7], payload: *slot };
+            crate::tagged::release_tagged_payload_pub(&old_tv);
+            *slot = val.payload;
+        }
+        crate::tagged::retain_tagged_payload_pub(val);
+    }
+}
+
+/// Release all values in a dense map (called from lin_map_release).
+unsafe fn dense_release_entries(map: *const LinMap) {
+    let cap = (*map).cap;
+    if cap == 0 || (*map).ctrl.is_null() || (*map).slots.is_null() {
+        return;
+    }
+    let vk = (*map).value_kind;
+    // Walk via order list — avoids scanning the whole capacity.
+    let len = (*map).len as usize;
+    if !(*map).order.is_null() {
+        for i in 0..len {
+            let key = *(*map).order.add(i);
+            if key < cap as u64 && dense_is_present((*map).ctrl, key) {
+                if vk == VKIND_MIXED {
+                    let slot = ((*map).slots as *const TaggedVal).add(key as usize);
+                    crate::tagged::release_tagged_payload_pub(&*slot);
+                } else {
+                    let payload = *((*map).slots.add(key as usize * 8) as *const u64);
+                    let tv = TaggedVal { tag: vk as u8, _pad: [0; 7], payload };
+                    crate::tagged::release_tagged_payload_pub(&tv);
+                }
+            }
+        }
+    }
+    if !(*map).ctrl.is_null() {
+        dealloc((*map).ctrl, dense_bitmap_layout(cap));
+    }
+    if !(*map).slots.is_null() {
+        if vk == VKIND_MIXED {
+            dealloc((*map).slots, dense_vals_layout(cap, VKIND_MIXED));
+        } else if vk != VKIND_UNINIT {
+            dealloc((*map).slots, dense_vals_layout(cap, vk));
+        }
+    }
+}
+
+/// Convert a `KEY_KIND_DENSE` map in place to a `KEY_KIND_INT` SwissTable, preserving every entry
+/// (with its value refcount) and insertion order. Called when a key would force a pathological dense
+/// capacity (> `MAX_DENSE_CAP`) or is negative. After this returns `(*map).key_kind == KEY_KIND_INT`
+/// and the caller can proceed on the normal int path.
+unsafe fn dense_spill_to_swiss(map: *mut LinMap) {
+    let old_ctrl = (*map).ctrl;
+    let old_slots = (*map).slots;
+    let old_order = (*map).order;
+    let old_len = (*map).len;
+    let old_cap = (*map).cap;
+    let old_cap_order = (*map).cap_order;
+    let old_vk = (*map).value_kind;
+
+    // Reset to a FRESH empty INT (SwissTable) map state — identical to `lin_map_alloc(_, KEY_KIND_INT)`:
+    // a valid power-of-two `cap` (ctrl/slots stay lazily null until the first insert allocates them at
+    // `cap`), and a NEWLY allocated `order` list (the reinsert loop reads the OLD order list, so the new
+    // one must be a separate allocation to avoid read/write aliasing). NOTE: must NOT leave `cap = 0` —
+    // the int path's `ensure_capacity` would then allocate a zero-size table and `find_slot_int` would
+    // probe out of bounds (segfault).
+    (*map).key_kind = KEY_KIND_INT;
+    (*map).ctrl = std::ptr::null_mut();
+    (*map).slots = std::ptr::null_mut();
+    (*map).order = alloc_order(INITIAL_CAP);
+    (*map).cap = INITIAL_CAP;
+    (*map).cap_order = INITIAL_CAP;
+    (*map).len = 0;
+    (*map).value_kind = VKIND_UNINIT;
+
+    // Re-insert each entry in insertion order. set_int retains the value (+1); we then release the
+    // dense copy (−1), so the value's refcount is unchanged and ownership transfers dense → swiss.
+    // The dense backing arrays are freed RAW below (no per-value release), completing the transfer.
+    if !old_order.is_null() && old_cap > 0 && !old_slots.is_null() && !old_ctrl.is_null() {
+        for i in 0..old_len as usize {
+            let key = *old_order.add(i);
+            if key >= old_cap as u64 || !dense_is_present(old_ctrl, key) {
+                continue;
+            }
+            let tv = if old_vk == VKIND_MIXED {
+                std::ptr::read((old_slots as *const TaggedVal).add(key as usize))
+            } else {
+                let payload = *(old_slots.add(key as usize * 8) as *const u64);
+                TaggedVal { tag: old_vk as u8, _pad: [0; 7], payload }
+            };
+            lin_map_set_int(map, key as i64, &tv);
+            crate::tagged::release_tagged_payload_pub(&tv);
+        }
+    }
+
+    // Free the old dense backing arrays (raw — values already transferred above).
+    if old_cap > 0 {
+        if !old_ctrl.is_null() {
+            dealloc(old_ctrl, dense_bitmap_layout(old_cap));
+        }
+        if !old_slots.is_null() {
+            if old_vk == VKIND_MIXED {
+                dealloc(old_slots, dense_vals_layout(old_cap, VKIND_MIXED));
+            } else if old_vk != VKIND_UNINIT {
+                dealloc(old_slots, dense_vals_layout(old_cap, old_vk));
+            }
+        }
+    }
+    if old_cap_order > 0 && !old_order.is_null() {
+        dealloc(old_order as *mut u8, order_layout(old_cap_order));
+    }
+}
+
+// ── END dense helpers ──────────────────────────────────────────────────────────────────────────
 
 unsafe fn map_header_layout() -> Layout {
     Layout::from_size_align_unchecked(
@@ -705,12 +1052,23 @@ pub unsafe extern "C" fn lin_map_get(map: *const LinMap, key: *const LinString) 
     }
 }
 
-/// Insert / overwrite `key -> *val` (Int map).
+/// Insert / overwrite `key -> *val` (Int map, or dense map).
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_set_int(map: *mut LinMap, key: i64, val: *const TaggedVal) {
     if map.is_null() { return; }
     let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
     let val_ref: &TaggedVal = if val.is_null() { &null_tv } else { &*val };
+    // Dense path: direct flat-array set (O(1), no hashing) — but only for non-negative keys within
+    // the dense capacity ceiling. A negative or large/sparse key would force a pathological flat
+    // array, so spill to a SwissTable and fall through to the normal int path.
+    if (*map).key_kind == KEY_KIND_DENSE {
+        if key >= 0 && (key as u64) < MAX_DENSE_CAP {
+            dense_set(map, key as u64, val_ref);
+            return;
+        }
+        dense_spill_to_swiss(map);
+        // key_kind is now KEY_KIND_INT — fall through.
+    }
     note_value_tag(map, val_ref.tag);
     ensure_capacity(map);
     let vk = (*map).value_kind;
@@ -736,10 +1094,16 @@ pub unsafe extern "C" fn lin_map_set_int(map: *mut LinMap, key: i64, val: *const
     }
 }
 
-/// Look up `key` (Int map). Returns borrowed pointer or null if absent.
+/// Look up `key` (Int map, or dense map). Returns borrowed pointer or null if absent.
 #[no_mangle]
 pub unsafe extern "C" fn lin_map_get_int(map: *const LinMap, key: i64) -> *const TaggedVal {
-    if map.is_null() || (*map).ctrl.is_null() || (*map).len == 0 {
+    if map.is_null() { return std::ptr::null(); }
+    // Dense path: O(1) flat-array lookup (no hash, no probe, no branch-on-ctrl-byte).
+    if (*map).key_kind == KEY_KIND_DENSE {
+        if key < 0 { return std::ptr::null(); }
+        return dense_get(map, key as u64);
+    }
+    if (*map).ctrl.is_null() || (*map).len == 0 {
         return std::ptr::null();
     }
     let key_bits = key as u64;
@@ -954,7 +1318,7 @@ pub unsafe extern "C" fn lin_map_keys(map: *const LinMap) -> *mut crate::array::
     let len = if map.is_null() { 0 } else { (*map).len };
     let arr = crate::array::lin_array_alloc(len as u64);
     if !map.is_null() && len > 0 && !(*map).order.is_null() {
-        let is_int = (*map).key_kind == KEY_KIND_INT;
+        let is_int = (*map).key_kind == KEY_KIND_INT || (*map).key_kind == KEY_KIND_DENSE;
         for i in 0..len as usize {
             let key = *(*map).order.add(i);
             let dst = (*arr).data.add(i);
@@ -979,7 +1343,7 @@ pub unsafe extern "C" fn lin_map_values(map: *const LinMap) -> *mut crate::array
     let len = if map.is_null() { 0 } else { (*map).len };
     let arr = crate::array::lin_array_alloc(len as u64);
     if !map.is_null() && len > 0 && !(*map).order.is_null() {
-        let is_int = (*map).key_kind == KEY_KIND_INT;
+        let is_int = (*map).key_kind == KEY_KIND_INT || (*map).key_kind == KEY_KIND_DENSE;
         for i in 0..len as usize {
             let key = *(*map).order.add(i);
             let v = if is_int {
@@ -1005,7 +1369,7 @@ pub unsafe extern "C" fn lin_map_entries(map: *const LinMap) -> *mut crate::arra
     let len = if map.is_null() { 0 } else { (*map).len };
     let out = crate::array::lin_array_alloc(len as u64);
     if !map.is_null() && len > 0 && !(*map).order.is_null() {
-        let is_int = (*map).key_kind == KEY_KIND_INT;
+        let is_int = (*map).key_kind == KEY_KIND_INT || (*map).key_kind == KEY_KIND_DENSE;
         for i in 0..len as usize {
             let key = *(*map).order.add(i);
             let pair = crate::array::lin_array_alloc(2);
@@ -1053,7 +1417,12 @@ pub unsafe extern "C" fn lin_map_release(map: *mut LinMap) {
         return;
     }
     let cap = (*map).cap;
-    if cap > 0 && !(*map).ctrl.is_null() {
+    if (*map).key_kind == KEY_KIND_DENSE {
+        // Dense map: release values via bitmap-guided walk, free flat arrays.
+        if cap > 0 {
+            dense_release_entries(map);
+        }
+    } else if cap > 0 && !(*map).ctrl.is_null() {
         let is_int = (*map).key_kind == KEY_KIND_INT;
         let vk = (*map).value_kind;
         let stride = slot_stride(vk);
@@ -1277,7 +1646,7 @@ pub unsafe extern "C" fn lin_map_raw_key_at(map: *const LinMap, i: i64) -> *mut 
         return crate::tagged::alloc_tagged(crate::tagged::TAG_NULL, 0);
     }
     let key = *(*map).order.add(i as usize);
-    if (*map).key_kind == KEY_KIND_INT {
+    if (*map).key_kind == KEY_KIND_INT || (*map).key_kind == KEY_KIND_DENSE {
         crate::tagged::alloc_tagged(crate::tagged::TAG_INT64, key)
     } else {
         lin_string_inc_ref(key as *mut LinString);
@@ -1291,7 +1660,7 @@ pub unsafe extern "C" fn lin_map_raw_value_at(map: *const LinMap, i: i64) -> *mu
         return crate::tagged::alloc_tagged(crate::tagged::TAG_NULL, 0);
     }
     let key = *(*map).order.add(i as usize);
-    let v = if (*map).key_kind == KEY_KIND_INT {
+    let v = if (*map).key_kind == KEY_KIND_INT || (*map).key_kind == KEY_KIND_DENSE {
         let p = lin_map_get_int(map, key as i64);
         if p.is_null() { crate::tagged::TaggedVal { tag: crate::tagged::TAG_NULL, _pad: [0; 7], payload: 0 } } else { *p }
     } else {
@@ -1327,8 +1696,33 @@ pub unsafe extern "C" fn lin_to_map(p: *const u8) -> *mut LinMap {
 pub unsafe extern "C" fn lin_map_eq(a: *const LinMap, b: *const LinMap) -> u8 {
     if a == b { return 1; }
     if a.is_null() || b.is_null() { return 0; }
-    if (*a).key_kind != (*b).key_kind { return 0; }
+    // Dense and SwissTable maps with same key_kind=DENSE are treated equally by content.
+    // Mixed key-kinds (DENSE vs INT) should still compare equal if content matches.
     if (*a).len != (*b).len { return 0; }
+    // Dense path: iterate via order list, check each key in b.
+    if (*a).key_kind == KEY_KIND_DENSE || (*b).key_kind == KEY_KIND_DENSE {
+        // Walk a's entries, look up in b.
+        let len = (*a).len as usize;
+        if len == 0 { return 1; }
+        if (*a).order.is_null() { return 1; }
+        let a_vk = (*a).value_kind;
+        for i in 0..len {
+            let key = *(*a).order.add(i);
+            // Get value from a.
+            let ap = dense_get(a, key);
+            if ap.is_null() { return 0; }
+            let av = *ap;
+            // Get value from b (supports both key_kind).
+            let bval = lin_map_get_int(b, key as i64);
+            let _ = a_vk;
+            if bval.is_null() { return 0; }
+            let av_ptr = &av as *const TaggedVal as *const u8;
+            if crate::tagged::lin_tagged_eq(av_ptr, bval as *const u8) == 0 {
+                return 0;
+            }
+        }
+        return 1;
+    }
     if (*a).ctrl.is_null() { return 1; } // len matched and a is empty → equal
     let cap = (*a).cap as usize;
     let is_int = (*a).key_kind == KEY_KIND_INT;
@@ -1359,7 +1753,7 @@ pub unsafe extern "C" fn lin_map_eq(a: *const LinMap, b: *const LinMap) -> u8 {
 pub unsafe extern "C-unwind" fn lin_map_merge(dst: *mut LinMap, src: *const LinMap) {
     if src.is_null() || dst.is_null() { return; }
     let len = (*src).len as usize;
-    let is_int = (*src).key_kind == KEY_KIND_INT;
+    let is_int = (*src).key_kind == KEY_KIND_INT || (*src).key_kind == KEY_KIND_DENSE;
     if (*src).order.is_null() || len == 0 { return; }
     for i in 0..len {
         let key = *(*src).order.add(i);
@@ -1889,6 +2283,54 @@ mod tests {
                 lin_string_release(k);
             }
             lin_map_release(m);
+        }
+    }
+
+    // Test the nested dense-map pattern used by RAPTOR kConnections:
+    // outer = { StopIndex (u32): { UInt8: LinMap* } }
+    // Simulates setTrip / getJourneyLegs round-trip.
+    #[test]
+    fn nested_dense_map_round_trip() {
+        unsafe {
+            use crate::tagged::*;
+            // Build outer dense map (kConnections)
+            let outer = lin_map_alloc(1, KEY_KIND_DENSE);
+
+            // Store inner maps at stop indices 0, 100, 5000.
+            let stop_indices: &[i64] = &[0, 100, 5000];
+            let mut inners: Vec<*mut LinMap> = Vec::new();
+            for &stop in stop_indices {
+                // Create inner dense map (round → tagged int value)
+                let inner = lin_map_alloc(1, KEY_KIND_DENSE);
+                inners.push(inner);
+                // Store int 42 at round 1
+                let v = TaggedVal { tag: TAG_INT32, _pad: [0; 7], payload: 42 };
+                lin_map_set_int(inner, 1i64, &v);
+                // Store inner in outer via a TaggedVal(TAG_MAP, inner)
+                let tv_inner = TaggedVal { tag: TAG_MAP, _pad: [0; 7], payload: inner as u64 };
+                lin_map_set_int(outer, stop, &tv_inner);
+            }
+
+            // Now retrieve each stop and verify inner map round-trip
+            for (idx, &stop) in stop_indices.iter().enumerate() {
+                let got = lin_map_get_int(outer, stop);
+                assert!(!got.is_null(), "stop {} not found in outer dense map", stop);
+                assert_eq!((*got).tag, TAG_MAP, "outer value should be TAG_MAP for stop {}", stop);
+                let inner_ptr = (*got).payload as *const LinMap;
+                assert!(!inner_ptr.is_null(), "inner map ptr null for stop {}", stop);
+                assert_eq!(inner_ptr, inners[idx] as *const LinMap, "wrong inner map returned for stop {}", stop);
+                // Check inner map has round 1
+                let inner_got = lin_map_get_int(inner_ptr, 1i64);
+                assert!(!inner_got.is_null(), "round 1 not found in inner map for stop {}", stop);
+                assert_eq!((*inner_got).payload as i32, 42i32, "wrong value in inner map for stop {}", stop);
+            }
+
+            // Cleanup: release outer (its dense_set retained inners; release balances)
+            // We must release the inners ourselves since they were passed to set but also still in inners vec.
+            for inner in &inners {
+                lin_map_release(*inner);
+            }
+            lin_map_release(outer);
         }
     }
 }

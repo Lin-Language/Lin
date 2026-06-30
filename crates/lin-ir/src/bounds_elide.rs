@@ -76,12 +76,14 @@ pub fn elide_bounds(module: &mut LinModule) {
         }
     }
 
+    let alloc_wrappers = collect_alloc_wrapper_fns(module);
+
     let mut total_elided = 0usize;
     for func in &mut module.functions {
         let before: usize = func.blocks.iter().flat_map(|b| b.instructions.iter())
             .filter(|i| matches!(i, Instruction::Index { proven_inbounds: true, .. }))
             .count();
-        annotate_function(func, &slot_lengths, &initial_nonneg_params, &global_const_vals);
+        annotate_function(func, &slot_lengths, &initial_nonneg_params, &global_const_vals, &alloc_wrappers);
         let after: usize = func.blocks.iter().flat_map(|b| b.instructions.iter())
             .filter(|i| matches!(i, Instruction::Index { proven_inbounds: true, .. }))
             .count();
@@ -360,6 +362,167 @@ fn collect_const_int_vals_with_globals(
     m
 }
 
+/// Collect LOCAL array temps (within a single function) with statically-known lengths.
+/// Returns a map from array-producing temp → length (usize).
+///
+/// Covers:
+/// - Direct `CallIntrinsic { ArrayAllocateFilled | ArrayAllocate, args: [n, ..] }` where
+///   the size arg `n` is a compile-time int constant.
+/// - Calls to alloc-wrapper functions (monomorphized stdlib wrappers like
+///   `arrayAllocateFilled$Float64`) detected via `collect_alloc_wrapper_fns`, where the
+///   first argument is a constant.
+/// - `MakeArray { elements, spreads: [] }` literals — length = elements.len().
+/// - `GlobalValGet { slot, immutable: true }` where that slot is in `slot_lengths`.
+///
+/// Safety: the lengths are only trusted for flat-scalar-array operands (`is_flat_scalar_array_ty`);
+/// and only used for bounds-check elision — the conservative fallback always keeps the check.
+pub(crate) fn collect_local_temp_lengths(
+    func: &LinFunction,
+    slot_lengths: &HashMap<usize, usize>,
+    alloc_wrappers: &HashSet<FuncId>,
+) -> HashMap<Temp, usize> {
+    // Build gvget_slot: temp → slot for immutable GlobalValGet instructions.
+    let gvget_slot: HashMap<Temp, usize> = func.blocks.iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|i| if let Instruction::GlobalValGet { dst, slot, immutable: true, .. } = i { Some((*dst, *slot)) } else { None })
+        .collect();
+
+    let const_vals = collect_const_int_vals(func);
+    let mut temp_len: HashMap<Temp, usize> = HashMap::new();
+
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            match instr {
+                Instruction::CallIntrinsic {
+                    dst,
+                    intrinsic: Intrinsic::ArrayAllocateFilled | Intrinsic::ArrayAllocate,
+                    args,
+                    ..
+                } => {
+                    if let Some(&n_temp) = args.first() {
+                        if let Some(&n) = const_vals.get(&n_temp) {
+                            if n > 0 { temp_len.insert(*dst, n as usize); }
+                        }
+                    }
+                }
+                Instruction::Call {
+                    dst,
+                    callee: CallTarget::Direct(callee_fid),
+                    args,
+                    ..
+                } => {
+                    if alloc_wrappers.contains(callee_fid) {
+                        if let Some(&n_temp) = args.first() {
+                            if let Some(&n) = const_vals.get(&n_temp) {
+                                if n > 0 { temp_len.insert(*dst, n as usize); }
+                            }
+                        }
+                    }
+                }
+                Instruction::MakeArray { dst, elements, spreads, .. } => {
+                    if spreads.is_empty() {
+                        temp_len.insert(*dst, elements.len());
+                    }
+                }
+                Instruction::GlobalValGet { dst, slot, immutable: true, .. } => {
+                    if let Some(&len) = slot_lengths.get(slot) {
+                        temp_len.insert(*dst, len);
+                    }
+                }
+                Instruction::Copy { dst, src, .. } => {
+                    // Propagate through copies/renamings.
+                    if let Some(&len) = temp_len.get(src) {
+                        temp_len.insert(*dst, len);
+                    }
+                    // Also propagate from gvget_slot → slot_lengths for GVGet sources.
+                    if let Some(&slot) = gvget_slot.get(src) {
+                        if let Some(&len) = slot_lengths.get(&slot) {
+                            temp_len.insert(*dst, len);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    temp_len
+}
+
+/// Extend `const_vals` with temps produced by `Length`/`ArrayLength` intrinsic calls on
+/// known-length arrays (from `temp_lengths`), and with `Coerce` int-to-int propagation.
+///
+/// This enables edge-fact extraction for comparisons of the form `i < length(arr)` when
+/// `arr` is a fixed-size array: the Length call result is treated as a compile-time
+/// constant equal to the array's static length.
+///
+/// Safety: same as existing slot_lengths assumption.
+fn augment_const_vals_with_length_calls(
+    func: &LinFunction,
+    const_vals: &mut HashMap<Temp, i64>,
+    temp_lengths: &HashMap<Temp, usize>,
+) {
+    let mut length_vals: HashMap<Temp, i64> = HashMap::new();
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            match instr {
+                Instruction::CallIntrinsic {
+                    dst,
+                    intrinsic: Intrinsic::Length | Intrinsic::ArrayLength,
+                    args,
+                    ..
+                } => {
+                    if let Some(&arr_temp) = args.first() {
+                        if let Some(&len) = temp_lengths.get(&arr_temp) {
+                            let v = len as i64;
+                            length_vals.insert(*dst, v);
+                            const_vals.insert(*dst, v);
+                        }
+                    }
+                }
+                // Named call targets for lin_array_length (some lowering paths).
+                Instruction::Call {
+                    dst,
+                    callee: CallTarget::Named(name),
+                    args,
+                    ..
+                } if name == "lin_array_length" || name.ends_with("lin_array_length") => {
+                    if let Some(&arr_temp) = args.first() {
+                        if let Some(&len) = temp_lengths.get(&arr_temp) {
+                            let v = len as i64;
+                            length_vals.insert(*dst, v);
+                            const_vals.insert(*dst, v);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if length_vals.is_empty() {
+        return;
+    }
+
+    // Propagate through Coerce (int-to-int type casts, e.g. Int64→Int32 for range bounds).
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            if let Instruction::Coerce { dst, src, to_ty, .. } = instr {
+                if let Some(&len_val) = length_vals.get(src).or_else(|| const_vals.get(src)) {
+                    let fits = match to_ty {
+                        lin_check::types::Type::Int32 => len_val >= i32::MIN as i64 && len_val <= i32::MAX as i64,
+                        lin_check::types::Type::Int64 | lin_check::types::Type::UInt64 => true,
+                        lin_check::types::Type::UInt32 => len_val >= 0 && len_val <= u32::MAX as i64,
+                        _ => false,
+                    };
+                    if fits {
+                        const_vals.insert(*dst, len_val);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn is_nonneg_const(t: Temp, const_vals: &HashMap<Temp, i64>) -> bool {
     const_vals.get(&t).map_or(false, |&v| v >= 0)
 }
@@ -388,8 +551,23 @@ fn annotate_function(
     slot_lengths: &HashMap<usize, usize>,
     initial_nonneg_params: &HashMap<FuncId, Vec<bool>>,
     global_const_vals: &HashMap<usize, i64>,
+    alloc_wrappers: &HashSet<FuncId>,
 ) {
-    let const_vals = collect_const_int_vals_with_globals(func, global_const_vals);
+    let mut const_vals = collect_const_int_vals_with_globals(func, global_const_vals);
+
+    // Build per-function temp → known-length map (local allocs + GVGet-backed arrays).
+    // This lets the dataflow treat `length(xs)` as a compile-time constant for any array
+    // whose length is statically known, enabling range(0, length(xs)) elision for both
+    // module-level globals AND function-local allocations.
+    let temp_lengths = collect_local_temp_lengths(func, slot_lengths, alloc_wrappers);
+
+    if std::env::var("LIN_DEBUG_BOUNDS").is_ok() {
+        eprintln!("[bounds_elide] fn {:?} ({:?}) temp_lengths: {:?}", func.id, func.name, temp_lengths);
+    }
+
+    // Part B: extend const_vals with Length/ArrayLength results on known-length arrays.
+    augment_const_vals_with_length_calls(func, &mut const_vals, &temp_lengths);
+    let const_vals = const_vals;
 
     // Build CFG.
     let successors = build_successors(func);
@@ -417,9 +595,28 @@ fn annotate_function(
     // TCO inductive nonneg: params provably nonneg via induction through TailCall.
     let tco_nonneg = compute_tco_inductive_nonneg(func, &initially_nonneg, &const_vals);
 
+    // Phi-IV inductive nonneg: a Phi node %i = phi [nonneg_const, _], [%i+k, _] (k>0 const)
+    // is nonneg inductively — the initial value is nonneg and each step adds a non-negative value.
+    // This covers the standard range_for pattern: `i = phi [0, pre], [i+1, body]`.
+    let phi_iv_nonneg = compute_phi_iv_nonneg(func, &const_vals);
+
     if let Some(entry_nonneg) = block_nonneg.get_mut(&func.blocks[0].id) {
         for t in &initially_nonneg { entry_nonneg.insert(*t); }
         for t in &tco_nonneg { entry_nonneg.insert(*t); }
+    }
+
+    // Phi-IV nonneg temps are added to the entry block's nonneg set so the dataflow
+    // propagates them into all blocks that can reach the loop body.
+    // We add them to EVERY block's entry set so they survive the intersection merge
+    // (all-predecessor-intersection would kill them at the header since the back-edge's
+    // predecessor may not yet have the fact seeded). This is sound: a Phi IV is nonneg
+    // on ALL executions by the induction argument.
+    if !phi_iv_nonneg.is_empty() {
+        for block in &func.blocks {
+            if let Some(nn) = block_nonneg.get_mut(&block.id) {
+                for t in &phi_iv_nonneg { nn.insert(*t); }
+            }
+        }
     }
 
     // Build per-block edge facts: for each block with a CondJump, what do we know
@@ -440,6 +637,15 @@ fn annotate_function(
         .flat_map(|b| b.instructions.iter())
         .filter_map(|i| if let Instruction::GlobalValGet { dst, slot, .. } = i { Some((*dst, *slot)) } else { None })
         .collect();
+
+    // Helper: look up the static length of `object` from either global slots OR local allocs.
+    let lookup_arr_len = |object: &Temp| -> Option<usize> {
+        if let Some(&slot) = gvget_slot.get(object) {
+            slot_lengths.get(&slot).copied()
+        } else {
+            temp_lengths.get(object).copied()
+        }
+    };
 
     // Forward dataflow fixpoint.
     let block_ids: Vec<BlockId> = func.blocks.iter().map(|b| b.id).collect();
@@ -546,25 +752,44 @@ fn annotate_function(
                 }
                 Instruction::Index { object, key, obj_ty, proven_inbounds, nonneg, .. } => {
                     if is_flat_scalar_array_ty(obj_ty) {
-                        if let Some(&slot) = gvget_slot.get(object) {
-                            if let Some(&arr_len) = slot_lengths.get(&slot) {
-                                let arr_len = arr_len as i64;
-                                let key_nn = b_nn.contains(key)
-                                    || const_vals.get(key).map_or(false, |&v| v >= 0);
-                                let key_lt = if let Some(&v) = const_vals.get(key) {
-                                    v >= 0 && v < arr_len
-                                } else {
-                                    b_ub.get(key).map_or(false, |&ub| ub <= arr_len)
-                                };
-                                if key_nn && key_lt {
-                                    *proven_inbounds = true;
-                                    *nonneg = true;
-                                }
+                        if let Some(arr_len) = lookup_arr_len(object) {
+                            let arr_len = arr_len as i64;
+                            let key_nn = b_nn.contains(key)
+                                || const_vals.get(key).map_or(false, |&v| v >= 0);
+                            let key_lt = if let Some(&v) = const_vals.get(key) {
+                                v >= 0 && v < arr_len
+                            } else {
+                                b_ub.get(key).map_or(false, |&ub| ub <= arr_len)
+                            };
+                            if key_nn && key_lt {
+                                *proven_inbounds = true;
+                                *nonneg = true;
                             }
                         }
                     }
                     // Don't update running facts for Index — it defines dst but we don't
                     // propagate nonneg through index results here.
+                }
+                Instruction::IndexSet { object, key, obj_ty, proven_inbounds, nonneg, .. } => {
+                    // Mirror the Index annotation: elide bounds check on provably in-bounds writes.
+                    // OOB-write semantics (silent no-op) are preserved on non-proven sites; only
+                    // a PROVEN-in-bounds write emits an unchecked store (never an OOB store).
+                    if is_flat_scalar_array_ty(obj_ty) {
+                        if let Some(arr_len) = lookup_arr_len(object) {
+                            let arr_len = arr_len as i64;
+                            let key_nn = b_nn.contains(key)
+                                || const_vals.get(key).map_or(false, |&v| v >= 0);
+                            let key_lt = if let Some(&v) = const_vals.get(key) {
+                                v >= 0 && v < arr_len
+                            } else {
+                                b_ub.get(key).map_or(false, |&ub| ub <= arr_len)
+                            };
+                            if key_nn && key_lt {
+                                *proven_inbounds = true;
+                                *nonneg = true;
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -633,6 +858,106 @@ fn compute_body_nonneg(
         }
     }
     nonneg
+}
+
+// ---------------------------------------------------------------------------
+// Phi-IV inductive nonneg
+// ---------------------------------------------------------------------------
+
+/// Return all Phi-based loop induction variables that are provably non-negative by induction.
+///
+/// A Phi is a nonneg IV when:
+/// 1. One incoming value (the "init") is a provably nonneg constant (>= 0).
+/// 2. The other incoming value (the "update") traces back to `phi_temp + k` where `k` is
+///    a provably nonneg constant (`k >= 0`).
+///
+/// This covers `i = phi [0, pre], [i+1, body]` (the standard range_for pattern).
+///
+/// Safety: only Int32/Int64 Phi nodes are considered (Bool/Float etc. are excluded).
+/// Overflow is technically possible for a very long loop (i32 → negative wrap), but in practice
+/// the Lin runtime would have exhausted memory long before a Float64[] of 2^31 elements.
+fn compute_phi_iv_nonneg(func: &LinFunction, const_vals: &HashMap<Temp, i64>) -> HashSet<Temp> {
+    // Build a map: dst → (op, lhs, rhs) for Binary instructions (to trace additions).
+    let mut binary_defs: HashMap<Temp, (BinOp, Temp, Temp)> = HashMap::new();
+    let mut copy_defs: HashMap<Temp, Temp> = HashMap::new();
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            match instr {
+                Instruction::Binary { dst, op, lhs, rhs, .. } => {
+                    binary_defs.insert(*dst, (*op, *lhs, *rhs));
+                }
+                Instruction::Copy { dst, src, .. } => {
+                    copy_defs.insert(*dst, *src);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Collect all Phi nodes in the function.
+    let mut nonneg_ivs = HashSet::new();
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            if let Instruction::Phi { dst, ty, incomings } = instr {
+                // Only consider integer Phi nodes.
+                use lin_check::types::Type;
+                if !matches!(ty, Type::Int32 | Type::Int64 | Type::UInt32 | Type::UInt64) {
+                    continue;
+                }
+                if incomings.len() != 2 { continue; }
+                let (v0, _) = incomings[0];
+                let (v1, _) = incomings[1];
+
+                // Try both orderings: one is the init, the other is the back-edge update.
+                for &(init_val, update_val) in &[(v0, v1), (v1, v0)] {
+                    // Check: init_val is a nonneg constant.
+                    let init_ok = const_vals.get(&init_val).map_or(false, |&c| c >= 0);
+                    if !init_ok { continue; }
+
+                    // Check: update_val is `phi + k` where k >= 0 (traces to dst + nonneg_const).
+                    // Allow one level of copy-chain resolution.
+                    let update_ok = traces_to_add_of_phi(*dst, update_val, &binary_defs, &copy_defs, const_vals);
+                    if update_ok {
+                        nonneg_ivs.insert(*dst);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    nonneg_ivs
+}
+
+/// Returns true when `update_temp` is of the form `phi_dst + k` (k >= 0) after following
+/// Copy chains. This covers `i_next = i + 1` directly or `i_next = copy(i + 1)`.
+fn traces_to_add_of_phi(
+    phi_dst: Temp,
+    update_temp: Temp,
+    binary_defs: &HashMap<Temp, (BinOp, Temp, Temp)>,
+    copy_defs: &HashMap<Temp, Temp>,
+    const_vals: &HashMap<Temp, i64>,
+) -> bool {
+    // Follow Copy chain.
+    let mut t = update_temp;
+    for _ in 0..8 {
+        if let Some(&(op, lhs, rhs)) = binary_defs.get(&t) {
+            if op != BinOp::Add { return false; }
+            // lhs == phi_dst and rhs is a nonneg constant, OR vice versa.
+            if lhs == phi_dst {
+                return const_vals.get(&rhs).map_or(false, |&c| c >= 0);
+            }
+            if rhs == phi_dst {
+                return const_vals.get(&lhs).map_or(false, |&c| c >= 0);
+            }
+            return false;
+        }
+        if let Some(&src) = copy_defs.get(&t) {
+            t = src;
+        } else {
+            break;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------

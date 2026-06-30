@@ -457,7 +457,13 @@ pub enum Instruction {
     /// normal checked path (always safe to be conservative).
     Index { dst: Temp, object: Temp, key: Temp, obj_ty: Type, key_ty: Type, result_ty: Type, nonneg: bool, proven_inbounds: bool },
     /// object[key] = value  — in-place array/object element assignment (no result).
-    IndexSet { object: Temp, key: Temp, value: Temp, obj_ty: Type, key_ty: Type, val_ty: Type },
+    /// `nonneg`: the key is provably >= 0 (same contract as `Index::nonneg`): codegen can
+    /// skip the negative-wrap select in the flat-array write path.
+    /// `proven_inbounds`: the bounds-elide pass has proved BOTH `key >= 0` AND `key < len`
+    /// for this specific write site.  When true, codegen skips the OOB branch and emits a
+    /// direct GEP+store.  OOB-write semantics (silent no-op) are preserved on all non-proven
+    /// sites.  Set ONLY when the analysis is certain; `false` keeps the normal checked path.
+    IndexSet { object: Temp, key: Temp, value: Temp, obj_ty: Type, key_ty: Type, val_ty: Type, nonneg: bool, proven_inbounds: bool },
     /// result = object.field  — known-shape field access
     FieldGet { dst: Temp, object: Temp, field: String, obj_ty: Type, result_ty: Type },
     /// object.field = value  — known-shape (literal-key) field WRITE into a PACKED SEALED RECORD.
