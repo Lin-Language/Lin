@@ -5,6 +5,42 @@ use lin_common::tags::{TAG_INT32, TAG_INT64, TAG_MAP, TAG_RECORD};
 use lin_check::types::Type;
 use super::super::Codegen;
 
+/// Returns `true` when `ty` is an integer-literal union (e.g. `DayOfWeek = 0|1|…|6`),
+/// meaning its runtime representation is a boxed `TaggedVal*` wrapping a small int.
+fn key_ty_is_int_literal_union(ty: &Type) -> bool {
+    matches!(ty, Type::Union(vs) if vs.iter().all(|v| matches!(v, Type::IntLit(_))))
+}
+
+/// If `fields` is a sealed record whose keys are exactly `"0"`, `"1"`, …, `"N-1"` (all
+/// decimal digit strings starting at 0, contiguous) and all values share the same SCALAR type
+/// (non-heap), return `(base_offset, slot_size_bytes, field_type)`.
+/// This shape arises from `{ IntLitUnion: V }` expansion (e.g. `{ DayOfWeek: Boolean }`).
+fn sealed_seq_int_key_layout(fields: &indexmap::IndexMap<String, Type>) -> Option<(u64, u64, Type)> {
+    if fields.is_empty() { return None; }
+    // All keys must be exactly "0", "1", ..., "N-1".
+    for (i, k) in fields.keys().enumerate() {
+        if k != &i.to_string() { return None; }
+    }
+    // All values must share the same scalar type (no heap fields — those need retain).
+    let mut it = fields.values();
+    let first_ty = it.next().unwrap().clone();
+    if Codegen::sealed_field_kind(&first_ty).is_some() { return None; } // heap field
+    for ty in it {
+        if ty != &first_ty { return None; }
+    }
+    // Slot size via bit_width (scalars only at this point).
+    let slot_sz = first_ty.bit_width().map(|b| (b as u64) / 8).unwrap_or(1).max(1);
+    // Verify that the real layout is exactly SEALED_HEADER + i * slot_sz for each field.
+    // (Always true for uniform scalars with no alignment gap, but guard defensively.)
+    let base = Codegen::SEALED_HEADER;
+    for (i, (k, _)) in fields.iter().enumerate() {
+        let expected = base + i as u64 * slot_sz;
+        let (actual, _) = Codegen::sealed_field_layout(fields, k);
+        if actual != expected { return None; }
+    }
+    Some((base, slot_sz, first_ty))
+}
+
 impl<'ctx> Codegen<'ctx> {
     /// Coerce an IR value to a raw heap pointer (LinObject*/LinArray*/LinString*): if the
     /// static type is a union (boxed TaggedVal*) OR the value isn't already a pointer, unbox
@@ -79,9 +115,19 @@ impl<'ctx> Codegen<'ctx> {
         // int → array get, otherwise → object get. The static `is_array_access` test below
         // would misclassify this as object access and a runtime array would return null.
         // Mirrors the AST compile_index pointer-key runtime dispatch.
+        // ...but ONLY when the object could DYNAMICALLY be an array — the int-key branch below
+        // assumes array indexing (`lin_array_get_tagged`). A CONCRETE map-only union (e.g.
+        // `{UInt32: V} | Null`, the inner result of a chained `m[a][b]`) must NOT take this path:
+        // array-getting a map returns Null (the chained-index-in-closure bug). It falls through to
+        // the typed int-keyed-map path below instead. Genuine `AnyVal`/Json (or a union that really
+        // includes an array variant) still dispatches here.
+        let obj_could_be_array = obj_ty.is_any_val()
+            || matches!(obj_ty, Type::Union(vs)
+                if vs.iter().any(|v| matches!(v, Type::Array(_) | Type::FixedArray(_)) || v.is_any_val()));
         if Self::is_union_type(obj_ty)
             && Self::is_union_type(key_ty)
             && key.is_pointer_value()
+            && obj_could_be_array
         {
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
             let k_tag = self.builder.call(self.rt.get_tag, &[key.into()], "ir_idxk_tag").try_as_basic_value().unwrap_basic().into_int_value();
@@ -139,7 +185,12 @@ impl<'ctx> Codegen<'ctx> {
         //   `{ UInt8: Int32 } | Null` (union), so the inner `[1]` hits this path.
         //
         // `container` at this point is already the unboxed raw `LinMap*` (line 71-75 above).
-        if Self::is_union_type(obj_ty) && (key_ty.is_numeric() || key.is_int_value()) {
+        // The key may arrive BOXED (a `*TaggedVal`) even for an int-keyed map: e.g. a chained index
+        // `m[a][b]` inside a closure whose `b` is a destructured `.entries` param typed `AnyVal`, so
+        // `key_ty.is_numeric()` is false AND `key.is_int_value()` is false (it's a pointer). The key
+        // extraction below already unboxes a pointer key, but without `key.is_pointer_value()` here
+        // the whole path was skipped and the outer index fell through to a wrong accessor → Null.
+        if Self::is_union_type(obj_ty) && (key_ty.is_numeric() || key.is_int_value() || key.is_pointer_value()) {
             let int_map_variant: Option<()> = match obj_ty {
                 Type::Union(vs) => vs.iter().find_map(|v| match v {
                     Type::Map { key: k, .. } if k.is_integer() => Some(()),
@@ -390,6 +441,71 @@ impl<'ctx> Codegen<'ctx> {
         // STAGE 3: a sealed record indexed by a non-literal key — packed-struct ASSUME from repr.
         if let Some(fields) = obj_repr.packed_struct_fields().cloned() {
             if obj.is_pointer_value() {
+                // Fast path: sealed record with uniform-scalar sequential-integer fields
+                // (e.g. `{ DayOfWeek: Boolean }` = { "0":bool, ..., "6":bool }) indexed by a
+                // runtime integer. All fields have decimal-digit names "0".."N-1", uniform scalar
+                // type, and uniform slot size → direct GEP: field_ptr = obj + base_off + key * slot.
+                // Avoids the full map-materialise (7 alloc+set+free) per call.
+                if key_ty.is_int_map_key() || (Self::is_union_type(key_ty) && key.is_pointer_value() && key_ty_is_int_literal_union(key_ty)) {
+                    if let Some((base_off, slot_sz, fld_ty)) = sealed_seq_int_key_layout(&fields) {
+                        let i64_ty = self.context.i64_type();
+                        let i8_ty  = self.context.i8_type();
+                        let obj_ptr = obj.into_pointer_value();
+                        // Unbox key to i64.
+                        let key_i64 = if key.is_int_value() {
+                            self.builder.int_s_extend_or_bit_cast(key.into_int_value(), i64_ty, "sseq_k64")
+                        } else {
+                            self.unbox_value(key, &Type::Int64).into_int_value()
+                        };
+                        let n = fields.len() as u64;
+                        // Bounds-check: 0 ≤ key < n (key is unsigned-comparable even as i64 here
+                        // because DayOfWeek values are non-negative small integers).
+                        let n_v = i64_ty.const_int(n, false);
+                        let oob = self.builder.int_compare(IntPredicate::UGE, key_i64, n_v, "sseq_oob");
+                        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                        let ok_b  = self.context.append_basic_block(llvm_fn, "sseq_ok");
+                        let oob_b = self.context.append_basic_block(llvm_fn, "sseq_oob");
+                        let mrg_b = self.context.append_basic_block(llvm_fn, "sseq_mrg");
+                        self.builder.conditional_branch(oob, oob_b, ok_b);
+                        // OOB → null (safe-bracket §6.1).
+                        self.builder.position_at_end(oob_b);
+                        let null_v = ptr_ty.const_null();
+                        self.builder.unconditional_branch(mrg_b);
+                        let oob_exit = self.builder.get_insert_block().unwrap();
+                        // In-bounds → GEP to field.
+                        self.builder.position_at_end(ok_b);
+                        let byte_off = self.builder.int_mul(key_i64, i64_ty.const_int(slot_sz, false), "sseq_boff");
+                        let base_v   = i64_ty.const_int(base_off, false);
+                        let total_off = self.builder.int_add(base_v, byte_off, "sseq_toff");
+                        let fld_p = unsafe { self.builder.gep(i8_ty, obj_ptr, &[total_off], "sseq_fp") };
+                        let llvm_fld = self.llvm_type(&fld_ty);
+                        let loaded = self.builder.load(llvm_fld, fld_p, "sseq_v");
+                        // Coerce to result_ty if needed (e.g. bool i1 → i1 is already correct).
+                        let coerced: BasicValueEnum<'ctx> = if &fld_ty == result_ty {
+                            loaded
+                        } else {
+                            self.compile_ir_coerce(loaded, &fld_ty, result_ty)
+                        };
+                        let ok_exit = self.builder.get_insert_block().unwrap();
+                        self.builder.unconditional_branch(mrg_b);
+                        self.builder.position_at_end(mrg_b);
+                        // Scalar result (Bool/int): phi between 0 (OOB sentinel) and the loaded value.
+                        // Heap/pointer result: phi between null and coerced pointer.
+                        // The type system (integer-literal-union key in a closed range) ensures
+                        // OOB never fires in valid programs; the zero/null is a safe fallback.
+                        if coerced.is_int_value() {
+                            let int_ty = coerced.into_int_value().get_type();
+                            let zero_v = int_ty.const_zero();
+                            let phi = self.builder.phi(int_ty, "sseq_phi");
+                            phi.add_incoming(&[(&zero_v, oob_exit), (&coerced.into_int_value(), ok_exit)]);
+                            return phi.as_basic_value();
+                        } else {
+                            let phi = self.builder.phi(ptr_ty, "sseq_phi");
+                            phi.add_incoming(&[(&null_v, oob_exit), (&coerced.into_pointer_value(), ok_exit)]);
+                            return phi.as_basic_value();
+                        }
+                    }
+                }
                 // Stage 6b Phase 2: materialize sealed record to a fresh LinMap* then map_get.
                 let mat = self.sealed_materialize_to_map(obj, &fields).into_pointer_value();
                 // The materialized map always uses STRING keys (the field names are always strings,
@@ -485,6 +601,24 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.conditional_branch(is_map, map_b, chk_rec);
             self.builder.position_at_end(map_b);
             let map_entry = self.inline_map_get_str(container, key_str, "ir_mget_u");
+            // OWNERSHIP NORMALISATION: when result_ty is union/AnyVal, the TAG_RECORD arm below
+            // returns an OWNED +1 TaggedVal* (from `lin_record_get_field`). To make the phi hold
+            // uniformly OWNED values from all arms, clone the borrowed MAP interior pointer here.
+            // `lin_tagged_clone` on a null/interior pointer is always safe (null payload → null
+            // clone). The TAG_MAP arm's borrowed interior is NOT released — it is an interior
+            // slice pointer into the container, not heap-allocated separately. Net: both live paths
+            // (TAG_MAP and TAG_RECORD) exit `inner_mrg` / the phi with exactly +1 owned reference.
+            // For concrete result_ty the borrow unbox path is fine (scalar extracted before inner_mrg).
+            let map_result = if Self::is_union_type(result_ty) {
+                let clone_fn = self.get_or_declare_fn(
+                    "lin_tagged_clone",
+                    ptr_ty.fn_type(&[ptr_ty.into()], false),
+                );
+                self.builder.call(clone_fn, &[map_entry.into()], "ir_mget_u_own")
+                    .try_as_basic_value().unwrap_basic()
+            } else {
+                map_entry
+            };
             let map_exit = self.builder.get_insert_block().unwrap();
             self.builder.unconditional_branch(inner_mrg);
             self.builder.position_at_end(chk_rec);
@@ -492,10 +626,11 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.position_at_end(no);
             let null_res = ptr_ty.const_null();
             self.builder.unconditional_branch(inner_mrg);
-            // inner_mrg: collect borrowed TaggedVal* from map/null paths, unbox, branch to final.
+            // inner_mrg: collect owned TaggedVal* (union result) or borrowed (concrete result)
+            // from map/null paths, unbox, branch to final.
             self.builder.position_at_end(inner_mrg);
             let inner_phi = self.builder.phi(ptr_ty, "ir_idx_inner_phi");
-            inner_phi.add_incoming(&[(&map_entry, map_exit), (&null_res, no)]);
+            inner_phi.add_incoming(&[(&map_result, map_exit), (&null_res, no)]);
             let inner_result_ptr = inner_phi.as_basic_value();
             let inner_unboxed = self.unbox_tagged_val_to_type(inner_result_ptr, result_ty);
             // inner_unboxed may be a pointer or a scalar. For the phi we need a uniform type; we use
@@ -875,7 +1010,7 @@ impl<'ctx> Codegen<'ctx> {
     /// `emit_array_set` helpers so the boxing/retain/release sequence is IDENTICAL to the
     /// `lin_map_set`/`lin_array_set` intrinsics; the matching IR-level ownership transfer
     /// is emitted in `IndexSet` lowering (`lin-ir`).
-    pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, val_ty: &Type, val_repr: &lin_ir::repr::Repr) {
+    pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, val_ty: &Type, val_repr: &lin_ir::repr::Repr, nonneg: bool, proven_inbounds: bool) {
         // Resolve an object key to a raw `LinString*`. A string key that is a callback param
         // arrives boxed (a `TaggedVal*`); unbox it, or `lin_map_set` reads the box as a
         // LinString and corrupts the key.
@@ -963,7 +1098,7 @@ impl<'ctx> Codegen<'ctx> {
                 // A differing scalar width/kind would need the runtime's value conversion, so fall
                 // back. A FixedArray is always stored tagged (heterogeneous slots) — handled below.
                 else if Self::is_flat_scalar(elem) && elem.as_ref() == val_ty {
-                    self.flat_array_set(obj, idx, value, val_ty);
+                    self.flat_array_set(obj, idx, value, val_ty, nonneg, proven_inbounds);
                 } else {
                     self.emit_array_set(obj, idx, value, val_ty);
                 }

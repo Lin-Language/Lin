@@ -587,6 +587,14 @@ impl<'ctx> Codegen<'ctx> {
         if matches!(from, Type::Array(_) | Type::FixedArray(_)) && matches!(to, Type::Array(_) | Type::FixedArray(_)) {
             return false;
         }
+        // Two sum-type-eligible unions are physically the same representation (*SumNode).
+        // Different structural expansions of the same recursive sum type (e.g. partial vs
+        // full Named-alias inlining) must not be treated as a repr change — compile_ir_coerce
+        // carries the value verbatim in this case and does NOT produce a fresh +1 reference.
+        // Without this guard, compile_ir_field_set would skip the retain (assuming the coerce
+        // produced a fresh ref) while the coerce did nothing, leaving the field without an
+        // owned reference → use-after-free when the source temp is released at scope exit.
+        if Self::is_sum_type(from) && Self::is_sum_type(to) { return false; }
         from != to
     }
 

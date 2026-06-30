@@ -734,6 +734,37 @@ mod bare_key_record_hint_tests {
         );
     }
 
+    /// A multi-line bare-key record with NO commas (newline-separated only) also produces exactly
+    /// one diagnostic with the quoting hint. Regression for the case where the old comma-only
+    /// check produced the raw "expected RBrace" error instead of the helpful hint.
+    #[test]
+    fn multi_entry_bare_key_newline_only_produces_single_diagnostic() {
+        let diags = diagnostics_for("type T = {\n  a: UInt32\n  b: UInt8\n}\n");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly 1 diagnostic for newline-only bare-key type, got: {diags:?}"
+        );
+        let d = &diags[0];
+        let combined = format!("{} {}", d.message, d.help.as_deref().unwrap_or(""));
+        assert!(
+            combined.contains("index-signature"),
+            "diagnostic must mention 'index-signature'; got: {:?}",
+            combined
+        );
+        assert!(
+            combined.contains("quote") || combined.contains("quoted"),
+            "diagnostic must mention quoting; got: {:?}",
+            combined
+        );
+        // Must NOT fall back to the raw "expected RBrace" error.
+        assert!(
+            !combined.contains("expected RBrace"),
+            "diagnostic must not contain raw 'expected RBrace'; got: {:?}",
+            combined
+        );
+    }
+
     /// A quoted-key record type must be completely unaffected.
     #[test]
     fn quoted_key_record_is_not_affected() {
