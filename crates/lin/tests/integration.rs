@@ -532,6 +532,48 @@ print(toString(c()))
     assert_eq!(output, vec!["1", "2", "3"]);
 }
 
+// Regression for stack-allocated non-escaping `var` cells (escape::analyze_cells). A `var`
+// accumulator mutated inside a `range().for()` callback is a heap cell PROVEN non-escaping (it has
+// a scope-exit FreeCell and its pointer is never captured by a surviving closure), so the pass
+// lowers it to an entry-block alloca. This pins that the stack path computes the SAME sum as the
+// heap path. The SECOND half exercises the ESCAPING case in the SAME program: a `makeCounter`
+// factory whose `var count` IS captured by a returned closure that outlives the frame MUST stay
+// heap (the direct-use scan sees the MakeClosure capture and refuses the stack alloca). Two
+// independent counters must not share state — a use-after-return or aliased stack cell would
+// corrupt one of them.
+#[test]
+fn test_var_cell_stack_accumulator_and_escaping_counter() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+// Non-escaping accumulator -> stack alloca path.
+val sumRange = (n: Int32) =>
+  var sum = 0
+  range(0, n).for(i =>
+    sum = sum + i
+  )
+  sum
+
+// Escaping captured var -> must stay heap.
+val makeCounter = () =>
+  var count = 0
+  () =>
+    count = count + 1
+    count
+
+print(toString(sumRange(1000)))
+val c = makeCounter()
+val d = makeCounter()
+print(toString(c()))
+print(toString(c()))
+print(toString(d()))
+print(toString(c()))
+"#);
+    // sum 0..999 = 499500; c counts 1,2,_,3 ; d counts independently 1.
+    assert_eq!(output, vec!["499500", "1", "2", "1", "3"]);
+}
+
 // Regression: a closure-local `var` (NOT captured by any inner closure) reassigned inside an
 // `if` branch and READ AFTER the branch joins must observe the in-branch write. Previously the
 // branch's reassignment was dropped: the surrounding block "restored" the slot's pre-block temp

@@ -515,7 +515,15 @@ pub enum Instruction {
     /// dst = heap cell holding `init` (a `var` mutably captured by a closure). The cell
     /// pointer is shared by reference: closures capture it and read/write the live value
     /// through CellGet/CellSet (ADR-012). `ty` is the stored value's type.
-    MakeCell { dst: Temp, init: Temp, ty: Type },
+    ///
+    /// `stack`: when true, the escape pass (`escape::analyze_cells`) has PROVEN this cell never
+    /// escapes its creating frame (it has a matching `FreeCell` AND its pointer is used ONLY by
+    /// local `CellGet`/`CellSet`/`FreeCell` — never captured by a closure, returned, or stored).
+    /// Codegen then emits an entry-block `alloca` instead of `lin_alloc`, so mem2reg/SROA can
+    /// promote the cell to an SSA register and LICM/bounds_elide stop being defeated by the opaque
+    /// heap pointer. Default `false` (heap) at all construction sites; on ANY doubt the pass leaves
+    /// it `false`. See `escape.rs` for the soundness argument.
+    MakeCell { dst: Temp, init: Temp, ty: Type, stack: bool },
     /// result = *cell  (load the current value of a captured `var` cell).
     CellGet { dst: Temp, cell: Temp, ty: Type },
     /// *cell = value  (update a captured `var` cell in place).
@@ -527,7 +535,12 @@ pub enum Instruction {
     /// combinator (for/while/map/filter/reduce). Reclaims the per-call cell + its current value
     /// (fixing the captured-cell leak). Never emitted for an escaping cell (would be a
     /// use-after-free when a surviving closure later reads it).
-    FreeCell { cell: Temp, ty: Type },
+    ///
+    /// `stack`: mirrors the matching `MakeCell.stack` (set by `escape::analyze_cells`). When true the
+    /// cell lives in an entry-block `alloca`, so codegen KEEPS the contents-release (the cell still
+    /// owns one reference to its current value) but SKIPS the `lin_cell_free` call — there is no heap
+    /// allocation to reclaim. Default `false`.
+    FreeCell { cell: Temp, ty: Type, stack: bool },
     /// Increment refcount of a heap value (string, array, object, closure env).
     Retain { val: Temp, ty: Type },
     /// Decrement refcount; free if zero. Only emitted for owned values.

@@ -428,7 +428,7 @@ pub(crate) fn inline_lambda_body_tracking_elem_boxes(
             .map(|(c, ty, _)| (*c, ty.clone()))
             .collect();
         for (cell, ty) in to_free {
-            builder.emit(Instruction::FreeCell { cell, ty });
+            builder.emit(Instruction::FreeCell { cell, ty, stack: false });
         }
     }
     // Release this body scope's own locals, KEEPING the result temp AND the tracked element boxes
@@ -1850,7 +1850,7 @@ pub(crate) fn fm_alloc_counters(
         if param_count >= 2 {
             let zero = builder.const_temp(Const::Int(0, Type::Int32));
             let cell = builder.alloc_temp(Type::TypeVar(u32::MAX));
-            builder.emit(Instruction::MakeCell { dst: cell, init: zero, ty: Type::Int32 });
+            builder.emit(Instruction::MakeCell { dst: cell, init: zero, ty: Type::Int32, stack: false });
             counters.push(Some(cell));
         } else {
             counters.push(None);
@@ -1863,7 +1863,7 @@ pub(crate) fn fm_alloc_counters(
 /// reclaims the allocation, no value release). Called after the outer loop completes.
 pub(crate) fn fm_free_counters(counters: &[Option<Temp>], builder: &mut FuncBuilder) {
     for cell in counters.iter().flatten() {
-        builder.emit(Instruction::FreeCell { cell: *cell, ty: Type::Int32 });
+        builder.emit(Instruction::FreeCell { cell: *cell, ty: Type::Int32, stack: false });
     }
 }
 
@@ -2743,7 +2743,7 @@ pub(crate) fn lower_some(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mu
     // Allocate a Bool cell initialised to `false`.
     let false_init = builder.const_temp(Const::Bool(false));
     let result_cell = builder.alloc_temp(Type::Bool);
-    builder.emit(Instruction::MakeCell { dst: result_cell, init: false_init, ty: Type::Bool });
+    builder.emit(Instruction::MakeCell { dst: result_cell, init: false_init, ty: Type::Bool, stack: false });
     emit_combinator_loop(iterable, &iterable_ty, ElemAccess::Materialize(&elem_ty), builder, ctx,
         |i, elem, b, _| {
             let idx = narrow_loop_index(i, b);
@@ -2767,7 +2767,7 @@ pub(crate) fn lower_some(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mu
         });
     let result = builder.alloc_temp(Type::Bool);
     builder.emit(Instruction::CellGet { dst: result, cell: result_cell, ty: Type::Bool });
-    builder.emit(Instruction::FreeCell { cell: result_cell, ty: Type::Bool });
+    builder.emit(Instruction::FreeCell { cell: result_cell, ty: Type::Bool, stack: false });
     result
 }
 
@@ -3004,7 +3004,7 @@ pub(crate) fn lower_every(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &m
     let elem_ty = read_elem_ty;
     let true_init = builder.const_temp(Const::Bool(true));
     let result_cell = builder.alloc_temp(Type::Bool);
-    builder.emit(Instruction::MakeCell { dst: result_cell, init: true_init, ty: Type::Bool });
+    builder.emit(Instruction::MakeCell { dst: result_cell, init: true_init, ty: Type::Bool, stack: false });
     emit_combinator_loop(iterable, &iterable_ty, ElemAccess::Materialize(&elem_ty), builder, ctx,
         |i, elem, b, _| {
             let idx = narrow_loop_index(i, b);
@@ -3025,7 +3025,7 @@ pub(crate) fn lower_every(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &m
         });
     let result = builder.alloc_temp(Type::Bool);
     builder.emit(Instruction::CellGet { dst: result, cell: result_cell, ty: Type::Bool });
-    builder.emit(Instruction::FreeCell { cell: result_cell, ty: Type::Bool });
+    builder.emit(Instruction::FreeCell { cell: result_cell, ty: Type::Bool, stack: false });
     result
 }
 
@@ -3972,7 +3972,7 @@ pub(crate) fn lower_fused_reduce_flatmap(
     let init = coerce_arg_to_param_repr(init_raw, init_ty, &acc_ty, builder);
     // Accumulator cell (scalar — no value RC on store/free).
     let acc_cell = builder.alloc_temp(Type::TypeVar(u32::MAX));
-    builder.emit(Instruction::MakeCell { dst: acc_cell, init, ty: acc_ty.clone() });
+    builder.emit(Instruction::MakeCell { dst: acc_cell, init, ty: acc_ty.clone(), stack: false });
     // The reducer's index is its THIRD param; allocate an output counter only if it's declared.
     let want_out_idx = reducer_params.len() >= 3;
     emit_flatmap_fused_loop(iterable, &base_ty, &read_elem_ty, stages,
@@ -3992,7 +3992,7 @@ pub(crate) fn lower_fused_reduce_flatmap(
     // the accumulator cell is ours — load the final value and free the cell.
     let result = builder.alloc_temp(acc_ty.clone());
     builder.emit(Instruction::CellGet { dst: result, cell: acc_cell, ty: acc_ty.clone() });
-    builder.emit(Instruction::FreeCell { cell: acc_cell, ty: acc_ty.clone() });
+    builder.emit(Instruction::FreeCell { cell: acc_cell, ty: acc_ty.clone(), stack: false });
     result
 }
 
