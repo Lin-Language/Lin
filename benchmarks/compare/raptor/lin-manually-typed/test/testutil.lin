@@ -2,10 +2,10 @@
 // Mirrors lin-typed/testutil.lin but adapted to the manually-typed module/type API.
 import { for } from "std/iter"
 import { length, push } from "std/array"
-import { StopTime, Trip, Transfer, TimetableLeg } from "../gtfs/gtfs"
-import { Service, ServiceDays } from "../gtfs/service"
-import { DateIndex, DateNumber } from "../gtfs/date"
-import { AnyLeg, Journey } from "../results/journey"
+import { StopTime, Trip, Transfer, TimetableLeg } from "../src/gtfs/gtfs"
+import { Service, ServiceDays } from "../src/gtfs/service"
+import { DateIndex, DateNumber } from "../src/gtfs/date"
+import { AnyLeg, Journey } from "../src/results/journey"
 
 val MAX: UInt32 = 4294967295u32
 
