@@ -425,12 +425,6 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     // DWARF (--debug): finalise all debug metadata before any IR/object emission. No-op otherwise.
     cg.finalize_debug_info();
 
-    // 5. Emit LLVM IR if requested (before verify so we can inspect broken IR)
-    if opts.emit_ir {
-        let ir_path = opts.output_path.with_extension("ll");
-        cg.emit_llvm_ir(&ir_path).map_err(CompileError::Codegen)?;
-    }
-
     // Debug builds are O0: the LLVM optimisation pipeline would mangle/coalesce instructions and
     // break the line-table mapping. `opts.optimize` is already false in `--debug` (set by the CLI),
     // but guard here too so debug info is never run through the optimiser.
@@ -462,6 +456,16 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
             }
         }
         cg.run_optimization_passes(&opts.pgo).map_err(CompileError::Codegen)?;
+    }
+
+    // 5. Emit LLVM IR if requested. Emitted AFTER the optimisation pipeline so it reflects the IR
+    // that is actually compiled into the object — with `LIN_NO_OPT=1`/`--debug` (optimize == false)
+    // the pipeline is skipped, so this is the raw pre-optimisation IR (what the IR-inspection tests
+    // rely on); with optimisation on it is the optimised IR (so e.g. inlined leaf helpers are gone).
+    // Still before `verify` so broken IR can be inspected.
+    if opts.emit_ir {
+        let ir_path = opts.output_path.with_extension("ll");
+        cg.emit_llvm_ir(&ir_path).map_err(CompileError::Codegen)?;
     }
 
     cg.verify().map_err(CompileError::Codegen)?;
