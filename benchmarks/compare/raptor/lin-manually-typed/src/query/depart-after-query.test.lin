@@ -1,7 +1,7 @@
 // DepartAfterQuery.test.lin — mirrors DepartAfterQuery.test.js (25 TS cases, 25 ported).
 // Tests the REAL DepartAfterQuery SUT: scalar origin/destination, NO filters.
 import { expect, toSatisfy, toBe, test, suite, run } from "std/test"
-import { t, st, tf, j, setDefaultTrip, journeysEq } from "./testutil"
+import { t, st, tf, j, setDefaultTrip, journeysEq } from "../../test/testutil"
 import { Trip } from "../gtfs/gtfs"
 import { Service, ServiceDays } from "../gtfs/service"
 import { DateIndex } from "../gtfs/date"

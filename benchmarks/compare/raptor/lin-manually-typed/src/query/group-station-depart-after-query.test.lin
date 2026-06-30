@@ -1,7 +1,7 @@
 // GroupStationDepartAfterQuery.spec.ts — multi-origin / multi-destination plans
 // with the default MultipleCriteriaFilter applied.
 import { expect, toSatisfy, toBe, test, suite, run } from "std/test"
-import { t, st, tf, j, setDefaultTrip, journeysEq } from "./testutil"
+import { t, st, tf, j, setDefaultTrip, journeysEq } from "../../test/testutil"
 import { create } from "../raptor/raptor-algorithm-factory"
 import { createGroupStationDepartAfterQuery, plan } from "./group-station-depart-after-query"
 import { getResults } from "../results/journey-factory"

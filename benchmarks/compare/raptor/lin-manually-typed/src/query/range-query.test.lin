@@ -1,7 +1,7 @@
 // RangeQuery tests.
 // Mirrors raptor-typescript/test/RangeQuery.test.js.
 import { expect, toBe, toSatisfy, test, suite, run } from "std/test"
-import { t, st, j, setDefaultTrip, journeysEq } from "./testutil"
+import { t, st, j, setDefaultTrip, journeysEq } from "../../test/testutil"
 import { create } from "../raptor/raptor-algorithm-factory"
 import { createGroupStationDepartAfterQuery, plan as groupPlan } from "./group-station-depart-after-query"
 import { createRangeQuery, plan } from "./range-query"
