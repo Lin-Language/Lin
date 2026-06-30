@@ -60,9 +60,7 @@ pub fn lower_module_with_imports(
     let mut diagnostics = Vec::new();
     // Build a mutable owned copy: either the monomorphized version (if the module uses generics)
     // or a fresh clone (for the sinking pass below). We always need a mutable copy.
-    let mut owned: TypedModule = if crate::monomorphize::module_uses_generic(module, imports)
-        || crate::monomorphize::module_calls_inlinable_import(module, imports)
-    {
+    let mut owned: TypedModule = if crate::monomorphize::module_uses_generic(module, imports) {
         let mut m = module.clone();
         diagnostics = crate::monomorphize::monomorphize_with_imports(&mut m, imports);
         m
@@ -307,9 +305,7 @@ pub fn lower_import_module_with_imports(
     // from the checker but lowers to the boxed generic symbol — a representation mismatch that
     // crashes codegen. Generic originals are all KEPT (external importers may issue a boxed `Named`
     // call to them). No-op for a module that neither defines nor uses a generic (byte-identical).
-    let mut owned: TypedModule = if crate::monomorphize::module_uses_generic(module, imports)
-        || crate::monomorphize::module_calls_inlinable_import(module, imports)
-    {
+    let mut owned: TypedModule = if crate::monomorphize::module_uses_generic(module, imports) {
         let mut m = module.clone();
         let _ = crate::monomorphize::monomorphize_import_with_imports(&mut m, imports);
         m
