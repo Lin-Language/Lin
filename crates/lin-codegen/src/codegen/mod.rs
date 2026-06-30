@@ -315,6 +315,50 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Maximum LinIR instruction count for a leaf user function to be `alwaysinline`. Tuned so the
+    /// RAPTOR-shape one-line helpers (borrowed-array field read + a mask/arith, ~13 instructions)
+    /// qualify, while keeping the threshold small enough to avoid code bloat from larger bodies.
+    const ALWAYSINLINE_MAX_INSTRS: usize = 24;
+
+    /// Mark a *small, leaf* top-level user `val` function `alwaysinline` so LLVM's cost-based
+    /// inliner cannot veto it (these tiny helpers — e.g. `arrivalTime = (st, i) => st[i]["a"] & MASK`
+    /// — lower to ~13-instruction leaves but were left as real `call`s in hot loops at -O2).
+    ///
+    /// SOUNDNESS: `alwaysinline` on a function that participates in a (direct/tail) recursion cycle
+    /// is an LLVM HARD ERROR. We make cycles impossible by construction by restricting to LEAF
+    /// functions — a body with NO `Call` instruction (intrinsic/runtime `CallIntrinsic` is fine) and
+    /// NO self-recursive `TailCall` terminator cannot be self- or mutually-recursive. We also exclude
+    /// `main` (the C entry point) and closures/anonymous functions. When in doubt, do nothing.
+    pub(crate) fn maybe_mark_alwaysinline(&self, func: &lir::LinFunction, f: FunctionValue<'ctx>) {
+        // Top-level named user function only: must have a name, not be `main`, not be a closure.
+        match &func.name {
+            Some(n) if n != "main" => {}
+            _ => return,
+        }
+        if func.is_closure {
+            return;
+        }
+        let mut n_instrs: usize = 0;
+        for block in &func.blocks {
+            // A self-recursive tail call is a 1-node cycle — never `alwaysinline`.
+            if matches!(block.terminator, lir::Terminator::TailCall { .. }) {
+                return;
+            }
+            for instr in &block.instructions {
+                // Any direct/named/indirect call to another function disqualifies (leaf only).
+                // Intrinsic/runtime calls (`CallIntrinsic`) are fine — they are not user functions
+                // and cannot form a Lin-level recursion cycle with this body.
+                if matches!(instr, lir::Instruction::Call { .. }) {
+                    return;
+                }
+                n_instrs += 1;
+            }
+        }
+        if n_instrs <= Self::ALWAYSINLINE_MAX_INSTRS {
+            self.add_fn_attrs(f, &["alwaysinline"]);
+        }
+    }
+
     /// Set by the driver before any module is compiled, once it has scanned the whole program
     /// (main + all imports) for any concurrency intrinsic. See `uses_async`.
     pub fn set_uses_async(&mut self, v: bool) {
@@ -1022,6 +1066,9 @@ impl<'ctx> Codegen<'ctx> {
                     f
                 }
             };
+            // PERF: mark small leaf user helpers `alwaysinline` so the O2 inliner cannot veto them
+            // (sound only for leaves — see `maybe_mark_alwaysinline`).
+            self.maybe_mark_alwaysinline(func, llvm_fn);
             self.named_fns.insert(name.clone(), llvm_fn);
             ir_fn_to_llvm.insert(func.id, llvm_fn);
             ir_fn_symbol.insert(func.id, name.clone());
