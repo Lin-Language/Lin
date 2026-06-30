@@ -12,9 +12,9 @@ import { for } from "std/iter"
 // sparse `?? 0` semantics. Round 0 is MAX_TIME-filled (origins overwritten with their departure).
 export type Arrivals = Time[]
 export type ArrivalsByNumChanges = Arrivals[]
-// A boarded trip leg: routeId + tripIndex + boarding/alighting positions. The journey factory
-// reconstructs stops/times/tripId from the flat timetable arrays by these integers.
-export type Connection = { "routeId": RouteIntId, "tripIndex": Int32, "start": Int32, "end": Int32 }
+// A boarded trip leg: (routeId, tripIndex, boarding position, alighting position). The journey
+// factory reconstructs stops/times/tripId from the flat timetable arrays by these integers.
+export type Connection = [RouteIntId, Int32, Int32, Int32]
 export type ConnectionIndex = { StopIndex: { UInt8: Connection | Transfer } }
 
 export type ScanResults = {
@@ -76,7 +76,7 @@ export val setTrip = (results: ScanResults, stopPi: StopIndex, time: Time, route
   results["bestArrivals"][stopPi] = time
   if results["kConnections"][stopPi] == null then
     results["kConnections"][stopPi] = {}
-  results["kConnections"][stopPi][k] = { "routeId": routeId, "tripIndex": tripIndex, "start": startIndex, "end": endIndex }
+  results["kConnections"][stopPi][k] = [routeId, tripIndex, startIndex, endIndex]
 
 // The caller (scanTransfers) already interned the destination stop to an int.
 export val setTransfer = (results: ScanResults, stopPi: StopIndex, transfer: Transfer, time: Time): Null =>
