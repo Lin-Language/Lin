@@ -974,6 +974,46 @@ RAPTOR + adversarial + valgrind re-verification caught.
 
 ---
 
+### 5.15 RAPTOR GROUP 2026-07-01 — the real lever was ALLOCATION, not the map lookups the profile showed
+
+After the drop-Trip + dense-`routeStopIndex` refactors, the manually-typed RAPTOR **GROUP** phase (the 24
+group-station queries) sat at **Lin 1881 ms vs Go 343 ms = 5.5×** (RANGE 6145 vs 1107). A gdb self-time
+sampler of the GROUP-only loop (perf is locked down in-container; `sudo gdb -batch -ex bt` sampling works)
+attributed **~33 % to `lin_map_get_int`** — integer-keyed hashmaps that Go stores as dense int-indexed
+slices — with `getTrip` at 18 % self / 48 % inclusive and the allocator ~18 %. The obvious read was "kill the
+int-keyed maps." **That read was wrong**, and correcting it is the lesson.
+
+**Two changes shipped (both merged, release-verified, digest-exact `26203913/773022892/139`, RAPTOR suite 13/13):**
+
+| commit | change | GROUP | mechanism |
+|---|---|--:|---|
+| `b5b3aa0e` | **stack-promote loop-captured scalar `var` cells** (`escape.rs`) | 1881→1197 (**−36 %***) | Lin's idiomatic loop `while(() => …)` captures its mutable `var`s by reference (ADR-012) → each is a heap `lin_alloc(4)` cell. `getTrip`'s IR showed **3 `lin_alloc(4)` per call** (`var i`/`lastFoundPosition`/`lastFound`). Relaxing the escape pass so a **flat-scalar** cell (Int/UInt/Float/Bool — no RC, so a missing `FreeCell` can't leak) promotes on the local-use signal **alone** puts them in entry-block allocas → mem2reg → registers. Fires for every hot loop (getTrip/scanRoutes/scanTransfers/getQueue). |
+| `3562e955` | **dense arrays for the int-keyed scan maps** | 1197→1032 (**−14 %**) | interchange `{StopIntId:Time}`→`Time[]`, routeScanPosition `{RouteIntId:Int32}`→`Int32[]`, route queue→dense (`queueStop`/`queueSet` + a `queueOrder` insertion-order list, mirroring Go — the order is digest-load-bearing); + read `Route` fields directly instead of binding+passing the whole record to `stopTimeIndexOf` (kills a per-call `lin_sealed_alloc(48)`). Dense interchange is never null, so the defensive `?? 0` is dropped. Faithful — Go/Rust do exactly this; the ids are already `0..N-1`. |
+
+*The −36 % figure is measured on the post-`ce6051b5` master (footpath transfers interned to int at build
+time, which independently removed the scanTransfers string-hash); the pure lever-A delta on the prior base was −31 %.
+
+**Cumulative: GROUP 1881→1029 ms (−45 %), RANGE 6145→3009 ms (−51 %); 5.5×→~3.0× Go.**
+
+**The finding (self-time ≠ wall-time, third confirmation — cf. §5.9/§5.10).** `lin_map_get_int` was the single
+biggest **self-time** bucket (33 %), yet the dense-array change that removes it bought only **−10 % alone** and,
+on the messy pre-transfer base, **~+1 % on top of lever A**. The map probes were **overlapped** with the
+loop-var/`getTrip` **allocations**; once lever A removes the serializing alloc traffic, the map work was already
+hidden behind it. **The real GROUP lever was allocation, not the map lookups the profile pointed at.** The
+dense-array change is still worth it (−14 % on the clean base, and it moves the layout toward Go's), but it is
+the *second* lever, not the first — and a self-time profile again mis-ranked which one moves the wall. `routeStopIndex`
+(a `{StopIntId:RoutePosition}[]` per-route inner map) remains a map — deferred.
+
+**Process note (the diff is the gate, not the digest).** Two sonnet port-agents, briefed on a base that master had
+already moved past, *both* independently rewrote the transfer path in the wrong direction (string re-interning
+instead of the int endpoints). This was **invisible to the digest** — it hashes only `departureTime`/`arrivalTime`/
+`legs.length()`, not leg *contents* — and passed `cargo test` (which doesn't run the `.lin` RAPTOR suite). Only
+reading the diff + running the RAPTOR `.lin` unit tests (which *do* assert transfer-leg contents) caught it. And a
+backgrounded `cargo test` wrapper reported "exit 0" that was the trailing `echo`'s code, masking the real `101` —
+capture `$?` to a file and read the result line (§2 / the never-pipe-mask rule), every time.
+
+---
+
 ## 6. Guidance for writing fast Lin
 
 1. **Prefer typed records and `&`-composed named types over `AnyVal`.** This is the
