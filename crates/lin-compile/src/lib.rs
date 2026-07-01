@@ -385,7 +385,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         // 0xFE inline gate: must run BEFORE repr::run so repr seeding sees the updated inline flags.
         lin_ir::escape::analyze_array_inline(&mut ir_module);
         lin_ir::repr::run(&mut ir_module);
-        rc_elide::elide_rc(&mut ir_module);
+        rc_elide::elide_rc(&mut ir_module, &cg.import_named_convs);
         // Sealed-records Stage 4: mark non-escaping all-scalar sealed-record constructions for
         // stack allocation AND suppress their Retain/Release emission (see lin_ir::escape). Runs
         // after RC elision so it sees and removes the surviving Retain/Release on stack values.

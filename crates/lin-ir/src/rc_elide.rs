@@ -31,13 +31,19 @@
 //!      on *every* path leaving the Retain. Without post-dominance the Release
 //!      covers only some successor paths and eliding the Retain would leak on
 //!      the others (the original cross-block soundness hole).
-//! 3. **Liveness gate (the documented safety net)**: a pair is elided only when
-//!    liveness confirms the temp is *dead immediately after the matched
-//!    Release* (a true last-use). If the temp is still live past the Release,
-//!    that Release is not the final drop — another owning reference is in play —
-//!    so the pair is kept. This is what actually drives the elision decision;
-//!    the structural path/post-dominance checks narrow the candidate set, and
-//!    liveness has the final say.
+//! 3. **Elision gate**: a pair is elided when EITHER:
+//!    - **Liveness last-use**: liveness confirms the temp is *dead immediately
+//!      after the matched Release* (a true last-use — the final drop). In this
+//!      case the Release actually frees the value and eliding the Retain/Release
+//!      is sound because no other owner is in play.
+//!    - **All-Borrow path**: the full path from Retain to Release (retain-block
+//!      tail, all intermediate idom-chain blocks, and release-block prefix) is
+//!      interference-free — meaning no instruction on that path creates an
+//!      independent owner of the temp. In this case the Retain/Release pair is
+//!      a no-op: an outer reference already keeps the value alive; removing the
+//!      inner pair leaves RC balanced on every execution path. This is the key
+//!      case for "read-only loop body" patterns like passing a FieldGet result
+//!      to a Borrow-convention imported function on each loop iteration.
 //! 4. Remove the elided Retain/Release pairs from the instruction lists.
 //!
 //! This is a conservative approximation: we err on the side of keeping RC ops
@@ -56,8 +62,26 @@ use crate::liveness::Liveness;
 use crate::ownership_verify::intrinsic_conventions;
 
 
+/// Extract a name → param-conventions map from an already-inferred module.
+///
+/// Used by callers to accumulate import-module conventions into a `named_conv_map` that is then
+/// passed to `elide_rc` for the importing (main) module, so that Named calls to imported
+/// functions can be treated as non-interference when their parameters are all Borrow/Inout.
+pub fn extract_named_conventions(module: &LinModule) -> HashMap<String, Vec<Convention>> {
+    module
+        .functions
+        .iter()
+        .filter_map(|f| f.name.as_deref().map(|n| (n.to_string(), f.param_conventions.clone())))
+        .collect()
+}
+
 /// Run the RC elision pass on all functions in a module, mutating in place.
-pub fn elide_rc(module: &mut LinModule) {
+///
+/// `named_conv_map` maps mangled symbol names (e.g. `_timetable_departureTime`) to their
+/// inferred param-convention vectors. Built by the caller from previously-compiled import
+/// modules via [`extract_named_conventions`]. Pass an empty map when no cross-module
+/// convention information is available (e.g. for standalone import compilation).
+pub fn elide_rc(module: &mut LinModule, named_conv_map: &HashMap<String, Vec<Convention>>) {
     // Build a stable function-id → convention table before mutating.
     // We only need the param_conventions (populated by infer_conventions which runs first).
     let conv_map: HashMap<FuncId, Vec<Convention>> = module
@@ -67,12 +91,13 @@ pub fn elide_rc(module: &mut LinModule) {
         .collect();
 
     for func in &mut module.functions {
-        elide_rc_fn(func, &conv_map);
-        elide_clonebox_reads_fn(func, &conv_map);
+        elide_rc_fn(func, &conv_map, named_conv_map);
+        elide_clonebox_reads_fn(func, &conv_map, named_conv_map);
+        elide_fieldget_retain_fn(func, &conv_map, named_conv_map);
     }
 }
 
-fn elide_rc_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Vec<Convention>>) {
+fn elide_rc_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Vec<Convention>>, named_conv_map: &HashMap<String, Vec<Convention>>) {
     let liveness = Liveness::compute(func);
     // Post-dominators over the CFG: used to require that a cross-block Release is
     // reached on every path leaving the Retain before we elide the pair.
@@ -115,7 +140,7 @@ fn elide_rc_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Vec<Convention
                     to_remove.contains(&(block_idx, i))
                 })
             {
-                if path_has_no_interference(*retain_val, retain_idx, release_idx, &instrs, conv_map)
+                if path_has_no_interference(*retain_val, retain_idx, release_idx, &instrs, conv_map, named_conv_map)
                     && release_is_last_use(
                         &liveness,
                         &func.blocks[block_idx],
@@ -148,7 +173,7 @@ fn elide_rc_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Vec<Convention
             // The tail of the current block (instructions after the Retain) must
             // itself be clean before we leave the block.
             let tail_clean =
-                path_has_no_interference(*retain_val, retain_idx, instrs.len(), &instrs, conv_map);
+                path_has_no_interference(*retain_val, retain_idx, instrs.len(), &instrs, conv_map, named_conv_map);
             if !tail_clean {
                 continue;
             }
@@ -161,6 +186,7 @@ fn elide_rc_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Vec<Convention
                 &to_remove,
                 &postdom,
                 conv_map,
+                named_conv_map,
             ) {
                 let release_block_id = func.blocks[release_block_idx].id;
                 let retain_block_id = func.blocks[block_idx].id;
@@ -171,20 +197,32 @@ fn elide_rc_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Vec<Convention
                     release_instr_idx,
                     &func.blocks[release_block_idx].instructions,
                     conv_map,
+                    named_conv_map,
                 );
                 // SOUNDNESS: the Release must be reached on EVERY path leaving the
                 // Retain. If the release block only post-dominates the retain block
                 // along some successor edges, eliding the Retain leaks on the others.
                 let release_postdominates =
                     postdom.post_dominates(release_block_id, retain_block_id);
-                // And the Release must be the temp's last use (liveness gate).
+                // Liveness gate: a pair is elided either when the Release is the
+                // temp's true last-use (the normal last-drop case), OR when the full
+                // path tail→intermediates→prefix is interference-free (`tail_clean &&
+                // prefix_clean`, with intermediate blocks already verified by
+                // `find_paired_release_cross_block`). In the interference-free case the
+                // pair is a no-op: no independent owner is created between Retain and
+                // Release, so an outer reference already keeps the value alive and
+                // removing the inner pair leaves RC balanced on every path.
                 let last_use = release_is_last_use(
                     &liveness,
                     &func.blocks[release_block_idx],
                     release_instr_idx,
                     *retain_val,
                 );
-                if prefix_clean && release_postdominates && last_use {
+                // `tail_clean` was checked above (at lines 176-180); if we reach here it
+                // is `true`. `prefix_clean` is the release-block prefix check above.
+                // Together they mean the whole path is interference-free.
+                let path_all_borrow = tail_clean && prefix_clean;
+                if prefix_clean && release_postdominates && (last_use || path_all_borrow) {
                     to_remove.insert((block_idx, retain_idx));
                     to_remove.insert((release_block_idx, release_instr_idx));
                 }
@@ -286,6 +324,7 @@ fn find_paired_release_cross_block(
     claimed: &HashSet<(usize, usize)>,
     postdom: &PostDom,
     conv_map: &HashMap<FuncId, Vec<Convention>>,
+    named_conv_map: &HashMap<String, Vec<Convention>>,
 ) -> Option<(usize, usize)> {
     let origin_id = func.blocks[origin_block_idx].id;
 
@@ -318,7 +357,7 @@ fn find_paired_release_cross_block(
 
         // If the block is tainted (interference or temp redefined) we cannot
         // skip over it; stop the walk.
-        if !block_is_clean_for(temp, block, conv_map) || !block_temp_survives(temp, block) {
+        if !block_is_clean_for(temp, block, conv_map, named_conv_map) || !block_temp_survives(temp, block) {
             break;
         }
 
@@ -356,9 +395,10 @@ fn block_is_clean_for(
     temp: Temp,
     block: &BasicBlock,
     conv_map: &HashMap<FuncId, Vec<Convention>>,
+    named_conv_map: &HashMap<String, Vec<Convention>>,
 ) -> bool {
     for instr in &block.instructions {
-        if instr_is_interference(temp, instr, conv_map) {
+        if instr_is_interference(temp, instr, conv_map, named_conv_map) {
             return false;
         }
     }
@@ -385,6 +425,7 @@ fn instr_is_interference(
     temp: Temp,
     instr: &Instruction,
     conv_map: &HashMap<FuncId, Vec<Convention>>,
+    named_conv_map: &HashMap<String, Vec<Convention>>,
 ) -> bool {
     match instr {
         // CallIntrinsic: use the hand-audited intrinsic convention table. If temp
@@ -411,7 +452,6 @@ fn instr_is_interference(
             true
         }
         // Direct call to a known function: use the inferred convention table.
-        // Named/Indirect calls remain interference (unknown conventions).
         Instruction::Call { callee: CallTarget::Direct(fid), args, .. } => {
             if let Some(convs) = conv_map.get(fid) {
                 // Borrow or Inout positions do not create an independent owner: the callee
@@ -432,7 +472,28 @@ fn instr_is_interference(
             }
             true
         }
-        Instruction::Call { callee: CallTarget::Named(_) | CallTarget::Indirect(_), .. }
+        // Named call to an imported function: look up in the cross-module convention table.
+        // When ALL argument positions where `temp` appears have Borrow/Inout convention, the
+        // callee does not create an independent owner and is not interference. When the symbol
+        // is absent from the map (convention unknown), fall through to the conservative `true`.
+        Instruction::Call { callee: CallTarget::Named(sym), args, .. } => {
+            if let Some(convs) = named_conv_map.get(sym.as_str()) {
+                let all_non_escaping = args.iter().enumerate().all(|(i, &a)| {
+                    if a != temp {
+                        return true;
+                    }
+                    matches!(
+                        convs.get(i).copied().unwrap_or(Convention::Own),
+                        Convention::Borrow | Convention::Inout
+                    )
+                });
+                if all_non_escaping {
+                    return false;
+                }
+            }
+            true
+        }
+        Instruction::Call { callee: CallTarget::Indirect(_), .. }
         | Instruction::MakeObject { .. }
         | Instruction::MakeArray { .. }
         | Instruction::MakeClosure { .. }
@@ -634,11 +695,12 @@ fn path_has_no_interference(
     end_exclusive: usize,
     instrs: &[Instruction],
     conv_map: &HashMap<FuncId, Vec<Convention>>,
+    named_conv_map: &HashMap<String, Vec<Convention>>,
 ) -> bool {
     let start = if start_exclusive == usize::MAX { 0 } else { start_exclusive + 1 };
     let end = end_exclusive.min(instrs.len());
     for i in start..end {
-        if instr_is_interference(temp, &instrs[i], conv_map) {
+        if instr_is_interference(temp, &instrs[i], conv_map, named_conv_map) {
             return false;
         }
     }
@@ -696,7 +758,7 @@ struct CloneBoxElision {
     substitutions: Vec<(usize, usize)>,
 }
 
-fn elide_clonebox_reads_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Vec<Convention>>) {
+fn elide_clonebox_reads_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Vec<Convention>>, named_conv_map: &HashMap<String, Vec<Convention>>) {
     // Compute liveness and post-dominators once.
     let liveness = Liveness::compute(func);
     let postdom = PostDom::compute(func);
@@ -725,6 +787,7 @@ fn elide_clonebox_reads_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Ve
                 &block_index,
                 &postdom,
                 conv_map,
+                named_conv_map,
             );
             let (release_block_idx, release_instr_idx) = match release_loc {
                 Some(x) => x,
@@ -772,7 +835,7 @@ fn elide_clonebox_reads_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Ve
                 for i in start..end {
                     let instr = &instrs_cb[i];
                     if instr_uses_temp(instr, dst) {
-                        if instr_is_interference(dst, instr, conv_map) {
+                        if instr_is_interference(dst, instr, conv_map, named_conv_map) {
                             all_clean = false;
                             break;
                         }
@@ -794,7 +857,7 @@ fn elide_clonebox_reads_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Ve
                 for i in 0..end {
                     let instr = &instrs_b[i];
                     if instr_uses_temp(instr, dst) {
-                        if instr_is_interference(dst, instr, conv_map) {
+                        if instr_is_interference(dst, instr, conv_map, named_conv_map) {
                             all_clean = false;
                             break;
                         }
@@ -815,7 +878,7 @@ fn elide_clonebox_reads_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Ve
                 for i in 0..release_instr_idx {
                     let instr = &instrs_rb[i];
                     if instr_uses_temp(instr, dst) {
-                        if instr_is_interference(dst, instr, conv_map) {
+                        if instr_is_interference(dst, instr, conv_map, named_conv_map) {
                             all_clean = false;
                             break;
                         }
@@ -898,6 +961,219 @@ fn is_union_clonebox_ty(ty: &Type) -> bool {
     )
 }
 
+// ===========================================================================
+// FieldGet/Index-result Retain elision
+// ===========================================================================
+//
+// Eliminates `Retain { val: dst }` / `Release { val: dst }` pairs where `dst`
+// is the result of a `FieldGet { dst, object }` whose `result_ty` is a
+// concrete-RC collection type (Array, Object, Map, Str, etc.) AND:
+//   1. `dst` is ONLY consumed at Borrow-convention positions across its live
+//      range — the existing `instr_is_interference` predicate rejects Own-
+//      convention uses, escapes, and non-Borrow calls.
+//   2. `object` (the container that holds the field) is not released or
+//      redefined in any block where `dst` is live — the container's owner
+//      outlives all reads of `dst`.
+//   3. The Release block post-dominates the Retain block — the Release is
+//      reached on every execution path through the Retain.
+//
+// Why this is sound:
+//   A `FieldGet` extracts a raw interior pointer from a sealed struct (a
+//   constant-offset load from the struct's heap allocation). That pointer is
+//   valid as long as the container is alive and not mutated. The interference
+//   check rejects any `IndexSet`, `FieldSet`, `CellSet`, `GlobalValSet`, or
+//   any non-Borrow call — exactly the instructions that could mutate the
+//   backing store or drop the container. The container-liveness check
+//   (`src_instr_invalidates`) rejects any Release or redefinition of `object`.
+//   Together these guarantee the interior pointer remains valid for all reads.
+//
+// Unlike CloneBox elision, NO substitution is needed: the FieldGet instruction
+// itself stays (it performs the actual field load). We only remove the
+// Retain and its matching Release, leaving `dst` in place but without an RC
+// count increment. The FieldGet yields a borrowed interior pointer; the
+// container's reference covers it for the duration of the live range.
+//
+// Cross-block support mirrors the CloneBox pass exactly: uses of `dst` may
+// span multiple basic blocks; all live blocks are checked; the Release is
+// located via the idom post-dominator chain.
+
+/// A FieldGet Retain/Release pair that is safe to elide.
+struct FieldGetElision {
+    /// The block/index of the Retain instruction to remove.
+    retain_block_idx: usize,
+    retain_instr_idx: usize,
+    /// The block/index of the Release instruction to remove.
+    release_block_idx: usize,
+    release_instr_idx: usize,
+}
+
+fn elide_fieldget_retain_fn(func: &mut LinFunction, conv_map: &HashMap<FuncId, Vec<Convention>>, named_conv_map: &HashMap<String, Vec<Convention>>) {
+    let liveness = Liveness::compute(func);
+    let postdom = PostDom::compute(func);
+    let block_index: HashMap<BlockId, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+
+    let mut elisions: Vec<FieldGetElision> = Vec::new();
+
+    for retain_block_idx in 0..func.blocks.len() {
+        let retain_block_id = func.blocks[retain_block_idx].id;
+        let instrs = func.blocks[retain_block_idx].instructions.clone();
+
+        for (retain_instr_idx, instr) in instrs.iter().enumerate() {
+            // Looking for: Retain { val: dst } where dst came from a FieldGet
+            // in the same block at the immediately preceding instruction.
+            let (dst, retain_ty) = match instr {
+                Instruction::Retain { val, ty } if is_concrete_rc_ty(ty) => (*val, ty.clone()),
+                _ => continue,
+            };
+
+            // The FieldGet must immediately precede this Retain in the same block.
+            let container = if retain_instr_idx == 0 {
+                continue; // No preceding instruction in this block.
+            } else {
+                match &instrs[retain_instr_idx - 1] {
+                    Instruction::FieldGet { dst: fget_dst, object, result_ty, .. }
+                        if *fget_dst == dst && is_concrete_rc_ty(result_ty) =>
+                    {
+                        *object
+                    }
+                    _ => continue, // Preceding instruction is not a FieldGet for this dst.
+                }
+            };
+
+            // STEP 1: Find the Release for `dst` via the idom chain.
+            let release_loc = find_clonebox_release_cross_block(
+                dst,
+                retain_block_idx,
+                retain_instr_idx, // scan from retain_instr_idx+1
+                func,
+                &block_index,
+                &postdom,
+                conv_map,
+                named_conv_map,
+            );
+            let (release_block_idx, release_instr_idx) = match release_loc {
+                Some(x) => x,
+                None => continue,
+            };
+            let release_block_id = func.blocks[release_block_idx].id;
+
+            // STEP 2: Collect all blocks where `dst` is live_in (intermediate blocks).
+            let live_blocks: Vec<usize> = func.blocks.iter().enumerate().filter_map(|(bi, b)| {
+                if liveness.live_in.get(&b.id).map_or(false, |s| s.contains(&dst)) {
+                    Some(bi)
+                } else {
+                    None
+                }
+            }).collect();
+
+            // STEP 3: Check all blocks in `dst`'s live range.
+            // For each block where dst is live, verify:
+            //   (a) all uses of dst are at Borrow positions (no interference),
+            //   (b) container is not invalidated (released or redefined).
+            let mut all_clean = true;
+
+            // Check retain block (after retain_instr_idx, i.e., the uses after the Retain).
+            {
+                let instrs_rb = &func.blocks[retain_block_idx].instructions;
+                let start = retain_instr_idx + 1;
+                let end = if retain_block_idx == release_block_idx {
+                    release_instr_idx
+                } else {
+                    instrs_rb.len()
+                };
+                for i in start..end {
+                    let instr = &instrs_rb[i];
+                    if instr_uses_temp(instr, dst) && instr_is_interference(dst, instr, conv_map, named_conv_map) {
+                        all_clean = false;
+                        break;
+                    }
+                    if src_instr_invalidates(container, instr) {
+                        all_clean = false;
+                        break;
+                    }
+                }
+            }
+            if !all_clean { continue; }
+
+            // Check intermediate blocks (live_in blocks that are not the retain/release block).
+            for &bi in &live_blocks {
+                if bi == retain_block_idx || bi == release_block_idx { continue; }
+                let instrs_b = &func.blocks[bi].instructions;
+                for i in 0..instrs_b.len() {
+                    let instr = &instrs_b[i];
+                    if instr_uses_temp(instr, dst) && instr_is_interference(dst, instr, conv_map, named_conv_map) {
+                        all_clean = false;
+                        break;
+                    }
+                    if src_instr_invalidates(container, instr) {
+                        all_clean = false;
+                        break;
+                    }
+                }
+                if !all_clean { break; }
+            }
+            if !all_clean { continue; }
+
+            // Check release block (before release_instr_idx), if different from retain block.
+            if release_block_idx != retain_block_idx {
+                let instrs_relb = &func.blocks[release_block_idx].instructions;
+                for i in 0..release_instr_idx {
+                    let instr = &instrs_relb[i];
+                    if instr_uses_temp(instr, dst) && instr_is_interference(dst, instr, conv_map, named_conv_map) {
+                        all_clean = false;
+                        break;
+                    }
+                    if src_instr_invalidates(container, instr) {
+                        all_clean = false;
+                        break;
+                    }
+                }
+                if !all_clean { continue; }
+            }
+
+            // STEP 4: Verify release block post-dominates retain block.
+            if !postdom.post_dominates(release_block_id, retain_block_id) {
+                continue;
+            }
+
+            let _ = retain_ty; // silence unused warning
+            elisions.push(FieldGetElision {
+                retain_block_idx,
+                retain_instr_idx,
+                release_block_idx,
+                release_instr_idx,
+            });
+        }
+    }
+
+    if elisions.is_empty() {
+        return;
+    }
+
+    // Collect all (block_idx, instr_idx) pairs to remove.
+    let mut to_remove: HashSet<(usize, usize)> = HashSet::new();
+    for e in &elisions {
+        to_remove.insert((e.retain_block_idx, e.retain_instr_idx));
+        to_remove.insert((e.release_block_idx, e.release_instr_idx));
+    }
+
+    // Remove in descending order per block (same pattern as other passes).
+    for block_idx in 0..func.blocks.len() {
+        let mut remove_here: Vec<usize> = to_remove
+            .iter()
+            .filter(|(b, _)| *b == block_idx)
+            .map(|(_, i)| *i)
+            .collect();
+        remove_here.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in remove_here {
+            func.blocks[block_idx].instructions.remove(idx);
+            if idx < func.blocks[block_idx].instr_spans.len() {
+                func.blocks[block_idx].instr_spans.remove(idx);
+            }
+        }
+    }
+}
+
 /// Returns true if `instr` uses `temp` in any position (use, def, or otherwise).
 /// We use this to enumerate substitution sites.
 fn instr_uses_temp(instr: &Instruction, temp: Temp) -> bool {
@@ -938,6 +1214,7 @@ fn find_clonebox_release_cross_block(
     block_index: &HashMap<BlockId, usize>,
     postdom: &PostDom,
     conv_map: &HashMap<FuncId, Vec<Convention>>,
+    named_conv_map: &HashMap<String, Vec<Convention>>,
 ) -> Option<(usize, usize)> {
     let clone_block_id = func.blocks[clone_block_idx].id;
 
@@ -976,7 +1253,7 @@ fn find_clonebox_release_cross_block(
         }
 
         // If this block is tainted for `dst` or redefs it, stop.
-        if !block_is_clean_for(dst, block, conv_map) || !block_temp_survives(dst, block) {
+        if !block_is_clean_for(dst, block, conv_map, named_conv_map) || !block_temp_survives(dst, block) {
             break;
         }
 
@@ -1224,7 +1501,7 @@ mod tests {
             Instruction::Release { val: Temp(0), ty: Type::Str },
         ];
         let mut module = make_module(make_fn(FuncId(0), instrs));
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let remaining = &module.functions[0].blocks[0].instructions;
         assert!(
             !remaining.iter().any(|i| matches!(i, Instruction::Retain { .. })),
@@ -1253,7 +1530,7 @@ mod tests {
             Instruction::Release { val: Temp(0), ty: Type::Str },
         ];
         let mut module = make_module(make_fn(FuncId(0), instrs));
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let remaining = &module.functions[0].blocks[0].instructions;
         let retains = remaining.iter().filter(|i| matches!(i, Instruction::Retain { .. })).count();
         let releases = remaining.iter().filter(|i| matches!(i, Instruction::Release { .. })).count();
@@ -1278,7 +1555,7 @@ mod tests {
             Instruction::Release { val: Temp(0), ty: Type::Str },
         ];
         let mut module = make_module(make_fn(FuncId(0), instrs));
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let remaining = &module.functions[0].blocks[0].instructions;
         assert!(
             remaining.iter().any(|i| matches!(i, Instruction::Retain { .. })),
@@ -1308,7 +1585,7 @@ mod tests {
             Instruction::Release { val: Temp(0), ty: Type::Str },
         ];
         let mut module = make_module(make_two_block_fn(FuncId(0), instrs0, instrs1));
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let b0 = &module.functions[0].blocks[0].instructions;
         let b1 = &module.functions[0].blocks[1].instructions;
         assert!(
@@ -1340,7 +1617,7 @@ mod tests {
             Instruction::Release { val: Temp(0), ty: Type::Str },
         ];
         let mut module = make_module(make_two_block_fn(FuncId(0), instrs0, instrs1));
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let b0 = &module.functions[0].blocks[0].instructions;
         let b1 = &module.functions[0].blocks[1].instructions;
         assert!(
@@ -1376,7 +1653,7 @@ mod tests {
         ];
         let mut module =
             make_module(make_three_block_fn(FuncId(0), instrs0, instrs1, instrs2));
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let b0 = &module.functions[0].blocks[0].instructions;
         let b2 = &module.functions[0].blocks[2].instructions;
         assert!(
@@ -1418,7 +1695,7 @@ mod tests {
         );
 
         let mut module = make_module(func);
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let b0 = &module.functions[0].blocks[0].instructions;
         let b1 = &module.functions[0].blocks[1].instructions;
         assert!(
@@ -1470,7 +1747,7 @@ mod tests {
         let mut module = make_module(make_fn(FuncId(0), instrs));
         let before = count_rc(&module.functions[0], Temp(0));
         assert_eq!(before, (2, 1), "precondition: input is net +1");
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let (retains, releases) = count_rc(&module.functions[0], Temp(0));
         let net_before = before.0 as i64 - before.1 as i64;
         let net_after = retains as i64 - releases as i64;
@@ -1493,7 +1770,7 @@ mod tests {
             Instruction::Release { val: Temp(0), ty: Type::Str },
         ];
         let mut module = make_module(make_fn(FuncId(0), instrs));
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let (retains, releases) = count_rc(&module.functions[0], Temp(0));
         assert_eq!(
             retains, releases,
@@ -1557,7 +1834,7 @@ mod tests {
             getset_fuse: std::collections::HashSet::new(),
         };
         let mut module = make_module(func);
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let func = &module.functions[0];
         let (retains, releases) = count_rc(func, Temp(0));
         assert_eq!(retains, 1, "Retain must be kept (release does not post-dominate)");
@@ -1571,7 +1848,7 @@ mod tests {
         let instrs0 = vec![Instruction::Retain { val: Temp(0), ty: Type::Str }];
         let instrs1 = vec![Instruction::Release { val: Temp(0), ty: Type::Str }];
         let mut module = make_module(make_two_block_fn(FuncId(0), instrs0, instrs1));
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let (retains, releases) = count_rc(&module.functions[0], Temp(0));
         assert_eq!((retains, releases), (0, 0), "clean post-dominating pair should elide");
     }
@@ -1642,7 +1919,7 @@ mod tests {
         // 10 intermediate clean blocks → release is 11 idom hops away
         let func = make_linear_chain_fn(FuncId(0), instrs_first, 10, instrs_last);
         let mut module = make_module(func);
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let (retains, releases) = count_rc(&module.functions[0], Temp(0));
         assert_eq!(
             (retains, releases),
@@ -1704,7 +1981,7 @@ mod tests {
             getset_fuse: std::collections::HashSet::new(),
         };
         let mut module = make_module(func);
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let (retains, releases) = count_rc(&module.functions[0], Temp(0));
         assert_eq!(retains, 1, "Retain must be kept (interference in intermediate block)");
         assert_eq!(releases, 1, "Release must be kept (interference in intermediate block)");
@@ -1835,7 +2112,7 @@ mod tests {
             Instruction::Release { val: Temp(1), ty: union_ty.clone() },
         ];
         let mut module = make_module(make_clonebox_fn(FuncId(0), instrs));
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let func = &module.functions[0];
         assert_eq!(count_clonebox(func, Temp(1)), 0, "CloneBox should be elided");
         assert_eq!(count_release(func, Temp(1)), 0, "Release(dst) should be elided");
@@ -1863,7 +2140,7 @@ mod tests {
             Instruction::Release { val: Temp(1), ty: union_ty.clone() },
         ];
         let mut module = make_module(make_clonebox_two_block_fn(FuncId(0), instrs0, instrs1));
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let func = &module.functions[0];
         assert_eq!(count_clonebox(func, Temp(1)), 0, "CloneBox should be elided (cross-block)");
         assert_eq!(count_release(func, Temp(1)), 0, "Release(dst) should be elided (cross-block)");
@@ -1888,10 +2165,264 @@ mod tests {
             Instruction::Release { val: Temp(1), ty: union_ty.clone() },
         ];
         let mut module = make_module(make_clonebox_fn(FuncId(0), instrs));
-        elide_rc(&mut module);
+        elide_rc(&mut module, &HashMap::new());
         let func = &module.functions[0];
         assert_eq!(count_clonebox(func, Temp(1)), 1, "CloneBox must be kept (Own use)");
         assert_eq!(count_release(func, Temp(1)), 1, "Release must be kept (Own use)");
+    }
+
+    // -------------------------------------------------------------------------
+    // named_conv_map — Named call Borrow-convention elision tests
+    // -------------------------------------------------------------------------
+
+    /// Positive: Retain(t0) + Named call where t0 is passed as a Borrow-convention
+    /// arg + Release(t0) in the same block.  With a non-empty named_conv_map recording
+    /// Borrow for position 0, the Named call is NOT interference → pair elided.
+    #[test]
+    fn named_borrow_call_elides_retain_release() {
+        // named_conv_map: "borrow_fn" param 0 = Borrow.
+        let mut named_conv_map = HashMap::new();
+        named_conv_map.insert("borrow_fn".to_string(), vec![Convention::Borrow]);
+
+        let instrs = vec![
+            Instruction::Retain { val: Temp(0), ty: Type::Str },
+            Instruction::Call {
+                dst: Temp(1),
+                callee: CallTarget::Named("borrow_fn".into()),
+                args: vec![Temp(0)],
+                ret_ty: Type::Null,
+            },
+            Instruction::Release { val: Temp(0), ty: Type::Str },
+        ];
+        let mut module = make_module(make_fn(FuncId(0), instrs));
+        elide_rc(&mut module, &named_conv_map);
+        let remaining = &module.functions[0].blocks[0].instructions;
+        assert!(
+            !remaining.iter().any(|i| matches!(i, Instruction::Retain { .. })),
+            "Retain should be elided: call is Borrow-convention (not interference)"
+        );
+        assert!(
+            !remaining.iter().any(|i| matches!(i, Instruction::Release { .. })),
+            "Release should be elided: call is Borrow-convention (not interference)"
+        );
+    }
+
+    /// Negative: same as above but the named_conv_map records Own for position 0.
+    /// The call escapes t0 → NOT safe to elide.
+    #[test]
+    fn named_own_call_keeps_retain_release() {
+        let mut named_conv_map = HashMap::new();
+        named_conv_map.insert("own_fn".to_string(), vec![Convention::Own]);
+
+        let instrs = vec![
+            Instruction::Retain { val: Temp(0), ty: Type::Str },
+            Instruction::Call {
+                dst: Temp(1),
+                callee: CallTarget::Named("own_fn".into()),
+                args: vec![Temp(0)],
+                ret_ty: Type::Null,
+            },
+            Instruction::Release { val: Temp(0), ty: Type::Str },
+        ];
+        let mut module = make_module(make_fn(FuncId(0), instrs));
+        elide_rc(&mut module, &named_conv_map);
+        let remaining = &module.functions[0].blocks[0].instructions;
+        assert!(
+            remaining.iter().any(|i| matches!(i, Instruction::Retain { .. })),
+            "Retain must be kept: call is Own-convention (interference)"
+        );
+        assert!(
+            remaining.iter().any(|i| matches!(i, Instruction::Release { .. })),
+            "Release must be kept: call is Own-convention (interference)"
+        );
+    }
+
+    /// Negative: Named call where position 0 is Borrow but t0 appears at position 1
+    /// (which is Own by default/absence).  The call escapes t0 at pos 1 → keep both.
+    #[test]
+    fn named_borrow_at_wrong_position_keeps_retain_release() {
+        // Conventions: pos 0 = Borrow, pos 1 = Own (absence → Own).
+        let mut named_conv_map = HashMap::new();
+        named_conv_map.insert("mixed_fn".to_string(), vec![Convention::Borrow]);
+
+        let instrs = vec![
+            Instruction::Retain { val: Temp(0), ty: Type::Str },
+            Instruction::Call {
+                dst: Temp(2),
+                callee: CallTarget::Named("mixed_fn".into()),
+                // t0 at position 1 (which has no Borrow entry) — should be Own
+                args: vec![Temp(1), Temp(0)],
+                ret_ty: Type::Null,
+            },
+            Instruction::Release { val: Temp(0), ty: Type::Str },
+        ];
+        let mut module = make_module(make_fn(FuncId(0), instrs));
+        elide_rc(&mut module, &named_conv_map);
+        let remaining = &module.functions[0].blocks[0].instructions;
+        assert!(
+            remaining.iter().any(|i| matches!(i, Instruction::Retain { .. })),
+            "Retain must be kept: t0 at Own position 1"
+        );
+        assert!(
+            remaining.iter().any(|i| matches!(i, Instruction::Release { .. })),
+            "Release must be kept: t0 at Own position 1"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // path_all_borrow — cross-block loop body elision (temp still live after release)
+    // -------------------------------------------------------------------------
+
+    /// Positive: Retain in block 0, Named Borrow-call in block 1, Release in block 1.
+    /// t0 is still live after the Release (it is live_out of block 1, because block 2
+    /// uses it).  Without path_all_borrow, liveness gate would block elision.  With
+    /// path_all_borrow the pair is provably a no-op and must be elided.
+    #[test]
+    fn cross_block_path_all_borrow_elides_despite_temp_live_after_release() {
+        // Build:
+        //   block 0: Retain(t0)          → Jump(1)
+        //   block 1: Call(t1, borrow_fn, [t0]); Release(t0)  → Jump(2)
+        //   block 2: Copy(t2, t0)        → Return
+        // t0 is live_out of block 1 (used in block 2) so last_use=false.
+        // But path is fully clean (only Borrow call), so path_all_borrow fires.
+        let mut named_conv_map = HashMap::new();
+        named_conv_map.insert("borrow_fn".to_string(), vec![Convention::Borrow]);
+
+        let block0 = BasicBlock {
+            id: BlockId(0),
+            label: None,
+            instructions: vec![Instruction::Retain { val: Temp(0), ty: Type::Str }],
+            terminator: Terminator::Jump(BlockId(1)),
+            span: None,
+            instr_spans: Vec::new(),
+        };
+        let block1 = BasicBlock {
+            id: BlockId(1),
+            label: None,
+            instructions: vec![
+                Instruction::Call {
+                    dst: Temp(1),
+                    callee: CallTarget::Named("borrow_fn".into()),
+                    args: vec![Temp(0)],
+                    ret_ty: Type::Null,
+                },
+                Instruction::Release { val: Temp(0), ty: Type::Str },
+            ],
+            terminator: Terminator::Jump(BlockId(2)),
+            span: None,
+            instr_spans: Vec::new(),
+        };
+        let block2 = BasicBlock {
+            id: BlockId(2),
+            label: None,
+            instructions: vec![Instruction::Copy { dst: Temp(2), src: Temp(0) }],
+            terminator: Terminator::Return(None),
+            span: None,
+            instr_spans: Vec::new(),
+        };
+        let mut temp_types = std::collections::HashMap::new();
+        temp_types.insert(Temp(0), Type::Str);
+        temp_types.insert(Temp(1), Type::Null);
+        temp_types.insert(Temp(2), Type::Str);
+        let func = LinFunction {
+            id: FuncId(0),
+            name: None,
+            params: vec![],
+            is_closure: false,
+            ret_ty: Type::Null,
+            param_conventions: Vec::new(),
+            ret_convention: Convention::Own,
+            blocks: vec![block0, block1, block2],
+            temp_types,
+            temp_count: 3,
+            intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
+            coverage_origin: None,
+            substr_fuse: std::collections::HashMap::new(),
+            getset_fuse: std::collections::HashSet::new(),
+        };
+
+        // Verify that t0 IS live_out of block 1 (the liveness gate would block without
+        // path_all_borrow).
+        let liveness = Liveness::compute(&func);
+        let live_out_b1 = liveness.live_out.get(&BlockId(1)).cloned().unwrap_or_default();
+        assert!(
+            live_out_b1.contains(&Temp(0)),
+            "precondition: t0 must be live_out of block 1 so this tests the path_all_borrow bypass"
+        );
+
+        let mut module = make_module(func);
+        elide_rc(&mut module, &named_conv_map);
+        let (retains, releases) = count_rc(&module.functions[0], Temp(0));
+        assert_eq!(retains, 0, "Retain should be elided via path_all_borrow (whole path is Borrow-only)");
+        assert_eq!(releases, 0, "Release should be elided via path_all_borrow (whole path is Borrow-only)");
+    }
+
+    /// Negative: same shape as above but the named_conv_map records Own for "own_fn",
+    /// so the path is NOT clean.  path_all_borrow must NOT fire; pair kept.
+    #[test]
+    fn cross_block_path_all_borrow_kept_when_path_has_own_call() {
+        let mut named_conv_map = HashMap::new();
+        named_conv_map.insert("own_fn".to_string(), vec![Convention::Own]);
+
+        let block0 = BasicBlock {
+            id: BlockId(0),
+            label: None,
+            instructions: vec![Instruction::Retain { val: Temp(0), ty: Type::Str }],
+            terminator: Terminator::Jump(BlockId(1)),
+            span: None,
+            instr_spans: Vec::new(),
+        };
+        let block1 = BasicBlock {
+            id: BlockId(1),
+            label: None,
+            instructions: vec![
+                Instruction::Call {
+                    dst: Temp(1),
+                    callee: CallTarget::Named("own_fn".into()),
+                    args: vec![Temp(0)],
+                    ret_ty: Type::Null,
+                },
+                Instruction::Release { val: Temp(0), ty: Type::Str },
+            ],
+            terminator: Terminator::Jump(BlockId(2)),
+            span: None,
+            instr_spans: Vec::new(),
+        };
+        let block2 = BasicBlock {
+            id: BlockId(2),
+            label: None,
+            instructions: vec![Instruction::Copy { dst: Temp(2), src: Temp(0) }],
+            terminator: Terminator::Return(None),
+            span: None,
+            instr_spans: Vec::new(),
+        };
+        let mut temp_types = std::collections::HashMap::new();
+        temp_types.insert(Temp(0), Type::Str);
+        temp_types.insert(Temp(1), Type::Null);
+        temp_types.insert(Temp(2), Type::Str);
+        let func = LinFunction {
+            id: FuncId(0),
+            name: None,
+            params: vec![],
+            is_closure: false,
+            ret_ty: Type::Null,
+            param_conventions: Vec::new(),
+            ret_convention: Convention::Own,
+            blocks: vec![block0, block1, block2],
+            temp_types,
+            temp_count: 3,
+            intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
+            coverage_origin: None,
+            substr_fuse: std::collections::HashMap::new(),
+            getset_fuse: std::collections::HashSet::new(),
+        };
+        let mut module = make_module(func);
+        elide_rc(&mut module, &named_conv_map);
+        let (retains, releases) = count_rc(&module.functions[0], Temp(0));
+        assert_eq!(retains, 1, "Retain must be kept: Own call taints the path");
+        assert_eq!(releases, 1, "Release must be kept: Own call taints the path");
     }
 
     /// Negative: CloneBox where the type is NOT a union (e.g. plain Str).
@@ -1909,8 +2440,9 @@ mod tests {
         // The Retain/Release pass may or may not convert a non-union CloneBox — that is not
         // what we're testing here.
         let conv_map = HashMap::new();
+        let named_conv_map = HashMap::new();
         let mut func = make_clonebox_fn(FuncId(0), instrs);
-        elide_clonebox_reads_fn(&mut func, &conv_map);
+        elide_clonebox_reads_fn(&mut func, &conv_map, &named_conv_map);
         // The CloneBox (Str-typed) must survive the CloneBox-read pass.
         assert_eq!(count_clonebox(&func, Temp(1)), 1, "Non-union CloneBox must not be touched by clonebox-read pass");
     }

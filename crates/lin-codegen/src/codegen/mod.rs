@@ -175,6 +175,12 @@ pub struct Codegen<'ctx> {
     /// Pre-built TBAA metadata nodes for flat-array accesses. Attached to header-field loads
     /// and data-element stores so LLVM's LICM can hoist the length load out of inner loops.
     tbaa: TbaaNodes<'ctx>,
+    /// Accumulated parameter-convention map for all compiled import modules, keyed by mangled
+    /// symbol name (e.g. `_timetable_departureTime`). Built incrementally by
+    /// `compile_import_from_ir` after `infer_conventions` runs on each import's IR. Passed to
+    /// `elide_rc` for the main module so Named calls to imported functions are recognized as
+    /// non-interference when all touched parameters have Borrow/Inout convention.
+    pub import_named_convs: HashMap<String, Vec<lin_ir::ir::Convention>>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -218,6 +224,7 @@ impl<'ctx> Codegen<'ctx> {
             str_literal_globals: std::cell::RefCell::new(HashMap::new()),
             flat_union_return_fns: HashSet::new(),
             tbaa: TbaaNodes::new(context),
+            import_named_convs: HashMap::new(),
         }
     }
 
@@ -415,6 +422,11 @@ impl<'ctx> Codegen<'ctx> {
         // so the corpus run covers std/* and example imports. Inference is pure data; the verifier
         // (gated by LIN_OWNERSHIP_SHADOW) is report-only. Neither changes codegen output.
         lin_ir::ownership_verify::infer_conventions(&mut ir_module);
+        // Collect name→convention map for this import's exported functions and merge into the
+        // accumulator so the main module's elide_rc can treat Named calls to these functions
+        // as non-interference when their parameters are all Borrow/Inout.
+        let named_convs = lin_ir::rc_elide::extract_named_conventions(&ir_module);
+        self.import_named_convs.extend(named_convs);
         if std::env::var("LIN_OWNERSHIP_SHADOW").is_ok() {
             for v in lin_ir::ownership_verify::verify_module(&ir_module) {
                 if v.kind == lin_ir::ownership_verify::ViolationKind::UnauditedIntrinsic {
@@ -428,7 +440,12 @@ impl<'ctx> Codegen<'ctx> {
         // shape as the main module. Stores the per-temp repr table on each `func.repr` for codegen
         // to consume at DECIDE / ASSUME sites, and (debug builds) asserts the oracle + verifier.
         lin_ir::repr::run(&mut ir_module);
-        lin_ir::rc_elide::elide_rc(&mut ir_module);
+        // Pass the accumulated import conventions: an import can call functions from other
+        // already-compiled imports (e.g. route_scanner calls timetable.departureTime).
+        // By this point `self.import_named_convs` already contains all previously compiled
+        // imports' conventions (they are extended above, before this call). The compilation
+        // order follows the import graph, so dependencies are compiled before dependents.
+        lin_ir::rc_elide::elide_rc(&mut ir_module, &self.import_named_convs);
         // Sealed-records Stage 4: stack-allocate non-escaping all-scalar sealed records and suppress
         // their Retain/Release emission (imports get the same analysis as the main module).
         lin_ir::escape::analyze(&mut ir_module);
