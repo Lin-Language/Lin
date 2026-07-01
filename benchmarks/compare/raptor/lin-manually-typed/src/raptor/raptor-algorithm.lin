@@ -68,24 +68,23 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
 
   queue.entries([routeId, stopP] =>
     var boardingPoint: RoutePosition = 0u8
-    var tripIdx: Int32 = -1
+    var tripIdx: UInt32 | Null = null
     val route = tt["routes"][routeId]
-    val numStops = route["numStops"].toInt32()
     val routeStopsBase = route["routeStopsBase"]
     val boardingPointIndex = tt["routeStopIndex"][routeId][stopP] ?? 0u8
 
-    range(boardingPointIndex.toInt32(), numStops).for(pi =>
+    range(boardingPointIndex, route["numStops"]).for(pi =>
       val pos = pi.toUInt8()
       val stopPi = tt["routeStops"][routeStopsBase + pi]
       val prevArrival = results.previousArrival(stopPi)
 
-      if tripIdx >= 0 then
+      if tripIdx != null then
         val interchange = tt["interchange"][stopPi] ?? 0
-        val sti = route.stopTimeIndexOf(tripIdx.toUInt32(), pos)
+        val sti = route.stopTimeIndexOf(tripIdx, pos)
         val arrival = tt["stopTimes"].arrivalTime(sti) + interchange
 
         if tt["stopTimes"].isDropOff(sti) && arrival < results.bestArrival(stopPi) then
-          results.setTrip(stopPi, arrival, routeId, tripIdx.toUInt32(), boardingPoint, pos)
+          results.setTrip(stopPi, arrival, routeId, tripIdx, boardingPoint, pos) // TODO do we really need all these agrs? stopPi, plus pos
         else if prevArrival != 0 && prevArrival < arrival then
           val newIdx = routeScanner.getTrip(tt, routeId, pos, prevArrival)
           if newIdx >= 0 then
