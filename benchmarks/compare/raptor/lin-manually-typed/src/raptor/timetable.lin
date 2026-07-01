@@ -80,6 +80,7 @@ export type Timetable = {
     "stopTimes": StopTimeEntry[],     // all stop times, route["stopTimesBase"] + t*numStops + s
     "tripServiceId": ServiceIntId[],  // tripId → serviceId
     "services": Service[],            // packed service array
+    "tripIds": String[],              // tripId → trip id string (journey output only, cold)
   }
   "stops": {
     "stopIds": { StopId: StopIntId }, // stopCode → stopId

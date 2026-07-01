@@ -40,30 +40,30 @@ val getJourneyLegs = (tt: Timetable, kConnections: ConnectionIndex, k: UInt8, fi
     if connection is Transfer then
       legs.push(connection)
       // Transfer.origin is a string stop code — intern it to continue the int walk
-      destination = tt["stopIds"][connection["origin"]] ?? 0u32
+      destination = tt["stops"]["stopIds"][connection["origin"]] ?? 0u32
     else if connection != null then
       // Connection is [routeId, tripIndex, boardingPos, alightingPos]. Reconstruct the leg's
       // stop sequence + times from the flat timetable arrays (cold path — helpers are fine here).
       val [routeId, t, start, end] = connection
-      val route = tt["routes"][routeId]
+      val route = tt["routes"]["routes"][routeId]
       val rsBase = route["routeStopsBase"]
 
       val stopTimes = range(start, end + 1).map(pos =>
         val sti = route.stopTimeIndexOf(t, pos.toUInt8())
         {
-          "stop": tt["stopNames"][tt["routeStops"][rsBase + pos]],
-          "arrivalTime": tt["stopTimes"].arrivalTime(sti),
-          "departureTime": tt["stopTimes"].departureTime(sti),
-          "pickUp": tt["stopTimes"].isPickUp(sti),
-          "dropOff": tt["stopTimes"].isDropOff(sti)
+          "stop": tt["stops"]["stopNames"][tt["routes"]["routeStops"][rsBase + pos]],
+          "arrivalTime": tt["trips"]["stopTimes"].arrivalTime(sti),
+          "departureTime": tt["trips"]["stopTimes"].departureTime(sti),
+          "pickUp": tt["trips"]["stopTimes"].isPickUp(sti),
+          "dropOff": tt["trips"]["stopTimes"].isDropOff(sti)
         }
       )
       val origin = stopTimes[0]["stop"]
       val destinationStr = stopTimes[stopTimes.length() - 1]["stop"]
-      val tripId = tt["tripIds"][route["tripsBase"] + t]
+      val tripId = tt["trips"]["tripIds"][route["tripsBase"] + t]
       legs.push({ "stopTimes": stopTimes, "origin": origin, "destination": destinationStr, "tripId": tripId })
       // The boarding stop (position `start`) is the next cursor — read its int id directly
-      destination = tt["routeStops"][rsBase + start]
+      destination = tt["routes"]["routeStops"][rsBase + start]
   )
 
   legs.reverse()

@@ -1,6 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { createQueueFactory, getQueue } from "./queue-factory"
 import { RouteStopIndex } from "./timetable"
+import { push } from "std/array"
 
 // Stop indices (dense UInt32).
 val stopA: UInt32 = 0u32
@@ -22,17 +23,17 @@ val makeStopRoutes = (): [UInt32[], UInt32[]] =>
 val s = suite("raptor/queue-factory", [
   // RouteB sits earlier at StopB (index 1) than StopA (index 2), so it enqueues at StopB
   test("enqueues stops", () =>
-    val rsi: RouteStopIndex = {}
+    val rsi: RouteStopIndex = []
     val rsiA: { UInt32: UInt8 } = {}
     rsiA[stopA] = 1u8
-    rsi[routeA] = rsiA
+    rsi.push(rsiA)
     val rsiB: { UInt32: UInt8 } = {}
     rsiB[stopA] = 2u8
     rsiB[stopB] = 1u8
-    rsi[routeB] = rsiB
+    rsi.push(rsiB)
     val rsiC: { UInt32: UInt8 } = {}
     rsiC[stopB] = 1u8
-    rsi[routeC] = rsiC
+    rsi.push(rsiC)
 
     val [sr, srb] = makeStopRoutes()
     val factory = createQueueFactory(sr, srb, rsi)
@@ -46,17 +47,17 @@ val s = suite("raptor/queue-factory", [
 
   // RouteB now sits earlier at StopA (index 1), so it picks StopA even though StopB is marked first
   test("picks the earliest stop on the route", () =>
-    val rsi: RouteStopIndex = {}
+    val rsi: RouteStopIndex = []
     val rsiA: { UInt32: UInt8 } = {}
     rsiA[stopA] = 1u8
-    rsi[routeA] = rsiA
+    rsi.push(rsiA)
     val rsiB: { UInt32: UInt8 } = {}
     rsiB[stopA] = 1u8
     rsiB[stopB] = 2u8
-    rsi[routeB] = rsiB
+    rsi.push(rsiB)
     val rsiC: { UInt32: UInt8 } = {}
     rsiC[stopB] = 1u8
-    rsi[routeC] = rsiC
+    rsi.push(rsiC)
 
     val [sr, srb] = makeStopRoutes()
     val factory = createQueueFactory(sr, srb, rsi)

@@ -1,0 +1,37 @@
+// LOAD-only timing harness — mirrors bench.lin's t0..loadMs window exactly
+// (loadGtfs + frozen(trips) + frozen(transfers)) so the LOAD number is comparable,
+// but skips PREP/GROUP/RANGE so it runs in seconds for fast perf iteration.
+// Prints a cheap correctness digest (loader-shape checksum) to catch regressions;
+// the authoritative gate remains the full bench digest 26203913/773022892/139.
+import { loadGtfs } from "./gtfs/gtfs-loader"
+import { frozen } from "std/async"
+import { now } from "std/time"
+import { print } from "std/io"
+import { toString } from "std/string"
+import { length, push } from "std/array"
+import { keys, values } from "std/object"
+import { for, reduce } from "std/iter"
+
+val DATA_DIR = "/home/linus/Work/linusnorton/lin-lang/benchmarks/compare/raptor/gtfs.tar.gz"
+
+val main = () =>
+  val t0 = now()
+  val [trips, transfers, interchange, stops] = loadGtfs(DATA_DIR)
+  val ftrips = frozen(trips)
+  val ftransfers = frozen(transfers)
+  val loadMs = now() - t0
+  print("LOAD ms=${ toString(loadMs) }")
+
+  // Cheap loader-shape digest: trip count, total stop-times, sum of arrival times,
+  // transfer-origin count, stop count, interchange count.
+  val nTrips = length(ftrips)
+  val totalStopTimes = ftrips.reduce(0, (acc: Int32, t) => acc + length(t["stopTimes"]))
+  val arrSum = ftrips.reduce(0, (acc: Int64, t) =>
+    acc + t["stopTimes"].reduce(0, (a: Int64, st) => a + st["arrivalTime"])
+  )
+  val nTransferOrigins = length(keys(ftransfers))
+  val nStops = length(keys(stops))
+  val nInterchange = length(keys(interchange))
+  print("LDIGEST trips=${ toString(nTrips) } stopTimes=${ toString(totalStopTimes) } arrSum=${ toString(arrSum) } transferOrigins=${ toString(nTransferOrigins) } stops=${ toString(nStops) } interchange=${ toString(nInterchange) }")
+
+main()

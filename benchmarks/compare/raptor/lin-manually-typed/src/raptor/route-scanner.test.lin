@@ -55,17 +55,23 @@ val makeTimetable = (trips: Trip[]): Timetable =>
     tripIds.push(t["tripId"])
   )
   {
-    "routes": [route],
-    "routeStops": [0u32],
-    "stopTimes": st,
-    "tripServiceId": tripServiceId,
-    "services": services,
-    "tripIds": tripIds,
-    "routeStopIndex": {},
-    "interchange": {},
-    "transfers": {},
-    "stopIds": {},
-    "stopNames": ["A"]
+    "routes": {
+      "routes": [route],
+      "routeStops": [0u32],
+      "routeStopIndex": []
+    },
+    "trips": {
+      "stopTimes": st,
+      "tripServiceId": tripServiceId,
+      "services": services,
+      "tripIds": tripIds
+    },
+    "stops": {
+      "stopIds": {},
+      "stopNames": ["A"],
+      "transfers": {},
+      "interchange": {}
+    }
   }
 
 val s = suite("raptor/route-scanner", [
@@ -75,7 +81,7 @@ val s = suite("raptor/route-scanner", [
     val sc = createRouteScanner(20180615, friday)
     val idx = getTrip(sc, tt, routeId0, 0, 1000)
     [
-      expect(tt["tripIds"][idx]).toBe("t1000")
+      expect(tt["trips"]["tripIds"][idx]).toBe("t1000")
     ]
   ),
 
@@ -85,7 +91,7 @@ val s = suite("raptor/route-scanner", [
     val sc = createRouteScanner(20180615, friday)
     val idx = getTrip(sc, tt, routeId0, 0, 1150)
     [
-      expect(tt["tripIds"][idx]).toBe("t1200")
+      expect(tt["trips"]["tripIds"][idx]).toBe("t1200")
     ]
   ),
 
@@ -104,7 +110,7 @@ val s = suite("raptor/route-scanner", [
     val sc = createRouteScanner(20180615, friday)
     val idx = getTrip(sc, tt, routeId0, 0, 1000)
     [
-      expect(tt["tripIds"][idx]).toBe("t1100")
+      expect(tt["trips"]["tripIds"][idx]).toBe("t1100")
     ]
   ),
 
@@ -115,7 +121,7 @@ val s = suite("raptor/route-scanner", [
     val sc = f(20180615, friday)
     val idx = getTrip(sc, tt, routeId0, 0, 1000)
     [
-      expect(tt["tripIds"][idx]).toBe("t1000")
+      expect(tt["trips"]["tripIds"][idx]).toBe("t1000")
     ]
   )
 ])

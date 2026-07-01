@@ -9,7 +9,7 @@ import { Service } from "../gtfs/service"
 // RouteScanner / ScanResultsFactory) and is covered by the query specs.
 val s = suite("raptor/raptor-algorithm", [
   test("createRaptorAlgorithm returns a record with the expected fields", () =>
-    val routeStopIndex: RouteStopIndex = {}
+    val routeStopIndex: RouteStopIndex = []
     val routes: Route[] = []
     val routeStops: UInt32[] = []
     val gStopTimes: StopTimeEntry[] = []
@@ -18,23 +18,29 @@ val s = suite("raptor/raptor-algorithm", [
     val tripIds: String[] = []
     val transfers: TransfersByOrigin = {}
     val interchange: Interchange = {}
-    val queueFactory: QueueFactory = { "stopRoutes": [], "stopRoutesBase": [], "routeStopIndex": {} }
+    val queueFactory: QueueFactory = { "stopRoutes": [], "stopRoutesBase": [], "routeStopIndex": [] }
     val routeScannerFactory: RouteScannerFactory = createRouteScanner
     val stopIndexOf: { String: UInt32 } = {}
     val stopNames: String[] = []
 
     val timetable: Timetable = {
-      "routes": routes,
-      "routeStops": routeStops,
-      "stopTimes": gStopTimes,
-      "tripServiceId": tripServiceId,
-      "services": services,
-      "tripIds": tripIds,
-      "routeStopIndex": routeStopIndex,
-      "interchange": interchange,
-      "transfers": transfers,
-      "stopIds": stopIndexOf,
-      "stopNames": stopNames
+      "routes": {
+        "routes": routes,
+        "routeStops": routeStops,
+        "routeStopIndex": routeStopIndex
+      },
+      "trips": {
+        "stopTimes": gStopTimes,
+        "tripServiceId": tripServiceId,
+        "services": services,
+        "tripIds": tripIds
+      },
+      "stops": {
+        "stopIds": stopIndexOf,
+        "stopNames": stopNames,
+        "transfers": transfers,
+        "interchange": interchange
+      }
     }
 
     val raptor = createRaptorAlgorithm(
@@ -43,10 +49,10 @@ val s = suite("raptor/raptor-algorithm", [
       routeScannerFactory
     )
     [
-      expect(raptor["timetable"]["routeStopIndex"]).toBe(routeStopIndex),
-      expect(raptor["timetable"]["routes"]).toBe(routes),
-      expect(raptor["timetable"]["transfers"]).toBe(transfers),
-      expect(raptor["timetable"]["interchange"]).toBe(interchange),
+      expect(raptor["timetable"]["routes"]["routeStopIndex"]).toBe(routeStopIndex),
+      expect(raptor["timetable"]["routes"]["routes"]).toBe(routes),
+      expect(raptor["timetable"]["stops"]["transfers"]).toBe(transfers),
+      expect(raptor["timetable"]["stops"]["interchange"]).toBe(interchange),
       expect(raptor["queueFactory"]).toBe(queueFactory),
       expect(raptor["routeScannerFactory"]).toBe(routeScannerFactory)
     ]

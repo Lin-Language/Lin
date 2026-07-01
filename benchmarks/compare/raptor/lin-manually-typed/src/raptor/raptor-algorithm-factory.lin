@@ -54,7 +54,7 @@ export val create = (
 
   // Per-route temp structures (pass 1 output)
   val tripsByRoute: { UInt32: Trip[] } = {}    // int routeId → trips in sorted order
-  val routeStopIndex: RouteStopIndex = {}       // int routeId → stop → position
+  val routeStopIndex: RouteStopIndex = []       // dense array: int routeId → stop → position
   val routePathsTemp: { UInt32: StopIntId[] } = {}   // int routeId → stop sequence
 
   // Inverse index per stop (for building stopRoutes/stopRoutesBase)
@@ -104,7 +104,8 @@ export val create = (
   // each stop's transfers/interchange, and the stop→routes inverse index.
   val buildRouteIndexes = (routeId: RouteIntId, path: StopIntId[], stopTimes: StopTime[]) =>
     val stopIndex: { StopIntId: RoutePosition } = {}
-    routeStopIndex[routeId] = stopIndex
+    // routeId is assigned sequentially in id order, so appending lands at index routeId
+    routeStopIndex.push(stopIndex)
 
     range(0, path.length()).for(i =>
       val stop = path[i]
@@ -213,17 +214,23 @@ export val create = (
   val frozenRouteStopIndex = frozen(routeStopIndex)
 
   val timetable: Timetable = {
-    "routes": frozen(routes),
-    "routeStops": frozen(routeStops),
-    "stopTimes": frozen(stopTimes),
-    "tripServiceId": frozen(tripServiceId),
-    "services": frozen(services),
-    "tripIds": frozen(tripIds),
-    "routeStopIndex": frozenRouteStopIndex,
-    "interchange": frozen(intInterchange),
-    "transfers": frozen(usefulTransfers),
-    "stopIds": frozen(stopIndexOf),
-    "stopNames": frozen(stopNames)
+    "routes": {
+      "routes": frozen(routes),
+      "routeStops": frozen(routeStops),
+      "routeStopIndex": frozenRouteStopIndex
+    },
+    "trips": {
+      "stopTimes": frozen(stopTimes),
+      "tripServiceId": frozen(tripServiceId),
+      "services": frozen(services),
+      "tripIds": frozen(tripIds)
+    },
+    "stops": {
+      "stopIds": frozen(stopIndexOf),
+      "stopNames": frozen(stopNames),
+      "transfers": frozen(usefulTransfers),
+      "interchange": frozen(intInterchange)
+    }
   }
 
   createRaptorAlgorithm(
