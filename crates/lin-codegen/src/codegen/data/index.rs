@@ -1722,6 +1722,35 @@ impl<'ctx> Codegen<'ctx> {
                 let key_str = self.compile_string_lit(field);
                 return self.compile_ir_index(obj, key_str, obj_ty, &Type::Str, result_ty, obj_repr, false, false);
             }
+            // A value statically typed as a SEALED record but reaching here with a BOXED repr is a
+            // `TaggedVal*` box wrapping the record — e.g. a `Record | Null` binding assigned a UNION
+            // field-index result (`r["value"]`, which stays boxed by design), then null-narrowed and
+            // field-read. A blind `map_get` on the box treats the TaggedVal (or the sealed struct it
+            // wraps) as a LinMap → `find_slot_string` on garbage → segfault. Project the box to a
+            // packed struct (the same boxed→sealed conversion the Index path uses for a sealed-record
+            // result — it handles a TAG_RECORD or TAG_MAP source uniformly), read the field by const
+            // offset, then release the temporary projection. The read value aliases the SOURCE box's
+            // heap field (retained by the projection, and the source box outlives this read), so it
+            // survives the projection release; the IR emits its own Retain on the dst for the caller.
+            if let Some(fields) = Self::sealed_scalar_fields(obj_ty) {
+                let fields = fields.clone();
+                if !fields.contains_key(field) {
+                    return self.null_value_for(result_ty);
+                }
+                let projected = self.unbox_tagged_val_to_type(obj, obj_ty);
+                if projected.is_pointer_value() {
+                    let raw = self.sealed_field_get(projected, field, &fields, result_ty);
+                    self.emit_sealed_release(projected, &fields);
+                    // Pure IntLit-union fields are stored as i32; box to TaggedVal*(TAG_INT32) so the
+                    // result matches the Union type callers expect (mirrors the packed branch).
+                    if fields.get(field).map(|t| t.is_pure_int_lit_union()).unwrap_or(false) && raw.is_int_value() {
+                        let i32v = self.builder.int_s_extend_or_bit_cast(raw.into_int_value(), self.context.i32_type(), "ilu_bfg_i32");
+                        return self.builder.call(self.rt.box_int32, &[i32v.into()], "ilu_bfg_box").try_as_basic_value().unwrap_basic();
+                    }
+                    return raw;
+                }
+                return self.null_value_for(result_ty);
+            }
             let key_str = self.compile_string_lit(field).into_pointer_value();
             // Stage 6b Phase 2: concrete (non-union) open-object container is a LinMap*; use map_get.
             let container = obj;

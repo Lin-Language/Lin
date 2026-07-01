@@ -593,6 +593,35 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                 if let Some(&cell) = builder.slots.get(slot) {
                     let dst = builder.alloc_temp(cell_ty.clone());
                     builder.emit(Instruction::CellGet { dst, cell, ty: cell_ty.clone() });
+                    // The cell holds the var's DECLARED representation; if this use wants a
+                    // narrower concrete type (e.g. a captured `var x: UInt32 | Null` read as
+                    // UInt32 after a null-check), unbox it — mirroring the global-var and local-slot
+                    // branches. Without this the boxed `TaggedVal*` flows out where an unboxed scalar
+                    // is expected (arithmetic / a scalar-param call), which the verifier rejects.
+                    let narrowed = is_union_ty(&cell_ty) && !is_union_ty(ty);
+                    let narrowed_from_nullable =
+                        is_nullable_sealed_record(&cell_ty) && is_sealed_scalar_repr(ty);
+                    if narrowed || narrowed_from_nullable {
+                        let d = builder.alloc_temp(ty.clone());
+                        builder.emit(Instruction::Coerce {
+                            dst: d, src: dst, from_ty: cell_ty.clone(), to_ty: ty.clone(),
+                        });
+                        // A union narrowed to a SEALED scalar record is a fresh +1 projection
+                        // (register owned, no retain); a nullable-record identity cast or a
+                        // borrowed-unbox of a heap payload aliases the box's inner and must be
+                        // retained. A scalar (non-rc) narrowing needs neither. (Same distinctions
+                        // as the local-slot branch below.)
+                        if narrowed && is_sealed_scalar_repr(ty) {
+                            builder.register_owned(d, ty.clone());
+                        } else if narrowed_from_nullable {
+                            builder.emit(Instruction::Retain { val: d, ty: ty.clone() });
+                            builder.register_owned(d, ty.clone());
+                        } else if is_rc_type(ty) {
+                            builder.emit(Instruction::Retain { val: d, ty: ty.clone() });
+                            builder.register_owned(d, ty.clone());
+                        }
+                        return d;
+                    }
                     // Owning read: take an independently-owned copy of the loaded value so it
                     // survives a later reassignment of the cell (release-old on CellSet) and is
                     // released at scope exit. Concrete rc: retain in place. Union: clone the box
