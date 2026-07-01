@@ -24698,3 +24698,73 @@ print(toString(isOpen(sched, d6)))
     );
     assert_eq!(output, vec!["false", "true", "false", "false"]);
 }
+
+// Regression (perf/loopvar-stack-promote): scalar `var` cells (`Int32`/`Bool`) captured only by
+// an inlined `while` body (no `MakeClosure`) must be stack-promoted (entry-block `alloca`) even
+// when the `MakeCell` instruction lands in a NON-entry block (e.g. after an RC-release
+// continuation block). Previously, `escape::analyze_cells` required a `FreeCell` (signal 1) as a
+// gate; `FreeCell` is only emitted for entry-block cells, so these were stuck on the heap.
+// Fix: scalar cells with no RC requirement are promoted on signal-2 alone (direct-use scan).
+//
+// Test structure:
+//   (a) Correctness — `sumDown` with 3 Int32 vars (models RAPTOR `getTrip`'s `i`/`lastFoundPosition`
+//       /`lastFound`) computes the right answer across multiple calls.
+//   (b) Stack safety — the same function called 100 k times verifies no per-call stack growth from
+//       alloca-in-loop-body (the brief's prior-bug). The alloca must be in the ENTRY block so it
+//       is allocated once per call, not once per iteration.
+//   (c) Escaping counter stays heap — a `var` returned via a closure still behaves correctly
+//       (stack-promotion must not fire when the pointer escapes into a `MakeClosure`).
+#[test]
+fn test_scalar_var_cell_stack_promote_non_entry_block() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { while } from "std/iter"
+import { range, for } from "std/iter"
+
+// (a) correctness: 3-var backwards scan, mirrors RAPTOR getTrip structure.
+// var i/lastPos/lastFound all land in a non-entry block after RC-release.
+val scan = (n: Int32): Int32 =>
+  var i = n
+  var lastPos = i
+  var lastFound: Int32 = -1
+  while(() =>
+    if i < 0 then
+      false
+    else
+      val hi = i > 50
+      if hi then lastFound = i
+      val lo = i < lastPos
+      if lo then lastPos = i
+      i = i - 1
+      true
+  )
+  lastFound
+
+print(toString(scan(100)))
+print(toString(scan(49)))
+
+// (b) stack-safety: 100k rounds with 101-iteration inner loop = 10.1M total loop steps.
+// Stack overflow would occur here if alloca were placed inside the loop body (not entry block).
+var total = 0
+range(0, 100000).for(_ =>
+  total = total + scan(100)
+)
+print(toString(total))
+
+// (c) escaping counter must stay heap-allocated — must not corrupt independent counters.
+val makeCounter = () =>
+  var count = 0
+  () =>
+    count = count + 1
+    count
+val c = makeCounter()
+val d = makeCounter()
+print(toString(c()))
+print(toString(c()))
+print(toString(d()))
+"#);
+    // scan(100) = 51 (first i > 50 found descending from 100 is 51); scan(49) = -1 (none > 50).
+    // 100k * 51 = 5100000.
+    // Counters c,d independent: c→1, c→2, d→1.
+    assert_eq!(output, vec!["51", "-1", "5100000", "1", "2", "1"]);
+}
