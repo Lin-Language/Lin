@@ -34,6 +34,9 @@ import foreign "lin-runtime"
   val lin_stream_count: (Int32, Int32) => Stream
   val lin_stream_repeat: (AnyVal, Int32) => Stream
   val lin_stream_cycle: (AnyVal) => Stream
+  // Truncate an Int64 range bound to the native Int32 loop counter. Declared directly (rather than
+  // importing std/number's `toInt32`) to keep std/iter self-contained / import-cycle-free.
+  val lin_narrow_int32: (Int64) => Int32
 // Maintainer note: the combinators here were relocated verbatim out of std/array (Stage 1 of the
 // std/iter unification); their eager Array/Iterator bodies are unchanged. std/iter is the
 // LOWER-LEVEL module: it must NOT import from std/array (that would form an array->iter->array import
@@ -94,11 +97,13 @@ val whileLoop = (f: () => Boolean): Null =>
 // @returns an `Int32[]` of the range.
 // @example range(0, 5).for(i => print(i))    // 0 1 2 3 4
 // @example range(1, 6).map(i => i * i)        // [1, 4, 9, 16, 25]
-export val range = (start: Int32, end: Int32) =>
-  // Delegate to the lin_range builtin, which materialises a flat Int32 array directly with no
-  // per-call closures (the general lin_iter form — 4 closures + envs per element — is needlessly
-  // expensive for the common integer-range case).
-  lin_range(start, end)
+export val range = (start: Int64, end: Int64) =>
+  // Bounds are `Int64` so any narrower integer (signed OR unsigned — e.g. a `UInt32` array offset)
+  // widens in without an explicit cast at the call site; they are truncated back to the native
+  // `Int32` loop counter here (the result element type stays `Int32`). Delegate to the lin_range
+  // builtin, which materialises a flat Int32 array directly with no per-call closures (the general
+  // lin_iter form — 4 closures + envs per element — is needlessly expensive for the common case).
+  lin_range(lin_narrow_int32(start), lin_narrow_int32(end))
 
 // Build an integer sequence from `start` toward `end` (exclusive) advancing by `step` (3-arg
 // overload of `range`). Resolved by arity: the 2-arg form above takes the fast `lin_range` path,
@@ -110,21 +115,26 @@ export val range = (start: Int32, end: Int32) =>
 // @returns an `Int32[]` of the stepped range.
 // @example range(0, 10, 2).for(i => print(i))   // 0, 2, 4, 6, 8
 // @example range(5, 0, -1).map(i => i)           // [5, 4, 3, 2, 1]
-export val range = (start: Int32, end: Int32, step: Int32): Int32[] =>
+export val range = (start: Int64, end: Int64, step: Int64): Int32[] =>
+  // As with the 2-arg form, bounds/step are `Int64` so narrower integers (signed or unsigned) widen
+  // in without a cast; truncate to the native `Int32` counter up front.
+  val s = lin_narrow_int32(start)
+  val e = lin_narrow_int32(end)
+  val st = lin_narrow_int32(step)
   val result: Int32[] = []
-  var cur = start
-  if step > 0 then
+  var cur = s
+  if st > 0 then
     whileLoop(() =>
-      val keep = cur < end
+      val keep = cur < e
       if keep then push(result, cur)
-      cur = cur + step
+      cur = cur + st
       keep
     )
-  else if step < 0 then
+  else if st < 0 then
     whileLoop(() =>
-      val keep = cur > end
+      val keep = cur > e
       if keep then push(result, cur)
-      cur = cur + step
+      cur = cur + st
       keep
     )
   result
