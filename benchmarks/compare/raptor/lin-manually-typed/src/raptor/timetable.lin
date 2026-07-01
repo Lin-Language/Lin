@@ -58,8 +58,8 @@ export type Route = {
 export val stopTimeIndexOf = (route: Route, tripIndex: TripIndex, stopPos: RoutePosition): Offset =>
   route["stopTimesBase"] + tripIndex * route["numStops"] + stopPos
 
-// route id → (stop id → that stop's position on the route)
-export type RouteStopIndex = { RouteIntId: { StopIntId: RoutePosition } }
+// dense array of route id → (stop id → that stop's position on the route)
+export type RouteStopIndex = { StopIntId: RoutePosition }[] 
 
 // stop id → interchange (transfer) time in seconds
 export type Interchange = { StopIntId: Time }
@@ -67,21 +67,24 @@ export type Interchange = { StopIntId: Time }
 // origin stop id → footpaths leaving it
 export type TransfersByOrigin = { StopIntId: Transfer[] }
 
+
+
 // Timetable as per Raptor paper's design (int packed arrays)
 export type Timetable = {
-  "routes": Route[],              // indexed by RouteIntId
-  "routeStops": StopIntId[],      // each route's stop sequence, concatenated (slice at routeStopsBase)
-  "stopTimes": StopTimeEntry[],   // GLOBAL, trip-major: stopTimesBase + t*numStops + s
-  // Per-trip data as flat parallel arrays (GLOBAL, route-major: tripsBase + t) — the paper has no
-  // Trip object; a trip is just the integer (routeId, t). `services` is deduped by calendar.
-  "tripServiceId": ServiceIntId[], // → services[]; the runsOn calendar lookup reads this
-  "services": Service[],           // deduped services, indexed by ServiceIntId
-  "tripIds": String[],             // trip id strings — journey output only (cold)
-  // (the stop→routes inverse index — stopRoutes/stopRoutesBase — lives in the QueueFactory, the
-  //  only thing that reads it, so it is NOT duplicated here)
-  "routeStopIndex": RouteStopIndex,
-  "interchange": Interchange,
-  "transfers": TransfersByOrigin,
-  "stopIds": { StopId: StopIntId },       // intern:   stop code → id
-  "stopNames": String[]                  // de-intern: id (index) → stop code
+  "routes": {
+    "routes": Route[],                // indexed by RouteIntId
+    "routeStops": StopIntId[],        // each route's stop sequence, concatenated (slice at routeStopsBase)
+    "routeStopIndex": RouteStopIndex, // the stop→routes inverse index — stopRoutes/stopRoutesBase — lives in the QueueFactory, 
+  }
+  "trips": {
+    "stopTimes": StopTimeEntry[],     // all stop times, route["stopTimesBase"] + t*numStops + s
+    "tripServiceId": ServiceIntId[],  // tripId → serviceId
+    "services": Service[],            // packed service array
+  }
+  "stops": {
+    "stopIds": { StopId: StopIntId }, // stopCode → stopId
+    "stopNames": String[],            // stopId → stopCode 
+    "transfers": TransfersByOrigin,   // stopId -> Transfers[]
+    "interchange": Interchange        // stopId -> Time
+  }
 }

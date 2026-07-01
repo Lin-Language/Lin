@@ -74,8 +74,7 @@ export val setTrip = (results: ScanResults, stopPi: StopIndex, time: Time, route
   results.mark(stopPi)
   results["kArrivals"][k][stopPi] = time
   results["bestArrivals"][stopPi] = time
-  if results["kConnections"][stopPi] == null then
-    results["kConnections"][stopPi] = {}
+  results["kConnections"][stopPi] = results["kConnections"][stopPi] ?? {}
   results["kConnections"][stopPi][k] = [routeId, tripIndex, startIndex, endIndex]
 
 // The caller (scanTransfers) already interned the destination stop to an int.
@@ -85,8 +84,7 @@ export val setTransfer = (results: ScanResults, stopPi: StopIndex, transfer: Tra
   results.mark(stopPi)
   results["kArrivals"][k][stopPi] = time
   results["bestArrivals"][stopPi] = time
-  if results["kConnections"][stopPi] == null then
-    results["kConnections"][stopPi] = {}
+  results["kConnections"][stopPi] = results["kConnections"][stopPi] ?? {}
   results["kConnections"][stopPi][k] = transfer
 
 export val bestArrival = (results: ScanResults, stopPi: StopIndex): Time =>

@@ -1,6 +1,6 @@
 import { StopIntId, RouteIntId, RouteStopIndex, Offset } from "./timetable"
 import { for, range } from "std/iter"
-import { toInt32, toUInt32 } from "std/number"
+import { toInt32 } from "std/number"
 
 export type QueueFactory = {
   "stopRoutes": RouteIntId[],
@@ -41,7 +41,7 @@ export val getQueue = (factory: QueueFactory, markedStops: StopIntId[]): RouteQu
   markedStops.for(stop =>
     val base = factory["stopRoutesBase"][stop]
     val end = factory["stopRoutesBase"][stop + 1]
-    range(base.toInt32(), end.toInt32()).for(k =>
+    range(base, end).for(k =>
       val routeId = factory["stopRoutes"][k]
       val current = queue[routeId]
       if current == null then
@@ -56,8 +56,4 @@ export val getQueue = (factory: QueueFactory, markedStops: StopIntId[]): RouteQu
 
 
 val isStopBefore = (factory: QueueFactory, routeId: RouteIntId, stopA: StopIntId, stopB: StopIntId): Boolean =>
-  val rsi = factory["routeStopIndex"][routeId]
-  if rsi == null then
-    false
-  else
-    rsi[stopA] < rsi[stopB]
+  factory["routeStopIndex"][routeId][stopA] < factory["routeStopIndex"][routeId][stopB]
