@@ -6,10 +6,10 @@ import { getDateNumber } from "../query/date-util"
 import { RaptorAlgorithm, createRaptorAlgorithm } from "./raptor-algorithm"
 import { RouteIntId, StopTimeEntry, Route, Timetable, StopIntId, RouteStopIndex, Interchange, Transfer, TransfersByOrigin, Offset, RoutePosition, packArrival, packDeparture } from "./timetable"
 import { RoutesIndexedByStop, createQueueFactory } from "./queue-factory"
-import { createRouteScanner } from "./route-scanner"
+import { makeRouteScannerFactory } from "./route-scanner"
 import { frozen } from "std/async"
 import { join } from "std/string"
-import { length, push, sort } from "std/array"
+import { length, push, sort, arrayAllocateFilled } from "std/array"
 import { for, range, filter, some, map } from "std/iter"
 import { toUInt8, toUInt32, toInt32 } from "std/number"
 
@@ -61,7 +61,6 @@ export val create = (
   val routesAtStopTemp: RoutesIndexedByStop = {}
 
   val usefulTransfers: TransfersByOrigin = {}
-  val intInterchange: Interchange = {}
 
   val activeTrips =
     if date == null then
@@ -195,6 +194,9 @@ export val create = (
   val stopRoutesBase: Offset[] = []
   var srOffset: UInt32 = 0u32
 
+  // Dense interchange array indexed by StopIntId (0..numStops-1); filled per-stop in the loop below.
+  val intInterchange: Interchange = arrayAllocateFilled(numStopCount, DEFAULT_INTERCHANGE_TIME)
+
   range(0, numStopCount).for(si =>
     val sIdx = si.toUInt32()
     val stopStr = stopNames[si]
@@ -244,6 +246,6 @@ export val create = (
 
   createRaptorAlgorithm(
     timetable,
-    createQueueFactory(frozen(stopRoutes), frozen(stopRoutesBase), frozenRouteStopIndex),
-    createRouteScanner
+    createQueueFactory(frozen(stopRoutes), frozen(stopRoutesBase), frozenRouteStopIndex, numRoutes.toInt32()),
+    makeRouteScannerFactory(numRoutes.toInt32())
   )

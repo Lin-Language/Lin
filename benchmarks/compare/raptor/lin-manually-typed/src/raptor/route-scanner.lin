@@ -1,12 +1,14 @@
 import { DayOfWeek, DateNumber } from "../gtfs/date"
 import { Time } from "../gtfs/gtfs"
 import { runsOn } from "../gtfs/service"
-import { StopIntId, RouteIntId, RoutePosition, StopTimeEntry, Route, Timetable, stopTimeIndexOf, departureTime } from "./timetable"
+import { StopIntId, RouteIntId, RoutePosition, StopTimeEntry, Route, Timetable, departureTime } from "./timetable"
 import { while } from "std/iter"
 import { toInt32, toUInt32 } from "std/number"
+import { arrayAllocateFilled } from "std/array"
 
-// Per-route mutable scan position (one Int32 per route id, keyed by dense int route id).
-export type RouteScanPosition = { RouteIntId: Int32 }
+// Per-route mutable scan position — dense Int32 array indexed by RouteIntId.
+// Sentinel -1 means "not yet scanned this round" (use numTrips-1 as start position).
+export type RouteScanPosition = Int32[]
 
 //
 // RouteScanner holds the mutable scan-position cursor used during one RAPTOR round.
@@ -19,6 +21,25 @@ export type RouteScanner = {
   "routeScanPosition": RouteScanPosition
 }
 
+//
+// A RouteScannerFactory is just `(date, dow) => RouteScanner`.
+//
+export type RouteScannerFactory = (DateNumber, DayOfWeek) => RouteScanner
+
+//
+// Build a RouteScannerFactory that closes over numRoutes so it can allocate the
+// dense Int32[] sentinel array (-1 = unvisited) for each new query round.
+//
+export val makeRouteScannerFactory = (numRoutes: Int32): RouteScannerFactory =>
+  (date: DateNumber, dow: DayOfWeek): RouteScanner =>
+    {
+      "date": date,
+      "dow": dow,
+      "routeScanPosition": arrayAllocateFilled(numRoutes, -1)
+    }
+
+// Kept for tests that directly call createRouteScanner — they pass their own empty timetable so
+// numRoutes is effectively 0; sentinel read falls back to route["numTrips"]-1 which is still correct.
 export val createRouteScanner = (
   date: DateNumber,
   dow: DayOfWeek
@@ -26,13 +47,8 @@ export val createRouteScanner = (
   {
     "date": date,
     "dow": dow,
-    "routeScanPosition": {}
+    "routeScanPosition": arrayAllocateFilled(0, -1)
   }
-
-//
-// A RouteScannerFactory is just `createRouteScanner` partially applied — `(date, dow) => RouteScanner`.
-//
-export type RouteScannerFactory = (DateNumber, DayOfWeek) => RouteScanner
 
 //
 // Return the earliest reachable trip on the given route, scanning backwards from the last position
@@ -49,13 +65,18 @@ export val getTrip = (
   stopIndex: RoutePosition,
   time: Time
 ): Int32 =>
-  val route = timetable["routes"]["routes"][routeId]
+  val routeIdInt = routeId.toInt32()
+  val stopTimesBase = timetable["routes"]["routes"][routeId]["stopTimesBase"]
+  val numStops = timetable["routes"]["routes"][routeId]["numStops"]
+  val numTrips = timetable["routes"]["routes"][routeId]["numTrips"]
+  val tripsBase = timetable["routes"]["routes"][routeId]["tripsBase"]
 
   // first scan of this route starts at the last trip; later scans resume from the cached position.
   // `i` is the backward-walk cursor: it runs down to -1 to terminate, so the route's trip count is
   // widened to Int32 to give an empty route a -1 start. The RESULT is the found trip's index, or
   // -1 when no reachable+running trip exists (caller treats <0 as "no trip").
-  var i = scanner["routeScanPosition"][routeId] ?? (route["numTrips"].toInt32() - 1)
+  val cached = scanner["routeScanPosition"][routeIdInt]
+  var i = if cached == -1 then numTrips.toInt32() - 1 else cached
   var lastFoundPosition = i
   var lastFound: Int32 = -1
 
@@ -68,12 +89,12 @@ export val getTrip = (
     if i < 0 then
       false
     else
-      val dep = timetable["trips"]["stopTimes"].departureTime(route.stopTimeIndexOf(i.toUInt32(), stopIndex))
+      val dep = timetable["trips"]["stopTimes"].departureTime(stopTimesBase + i.toUInt32() * numStops + stopIndex.toUInt32())
 
       if dep < time then
         false
       else
-        val foundHere = timetable["trips"]["services"][timetable["trips"]["tripServiceId"][route["tripsBase"] + i]].runsOn(scanner["date"], scanner["dow"])
+        val foundHere = timetable["trips"]["services"][timetable["trips"]["tripServiceId"][tripsBase + i.toUInt32()]].runsOn(scanner["date"], scanner["dow"])
         if foundHere then
           lastFound = i
 
@@ -85,5 +106,5 @@ export val getTrip = (
         true
   )
 
-  scanner["routeScanPosition"][routeId] = lastFoundPosition
+  scanner["routeScanPosition"][routeIdInt] = lastFoundPosition
   lastFound

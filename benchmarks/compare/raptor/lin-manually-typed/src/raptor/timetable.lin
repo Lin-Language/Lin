@@ -61,8 +61,8 @@ export val stopTimeIndexOf = (route: Route, tripIndex: TripIndex, stopPos: Route
 // dense array of route id → (stop id → that stop's position on the route)
 export type RouteStopIndex = { StopIntId: RoutePosition }[] 
 
-// stop id → interchange (transfer) time in seconds
-export type Interchange = { StopIntId: Time }
+// stop id → interchange (transfer) time in seconds; dense array indexed by StopIntId (0..numStops-1)
+export type Interchange = Time[]
 
 // origin stop id → footpaths leaving it
 // A footpath transfer with INTERNED (int) endpoints. Everything inside the algorithm uses int stop

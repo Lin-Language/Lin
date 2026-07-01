@@ -1,7 +1,8 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { createQueueFactory, getQueue } from "./queue-factory"
+import { createQueueFactory, getQueue, RouteQueue } from "./queue-factory"
 import { RouteStopIndex } from "./timetable"
 import { push } from "std/array"
+import { toInt32 } from "std/number"
 
 // Stop indices (dense UInt32).
 val stopA: UInt32 = 0u32
@@ -36,12 +37,12 @@ val s = suite("raptor/queue-factory", [
     rsi.push(rsiC)
 
     val [sr, srb] = makeStopRoutes()
-    val factory = createQueueFactory(sr, srb, rsi)
+    val factory = createQueueFactory(sr, srb, rsi, 3)
     val actual = factory.getQueue([stopA, stopB])
     [
-      expect(actual[routeA]).toBe(stopA),
-      expect(actual[routeB]).toBe(stopB),
-      expect(actual[routeC]).toBe(stopB)
+      expect(actual["queueStop"][routeA.toInt32()]).toBe(stopA),
+      expect(actual["queueStop"][routeB.toInt32()]).toBe(stopB),
+      expect(actual["queueStop"][routeC.toInt32()]).toBe(stopB)
     ]
   ),
 
@@ -60,12 +61,12 @@ val s = suite("raptor/queue-factory", [
     rsi.push(rsiC)
 
     val [sr, srb] = makeStopRoutes()
-    val factory = createQueueFactory(sr, srb, rsi)
+    val factory = createQueueFactory(sr, srb, rsi, 3)
     val actual = factory.getQueue([stopB, stopA])
     [
-      expect(actual[routeA]).toBe(stopA),
-      expect(actual[routeB]).toBe(stopA),
-      expect(actual[routeC]).toBe(stopB)
+      expect(actual["queueStop"][routeA.toInt32()]).toBe(stopA),
+      expect(actual["queueStop"][routeB.toInt32()]).toBe(stopA),
+      expect(actual["queueStop"][routeC.toInt32()]).toBe(stopB)
     ]
   )
 ])
