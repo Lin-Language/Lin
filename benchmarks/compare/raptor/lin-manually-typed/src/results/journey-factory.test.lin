@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { length } from "std/array"
-import { Transfer } from "../gtfs/gtfs"
+import { Transfer } from "../raptor/timetable"
 import { Service } from "../gtfs/service"
 import { Connection, ConnectionIndex } from "../raptor/scan-results"
 import { StopIndex } from "../raptor/raptor-algorithm"
@@ -44,8 +44,8 @@ val tt: Timetable = {
 val tripConnection: Connection = [0u32, 0, 0, 1]
 
 val transfer: Transfer = {
-  "origin": "A",
-  "destination": "B",
+  "origin": 0u32,
+  "destination": 1u32,
   "duration": 5,
   "startTime": 0,
   "endTime": 86400

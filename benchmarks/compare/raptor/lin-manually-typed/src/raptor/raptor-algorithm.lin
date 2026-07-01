@@ -1,4 +1,4 @@
-import { Time, Transfer } from "../gtfs/gtfs"
+import { Time } from "../gtfs/gtfs"
 import { DayOfWeek, DateNumber } from "../gtfs/date"
 import { QueueFactory, getQueue } from "./queue-factory"
 import { RouteScanner, RouteScannerFactory, getTrip } from "./route-scanner"
@@ -100,16 +100,13 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
 
 
 val scanTransfers = (raptor: RaptorAlgorithm, results: ScanResults, markedStops: StopIndex[], tt: Timetable) =>
-  val stopIndexOf = tt["stops"]["stopIds"]
-
   markedStops.for(stopP =>
     tt["stops"]["transfers"][stopP].for(transfer =>
-      val stopPiOrNull = stopIndexOf[transfer["destination"]]
-      if stopPiOrNull != null then
-        val stopPi = stopPiOrNull
-        val arrival = results.previousArrival(stopP) + transfer["duration"] + (tt["stops"]["interchange"][stopPi] ?? 0)
+      // Transfer endpoints are already interned to int ids at build time.
+      val stopPi = transfer["destination"]
+      val arrival = results.previousArrival(stopP) + transfer["duration"] + (tt["stops"]["interchange"][stopPi] ?? 0)
 
-        if transfer["startTime"] <= arrival && transfer["endTime"] >= arrival && arrival < results.bestArrival(stopPi) then
-          results.setTransfer(stopPi, transfer, arrival)
+      if transfer["startTime"] <= arrival && transfer["endTime"] >= arrival && arrival < results.bestArrival(stopPi) then
+        results.setTransfer(stopPi, transfer, arrival)
     )
   )

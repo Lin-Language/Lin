@@ -1,4 +1,4 @@
-import { Time, Transfer, StopId, TripId } from "../gtfs/gtfs"
+import { Time, Duration, StopId, TripId } from "../gtfs/gtfs"
 import { Service } from "../gtfs/service"
 
 // Dense integer stop id — each distinct stop string is interned to a UInt32 in 0..numStops-1.
@@ -65,6 +65,17 @@ export type RouteStopIndex = { StopIntId: RoutePosition }[]
 export type Interchange = { StopIntId: Time }
 
 // origin stop id → footpaths leaving it
+// A footpath transfer with INTERNED (int) endpoints. Everything inside the algorithm uses int stop
+// ids; results/journey-factory reads them straight through. (The GTFS `Transfer` in gtfs.lin keeps
+// string endpoints — that is the loader's input, interned to these in raptor-algorithm-factory.)
+export type Transfer = {
+  "origin": StopIntId,
+  "destination": StopIntId,
+  "duration": Duration,
+  "startTime": Time,
+  "endTime": Time
+}
+
 export type TransfersByOrigin = { StopIntId: Transfer[] }
 
 

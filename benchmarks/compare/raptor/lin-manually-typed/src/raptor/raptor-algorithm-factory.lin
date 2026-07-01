@@ -1,10 +1,10 @@
-import { Trip, StopId, StopTime, Transfer, Time } from "../gtfs/gtfs"
+import { Trip, StopId, StopTime, Time } from "../gtfs/gtfs"
 import { Interchange as GtfsInterchange, TransfersByOrigin as GtfsTransfersByOrigin } from "../gtfs/gtfs-loader"
 import { runsOn, Service } from "../gtfs/service"
 import { Date, weekday } from "std/datetime"
 import { getDateNumber } from "../query/date-util"
 import { RaptorAlgorithm, createRaptorAlgorithm } from "./raptor-algorithm"
-import { RouteIntId, StopTimeEntry, Route, Timetable, StopIntId, RouteStopIndex, Interchange, TransfersByOrigin, Offset, RoutePosition, packArrival, packDeparture } from "./timetable"
+import { RouteIntId, StopTimeEntry, Route, Timetable, StopIntId, RouteStopIndex, Interchange, Transfer, TransfersByOrigin, Offset, RoutePosition, packArrival, packDeparture } from "./timetable"
 import { RoutesIndexedByStop, createQueueFactory } from "./queue-factory"
 import { createRouteScanner } from "./route-scanner"
 import { frozen } from "std/async"
@@ -109,12 +109,8 @@ export val create = (
 
     range(0, path.length()).for(i =>
       val stop = path[i]
-      val stopStr = stopTimes[i]["stop"]
       if stopIndex[stop] == null then
         stopIndex[stop] = i.toUInt8()
-
-      usefulTransfers[stop] = transfers[stopStr] ?? []
-      intInterchange[stop] = interchange[stopStr] ?? DEFAULT_INTERCHANGE_TIME
 
       val stopRoutesList = routesAtStopTemp[stop] ?? []
       if stopTimes[i]["pickUp"] then
@@ -201,10 +197,23 @@ export val create = (
 
   range(0, numStopCount).for(si =>
     val sIdx = si.toUInt32()
+    val stopStr = stopNames[si]
     stopRoutesBase.push(srOffset)
     val sRoutes = routesAtStopTemp[sIdx] ?? []
     sRoutes.for(r => stopRoutes.push(r))
     srOffset = srOffset + sRoutes.length().toUInt32()
+
+    // Intern this stop's footpath transfers to int endpoints now that every stop has an id. A
+    // transfer to a stop that never appears in a trip has no int id, so it is dropped (this is the
+    // old scan-time `stopIndexOf[...] != null` guard, moved to build time — done once, not per scan).
+    val ts: Transfer[] = []
+    (transfers[stopStr] ?? []).for(t =>
+      val destId = stopIndexOf[t["destination"]]
+      if destId != null then
+        ts.push({ "origin": sIdx, "destination": destId, "duration": t["duration"], "startTime": t["startTime"], "endTime": t["endTime"] })
+    )
+    usefulTransfers[sIdx] = ts
+    intInterchange[sIdx] = interchange[stopStr] ?? DEFAULT_INTERCHANGE_TIME
   )
   stopRoutesBase.push(srOffset)  // sentinel
 
