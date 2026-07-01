@@ -1014,6 +1014,36 @@ capture `$?` to a file and read the result line (§2 / the never-pipe-mask rule)
 
 ---
 
+### 5.16 RC elision for read-only borrowed FieldGet/Index results (2026-07-01)
+
+After §5.15 landed (RAPTOR GROUP 1881→1029 ms), a gdb profile of the `getTrip` hot path showed **~19 % self-time in `lin_rc_release` calls on arrays that are loaded from frozen `timetable` fields** (`stopTimes`, `services`, `tripServiceId`). These fields are immortal (Frozen<Timetable>), but the codegen still emits a Retain when binding a FieldGet result and a Release when that binding leaves scope — a no-op increment/decrement pair on a value whose real RC is pinned at the outer scope.
+
+**Root cause.** The RC-elision pass (`rc_elide.rs`) treated every `CallTarget::Named` call as interference (an unknown potential owner-transfer), so cross-block Retain/Release pairs around calls to `timetable.departureTime`, `timetable.arrivalOf`, etc. were never elided. Two structural gaps compounded:
+
+1. **Cross-module convention blindness.** `elide_rc` received `&HashMap::new()` for the import module's compilation — so convention information from `timetable`'s functions (whose array params are correctly inferred `Borrow`) was invisible to `route_scanner`'s elision pass.
+
+2. **Liveness gate over-conservative for loop bodies.** For a Retain/Release pair inside a while-loop body (`getTrip`'s inner scan), the temp is still live after the Release (the outer loop re-uses it), so the liveness last-use gate blocked elision even on a fully-clean path.
+
+**Two fixes, both in `rc_elide.rs`:**
+
+| Fix | Mechanism |
+|---|---|
+| **Cross-module Named call convention lookup** | `extract_named_conventions(module)` builds a `HashMap<String, Vec<Convention>>` from a compiled import. `Codegen` accumulates these in `import_named_convs` as imports are compiled in topological order, then passes the map to every subsequent `elide_rc` call (both import and main module). `instr_is_interference` checks the map for Named calls and returns `false` when all positions where the temp appears have `Borrow` or `Inout` convention. |
+| **`path_all_borrow` liveness gate bypass** | When the complete path from Retain to Release (retain-block tail, all intermediate idom-chain blocks, release-block prefix) contains no interference, the Retain/Release is provably a no-op — no instruction creates an independent owner, so the outer reference already keeps the value alive. The inner pair is removed unconditionally, without requiring liveness `last_use`. |
+
+**Result (6-trial medians, RAPTOR benchmark, digest-exact `group=26203913 range=773022892 journeys=139`):**
+
+| Benchmark | Before | After | Delta |
+|---|--:|--:|---:|
+| GROUP | 688 ms | 654 ms | **−5.1 %** |
+| RANGE | 2042 ms | 1953 ms | **−4.4 %** |
+
+Total Retain calls removed: 7292 → 6944 (−348), of which 340 → 327 in `getTrip`. ASan clean; 988/989 tests pass (1 pre-existing UDP sandbox failure).
+
+**Lesson (convention propagation matters at module boundaries).** The elision pass had the right shape — it inferred Borrow on array params and checked conventions on intra-module calls. But imports were compiled with `&HashMap::new()`, so the conventions never crossed the module boundary. The pattern generalises: any optimisation that keys off inferred facts must thread those facts through the compilation order, not re-derive from scratch per module.
+
+---
+
 ## 6. Guidance for writing fast Lin
 
 1. **Prefer typed records and `&`-composed named types over `AnyVal`.** This is the
