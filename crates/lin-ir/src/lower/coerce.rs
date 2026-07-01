@@ -333,10 +333,19 @@ pub(crate) fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Typ
 /// (small-int/bool boxes are immortal statics and never freed) and result-alias safe (a callee that
 /// returns its Json param hands the same box back as the result — skipped when shell == result).
 /// Without this, `f(1_000_000)` / `f(3.14)` into a Json param leaked the 16-byte box shell per call.
+///
+/// A `T | Null` NullableRecord is EXCLUDED: `is_union_ty` reports it `false` (it is a raw-pointer
+/// repr, not a `TaggedVal` union), so it would otherwise slip through this "not-union, not-heap →
+/// scalar-like" gate. But it is NOT a cached scalar — when the value is PHYSICALLY boxed (e.g. a
+/// `Record | Null` bound to a union field-index result, `r["value"]`), the box→Json coerce is an
+/// IDENTITY that shares the box, so `FreeBoxShellIfDistinct` would free the still-live source value
+/// (`toString(v)` then reusing `v` → use-after-free). Leaving it out costs at most a 16-byte shell
+/// per call in the rarer genuine-raw-pointer case; correctness on the boxed case is mandatory.
 pub(crate) fn arg_box_is_caller_owned_scalar_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
     match param_ty {
         Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && !is_heap_ty(arg_ty)
             && !is_sealed_scalar_repr(arg_ty)
+            && !is_nullable_sealed_record(arg_ty)
             && !sum_arg_projected(arg_ty, p),
         None => false,
     }

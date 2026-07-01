@@ -776,6 +776,15 @@ fn is_packed_struct(repr: &Repr, fields: &IndexMap<String, Type>) -> bool {
     matches!(repr, Repr::Packed(Layout::PackedStruct { fields: f }) if f == fields)
 }
 
+/// Is `repr` a boxed dynamic value (`Boxed(_)`)? A FieldGet READ on a boxed value whose static
+/// `obj_ty` is a sealed record is a VALID combination: the value is a `TaggedVal*` box wrapping the
+/// record (e.g. a `Record | Null` binding assigned a union field-index result, which stays boxed),
+/// and `compile_ir_field_get`'s boxed path projects it to a packed struct before reading the field.
+/// So the read-side oracle/verifier must accept it (the WRITE side has no such projection path).
+fn is_boxed(repr: &Repr) -> bool {
+    matches!(repr, Repr::Boxed(_))
+}
+
 /// Is `repr` a Packed sealed array whose element layout is `elem_fields`?
 fn is_packed_sealed_array(repr: &Repr, elem_fields: &IndexMap<String, Type>) -> bool {
     matches!(repr, Repr::Packed(Layout::PackedSealedArray { elem_layout, .. }) if elem_layout == elem_fields)
@@ -886,9 +895,13 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                             // NullableRecord: a sealed obj_ty with Packed(NullableRecord) repr is the
                             // non-null then-branch object — it is physically a raw sealed ptr, same
                             // as PackedStruct. compile_ir_field_get handles it identically.
+                            // Boxed: a sealed obj_ty with a Boxed repr is a TaggedVal* box wrapping the
+                            // record (a `Record|Null` binding assigned a union field-index result);
+                            // compile_ir_field_get's boxed path projects it to a packed struct first.
                             if r.sumnode_sum_ty().is_none()
                                 && r.nullable_record_fields() != Some(f)
                                 && !is_packed_struct(r, f)
+                                && !is_boxed(r)
                             {
                                 report(&mut bad, "FieldGet(object packed)", *object, "Packed(struct)", r);
                             }
@@ -1068,9 +1081,13 @@ pub fn verify(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                         // the correct variant-specific payload offset — not a Packed(struct) mismatch).
                         // NullableRecord: a sealed obj_ty + Packed(NullableRecord) repr is valid in a
                         // then-branch where non-null is guaranteed; the raw sealed ptr IS the struct.
+                        // Boxed: a boxed object with a sealed obj_ty is projected to a packed struct
+                        // by compile_ir_field_get before the field read (the union-field-index → boxed
+                        // `Record|Null` binding case) — a valid, handled combination on the READ side.
                         if repr[object.0 as usize].sumnode_sum_ty().is_none()
                             && repr[object.0 as usize].nullable_record_fields() != Some(f)
                             && !is_packed_struct(&repr[object.0 as usize], f)
+                            && !is_boxed(&repr[object.0 as usize])
                         {
                             bad.push(format!(
                                 "{fname}: FieldGet requires Packed(struct) of t{}, has {:?}",

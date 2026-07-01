@@ -13584,6 +13584,97 @@ print(loop(0, 100, 0))
 }
 
 #[test]
+fn test_captured_union_var_narrowed_to_scalar_unboxes() {
+    // Regression: a mutably-CAPTURED `var` of union type (`UInt32 | Null`), read inside a nested
+    // closure and narrowed to its scalar member after a null-check, must be UNBOXED before it is
+    // used as that scalar (arithmetic, or passed to a scalar-param function). The heap-cell read
+    // path in lin-ir lowering was missing the narrowing Coerce that the global-var and local-slot
+    // paths already had, so the boxed `TaggedVal*` flowed out where an `i32` was expected — an LLVM
+    // "call parameter type does not match" / "operands not of the same type" verifier failure (the
+    // RAPTOR `tripIdx: UInt32 | Null` scan cursor). Here the var is captured by the `range().for`
+    // callback, narrowed, then both added to a scalar and passed to a UInt32-param function.
+    let out = run(r#"import { print } from "std/io"
+import { range, for } from "std/iter"
+import { toUInt32 } from "std/number"
+val useIt = (a: UInt32): UInt32 => a + 1u32
+val main = () =>
+  var tripIdx: UInt32 | Null = null
+  var total: UInt32 = 0u32
+  range(0u32, 5u32).for(pi =>
+    if tripIdx != null then
+      total = total + useIt(tripIdx)
+    else
+      tripIdx = pi.toUInt32()
+  )
+  print(total)
+main()
+"#);
+    // pi=0: null -> set tripIdx=0. pi=1..4: useIt(0)=1 each => total = 4.
+    assert_eq!(out, vec!["4"]);
+}
+
+#[test]
+fn test_field_read_of_union_extracted_sealed_record() {
+    // Regression (release segfault): a sealed record extracted from a UNION via field/index access
+    // (`parsed["value"]`) is physically a BOXED `TaggedVal*` (union-index results stay boxed by
+    // design), but its static type is the sealed `Record`. A subsequent typed field read
+    // (`rec["name"]`) had `obj_ty` narrowed to the sealed record while `repr` was `Boxed`; codegen's
+    // boxed FieldGet path then did a raw `lin_map_get` on the box → `find_slot_string` on garbage →
+    // segfault (the report/parse.lin example). Fix: the boxed FieldGet path projects a boxed value
+    // with a sealed `obj_ty` to a packed struct before the field read (releasing the temporary
+    // projection); the repr oracle/verifier accept a Boxed object for a sealed-obj_ty FieldGet.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Record = { "name": String, "score": Int32 }
+type Success = { "type": "success", "value": Record }
+type Failure = { "type": "failure", "error": String }
+type Parsed = Success | Failure
+val parse = (ok: Boolean): Parsed =>
+  if ok then { "type": "success", "value": { "name": "Alice", "score": 85 } }
+  else { "type": "failure", "error": "bad" }
+val main = () =>
+  val rec = parse(true)["value"]
+  print(rec["name"])
+  print(toString(rec["score"]))
+main()
+"#);
+    assert_eq!(out, vec!["Alice", "85"]);
+}
+
+#[test]
+fn test_tostring_of_boxed_nullable_record_then_reuse_no_uaf() {
+    // Regression (use-after-free): `toString(v)` (or any Json-coercing call) on a `T | Null`
+    // NullableRecord that is PHYSICALLY BOXED — e.g. bound to a union field-index result
+    // (`r["value"]`) — then reusing `v`. `is_union_ty` reports a NullableRecord `false` (it is a
+    // raw-pointer repr), so the arg slipped through `arg_box_is_caller_owned_scalar_shell`'s
+    // "not-union, not-heap → scalar-like" gate and got a `FreeBoxShellIfDistinct` after the call.
+    // But the box→Json coerce of an already-boxed value is an IDENTITY sharing the box, so freeing
+    // the "shell" freed the live `v` → the later reuse read freed memory (hang/crash). Fix: exclude
+    // NullableRecord from the scalar-shell predicate. Here `v` is boxed (union-index result), passed
+    // to `toString`, then reused via a field read AND another `toString`.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Record = { "name": String, "score": Int32 }
+type Success = { "type": "success", "value": Record }
+type Failure = { "type": "failure", "error": String }
+type Parsed = Success | Failure
+val parse = (ok: Boolean): Parsed =>
+  if ok then { "type": "success", "value": { "name": "Alice", "score": 85 } }
+  else { "type": "failure", "error": "bad" }
+val main = () =>
+  val v = parse(true)["value"]
+  print(toString(v))
+  print(v["name"])
+  print(toString(v))
+main()
+"#);
+    assert_eq!(
+        out,
+        vec!["{\"name\": \"Alice\", \"score\": 85}", "Alice", "{\"name\": \"Alice\", \"score\": 85}"]
+    );
+}
+
+#[test]
 fn test_index_assign_evaluates_to_assigned_value() {
     // Spec §8 / §27 rule 8: an assignment expression evaluates to the assigned value. This held
     // for `var x = v` (`LocalSet`) but `m[k] = v` (`IndexSet`) wrongly evaluated to `Null`. Now an
