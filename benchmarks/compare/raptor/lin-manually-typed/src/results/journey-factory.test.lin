@@ -36,7 +36,7 @@ val tt: Timetable = {
     "stopIds": { "A": 0u32, "B": 1u32 },
     "stopNames": ["A", "B"],
     "transfers": {},
-    "interchange": {}
+    "interchange": []
   }
 }
 
