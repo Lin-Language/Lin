@@ -1,0 +1,18 @@
+// Profiling-only: loop loadGtfs (no frozen, so each iteration's graph is reclaimed)
+// to give the gdb stack-sampler a long, steady-state window over the parse+build path.
+import { loadGtfs } from "./gtfs/gtfs-loader"
+import { now } from "std/time"
+import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+import { range, for } from "std/iter"
+
+val DATA_DIR = "/home/linus/Work/linusnorton/lin-lang/benchmarks/compare/raptor/gtfs.tar.gz"
+
+val main = () =>
+  range(0, 8).for(i =>
+    val [trips, transfers, interchange, stops] = loadGtfs(DATA_DIR)
+    print("iter ${ toString(i) } trips=${ toString(length(trips)) }")
+  )
+
+main()

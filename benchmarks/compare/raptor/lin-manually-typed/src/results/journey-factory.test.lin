@@ -21,17 +21,23 @@ val service1: Service = {
 // The journey factory reconstructs legs from these flat arrays by the connection's integers.
 val route0: Route = { "stopTimesBase": 0u32, "routeStopsBase": 0u32, "tripsBase": 0u32, "numStops": 2u32, "numTrips": 1u32 }
 val tt: Timetable = {
-  "routes": [route0],
-  "routeStops": [0u32, 1u32],
-  "stopTimes": [{ "arrival": 850, "departure": 900 }, { "arrival": 1000, "departure": 1010 }],
-  "tripServiceId": [0u32],
-  "services": [service1],
-  "tripIds": ["t1"],
-  "routeStopIndex": {},
-  "interchange": {},
-  "transfers": {},
-  "stopIds": { "A": 0u32, "B": 1u32 },
-  "stopNames": ["A", "B"]
+  "routes": {
+    "routes": [route0],
+    "routeStops": [0u32, 1u32],
+    "routeStopIndex": []
+  },
+  "trips": {
+    "stopTimes": [{ "arrival": 850, "departure": 900 }, { "arrival": 1000, "departure": 1010 }],
+    "tripServiceId": [0u32],
+    "services": [service1],
+    "tripIds": ["t1"]
+  },
+  "stops": {
+    "stopIds": { "A": 0u32, "B": 1u32 },
+    "stopNames": ["A", "B"],
+    "transfers": {},
+    "interchange": {}
+  }
 }
 
 // The connection that reached B: route 0, trip 0, boarding pos 0 (A), alighting pos 1 (B).

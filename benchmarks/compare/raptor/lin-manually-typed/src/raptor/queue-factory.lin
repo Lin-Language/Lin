@@ -1,6 +1,5 @@
 import { StopIntId, RouteIntId, RouteStopIndex, Offset } from "./timetable"
 import { for, range } from "std/iter"
-import { toInt32 } from "std/number"
 
 export type QueueFactory = {
   "stopRoutes": RouteIntId[],

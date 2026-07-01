@@ -49,7 +49,7 @@ export val getTrip = (
   stopIndex: RoutePosition,
   time: Time
 ): Int32 =>
-  val route = timetable["routes"][routeId]
+  val route = timetable["routes"]["routes"][routeId]
 
   // first scan of this route starts at the last trip; later scans resume from the cached position.
   // `i` is the backward-walk cursor: it runs down to -1 to terminate, so the route's trip count is
@@ -68,12 +68,12 @@ export val getTrip = (
     if i < 0 then
       false
     else
-      val dep = timetable["stopTimes"].departureTime(route.stopTimeIndexOf(i.toUInt32(), stopIndex))
+      val dep = timetable["trips"]["stopTimes"].departureTime(route.stopTimeIndexOf(i.toUInt32(), stopIndex))
 
       if dep < time then
         false
       else
-        val foundHere = timetable["services"][timetable["tripServiceId"][route["tripsBase"] + i]].runsOn(scanner["date"], scanner["dow"])
+        val foundHere = timetable["trips"]["services"][timetable["trips"]["tripServiceId"][route["tripsBase"] + i]].runsOn(scanner["date"], scanner["dow"])
         if foundHere then
           lastFound = i
 
