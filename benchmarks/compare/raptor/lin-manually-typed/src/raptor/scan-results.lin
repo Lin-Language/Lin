@@ -1,6 +1,6 @@
-import { Time, Transfer } from "../gtfs/gtfs"
+import { Time } from "../gtfs/gtfs"
 import { StopIndex, StopTimes } from "./raptor-algorithm"
-import { RouteIntId, TripIndex, RoutePosition } from "./timetable"
+import { RouteIntId, TripIndex, RoutePosition, Transfer } from "./timetable"
 import { MAX_TIME } from "../gtfs/date"
 import { keys } from "std/object"
 import { push, arrayAllocateFilled } from "std/array"

@@ -1,5 +1,5 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { Transfer } from "../gtfs/gtfs"
+import { Transfer } from "./timetable"
 import { length } from "std/array"
 import { Connection } from "./scan-results"
 import { createScanResults, addRound, previousArrival, setTrip, setTransfer, bestArrival, getMarkedStops, finalize } from "./scan-results"
@@ -44,8 +44,8 @@ val s = suite("raptor/scan-results", [
     val r = freshResults()
     r.addRound()
     val transfer: Transfer = {
-      "origin": "StopA",
-      "destination": "StopB",
+      "origin": 1u32,
+      "destination": 2u32,
       "duration": 120,
       "startTime": 0,
       "endTime": 86400
@@ -78,8 +78,8 @@ val s = suite("raptor/scan-results", [
     val r = freshResults()
     r.addRound()
     val transfer: Transfer = {
-      "origin": "StopA",
-      "destination": "StopB",
+      "origin": 1u32,
+      "destination": 2u32,
       "duration": 120,
       "startTime": 0,
       "endTime": 86400
@@ -96,8 +96,8 @@ val s = suite("raptor/scan-results", [
     // Round 1: record an arrival at stop 2.
     r.addRound()
     val transfer: Transfer = {
-      "origin": "StopA",
-      "destination": "StopB",
+      "origin": 1u32,
+      "destination": 2u32,
       "duration": 120,
       "startTime": 0,
       "endTime": 86400
@@ -115,15 +115,15 @@ val s = suite("raptor/scan-results", [
     val r = freshResults()
     r.addRound()
     val tA: Transfer = {
-      "origin": "X",
-      "destination": "StopA",
+      "origin": 0u32,
+      "destination": 1u32,
       "duration": 1,
       "startTime": 0,
       "endTime": 86400
     }
     val tB: Transfer = {
-      "origin": "X",
-      "destination": "StopB",
+      "origin": 0u32,
+      "destination": 2u32,
       "duration": 1,
       "startTime": 0,
       "endTime": 86400
@@ -149,8 +149,8 @@ val s = suite("raptor/scan-results", [
     val r = freshResults()
     r.addRound()
     val transfer: Transfer = {
-      "origin": "StopA",
-      "destination": "StopB",
+      "origin": 1u32,
+      "destination": 2u32,
       "duration": 120,
       "startTime": 0,
       "endTime": 86400
