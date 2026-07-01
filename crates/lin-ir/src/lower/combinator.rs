@@ -787,6 +787,30 @@ pub(crate) fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type,
 /// True when two types have a different runtime representation such that a value of one
 /// must be coerced (boxed/unboxed) to be used as the other. Specifically: one is a
 /// union/Json (TaggedVal*) and the other is a concrete type.
+/// True iff `ty` is a `Scalar | Null` union that codegen represents as a flat `{ i1, i64 }` value
+/// (VA.1 CPR) rather than a boxed `TaggedVal*`. Mirrors codegen's `flat_union_scalar_type` /
+/// `is_flat_union_scalar` EXACTLY so `type_repr_differs` and the return/sig ABI agree.
+fn is_flat_union_scalar_nullable(ty: &Type) -> bool {
+    let Type::Union(vs) = ty else { return false; };
+    if vs.len() != 2 {
+        return false;
+    }
+    let mut has_null = false;
+    let mut scalars = 0;
+    for v in vs {
+        match v {
+            Type::Null => has_null = true,
+            Type::Bool
+            | Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_)
+            | Type::UInt8 | Type::UInt16 | Type::UInt32
+            | Type::Int64 | Type::UInt64
+            | Type::Float32 | Type::Float64 => scalars += 1,
+            _ => return false,
+        }
+    }
+    has_null && scalars == 1
+}
+
 pub(crate) fn type_repr_differs(from: &Type, to: &Type) -> bool {
     // A sealed scalar record flowing into (or out of) a `Named` type reference: same physical
     // representation (an opaque struct ptr), no conversion. `Named` is treated as union-ish by
@@ -884,6 +908,18 @@ pub(crate) fn type_repr_differs(from: &Type, to: &Type) -> bool {
         }
         // Both Named-alias-nullable: same repr.
         return false;
+    }
+    // FLAT-UNION scalar-nullable boundary (VA.1 CPR). A `Scalar | Null` union is passed/returned BY
+    // VALUE as a flat `{ i1, i64 }` struct, NOT a boxed `TaggedVal*`. So it has a DIFFERENT physical
+    // repr from a boxed union / Json / `TypeVar` wildcard (a heap ptr). Both are `is_union_ty`, so the
+    // union arm below MISSES this (true != true → false). Without a Coerce here, a `.for`/combinator
+    // callback whose inferred `UInt32 | Null` body flows into the AnyVal callback ABI returned the raw
+    // `{ i1, i64 }` into a `ptr` signature — an LLVM "return type does not match" verify failure (the
+    // RAPTOR `addTransfer` callback). Codegen's Coerce boxes the flat union to a `TaggedVal*` (or
+    // unboxes on the reverse edge). A flat union meeting a CONCRETE scalar/heap type is already caught
+    // by the union arm (`is_union_ty` differs), so this only adds the flat-vs-boxed-union case.
+    if is_flat_union_scalar_nullable(from) != is_flat_union_scalar_nullable(to) {
+        return true;
     }
     // The union/Json box boundary.
     if is_union_ty(from) != is_union_ty(to) {
