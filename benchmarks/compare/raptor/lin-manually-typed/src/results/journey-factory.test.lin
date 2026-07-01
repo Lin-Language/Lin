@@ -23,8 +23,7 @@ val route0: Route = { "stopTimesBase": 0u32, "routeStopsBase": 0u32, "tripsBase"
 val tt: Timetable = {
   "routes": {
     "routes": [route0],
-    "routeStops": [0u32, 1u32],
-    "routeStopIndex": []
+    "routeStops": [0u32, 1u32]
   },
   "trips": {
     "stopTimes": [{ "arrival": 850, "departure": 900 }, { "arrival": 1000, "departure": 1010 }],

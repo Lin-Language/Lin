@@ -57,8 +57,7 @@ val makeTimetable = (trips: Trip[]): Timetable =>
   {
     "routes": {
       "routes": [route],
-      "routeStops": [0u32],
-      "routeStopIndex": []
+      "routeStops": [0u32]
     },
     "trips": {
       "stopTimes": st,
