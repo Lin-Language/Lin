@@ -1,4 +1,4 @@
-import { StopIntId, RouteIntId, RouteStopIndex, Offset } from "./timetable"
+import { RouteIntId, RoutePosition, StopIntId, Offset } from "./timetable"
 import { for, range } from "std/iter"
 import { arrayAllocateFilled, length, push } from "std/array"
 import { toInt32 } from "std/number"
@@ -6,15 +6,15 @@ import { toInt32 } from "std/number"
 export type QueueFactory = {
   "stopRoutes": RouteIntId[],
   "stopRoutesBase": Offset[],
-  "routeStopIndex": RouteStopIndex,
+  "stopRoutePos": RoutePosition[],
   "numRoutes": Int32
 }
 
-// Dense queue representation (mirrors Go's getQueue):
-//   queueStop[routeId] = first marked stop on that route (only valid when queueSet[routeId] is true)
+// Dense queue representation (mirrors Go's scanRoutes):
+//   queuePos[routeId] = earliest stop position on that route (only valid when queueSet[routeId] is true)
 //   queueOrder = route ids in first-seen insertion order (LOAD-BEARING: digest depends on scan order)
 export type RouteQueue = {
-  "queueStop": StopIntId[],
+  "queuePos": RoutePosition[],
   "queueSet": Boolean[],
   "queueOrder": RouteIntId[]
 }
@@ -24,17 +24,17 @@ export type RoutesIndexedByStop = { StopIntId: RouteIntId[] }
 
 
 //
-// Create a queue factory from the global stop-routes inverse index and the route-stop-index.
+// Create a queue factory from the global stop-routes inverse index and the parallel stopRoutePos array.
 //
 export val createQueueFactory = (
   stopRoutes: RouteIntId[],
   stopRoutesBase: Offset[],
-  routeStopIndex: RouteStopIndex,
+  stopRoutePos: RoutePosition[],
   numRoutes: Int32
 ): QueueFactory => {
   stopRoutes,
   stopRoutesBase,
-  routeStopIndex,
+  stopRoutePos,
   numRoutes
 }
 
@@ -42,11 +42,11 @@ export val createQueueFactory = (
 //
 // Take the marked stops and return an index of any routes that pass through those stops.
 // For each marked stop, the routes serving it are in stopRoutes[stopRoutesBase[stop]..stopRoutesBase[stop+1]].
-// queueStop[routeId] = earliest marked stop on the route; queueOrder preserves first-seen insertion order.
+// queuePos[routeId] = earliest stop position on the route; queueOrder preserves first-seen insertion order.
 //
-export val getQueue = (factory: QueueFactory, markedStops: StopIntId[]): RouteQueue =>
+export val getQueue = (factory: QueueFactory, markedStops: RouteIntId[]): RouteQueue =>
   val numRoutes = factory["numRoutes"]
-  val queueStop: StopIntId[] = arrayAllocateFilled(numRoutes, 0u32)
+  val queuePos: RoutePosition[] = arrayAllocateFilled(numRoutes, 0u8)
   val queueSet: Boolean[] = arrayAllocateFilled(numRoutes, false)
   val queueOrder: RouteIntId[] = []
 
@@ -56,16 +56,13 @@ export val getQueue = (factory: QueueFactory, markedStops: StopIntId[]): RouteQu
     range(base, end).for(k =>
       val routeId = factory["stopRoutes"][k]
       val routeIdInt = routeId.toInt32()
+      val pos = factory["stopRoutePos"][k]
       if !queueSet[routeIdInt] then
         queueSet[routeIdInt] = true
-        queueStop[routeIdInt] = stop
+        queuePos[routeIdInt] = pos
         queueOrder.push(routeId)
-      else if !factory.isStopBefore(routeId, queueStop[routeIdInt], stop) then
-        queueStop[routeIdInt] = stop
+      else if pos < queuePos[routeIdInt] then
+        queuePos[routeIdInt] = pos
     )
   )
-  { queueStop, queueSet, queueOrder }
-
-
-val isStopBefore = (factory: QueueFactory, routeId: RouteIntId, stopA: StopIntId, stopB: StopIntId): Boolean =>
-  factory["routeStopIndex"][routeId][stopA] < factory["routeStopIndex"][routeId][stopB]
+  { queuePos, queueSet, queueOrder }

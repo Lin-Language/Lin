@@ -83,9 +83,8 @@ export type TransfersByOrigin = { StopIntId: Transfer[] }
 // Timetable as per Raptor paper's design (int packed arrays)
 export type Timetable = {
   "routes": {
-    "routes": Route[],                // indexed by RouteIntId
-    "routeStops": StopIntId[],        // each route's stop sequence, concatenated (slice at routeStopsBase)
-    "routeStopIndex": RouteStopIndex, // the stop→routes inverse index — stopRoutes/stopRoutesBase — lives in the QueueFactory, 
+    "routes": Route[],         // indexed by RouteIntId
+    "routeStops": StopIntId[], // each route's stop sequence, concatenated (slice at routeStopsBase)
   }
   "trips": {
     "stopTimes": StopTimeEntry[],     // all stop times, route["stopTimesBase"] + t*numStops + s

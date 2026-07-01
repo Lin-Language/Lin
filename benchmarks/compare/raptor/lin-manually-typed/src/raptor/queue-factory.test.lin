@@ -1,6 +1,5 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { createQueueFactory, getQueue, RouteQueue } from "./queue-factory"
-import { RouteStopIndex } from "./timetable"
 import { push } from "std/array"
 import { toInt32 } from "std/number"
 
@@ -13,60 +12,41 @@ val routeA: UInt32 = 0u32
 val routeB: UInt32 = 1u32
 val routeC: UInt32 = 2u32
 
-// Build stopRoutes / stopRoutesBase for the two-stop scenario:
-//   stop 0 (A) → routes [0, 1]
-//   stop 1 (B) → routes [1, 2]
-val makeStopRoutes = (): [UInt32[], UInt32[]] =>
+// Build stopRoutes / stopRoutesBase / stopRoutePos for the two-stop scenario:
+//   stop 0 (A) → routes [0, 1] at positions [1, 2]   (routeA has stopA at pos 1; routeB at pos 2)
+//   stop 1 (B) → routes [1, 2] at positions [1, 1]   (routeB has stopB at pos 1; routeC at pos 1)
+val makeStopRoutes = (): [UInt32[], UInt32[], UInt8[]] =>
   val sr: UInt32[] = [routeA, routeB, routeB, routeC]
   val srb: UInt32[] = [0u32, 2u32, 4u32]
-  [sr, srb]
+  val srp: UInt8[] = [1u8, 2u8, 1u8, 1u8]
+  [sr, srb, srp]
 
 val s = suite("raptor/queue-factory", [
-  // RouteB sits earlier at StopB (index 1) than StopA (index 2), so it enqueues at StopB
+  // RouteB's stopB position (1) is earlier than stopA position (2), so enqueues at position 1
   test("enqueues stops", () =>
-    val rsi: RouteStopIndex = []
-    val rsiA: { UInt32: UInt8 } = {}
-    rsiA[stopA] = 1u8
-    rsi.push(rsiA)
-    val rsiB: { UInt32: UInt8 } = {}
-    rsiB[stopA] = 2u8
-    rsiB[stopB] = 1u8
-    rsi.push(rsiB)
-    val rsiC: { UInt32: UInt8 } = {}
-    rsiC[stopB] = 1u8
-    rsi.push(rsiC)
-
-    val [sr, srb] = makeStopRoutes()
-    val factory = createQueueFactory(sr, srb, rsi, 3)
+    val [sr, srb, srp] = makeStopRoutes()
+    val factory = createQueueFactory(sr, srb, srp, 3)
     val actual = factory.getQueue([stopA, stopB])
     [
-      expect(actual["queueStop"][routeA.toInt32()]).toBe(stopA),
-      expect(actual["queueStop"][routeB.toInt32()]).toBe(stopB),
-      expect(actual["queueStop"][routeC.toInt32()]).toBe(stopB)
+      expect(actual["queuePos"][routeA.toInt32()]).toBe(1u8),
+      expect(actual["queuePos"][routeB.toInt32()]).toBe(1u8),
+      expect(actual["queuePos"][routeC.toInt32()]).toBe(1u8)
     ]
   ),
 
-  // RouteB now sits earlier at StopA (index 1), so it picks StopA even though StopB is marked first
-  test("picks the earliest stop on the route", () =>
-    val rsi: RouteStopIndex = []
-    val rsiA: { UInt32: UInt8 } = {}
-    rsiA[stopA] = 1u8
-    rsi.push(rsiA)
-    val rsiB: { UInt32: UInt8 } = {}
-    rsiB[stopA] = 1u8
-    rsiB[stopB] = 2u8
-    rsi.push(rsiB)
-    val rsiC: { UInt32: UInt8 } = {}
-    rsiC[stopB] = 1u8
-    rsi.push(rsiC)
-
-    val [sr, srb] = makeStopRoutes()
-    val factory = createQueueFactory(sr, srb, rsi, 3)
+  // RouteB now sits earlier at StopA (position 1) vs StopB (position 2), so picks position 1 even
+  // though StopB is marked first.
+  test("picks the earliest stop position on the route", () =>
+    val sr: UInt32[] = [routeA, routeB, routeB, routeC]
+    val srb: UInt32[] = [0u32, 2u32, 4u32]
+    // routeA:stopA=1, routeB:stopA=1, routeB:stopB=2, routeC:stopB=1
+    val srp: UInt8[] = [1u8, 1u8, 2u8, 1u8]
+    val factory = createQueueFactory(sr, srb, srp, 3)
     val actual = factory.getQueue([stopB, stopA])
     [
-      expect(actual["queueStop"][routeA.toInt32()]).toBe(stopA),
-      expect(actual["queueStop"][routeB.toInt32()]).toBe(stopA),
-      expect(actual["queueStop"][routeC.toInt32()]).toBe(stopB)
+      expect(actual["queuePos"][routeA.toInt32()]).toBe(1u8),
+      expect(actual["queuePos"][routeB.toInt32()]).toBe(1u8),
+      expect(actual["queuePos"][routeC.toInt32()]).toBe(1u8)
     ]
   )
 ])

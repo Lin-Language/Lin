@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { createRaptorAlgorithm } from "./raptor-algorithm"
-import { Route, RouteIntId, StopTimeEntry, Timetable, RouteStopIndex, Interchange, TransfersByOrigin } from "./timetable"
+import { Route, RouteIntId, StopTimeEntry, Timetable, Interchange, TransfersByOrigin } from "./timetable"
 import { QueueFactory } from "./queue-factory"
 import { RouteScannerFactory, createRouteScanner } from "./route-scanner"
 import { Service } from "../gtfs/service"
@@ -9,7 +9,6 @@ import { Service } from "../gtfs/service"
 // RouteScanner / ScanResultsFactory) and is covered by the query specs.
 val s = suite("raptor/raptor-algorithm", [
   test("createRaptorAlgorithm returns a record with the expected fields", () =>
-    val routeStopIndex: RouteStopIndex = []
     val routes: Route[] = []
     val routeStops: UInt32[] = []
     val gStopTimes: StopTimeEntry[] = []
@@ -18,7 +17,7 @@ val s = suite("raptor/raptor-algorithm", [
     val tripIds: String[] = []
     val transfers: TransfersByOrigin = {}
     val interchange: Interchange = []
-    val queueFactory: QueueFactory = { "stopRoutes": [], "stopRoutesBase": [], "routeStopIndex": [], "numRoutes": 0 }
+    val queueFactory: QueueFactory = { "stopRoutes": [], "stopRoutesBase": [], "stopRoutePos": [], "numRoutes": 0 }
     val routeScannerFactory: RouteScannerFactory = createRouteScanner
     val stopIndexOf: { String: UInt32 } = {}
     val stopNames: String[] = []
@@ -26,8 +25,7 @@ val s = suite("raptor/raptor-algorithm", [
     val timetable: Timetable = {
       "routes": {
         "routes": routes,
-        "routeStops": routeStops,
-        "routeStopIndex": routeStopIndex
+        "routeStops": routeStops
       },
       "trips": {
         "stopTimes": gStopTimes,
@@ -49,7 +47,6 @@ val s = suite("raptor/raptor-algorithm", [
       routeScannerFactory
     )
     [
-      expect(raptor["timetable"]["routes"]["routeStopIndex"]).toBe(routeStopIndex),
       expect(raptor["timetable"]["routes"]["routes"]).toBe(routes),
       expect(raptor["timetable"]["stops"]["transfers"]).toBe(transfers),
       expect(raptor["timetable"]["stops"]["interchange"]).toBe(interchange),

@@ -65,17 +65,16 @@ export val scan = (
 
 val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: RouteScanner, markedStops: StopIndex[], tt: Timetable) =>
   val queue = raptor["queueFactory"].getQueue(markedStops)
-  val queueStop = queue["queueStop"]
+  val queuePos = queue["queuePos"]
   val queueOrder = queue["queueOrder"]
 
   queueOrder.for(routeId =>
-    val stopP = queueStop[routeId.toInt32()]
+    val boardingPointIndex = queuePos[routeId.toInt32()]
     var boardingPoint: RoutePosition = 0u8
     var tripIdx: UInt32 | Null = null
     val stopTimesBase = tt["routes"]["routes"][routeId]["stopTimesBase"]
     val routeStopsBase = tt["routes"]["routes"][routeId]["routeStopsBase"]
     val numStops = tt["routes"]["routes"][routeId]["numStops"]
-    val boardingPointIndex = tt["routes"]["routeStopIndex"][routeId][stopP] ?? 0u8
 
     range(boardingPointIndex, numStops).for(pi =>
       val pos = pi.toUInt8()

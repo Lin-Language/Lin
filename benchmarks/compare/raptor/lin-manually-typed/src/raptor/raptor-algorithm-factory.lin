@@ -59,6 +59,8 @@ export val create = (
 
   // Inverse index per stop (for building stopRoutes/stopRoutesBase)
   val routesAtStopTemp: RoutesIndexedByStop = {}
+  // Parallel to routesAtStopTemp: position of each (stop, route) entry within that route.
+  val routePosAtStopTemp: { StopIntId: RoutePosition[] } = {}
 
   val usefulTransfers: TransfersByOrigin = {}
 
@@ -108,13 +110,17 @@ export val create = (
 
     range(0, path.length()).for(i =>
       val stop = path[i]
+      val pos = i.toUInt8()
       if stopIndex[stop] == null then
-        stopIndex[stop] = i.toUInt8()
+        stopIndex[stop] = pos
 
       val stopRoutesList = routesAtStopTemp[stop] ?? []
+      val stopPosList = routePosAtStopTemp[stop] ?? []
       if stopTimes[i]["pickUp"] then
         stopRoutesList.push(routeId)
+        stopPosList.push(pos)
       routesAtStopTemp[stop] = stopRoutesList
+      routePosAtStopTemp[stop] = stopPosList
     )
 
   // ── PASS 1: assign each trip to a route, building each route's indexes once ──
@@ -188,10 +194,11 @@ export val create = (
     )
   )
 
-  // ── Build stopRoutes / stopRoutesBase ─────────────────────────────────────
+  // ── Build stopRoutes / stopRoutesBase / stopRoutePos ─────────────────────────────────────
   val numStopCount = stopNames.length()
   val stopRoutes: RouteIntId[] = []
   val stopRoutesBase: Offset[] = []
+  val stopRoutePos: RoutePosition[] = []
   var srOffset: UInt32 = 0u32
 
   // Dense interchange array indexed by StopIntId (0..numStops-1); filled per-stop in the loop below.
@@ -202,7 +209,9 @@ export val create = (
     val stopStr = stopNames[si]
     stopRoutesBase.push(srOffset)
     val sRoutes = routesAtStopTemp[sIdx] ?? []
+    val sPos = routePosAtStopTemp[sIdx] ?? []
     sRoutes.for(r => stopRoutes.push(r))
+    sPos.for(p => stopRoutePos.push(p))
     srOffset = srOffset + sRoutes.length().toUInt32()
 
     // Intern this stop's footpath transfers to int endpoints now that every stop has an id. A
@@ -219,16 +228,10 @@ export val create = (
   )
   stopRoutesBase.push(srOffset)  // sentinel
 
-  // Freeze each load-once structure into an immortal read-only value as it's handed off.
-  // routeStopIndex is read by BOTH the timetable (scanRoutes) and the queue factory, so freeze it
-  // once and share; every other structure has a single consumer and is frozen inline at that site.
-  val frozenRouteStopIndex = frozen(routeStopIndex)
-
   val timetable: Timetable = {
     "routes": {
       "routes": frozen(routes),
-      "routeStops": frozen(routeStops),
-      "routeStopIndex": frozenRouteStopIndex
+      "routeStops": frozen(routeStops)
     },
     "trips": {
       "stopTimes": frozen(stopTimes),
@@ -246,6 +249,6 @@ export val create = (
 
   createRaptorAlgorithm(
     timetable,
-    createQueueFactory(frozen(stopRoutes), frozen(stopRoutesBase), frozenRouteStopIndex, numRoutes.toInt32()),
+    createQueueFactory(frozen(stopRoutes), frozen(stopRoutesBase), frozen(stopRoutePos), numRoutes.toInt32()),
     makeRouteScannerFactory(numRoutes.toInt32())
   )
