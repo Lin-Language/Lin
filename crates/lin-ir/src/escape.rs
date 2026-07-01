@@ -109,7 +109,17 @@ pub fn analyze(module: &mut LinModule) {
 /// use-after-return (a silent corruption class `cargo test` does NOT catch — only ASan). So the
 /// rule is: stack-allocate ONLY when PROVABLY non-escaping; on ANY doubt, heap. Fail SAFE.
 ///
-/// We require BOTH independent signals to AGREE; if either is unsure, heap:
+/// ## Signal classification
+///
+/// For cells whose type REQUIRES no refcount cleanup (flat scalars: Int*/UInt*/Float*/Bool — the
+/// same set as `Type::is_flat_scalar()`), **signal 2 alone is sufficient**: if the cell pointer
+/// never appears in a `MakeClosure` (or any other non-local use), the cell cannot outlive the
+/// frame. Stack-allocating a scalar cell that has no `FreeCell` (e.g., a cell created in a
+/// non-entry block after an RC-release continuation) is safe: the alloca is reclaimed on return,
+/// and there is no owned RC value to leak.
+///
+/// For cells whose type IS refcount-managed (String, Array, Object, Function, union/Json), we
+/// require BOTH independent signals to AGREE before promoting:
 ///
 ///   1. **FreeCell signal (the lowerer's own proof).** `lower/func.rs` emits a scope-exit
 ///      `FreeCell` for a cell ONLY when every closure capturing it was lowered as a synchronous,
@@ -134,14 +144,14 @@ pub fn analyze_cells(module: &mut LinModule) {
 }
 
 fn analyze_cells_fn(func: &mut LinFunction) {
-    // Collect (block, instr) of every MakeCell, and the set of cell temps that have a matching
-    // FreeCell somewhere in this function (signal 1).
-    let mut make_sites: Vec<(usize, usize, Temp)> = Vec::new();
+    // Collect every MakeCell site: (block_idx, instr_idx, dst_temp, value_type).
+    // Also collect the set of cell temps that have a matching FreeCell (signal 1 — lowerer proof).
+    let mut make_sites: Vec<(usize, usize, Temp, Type)> = Vec::new();
     let mut freed_cells: std::collections::HashSet<Temp> = std::collections::HashSet::new();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, instr) in block.instructions.iter().enumerate() {
             match instr {
-                Instruction::MakeCell { dst, .. } => make_sites.push((bi, ii, *dst)),
+                Instruction::MakeCell { dst, ty, .. } => make_sites.push((bi, ii, *dst, ty.clone())),
                 Instruction::FreeCell { cell, .. } => {
                     freed_cells.insert(*cell);
                 }
@@ -153,13 +163,27 @@ fn analyze_cells_fn(func: &mut LinFunction) {
         return;
     }
 
-    // For each candidate cell, decide stack-eligibility: it must be FreeCell-proven (signal 1) AND
-    // every use of its pointer temp must be a local CellGet/CellSet/FreeCell on THAT cell (signal 2).
+    // For each candidate cell, decide stack-eligibility:
+    //
+    //  • Flat-scalar cells (Int*/UInt*/Float*/Bool): signal 2 alone suffices.
+    //    Scalar values carry no RC, so a missing FreeCell is not a leak — the value dies with the
+    //    frame. This path fires for cells created in non-entry blocks (e.g. after an RC-release
+    //    continuation) that the lowerer does not emit FreeCell for; stack-promoting those is safe
+    //    and is the key win for loops like RAPTOR's `getTrip` whose `var i`/`var lastFound` cells
+    //    were heap-allocated despite never escaping.
+    //
+    //  • RC-managed cells (String/Array/Object/Function/union): require BOTH signal 1 AND signal 2.
+    //    If FreeCell is absent the lowerer did not prove non-escape, or the cell is in a non-entry
+    //    block whose FreeCell would be undominated — keep heap (fail safe).
     let mut stack_cells: std::collections::HashSet<Temp> = std::collections::HashSet::new();
-    for (_, _, cell) in &make_sites {
-        if !freed_cells.contains(cell) {
-            continue; // signal 1 says heap (escaping, or no entry-block FreeCell)
+    for (_, _, cell, ty) in &make_sites {
+        let is_scalar = ty.is_flat_scalar() || matches!(ty, Type::Bool);
+        let signal1 = freed_cells.contains(cell);
+        if !is_scalar && !signal1 {
+            // RC cell with no FreeCell proof → heap.
+            continue;
         }
+        // Signal 2: the cell pointer must be used ONLY via local CellGet/CellSet/FreeCell.
         if cell_pointer_is_local(&func.blocks, *cell) {
             stack_cells.insert(*cell);
         }
