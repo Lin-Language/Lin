@@ -76,17 +76,21 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
     val routeStopsBase = tt["routes"]["routes"][routeId]["routeStopsBase"]
     val numStops = tt["routes"]["routes"][routeId]["numStops"]
 
+    val routeStops = tt["routes"]["routeStops"]
+    val interchange = tt["stops"]["interchange"]
+    val stopTimes = tt["trips"]["stopTimes"]
+
     range(boardingPointIndex, numStops).for(pi =>
       val pos = pi.toUInt8()
-      val stopPi = tt["routes"]["routeStops"][routeStopsBase + pi]
+      val stopPi = routeStops[routeStopsBase + pi]
       val prevArrival = results.previousArrival(stopPi)
 
       if tripIdx != null then
-        val interchange = tt["stops"]["interchange"][stopPi.toInt32()]
+        val interchangeStop = interchange[stopPi.toInt32()]
         val sti = stopTimesBase + tripIdx * numStops + pos.toUInt32()
-        val arrival = tt["trips"]["stopTimes"].arrivalTime(sti) + interchange
+        val arrival = stopTimes.arrivalTime(sti) + interchangeStop
 
-        if tt["trips"]["stopTimes"].isDropOff(sti) && arrival < results.bestArrival(stopPi) then
+        if stopTimes.isDropOff(sti) && arrival < results.bestArrival(stopPi) then
           results.setTrip(stopPi, arrival, routeId, tripIdx, boardingPoint, pos)
         else if prevArrival != 0 && prevArrival < arrival then
           val newIdx = routeScanner.getTrip(tt, routeId, pos, prevArrival)
@@ -103,11 +107,14 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
 
 
 val scanTransfers = (raptor: RaptorAlgorithm, results: ScanResults, markedStops: StopIndex[], tt: Timetable) =>
+  val transfers = tt["stops"]["transfers"]
+  val interchange = tt["stops"]["interchange"]
+
   markedStops.for(stopP =>
-    tt["stops"]["transfers"][stopP].for(transfer =>
+    transfers[stopP].for(transfer =>
       // Transfer endpoints are already interned to int ids at build time.
       val stopPi = transfer["destination"]
-      val arrival = results.previousArrival(stopP) + transfer["duration"] + tt["stops"]["interchange"][stopPi]
+      val arrival = results.previousArrival(stopP) + transfer["duration"] + interchange[stopPi]
 
       if transfer["startTime"] <= arrival && transfer["endTime"] >= arrival && arrival < results.bestArrival(stopPi) then
         results.setTransfer(stopPi, transfer, arrival)
