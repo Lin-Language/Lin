@@ -298,6 +298,23 @@ fn flush_aligned_run(run: &mut Vec<(String, String, bool)>, lines: &mut Vec<Stri
     }
 }
 
+/// The leftmost source char offset of `expr` — the start of the first token rendered by this
+/// expression. For DotCall/Call/Index/BinaryOp chains the `span()` points at the operator token
+/// (the `.`, `(`, `[`, operator symbol), NOT the chain's first token. For blank-line detection
+/// we need the position of the first RENDERED character so that `source_blank_before` checks
+/// the line immediately above it, not some line in the middle of the expression.
+fn expr_leftmost_start(expr: &Expr) -> u32 {
+    match expr {
+        Expr::BinaryOp { left, .. } => expr_leftmost_start(left),
+        Expr::Coalesce { left, .. } => expr_leftmost_start(left),
+        Expr::DotCall { receiver, .. } => expr_leftmost_start(receiver),
+        Expr::Call { func, .. } => expr_leftmost_start(func),
+        Expr::Index { object, .. } => expr_leftmost_start(object),
+        Expr::Is { expr, .. } | Expr::Has { expr, .. } => expr_leftmost_start(expr),
+        other => other.span().start,
+    }
+}
+
 /// The source char offset where the statement at `anchor_start` effectively begins for
 /// blank-line purposes: the start of its first leading comment if it has any, else
 /// `anchor_start` itself. This keeps a blank line that precedes a leading comment.
@@ -309,6 +326,21 @@ fn leading_start(anchor_start: u32) -> u32 {
             .and_then(|cs| cs.first())
             .map(|cm| cm.span.start)
             .unwrap_or(anchor_start)
+    })
+}
+
+/// Like `leading_start`, but uses `visual_start` as the fallback when there is no leading
+/// comment at `anchor_start`. This is needed for expression statements that are DotCall/Call
+/// chains: the statement's `span().start` is the operator token (not the chain root), so
+/// without a leading comment the fallback must be the visual leftmost start, not the operator.
+fn leading_start_or(anchor_start: u32, visual_start: u32) -> u32 {
+    CTX.with(|c| {
+        let c = c.borrow();
+        c.leading
+            .get(&anchor_start)
+            .and_then(|cs| cs.first())
+            .map(|cm| cm.span.start)
+            .unwrap_or(visual_start)
     })
 }
 
@@ -417,10 +449,11 @@ impl Formatter {
                 continue;
             }
             let anchor = stmt.span().start;
+            let blank_check = if let Stmt::Expr(e) = stmt { expr_leftmost_start(e) } else { anchor };
             if !first {
                 // Rule 2: emit a blank line before this statement only if the source had a
                 // blank line just before it (or its leading comment). Runs collapse to one.
-                if source_blank_before(leading_start(anchor)) {
+                if source_blank_before(leading_start_or(anchor, blank_check)) {
                     flush_aligned_run(&mut run, &mut lines);
                     lines.push(String::new());
                 }
@@ -2278,7 +2311,13 @@ fn fmt_block(stmts: &[Stmt], tail: &Expr, ind: &str) -> String {
         // preserved as exactly one blank entry; runs collapse to one. An empty `lines`
         // entry becomes a blank line via the final `join("\n")`. Not applied before the
         // first statement of the block (no leading blank inside a block body).
-        if seen_stmt && source_blank_before(leading_start(anchor)) {
+        //
+        // For expression statements that are DotCall/Call chains, `stmt.span().start` is
+        // the operator token (the `.`, `(`), NOT the chain root. Use the visual leftmost
+        // start so blank-line detection checks the line above the first rendered character,
+        // not some intermediate line inside the chain.
+        let blank_check = if let Stmt::Expr(e) = stmt { expr_leftmost_start(e) } else { anchor };
+        if seen_stmt && source_blank_before(leading_start_or(anchor, blank_check)) {
             flush_aligned_run(&mut run, &mut lines);
             lines.push(String::new());
         }
@@ -2310,8 +2349,9 @@ fn fmt_block(stmts: &[Stmt], tail: &Expr, ind: &str) -> String {
 
     // Tail: leading comments, then the tail expr.
     let tail_anchor = tail.span().start;
+    let tail_blank_check = expr_leftmost_start(tail);
     // A blank source line between the last statement and the tail is preserved.
-    if seen_stmt && source_blank_before(leading_start(tail_anchor)) {
+    if seen_stmt && source_blank_before(leading_start_or(tail_anchor, tail_blank_check)) {
         lines.push(String::new());
     }
     let tail_leading = take_leading(tail_anchor, ind);

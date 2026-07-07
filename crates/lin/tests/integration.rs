@@ -11277,6 +11277,31 @@ fn test_fmt_corpus_idempotent_and_comments_preserved() {
     );
 }
 
+/// Regression: when a multi-line record `type` declaration is collapsed to a single line on
+/// pass 1, blank lines inside a following function's block body must still be preserved on
+/// pass 2.  Root cause: for a block statement that is a DotCall/Call chain, `stmt.span().start`
+/// points at the outermost operator token (`.for`, `(`), not the chain root.  The
+/// blank-line-before check was therefore testing the line immediately above the operator rather
+/// than the line above the first rendered character, silently dropping the blank on pass 2.
+#[test]
+fn test_fmt_blank_in_function_body_after_collapsed_type_is_idempotent() {
+    // Pattern: multi-line record type that pass 1 collapses onto one line, followed by a
+    // function whose block body has a blank line before the tail expression.  The blank must
+    // survive a second format pass unchanged.
+    let src = "export type ScanResults = {\n  \"bestArrivals\": Int32[],\n  \"kArrivals\": Int32[],\n  \"numStops\": Int32\n}\n\n//\n// Builds the initial ScanResults.\n//\nexport val createScanResults = (numStops: Int32): ScanResults =>\n  val bestArrivals: Int32[] = []\n  val round0: Int32[] = []\n\n  bestArrivals\n";
+    let pass1 = fmt(src);
+    let pass2 = fmt(&pass1);
+    assert_eq!(
+        pass1, pass2,
+        "formatter not idempotent: blank line before tail in function body was dropped on pass 2.\npass1:\n{pass1}\npass2:\n{pass2}"
+    );
+    // The blank between round0 and the tail must appear in pass1.
+    assert!(
+        pass1.contains("val round0: Int32[] = []\n\n  bestArrivals"),
+        "blank line between round0 and tail expression missing from pass1:\n{pass1}"
+    );
+}
+
 /// True if the source has no relative/sibling import (only `std/...` or `foreign`), so it
 /// can be type-checked as a standalone temp file in the workspace root.
 fn is_self_contained(source: &str) -> bool {
