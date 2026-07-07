@@ -11302,6 +11302,43 @@ fn test_fmt_blank_in_function_body_after_collapsed_type_is_idempotent() {
     );
 }
 
+#[test]
+fn test_fmt_import_foreign_inner_comment_stays_inside_block() {
+    // A leading comment attached to a binding INSIDE an `import foreign` block must remain
+    // inside the block on re-format — it must NOT drift to module level after the block.
+    let src = "import foreign \"lin-runtime\"\n  val lin_foo: (Int32) => Int32\n  // Comment for lin_bar.\n  val lin_bar: (Int64) => Int32\n";
+    let formatted = fmt(src);
+    assert_eq!(
+        src, formatted,
+        "import foreign block comment drifted out of the block.\nexpected:\n{src}\ngot:\n{formatted}"
+    );
+    // Must be idempotent.
+    let pass2 = fmt(&formatted);
+    assert_eq!(
+        formatted, pass2,
+        "formatter not idempotent on import foreign with inner comment.\npass1:\n{formatted}\npass2:\n{pass2}"
+    );
+}
+
+#[test]
+fn test_fmt_val_run_eq_alignment_preserved() {
+    // When consecutive `val` statements have their `=` signs column-aligned by the author
+    // (more than one space before `=`), the formatter must preserve that alignment across
+    // a format pass — the extra padding must not be stripped.
+    let src = "val N_MAPS  = 500\nval N_ITERS = 2000\n";
+    let formatted = fmt(src);
+    assert_eq!(
+        src, formatted,
+        "val run `=` alignment was stripped by the formatter.\nexpected:\n{src}\ngot:\n{formatted}"
+    );
+    // Must be idempotent.
+    let pass2 = fmt(&formatted);
+    assert_eq!(
+        formatted, pass2,
+        "formatter not idempotent on aligned val run.\npass1:\n{formatted}\npass2:\n{pass2}"
+    );
+}
+
 /// True if the source has no relative/sibling import (only `std/...` or `foreign`), so it
 /// can be type-checked as a standalone temp file in the workspace root.
 fn is_self_contained(source: &str) -> bool {

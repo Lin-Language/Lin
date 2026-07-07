@@ -254,6 +254,38 @@ fn match_arms_aligned_in_source(arms: &[MatchArm]) -> bool {
     })
 }
 
+/// True if the `val`/`var` statement at `anchor_start` had its `=` sign column-aligned by the
+/// author — more than one space before `=` in source. Opt-in signal for val-run `=` alignment;
+/// false when no source is installed. Scans from `anchor_start` to the first `=` on its line.
+fn val_eq_padded_in_source(anchor_start: u32) -> bool {
+    SOURCE_CHARS.with(|src_c| {
+        let src = src_c.borrow();
+        if src.is_empty() { return false; }
+        let start = anchor_start as usize;
+        if start >= src.len() { return false; }
+        let mut i = start;
+        // Scan forward to find `=` that is not `==` and is not inside a type annotation.
+        // We only need to find the assignment `=` in `val name = ...` or `val name: T = ...`.
+        // Stop at newline.
+        while i < src.len() && src[i] != '\n' {
+            if src[i] == '=' {
+                // Make sure it's not `==`
+                if i + 1 < src.len() && src[i + 1] == '>' { i += 1; continue; } // `=>`
+                if i + 1 < src.len() && src[i + 1] == '=' { i += 2; continue; } // `==`
+                if i > 0 && (src[i - 1] == '!' || src[i - 1] == '<' || src[i - 1] == '>') {
+                    i += 1; continue; // `!=`, `<=`, `>=`
+                }
+                // Count spaces before this `=`
+                let mut spaces = 0; let mut j = i;
+                while j > 0 && src[j - 1] == ' ' { spaces += 1; j -= 1; }
+                return spaces > 1;
+            }
+            i += 1;
+        }
+        false
+    })
+}
+
 /// True if the trailing comment on `anchor_start` was column-aligned by the author — >1 space
 /// before its `//` in source. Opt-in signal; false with no source. Requires a non-space,
 /// non-newline char before the space run (so an own-line comment doesn't count).
@@ -269,28 +301,65 @@ fn trailing_aligned_in_source(anchor_start: u32) -> bool {
     })
 }
 
-/// Emit a maximal run of consecutive statements with run-based trailing-comment alignment.
-/// Each entry is `(code, trailing, aligned)` where `code` is the rendered statement (no
-/// trailing comment), `trailing` is the comment text ("" = none), and `aligned` is the
-/// author's opt-in signal. If ANY member opted in, align all trailing `//` to the widest
-/// code member (the widest keeps a single space); otherwise single space. Clears `run`.
-fn flush_aligned_run(run: &mut Vec<(String, String, bool)>, lines: &mut Vec<String>) {
+/// Emit a maximal run of consecutive statements with run-based trailing-comment alignment
+/// and optional `val`/`var` `=`-sign alignment.
+///
+/// Each entry is `(code, trailing, trailing_aligned, val_eq_aligned)`:
+/// - `code`: the rendered statement text (no trailing comment)
+/// - `trailing`: trailing comment text ("" = none)
+/// - `trailing_aligned`: author opt-in for trailing-comment column alignment (>1 space before `//`)
+/// - `val_eq_aligned`: author opt-in for `=` column alignment (>1 space before `=` in source)
+///
+/// If ANY entry opts in to trailing alignment, all trailing `//` are aligned to the widest code.
+/// If ANY single-line entry opts in to `=` alignment, `=` signs in `val`/`var` code are aligned
+/// by padding the part before `=` (the widest pre-`=` prefix sets the column). Clears `run`.
+fn flush_aligned_run(run: &mut Vec<(String, String, bool, bool)>, lines: &mut Vec<String>) {
     if run.is_empty() { return; }
-    let any_aligned = run.iter().any(|(_, t, a)| *a && !t.is_empty());
-    let width = if any_aligned {
+    let any_trailing_aligned = run.iter().any(|(_, t, a, _)| *a && !t.is_empty());
+    // val = alignment: opt-in when ANY single-line entry has >1 space before `=` in source.
+    // When active, ALL single-line entries that contain ` = ` have their `=` column-aligned
+    // to the widest such entry in the run.
+    let any_val_eq_aligned = run.iter().any(|(code, _, _, va)| *va && !code.contains('\n'));
+    // Widest pre-`=` prefix across ALL single-line entries that contain ` = ` (not just
+    // opted-in ones): this is the target column for all `=` signs in the run.
+    let eq_prefix_width = if any_val_eq_aligned {
         run.iter()
-            .filter(|(_, t, _)| !t.is_empty())
-            .map(|(code, _, _)| code.chars().count())
+            .filter(|(code, _, _, _)| !code.contains('\n'))
+            .filter_map(|(code, _, _, _)| code.find(" = "))
             .max()
             .unwrap_or(0)
     } else {
         0
     };
-    for (code, trailing, _) in run.drain(..) {
+    let trailing_width = if any_trailing_aligned {
+        run.iter()
+            .filter(|(_, t, _, _)| !t.is_empty())
+            .map(|(code, _, _, _)| code.chars().count())
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    for (code, trailing, _, _) in run.drain(..) {
+        // Apply val `=` alignment: pad before ` = ` in every single-line entry that has one.
+        let code = if any_val_eq_aligned && !code.contains('\n') {
+            if let Some(eq_pos) = code.find(" = ") {
+                let pad = eq_prefix_width.saturating_sub(eq_pos);
+                if pad > 0 {
+                    format!("{}{}{}", &code[..eq_pos], " ".repeat(pad), &code[eq_pos..])
+                } else {
+                    code
+                }
+            } else {
+                code
+            }
+        } else {
+            code
+        };
         if trailing.is_empty() {
             lines.push(code);
-        } else if any_aligned {
-            let pad = width.saturating_sub(code.chars().count());
+        } else if any_trailing_aligned {
+            let pad = trailing_width.saturating_sub(code.chars().count());
             lines.push(format!("{}{} {}", code, " ".repeat(pad), trailing));
         } else {
             lines.push(format!("{} {}", code, trailing));
@@ -440,7 +509,7 @@ impl Formatter {
         // breaks the run. We accumulate `lines` (each entry = one emitted output line,
         // joined by '\n' at the end). A blank line is an empty entry.
         let mut lines: Vec<String> = Vec::new();
-        let mut run: Vec<(String, String, bool)> = Vec::new();
+        let mut run: Vec<(String, String, bool, bool)> = Vec::new();
         let mut first = true;
         for stmt in &module.statements {
             // Skip bare NullLit statements — they are either no-ops or artifacts
@@ -482,7 +551,9 @@ impl Formatter {
                     lines.push(format!("{} {}", s, trailing));
                 }
             } else {
-                run.push((s, trailing, trailing_aligned_in_source(anchor)));
+                let is_binding = matches!(stmt, Stmt::Val { .. } | Stmt::Var { .. });
+                run.push((s, trailing, trailing_aligned_in_source(anchor),
+                    is_binding && val_eq_padded_in_source(anchor)));
             }
         }
         flush_aligned_run(&mut run, &mut lines);
@@ -551,6 +622,14 @@ fn collect_anchors_stmt(stmt: &Stmt, out: &mut Vec<Anchor>) {
             collect_anchors_expr(value, out)
         }
         Stmt::Expr(e) => collect_anchors_expr(e, out),
+        // Each foreign binding is its own anchor so leading comments inside the block
+        // (e.g. `// Truncate...` before `val lin_narrow_int32`) attach to the binding
+        // rather than drifting to the next module-level statement.
+        Stmt::ForeignImport { bindings, .. } => {
+            for b in bindings {
+                out.push(Anchor { start: b.span.start, end: b.span.end, trailing_ok: true });
+            }
+        }
         _ => {}
     }
 }
@@ -2297,7 +2376,7 @@ fn fmt_block(stmts: &[Stmt], tail: &Expr, ind: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     // Run-based trailing-comment alignment: a maximal run of consecutive single-line
     // statements; a blank line, a leading comment, or a multi-line statement breaks it.
-    let mut run: Vec<(String, String, bool)> = Vec::new();
+    let mut run: Vec<(String, String, bool, bool)> = Vec::new();
 
     // Each stmt is rendered as a fully-indented multi-line string at `ind`.
     // Skip bare NullLit statements (DEDENT artifacts).
@@ -2342,7 +2421,9 @@ fn fmt_block(stmts: &[Stmt], tail: &Expr, ind: &str) -> String {
                 lines.push(format!("{} {}", s, trailing));
             }
         } else {
-            run.push((s, trailing, trailing_aligned_in_source(anchor)));
+            let is_binding = matches!(stmt, Stmt::Val { .. } | Stmt::Var { .. });
+            run.push((s, trailing, trailing_aligned_in_source(anchor),
+                is_binding && val_eq_padded_in_source(anchor)));
         }
     }
     flush_aligned_run(&mut run, &mut lines);
@@ -2465,8 +2546,15 @@ fn fmt_stmt(stmt: &Stmt, ind: &str) -> String {
 
         Stmt::ForeignImport { path, bindings, .. } => {
             let mut out = format!("{}import foreign \"{}\"", ind, path);
+            let bind_ind = format!("{}  ", ind);
             for b in bindings {
-                out.push_str(&format!("\n{}  val {}: {}", ind, b.name, fmt_type(&b.type_ann)));
+                // Emit any leading comment(s) that were attached to this binding's anchor.
+                let leading = take_leading(b.span.start, &bind_ind);
+                if !leading.is_empty() {
+                    out.push('\n');
+                    out.push_str(leading.trim_end_matches('\n'));
+                }
+                out.push_str(&format!("\n{}val {}: {}", bind_ind, b.name, fmt_type(&b.type_ann)));
             }
             out
         }
