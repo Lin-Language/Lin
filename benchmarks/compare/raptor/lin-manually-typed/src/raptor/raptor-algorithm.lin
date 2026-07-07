@@ -54,6 +54,8 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
   val queue = raptor["queueFactory"].getQueue(markedStops)
   val queuePos = queue["queuePos"]
   val queueOrder = queue["queueOrder"]
+  val prevArrivals: Arrivals = results["kArrivals"][results["k"] - 1]
+  val bestArrivals: Arrivals = results["bestArrivals"]
 
   queueOrder.for(routeId =>
     val boardingPointIndex = queuePos[routeId.toInt32()]
@@ -70,14 +72,14 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
     range(boardingPointIndex, numStops).for(pi =>
       val pos = pi.toUInt8()
       val stopPi = routeStops[routeStopsBase + pi]
-      val prevArrival = results.previousArrival(stopPi)
+      val prevArrival = prevArrivals[stopPi]
 
       if tripIdx >= 0 then
         val interchangeStop = interchange[stopPi.toInt32()]
         val sti = stopTimesBase + tripIdx.toUInt32() * numStops + pos.toUInt32()
         val arrival = stopTimes.arrivalTime(sti) + interchangeStop
 
-        if stopTimes.isDropOff(sti) && arrival < results.bestArrival(stopPi) then
+        if stopTimes.isDropOff(sti) && arrival < bestArrivals[stopPi] then
           results.setTrip(stopPi, arrival, routeId, tripIdx.toUInt32(), boardingPoint, pos)
         else if prevArrival != 0 && prevArrival < arrival then
           val newIdx = routeScanner.getTrip(tt, routeId, pos, prevArrival)
@@ -95,14 +97,16 @@ val scanRoutes = (raptor: RaptorAlgorithm, results: ScanResults, routeScanner: R
 val scanTransfers = (raptor: RaptorAlgorithm, results: ScanResults, markedStops: StopIndex[], tt: Timetable) =>
   val transfers = tt["stops"]["transfers"]
   val interchange = tt["stops"]["interchange"]
+  val prevArrivals: Arrivals = results["kArrivals"][results["k"] - 1]
+  val bestArrivals: Arrivals = results["bestArrivals"]
 
   markedStops.for(stopP =>
     transfers[stopP].for(transfer =>
       // Transfer endpoints are already interned to int ids at build time.
       val stopPi = transfer["destination"]
-      val arrival = results.previousArrival(stopP) + transfer["duration"] + interchange[stopPi]
+      val arrival = prevArrivals[stopP] + transfer["duration"] + interchange[stopPi]
 
-      if transfer["startTime"] <= arrival && transfer["endTime"] >= arrival && arrival < results.bestArrival(stopPi) then
+      if transfer["startTime"] <= arrival && transfer["endTime"] >= arrival && arrival < bestArrivals[stopPi] then
         results.setTransfer(stopPi, transfer, arrival)
     )
   )
