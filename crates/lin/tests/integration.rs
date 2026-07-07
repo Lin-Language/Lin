@@ -24768,3 +24768,57 @@ print(toString(d()))
     // Counters c,d independent: c→1, c→2, d→1.
     assert_eq!(output, vec!["51", "-1", "5100000", "1", "2", "1"]);
 }
+
+#[test]
+fn test_sumnode_kind5_namespace_violation_regression() {
+    // Regression: a SumNode whose variant carries a non-recursive sum-type field (e.g. Cursor
+    // holding an `Ast` field where `Ast = Num | BinOp`) caused the SumDesc to record
+    // KIND_SUMNODE_FIELD (5) for that slot. `sumnode::release_field` only handles kinds 1–4;
+    // on the next `lin_sumnode_release` of the outer sum it hit the debug_assert("unknown kind
+    // 5 — possible namespace violation") and aborted. Fix: translate KIND_SUMNODE_FIELD →
+    // KIND_SUMNODE (4) in `sumnode_descriptor` so the drop walk calls `lin_sumnode_release_self`.
+    let out = run(r#"import { print } from "std/io"
+type Num = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "binop", "op": String, "left": Ast, "right": Ast }
+type Ast = Num | BinOp
+type Failure = { "type": "failure", "error": String }
+type Cursor = { "type": "cursor", "node": Ast, "pos": Int32 }
+type Step = Cursor | Failure
+val run = (): String =>
+  val ast: Ast = { "kind": "num", "value": 42 }
+  val step: Step = { "type": "cursor", "node": ast, "pos": 1 }
+  match step
+    is Failure => "failed"
+    else => "ok"
+print(run())
+"#);
+    assert_eq!(out, vec!["ok"]);
+}
+
+#[test]
+fn test_sumnode_heap_field_materializer_double_free_regression() {
+    // Regression: when a SumNode with a String heap field (Kind=KIND_STRING in SumDesc) was
+    // materialized via `lin_summat_*` to read a field, the materializer used `lin_tagged_release`
+    // after `lin_map_set`, which undid the map's retain on the inner String. The map then released
+    // the String (RC→0, freed). The subsequent `lin_sumnode_release` SumDesc walk attempted a
+    // second `lin_string_release` → refcount underflow (double free). Fix: use `lin_tagged_free_box`
+    // (shell-only) in the materializer for fields where `box_value` doesn't yield a fresh owned
+    // value (String/Array/Map fields), so the map and SumDesc each hold one RC reference.
+    let out = run(r#"import { print } from "std/io"
+type Config = { "host": String, "port": Int32 }
+type Success = { "type": "success", "value": Config }
+type Failure = { "type": "failure", "error": String }
+type LoadResult = Success | Failure
+val load = (input: String): LoadResult =>
+  if input == "ok" then
+    { "type": "success", "value": { "host": "localhost", "port": 8080 } }
+  else
+    { "type": "failure", "error": "bad input: ${input}" }
+val r1 = load("ok")
+val r2 = load("nope")
+print(r1["type"])
+print(r2["type"])
+print(r2["error"])
+"#);
+    assert_eq!(out, vec!["success", "failure", "bad input: nope"]);
+}
