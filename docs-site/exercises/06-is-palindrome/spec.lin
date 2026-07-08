@@ -1,4 +1,5 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, reduce } from "std/iter"
 
 export val tests = (solve: (String) => Boolean): AnyVal =>
   suite("06-is-palindrome", [
@@ -10,5 +11,19 @@ export val tests = (solve: (String) => Boolean): AnyVal =>
 
     test("single char is a palindrome", () => [expect(solve("a")).toBe(true)]),
 
-    test("ab is not a palindrome", () => [expect(solve("ab")).toBe(false)])
+    test("ab is not a palindrome", () => [expect(solve("ab")).toBe(false)]),
+
+    test("two same chars is a palindrome", () => [expect(solve("aa")).toBe(true)]),
+
+    test("case-sensitive: Aba is not a palindrome", () => [expect(solve("Aba")).toBe(false)]),
+
+    test("level is a palindrome", () => [expect(solve("level")).toBe(true)]),
+
+    test("large even palindrome", () =>
+      [expect(solve("abcddcba")).toBe(true)]
+    ),
+
+    test("large input: 500 a's + 500 a's is a palindrome", () =>
+      [expect(solve(range(0, 1000).reduce("", (acc, _) => "${acc}a"))).toBe(true)]
+    )
   ])

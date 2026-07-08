@@ -1,5 +1,15 @@
-// Word Frequencies — count how many times each word appears in the list.
-// TODO: implement solve to return a map from word to its count.
+// Word Frequencies
+//
+// Given an array of strings, return a map from each unique word to the number
+// of times it appears in the array. An empty array returns an empty map.
+//
+// Signature:
+//   solve(words: String[]): { String: Int32 }
+//
+// Examples:
+//   solve(["a", "b", "a"])   // { "a": 2, "b": 1 }
+//   solve([])                // {}
+//   solve(["x"])             // { "x": 1 }
 
 export val solve = (words: String[]): { String: Int32 } =>
   val r: { String: Int32 } = {}

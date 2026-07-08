@@ -1,5 +1,17 @@
-// Two Sum — find indices of two numbers that add up to target.
-// TODO: implement solve using a hash map from value → index (one pass).
+// Two Sum
+//
+// Given an array of integers xs and a target integer, return the indices [i, j]
+// (with i < j) of the two numbers that add up to the target.
+// Return [] if no such pair exists.
+//
+// Signature:
+//   solve(xs: Int32[], target: Int32): Int32[]
+//
+// Examples:
+//   solve([2, 7, 11, 15], 9)   // [0, 1]
+//   solve([3, 2, 4], 6)        // [1, 2]
+//   solve([3, 3], 6)           // [0, 1]
+//   solve([1, 2], 10)          // []
 
 export val solve = (xs: Int32[], target: Int32): Int32[] =>
   []

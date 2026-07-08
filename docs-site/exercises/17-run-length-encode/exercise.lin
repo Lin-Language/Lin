@@ -1,5 +1,17 @@
-// Run-Length Encoding — encode runs of equal characters as <char><count>.
-// TODO: implement solve. Example: "aaabbc" -> "a3b2c1".
+// Run-Length Encoding
+//
+// Encode a string by replacing each run of identical characters with the
+// character followed by its count (including singletons). An empty string
+// encodes to "".
+//
+// Signature:
+//   solve(s: String): String
+//
+// Examples:
+//   solve("aaabbc")   // "a3b2c1"
+//   solve("abc")      // "a1b1c1"
+//   solve("")         // ""
+//   solve("aaaa")     // "a4"
 
 export val solve = (s: String): String =>
   ""

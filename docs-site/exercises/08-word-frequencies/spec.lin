@@ -1,4 +1,5 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, map } from "std/iter"
 
 export val tests = (solve: (String[]) => { String: Int32 }): AnyVal =>
   suite("08-word-frequencies", [
@@ -20,5 +21,13 @@ export val tests = (solve: (String[]) => { String: Int32 }): AnyVal =>
 
     test("no duplicates", () =>
       [expect(solve(["p", "q", "r"])).toBe({ "p": 1, "q": 1, "r": 1 })]
+    ),
+
+    test("two distinct words equal counts", () =>
+      [expect(solve(["x", "y", "x", "y"])).toBe({ "x": 2, "y": 2 })]
+    ),
+
+    test("large input: 500 'a' + 500 'b' gives correct counts", () =>
+      [expect(solve(range(0, 1000).map(i => if i < 500 then "a" else "b"))).toBe({ "a": 500, "b": 500 })]
     )
   ])

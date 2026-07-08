@@ -1,5 +1,17 @@
-// Coin Change — fewest coins summing to amount, or -1 if impossible.
-// TODO: DP array dp[0..amount], dp[i] = min coins to make i.
+// Coin Change
+//
+// Given a list of coin denominations and an amount, return the minimum number
+// of coins needed to make that amount. Each coin may be used any number of times.
+// Return -1 if no combination sums to the amount. Return 0 when amount is 0.
+//
+// Signature:
+//   solve(coins: Int32[], amount: Int32): Int32
+//
+// Examples:
+//   solve([1,2,5], 11)        // 3   (5+5+1)
+//   solve([2], 3)             // -1
+//   solve([1], 0)             // 0
+//   solve([1,5,10,25], 30)    // 2   (25+5)
 
 export val solve = (coins: Int32[], amount: Int32): Int32 =>
   -1

@@ -1,4 +1,6 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, map, for } from "std/iter"
+import { push, length } from "std/array"
 
 export val tests = (solve: (Int32[][]) => Int32): AnyVal =>
   suite("28-shortest-path-grid", [
@@ -10,5 +12,25 @@ export val tests = (solve: (Int32[][]) => Int32): AnyVal =>
 
     test("2x2 open gives 3", () => [expect(solve([[0, 0], [0, 0]])).toBe(3)]),
 
-    test("1x1 open gives 1", () => [expect(solve([[0]])).toBe(1)])
+    test("1x1 open gives 1", () => [expect(solve([[0]])).toBe(1)]),
+
+    test("start is wall gives -1", () => [
+      expect(solve([[1, 0], [0, 0]])).toBe(-1)
+    ]),
+
+    test("end is wall gives -1", () => [
+      expect(solve([[0, 0], [0, 1]])).toBe(-1)
+    ]),
+
+    test("straight corridor", () => [
+      expect(solve([[0, 0, 0, 0, 0]])).toBe(5)
+    ]),
+
+    test("all walls except start/end, no path", () => [
+      expect(solve([[0, 1, 0], [1, 1, 1], [0, 1, 0]])).toBe(-1)
+    ]),
+
+    test("large open 10x10 grid: shortest path = 19", () =>
+      [expect(solve(range(0, 10).map(_ => range(0, 10).map(_ => 0)))).toBe(19)]
+    )
   ])

@@ -1,5 +1,19 @@
-// Factorial — compute n! using a loop (0! = 1, assume 0 ≤ n ≤ 12).
-// TODO: implement solve to compute the factorial of n.
+// Factorial
+//
+// Compute n!, the product of all integers from 1 up to n.
+// By convention 0! = 1. You may assume 0 <= n <= 12 (result fits in Int32).
+// Use a loop, not recursion.
+//
+// Signature:
+//   solve(n: Int32): Int32
+//
+// Examples:
+//   solve(0)    // 1
+//   solve(1)    // 1
+//   solve(5)    // 120
+//   solve(7)    // 5040
+//   solve(12)   // 479001600
+
 import { range } from "std/iter"
 
 export val solve = (n: Int32): Int32 =>

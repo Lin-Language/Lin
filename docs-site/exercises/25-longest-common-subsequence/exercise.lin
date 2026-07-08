@@ -1,5 +1,18 @@
-// Longest Common Subsequence — length of the LCS of two strings.
-// TODO: fill a 2-D DP table, dp[i][j] = LCS length for a[0..i) and b[0..j).
+// Longest Common Subsequence
+//
+// Return the length of the longest common subsequence of strings a and b.
+// A subsequence is formed by deleting zero or more characters without reordering.
+// Return 0 if either string is empty or they share no characters.
+//
+// Signature:
+//   solve(a: String, b: String): Int32
+//
+// Examples:
+//   solve("abcde", "ace")       // 3
+//   solve("abc", "abc")         // 3
+//   solve("abc", "def")         // 0
+//   solve("", "x")              // 0
+//   solve("AGGTAB", "GXTXAYB")  // 4
 
 export val solve = (a: String, b: String): Int32 =>
   0

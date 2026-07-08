@@ -1,5 +1,18 @@
-// Shortest Path in a Grid — BFS from [0][0] to bottom-right; return cells on shortest path or -1.
-// TODO: BFS with a queue (array + head index); visited keyed by r*cols+c.
+// Shortest Path in a Grid
+//
+// Find the shortest path from the top-left cell [0][0] to the bottom-right cell
+// of a grid. Cells are 0 (open) or 1 (wall). Movement is in 4 directions.
+// Return the number of cells on the shortest path (start and end inclusive),
+// or -1 if no path exists or if start/end is a wall.
+//
+// Signature:
+//   solve(grid: Int32[][]): Int32
+//
+// Examples:
+//   solve([[0,0,0],[0,1,0],[0,0,0]])   // 5
+//   solve([[0,1],[1,0]])               // -1
+//   solve([[0,0],[0,0]])               // 3
+//   solve([[0]])                       // 1
 
 export val solve = (grid: Int32[][]): Int32 =>
   -1

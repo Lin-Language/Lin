@@ -1,4 +1,6 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, map } from "std/iter"
+import { length } from "std/array"
 
 export val tests = (solve: (Int32[]) => Int32[]): AnyVal =>
   suite("09-filter-evens", [
@@ -20,5 +22,17 @@ export val tests = (solve: (Int32[]) => Int32[]): AnyVal =>
 
     test("negatives included", () =>
       [expect(solve([-4, -3, 0, 1])).toBe([-4, 0])]
+    ),
+
+    test("all evens preserved in order", () =>
+      [expect(solve([2, 4, 6, 8])).toBe([2, 4, 6, 8])]
+    ),
+
+    test("zero is even", () =>
+      [expect(solve([0])).toBe([0])]
+    ),
+
+    test("large input: 0..999, half are even", () =>
+      [expect(length(solve(range(0, 1000).map(i => i)))).toBe(500)]
     )
   ])

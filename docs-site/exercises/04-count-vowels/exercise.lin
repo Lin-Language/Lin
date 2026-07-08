@@ -1,5 +1,19 @@
-// Count the Vowels — count how many vowels (a, e, i, o, u, upper or lower) are in s.
-// TODO: implement solve to count vowels in the string.
+// Count the Vowels
+//
+// Count how many vowels (a, e, i, o, u — upper or lower case) appear in a string.
+// Consonants, digits, spaces, and punctuation are not counted.
+// An empty string returns 0.
+//
+// Signature:
+//   solve(s: String): Int32
+//
+// Examples:
+//   solve("hello")       // 2
+//   solve("AEIOU")       // 5
+//   solve("xyz")         // 0
+//   solve("")            // 0
+//   solve("Hello World") // 3
+
 import { split } from "std/string"
 import { filter } from "std/iter"
 import { length } from "std/array"

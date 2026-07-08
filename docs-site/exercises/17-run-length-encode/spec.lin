@@ -1,4 +1,5 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, reduce } from "std/iter"
 
 export val tests = (solve: (String) => String): AnyVal =>
   suite("17-run-length-encode", [
@@ -20,5 +21,17 @@ export val tests = (solve: (String) => String): AnyVal =>
 
     test("longer mixed", () =>
       [expect(solve("aabbcc")).toBe("a2b2c2")]
+    ),
+
+    test("single character", () =>
+      [expect(solve("z")).toBe("z1")]
+    ),
+
+    test("alternating characters", () =>
+      [expect(solve("ababab")).toBe("a1b1a1b1a1b1")]
+    ),
+
+    test("large uniform run of 100 chars", () =>
+      [expect(solve(range(0, 100).reduce("", (acc, _) => "${acc}x"))).toBe("x100")]
     )
   ])

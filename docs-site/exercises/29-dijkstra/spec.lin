@@ -1,4 +1,6 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, map, for } from "std/iter"
+import { push } from "std/array"
 
 export val tests = (solve: (Int32, Int32[][], Int32) => Int32[]): AnyVal =>
   suite("29-dijkstra", [
@@ -10,5 +12,29 @@ export val tests = (solve: (Int32, Int32[][], Int32) => Int32[]): AnyVal =>
       expect(solve(3, [[0, 1, 5]], 0)).toBe([0, 5, -1])
     ]),
 
-    test("single node", () => [expect(solve(1, [], 0)).toBe([0])])
+    test("single node", () => [expect(solve(1, [], 0)).toBe([0])]),
+
+    test("src not at 0", () => [
+      expect(solve(3, [[0, 1, 10], [1, 2, 5]], 2)).toBe([15, 5, 0])
+    ]),
+
+    test("two nodes direct edge", () => [
+      expect(solve(2, [[0, 1, 7]], 0)).toBe([0, 7])
+    ]),
+
+    test("zero-weight edge", () => [
+      expect(solve(2, [[0, 1, 0]], 0)).toBe([0, 0])
+    ]),
+
+    test("fully disconnected: all -1 except src", () => [
+      expect(solve(4, [], 0)).toBe([0, -1, -1, -1])
+    ]),
+
+    test("triangle: shorter indirect path", () => [
+      expect(solve(3, [[0, 1, 10], [1, 2, 1], [0, 2, 100]], 0)).toBe([0, 10, 11])
+    ]),
+
+    test("chain of 10 nodes with unit weights: dist[9] = 9", () =>
+      [expect(solve(10, range(0, 9).map(i => [i, i + 1, 1]), 0)[9]).toBe(9)]
+    )
   ])

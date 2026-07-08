@@ -1,4 +1,6 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, map, for } from "std/iter"
+import { push, length } from "std/array"
 
 export val tests = (solve: (Int32[], Int32) => Int32[]): AnyVal =>
   suite("23-top-k-frequent", [
@@ -10,5 +12,25 @@ export val tests = (solve: (Int32[], Int32) => Int32[]): AnyVal =>
 
     test("single element", () => [expect(solve([7], 1)).toBe([7])]),
 
-    test("two-way tie", () => [expect(solve([1, 2, 2, 3, 3], 2)).toBe([2, 3])])
+    test("two-way tie", () => [expect(solve([1, 2, 2, 3, 3], 2)).toBe([2, 3])]),
+
+    test("k=1 returns most frequent", () => [
+      expect(solve([1, 2, 2, 3, 3, 3], 1)).toBe([3])
+    ]),
+
+    test("all same frequency, tie-break ascending", () => [
+      expect(solve([5, 3, 1, 4, 2], 3)).toBe([1, 2, 3])
+    ]),
+
+    test("k equals distinct count", () => [
+      expect(solve([1, 2, 3], 3)).toBe([1, 2, 3])
+    ]),
+
+    test("large input: most frequent is 0 (appears 1000 times)", () =>
+      [
+        expect(
+          solve(range(0, 1000).map(i => if i < 1000 then 0 else i), 1)
+        ).toBe([0])
+      ]
+    )
   ])

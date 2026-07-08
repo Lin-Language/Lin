@@ -1,5 +1,17 @@
-// Sum a List — return the sum of all elements in the array.
-// TODO: implement solve so it sums every element (empty list → 0).
+// Sum a List
+//
+// Given an array of integers, return the sum of all its elements.
+// An empty array sums to 0.
+//
+// Signature:
+//   solve(xs: Int32[]): Int32
+//
+// Examples:
+//   solve([1, 2, 3, 4])   // 10
+//   solve([])             // 0
+//   solve([-5, 5])        // 0
+//   solve([42])           // 42
+
 import { reduce } from "std/iter"
 
 export val solve = (xs: Int32[]): Int32 =>
