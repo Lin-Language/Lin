@@ -2164,6 +2164,10 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
     }
 
     // Handle a call to a generic function (directly by name, or through a `val f = id` alias).
+    // Copy `partial` before taking a mutable borrow of `expr` (borrow-checker: `expr` is also
+    // passed to `repoint_call_native`/`boxed_fallback_call` as `&mut`, which needs full exclusive
+    // access; reading through a pattern-bound reference into `expr` at that point would conflict).
+    let call_is_partial_app = if let TypedExpr::Call { partial, .. } = expr { *partial } else { false };
     if let TypedExpr::Call { func, args, result_type, span, .. } = expr {
         if let TypedExpr::LocalGet { .. } = func.as_ref() {
             // STREAM RECEIVER: a generic combinator (`map`/`filter`/`reduce`/`while`) called with a
@@ -2386,14 +2390,14 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                     if fully_concrete && refs_origin_global {
                         // Boxed fallback: keep the origin-module body (global in scope), share one copy.
                         state.boxed_fallback_used.insert(gslot);
-                        boxed_fallback_call(expr, gslot, &params, &ret_type, state);
+                        boxed_fallback_call(expr, gslot, &params, &ret_type, state, call_is_partial_app);
                     } else if fully_concrete && sealed_arg && unsound_combinator {
                         // Materialize-to-boxed boundary: keep the type-erased generic original and
                         // route this call through it. `box_value` converts the sealed array/record
                         // to its boxed view at the arg boundary; the wrapping Coerce re-seals the
                         // result. (No specialization budget interaction — the boxed original is shared.)
                         state.boxed_fallback_used.insert(gslot);
-                        boxed_fallback_call(expr, gslot, &params, &ret_type, state);
+                        boxed_fallback_call(expr, gslot, &params, &ret_type, state, call_is_partial_app);
                     } else if fully_concrete {
                         // Sound to native-specialize (no sealed arg, or a sealed arg through a
                         // projection-style combinator that reads the packed element correctly).
@@ -2404,7 +2408,7 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                         if known || count < state.budget {
                             let base_name = g_name(state, gslot);
                             let spec_slot = native_spec_slot(state, gslot, &base_name, key, subs.clone(), callback_devirt.clone());
-                            repoint_call_native(expr, &params, &ret_type, &body, &subs, spec_slot);
+                            repoint_call_native(expr, &params, &ret_type, &body, &subs, spec_slot, call_is_partial_app);
                         } else {
                             // Budget exceeded: fall back to one shared boxed copy of the original.
                             if state.boxed_fallback_used.insert(gslot) {
@@ -2418,7 +2422,7 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                                     .with_help("further instantiations are compiled as a single boxed (type-erased) copy — correct, but slower than a per-type specialization".to_string())
                                 );
                             }
-                            boxed_fallback_call(expr, gslot, &params, &ret_type, state);
+                            boxed_fallback_call(expr, gslot, &params, &ret_type, state, call_is_partial_app);
                         }
                     } else if mentions_unconstrained(&subs, &params, &ret_type) {
                         // A type parameter is not pinned down by the arguments or the result type:
@@ -2434,7 +2438,7 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                         );
                         // Keep the original around so codegen still has a (boxed) definition.
                         state.boxed_fallback_used.insert(gslot);
-                        boxed_fallback_call(expr, gslot, &params, &ret_type, state);
+                        boxed_fallback_call(expr, gslot, &params, &ret_type, state, call_is_partial_app);
                     } else {
                         // No substitution at all (e.g. a generic used purely as a value here).
                         state.used_generic_slots.insert(gslot);
@@ -2845,6 +2849,7 @@ fn repoint_call_native(
     body: &TypedExpr,
     subs: &HashMap<u32, Type>,
     spec_slot: usize,
+    is_partial_app: bool,
 ) {
     let concrete_params: Vec<Type> = params.iter().map(|p| subst_type(&p.ty, subs)).collect();
     let mut concrete_ret = subst_type(ret_type, subs);
@@ -2879,6 +2884,14 @@ fn repoint_call_native(
     if let TypedExpr::LocalGet { slot: fslot, ty, .. } = func.as_mut() {
         *fslot = spec_slot;
         *ty = fn_ty;
+    }
+    // For partial application (`f(x,)`), the Call's result_type is the checker-produced partial
+    // application closure type (a Function type awaiting the remaining arguments). Do NOT overwrite
+    // it with the callee's concrete return type — codegen's partial_app closure checks result_type
+    // and only builds the closure wrapper when it is a Function type. Also skip the Coerce: the
+    // surrounding context consumes the closure value, not the underlying return type.
+    if is_partial_app {
+        return;
     }
     let original_result = result_type.clone();
     // The native spec produces `concrete_ret`. Make the Call node report that.
@@ -2921,6 +2934,7 @@ fn boxed_fallback_call(
     params: &[TypedParam],
     ret_type: &Type,
     _state: &mut MonoState<'_>,
+    is_partial_app: bool,
 ) {
     let TypedExpr::Call { func, result_type, .. } = expr else { return };
     let concrete_result = result_type.clone();
@@ -2936,6 +2950,13 @@ fn boxed_fallback_call(
     if let TypedExpr::LocalGet { slot: fslot, ty, .. } = func.as_mut() {
         *fslot = gslot;
         *ty = generic_fn_ty;
+    }
+    // For partial application (`f(x,)`), preserve the checker's partial-application result type
+    // (a Function type awaiting the remaining arguments). Do not rewrite result_type or wrap in
+    // Coerce — codegen's partial_app closure checks result_type and builds the wrapper when it is
+    // a Function type.
+    if is_partial_app {
+        return;
     }
     // The Direct call now yields the generic return type (a boxed ptr for a TypeVar). Make the
     // Call's own result_type match that so lowering reads a ptr, then unbox via Coerce.

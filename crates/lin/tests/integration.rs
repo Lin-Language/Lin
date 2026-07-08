@@ -4117,6 +4117,54 @@ print(toString(result))
 }
 
 #[test]
+fn test_partial_application_of_local_generic_function() {
+    // Regression: partial application of a generic function crashed codegen (panicked in
+    // intrinsics.rs or emitted an invalid ZExt). The monomorphizer was overwriting the Call's
+    // result_type with the callee's concrete return type instead of preserving the
+    // partial-application closure type.
+    let output = run(r#"import { print } from "std/io"
+
+val second = <T>(a: T, b: T): T => b
+val g = second(1u32,)
+print("${g(7u32)}")
+"#);
+    assert_eq!(output, vec!["7"]);
+}
+
+#[test]
+fn test_partial_application_of_generic_stdlib_function_bound_to_val() {
+    // Regression: partial application of a generic stdlib function (`push`) bound to a val
+    // and passed to a combinator crashed with "ZExt only operates on integer".
+    let output = run(r#"import { push, length } from "std/array"
+import { for } from "std/iter"
+import { print } from "std/io"
+
+val src: UInt32[] = [1u32, 2u32, 3u32]
+val acc: UInt32[] = []
+val f = push(acc,)
+src.for(f)
+print("${acc.length()}")
+"#);
+    assert_eq!(output, vec!["3"]);
+}
+
+#[test]
+fn test_partial_application_of_generic_stdlib_function_inline() {
+    // Regression: partial application of a generic stdlib function directly in argument
+    // position (`src.for(push(acc,))`) also crashed with the same monomorphizer bug.
+    let output = run(r#"import { push, length } from "std/array"
+import { for } from "std/iter"
+import { print } from "std/io"
+
+val src: UInt32[] = [1u32, 2u32, 3u32]
+val acc: UInt32[] = []
+src.for(push(acc,))
+print("${acc.length()}")
+"#);
+    assert_eq!(output, vec!["3"]);
+}
+
+#[test]
 fn test_default_args_runtime_fill() {
     // Consolidated default-argument runtime behaviours (4 former one-build tests → one program,
     // distinct function names, every assertion preserved in order). The compile-error cases
