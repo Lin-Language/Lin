@@ -317,8 +317,20 @@ impl<'ctx> Codegen<'ctx> {
                         // Heap-field SumNode Stage 3: String/Array/nested-sealed fields need a
                         // descriptor entry so the runtime drop walk releases them. Uses the same
                         // KIND_STRING/KIND_ARRAY/KIND_SEALED constants as sealed records.
+                        //
+                        // CRITICAL: `sealed_field_kind` returns KIND_SUMNODE_FIELD (5) for a
+                        // non-recursive sum-type field — that code is valid ONLY in sealed record
+                        // descriptors (walked by `sealed::release_field`). In a SumDesc, the drop
+                        // walk is `sumnode::release_field`, which only understands kinds 1–4.
+                        // A `*SumNode` field inside a SumNode variant must use KIND_SUMNODE (4)
+                        // so the runtime calls `lin_sumnode_release_self`, not panics on kind 5.
+                        let sumdesc_kind = if kind == Self::KIND_SUMNODE_FIELD {
+                            Self::KIND_SUMNODE
+                        } else {
+                            kind
+                        };
                         let offset = Self::sumnode_field_offset(&payload, k);
-                        heap.push((offset, kind));
+                        heap.push((offset, sumdesc_kind));
                         any_heap = true;
                     }
                 }
@@ -1346,15 +1358,29 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 // Heap-field SumNode Stage 3: a heap field (String/Array/nested-sealed) is stored
                 // as an owned interior pointer in the node. Read it directly (BORROWED — the node
-                // still owns it), box it, set it in the map (map_set retains), then
-                // release our fresh-box shell. The node remains the owner; the map takes its own
-                // reference via map_set's retain.
+                // still owns it), box it, set it in the map (map_set retains), then free the
+                // box shell. The node remains the sole RC owner; the map takes its own reference
+                // via map_set's retain (+1). When the map is later released it decrements back to
+                // the original RC; the SumDesc drop walk performs the final decrement on release.
+                //
+                // CRITICAL: use `lin_tagged_free_box` (shell-only) NOT `lin_tagged_release`
+                // (inner+shell). `lin_tagged_release` would decrement the inner payload RC, leaving
+                // the map holding it at the original RC with NO extra ref — when the map is then
+                // released the inner RC hits 0 and the payload is freed. The SumDesc walk then
+                // tries a second release → double-free (observed as `lin_string_release: refcount
+                // underflow`). The exception is when `box_value` yields a FRESH +1 (nested sealed
+                // record → materialized map; sum-type child → materialized map): in those cases
+                // the boxed value is independently owned, so `tagged_release` IS correct.
                 if Self::sealed_field_kind(fty).is_some() && !Self::is_sum_scalar_field(fty) {
                     let v = self.sumnode_field_get(node, k, payload, fty);
                     let boxed = self.box_value(v, fty);
                     self.builder.call(self.rt.map_set, &[obj.into(), key_str.into(), boxed.into()], "");
                     if boxed.is_pointer_value() {
-                        self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                        if Self::box_value_yields_fresh_owned(fty) {
+                            self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                        } else {
+                            self.builder.call(free_box_shell, &[boxed.into()], "");
+                        }
                     }
                     continue;
                 }
