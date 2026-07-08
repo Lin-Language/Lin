@@ -1,5 +1,20 @@
-// Rotate a Matrix — rotate an N×N matrix 90° clockwise.
-// TODO: implement solve. For element at [r][c], it goes to [c][N-1-r] in the rotated matrix.
+// Rotate a Matrix
+//
+// Given an N x N matrix (array of rows), return a new N x N matrix rotated 90
+// degrees clockwise. Return [] for an empty input. Do not mutate the input.
+//
+// Signature:
+//   solve(m: Int32[][]): Int32[][]
+//
+// Examples:
+//   solve([[1, 2], [3, 4]])
+//     // [[3, 1], [4, 2]]
+//
+//   solve([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+//     // [[7, 4, 1], [8, 5, 2], [9, 6, 3]]
+//
+//   solve([[5]])   // [[5]]
+//   solve([])      // []
 
 export val solve = (m: Int32[][]): Int32[][] =>
   []

@@ -1,5 +1,17 @@
-// Word Break — can s be segmented into a sequence of dictionary words?
-// TODO: DP over prefix lengths; dp[i] = true if s[0..i) can be segmented.
+// Word Break
+//
+// Return true if the string s can be fully segmented into one or more words
+// from the dictionary dict (words may be reused). An empty string is always
+// segmentable.
+//
+// Signature:
+//   solve(s: String, dict: String[]): Boolean
+//
+// Examples:
+//   solve("leetcode", ["leet","code"])                             // true
+//   solve("applepenapple", ["apple","pen"])                       // true
+//   solve("catsandog", ["cats","dog","sand","and","cat"])          // false
+//   solve("", ["a"])                                              // true
 
 export val solve = (s: String, dict: String[]): Boolean =>
   false

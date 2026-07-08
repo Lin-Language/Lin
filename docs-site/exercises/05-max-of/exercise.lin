@@ -1,5 +1,15 @@
-// Largest in the List — return the maximum element, or null if the list is empty.
-// TODO: implement solve to find the maximum element.
+// Largest in the List
+//
+// Return the maximum element of an integer array, or null if the array is empty.
+//
+// Signature:
+//   solve(xs: Int32[]): Int32 | Null
+//
+// Examples:
+//   solve([3, 1, 4, 1, 5])   // 5
+//   solve([-3, -7, -2])      // -2
+//   solve([])                // null
+//   solve([9])               // 9
 
 export val solve = (xs: Int32[]): Int32 | Null =>
   null

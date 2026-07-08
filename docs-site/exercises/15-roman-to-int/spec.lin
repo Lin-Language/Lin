@@ -24,5 +24,29 @@ export val tests = (solve: (String) => Int32): AnyVal =>
 
     test("single symbol M = 1000", () =>
       [expect(solve("M")).toBe(1000)]
+    ),
+
+    test("I = 1", () =>
+      [expect(solve("I")).toBe(1)]
+    ),
+
+    test("XL = 40", () =>
+      [expect(solve("XL")).toBe(40)]
+    ),
+
+    test("XC = 90", () =>
+      [expect(solve("XC")).toBe(90)]
+    ),
+
+    test("CD = 400", () =>
+      [expect(solve("CD")).toBe(400)]
+    ),
+
+    test("CM = 900", () =>
+      [expect(solve("CM")).toBe(900)]
+    ),
+
+    test("MMMDCCCLXXXVIII = 3888 (largest common)", () =>
+      [expect(solve("MMMDCCCLXXXVIII")).toBe(3888)]
     )
   ])

@@ -1254,6 +1254,24 @@ empty source. **Array/Iterator** → `Boolean`. **Stream** → **terminal** `Boo
 
 ---
 
+### findMap (iter) {#findmap-iter}
+
+```txt
+val findMap: <T, U>(src: T[] | Iterator | Stream, f: (T[, i: Int32]) -> U | Null) -> U | Null
+```
+
+The fused `find` + `map`: maps each element and returns the first non-null result, short-circuiting
+the scan. `f` returns `null` to mean "no match, keep scanning" — Lin has no boolean literal type, so
+`Null` is the sentinel (mirroring `find`'s own `T | Null` convention) rather than `false`. Yields
+`null` if no element produces a non-null result.
+
+```txt
+[1, 3, 5, 6].findMap(x => if x % 2 == 0 then x * 10 else null)   // 60
+[1, 3, 5].findMap(x => if x % 2 == 0 then x * 10 else null)      // null
+```
+
+---
+
 ### range
 
 ```txt

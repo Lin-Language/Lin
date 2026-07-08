@@ -1044,6 +1044,26 @@ Total Retain calls removed: 7292 → 6944 (−348), of which 340 → 327 in `get
 
 ---
 
+### 5.17 RAPTOR GROUP 2026-07-08 — union-var boxing, arrival-row hoists; the elem-copy walk-skip is a wall-clock no-op
+
+Fresh gdb profile at 660 ms GROUP (post-§5.16): `getTrip` 36 % self, then ~21 % of all samples in RC/boxing calls Go doesn't pay — `lin_tagged_release`/`lin_unbox_*`/`lin_tagged_clone` attributed to the scan loop, `lin_array_release` under `getTrip`, `lin_map_get_int` under `runsOn`.
+
+**Three port commits (merged), all mirroring what the Go reference already does:**
+
+| Change | Mechanism | Where |
+|---|---|---|
+| `tripIdx: UInt32 \| Null` → `Int32 = -1` sentinel | A union-typed `var` boxes on every write, unboxes on every read, and releases the old box on every reassignment — in the innermost scan loop. Go uses `int32(-1)`; the sentinel is both faster and *more* faithful. | `scanRoutes` |
+| bind `service["dates"][date]` once | The exception-hit path probed the dates map twice (`if x != null then x`). | `runsOn` |
+| hoist `prevArrivals` / `bestArrivals` rows | `previousArrival` re-did the boxed outer read `kArrivals[k-1]` per stop visit; Go binds the row slices once per scan. In-place element writes stay visible through the hoisted binding (records are reference types). | `scanRoutes`, `scanTransfers` |
+
+**Result (4-round interleaved, quiet box, digest-exact):** GROUP 676 → 604 ms median (**−11 %**), RANGE 1947 → 1770 ms (**−9 %**). Cumulative campaign: GROUP 1881 → ~604 ms, 5.5× → ~1.5× Go.
+
+**Negative result (unmerged `perf/group-borrow-v3`) — don't re-try:** `services[idx].runsOn(...)` materializes a 48-byte Service copy per reachable-trip test; its drop's per-field release walk is ~6 % of gdb *self*-time. Gating that walk on source-array immortality (flag threaded from materialize site to the same-function drop; IR-verified firing in `getTrip`) was **perf-neutral** — the release calls overlap the copy's `lin_sealed_alloc`+memcpy latency. Self-time ≠ wall-time, again (§5.9, §5.15). The copy *itself* is the remaining cost; only a borrowed-element pass (interior/spine pointer to Borrow-convention callees, with the temp's drop suppressed, runtime elem-tag dispatch, and a callee "field-reads-only" fact) can remove it. Two earlier attempts that nulled the stored `heap_desc` instead are rejected on design: a live record's header must always match its type's layout.
+
+**Correctness fallout (fixed on master):** baselining `lin test` with the *release* lin masked a latent bug — SumDescs carried the sealed-namespace `KIND_SUMNODE_FIELD` (5) for sum-typed variant fields, and the sumnode materializer double-released map-set heap fields. Debug builds assert (`sumnode.rs:144`); release builds walked wrong descriptors silently. Both fixed in `fix(codegen)` with fail-before/pass-after regression tests; `stdlib/ examples/` is 74/74 under the **debug** lin (always baseline with debug — `debug_assert`s don't exist in release).
+
+---
+
 ## 6. Guidance for writing fast Lin
 
 1. **Prefer typed records and `&`-composed named types over `AnyVal`.** This is the

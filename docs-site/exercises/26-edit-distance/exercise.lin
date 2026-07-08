@@ -1,5 +1,17 @@
-// Edit Distance — minimum insertions, deletions, or substitutions to transform a into b.
-// TODO: fill a 2-D DP table, dp[i][j] = edit distance for a[0..i) and b[0..j).
+// Edit Distance
+//
+// Return the minimum number of single-character insertions, deletions, or
+// substitutions needed to transform string a into string b (Levenshtein distance).
+// Return 0 for identical strings; return length(b) when a is empty.
+//
+// Signature:
+//   solve(a: String, b: String): Int32
+//
+// Examples:
+//   solve("horse", "ros")           // 3
+//   solve("intention", "execution") // 5
+//   solve("", "abc")                // 3
+//   solve("abc", "abc")             // 0
 
 export val solve = (a: String, b: String): Int32 =>
   0

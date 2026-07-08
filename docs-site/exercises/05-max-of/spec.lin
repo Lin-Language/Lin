@@ -1,4 +1,5 @@
 import { expect, toBe, toBeNull, test, suite } from "std/test"
+import { range, map } from "std/iter"
 
 export val tests = (solve: (Int32[]) => Int32 | Null): AnyVal =>
   suite("05-max-of", [
@@ -12,5 +13,15 @@ export val tests = (solve: (Int32[]) => Int32 | Null): AnyVal =>
 
     test("single element returns that element", () => [expect(solve([9])).toBe(9)]),
 
-    test("all same value", () => [expect(solve([4, 4, 4])).toBe(4)])
+    test("all same value", () => [expect(solve([4, 4, 4])).toBe(4)]),
+
+    test("max is at index 0", () => [expect(solve([10, 1, 2])).toBe(10)]),
+
+    test("max is at last index", () => [expect(solve([1, 2, 10])).toBe(10)]),
+
+    test("single zero", () => [expect(solve([0])).toBe(0)]),
+
+    test("large input: max of 0..999 is 999", () =>
+      [expect(solve(range(0, 1000).map(i => i))).toBe(999)]
+    )
   ])

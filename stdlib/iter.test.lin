@@ -3,7 +3,7 @@ import { toString } from "std/string"
 import { push, length } from "std/array"
 import { writeFile } from "std/fs"
 import { readStream, lines } from "std/stream"
-import { sliding, pairwise, zipWith, intersperse, dedup, count, repeat, cycle, take, map, for, while } from "std/iter"
+import { sliding, pairwise, zipWith, intersperse, dedup, count, repeat, cycle, take, map, for, while, findMap } from "std/iter"
 
 // Empty-literal sources need an annotation to pin the element type (ADR-058): an unannotated `[]`
 // is `Never[]`, which a `T`-element combinator rejects. These module-level empties stand in for the
@@ -252,6 +252,29 @@ val s = suite("std/iter combinators", [
       x >= 0
     )
     [expect(seen.toString()).toBe("[1, 2, -3]")]
+  ),
+
+  // ---- findMap (eager) ----
+  test("findMap returns the first non-null mapped result", () =>
+    val result = [1, 3, 5, 6].findMap(x => if x % 2 == 0 then x * 10 else null)
+    [expect(result).toBe(60)]
+  ),
+
+  test("findMap returns null when no item maps to non-null", () =>
+    val result = [1, 3, 5].findMap(x => if x % 2 == 0 then x * 10 else null)
+    [expect(result).toBe(null)]
+  ),
+
+  test("findMap short-circuits and does not call f past the match", () =>
+    var calls = 0
+    val result = [1, 2, 3, 4].findMap(x =>
+      calls = calls + 1
+      if x >= 3 then x * 100 else null
+    )
+    [
+      expect(result).toBe(300),
+      expect(calls).toBe(3)
+    ]
   )
 ])
 

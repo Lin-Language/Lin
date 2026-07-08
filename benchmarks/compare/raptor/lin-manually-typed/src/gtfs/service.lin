@@ -6,22 +6,18 @@ import { DateIndex, DateNumber, DayOfWeek } from "./date"
 export type ServiceDays = { DayOfWeek: Boolean }
 
 //
-// Service dates 
+// Service dates
 //
-export type Service = {
-  "startDate": DateNumber,
-  "endDate": DateNumber,
-  "days": ServiceDays,
-  "dates": DateIndex
-}
+export type Service = { "startDate": DateNumber, "endDate": DateNumber, "days": ServiceDays, "dates": DateIndex }
 
 //
 // Returns true if the service is running on the given date and day of the week
 //
 export val runsOn = (service: Service, date: DateNumber, dow: DayOfWeek): Boolean =>
-  if service["dates"][date] != null then
-    service["dates"][date]
+  val exception: Boolean | Null = service["dates"][date]
+  if exception != null then
+    exception
   else if service["startDate"] <= date && service["endDate"] >= date then
     service["days"][dow]
-  else 
+  else
     false

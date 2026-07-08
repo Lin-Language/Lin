@@ -1,5 +1,17 @@
-// Longest Substring Without Repeating Characters — length of the longest substring with no repeated character.
-// TODO: implement a sliding window that tracks the last-seen index of each character.
+// Longest Substring Without Repeating Characters
+//
+// Given a string, return the length of the longest substring that contains
+// no repeated character. Return 0 for an empty string.
+//
+// Signature:
+//   solve(s: String): Int32
+//
+// Examples:
+//   solve("abcabcbb")   // 3
+//   solve("bbbbb")      // 1
+//   solve("pwwkew")     // 3
+//   solve("")           // 0
+//   solve("abcdef")     // 6
 
 export val solve = (s: String): Int32 =>
   0

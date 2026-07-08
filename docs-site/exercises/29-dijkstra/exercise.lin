@@ -1,5 +1,16 @@
-// Shortest Paths (Dijkstra) — shortest distances from src to all nodes, or -1 if unreachable.
-// TODO: O(n^2) Dijkstra; adjacency list in a { Int32: Int32[][] } map; relax edges.
+// Shortest Paths (Dijkstra)
+//
+// Given n nodes (numbered 0 to n-1) and a list of undirected weighted edges
+// [u, v, w], return an array dist of length n where dist[i] is the shortest
+// distance from src to node i, or -1 if node i is unreachable.
+//
+// Signature:
+//   solve(n: Int32, edges: Int32[][], src: Int32): Int32[]
+//
+// Examples:
+//   solve(4, [[0,1,1],[1,2,2],[0,2,4],[2,3,1]], 0)   // [0,1,3,4]
+//   solve(3, [[0,1,5]], 0)                           // [0,5,-1]
+//   solve(1, [], 0)                                  // [0]
 
 export val solve = (n: Int32, edges: Int32[][], src: Int32): Int32[] =>
   val r: Int32[] = []

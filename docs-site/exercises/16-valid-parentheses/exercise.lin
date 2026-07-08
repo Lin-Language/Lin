@@ -1,5 +1,20 @@
-// Valid Parentheses — check if bracket pairs are properly nested.
-// TODO: implement solve using an array as a stack.
+// Valid Parentheses
+//
+// Return true if every bracket in the string is correctly opened and closed in the
+// right order. Supported brackets: ( ) [ ] { }.
+// Brackets may be nested but must not interleave. An empty string is valid.
+//
+// Signature:
+//   solve(s: String): Boolean
+//
+// Examples:
+//   solve("()")      // true
+//   solve("()[]{}")  // true
+//   solve("(]")      // false
+//   solve("([)]")    // false
+//   solve("{[]}")    // true
+//   solve("")        // true
+//   solve("(")       // false
 
 export val solve = (s: String): Boolean =>
   false

@@ -1,4 +1,5 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, reduce } from "std/iter"
 
 export val tests = (solve: (String, String) => Int32): AnyVal =>
   suite("25-longest-common-subsequence", [
@@ -12,5 +13,20 @@ export val tests = (solve: (String, String) => Int32): AnyVal =>
 
     test("AGGTAB vs GXTXAYB gives 4", () => [
       expect(solve("AGGTAB", "GXTXAYB")).toBe(4)
-    ])
+    ]),
+
+    test("both empty gives 0", () => [expect(solve("", "")).toBe(0)]),
+
+    test("one char match", () => [expect(solve("a", "a")).toBe(1)]),
+
+    test("one char no match", () => [expect(solve("a", "b")).toBe(0)]),
+
+    test("subsequence not substring", () => [expect(solve("axbycz", "abc")).toBe(3)]),
+
+    test("large: identical 200-char string", () =>
+      [expect(solve(
+        range(0, 100).reduce("", (acc, _) => "${acc}ab"),
+        range(0, 100).reduce("", (acc, _) => "${acc}ab")
+      )).toBe(200)]
+    )
   ])

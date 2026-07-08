@@ -223,6 +223,27 @@ export val some = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): B
 export val every = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): Boolean =>
   lin_every(arr, f)
 
+// Map each item and return the first non-null result, short-circuiting the scan (the fused
+// `find` + `map`). `f` returns `null` to mean "no match, keep scanning" — Lin has no boolean
+// literal type, so `Null` is the "keep going" sentinel (mirroring `find`'s own `T | Null`
+// convention) rather than `false`.
+// @param arr  an Array, Iterator, or Stream of `T`.
+// @param f    `(item, index?) => U | Null`; `null` continues the scan, anything else stops it.
+// @returns the first non-null mapped result, or `null` if none match (typed `U | Null`).
+// @example [1, 3, 5, 6].findMap(x => if x % 2 == 0 then x * 10 else null)   // 60
+// @example [1, 3, 5].findMap(x => if x % 2 == 0 then x * 10 else null)     // null
+export val findMap = <T, U>(arr: T[] | Iterator | Stream, f: (T, Int32) => U | Null): U | Null =>
+  var result: U | Null = null
+  arr.while((item, idx) =>
+    val r = f(item, idx)
+    match r
+      is Null => true
+      else =>
+        result = r
+        false
+  )
+  result
+
 // Map each item to an inner array and concatenate all the results into one array.
 // @param arr  an Array, Iterator, or Stream of `T`.
 // @param f    `(item, index?) => U[]`; the trailing 0-based `Int32` index is optional.

@@ -1,5 +1,17 @@
-// Merge Intervals — merge all overlapping intervals and return them sorted by start.
-// TODO: sort by start, then sweep and merge touching/overlapping intervals.
+// Merge Intervals
+//
+// Given a list of [start, end] intervals (both endpoints inclusive), merge all
+// overlapping or touching intervals and return the result sorted by start
+// ascending. Return [] for an empty input.
+//
+// Signature:
+//   solve(intervals: Int32[][]): Int32[][]
+//
+// Examples:
+//   solve([[1,3],[2,6],[8,10],[15,18]])   // [[1,6],[8,10],[15,18]]
+//   solve([[1,4],[4,5]])                  // [[1,5]]
+//   solve([])                            // []
+//   solve([[1,4],[2,3]])                  // [[1,4]]
 
 export val solve = (intervals: Int32[][]): Int32[][] =>
   val r: Int32[][] = []
