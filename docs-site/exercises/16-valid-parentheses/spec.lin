@@ -1,4 +1,5 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, reduce } from "std/iter"
 
 export val tests = (solve: (String) => Boolean): AnyVal =>
   suite("16-valid-parentheses", [
@@ -28,5 +29,25 @@ export val tests = (solve: (String) => Boolean): AnyVal =>
 
     test("unclosed", () =>
       [expect(solve("(")).toBe(false)]
+    ),
+
+    test("just close", () =>
+      [expect(solve(")")).toBe(false)]
+    ),
+
+    test("deeply nested valid", () =>
+      [expect(solve("(((())))")).toBe(true)]
+    ),
+
+    test("deeply nested invalid", () =>
+      [expect(solve("(((()))))(")).toBe(false)]
+    ),
+
+    test("large valid: 500 pairs of ()", () =>
+      [expect(solve(range(0, 500).reduce("", (acc, _) => "${acc}()"))).toBe(true)]
+    ),
+
+    test("large invalid: 500 open parens", () =>
+      [expect(solve(range(0, 500).reduce("", (acc, _) => "${acc}("))).toBe(false)]
     )
   ])

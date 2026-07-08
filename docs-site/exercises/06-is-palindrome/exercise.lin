@@ -1,5 +1,19 @@
-// Palindrome Check — return true if s reads the same forwards and backwards.
-// TODO: implement solve to check whether s is a palindrome.
+// Palindrome Check
+//
+// Return true if the string reads the same forwards and backwards.
+// The comparison is exact (case-sensitive, no stripping).
+// An empty string and a single character are both palindromes.
+//
+// Signature:
+//   solve(s: String): Boolean
+//
+// Examples:
+//   solve("racecar")   // true
+//   solve("hello")     // false
+//   solve("")          // true
+//   solve("a")         // true
+//   solve("ab")        // false
+
 import { split, join } from "std/string"
 import { reverse } from "std/array"
 

@@ -1,5 +1,18 @@
-// Reverse a String — return the characters of s in reverse order.
-// TODO: implement solve to reverse the input string.
+// Reverse a String
+//
+// Given a string, return the characters in reverse order.
+// No case changes, no stripping — exact character reversal.
+// The empty string reverses to itself.
+//
+// Signature:
+//   solve(s: String): String
+//
+// Examples:
+//   solve("hello")   // "olleh"
+//   solve("")        // ""
+//   solve("a")       // "a"
+//   solve("abc")     // "cba"
+
 import { split, join } from "std/string"
 import { reverse } from "std/array"
 

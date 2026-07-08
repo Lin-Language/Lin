@@ -10,5 +10,17 @@ export val tests = (solve: (Int32, Int32) => Int32): AnyVal =>
 
     test("gcd(100, 10) = 10", () => [expect(solve(100, 10)).toBe(10)]),
 
-    test("gcd(a, a) = a", () => [expect(solve(7, 7)).toBe(7)])
+    test("gcd(a, a) = a", () => [expect(solve(7, 7)).toBe(7)]),
+
+    test("gcd(1, n) = 1", () => [expect(solve(1, 999)).toBe(1)]),
+
+    test("gcd(n, 1) = 1", () => [expect(solve(999, 1)).toBe(1)]),
+
+    test("gcd commutative: gcd(8, 12) = gcd(12, 8)", () =>
+      [expect(solve(8, 12)).toBe(solve(12, 8))]
+    ),
+
+    test("gcd(360, 252) = 36", () => [expect(solve(360, 252)).toBe(36)]),
+
+    test("gcd of large coprime numbers", () => [expect(solve(100003, 100019)).toBe(1)])
   ])

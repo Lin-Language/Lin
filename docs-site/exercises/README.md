@@ -1,10 +1,10 @@
 # Lin Exercises
 
-Thirty Advent-of-Code-style puzzles for learning Lin by doing. They start easy and get
-progressively harder — by the end you're solving Google/Facebook-interview-level problems
+Thirty coding exercises for learning Lin by doing. They start easy and get
+progressively harder — by the end you're solving interview-level problems
 (sliding windows, dynamic programming, BFS, Dijkstra).
 
-Each puzzle lives in its own numbered folder and is a real, runnable Lin module:
+Each exercise lives in its own numbered folder and is a real, runnable Lin module:
 
 ```
 NN-slug/
@@ -12,13 +12,13 @@ NN-slug/
   exercise.test.lin   # the unit test you make pass (run this)
   spec.lin            # the shared assertions (you don't need to edit this)
   solution.lin        # reference answer (the spoiler — try not to peek!)
-  solution.test.lin   # proves the puzzle is solvable
+  solution.test.lin   # proves the exercise is solvable
 ```
 
-## How to solve a puzzle
+## How to solve an exercise
 
-1. Open `NN-slug/exercise.lin` and read the `// TODO`. The matching write-up — story,
-   examples, hints — is at `/exercises/NN-slug` in the docs site.
+1. Open `NN-slug/exercise.lin`. The problem statement, input/output contract,
+   and worked examples are in the `//` comment header at the top of the file.
 2. Replace the stub body of `solve` with your implementation.
 3. Run its test until it's green:
 

@@ -1,5 +1,17 @@
-// Group Anagrams — group words that are anagrams of each other.
-// TODO: implement solve. Key = sorted characters of each word.
+// Group Anagrams
+//
+// Given an array of strings, group words that are anagrams of each other
+// (same letters in any order). Return the groups in order of first appearance;
+// within each group, preserve the input order.
+//
+// Signature:
+//   solve(words: String[]): String[][]
+//
+// Examples:
+//   solve(["eat", "tea", "tan", "ate", "nat", "bat"])
+//     // [["eat", "tea", "ate"], ["tan", "nat"], ["bat"]]
+//   solve([])    // []
+//   solve(["x"]) // [["x"]]
 
 import { split, join } from "std/string"
 import { sort, push, length } from "std/array"

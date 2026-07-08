@@ -1,5 +1,20 @@
-// FizzBuzz — produce the classic FizzBuzz sequence of length n.
-// TODO: implement solve to return the array of n FizzBuzz strings.
+// FizzBuzz
+//
+// Return an array of n strings where each entry at position i (1-indexed) is:
+//   "FizzBuzz" if i is divisible by both 3 and 5,
+//   "Fizz"     if i is divisible by 3 only,
+//   "Buzz"     if i is divisible by 5 only,
+//   the number as a string otherwise.
+//
+// Signature:
+//   solve(n: Int32): String[]
+//
+// Examples:
+//   solve(0)   // []
+//   solve(1)   // ["1"]
+//   solve(5)   // ["1", "2", "Fizz", "4", "Buzz"]
+//   solve(15)  // [..., "14", "FizzBuzz"]
+
 import { map } from "std/iter"
 import { range } from "std/iter"
 import { toString } from "std/string"

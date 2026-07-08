@@ -1,4 +1,5 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, reduce } from "std/iter"
 
 export val tests = (solve: (String, String) => Int32): AnyVal =>
   suite("26-edit-distance", [
@@ -10,5 +11,29 @@ export val tests = (solve: (String, String) => Int32): AnyVal =>
 
     test("empty to abc is 3", () => [expect(solve("", "abc")).toBe(3)]),
 
-    test("identical strings is 0", () => [expect(solve("abc", "abc")).toBe(0)])
+    test("identical strings is 0", () => [expect(solve("abc", "abc")).toBe(0)]),
+
+    test("abc to empty is 3", () => [expect(solve("abc", "")).toBe(3)]),
+
+    test("both empty is 0", () => [expect(solve("", "")).toBe(0)]),
+
+    test("single insertion", () => [expect(solve("a", "ab")).toBe(1)]),
+
+    test("single deletion", () => [expect(solve("ab", "a")).toBe(1)]),
+
+    test("single substitution", () => [expect(solve("a", "b")).toBe(1)]),
+
+    test("large: 100-char identical strings", () =>
+      [expect(solve(
+        range(0, 100).reduce("", (acc, _) => "${acc}a"),
+        range(0, 100).reduce("", (acc, _) => "${acc}a")
+      )).toBe(0)]
+    ),
+
+    test("large: 100 a's to 100 b's costs 100", () =>
+      [expect(solve(
+        range(0, 100).reduce("", (acc, _) => "${acc}a"),
+        range(0, 100).reduce("", (acc, _) => "${acc}b")
+      )).toBe(100)]
+    )
   ])

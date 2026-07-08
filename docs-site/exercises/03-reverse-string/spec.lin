@@ -1,4 +1,6 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, reduce } from "std/iter"
+import { toString } from "std/string"
 
 export val tests = (solve: (String) => String): AnyVal =>
   suite("03-reverse-string", [
@@ -10,5 +12,13 @@ export val tests = (solve: (String) => String): AnyVal =>
 
     test("reverses abc", () => [expect(solve("abc")).toBe("cba")]),
 
-    test("palindrome unchanged", () => [expect(solve("racecar")).toBe("racecar")])
+    test("palindrome unchanged", () => [expect(solve("racecar")).toBe("racecar")]),
+
+    test("two characters swapped", () => [expect(solve("ab")).toBe("ba")]),
+
+    test("preserves spaces", () => [expect(solve("hi there")).toBe("ereht ih")]),
+
+    test("large input: reversing twice gives original", () =>
+      [expect(solve(solve("abcdefghijklmnopqrstuvwxyz"))).toBe("abcdefghijklmnopqrstuvwxyz")]
+    )
   ])

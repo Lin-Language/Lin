@@ -1,5 +1,19 @@
-// Roman Numerals to Integer — parse a valid Roman numeral string.
-// TODO: implement solve using the subtractive rule (if value < next, subtract it).
+// Roman Numerals to Integer
+//
+// Parse a valid Roman numeral string and return its integer value.
+// Symbol values: I=1, V=5, X=10, L=50, C=100, D=500, M=1000.
+// When a symbol's value is less than the next symbol's value, subtract it;
+// otherwise add it.
+//
+// Signature:
+//   solve(s: String): Int32
+//
+// Examples:
+//   solve("III")      // 3
+//   solve("IV")       // 4
+//   solve("IX")       // 9
+//   solve("LVIII")    // 58
+//   solve("MCMXCIV")  // 1994
 
 export val solve = (s: String): Int32 =>
   0

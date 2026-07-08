@@ -1,4 +1,6 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, map, for } from "std/iter"
+import { push, length } from "std/array"
 
 export val tests = (solve: (Int32[][]) => Int32[][]): AnyVal =>
   suite("18-rotate-matrix", [
@@ -18,5 +20,15 @@ export val tests = (solve: (Int32[][]) => Int32[][]): AnyVal =>
 
     test("empty matrix", () =>
       [expect(solve([])).toBe([])]
+    ),
+
+    test("rotating 4 times returns original", () =>
+      [expect(solve(solve(solve(solve([[1, 2], [3, 4]]))))).toBe([[1, 2], [3, 4]])]
+    ),
+
+    test("4x4 corner values after rotation", () =>
+      [
+        expect(solve([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]])[0][0]).toBe(13)
+      ]
     )
   ])

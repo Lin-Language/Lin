@@ -1,4 +1,5 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, map, reduce } from "std/iter"
 
 export val tests = (solve: (Int32[]) => Int32): AnyVal =>
   suite("01-sum-list", [
@@ -10,5 +11,15 @@ export val tests = (solve: (Int32[]) => Int32): AnyVal =>
 
     test("single element", () => [expect(solve([42])).toBe(42)]),
 
-    test("all negatives", () => [expect(solve([-1, -2, -3])).toBe(-6)])
+    test("all negatives", () => [expect(solve([-1, -2, -3])).toBe(-6)]),
+
+    test("single negative", () => [expect(solve([-7])).toBe(-7)]),
+
+    test("all zeros", () => [expect(solve([0, 0, 0])).toBe(0)]),
+
+    test("two elements", () => [expect(solve([100, 200])).toBe(300)]),
+
+    test("large input: 0+1+...+999 = 499500", () =>
+      [expect(solve(range(0, 1000).map(i => i))).toBe(499500)]
+    )
   ])

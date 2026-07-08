@@ -1,4 +1,6 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, map } from "std/iter"
+import { length } from "std/array"
 
 export val tests = (solve: (Int32[][]) => Int32[][]): AnyVal =>
   suite("22-merge-intervals", [
@@ -14,5 +16,29 @@ export val tests = (solve: (Int32[][]) => Int32[][]): AnyVal =>
 
     test("one fully contained", () => [
       expect(solve([[1, 4], [2, 3]])).toBe([[1, 4]])
-    ])
+    ]),
+
+    test("single interval", () => [
+      expect(solve([[5, 10]])).toBe([[5, 10]])
+    ]),
+
+    test("all disjoint", () => [
+      expect(solve([[1, 2], [4, 5], [7, 8]])).toBe([[1, 2], [4, 5], [7, 8]])
+    ]),
+
+    test("all merge into one", () => [
+      expect(solve([[1, 10], [2, 8], [3, 6]])).toBe([[1, 10]])
+    ]),
+
+    test("unsorted input gets sorted", () => [
+      expect(solve([[8, 10], [1, 3], [2, 6], [15, 18]])).toBe([[1, 6], [8, 10], [15, 18]])
+    ]),
+
+    test("large input: 500 non-overlapping intervals", () =>
+      [expect(length(solve(range(0, 500).map(i => [i * 3, i * 3 + 1])))).toBe(500)]
+    ),
+
+    test("large input: all overlapping reduces to one", () =>
+      [expect(solve(range(0, 100).map(i => [i, i + 50]))).toBe([[0, 149]])]
+    )
   ])

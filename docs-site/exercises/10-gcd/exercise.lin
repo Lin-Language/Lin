@@ -1,5 +1,17 @@
-// Greatest Common Divisor — compute gcd(a, b) using Euclid's algorithm (loop).
-// TODO: implement solve using a loop, not recursion (a, b ≥ 0, not both 0).
+// Greatest Common Divisor
+//
+// Return the largest integer that divides both a and b without a remainder.
+// You may assume a, b >= 0 and they are not both zero.
+// Use a loop, not recursion.
+//
+// Signature:
+//   solve(a: Int32, b: Int32): Int32
+//
+// Examples:
+//   solve(12, 8)    // 4
+//   solve(17, 5)    // 1
+//   solve(0, 9)     // 9
+//   solve(100, 10)  // 10
 
 export val solve = (a: Int32, b: Int32): Int32 =>
   1

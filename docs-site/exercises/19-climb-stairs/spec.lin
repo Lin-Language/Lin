@@ -24,5 +24,21 @@ export val tests = (solve: (Int32) => Int32): AnyVal =>
 
     test("10 steps = 89 ways", () =>
       [expect(solve(10)).toBe(89)]
+    ),
+
+    test("4 steps = 5 ways", () =>
+      [expect(solve(4)).toBe(5)]
+    ),
+
+    test("6 steps = 13 ways", () =>
+      [expect(solve(6)).toBe(13)]
+    ),
+
+    test("20 steps = 10946 ways", () =>
+      [expect(solve(20)).toBe(10946)]
+    ),
+
+    test("30 steps = 1346269 ways", () =>
+      [expect(solve(30)).toBe(1346269)]
     )
   ])

@@ -1,4 +1,5 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, reduce } from "std/iter"
 
 export val tests = (solve: (String, Int32) => String): AnyVal =>
   suite("20-caesar-cipher", [
@@ -24,5 +25,21 @@ export val tests = (solve: (String, Int32) => String): AnyVal =>
 
     test("empty string", () =>
       [expect(solve("", 3)).toBe("")]
+    ),
+
+    test("uppercase wraps at Z", () =>
+      [expect(solve("XYZ", 3)).toBe("ABC")]
+    ),
+
+    test("digits unchanged", () =>
+      [expect(solve("a1b2", 1)).toBe("b1c2")]
+    ),
+
+    test("shift 13 is ROT13", () =>
+      [expect(solve(solve("Hello", 13), 13)).toBe("Hello")]
+    ),
+
+    test("large shift: shift 52 is identity", () =>
+      [expect(solve("abcXYZ", 52)).toBe("abcXYZ")]
     )
   ])

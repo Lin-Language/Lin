@@ -1,4 +1,6 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, map, filter } from "std/iter"
+import { length } from "std/array"
 
 export val tests = (solve: (Int32) => String[]): AnyVal =>
   suite("02-fizzbuzz", [
@@ -13,26 +15,26 @@ export val tests = (solve: (Int32) => String[]): AnyVal =>
     test("n=15 ends with FizzBuzz", () =>
       [
         expect(solve(15)).toBe([
-          "1",
-          "2",
-          "Fizz",
-          "4",
-          "Buzz",
-          "Fizz",
-          "7",
-          "8",
-          "Fizz",
-          "Buzz",
-          "11",
-          "Fizz",
-          "13",
-          "14",
-          "FizzBuzz"
+          "1", "2", "Fizz", "4", "Buzz",
+          "Fizz", "7", "8", "Fizz", "Buzz",
+          "11", "Fizz", "13", "14", "FizzBuzz"
         ])
       ]
     ),
 
     test("n=3 last element is Fizz", () =>
       [expect(solve(3)).toBe(["1", "2", "Fizz"])]
+    ),
+
+    test("n=30 has exactly 2 FizzBuzz entries", () =>
+      [expect(length(solve(30).filter(s => s == "FizzBuzz"))).toBe(2)]
+    ),
+
+    test("large input: n=300 has correct length", () =>
+      [expect(length(solve(300))).toBe(300)]
+    ),
+
+    test("large input: n=300 entry at index 14 (i=15) is FizzBuzz", () =>
+      [expect(solve(300)[14]).toBe("FizzBuzz")]
     )
   ])

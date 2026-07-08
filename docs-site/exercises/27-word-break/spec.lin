@@ -1,4 +1,5 @@
 import { expect, toBe, test, suite } from "std/test"
+import { range, map, reduce } from "std/iter"
 
 export val tests = (solve: (String, String[]) => Boolean): AnyVal =>
   suite("27-word-break", [
@@ -14,5 +15,27 @@ export val tests = (solve: (String, String[]) => Boolean): AnyVal =>
       expect(solve("catsandog", ["cats", "dog", "sand", "and", "cat"])).toBe(false)
     ]),
 
-    test("empty string is always true", () => [expect(solve("", ["a"])).toBe(true)])
+    test("empty string is always true", () => [expect(solve("", ["a"])).toBe(true)]),
+
+    test("single word in dict", () => [expect(solve("hello", ["hello"])).toBe(true)]),
+
+    test("single word not in dict", () => [expect(solve("hello", ["world"])).toBe(false)]),
+
+    test("word must be fully covered", () => [expect(solve("ab", ["a"])).toBe(false)]),
+
+    test("reuse words", () => [expect(solve("aaa", ["a", "aa"])).toBe(true)]),
+
+    test("large: 50-char string of repeated 'ab' segmented by 'ab'", () =>
+      [expect(solve(
+        range(0, 25).reduce("", (acc, _) => "${acc}ab"),
+        ["ab"]
+      )).toBe(true)]
+    ),
+
+    test("large: unsegmentable 50-char string", () =>
+      [expect(solve(
+        range(0, 50).reduce("", (acc, _) => "${acc}a"),
+        ["b"]
+      )).toBe(false)]
+    )
   ])
