@@ -11277,6 +11277,68 @@ fn test_fmt_corpus_idempotent_and_comments_preserved() {
     );
 }
 
+/// Regression: when a multi-line record `type` declaration is collapsed to a single line on
+/// pass 1, blank lines inside a following function's block body must still be preserved on
+/// pass 2.  Root cause: for a block statement that is a DotCall/Call chain, `stmt.span().start`
+/// points at the outermost operator token (`.for`, `(`), not the chain root.  The
+/// blank-line-before check was therefore testing the line immediately above the operator rather
+/// than the line above the first rendered character, silently dropping the blank on pass 2.
+#[test]
+fn test_fmt_blank_in_function_body_after_collapsed_type_is_idempotent() {
+    // Pattern: multi-line record type that pass 1 collapses onto one line, followed by a
+    // function whose block body has a blank line before the tail expression.  The blank must
+    // survive a second format pass unchanged.
+    let src = "export type ScanResults = {\n  \"bestArrivals\": Int32[],\n  \"kArrivals\": Int32[],\n  \"numStops\": Int32\n}\n\n//\n// Builds the initial ScanResults.\n//\nexport val createScanResults = (numStops: Int32): ScanResults =>\n  val bestArrivals: Int32[] = []\n  val round0: Int32[] = []\n\n  bestArrivals\n";
+    let pass1 = fmt(src);
+    let pass2 = fmt(&pass1);
+    assert_eq!(
+        pass1, pass2,
+        "formatter not idempotent: blank line before tail in function body was dropped on pass 2.\npass1:\n{pass1}\npass2:\n{pass2}"
+    );
+    // The blank between round0 and the tail must appear in pass1.
+    assert!(
+        pass1.contains("val round0: Int32[] = []\n\n  bestArrivals"),
+        "blank line between round0 and tail expression missing from pass1:\n{pass1}"
+    );
+}
+
+#[test]
+fn test_fmt_import_foreign_inner_comment_stays_inside_block() {
+    // A leading comment attached to a binding INSIDE an `import foreign` block must remain
+    // inside the block on re-format — it must NOT drift to module level after the block.
+    let src = "import foreign \"lin-runtime\"\n  val lin_foo: (Int32) => Int32\n  // Comment for lin_bar.\n  val lin_bar: (Int64) => Int32\n";
+    let formatted = fmt(src);
+    assert_eq!(
+        src, formatted,
+        "import foreign block comment drifted out of the block.\nexpected:\n{src}\ngot:\n{formatted}"
+    );
+    // Must be idempotent.
+    let pass2 = fmt(&formatted);
+    assert_eq!(
+        formatted, pass2,
+        "formatter not idempotent on import foreign with inner comment.\npass1:\n{formatted}\npass2:\n{pass2}"
+    );
+}
+
+#[test]
+fn test_fmt_val_run_eq_alignment_preserved() {
+    // When consecutive `val` statements have their `=` signs column-aligned by the author
+    // (more than one space before `=`), the formatter must preserve that alignment across
+    // a format pass — the extra padding must not be stripped.
+    let src = "val N_MAPS  = 500\nval N_ITERS = 2000\n";
+    let formatted = fmt(src);
+    assert_eq!(
+        src, formatted,
+        "val run `=` alignment was stripped by the formatter.\nexpected:\n{src}\ngot:\n{formatted}"
+    );
+    // Must be idempotent.
+    let pass2 = fmt(&formatted);
+    assert_eq!(
+        formatted, pass2,
+        "formatter not idempotent on aligned val run.\npass1:\n{formatted}\npass2:\n{pass2}"
+    );
+}
+
 /// True if the source has no relative/sibling import (only `std/...` or `foreign`), so it
 /// can be type-checked as a standalone temp file in the workspace root.
 fn is_self_contained(source: &str) -> bool {
@@ -24767,4 +24829,58 @@ print(toString(d()))
     // 100k * 51 = 5100000.
     // Counters c,d independent: c→1, c→2, d→1.
     assert_eq!(output, vec!["51", "-1", "5100000", "1", "2", "1"]);
+}
+
+#[test]
+fn test_sumnode_kind5_namespace_violation_regression() {
+    // Regression: a SumNode whose variant carries a non-recursive sum-type field (e.g. Cursor
+    // holding an `Ast` field where `Ast = Num | BinOp`) caused the SumDesc to record
+    // KIND_SUMNODE_FIELD (5) for that slot. `sumnode::release_field` only handles kinds 1–4;
+    // on the next `lin_sumnode_release` of the outer sum it hit the debug_assert("unknown kind
+    // 5 — possible namespace violation") and aborted. Fix: translate KIND_SUMNODE_FIELD →
+    // KIND_SUMNODE (4) in `sumnode_descriptor` so the drop walk calls `lin_sumnode_release_self`.
+    let out = run(r#"import { print } from "std/io"
+type Num = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "binop", "op": String, "left": Ast, "right": Ast }
+type Ast = Num | BinOp
+type Failure = { "type": "failure", "error": String }
+type Cursor = { "type": "cursor", "node": Ast, "pos": Int32 }
+type Step = Cursor | Failure
+val run = (): String =>
+  val ast: Ast = { "kind": "num", "value": 42 }
+  val step: Step = { "type": "cursor", "node": ast, "pos": 1 }
+  match step
+    is Failure => "failed"
+    else => "ok"
+print(run())
+"#);
+    assert_eq!(out, vec!["ok"]);
+}
+
+#[test]
+fn test_sumnode_heap_field_materializer_double_free_regression() {
+    // Regression: when a SumNode with a String heap field (Kind=KIND_STRING in SumDesc) was
+    // materialized via `lin_summat_*` to read a field, the materializer used `lin_tagged_release`
+    // after `lin_map_set`, which undid the map's retain on the inner String. The map then released
+    // the String (RC→0, freed). The subsequent `lin_sumnode_release` SumDesc walk attempted a
+    // second `lin_string_release` → refcount underflow (double free). Fix: use `lin_tagged_free_box`
+    // (shell-only) in the materializer for fields where `box_value` doesn't yield a fresh owned
+    // value (String/Array/Map fields), so the map and SumDesc each hold one RC reference.
+    let out = run(r#"import { print } from "std/io"
+type Config = { "host": String, "port": Int32 }
+type Success = { "type": "success", "value": Config }
+type Failure = { "type": "failure", "error": String }
+type LoadResult = Success | Failure
+val load = (input: String): LoadResult =>
+  if input == "ok" then
+    { "type": "success", "value": { "host": "localhost", "port": 8080 } }
+  else
+    { "type": "failure", "error": "bad input: ${input}" }
+val r1 = load("ok")
+val r2 = load("nope")
+print(r1["type"])
+print(r2["type"])
+print(r2["error"])
+"#);
+    assert_eq!(out, vec!["success", "failure", "bad input: nope"]);
 }
