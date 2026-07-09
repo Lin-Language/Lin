@@ -126,6 +126,7 @@ jobs:
         run: |
           npx @vscode/vsce publish \
             --no-dependencies \
+            --skip-duplicate \
             --packagePath ../../lin-lang-${{ matrix.vsix_platform }}.vsix
 
       - uses: actions/upload-artifact@v4
