@@ -49,9 +49,17 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-// One heap descriptor is built per distinct sealed type. Named-desc pointers are stable (static
-// codegen globals), so the pointer value is a sound key.
-static HEAP_DESC_MEMO: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+// One heap descriptor is built per distinct sealed type, memoised keyed on the named-desc pointer.
+//
+// The named-desc pointer alone is NOT a sound key: it is only stable+unique for compiler-emitted
+// static globals. Any caller passing an ephemeral buffer (unit tests build descriptors on the heap;
+// a future dynamic-descriptor feature would too) can present a REUSED address for a DIFFERENT record
+// shape after the original buffer is freed. Returning the prior shape's heap descriptor then makes a
+// scalar field look like a heap field, so a scalar `(x,y)` pair gets dereferenced as a `LinString*`
+// (a tagged immediate → "misaligned pointer" / UAF under ASan). The heap descriptor is a pure
+// function of the named-desc CONTENT, so we store the content bytes alongside each entry and verify
+// them on lookup; a content mismatch rebuilds instead of returning the stale descriptor.
+static HEAP_DESC_MEMO: Mutex<Option<HashMap<usize, (Vec<u8>, usize)>>> = Mutex::new(None);
 
 /// Header size in bytes: `u32 refcount` + `u32 size` + `u64 heap_desc_ptr` + `u64 named_desc_ptr`.
 /// Field payload begins at offset 24. Kept in lockstep with `Codegen::SEALED_HEADER`.
@@ -617,19 +625,11 @@ pub unsafe fn build_heap_desc_from_named_desc(named_desc: *const u8) -> *const u
         return std::ptr::null();
     }
     let key = named_desc as usize;
-    // Fast path: check the memo under lock before doing any work.
-    {
-        let guard = HEAP_DESC_MEMO.lock().unwrap();
-        if let Some(ref map) = *guard {
-            if let Some(&cached) = map.get(&key) {
-                return cached as *const u8;
-            }
-        }
-    }
     let field_count = u32::from_le_bytes([
         *named_desc, *named_desc.add(1), *named_desc.add(2), *named_desc.add(3),
     ]) as usize;
-    // Collect heap fields: (offset, kind) pairs.
+    // Collect heap fields: (offset, kind) pairs, tracking the blob's total byte length so we can
+    // snapshot the named-desc CONTENT for the memo key-verification (see HEAP_DESC_MEMO comment).
     let mut heap_fields: Vec<(u32, u32)> = Vec::new();
     let mut cur = 8usize; // skip the 8-byte header [u32 field_count | u32 pad]
     for _ in 0..field_count {
@@ -644,6 +644,23 @@ pub unsafe fn build_heap_desc_from_named_desc(named_desc: *const u8) -> *const u
             _ => continue,
         };
         heap_fields.push((offset, kind));
+    }
+    // `cur` now points one past the last field row = the full named-desc byte length. Borrow the
+    // content as a slice — no allocation on the hot cache-hit path; we only snapshot to an owned
+    // Vec when actually inserting a new memo entry below.
+    let live_bytes = std::slice::from_raw_parts(named_desc, cur);
+    // Fast path: return the cached descriptor only if the content at this address still matches the
+    // shape we cached it for. A raw-address match with a content mismatch means the address was
+    // reused for a different record shape (freed test buffer / dynamic descriptor) — rebuild.
+    {
+        let guard = HEAP_DESC_MEMO.lock().unwrap();
+        if let Some(ref map) = *guard {
+            if let Some((cached_bytes, cached_ptr)) = map.get(&key) {
+                if cached_bytes.as_slice() == live_bytes {
+                    return *cached_ptr as *const u8;
+                }
+            }
+        }
     }
     let result_ptr: *const u8 = if heap_fields.is_empty() {
         std::ptr::null()
@@ -664,17 +681,25 @@ pub unsafe fn build_heap_desc_from_named_desc(named_desc: *const u8) -> *const u
     // Store in the memo (initialising the map on first use).
     let mut guard = HEAP_DESC_MEMO.lock().unwrap();
     let map = guard.get_or_insert_with(HashMap::new);
-    // Another thread may have raced and inserted while we built; prefer the winner's allocation
-    // to avoid a double-free: if already present, free the blob we just built and return theirs.
-    if let Some(&existing) = map.get(&key) {
-        if !result_ptr.is_null() {
-            let byte_len = 4 + heap_fields.len() * 8;
-            let layout = std::alloc::Layout::from_size_align_unchecked(byte_len, 4);
-            std::alloc::dealloc(result_ptr as *mut u8, layout);
+    // Another thread may have raced and inserted while we built. If the existing entry is for the
+    // SAME shape (content matches), prefer the winner's allocation to avoid a double-free: free the
+    // blob we just built and return theirs. If it's a STALE entry (address reused for a different
+    // shape), free the stale blob and replace it with ours.
+    if let Some((existing_bytes, existing_ptr)) = map.get(&key) {
+        if existing_bytes.as_slice() == live_bytes {
+            if !result_ptr.is_null() {
+                let byte_len = 4 + heap_fields.len() * 8;
+                let layout = std::alloc::Layout::from_size_align_unchecked(byte_len, 4);
+                std::alloc::dealloc(result_ptr as *mut u8, layout);
+            }
+            return *existing_ptr as *const u8;
         }
-        return existing as *const u8;
+        // Stale entry: the address was reused for a different record shape. We do NOT free the old
+        // blob — heap descriptors are process-lifetime by contract (see the module doc), and a live
+        // array built from the previous shape may still reference it via `elem_desc`. Overwrite the
+        // memo so future lookups get the correct descriptor for the current shape.
     }
-    map.insert(key, result_ptr as usize);
+    map.insert(key, (live_bytes.to_vec(), result_ptr as usize));
     result_ptr
 }
 
@@ -1273,6 +1298,62 @@ mod named_desc_tests {
             assert_eq!((*s).refcount, 1);
             // Array drop walks the heap desc: string rc -> 0, freed exactly once.
             crate::array::lin_array_release(arr);
+        }
+    }
+
+    /// REGRESSION (heap-desc memo staleness): `build_heap_desc_from_named_desc` memoises the derived
+    /// heap descriptor keyed on the raw named-desc POINTER. That is only sound while distinct record
+    /// shapes have distinct addresses — true for compiler-emitted static globals, but NOT for any
+    /// caller that reuses a buffer address for a different shape (unit tests build descriptors on the
+    /// heap; the allocator recycles freed addresses across tests). Before the content-verification
+    /// fix, the second shape below reused the first's freed key and got back the FIRST descriptor:
+    /// a scalar-only record would be handed a heap descriptor with a KIND_STRING entry, and a scalar
+    /// field (a tagged immediate like 0x160000000b) would be dereferenced as a `LinString*` →
+    /// "misaligned pointer" / UAF under ASan.
+    ///
+    /// This test forces the exact collision deterministically: build shape A (a heap-field record) at
+    /// a known heap address, drop it, then build a DIFFERENT shape B (scalar-only) — retrying until
+    /// the allocator hands back the same address so the memo key collides. The fix must return B's
+    /// (empty) descriptor, not A's stale one.
+    #[test]
+    fn heap_desc_memo_rejects_stale_reused_address() {
+        // Shape A: { name: String, n: Int32 } → heap desc has ONE KIND_STRING entry.
+        // Shape B: { x: Int32, y: Int32 }     → scalar-only, heap desc is NULL.
+        // Both blobs are the SAME byte length so the allocator is most likely to reuse the slot.
+        let build_a = || build_named_desc(&[
+            ("name", 24, NKIND_STRING, std::ptr::null()),
+            ("nn", 32, NKIND_INT32, std::ptr::null()),
+        ]);
+        let build_b = || build_named_desc(&[
+            ("xx", 24, NKIND_INT32, std::ptr::null()),
+            ("yy", 28, NKIND_INT32, std::ptr::null()),
+        ]);
+        assert_eq!(build_a().len(), build_b().len(), "blobs must match length for address reuse");
+
+        // Try repeatedly to land shape B on shape A's freed address so the memo key (the pointer)
+        // collides. A handful of iterations reliably reuses the slot with any real allocator; if it
+        // somehow never collides the assertions still hold (they just don't exercise the stale path).
+        for _ in 0..256 {
+            let a = build_a();
+            let a_addr = a.as_ptr() as usize;
+            let heap_a = unsafe { build_heap_desc_from_named_desc(a.as_ptr()) };
+            // Shape A has a heap field → non-NULL descriptor with exactly one entry.
+            assert!(!heap_a.is_null(), "shape A must have a heap descriptor");
+            unsafe { assert_eq!(*(heap_a as *const u32), 1, "shape A: one KIND_STRING field"); }
+            drop(a); // free the buffer so its address can be reused
+
+            let b = build_b();
+            let heap_b = unsafe { build_heap_desc_from_named_desc(b.as_ptr()) };
+            // Shape B is scalar-only → its heap descriptor MUST be NULL, regardless of whether it
+            // reused shape A's address. Before the fix, a reused address returned shape A's descriptor
+            // (non-NULL, KIND_STRING) here → the crash class this test guards.
+            assert!(heap_b.is_null(),
+                "scalar-only shape B must have a NULL heap descriptor even when its named-desc buffer \
+                 reuses a freed address; got a stale descriptor from the pointer-keyed memo");
+            if b.as_ptr() as usize == a_addr {
+                // Collision exercised: the memo key matched but content verification rebuilt correctly.
+                break;
+            }
         }
     }
 }
