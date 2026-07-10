@@ -62,7 +62,10 @@ jobs:
         run: |
           next="${{ steps.ver.outputs.next }}"
           sed -i -E "s/^version = \"[0-9][^\"]*\"/version = \"$next\"/" Cargo.toml
-          cargo update --workspace --offline
+          # No --offline: a fresh runner has no registry index cached, and --offline then
+          # fails to resolve external deps. --workspace still only rewrites the workspace
+          # members' own versions in Cargo.lock; external deps stay pinned.
+          cargo update --workspace
           git cliff --tag "v$next" -o CHANGELOG.md
 
       - name: Create/update release PR
