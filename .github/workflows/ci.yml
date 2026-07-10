@@ -274,5 +274,14 @@ jobs:
           # --lib: run the unit-test suite (which holds the multi-threaded race tests). Doctests
           # are skipped — under -Zbuild-std rustdoc can't reconcile the sanitizer ABI across a
           # transitive dependency, an artifact unrelated to the race-class guard.
-          cargo +nightly test -p lin-runtime -Zbuild-std --lib \
+          #
+          # --no-default-features disables the mimalloc global allocator for this leg. mimalloc is C
+          # code that TSan does NOT instrument, so it cannot observe the happens-before that
+          # mimalloc's internal locks establish across free→realloc. The result is a flood of FALSE
+          # "data race" reports on any heap address that one finished test freed and a later test
+          # reallocated (e.g. two sequential #[test]s that happen to reuse the same slot). Falling
+          # back to the system allocator — which TSan fully intercepts — lets TSan track that
+          # synchronization and report only genuine races. The RC/atomic code under test is
+          # allocator-agnostic, so this changes nothing about what the leg actually guards.
+          cargo +nightly test -p lin-runtime --no-default-features -Zbuild-std --lib \
             --target x86_64-unknown-linux-gnu
