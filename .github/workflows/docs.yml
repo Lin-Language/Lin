@@ -44,7 +44,7 @@ jobs:
       - name: Build Lin compiler
         run: cargo build --workspace
 
-      # Mirror the release-plz-generated changelog onto the docs site. The
+      # Mirror the git-cliff-generated changelog onto the docs site. The
       # `|| true` guards the pre-first-release case where CHANGELOG.md is absent
       # (the committed placeholder page stays in place until then).
       - name: Mirror changelog to docs site

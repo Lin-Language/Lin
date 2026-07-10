@@ -37,10 +37,10 @@ A source formatter exists: `cargo run -p lin -- fmt <paths>` rewrites `.lin` fil
 
 ## Releasing
 
-Releases are automated with [release-plz](https://release-plz.dev/) and driven by Conventional Commits.
+Releases are automated with [git-cliff](https://git-cliff.org/) (in `.github/workflows/release-stable.yml`, config in `cliff.toml`) and driven by Conventional Commits. (This replaced release-plz, whose change-detection requires every crate to be independently `cargo package`-able — which this binary-shipping workspace, with crates that `include_str!` the workspace-root stdlib, is not.)
 
 - **Single source of truth for the version**: `[workspace.package].version` in the root `Cargo.toml`. Every crate inherits it via `version.workspace = true`; never bump a crate version by hand.
-- **Cutting a release**: every push to `master` updates an open "chore: release" PR (version bump + generated `CHANGELOG.md`). **Merging that PR cuts the release** — release-plz then creates the `vX.Y.Z` tag + GitHub release and attaches the platform binaries/VSIX. Commit prefixes matter: `feat` → minor, `fix`/`perf` → patch, `!`/`BREAKING CHANGE` → major; `chore`/`ci`/`test`/`style` are skipped.
+- **Cutting a release**: every push to `master` updates an open "chore: release" PR (git-cliff bumps the version in `Cargo.toml`/`Cargo.lock` and regenerates `CHANGELOG.md`). **Merging that PR cuts the release** — the `release` job sees the bumped version has no matching tag, so it creates the `vX.Y.Z` tag + GitHub release and attaches the platform binaries/VSIX. Commit prefixes matter: `feat` → minor, `fix`/`perf` → patch, `!`/`BREAKING CHANGE` → major; `chore`/`ci`/`test`/`style` are skipped.
 - **Bleeding edge**: `release.yml` still publishes a rolling `latest` *prerelease* on every push to `master`.
 - **Install**: `install.sh` installs the newest *stable* release by default (skips the rolling prerelease); `LIN_VERSION=vX.Y.Z` pins one.
 

@@ -5,8 +5,8 @@ name: Build binaries
 # them as workflow artifacts so the caller can download/attach them.
 #
 # Callers:
-#   - release.yml        passes a commit-count-derived stamp (rolling `latest`)
-#   - release-plz.yml     passes the released semver version (stable tag)
+#   - release.yml         passes a commit-count-derived stamp (rolling `latest`)
+#   - release-stable.yml  passes the released semver version (stable tag)
 on:
   workflow_call:
     inputs:

@@ -1,0 +1,155 @@
+name: Release
+
+# Stable-release automation, driven by Conventional Commits via git-cliff.
+#
+# Flow (mirrors the old release-plz UX, without release-plz's requirement that every
+# crate be independently cargo-packageable — which this binary-shipping workspace is not):
+#   1. release-pr: on every push to master, compute the next semver from the commits since
+#      the last vX.Y.Z tag, and keep a "chore: release vX.Y.Z" PR updated with the version
+#      bump (Cargo.toml + Cargo.lock) and regenerated CHANGELOG.md.
+#   2. release: when that PR is merged, master's version has no matching tag yet, so this job
+#      creates the vX.Y.Z tag + GitHub release (git-cliff release notes) and triggers the
+#      binary build. Ordinary pushes are a no-op (the version already has a tag).
+#
+# The rolling `latest` prerelease is still handled separately by release.yml.
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-stable-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    name: Release PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff@2.13.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compute next version
+        id: ver
+        run: |
+          current=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          next=$(git cliff --bumped-version 2>/dev/null | sed 's/^v//')
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          if [ -z "$next" ] || [ "$current" = "$next" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No releasable commits since the last tag (current=$current, next=$next)."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Next release: $current -> $next"
+          fi
+
+      - name: Apply version bump + changelog
+        if: steps.ver.outputs.changed == 'true'
+        run: |
+          next="${{ steps.ver.outputs.next }}"
+          sed -i -E "s/^version = \"[0-9][^\"]*\"/version = \"$next\"/" Cargo.toml
+          cargo update --workspace --offline
+          git cliff --tag "v$next" -o CHANGELOG.md
+
+      - name: Create/update release PR
+        if: steps.ver.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: release/next
+          delete-branch: true
+          base: master
+          title: "chore: release v${{ steps.ver.outputs.next }}"
+          commit-message: "chore: release v${{ steps.ver.outputs.next }}"
+          labels: release
+          body: |
+            Automated release PR. **Merging this cuts `v${{ steps.ver.outputs.next }}`** — the
+            `release` job tags the merge commit, publishes the GitHub release, and attaches the
+            platform binaries/VSIX.
+
+            This PR bumps the workspace version and regenerates `CHANGELOG.md`. It is kept up to
+            date on every push to `master`; close it to skip the release.
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.tag.outputs.released }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff@2.13.1
+
+      - name: Tag + release when a version bump has landed
+        id: tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse "v$version" >/dev/null 2>&1; then
+            echo "Tag v$version already exists — ordinary push, nothing to release."
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Version $version has no tag — the release PR just merged. Cutting the release."
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$version" -m "Release v$version"
+          git push origin "v$version"
+          git cliff --unreleased --tag "v$version" --strip all > release-notes.md
+          gh release create "v$version" \
+            --title "v$version" \
+            --notes-file release-notes.md \
+            --latest
+          echo "released=true" >> "$GITHUB_OUTPUT"
+
+  # Build the platform binaries/VSIX stamped with the released version and attach them.
+  attach-artifacts:
+    name: Attach release artifacts
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      version_stamp: ${{ needs.release.outputs.version }}
+      release_kind: stable
+    secrets: inherit
+
+  upload-artifacts:
+    name: Upload artifacts to release
+    needs: [release, attach-artifacts]
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist/
+      - name: Upload to GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release upload "v${VERSION}" dist/* --repo "$REPO" --clobber
