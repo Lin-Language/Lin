@@ -170,11 +170,21 @@ unsafe fn get_or_build_descriptors(
         Box::leak(heap_blob.into_boxed_slice()).as_ptr()
     };
 
-    // Insert into cache.
-    {
+    // Insert into cache — and adopt whatever is already there.
+    //
+    // The miss check above released the lock before building, so two threads can both miss
+    // for the same shape and both leak a blob pair. `or_insert` keeps the FIRST, so every
+    // racer must return the entry's value rather than the pair it just built — otherwise the
+    // loser hands out a private descriptor and two structs of identical shape end up with
+    // different `named_desc` pointers, which is exactly the invariant interning exists to
+    // provide. The loser's blobs stay leaked; they are immortal by design and merely wasted.
+    let (heap_ptr, named_ptr) = {
         let mut cache = desc_cache().lock().unwrap();
-        cache.entry(key).or_insert((heap_ptr as usize, named_ptr as usize));
-    }
+        let &mut (hp, np) = cache
+            .entry(key)
+            .or_insert((heap_ptr as usize, named_ptr as usize));
+        (hp as *const u8, np as *const u8)
+    };
 
     (heap_ptr, named_ptr)
 }
