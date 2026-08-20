@@ -2006,17 +2006,26 @@ Explicit narrowing — assigning a wider numeric to a narrower one, or any float
 The explicit-narrowing mechanism is a family of `std/number` cast functions, each truncating to the named width with two's-complement (`as`-cast) semantics:
 
 ```txt
-toInt32:  (Float64) => Int32      // truncate a float to a 32-bit int
-toFloat64:(Int32)   => Float64    // widen
-toUInt8 / toInt8:    (UInt64) => UInt8 / Int8       // integer narrowing
-toUInt16 / toInt16:  (UInt64) => UInt16 / Int16
-toUInt32 / toInt64:  (UInt64) => UInt32 / Int64
-toUInt64:            (UInt64) => UInt64
+toFloat64: (Int32)   => Float64   // widen
+toFloat32: (Float64) => Float32   // narrow a double to single precision
+
+// Integer narrowing — every width has TWO overloads, selected by argument type:
+toUInt8:   (UInt64) => UInt8      toUInt8:  (Int64) => UInt8
+toInt8:    (UInt64) => Int8       toInt8:   (Int64) => Int8
+toUInt16:  (UInt64) => UInt16     toUInt16: (Int64) => UInt16
+toInt16:   (UInt64) => Int16      toInt16:  (Int64) => Int16
+toUInt32:  (UInt64) => UInt32     toUInt32: (Int64) => UInt32
+toUInt64:  (UInt64) => UInt64     toUInt64: (Int64) => UInt64
+toInt64:   (UInt64) => Int64      // reinterpret the bits as signed
+toInt32:   (Float64) => Int32     toInt32:  (Int64) => Int32
 ```
 
-The integer-narrowing casts take their input as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value first masked down to a byte/word — widens into the parameter without range loss before truncation; a bare integer literal in range is accepted directly. These are the byte-extraction primitives used by `std/bytes` (§27.3) and are generally useful wherever explicit width control is needed.
+Each integer-narrowing name is an **overload pair** distinguished by the argument type, because the two source families cannot share one parameter type:
 
-A parallel `narrowTo*` family takes a **signed `Int64`** input instead, covering the case the `UInt64`-input family cannot — a value *computed* in `Int64` (or any signed integer). Because `Int64 → UInt64` is not an implicit coercion (it could wrap a negative), a computed `Int64` can never reach the `toUInt8`/… casts; `narrowToUInt8`/`narrowToInt8`/`narrowToUInt16`/`narrowToInt16`/`narrowToUInt32`/`narrowToInt32`/`narrowToUInt64` accept it directly and truncate to the named width with the same two's-complement semantics. `narrowToInt32: (Int64) => Int32` also fills the integer-to-`Int32` gap (the `toInt32` above takes a `Float64`). Use these to store a wide computed result into a narrow field — e.g. a `month: UInt8` derived from `Int64` calendar arithmetic.
+- The **`UInt64` overload** takes an already-unsigned value: any narrower *unsigned* integer, or a value first masked down to a byte/word, widens into it without range loss before truncation, and a bare integer literal in range is accepted directly.
+- The **`Int64` overload** takes a signed or *computed* integer. `Int64 -> UInt64` is deliberately not an implicit coercion (it could wrap a negative), so a value computed in `Int64` — or held in any narrower *signed* integer — can never reach the `UInt64` overload and resolves here instead. Use it to store a wide computed result into a narrow field, e.g. a `month: UInt8` derived from `Int64` calendar arithmetic.
+
+Both overloads produce identical low bits with the same two's-complement (`as`-cast) truncation; the argument type only records whether the source was unsigned or signed. Truncation never fails — an out-of-range value silently keeps its low bits. `toInt32` follows the same shape with a `Float64` overload in place of the unsigned one: `(Float64) => Int32` truncates a float toward zero, `(Int64) => Int32` truncates a wide signed integer to its low 32 bits. These casts are the byte-extraction primitives used by `std/bytes` (§27.3) and are generally useful wherever explicit width control is needed.
 
 > **Caution.** Reading a narrow integer field *back* into wide arithmetic does **not** auto-widen the expression: a suffixless literal next to a narrow operand adopts that operand's width (per the literal-inference rule below), so `153 * month` with `month: UInt8` computes at `UInt8` width and silently overflows. Either widen the field read first (`val m: Int64 = d["month"]`) or keep hot-path numeric fields at `Int64` and narrow only at the storage boundary.
 
@@ -2893,7 +2902,7 @@ f64ToBe / f64ToLe:     (Float64) => UInt8[]
 f64FromBe / f64FromLe: (UInt8[], Int32) => Float64
 ```
 
-The narrowing casts that back the byte-extraction live in `std/number` (§21): `toUInt8`, `toInt8`, `toUInt16`, `toInt16`, `toUInt32`, `toInt64`, `toUInt64`, each `(UInt64) => <target>`, truncating with two's-complement (`as`-cast) semantics.
+The narrowing casts that back the byte-extraction live in `std/number` (§21): `toUInt8`, `toInt8`, `toUInt16`, `toInt16`, `toUInt32`, `toUInt64` — each an overload pair, `(UInt64) => <target>` for an unsigned source and `(Int64) => <target>` for a signed or computed one — plus `toInt64: (UInt64) => Int64`, all truncating with two's-complement (`as`-cast) semantics.
 
 Slicing is a function, `slice(buf, start, end)`; there is no range-index syntax (`buf[a..b]`). `slice` preserves element type — slicing a `UInt8[]` yields a `UInt8[]`.
 

@@ -61,6 +61,14 @@ impl UtcDate {
 
     /// Day of week, Sunday = 0 .. Saturday = 6 (matches JS `getDay` for UTC dates).
     /// Computed via Sakamoto's algorithm.
+    ///
+    /// This deliberately duplicates `weekday_from_days` in `crates/lin-runtime/src/time.rs`.
+    /// This crate is a standalone port of the TypeScript reference (see
+    /// `../../PORTING_CONTRACT.md`), detached from the compiler's cargo workspace and
+    /// depending only on `indexmap`, so that the cross-language benchmark measures the
+    /// same hand-written program in every language. Sharing the compiler runtime's
+    /// calendar code would couple the benchmark to the thing being benchmarked and
+    /// change what is measured — do not consolidate.
     pub fn day_of_week(&self) -> DayOfWeek {
         let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
         let mut y = self.year;

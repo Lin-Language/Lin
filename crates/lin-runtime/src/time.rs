@@ -137,6 +137,17 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     if month == 2 && is_leap(year) { 29 } else { MONTH_DAYS[(month - 1) as usize] }
 }
 
+/// Days elapsed before the 1st of each month in a non-leap year, indexed by `month - 1`.
+const DAYS_BEFORE_MONTH: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
+/// Ordinal day of the year, 1..=366 (Jan 1 = 1). A table lookup plus the leap-day
+/// adjustment — equivalent to `days_from_civil(y, m, d) - days_from_civil(y, 1, 1) + 1`
+/// but without the second civil conversion. `month` is assumed in 1..=12.
+fn day_of_year(year: i64, month: i64, day: i64) -> i64 {
+    let leap_day = if month > 2 && is_leap(year) { 1 } else { 0 };
+    DAYS_BEFORE_MONTH[(month - 1) as usize] + day + leap_day
+}
+
 const WEEKDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const WEEKDAY_FULL: [&str; 7] = [
     "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
@@ -176,7 +187,7 @@ fn strftime(c: &CivilDateTime, pattern: &str) -> String {
             Some('S') => out.push_str(&format!("{:02}", c.sec)),
             Some('y') => out.push_str(&format!("{:02}", rem_floor(c.year, 100))),
             Some('j') => {
-                let doy = days - days_from_civil(c.year, 1, 1) + 1;
+                let doy = day_of_year(c.year, c.month, c.day);
                 out.push_str(&format!("{:03}", doy));
             }
             Some('I') => {
@@ -457,7 +468,7 @@ pub unsafe extern "C" fn lin_time_components(ms: i64) -> *mut u8 {
     let minute = rem / 60;
     let second = rem % 60;
     let weekday = weekday_from_days(days);
-    let year_day = days - days_from_civil(year, 1, 1) + 1;
+    let year_day = day_of_year(year, month, day);
 
     let map = lin_map_alloc(9, 0);
     map_set_int32(map, "year", year as i32);
@@ -629,6 +640,45 @@ mod tests {
         assert_eq!(weekday_from_days(0), 4);
         // 2024-01-15 was a Monday=1
         assert_eq!(weekday_from_days(div_floor(1_705_314_600_000, 86_400_000)), 1);
+    }
+
+    #[test]
+    fn day_of_year_matches_epoch_day_difference() {
+        // The table-driven helper must agree with the `days - days_from_civil(y, 1, 1) + 1`
+        // formula it replaced, for every calendar day of each year below: leap years, the
+        // century non-leap / %400 leap pair, ordinary years, and pre-epoch years (negative
+        // epoch days).
+        let years: &[i64] = &[1600, 1899, 1900, 1901, 1969, 1970, 1999, 2000, 2020, 2021, 2024, 2100];
+        for &y in years {
+            let jan1 = days_from_civil(y, 1, 1);
+            let mut expected_ordinal = 0i64;
+            for m in 1..=12 {
+                for d in 1..=days_in_month(y, m) {
+                    expected_ordinal += 1;
+                    let reference = days_from_civil(y, m, d) - jan1 + 1;
+                    assert_eq!(
+                        day_of_year(y, m, d),
+                        reference,
+                        "day_of_year mismatch for {y}-{m:02}-{d:02}"
+                    );
+                    // ...and it really is the running ordinal within the year.
+                    assert_eq!(day_of_year(y, m, d), expected_ordinal);
+                }
+            }
+            assert_eq!(expected_ordinal, if is_leap(y) { 366 } else { 365 });
+        }
+    }
+
+    #[test]
+    fn components_year_day_agrees_with_strftime_j() {
+        // `%j` and the `yearDay` field of `components` share the helper; spot-check both
+        // against known values, including a leap-day and a pre-epoch instant.
+        let c = CivilDateTime::from_unix_secs(1_709_164_800); // 2024-02-29
+        assert_eq!(strftime(&c, "%j"), "060");
+        let c = CivilDateTime::from_unix_secs(-86_400); // 1969-12-31
+        assert_eq!(strftime(&c, "%j"), "365");
+        let c = CivilDateTime::from_unix_secs(1_704_067_200); // 2024-01-01
+        assert_eq!(strftime(&c, "%j"), "001");
     }
 
     #[test]

@@ -8,6 +8,7 @@ import { Weekday, Sun, Mon, Tue, Wed, Thu, Fri, Sat } from "std/datetime"
 import { millis, seconds, minutes, hours, days, plus, minus, scale } from "std/datetime"
 import { toMillis, toSeconds, toMinutes, toHours, toDays, between, plusDuration, minusDuration } from "std/datetime"
 import { compareDate, compare, isBefore, isAfter } from "std/datetime"
+import { range, reduce } from "std/iter"
 import { toIsoDate, toIsoTime, toIso, parseIsoDate, parseIsoTime, parseIso } from "std/datetime"
 import { OffsetDateTime, withOffset, offsetOf, toInstant, atOffset, toOffset, toUtc } from "std/datetime"
 import { toIsoOffset, toIsoOffsetDateTime, parseIsoOffset, parseIsoOffsetDateTime } from "std/datetime"
@@ -66,6 +67,29 @@ val unwrapOdt = (r: OffsetDateTime | Error): OffsetDateTime =>
 
 // A known instant: 2024-01-15T10:30:00.000Z = 1705314600000 ms.
 val KNOWN: Int64 = 1705314600000
+
+// The pre-table `dayOfYear`: the difference between the date's epoch day and Jan 1's, which the
+// month-offset table replaced. Kept here as the oracle for the corpus sweep below.
+val refDayOfYear = (d: Date): Int64 =>
+  toEpochDay(d) - toEpochDay({
+    "year": d["year"],
+    "month": 1,
+    "day": 1
+  }) + 1
+
+// How many days of `year` the exported `dayOfYear` gets wrong relative to `refDayOfYear` — sweeps
+// every calendar day of the year, so it covers all twelve month boundaries and the leap day.
+val dayOfYearMismatches = (year: Int64): Int64 =>
+  range(1, 13).reduce(0, (acc, m) =>
+    range(1, daysInMonth(year, m) + 1).reduce(acc, (a, day) =>
+      val d: Date = {
+        "year": year,
+        "month": m,
+        "day": day
+      }
+      if dayOfYear(d) == refDayOfYear(d) then a else a + 1
+    )
+  )
 
 val s = suite("std/datetime", [
   // ── isLeapYear / daysInMonth ──────────────────────────────────────────────
@@ -303,6 +327,30 @@ val s = suite("std/datetime", [
     expect(dayOfYear({ "year": 2024, "month": 12, "day": 31 })).toBe(366),
     expect(dayOfYear({ "year": 2023, "month": 12, "day": 31 })).toBe(365),
     expect(dayOfYear({ "year": 2024, "month": 3, "day": 1 })).toBe(61) // after Feb 29
+  ]),
+
+  test("dayOfYear agrees with the epoch-day difference it replaced", () => [
+    // Every calendar day of a leap year, a century non-leap, a 400-year leap, ordinary years and
+    // two pre-epoch years (negative epoch days) — 0 mismatches against `toEpochDay(d) - toEpochDay(Jan 1) + 1`.
+    expect(dayOfYearMismatches(2020)).toBe(0),
+    expect(dayOfYearMismatches(2000)).toBe(0),
+    expect(dayOfYearMismatches(2021)).toBe(0),
+    expect(dayOfYearMismatches(1900)).toBe(0),
+    expect(dayOfYearMismatches(1969)).toBe(0),
+    expect(dayOfYearMismatches(2024)).toBe(0),
+    expect(dayOfYearMismatches(1600)).toBe(0)
+  ]),
+
+  test("dayOfYear hits the month boundaries in leap and non-leap years", () => [
+    // day before / day of / day after each month start, leap year vs common year
+    expect(dayOfYear({ "year": 2020, "month": 2, "day": 28 })).toBe(59),
+    expect(dayOfYear({ "year": 2020, "month": 2, "day": 29 })).toBe(60),
+    expect(dayOfYear({ "year": 2020, "month": 3, "day": 1 })).toBe(61),
+    expect(dayOfYear({ "year": 1900, "month": 2, "day": 28 })).toBe(59),
+    expect(dayOfYear({ "year": 1900, "month": 3, "day": 1 })).toBe(60),
+    expect(dayOfYear({ "year": 1900, "month": 12, "day": 31 })).toBe(365),
+    expect(dayOfYear({ "year": 1969, "month": 7, "day": 20 })).toBe(201),
+    expect(dayOfYear({ "year": 2000, "month": 12, "day": 31 })).toBe(366)
   ]),
 
   // ── addDays / addMonths / addYears ────────────────────────────────────────
