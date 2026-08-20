@@ -608,6 +608,65 @@ pub(crate) fn emit_discriminator(
 // Match lowering
 // -------------------------------------------------------------------------
 
+/// True when a value of this type is held in a raw LLVM scalar register (int / float / i1) —
+/// never a boxed `TaggedVal*`. Two such temps compare with a native `icmp`/`fcmp`; codegen's
+/// `compile_binary_op_values` reconciles differing widths.
+fn is_native_eq_scalar(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Bool
+            | Type::Int8
+            | Type::Int16
+            | Type::Int32
+            | Type::Int64
+            | Type::UInt8
+            | Type::UInt16
+            | Type::UInt32
+            | Type::UInt64
+            | Type::Float32
+            | Type::Float64
+            | Type::IntLit(_)
+    )
+}
+
+/// True when `scrut_ty` and `lit_ty` are both raw scalars that a native `Eq` compares
+/// correctly. `Bool` is kept apart from the numeric family: an i1 vs iN compare would need a
+/// width extension whose meaning (`true == 1`) the checker never sanctions anyway.
+fn native_eq_pair(scrut_ty: &Type, lit_ty: &Type) -> bool {
+    is_native_eq_scalar(scrut_ty)
+        && is_native_eq_scalar(lit_ty)
+        && matches!(scrut_ty, Type::Bool) == matches!(lit_ty, Type::Bool)
+}
+
+/// Whether the scrutinee must be boxed to a `TaggedVal*` before the arm tests run.
+///
+/// Tag-dispatching patterns (`is T`, `is <Name>`, object/array shapes, `has { .. }`) read a
+/// runtime tag byte off the box, so they need one. But a SCALAR scrutinee (`Int*`/`UInt*`/
+/// `Float*`/`Bool`) tested only by scalar LITERAL arms (`is 0`, `is 1`, `else`) does not:
+/// literal patterns match by VALUE, and two raw scalars compare with a native `icmp`.
+///
+/// Boxing them is what made the integer-literal-union enum idiom (`type W = 0 | 1 | 2`,
+/// `stdlib/datetime.lin`'s `Weekday`) expensive: one heap `lin_box_*` for the scrutinee, one
+/// more per literal arm, and an opaque `lin_tagged_eq` runtime call per arm — none of which
+/// LLVM can see through. The decision is driven ONLY by the scrutinee's own type and the arm
+/// patterns; the match's RESULT type (the literal union) is irrelevant to how dispatch happens.
+fn scrutinee_needs_boxing(scrut_ty: &Type, arms: &[TypedMatchArm]) -> bool {
+    if !is_native_eq_scalar(scrut_ty) {
+        return true;
+    }
+    !arms.iter().all(|arm| match &arm.pattern {
+        TypedMatchPattern::Else => true,
+        TypedMatchPattern::Is(TypedPattern::Literal(lit)) => native_eq_pair(scrut_ty, &lit.ty()),
+        TypedMatchPattern::Is(TypedPattern::Wildcard(_)) => true,
+        // `is n` / `is n when …` over a scalar binds the raw scalar directly (the `Bind` arm of
+        // `lower_typed_pattern_bindings`). Require an IDENTICAL binding type: `Bind` is a plain
+        // alias with no width/representation coercion, so a narrower binding type would alias an
+        // i64 register into an i32 slot.
+        TypedMatchPattern::Is(TypedPattern::Binding(_, ty, _)) => ty == scrut_ty,
+        _ => false,
+    })
+}
+
 pub(crate) fn lower_match(
     scrutinee: &TypedExpr,
     arms: &[TypedMatchArm],
@@ -618,8 +677,14 @@ pub(crate) fn lower_match(
     let scrut_ty = scrutinee.ty();
     let raw_scrut = lower_expr(scrutinee, builder, ctx);
     // `is`/`has` pattern tests use runtime tag dispatch (lin_get_tag), which needs a
-    // boxed TaggedVal*. Box a concrete scrutinee so type checks see a real tag.
-    let scrut_temp = box_to_json(raw_scrut, &scrut_ty, builder);
+    // boxed TaggedVal*. Box a concrete scrutinee so type checks see a real tag — unless every
+    // arm is a scalar literal / catch-all over a scalar scrutinee, in which case dispatch is a
+    // native integer compare and the box is pure overhead (see `scrutinee_needs_boxing`).
+    let scrut_temp = if scrutinee_needs_boxing(&scrut_ty, arms) {
+        box_to_json(raw_scrut, &scrut_ty, builder)
+    } else {
+        raw_scrut
+    };
     let merge_block = builder.alloc_block("match_merge");
     let result_dst = builder.alloc_temp(result_type.clone());
     // Collect (arm_result, predecessor_block) for a Phi in the merge block — a shared
@@ -759,6 +824,32 @@ pub(crate) fn lower_match_pattern(
         TypedMatchPattern::Is(TypedPattern::Literal(lit)) => {
             let lit_ty = lit.ty();
             let lit_raw = lower_expr(lit, builder, ctx);
+            // The scrutinee's RUNTIME representation — not its static type — decides the compare.
+            // `lower_match` leaves a scalar scrutinee unboxed when every arm is a scalar literal
+            // (`scrutinee_needs_boxing`); everything else arrives as a boxed `TaggedVal*` whose
+            // temp type is the Json wildcard or a union.
+            let scrut_repr_ty = builder
+                .temp_types
+                .get(&scrut)
+                .cloned()
+                .unwrap_or(Type::TypeVar(u32::MAX));
+            if native_eq_pair(&scrut_repr_ty, &lit_ty) {
+                // NATIVE compare: both operands are raw scalar registers. Widen the literal to the
+                // scrutinee's width first (`Coerce` sign-extends per the source type; the width
+                // reconciliation in codegen zero-extends an `IntLit`, which would turn `is -1`
+                // into 0xFFFFFFFF against an i64 scrutinee).
+                let lit_temp = coerce_to_slot_type(lit_raw, &lit_ty, &scrut_repr_ty, builder);
+                let dst = builder.alloc_temp(Type::Bool);
+                builder.emit(Instruction::Binary {
+                    dst,
+                    op: BinOp::Eq,
+                    lhs: scrut,
+                    rhs: lit_temp,
+                    operand_ty: scrut_repr_ty,
+                    ty: Type::Bool,
+                });
+                return PatternTest::Cond(dst);
+            }
             // Box the literal to Json so both operands are TaggedVal* for lin_tagged_eq
             // (the scrutinee is already boxed).
             let lit_temp = box_to_json(lit_raw, &lit_ty, builder);

@@ -24874,3 +24874,180 @@ print(r2["error"])
 "#);
     assert_eq!(out, vec!["success", "failure", "bad input: nope"]);
 }
+
+// ---------------------------------------------------------------------------
+// Scalar-scrutinee match dispatch: native integer compares, no tagged boxing.
+// ---------------------------------------------------------------------------
+// A `match` whose scrutinee is a raw scalar (Int*/UInt*/Float*/Boolean) and whose arms are all
+// scalar literals used to box the scrutinee AND every arm literal into heap `TaggedVal*`s and
+// dispatch through the opaque `lin_tagged_eq` runtime call — one box + one call per arm. That is
+// what made the integer-literal-union enum idiom (`type Weekday = 0 | 1 | … | 6`) cost ~216 ns per
+// narrowing match. `lower_match`'s `scrutinee_needs_boxing` now leaves such a scrutinee unboxed and
+// the literal-pattern arm emits a native `icmp`. Tag-dispatching patterns (`is T`, object/array
+// shapes, `has { … }`) and genuinely-union scrutinees MUST keep the tagged path — pinned below.
+
+#[test]
+fn test_scalar_match_literal_union_result_uses_native_compare() {
+    // The exact regression shape: the match RESULT type is an integer-literal union, and the
+    // scrutinee is a user function call (the case that used to defeat every heuristic). The
+    // dispatch must be native integer compares regardless of the result type.
+    let ir = build_ir(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type W = 0 | 1 | 2
+val id = (a: Int64): Int64 => a
+export val q1 = (n: Int64): W => match n
+  is 0 => 0
+  is 1 => 1
+  else => 2
+export val q2 = (n: Int64): W => match n % 3
+  is 0 => 0
+  is 1 => 1
+  else => 2
+export val q3 = (n: Int64): W => match id(n)
+  is 0 => 0
+  is 1 => 1
+  else => 2
+export val q4 = (n: Int64): W =>
+  val v: Int64 = id(n)
+  match v
+    is 0 => 0
+    is 1 => 1
+    else => 2
+print("${q1(1).toString()}${q2(1).toString()}${q3(1).toString()}${q4(1).toString()}")
+"#);
+    for name in ["q1", "q2", "q3", "q4"] {
+        let f = ir_function(&ir, name);
+        assert!(
+            !f.contains("@lin_tagged_eq"),
+            "@{name}: scalar-scrutinee literal match must dispatch on native icmp, not lin_tagged_eq:\n{f}"
+        );
+        // The scrutinee and each arm literal must not be heap-boxed for the compare. (An
+        // `lin_box_int32` for the literal-union RESULT value is a separate, legitimate concern —
+        // it is the union return representation — so assert on the i64 scrutinee box specifically
+        // plus the total box count staying at the 3 arm results.)
+        assert!(
+            !f.contains("@lin_box_int64"),
+            "@{name}: the Int64 scrutinee must not be boxed for the match dispatch:\n{f}"
+        );
+        assert!(
+            f.matches("@lin_box_int32").count() <= 3,
+            "@{name}: expected at most 3 lin_box_int32 (one per arm RESULT, the union return \
+             representation) — extra boxes mean the arm literals are being boxed for dispatch:\n{f}"
+        );
+    }
+}
+
+#[test]
+fn test_scalar_match_native_compare_semantics_preserved() {
+    // Native-compare correctness across the scalar families the fast path now covers: negative
+    // literals against a WIDE scrutinee (must sign-extend, not zero-extend), unsigned scrutinees
+    // (must zero-extend), floats, Boolean, and a binding arm with a guard.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+val id = (a: Int64): Int64 => a
+val neg = (n: Int64): String =>
+  match n
+    is -1 => "minus-one"
+    is -2 => "minus-two"
+    is 0 => "zero"
+    else => "other"
+val u = (n: UInt8): Int32 =>
+  match n
+    is 250 => 1
+    is 0 => 2
+    else => 3
+val f = (x: Float64): Int32 =>
+  match x
+    is 0.5 => 1
+    is 2 => 2
+    else => 3
+val b = (v: Boolean): String =>
+  match v
+    is true => "T"
+    else => "F"
+val g = (n: Int64): String =>
+  match n
+    is 0 => "z"
+    is m when m > 10 => "big"
+    else => "small"
+print("${neg(id(-1))} ${neg(id(-2))} ${neg(id(0))} ${neg(id(5))}")
+print("${u(250).toString()}${u(0).toString()}${u(9).toString()}")
+print("${f(0.5).toString()}${f(2.0).toString()}${f(9.0).toString()}")
+print("${b(true)}${b(false)}")
+print("${g(id(0))} ${g(id(99))} ${g(id(3))}")
+"#);
+    assert_eq!(
+        out,
+        vec!["minus-one minus-two zero other", "123", "123", "TF", "z big small"]
+    );
+}
+
+#[test]
+fn test_tagged_scrutinee_keeps_tagged_dispatch() {
+    // The other side of the gate: a genuinely BOXED scrutinee (a `String | Int32` union, and an
+    // object matched on shape) must keep using tag dispatch — the scalar fast path must not
+    // swallow it. Both the emitted IR shape and the observable narrowing are pinned.
+    let src = r#"
+import { print } from "std/io"
+type Shape = { "kind": String, "n": Int32 }
+export val tagged = (v: String | Int32): String =>
+  match v
+    is "hi" => "str-hi"
+    is 7 => "int-7"
+    is String => "str"
+    else => "int"
+export val shape = (s: Shape): String =>
+  match s
+    is { "kind": "a" } => "A"
+    is { "kind": "b" } => "B"
+    else => "?"
+print("${tagged("hi")} ${tagged(7)} ${tagged("yo")} ${tagged(9)}")
+print("${shape({ "kind": "a", "n": 1 })}${shape({ "kind": "b", "n": 1 })}${shape({ "kind": "z", "n": 1 })}")
+"#;
+    let ir = build_ir(src);
+    let tagged = ir_function(&ir, "tagged");
+    assert!(
+        tagged.contains("@lin_tagged_eq"),
+        "a String|Int32 union scrutinee must still dispatch through lin_tagged_eq:\n{tagged}"
+    );
+    let shape = ir_function(&ir, "shape");
+    assert!(
+        shape.contains("@lin_tagged_eq"),
+        "an object-shape match must still dispatch through lin_tagged_eq:\n{shape}"
+    );
+    let out = run(src);
+    assert_eq!(out, vec!["str-hi int-7 str int", "AB?"]);
+}
+
+#[test]
+fn test_literal_union_narrowing_match_has_no_tagged_dispatch() {
+    // `stdlib/datetime.lin`'s `weekday` shape, the real-world motivation: an `Int64` arithmetic
+    // result narrowed to a literal-union enum. It used to emit 7x lin_box_int32 + 6x lin_tagged_eq.
+    let ir = build_ir(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Weekday = 0 | 1 | 2 | 3 | 4 | 5 | 6
+val floorMod = (a: Int64, b: Int64): Int64 => ((a % b) + b) % b
+export val weekdayOf = (epochDay: Int64): Weekday =>
+  match floorMod(epochDay + 4i64, 7i64)
+    is 0 => 0
+    is 1 => 1
+    is 2 => 2
+    is 3 => 3
+    is 4 => 4
+    is 5 => 5
+    else => 6
+print(weekdayOf(0i64).toString())
+"#);
+    let f = ir_function(&ir, "weekdayOf");
+    assert!(
+        !f.contains("@lin_tagged_eq"),
+        "literal-union narrowing must dispatch on native icmp:\n{f}"
+    );
+    assert!(
+        !f.contains("@lin_box_int64"),
+        "the Int64 scrutinee must not be boxed for the match dispatch:\n{f}"
+    );
+}
