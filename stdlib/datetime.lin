@@ -100,6 +100,23 @@ export val daysInMonth = (year: Int64, month: Int64): Int64 =>
   else
     31
 
+// Days elapsed before the 1st of each month in a NON-leap year, indexed by `month - 1`
+// (Jan 0, Feb 31, Mar 59, ...). `dayOfYear` adds the leap day back for Mar-Dec.
+val DAYS_BEFORE_MONTH: Int64[] = [
+  0,
+  31,
+  59,
+  90,
+  120,
+  151,
+  181,
+  212,
+  243,
+  273,
+  304,
+  334
+]
+
 // ── Civil <-> epoch-day (Howard Hinnant's algorithm) ───────────────────────────────
 // These convert between a (year, month, day) triple and a count of days since the Unix epoch
 // (1970-01-01 = day 0). They are exact for the whole Int64 range and assume truncating division,
@@ -318,13 +335,12 @@ export val weekday = (d: Date): Weekday =>
     is 5 => Fri
     else => Sat
 
-// The day of the year, 1-366 (Jan 1 = 1).
+// The day of the year, 1-366 (Jan 1 = 1). Table lookup rather than two epoch-day conversions:
+// the days before the month are a constant per month, plus one for Mar-Dec of a leap year.
+// `month` is assumed in range 1-12 (the `Date` contract).
 export val dayOfYear = (d: Date): Int64 =>
-  toEpochDay(d) - toEpochDay({
-    "year": d["year"],
-    "month": 1,
-    "day": 1
-  }) + 1
+  val leapDay = if d["month"] > 2 && isLeapYear(d["year"]) then 1 else 0
+  DAYS_BEFORE_MONTH[d["month"] - 1] + d["day"] + leapDay
 
 // ── Calendar arithmetic (never fails; clamps month-end) ──────────────────────────────
 // Shift a `Date` by `n` whole days (`n` may be negative). Exact day arithmetic, no clamping needed.
