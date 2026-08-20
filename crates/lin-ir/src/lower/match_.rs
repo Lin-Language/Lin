@@ -629,13 +629,74 @@ fn is_native_eq_scalar(ty: &Type) -> bool {
     )
 }
 
-/// True when `scrut_ty` and `lit_ty` are both raw scalars that a native `Eq` compares
-/// correctly. `Bool` is kept apart from the numeric family: an i1 vs iN compare would need a
-/// width extension whose meaning (`true == 1`) the checker never sanctions anyway.
-fn native_eq_pair(scrut_ty: &Type, lit_ty: &Type) -> bool {
-    is_native_eq_scalar(scrut_ty)
-        && is_native_eq_scalar(lit_ty)
-        && matches!(scrut_ty, Type::Bool) == matches!(lit_ty, Type::Bool)
+/// The runtime integer slot `(bit width, signed)` a value of this type occupies, or `None` for
+/// non-integer types. `IntLit` is `Int32` at runtime (see its variant docs), so it reports the
+/// i32 slot rather than a width of its own.
+fn int_slot(ty: &Type) -> Option<(u32, bool)> {
+    match ty {
+        Type::Int8 => Some((8, true)),
+        Type::Int16 => Some((16, true)),
+        Type::Int32 | Type::IntLit(_) => Some((32, true)),
+        Type::Int64 => Some((64, true)),
+        Type::UInt8 => Some((8, false)),
+        Type::UInt16 => Some((16, false)),
+        Type::UInt32 => Some((32, false)),
+        Type::UInt64 => Some((64, false)),
+        _ => None,
+    }
+}
+
+/// Whether the integer `v` is exactly representable in the `(bits, signed)` slot.
+fn int_value_fits(v: i64, (bits, signed): (u32, bool)) -> bool {
+    let v = v as i128;
+    if signed {
+        v >= -(1i128 << (bits - 1)) && v < (1i128 << (bits - 1))
+    } else {
+        v >= 0 && v < (1i128 << bits)
+    }
+}
+
+/// True when a native `Eq` between a scalar scrutinee of `scrut_ty` and the scalar literal
+/// `lit` gives the SAME answer as the boxed `lin_tagged_eq` path it replaces.
+///
+/// The native path first `Coerce`s the literal to the scrutinee's type, so it is valid exactly
+/// when that coercion is VALUE-PRESERVING for THIS literal. A lossy coercion silently turns a
+/// non-equal pair into an equal one — every case rejected below is a real miscompile, not
+/// caution. The check is on the literal's VALUE, not its type: the checker types a bare pattern
+/// literal as `Int32`/`Float64` regardless of the scrutinee, so a width comparison alone would
+/// both admit `is 300` against a `UInt8` (truncates to 44) and reject the whole hot path.
+///
+///  * CROSS-FAMILY, e.g. an `Int64` scrutinee against the float literal `1.5`. The coerce
+///    truncates toward zero, so `1 == 1.5` would answer TRUE. Spec §3.4 makes cross-numeric
+///    equality compare by VALUE, which `lin_tagged_eq` does correctly — so int/float pairs stay
+///    boxed. (Comparing in the float domain instead is not a fix: `Float64` cannot represent
+///    every `Int64` above 2^53.)
+///  * INT NARROWING, e.g. a `UInt8` scrutinee against the literal `300`. The truncation wraps
+///    to 44, so a scrutinee holding 44 would answer TRUE. `is 255` against the same scrutinee
+///    is fine and stays on the fast path — hence the per-value check.
+///  * FLOAT NARROWING, e.g. a `Float32` scrutinee against the `Float64` literal `0.1`. `fptrunc`
+///    rounds the literal to f32, so `0.1f32 == 0.1f64` would answer TRUE; the tagged path widens
+///    the scrutinee to f64 instead and correctly answers FALSE. A literal that round-trips
+///    through f32 exactly (`0.5`) is unaffected and stays on the fast path.
+///
+/// `Bool` stays segregated from the numeric families for the same reason: an i1-vs-iN compare
+/// needs a width extension whose meaning (`true == 1`) the checker never sanctions anyway.
+fn native_eq_lit(scrut_ty: &Type, lit: &TypedExpr) -> bool {
+    match lit {
+        TypedExpr::BoolLit(..) => matches!(scrut_ty, Type::Bool),
+        TypedExpr::IntLit(v, ..) => {
+            int_slot(scrut_ty).is_some_and(|slot| int_value_fits(*v, slot))
+        }
+        TypedExpr::FloatLit(v, lit_ty, _) => match scrut_ty {
+            // fpext (or no coercion at all) is exact. A `Float32`-typed literal is excluded
+            // only because it has already been rounded once and is not worth reasoning about.
+            Type::Float64 => !matches!(lit_ty, Type::Float32),
+            // fptrunc is exact for this literal iff it round-trips through f32.
+            Type::Float32 => (*v as f32) as f64 == *v,
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Whether the scrutinee must be boxed to a `TaggedVal*` before the arm tests run.
@@ -656,7 +717,7 @@ fn scrutinee_needs_boxing(scrut_ty: &Type, arms: &[TypedMatchArm]) -> bool {
     }
     !arms.iter().all(|arm| match &arm.pattern {
         TypedMatchPattern::Else => true,
-        TypedMatchPattern::Is(TypedPattern::Literal(lit)) => native_eq_pair(scrut_ty, &lit.ty()),
+        TypedMatchPattern::Is(TypedPattern::Literal(lit)) => native_eq_lit(scrut_ty, lit),
         TypedMatchPattern::Is(TypedPattern::Wildcard(_)) => true,
         // `is n` / `is n when …` over a scalar binds the raw scalar directly (the `Bind` arm of
         // `lower_typed_pattern_bindings`). Require an IDENTICAL binding type: `Bind` is a plain
@@ -833,11 +894,12 @@ pub(crate) fn lower_match_pattern(
                 .get(&scrut)
                 .cloned()
                 .unwrap_or(Type::TypeVar(u32::MAX));
-            if native_eq_pair(&scrut_repr_ty, &lit_ty) {
-                // NATIVE compare: both operands are raw scalar registers. Widen the literal to the
-                // scrutinee's width first (`Coerce` sign-extends per the source type; the width
-                // reconciliation in codegen zero-extends an `IntLit`, which would turn `is -1`
-                // into 0xFFFFFFFF against an i64 scrutinee).
+            if native_eq_lit(&scrut_repr_ty, lit) {
+                // NATIVE compare: both operands are raw scalar registers. Coerce the literal to
+                // the scrutinee's type first — `native_eq_lit` has proven that coercion exact for
+                // this value. It is also load-bearing for correctness: codegen's own width
+                // reconciliation zero-extends by the SOURCE type's signedness, which for a
+                // 32-bit-typed `is -1` against an i64 scrutinee would give 0xFFFFFFFF.
                 let lit_temp = coerce_to_slot_type(lit_raw, &lit_ty, &scrut_repr_ty, builder);
                 let dst = builder.alloc_temp(Type::Bool);
                 builder.emit(Instruction::Binary {

@@ -25051,3 +25051,75 @@ print(weekdayOf(0i64).toString())
         "the Int64 scrutinee must not be boxed for the match dispatch:\n{f}"
     );
 }
+
+#[test]
+fn test_scalar_match_cross_family_literal_matches_tagged_semantics() {
+    // The native-compare fast path `Coerce`s the arm literal to the scrutinee's type before the
+    // `icmp`/`fcmp`. A LOSSY coercion silently turns a non-equal pair into an equal one, so
+    // `native_eq_lit` admits a literal only when that coercion is exact FOR THAT VALUE. These are
+    // the cases where a type-level-only gate got it wrong; every expected value here is what the
+    // boxed `lin_tagged_eq` path (i.e. master, before the fast path existed) produces.
+    //
+    // Observable OUTPUT is the assertion, deliberately: the IR-shape assertions in the tests above
+    // pass whether or not the compare is correct, so they cannot catch a miscompile here.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+val id = (a: Int64): Int64 => a
+val fid = (a: Float64): Float64 => a
+val uid = (a: UInt8): UInt8 => a
+val f32id = (a: Float32): Float32 => a
+
+// t1: Int64 scrutinee vs a NON-INTEGRAL float literal. Truncation toward zero would make
+// `1 == 1.5` true. Cross-numeric equality compares by value (spec 3.4) so there is no match.
+val t1 = (n: Int64): Int64 =>
+  match id(n)
+    is 1.5 => 111
+    else => 999
+// t2: Int64 scrutinee vs an INTEGRAL float literal. `1 == 1.0` IS true by value.
+val t2 = (n: Int64): Int64 =>
+  match id(n)
+    is 1.0 => 111
+    else => 999
+// t3/t4: the mirror shape, a Float64 scrutinee against an integer literal.
+val t3 = (x: Float64): Int64 =>
+  match fid(x)
+    is 1 => 111
+    else => 999
+// t5: UInt8 scrutinee vs a literal at the top of its range. Exact, stays on the fast path.
+val t5 = (n: UInt8): Int64 =>
+  match uid(n)
+    is 255 => 111
+    else => 999
+// t7: UInt8 scrutinee vs an OUT-OF-RANGE literal. Truncating 300 to u8 gives 44, which would
+// wrongly match a scrutinee holding 44. The checker accepts this program.
+val t7 = (n: UInt8): Int64 =>
+  match uid(n)
+    is 300 => 111
+    else => 999
+// t6: Float32 scrutinee vs a Float64 literal NOT representable in f32. `fptrunc` would round the
+// literal to the scrutinee's own value and wrongly match; the tagged path widens the scrutinee.
+val t6 = (x: Float32): Int64 =>
+  match f32id(x)
+    is 0.1 => 111
+    else => 999
+// t6b: the same shape with a literal that DOES round-trip through f32, which must still match.
+val t6b = (x: Float32): Int64 =>
+  match f32id(x)
+    is 0.5 => 111
+    else => 999
+val tenth: Float32 = 0.1
+val half: Float32 = 0.5
+print("t1=${t1(1).toString()} t2=${t2(1).toString()} t3=${t3(1.0).toString()} t4=${t3(1.5).toString()} t5=${t5(255).toString()}")
+print("t6=${t6(tenth).toString()} t6b=${t6b(half).toString()} t7a=${t7(44).toString()} t7b=${t7(255).toString()}")
+"#);
+    assert_eq!(
+        out,
+        vec![
+            // t1: 1 != 1.5. t2: 1 == 1.0. t3: 1.0 == 1. t4: 1.5 != 1. t5: 255 == 255.
+            "t1=999 t2=111 t3=111 t4=999 t5=111",
+            // t6: 0.1f32 != 0.1f64. t6b: 0.5f32 == 0.5f64. t7a: 44 != 300. t7b: 255 != 300.
+            "t6=999 t6b=111 t7a=999 t7b=999",
+        ]
+    );
+}
