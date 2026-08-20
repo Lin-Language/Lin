@@ -4,11 +4,11 @@
 // `tryParseInt32`/`tryParseFloat64` narrow to `null` instead so callers can test with a plain
 // `== null` / `is Int32`. Guard untrusted input with `isInt32`/`isFloat64`, or just use the
 // try-variants. `toInt32`/`toFloat64`/`toFloat32` convert between the numeric types (truncating or
-// widening). The fixed-width casts (toUInt8/toInt8/…/toUInt64) take a UInt64 and truncate/reinterpret
-// to the target width — the building blocks for the bit-level packing in std/bytes. The parallel
-// `narrowToUInt8`/…/`narrowToUInt64` family takes a SIGNED Int64 instead, so a value computed in
-// Int64 can be narrowed to a small field (which the UInt64-input family cannot accept, because
-// Int64 -> UInt64 is not an implicit coercion).
+// widening). The fixed-width casts (toUInt8/toInt8/…/toUInt64) truncate/reinterpret to the target
+// width — the building blocks for the bit-level packing in std/bytes. Each is an OVERLOAD PAIR
+// (ADR-074/075): a `UInt64` overload for an already-unsigned source, and an `Int64` overload so a
+// value computed in `Int64` can be narrowed into a small field (it cannot reach the UInt64 overload,
+// because `Int64 -> UInt64` is not an implicit coercion — it could wrap a negative).
 //
 //   import { parseInt32, parseFloat64, toInt32, toFloat64, isInt32, isFloat64 } from "std/number"
 import foreign "lin-runtime"

@@ -87,7 +87,8 @@ pub extern "C" fn lin_to_uint64(v: u64) -> u64 {
 // signed/computed integer narrows explicitly. Truncation is two's-complement
 // (`as`-cast), so the low bits are identical to the u64 family for the same
 // bit pattern; the only difference is the accepted input type. They back the
-// std/number `narrowToUInt8`/`narrowToInt32`/... exports.
+// `Int64` half of the std/number `toUInt8`/`toInt32`/... overload pairs
+// (ADR-075); the `lin_to_*` family above backs the `UInt64` half.
 // -------------------------------------------------------------------------
 
 #[no_mangle]
