@@ -30,7 +30,21 @@ struct Backend {
     /// Whether to emit inferred-type inlay hints on unannotated function/lambda parameters. Mirrors
     /// `lin.inlayHints.parameterTypes`; defaults true. Captured/refreshed alongside the above.
     inlay_parameter_types: AtomicBool,
+    /// Newest `update` ticket seen per document — the staleness guard for concurrent edits.
+    ///
+    /// tower-lsp processes up to four messages CONCURRENTLY (`DEFAULT_MAX_CONCURRENCY`), so two
+    /// `did_change` notifications for the same file can be in flight at once and finish out of
+    /// order. Without this, an older update could overwrite the buffer with older text and publish
+    /// its older diagnostics last — leaving the error underline up on code the user has already
+    /// fixed, until some later edit happened to land in order.
+    ///
+    /// Tickets are handed out in arrival order, so an update holding a ticket lower than the
+    /// recorded one has been superseded and drops out.
+    doc_generation: RwLock<HashMap<Url, u64>>,
 }
+
+/// Source of the monotonically increasing `update` tickets. See `Backend::doc_generation`.
+static NEXT_DOC_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
@@ -214,6 +228,10 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.docs.write().unwrap_or_else(|e| e.into_inner()).remove(&params.text_document.uri);
+        self.doc_generation
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&params.text_document.uri);
         self.client
             .publish_diagnostics(params.text_document.uri, vec![], None)
             .await;
@@ -227,7 +245,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let base_dir = file_dir(uri);
-        let analysis = analyse(&source, base_dir.as_deref());
+        let analysis = analyse_cached(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
         let Some((_, ty_str, def_span)) = tightest_span(&analysis.span_type_map, offset).cloned()
@@ -273,7 +291,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let base_dir = file_dir(uri);
-        let analysis = analyse(&source, base_dir.as_deref());
+        let analysis = analyse_cached(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
         // Same-file first: a local/parameter use carries a `def_span` pointing at its binding in
@@ -322,7 +340,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let base_dir = file_dir(uri);
-        let analysis = analyse(&source, base_dir.as_deref());
+        let analysis = analyse_cached(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
         // Import-path completion: inside a `from "…"` / `import foreign "…"` string, complete
@@ -673,7 +691,7 @@ impl LanguageServer for Backend {
             return Ok(item);
         };
         let base_dir = file_dir(&uri);
-        let analysis = analyse(&source, base_dir.as_deref());
+        let analysis = analyse_cached(&source, base_dir.as_deref());
 
         // Unimported candidate (stdlib FIX B or userland PART 2): the item carries the import
         // `module` specifier. Attach the import edit (computed by the SAME `auto_import_edit` the
@@ -759,7 +777,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let base_dir = file_dir(uri);
-        let analysis = analyse(&source, base_dir.as_deref());
+        let analysis = analyse_cached(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
         let include_decl = params.context.include_declaration;
@@ -831,7 +849,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let base_dir = file_dir(uri);
-        let analysis = analyse(&source, base_dir.as_deref());
+        let analysis = analyse_cached(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
         let occ = occurrences_at(&analysis.span_type_map, offset);
@@ -862,7 +880,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let base_dir = file_dir(uri);
-        let analysis = analyse(&source, base_dir.as_deref());
+        let analysis = analyse_cached(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
         // Cross-file first: a top-level exported/imported symbol renames everywhere.
@@ -927,7 +945,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let base_dir = file_dir(uri);
-        let analysis = analyse(&source, base_dir.as_deref());
+        let analysis = analyse_cached(&source, base_dir.as_deref());
 
         // Only emit hints whose anchor falls inside the requested range — clients re-request as the
         // viewport scrolls, so honouring the range keeps the response small.
@@ -951,7 +969,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let base_dir = file_dir(uri);
-        let analysis = analyse(&source, base_dir.as_deref());
+        let analysis = analyse_cached(&source, base_dir.as_deref());
 
         let data = semantic_tokens(&source, &analysis);
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
@@ -971,7 +989,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let base_dir = file_dir(uri);
-        let analysis = analyse(&source, base_dir.as_deref());
+        let analysis = analyse_cached(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
         // Resolve a callee's doc comment by NAME: a local declaration in this file first (its leading
@@ -1055,7 +1073,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let base_dir = file_dir(uri);
-        let analysis = analyse(&source, base_dir.as_deref());
+        let analysis = analyse_cached(&source, base_dir.as_deref());
         let ranges = params
             .positions
             .iter()
@@ -1123,7 +1141,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let base_dir = file_dir(uri);
-        let analysis = analyse(&source, base_dir.as_deref());
+        let analysis = analyse_cached(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
         // The value's rendered type at the cursor (e.g. `Point` or `Point[]`).
@@ -1167,16 +1185,31 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
+    /// Whether a newer `update` for `uri` has started since this one took `ticket`.
+    fn superseded(&self, uri: &Url, ticket: u64) -> bool {
+        self.doc_generation
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(uri)
+            .is_some_and(|newest| *newest > ticket)
+    }
+
     async fn update(&self, uri: &Url, source: &str) {
+        // Claim this edit's place in the arrival order, and bail out if a newer edit for the same
+        // document has already claimed one. See `Backend::doc_generation`.
+        let ticket = NEXT_DOC_GENERATION.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut generations = self.doc_generation.write().unwrap_or_else(|e| e.into_inner());
+            if generations.get(uri).is_some_and(|newest| *newest > ticket) {
+                return;
+            }
+            generations.insert(uri.clone(), ticket);
+        }
+
         self.docs
             .write()
             .unwrap()
             .insert(uri.clone(), source.to_string());
-        // Drop the cross-request caches of type-checked user modules and their export types: this
-        // file may be a dependency of any of them, and the caches key on each module's OWN source,
-        // which cannot see that. Must happen BEFORE the `analyse` below, so this file's own
-        // dependents re-check against the new content.
-        invalidate_user_module_cache();
         // Re-index this file's symbol/import table so cross-file
         // references/symbols/rename stay current. This also refreshes the export
         // signatures dependents read through `analyse`'s `pre_resolve_imports`.
@@ -1185,11 +1218,20 @@ impl Backend {
                 .write()
                 .unwrap()
                 .insert_user_file(&path, source);
+            // Evict the cached analyses this edit invalidates — the modules that import this one.
+            // Must happen BEFORE the `analyse` below, so dependents re-check against the new
+            // content. Re-indexing first keeps the import graph current for the walk.
+            invalidate_dependents_of(&canonical_id(&path));
         }
         let base_dir = file_dir(uri);
-        let analysis = analyse(source, base_dir.as_deref());
+        let analysis = analyse_cached(source, base_dir.as_deref());
+        // A newer edit may have landed while this one was analysing; publishing now would replace
+        // that newer document's diagnostics with this older text's.
+        if self.superseded(uri, ticket) {
+            return;
+        }
         self.client
-            .publish_diagnostics(uri.clone(), analysis.diagnostics, None)
+            .publish_diagnostics(uri.clone(), analysis.diagnostics.clone(), None)
             .await;
 
         // Dependent re-check: when F changes, any OPEN file B that imports from F
@@ -1215,6 +1257,11 @@ impl Backend {
         // re-analyse (we do NOT recursively call `update`, which would re-trigger),
         // and we skip F's own URI defensively. A cyclic graph (A↔B) is therefore
         // safe — editing A re-checks B once and stops.
+        // Same staleness guard: if a newer edit landed while we were analysing, it will run its own
+        // dependent re-check against the newer text, so this one has nothing to add.
+        if self.superseded(uri, ticket) {
+            return;
+        }
         self.recheck_open_dependents(uri).await;
     }
 
@@ -1253,9 +1300,9 @@ impl Backend {
 
         for (dep_uri, dep_source) in to_recheck {
             let base_dir = file_dir(&dep_uri);
-            let analysis = analyse(&dep_source, base_dir.as_deref());
+            let analysis = analyse_cached(&dep_source, base_dir.as_deref());
             self.client
-                .publish_diagnostics(dep_uri, analysis.diagnostics, None)
+                .publish_diagnostics(dep_uri, analysis.diagnostics.clone(), None)
                 .await;
         }
     }
@@ -1556,13 +1603,95 @@ fn source_hash(src: &str) -> u64 {
 static MODULE_CACHE: std::sync::LazyLock<RwLock<HashMap<(String, u64), Arc<TypedModule>>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Drop every cached USER module (stdlib entries are immutable, so they stay). Called on every
-/// document open/change/save: a cached module's types depend on its dependencies' contents, which
-/// its own source hash does not capture, so an edit anywhere invalidates the user half wholesale.
-fn invalidate_user_module_cache() {
-    let mut cache = MODULE_CACHE.write().unwrap_or_else(|e| e.into_inner());
-    cache.retain(|(identity, _), _| stdlib_source(identity).is_some());
-    EXPORT_TYPE_CACHE.write().unwrap_or_else(|e| e.into_inner()).clear();
+/// Drop the cached analyses invalidated by an edit to `changed_id` (a canonical module id).
+///
+/// A module's cache entry is keyed by its OWN source hash, so the edited file's own entries become
+/// unreachable the moment its text changes — nothing to do for it. What the hash cannot see is that
+/// a module's types depend on its DEPENDENCIES' contents, so every module that imports the edited
+/// one, transitively, must be evicted.
+///
+/// This used to wipe the whole user half of both caches on any change, which meant the caches were
+/// cold again after every keystroke — and the workspace-wide candidate sweep that completion runs
+/// took ~850ms every time you typed a character. Evicting only the affected subgraph keeps them
+/// warm through an editing session; for a leaf file (nothing imports it) that subgraph is empty.
+/// Every module that imports `changed_id`, directly or transitively. `changed_id` itself is NOT
+/// included (a module does not depend on itself), and an import cycle terminates — a module already
+/// in the set is never queued twice.
+fn transitive_dependents(index: &WorkspaceIndex, changed_id: &str) -> HashSet<String> {
+    let mut affected: HashSet<String> = HashSet::new();
+    let mut queue = vec![changed_id.to_string()];
+    while let Some(id) = queue.pop() {
+        for dep in index.dependents_of(&id) {
+            if dep != changed_id && affected.insert(dep.clone()) {
+                queue.push(dep);
+            }
+        }
+    }
+    affected
+}
+
+fn invalidate_dependents_of(changed_id: &str) {
+    let mut affected = {
+        let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
+        transitive_dependents(&index, changed_id)
+    };
+    // The changed module's own entries are already unreachable by hash, but evicting them keeps the
+    // caches from growing by one dead entry per edit over a long session.
+    affected.insert(changed_id.to_string());
+
+    // The document analyses are dropped wholesale: they are keyed by source text, not by module
+    // identity, so there is nothing to match `affected` against. They are re-derived per edit
+    // anyway — the cache exists to serve one edit generation's burst of requests, not to persist.
+    ANALYSIS_CACHE.write().unwrap_or_else(|e| e.into_inner()).clear();
+    MODULE_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(identity, _), _| !affected.contains(identity));
+    EXPORT_TYPE_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(identity, _), _| !affected.contains(identity));
+}
+
+/// Cache of whole-document analyses, keyed by source hash + base dir.
+///
+/// After every edit the client fires a burst of requests against the SAME unchanged text — inlay
+/// hints, semantic tokens, document symbols, code lenses, folding ranges — and each handler called
+/// `analyse` for itself. On a 1700-line file that is ~22ms of identical work per handler, so a
+/// single keystroke paid it five times over before anything was drawn.
+///
+/// Small and short-lived by design: it holds the few documents in flight for one edit generation,
+/// and `invalidate_dependents_of` clears it on every change. A file's own edit therefore never
+/// reads a stale entry (the text hash differs), and a DEPENDENCY's edit can't either (the clear).
+static ANALYSIS_CACHE: std::sync::LazyLock<
+    RwLock<HashMap<(u64, Option<PathBuf>), Arc<Analysis>>>,
+> = std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// How many analyses to keep. Just needs to cover the documents in flight for one edit generation;
+/// on overflow the cache is dropped wholesale rather than evicting by age, which keeps this
+/// dependency-free and is harmless — the next request re-populates it.
+const ANALYSIS_CACHE_CAP: usize = 16;
+
+/// `analyse`, memoised for the duration of one edit generation. Use this from request handlers,
+/// which re-analyse the same document text repeatedly; internal callers that analyse OTHER files
+/// (`owner_export_types`) use `analyse` directly, so a workspace-wide sweep can't thrash this.
+fn analyse_cached(source: &str, base_dir: Option<&Path>) -> Arc<Analysis> {
+    let key = (source_hash(source), base_dir.map(|p| p.to_path_buf()));
+    if let Some(hit) = ANALYSIS_CACHE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return hit;
+    }
+    let analysis = Arc::new(analyse(source, base_dir));
+    let mut cache = ANALYSIS_CACHE.write().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= ANALYSIS_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, Arc::clone(&analysis));
+    analysis
 }
 
 fn pre_resolve_imports(
@@ -6961,6 +7090,7 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         docs: RwLock::new(HashMap::new()),
+        doc_generation: RwLock::new(HashMap::new()),
         snippet_support: AtomicBool::new(false),
         inlay_variable_types: AtomicBool::new(true),
         inlay_parameter_types: AtomicBool::new(true),
@@ -10297,7 +10427,103 @@ export val thingCount = 7
     fn labels(items: &[CompletionItem]) -> Vec<&str> {
         items.iter().map(|i| i.label.as_str()).collect()
     }
+
+    // ── edit invalidation + shared analyses ───────────────────────────────────────
+
+    /// An edit must invalidate the modules that import the edited one, all the way up the chain:
+    /// each cache entry is keyed by its module's OWN source hash, which cannot see that a
+    /// DEPENDENCY changed underneath it.
+    #[test]
+    fn transitive_dependents_walks_the_whole_import_chain() {
+        let a = "export val foo = 1\n";
+        let b = "import { foo } from \"a\"\nexport val bar = foo\n";
+        let c = "import { bar } from \"b\"\nval x = bar\n";
+        let d = "val unrelated = 99\n";
+        let index = index_from(&[
+            ("/ws/a.lin", a),
+            ("/ws/b.lin", b),
+            ("/ws/c.lin", c),
+            ("/ws/d.lin", d),
+        ]);
+
+        let affected = transitive_dependents(&index, &id_of("/ws/a.lin"));
+        assert!(affected.contains(&id_of("/ws/b.lin")), "direct importer: {:?}", affected);
+        assert!(affected.contains(&id_of("/ws/c.lin")), "importer-of-importer: {:?}", affected);
+        assert!(!affected.contains(&id_of("/ws/d.lin")), "unrelated file: {:?}", affected);
+        assert!(!affected.contains(&id_of("/ws/a.lin")), "never itself: {:?}", affected);
+    }
+
+    /// A leaf — the common case, the file you are typing in — invalidates nothing. That is what
+    /// keeps the caches warm through an editing session instead of cold after every keystroke.
+    #[test]
+    fn transitive_dependents_of_a_leaf_is_empty() {
+        let index = index_from(&[
+            ("/ws/a.lin", "export val foo = 1\n"),
+            ("/ws/b.lin", "import { foo } from \"a\"\nval x = foo\n"),
+        ]);
+        assert!(transitive_dependents(&index, &id_of("/ws/b.lin")).is_empty());
+    }
+
+    /// A cyclic import graph must terminate rather than queueing a module twice.
+    #[test]
+    fn transitive_dependents_terminates_on_an_import_cycle() {
+        let index = index_from(&[
+            ("/ws/a.lin", "import { b } from \"b\"\nexport val a = b\n"),
+            ("/ws/b.lin", "import { a } from \"a\"\nexport val b = 1\n"),
+        ]);
+        let affected = transitive_dependents(&index, &id_of("/ws/a.lin"));
+        assert_eq!(affected, [id_of("/ws/b.lin")].into_iter().collect::<HashSet<_>>());
+    }
+
+    /// The burst of requests a client fires after one edit (inlay hints, semantic tokens, document
+    /// symbols, …) must share a single analysis rather than each re-checking the same text.
+    #[test]
+    fn analyse_cached_reuses_one_analysis_for_repeated_requests() {
+        let src = "val analyse_cached_probe = 1\nval other = analyse_cached_probe + 1\n";
+        let first = analyse_cached(src, None);
+        let second = analyse_cached(src, None);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second request re-analysed instead of reusing the first"
+        );
+    }
+
+    /// tower-lsp runs up to four messages concurrently, so two edits to one document can be in
+    /// flight at once. The older one must drop out rather than overwrite the buffer with older text
+    /// and republish its older diagnostics — which is what left an error underline standing on code
+    /// the user had already fixed.
+    #[test]
+    fn a_superseded_update_drops_out() {
+        let generations: RwLock<HashMap<Url, u64>> = RwLock::new(HashMap::new());
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+
+        // Two updates take tickets in arrival order; the NEWER one records its ticket first
+        // (it finished claiming the document while the older one was still working).
+        let older = 1u64;
+        let newer = 2u64;
+        generations.write().unwrap().insert(uri.clone(), newer);
+
+        let superseded = |ticket: u64| {
+            generations
+                .read()
+                .unwrap()
+                .get(&uri)
+                .is_some_and(|newest| *newest > ticket)
+        };
+        assert!(superseded(older), "the older edit must not publish");
+        assert!(!superseded(newer), "the newest edit must publish");
+    }
+
+    /// Tickets are handed out monotonically, so arrival order is recoverable.
+    #[test]
+    fn update_tickets_increase_monotonically() {
+        let a = NEXT_DOC_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let b = NEXT_DOC_GENERATION.fetch_add(1, Ordering::Relaxed);
+        assert!(b > a, "expected increasing tickets, got {} then {}", a, b);
+    }
 }
+
+
 
 
 
