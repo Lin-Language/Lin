@@ -220,6 +220,20 @@ impl Checker {
             }
         };
 
+        // Record the WHOLE binary expression's result type, spanning both operands. Only identifier
+        // uses, method names and binder definition sites were recorded before, so a compound
+        // expression had no type at any offset — which left the LSP unable to type a parenthesised
+        // dot receiver like `(xs.length() / 2).`, since parentheses are transparent in the AST and
+        // the only span that could carry the type is the operation's own. `span` itself covers just
+        // the operator token (it is the diagnostic anchor), hence the reconstruction from the
+        // operands. `tightest_span` prefers the narrowest match, so nested identifiers still win for
+        // hover; the `None` def-span keeps these entries out of the references/rename lookups,
+        // which require one.
+        let full_span = Span::new(span.file_id, left.span().start, right.span().end);
+        if full_span.end > full_span.start {
+            self.span_type_map.push((full_span, result_type.to_string(), None));
+        }
+
         Ok(TypedExpr::BinaryOp {
             left: Box::new(typed_left),
             op,

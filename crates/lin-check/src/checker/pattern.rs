@@ -3,7 +3,7 @@ use lin_common::Diagnostic;
 use lin_parse::ast::{MatchPattern, Pattern};
 
 use super::Checker;
-use super::helpers::collect_type_subs;
+use super::helpers::{collect_type_subs, occurs_in};
 use crate::resolve::resolve_type;
 use crate::typed_ir::*;
 use crate::types::Type;
@@ -409,7 +409,10 @@ impl Checker {
                         {
                             if let Type::TypeVar(id) = old_ret.as_ref() {
                                 let id = *id;
-                                if id < 9000 && !self.protected_type_vars.contains(&id) {
+                                if id < 9000
+                                    && !self.protected_type_vars.contains(&id)
+                                    && !occurs_in(id, new_ret, &self.solved_type_vars)
+                                {
                                     self.solved_type_vars.entry(id).or_insert_with(|| *new_ret.clone());
                                 }
                             }
@@ -493,7 +496,13 @@ impl Checker {
         for (id, ty) in local.iter() {
             // Intrinsic TypeVars (≥ 9000) are generic slots — don't solve them globally.
             // Protected TypeVars come from imported module signatures — never solve them either.
-            if *id < 9000 && !self.protected_type_vars.contains(id) {
+            // The occurs check is re-run against the GLOBAL map: `local` was checked against
+            // itself, but a binding that is acyclic there can still close a cycle once merged
+            // with solutions collected earlier in the module (`a := b` globally, `b := a` locally).
+            if *id < 9000
+                && !self.protected_type_vars.contains(id)
+                && !occurs_in(*id, ty, &self.solved_type_vars)
+            {
                 self.solved_type_vars.entry(*id).or_insert_with(|| ty.clone());
             }
         }
@@ -536,7 +545,10 @@ impl Checker {
                 Some(existing) if Self::omits_required_field(&ty, existing) => {}
                 _ => {
                     local.insert(id, ty.clone());
-                    if id < 9000 && !self.protected_type_vars.contains(&id) {
+                    if id < 9000
+                        && !self.protected_type_vars.contains(&id)
+                        && !occurs_in(id, &ty, &self.solved_type_vars)
+                    {
                         self.solved_type_vars.entry(id).or_insert(ty);
                     }
                 }

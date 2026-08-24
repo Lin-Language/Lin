@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -90,6 +90,13 @@ impl LanguageServer for Backend {
                 }
             }
         }
+        // Warm the unimported-stdlib candidate lists here rather than on the first completion.
+        // Both type-check the embedded stdlib to render their signatures, which is startup work,
+        // not something to charge to whoever presses ctrl+space first.
+        std::thread::spawn(|| {
+            let _ = STDLIB_DOT_CANDIDATES.len();
+            let _ = STDLIB_ALL_CANDIDATES.len();
+        });
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -339,8 +346,22 @@ impl LanguageServer for Backend {
         // Detect whether cursor is in a dot-completion context and resolve the receiver's type
         // category (e.g. "array", "string", "object") AND, when the receiver type-checked, its
         // PRECISE cleaned type-string — used by the type-accurate `first_param_accepts` dot gate.
-        let (in_dot_context, receiver_category, receiver_precise) =
+        let (in_dot_context, mut receiver_category, mut receiver_precise) =
             dot_receiver_category(&source, offset, &analysis.span_type_map);
+
+        // A half-typed member access (`xs.len`, `(a / b).to`) does not type-check, and a statement
+        // that fails to check contributes NOTHING to `span_type_map` — including the receiver's own
+        // type. That is the state the file is in for essentially every completion request, so
+        // without this the receiver type was almost never known and the dot gate fell open, offering
+        // the whole candidate set regardless of the receiver. Retry against a REPAIRED copy of the
+        // source with the incomplete `.member` deleted, which restores a checkable statement.
+        // Offsets before the dot are unchanged by the deletion, so the receiver lookup is unaffected.
+        if in_dot_context && receiver_precise.is_none() {
+            if let Some(ty) = repaired_receiver_type(&source, offset, base_dir.as_deref()) {
+                receiver_category = Some(type_to_category(&ty).to_string());
+                receiver_precise = Some(clean_type_string(&ty));
+            }
+        }
 
         // TUPLE-ARGS receiver (`(a, b).f`): Lin spreads the N elements over the candidate's leading N
         // params (`f(a, b, ...)`, spec §1310). `receiver_elems` is `Some` only when EVERY element
@@ -583,6 +604,23 @@ impl LanguageServer for Backend {
                 receiver_category.as_deref().unwrap_or("any"),
                 receiver_precise.as_deref(),
                 receiver_elems.as_deref(),
+                prefix,
+                &already,
+                uri,
+                snippet_support,
+                next_char_is_paren,
+            ));
+        }
+
+        // 5b. UNIMPORTED stdlib exports in IDENTIFIER position. The dot path above only fires after
+        // a `.`, so before this a stdlib name the file hadn't imported yet (`toInt32`) completed to
+        // nothing. Requires a typed prefix — see `stdlib_identifier_completion_items`.
+        if !in_dot_context
+            && matches!(ctx, CompletionContext::Expression | CompletionContext::StatementStart)
+        {
+            let already: HashSet<String> = items.iter().map(|i| i.label.clone()).collect();
+            items.extend(stdlib_identifier_completion_items(
+                STDLIB_ALL_CANDIDATES.iter(),
                 prefix,
                 &already,
                 uri,
@@ -1134,6 +1172,11 @@ impl Backend {
             .write()
             .unwrap()
             .insert(uri.clone(), source.to_string());
+        // Drop the cross-request caches of type-checked user modules and their export types: this
+        // file may be a dependency of any of them, and the caches key on each module's OWN source,
+        // which cannot see that. Must happen BEFORE the `analyse` below, so this file's own
+        // dependents re-check against the new content.
+        invalidate_user_module_cache();
         // Re-index this file's symbol/import table so cross-file
         // references/symbols/rename stay current. This also refreshes the export
         // signatures dependents read through `analyse`'s `pre_resolve_imports`.
@@ -1274,7 +1317,7 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
         .map(|d| lsp_diagnostic(source, d))
         .collect();
 
-    let mut imported: HashMap<String, TypedModule> = HashMap::new();
+    let mut imported: HashMap<String, Arc<TypedModule>> = HashMap::new();
     let effective_base = base_dir
         .map(|p| p.to_path_buf())
         .or_else(|| WORKSPACE_ROOT.read().unwrap_or_else(|e| e.into_inner()).clone())
@@ -1489,10 +1532,43 @@ fn module_identity(path: &str, base_dir: &Path) -> String {
         .to_string()
 }
 
+/// Content hash of a module source, used as the cache key component that makes a stale entry
+/// impossible to hit for the file it was built from.
+fn source_hash(src: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    src.hash(&mut h);
+    h.finish()
+}
+
+/// Cross-request cache of type-checked IMPORTED modules, keyed by resolved module identity plus the
+/// hash of that module's own source.
+///
+/// Without this, every request that calls `analyse` re-parsed and re-type-checked every module in
+/// the file's import closure — the embedded `std/*` sources included. That dominated the cost of a
+/// single analysis (~33ms of ~40ms for a two-import file), and completion multiplies it by the
+/// number of workspace files it inspects.
+///
+/// Entries for a module are keyed by that module's OWN source hash, so editing a file can't hit its
+/// own stale entry; a module's typed result also depends on its dependencies, which the hash does
+/// NOT cover, so `invalidate_user_module_cache` drops every non-stdlib entry whenever any document
+/// changes. Stdlib entries are built from `&'static` sources and never need invalidating.
+static MODULE_CACHE: std::sync::LazyLock<RwLock<HashMap<(String, u64), Arc<TypedModule>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Drop every cached USER module (stdlib entries are immutable, so they stay). Called on every
+/// document open/change/save: a cached module's types depend on its dependencies' contents, which
+/// its own source hash does not capture, so an edit anywhere invalidates the user half wholesale.
+fn invalidate_user_module_cache() {
+    let mut cache = MODULE_CACHE.write().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|(identity, _), _| stdlib_source(identity).is_some());
+    EXPORT_TYPE_CACHE.write().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 fn pre_resolve_imports(
     ast_module: &lin_parse::ast::Module,
     base_dir: &Path,
-    cache: &mut HashMap<String, TypedModule>,
+    cache: &mut HashMap<String, Arc<TypedModule>>,
     // Identities of modules currently being resolved or already resolved. Guards
     // against infinite recursion on cyclic import graphs (a now-supported language
     // feature; cf. lin-compile's Tarjan SCC handling). Unlike the compiler, the LSP
@@ -1507,30 +1583,41 @@ fn pre_resolve_imports(
             }
             let identity = module_identity(path.as_str(), base_dir);
             // Already resolved or currently on the resolution stack: skip to break cycles.
-            if !visiting.insert(identity) {
+            if !visiting.insert(identity.clone()) {
                 continue;
             }
-            let (ast_mod, child_base) = if let Some(src) = stdlib_source(path.as_str()) {
-                let mut lexer = lin_lex::Lexer::new(src, 0);
-                let tokens = lexer.tokenize();
-                let mut parser = lin_parse::Parser::new(tokens);
-                (parser.parse_module(), base_dir.to_path_buf())
+            let (src, child_base) = if let Some(src) = stdlib_source(path.as_str()) {
+                (src.to_string(), base_dir.to_path_buf())
             } else {
                 let file_path = base_dir.join(format!("{}.lin", path));
                 match std::fs::read_to_string(&file_path) {
                     Ok(src) => {
-                        let mut lexer = lin_lex::Lexer::new(&src, 0);
-                        let tokens = lexer.tokenize();
-                        let mut parser = lin_parse::Parser::new(tokens);
-                        let ast = parser.parse_module();
-                        let child = file_path
-                            .parent()
-                            .unwrap_or(base_dir)
-                            .to_path_buf();
-                        (ast, child)
+                        let child = file_path.parent().unwrap_or(base_dir).to_path_buf();
+                        (src, child)
                     }
                     Err(_) => continue,
                 }
+            };
+
+            // Cache hit: reuse the already-checked module and skip its subtree entirely. Its own
+            // imports don't need resolving — the only reason to descend was to seed the checker
+            // for THIS module, and it is already checked.
+            let key = (identity, source_hash(&src));
+            if let Some(hit) = MODULE_CACHE
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .cloned()
+            {
+                cache.insert(path.clone(), hit);
+                continue;
+            }
+
+            let ast_mod = {
+                let mut lexer = lin_lex::Lexer::new(&src, 0);
+                let tokens = lexer.tokenize();
+                let mut parser = lin_parse::Parser::new(tokens);
+                parser.parse_module()
             };
 
             pre_resolve_imports(&ast_mod, &child_base, cache, visiting);
@@ -1539,7 +1626,7 @@ fn pre_resolve_imports(
             let mut import_type_decls: HashMap<(String, String), (Vec<String>, Type)> =
                 HashMap::new();
             for (dep_path, dep_module) in cache.iter() {
-                for (name, ty) in extract_exports(dep_module) {
+                for (name, ty) in extract_exports(dep_module.as_ref()) {
                     import_type_map.insert((dep_path.clone(), name), ty);
                 }
                 // Register imported `type` declarations so transitively-imported types
@@ -1558,6 +1645,11 @@ fn pre_resolve_imports(
             checker.lenient_json = is_stdlib;
             checker.allow_intrinsics = is_stdlib;
             if let Ok(typed) = checker.check_module(&ast_mod) {
+                let typed = Arc::new(typed);
+                MODULE_CACHE
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, Arc::clone(&typed));
                 cache.insert(path.clone(), typed);
             }
         }
@@ -1748,19 +1840,95 @@ fn dot_receiver_category(
         Some(o) => o,
         None => return (true, None, None),
     };
-    let ty_str = tightest_span(span_type_map, receiver_offset)
-        .map(|(_, s, _)| s.as_str())
-        .unwrap_or("");
-
-    if ty_str.is_empty() {
+    let Some(ty_str) = receiver_type_at(source, receiver_offset, span_type_map) else {
         // In dot context but type unknown — show all stdlib items.
         return (true, None, None);
-    }
+    };
 
     // Clean the raw type-string (resolve `?T<id>` solver ids → `Json`/generic letters) so the
     // precise gate matches on the same rendered form `detail` uses.
-    let precise = clean_type_string(ty_str);
-    (true, Some(type_to_category(ty_str).to_string()), Some(precise))
+    let precise = clean_type_string(&ty_str);
+    (true, Some(type_to_category(&ty_str).to_string()), Some(precise))
+}
+
+/// Re-derive the dot receiver's type from a copy of `source` with the incomplete `.member` at the
+/// cursor removed (`val n = xs.len` -> `val n = xs`), so the enclosing statement type-checks and the
+/// receiver's span is recorded. Returns the RAW type string, or `None` when the repair still doesn't
+/// yield a type (the file is broken for some other reason).
+///
+/// Costs one extra analysis, and only on the path where the direct lookup already failed.
+fn repaired_receiver_type(source: &str, offset: usize, base_dir: Option<&Path>) -> Option<String> {
+    let prefix_len = word_before(source, offset).len();
+    let dot_offset = offset.checked_sub(prefix_len + 1)?;
+    let dot_byte = char_offset_to_byte(source, dot_offset);
+    if source.as_bytes().get(dot_byte) != Some(&b'.') {
+        return None;
+    }
+    let cursor_byte = char_offset_to_byte(source, offset);
+    let mut repaired = String::with_capacity(source.len());
+    repaired.push_str(&source[..dot_byte]);
+    repaired.push_str(&source[cursor_byte..]);
+
+    let analysis = analyse(&repaired, base_dir);
+    receiver_type_at(&repaired, dot_offset.checked_sub(1)?, &analysis.span_type_map)
+}
+
+/// The rendered type of the dot-completion receiver whose LAST character sits at `receiver_offset`
+/// (a char offset — the character immediately before the `.`).
+///
+/// Normally the tightest recorded span containing that character IS the receiver. The exception is a
+/// PARENTHESISED receiver — `(xs.length() / 2).` — where the last character is `)`: parentheses are
+/// transparent in the AST (there is no `Expr::Paren`), so no span covers them and the tightest-span
+/// lookup finds nothing at all. Handle that by matching the paren pair and taking the WIDEST span
+/// enclosed by it, which is the parenthesised expression itself.
+fn receiver_type_at(
+    source: &str,
+    receiver_offset: usize,
+    span_type_map: &[(lin_common::Span, String, Option<lin_common::Span>)],
+) -> Option<String> {
+    if source.as_bytes().get(char_offset_to_byte(source, receiver_offset)) == Some(&b')') {
+        if let Some(open) = matching_open_paren(source, receiver_offset) {
+            // The span of the parenthesised expression itself: it starts after the `(` and ends
+            // exactly at the `)`. Requiring the exact end is what keeps this honest — a span that
+            // merely sits inside the parens belongs to some sub-expression (`length` in
+            // `(xs.length() / 2)`), and reporting ITS type as the receiver's would be worse than
+            // reporting none, since the dot gate would then filter against the wrong type.
+            let inner = span_type_map
+                .iter()
+                .filter(|(span, _, _)| {
+                    span.start as usize > open && span.end as usize == receiver_offset
+                })
+                .max_by_key(|(span, _, _)| span.end - span.start);
+            if let Some((_, ty, _)) = inner {
+                if !ty.is_empty() {
+                    return Some(ty.clone());
+                }
+            }
+        }
+    }
+    tightest_span(span_type_map, receiver_offset)
+        .map(|(_, ty, _)| ty.clone())
+        .filter(|ty| !ty.is_empty())
+}
+
+/// Char offset of the `(` matching the `)` at char offset `close`, or `None` if unbalanced.
+/// Parens inside string literals are not tracked — a mismatch there only costs a receiver type,
+/// which is already the degraded case.
+fn matching_open_paren(source: &str, close: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, ch) in source.chars().enumerate().take(close + 1).collect::<Vec<_>>().into_iter().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Maps a Lin type string to a broad category used for dot-completion filtering.
@@ -2658,10 +2826,12 @@ struct StdlibCandidate {
 /// (deliberately narrow so a dot doesn't dump the whole stdlib): the combinator/method-bearing
 /// modules a user reaches for via `xs.method(...)` — receiver-polymorphic iterable combinators
 /// (`std/iter`: map/filter/reduce/for/range…), array ops (`std/array`: push/length/slice/sort…),
-/// string ops (`std/string`), and object ops (`std/object`: keys). Each candidate is still gated by
-/// `dot_item_applies` against the receiver category at offer time, so only relevant ones appear.
+/// string ops (`std/string`), object ops (`std/object`: keys), and the numeric conversions and
+/// maths a user reaches for on a number receiver (`std/number`: toInt32/toFloat64…, `std/math`).
+/// Each candidate is still gated by `dot_item_applies` against the receiver category at offer time,
+/// so only relevant ones appear.
 const DOT_CANDIDATE_MODULES: &[&str] =
-    &["std/iter", "std/array", "std/string", "std/object"];
+    &["std/iter", "std/array", "std/string", "std/object", "std/number", "std/math"];
 
 /// All offered stdlib dot-completion candidates, computed ONCE from the embedded stdlib sources
 /// (which are static, so this never goes stale) and memoised. Type-checks each candidate module via
@@ -2750,6 +2920,79 @@ fn stdlib_dot_completion_items<'a>(
     out
 }
 
+/// Every stdlib export, for completion in plain IDENTIFIER position (not after a dot). Built once
+/// from the embedded sources, like `STDLIB_DOT_CANDIDATES`, but over the FULL module set rather than
+/// the method-bearing few: at an identifier the user is naming a function directly, so there is no
+/// receiver to narrow by and no reason to hide `std/fs`'s `readFile` or `std/number`'s `toInt32`.
+static STDLIB_ALL_CANDIDATES: std::sync::LazyLock<Vec<StdlibCandidate>> =
+    std::sync::LazyLock::new(|| {
+        let mut out = Vec::new();
+        for &module in STDLIB_MODULE_IDS {
+            for (name, ty) in stdlib_module_exports(module) {
+                if name.starts_with('_') {
+                    continue;
+                }
+                out.push(StdlibCandidate { name, module: module.to_string(), ty: ty.to_string() });
+            }
+        }
+        out
+    });
+
+/// Build unimported-stdlib completion items for plain IDENTIFIER position — the counterpart to
+/// `stdlib_dot_completion_items`, which only ever ran after a dot. Without this, typing a stdlib
+/// name the file hasn't imported (`toInt32`) and asking for completions offered nothing at all: the
+/// only stdlib names on the list were the ones already imported.
+///
+/// A candidate is offered when its name starts with `prefix` and isn't already offered. Unlike the
+/// dot path this keeps VALUES as well as functions (a constant like `MAX_INT32` is a legitimate
+/// thing to name here) and applies no receiver gate — there is no receiver.
+///
+/// `prefix` MUST be non-empty; the caller enforces it. Completing on an empty prefix here would
+/// dump every stdlib export into the list, drowning the in-scope bindings that are almost always
+/// what the user wants.
+fn stdlib_identifier_completion_items<'a>(
+    candidates: impl Iterator<Item = &'a StdlibCandidate>,
+    prefix: &str,
+    already: &HashSet<String>,
+    uri: &Url,
+    snippet_support: bool,
+    next_char_is_paren: bool,
+) -> Vec<CompletionItem> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for cand in candidates {
+        if !cand.name.starts_with(prefix) || already.contains(&cand.name) {
+            continue;
+        }
+        // Overloads (ADR-074) export the same name more than once; offer it a single time.
+        if !seen.insert(cand.name.as_str()) {
+            continue;
+        }
+        let is_function = cand.ty.contains("=>");
+        let mut item = CompletionItem {
+            label: cand.name.clone(),
+            kind: Some(if is_function {
+                CompletionItemKind::FUNCTION
+            } else {
+                CompletionItemKind::VALUE
+            }),
+            detail: Some(format!("{}  (from {})", clean_type_string(&cand.ty), cand.module)),
+            documentation: Some(Documentation::String(format!("from {}", cand.module))),
+            data: completion_resolve_data_stdlib(uri, &cand.name, &cand.module),
+            ..Default::default()
+        };
+        if is_function {
+            // No receiver here, so the call fills every parameter (arity − 0).
+            apply_function_parens(&mut item, &cand.ty, 0, snippet_support, next_char_is_paren);
+        }
+        out.push(item);
+    }
+    out
+}
+
 /// One USERLAND (cross-file) export offered as an unimported completion candidate: a function or
 /// value `export`ed by another workspace file. `owner_id` is the OWNER file's canonical module id
 /// (used for doc resolution via the index); `specifier` is the importing-file-relative path string
@@ -2769,6 +3012,47 @@ struct UserlandCandidate {
 /// candidate carries the owner's canonical id (doc resolution) + the importing-file-relative import
 /// specifier. The owner's export TYPES are recovered by re-analysing the owner's indexed source (the
 /// same path the stdlib candidate builder uses), so the precise dot-gate + detail have a real type.
+/// Memoised `export name → rendered type` map for one workspace file, keyed by its source hash so a
+/// stale entry can never be hit for edited content. `invalidate_user_module_cache` clears it
+/// alongside `MODULE_CACHE`, since these types come from a full analysis of the owner and so depend
+/// on the owner's dependencies too.
+static EXPORT_TYPE_CACHE: std::sync::LazyLock<
+    RwLock<HashMap<(String, u64), Arc<HashMap<String, String>>>>,
+> = std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn owner_export_types(
+    mod_id: &str,
+    source: &str,
+    owner_dir: Option<&Path>,
+) -> Arc<HashMap<String, String>> {
+    let key = (mod_id.to_string(), source_hash(source));
+    if let Some(hit) = EXPORT_TYPE_CACHE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return hit;
+    }
+    let analysis = analyse(source, owner_dir);
+    let types: HashMap<String, String> = analysis
+        .typed
+        .as_ref()
+        .map(|t| {
+            extract_exports(t)
+                .into_iter()
+                .map(|(n, ty)| (n, clean_type_string(&ty.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let types = Arc::new(types);
+    EXPORT_TYPE_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, Arc::clone(&types));
+    types
+}
+
 fn collect_userland_candidates(
     index: &WorkspaceIndex,
     uri: &Url,
@@ -2797,22 +3081,11 @@ fn collect_userland_candidates(
         let Some(specifier) = import_path_for(mod_id, base_dir) else {
             continue;
         };
-        // Recover the owner's export name→type map by re-analysing its source. Cheap-ish and only
-        // done for files that actually export something; degrades to no-type when checking fails.
+        // Recover the owner's export name→type map. This runs for EVERY exporting workspace file on
+        // EVERY completion request, so it is memoised on the owner's source hash — re-analysing each
+        // owner from scratch cost seconds on a workspace of a few hundred files.
         let owner_dir = Path::new(mod_id).parent().map(|p| p.to_path_buf());
-        let export_types: HashMap<String, String> = {
-            let owner_analysis = analyse(&file.source, owner_dir.as_deref());
-            owner_analysis
-                .typed
-                .as_ref()
-                .map(|t| {
-                    extract_exports(t)
-                        .into_iter()
-                        .map(|(n, ty)| (n, clean_type_string(&ty.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
+        let export_types = owner_export_types(mod_id, &file.source, owner_dir.as_deref());
         for (name, _span) in &file.exports {
             if already_imported.contains(name) {
                 continue;
@@ -2926,13 +3199,13 @@ fn stdlib_module_exports(module_id: &str) -> Vec<(String, Type)> {
     // Resolve the module's own imports (e.g. std/iter -> intrinsics) so it type-checks. stdlib ids
     // are absolute, so the base dir is unused for resolution.
     let base = PathBuf::from(".");
-    let mut cache: HashMap<String, TypedModule> = HashMap::new();
+    let mut cache: HashMap<String, Arc<TypedModule>> = HashMap::new();
     let mut visiting: HashSet<String> = HashSet::new();
     pre_resolve_imports(&ast, &base, &mut cache, &mut visiting);
 
     let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
     for (dep_path, dep_module) in cache.iter() {
-        for (name, ty) in extract_exports(dep_module) {
+        for (name, ty) in extract_exports(dep_module.as_ref()) {
             import_type_map.insert((dep_path.clone(), name), ty);
         }
     }
@@ -7644,7 +7917,7 @@ export val thingCount = 7
         std::fs::write(dir.join("b.lin"), "import { fromA } from \"a\"\nval fromB = 2\n").unwrap();
 
         let entry = parse("import { fromA } from \"a\"\n");
-        let mut cache: HashMap<String, TypedModule> = HashMap::new();
+        let mut cache: HashMap<String, Arc<TypedModule>> = HashMap::new();
         let mut visiting: HashSet<String> = HashSet::new();
         // The assertion is simply that this call returns (does not overflow the stack).
         pre_resolve_imports(&entry, &dir, &mut cache, &mut visiting);
@@ -7660,7 +7933,7 @@ export val thingCount = 7
         std::fs::write(dir.join("leaf.lin"), "val leafVal = 42\n").unwrap();
 
         let entry = parse("import { leafVal } from \"leaf\"\n");
-        let mut cache: HashMap<String, TypedModule> = HashMap::new();
+        let mut cache: HashMap<String, Arc<TypedModule>> = HashMap::new();
         let mut visiting: HashSet<String> = HashSet::new();
         pre_resolve_imports(&entry, &dir, &mut cache, &mut visiting);
 
@@ -7715,7 +7988,7 @@ export val thingCount = 7
         .unwrap();
 
         let entry = parse("import { makeId } from \"b\"\n");
-        let mut cache: HashMap<String, TypedModule> = HashMap::new();
+        let mut cache: HashMap<String, Arc<TypedModule>> = HashMap::new();
         let mut visiting: HashSet<String> = HashSet::new();
         pre_resolve_imports(&entry, &dir, &mut cache, &mut visiting);
 
@@ -9847,5 +10120,184 @@ export val thingCount = 7
         let new_text = organize_new_text(src).expect("action should be produced");
         assert_eq!(new_text, "import { bar } from \"std/string\"\n");
     }
+
+    // ── dot-receiver type recovery ────────────────────────────────────────────────
+
+    /// Resolve the dot receiver's type the way `completion` does: direct lookup first, then the
+    /// repaired-source retry when the half-typed member access stopped the statement checking.
+    fn receiver_type_for_completion(src: &str, cursor_after: &str) -> Option<String> {
+        let byte_off = src.find(cursor_after).expect("cursor not found") + cursor_after.len();
+        let offset = byte_offset_to_char(src, byte_off);
+        let module = parse(src);
+        let mut checker = Checker::new();
+        let _ = checker.check_module(&module);
+        let (in_dot, _, precise) = dot_receiver_category(src, offset, &checker.span_type_map);
+        assert!(in_dot, "expected a dot context after {:?}", cursor_after);
+        precise.or_else(|| {
+            repaired_receiver_type(src, offset, None).map(|t| clean_type_string(&t))
+        })
+    }
+
+    /// A half-typed member name (`xs.len`) makes its statement fail to check, and a failed statement
+    /// records no spans at all — so the receiver's own type was invisible in exactly the state every
+    /// completion request sees it. The repaired-source retry restores it.
+    #[test]
+    fn receiver_type_survives_a_half_typed_member_name() {
+        let src = "import { length } from \"std/array\"\nval f = (xs: Int32[]) =>\n  xs.len\n";
+        assert_eq!(receiver_type_for_completion(src, "xs.len").as_deref(), Some("Int32[]"));
+    }
+
+    #[test]
+    fn receiver_type_resolves_with_nothing_typed_after_the_dot() {
+        let src = "val f = (s: String) =>\n  s.\n";
+        assert_eq!(receiver_type_for_completion(src, "s.").as_deref(), Some("String"));
+    }
+
+    /// Parentheses are transparent in the AST, so no span covers the `)` a parenthesised receiver
+    /// ends on. `receiver_type_at` matches the paren pair and reads the span that ends exactly at
+    /// the `)` — the binary expression's, which `infer_binary_op` records.
+    #[test]
+    fn receiver_type_resolves_through_a_parenthesised_expression() {
+        let src = "import { length } from \"std/array\"\nval f = (xs: Int32[]) =>\n  (xs.length() / 2).to\n";
+        assert_eq!(receiver_type_for_completion(src, "(xs.length() / 2).to").as_deref(), Some("Int32"));
+    }
+
+    /// A sub-expression's type must never stand in for the receiver's: reporting `length`'s
+    /// signature as the type of `(xs.length() / 2)` would make the dot gate filter against a
+    /// function type and hide every relevant numeric method.
+    #[test]
+    fn parenthesised_receiver_never_reports_a_sub_expression_type() {
+        let src = "import { length } from \"std/array\"\nval f = (xs: Int32[]) =>\n  (xs.length()).to\n";
+        let ty = receiver_type_for_completion(src, "(xs.length()).to");
+        assert!(
+            ty.as_deref() != Some("(AnyVal) => Int32"),
+            "receiver reported as the callee's own signature: {:?}",
+            ty
+        );
+    }
+
+    /// An unrelated type error elsewhere in the file must not cost the receiver its type.
+    #[test]
+    fn receiver_type_survives_an_unrelated_type_error() {
+        let src = "import { length } from \"std/array\"\nval bad: String = 42\nval f = (xs: Int32[]) =>\n  xs.len\n";
+        assert_eq!(receiver_type_for_completion(src, "xs.len").as_deref(), Some("Int32[]"));
+    }
+
+    // ── stdlib completion in identifier position ──────────────────────────────────
+
+    /// Typing a stdlib name the file hasn't imported and asking for completions used to offer
+    /// nothing: unimported stdlib candidates were only ever built after a dot.
+    #[test]
+    fn identifier_position_offers_an_unimported_stdlib_function() {
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+        let items = stdlib_identifier_completion_items(
+            STDLIB_ALL_CANDIDATES.iter(),
+            "toInt32",
+            &HashSet::new(),
+            &uri,
+            false,
+            false,
+        );
+        let hit = items.iter().find(|i| i.label == "toInt32");
+        assert!(hit.is_some(), "expected toInt32, got {:?}", labels(&items));
+        assert!(
+            hit.unwrap().detail.as_deref().unwrap_or("").contains("std/number"),
+            "expected the detail to name the owning module: {:?}",
+            hit.unwrap().detail
+        );
+    }
+
+    /// An overloaded export (`toInt32` has a Float64 and an Int64 arm, ADR-074) is one list entry.
+    #[test]
+    fn identifier_position_offers_an_overloaded_name_once() {
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+        let items = stdlib_identifier_completion_items(
+            STDLIB_ALL_CANDIDATES.iter(),
+            "toInt32",
+            &HashSet::new(),
+            &uri,
+            false,
+            false,
+        );
+        assert_eq!(items.iter().filter(|i| i.label == "toInt32").count(), 1);
+    }
+
+    /// Values, not just functions — a stdlib constant is a legitimate thing to name here.
+    #[test]
+    fn identifier_position_offers_stdlib_constants() {
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+        let items = stdlib_identifier_completion_items(
+            STDLIB_ALL_CANDIDATES.iter(),
+            "MAX_INT32",
+            &HashSet::new(),
+            &uri,
+            false,
+            false,
+        );
+        assert!(
+            items.iter().any(|i| i.label == "MAX_INT32"),
+            "expected MAX_INT32, got {:?}",
+            labels(&items)
+        );
+    }
+
+    /// An empty prefix must not dump the whole stdlib over the in-scope bindings.
+    #[test]
+    fn identifier_position_offers_nothing_without_a_prefix() {
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+        let items = stdlib_identifier_completion_items(
+            STDLIB_ALL_CANDIDATES.iter(),
+            "",
+            &HashSet::new(),
+            &uri,
+            false,
+            false,
+        );
+        assert!(items.is_empty(), "expected nothing, got {} items", items.len());
+    }
+
+    /// A name already on the list (imported, or a local binding) isn't offered a second time.
+    #[test]
+    fn identifier_position_skips_already_offered_names() {
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+        let already: HashSet<String> = ["toInt32".to_string()].into_iter().collect();
+        let items = stdlib_identifier_completion_items(
+            STDLIB_ALL_CANDIDATES.iter(),
+            "toInt32",
+            &already,
+            &uri,
+            false,
+            false,
+        );
+        assert!(items.is_empty(), "expected nothing, got {:?}", labels(&items));
+    }
+
+    /// `std/number` is a dot candidate too, so `n.toInt32` completes on a number receiver.
+    #[test]
+    fn number_conversions_are_offered_on_a_number_receiver() {
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+        let items = stdlib_dot_completion_items(
+            STDLIB_DOT_CANDIDATES.iter(),
+            "number",
+            Some("Float64"),
+            None,
+            "toInt32",
+            &HashSet::new(),
+            &uri,
+            false,
+            false,
+        );
+        assert!(
+            items.iter().any(|i| i.label == "toInt32"),
+            "expected toInt32, got {:?}",
+            labels(&items)
+        );
+    }
+
+    fn labels(items: &[CompletionItem]) -> Vec<&str> {
+        items.iter().map(|i| i.label.as_str()).collect()
+    }
 }
+
+
 
