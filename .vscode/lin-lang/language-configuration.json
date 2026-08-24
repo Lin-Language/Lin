@@ -19,9 +19,16 @@
     ["(", ")"],
     ["\"", "\""]
   ],
+  "onEnterRules": [
+    {
+      "beforeText": "^$",
+      "afterText": "^\\S",
+      "action": { "indent": "none" }
+    }
+  ],
   "indentationRules": {
-    "increaseIndentPattern": "=>\\s*$",
-    "decreaseIndentPattern": "^\\s*(else|then)\\b"
+    "increaseIndentPattern": "(=>|\\bthen|\\belse)\\s*$|^\\s*match\\b",
+    "decreaseIndentPattern": "^\\s*(else\\b(?!\\s*=>)|then\\b)"
   },
   "wordPattern": "[a-zA-Z_][a-zA-Z0-9_]*"
 }
