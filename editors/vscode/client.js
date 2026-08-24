@@ -650,6 +650,19 @@ function attachLcovCoverage(run, lcovFile) {
   coverageDetailCache.set(run, detail);
 }
 
+// Does a `file` NDJSON record need reporting against the file item, or did the per-test records
+// already cover it? `pass` never needs it. A `fail` that arrived after per-test records is the
+// ordinary "some tests failed" summary — those tests are already marked, so reporting it again
+// would double-count. Everything else — compile_error, timeout, or a `fail` from a binary that
+// died (runtime error, panic, non-zero exit) before emitting a single record — has nothing else
+// reporting it, and without it the run ends empty and VSCode says "Test run did not record any
+// output".
+function fileRecordNeedsReporting(status, sawTestRecords) {
+  if (status === "pass") return false;
+  if (status === "fail" && sawTestRecords) return false;
+  return true;
+}
+
 function setupTestController(context, linBin) {
   const controller = tests.createTestController("lin", "Lin Tests");
   context.subscriptions.push(controller);
@@ -774,6 +787,14 @@ function setupTestController(context, linBin) {
 
     let buffer = "";
     let warnedSchema = false;
+    // The runner's own stderr. Nothing normally goes here (diagnostics ride in the NDJSON), but
+    // draining it keeps a chatty child from blocking on a full pipe, and it's the only diagnostic
+    // we have if `lin test` itself fails before it can emit any record.
+    let stderrBuffer = "";
+    // Files that emitted at least one per-test record. A binary that crashes (or exits non-zero)
+    // before printing any record produces none — the `file` fallback below turns that into a
+    // visible failure rather than an empty run.
+    const filesWithTestRecords = new Set();
     const handleRecord = (rec) => {
       if (rec.event === "meta") {
         if (typeof rec.schema === "number" && rec.schema > SUPPORTED_SCHEMA && !warnedSchema) {
@@ -792,6 +813,7 @@ function setupTestController(context, linBin) {
         }
       } else if (rec.event === "test") {
         const item = findOrCreateTestItem(controller, rec.file, rec.name);
+        filesWithTestRecords.add(rec.file);
         run.started(item);
         const durationMs = typeof rec.durationMs === "number" ? rec.durationMs : undefined;
         // Always record a per-test summary line in the output tab (pass AND fail) so the run
@@ -828,17 +850,26 @@ function setupTestController(context, linBin) {
           run.failed(item, tm, durationMs);
         }
       } else if (rec.event === "file") {
-        if (rec.status === "compile_error" || rec.status === "timeout") {
-          hasOutput = true;
-          failCount++;
-          const fileItem = getOrCreateFileItem(controller, Uri.file(rec.file));
-          const tm = new TestMessage(rec.message || rec.status);
-          // Mark the file item and ALL its descendants (suite groups → tests) as errored so
-          // the failure is visible even when no per-test records were produced.
-          run.errored(fileItem, tm);
-          const erroredAll = (it) => it.children.forEach((c) => { run.errored(c, tm); erroredAll(c); });
-          erroredAll(fileItem);
-        }
+        if (!fileRecordNeedsReporting(rec.status, filesWithTestRecords.has(rec.file))) return;
+        hasOutput = true;
+        failCount++;
+        const label = path.basename(rec.file);
+        if (!firstFailName) firstFailName = label;
+        const message = rec.message || rec.status;
+        const fileItem = getOrCreateFileItem(controller, Uri.file(rec.file));
+        const tm = new TestMessage(message);
+        // Echo it into the output tab too — the message is usually the compiler diagnostic or the
+        // runtime error's stderr, which is the only clue the user gets about why nothing ran.
+        run.appendOutput(
+          `✗ ${label} (${rec.status})\r\n    ${message.replace(/\r?\n/g, "\r\n    ")}\r\n`,
+          undefined,
+          fileItem
+        );
+        // Mark the file item and ALL its descendants (suite groups → tests) as errored so
+        // the failure is visible even when no per-test records were produced.
+        run.errored(fileItem, tm);
+        const erroredAll = (it) => it.children.forEach((c) => { run.errored(c, tm); erroredAll(c); });
+        erroredAll(fileItem);
       }
     };
 
@@ -857,9 +888,22 @@ function setupTestController(context, linBin) {
       }
     });
 
-    child.on("close", () => {
+    child.stderr.on("data", (chunk) => {
+      if (stderrBuffer.length < 64 * 1024) stderrBuffer += chunk.toString();
+    });
+
+    child.on("close", (code) => {
       if (buffer.trim()) {
         try { handleRecord(JSON.parse(buffer.trim())); } catch (_) { /* ignore */ }
+      }
+      // The runner exited non-zero without a single record attributable to a test file — it
+      // failed before it could report (bad arguments, no test files matched, a crash). Say so
+      // rather than ending a silent, empty run.
+      if (!hasOutput && code !== 0 && !token.isCancellationRequested) {
+        const detail = stderrBuffer.trim() || `\`lin test\` exited with code ${code} and produced no results.`;
+        hasOutput = true;
+        run.appendOutput(detail.replace(/\r?\n/g, "\r\n") + "\r\n");
+        window.showErrorMessage(`Lin: test run failed — ${detail.split("\n")[0]}`);
       }
       if (lcovFile) {
         attachLcovCoverage(run, lcovFile);
@@ -1346,5 +1390,5 @@ module.exports = {
   deactivate,
   // Exposed for the standalone discovery/unescape unit test (test/discovery.test.js).
   // These are pure (no VS Code API) and safe to call directly.
-  _test: { discoverLine, unescapeLinString, stripLineComment, isInsideString, firstStringArg, discoverFileStructure, findDescendantById },
+  _test: { discoverLine, unescapeLinString, stripLineComment, isInsideString, firstStringArg, discoverFileStructure, findDescendantById, fileRecordNeedsReporting },
 };
