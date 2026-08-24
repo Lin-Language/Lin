@@ -30,7 +30,21 @@ struct Backend {
     /// Whether to emit inferred-type inlay hints on unannotated function/lambda parameters. Mirrors
     /// `lin.inlayHints.parameterTypes`; defaults true. Captured/refreshed alongside the above.
     inlay_parameter_types: AtomicBool,
+    /// Newest `update` ticket seen per document — the staleness guard for concurrent edits.
+    ///
+    /// tower-lsp processes up to four messages CONCURRENTLY (`DEFAULT_MAX_CONCURRENCY`), so two
+    /// `did_change` notifications for the same file can be in flight at once and finish out of
+    /// order. Without this, an older update could overwrite the buffer with older text and publish
+    /// its older diagnostics last — leaving the error underline up on code the user has already
+    /// fixed, until some later edit happened to land in order.
+    ///
+    /// Tickets are handed out in arrival order, so an update holding a ticket lower than the
+    /// recorded one has been superseded and drops out.
+    doc_generation: RwLock<HashMap<Url, u64>>,
 }
+
+/// Source of the monotonically increasing `update` tickets. See `Backend::doc_generation`.
+static NEXT_DOC_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
@@ -214,6 +228,10 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.docs.write().unwrap_or_else(|e| e.into_inner()).remove(&params.text_document.uri);
+        self.doc_generation
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&params.text_document.uri);
         self.client
             .publish_diagnostics(params.text_document.uri, vec![], None)
             .await;
@@ -1167,7 +1185,27 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
+    /// Whether a newer `update` for `uri` has started since this one took `ticket`.
+    fn superseded(&self, uri: &Url, ticket: u64) -> bool {
+        self.doc_generation
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(uri)
+            .is_some_and(|newest| *newest > ticket)
+    }
+
     async fn update(&self, uri: &Url, source: &str) {
+        // Claim this edit's place in the arrival order, and bail out if a newer edit for the same
+        // document has already claimed one. See `Backend::doc_generation`.
+        let ticket = NEXT_DOC_GENERATION.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut generations = self.doc_generation.write().unwrap_or_else(|e| e.into_inner());
+            if generations.get(uri).is_some_and(|newest| *newest > ticket) {
+                return;
+            }
+            generations.insert(uri.clone(), ticket);
+        }
+
         self.docs
             .write()
             .unwrap()
@@ -1187,6 +1225,11 @@ impl Backend {
         }
         let base_dir = file_dir(uri);
         let analysis = analyse_cached(source, base_dir.as_deref());
+        // A newer edit may have landed while this one was analysing; publishing now would replace
+        // that newer document's diagnostics with this older text's.
+        if self.superseded(uri, ticket) {
+            return;
+        }
         self.client
             .publish_diagnostics(uri.clone(), analysis.diagnostics.clone(), None)
             .await;
@@ -1214,6 +1257,11 @@ impl Backend {
         // re-analyse (we do NOT recursively call `update`, which would re-trigger),
         // and we skip F's own URI defensively. A cyclic graph (A↔B) is therefore
         // safe — editing A re-checks B once and stops.
+        // Same staleness guard: if a newer edit landed while we were analysing, it will run its own
+        // dependent re-check against the newer text, so this one has nothing to add.
+        if self.superseded(uri, ticket) {
+            return;
+        }
         self.recheck_open_dependents(uri).await;
     }
 
@@ -7042,6 +7090,7 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         docs: RwLock::new(HashMap::new()),
+        doc_generation: RwLock::new(HashMap::new()),
         snippet_support: AtomicBool::new(false),
         inlay_variable_types: AtomicBool::new(true),
         inlay_parameter_types: AtomicBool::new(true),
@@ -10438,7 +10487,42 @@ export val thingCount = 7
             "the second request re-analysed instead of reusing the first"
         );
     }
+
+    /// tower-lsp runs up to four messages concurrently, so two edits to one document can be in
+    /// flight at once. The older one must drop out rather than overwrite the buffer with older text
+    /// and republish its older diagnostics — which is what left an error underline standing on code
+    /// the user had already fixed.
+    #[test]
+    fn a_superseded_update_drops_out() {
+        let generations: RwLock<HashMap<Url, u64>> = RwLock::new(HashMap::new());
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+
+        // Two updates take tickets in arrival order; the NEWER one records its ticket first
+        // (it finished claiming the document while the older one was still working).
+        let older = 1u64;
+        let newer = 2u64;
+        generations.write().unwrap().insert(uri.clone(), newer);
+
+        let superseded = |ticket: u64| {
+            generations
+                .read()
+                .unwrap()
+                .get(&uri)
+                .is_some_and(|newest| *newest > ticket)
+        };
+        assert!(superseded(older), "the older edit must not publish");
+        assert!(!superseded(newer), "the newest edit must publish");
+    }
+
+    /// Tickets are handed out monotonically, so arrival order is recoverable.
+    #[test]
+    fn update_tickets_increase_monotonically() {
+        let a = NEXT_DOC_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let b = NEXT_DOC_GENERATION.fetch_add(1, Ordering::Relaxed);
+        assert!(b > a, "expected increasing tickets, got {} then {}", a, b);
+    }
 }
+
 
 
 
