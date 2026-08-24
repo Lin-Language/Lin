@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -1134,6 +1134,11 @@ impl Backend {
             .write()
             .unwrap()
             .insert(uri.clone(), source.to_string());
+        // Drop the cross-request caches of type-checked user modules and their export types: this
+        // file may be a dependency of any of them, and the caches key on each module's OWN source,
+        // which cannot see that. Must happen BEFORE the `analyse` below, so this file's own
+        // dependents re-check against the new content.
+        invalidate_user_module_cache();
         // Re-index this file's symbol/import table so cross-file
         // references/symbols/rename stay current. This also refreshes the export
         // signatures dependents read through `analyse`'s `pre_resolve_imports`.
@@ -1274,7 +1279,7 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
         .map(|d| lsp_diagnostic(source, d))
         .collect();
 
-    let mut imported: HashMap<String, TypedModule> = HashMap::new();
+    let mut imported: HashMap<String, Arc<TypedModule>> = HashMap::new();
     let effective_base = base_dir
         .map(|p| p.to_path_buf())
         .or_else(|| WORKSPACE_ROOT.read().unwrap_or_else(|e| e.into_inner()).clone())
@@ -1489,10 +1494,43 @@ fn module_identity(path: &str, base_dir: &Path) -> String {
         .to_string()
 }
 
+/// Content hash of a module source, used as the cache key component that makes a stale entry
+/// impossible to hit for the file it was built from.
+fn source_hash(src: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    src.hash(&mut h);
+    h.finish()
+}
+
+/// Cross-request cache of type-checked IMPORTED modules, keyed by resolved module identity plus the
+/// hash of that module's own source.
+///
+/// Without this, every request that calls `analyse` re-parsed and re-type-checked every module in
+/// the file's import closure — the embedded `std/*` sources included. That dominated the cost of a
+/// single analysis (~33ms of ~40ms for a two-import file), and completion multiplies it by the
+/// number of workspace files it inspects.
+///
+/// Entries for a module are keyed by that module's OWN source hash, so editing a file can't hit its
+/// own stale entry; a module's typed result also depends on its dependencies, which the hash does
+/// NOT cover, so `invalidate_user_module_cache` drops every non-stdlib entry whenever any document
+/// changes. Stdlib entries are built from `&'static` sources and never need invalidating.
+static MODULE_CACHE: std::sync::LazyLock<RwLock<HashMap<(String, u64), Arc<TypedModule>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Drop every cached USER module (stdlib entries are immutable, so they stay). Called on every
+/// document open/change/save: a cached module's types depend on its dependencies' contents, which
+/// its own source hash does not capture, so an edit anywhere invalidates the user half wholesale.
+fn invalidate_user_module_cache() {
+    let mut cache = MODULE_CACHE.write().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|(identity, _), _| stdlib_source(identity).is_some());
+    EXPORT_TYPE_CACHE.write().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 fn pre_resolve_imports(
     ast_module: &lin_parse::ast::Module,
     base_dir: &Path,
-    cache: &mut HashMap<String, TypedModule>,
+    cache: &mut HashMap<String, Arc<TypedModule>>,
     // Identities of modules currently being resolved or already resolved. Guards
     // against infinite recursion on cyclic import graphs (a now-supported language
     // feature; cf. lin-compile's Tarjan SCC handling). Unlike the compiler, the LSP
@@ -1507,30 +1545,41 @@ fn pre_resolve_imports(
             }
             let identity = module_identity(path.as_str(), base_dir);
             // Already resolved or currently on the resolution stack: skip to break cycles.
-            if !visiting.insert(identity) {
+            if !visiting.insert(identity.clone()) {
                 continue;
             }
-            let (ast_mod, child_base) = if let Some(src) = stdlib_source(path.as_str()) {
-                let mut lexer = lin_lex::Lexer::new(src, 0);
-                let tokens = lexer.tokenize();
-                let mut parser = lin_parse::Parser::new(tokens);
-                (parser.parse_module(), base_dir.to_path_buf())
+            let (src, child_base) = if let Some(src) = stdlib_source(path.as_str()) {
+                (src.to_string(), base_dir.to_path_buf())
             } else {
                 let file_path = base_dir.join(format!("{}.lin", path));
                 match std::fs::read_to_string(&file_path) {
                     Ok(src) => {
-                        let mut lexer = lin_lex::Lexer::new(&src, 0);
-                        let tokens = lexer.tokenize();
-                        let mut parser = lin_parse::Parser::new(tokens);
-                        let ast = parser.parse_module();
-                        let child = file_path
-                            .parent()
-                            .unwrap_or(base_dir)
-                            .to_path_buf();
-                        (ast, child)
+                        let child = file_path.parent().unwrap_or(base_dir).to_path_buf();
+                        (src, child)
                     }
                     Err(_) => continue,
                 }
+            };
+
+            // Cache hit: reuse the already-checked module and skip its subtree entirely. Its own
+            // imports don't need resolving — the only reason to descend was to seed the checker
+            // for THIS module, and it is already checked.
+            let key = (identity, source_hash(&src));
+            if let Some(hit) = MODULE_CACHE
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .cloned()
+            {
+                cache.insert(path.clone(), hit);
+                continue;
+            }
+
+            let ast_mod = {
+                let mut lexer = lin_lex::Lexer::new(&src, 0);
+                let tokens = lexer.tokenize();
+                let mut parser = lin_parse::Parser::new(tokens);
+                parser.parse_module()
             };
 
             pre_resolve_imports(&ast_mod, &child_base, cache, visiting);
@@ -1539,7 +1588,7 @@ fn pre_resolve_imports(
             let mut import_type_decls: HashMap<(String, String), (Vec<String>, Type)> =
                 HashMap::new();
             for (dep_path, dep_module) in cache.iter() {
-                for (name, ty) in extract_exports(dep_module) {
+                for (name, ty) in extract_exports(dep_module.as_ref()) {
                     import_type_map.insert((dep_path.clone(), name), ty);
                 }
                 // Register imported `type` declarations so transitively-imported types
@@ -1558,6 +1607,11 @@ fn pre_resolve_imports(
             checker.lenient_json = is_stdlib;
             checker.allow_intrinsics = is_stdlib;
             if let Ok(typed) = checker.check_module(&ast_mod) {
+                let typed = Arc::new(typed);
+                MODULE_CACHE
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, Arc::clone(&typed));
                 cache.insert(path.clone(), typed);
             }
         }
@@ -2769,6 +2823,47 @@ struct UserlandCandidate {
 /// candidate carries the owner's canonical id (doc resolution) + the importing-file-relative import
 /// specifier. The owner's export TYPES are recovered by re-analysing the owner's indexed source (the
 /// same path the stdlib candidate builder uses), so the precise dot-gate + detail have a real type.
+/// Memoised `export name → rendered type` map for one workspace file, keyed by its source hash so a
+/// stale entry can never be hit for edited content. `invalidate_user_module_cache` clears it
+/// alongside `MODULE_CACHE`, since these types come from a full analysis of the owner and so depend
+/// on the owner's dependencies too.
+static EXPORT_TYPE_CACHE: std::sync::LazyLock<
+    RwLock<HashMap<(String, u64), Arc<HashMap<String, String>>>>,
+> = std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn owner_export_types(
+    mod_id: &str,
+    source: &str,
+    owner_dir: Option<&Path>,
+) -> Arc<HashMap<String, String>> {
+    let key = (mod_id.to_string(), source_hash(source));
+    if let Some(hit) = EXPORT_TYPE_CACHE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return hit;
+    }
+    let analysis = analyse(source, owner_dir);
+    let types: HashMap<String, String> = analysis
+        .typed
+        .as_ref()
+        .map(|t| {
+            extract_exports(t)
+                .into_iter()
+                .map(|(n, ty)| (n, clean_type_string(&ty.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let types = Arc::new(types);
+    EXPORT_TYPE_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, Arc::clone(&types));
+    types
+}
+
 fn collect_userland_candidates(
     index: &WorkspaceIndex,
     uri: &Url,
@@ -2797,22 +2892,11 @@ fn collect_userland_candidates(
         let Some(specifier) = import_path_for(mod_id, base_dir) else {
             continue;
         };
-        // Recover the owner's export name→type map by re-analysing its source. Cheap-ish and only
-        // done for files that actually export something; degrades to no-type when checking fails.
+        // Recover the owner's export name→type map. This runs for EVERY exporting workspace file on
+        // EVERY completion request, so it is memoised on the owner's source hash — re-analysing each
+        // owner from scratch cost seconds on a workspace of a few hundred files.
         let owner_dir = Path::new(mod_id).parent().map(|p| p.to_path_buf());
-        let export_types: HashMap<String, String> = {
-            let owner_analysis = analyse(&file.source, owner_dir.as_deref());
-            owner_analysis
-                .typed
-                .as_ref()
-                .map(|t| {
-                    extract_exports(t)
-                        .into_iter()
-                        .map(|(n, ty)| (n, clean_type_string(&ty.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
+        let export_types = owner_export_types(mod_id, &file.source, owner_dir.as_deref());
         for (name, _span) in &file.exports {
             if already_imported.contains(name) {
                 continue;
@@ -2926,13 +3010,13 @@ fn stdlib_module_exports(module_id: &str) -> Vec<(String, Type)> {
     // Resolve the module's own imports (e.g. std/iter -> intrinsics) so it type-checks. stdlib ids
     // are absolute, so the base dir is unused for resolution.
     let base = PathBuf::from(".");
-    let mut cache: HashMap<String, TypedModule> = HashMap::new();
+    let mut cache: HashMap<String, Arc<TypedModule>> = HashMap::new();
     let mut visiting: HashSet<String> = HashSet::new();
     pre_resolve_imports(&ast, &base, &mut cache, &mut visiting);
 
     let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
     for (dep_path, dep_module) in cache.iter() {
-        for (name, ty) in extract_exports(dep_module) {
+        for (name, ty) in extract_exports(dep_module.as_ref()) {
             import_type_map.insert((dep_path.clone(), name), ty);
         }
     }
@@ -7644,7 +7728,7 @@ export val thingCount = 7
         std::fs::write(dir.join("b.lin"), "import { fromA } from \"a\"\nval fromB = 2\n").unwrap();
 
         let entry = parse("import { fromA } from \"a\"\n");
-        let mut cache: HashMap<String, TypedModule> = HashMap::new();
+        let mut cache: HashMap<String, Arc<TypedModule>> = HashMap::new();
         let mut visiting: HashSet<String> = HashSet::new();
         // The assertion is simply that this call returns (does not overflow the stack).
         pre_resolve_imports(&entry, &dir, &mut cache, &mut visiting);
@@ -7660,7 +7744,7 @@ export val thingCount = 7
         std::fs::write(dir.join("leaf.lin"), "val leafVal = 42\n").unwrap();
 
         let entry = parse("import { leafVal } from \"leaf\"\n");
-        let mut cache: HashMap<String, TypedModule> = HashMap::new();
+        let mut cache: HashMap<String, Arc<TypedModule>> = HashMap::new();
         let mut visiting: HashSet<String> = HashSet::new();
         pre_resolve_imports(&entry, &dir, &mut cache, &mut visiting);
 
@@ -7715,7 +7799,7 @@ export val thingCount = 7
         .unwrap();
 
         let entry = parse("import { makeId } from \"b\"\n");
-        let mut cache: HashMap<String, TypedModule> = HashMap::new();
+        let mut cache: HashMap<String, Arc<TypedModule>> = HashMap::new();
         let mut visiting: HashSet<String> = HashSet::new();
         pre_resolve_imports(&entry, &dir, &mut cache, &mut visiting);
 
