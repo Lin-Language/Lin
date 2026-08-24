@@ -71,7 +71,18 @@ pub(crate) fn check_int_literal_fits(v: i64, ty: &Type, span: Span) -> Result<()
 pub(crate) fn collect_type_subs(pattern: &Type, actual: &Type, subs: &mut std::collections::HashMap<u32, Type>) {
     match (pattern, actual) {
         (Type::TypeVar(id), _) if *id == u32::MAX => {}  // AnyVal wildcard: skip
-        (Type::TypeVar(id), t) => { subs.insert(*id, t.clone()); }
+        // OCCURS CHECK: refuse a binding whose solution mentions the very variable being bound
+        // (directly, or transitively through bindings already in `subs`). Such an entry makes the
+        // substitution map cyclic, and the zonking pass — which expands a solved TypeVar by
+        // recursing into its solution — then never terminates and blows the stack. The `Union`
+        // pattern arm below is the usual source: unifying a pattern `T | Int32` against an actual
+        // `T | String` would otherwise record `T := T | String`. Dropping the binding leaves `T`
+        // unsolved, which is exactly the pre-existing behaviour for an un-unifiable pattern.
+        (Type::TypeVar(id), t) => {
+            if !occurs_in(*id, t, subs) {
+                subs.insert(*id, t.clone());
+            }
+        }
         (Type::Array(pt), Type::Array(at)) => collect_type_subs(pt, at, subs),
         (Type::Array(pt), Type::FixedArray(ats)) => {
             for at in ats { collect_type_subs(pt, at, subs); }
@@ -136,6 +147,49 @@ pub(crate) fn collect_type_subs(pattern: &Type, actual: &Type, subs: &mut std::c
         }
         _ => {}
     }
+}
+
+/// True when TypeVar `id` occurs anywhere inside `ty`, following the bindings already recorded in
+/// `subs` (so an indirect cycle `a := b`, `b := a` is caught as well as the direct `a := a`).
+/// `seen` breaks the walk on substitution chains that are ALREADY cyclic, so this helper can never
+/// itself be the thing that recurses forever.
+pub(crate) fn occurs_in(id: u32, ty: &Type, subs: &std::collections::HashMap<u32, Type>) -> bool {
+    fn go(
+        id: u32,
+        ty: &Type,
+        subs: &std::collections::HashMap<u32, Type>,
+        seen: &mut std::collections::HashSet<u32>,
+    ) -> bool {
+        match ty {
+            Type::TypeVar(v) => {
+                if *v == id {
+                    return true;
+                }
+                // Follow the chain: if `v` is already solved, `id` occurring in its solution still
+                // makes the map cyclic once `id := ty` is added.
+                if !seen.insert(*v) {
+                    return false;
+                }
+                subs.get(v).is_some_and(|t| go(id, t, subs, seen))
+            }
+            Type::Array(t)
+            | Type::Iterator(t)
+            | Type::Shared(t)
+            | Type::Stream(t)
+            | Type::Promise(t) => go(id, t, subs, seen),
+            Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(|t| go(id, t, subs, seen)),
+            Type::Map { key, value, .. } => {
+                go(id, key, subs, seen) || go(id, value, subs, seen)
+            }
+            Type::Object { fields, .. } => fields.values().any(|t| go(id, t, subs, seen)),
+            Type::Function { params, ret, .. } => {
+                params.iter().any(|t| go(id, t, subs, seen)) || go(id, ret, subs, seen)
+            }
+            _ => false,
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    go(id, ty, subs, &mut seen)
 }
 
 /// Apply collected substitutions to a type.

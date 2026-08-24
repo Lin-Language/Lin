@@ -21,25 +21,45 @@ pub fn zonk_module(module: &mut TypedModule, subs: &HashMap<u32, Type>) {
 }
 
 pub(crate) fn zonk_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
+    zonk_type_guarded(ty, subs, &mut Vec::new())
+}
+
+/// `zonk_type` with an explicit stack of TypeVar ids currently being expanded.
+///
+/// BACKSTOP against a cyclic substitution map (`a := a`, or `a := b` / `b := a`). The checker's
+/// occurs check (`helpers::occurs_in`) is what actually prevents such an entry from being recorded;
+/// this guard exists because zonking is the point where a cycle turns into unbounded recursion, and
+/// an infinite loop here takes the whole process down — including the language server, which zonks
+/// every workspace file. On re-entering a var already on the stack we stop and leave it as an
+/// unsolved `TypeVar`, which downstream already handles (it is the same shape a genuinely
+/// under-constrained variable has).
+fn zonk_type_guarded(ty: &Type, subs: &HashMap<u32, Type>, expanding: &mut Vec<u32>) -> Type {
     match ty {
         Type::TypeVar(id) => {
             if let Some(concrete) = subs.get(id) {
+                if expanding.contains(id) {
+                    // Cyclic substitution — stop unfolding and keep the variable unsolved.
+                    return ty.clone();
+                }
+                expanding.push(*id);
                 // Recursively zonk the solution in case it also contains TypeVars.
-                zonk_type(concrete, subs)
+                let out = zonk_type_guarded(concrete, subs, expanding);
+                expanding.pop();
+                out
             } else {
                 ty.clone()
             }
         }
-        Type::Array(inner) => Type::Array(Box::new(zonk_type(inner, subs))),
-        Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| zonk_type(t, subs)).collect()),
-        Type::Iterator(inner) => Type::Iterator(Box::new(zonk_type(inner, subs))),
-        Type::Shared(inner) => Type::Shared(Box::new(zonk_type(inner, subs))),
-        Type::Stream(inner) => Type::Stream(Box::new(zonk_type(inner, subs))),
-        Type::Promise(inner) => Type::Promise(Box::new(zonk_type(inner, subs))),
-        Type::Union(ts) => Type::flatten_union(ts.iter().map(|t| zonk_type(t, subs)).collect()),
+        Type::Array(inner) => Type::Array(Box::new(zonk_type_guarded(inner, subs, expanding))),
+        Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| zonk_type_guarded(t, subs, expanding)).collect()),
+        Type::Iterator(inner) => Type::Iterator(Box::new(zonk_type_guarded(inner, subs, expanding))),
+        Type::Shared(inner) => Type::Shared(Box::new(zonk_type_guarded(inner, subs, expanding))),
+        Type::Stream(inner) => Type::Stream(Box::new(zonk_type_guarded(inner, subs, expanding))),
+        Type::Promise(inner) => Type::Promise(Box::new(zonk_type_guarded(inner, subs, expanding))),
+        Type::Union(ts) => Type::flatten_union(ts.iter().map(|t| zonk_type_guarded(t, subs, expanding)).collect()),
         Type::Function { params, ret, required, lset } => Type::Function {
-            params: params.iter().map(|p| zonk_type(p, subs)).collect(),
-            ret: Box::new(zonk_type(ret, subs)),
+            params: params.iter().map(|p| zonk_type_guarded(p, subs, expanding)).collect(),
+            ret: Box::new(zonk_type_guarded(ret, subs, expanding)),
             required: *required,
             lset: lset.clone(),
         },
@@ -49,7 +69,7 @@ pub(crate) fn zonk_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
             // name must survive to Display/LSP after zonking).
             let mut out = indexmap::IndexMap::new();
             for (k, v) in fields {
-                out.insert(k.clone(), zonk_type(v, subs));
+                out.insert(k.clone(), zonk_type_guarded(v, subs, expanding));
             }
             Type::Object { fields: out, sealed: *sealed, name: name.clone() }
         }
@@ -226,5 +246,48 @@ fn zonk_pattern(pat: &mut TypedPattern, subs: &HashMap<u32, Type>) {
             for e in elements { zonk_pattern(e, subs); }
         }
         TypedPattern::Wildcard(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Type;
+
+    /// A cyclic substitution map must not send `zonk_type` into unbounded recursion. The checker's
+    /// occurs check should keep such an entry out of `solved_type_vars` in the first place; this
+    /// pins the backstop so a future inference change can't turn a bad binding into a process-killing
+    /// stack overflow (it took down the language server — see `occurs_check_*` in the checker tests).
+    #[test]
+    fn zonk_type_terminates_on_a_self_referential_substitution() {
+        let mut subs = HashMap::new();
+        subs.insert(1, Type::TypeVar(1));
+        assert_eq!(zonk_type(&Type::TypeVar(1), &subs), Type::TypeVar(1));
+    }
+
+    #[test]
+    fn zonk_type_terminates_on_an_indirect_substitution_cycle() {
+        let mut subs = HashMap::new();
+        subs.insert(1, Type::Array(Box::new(Type::TypeVar(2))));
+        subs.insert(2, Type::Array(Box::new(Type::TypeVar(1))));
+        // Unfolds until it re-enters `1`, then stops with the variable left unsolved.
+        let out = zonk_type(&Type::TypeVar(1), &subs);
+        assert_eq!(
+            out,
+            Type::Array(Box::new(Type::Array(Box::new(Type::TypeVar(1)))))
+        );
+    }
+
+    /// The guard must not truncate a legitimately deep, ACYCLIC chain.
+    #[test]
+    fn zonk_type_still_fully_expands_an_acyclic_chain() {
+        let mut subs = HashMap::new();
+        subs.insert(1, Type::TypeVar(2));
+        subs.insert(2, Type::Array(Box::new(Type::TypeVar(3))));
+        subs.insert(3, Type::Int32);
+        assert_eq!(
+            zonk_type(&Type::TypeVar(1), &subs),
+            Type::Array(Box::new(Type::Int32))
+        );
     }
 }
