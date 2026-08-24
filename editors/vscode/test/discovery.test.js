@@ -249,5 +249,36 @@ check("returns undefined for an unknown id (so caller creates it)", () => {
   assert.strictEqual(findDescendantById(file, "/f.test.lin::nope"), undefined);
 });
 
+console.log("\nfileRecordNeedsReporting:");
+
+check("pass never reports (per-test records already cover it)", () => {
+  const { fileRecordNeedsReporting } = _test;
+  assert.strictEqual(fileRecordNeedsReporting("pass", true), false);
+  assert.strictEqual(fileRecordNeedsReporting("pass", false), false);
+});
+
+check("fail after per-test records is the ordinary summary — no double report", () => {
+  const { fileRecordNeedsReporting } = _test;
+  assert.strictEqual(fileRecordNeedsReporting("fail", true), false);
+});
+
+check("fail with NO per-test records reports (binary crashed before printing any)", () => {
+  const { fileRecordNeedsReporting } = _test;
+  assert.strictEqual(fileRecordNeedsReporting("fail", false), true);
+});
+
+check("compile_error and timeout always report", () => {
+  const { fileRecordNeedsReporting } = _test;
+  for (const status of ["compile_error", "timeout"]) {
+    assert.strictEqual(fileRecordNeedsReporting(status, false), true);
+    assert.strictEqual(fileRecordNeedsReporting(status, true), true);
+  }
+});
+
+check("an unknown future status reports rather than being swallowed", () => {
+  const { fileRecordNeedsReporting } = _test;
+  assert.strictEqual(fileRecordNeedsReporting("link_error", false), true);
+});
+
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);
