@@ -339,8 +339,22 @@ impl LanguageServer for Backend {
         // Detect whether cursor is in a dot-completion context and resolve the receiver's type
         // category (e.g. "array", "string", "object") AND, when the receiver type-checked, its
         // PRECISE cleaned type-string — used by the type-accurate `first_param_accepts` dot gate.
-        let (in_dot_context, receiver_category, receiver_precise) =
+        let (in_dot_context, mut receiver_category, mut receiver_precise) =
             dot_receiver_category(&source, offset, &analysis.span_type_map);
+
+        // A half-typed member access (`xs.len`, `(a / b).to`) does not type-check, and a statement
+        // that fails to check contributes NOTHING to `span_type_map` — including the receiver's own
+        // type. That is the state the file is in for essentially every completion request, so
+        // without this the receiver type was almost never known and the dot gate fell open, offering
+        // the whole candidate set regardless of the receiver. Retry against a REPAIRED copy of the
+        // source with the incomplete `.member` deleted, which restores a checkable statement.
+        // Offsets before the dot are unchanged by the deletion, so the receiver lookup is unaffected.
+        if in_dot_context && receiver_precise.is_none() {
+            if let Some(ty) = repaired_receiver_type(&source, offset, base_dir.as_deref()) {
+                receiver_category = Some(type_to_category(&ty).to_string());
+                receiver_precise = Some(clean_type_string(&ty));
+            }
+        }
 
         // TUPLE-ARGS receiver (`(a, b).f`): Lin spreads the N elements over the candidate's leading N
         // params (`f(a, b, ...)`, spec §1310). `receiver_elems` is `Some` only when EVERY element
@@ -1802,19 +1816,95 @@ fn dot_receiver_category(
         Some(o) => o,
         None => return (true, None, None),
     };
-    let ty_str = tightest_span(span_type_map, receiver_offset)
-        .map(|(_, s, _)| s.as_str())
-        .unwrap_or("");
-
-    if ty_str.is_empty() {
+    let Some(ty_str) = receiver_type_at(source, receiver_offset, span_type_map) else {
         // In dot context but type unknown — show all stdlib items.
         return (true, None, None);
-    }
+    };
 
     // Clean the raw type-string (resolve `?T<id>` solver ids → `Json`/generic letters) so the
     // precise gate matches on the same rendered form `detail` uses.
-    let precise = clean_type_string(ty_str);
-    (true, Some(type_to_category(ty_str).to_string()), Some(precise))
+    let precise = clean_type_string(&ty_str);
+    (true, Some(type_to_category(&ty_str).to_string()), Some(precise))
+}
+
+/// Re-derive the dot receiver's type from a copy of `source` with the incomplete `.member` at the
+/// cursor removed (`val n = xs.len` -> `val n = xs`), so the enclosing statement type-checks and the
+/// receiver's span is recorded. Returns the RAW type string, or `None` when the repair still doesn't
+/// yield a type (the file is broken for some other reason).
+///
+/// Costs one extra analysis, and only on the path where the direct lookup already failed.
+fn repaired_receiver_type(source: &str, offset: usize, base_dir: Option<&Path>) -> Option<String> {
+    let prefix_len = word_before(source, offset).len();
+    let dot_offset = offset.checked_sub(prefix_len + 1)?;
+    let dot_byte = char_offset_to_byte(source, dot_offset);
+    if source.as_bytes().get(dot_byte) != Some(&b'.') {
+        return None;
+    }
+    let cursor_byte = char_offset_to_byte(source, offset);
+    let mut repaired = String::with_capacity(source.len());
+    repaired.push_str(&source[..dot_byte]);
+    repaired.push_str(&source[cursor_byte..]);
+
+    let analysis = analyse(&repaired, base_dir);
+    receiver_type_at(&repaired, dot_offset.checked_sub(1)?, &analysis.span_type_map)
+}
+
+/// The rendered type of the dot-completion receiver whose LAST character sits at `receiver_offset`
+/// (a char offset — the character immediately before the `.`).
+///
+/// Normally the tightest recorded span containing that character IS the receiver. The exception is a
+/// PARENTHESISED receiver — `(xs.length() / 2).` — where the last character is `)`: parentheses are
+/// transparent in the AST (there is no `Expr::Paren`), so no span covers them and the tightest-span
+/// lookup finds nothing at all. Handle that by matching the paren pair and taking the WIDEST span
+/// enclosed by it, which is the parenthesised expression itself.
+fn receiver_type_at(
+    source: &str,
+    receiver_offset: usize,
+    span_type_map: &[(lin_common::Span, String, Option<lin_common::Span>)],
+) -> Option<String> {
+    if source.as_bytes().get(char_offset_to_byte(source, receiver_offset)) == Some(&b')') {
+        if let Some(open) = matching_open_paren(source, receiver_offset) {
+            // The span of the parenthesised expression itself: it starts after the `(` and ends
+            // exactly at the `)`. Requiring the exact end is what keeps this honest — a span that
+            // merely sits inside the parens belongs to some sub-expression (`length` in
+            // `(xs.length() / 2)`), and reporting ITS type as the receiver's would be worse than
+            // reporting none, since the dot gate would then filter against the wrong type.
+            let inner = span_type_map
+                .iter()
+                .filter(|(span, _, _)| {
+                    span.start as usize > open && span.end as usize == receiver_offset
+                })
+                .max_by_key(|(span, _, _)| span.end - span.start);
+            if let Some((_, ty, _)) = inner {
+                if !ty.is_empty() {
+                    return Some(ty.clone());
+                }
+            }
+        }
+    }
+    tightest_span(span_type_map, receiver_offset)
+        .map(|(_, ty, _)| ty.clone())
+        .filter(|ty| !ty.is_empty())
+}
+
+/// Char offset of the `(` matching the `)` at char offset `close`, or `None` if unbalanced.
+/// Parens inside string literals are not tracked — a mismatch there only costs a receiver type,
+/// which is already the degraded case.
+fn matching_open_paren(source: &str, close: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, ch) in source.chars().enumerate().take(close + 1).collect::<Vec<_>>().into_iter().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Maps a Lin type string to a broad category used for dot-completion filtering.
@@ -9931,5 +10021,68 @@ export val thingCount = 7
         let new_text = organize_new_text(src).expect("action should be produced");
         assert_eq!(new_text, "import { bar } from \"std/string\"\n");
     }
+
+    // ── dot-receiver type recovery ────────────────────────────────────────────────
+
+    /// Resolve the dot receiver's type the way `completion` does: direct lookup first, then the
+    /// repaired-source retry when the half-typed member access stopped the statement checking.
+    fn receiver_type_for_completion(src: &str, cursor_after: &str) -> Option<String> {
+        let byte_off = src.find(cursor_after).expect("cursor not found") + cursor_after.len();
+        let offset = byte_offset_to_char(src, byte_off);
+        let module = parse(src);
+        let mut checker = Checker::new();
+        let _ = checker.check_module(&module);
+        let (in_dot, _, precise) = dot_receiver_category(src, offset, &checker.span_type_map);
+        assert!(in_dot, "expected a dot context after {:?}", cursor_after);
+        precise.or_else(|| {
+            repaired_receiver_type(src, offset, None).map(|t| clean_type_string(&t))
+        })
+    }
+
+    /// A half-typed member name (`xs.len`) makes its statement fail to check, and a failed statement
+    /// records no spans at all — so the receiver's own type was invisible in exactly the state every
+    /// completion request sees it. The repaired-source retry restores it.
+    #[test]
+    fn receiver_type_survives_a_half_typed_member_name() {
+        let src = "import { length } from \"std/array\"\nval f = (xs: Int32[]) =>\n  xs.len\n";
+        assert_eq!(receiver_type_for_completion(src, "xs.len").as_deref(), Some("Int32[]"));
+    }
+
+    #[test]
+    fn receiver_type_resolves_with_nothing_typed_after_the_dot() {
+        let src = "val f = (s: String) =>\n  s.\n";
+        assert_eq!(receiver_type_for_completion(src, "s.").as_deref(), Some("String"));
+    }
+
+    /// Parentheses are transparent in the AST, so no span covers the `)` a parenthesised receiver
+    /// ends on. `receiver_type_at` matches the paren pair and reads the span that ends exactly at
+    /// the `)` — the binary expression's, which `infer_binary_op` records.
+    #[test]
+    fn receiver_type_resolves_through_a_parenthesised_expression() {
+        let src = "import { length } from \"std/array\"\nval f = (xs: Int32[]) =>\n  (xs.length() / 2).to\n";
+        assert_eq!(receiver_type_for_completion(src, "(xs.length() / 2).to").as_deref(), Some("Int32"));
+    }
+
+    /// A sub-expression's type must never stand in for the receiver's: reporting `length`'s
+    /// signature as the type of `(xs.length() / 2)` would make the dot gate filter against a
+    /// function type and hide every relevant numeric method.
+    #[test]
+    fn parenthesised_receiver_never_reports_a_sub_expression_type() {
+        let src = "import { length } from \"std/array\"\nval f = (xs: Int32[]) =>\n  (xs.length()).to\n";
+        let ty = receiver_type_for_completion(src, "(xs.length()).to");
+        assert!(
+            ty.as_deref() != Some("(AnyVal) => Int32"),
+            "receiver reported as the callee's own signature: {:?}",
+            ty
+        );
+    }
+
+    /// An unrelated type error elsewhere in the file must not cost the receiver its type.
+    #[test]
+    fn receiver_type_survives_an_unrelated_type_error() {
+        let src = "import { length } from \"std/array\"\nval bad: String = 42\nval f = (xs: Int32[]) =>\n  xs.len\n";
+        assert_eq!(receiver_type_for_completion(src, "xs.len").as_deref(), Some("Int32[]"));
+    }
 }
+
 
