@@ -90,6 +90,13 @@ impl LanguageServer for Backend {
                 }
             }
         }
+        // Warm the unimported-stdlib candidate lists here rather than on the first completion.
+        // Both type-check the embedded stdlib to render their signatures, which is startup work,
+        // not something to charge to whoever presses ctrl+space first.
+        std::thread::spawn(|| {
+            let _ = STDLIB_DOT_CANDIDATES.len();
+            let _ = STDLIB_ALL_CANDIDATES.len();
+        });
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -597,6 +604,23 @@ impl LanguageServer for Backend {
                 receiver_category.as_deref().unwrap_or("any"),
                 receiver_precise.as_deref(),
                 receiver_elems.as_deref(),
+                prefix,
+                &already,
+                uri,
+                snippet_support,
+                next_char_is_paren,
+            ));
+        }
+
+        // 5b. UNIMPORTED stdlib exports in IDENTIFIER position. The dot path above only fires after
+        // a `.`, so before this a stdlib name the file hadn't imported yet (`toInt32`) completed to
+        // nothing. Requires a typed prefix — see `stdlib_identifier_completion_items`.
+        if !in_dot_context
+            && matches!(ctx, CompletionContext::Expression | CompletionContext::StatementStart)
+        {
+            let already: HashSet<String> = items.iter().map(|i| i.label.clone()).collect();
+            items.extend(stdlib_identifier_completion_items(
+                STDLIB_ALL_CANDIDATES.iter(),
                 prefix,
                 &already,
                 uri,
@@ -2802,10 +2826,12 @@ struct StdlibCandidate {
 /// (deliberately narrow so a dot doesn't dump the whole stdlib): the combinator/method-bearing
 /// modules a user reaches for via `xs.method(...)` — receiver-polymorphic iterable combinators
 /// (`std/iter`: map/filter/reduce/for/range…), array ops (`std/array`: push/length/slice/sort…),
-/// string ops (`std/string`), and object ops (`std/object`: keys). Each candidate is still gated by
-/// `dot_item_applies` against the receiver category at offer time, so only relevant ones appear.
+/// string ops (`std/string`), object ops (`std/object`: keys), and the numeric conversions and
+/// maths a user reaches for on a number receiver (`std/number`: toInt32/toFloat64…, `std/math`).
+/// Each candidate is still gated by `dot_item_applies` against the receiver category at offer time,
+/// so only relevant ones appear.
 const DOT_CANDIDATE_MODULES: &[&str] =
-    &["std/iter", "std/array", "std/string", "std/object"];
+    &["std/iter", "std/array", "std/string", "std/object", "std/number", "std/math"];
 
 /// All offered stdlib dot-completion candidates, computed ONCE from the embedded stdlib sources
 /// (which are static, so this never goes stale) and memoised. Type-checks each candidate module via
@@ -2889,6 +2915,79 @@ fn stdlib_dot_completion_items<'a>(
         // `completion_resolve` — `insert_text` here is an independent field.
         let receiver_arity = receiver_elems.map(|e| e.len()).unwrap_or(1);
         apply_function_parens(&mut item, &cand.ty, receiver_arity, snippet_support, next_char_is_paren);
+        out.push(item);
+    }
+    out
+}
+
+/// Every stdlib export, for completion in plain IDENTIFIER position (not after a dot). Built once
+/// from the embedded sources, like `STDLIB_DOT_CANDIDATES`, but over the FULL module set rather than
+/// the method-bearing few: at an identifier the user is naming a function directly, so there is no
+/// receiver to narrow by and no reason to hide `std/fs`'s `readFile` or `std/number`'s `toInt32`.
+static STDLIB_ALL_CANDIDATES: std::sync::LazyLock<Vec<StdlibCandidate>> =
+    std::sync::LazyLock::new(|| {
+        let mut out = Vec::new();
+        for &module in STDLIB_MODULE_IDS {
+            for (name, ty) in stdlib_module_exports(module) {
+                if name.starts_with('_') {
+                    continue;
+                }
+                out.push(StdlibCandidate { name, module: module.to_string(), ty: ty.to_string() });
+            }
+        }
+        out
+    });
+
+/// Build unimported-stdlib completion items for plain IDENTIFIER position — the counterpart to
+/// `stdlib_dot_completion_items`, which only ever ran after a dot. Without this, typing a stdlib
+/// name the file hasn't imported (`toInt32`) and asking for completions offered nothing at all: the
+/// only stdlib names on the list were the ones already imported.
+///
+/// A candidate is offered when its name starts with `prefix` and isn't already offered. Unlike the
+/// dot path this keeps VALUES as well as functions (a constant like `MAX_INT32` is a legitimate
+/// thing to name here) and applies no receiver gate — there is no receiver.
+///
+/// `prefix` MUST be non-empty; the caller enforces it. Completing on an empty prefix here would
+/// dump every stdlib export into the list, drowning the in-scope bindings that are almost always
+/// what the user wants.
+fn stdlib_identifier_completion_items<'a>(
+    candidates: impl Iterator<Item = &'a StdlibCandidate>,
+    prefix: &str,
+    already: &HashSet<String>,
+    uri: &Url,
+    snippet_support: bool,
+    next_char_is_paren: bool,
+) -> Vec<CompletionItem> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for cand in candidates {
+        if !cand.name.starts_with(prefix) || already.contains(&cand.name) {
+            continue;
+        }
+        // Overloads (ADR-074) export the same name more than once; offer it a single time.
+        if !seen.insert(cand.name.as_str()) {
+            continue;
+        }
+        let is_function = cand.ty.contains("=>");
+        let mut item = CompletionItem {
+            label: cand.name.clone(),
+            kind: Some(if is_function {
+                CompletionItemKind::FUNCTION
+            } else {
+                CompletionItemKind::VALUE
+            }),
+            detail: Some(format!("{}  (from {})", clean_type_string(&cand.ty), cand.module)),
+            documentation: Some(Documentation::String(format!("from {}", cand.module))),
+            data: completion_resolve_data_stdlib(uri, &cand.name, &cand.module),
+            ..Default::default()
+        };
+        if is_function {
+            // No receiver here, so the call fills every parameter (arity − 0).
+            apply_function_parens(&mut item, &cand.ty, 0, snippet_support, next_char_is_paren);
+        }
         out.push(item);
     }
     out
@@ -10083,6 +10182,122 @@ export val thingCount = 7
         let src = "import { length } from \"std/array\"\nval bad: String = 42\nval f = (xs: Int32[]) =>\n  xs.len\n";
         assert_eq!(receiver_type_for_completion(src, "xs.len").as_deref(), Some("Int32[]"));
     }
+
+    // ── stdlib completion in identifier position ──────────────────────────────────
+
+    /// Typing a stdlib name the file hasn't imported and asking for completions used to offer
+    /// nothing: unimported stdlib candidates were only ever built after a dot.
+    #[test]
+    fn identifier_position_offers_an_unimported_stdlib_function() {
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+        let items = stdlib_identifier_completion_items(
+            STDLIB_ALL_CANDIDATES.iter(),
+            "toInt32",
+            &HashSet::new(),
+            &uri,
+            false,
+            false,
+        );
+        let hit = items.iter().find(|i| i.label == "toInt32");
+        assert!(hit.is_some(), "expected toInt32, got {:?}", labels(&items));
+        assert!(
+            hit.unwrap().detail.as_deref().unwrap_or("").contains("std/number"),
+            "expected the detail to name the owning module: {:?}",
+            hit.unwrap().detail
+        );
+    }
+
+    /// An overloaded export (`toInt32` has a Float64 and an Int64 arm, ADR-074) is one list entry.
+    #[test]
+    fn identifier_position_offers_an_overloaded_name_once() {
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+        let items = stdlib_identifier_completion_items(
+            STDLIB_ALL_CANDIDATES.iter(),
+            "toInt32",
+            &HashSet::new(),
+            &uri,
+            false,
+            false,
+        );
+        assert_eq!(items.iter().filter(|i| i.label == "toInt32").count(), 1);
+    }
+
+    /// Values, not just functions — a stdlib constant is a legitimate thing to name here.
+    #[test]
+    fn identifier_position_offers_stdlib_constants() {
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+        let items = stdlib_identifier_completion_items(
+            STDLIB_ALL_CANDIDATES.iter(),
+            "MAX_INT32",
+            &HashSet::new(),
+            &uri,
+            false,
+            false,
+        );
+        assert!(
+            items.iter().any(|i| i.label == "MAX_INT32"),
+            "expected MAX_INT32, got {:?}",
+            labels(&items)
+        );
+    }
+
+    /// An empty prefix must not dump the whole stdlib over the in-scope bindings.
+    #[test]
+    fn identifier_position_offers_nothing_without_a_prefix() {
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+        let items = stdlib_identifier_completion_items(
+            STDLIB_ALL_CANDIDATES.iter(),
+            "",
+            &HashSet::new(),
+            &uri,
+            false,
+            false,
+        );
+        assert!(items.is_empty(), "expected nothing, got {} items", items.len());
+    }
+
+    /// A name already on the list (imported, or a local binding) isn't offered a second time.
+    #[test]
+    fn identifier_position_skips_already_offered_names() {
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+        let already: HashSet<String> = ["toInt32".to_string()].into_iter().collect();
+        let items = stdlib_identifier_completion_items(
+            STDLIB_ALL_CANDIDATES.iter(),
+            "toInt32",
+            &already,
+            &uri,
+            false,
+            false,
+        );
+        assert!(items.is_empty(), "expected nothing, got {:?}", labels(&items));
+    }
+
+    /// `std/number` is a dot candidate too, so `n.toInt32` completes on a number receiver.
+    #[test]
+    fn number_conversions_are_offered_on_a_number_receiver() {
+        let uri = Url::parse("file:///w/a.lin").unwrap();
+        let items = stdlib_dot_completion_items(
+            STDLIB_DOT_CANDIDATES.iter(),
+            "number",
+            Some("Float64"),
+            None,
+            "toInt32",
+            &HashSet::new(),
+            &uri,
+            false,
+            false,
+        );
+        assert!(
+            items.iter().any(|i| i.label == "toInt32"),
+            "expected toInt32, got {:?}",
+            labels(&items)
+        );
+    }
+
+    fn labels(items: &[CompletionItem]) -> Vec<&str> {
+        items.iter().map(|i| i.label.as_str()).collect()
+    }
 }
+
 
 
