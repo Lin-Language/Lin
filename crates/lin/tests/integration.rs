@@ -17135,6 +17135,183 @@ fn test_json_reporter_structured_expected_actual() {
     assert!(sat["message"].as_str().unwrap_or("").contains("predicate"), "satisfy message preserved");
 }
 
+// --- `lin test` timeout diagnostics ------------------------------------------
+//
+// A hanging test file used to report a bare `TIMEOUT <file>` with no output and left the child
+// process running forever. `std/test` now prints a `##LINTEST## {"event":"start",...}` marker
+// before each test body (gated on LIN_TEST_TRACE, which `lin test` always sets), the CLI streams
+// the binary's output so it survives the kill, and the last `start` marker names the hung test.
+
+/// A fixture whose SECOND test spins forever. The first test passing (and being reported as
+/// started) is what proves the CLI picks the LAST start marker, not merely the first.
+const HANGING_FIXTURE: &str = r#"import { expect, toBe, test, suite, run } from "std/test"
+
+val spin = (n: Int32): Int32 =>
+  if n == 0 then
+    0
+  else
+    spin(n)
+
+val s = suite("hang", [
+  test("finishes quickly", () =>
+    [expect(1).toBe(1)]
+  ),
+  test("hangs forever", () =>
+    [expect(spin(1)).toBe(0)]
+  )
+])
+
+run(s)
+"#;
+
+#[test]
+fn test_timeout_names_the_hung_test_human_reporter() {
+    use std::time::{Duration, Instant};
+    let fixture = write_test_fixture(HANGING_FIXTURE);
+    let ws = workspace_root();
+    let started = Instant::now();
+    let out = lin_cmd()
+        .args(["test", fixture.to_str().unwrap(), "--timeout", "1"])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin test - run `cargo build -p lin` first");
+    let elapsed = started.elapsed();
+    let _ = fs::remove_file(&fixture);
+
+    assert!(!out.status.success(), "a timing-out file must exit non-zero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("TIMEOUT"), "expected a TIMEOUT line; got:\n{}", stderr);
+    assert!(
+        stderr.contains("timed out during test: \"hangs forever\""),
+        "the TIMEOUT report must name the hung test; got:\n{}",
+        stderr
+    );
+    // The runner records are machine chatter - human mode must not dump them.
+    assert!(
+        !stderr.contains("##LINTEST##"),
+        "human output must not leak runner marker lines; got:\n{}",
+        stderr
+    );
+    // The parent must not block waiting on the killed child: the whole invocation returns shortly
+    // after the 1s timeout (the bulk of the remaining time is the compile, which happens first).
+    // NOTE: we deliberately do NOT assert "no stray process" - there is no portable way to observe
+    // another process's liveness from a test without shelling out to `ps`, and any such check
+    // would be racy. `kill()` + `wait()` in `run_binary` is what reaps it.
+    assert!(
+        elapsed < Duration::from_secs(120),
+        "lin test should return promptly after killing the child; took {:?}",
+        elapsed
+    );
+}
+
+#[test]
+fn test_timeout_names_the_hung_test_json_reporter() {
+    let fixture = write_test_fixture(HANGING_FIXTURE);
+    let (success, lines) = run_test_json(&fixture, &["--timeout", "1"]);
+    let _ = fs::remove_file(&fixture);
+
+    assert!(!success, "a timing-out file must exit non-zero");
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON line {:?}: {}", l, e)))
+        .collect();
+
+    let file_rec = records
+        .iter()
+        .find(|r| r["event"] == "file")
+        .unwrap_or_else(|| panic!("expected a file record; got:\n{:?}", records));
+    assert_eq!(file_rec["status"], "timeout");
+    assert!(
+        file_rec["message"].as_str().unwrap_or("").contains("during test \"hangs forever\""),
+        "the timeout file record must name the hung test; got:\n{:?}",
+        file_rec
+    );
+
+    // `start` markers are runner records, not results: they must not become `test` records
+    // (which would show up as nameless/statusless entries in the Test Explorer)...
+    for r in records.iter().filter(|r| r["event"] == "test") {
+        assert!(
+            r["status"] == "pass" || r["status"] == "fail",
+            "every emitted test record must carry a real status; got:\n{:?}",
+            r
+        );
+    }
+    // ...nor leak into the user-output record.
+    for r in records.iter().filter(|r| r["event"] == "output") {
+        assert!(
+            !r["text"].as_str().unwrap_or("").contains("##LINTEST##"),
+            "output record must exclude runner records; got:\n{:?}",
+            r
+        );
+    }
+}
+
+// A test binary that leaves a BACKGROUND PROCESS running must not stall the runner.
+//
+// The reader threads that stream the binary's stdout/stderr only finish at EOF, and EOF needs
+// every write end closed. `std/process`'s `spawn` leaves stderr inherited, so a spawned
+// grandchild that outlives the test binary keeps the pipe open after the binary has exited —
+// an unconditional `join()` on the readers then blocks for that grandchild's whole lifetime,
+// with no timeout left to rescue it (the child is already reaped). This regressed
+// `stdlib/process.test.lin` into a 30s "PASS" under parallel load. `run_binary` now bounds the
+// join with a short grace period; this fixture makes the failure deterministic rather than
+// load-dependent.
+//
+// The sleeper self-reaps a few seconds later, so the test leaves nothing running for long, and
+// a regression costs seconds rather than a spawned daemon's full lifetime.
+const ORPHAN_PIPE_FIXTURE: &str = r#"import { expect, toBe, test, suite, run } from "std/test"
+import { spawn } from "std/process"
+
+val s = suite("orphan pipe holder", [
+  test("spawns a process that outlives the binary", () =>
+    val h = spawn("sh", ["-c", "exec sleep 5"])
+    [expect(h is Error).toBe(false)]
+  )
+])
+
+run(s)
+"#;
+
+/// Parse the `(N.NNs)` duration the human reporter prints on a result line.
+fn parse_reported_secs(line: &str) -> Option<f64> {
+    let (_, rest) = line.rsplit_once('(')?;
+    rest.trim_end_matches(')').strip_suffix('s')?.parse::<f64>().ok()
+}
+
+#[test]
+fn test_background_process_holding_pipes_does_not_stall_runner() {
+    let fixture = write_test_fixture(ORPHAN_PIPE_FIXTURE);
+    let ws = workspace_root();
+    let out = lin_cmd()
+        .args(["test", fixture.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin test - run `cargo build -p lin` first");
+    let _ = fs::remove_file(&fixture);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "fixture should pass; got:\n{}", stderr);
+
+    // Assert on the duration the runner itself reports. That number is measured around
+    // `run_binary` ONLY, so it excludes the (load-sensitive) compile phase and isolates exactly
+    // the thing under test. Pre-fix it read 5.00s — the sleeper's whole lifetime; post-fix it is
+    // the binary's own runtime plus at most the ~300ms reader grace (measured: 0.33s).
+    let pass_line = stderr
+        .lines()
+        .find(|l| l.starts_with("PASS"))
+        .unwrap_or_else(|| panic!("expected a PASS line in:\n{}", stderr));
+    let secs = parse_reported_secs(pass_line)
+        .unwrap_or_else(|| panic!("could not parse a duration from {:?}", pass_line));
+
+    assert!(
+        secs < 3.0,
+        "a spawned background process must not hold the runner hostage: run phase took {:.2}s \
+         (expected well under the 5s sleeper's lifetime); full output:\n{}",
+        secs,
+        stderr
+    );
+}
+
 // ── `Number` as a numerically-bounded generic parameter (ADR-014, reversed) ─────────────────────
 // `(x: Number)` is sugar for `<T: numeric>(x: T)`: the body type-checks (the bound permits
 // arithmetic), and monomorphization specializes per call-site family to native unboxed ops.

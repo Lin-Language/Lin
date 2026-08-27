@@ -321,6 +321,67 @@ fn compile_test(src: &PathBuf, coverage: bool, json: bool) -> Result<PathBuf, St
     }
 }
 
+/// Drain `pipe` into `sink` until EOF. Runs on its own thread so a chatty child can never block
+/// on a full pipe buffer while we're waiting for it, and — crucially — so whatever the binary
+/// managed to print is still available if we have to kill it. Reading line-at-a-time (rather
+/// than `read_to_end`) keeps the shared buffer usefully complete at any instant.
+fn drain_pipe<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+    sink: Arc<Mutex<String>>,
+) -> std::thread::JoinHandle<()> {
+    use std::io::BufRead;
+    std::thread::spawn(move || {
+        let Some(pipe) = pipe else { return };
+        let mut reader = std::io::BufReader::new(pipe);
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    let chunk = String::from_utf8_lossy(&buf);
+                    if let Ok(mut sink) = sink.lock() {
+                        sink.push_str(&chunk);
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// How long to wait for a reader thread to finish after the child has exited (or been killed).
+/// A reader whose every writer has closed drains the pipe and hits EOF in microseconds, so this
+/// is ~4 orders of magnitude of headroom for the legitimate case while staying small enough that
+/// the pathological case below costs nothing noticeable per test file.
+const READER_GRACE: Duration = Duration::from_millis(300);
+
+/// Wait for a reader thread — but NEVER indefinitely.
+///
+/// A `drain_pipe` reader only finishes at **EOF**, and EOF needs EVERY write end of the pipe
+/// closed, not just the test binary's. `std/process`'s `spawn` leaves stderr INHERITED, so a
+/// test that spawns a background process hands that grandchild a copy of the binary's stderr
+/// write end (`stdlib/process.test.lin` runs `sh -c "sleep 30"`); if the grandchild outlives the
+/// binary, the pipe stays open after the binary has already exited. An unconditional `join()`
+/// there blocks for the grandchild's ENTIRE lifetime — 30s in that test, unbounded for a spawned
+/// daemon or server fixture — and no deadline can rescue it, because the child is already reaped
+/// and the timeout loop is over. (Observed as a `PASS stdlib/process.test.lin (30.03s)` under
+/// parallel load, where the fork/exec race that lets the sleeper survive its SIGTERM widens.)
+///
+/// So: poll `is_finished()` briefly, then give up and detach. That is safe — the buffers are
+/// `Arc<Mutex<String>>`, so the caller reads everything drained so far without needing the join,
+/// and the orphaned thread exits on its own at EOF (or at process exit).
+/// **Do not turn this back into a plain `join()`.**
+fn join_with_grace(handle: std::thread::JoinHandle<()>, grace: Duration) {
+    let deadline = Instant::now() + grace;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let _ = handle.join();
+}
+
 fn run_binary(
     bin: &PathBuf,
     profraw: Option<&PathBuf>,
@@ -329,8 +390,6 @@ fn run_binary(
     filter_test: &[String],
 ) -> (Outcome, String, String) {
     use std::process::{Command, Stdio};
-    use std::sync::mpsc;
-    use std::thread;
 
     let mut cmd = Command::new(bin);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -341,6 +400,11 @@ fn run_binary(
     if json {
         cmd.env("LIN_TEST_JSON", "1");
     }
+    // Always ask std/test to print a `start` marker before each test body. Nothing else is
+    // printed until the suite finishes, so these markers are the ONLY way to name the test that
+    // was running when a hang forced us to kill the binary. They are filtered back out of human
+    // output and are not turned into `test` records in json mode.
+    cmd.env("LIN_TEST_TRACE", "1");
     // When the user asked for specific tests, pass the names (newline-separated) so std/test's
     // `test` skips every non-selected body. Test names are single-line string literals, so a
     // newline separator can never collide with a name.
@@ -348,7 +412,7 @@ fn run_binary(
         cmd.env("LIN_TEST_ONLY", filter_test.join("\n"));
     }
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -359,25 +423,81 @@ fn run_binary(
         }
     };
 
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let out = child.wait_with_output();
-        let _ = tx.send(out);
-    });
+    // The `Child` stays owned HERE (rather than being moved into a `wait_with_output` thread) so
+    // that a timeout can `kill()` + `wait()` it. Without the wait the killed child would linger
+    // as a zombie; without the kill it kept running forever after `lin test` exited.
+    let out_buf = Arc::new(Mutex::new(String::new()));
+    let err_buf = Arc::new(Mutex::new(String::new()));
+    let out_thread = drain_pipe(child.stdout.take(), Arc::clone(&out_buf));
+    let err_thread = drain_pipe(child.stderr.take(), Arc::clone(&err_buf));
 
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-            if out.status.success() {
-                (Outcome::Pass, stdout, stderr)
-            } else {
-                (Outcome::Fail, stdout, stderr)
+    // Poll for exit with an exponential backoff: a short first sleep keeps the common case (a
+    // test file that finishes in tens of milliseconds) responsive, and the cap keeps a long
+    // timeout from busy-spinning.
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_micros(250);
+    const MAX_BACKOFF: Duration = Duration::from_millis(20);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                join_with_grace(out_thread, READER_GRACE);
+                join_with_grace(err_thread, READER_GRACE);
+                return (Outcome::Fail, String::new(), format!("IO error: {}", e));
             }
         }
-        Ok(Err(e)) => (Outcome::Fail, String::new(), format!("IO error: {}", e)),
-        Err(_) => (Outcome::Timeout, String::new(), String::new()),
+        let now = Instant::now();
+        if now >= deadline {
+            break None;
+        }
+        std::thread::sleep(backoff.min(deadline - now));
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    };
+
+    let timed_out = status.is_none();
+    if timed_out {
+        // Kill, then reap — always before touching the readers, so the binary's own write ends
+        // are gone by the time we start waiting on them.
+        let _ = child.kill();
+        let _ = child.wait();
     }
+    // Bounded on BOTH paths: a surviving grandchild can hold the pipe open long after the child
+    // itself is gone. See `join_with_grace`.
+    join_with_grace(out_thread, READER_GRACE);
+    join_with_grace(err_thread, READER_GRACE);
+
+    let take = |b: &Arc<Mutex<String>>| {
+        b.lock().map(|g| g.clone()).unwrap_or_default()
+    };
+    let stdout = take(&out_buf);
+    let stderr = take(&err_buf);
+
+    match status {
+        Some(status) if status.success() => (Outcome::Pass, stdout, stderr),
+        // A timeout keeps whatever partial output the binary produced — that's what names the
+        // test that hung.
+        Some(_) => (Outcome::Fail, stdout, stderr),
+        None => (Outcome::Timeout, stdout, stderr),
+    }
+}
+
+/// Scan a captured stdout blob for the LAST `##LINTEST## {"event":"start",…}` record and return
+/// the test name it carries. `std/test` runs test bodies eagerly and sequentially as the suite
+/// array is built, and prints nothing on completion until `report` runs at the very end — so the
+/// last test to have STARTED is precisely the one that was still running when we killed it.
+/// Returns `None` when the binary hung before reaching the first test (module top level).
+fn hung_test_name(stdout: &str) -> Option<String> {
+    stdout.lines().rev().find_map(|line| {
+        let rest = line.strip_prefix(MARKER)?;
+        let val = serde_json::from_str::<serde_json::Value>(rest).ok()?;
+        if val.get("event").and_then(|v| v.as_str()) != Some("start") {
+            return None;
+        }
+        val.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
+    })
 }
 
 /// Re-emit a finished test file's results as canonical NDJSON on stdout (json reporter mode).
@@ -402,6 +522,14 @@ fn emit_json_for_result(result: &TestResult, lock: &Arc<Mutex<()>>) {
         };
         // Parse the runner's record, then rebuild a canonical one with the file attached.
         let Ok(val) = serde_json::from_str::<serde_json::Value>(rest) else { continue };
+        // Only per-test results become `test` records. Other runner records (currently just the
+        // `start` trace marker, which exists so a timeout can name the hung test) are consumed
+        // here and never forwarded. An ABSENT `event` is treated as `test` for compatibility
+        // with a runner that predates the tagged records.
+        let event = val.get("event").and_then(|v| v.as_str()).unwrap_or("test");
+        if event != "test" {
+            continue;
+        }
         let name = val.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let status = val.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let message = val.get("message").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -435,7 +563,16 @@ fn emit_json_for_result(result: &TestResult, lock: &Arc<Mutex<()>>) {
     let (status, message) = match result.outcome {
         Outcome::Pass => ("pass", None),
         Outcome::Fail => ("fail", non_empty(&result.stderr)),
-        Outcome::Timeout => ("timeout", Some("test binary exceeded the timeout".to_string())),
+        Outcome::Timeout => (
+            "timeout",
+            Some(match hung_test_name(&result.stdout) {
+                Some(name) => {
+                    format!("test binary exceeded the timeout during test {:?}", name)
+                }
+                None => "test binary exceeded the timeout before the first test started"
+                    .to_string(),
+            }),
+        ),
         Outcome::CompileError => ("compile_error", non_empty(&result.stderr)),
     };
     emit_record(&JsonRecord::File {
@@ -468,12 +605,27 @@ fn print_result(result: &TestResult, verbose: bool, lock: &Arc<Mutex<()>>) {
         result.path.display(),
         result.elapsed.as_secs_f64()
     );
+    // A timeout used to say nothing about WHICH test hung. The `start` trace markers the binary
+    // streamed before we killed it name it.
+    if matches!(result.outcome, Outcome::Timeout) {
+        match hung_test_name(&result.stdout) {
+            Some(name) => eprintln!("  timed out during test: {:?}", name),
+            None => eprintln!("  timed out before the first test started (module top level?)"),
+        }
+    }
     let show_output =
         verbose || !matches!(result.outcome, Outcome::Pass | Outcome::CompileError);
     if show_output {
-        if !result.stdout.is_empty() {
+        // `##LINTEST## ` lines are machine records for the json reporter (and the trace markers
+        // above) — never something a human asked to see.
+        let user_stdout: Vec<&str> = result
+            .stdout
+            .lines()
+            .filter(|l| !l.starts_with(MARKER))
+            .collect();
+        if !user_stdout.is_empty() {
             eprintln!("  --- stdout ---");
-            for line in result.stdout.lines() {
+            for line in user_stdout {
                 eprintln!("  {}", line);
             }
         }
