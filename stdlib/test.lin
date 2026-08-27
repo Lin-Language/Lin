@@ -19,6 +19,16 @@
 // injection — compose it via partial application, e.g. `val withDb = withFixture(openDb, closeDb,)`.
 // Mocking is the test-only `replace <name> = <expr>` statement (see the Testing tutorial),
 // permitted only in a `*.test.lin`.
+//
+// Three environment variables (all set by `lin test`, none meant to be set by hand):
+//   LIN_TEST_JSON   — emit one `##LINTEST## ` NDJSON record per test result instead of the
+//                     human-readable summary (`lin test --reporter json`).
+//   LIN_TEST_ONLY   — newline-separated set of test names to run; every other test is skipped
+//                     without evaluating its body (`lin test --filter-test`).
+//   LIN_TEST_TRACE  — print a `##LINTEST## {"event":"start",…}` marker before each test body.
+//                     Test bodies run eagerly and nothing is printed until the suite finishes,
+//                     so this marker is what lets `lin test` name the test that was running
+//                     when a hanging binary hit its timeout and was killed.
 import { print } from "std/io"
 import { toString, join, split } from "std/string"
 import { length } from "std/array"
@@ -176,6 +186,17 @@ val _isSelected = (name: String): Boolean =>
     val wanted = split(only, "\n").filter(n => n == name)
     length(wanted) > 0
 
+// Announce that a test body is about to be evaluated, when `LIN_TEST_TRACE` is set (by `lin
+// test`). Test bodies run EAGERLY as the suite array is built and nothing is printed until
+// `report` at the very end, so without this marker a binary that hangs produces no output at
+// all and the CLI cannot say which test hung. Same `##LINTEST## ` prefix and `toJsonString`
+// escaping as `_reportJsonResult`.
+val _traceStart = (name: String): Null =>
+  if getEnv("LIN_TEST_TRACE") == null then
+    null
+  else
+    print("##LINTEST## {\"event\":\"start\",\"name\":${toJsonString(name)}}")
+
 // Define a test: eagerly run its body and store the result alongside the name.
 // @param name  the test name (also used by `--filter-test` selection).
 // @param body  a thunk returning an `Assertion[]` (use the `[ expect(...).toBe(...), ... ]` form,
@@ -185,6 +206,7 @@ val _isSelected = (name: String): Boolean =>
 //   sentinel is produced, which `report` counts as neither pass nor fail.
 export val test = (name: String, body: () => AnyVal[]): AnyVal =>
   if _isSelected(name) then
+    _traceStart(name)
     val timer = startTimer()
     val results = body()
     _evalResult(name, results, elapsed(timer))

@@ -5390,6 +5390,31 @@ the `LIN_TEST_JSON` environment variable; the CLI strips the prefix, attaches th
 and re-serializes each record canonically. The marker lets the CLI separate runner records from
 any `print` output your own test code emits on the same stdout stream.
 
+**Environment variables.** `lin test` sets three variables on the test binary. They are an
+internal protocol between the CLI and `std/test` - don't set them by hand.
+
+| Variable | Set by | Effect on `std/test` |
+| --- | --- | --- |
+| `LIN_TEST_JSON` | `--reporter json` | emit one `##LINTEST## ` NDJSON record per test result instead of the human-readable summary |
+| `LIN_TEST_ONLY` | `--filter-test` | newline-separated set of test names to run; every other test is skipped without evaluating its body |
+| `LIN_TEST_TRACE` | always | print `##LINTEST## {"event":"start","name":"<test name>"}` immediately before each selected test's body runs |
+
+The `start` record is a *trace marker*, not a result: it is never turned into a `test` record and
+never forwarded as user `output`. It exists because test bodies run **eagerly** as the suite array
+is built and nothing is printed until `report`/`run` at the very end - so a test that hangs would
+otherwise produce no output at all. `lin test` streams the binary's stdout as it arrives, so when a
+file exceeds `--timeout` the last `start` marker it saw names the test that was still running. The
+child is then killed and reaped (it is not left behind), and the timeout is reported as:
+
+```txt
+TIMEOUT  slow.test.lin  (30.00s)
+  timed out during test: "absent element returns -1"
+```
+
+In `--reporter json` mode the same information rides on the `file` record's `message`
+(`test binary exceeded the timeout during test "<name>"`). Consumers that ignore unknown `event`
+values are unaffected by the `start` record, so the schema version is unchanged.
+
 **Running a subset by name.** Pass `--filter-test "<name>"` (repeatable) to run only the named
 test(s) within the matched files; every other test is *skipped* — its body is never evaluated
 (so no side effects, and no `withFixture` setup/teardown) and it emits no record. A skipped test
