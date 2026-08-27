@@ -896,14 +896,16 @@ function setupTestController(context, linBin) {
       if (buffer.trim()) {
         try { handleRecord(JSON.parse(buffer.trim())); } catch (_) { /* ignore */ }
       }
-      // The runner exited non-zero without a single record attributable to a test file — it
-      // failed before it could report (bad arguments, no test files matched, a crash). Say so
-      // rather than ending a silent, empty run.
-      if (!hasOutput && code !== 0 && !token.isCancellationRequested) {
-        const detail = stderrBuffer.trim() || `\`lin test\` exited with code ${code} and produced no results.`;
+      // The runner reported nothing attributable to any test file. Whatever the exit code, the
+      // run has no result to show — a zero exit means it declined to run anything (no *.test.lin
+      // matched the target), a non-zero one means it died before it could report. Both used to
+      // end as a silent, empty run; say which it was instead.
+      if (!hasOutput && !token.isCancellationRequested) {
+        const detail = stderrBuffer.trim()
+          || `\`lin test\` exited with code ${code} without reporting any test results.`;
         hasOutput = true;
         run.appendOutput(detail.replace(/\r?\n/g, "\r\n") + "\r\n");
-        window.showErrorMessage(`Lin: test run failed — ${detail.split("\n")[0]}`);
+        window.showErrorMessage(`Lin: no tests ran — ${detail.split("\n")[0]}`);
       }
       if (lcovFile) {
         attachLcovCoverage(run, lcovFile);

@@ -4292,6 +4292,11 @@ fn ranges_overlap(a: Range, b: Range) -> bool {
 
 // ── code lens (run-test) ───────────────────────────────────────────────────────
 
+/// Whether `lin test` would actually run this file: it collects `*.test.lin` only.
+fn is_runnable_test_file(uri: &Url) -> bool {
+    uri.path().ends_with(".test.lin")
+}
+
 /// Build the run-test CodeLenses for a file: one `▶ Run Test` lens above each
 /// `test("name", ...)` / `withFixture(..., "name", ...)` call (mirroring the VSCode
 /// Test Explorer's `TEST_DECL_RE` / `WITHFIXTURE_DECL_RE` discovery, but driven off
@@ -4300,6 +4305,16 @@ fn ranges_overlap(a: Range, b: Range) -> bool {
 /// Lens commands use the fixed `lin.runTest(uri, name)` / `lin.testFile(uri)` /
 /// `lin.runSuite(uri, suiteName, memberNames)` contract the extension wires against.
 fn test_code_lenses(source: &str, uri: &Url, module: &lin_parse::ast::Module) -> Vec<CodeLens> {
+    // Only `*.test.lin` files get run lenses. `lin test <path>` collects `*.test.lin` and
+    // nothing else, so a lens on a plain `.lin` that merely *defines* tests — a shared
+    // `spec.lin` exporting a `suite(...)` for several runner files to import, say — would
+    // shell out to a run that matches no files, emits no records, and exits 0: a silent,
+    // empty test run with no indication anything went wrong. Offer the button only where
+    // pressing it can actually run something.
+    if !is_runnable_test_file(uri) {
+        return Vec::new();
+    }
+
     let mut tests: Vec<(String, lin_common::Span)> = Vec::new();
     for stmt in &module.statements {
         collect_test_calls_in_stmt(stmt, &mut tests);
@@ -8850,6 +8865,11 @@ export val thingCount = 7
         Url::parse("file:///tmp/lsp_test.lin").unwrap()
     }
 
+    /// A `*.test.lin` URI — run CodeLenses are emitted only for files `lin test` collects.
+    fn dummy_test_uri() -> Url {
+        Url::parse("file:///tmp/lsp_test.test.lin").unwrap()
+    }
+
     /// Apply a single `TextEdit` to `src`, returning the new document. Uses the same
     /// position→char→byte conversion discipline as production so the result matches what a
     /// client would compute.
@@ -9364,7 +9384,7 @@ export val thingCount = 7
                    ])\n\
                    val w = withFixture(setup, \"gamma\", (f) => [])\n";
         let module = parse(src);
-        let uri = dummy_uri();
+        let uri = dummy_test_uri();
         let lenses = test_code_lenses(src, &uri, &module);
 
         // One file-level lens + three test lenses.
@@ -9407,7 +9427,7 @@ export val thingCount = 7
                      test(\"b\", () => []),\n\
                    ])\n";
         let module = parse(src);
-        let uri = dummy_uri();
+        let uri = dummy_test_uri();
         let lenses = test_code_lenses(src, &uri, &module);
 
         // Find the suite lens.
@@ -9472,12 +9492,39 @@ export val thingCount = 7
         assert_eq!(test_lenses.len(), 7, "expected 7 test lenses");
     }
 
+    /// A plain `.lin` file gets no run lenses even when it is full of `test(...)` declarations.
+    /// This is the shared-spec shape: `spec.lin` exports a `suite(...)` that `exercise.test.lin`
+    /// imports and runs. `lin test spec.lin` matches no `*.test.lin`, so a lens there would kick
+    /// off a run that reports nothing at all.
+    #[test]
+    fn code_lens_gated_to_test_lin_files() {
+        let src = "import { suite, test } from \"std/test\"\n\
+                   export val tests = (solve) =>\n\
+                     suite(\"binary-search\", [\n\
+                       test(\"finds middle element\", () => []),\n\
+                     ])\n";
+        let module = parse(src);
+
+        let spec = Url::parse("file:///tmp/spec.lin").unwrap();
+        assert!(
+            test_code_lenses(src, &spec, &module).is_empty(),
+            "a non-.test.lin file must get no run lenses"
+        );
+
+        // The same source in a runnable file still gets them.
+        let runner = Url::parse("file:///tmp/spec.test.lin").unwrap();
+        assert!(
+            !test_code_lenses(src, &runner, &module).is_empty(),
+            "a .test.lin file must still get run lenses"
+        );
+    }
+
     /// No tests in a file → no lenses (not even the file-level one).
     #[test]
     fn code_lens_empty_when_no_tests() {
         let src = "val x = 1\n";
         let module = parse(src);
-        let lenses = test_code_lenses(src, &dummy_uri(), &module);
+        let lenses = test_code_lenses(src, &dummy_test_uri(), &module);
         assert!(lenses.is_empty(), "expected no lenses, got {:?}", lenses.len());
     }
 
