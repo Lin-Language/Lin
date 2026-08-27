@@ -1,25 +1,19 @@
 // Binary Search — reference solution.
 import { length } from "std/array"
-import { while } from "std/iter"
+
+// The window is half-open [i, j), so the base case is the EMPTY window i >= j —
+// a one-element window still holds an unchecked candidate. That guard must precede
+// the xs[midIndex] read: on an empty window midIndex == i == j, which is out of bounds.
+val find = (xs: Int32[], target: Int32, i: Int32, j: Int32): Int32 =>
+  val midIndex = i + (j - i) / 2
+  if i >= j then
+    -1
+  else if xs[midIndex] == target then
+    midIndex
+  else if target > xs[midIndex] then
+    find(xs, target, midIndex + 1, j)
+  else
+    find(xs, target, i, midIndex)
 
 export val solve = (xs: Int32[], target: Int32): Int32 =>
-  var lo = 0
-  var hi = length(xs) - 1
-  var result = -1
-  while(() =>
-    if lo > hi then
-      false
-    else
-      val mid = (lo + hi) / 2
-      val v = xs[mid]
-      if v == target then
-        result = mid
-        false
-      else if v < target then
-        lo = mid + 1
-        true
-      else
-        hi = mid - 1
-        true
-  )
-  result
+  find(xs, target, 0, xs.length())
