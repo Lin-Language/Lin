@@ -136,6 +136,12 @@ pub fn run(args: &TestArgs) {
 
     let test_files = collect_test_files(&args.paths, args.filter.as_deref());
     if test_files.is_empty() {
+        // Still open the NDJSON stream. A consumer handed zero bytes on stdout can't tell
+        // "nothing matched" from "the runner died before it could say anything" — the meta
+        // record is the difference between an empty run and a broken one.
+        if args.reporter == Reporter::Json {
+            emit_record(&JsonRecord::Meta { schema: NDJSON_SCHEMA });
+        }
         eprintln!("No *.test.lin files found.");
         process::exit(0);
     }
