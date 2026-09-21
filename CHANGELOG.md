@@ -1,6 +1,61 @@
 # Changelog
 
 All notable changes to Lin are documented here.
+## [1.2.0](https://github.com/Lin-Language/Lin/compare/v1.1.0...v1.2.0) - 2026-08-27
+
+### Bug Fixes
+
+- **ir**: Gate the native match compare on the literal's value, not its type
+- **runtime**: Return the interned descriptor, not the racing thread's own
+- **vscode**: Stop auto-indent yanking `else` and top-level lines to the wrong column
+- **vscode**: Surface test files whose binary crashed instead of an empty run
+- **check**: Occurs-check TypeVar bindings so zonking can't recurse forever
+- **lsp**: Recover the dot receiver's type so completion filters on it
+- **lsp**: Drop superseded edits instead of republishing their diagnostics
+- **lsp,vscode**: Don't offer run lenses for files `lin test` won't run
+- **test**: Name the hung test on timeout, keep its output, and kill the child
+
+### Documentation
+
+- **spec**: Describe the real narrowing-cast overload pairs, not narrowTo*
+- **bench**: Record that raptor's day_of_week duplication is intentional
+- **exercises**: Make binary search reference solution recursive
+
+### Features
+
+- **lsp**: Complete unimported stdlib names in identifier position
+
+### Other
+
+- Merge branch 'fix/match-literal-union-boxing'
+
+Dispatch scalar-scrutinee literal matches on native integer compares instead
+of boxing both operands and calling lin_tagged_eq per arm.
+- Merge branch 'perf/date-redundant-work'
+
+Remove redundant civil-date conversions from dayOfYear and the runtime
+year-day path, and correct the stale narrowTo* spec text.
+- Merge branch 'fix/vscode-test-runtime-fail'
+- Merge branch 'master' into worktree-agent-add847d9a86ac9396
+- Merge branch 'worktree-agent-add847d9a86ac9396'
+- Merge branch 'master' into perf/lsp-completion
+- Merge branch 'perf/lsp-completion'
+
+Claude-Session: https://claude.ai/code/session_01LzLGpvSxCcYiTwBsNcRFqk
+- Merge branch 'perf/lsp-responsiveness'
+
+Claude-Session: https://claude.ai/code/session_01LzLGpvSxCcYiTwBsNcRFqk
+- Merge branch 'fix/test-lens-gating'
+- Merge branch 'fix/test-timeout-reporting'
+- Merge branch 'docs/binary-search-recursive-solution'
+
+### Performance
+
+- **ir**: Dispatch scalar-scrutinee literal matches on native compares
+- **datetime**: Compute dayOfYear from a month-offset table
+- **runtime**: Derive the year-day from a month table, not a second civil conversion
+- **lsp**: Cache checked import modules and workspace export types
+- **lsp**: Keep caches warm across edits and share one analysis per edit
 ## [1.1.0](https://github.com/Lin-Language/Lin/compare/v1.0.0...v1.1.0) - 2026-07-10
 
 ### Bug Fixes
@@ -216,6 +271,9 @@ This reverts commit e22f6fb796c0c459dc31f2e6c5c429aae19af31a.
 - Merge branch 'master' into perf/group-scan-unbox
 - Merge branch 'latest-master-tmp' into worktree-agent-a4a38ad2e8462715f
 - Merge master into fix/partial-apply-generic
+- Merge pull request #15 from Lin-Language/release/next
+
+chore: release v1.1.0
 
 ### Performance
 

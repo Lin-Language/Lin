@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "lin"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "glob",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "lin-check"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bincode",
  "indexmap",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "lin-codegen"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "flate2",
  "indexmap",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "lin-common"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ariadne",
  "serde",
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "lin-compile"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bincode",
  "inkwell",
@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "lin-ir"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "indexmap",
  "lin-check",
@@ -1050,14 +1050,14 @@ dependencies = [
 
 [[package]]
 name = "lin-lex"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "lin-common",
 ]
 
 [[package]]
 name = "lin-lsp"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "lin-check",
  "lin-common",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "lin-parse"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "lin-common",
  "lin-lex",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "lin-runtime"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "digest",
  "flate2",
