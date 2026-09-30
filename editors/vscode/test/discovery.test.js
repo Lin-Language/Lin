@@ -280,5 +280,40 @@ check("an unknown future status reports rather than being swallowed", () => {
   assert.strictEqual(fileRecordNeedsReporting("link_error", false), true);
 });
 
-console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
-process.exit(failures === 0 ? 0 : 1);
+async function checkAsync(label, fn) {
+  try {
+    await fn();
+    console.log(`  ok   ${label}`);
+  } catch (err) {
+    failures++;
+    console.log(`  FAIL ${label}: ${err.message}`);
+  }
+}
+
+(async () => {
+  await checkAsync("findTestFiles skips symlinked dirs, dot-dirs, node_modules and non-test files", async () => {
+    const fs = require("fs");
+    const os = require("os");
+    const { findTestFiles } = _test;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "lin-discovery-"));
+    try {
+      for (const d of ["src/nested", "node_modules", ".hidden"]) {
+        fs.mkdirSync(path.join(root, d), { recursive: true });
+      }
+      fs.writeFileSync(path.join(root, "src/nested/a.test.lin"), "");
+      fs.writeFileSync(path.join(root, "src/b.lin"), "");
+      fs.writeFileSync(path.join(root, "node_modules/x.test.lin"), "");
+      fs.writeFileSync(path.join(root, ".hidden/y.test.lin"), "");
+      fs.symlinkSync(root, path.join(root, "src/loop"), "dir");
+      fs.symlinkSync("/", path.join(root, "rootfs"), "dir");
+
+      const files = await findTestFiles(root);
+      assert.deepStrictEqual(files, [path.join(root, "src/nested/a.test.lin")]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
+  process.exit(failures === 0 ? 0 : 1);
+})();

@@ -7039,8 +7039,9 @@ fn canonical_id(path: &Path) -> String {
 }
 
 /// Recursively collect `*.lin` files under `root`, skipping hidden directories,
-/// `target/`, `node_modules/`, and `.lin-cache/`. Bounded depth guards against
-/// pathological trees. Returns absolute paths.
+/// `target/`, `node_modules/`, and `.lin-cache/`. Symlinked directories are not
+/// followed (a link to `/` or an ancestor would otherwise walk the whole filesystem).
+/// Bounded depth guards against pathological trees. Returns absolute paths.
 fn collect_lin_files(root: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         if depth > 32 {
@@ -7051,7 +7052,8 @@ fn collect_lin_files(root: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else { continue };
+            if file_type.is_dir() {
                 if name.starts_with('.') || name == "target" || name == "node_modules" {
                     continue;
                 }
@@ -8048,6 +8050,23 @@ export val thingCount = 7
             titles.iter().any(|t| t == "Import `myArr` from \"helpers\""),
             "expected a userland auto-import action, got {titles:?}",
         );
+    }
+
+    /// A symlink to `/` or back to an ancestor must not be descended into, or indexing on
+    /// `initialize` walks the whole filesystem.
+    #[cfg(unix)]
+    #[test]
+    fn collect_lin_files_does_not_follow_symlinked_dirs() {
+        let dir = std::env::temp_dir().join(format!("lin_lsp_symlinks_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.lin"), "val x = 1\n").unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("src/loop")).unwrap();
+        std::os::unix::fs::symlink("/", dir.join("root")).unwrap();
+
+        let files = collect_lin_files(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(files, vec![dir.join("src/main.lin")]);
     }
 
     /// Cyclic import graph (A imports B, B imports A) must terminate, not

@@ -453,10 +453,45 @@ function getOrCreateFileItem(controller, uri) {
   return item;
 }
 
+const DISCOVERY_SKIP_DIRS = new Set(["node_modules", "target"]);
+const DISCOVERY_MAX_DEPTH = 32;
+const DISCOVERY_MAX_DIRS = 20000;
+
+// `workspace.findFiles` follows symlinks (ripgrep `--follow`), so a symlink to `/` in the
+// workspace makes it crawl the whole filesystem. Walk the tree ourselves instead, never
+// descending into symlinked directories and skipping the same dirs as lin-lsp's index.
+async function findTestFiles(root) {
+  const out = [];
+  let dirsVisited = 0;
+  async function walk(dir, depth) {
+    if (depth > DISCOVERY_MAX_DEPTH || dirsVisited >= DISCOVERY_MAX_DIRS) return;
+    dirsVisited++;
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch (_) {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith(".") || DISCOVERY_SKIP_DIRS.has(entry.name)) continue;
+        await walk(full, depth + 1);
+      } else if (entry.isFile() && entry.name.endsWith(".test.lin")) {
+        out.push(full);
+      }
+    }
+  }
+  await walk(root, 0);
+  return out;
+}
+
 async function discoverAllTestFiles(controller) {
-  const files = await workspace.findFiles("**/*.test.lin");
-  for (const uri of files) {
-    getOrCreateFileItem(controller, uri);
+  for (const folder of workspace.workspaceFolders || []) {
+    if (folder.uri.scheme !== "file") continue;
+    for (const file of await findTestFiles(folder.uri.fsPath)) {
+      getOrCreateFileItem(controller, Uri.file(file));
+    }
   }
 }
 
@@ -1392,5 +1427,5 @@ module.exports = {
   deactivate,
   // Exposed for the standalone discovery/unescape unit test (test/discovery.test.js).
   // These are pure (no VS Code API) and safe to call directly.
-  _test: { discoverLine, unescapeLinString, stripLineComment, isInsideString, firstStringArg, discoverFileStructure, findDescendantById, fileRecordNeedsReporting },
+  _test: { discoverLine, unescapeLinString, stripLineComment, isInsideString, firstStringArg, discoverFileStructure, findDescendantById, fileRecordNeedsReporting, findTestFiles },
 };
