@@ -1,7 +1,12 @@
 # Changelog
 
 All notable changes to Lin are documented here.
-## [1.2.0](https://github.com/Lin-Language/Lin/compare/v1.1.0...v1.2.0) - 2026-08-27
+## [1.2.1](https://github.com/Lin-Language/Lin/compare/v1.2.0...v1.2.1) - 2026-09-30
+
+### Bug Fixes
+
+- **vscode**: Don't follow symlinks during .lin/.test.lin workspace discovery
+## [1.2.0](https://github.com/Lin-Language/Lin/compare/v1.1.0...v1.2.0) - 2026-09-21
 
 ### Bug Fixes
 
@@ -48,6 +53,9 @@ Claude-Session: https://claude.ai/code/session_01LzLGpvSxCcYiTwBsNcRFqk
 - Merge branch 'fix/test-lens-gating'
 - Merge branch 'fix/test-timeout-reporting'
 - Merge branch 'docs/binary-search-recursive-solution'
+- Merge pull request #16 from Lin-Language/release/next
+
+chore: release v1.2.0
 
 ### Performance
 
