@@ -25383,6 +25383,389 @@ print("t6=${t6(tenth).toString()} t6b=${t6b(half).toString()} t7a=${t7(44).toStr
     );
 }
 
+/// Virtual-memory cap for programs that must run in constant space: a per-call box leak over
+/// millions of iterations exceeds it and aborts the program.
+#[cfg(target_os = "linux")]
+const FLAT_NULLABLE_VMEM_CAP_KB: u64 = 60_000;
+
+/// Like `run`, but executes the binary under `ulimit -v <cap_kb>`.
+#[cfg(target_os = "linux")]
+fn run_with_vmem_cap_kb(source: &str, cap_kb: u64) -> Vec<String> {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_{}", id));
+    fs::write(&src_path, source).unwrap();
+    let compile = lin_cmd()
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(
+        compile.status.success(),
+        "compilation failed:\nstderr: {}\nsource:\n{}",
+        String::from_utf8_lossy(&compile.stderr),
+        source
+    );
+    let run_out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("ulimit -v {cap_kb}; exec \"$0\""))
+        .arg(&bin_path)
+        .output()
+        .expect("failed to run compiled binary");
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_out.status.success(),
+        "runtime error (memory cap {cap_kb} KB):\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&run_out.stderr),
+        String::from_utf8_lossy(&run_out.stdout),
+    );
+    String::from_utf8_lossy(&run_out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
+}
+
+// Flat `Scalar | Null` temps (`{ i1, i64 }`) are proven by `repr::mark_flat_nullable`; every other
+// consumer of a `Scalar | Null` call result sees an owned boxed value. Each program below used to
+// miscompile, fail LLVM verification or crash when its consumer was not flat-aware.
+
+#[test]
+fn test_flat_nullable_arrelem() {
+    // A flat nullable call result stored as array literal elements.
+    let out = run(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val f = (i: Int32): (Int32 | Null)[] => [pick(i), pick(i + 1), pick(i + 2)]
+print(toString(f(3)))
+"##);
+    assert_eq!(out, vec!["[null, 400000, 500000]"]);
+}
+
+#[test]
+fn test_flat_nullable_closure() {
+    // A flat nullable call result captured by a closure.
+    let out = run(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val f = (n: Int32): () => Int32 =>
+  val x = pick(n)
+  () => if x is Int32 then x else -1
+print(toString(f(4)()))
+print(toString(f(3)()))
+"##);
+    assert_eq!(out, vec!["400000", "-1"]);
+}
+
+#[test]
+fn test_flat_nullable_cmp() {
+    // A flat nullable call result compared with a scalar.
+    let out = run(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val f = (n: Int32): Boolean =>
+  val x = pick(n)
+  x == 400000
+print(toString(f(4)))
+print(toString(f(3)))
+"##);
+    assert_eq!(out, vec!["true", "false"]);
+}
+
+#[test]
+fn test_flat_nullable_mapcb() {
+    // A flat nullable call result returned from a map callback.
+    let out = run(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val f = (xs: Int32[]): (Int32 | Null)[] => xs.map(x => pick(x))
+print(toString(f([1, 2, 3, 4])))
+"##);
+    assert_eq!(out, vec!["[100000, 200000, null, 400000]"]);
+}
+
+#[test]
+fn test_flat_nullable_mapset() {
+    // A flat nullable call result stored into a map slot.
+    let out = run(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val f = (n: Int32): { String: Int32 | Null } =>
+  var m: { String: Int32 | Null } = {}
+  m["a"] = pick(n)
+  m["b"] = pick(n + 1)
+  m
+print(toString(f(3)))
+"##);
+    assert_eq!(out, vec!["{\"a\": null, \"b\": 400000}"]);
+}
+
+#[test]
+fn test_flat_nullable_objfield() {
+    // A flat nullable call result stored in a record field.
+    let out = run(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+type R = { "a": Int32 | Null, "b": Int32 }
+val f = (n: Int32): R => { "a": pick(n), "b": n }
+val r = f(4)
+val r2 = f(3)
+print(toString(r["a"]))
+print(toString(r2["a"]))
+"##);
+    assert_eq!(out, vec!["400000", "null"]);
+}
+
+#[test]
+fn test_flat_nullable_objfield_ctl() {
+    // The three-member-union control for the record field and closure capture cases.
+    let out = run(r##"import { print } from "std/io"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null | String => if i % 3 == 0 then null else i * 100000
+type R = { "a": Int32 | Null | String, "b": Int32 }
+val f = (n: Int32): R => { "a": pick(n), "b": n }
+val r = f(4)
+val r2 = f(3)
+print(toString(r["a"]))
+print(toString(r2["a"]))
+val g = (n: Int32): () => Int32 =>
+  val x = pick(n)
+  () => if x is Int32 then x else -1
+print(toString(g(4)()))
+print(toString(g(3)()))
+"##);
+    assert_eq!(out, vec!["400000", "null", "400000", "-1"]);
+}
+
+#[test]
+fn test_flat_nullable_phi() {
+    // A flat nullable call result merged by an if/else phi.
+    let out = run(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val f = (c: Boolean, i: Int32): Int32 =>
+  val x = if c then pick(i) else pick(i + 1)
+  if x is Int32 then x else -1
+print(toString(f(true, 4)))
+print(toString(f(true, 3)))
+"##);
+    assert_eq!(out, vec!["400000", "-1"]);
+}
+
+#[test]
+fn test_flat_nullable_pushel() {
+    // A flat nullable call result pushed onto an array.
+    let out = run(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val f = (n: Int32): Int32 =>
+  var acc: (Int32 | Null)[] = []
+  range(0, n).for(i => acc.push(pick(i)))
+  length(acc)
+print(toString(f(10)))
+"##);
+    assert_eq!(out, vec!["10"]);
+}
+
+#[test]
+fn test_flat_nullable_tco() {
+    // A self tail call with a flat nullable accumulator argument.
+    let out = run(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val go = (i: Int32, acc: Int32 | Null): Int32 | Null =>
+  if i == 0 then acc else go(i - 1, pick(i))
+print(toString(go(10, null)))
+"##);
+    assert_eq!(out, vec!["100000"]);
+}
+
+#[test]
+fn test_flat_nullable_tco2() {
+    // A deep self tail call with a flat nullable accumulator argument.
+    let out = run(r##"import { print } from "std/io"
+import { toString } from "std/string"
+val go = (i: Int32, acc: Int32 | Null): Int32 | Null =>
+  if i == 0 then acc else go(i - 1, if i % 3 == 0 then null else i * 100000)
+print(toString(go(10, null)))
+print(toString(go(20000000, null)))
+"##);
+    assert_eq!(out, vec!["100000", "100000"]);
+}
+
+#[test]
+fn test_flat_nullable_varassign() {
+    // A flat nullable call result narrowed and assigned to a var.
+    let out = run(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val f = (n: Int32): Int32 =>
+  var best: Int32 | Null = null
+  range(0, n).for(i =>
+    val r = pick(i)
+    if r is Int32 then best = r)
+  if best is Int32 then best else -1
+print(toString(f(20000000)))
+"##);
+    assert_eq!(out, vec!["-1454859936"]);
+}
+
+#[test]
+fn test_flat_nullable_wider() {
+    // A flat nullable call result returned as a wider union.
+    let out = run(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val f = (n: Int32): Int32 | String | Null =>
+  if n > 100 then "big" else pick(n)
+print(toString(f(4)))
+print(toString(f(3)))
+print(toString(f(400)))
+"##);
+    assert_eq!(out, vec!["400000", "null", "big"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_flat_nullable_no_leak_arg() {
+    // A flat nullable call result passed as an argument in a loop must not allocate per call.
+    let out = run_with_vmem_cap_kb(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val show = (v: Int32 | Null): Int32 => if v is Null then 0 else 1
+val f = (n: Int32): Int32 =>
+  var t = 0
+  range(0, n).for(i =>
+    t = t + show(pick(i)))
+  t
+print(toString(f(20000000)))
+"##, FLAT_NULLABLE_VMEM_CAP_KB);
+    assert_eq!(out, vec!["13333333"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_flat_nullable_no_leak_cmp() {
+    // A flat nullable call result compared with `==` in a loop must not allocate per call.
+    let out = run_with_vmem_cap_kb(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val f = (n: Int32): Int32 =>
+  var t = 0
+  range(0, n).for(i =>
+    t = t + (if pick(i) == 400000 then 1 else 0))
+  t
+print(toString(f(20000000)))
+"##, FLAT_NULLABLE_VMEM_CAP_KB);
+    assert_eq!(out, vec!["1"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_flat_nullable_no_leak_interp() {
+    // A flat nullable call result passed to toString in a loop must not allocate per call.
+    let out = run_with_vmem_cap_kb(r##"import { print } from "std/io"
+import { range, for, map } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val pick = (i: Int32): Int32 | Null => if i % 3 == 0 then null else i * 100000
+
+val f = (n: Int32): Int32 =>
+  var t = 0
+  range(0, n).for(i =>
+    val s = toString(pick(i))
+    t = t + length([s]))
+  t
+print(toString(f(5000000)))
+"##, FLAT_NULLABLE_VMEM_CAP_KB);
+    assert_eq!(out, vec!["5000000"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_flat_nullable_no_leak_null_test() {
+    // A flat nullable call result tested with `!= null` and `??` in a loop must not allocate per call.
+    let out = run_with_vmem_cap_kb(r##"import { print } from "std/io"
+import { range, for, find } from "std/iter"
+import { at, push } from "std/array"
+import { toString } from "std/string"
+
+val pick = (xs: Int32[], i: Int32): Int32 | Null =>
+  val v = xs[i & 1023]
+  if v % 3 == 0 then null else v
+
+val run = (xs: Int32[], n: Int32): Int32 =>
+  var total = 0
+  range(0, n).for(i =>
+    val r = pick(xs, i)
+    if r != null then total = total + r % 5
+    total = total + (pick(xs, i + 7) ?? 2)
+  )
+  total
+
+var xs: Int32[] = []
+range(0, 1024).for(i => xs.push((i * 7919 + 13) % 100003))
+print(toString(run(xs, 20000000)))
+"##, FLAT_NULLABLE_VMEM_CAP_KB);
+    assert_eq!(out, vec!["637472399"]);
+}
+
 // A recursive sum type folded through `reduce` as the accumulator. The generic boxed-accumulator
 // path must materialize the raw `*SumNode` init into a Json box (and project the result back), the
 // closure wrapper must release the node it projects for the callback, and a pure-IntLit-union

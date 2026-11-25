@@ -151,39 +151,13 @@ impl<'ctx> Codegen<'ctx> {
     // and back on load, so the struct is always `{ i1, i64 }`.
 
     /// If `ty` is a flat-union–qualifying type (`T | Null` with scalar T), return `T`.
-    /// Otherwise `None`.
     pub(crate) fn flat_union_scalar_type(ty: &Type) -> Option<Type> {
-        let variants = match ty {
-            Type::Union(vs) => vs,
-            _ => return None,
-        };
-        if variants.len() != 2 {
-            return None;
-        }
-        let mut scalar: Option<Type> = None;
-        for v in variants {
-            match v {
-                Type::Null => {}
-                t if Self::is_flat_union_scalar(t) => {
-                    if scalar.is_some() { return None; } // two non-null → not simple nullable
-                    scalar = Some(t.clone());
-                }
-                _ => return None,
-            }
-        }
-        scalar
+        lin_ir::repr::flat_nullable_scalar(ty).cloned()
     }
 
     /// True for types that qualify as the scalar member of a flat-union `T | Null`.
     pub(crate) fn is_flat_union_scalar(ty: &Type) -> bool {
-        matches!(
-            ty,
-            Type::Bool
-                | Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_)
-                | Type::UInt8 | Type::UInt16 | Type::UInt32
-                | Type::Int64 | Type::UInt64
-                | Type::Float32 | Type::Float64
-        )
+        lin_ir::repr::is_flat_nullable_scalar(ty)
     }
 
     /// The LLVM struct type for a flat-union return: `{ i1 is_null, i64 value }`.
