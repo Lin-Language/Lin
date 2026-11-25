@@ -1436,6 +1436,22 @@ val x: Int32 | String = …
 show(x)   // error: no overload of `show` accepts `Int32 | String`
 ```
 
+**`AnyVal` arguments must resolve unambiguously.** An `AnyVal` argument says
+nothing about which overload it fits, so it is not used to pick between them. If
+more than one overload could accept an `AnyVal` argument in that position, and
+those overloads differ there, the call is a compile error (`ambiguous call`).
+Narrow the value first (`is`, `match`, `fromJson`) or give it a concrete type. If
+an overload takes `AnyVal` (or a type parameter) in that position, that overload
+is chosen.
+
+```txt
+val count = (a: Item): Int32   => 1
+val count = (a: Item[]): Int32 => length(a)
+
+val v: AnyVal = …
+count(v)   // error: ambiguous call — argument 1 is `AnyVal`
+```
+
 **Distinguished by parameters only.** Two overloads with identical parameter
 types are a compile error even if their return types differ — the return type is
 never used to select an overload. Only functions may overload; a name cannot be

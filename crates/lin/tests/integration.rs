@@ -23179,6 +23179,64 @@ print(toString(f(both)))
     assert!(err.contains("ambiguous call"), "got: {err}");
 }
 
+const ANYVAL_OVERLOAD_PRELUDE: &str = r#"import { print } from "std/io"
+import { length } from "std/array"
+import { fromJson } from "std/json"
+type A = { "n": Int32 }
+type As = A[]
+val f = (x: A): Int32 => x["n"]
+val f = (x: A[]): Int32 => x.length
+"#;
+
+#[test]
+fn test_overload_anyval_argument_ambiguous_is_error() {
+    let src = format!(
+        "{}val v: AnyVal = {{ \"n\": 5 }}\nprint(f(v))\n",
+        ANYVAL_OVERLOAD_PRELUDE
+    );
+    let err = run_expect_err(&src);
+    assert!(
+        err.contains("ambiguous call to `f(AnyVal)`")
+            && err.contains("argument 1 is `AnyVal`, so more than one overload could accept it"),
+        "got: {err}"
+    );
+    assert!(err.contains("(A) => Int32") && err.contains("(A[]) => Int32"), "got: {err}");
+    assert!(err.contains("narrow the argument first"), "got: {err}");
+}
+
+#[test]
+fn test_overload_anyval_narrowed_record_runs() {
+    let src = format!(
+        "{}val v: AnyVal = {{ \"n\": 5 }}\nval a = A.fromJson(v)\nmatch a\n  is A => print(f(a))\n  _ => print(-1)\n",
+        ANYVAL_OVERLOAD_PRELUDE
+    );
+    assert_eq!(run(&src), vec!["5"]);
+}
+
+#[test]
+fn test_overload_anyval_narrowed_array_runs() {
+    let src = format!(
+        "{}val v: AnyVal = [{{ \"n\": 1 }}, {{ \"n\": 2 }}]\nval a = As.fromJson(v)\nmatch a\n  is As => print(f(a))\n  _ => print(-1)\n",
+        ANYVAL_OVERLOAD_PRELUDE
+    );
+    assert_eq!(run(&src), vec!["2"]);
+}
+
+#[test]
+fn test_overload_anyval_unambiguous_still_works() {
+    let out = run(r#"import { print } from "std/io"
+val g = (x: AnyVal): String => "dyn"
+val g = (x: Int32): String => "int"
+val h = (x: Int32): String => "h"
+val viaDyn = (v: AnyVal): String => g(v)
+val viaH = (v: AnyVal): String => h(v)
+print(viaDyn(3))
+print(g(3))
+print(viaH(3))
+"#);
+    assert_eq!(out, vec!["dyn", "int", "h"]);
+}
+
 #[test]
 fn test_overload_bare_reference_is_error() {
     // An overloaded name cannot be used as a value — only called.
