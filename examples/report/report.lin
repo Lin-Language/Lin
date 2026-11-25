@@ -41,7 +41,7 @@ export val stats = (records: Record[]): Stats =>
     }
   else
     val total = records.reduce(0, (sum, r) => sum + r["score"])
-    val ranked = records.sortBy(r => 0 - r["score"])
+    val ranked = records.sortBy(r => -r["score"])
     {
       "count": count,
       "total": total,
@@ -64,7 +64,7 @@ val errorNote = (errs: String[]): String =>
 export val render = (lines: String[]): String =>
   val records = validRecords(lines).unique()
   val st = stats(records)
-  val ranked = records.sortBy(r => 0 - r["score"])
+  val ranked = records.sortBy(r => -r["score"])
   val rows = ranked
     .map((r, i) => "  ${i + 1}. ${r["name"]}: ${r["score"]}")
     .join("\n")
