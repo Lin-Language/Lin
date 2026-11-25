@@ -1001,6 +1001,9 @@ pub(crate) fn int_width_repr_differs(from: &Type, to: &Type) -> bool {
 /// the converted buffer (`flat_array_widen`). This is the whole-array analogue of
 /// `scalar_numeric_repr_differs` (the mixed-numeric array LITERAL element case).
 pub(crate) fn flat_scalar_array_repr_differs(from: &Type, to: &Type) -> bool {
+    if let (Type::FixedArray(_), Type::Array(te)) = (from, to) {
+        return te.is_flat_scalar();
+    }
     if let (Type::Array(fe), Type::Array(te)) = (from, to) {
         return fe.is_flat_scalar() && te.is_flat_scalar() && fe != te;
     }
