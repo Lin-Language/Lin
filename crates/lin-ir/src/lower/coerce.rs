@@ -634,6 +634,14 @@ pub(crate) fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>
         // call above — the predicate it evaluates is exactly the union of these two conditions.]
         return dst;
     }
+    // A tuple or a flat scalar array of a different element type flowing into a flat numeric array
+    // param: materialize a fresh packed buffer (the call's arg scope releases it).
+    if flat_scalar_array_repr_differs(arg_ty, param_ty) {
+        let dst = builder.alloc_temp(param_ty.clone());
+        builder.emit(Instruction::Coerce { dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone() });
+        builder.register_owned(dst, param_ty.clone());
+        return dst;
+    }
     // Numeric width/kind mismatch between two concrete numeric types.
     if arg_ty.is_numeric() && param_ty.is_numeric() && arg_ty != param_ty {
         let dst = builder.alloc_temp(param_ty.clone());
@@ -687,12 +695,29 @@ pub(crate) fn try_lower_sealed_literal(
     if !target_fields.keys().all(|k| fields.iter().any(|(fk, _)| fk == k)) {
         return None;
     }
-    let lowered_fields: Vec<(String, Temp)> =
-        fields.iter().map(|(k, v)| (k.clone(), lower_expr(v, builder, ctx))).collect();
+    let lowered_fields: Vec<(String, Temp)> = fields
+        .iter()
+        .map(|(k, v)| {
+            let t = lower_expr(v, builder, ctx);
+            (k.clone(), coerce_tuple_field_to_flat(t, &v.ty(), target_fields.get(k), builder))
+        })
+        .collect();
     let dst = builder.alloc_temp(slot_ty.clone());
     builder.emit(Instruction::MakeObject { dst, fields: lowered_fields, spreads: vec![], computed_fields: vec![], ty: slot_ty.clone(), stack: false });
     builder.register_owned(dst, slot_ty.clone());
     Some(dst)
+}
+
+/// A tuple-typed record field value flowing into a flat-numeric-array field (`xs: Float64[]`) is
+/// converted to a fresh packed buffer (registered owned); every other field is returned as is.
+pub(crate) fn coerce_tuple_field_to_flat(t: Temp, value_ty: &Type, field_ty: Option<&Type>, builder: &mut FuncBuilder) -> Temp {
+    let Some(field_ty) = field_ty else { return t };
+    if matches!(value_ty, Type::FixedArray(_)) && flat_scalar_array_repr_differs(value_ty, field_ty) {
+        let dst = coerce_to_slot_type(t, value_ty, field_ty, builder);
+        builder.register_owned(dst, field_ty.clone());
+        return dst;
+    }
+    t
 }
 
 /// FUSED `arr[i].field` / `arr[i]["field"]` over a SEALED-RECORD ARRAY (Stage 3). When `object`
@@ -1255,6 +1280,18 @@ pub(crate) fn coerce_if_branch(
         // owner — do not keep it. The merge owns `unboxed` (+1 concrete rc).
         builder.emit(Instruction::FreeBoxShell { val: cloned });
         return (unboxed, vec![unboxed], true);
+    }
+    // A sum-typed value (physically a `*SumNode`) merging into a non-sum union result (e.g. an
+    // inner `Shape` if-result flowing into a `Shape | Null` merge) is a representation change:
+    // materialize it explicitly. Forwarding it as a union would put a SumNode and a boxed value in
+    // one phi carry class. The coerce result is a fresh +1 owned by the merge; the source stays
+    // with its own scope.
+    if crate::repr::sum_type_eligible(value_ty)
+        && !crate::repr::sum_type_eligible(result_type)
+        && is_union_ty(result_type)
+    {
+        let converted = coerce_to_slot_type(raw, value_ty, result_type, builder);
+        return (converted, vec![converted], true);
     }
     // (2) Union merge value. Ensure it is an independently-owned +1 box.
     if is_union_ty(result_type) {

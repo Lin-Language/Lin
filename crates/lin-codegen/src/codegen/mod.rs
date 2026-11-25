@@ -1806,21 +1806,12 @@ impl<'ctx> Codegen<'ctx> {
                             // non-flat-union Direct or any Named/Indirect call) expects a boxed ptr.
                             // Flat-union functions have concrete-typed params (not union), so they are
                             // not affected here.
-                            let arg_vals_raw: Vec<BasicValueEnum> = args
+                            let arg_vals: Vec<BasicMetadataValueEnum> = args
                                 .iter()
                                 .filter_map(|a| temp_map.get(a).copied())
+                                .inspect(|v| debug_assert!(!v.is_struct_value(), "flat nullable temp passed as a call argument"))
+                                .map(|v| v.into())
                                 .collect();
-                            let mut arg_vals_mat: Vec<BasicValueEnum> = arg_vals_raw;
-                            for (i, a) in args.iter().enumerate() {
-                                if let Some(v) = arg_vals_mat.get(i).copied() {
-                                    if v.is_struct_value() {
-                                        let ty = func.temp_types.get(a).cloned().unwrap_or(Type::Null);
-                                        arg_vals_mat[i] = self.materialize_flat_union_if_needed(v, &ty, llvm_fn);
-                                    }
-                                }
-                            }
-                            let arg_vals: Vec<BasicMetadataValueEnum> = arg_vals_mat
-                                .iter().map(|v| (*v).into()).collect();
                             // Detect under-application: fewer args than the callee's arity
                             // and a Function result type ⇒ build a partial-application closure.
                             let partial_app = |s: &mut Self, callee_fn: FunctionValue<'ctx>| -> Option<BasicValueEnum<'ctx>> {
@@ -2164,21 +2155,11 @@ impl<'ctx> Codegen<'ctx> {
                                 .iter()
                                 .map(|a| func.temp_types.get(a).cloned().unwrap_or(Type::Null))
                                 .collect();
-                            // VA.1 CPR: if an argument is a flat-union struct `{ i1, i64 }`,
-                            // materialize it to a boxed `TaggedVal*` before passing to the intrinsic —
-                            // intrinsic dispatch (ToString, Push, etc.) operates on tagged pointers.
-                            let mut arg_vals: Vec<BasicValueEnum> = args
+                            let arg_vals: Vec<BasicValueEnum> = args
                                 .iter()
                                 .filter_map(|a| temp_map.get(a).copied())
+                                .inspect(|v| debug_assert!(!v.is_struct_value(), "flat nullable temp passed to an intrinsic"))
                                 .collect();
-                            for i in 0..args.len() {
-                                if let Some(v) = arg_vals.get(i).copied() {
-                                    if v.is_struct_value() {
-                                        let ty = arg_tys.get(i).cloned().unwrap_or(Type::Null);
-                                        arg_vals[i] = self.materialize_flat_union_if_needed(v, &ty, llvm_fn);
-                                    }
-                                }
-                            }
                             // STAGE 3: the per-operand physical representation (from `func.repr`) so
                             // repr-deciding intrinsics (Push) dispatch on the proven repr instead of
                             // re-deriving from the static type.
@@ -2734,26 +2715,33 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty, nonneg, proven_inbounds } => {
                             if let Some(&obj_v) = temp_map.get(object) {
+                                let mut result = None;
                                 // Get-set fusion: if this Index is part of a get-set pair, emit
                                 // lin_map_upsert_slot_bytes now and defer the actual value read;
                                 // the IndexSet emitter will write the new value to the slot directly.
                                 if func.getset_fuse.contains(dst) {
                                     if let Some(&(data_ptr, key_len)) = slice_byte_map.get(key) {
-                                        let result = self.emit_upsert_index(
+                                        result = Some(self.emit_upsert_index(
                                             obj_v, data_ptr, key_len, obj_ty, result_ty,
                                             *key, &mut upsert_slot_map, *dst,
-                                        );
-                                        temp_map.insert(*dst, result);
+                                        ));
                                     }
                                 }
                                 // Substring-key fusion (non-getset): if key is a fused slice temp, use the
                                 // byte-keyed map get (lin_map_get_bytes) instead of the normal string path.
                                 else if let Some(&(data_ptr, key_len)) = slice_byte_map.get(key) {
-                                    let result = self.emit_map_get_bytes_fused(obj_v, data_ptr, key_len, obj_ty, result_ty);
-                                    temp_map.insert(*dst, result);
+                                    result = Some(self.emit_map_get_bytes_fused(obj_v, data_ptr, key_len, obj_ty, result_ty));
                                 } else if let Some(&key_v) = temp_map.get(key) {
                                     let obj_repr = func.repr_of(*object);
-                                    let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty, &obj_repr, *nonneg, *proven_inbounds);
+                                    result = Some(self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty, &obj_repr, *nonneg, *proven_inbounds));
+                                }
+                                if let Some(mut result) = result {
+                                    // Map reads yield a borrowed `TaggedVal*`: a flat destination reads
+                                    // tag and payload from it directly, so nothing is boxed or freed.
+                                    if let lin_ir::repr::Repr::FlatNullable { scalar } = func.repr_of(*dst) {
+                                        debug_assert!(result.is_pointer_value());
+                                        result = self.borrowed_tagged_to_flat_union(result.into_pointer_value(), &scalar);
+                                    }
                                     temp_map.insert(*dst, result);
                                 }
                             }
@@ -2877,14 +2865,10 @@ impl<'ctx> Codegen<'ctx> {
                                         .load(llvm_ty, glob.as_pointer_value(), "ir_gv_old");
                                     self.emit_release(old, ty);
                                 }
-                                // VA.1 CPR: globals always store boxed `ptr` for union types.
-                                // If the value is a flat-union struct `{ i1, i64 }`, materialize
-                                // it to a boxed ptr before storing (globals are shared across
-                                // functions and must hold a uniform representation).
-                                let store_v = if v.is_struct_value() {
-                                    self.materialize_flat_union_if_needed(v, ty, llvm_fn)
-                                } else { v };
-                                self.builder.store(glob.as_pointer_value(), store_v);
+                                // Globals hold the uniform boxed representation; the classifier
+                                // boxes flat temps stored here at their definition.
+                                debug_assert!(!v.is_struct_value(), "flat nullable temp stored to a global");
+                                self.builder.store(glob.as_pointer_value(), v);
                             }
                         }
                         Instruction::GlobalValGet { dst, slot, ty, immutable } => {
@@ -2898,11 +2882,7 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::MakeCell { dst, init, ty, stack } => {
                             if let Some(&v) = temp_map.get(init) {
-                                // VA.1 CPR: cells always hold boxed ptrs, not flat-union structs.
-                                // If the initial value is a flat-union struct, materialize it first.
-                                let store_v = if v.is_struct_value() {
-                                    self.materialize_flat_union_if_needed(v, ty, llvm_fn)
-                                } else { v };
+                                debug_assert!(!v.is_struct_value(), "flat nullable temp stored to a cell");
                                 let llvm_ty = self.llvm_type(ty);
                                 let cell = if *stack {
                                     // Non-escaping cell (escape::analyze_cells proved it never leaves
@@ -2930,7 +2910,7 @@ impl<'ctx> Codegen<'ctx> {
                                     let size_i64 = self.builder.int_z_extend_or_bit_cast(size, i64_ty, "cell_sz");
                                     self.builder.call(self.rt.alloc, &[size_i64.into()], "ir_cell").try_as_basic_value().unwrap_basic().into_pointer_value()
                                 };
-                                self.builder.store(cell, store_v);
+                                self.builder.store(cell, v);
                                 temp_map.insert(*dst, cell.into());
                             }
                         }
@@ -2964,11 +2944,8 @@ impl<'ctx> Codegen<'ctx> {
                                             .load(llvm_ty, c.into_pointer_value(), "ir_cell_old");
                                         self.emit_release(old, ty);
                                     }
-                                    // VA.1 CPR: cells always hold boxed ptrs, not flat-union structs.
-                                    let store_v = if v.is_struct_value() {
-                                        self.materialize_flat_union_if_needed(v, ty, llvm_fn)
-                                    } else { v };
-                                    self.builder.store(c.into_pointer_value(), store_v);
+                                    debug_assert!(!v.is_struct_value(), "flat nullable temp stored to a cell");
+                                    self.builder.store(c.into_pointer_value(), v);
                                 }
                             }
                         }

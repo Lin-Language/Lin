@@ -585,12 +585,7 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
                 let right = self.parse_postfix_expr();
-                Expr::BinaryOp {
-                    left: Box::new(Expr::IntLit(0, None, span)),
-                    op: BinOp::Sub,
-                    right: Box::new(right),
-                    span,
-                }
+                Expr::UnaryOp { op: UnaryOp::Neg, operand: Box::new(right), span }
             }
             // Lin has no semicolons (spec §1.2). A `;` here is almost always someone
             // separating statements C-style (e.g. inside an inline closure body

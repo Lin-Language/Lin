@@ -1263,8 +1263,8 @@ fn same_flat_scalar(a: Option<&Type>, b: Option<&Type>) -> bool {
 }
 
 /// Temps that cannot remain flat given the current candidate set `flat`. Every definition of a flat
-/// temp must be flat-capable (flat-return call, `Coerce` from the scalar or `Null`, `Const Null`,
-/// `Phi`, `Copy`/`Bind`/`CloneBox` of a same-scalar temp) and every use flat-aware (`IsType`,
+/// temp must be flat-capable (flat-return call, `Index` of a `{ K: Scalar }` map, `Coerce` from the
+/// scalar or `Null`, `Const Null`, `Phi`, `Copy`/`Bind`/`CloneBox` of a same-scalar temp) and every use flat-aware (`IsType`,
 /// `Coerce` to the scalar or `Null`, `==`/`!=` against `Null`, `Retain`/`Release`, `Return` from a
 /// flat-returning function). Anything else, including instructions not listed here, is reported so
 /// the temp is boxed once at its definition.
@@ -1341,6 +1341,16 @@ fn flat_violations(func: &LinFunction, instr: &Instruction, flat: &HashSet<Temp>
                     out.push(*t);
                 }
             }
+        }
+        Instruction::Index { dst, object, key, obj_ty, result_ty, .. } => {
+            if f(dst) {
+                let ok = same_flat_scalar(ty_of(dst), Some(result_ty))
+                    && matches!(obj_ty, Type::Map { value, .. } if flat_nullable_scalar(result_ty) == Some(&**value));
+                if !ok {
+                    out.push(*dst);
+                }
+            }
+            out.extend([object, key].into_iter().filter(|t| f(t)).copied());
         }
         Instruction::IsType { val, ty, .. } => {
             if f(val) {
@@ -1952,6 +1962,80 @@ mod tests {
         let types = [(0, int_or_null()), (1, Type::Null), (2, Type::Bool), (3, Type::Bool)];
         let mut f = flat_fn(instrs, Some(Temp(2)), &types, Type::Bool);
         assert!(mark(&mut f).contains(&Temp(0)));
+    }
+
+    fn map_of(value: Type) -> Type {
+        Type::Map { key: Box::new(Type::Str), value: Box::new(value), name: None }
+    }
+
+    fn map_index(dst: u32, obj_ty: Type) -> Instruction {
+        Instruction::Index {
+            dst: Temp(dst),
+            object: Temp(8),
+            key: Temp(9),
+            obj_ty,
+            key_ty: Type::Str,
+            result_ty: int_or_null(),
+            nonneg: false,
+            proven_inbounds: false,
+        }
+    }
+
+    fn null_check(dst: u32, lhs: u32, null: u32) -> Vec<Instruction> {
+        vec![
+            Instruction::Const { dst: Temp(null), val: Const::Null },
+            Instruction::Binary {
+                dst: Temp(dst),
+                op: lin_parse::ast::BinOp::NotEq,
+                lhs: Temp(lhs),
+                rhs: Temp(null),
+                operand_ty: int_or_null(),
+                ty: Type::Bool,
+            },
+        ]
+    }
+
+    #[test]
+    fn map_index_compared_with_null_is_flat() {
+        let mut instrs = vec![map_index(0, map_of(Type::Int32))];
+        instrs.extend(null_check(2, 0, 1));
+        let types = [(0, int_or_null()), (1, Type::Null), (2, Type::Bool)];
+        let mut f = flat_fn(instrs, Some(Temp(2)), &types, Type::Bool);
+        assert!(mark(&mut f).contains(&Temp(0)));
+        assert!(verify_flat_nullable(&f).is_empty());
+    }
+
+    #[test]
+    fn map_index_with_a_different_value_type_is_boxed() {
+        let mut instrs = vec![map_index(0, map_of(Type::Int64))];
+        instrs.extend(null_check(2, 0, 1));
+        let types = [(0, int_or_null()), (1, Type::Null), (2, Type::Bool)];
+        let mut f = flat_fn(instrs, Some(Temp(2)), &types, Type::Bool);
+        assert!(mark(&mut f).is_empty());
+    }
+
+    #[test]
+    fn map_index_of_a_non_map_is_boxed() {
+        let mut instrs = vec![map_index(0, Type::Array(Box::new(Type::Int32)))];
+        instrs.extend(null_check(2, 0, 1));
+        let types = [(0, int_or_null()), (1, Type::Null), (2, Type::Bool)];
+        let mut f = flat_fn(instrs, Some(Temp(2)), &types, Type::Bool);
+        assert!(mark(&mut f).is_empty());
+    }
+
+    #[test]
+    fn map_index_used_as_call_argument_is_boxed() {
+        let instrs = vec![
+            map_index(0, map_of(Type::Int32)),
+            Instruction::Call {
+                dst: Temp(1),
+                callee: CallTarget::Named("g".into()),
+                args: vec![Temp(0)],
+                ret_ty: Type::Int32,
+            },
+        ];
+        let mut f = flat_fn(instrs, Some(Temp(1)), &[(0, int_or_null()), (1, Type::Int32)], Type::Int32);
+        assert!(mark(&mut f).is_empty());
     }
 
     #[test]

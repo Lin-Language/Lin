@@ -995,6 +995,7 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
             let ir_op = match op {
                 lin_parse::ast::UnaryOp::BNot => crate::ir::UnaryOp::Not,
                 lin_parse::ast::UnaryOp::Not => crate::ir::UnaryOp::Not,
+                lin_parse::ast::UnaryOp::Neg => unreachable!("negation is desugared to `0 - x` by the checker"),
             };
             // For logical `!` whose operand is not statically Bool (e.g. a boxed
             // TypeVar), coerce/unbox to a raw i1 first so the Unary sees a real bool.
@@ -1157,6 +1158,11 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                 .map(|(k, v)| {
                     let t = lower_expr(v, builder, ctx);
                     let vty = v.ty();
+                    let target = match ty {
+                        Type::Object { fields, .. } => fields.get(k),
+                        _ => None,
+                    };
+                    let t = coerce_tuple_field_to_flat(t, &vty, target, builder);
                     if is_sealed_scalar_repr(&vty) {
                         let to = Type::object(match &vty {
                             Type::Object { fields, .. } => fields.clone(),

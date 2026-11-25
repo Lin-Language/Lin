@@ -1,4 +1,4 @@
-import { json, text, badRequest, matchPath, HttpRequest as Request, HttpResponse as Response } from "std/http"
+import { json, text, matchPath, HttpRequest as Request, HttpResponse as Response } from "std/http"
 import { render } from "std/template"
 import { Config } from "./config"
 import { solve, RouteFound, RouteNone, RouteError } from "./routing"
@@ -18,7 +18,7 @@ export val getIndex = (req: Request, config: Config): Response =>
   }
   val html = render("examples/web-server/views/index.jinja", data)
   match html
-    is Error => badRequest("template error: ${html["message"]}")
+    is Error => json(500, { "error": "template error: ${html["message"]}" })
     else => text(200, html)
 
 // GET /api/status — a JSON health/status payload including the service name.

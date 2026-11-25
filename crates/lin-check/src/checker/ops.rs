@@ -250,6 +250,9 @@ impl Checker {
         operand: &Expr,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
+        if op == UnaryOp::Neg {
+            return self.infer_binary_op(&Expr::IntLit(0, None, span), BinOp::Sub, operand, span);
+        }
         let prev_tail = std::mem::replace(&mut self.in_tail_position, false);
         let typed_operand = self.infer_expr(operand)?;
         self.in_tail_position = prev_tail;
@@ -274,6 +277,7 @@ impl Checker {
                     ));
                 }
             }
+            UnaryOp::Neg => unreachable!("handled above"),
             UnaryOp::Not => {
                 if matches!(operand_ty, Type::Bool) {
                     Type::Bool

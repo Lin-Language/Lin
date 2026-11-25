@@ -322,6 +322,8 @@ pub enum BinOp {
 pub enum UnaryOp {
     BNot,
     Not,
+    /// Arithmetic negation `-x`. The checker types it as `0 - x`; it never reaches typed IR.
+    Neg,
 }
 
 #[derive(Debug, Clone)]

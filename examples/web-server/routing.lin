@@ -81,7 +81,7 @@ val processQueue = (pq: PqEntry[], adj: { String: Neighbor[] }, dist: { String: 
         neighbors.for(edge =>
           val v = edge["to"]
           val du = dist[u] ?? 0
-          val dv = dist[v] ?? 0
+          val dv = dist[v] ?? UNREACHABLE
           val newDist = du + edge["weight"]
           if newDist < dv then
             dist[v] = newDist
