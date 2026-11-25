@@ -1,8 +1,8 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 import { range, reduce } from "std/iter"
 import { toString } from "std/string"
 
-export val tests = (solve: (String) => String): AnyVal =>
+export val tests = (solve: (String) => String): Suite =>
   suite("03-reverse-string", [
     test("reverses a word", () => [expect(solve("hello")).toBe("olleh")]),
 
@@ -19,6 +19,8 @@ export val tests = (solve: (String) => String): AnyVal =>
     test("preserves spaces", () => [expect(solve("hi there")).toBe("ereht ih")]),
 
     test("large input: reversing twice gives original", () =>
-      [expect(solve(solve("abcdefghijklmnopqrstuvwxyz"))).toBe("abcdefghijklmnopqrstuvwxyz")]
+      [
+        expect(solve(solve("abcdefghijklmnopqrstuvwxyz"))).toBe("abcdefghijklmnopqrstuvwxyz")
+      ]
     )
   ])

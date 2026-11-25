@@ -1,7 +1,7 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 import { range, map, reduce } from "std/iter"
 
-export val tests = (solve: (Int32[]) => Int32): AnyVal =>
+export val tests = (solve: (Int32[]) => Int32): Suite =>
   suite("01-sum-list", [
     test("sums a normal list", () => [expect(solve([1, 2, 3, 4])).toBe(10)]),
 

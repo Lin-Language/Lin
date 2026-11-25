@@ -1,7 +1,7 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 import { length } from "std/array"
 
-export val tests = (solve: (String[]) => String[][]): AnyVal =>
+export val tests = (solve: (String[]) => String[][]): Suite =>
   suite("14-group-anagrams", [
     test("classic example", () =>
       [
@@ -26,7 +26,9 @@ export val tests = (solve: (String[]) => String[][]): AnyVal =>
     ),
 
     test("two groups, each two words", () =>
-      [expect(solve(["ab", "cd", "ba", "dc"])).toBe([["ab", "ba"], ["cd", "dc"]])]
+      [
+        expect(solve(["ab", "cd", "ba", "dc"])).toBe([["ab", "ba"], ["cd", "dc"]])
+      ]
     ),
 
     test("single-char words all distinct", () =>
@@ -34,6 +36,8 @@ export val tests = (solve: (String[]) => String[][]): AnyVal =>
     ),
 
     test("larger: 10 words in two groups of 5", () =>
-      [expect(length(solve(["abc","bca","cab","cba","bac","abc","bca","cab","cba","bac"]))).toBe(1)]
+      [
+        expect(length(solve(["abc", "bca", "cab", "cba", "bac", "abc", "bca", "cab", "cba", "bac"]))).toBe(1)
+      ]
     )
   ])

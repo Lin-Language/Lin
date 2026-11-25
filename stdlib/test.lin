@@ -20,6 +20,9 @@
 // Mocking is the test-only `replace <name> = <expr>` statement (see the Testing tutorial),
 // permitted only in a `*.test.lin`.
 //
+// `report` always prints one `##LINTEST## {"event":"summary","passed":N,"failed":M}` record, whatever
+// the reporter mode, so `lin test` can fail a file that ran zero tests.
+//
 // Three environment variables (all set by `lin test`, none meant to be set by hand):
 //   LIN_TEST_JSON   — emit one `##LINTEST## ` NDJSON record per test result instead of the
 //                     human-readable summary (`lin test --reporter json`).
@@ -32,7 +35,7 @@
 import { print } from "std/io"
 import { toString, join, split } from "std/string"
 import { length } from "std/array"
-import { filter, for, map } from "std/iter"
+import { filter, for, map, reduce } from "std/iter"
 import { exit } from "std/io"
 import { getEnv } from "std/env"
 import { toJsonString, toJson } from "std/json"
@@ -231,11 +234,14 @@ export val withFixture = (setup: () => AnyVal, teardown: (AnyVal) => Null, name:
     results
   )
 
+// A named group of test result records, as built by `suite`.
+export type Suite = { "name": String, "tests": AnyVal[] }
+
 // Group test results into a named suite for `report`/`run`.
 // @param name   the suite name.
 // @param tests  the array of test result records (from `test`/`withFixture`).
 // @returns a suite record `{ "name", "tests" }`.
-export val suite = (name: String, tests: AnyVal[]): AnyVal =>
+export val suite = (name: String, tests: AnyVal[]): Suite =>
   { "name": name, "tests": tests }
 
 // Machine-readable NDJSON emission, gated on the LIN_TEST_JSON env var (see `report`).
@@ -278,11 +284,14 @@ val _reportJsonResult = (r: AnyVal): Null =>
 //   excluded from both pass and fail counts. When LIN_TEST_JSON is set, the human-readable lines
 //   are suppressed and one NDJSON record is emitted per test (for `lin test --reporter json`); the
 //   return value is identical in both modes.
-export val report = (s: AnyVal): Int32 =>
+export val report = (s: Suite): Int32 =>
   val failed = s["tests"].filter(r => r["type"] == "fail")
   val skipped = s["tests"].filter(r => r["type"] == "skip")
   val passCount = length(s["tests"]) - length(failed) - length(skipped)
   val failCount = length(failed)
+  print(
+    "##LINTEST## {\"event\":\"summary\",\"passed\":${toString(passCount)},\"failed\":${toString(failCount)}}"
+  )
   if getEnv("LIN_TEST_JSON") != null then
     s["tests"].for(r => _reportJsonResult(r))
   else
@@ -294,11 +303,25 @@ export val report = (s: AnyVal): Int32 =>
       print("${toString(failCount)} failed, ${toString(passCount)} passed")
   failCount
 
+// Print every suite's results and return the total failure count across all of them.
+// @param suites  the suites from `suite`.
+// @returns the total number of failed tests.
+export val report = (suites: Suite[]): Int32 =>
+  suites.reduce(0, (total, s) => total + report(s))
+
 // Run a suite: print results and `exit(1)` if any test failed (the common case — a non-zero status
 // fails CI). For guaranteed post-run teardown even on failure, use `report` instead.
 // @param s  the suite from `suite`.
-export val run = (s: AnyVal): Null =>
+export val run = (s: Suite): Null =>
   if report(s) > 0 then
+    exit(1)
+  else
+    null
+
+// Run several suites: print every suite's results and `exit(1)` if any test in any of them failed.
+// @param suites  the suites from `suite`.
+export val run = (suites: Suite[]): Null =>
+  if report(suites) > 0 then
     exit(1)
   else
     null

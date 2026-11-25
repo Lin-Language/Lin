@@ -1,7 +1,7 @@
-import { expect, toBe, toBeNull, test, suite } from "std/test"
+import { expect, toBe, toBeNull, test, suite, Suite } from "std/test"
 import { range, map } from "std/iter"
 
-export val tests = (solve: (Int32[]) => Int32 | Null): AnyVal =>
+export val tests = (solve: (Int32[]) => Int32 | Null): Suite =>
   suite("05-max-of", [
     test("finds max in mixed list", () => [expect(solve([3, 1, 4, 1, 5])).toBe(5)]),
 

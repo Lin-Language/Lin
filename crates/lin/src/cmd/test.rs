@@ -476,12 +476,40 @@ fn run_binary(
     let stderr = take(&err_buf);
 
     match status {
-        Some(status) if status.success() => (Outcome::Pass, stdout, stderr),
+        Some(status) if status.success() => {
+            // A binary that exits 0 without reporting a single test proves nothing (a file
+            // that never calls `run`/`report`, or one whose suites are empty). A
+            // `--filter-test` selection legitimately matches nothing in most files.
+            if filter_test.is_empty() && reported_test_count(&stdout) == 0 {
+                let stderr = format!(
+                    "{}no tests ran: the file exited successfully without reporting a single test",
+                    if stderr.is_empty() { String::new() } else { format!("{}\n", stderr) }
+                );
+                (Outcome::Fail, stdout, stderr)
+            } else {
+                (Outcome::Pass, stdout, stderr)
+            }
+        }
         // A timeout keeps whatever partial output the binary produced — that's what names the
         // test that hung.
         Some(_) => (Outcome::Fail, stdout, stderr),
         None => (Outcome::Timeout, stdout, stderr),
     }
+}
+
+/// Total number of tests (passed + failed, skips excluded) reported by the `summary` records
+/// `std/test`'s `report` always prints, independent of the reporter mode or any mocked `getEnv`.
+fn reported_test_count(stdout: &str) -> u64 {
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(MARKER))
+        .filter_map(|rest| serde_json::from_str::<serde_json::Value>(rest).ok())
+        .filter(|val| val.get("event").and_then(|v| v.as_str()) == Some("summary"))
+        .map(|val| {
+            let n = |k: &str| val.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            n("passed") + n("failed")
+        })
+        .sum()
 }
 
 /// Scan a captured stdout blob for the LAST `##LINTEST## {"event":"start",…}` record and return

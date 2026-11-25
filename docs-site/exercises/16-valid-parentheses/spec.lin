@@ -1,7 +1,7 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 import { range, reduce } from "std/iter"
 
-export val tests = (solve: (String) => Boolean): AnyVal =>
+export val tests = (solve: (String) => Boolean): Suite =>
   suite("16-valid-parentheses", [
     test("simple parens", () =>
       [expect(solve("()")).toBe(true)]
@@ -44,10 +44,14 @@ export val tests = (solve: (String) => Boolean): AnyVal =>
     ),
 
     test("large valid: 500 pairs of ()", () =>
-      [expect(solve(range(0, 500).reduce("", (acc, _) => "${acc}()"))).toBe(true)]
+      [
+        expect(solve(range(0, 500).reduce("", (acc, _) => "${acc}()"))).toBe(true)
+      ]
     ),
 
     test("large invalid: 500 open parens", () =>
-      [expect(solve(range(0, 500).reduce("", (acc, _) => "${acc}("))).toBe(false)]
+      [
+        expect(solve(range(0, 500).reduce("", (acc, _) => "${acc}("))).toBe(false)
+      ]
     )
   ])

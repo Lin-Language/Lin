@@ -1,8 +1,8 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 import { range, map, for } from "std/iter"
 import { push, length } from "std/array"
 
-export val tests = (solve: (Int32[], Int32) => Int32[]): AnyVal =>
+export val tests = (solve: (Int32[], Int32) => Int32[]): Suite =>
   suite("23-top-k-frequent", [
     test("basic top-2", () => [expect(solve([1, 1, 1, 2, 2, 3], 2)).toBe([1, 2])]),
 
@@ -28,9 +28,7 @@ export val tests = (solve: (Int32[], Int32) => Int32[]): AnyVal =>
 
     test("large input: most frequent is 0 (appears 1000 times)", () =>
       [
-        expect(
-          solve(range(0, 1000).map(i => if i < 1000 then 0 else i), 1)
-        ).toBe([0])
+        expect(solve(range(0, 1000).map(i => if i < 1000 then 0 else i), 1)).toBe([0])
       ]
     )
   ])

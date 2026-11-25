@@ -25870,3 +25870,77 @@ print(r2)
 "#);
     assert_eq!(out, vec!["-1", "7"]);
 }
+
+// --- `std/test` `run` over an array of suites, and zero-test files ------------
+
+fn run_test_human(source: &str) -> (bool, String) {
+    let fixture = write_test_fixture(source);
+    let out = lin_cmd()
+        .args(["test", fixture.to_str().unwrap()])
+        .current_dir(workspace_root())
+        .output()
+        .expect("failed to invoke lin test - run `cargo build -p lin` first");
+    let _ = fs::remove_file(&fixture);
+    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+#[test]
+fn test_run_array_of_suites_runs_every_suite_and_fails_on_any_failure() {
+    let (ok, stderr) = run_test_human(
+        r#"import { expect, toBe, test, suite, run } from "std/test"
+
+val a = suite("a", [test("good", () => [expect(1).toBe(1)])])
+val b = suite("b", [test("bad", () => [expect(1).toBe(2)])])
+
+run([a, b])
+"#,
+    );
+    assert!(!ok, "a failing test in the second suite must fail the file; got:\n{}", stderr);
+    assert!(stderr.contains("ok  good"), "first suite must run; got:\n{}", stderr);
+    assert!(stderr.contains("FAIL  bad"), "second suite must run; got:\n{}", stderr);
+}
+
+#[test]
+fn test_run_array_of_passing_suites_counts_every_test() {
+    let (ok, stderr) = run_test_human(
+        r#"import { expect, toBe, test, suite, run } from "std/test"
+
+val a = suite("a", [test("one", () => [expect(1).toBe(1)])])
+val b = suite("b", [test("two", () => [expect(2).toBe(2)]), test("three", () => [expect(3).toBe(3)])])
+
+run([a, b])
+"#,
+    );
+    assert!(ok, "all-passing suites must pass; got:\n{}", stderr);
+}
+
+#[test]
+fn test_run_rejects_a_non_suite_argument() {
+    let (ok, stderr) = run_test_human(
+        r#"import { run } from "std/test"
+
+run([1, 2])
+"#,
+    );
+    assert!(!ok);
+    assert!(stderr.contains("no matching overload"), "got:\n{}", stderr);
+}
+
+#[test]
+fn test_file_that_reports_zero_tests_fails() {
+    let (ok, stderr) = run_test_human(
+        r#"import { suite, run } from "std/test"
+
+run(suite("empty", []))
+"#,
+    );
+    assert!(!ok, "a file that runs zero tests must fail; got:\n{}", stderr);
+    assert!(stderr.contains("no tests ran"), "got:\n{}", stderr);
+}
+
+#[test]
+fn test_file_that_never_calls_run_fails() {
+    let (ok, stderr) = run_test_human("import { print } from \"std/io\"\nprint(\"hi\")\n");
+    assert!(!ok, "a test file with no run() must fail; got:\n{}", stderr);
+    assert!(stderr.contains("no tests ran"), "got:\n{}", stderr);
+}
