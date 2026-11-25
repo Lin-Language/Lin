@@ -21,8 +21,8 @@ val s = suite("web-server integration", [
     val resp = route(makeReq("/"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "<!DOCTYPE html>")).toBe(true),
-      expect(contains(resp["body"], "Lin Maps")).toBe(true)
+      expect(resp["body"].contains("<!DOCTYPE html>")).toBe(true),
+      expect(resp["body"].contains("Lin Maps")).toBe(true)
     ]
   ),
 
@@ -30,7 +30,7 @@ val s = suite("web-server integration", [
     val resp = route(makeReq("/api/status"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "\"status\": \"ok\"")).toBe(true)
+      expect(resp["body"].contains("\"status\": \"ok\"")).toBe(true)
     ]
   ),
 
@@ -38,8 +38,8 @@ val s = suite("web-server integration", [
     val resp = route(makeReq("/route/A/E"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "\"distance\": 14")).toBe(true),
-      expect(contains(resp["body"], "\"A\", \"C\", \"B\", \"D\", \"E\"")).toBe(true)
+      expect(resp["body"].contains("\"distance\": 14")).toBe(true),
+      expect(resp["body"].contains("\"A\", \"C\", \"B\", \"D\", \"E\"")).toBe(true)
     ]
   ),
 
@@ -47,7 +47,7 @@ val s = suite("web-server integration", [
     val resp = route(makeReq("/users/42"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "User 42")).toBe(true)
+      expect(resp["body"].contains("User 42")).toBe(true)
     ]
   ),
 
@@ -55,7 +55,7 @@ val s = suite("web-server integration", [
     val resp = route(makeReq("/no/such/route"), config)
     [
       expect(resp["status"]).toBe(404),
-      expect(contains(resp["body"], "Not Found")).toBe(true)
+      expect(resp["body"].contains("Not Found")).toBe(true)
     ]
   )
 ])

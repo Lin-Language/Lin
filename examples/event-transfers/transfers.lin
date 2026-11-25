@@ -32,7 +32,7 @@ export val SAMPLE: Transfer = {
 export val transferSink = (): AnyVal =>
   emitter(
     (t: Transfer, acc: Transfer[]): Transfer[] =>
-      push(acc, t)
+      acc.push(t)
       acc,
     [],
     SAMPLE

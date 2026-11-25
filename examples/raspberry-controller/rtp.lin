@@ -19,11 +19,6 @@
 //   - `advanceTimestamp(ts)` returns the next frame's timestamp.
 // seq is UInt16 and ts/ssrc are UInt32, exactly the wire field widths; the byte
 // helpers (u16ToBe/u32ToBe) consume them directly.
-//
-// Stdlib used:
-//   std/bytes  — u16ToBe / u32ToBe (big-endian header fields)
-//   std/array  — concat (flat UInt8[]), slice, length, push
-//   std/number — toUInt8 (compose FU indicator / header bytes)
 import { u16ToBe, u32ToBe } from "std/bytes"
 import { slice, length } from "std/array"
 import { concat, range, map } from "std/iter"

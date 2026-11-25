@@ -40,7 +40,7 @@ export val runConcurrent = (tasks: Task[]): RunReport =>
   val raw = parallel(tasks.map(t =>
     () =>
       val res = runTask(t)
-      withLock(progress, a => push(a, t["name"]))
+      withLock(progress, a => a.push(t["name"]))
       res
   ))
   {

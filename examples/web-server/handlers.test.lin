@@ -29,9 +29,9 @@ val s = suite("handlers", [
     val resp = getIndex(makeReq("/"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "<!DOCTYPE html>")).toBe(true),
-      expect(contains(resp["body"], "Lin Maps")).toBe(true),
-      expect(contains(resp["body"], "Welcome to Lin Maps")).toBe(true)
+      expect(resp["body"].contains("<!DOCTYPE html>")).toBe(true),
+      expect(resp["body"].contains("Lin Maps")).toBe(true),
+      expect(resp["body"].contains("Welcome to Lin Maps")).toBe(true)
     ]
   ),
 
@@ -39,7 +39,7 @@ val s = suite("handlers", [
     val resp = getStatus(makeReq("/api/status"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "Lin Maps")).toBe(true)
+      expect(resp["body"].contains("Lin Maps")).toBe(true)
     ]
   ),
 
@@ -47,8 +47,8 @@ val s = suite("handlers", [
     val resp = getRoute(makeReq("/route/A/E"))
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "\"distance\": 42")).toBe(true),
-      expect(contains(resp["body"], "\"from\": \"A\"")).toBe(true)
+      expect(resp["body"].contains("\"distance\": 42")).toBe(true),
+      expect(resp["body"].contains("\"from\": \"A\"")).toBe(true)
     ]
   ),
 
@@ -56,7 +56,7 @@ val s = suite("handlers", [
     val resp = getRoute(makeReq("/route/A/Z"))
     [
       expect(resp["status"]).toBe(404),
-      expect(contains(resp["body"], "no route")).toBe(true)
+      expect(resp["body"].contains("no route")).toBe(true)
     ]
   ),
 
@@ -64,7 +64,7 @@ val s = suite("handlers", [
     val resp = getRoute(makeReq("/route/A/boom"))
     [
       expect(resp["status"]).toBe(500),
-      expect(contains(resp["body"], "routing unavailable")).toBe(true)
+      expect(resp["body"].contains("routing unavailable")).toBe(true)
     ]
   ),
 

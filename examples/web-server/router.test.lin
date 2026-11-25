@@ -40,7 +40,7 @@ val s = suite("router", [
     val resp = route(makeReq("/route/A/E"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "\"distance\": 42")).toBe(true)
+      expect(resp["body"].contains("\"distance\": 42")).toBe(true)
     ]
   ),
 
@@ -48,7 +48,7 @@ val s = suite("router", [
     val resp = route(makeReq("/route/A/Z"), config)
     [
       expect(resp["status"]).toBe(404),
-      expect(contains(resp["body"], "no route")).toBe(true)
+      expect(resp["body"].contains("no route")).toBe(true)
     ]
   ),
 
@@ -72,7 +72,7 @@ val s = suite("router", [
     val resp = handler(makeReq("/api/status"))
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "Lin Maps")).toBe(true)
+      expect(resp["body"].contains("Lin Maps")).toBe(true)
     ]
   )
 ])

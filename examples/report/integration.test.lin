@@ -2,7 +2,7 @@
 //
 // Drives report.lin's public entry (render) end to end over a realistic batch
 // that includes malformed rows (which must be skipped and noted), and a large
-// batch as an ASan guard against RC corruption in the map/filter/reduce churn.
+// batch through the map/filter/reduce pipeline.
 import { expect, toBe, test, suite, run } from "std/test"
 import { render, validRecords, stats } from "./report"
 import { length } from "std/array"
@@ -37,7 +37,7 @@ val s = suite("report-integration", [
     ]
   ),
 
-  // --- Churn: a large batch must render without RC corruption (ASan guard) ---
+  // --- A large batch must render correctly ---
   test("handles a larger batch without corruption", () =>
     val many = [
       "A, 1",

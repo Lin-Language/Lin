@@ -3,7 +3,7 @@
 // Plain `export val`s are re-exportable across modules, so the two demos import their shared
 // numbers from here. (Foreign `import foreign` bindings are NOT re-exportable — they are
 // file-local — so each demo declares its own `import foreign "…/libSDL3.so"` block; see the
-// README and DECISIONS ADR for why.)
+// README for why.)
 //
 // Values mirror the REAL SDL3 3.4.10 headers (vendored at examples/sdl/libs/libSDL3.so).
 //

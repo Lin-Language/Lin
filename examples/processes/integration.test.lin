@@ -10,7 +10,7 @@ import { sleep } from "std/time"
 // End-to-end: a mixed task list driven through the WHOLE consolidated pipeline — the
 // concurrent scheduler (std/async) runs each task (std/process), classifies it, tracks
 // progress, summarizes (report.lin) and renders. A deadline'd step exercises the Result
-// path. `exec` is mocked (ADR-046) so the run is deterministic and hermetic: no real
+// path. `exec` is mocked so the run is deterministic and hermetic: no real
 // subprocesses, no dependence on host binaries or platform exit codes, and the
 // "command could not launch" case (an Error return) is reproduced exactly.
 replace exec = (command: String, args: String[]): AnyVal =>
