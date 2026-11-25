@@ -4518,7 +4518,16 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
         });
         boxed
     } else {
-        box_to_json(init_raw, &init_ty, builder)
+        // The phi owns every accumulator box, so the init must be an independently-owned +1 box:
+        // a union init may alias a borrowed local, and a freshly boxed concrete init shares its
+        // inner payload with the raw value that its own scope still releases.
+        let boxed = box_to_json(init_raw, &init_ty, builder);
+        let owned = builder.alloc_temp(json.clone());
+        builder.emit(Instruction::CloneBox { dst: owned, src: boxed, ty: json.clone() });
+        if boxed != init_raw {
+            builder.emit(Instruction::FreeBoxShell { val: boxed });
+        }
+        owned
     };
     let f = lower_callback_in_safe_ctx(&args[2], builder, ctx);
 
@@ -4571,17 +4580,26 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
     // declared param types. A 3-param reducer `(acc, item, i) => …` also receives the OPTIONAL
     // 0-based SOURCE index (narrowed Int64→Int32); a 2-param reducer omits it (its closure wrapper
     // has only two parameters, so passing a third would be ABI UB).
+    // The element and index are boxed explicitly for the boxed closure ABI so the fresh shells can
+    // be reclaimed after the call (the callee only borrows them).
     let acc_arg = coerce_arg_to_param(acc, &json, param_tys.first(), builder);
-    let elem_arg = coerce_arg_to_param(elem, &read_elem_ty, param_tys.get(1), builder);
+    let elem_arg = box_to_json(elem, &read_elem_ty, builder);
     let mut call_args = vec![acc_arg, elem_arg];
+    let mut boxed_args: Vec<(Temp, Temp)> = vec![(elem, elem_arg)];
     if param_tys.len() >= 3 {
         let idx = narrow_loop_index(i, builder);
-        let idx_arg = coerce_arg_to_param(idx, &Type::Int32, param_tys.get(2), builder);
+        let idx_arg = box_to_json(idx, &Type::Int32, builder);
         call_args.push(idx_arg);
+        boxed_args.push((idx, idx_arg));
     }
     builder.emit(Instruction::Call {
         dst: acc_next, callee: CallTarget::Indirect(f), args: call_args, ret_ty: json.clone(),
     });
+    for (raw, boxed) in boxed_args {
+        if raw != boxed {
+            builder.emit(Instruction::FreeBoxShellIfDistinct { val: boxed, other: acc_next });
+        }
+    }
     // FULLY reclaim the per-iteration element box (inner + shell): `lin_array_get_tagged` returned it
     // as a fresh +1 with its inner heap payload retained, and the reducer BORROWS it (its return
     // `acc_next` is its own freshly-owned +1), so the element box is dropped each iteration — release
@@ -4590,11 +4608,9 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
     // `acc_next` would alias the element box and the phi/exit release already owns it. A flat-scalar
     // element box has no inner, so this degrades to a shell free.
     builder.emit(Instruction::ReleaseIfDistinct { val: elem, other: acc_next });
-    // A sum-typed accumulator's Json box is a fresh materialization owned solely by the phi (the
-    // init box above, then each callback result), so the superseded one is dropped each iteration.
-    if crate::repr::sum_type_eligible(&init_ty) {
-        builder.emit(Instruction::ReleaseIfDistinct { val: acc, other: acc_next });
-    }
+    // The accumulator's Json box is owned solely by the phi (the init box above, then each callback
+    // result), so the superseded one is dropped each iteration.
+    builder.emit(Instruction::ReleaseIfDistinct { val: acc, other: acc_next });
     let one = builder.const_temp(Const::Int(1, Type::Int64));
     builder.emit(Instruction::Binary {
         dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
