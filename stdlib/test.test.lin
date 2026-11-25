@@ -157,6 +157,20 @@ val s = suite("std/test", [
       test("bad", () => [expect(1).toBe(2)])
     ])
     [expect(report(sub)).toBe(1)]
+  ),
+
+  test("report over an array of suites totals the failures of every suite", () =>
+    val first = suite("first", [
+      test("ok", () => [expect(1).toBe(1)]),
+
+      test("bad", () => [expect(1).toBe(2)])
+    ])
+    val second = suite("second", [
+      test("bad one", () => [expect(1).toBe(2)]),
+
+      test("bad two", () => [expect(3).toBe(4)])
+    ])
+    [expect(report([first, second])).toBe(3)]
   )
 ])
 

@@ -1,7 +1,7 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 import { range, reduce } from "std/iter"
 
-export val tests = (solve: (String, Int32) => String): AnyVal =>
+export val tests = (solve: (String, Int32) => String): Suite =>
   suite("20-caesar-cipher", [
     test("shift by 1", () =>
       [expect(solve("abc", 1)).toBe("bcd")]

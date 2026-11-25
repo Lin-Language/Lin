@@ -414,7 +414,7 @@ incrementally (constant memory) and threads decode errors in-band like every oth
 | Name | Signature | Summary |
 | --- | --- | --- |
 | [`expect`](#expect) | `(AnyVal) -> Asserter` | Begin an assertion chain |
-| [`run`](#run-test) | `(Suite[]) -> Null` | Execute suites, print results, exit non-zero on failure |
+| [`run`](#run-test) | `(Suite) -> Null` or `(Suite[]) -> Null` | Execute one or more suites, print results, exit non-zero on failure |
 | [`suite`](#suite) | `(String, Test[]) -> Suite` | Group tests under a name |
 | [`test`](#test) | `(String, () -> Assertion[]) -> Test` | Declare a single test case |
 
@@ -5209,10 +5209,11 @@ test("string conversions", () => [
 ### run {#run-test}
 
 ```txt
+val run: (suite: Suite) -> Null
 val run: (suites: Suite[]) -> Null
 ```
 
-Executes all suites in order, prints results to stdout, and exits non-zero if any test failed.
+Executes one suite, or every suite of an array in order, prints results to stdout, and exits non-zero if any test in any suite failed. Passing anything that is not a `Suite` or `Suite[]` is a compile error. A test file that reports zero tests is treated as a failure by `lin test`.
 
 ```txt
 run([unitTests, integrationTests])
@@ -5305,6 +5306,7 @@ val tests = [
 
 ```txt
 val report: (s: Suite) -> Int32
+val report: (suites: Suite[]) -> Int32
 ```
 
 Like `run`, but **returns the failure count** (0 = all passed) instead of exiting.

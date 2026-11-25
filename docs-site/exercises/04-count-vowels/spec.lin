@@ -1,9 +1,9 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 import { range, reduce, map } from "std/iter"
 import { toString } from "std/string"
 import { length } from "std/array"
 
-export val tests = (solve: (String) => Int32): AnyVal =>
+export val tests = (solve: (String) => Int32): Suite =>
   suite("04-count-vowels", [
     test("counts vowels in hello", () => [expect(solve("hello")).toBe(2)]),
 
@@ -22,6 +22,8 @@ export val tests = (solve: (String) => Int32): AnyVal =>
     test("all same vowel", () => [expect(solve("aaaaa")).toBe(5)]),
 
     test("large input: 1000 copies of 'a' gives 1000", () =>
-      [expect(solve(range(0, 1000).reduce("", (acc, _) => "${acc}a"))).toBe(1000)]
+      [
+        expect(solve(range(0, 1000).reduce("", (acc, _) => "${acc}a"))).toBe(1000)
+      ]
     )
   ])

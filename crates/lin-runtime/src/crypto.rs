@@ -18,7 +18,7 @@
 use crate::array::{lin_array_length, lin_flat_array_alloc_u8, lin_flat_array_push_u8, LinArray};
 use crate::fs::{make_error_tagged, make_string, resolve_lin_str};
 use crate::tagged::{
-    alloc_tagged, lin_box_bool, lin_box_int64, TaggedVal, TAG_ARRAY, TAG_INT8, TAG_UINT8,
+    alloc_tagged, lin_box_int64, TaggedVal, TAG_ARRAY, TAG_INT8, TAG_UINT8,
 };
 
 use std::collections::HashMap;
@@ -174,16 +174,16 @@ pub unsafe extern "C" fn lin_crypto_uuid_v7() -> *mut u8 {
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_crypto_ct_eq(a: *const u8, b: *const u8) -> *mut u8 {
+pub unsafe extern "C" fn lin_crypto_ct_eq(a: *const u8, b: *const u8) -> u8 {
     let av = read_byte_buf(a);
     let bv = read_byte_buf(b);
     // Differing lengths are not secret in these protocols → return false immediately.
     if av.len() != bv.len() {
-        return lin_box_bool(false as u8);
+        return 0;
     }
     use subtle::ConstantTimeEq;
     let eq: bool = av.ct_eq(&bv).into();
-    lin_box_bool(eq as u8)
+    eq as u8
 }
 
 // (hex/UTF-8 codecs — toHex/fromHex/toBytes — are pure Lin in std/crypto over std/encoding.)

@@ -1,7 +1,7 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 import { range, reduce } from "std/iter"
 
-export val tests = (solve: (String) => Int32): AnyVal =>
+export val tests = (solve: (String) => Int32): Suite =>
   suite("21-longest-unique-substring", [
     test("abcabcbb gives 3", () => [expect(solve("abcabcbb")).toBe(3)]),
 
@@ -26,6 +26,8 @@ export val tests = (solve: (String) => Int32): AnyVal =>
     ),
 
     test("large: repeated 26-char block gives 26", () =>
-      [expect(solve(range(0, 10).reduce("", (acc, _) => "${acc}abcdefghijklmnopqrstuvwxyz"))).toBe(26)]
+      [
+        expect(solve(range(0, 10).reduce("", (acc, _) => "${acc}abcdefghijklmnopqrstuvwxyz"))).toBe(26)
+      ]
     )
   ])

@@ -1,8 +1,8 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 import { range, map, for } from "std/iter"
 import { push, length } from "std/array"
 
-export val tests = (solve: (Int32[][]) => Int32): AnyVal =>
+export val tests = (solve: (Int32[][]) => Int32): Suite =>
   suite("28-shortest-path-grid", [
     test("3x3 with center wall gives 5", () => [
       expect(solve([[0, 0, 0], [0, 1, 0], [0, 0, 0]])).toBe(5)

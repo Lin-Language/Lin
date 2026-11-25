@@ -1,7 +1,7 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 import { range, map } from "std/iter"
 
-export val tests = (solve: (String[]) => { String: Int32 }): AnyVal =>
+export val tests = (solve: (String[]) => { String: Int32 }): Suite =>
   suite("08-word-frequencies", [
     test("counts repeated words", () =>
       [expect(solve(["a", "b", "a"])).toBe({ "a": 2, "b": 1 })]
@@ -28,6 +28,8 @@ export val tests = (solve: (String[]) => { String: Int32 }): AnyVal =>
     ),
 
     test("large input: 500 'a' + 500 'b' gives correct counts", () =>
-      [expect(solve(range(0, 1000).map(i => if i < 500 then "a" else "b"))).toBe({ "a": 500, "b": 500 })]
+      [
+        expect(solve(range(0, 1000).map(i => if i < 500 then "a" else "b"))).toBe({ "a": 500, "b": 500 })
+      ]
     )
   ])

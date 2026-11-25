@@ -1,7 +1,7 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 import { range, map } from "std/iter"
 
-export val tests = (solve: (Int32[], Int32) => Int32): AnyVal =>
+export val tests = (solve: (Int32[], Int32) => Int32): Suite =>
   suite("12-binary-search", [
     test("finds middle element", () =>
       [expect(solve([1, 3, 5, 7, 9], 5)).toBe(2)]

@@ -1,7 +1,7 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 import { range, map } from "std/iter"
 
-export val tests = (solve: (Int32[]) => Int32): AnyVal =>
+export val tests = (solve: (Int32[]) => Int32): Suite =>
   suite("30-trapping-rain-water", [
     test("classic 12-bar example gives 6", () => [
       expect(solve([0, 1, 0, 2, 1, 0, 1, 3, 2, 1, 2, 1])).toBe(6)
@@ -26,8 +26,8 @@ export val tests = (solve: (Int32[]) => Int32): AnyVal =>
     test("symmetric valley", () => [expect(solve([5, 1, 5])).toBe(4)]),
 
     test("large flat profile: peaks at ends, 998 zeros in middle", () =>
-      [expect(solve(
-        range(0, 1000).map(i => if i == 0 || i == 999 then 10 else 0)
-      )).toBe(9980)]
+      [
+        expect(solve(range(0, 1000).map(i => if i == 0 || i == 999 then 10 else 0))).toBe(9980)
+      ]
     )
   ])

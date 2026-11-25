@@ -1,6 +1,6 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 
-export val tests = (solve: (String) => Int32): AnyVal =>
+export val tests = (solve: (String) => Int32): Suite =>
   suite("15-roman-to-int", [
     test("III = 3", () =>
       [expect(solve("III")).toBe(3)]

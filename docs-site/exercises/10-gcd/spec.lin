@@ -1,6 +1,6 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 
-export val tests = (solve: (Int32, Int32) => Int32): AnyVal =>
+export val tests = (solve: (Int32, Int32) => Int32): Suite =>
   suite("10-gcd", [
     test("gcd(12, 8) = 4", () => [expect(solve(12, 8)).toBe(4)]),
 
@@ -22,5 +22,7 @@ export val tests = (solve: (Int32, Int32) => Int32): AnyVal =>
 
     test("gcd(360, 252) = 36", () => [expect(solve(360, 252)).toBe(36)]),
 
-    test("gcd of large coprime numbers", () => [expect(solve(100003, 100019)).toBe(1)])
+    test("gcd of large coprime numbers", () => [
+      expect(solve(100003, 100019)).toBe(1)
+    ])
   ])

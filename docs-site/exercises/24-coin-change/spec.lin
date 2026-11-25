@@ -1,6 +1,6 @@
-import { expect, toBe, test, suite } from "std/test"
+import { expect, toBe, test, suite, Suite } from "std/test"
 
-export val tests = (solve: (Int32[], Int32) => Int32): AnyVal =>
+export val tests = (solve: (Int32[], Int32) => Int32): Suite =>
   suite("24-coin-change", [
     test("coins [1,2,5] amount 11 gives 3", () => [
       expect(solve([1, 2, 5], 11)).toBe(3)
