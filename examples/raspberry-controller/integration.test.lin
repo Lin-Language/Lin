@@ -24,10 +24,10 @@ val s = suite("raspberry-controller integration", [
   // (right +0.1), encode the resulting pair into the 8-byte wire packet, decode it
   // as the server would, and map each decoded speed to a PWM motor command.
   test("control path: keypress -> encode -> decode -> motor PWM", () =>
-    val afterQ: Float64[] = applyKey(KEY_LEFT_UP, 0.0, 0.0)              // q: left -> 0.1
-    val afterW: Float64[] = applyKey(KEY_RIGHT_UP, afterQ[0], afterQ[1]) // w: right -> 0.1
+    val afterQ: [Float64, Float64] = applyKey(KEY_LEFT_UP, 0.0, 0.0)              // q: left -> 0.1
+    val afterW: [Float64, Float64] = applyKey(KEY_RIGHT_UP, afterQ[0], afterQ[1]) // w: right -> 0.1
     val packet: UInt8[] = encodePacket(afterW[0], afterW[1])
-    val decoded: [Float64, Float64] = parsePacket(packet)                // server-side decode
+    val decoded: [Float64, Float64] = parsePacket(packet)                         // server-side decode
     val leftCmd: MotorCommand = motorCommand(decoded[0])
     val rightCmd: MotorCommand = motorCommand(decoded[1])
     [
@@ -48,9 +48,9 @@ val s = suite("raspberry-controller integration", [
   // Reverse + stop through the same path: 'a' steps left negative, then 'space'
   // stops both. Decode and confirm the motor sees a full stop.
   test("control path: reverse then stop maps to lpwm then stop", () =>
-    val rev: Float64[] = applyKey(KEY_LEFT_DOWN, 0.0, 0.0)      // a: left -> -0.1
+    val rev: [Float64, Float64] = applyKey(KEY_LEFT_DOWN, 0.0, 0.0)      // a: left -> -0.1
     val revCmd: MotorCommand = motorCommand(parsePacket(encodePacket(rev[0], rev[1]))[0])
-    val stopped: Float64[] = applyKey(KEY_STOP, rev[0], rev[1]) // space: stop
+    val stopped: [Float64, Float64] = applyKey(KEY_STOP, rev[0], rev[1]) // space: stop
     val stopPkt: UInt8[] = encodePacket(stopped[0], stopped[1])
     val stopDec: [Float64, Float64] = parsePacket(stopPkt)
     val stopCmd: MotorCommand = motorCommand(stopDec[0])
@@ -109,7 +109,7 @@ val s = suite("raspberry-controller integration", [
   // telemetry packet, and decode it back as the client would — closing the
   // reverse channel from motor.lin's MotorCommand through tlv.lin.
   test("telemetry path: motor duties -> TLV frame -> decode", () =>
-    val fwd: Float64[] = applyKey(KEY_LEFT_UP, 0.5, 0.0) // q: left -> 0.6
+    val fwd: [Float64, Float64] = applyKey(KEY_LEFT_UP, 0.5, 0.0) // q: left -> 0.6
     val leftCmd: MotorCommand = motorCommand(parsePacket(encodePacket(fwd[0], fwd[1]))[0])
     val rightCmd: MotorCommand = motorCommand(parsePacket(encodePacket(fwd[0], fwd[1]))[1])
     val report: Telemetry = {
