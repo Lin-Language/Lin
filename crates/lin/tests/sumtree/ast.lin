@@ -3,6 +3,8 @@
 // `Expr` is `Num | BinOp` where `BinOp` carries recursive `left`/`right : Expr` children. Each
 // node is dispatched on its `kind` tag, and a child read is a constant-offset load.
 
+import { range, reduce } from "std/iter"
+
 // A literal number.
 export type Num = { "kind": "num", "value": Int32 }
 
@@ -33,18 +35,10 @@ export val binOp = (code: OpCode, l: Expr, r: Expr): Expr =>
     "right": r
   }
 
-// Recursively build a left-leaning sum spine of `n` leaf 1's. A fresh sub-tree is built and
-// returned at every level.
+// Build a left-leaning sum spine of `n` leaf 1's by folding a fresh node around the accumulated
+// tree for each step.
 export val chain = (n: Int32): Expr =>
-  if n <= 1 then
-    { "kind": "num", "value": 1 }
-  else
-    {
-      "kind": "op",
-      "op": 0,
-      "left": chain(n - 1),
-      "right": { "kind": "num", "value": 1 }
-    }
+  range(1, n).reduce(num(1), (acc, _) => binOp(ADD, acc, num(1)))
 
 // Evaluate an expression tree to an Int32.
 export val eval = (e: Expr): Int32 =>
