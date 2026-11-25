@@ -8,26 +8,18 @@
 //
 //   q / a  →  left  +/-       w / s  →  right +/-
 //   space  →  stop            ESC    →  quit
-//
-// Stdlib used: std/net (UDP), std/tty (raw-mode keyboard), std/time (20 Hz tick),
-// std/io, std/string.
 import { print } from "std/io"
-import { toString } from "std/string"
 import { length } from "std/array"
 import { range, for } from "std/iter"
 import { udpBind, udpSendTo } from "std/net"
 import { rawMode, readKey } from "std/tty"
 import { sleep } from "std/time"
-import { clampSpeed, applyKey } from "./control"
+import { clampSpeed, applyKey, KEY_QUIT } from "./control"
 import { encodePacket } from "./protocol"
 import { encodeTelemetry, decodeTelemetry, Telemetry } from "./telemetry"
 
 // The full interactive loop (real TTY + UDP). Not exercised by CI — it needs a
 // live terminal and a listening peer — but this is the faithful control client.
-//
-// `left`/`right`/`running` are mutable cells the tick closure captures by
-// reference. The per-tick body is a single `tick` call (no block-form `if`
-// inside the `.for` lambda, since indentation is suppressed inside parens).
 export val runController = (host: String, port: Int32): Null =>
   // `udpBind` returns `Int32 | Error`; bail out early on failure so the rest of
   // the loop only runs with a real socket descriptor (narrowed to `Int32`).
@@ -47,21 +39,19 @@ export val runController = (host: String, port: Int32): Null =>
       // Next [left, right] pair for a key: ESC and unknown/no-key leave speeds
       // as-is (ESC's stop is handled in `tick`), space/q/a/w/s go through applyKey.
       val nextPair = (key: Int32 | Null): Float64[] =>
-        if key == null then
-          [left, right]
-        else if key == 27 then
+        if key == null || key == KEY_QUIT then
           [left, right]
         else
           applyKey(key, left, right)
 
       // One 20 Hz tick: poll a key (non-blocking), update speeds, send the packet.
-      // ESC (27) zeroes the speeds and stops the loop.
+      // ESC zeroes the speeds and stops the loop.
       val tick = (): Null =>
         val key = readKey()
         val pair = nextPair(key)
         left = pair[0]
         right = pair[1]
-        if key == 27 then
+        if key == KEY_QUIT then
           left = 0.0
           right = 0.0
           running = false
@@ -83,12 +73,12 @@ export val runController = (host: String, port: Int32): Null =>
 val demo = (): Null =>
   val stop = encodePacket(0.0, 0.0)
   val fwd = encodePacket(1.0, 1.0)
-  val mixed = encodePacket(0.5, 0.0 - 0.3)
+  val mixed = encodePacket(0.5, -0.3)
   print("stop packet bytes: ${stop.length()}")
   print("forward packet bytes: ${fwd.length()}")
   print("mixed packet bytes: ${mixed.length()}")
-  print("clampSpeed(1.5) = ${toString(clampSpeed(1.5))}")
-  print("clampSpeed(0.15) = ${toString(clampSpeed(0.15))}")
+  print("clampSpeed(1.5) = ${clampSpeed(1.5)}")
+  print("clampSpeed(0.15) = ${clampSpeed(0.15)}")
 
   // The reverse channel: build a telemetry frame the Pi would report back, send
   // it through encode -> decode, and show the recovered readings.
@@ -96,7 +86,7 @@ val demo = (): Null =>
     "battery": 87,
     "leftDuty": 750,
     "rightDuty": 1000,
-    "tempC": 0 - 5,
+    "tempC": -5,
     "health": 3,
     "link": 12
   }
@@ -107,7 +97,7 @@ val demo = (): Null =>
     is Error => print("telemetry decode failed (checksum?)")
     else =>
       print(
-        "telemetry: battery=${toString(decoded["battery"])}% leftDuty=${toString(decoded["leftDuty"])} tempC=${toString(decoded["tempC"])} link=${toString(decoded["link"])}"
+        "telemetry: battery=${decoded["battery"]}% leftDuty=${decoded["leftDuty"]} tempC=${decoded["tempC"]} link=${decoded["link"]}"
       )
 
 demo()

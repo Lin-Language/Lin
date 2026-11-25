@@ -1,12 +1,11 @@
 import { suite, test, expect, run, toBe } from "std/test"
 import { parseNals, nalType, startCodeAt } from "./nal"
-import { length } from "std/array"
 
 // Ports the single-buffer tests from server/src/nal.rs. The stateful cross-call
 // tests (chunked_input, start_code_split_across_chunks) are intentionally NOT
 // ported — see the PARSER MODEL note in nal.lin: this is a whole-buffer parser
-// with no carry-over between calls. Test bodies are Assertion[] arrays (assigned
-// to `checks` then returned) so every assertion runs.
+// with no carry-over between calls. Test bodies are Assertion[] arrays so every
+// assertion runs.
 //
 // Buffers are written as raw byte literals. Start codes: [0,0,0,1] (4-byte),
 // [0,0,1] (3-byte). NAL types: 0x67&0x1F=7 (SPS), 0x68&0x1F=8 (PPS),
@@ -74,16 +73,9 @@ val s = suite("raspberry-nal", [
       1,
       0x68
     ]
-    val nals = parseNals(buf)
-    val checks = [
-      expect(length(nals)).toBe(1),
-      expect(nals[0]["nalType"]).toBe(7),
-      expect(length(nals[0]["data"])).toBe(3),
-      expect(nals[0]["data"][0]).toBe(0x67),
-      expect(nals[0]["data"][1]).toBe(0xAA),
-      expect(nals[0]["data"][2]).toBe(0xBB)
+    [
+      expect(parseNals(buf)).toBe([{ "nalType": 7, "data": [0x67, 0xAA, 0xBB] }])
     ]
-    checks
   ),
 
   // multiple_nal_units: three NALs, plus trailing SC + 0x41 to flush the third.
@@ -116,14 +108,13 @@ val s = suite("raspberry-nal", [
       1,
       0x41
     ]
-    val nals = parseNals(buf)
-    val checks = [
-      expect(length(nals)).toBe(3),
-      expect(nals[0]["nalType"]).toBe(7),
-      expect(nals[1]["nalType"]).toBe(8),
-      expect(nals[2]["nalType"]).toBe(5)
+    [
+      expect(parseNals(buf)).toBe([
+        { "nalType": 7, "data": [0x67, 0x01, 0x02] },
+        { "nalType": 8, "data": [0x68, 0x03] },
+        { "nalType": 5, "data": [0x65, 0x04, 0x05, 0x06] }
+      ])
     ]
-    checks
   ),
 
   // three_byte_start_codes
@@ -139,12 +130,9 @@ val s = suite("raspberry-nal", [
       1,
       0x68
     ]
-    val nals = parseNals(buf)
-    val checks = [
-      expect(length(nals)).toBe(1),
-      expect(nals[0]["nalType"]).toBe(7)
+    [
+      expect(parseNals(buf)).toBe([{ "nalType": 7, "data": [0x67, 0xAA] }])
     ]
-    checks
   ),
 
   // mixed_start_code_lengths: SC4 ... SC3 ... SC4 -> two complete NALs.
@@ -167,29 +155,21 @@ val s = suite("raspberry-nal", [
       1,
       0x65
     ]
-    val nals = parseNals(buf)
-    val checks = [
-      expect(length(nals)).toBe(2),
-      expect(nals[0]["nalType"]).toBe(7),
-      expect(nals[1]["nalType"]).toBe(8)
+    [
+      expect(parseNals(buf)).toBe([{ "nalType": 7, "data": [0x67, 0x01] }, { "nalType": 8, "data": [0x68, 0x02] }])
     ]
-    checks
   ),
 
   // no_start_code: bytes with no start code yield nothing.
   test("no_start_code: no NALs", () =>
     val buf: UInt8[] = [0x41, 0x42, 0x43]
-    val nals = parseNals(buf)
-    val checks = [expect(length(nals)).toBe(0)]
-    checks
+    [expect(parseNals(buf)).toBe([])]
   ),
 
   // empty_input
   test("empty_input: no NALs", () =>
     val empty: UInt8[] = []
-    val nals = parseNals(empty)
-    val checks = [expect(length(nals)).toBe(0)]
-    checks
+    [expect(parseNals(empty)).toBe([])]
   )
 ])
 
