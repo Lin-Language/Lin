@@ -8,7 +8,7 @@
 import { push, length } from "std/array"
 import { for, range, map } from "std/iter"
 import { keys } from "std/object"
-import { join, byteAt, lengthBytes, substring } from "std/string"
+import { join, byteAt, lengthBytes, substringBytes } from "std/string"
 
 // ── byte constants ──────────────────────────────────────────────────────────
 val QUOTE = 34 // "
@@ -73,7 +73,7 @@ val trimAsciiWs = (s: String): String =>
   val n = lengthBytes(s)
   val start = trimStart(s, 0, n)
   val end = trimEnd(s, start, n)
-  substring(s, start, end)
+  substringBytes(s, start, end)
 
 // ── the field scanner ────────────────────────────────────────────────────────
 // Parse one field starting at byte `pos`. Returns a cursor object (always this one shape):
@@ -98,11 +98,11 @@ val scanQuotedSpans = (s: String, n: Int32, i: Int32, segStart: Int32, parts: St
     val next = byteAt(s, i + 1)
     if next == QUOTE then
       // Escaped quote: emit the span up to and including this quote's position, skip the pair.
-      push(parts, substring(s, segStart, i + 1))
+      push(parts, substringBytes(s, segStart, i + 1))
       scanQuotedSpans(s, n, i + 2, i + 2, parts)
     else
       // Closing quote: emit the final span, terminate.
-      push(parts, substring(s, segStart, i))
+      push(parts, substringBytes(s, segStart, i))
       {
         "pos": i + 1,
         "ok": true
@@ -145,7 +145,7 @@ val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean)
     // Unquoted field: scan to delimiter / CR / LF / EOF. A `"` mid-field is a stray-quote error.
     val res = scanUnquoted(s, n, start, delim)
     val i: Int32 = res["pos"]
-    val raw = substring(s, start, i)
+    val raw = substringBytes(s, start, i)
     {
       "value": if trim then trimAsciiWs(raw) else raw,
       "pos": i,
@@ -325,11 +325,11 @@ val renderField = (field: String, delim: Int32): String =>
     var segStart = 0
     range(0, n).for(i =>
       if byteAt(field, i) == QUOTE then
-        push(parts, substring(field, segStart, i + 1))
+        push(parts, substringBytes(field, segStart, i + 1))
         push(parts, "\"") // double it
         segStart = i + 1
     )
-    push(parts, substring(field, segStart, n))
+    push(parts, substringBytes(field, segStart, n))
     push(parts, "\"")
     join(parts, "")
   else

@@ -1,6 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { toString, trim, trimStart, trimEnd, toUpper, toLower, substring, indexOf, lastIndexOf, isBlank, contains, startsWith, endsWith, split, join, replace, replaceAll, repeat, at, lines, codePointAt, fromCodePoints, padStart, padEnd, byteAt, charCode, lengthBytes } from "std/string"
-import { map } from "std/iter"
+import { toString, trim, trimStart, trimEnd, toUpper, toLower, substring, indexOf, lastIndexOf, isBlank, contains, startsWith, endsWith, split, join, replace, replaceAll, repeat, at, lines, codePointAt, fromCodePoints, padStart, padEnd, byteAt, charCode, lengthBytes, substringBytes } from "std/string"
+import { map, range, for } from "std/iter"
+import { length, push } from "std/array"
 
 val s = suite("std/string", [
   test("toString of int", () => [
@@ -263,6 +264,73 @@ val s = suite("std/string", [
       expect(s.byteAt(s.lengthBytes() - 1)).toBe(169)
     ]
   ),
+
+  test("length counts codepoints for non-ASCII text", () => [
+    expect(length("hello")).toBe(5),
+    expect(length("héllo")).toBe(5),
+    expect(length("日本語")).toBe(3),
+    expect(length("a😀b")).toBe(3),
+    expect(length("")).toBe(0)
+  ]),
+
+  test("length of a string held as AnyVal counts codepoints", () =>
+    val v: AnyVal = "héllo😀"
+    [
+      expect(length(v)).toBe(6)
+    ]
+  ),
+
+  test("substring default end covers the whole non-ASCII string", () => [
+    expect("héllo".substring(1)).toBe("éllo"),
+    expect("日本語".substring(1)).toBe("本語"),
+    expect("a😀b".substring(1)).toBe("😀b")
+  ]),
+
+  test("lastIndexOf default fromIndex finds a match at the end of a non-ASCII string", () => [
+    expect("héllo wörld wörld".lastIndexOf("wörld")).toBe(12),
+    expect("日本語日本".lastIndexOf("日本")).toBe(3)
+  ]),
+
+  test("range(0, length(s)) with at visits every codepoint", () =>
+    val str = "hé😀日"
+    val out: String[] = []
+    range(0, length(str)).for(i => push(out, str.at(i)))
+    [
+      expect(out.join("|")).toBe("h|é|😀|日")
+    ]
+  ),
+
+  test("padStart and padEnd use codepoint width", () => [
+    expect("é".padStart(3, "*")).toBe("**é"),
+    expect("日".padEnd(3, "*")).toBe("日**")
+  ]),
+
+  test("indexOf and lastIndexOf report codepoint indices on non-ASCII text", () => [
+    expect("héllo wörld".indexOf("wörld")).toBe(6),
+    expect("日本語日本".indexOf("本", 2)).toBe(4),
+    expect("日本語日本".lastIndexOf("日")).toBe(3),
+    expect("a😀b😀".lastIndexOf("😀", 2)).toBe(1)
+  ]),
+
+  test("replace works on non-ASCII text", () => [
+    expect("héllo wörld".replace("wörld", "Lin")).toBe("héllo Lin"),
+    expect("日本語".replace("本", "x")).toBe("日x語")
+  ]),
+
+  test("substring uses codepoint indices incl. negatives", () => [
+    expect("日本語".substring(1, 2)).toBe("本"),
+    expect("héllo".substring(0, -1)).toBe("héll")
+  ]),
+
+  test("substringBytes uses byte offsets", () => [
+    expect("café!".substringBytes(0, 5)).toBe("café"),
+    expect("café!".substringBytes(5, 6)).toBe("!")
+  ]),
+
+  test("lengthBytes stays a byte count for emoji and CJK", () => [
+    expect("日本語".lengthBytes()).toBe(9),
+    expect("a😀b".lengthBytes()).toBe(6)
+  ]),
 
   test("fromCodePoints builds string from code points", () => [
     expect([72, 101, 108, 108, 111].fromCodePoints()).toBe("Hello")

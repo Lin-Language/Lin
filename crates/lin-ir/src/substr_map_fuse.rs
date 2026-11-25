@@ -8,7 +8,7 @@
 //! # Soundness contract
 //!
 //! A temp `t` is eligible for fusion ONLY when:
-//!   1. Its single definition is `Call { Named("lin_string_slice"), args: [src, start, end] }`.
+//!   1. Its single definition is `Call { Named("lin_string_byte_slice"), args: [src, start, end] }`.
 //!   2. Every use of `t` is one of:
 //!        - `Index  { key: t, obj_ty: Map{key: Str, ..} }` — string-keyed map get
 //!        - `IndexSet { key: t, obj_ty: Map{key: Str, ..} }` — string-keyed map set
@@ -40,20 +40,19 @@ pub fn run(module: &mut LinModule) {
 
 fn run_fn(func: &mut LinFunction) {
     // Phase 1: collect definitions of each temp.
-    // def_site[t] = Some((src, start, end)) when t is defined by lin_string_slice.
+    // def_site[t] = Some((src, start, end)) when t is defined by lin_string_byte_slice.
     let mut slice_defs: HashMap<Temp, [Temp; 3]> = HashMap::new();
 
     for block in &func.blocks {
         for instr in &block.instructions {
             if let Instruction::Call { dst, callee: CallTarget::Named(name), args, .. } = instr {
-                // Match both the internal `lin_string_slice` (when called directly from
-                // trusted stdlib code) and the public stdlib wrappers that user code sees:
-                //   std_string_substring(str, start, end)
-                //   std_string__substring(str, start, end)   [internal helper]
-                // All three have the same (String, Int32, Int32) -> String signature.
-                if args.len() == 3 && (name == "lin_string_slice"
-                    || name == "std_string_substring"
-                    || name == "std_string__substring")
+                // Only the BYTE-offset slice fuses: its (data + start, end - start) view is exactly
+                // what the fused map-key op reads. The codepoint `substring` needs a UTF-8 walk
+                // for non-ASCII input and so cannot be reduced to byte arithmetic.
+                //   lin_string_byte_slice(str, start, end)
+                //   std_string_substringBytes(str, start, end)
+                if args.len() == 3 && (name == "lin_string_byte_slice"
+                    || name == "std_string_substringBytes")
                 {
                     slice_defs.insert(*dst, [args[0], args[1], args[2]]);
                 }

@@ -1187,7 +1187,7 @@ impl<'ctx> Codegen<'ctx> {
             let mut temp_map: StdMap<lir::Temp, BasicValueEnum<'ctx>> = StdMap::new();
             // Substring-key fusion (substr_map_fuse pass): for each fused slice temp, store
             // the (data_ptr, key_len_i32) LLVM values produced inline from the source string,
-            // skipping the actual lin_string_slice heap allocation.
+            // skipping the actual lin_string_byte_slice heap allocation.
             let mut slice_byte_map: StdMap<lir::Temp, (BasicValueEnum<'ctx>, inkwell::values::IntValue<'ctx>)> = StdMap::new();
             // Get-set fusion (getset_map_fuse pass): for each fused Index, stores the raw slot
             // pointer and `is_new` alloca produced by the upsert call at Index-emit time.
@@ -1733,15 +1733,14 @@ impl<'ctx> Codegen<'ctx> {
                             }
                         }
                         Instruction::Call { dst, callee, args, ret_ty } => {
-                            // Substring-key fusion: when this call is `lin_string_slice` and the
+                            // Substring-key fusion: when this call is `lin_string_byte_slice` and the
                             // dst temp is a fused key (only used as map key operands), skip the
                             // heap allocation — compute (data_ptr, len) inline from the source
                             // string and store them in `slice_byte_map[dst]`. The real LLVM result
                             // placeholder is a null ptr (the temp is never used directly).
                             if let CallTarget::Named(name) = callee {
-                                if (name == "lin_string_slice"
-                                    || name == "std_string_substring"
-                                    || name == "std_string__substring")
+                                if (name == "lin_string_byte_slice"
+                                    || name == "std_string_substringBytes")
                                     && args.len() == 3
                                     && func.substr_fuse.contains_key(dst)
                                 {
@@ -1762,7 +1761,7 @@ impl<'ctx> Codegen<'ctx> {
                                         let sp = src.into_pointer_value();
                                         let len_p = unsafe { self.builder.gep(i8_ty, sp, &[i64_ty.const_int(4, false)], "kf_slen_p") };
                                         let str_len = self.builder.load(i32_ty, len_p, "kf_slen").into_int_value();
-                                        // Clamp start/end to [0, str_len] — mirrors lin_string_slice.
+                                        // Clamp start/end to [0, str_len] — mirrors lin_string_byte_slice.
                                         let start_i32 = if start.is_int_value() {
                                             start.into_int_value()
                                         } else if start.is_pointer_value() {
