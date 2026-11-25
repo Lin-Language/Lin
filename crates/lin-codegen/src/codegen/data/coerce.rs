@@ -152,4 +152,35 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(done);
         out
     }
+
+    /// Convert a TUPLE (`FixedArray`, a tagged-element array) into a FLAT scalar array of `to_elem`.
+    /// A tuple stores each element as a boxed tagged slot while `T[]` of a fixed-width numeric `T`
+    /// is a packed native-stride buffer, so assigning one to the other is a representation change,
+    /// not a pointer reinterpret. Builds a FRESH +1-owned flat buffer; the source tuple keeps its
+    /// own ownership. Each element is read via `lin_array_get_tagged` (a fresh +1 box, released
+    /// after unboxing), unboxed at its static element type and widened to `to_elem`.
+    pub(crate) fn tuple_to_flat_array(
+        &mut self,
+        src: BasicValueEnum<'ctx>,
+        elems: &[Type],
+        to_elem: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let alloc_fn = self.get_or_declare_fn(
+            &format!("lin_flat_array_alloc_{}", Self::flat_suffix(to_elem)),
+            ptr_ty.fn_type(&[i64_ty.into()], false));
+        let out = self.builder.call(alloc_fn, &[i64_ty.const_int(elems.len() as u64, false).into()], "t2f_out")
+            .try_as_basic_value().unwrap_basic();
+        let get_tagged = self.get_or_declare_fn("lin_array_get_tagged", ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+        for (idx, ety) in elems.iter().enumerate() {
+            let boxed = self.builder.call(get_tagged, &[src.into(), i64_ty.const_int(idx as u64, false).into()], "t2f_get")
+                .try_as_basic_value().unwrap_basic();
+            let elem = self.unbox_tagged_val_to_type(boxed, ety);
+            let conv = self.compile_ir_coerce(elem, ety, to_elem);
+            self.flat_array_push(out, conv, to_elem);
+            self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+        }
+        out
+    }
 }

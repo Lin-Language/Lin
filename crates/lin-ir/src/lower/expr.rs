@@ -1158,6 +1158,11 @@ pub(crate) fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx:
                 .map(|(k, v)| {
                     let t = lower_expr(v, builder, ctx);
                     let vty = v.ty();
+                    let target = match ty {
+                        Type::Object { fields, .. } => fields.get(k),
+                        _ => None,
+                    };
+                    let t = coerce_tuple_field_to_flat(t, &vty, target, builder);
                     if is_sealed_scalar_repr(&vty) {
                         let to = Type::object(match &vty {
                             Type::Object { fields, .. } => fields.clone(),
