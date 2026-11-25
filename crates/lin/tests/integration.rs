@@ -5916,6 +5916,88 @@ print(widened[0])
     assert_eq!(output, vec!["age", "42", "20", "3.5", "2", "age"]);
 }
 
+// The declared tuple return type is pushed into `if`/`match` branches, so array literals there
+// form the tuple instead of inferring a homogeneous `Float64[]`.
+#[test]
+fn test_tuple_return_type_pushed_into_if_and_match_branches() {
+    let output = run(r#"import { print } from "std/io"
+val pick = (b: Boolean): [Float64, Float64] =>
+  if b then [1.0, 2.0] else [3.0, 4.0]
+print(pick(true)[0])
+val m = (k: Int32): [Float64, Float64] =>
+  match k
+    is 1 => [1.0, 0.5]
+    else => [0.0, 0.0]
+print(m(1)[1])
+"#);
+    assert_eq!(output, vec!["1.0", "0.5"]);
+}
+
+// A tuple and a packed numeric array have different representations, so sharing one value
+// between them misread the elements. It is now a type error.
+#[test]
+fn test_tuple_not_assignable_to_flat_numeric_array() {
+    let result = run_expect_err(r#"import { print } from "std/io"
+val mk = (): [Float64, Float64] => [1.5, 2.5]
+val a: Float64[] = mk()
+print(a[1])
+"#);
+    assert!(result.contains("Float64[]"), "expected a type error, got: {result}");
+}
+
+// A suffixless integer literal argument checks against a parameter typed as a closed union of
+// integer literals in every call position: direct, dot-call, nested and inside a lambda.
+#[test]
+fn test_int_literal_arg_against_literal_union_param() {
+    let output = run(r#"import { print } from "std/io"
+import { map, range, reduce } from "std/iter"
+import { toString } from "std/string"
+type Op = 0 | 1 | 2
+val f = (o: Op, n: Int32): Int32 => n + 1
+val h = (n: Int32, o: Op): Int32 => n + 1
+print(toString(f(0, 1)))
+print(toString(5.h(2)))
+print(toString(h(h(1, 2), 1)))
+print(toString(range(1, 5).reduce(0, (acc, _) => f(0, acc))))
+print(toString(range(0, 3).map(x => h(x, 1))))
+"#);
+    assert_eq!(output, vec!["2", "6", "3", "4", "[1, 2, 3]"]);
+}
+
+// `flatMap(k => [[k, v], ...]).fromEntries()` forms tuple pairs: the expected `{ String: T }`
+// solves `fromEntries`' `T`, which reaches the flatMap callback as an array-of-tuples return.
+#[test]
+fn test_flatmap_pairs_into_from_entries() {
+    let output = run(r#"import { print } from "std/io"
+import { flatMap } from "std/iter"
+import { keys, fromEntries } from "std/object"
+val m: { String: Int32 } = { "a": 1, "b": 2 }
+val d: { String: Int32 } = m.keys().flatMap(k => [[k, 5], ["${k}2", 6]]).fromEntries()
+print(d)
+"#);
+    assert_eq!(output, vec![r#"{"a": 5, "a2": 6, "b": 5, "b2": 6}"#]);
+}
+
+// An `if` checked against a structured expected type narrows a union binding through a compound
+// (`||`) null test in the else branch, the same as an inferred `if`.
+#[test]
+fn test_expected_type_if_applies_compound_null_narrowing() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type P = { "x": Int32 }
+val mk = (k: Int32): P => { "x": k }
+val pair = (k: Int32): [Int32, Int32] => [k, k]
+val f = (key: Int32 | Null): [Int32, Int32] =>
+  if key == null || key == 5 then [0, 0] else pair(key)
+val g = (key: Int32 | Null): P =>
+  if key == null || key == 5 then { "x": 0 } else mk(key)
+print(toString(f(3)[1]))
+print(toString(g(4)["x"]))
+print(toString(g(null)["x"]))
+"#);
+    assert_eq!(output, vec!["3", "4", "0"]);
+}
+
 // Arity mismatch against a fixed-length array type is a compile-time error.
 #[test]
 fn test_fixed_length_array_arity_mismatch() {
@@ -25682,4 +25764,64 @@ range(0, 1024).for(i => xs.push((i * 7919 + 13) % 100003))
 print(toString(run(xs, 20000000)))
 "##, FLAT_NULLABLE_VMEM_CAP_KB);
     assert_eq!(out, vec!["637472399"]);
+}
+
+// A recursive sum type folded through `reduce` as the accumulator. The generic boxed-accumulator
+// path must materialize the raw `*SumNode` init into a Json box (and project the result back), the
+// closure wrapper must release the node it projects for the callback, and a pure-IntLit-union
+// field (`op: Op`, an inline i32 slot) must be stored/loaded as i32 across materialize/project.
+#[test]
+fn test_reduce_recursive_sum_type_accumulator() {
+    let out = run(r#"
+import { print } from "std/io"
+import { range, reduce } from "std/iter"
+type Op = 0 | 1 | 2
+val ZERO: Op = 0
+type Num = { "kind": "num", "value": Int32 }
+type Bin = { "kind": "op", "op": Op, "left": Expr, "right": Expr }
+type Expr = Num | Bin
+val num = (v: Int32): Expr => { "kind": "num", "value": v }
+val bin = (o: Op, l: Expr, r: Expr): Expr => { "kind": "op", "op": o, "left": l, "right": r }
+val ev = (e: Expr): Int32 =>
+  match e
+    is Num => e["value"]
+    is Bin => ev(e["left"]) + ev(e["right"])
+val t = range(1, 5).reduce(num(1), (acc, _) => bin(ZERO, acc, num(1)))
+print(ev(t))
+val deep = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].reduce(num(1), (acc, _) => bin(ZERO, acc, num(1)))
+print(ev(deep))
+"#);
+    assert_eq!(out, vec!["5", "13"]);
+}
+
+// A discriminated sum read back from a `{ String: Expr }` map is `Expr | Null`; after the
+// `is Null` arm the `else` arm passes it to a sum-typed parameter, which must project the boxed
+// read rather than treat the box as a node.
+#[test]
+fn test_sum_type_map_read_narrowed_by_null_arm() {
+    let out = run(r#"
+import { print } from "std/io"
+type Num = { "kind": "num", "value": Int32 }
+type Bin = { "kind": "op", "left": Expr, "right": Expr }
+type Expr = Num | Bin
+val num = (v: Int32): Expr => { "kind": "num", "value": v }
+val bin = (l: Expr, r: Expr): Expr => { "kind": "op", "left": l, "right": r }
+val ev = (e: Expr): Int32 =>
+  match e
+    is Num => e["value"]
+    is Bin => ev(e["left"]) + ev(e["right"])
+var m: { String: Expr } = {}
+m["a"] = bin(num(3), num(4))
+val missing = m["b"]
+val r1 = match missing
+  is Null => -1
+  else => ev(missing)
+val present = m["a"]
+val r2 = match present
+  is Null => -1
+  else => ev(present)
+print(r1)
+print(r2)
+"#);
+    assert_eq!(out, vec!["-1", "7"]);
 }

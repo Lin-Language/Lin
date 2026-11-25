@@ -4,6 +4,24 @@ import { map, range, for } from "std/iter"
 import { length, push } from "std/array"
 
 val s = suite("std/string", [
+  test("interpolation of typed containers matches toString", () =>
+    val m: { String: Int32 } = { "a": 1, "b": 2 }
+    val ms: { String: String } = { "a": "x" }
+    val mi: { Int32: String } = { 1: "x" }
+    val ma: { String: Int32[] } = { "a": [1, 2] }
+    val ia: Int32[] = [1, 2]
+    val fa: Float64[] = [1.5, 2.5]
+    [
+      expect("map=${m}").toBe("map={\"a\": 1, \"b\": 2}"),
+      expect("${m}").toBe(m.toString()),
+      expect("${ms}").toBe("{\"a\": \"x\"}"),
+      expect("${mi}").toBe(mi.toString()),
+      expect("${ma}").toBe("{\"a\": [1, 2]}"),
+      expect("${ia}").toBe("[1, 2]"),
+      expect("${fa}").toBe("[1.5, 2.5]")
+    ]
+  ),
+
   test("toString of int", () => [
     expect(42.toString()).toBe("42")
   ]),

@@ -1487,7 +1487,50 @@ fn collect_local_slots_expr(expr: &TypedExpr, out: &mut std::collections::HashSe
             for s in stmts { collect_local_slots_stmt(s, out); }
             collect_local_slots_expr(expr, out);
         }
+        TypedExpr::Match { arms, .. } => {
+            for arm in arms {
+                if let TypedMatchPattern::Is(p) | TypedMatchPattern::Has(p) = &arm.pattern {
+                    pattern_slots(p, &mut |slot| { out.insert(slot); });
+                }
+            }
+            for_each_child(expr, &mut |c| collect_local_slots_expr(c, out));
+        }
         _ => for_each_child(expr, &mut |c| collect_local_slots_expr(c, out)),
+    }
+}
+
+/// Visit every slot a match pattern binds (identifier bindings, object-field bindings, rest slots).
+fn pattern_slots(pat: &TypedPattern, f: &mut dyn FnMut(usize)) {
+    match pat {
+        TypedPattern::Binding(slot, _, _) => f(*slot),
+        TypedPattern::Object { fields, rest, .. } => {
+            for fld in fields {
+                if let Some(s) = fld.binding_slot { f(s); }
+            }
+            if let Some(s) = rest { f(*s); }
+        }
+        TypedPattern::Array { elements, rest, .. } => {
+            for e in elements { pattern_slots(e, f); }
+            if let Some(s) = rest { f(*s); }
+        }
+        _ => {}
+    }
+}
+
+fn pattern_slots_mut(pat: &mut TypedPattern, f: &mut dyn FnMut(&mut usize)) {
+    match pat {
+        TypedPattern::Binding(slot, _, _) => f(slot),
+        TypedPattern::Object { fields, rest, .. } => {
+            for fld in fields {
+                if let Some(s) = fld.binding_slot.as_mut() { f(s); }
+            }
+            if let Some(s) = rest { f(s); }
+        }
+        TypedPattern::Array { elements, rest, .. } => {
+            for e in elements { pattern_slots_mut(e, f); }
+            if let Some(s) = rest { f(s); }
+        }
+        _ => {}
     }
 }
 
@@ -1723,6 +1766,16 @@ fn rehome_walk(
             }
         }
         _ => {}
+    }
+    // Slots bound by match-arm patterns are locals of the cloned body too.
+    if let TypedExpr::Match { arms, .. } = expr {
+        for arm in arms.iter_mut() {
+            if let TypedMatchPattern::Is(p) | TypedMatchPattern::Has(p) = &mut arm.pattern {
+                pattern_slots_mut(p, &mut |slot| {
+                    *slot = resolve(*slot, origin, origin_path, locals, remap, state);
+                });
+            }
+        }
     }
     // Statement-bound slots inside blocks need their binding slot remapped too.
     if let TypedExpr::Block { stmts, .. } = expr {

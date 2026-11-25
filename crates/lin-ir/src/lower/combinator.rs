@@ -4509,7 +4509,17 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
     }
 
     let init_raw = lower_expr(&args[1], builder, ctx);
-    let init = box_to_json(init_raw, &init_ty, builder);
+    // A sum-eligible init is physically a raw `*SumNode`; the boxed-Json phi (and the closure ABI's
+    // boxed params) need it materialized into a Json box first.
+    let init = if crate::repr::sum_type_eligible(&init_ty) {
+        let boxed = builder.alloc_temp(json.clone());
+        builder.emit(Instruction::Coerce {
+            dst: boxed, src: init_raw, from_ty: init_ty.clone(), to_ty: json.clone(),
+        });
+        boxed
+    } else {
+        box_to_json(init_raw, &init_ty, builder)
+    };
     let f = lower_callback_in_safe_ctx(&args[2], builder, ctx);
 
     // Tag-checked length (0 for a non-array Json) when union. See emit_iterable_len.
@@ -4580,6 +4590,11 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
     // `acc_next` would alias the element box and the phi/exit release already owns it. A flat-scalar
     // element box has no inner, so this degrades to a shell free.
     builder.emit(Instruction::ReleaseIfDistinct { val: elem, other: acc_next });
+    // A sum-typed accumulator's Json box is a fresh materialization owned solely by the phi (the
+    // init box above, then each callback result), so the superseded one is dropped each iteration.
+    if crate::repr::sum_type_eligible(&init_ty) {
+        builder.emit(Instruction::ReleaseIfDistinct { val: acc, other: acc_next });
+    }
     let one = builder.const_temp(Const::Int(1, Type::Int64));
     builder.emit(Instruction::Binary {
         dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
@@ -4587,8 +4602,9 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
     builder.terminate(Terminator::Jump(header));
 
     builder.switch_to(exit);
-    // Coerce the Json accumulator back to the declared result type.
-    if is_union_ty(result_type) {
+    // Coerce the Json accumulator back to the declared result type. A sum-eligible union is
+    // physically a `*SumNode`, not a boxed value, so it is projected out of the Json box.
+    if is_union_ty(result_type) && !crate::repr::sum_type_eligible(result_type) {
         acc
     } else {
         let out = builder.alloc_temp(result_type.clone());
