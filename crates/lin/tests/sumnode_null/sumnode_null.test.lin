@@ -1,0 +1,105 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { toString } from "std/string"
+
+type Circle = { "kind": "circle", "r": Float64 }
+type Square = { "kind": "square", "side": Float64 }
+type Shape = Circle | Square
+
+type Num = { "kind": "num", "value": Int32 }
+type Add = { "kind": "add", "left": Expr, "right": Expr }
+type Expr = Num | Add
+
+val maybeShape = (i: Int32): Shape | Null =>
+  if i % 3 == 0 then
+    null
+  else if i % 3 == 1 then
+    { "kind": "circle", "r": 1.5 }
+  else
+    { "kind": "square", "side": 2.0 }
+
+val area = (s: Shape): Float64 =>
+  match s
+    is Circle => s["r"] * 2.0
+    is Square => s["side"] * s["side"]
+
+val describe = (s: Shape | Null): String =>
+  match s
+    is Null => "none"
+    is Circle => "circle ${toString(s["r"])}"
+    is Square => "square ${toString(s["side"])}"
+
+val areaOrZero = (s: Shape | Null): Float64 =>
+  match s
+    is Null => 0.0
+    else => area(s)
+
+val maybeExpr = (i: Int32): Expr | Null =>
+  if i % 3 == 0 then
+    null
+  else if i % 3 == 1 then
+    { "kind": "num", "value": i }
+  else
+    {
+      "kind": "add",
+      "left": { "kind": "num", "value": i },
+      "right": { "kind": "num", "value": 1 }
+    }
+
+val eval = (e: Expr): Int32 =>
+  match e
+    is Num => e["value"]
+    is Add => eval(e["left"]) + eval(e["right"])
+
+val evalOrNeg = (e: Expr | Null): Int32 =>
+  match e
+    is Null => -1
+    else => eval(e)
+
+val s = suite("sum type with null", [
+  test("null test", () => expect(maybeShape(0) == null).toBe(true)),
+
+  test("non-null", () => expect(maybeShape(1) != null).toBe(true)),
+
+  test("describe each branch", () => [
+    expect(describe(maybeShape(0))).toBe("none"),
+    expect(describe(maybeShape(1))).toBe("circle 1.5"),
+    expect(describe(maybeShape(2))).toBe("square 2.0")
+  ]),
+
+  test("pass to a function", () => [
+    expect(areaOrZero(maybeShape(0))).toBe(0.0),
+    expect(areaOrZero(maybeShape(1))).toBe(3.0),
+    expect(areaOrZero(maybeShape(2))).toBe(4.0)
+  ]),
+
+  test("store in a var", () =>
+    var v = maybeShape(2)
+    val first = describe(v)
+    v = maybeShape(0)
+    [
+      expect(first).toBe("square 2.0"),
+      expect(describe(v)).toBe("none")
+    ]
+  ),
+
+  test("put in an array", () =>
+    val arr = [
+      maybeShape(0),
+      maybeShape(1),
+      maybeShape(2)
+    ]
+    [
+      expect(describe(arr[0])).toBe("none"),
+      expect(describe(arr[1])).toBe("circle 1.5"),
+      expect(describe(arr[2])).toBe("square 2.0")
+    ]
+  ),
+
+  test("recursive sum type with null", () => [
+    expect(evalOrNeg(maybeExpr(0))).toBe(-1),
+    expect(evalOrNeg(maybeExpr(1))).toBe(1),
+    expect(evalOrNeg(maybeExpr(2))).toBe(3)
+  ])
+])
+
+run(s)

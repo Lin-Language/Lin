@@ -1256,6 +1256,18 @@ pub(crate) fn coerce_if_branch(
         builder.emit(Instruction::FreeBoxShell { val: cloned });
         return (unboxed, vec![unboxed], true);
     }
+    // A sum-typed value (physically a `*SumNode`) merging into a non-sum union result (e.g. an
+    // inner `Shape` if-result flowing into a `Shape | Null` merge) is a representation change:
+    // materialize it explicitly. Forwarding it as a union would put a SumNode and a boxed value in
+    // one phi carry class. The coerce result is a fresh +1 owned by the merge; the source stays
+    // with its own scope.
+    if crate::repr::sum_type_eligible(value_ty)
+        && !crate::repr::sum_type_eligible(result_type)
+        && is_union_ty(result_type)
+    {
+        let converted = coerce_to_slot_type(raw, value_ty, result_type, builder);
+        return (converted, vec![converted], true);
+    }
     // (2) Union merge value. Ensure it is an independently-owned +1 box.
     if is_union_ty(result_type) {
         if is_union_ty(value_ty) {
