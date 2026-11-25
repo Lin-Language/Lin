@@ -2715,26 +2715,33 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty, nonneg, proven_inbounds } => {
                             if let Some(&obj_v) = temp_map.get(object) {
+                                let mut result = None;
                                 // Get-set fusion: if this Index is part of a get-set pair, emit
                                 // lin_map_upsert_slot_bytes now and defer the actual value read;
                                 // the IndexSet emitter will write the new value to the slot directly.
                                 if func.getset_fuse.contains(dst) {
                                     if let Some(&(data_ptr, key_len)) = slice_byte_map.get(key) {
-                                        let result = self.emit_upsert_index(
+                                        result = Some(self.emit_upsert_index(
                                             obj_v, data_ptr, key_len, obj_ty, result_ty,
                                             *key, &mut upsert_slot_map, *dst,
-                                        );
-                                        temp_map.insert(*dst, result);
+                                        ));
                                     }
                                 }
                                 // Substring-key fusion (non-getset): if key is a fused slice temp, use the
                                 // byte-keyed map get (lin_map_get_bytes) instead of the normal string path.
                                 else if let Some(&(data_ptr, key_len)) = slice_byte_map.get(key) {
-                                    let result = self.emit_map_get_bytes_fused(obj_v, data_ptr, key_len, obj_ty, result_ty);
-                                    temp_map.insert(*dst, result);
+                                    result = Some(self.emit_map_get_bytes_fused(obj_v, data_ptr, key_len, obj_ty, result_ty));
                                 } else if let Some(&key_v) = temp_map.get(key) {
                                     let obj_repr = func.repr_of(*object);
-                                    let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty, &obj_repr, *nonneg, *proven_inbounds);
+                                    result = Some(self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty, &obj_repr, *nonneg, *proven_inbounds));
+                                }
+                                if let Some(mut result) = result {
+                                    // Map reads yield a borrowed `TaggedVal*`: a flat destination reads
+                                    // tag and payload from it directly, so nothing is boxed or freed.
+                                    if let lin_ir::repr::Repr::FlatNullable { scalar } = func.repr_of(*dst) {
+                                        debug_assert!(result.is_pointer_value());
+                                        result = self.borrowed_tagged_to_flat_union(result.into_pointer_value(), &scalar);
+                                    }
                                     temp_map.insert(*dst, result);
                                 }
                             }

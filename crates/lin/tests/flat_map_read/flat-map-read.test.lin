@@ -1,0 +1,158 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { push, length } from "std/array"
+import { keys } from "std/object"
+import { toString } from "std/string"
+import { for } from "std/iter"
+
+val intMap = (): { String: Int32 } =>
+  var m: { String: Int32 } = {}
+  m["a"] = 100000
+  m["zero"] = 0
+  m["neg"] = -7
+  m
+
+val bigMap = (): { Int32: Int64 } =>
+  var m: { Int32: Int64 } = {}
+  m[1] = 5000000000i64
+  m[2] = -5000000000i64
+  m
+
+val floatMap = (): { String: Float64 } =>
+  var m: { String: Float64 } = {}
+  m["pi"] = 3.25
+  m
+
+val boolMap = (): { String: Boolean } =>
+  var m: { String: Boolean } = {}
+  m["no"] = false
+  m["yes"] = true
+  m
+
+val nullableMap = (): { String: Int32 | Null } =>
+  var m: { String: Int32 | Null } = {}
+  m["set"] = 5
+  m["nul"] = null
+  m
+
+val describe = (x: Int32 | Null): String =>
+  if x is Int32 then "int ${x}" else "null"
+
+val takesNullable = (x: Int32 | Null): Int32 => x ?? -1
+
+val wide = (x: Int32 | Null): Int32 | String | Null => x
+
+val s = suite("flat map reads", [
+  test("hit, miss and zero compare against null", () =>
+    val m = intMap()
+    [
+      expect(m["a"] == null).toBe(false),
+      expect(m["a"] != null).toBe(true),
+      expect(m["missing"] == null).toBe(true),
+      expect(m["missing"] != null).toBe(false),
+      expect(m["zero"] == null).toBe(false),
+      expect(m["neg"] != null).toBe(true)
+    ]
+  ),
+
+  test("?? supplies the default only for a missing key", () =>
+    val m = intMap()
+    [
+      expect(m["a"] ?? -1).toBe(100000),
+      expect(m["missing"] ?? -1).toBe(-1),
+      expect(m["zero"] ?? -1).toBe(0),
+      expect(m["neg"] ?? 99).toBe(-7)
+    ]
+  ),
+
+  test("is Int32 and is Null narrow a map read", () =>
+    val m = intMap()
+    val hit = m["a"]
+    val miss = m["missing"]
+    [
+      expect(if hit is Int32 then hit + 1 else 0).toBe(100001),
+      expect(if miss is Int32 then miss + 1 else 0).toBe(0),
+      expect(if miss is Null then true else false).toBe(true),
+      expect(if hit is Null then true else false).toBe(false)
+    ]
+  ),
+
+  test("int-keyed Int64, Float64 and Boolean maps", () =>
+    val b = bigMap()
+    val f = floatMap()
+    val t = boolMap()
+    [
+      expect(b[1] ?? 0i64).toBe(5000000000i64),
+      expect(b[2] ?? 0i64).toBe(-5000000000i64),
+      expect(b[3] == null).toBe(true),
+      expect(f["pi"] ?? 0.0).toBe(3.25),
+      expect(f["tau"] ?? 6.5).toBe(6.5),
+      expect(t["no"] ?? true).toBe(false),
+      expect(t["yes"] ?? false).toBe(true),
+      expect(t["maybe"] == null).toBe(true)
+    ]
+  ),
+
+  test("a null stored in an Int32 | Null map reads as null, same as an absent key", () =>
+    val m = nullableMap()
+    [
+      expect(m["set"] ?? -1).toBe(5),
+      expect(m["nul"] == null).toBe(true),
+      expect(m["nul"] ?? -1).toBe(-1),
+      expect(m["absent"] == null).toBe(true),
+      expect(m["absent"] ?? -1).toBe(-1),
+      expect(length(keys(m))).toBe(2)
+    ]
+  ),
+
+  test("a map read used by a non-flat consumer is still boxed correctly", () =>
+    val m = intMap()
+    val hit = m["a"]
+    val miss = m["missing"]
+    val rec = { "h": hit, "m": miss }
+    val captured = () => hit
+    val capturedMiss = () => miss
+    var arr: (Int32 | Null)[] = []
+    arr.push(hit)
+    arr.push(miss)
+    [
+      expect(rec["h"] ?? -1).toBe(100000),
+      expect(rec["m"] == null).toBe(true),
+      expect(captured() ?? -1).toBe(100000),
+      expect(capturedMiss() == null).toBe(true),
+      expect(arr[0] ?? -1).toBe(100000),
+      expect(arr[1] == null).toBe(true),
+      expect(describe(hit)).toBe("int 100000"),
+      expect(describe(miss)).toBe("null"),
+      expect(takesNullable(hit)).toBe(100000),
+      expect(takesNullable(miss)).toBe(-1),
+      expect(wide(hit) ?? 0).toBe(100000),
+      expect(wide(miss) == null).toBe(true),
+      expect(toString(hit)).toBe("100000"),
+      expect(toString(miss)).toBe("null")
+    ]
+  ),
+
+  test("a map read stored back into a map", () =>
+    var m = intMap()
+    var dst: { String: Int32 | Null } = {}
+    dst["copy"] = m["a"]
+    dst["gone"] = m["missing"]
+    [
+      expect(dst["copy"] ?? -1).toBe(100000),
+      expect(dst["gone"] == null).toBe(true)
+    ]
+  ),
+
+  test("count-into-a-map idiom", () =>
+    var counts: { String: Int32 } = {}
+    val words = ["a", "b", "a", "c", "a", "b"]
+    words.for(w => counts[w] = (counts[w] ?? 0) + 1)
+    [
+      expect(counts["a"] ?? 0).toBe(3),
+      expect(counts["b"] ?? 0).toBe(2),
+      expect(counts["c"] ?? 0).toBe(1),
+      expect(counts["d"] == null).toBe(true)
+    ]
+  )
+])
+run(s)

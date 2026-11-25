@@ -292,16 +292,16 @@ impl<'ctx> Codegen<'ctx> {
         phi.as_basic_value()
     }
 
-    /// Inline `lin_tagged_eq(p, null)`: true iff `p` is a null pointer or its tag byte is
-    /// `TAG_NULL`. A null pointer is redirected to a constant zero byte so the tag load is
-    /// unconditional and branch-free.
-    pub(crate) fn emit_tagged_is_null(&mut self, p: inkwell::values::PointerValue<'ctx>) -> inkwell::values::IntValue<'ctx> {
-        let i8_ty = self.context.i8_type();
-        let zero_tag = match self.module.get_global("lin_null_tag_byte") {
+    /// `p`, or a pointer to a constant zero `TaggedVal` (tag `TAG_NULL`, payload 0) when `p` is
+    /// null, so the tag and payload can be loaded unconditionally and without a branch.
+    fn tagged_or_null_box(&mut self, p: inkwell::values::PointerValue<'ctx>) -> inkwell::values::PointerValue<'ctx> {
+        let i64_ty = self.context.i64_type();
+        let null_box = match self.module.get_global("lin_null_tagged_val") {
             Some(g) => g,
             None => {
-                let g = self.module.add_global(i8_ty, None, "lin_null_tag_byte");
-                g.set_initializer(&i8_ty.const_int(TAG_NULL as u64, false));
+                let ty = i64_ty.array_type(2);
+                let g = self.module.add_global(ty, None, "lin_null_tagged_val");
+                g.set_initializer(&ty.const_zero());
                 g.set_constant(true);
                 g.set_linkage(inkwell::module::Linkage::Internal);
                 g
@@ -309,14 +309,53 @@ impl<'ctx> Codegen<'ctx> {
         };
         let is_nullptr = self.builder.int_compare(
             inkwell::IntPredicate::EQ,
-            self.builder.ptr_to_int(p, self.context.i64_type(), "tn_p2i"),
-            self.context.i64_type().const_zero(),
+            self.builder.ptr_to_int(p, i64_ty, "tn_p2i"),
+            i64_ty.const_zero(),
             "tn_isnullptr",
         );
-        let safe = self.builder.select(is_nullptr, zero_tag.as_pointer_value(), p, "tn_safe").into_pointer_value();
+        self.builder.select(is_nullptr, null_box.as_pointer_value(), p, "tn_safe").into_pointer_value()
+    }
+
+    /// Inline `lin_tagged_eq(p, null)`: true iff `p` is a null pointer or its tag is `TAG_NULL`.
+    pub(crate) fn emit_tagged_is_null(&mut self, p: inkwell::values::PointerValue<'ctx>) -> inkwell::values::IntValue<'ctx> {
+        let i8_ty = self.context.i8_type();
+        let safe = self.tagged_or_null_box(p);
         let tag = self.builder.load(i8_ty, safe, "tn_tag").into_int_value();
         self.builder.int_compare(
             inkwell::IntPredicate::EQ, tag, i8_ty.const_int(TAG_NULL as u64, false), "tn_isnull")
+    }
+
+    /// Read a BORROWED `TaggedVal*` (null pointer or `TAG_NULL` meaning absent) holding a
+    /// `scalar_ty` payload into a flat `{ i1, i64 }` value. Nothing is allocated or released.
+    pub(crate) fn borrowed_tagged_to_flat_union(
+        &mut self,
+        p: inkwell::values::PointerValue<'ctx>,
+        scalar_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let i8_ty = self.context.i8_type();
+        let i64_ty = self.context.i64_type();
+        let safe = self.tagged_or_null_box(p);
+        let tag = self.builder.load(i8_ty, safe, "fb_tag").into_int_value();
+        let is_null = self.builder.int_compare(
+            inkwell::IntPredicate::EQ, tag, i8_ty.const_int(TAG_NULL as u64, false), "fb_isnull");
+        let payload_p = unsafe { self.builder.gep(i8_ty, safe, &[i64_ty.const_int(8, false)], "fb_payload_p") };
+        let raw = self.builder.load(i64_ty, payload_p, "fb_payload").into_int_value();
+        let scalar = match scalar_ty {
+            Type::Bool => self.builder.int_truncate_or_bit_cast(raw, self.context.bool_type(), "fb_bool").into(),
+            Type::Int8 | Type::UInt8 => self.builder.int_truncate_or_bit_cast(raw, i8_ty, "fb_i8").into(),
+            Type::Int16 | Type::UInt16 => self.builder.int_truncate_or_bit_cast(raw, self.context.i16_type(), "fb_i16").into(),
+            Type::Int32 | Type::IntLit(_) | Type::UInt32 => {
+                self.builder.int_truncate_or_bit_cast(raw, self.context.i32_type(), "fb_i32").into()
+            }
+            Type::Int64 | Type::UInt64 => raw.into(),
+            Type::Float32 => {
+                let f64v = self.builder.bit_cast(raw, self.context.f64_type(), "fb_f64").into_float_value();
+                self.builder.float_trunc(f64v, self.context.f32_type(), "fb_f32").into()
+            }
+            _ => self.builder.bit_cast(raw, self.context.f64_type(), "fb_f64"),
+        };
+        let flat = self.flat_union_scalar_value(scalar, scalar_ty);
+        self.builder.insert_value(flat, is_null, 0, "fb_flat").into_struct_value().into()
     }
 
     /// Convert a boxed `TaggedVal*` to a flat-union `{ i1, i64 }` struct at a return boundary.
