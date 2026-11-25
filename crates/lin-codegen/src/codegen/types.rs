@@ -292,6 +292,33 @@ impl<'ctx> Codegen<'ctx> {
         phi.as_basic_value()
     }
 
+    /// Inline `lin_tagged_eq(p, null)`: true iff `p` is a null pointer or its tag byte is
+    /// `TAG_NULL`. A null pointer is redirected to a constant zero byte so the tag load is
+    /// unconditional and branch-free.
+    pub(crate) fn emit_tagged_is_null(&mut self, p: inkwell::values::PointerValue<'ctx>) -> inkwell::values::IntValue<'ctx> {
+        let i8_ty = self.context.i8_type();
+        let zero_tag = match self.module.get_global("lin_null_tag_byte") {
+            Some(g) => g,
+            None => {
+                let g = self.module.add_global(i8_ty, None, "lin_null_tag_byte");
+                g.set_initializer(&i8_ty.const_int(TAG_NULL as u64, false));
+                g.set_constant(true);
+                g.set_linkage(inkwell::module::Linkage::Internal);
+                g
+            }
+        };
+        let is_nullptr = self.builder.int_compare(
+            inkwell::IntPredicate::EQ,
+            self.builder.ptr_to_int(p, self.context.i64_type(), "tn_p2i"),
+            self.context.i64_type().const_zero(),
+            "tn_isnullptr",
+        );
+        let safe = self.builder.select(is_nullptr, zero_tag.as_pointer_value(), p, "tn_safe").into_pointer_value();
+        let tag = self.builder.load(i8_ty, safe, "tn_tag").into_int_value();
+        self.builder.int_compare(
+            inkwell::IntPredicate::EQ, tag, i8_ty.const_int(TAG_NULL as u64, false), "tn_isnull")
+    }
+
     /// Convert a boxed `TaggedVal*` to a flat-union `{ i1, i64 }` struct at a return boundary.
     ///
     /// Emits:

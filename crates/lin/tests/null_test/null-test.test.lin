@@ -1,0 +1,133 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { push } from "std/array"
+
+type Rec = { "a": Int32, "b": String }
+type Circle = { "r": Float64 }
+type Square = { "side": Float64 }
+type Shape = Circle | Square
+
+val maybeInt = (i: Int32): Int32 | Null => if i % 2 == 0 then null else i * 100000
+val maybeBig = (i: Int32): Int64 | Null => if i % 2 == 0 then null else 5000000000i64 + i
+val maybeFloat = (i: Int32): Float64 | Null => if i % 2 == 0 then null else 2.5
+val maybeBool = (i: Int32): Boolean | Null => if i % 2 == 0 then null else false
+val maybeStr = (i: Int32): String | Null => if i % 2 == 0 then null else "s${i}"
+val maybeRec = (i: Int32): Rec | Null => if i % 2 == 0 then null else { "a": i, "b": "r" }
+val maybeArr = (i: Int32): Int32[] | Null => if i % 2 == 0 then null else [i, i]
+val maybeStrArr = (i: Int32): String[] | Null => if i % 2 == 0 then null else ["x", "y"]
+val maybeShape = (i: Int32): Shape | Null =>
+  if i % 3 == 0 then null
+  else if i % 3 == 1 then { "r": 1.5 }
+  else { "side": 2.0 }
+val mixed = (i: Int32): Int32 | String | Null =>
+  if i % 3 == 0 then null
+  else if i % 3 == 1 then i
+  else "str"
+val mixedRec = (i: Int32): Rec | Int32 | Null =>
+  if i % 3 == 0 then null
+  else if i % 3 == 1 then { "a": i, "b": "m" }
+  else i
+val any = (i: Int32): AnyVal => if i % 2 == 0 then null else { "k": i }
+val anyScalar = (i: Int32): AnyVal => if i % 2 == 0 then null else i
+
+val s = suite("null tests on boxed unions", [
+  test("Int32 | Null", () => [
+    expect(maybeInt(2) == null).toBe(true),
+    expect(maybeInt(3) == null).toBe(false),
+    expect(maybeInt(2) != null).toBe(false),
+    expect(maybeInt(3) != null).toBe(true),
+    expect(null == maybeInt(2)).toBe(true),
+    expect(null != maybeInt(3)).toBe(true),
+    expect(maybeInt(2) ?? -1).toBe(-1),
+    expect(maybeInt(3) ?? -1).toBe(300000)
+  ]),
+
+  test("Int64 | Null, Float64 | Null, Boolean | Null", () => [
+    expect(maybeBig(2) == null).toBe(true),
+    expect(maybeBig(3) != null).toBe(true),
+    expect(maybeBig(3) ?? 0i64).toBe(5000000003i64),
+    expect(maybeFloat(2) == null).toBe(true),
+    expect(maybeFloat(3) != null).toBe(true),
+    expect(maybeFloat(3) ?? 0.0).toBe(2.5),
+    expect(maybeFloat(2) ?? 7.5).toBe(7.5),
+    expect(maybeBool(2) == null).toBe(true),
+    expect(maybeBool(3) == null).toBe(false),
+    expect(maybeBool(3) ?? true).toBe(false),
+    expect(maybeBool(2) ?? true).toBe(true)
+  ]),
+
+  test("String | Null", () => [
+    expect(maybeStr(2) == null).toBe(true),
+    expect(maybeStr(3) == null).toBe(false),
+    expect(maybeStr(3) != null).toBe(true),
+    expect(maybeStr(2) ?? "dflt").toBe("dflt"),
+    expect(maybeStr(3) ?? "dflt").toBe("s3")
+  ]),
+
+  test("record | Null", () => [
+    expect(maybeRec(2) == null).toBe(true),
+    expect(maybeRec(3) == null).toBe(false),
+    expect(maybeRec(3) != null).toBe(true),
+    expect(maybeRec(3) ?? { "a": 0, "b": "d" }).toBe({ "a": 3, "b": "r" }),
+    expect(maybeRec(2) ?? { "a": 0, "b": "d" }).toBe({ "a": 0, "b": "d" })
+  ]),
+
+  test("array | Null", () => [
+    expect(maybeArr(2) == null).toBe(true),
+    expect(maybeArr(3) != null).toBe(true),
+    expect(maybeArr(3) ?? [0]).toBe([3, 3]),
+    expect(maybeArr(2) ?? [0]).toBe([0]),
+    expect(maybeStrArr(2) == null).toBe(true),
+    expect(maybeStrArr(3) != null).toBe(true)
+  ]),
+
+  test("sum-type record union | Null", () => [
+    expect(maybeShape(3) == null).toBe(true),
+    expect(maybeShape(4) == null).toBe(false),
+    expect(maybeShape(5) != null).toBe(true),
+    expect(null == maybeShape(4)).toBe(false)
+  ]),
+
+  test("mixed unions", () => [
+    expect(mixed(3) == null).toBe(true),
+    expect(mixed(4) == null).toBe(false),
+    expect(mixed(5) != null).toBe(true),
+    expect(mixed(4) ?? 0).toBe(4),
+    expect(mixed(3) ?? "none").toBe("none"),
+    expect(mixedRec(3) == null).toBe(true),
+    expect(mixedRec(4) != null).toBe(true),
+    expect(mixedRec(5) != null).toBe(true)
+  ]),
+
+  test("AnyVal holding null and non-null", () => [
+    expect(any(2) == null).toBe(true),
+    expect(any(3) == null).toBe(false),
+    expect(any(3) != null).toBe(true),
+    expect(anyScalar(2) == null).toBe(true),
+    expect(anyScalar(3) != null).toBe(true)
+  ]),
+
+  test("a stored null element of a union array is null", () =>
+    val xs: (String | Null)[] = []
+    xs.push("a")
+    xs.push(null)
+    xs.push("c")
+    [
+      expect(xs[0] == null).toBe(false),
+      expect(xs[1] == null).toBe(true),
+      expect(xs[1] != null).toBe(false),
+      expect(xs[2] != null).toBe(true),
+      expect(xs[1] ?? "dflt").toBe("dflt"),
+      expect(xs[2] ?? "dflt").toBe("c")
+    ]
+  ),
+
+  test("an absent object key reads as null", () =>
+    val o: AnyVal = { "a": 1 }
+    [
+      expect(o["a"] == null).toBe(false),
+      expect(o["missing"] == null).toBe(true),
+      expect(o["missing"] != null).toBe(false)
+    ]
+  )
+])
+run(s)
