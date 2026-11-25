@@ -13,7 +13,6 @@
 // 4. Release: no leaks (run with ASAN_OPTIONS=detect_leaks=1 to verify).
 
 import { print } from "std/io"
-import { toString } from "std/string"
 
 type Point = { "x": Int32, "y": Int32 }
 
@@ -26,9 +25,8 @@ val scanPoints = (n: Int32): Int32 =>
   ]
   pts[0]["x"] + pts[1]["y"] + pts[2]["x"] + n
 
-// Larger construction: build N-element all-scalar array via recursion,
-// verify field-by-field sums. This exercises the column layout arithmetic
-// for indices 0..2.
+// Read every field of a three-element all-scalar array back. This exercises the
+// column layout arithmetic for indices 0..2.
 val check = (): Boolean =>
   val pts: Point[] = [
     { "x": 1, "y": 2 },
@@ -43,5 +41,5 @@ val check = (): Boolean =>
   val y2 = pts[2]["y"]
   x0 == 1 && y0 == 2 && x1 == 3 && y1 == 4 && x2 == 5 && y2 == 6
 
-print("scan = ${toString(scanPoints(0))}")
-print("check = ${toString(check())}")
+print("scan = ${scanPoints(0)}")
+print("check = ${check()}")

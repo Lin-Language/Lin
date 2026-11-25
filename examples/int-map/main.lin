@@ -1,7 +1,5 @@
 import { print } from "std/io"
-import { toString } from "std/string"
-import { range, for } from "std/iter"
-import { length } from "std/array"
+import { for } from "std/iter"
 
 // Demonstrate {Int32: T} numeric-key hashmaps.
 
@@ -29,11 +27,11 @@ print(signs[1] ?? "?")
 
 // Type is inferred from integer keys without an annotation.
 val flags = { 0: false, 1: true }
-print(toString(flags[0] ?? false))
-print(toString(flags[1] ?? false))
+print(flags[0] ?? false)
+print(flags[1] ?? false)
 
-// --- Index-assign form (pre-existing) ---
-var scores: { Int32: String } = {}
+// --- Index-assign form ---
+val scores: { Int32: String } = {}
 scores[1] = "one"
 scores[2] = "two"
 scores[42] = "forty-two"
@@ -46,22 +44,22 @@ print(scores[1000] ?? "null")
 print(scores[99] ?? "null")
 
 // --- Key 0 and negative keys ---
-var edge: { Int32: Int32 } = {}
+val edge: { Int32: Int32 } = {}
 edge[0] = 100
 edge[-1] = 200
 edge[-999] = 300
 
-print(toString(edge[0] ?? -1))
-print(toString(edge[-1] ?? -1))
-print(toString(edge[-999] ?? -1))
-print(toString(edge[1] ?? -1))
+print(edge[0] ?? -1)
+print(edge[-1] ?? -1)
+print(edge[-999] ?? -1)
+print(edge[1] ?? -1)
 
 // --- Overwrite ---
 scores[42] = "overwritten"
 print(scores[42] ?? "null")
 
 // --- Use as a sparse frequency accumulator ---
-var freq: { Int32: Int32 } = {}
+val freq: { Int32: Int32 } = {}
 val data = [
   3,
   1,
@@ -75,11 +73,8 @@ val data = [
   3,
   5
 ]
-range(0, length(data)).for(i =>
-  val v = data[i]
-  freq[v] = (freq[v] ?? 0) + 1
-)
+data.for(v => freq[v] = (freq[v] ?? 0) + 1)
 
-print(toString(freq[5] ?? 0))
-print(toString(freq[1] ?? 0))
-print(toString(freq[7] ?? 0))
+print(freq[5] ?? 0)
+print(freq[1] ?? 0)
+print(freq[7] ?? 0)
