@@ -404,10 +404,12 @@ lin_panic(msg: *LinString, file_id: i32, offset: i32) -> void  (noreturn)
 ```
 lin_string_from_bytes(data: *u8, len: u32) -> *LinString
 lin_string_concat(a, b: *LinString) -> *LinString
-lin_string_length(s: *LinString) -> i32
+lin_string_length(s: *LinString) -> i32        // codepoint count
+lin_string_byte_length(s: *LinString) -> i32   // UTF-8 byte count, O(1)
 lin_string_eq(a, b: *LinString) -> bool
 lin_string_release(s: *mut LinString) -> void
-lin_string_slice(s, start, end) -> *LinString
+lin_string_slice(s, start, end) -> *LinString      // codepoint indices
+lin_string_byte_slice(s, start, end) -> *LinString // byte offsets
 lin_string_char_at(s, i) -> *LinString
 lin_string_trim / to_upper / to_lower / index_of / contains
 lin_string_starts_with / ends_with / replace / repeat / split / join
