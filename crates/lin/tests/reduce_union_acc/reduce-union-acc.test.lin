@@ -1,0 +1,79 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { range, reduce } from "std/iter"
+import { toString } from "std/string"
+
+// Reduce folds whose accumulator is a union box: each superseded accumulator must be released
+// exactly once, including a borrowed init that is still used afterwards.
+type Shape = { "a": Int32 } | { "b": Int32 }
+
+val tag = (s: Shape): String =>
+  match s
+    is { "a": Int32 } => "a"
+    else => "b"
+
+val s = suite("reduce union accumulator", [
+  test("object-union accumulator over many iterations", () =>
+    val init: Shape = { "a": 0 }
+    val r: Shape = range(0, 20000).reduce(init, (acc: Shape, i: Int32): Shape =>
+      if i % 2 == 0 then { "a": i } else { "b": i }
+    )
+    [
+      expect(tag(r)).toBe("b"),
+      expect(tag(init)).toBe("a")
+    ]
+  ),
+
+  test("zero iterations returns the init unchanged", () =>
+    val init: Shape = { "b": 7 }
+    val r: Shape = range(0, 0).reduce(init, (acc: Shape, i: Int32): Shape => { "a": i })
+    [
+      expect(tag(r)).toBe("b"),
+      expect(tag(init)).toBe("b")
+    ]
+  ),
+
+  test("identity reducer keeps a borrowed init alive", () =>
+    val init: Shape = { "a": 1 }
+    val r: Shape = range(0, 100).reduce(init, (acc: Shape, i: Int32): Shape => acc)
+    [
+      expect(tag(r)).toBe("a"),
+      expect(tag(init)).toBe("a")
+    ]
+  ),
+
+  test("T | Null accumulator", () =>
+    val r: String | Null = range(0, 5000).reduce("x", (acc: String | Null, i: Int32): String | Null =>
+      if i % 2 == 0 then toString(i) else null
+    )
+    [
+      expect(r is Null).toBe(true)
+    ]
+  ),
+
+  test("Error union accumulator", () =>
+    val r: Int32 | Error = range(0, 5000).reduce(0, (acc: Int32 | Error, i: Int32): Int32 | Error =>
+      if i % 2 == 0 then i else { "type": "error", "message": toString(i) }
+    )
+    [
+      expect(r is Error).toBe(true)
+    ]
+  ),
+
+  test("index-taking reducer with a union accumulator", () =>
+    val r: Shape = range(0, 3000).reduce({ "a": 0 }, (acc: Shape, x: Int32, i: Int32): Shape =>
+      if i % 3 == 0 then { "a": x } else { "b": x }
+    )
+    [
+      expect(tag(r)).toBe("b")
+    ]
+  ),
+
+  test("string accumulator", () =>
+    val r: String = range(0, 3000).reduce("", (acc: String, i: Int32): String => toString(i))
+    [
+      expect(r).toBe("2999")
+    ]
+  )
+])
+
+run(s)
