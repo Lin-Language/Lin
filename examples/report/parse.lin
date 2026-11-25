@@ -4,8 +4,8 @@
 // tagged result: { "type": "success", "value": { "name", "score" } } or
 // { "type": "failure", "error": <msg> }. Malformed rows are reported, not fatal.
 import { trim, split } from "std/string"
-import { isInt32, parseInt32 } from "std/number"
 import { length } from "std/array"
+import { isInt32, parseInt32 } from "std/number"
 
 // A validated CSV record.
 export type Record = { "name": String, "score": Int32 }
@@ -23,14 +23,14 @@ val fail = (msg: String): Failure =>
 // Parse one CSV line into a validated record result.
 export val parseRow = (line: String): Parsed =>
   val parts = line.split(",")
-  if length(parts) != 2 then
+  if parts.length() != 2 then
     fail("expected 2 fields: ${line}")
   else
     val name = parts[0].trim()
     val scoreStr = parts[1].trim()
     if name == "" then
       fail("empty name: ${line}")
-    else if scoreStr.isInt32() == false then
+    else if !scoreStr.isInt32() then
       fail("bad score: ${line}")
     else
       {

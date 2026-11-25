@@ -74,9 +74,9 @@ val s = suite("report-source", [
 
   // --- normalizeCsv: lazy file-to-file copy; reread renders end to end ---
   test("normalises a CSV file and the cleaned copy renders", () =>
-    val out = normalizeCsv(plainIn)
+    val out = cleanedPath(plainIn)
     [
-      expect(out).toBe("/tmp/lin_report_source_test.clean.csv"),
+      expect(normalizeCsv(plainIn)).toBe(out),
       // The cleaned file has the blank line stripped; rendering its 3 rows yields
       // 2 valid records (Alice, Bob) and 1 skipped (bad-row).
       expect(length(validRecords(rowsFromFile(out)))).toBe(2),
@@ -84,8 +84,8 @@ val s = suite("report-source", [
     ]
   ),
 
-  test("normalising a missing file degrades to an empty path", () => [
-    expect(normalizeCsv("/tmp/lin_report_missing_input.csv")).toBe("")
+  test("normalising a missing file yields an Error", () => [
+    expect(normalizeCsv("/tmp/lin_report_missing_input.csv") is Error).toBe(true)
   ])
 ])
 run(s)

@@ -1,17 +1,14 @@
 // Grade-band frequency histogram over the validated records.
 //
 // A real report doesn't just rank rows — it summarises the *distribution*. This
-// module tallies how many records fall in each letter-grade band using a typed
-// index-signature map `{ String: Int32 }` (the dictionary type, ADR-082): the band
-// label is an arbitrary String key, the tally an Int32 count, with O(1) average
-// lookup/insert. Reading a key yields `Int32 | Null`, so a first-seen band (Null)
-// starts at 0 — the canonical "count occurrences into a map" idiom.
+// module tallies how many records fall in each letter-grade band into a typed
+// index-signature map `{ String: Int32 }`: the band label is an arbitrary String
+// key, the tally an Int32 count.
 import { Record } from "./parse"
-import { for } from "std/iter"
 import { keys } from "std/object"
-import { sort, length } from "std/array"
-import { map, filter } from "std/iter"
-import { toString, join } from "std/string"
+import { sort, countBy } from "std/array"
+import { map } from "std/iter"
+import { join } from "std/string"
 
 // Map a numeric score onto a letter-grade band label.
 export val band = (score: Int32): String =>
@@ -26,22 +23,17 @@ export val band = (score: Int32): String =>
   else
     "F (<60)"
 
-// Count how many records fall in each grade band. Returns a String-keyed map of
-// band label -> count. A band not yet seen reads back as Null, which we treat as 0.
+// Count how many records fall in each grade band: band label -> count.
 export val tally = (records: Record[]): { String: Int32 } =>
-  var counts: { String: Int32 } = {}
-  records.for(r =>
-    val b = band(r["score"])
-    counts[b] = (counts[b] ?? 0) + 1
-  )
-  counts
+  records.countBy(r => band(r["score"]))
 
 // Render the histogram as indented "label: count" lines, in sorted-label order so
 // the output is deterministic. Bands with no records are omitted (the map only holds
 // labels that occurred).
 export val renderTally = (records: Record[]): String =>
   val counts = tally(records)
-  keys(counts)
+  counts
+    .keys()
     .sort((a, b) => if a < b then -1 else 1)
-    .map(label => "  ${label}: ${toString(counts[label])}")
+    .map(label => "  ${label}: ${counts[label]}")
     .join("\n")
