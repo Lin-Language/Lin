@@ -20,7 +20,7 @@ val s = suite("report-source", [
   test("lists the archive's CSV members", () =>
     val names = archiveMembers(archive)
     [
-      expect(length(names)).toBe(2),
+      expect(names.length()).toBe(2),
       expect(names.join(",")).toBe("q1.csv,q2.csv")
     ]
   ),
@@ -31,7 +31,7 @@ val s = suite("report-source", [
     [
       // 8 raw lines across q1+q2; "bad-row" and ", 50" are still present here
       // (parsing/validation happens later in report.lin), only blanks are dropped.
-      expect(length(rows)).toBe(8),
+      expect(rows.length()).toBe(8),
       expect(rows.join("|").contains("Alice, 85")).toBe(true),
       expect(rows.join("|").contains("Diana, 100")).toBe(true)
     ]
@@ -41,7 +41,7 @@ val s = suite("report-source", [
   test("archive rows render the validated report", () =>
     val out = render(rowsFromArchive(archive))
     [
-      expect(length(validRecords(rowsFromArchive(archive)))).toBe(6),
+      expect(validRecords(rowsFromArchive(archive)).length()).toBe(6),
       expect(out.contains("count=6 avg=86 top=Diana")).toBe(true),
       expect(out.contains("skipped 2 bad row(s)")).toBe(true)
     ]
@@ -50,7 +50,7 @@ val s = suite("report-source", [
   // --- a missing archive degrades to an empty batch, not a crash ---
   test("a missing archive yields no rows", () =>
     [
-      expect(length(rowsFromArchive("examples/report/does-not-exist.tar.gz"))).toBe(0)
+      expect(rowsFromArchive("examples/report/does-not-exist.tar.gz").length()).toBe(0)
     ]
   ),
 
@@ -58,13 +58,13 @@ val s = suite("report-source", [
   test("streams trimmed non-blank rows from a plain CSV file", () =>
     val rows = rowsFromFile(plainIn)
     [
-      expect(length(rows)).toBe(3),
+      expect(rows.length()).toBe(3),
       expect(rows.join("|")).toBe("Alice, 85|Bob, 92|bad-row")
     ]
   ),
 
   test("a missing plain CSV file yields no rows", () => [
-    expect(length(rowsFromFile("/tmp/lin_report_does_not_exist.csv"))).toBe(0)
+    expect(rowsFromFile("/tmp/lin_report_does_not_exist.csv").length()).toBe(0)
   ]),
 
   // --- cleanedPath derives a sibling "<stem>.clean.csv" via std/path ---
@@ -79,7 +79,7 @@ val s = suite("report-source", [
       expect(normalizeCsv(plainIn)).toBe(out),
       // The cleaned file has the blank line stripped; rendering its 3 rows yields
       // 2 valid records (Alice, Bob) and 1 skipped (bad-row).
-      expect(length(validRecords(rowsFromFile(out)))).toBe(2),
+      expect(validRecords(rowsFromFile(out)).length()).toBe(2),
       expect(render(rowsFromFile(out)).contains("skipped 1 bad row(s)")).toBe(true)
     ]
   ),

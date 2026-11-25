@@ -49,13 +49,13 @@ val s = suite("config", [
   ]),
 
   test("flags a missing required field", () => [
-    expect(length(validate(applyDefaults({ "port": 1 })))).toBe(1)
+    expect(validate(applyDefaults({ "port": 1 })).length()).toBe(1)
   ]),
 
   test("flags a wrong-typed field", () =>
     val cfg = applyDefaults({ "name": "svc", "port": "nope" })
     [
-      expect(length(validate(cfg))).toBe(1)
+      expect(validate(cfg).length()).toBe(1)
     ]
   ),
 

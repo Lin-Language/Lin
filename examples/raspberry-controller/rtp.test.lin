@@ -11,7 +11,7 @@ import { range, map } from "std/iter"
 // PAYLOAD_TYPE = 96; with marker, byte 1 = 0x80 | 96 = 224.
 // A NAL of exactly `n` bytes made by cycling `seed`.
 val repeated = (seed: UInt8[], n: Int32): UInt8[] =>
-  range(0, n).map(i => seed[i % length(seed)])
+  range(0, n).map(i => seed[i % seed.length()])
 
 val s = suite("raspberry-rtp", [
   // single_nal_small_packet: header bytes, SSRC at [8..12], payload verbatim.
@@ -28,7 +28,7 @@ val s = suite("raspberry-rtp", [
     val nal: UInt8[] = [0x67, 0xAA]
     val packets = packetize(0, 0, 1, nal, false)
     [
-      expect(length(packets)).toBe(1),
+      expect(packets.length()).toBe(1),
       expect(packets[0][1]).toBe(PAYLOAD_TYPE) // no marker bit
     ]
   ),
@@ -81,9 +81,9 @@ val s = suite("raspberry-rtp", [
     val nal = repeated(seed, MAX_RTP_PAYLOAD + 100) // IDR header (0x65) + big body
     val packets = packetize(0, 0, 1, nal, true)
     val first: UInt8[] = packets[0]
-    val last: UInt8[] = packets[length(packets) - 1]
+    val last: UInt8[] = packets[packets.length() - 1]
     [
-      expect(length(packets) >= 2).toBe(true),
+      expect(packets.length() >= 2).toBe(true),
       expect(first[0]).toBe(0x80), // V=2
       expect(first[1]).toBe(96), // no marker on first fragment
       expect(first[12] & 0x1F).toBe(28), // FU-A type

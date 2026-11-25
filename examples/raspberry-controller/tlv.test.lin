@@ -26,12 +26,12 @@ val s = suite("tlv", [
       expect(packed[0]).toBe(5),
       expect(packed[1]).toBe(0),
       expect(packed[2]).toBe(3),
-      expect(length(packed)).toBe(6)
+      expect(packed.length()).toBe(6)
     ]
   ),
 
   test("encodes multiple fields back to back", () => [
-    expect(length(encode([{ "tag": 1, "bytes": [10] }, { "tag": 2, "bytes": [20, 30] }]))).toBe(9)
+    expect(encode([{ "tag": 1, "bytes": [10] }, { "tag": 2, "bytes": [20, 30] }]).length()).toBe(9)
   ]),
 
   // --- Round-trips: decode(encode(x)) preserves structure ---

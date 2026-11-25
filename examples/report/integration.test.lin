@@ -59,7 +59,7 @@ val s = suite("report-integration", [
     ]
     val out = render(many)
     [
-      expect(length(validRecords(many))).toBe(16),
+      expect(validRecords(many).length()).toBe(16),
       expect(stats(validRecords(many))["total"]).toBe(72),
       expect(out.contains("=== Report ===")).toBe(true)
     ]

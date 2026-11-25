@@ -33,7 +33,7 @@ val s = suite("raspberry-controller integration", [
     [
       expect(afterW[0]).toBe(0.1),
       expect(afterW[1]).toBe(0.1),
-      expect(length(packet)).toBe(8), // two big-endian f32
+      expect(packet.length()).toBe(8), // two big-endian f32
       // 0.1 is not f32-exact, so the decoded speed is ~0.1 (not == 0.1); assert
       // the wire round-trips through the motor mapping, whose round() absorbs it.
       expect(decoded[0] > 0.0).toBe(true), // forward after round-trip
@@ -93,10 +93,10 @@ val s = suite("raspberry-controller integration", [
     val seqAfter = nextSequence(0, firstNal)
     val pkt: UInt8[] = packets[0]
     [
-      expect(length(nals)).toBe(2), // SPS(7) + PPS(8), 0x41 flushes
+      expect(nals.length()).toBe(2), // SPS(7) + PPS(8), 0x41 flushes
       expect(nals[0]["nalType"]).toBe(7),
       expect(nals[1]["nalType"]).toBe(8),
-      expect(length(packets)).toBe(1), // small NAL -> single packet
+      expect(packets.length()).toBe(1), // small NAL -> single packet
       expect(pkt[0]).toBe(0x80), // RTP V=2
       expect(pkt[8]).toBe(0x12), // SSRC big-endian
       expect(pkt[12]).toBe(0x67), // payload = NAL verbatim

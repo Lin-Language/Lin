@@ -42,12 +42,12 @@ export val advanceTimestamp = (ts: UInt32): UInt32 => ts + TIMESTAMP_INCREMENT
 // How many RTP packets a NAL produces: 0 if empty, 1 if it fits in one packet,
 // else the FU-A fragment count (ceil(payloadLen / maxFragment)).
 export val packetCount = (nal: UInt8[]): Int32 =>
-  if length(nal) == 0 then
+  if nal.length() == 0 then
     0
-  else if length(nal) <= MAX_RTP_PAYLOAD then
+  else if nal.length() <= MAX_RTP_PAYLOAD then
     1
   else
-    val payloadLen = length(nal) - 1 // skip the NAL header byte
+    val payloadLen = nal.length() - 1 // skip the NAL header byte
     (payloadLen + MAX_FRAGMENT - 1) / MAX_FRAGMENT // ceil division
 
 // Sequence number after packetizing `nal` (advanced by its packet count).
@@ -83,22 +83,22 @@ val fuPrefix = (nalHdr: UInt8, first: Boolean, last: Boolean): UInt8[] =>
 // advances per fragment. The fragment is: RTP header (marker only on the last
 // fragment, when `marker`) ++ [FU-I, FU-H] ++ fragment bytes.
 val fragmentPacket = (seq: UInt16, ts: UInt32, ssrc: UInt32, nalHdr: UInt8, payload: UInt8[], i: Int32, marker: Boolean): UInt8[] =>
-  val plen = length(payload)
+  val plen = payload.length()
   val offset = i * MAX_FRAGMENT
   val end = if offset + MAX_FRAGMENT < plen then offset + MAX_FRAGMENT else plen
   val last = end == plen
   val header = writeHeader(toUInt16(seq + i), ts, ssrc, marker && last)
   val prefix = fuPrefix(nalHdr, offset == 0, last)
-  val fragment: UInt8[] = slice(payload, offset, end)
+  val fragment: UInt8[] = payload.slice(offset, end)
   header.concat(prefix).concat(fragment)
 
 // Packetize one NAL unit into its RTP packets (array of UInt8[]). An empty NAL
 // produces no packets, matching Rust. Sequence threading is the caller's job:
 // pass the current seq, then advance it with nextSequence for the next call.
 export val packetize = (seq: UInt16, ts: UInt32, ssrc: UInt32, nal: UInt8[], marker: Boolean): UInt8[][] =>
-  if length(nal) == 0 then
+  if nal.length() == 0 then
     []
-  else if length(nal) <= MAX_RTP_PAYLOAD then
+  else if nal.length() <= MAX_RTP_PAYLOAD then
     [makeSingleNal(seq, ts, ssrc, nal, marker)]
   else
     val payload: UInt8[] = nal.slice(1, nal.length())

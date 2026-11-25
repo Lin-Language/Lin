@@ -86,7 +86,7 @@ val processQueue = (pq: PqEntry[], adj: { String: Neighbor[] }, dist: { String: 
           if newDist < dv then
             dist[v] = newDist
             prev[v] = u
-            push(remaining, { "node": v, "dist": newDist })
+            remaining.push({ "node": v, "dist": newDist })
         )
       queue = remaining
       true
