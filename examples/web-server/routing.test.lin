@@ -118,6 +118,15 @@ val s = suite("routing", [
     ]
   ),
 
+  test("a node absent from allNodes is still relaxed", () =>
+    val adj = buildAdj([{ "from": "A", "to": "B", "weight": 4 }])
+    val result = dijkstra(adj, "A", ["A"])
+    [
+      expect(result["dist"]["B"]).toBe(4),
+      expect(result["prev"]["B"]).toBe("A")
+    ]
+  ),
+
   // --- solve (fs-driven) ---
   test("reads the graph and solves the shortest A->E route", () =>
     [
