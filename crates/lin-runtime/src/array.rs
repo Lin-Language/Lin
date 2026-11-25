@@ -2621,7 +2621,7 @@ pub unsafe extern "C" fn lin_array_unique(arr_box: *const u8) -> *mut u8 {
             let key = lin_value_key(elem); // rc=1
             if crate::map::lin_map_get(seen, key).is_null() {
                 crate::map::lin_map_set(seen, key, &true_tv); // map retains key → rc=2
-                lin_array_push_tagged(out, elem as *const u8);
+                lin_push_dyn(out, elem);
             }
             // Release caller's rc regardless; map holds its own ref if inserted.
             crate::string::lin_string_release(key); // rc: 2→1 if inserted, 1→0 if dup
