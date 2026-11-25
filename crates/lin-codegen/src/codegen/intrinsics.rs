@@ -129,8 +129,8 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.tagged_release, &[tagged.into()], "");
                 s
             }
-            Type::Object { .. } => {
-                // Non-sealed open object: now backed by LinMap* (Phase 2 flip).
+            Type::Object { .. } | Type::Map { .. } => {
+                // Open object / typed index-signature map: both are a raw LinMap*.
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
                 let f = self.get_or_declare_fn("lin_map_to_string",
                     ptr_ty.fn_type(&[ptr_ty.into()], false));
