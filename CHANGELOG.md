@@ -1,7 +1,92 @@
 # Changelog
 
 All notable changes to Lin are documented here.
-## [1.2.0](https://github.com/Lin-Language/Lin/compare/v1.1.0...v1.2.0) - 2026-08-27
+## [1.2.1](https://github.com/Lin-Language/Lin/compare/v1.2.0...v1.2.1) - 2026-11-25
+
+### Bug Fixes
+
+- **vscode**: Don't follow symlinks during .lin/.test.lin workspace discovery
+- **stdlib**: String length counts codepoints
+- **codegen**: Hoist string interpolation parts buffer to the entry block
+- **codegen**: Prove flat Scalar | Null temps instead of sniffing LLVM value kinds
+- **runtime**: Unique dedupes sealed-record arrays structurally
+- **codegen**: String interpolation of typed index-signature maps
+- **check**: Narrow 'is Error' arm binding to the Error union member
+- **ir**: Remap match-pattern bound slots when re-homing imported generic bodies
+- **codegen**: Box recursive sum types correctly through reduce accumulators and map reads
+- **fmt**: Preserve unary minus instead of rewriting to 0 - x
+- **check**: Push tuple return type into if/match branches; reject tuple to flat numeric array
+- **check**: Accept integer literal argument for a literal-union parameter
+- **check**: Form tuple pairs for a flatMap callback returning [[k, v]]
+- **check**: Apply compound null narrowing in expected-type if branches
+- **test**: Run accepts an array of suites; fail files that report zero tests
+- **ir**: Materialize sum-typed if/match branch into a non-sum union merge
+- **examples**: Treat nodes missing from the dist map as unreachable in dijkstra
+- **examples**: Return 500 when the index template fails to render
+- **lower**: Convert tuple to packed numeric array instead of rejecting the assignment
+- **ir**: Release superseded reduce accumulator boxes for union accumulators
+- **check**: Reject overload calls made ambiguous by an AnyVal argument
+
+### Documentation
+
+- **spec**: AnyVal arguments must resolve overloads unambiguously
+
+### Other
+
+- Merge branch 'fix/string-length-codepoints'
+- Merge branch 'master' into worktree-agent-aa7b3bc22098b6bbc
+- Merge branch 'refactor/idiomatic-examples'
+- Merge branch 'worktree-agent-aaefb1886d37b3599'
+- Merge branch 'worktree-agent-aa6aa3a68852a1f8a'
+- Merge branch 'worktree-agent-a602b423b8f32bbcc'
+- Merge branch 'worktree-agent-a4e56394b87db057d'
+- Merge branch 'worktree-agent-ae581e09e138c94b6'
+- Merge branch 'master' into fix/flat-nullable-returns
+
+# Conflicts:
+#	crates/lin/tests/integration.rs
+- Merge branch 'fix/flat-nullable-returns'
+- Merge branch 'master' into fix/interp-alloca-in-loop
+- Merge branch 'fix/interp-alloca-in-loop'
+- Merge branch 'worktree-agent-a987e94f155c4c718'
+- Merge branch 'worktree-agent-aaba718f32dea60ff'
+- Merge branch 'worktree-agent-a43bd5815ce5d28b0'
+- Merge branch 'worktree-agent-a5c8229ddafb810d5'
+- Merge branch 'master' into perf/flat-nullable-phase1-2
+- Merge branch 'perf/flat-nullable-phase1-2'
+- Merge branch 'master' into fix/sumnode-null-repr-oracle
+- Merge branch 'fix/sumnode-null-repr-oracle'
+- Merge branch 'master' into fix/test-run-array-of-suites
+- Merge branch 'fix/test-run-array-of-suites'
+- Merge branch 'fix/anyval-overload-ambiguity'
+- Merge branch 'test/is-type-coverage'
+
+### Performance
+
+- **codegen**: Test null inline on boxed unions
+- **codegen**: Read Scalar | Null map entries without boxing
+
+### Refactor
+
+- **examples**: Idiomatic calc — shared result module, literal-union kinds, while-based lexer
+- **examples**: Idiomatic report — countBy/flatMap, no sentinel path, dot calls
+- **examples**: Idiomatic processes — Outcome literal union, flatMap, no toString
+- **examples**: Drop redundant toString, val for never-reassigned maps
+- **examples**: Idiomatic event-transfers — top-level program, stream adapters, shared SAMPLE
+- **examples**: Idiomatic raspberry-controller — while/map over recursion, key consts, whole-value tests
+- **examples**: Idiomatic sdl — reduce frame loops, shared render module, Axis record, trim unused constants
+- **examples**: Idiomatic web-server — shared fixtures, while/groupBy routing, typed handler arms
+- **examples**: Dot-form calls, drop stale ADR and ASan comments
+- **examples**: Dot-form length/push/slice calls
+- **examples**: Report uses std/array unique instead of hand-rolled uniqueRecords
+- **examples**: Use 'is Error' arm in processes/task
+- **examples**: Inline mapOk test thunks, drop stale workaround note
+- **examples**: Drop redundant ?? now that is Error narrows message to String
+- **examples**: Use tuple types for key pairs and motor duties
+- **codegen**: Drop struct-kind sniffing for flat nullable temps
+- **parse**: Represent unary minus as UnaryOp::Neg instead of desugaring to 0 - x
+- Use unary minus instead of 0 - x in stdlib and nbody
+## [1.2.0](https://github.com/Lin-Language/Lin/compare/v1.1.0...v1.2.0) - 2026-09-21
 
 ### Bug Fixes
 
@@ -48,6 +133,9 @@ Claude-Session: https://claude.ai/code/session_01LzLGpvSxCcYiTwBsNcRFqk
 - Merge branch 'fix/test-lens-gating'
 - Merge branch 'fix/test-timeout-reporting'
 - Merge branch 'docs/binary-search-recursive-solution'
+- Merge pull request #16 from Lin-Language/release/next
+
+chore: release v1.2.0
 
 ### Performance
 
