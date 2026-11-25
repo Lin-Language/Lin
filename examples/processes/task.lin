@@ -41,8 +41,8 @@ val launchError = (name: String, message: String): TaskResult =>
 export val runTask = (t: Task): TaskResult =>
   val r = exec(t["command"], t["args"])
   match r
-    is ExecResult => classify(t["name"], r)
-    else => launchError(t["name"], r["message"])
+    is Error => launchError(t["name"], r["message"])
+    else => classify(t["name"], r)
 
 export val runAll = (tasks: Task[]): TaskResult[] =>
   tasks.map(runTask)
