@@ -1344,6 +1344,14 @@ unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
             let inner: Vec<String> = pairs.into_iter().map(|(k, v)| format!("{}:{}", k, v)).collect();
             format!("o:{{{}}}", inner.join(","))
         }
+        TAG_RECORD => {
+            let sptr = payload as *const u8;
+            if sptr.is_null() { return "N".to_string(); }
+            let named_desc = *((sptr.add(16)) as *const *const u8);
+            let mut s = String::new();
+            push_display_sealed_struct(&mut s, sptr, named_desc);
+            format!("o:{s}")
+        }
         crate::tagged::TAG_FUNCTION => format!("fn:{:#x}", payload),
         _ => format!("?:{}", payload),
     }

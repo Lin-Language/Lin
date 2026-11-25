@@ -3,6 +3,8 @@ import { toString } from "std/string"
 import { indexOf, reverse, push, length, partition, zip, unique, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, arrayAllocate, arrayAllocateFilled, set, at, slice, binarySearch, lowerBound, upperBound, bisectLeft, bisectRight, searchBy, insertSorted, countInRange, findIndex, findLast, findLastIndex, dedupBy } from "std/array"
 import { map, filter, reduce, find, some, every, flatMap, concat, range, for, take, drop, takeWhile, dropWhile, flatten, iterOf } from "std/iter"
 
+type UniqueRec = { "name": String, "score": Int32 }
+
 val s = suite("std/array", [
   test("length of array", () => [
     expect([1, 2, 3].length()).toBe(3)
@@ -408,6 +410,20 @@ val s = suite("std/array", [
     val result = [1, 2, 3].unique()
     [
       expect(result.toString()).toBe("[1, 2, 3]")
+    ]
+  ),
+
+  test("unique dedupes named record arrays structurally", () =>
+    val rs: UniqueRec[] = [
+      { "name": "a", "score": 1 },
+      { "name": "a", "score": 1 },
+      { "name": "b", "score": 2 }
+    ]
+    val result = rs.unique()
+    [
+      expect(result.length()).toBe(2),
+      expect(result[1]["name"]).toBe("b"),
+      expect(result.toString()).toBe("[{\"name\": \"a\", \"score\": 1}, {\"name\": \"b\", \"score\": 2}]")
     ]
   ),
 
