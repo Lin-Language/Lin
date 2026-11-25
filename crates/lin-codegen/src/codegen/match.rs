@@ -473,6 +473,11 @@ impl<'ctx> Codegen<'ctx> {
                 return self.flat_array_widen(val, from_e, to_e);
             }
         }
+        if let (Type::FixedArray(elems), Type::Array(to_e)) = (from_ty, to_ty) {
+            if Self::is_flat_scalar(to_e) && val.is_pointer_value() {
+                return self.tuple_to_flat_array(val, elems, to_e);
+            }
+        }
         // ── Sealed-record ARRAY boundaries (sealed-records Stage 3) ───────────────────────
         // A `MyType[]` is a contiguous unboxed buffer (elem_tag 0xFE); a Json/Object[] is a tagged
         // array of boxed LinMaps. Crossing between them is a per-element PROJECTION /
