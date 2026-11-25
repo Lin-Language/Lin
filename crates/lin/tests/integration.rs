@@ -18566,6 +18566,51 @@ fn build_ir(source: &str) -> String {
     ir
 }
 
+const INTERP_LOOP_SRC: &str = r#"
+import { print } from "std/io"
+import { range, for } from "std/iter"
+import { toString } from "std/string"
+
+val run = (n: Int32): Int32 =>
+  var total = 0
+  range(0, n).for(i =>
+    if "${i} and ${i}" == "x" then total = total + 1
+  )
+  total
+
+print(toString(run(10000000)))
+"#;
+
+#[test]
+fn test_string_interpolation_in_loop_does_not_grow_stack() {
+    let out = run(INTERP_LOOP_SRC);
+    assert_eq!(out, vec!["0"]);
+}
+
+#[test]
+fn test_string_interpolation_parts_alloca_only_in_entry_block() {
+    let ir = build_ir(INTERP_LOOP_SRC);
+    let mut offenders = Vec::new();
+    let mut fn_name = String::new();
+    let mut in_entry = false;
+    let mut labels_seen = 0;
+    for line in ir.lines() {
+        if line.starts_with("define ") {
+            fn_name = line.to_string();
+            in_entry = true;
+            labels_seen = 0;
+        } else if line.starts_with('}') {
+            in_entry = false;
+        } else if !line.starts_with(' ') && line.trim_end().ends_with(':') {
+            labels_seen += 1;
+            in_entry = labels_seen == 1;
+        } else if !in_entry && line.contains("= alloca ") && line.contains("bldn_parts") {
+            offenders.push(format!("{fn_name}\n  {line}"));
+        }
+    }
+    assert!(offenders.is_empty(), "bldn_parts alloca outside entry block:\n{}", offenders.join("\n"));
+}
+
 #[test]
 fn test_sealed_stack_tco_loop_high_n_no_overflow() {
     // The records.lin shape at a HIGH iteration count: a TCO loop that builds a FRESH all-scalar
