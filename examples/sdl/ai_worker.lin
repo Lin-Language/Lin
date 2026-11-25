@@ -25,14 +25,15 @@
 //
 // Run headless:  SDL_VIDEODRIVER=dummy lin run examples/sdl/ai_worker.lin
 import { print } from "std/io"
-import { toString } from "std/string"
-import { toFloat32, toFloat64, toInt32, toInt64 } from "std/number"
+import { toFloat32, toInt32 } from "std/number"
+import { range, reduce, while } from "std/iter"
 import { toFixed } from "std/math"
 import { async, await } from "std/async"
-import { alloc, free, pokeF32, peekU8, peekI32, peekPtr, withCstr } from "std/ffi"
+import { alloc, free, pokeF32, withCstr } from "std/ffi"
 import { Vec2, vec2 } from "./vector"
 import { World, planStep, distanceToGoal } from "./agent"
-import { SDL_INIT_VIDEO, FRECT_BYTES, FRECT_X_OFF, FRECT_Y_OFF, FRECT_W_OFF, FRECT_H_OFF, EVENT_BYTES, SURFACE_PITCH_OFF, SURFACE_PIXELS_OFF, PIXEL_BYTES, PIXEL_B_OFF, PIXEL_G_OFF, PIXEL_R_OFF } from "./constants"
+import { SDL_INIT_VIDEO, FRECT_BYTES, FRECT_X_OFF, FRECT_Y_OFF, FRECT_W_OFF, FRECT_H_OFF, EVENT_BYTES, PIXEL_B_OFF, PIXEL_G_OFF, PIXEL_R_OFF } from "./constants"
+import { pixelChannel } from "./render"
 
 // Real SDL3 signatures (see bounce.lin for the field-by-field notes).
 import foreign "examples/sdl/libs/libSDL3.so"
@@ -82,10 +83,7 @@ val planAsync = (world: World): Vec2 =>
 // Drain and discard the per-frame event queue. We DO NOT use it to terminate (real headless SDL3
 // emits no QUIT); the loop runs a fixed frame count.
 val drainEvents = (eventBuf: Ptr): Null =>
-  if SDL_PollEvent(eventBuf) == 0 then
-    null
-  else
-    drainEvents(eventBuf)
+  while(() => SDL_PollEvent(eventBuf) != 0)
 
 // Draw the agent (a 12x12 square) at integer grid position scaled to pixels. Builds an SDL_FRect in
 // `rectBuf` via four pokeF32 and renders on the MAIN thread.
@@ -101,40 +99,29 @@ val drawAgent = (ren: Ptr, rectBuf: Ptr, agent: Vec2): Null =>
   SDL_RenderPresent(ren)
   null
 
-// Tail-recursive frame loop over a FIXED count. Each frame: drain events, offload a planning step
-// to a worker (plain values only cross the boundary), draw the new agent position on the main
-// thread, recurse. Self-terminating.
-val loop = (ren: Ptr, rectBuf: Ptr, eventBuf: Ptr, agent: Vec2, n: Int32): Vec2 =>
-  if n <= 0 then
-    agent
-  else
-    drainEvents(eventBuf)
-    val next = planAsync({ "agent": agent, "goal": GOAL })
-    drawAgent(ren, rectBuf, next)
-    loop(ren, rectBuf, eventBuf, next, n - 1)
-
-// Read channel `chanOff` (B/G/R) of pixel (x,y) out of a read-back SDL_Surface as an Int64 in
-// [0,255]. (See bounce.lin for the XRGB8888 byte-order rationale.)
-val pixelChannel = (surf: Ptr, x: Int32, y: Int32, chanOff: Int32): Int64 =>
-  val pitch = peekI32(surf, SURFACE_PITCH_OFF)
-  val pixels = peekPtr(surf, SURFACE_PIXELS_OFF)
-  val off = y * pitch + x * PIXEL_BYTES + chanOff
-  toInt64(peekU8(pixels, off))
+// One frame: drain events, offload a planning step to a worker (plain values only cross the
+// boundary), and draw the new agent position on the main thread.
+val frame = (ren: Ptr, rectBuf: Ptr, eventBuf: Ptr, agent: Vec2): Vec2 =>
+  drainEvents(eventBuf)
+  val next = planAsync({ "agent": agent, "goal": GOAL })
+  drawAgent(ren, rectBuf, next)
+  next
 
 SDL_Init(SDL_INIT_VIDEO)
 val win = withCstr("lin-sdl-ai-worker", title => SDL_CreateWindow(title, WIDTH, HEIGHT, 0))
-print("window handle non-null: ${toString(win != 0)}")
+print("window handle non-null: ${win != 0}")
 val ren = SDL_CreateRenderer(win, 0)
 
 val rectBuf = alloc(FRECT_BYTES)
 val eventBuf = alloc(EVENT_BYTES)
 
-val finalAgent = loop(ren, rectBuf, eventBuf, vec2(0.0, 0.0), FRAMES)
+// A FIXED frame count, so the demo self-terminates (no event dependency).
+val finalAgent = range(0, FRAMES).reduce(vec2(0.0, 0.0), (agent, i) => frame(ren, rectBuf, eventBuf, agent))
 val ax = toInt32(finalAgent["x"])
 val ay = toInt32(finalAgent["y"])
 
-print("frames drawn: ${toString(FRAMES)}")
-print("final agent: ${toString(ax)},${toString(ay)}")
+print("frames drawn: ${FRAMES}")
+print("final agent: ${ax},${ay}")
 print(
   "distance to goal (via C magnitude2): ${distanceToGoal({ "agent": finalAgent, "goal": GOAL }).toFixed(2)}"
 )
@@ -148,10 +135,8 @@ val r = pixelChannel(surf, px, py, PIXEL_R_OFF)
 val g = pixelChannel(surf, px, py, PIXEL_G_OFF)
 val b = pixelChannel(surf, px, py, PIXEL_B_OFF)
 val matches = r == 0 && g == 200 && b == 120
-print(
-  "pixel[${toString(px)},${toString(py)}] = ${toString(r)},${toString(g)},${toString(b)}"
-)
-print("rendered pixel matches fill: ${toString(matches)}")
+print("pixel[${px},${py}] = ${r},${g},${b}")
+print("rendered pixel matches fill: ${matches}")
 SDL_DestroySurface(surf)
 
 free(rectBuf)

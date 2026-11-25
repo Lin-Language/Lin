@@ -20,21 +20,7 @@ export type World = { "agent": Vec2, "goal": Vec2 }
 
 // -1 / 0 / +1 from a Float64, with a small dead-zone so tiny rotation round-off does not jitter.
 val sign = (x: Float64): Float64 =>
-  if x > 0.0001 then 1.0 else if x < 0.0 - 0.0001 then 0.0 - 1.0 else 0.0
-
-// Plan one grid step toward the goal. We compute the heading (atan2), rotate the canonical forward
-// unit vector (1, 0) by it with a rotation matrix, and snap each rotated component to a -1/0/+1 grid
-// move. If the agent is already on the goal (distance computed in C) it holds position.
-export val planStep = (world: World): Vec2 =>
-  val agent = world["agent"]
-  val goal = world["goal"]
-  val dist = cDistance(agent["x"], agent["y"], goal["x"], goal["y"])
-  if dist < 0.5 then
-    agent
-  else
-    val theta = heading(agent, goal)
-    val forward = applyToVec(rotation2D(theta), vec2(1.0, 0.0))
-    vec2(agent["x"] + sign(forward["x"]), agent["y"] + sign(forward["y"]))
+  if x > 0.0001 then 1.0 else if x < -0.0001 then -1.0 else 0.0
 
 // Distance from the agent to its goal (C-computed) — exported so the demo can report arrival.
 export val distanceToGoal = (world: World): Float64 =>
@@ -44,3 +30,16 @@ export val distanceToGoal = (world: World): Float64 =>
     world["goal"]["x"],
     world["goal"]["y"]
   )
+
+// Plan one grid step toward the goal. We compute the heading (atan2), rotate the canonical forward
+// unit vector (1, 0) by it with a rotation matrix, and snap each rotated component to a -1/0/+1 grid
+// move. If the agent is already on the goal (distance computed in C) it holds position.
+export val planStep = (world: World): Vec2 =>
+  val agent = world["agent"]
+  val goal = world["goal"]
+  if distanceToGoal(world) < 0.5 then
+    agent
+  else
+    val theta = heading(agent, goal)
+    val forward = applyToVec(rotation2D(theta), vec2(1.0, 0.0))
+    vec2(agent["x"] + sign(forward["x"]), agent["y"] + sign(forward["y"]))

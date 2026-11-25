@@ -52,6 +52,7 @@ the repo's Rust integration tests):
 - **`bounce.lin`**, **`ai_worker.lin`** — the two demos above.
 - **`constants.lin`** — shared SDL constants + `SDL_FRect`/`SDL_Event`/`SDL_Surface` byte-offsets
   and the XRGB8888 pixel-channel offsets (`export val`).
+- **`render.lin`** — `pixelChannel`, the surface pixel read-back both demos use.
 
 Vendored / committed C artefacts:
 
@@ -113,7 +114,8 @@ which returns a new `SDL_Surface*` (a `Ptr`), peeks the surface fields and a pix
 colour:
 
 - Surface field byte-offsets are read from the real header and verified with `offsetof` (sizeof 48):
-  `format` @ 4, `w` @ 8, `h` @ 12, `pitch` @ 16, `pixels` @ 24. They live in `constants.lin`.
+  `format` @ 4, `w` @ 8, `h` @ 12, `pitch` @ 16, `pixels` @ 24. The ones the demos read (`pitch`,
+  `pixels`) live in `constants.lin`.
 - The software renderer returns surfaces in **`SDL_PIXELFORMAT_XRGB8888`**. On little-endian, each
   4-byte pixel is laid out as **B, G, R, X** at offsets +0, +1, +2, +3. So a channel is read with
   `peekU8(pixels, y*pitch + x*4 + chanOff)` using `PIXEL_B_OFF=0`, `PIXEL_G_OFF=1`, `PIXEL_R_OFF=2`.
