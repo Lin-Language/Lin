@@ -5978,6 +5978,26 @@ print(d)
     assert_eq!(output, vec![r#"{"a": 5, "a2": 6, "b": 5, "b2": 6}"#]);
 }
 
+// An `if` checked against a structured expected type narrows a union binding through a compound
+// (`||`) null test in the else branch, the same as an inferred `if`.
+#[test]
+fn test_expected_type_if_applies_compound_null_narrowing() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type P = { "x": Int32 }
+val mk = (k: Int32): P => { "x": k }
+val pair = (k: Int32): [Int32, Int32] => [k, k]
+val f = (key: Int32 | Null): [Int32, Int32] =>
+  if key == null || key == 5 then [0, 0] else pair(key)
+val g = (key: Int32 | Null): P =>
+  if key == null || key == 5 then { "x": 0 } else mk(key)
+print(toString(f(3)[1]))
+print(toString(g(4)["x"]))
+print(toString(g(null)["x"]))
+"#);
+    assert_eq!(output, vec!["3", "4", "0"]);
+}
+
 // Arity mismatch against a fixed-length array type is a compile-time error.
 #[test]
 fn test_fixed_length_array_arity_mismatch() {

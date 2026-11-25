@@ -413,18 +413,25 @@ impl Checker {
                 self.in_tail_position = false;
                 let typed_cond = self.check_expr(condition, &Type::Bool)?;
                 self.in_tail_position = in_tail;
-                let narrowing = self.null_test_narrowing(condition);
+                let consumed_before = self.consumed_streams.clone();
+                let narrowing_facts = self.compound_condition_narrowings(condition);
+                let index_narrow_base = self.index_narrowings.len();
                 self.env.push_scope();
-                self.apply_null_narrowing(&narrowing, true);
+                self.apply_narrowings_list(&narrowing_facts, true);
                 let typed_then = self.check_branch_against(then_branch, expected);
                 self.env.pop_scope();
+                self.index_narrowings.truncate(index_narrow_base);
                 let typed_then = typed_then?;
+                let consumed_then = self.consumed_streams.clone();
+                self.consumed_streams = consumed_before;
                 self.in_tail_position = in_tail;
                 self.env.push_scope();
-                self.apply_null_narrowing(&narrowing, false);
+                self.apply_narrowings_list(&narrowing_facts, false);
                 let typed_else = self.check_branch_against(else_branch, expected);
                 self.env.pop_scope();
+                self.index_narrowings.truncate(index_narrow_base);
                 let typed_else = typed_else?;
+                self.consumed_streams.extend(consumed_then);
                 // Both branches were CHECKED compatible against `expected` (the declared
                 // return / context type). Prefer `expected` itself as the result type when it
                 // is a structured (object / union / named) target rather than re-`unify`ing the
