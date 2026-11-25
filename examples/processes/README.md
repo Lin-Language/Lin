@@ -70,11 +70,11 @@ They are documented here (rather than silently worked around) so they can be fix
    inside the thunk (and mocking its `exec`) is correct *and* keeps the scheduler testable.
 
 2. **Result combinators that introduce a fresh result type (`andThen`, `mapOk`) bind their
-   result to an annotated `val`, and `mapOk`'s test bodies are named lambdas.** A generic
+   result to an annotated `val`.** A generic
    call whose return type parameter is only resolvable from the surrounding expectation
    fails to infer it when nested inside an inline anonymous thunk argument
    (`() => [ … mapOk(r, f) … ]`), leaking the return type as `?T | Null`. Binding to an
-   annotated `val` and/or defining the test body as a named top-level lambda fixes it.
+   annotated `val` fixes it.
 
 3. **`outcome.lin` coverage is under-reported.** `lin test --coverage` does not attribute a
    *monomorphized generic function* back to its source module, so `outcome.lin` (all
