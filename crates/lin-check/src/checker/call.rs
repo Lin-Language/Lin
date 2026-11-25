@@ -1294,7 +1294,7 @@ impl Checker {
         // `required` and `params` arguments; a partial application (`f(x,)`) supplies a prefix, so
         // only the upper bound applies and selection ranks on that prefix.
         let n = arg_tys.len();
-        let applicable: Vec<&(usize, Type)> = candidates
+        let mut applicable: Vec<&(usize, Type)> = candidates
             .iter()
             .filter(|(_, ty)| {
                 let Type::Function { params, required, .. } = ty else { return false };
@@ -1307,6 +1307,51 @@ impl Checker {
                 })
             })
             .collect();
+
+        // A dynamically-typed (`AnyVal`) argument is accepted by some parameter types (arrays,
+        // scalars) and rejected by others (structured records, which need a checked decode), so
+        // plain applicability would silently pick whichever overload happens to accept it, not the
+        // one matching the value's runtime shape. Judge ambiguity over every candidate that fits
+        // the call apart from the `AnyVal` positions: if they disagree on the parameter an `AnyVal`
+        // argument feeds and none of them takes a dynamic/generic parameter there, the caller must
+        // narrow the value first.
+        for (i, arg) in arg_tys.iter().enumerate() {
+            if !matches!(arg, Some(t) if t.is_any_val()) {
+                continue;
+            }
+            let fits: Vec<&(usize, Type)> = candidates
+                .iter()
+                .filter(|(_, ty)| {
+                    let Type::Function { params, required, .. } = ty else { return false };
+                    if n > params.len() || (!partial && n < *required) {
+                        return false;
+                    }
+                    arg_tys.iter().zip(params.iter()).all(|(a, param)| match a {
+                        Some(at) if at.is_any_val() => true,
+                        Some(at) => self.arg_compatible(at, param),
+                        None => matches!(param, Type::Function { .. }),
+                    })
+                })
+                .collect();
+            let params_at: Vec<&Type> = fits
+                .iter()
+                .filter_map(|(_, t)| match t {
+                    Type::Function { params, .. } => params.get(i),
+                    _ => None,
+                })
+                .collect();
+            let dynamic_ok = params_at.iter().any(|p| matches!(p, Type::TypeVar(_)));
+            let all_same = params_at.windows(2).all(|w| w[0] == w[1]);
+            if fits.len() > 1 && !dynamic_ok && !all_same {
+                return Err(self.ambiguous_overload_diag(&fits, arg_tys, name, span, Some(i)));
+            }
+            if fits.len() > 1 && dynamic_ok {
+                applicable.retain(|(_, t)| {
+                    matches!(t, Type::Function { params, .. }
+                        if params.get(i).is_some_and(|p| matches!(p, Type::TypeVar(_))))
+                });
+            }
+        }
 
         if applicable.is_empty() {
             return Err(self.no_matching_overload_diag(candidates, arg_tys, name, span));
@@ -1390,7 +1435,7 @@ impl Checker {
             .collect();
         match best.as_slice() {
             [w] => Ok((***w).clone()),
-            _ => Err(self.ambiguous_overload_diag(&applicable, arg_tys, name, span)),
+            _ => Err(self.ambiguous_overload_diag(&applicable, arg_tys, name, span, None)),
         }
     }
 
@@ -1424,6 +1469,7 @@ impl Checker {
         arg_tys: &[Option<Type>],
         name: &str,
         span: Span,
+        dynamic_arg: Option<usize>,
     ) -> Diagnostic {
         let got = arg_tys
             .iter()
@@ -1435,6 +1481,21 @@ impl Checker {
             .map(|(_, t)| format!("  • {}", overload_signature(t)))
             .collect::<Vec<_>>()
             .join("\n");
+        if let Some(i) = dynamic_arg {
+            return Diagnostic::error(
+                span,
+                format!(
+                    "ambiguous call to `{}({})` — argument {} is `AnyVal`, so more than one overload could accept it",
+                    name,
+                    got,
+                    i + 1
+                ),
+            )
+            .with_help(format!(
+                "the candidate overloads are:\n{}\nnarrow the argument first (with `is`, `match`, or `fromJson`) or give it a concrete type annotation",
+                cands
+            ));
+        }
         Diagnostic::error(
             span,
             format!("ambiguous call to `{}({})` — more than one overload matches equally well", name, got),
