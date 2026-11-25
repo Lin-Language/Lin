@@ -182,9 +182,9 @@ val run = (step: Int32): Null =>
     run(step + 1)
 
 val p = sumMomentum(0, 0.0, 0.0, 0.0)
-set(vx, 0, (0 - p["x"]) / SOLAR_MASS)
-set(vy, 0, (0 - p["y"]) / SOLAR_MASS)
-set(vz, 0, (0 - p["z"]) / SOLAR_MASS)
+set(vx, 0, -p["x"] / SOLAR_MASS)
+set(vy, 0, -p["y"] / SOLAR_MASS)
+set(vz, 0, -p["z"] / SOLAR_MASS)
 
 val ig1 = run(0)
 

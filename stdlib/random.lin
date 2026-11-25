@@ -292,7 +292,7 @@ export val shuffled = <T>(xs: T[]): T[] =>
 val toI32 = (x: UInt64): Int32 =>
   val low = x & LOW32
   if low >= 2147483648u64 then
-    0 - toI32Pos(4294967296u64 - low)
+    -toI32Pos(4294967296u64 - low)
   else
     toI32Pos(low)
 
