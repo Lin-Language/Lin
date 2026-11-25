@@ -5916,6 +5916,35 @@ print(widened[0])
     assert_eq!(output, vec!["age", "42", "20", "3.5", "2", "age"]);
 }
 
+// The declared tuple return type is pushed into `if`/`match` branches, so array literals there
+// form the tuple instead of inferring a homogeneous `Float64[]`.
+#[test]
+fn test_tuple_return_type_pushed_into_if_and_match_branches() {
+    let output = run(r#"import { print } from "std/io"
+val pick = (b: Boolean): [Float64, Float64] =>
+  if b then [1.0, 2.0] else [3.0, 4.0]
+print(pick(true)[0])
+val m = (k: Int32): [Float64, Float64] =>
+  match k
+    is 1 => [1.0, 0.5]
+    else => [0.0, 0.0]
+print(m(1)[1])
+"#);
+    assert_eq!(output, vec!["1.0", "0.5"]);
+}
+
+// A tuple and a packed numeric array have different representations, so sharing one value
+// between them misread the elements. It is now a type error.
+#[test]
+fn test_tuple_not_assignable_to_flat_numeric_array() {
+    let result = run_expect_err(r#"import { print } from "std/io"
+val mk = (): [Float64, Float64] => [1.5, 2.5]
+val a: Float64[] = mk()
+print(a[1])
+"#);
+    assert!(result.contains("Float64[]"), "expected a type error, got: {result}");
+}
+
 // Arity mismatch against a fixed-length array type is a compile-time error.
 #[test]
 fn test_fixed_length_array_arity_mismatch() {
