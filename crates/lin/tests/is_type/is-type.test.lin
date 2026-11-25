@@ -1,0 +1,235 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { push } from "std/array"
+
+type Rec = { "a": Int32, "b": String }
+type Circle = { "r": Float64 }
+type Square = { "side": Float64 }
+type Shape = Circle | Square
+type Ints = Int32[]
+
+val mixed = (i: Int32): Int32 | Int64 | Float64 | Boolean | String | Null =>
+  if i == 0 then
+    null
+  else if i == 1 then
+    7
+  else if i == 2 then
+    5000000000i64
+  else if i == 3 then
+    2.5
+  else if i == 4 then
+    true
+  else
+    "str"
+
+val withRec = (i: Int32): Rec | Int32[] | String | Null =>
+  if i == 0 then
+    null
+  else if i == 1 then
+    { "a": 1, "b": "r" }
+  else if i == 2 then
+    [1, 2]
+  else
+    "s"
+
+val shapes = (i: Int32): Shape | Null =>
+  if i == 0 then
+    null
+  else if i == 1 then
+    { "r": 1.5 }
+  else
+    { "side": 2.0 }
+
+val maybeInt = (i: Int32): Int32 | Null => if i == 0 then null else i
+val maybeBool = (i: Int32): Boolean | Null => if i == 0 then null else true
+val maybeStr = (i: Int32): String | Null => if i == 0 then null else "s"
+val maybeRec = (i: Int32): Rec | Null => if i == 0 then null else { "a": i, "b": "r" }
+val maybeArr = (i: Int32): Int32[] | Null => if i == 0 then null else [i]
+val maybeU64 = (i: Int32): UInt64 | Null => if i == 0 then null else 18000000000000000000u64
+val maybeU8 = (i: Int32): UInt8 | Null => if i == 0 then null else 200u8
+
+val any = (i: Int32): AnyVal =>
+  if i == 0 then
+    null
+  else if i == 1 then
+    7
+  else if i == 2 then
+    2.5
+  else if i == 3 then
+    "str"
+  else if i == 4 then
+    true
+  else if i == 5 then
+    [1, 2]
+  else
+    { "k": i }
+
+val mixedFlags = (i: Int32): Boolean[] =>
+  val m = mixed(i)
+  [
+    m is Null,
+    m is Boolean,
+    m is Int32,
+    m is Int64,
+    m is Float64,
+    m is String
+  ]
+
+val recFlags = (i: Int32): Boolean[] =>
+  val m = withRec(i)
+  [m is Null, m is Rec, m is Ints, m is String]
+
+val anyFlags = (i: Int32): Boolean[] =>
+  val m = any(i)
+  [
+    m is Null,
+    m is Int32,
+    m is Float64,
+    m is String,
+    m is Boolean,
+    m is Ints
+  ]
+
+val n8 = (i: Int32): Int8 | Null => if i == 0 then null else -100i8
+val n16 = (i: Int32): Int16 | Null => if i == 0 then null else -30000i16
+val n32 = (i: Int32): Int32 | Null => if i == 0 then null else -2000000000
+val n64 = (i: Int32): Int64 | Null => if i == 0 then null else -5000000000i64
+val u8 = (i: Int32): UInt8 | Null => if i == 0 then null else 250u8
+val u16 = (i: Int32): UInt16 | Null => if i == 0 then null else 65000u16
+val u32 = (i: Int32): UInt32 | Null => if i == 0 then null else 4000000000u32
+val u64 = (i: Int32): UInt64 | Null => if i == 0 then null else 18000000000000000000u64
+val f32 = (i: Int32): Float32 | Null => if i == 0 then null else 1.5f32
+val f64 = (i: Int32): Float64 | Null => if i == 0 then null else -2.25
+val bl = (i: Int32): Boolean | Null => if i == 0 then null else true
+val str = (i: Int32): String | Null => if i == 0 then null else "txt"
+
+val s = suite("is on boxed unions", [
+  test("mixed scalar union", () => [
+    expect(mixedFlags(0)).toBe([true, false, false, false, false, false]),
+    expect(mixedFlags(1)).toBe([false, false, true, false, false, false]),
+    expect(mixedFlags(2)).toBe([false, false, false, true, false, false]),
+    expect(mixedFlags(3)).toBe([false, false, false, false, true, false]),
+    expect(mixedFlags(4)).toBe([false, true, false, false, false, false]),
+    expect(mixedFlags(5)).toBe([false, false, false, false, false, true])
+  ]),
+
+  test("record, array, string union", () => [
+    expect(recFlags(0)).toBe([true, false, false, false]),
+    expect(recFlags(1)).toBe([false, true, false, false]),
+    expect(recFlags(2)).toBe([false, false, true, false]),
+    expect(recFlags(3)).toBe([false, false, false, true])
+  ]),
+
+  test("sum-type records and null", () => [
+    expect(shapes(0) is Null).toBe(true),
+    expect(shapes(0) is Circle).toBe(false),
+    expect(shapes(1) is Circle).toBe(true),
+    expect(shapes(1) is Square).toBe(false),
+    expect(shapes(1) is Null).toBe(false),
+    expect(shapes(2) is Square).toBe(true),
+    expect(shapes(2) is Circle).toBe(false)
+  ]),
+
+  test("single-scalar nullable unions", () => [
+    expect(maybeInt(0) is Int32).toBe(false),
+    expect(maybeInt(0) is Null).toBe(true),
+    expect(maybeInt(3) is Int32).toBe(true),
+    expect(maybeInt(3) is Null).toBe(false),
+    expect(maybeBool(0) is Boolean).toBe(false),
+    expect(maybeBool(1) is Boolean).toBe(true),
+    expect(maybeStr(0) is String).toBe(false),
+    expect(maybeStr(1) is String).toBe(true),
+    expect(maybeStr(1) is Null).toBe(false),
+    expect(maybeRec(0) is Rec).toBe(false),
+    expect(maybeRec(2) is Rec).toBe(true),
+    expect(maybeRec(2) is Null).toBe(false),
+    expect(maybeArr(0) is Ints).toBe(false),
+    expect(maybeArr(2) is Ints).toBe(true),
+    expect(maybeU64(0) is UInt64).toBe(false),
+    expect(maybeU64(1) is UInt64).toBe(true),
+    expect(maybeU8(0) is UInt8).toBe(false),
+    expect(maybeU8(1) is UInt8).toBe(true)
+  ]),
+
+  test("AnyVal held values", () => [
+    expect(anyFlags(0)).toBe([true, false, false, false, false, false]),
+    expect(anyFlags(1)).toBe([false, true, false, false, false, false]),
+    expect(anyFlags(2)).toBe([false, false, true, false, false, false]),
+    expect(anyFlags(3)).toBe([false, false, false, true, false, false]),
+    expect(anyFlags(4)).toBe([false, false, false, false, true, false]),
+    expect(anyFlags(5)).toBe([false, false, false, false, false, true]),
+    expect(anyFlags(6)).toBe([false, false, false, false, false, false])
+  ]),
+
+  test("narrowing reads the payload", () =>
+    val m = mixed(1)
+    val n = mixed(2)
+    val f = mixed(3)
+    val b = mixed(4)
+    val t = mixed(5)
+    [
+      expect(if m is Int32 then m + 1 else -1).toBe(8),
+      expect(if n is Int64 then n + 1i64 else -1i64).toBe(5000000001i64),
+      expect(if f is Float64 then f * 2.0 else -1.0).toBe(5.0),
+      expect(if b is Boolean then !b else true).toBe(false),
+      expect(if t is String then "${t}!" else "").toBe("str!"),
+      expect(if mixed(0) is Int32 then 1 else 0).toBe(0)
+    ]
+  ),
+
+  test("stored elements of a union array", () =>
+    val xs: (Int32 | String | Null)[] = []
+    xs.push(4)
+    xs.push("a")
+    xs.push(null)
+    [
+      expect(xs[0] is Int32).toBe(true),
+      expect(xs[0] is String).toBe(false),
+      expect(xs[1] is String).toBe(true),
+      expect(xs[2] is Null).toBe(true),
+      expect(xs[2] is Int32).toBe(false)
+    ]
+  ),
+
+  test("payload of every scalar width after narrowing", () =>
+    val a = n8(1)
+    val b = n16(1)
+    val c = n32(1)
+    val d = n64(1)
+    val e = u8(1)
+    val f = u16(1)
+    val g = u32(1)
+    val h = u64(1)
+    val i = f32(1)
+    val j = f64(1)
+    val k = bl(1)
+    val l = str(1)
+    [
+      expect(if a is Int8 then a else 0i8).toBe(-100i8),
+      expect(if b is Int16 then b else 0i16).toBe(-30000i16),
+      expect(if c is Int32 then c else 0).toBe(-2000000000),
+      expect(if d is Int64 then d else 0i64).toBe(-5000000000i64),
+      expect(if e is UInt8 then e else 0u8).toBe(250u8),
+      expect(if f is UInt16 then f else 0u16).toBe(65000u16),
+      expect(if g is UInt32 then g else 0u32).toBe(4000000000u32),
+      expect(if h is UInt64 then h else 0u64).toBe(18000000000000000000u64),
+      expect(if i is Float32 then i else 0.0f32).toBe(1.5f32),
+      expect(if j is Float64 then j else 0.0).toBe(-2.25),
+      expect(if k is Boolean then k else false).toBe(true),
+      expect(if l is String then l else "").toBe("txt"),
+      expect(c ?? 0).toBe(-2000000000),
+      expect(g ?? 0u32).toBe(4000000000u32),
+      expect(j ?? 0.0).toBe(-2.25)
+    ]
+  ),
+
+  test("absent object key reads as null", () =>
+    val o: AnyVal = { "a": 1, "s": "x" }
+    [
+      expect(o["a"] is Int32).toBe(true),
+      expect(o["s"] is String).toBe(true),
+      expect(o["missing"] is Null).toBe(true),
+      expect(o["missing"] is Int32).toBe(false)
+    ]
+  )
+])
+run(s)
