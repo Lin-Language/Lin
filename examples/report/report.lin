@@ -3,10 +3,9 @@
 // (object) values.
 import { parseRow, Record, Success, Failure } from "./parse"
 import { renderTally } from "./frequency"
-import { length, sortBy, push } from "std/array"
-import { map, reduce, flatMap, for } from "std/iter"
+import { length, sortBy, unique } from "std/array"
+import { map, reduce, flatMap } from "std/iter"
 import { join } from "std/string"
-import { hash } from "std/encoding"
 
 // Summary statistics over a batch of valid records.
 export type Stats = { "count": Int32, "total": Int32, "average": Int32, "top": String }
@@ -19,21 +18,6 @@ export val validRecords = (lines: String[]): Record[] =>
       is Success => [r["value"]]
       is Failure => []
   )
-
-// Drop duplicate records — two rows with the same name AND score are the same entry.
-// `std/hash.hash` produces a structural key (equal values -> equal keys, order-
-// independent), so a `{ String: Boolean }` "seen" set gives O(1) dedup without an
-// O(n²) pairwise scan. First occurrence wins; order is otherwise preserved.
-export val uniqueRecords = (records: Record[]): Record[] =>
-  val seen: { String: Boolean } = {}
-  val out: Record[] = []
-  records.for(r =>
-    val key = hash(r)
-    if !(seen[key] ?? false) then
-      seen[key] = true
-      out.push(r)
-  )
-  out
 
 // The error messages from the rows that failed to parse.
 export val parseErrors = (lines: String[]): String[] =>
@@ -73,12 +57,12 @@ val errorNote = (errs: String[]): String =>
     "\nskipped ${errs.length()} bad row(s)"
 
 // Render a multi-line text report from a batch of CSV lines. Duplicate rows are
-// collapsed (uniqueRecords) before ranking, so a name+score that appears twice is
+// collapsed (unique) before ranking, so a name+score that appears twice is
 // counted once. The ranked rows are numbered with the indexed `map` form — the
 // 2-arg callback `(item, i)` receives the 0-based source index as a trailing
 // parameter (opt-in by arity), giving "1." / "2." prefixes without a manual counter.
 export val render = (lines: String[]): String =>
-  val records = uniqueRecords(validRecords(lines))
+  val records = validRecords(lines).unique()
   val st = stats(records)
   val ranked = records.sortBy(r => 0 - r["score"])
   val rows = ranked

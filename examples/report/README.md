@@ -25,8 +25,7 @@ streaming, constant-memory decompress + untar of the input archive.
 - **Tagged-union results**: `Parsed = Success | Failure`, consumed with
   `has { "type": "success", ... }` pattern matching.
 - **Typed dictionaries (`{ String: T }`, ADR-082)**: a grade-band histogram
-  (`frequency.lin`) tallies records per letter band into `{ String: Int32 }`; `std/hash`
-  gives an O(1) structural-key dedup set (`{ String: Boolean }`) in `uniqueRecords`.
+  (`frequency.lin`) tallies records per letter band into `{ String: Int32 }`. Duplicate rows are dropped with `std/array.unique` (structural equality).
 - **Indexed combinators**: the ranked report rows are numbered with the 2-arg
   `map((r, i) => …)` form (the 0-based source index, opt-in by arity).
 - **`std/path`**: the cleaned-output path is derived with `dirname`/`stem`/`join`
@@ -40,7 +39,7 @@ streaming, constant-memory decompress + untar of the input archive.
 | File | What it is |
 | --- | --- |
 | `parse.lin` | One-line CSV parsing + validation. `parseRow(line)` returns a `Parsed` result. Owns `Record`, `Tagged`, `Success`, `Failure`, `Parsed`. |
-| `report.lin` | The batch pipeline: `validRecords`, `uniqueRecords`, `parseErrors`, `stats`, `render`. Owns `Stats`. |
+| `report.lin` | The batch pipeline: `validRecords`, `parseErrors`, `stats`, `render`. Owns `Stats`. |
 | `frequency.lin` | The grade-band histogram over `{ String: Int32 }`: `band`, `tally`, `renderTally`. |
 | `source.lin` | Where the rows come from. Archive path: `rowsFromArchive`/`archiveMembers` (streaming `gunzip` + `untar`). Plain-file path: `rowsFromFile` (lazy line stream), `normalizeCsv` (lazy file-to-file clean), `cleanedPath` (std/path). |
 | `report-data.tar.gz` | The input fixture: a gzipped tar of `q1.csv` / `q2.csv`. |
