@@ -659,6 +659,13 @@ pub(crate) fn lower_function_expr_with_id(
     let sealed_array_projection_from_union = ret_coerced
         && is_union_ty(&body_ty)
         && is_sealed_scalar_array(&effective_ret);
+    // SUM MATERIALIZATION: a `*SumNode` body returned through a non-sum (Json/union) slot is
+    // DEEP-COPIED into a boxed map by the return coercion, so `ret_temp` does not alias `raw_ret`
+    // and the node must be released at scope exit rather than kept.
+    let sum_materialized_return = ret_coerced
+        && crate::repr::sum_type_eligible(&body_ty)
+        && !crate::repr::sum_type_eligible(&effective_ret)
+        && is_union_ty(&effective_ret);
     let return_keep: Vec<Temp> = if void_ret {
         // A void (`: Null`/`Never`) function emits `Return(None)` — the body value is NOT returned.
         // Keep NOTHING, so an OWNED heap body value (now possible since a `: Null` body may be any
@@ -670,6 +677,7 @@ pub(crate) fn lower_function_expr_with_id(
         || sealed_projection_from_object
         || anon_object_projection_from_object
         || sealed_array_projection_from_union
+        || sum_materialized_return
     {
         // For these cases `raw_ret` does not alias `ret_temp`: release it via scope-exit. For
         // `sealed_array_projection_from_union`, `raw_ret` is a union box whose full release

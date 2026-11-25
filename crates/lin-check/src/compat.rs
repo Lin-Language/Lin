@@ -235,8 +235,11 @@ pub fn is_compatible_env(
         (Type::Array(a), Type::Array(b)) => is_compatible_env(a, b, env, lenient_json, depth),
 
         // Fixed array to unbounded array
+        // A tuple is a tagged-element array while `T[]` of a fixed-width numeric `T` is a flat
+        // unboxed buffer, so the two cannot share a value: reject rather than misread it.
         (Type::FixedArray(elements), Type::Array(elem_ty)) => {
-            elements.iter().all(|e| is_compatible_env(e, elem_ty, env, lenient_json, depth))
+            !is_flat_numeric(elem_ty)
+                && elements.iter().all(|e| is_compatible_env(e, elem_ty, env, lenient_json, depth))
         }
 
         // Fixed array positional compatibility
@@ -567,6 +570,12 @@ fn explain_walk(
         }
 
         // FixedArray → Array: find the first element that doesn't match
+        (Type::FixedArray(_), Type::Array(elem_ty)) if is_flat_numeric(elem_ty) => {
+            out.push(format!(
+                "a fixed-length array is not interchangeable with `{}[]` (a packed numeric array); build the array with an array literal instead",
+                elem_ty
+            ));
+        }
         (Type::FixedArray(elements), Type::Array(elem_ty)) => {
             if let Some(e) = elements
                 .iter()
@@ -640,6 +649,23 @@ fn explain_walk(
         // Leaf types: push nothing (caller already shows both types).
         _ => {}
     }
+}
+
+/// Element types stored as a flat unboxed scalar buffer when they are the element of a `T[]`.
+fn is_flat_numeric(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Int8
+            | Type::UInt8
+            | Type::Int16
+            | Type::UInt16
+            | Type::Int32
+            | Type::UInt32
+            | Type::Int64
+            | Type::UInt64
+            | Type::Float32
+            | Type::Float64
+    )
 }
 
 #[cfg(test)]

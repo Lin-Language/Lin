@@ -67,6 +67,7 @@ impl Checker {
                 let narrowed = match &tp {
                     TypedPattern::TypeCheck(ty, _) => Some(ty.clone()),
                     TypedPattern::TypeCheckDeep(ty, _, _) => Some(ty.clone()),
+                    _ if Self::is_error_pattern(pat) => Self::error_member(scrutinee_ty).or_else(|| narrow_to.cloned()),
                     // No positive narrowing for this `is`-pattern (e.g. `is Error` desugars to an
                     // object discriminant pattern, a literal check, a binding/destructure). Fall
                     // back to the complement of preceding excluded arms, if any — this still tightens
@@ -116,6 +117,20 @@ impl Checker {
         })
     }
 
+    fn is_error_pattern(pat: &Pattern) -> bool {
+        matches!(pat, Pattern::TypeName(name, _) if name == "Error")
+    }
+
+    /// The `Error` member of a union scrutinee, used to narrow the binding inside an `is Error`
+    /// arm (the pattern itself lowers to an object discriminant, which carries no positive type).
+    fn error_member(scrutinee_ty: &Type) -> Option<Type> {
+        let err = crate::resolve::error_type();
+        match scrutinee_ty {
+            Type::Union(members) if members.contains(&err) => Some(err),
+            _ => None,
+        }
+    }
+
     /// Like `check_match_arm`, but checks the arm body against an `expected` type (bidirectional
     /// push). Used when a `match` is in a position with a known structured expected type (e.g. a
     /// declared object return type) so each arm refines/accepts against it directly, rather than
@@ -137,6 +152,7 @@ impl Checker {
                 let narrowed = match &tp {
                     TypedPattern::TypeCheck(ty, _) => Some(ty.clone()),
                     TypedPattern::TypeCheckDeep(ty, _, _) => Some(ty.clone()),
+                    _ if Self::is_error_pattern(pat) => Self::error_member(scrutinee_ty).or_else(|| narrow_to.cloned()),
                     // See `check_match_arm`: fall back to the complement when this `is`-pattern has
                     // no positive narrowing (e.g. `is Error`).
                     _ => narrow_to.cloned(),

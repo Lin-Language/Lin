@@ -92,6 +92,7 @@ impl<'ctx> Codegen<'ctx> {
         if body_is_closure {
             fwd_args.push(wf.get_nth_param(0).unwrap().into());
         }
+        let mut projected_sum_args: Vec<(BasicValueEnum<'ctx>, Type)> = Vec::new();
         for i in 0..n_args {
             let boxed_arg = wf.get_nth_param((i + 1) as u32).unwrap();
             // Concrete param type for the body's nth real argument. Prefer the true Lin type;
@@ -121,9 +122,19 @@ impl<'ctx> Codegen<'ctx> {
             // pointer unchanged for these). Concrete types are unboxed to their scalar/raw
             // pointer representation matching the body's declared param type.
             let unboxed = self.unbox_value(boxed_arg, &lin_ty);
+            // A sum-typed arg is projected into a FRESH `*SumNode` the wrapper owns; the body only
+            // borrows it, so the wrapper releases it after the call.
+            if unboxed.is_pointer_value() && Self::is_sum_type(&lin_ty) {
+                projected_sum_args.push((unboxed, lin_ty.clone()));
+            }
             fwd_args.push(unboxed.into());
         }
         let call = self.builder.call(named_fn, &fwd_args, "wfwd");
+        for (node, sum_ty) in projected_sum_args {
+            let total = Self::sumnode_total_size(&sum_ty);
+            let size = self.context.i64_type().const_int(total, false);
+            self.builder.call(self.rt.sumnode_release, &[node.into(), size.into()], "");
+        }
         // Box the concrete return to a TaggedVal*. Prefer the true Lin return type; fall back
         // to inferring from the LLVM return kind (scalars only — a bare pointer of unknown Lin
         // type is assumed already-boxed Json).

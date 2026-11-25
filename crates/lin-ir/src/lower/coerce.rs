@@ -410,6 +410,17 @@ pub(crate) fn free_arg_box_shells(shell_boxes: &[Temp], dst: Temp, builder: &mut
 /// passed to an Int64 param) so the call signature matches.
 pub(crate) fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: &mut FuncBuilder) -> Temp {
     let Some(param_ty) = param_ty else { return arg; };
+    // A value narrowed to a sum type by control flow (`match v is Null => … else => f(v)` over a
+    // `Sum | Null` read) keeps the BOXED temp it was read as; only its static type is the sum. Pass
+    // the temp's physical type so the sum param projects it instead of reading the box as a node.
+    let physical_ty = builder.temp_types.get(&arg).cloned();
+    let arg_ty = match &physical_ty {
+        Some(t) if crate::repr::sum_type_eligible(param_ty)
+            && crate::repr::sum_type_eligible(arg_ty)
+            && !crate::repr::sum_type_eligible(t)
+            && is_union_ty(t) => t,
+        _ => arg_ty,
+    };
     // A sealed scalar-record arg flowing into a `Named` param (a recursive/self-referential type
     // reference that resolution left unexpanded) is passed THROUGH unchanged: the callee reads
     // the SAME unresolved `Named` param consistently as the sealed struct (its body's FieldGet

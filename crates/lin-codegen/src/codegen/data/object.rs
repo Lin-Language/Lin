@@ -1086,6 +1086,16 @@ impl<'ctx> Codegen<'ctx> {
                 if stored.is_pointer_value() {
                     self.emit_rc_retain_inline(stored.into_pointer_value());
                 }
+            } else if fld_ty.is_pure_int_lit_union() {
+                // Pure-IntLit union: the physical slot is an inline i32, but the incoming value may
+                // be a boxed TaggedVal* (the Union ABI). Unbox to the raw i32 before the store.
+                let i32_val = if val.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_int32, &[(*val).into()], "ilu_sum_unbox")
+                        .try_as_basic_value().unwrap_basic()
+                } else {
+                    self.builder.int_s_extend_or_bit_cast(val.into_int_value(), i32_ty, "ilu_sum_i32").into()
+                };
+                self.builder.store(p, i32_val);
             } else {
                 // Scalar field: reconcile a wider/narrower numeric literal into the stored width.
                 let stored = if val_ty == &fld_ty { *val } else { self.compile_ir_coerce(*val, val_ty, &fld_ty) };
@@ -1223,9 +1233,19 @@ impl<'ctx> Codegen<'ctx> {
         let i64_ty = self.context.i64_type();
         let i8_ty = self.context.i8_type();
         let base = node.into_pointer_value();
-        let llvm_fld = self.llvm_type(&fld_ty);
+        let is_ilu = fld_ty.is_pure_int_lit_union();
+        // A pure-IntLit-union slot is an inline i32 (4 bytes), not the 8-byte pointer `llvm_type`
+        // reports for a Union.
+        let llvm_fld = if is_ilu { self.context.i32_type().into() } else { self.llvm_type(&fld_ty) };
         let p = unsafe { self.builder.gep(i8_ty, base, &[i64_ty.const_int(offset, false)], "sumnode_fld_p") };
         let loaded = self.builder.load(llvm_fld, p, "sumnode_fld");
+        if is_ilu {
+            if result_ty.is_pure_int_lit_union() || matches!(result_ty, Type::Union(_) | Type::TypeVar(_)) {
+                return self.builder.call(self.rt.box_int32, &[loaded.into()], "ilu_sum_box")
+                    .try_as_basic_value().unwrap_basic();
+            }
+            return self.compile_ir_coerce(loaded, &Type::Int32, result_ty);
+        }
         if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
     }
 

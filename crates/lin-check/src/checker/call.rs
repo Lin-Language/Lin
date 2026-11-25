@@ -895,6 +895,20 @@ impl Checker {
                             }
                         }
                     }
+                    // Integer-literal counterpart of the string-literal retyping below: a
+                    // suffixless literal argument whose parameter is a closed union of integer
+                    // literals (`type Op = 0 | 1 | 2`, possibly behind a `Named` alias) takes the
+                    // matching `IntLit` member type, as `check_expr` does for typed val/return
+                    // positions.
+                    if let (TypedExpr::IntLit(v, _, lit_span), Expr::IntLit(_, None, _)) = (&typed_args[i], &args[i]) {
+                        if !matches!(param_ty, Type::TypeVar(_)) {
+                            if let Some(members) = self.closed_int_literal_keys(param_ty) {
+                                if members.iter().any(|m| m == v) {
+                                    typed_args[i] = TypedExpr::IntLit(*v, Type::IntLit(*v), *lit_span);
+                                }
+                            }
+                        }
+                    }
                     // Spec §21, float counterpart: a suffixless float literal infers to `Float64`
                     // by default but takes its context type. When an argument is a bare float
                     // literal and the parameter is `Float32`, re-type the literal at `Float32` so

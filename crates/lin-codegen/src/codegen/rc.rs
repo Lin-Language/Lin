@@ -297,7 +297,7 @@ impl<'ctx> Codegen<'ctx> {
             // A boxed slot (Opaque): the box is a TaggedVal/LinMap whose release is the
             // tag-dispatched one. Fall through to the type-based dispatch which already picks the right
             // boxed releaser for the static type (object/array/tagged/map/closure/stream).
-            Repr::Boxed(_) | Repr::FlatScalar(_) | Repr::Unknown | Repr::Bottom => {}
+            Repr::Boxed(_) | Repr::FlatScalar(_) | Repr::FlatNullable { .. } | Repr::Unknown | Repr::Bottom => {}
         }
         self.emit_release(val, ty);
     }

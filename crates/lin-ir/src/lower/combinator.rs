@@ -788,27 +788,9 @@ pub(crate) fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type,
 /// must be coerced (boxed/unboxed) to be used as the other. Specifically: one is a
 /// union/Json (TaggedVal*) and the other is a concrete type.
 /// True iff `ty` is a `Scalar | Null` union that codegen represents as a flat `{ i1, i64 }` value
-/// (VA.1 CPR) rather than a boxed `TaggedVal*`. Mirrors codegen's `flat_union_scalar_type` /
-/// `is_flat_union_scalar` EXACTLY so `type_repr_differs` and the return/sig ABI agree.
+/// rather than a boxed `TaggedVal*`.
 fn is_flat_union_scalar_nullable(ty: &Type) -> bool {
-    let Type::Union(vs) = ty else { return false; };
-    if vs.len() != 2 {
-        return false;
-    }
-    let mut has_null = false;
-    let mut scalars = 0;
-    for v in vs {
-        match v {
-            Type::Null => has_null = true,
-            Type::Bool
-            | Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_)
-            | Type::UInt8 | Type::UInt16 | Type::UInt32
-            | Type::Int64 | Type::UInt64
-            | Type::Float32 | Type::Float64 => scalars += 1,
-            _ => return false,
-        }
-    }
-    has_null && scalars == 1
+    crate::repr::flat_nullable_scalar(ty).is_some()
 }
 
 pub(crate) fn type_repr_differs(from: &Type, to: &Type) -> bool {
@@ -4527,7 +4509,17 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
     }
 
     let init_raw = lower_expr(&args[1], builder, ctx);
-    let init = box_to_json(init_raw, &init_ty, builder);
+    // A sum-eligible init is physically a raw `*SumNode`; the boxed-Json phi (and the closure ABI's
+    // boxed params) need it materialized into a Json box first.
+    let init = if crate::repr::sum_type_eligible(&init_ty) {
+        let boxed = builder.alloc_temp(json.clone());
+        builder.emit(Instruction::Coerce {
+            dst: boxed, src: init_raw, from_ty: init_ty.clone(), to_ty: json.clone(),
+        });
+        boxed
+    } else {
+        box_to_json(init_raw, &init_ty, builder)
+    };
     let f = lower_callback_in_safe_ctx(&args[2], builder, ctx);
 
     // Tag-checked length (0 for a non-array Json) when union. See emit_iterable_len.
@@ -4598,6 +4590,11 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
     // `acc_next` would alias the element box and the phi/exit release already owns it. A flat-scalar
     // element box has no inner, so this degrades to a shell free.
     builder.emit(Instruction::ReleaseIfDistinct { val: elem, other: acc_next });
+    // A sum-typed accumulator's Json box is a fresh materialization owned solely by the phi (the
+    // init box above, then each callback result), so the superseded one is dropped each iteration.
+    if crate::repr::sum_type_eligible(&init_ty) {
+        builder.emit(Instruction::ReleaseIfDistinct { val: acc, other: acc_next });
+    }
     let one = builder.const_temp(Const::Int(1, Type::Int64));
     builder.emit(Instruction::Binary {
         dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
@@ -4605,8 +4602,9 @@ pub(crate) fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut
     builder.terminate(Terminator::Jump(header));
 
     builder.switch_to(exit);
-    // Coerce the Json accumulator back to the declared result type.
-    if is_union_ty(result_type) {
+    // Coerce the Json accumulator back to the declared result type. A sum-eligible union is
+    // physically a `*SumNode`, not a boxed value, so it is projected out of the Json box.
+    if is_union_ty(result_type) && !crate::repr::sum_type_eligible(result_type) {
         acc
     } else {
         let out = builder.alloc_temp(result_type.clone());

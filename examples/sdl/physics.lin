@@ -18,9 +18,9 @@ export type Axis = { "pos": Float64, "vel": Float64 }
 export val reflect1d = (p: Float64, v: Float64, hi: Float64): Axis =>
   val np = p + v
   if np < 0.0 then
-    { "pos": 0.0 - np, "vel": 0.0 - v }
+    { "pos": -np, "vel": -v }
   else if np > hi then
-    { "pos": hi - (np - hi), "vel": 0.0 - v }
+    { "pos": hi - (np - hi), "vel": -v }
   else
     { "pos": np, "vel": v }
 
