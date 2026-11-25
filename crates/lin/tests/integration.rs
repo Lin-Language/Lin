@@ -5964,6 +5964,20 @@ print(toString(range(0, 3).map(x => h(x, 1))))
     assert_eq!(output, vec!["2", "6", "3", "4", "[1, 2, 3]"]);
 }
 
+// `flatMap(k => [[k, v], ...]).fromEntries()` forms tuple pairs: the expected `{ String: T }`
+// solves `fromEntries`' `T`, which reaches the flatMap callback as an array-of-tuples return.
+#[test]
+fn test_flatmap_pairs_into_from_entries() {
+    let output = run(r#"import { print } from "std/io"
+import { flatMap } from "std/iter"
+import { keys, fromEntries } from "std/object"
+val m: { String: Int32 } = { "a": 1, "b": 2 }
+val d: { String: Int32 } = m.keys().flatMap(k => [[k, 5], ["${k}2", 6]]).fromEntries()
+print(d)
+"#);
+    assert_eq!(output, vec![r#"{"a": 5, "a2": 6, "b": 5, "b2": 6}"#]);
+}
+
 // Arity mismatch against a fixed-length array type is a compile-time error.
 #[test]
 fn test_fixed_length_array_arity_mismatch() {
