@@ -1,0 +1,81 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { push } from "std/array"
+import { frozen } from "std/async"
+
+type Pt = { "x": Int32, "y": Int32 }
+
+// Build a pointer-backed record array with push, then frozen() (repacks it to inline records),
+// then read fields back — they must stay correct after the in-place repack.
+val buildAndFreeze = (): Pt[] =>
+  val points: Pt[] = []
+  points.push({ "x": 1, "y": 2 })
+  points.push({ "x": 3, "y": 4 })
+  points.push({ "x": 5, "y": 6 })
+  frozen(points)
+
+// Regression: a record with INT-KEYED map fields (a GTFS-style calendar: `dates`/`days` keyed by
+// integer DateNumber / day-of-week) must freeze without crashing. freeze_map used to treat every
+// map key as a `LinString*`, so an integer key (e.g. a DateNumber like 20250902) was dereferenced
+// as a string pointer → segfault.
+type Service = { "startDate": UInt32, "days": { Int32: Boolean }, "dates": { UInt32: Boolean } }
+
+val buildServiceFrozen = (): Service[] =>
+  val services: Service[] = []
+  services.push({
+    "startDate": 20250519u32,
+    "days": {
+      0: true,
+      1: false,
+      2: true
+    },
+    "dates": { 20250902u32: false, 20251225u32: true }
+  })
+  frozen(services)
+
+// Regression: the SAME record shared by two live arrays. freeze's repack frees each element's
+// struct shell after copying it inline — but a shared shell is still referenced by the other
+// array, so freeing it was a use-after-free → heap corruption. freeze now repacks only when the
+// array exclusively owns its shells (rc == 1) and otherwise immortalises in place.
+val sharedPt: Pt = { "x": 7, "y": 8 }
+
+val buildSharedFrozen = (): Pt[] =>
+  val points: Pt[] = []
+  points.push(sharedPt)
+  frozen(points)
+
+val readOtherShared = (): Pt[] =>
+  val points: Pt[] = []
+  points.push(sharedPt)
+  points
+
+val s = suite("freeze", [
+  test("freeze repacks record arrays to inline; every field reads back correctly", () => [
+    expect(buildAndFreeze()).toBe([{ "x": 1, "y": 2 }, { "x": 3, "y": 4 }, { "x": 5, "y": 6 }])
+  ]),
+
+  test("sum across the frozen array", () =>
+    val points = buildAndFreeze()
+    [
+      expect(points[0]["x"] + points[1]["y"] + points[2]["x"]).toBe(10)
+    ]
+  ),
+
+  test("freeze of records with int-keyed map fields does not crash", () =>
+    val services = buildServiceFrozen()
+    [
+      expect(services[0]["startDate"]).toBe(20250519u32),
+      expect(services[0]["days"][2]).toBe(true),
+      expect(services[0]["dates"][20250902u32]).toBe(false)
+    ]
+  ),
+
+  test("freeze of an array sharing a record with another live array (no use-after-free)", () =>
+    val frozenPoints = buildSharedFrozen()
+    val livePoints = readOtherShared()
+    [
+      expect(frozenPoints[0]).toBe({ "x": 7, "y": 8 }),
+      expect(livePoints[0]).toBe({ "x": 7, "y": 8 })
+    ]
+  )
+])
+run(s)

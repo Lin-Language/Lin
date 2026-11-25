@@ -61,7 +61,7 @@ jobs:
         if: runner.os == 'Linux'
         # `lin-manually-typed` is a work-in-progress hand-port that is not yet valid
         # Lin; exclude it from the fmt gate until it parses.
-        run: cargo run -p lin -- fmt --check stdlib/ examples/ benchmarks/ docs-site/builder/ --exclude '**/lin-manually-typed/**'
+        run: cargo run -p lin -- fmt --check stdlib/ examples/ crates/lin/tests/ benchmarks/ docs-site/builder/ --exclude '**/lin-manually-typed/**'
 
       - name: Test
         run: cargo test --workspace
@@ -104,7 +104,7 @@ jobs:
         # surfacing later as a multi-minute ASan/lldb bisect. (docs/COMPILER_COHERENCE.md Phase 0.)
         env:
           LIN_VERIFY_RC: strict
-        run: cargo run -p lin --quiet -- test stdlib/ examples/ --timeout 120
+        run: cargo run -p lin --quiet -- test stdlib/ examples/ crates/lin/tests/ --timeout 120
 
       - name: Run RAPTOR benchmark unit tests
         # Run from repo root so gtfs-loader.test.lin resolves its fixture path correctly.
@@ -193,7 +193,7 @@ jobs:
           # multi-module programs (calc/report/config/raspberry-controller/…) whose map/filter/
           # reduce, flat-array, projection, and closure usage is the strongest RC/UAF guard.
           # `lin build` bundles a test's relative-import modules into one linkable .ll.
-          for f in stdlib/*.test.lin examples/*/*.test.lin; do
+          for f in stdlib/*.test.lin examples/*/*.test.lin crates/lin/tests/*/*.test.lin; do
             echo "==> $f"
             cargo run -p lin --quiet -- build "$f" -o /tmp/asan_test || { echo "BUILD FAIL $f"; fail=1; continue; }
             # The sdl FFI suites (mathffi/agent) call into a committed C archive (clib/libmathlib.a),
