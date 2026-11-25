@@ -2099,7 +2099,7 @@ impl Checker {
     pub(crate) fn infer_object(&mut self, fields: &[ObjectField], span: Span) -> Result<TypedExpr, Diagnostic> {
         // Detect whether this is an integer-keyed map literal (§5.1.1).
         // A bare integer literal key (`1:`, `-1:`, `42:`) unambiguously signals `{ Int: T }`.
-        // Negative literals arrive as BinaryOp(0 - v) from the parser's Minus prefix rule.
+        // Negative literals arrive as UnaryOp(Neg, v).
         let first_int_key = fields.iter().find_map(|f| {
             if let ObjectField::Pair(k, _) = f { extract_int_key(k) } else { None }
         });
@@ -3203,19 +3203,15 @@ pub(crate) fn type_mentions_generic_tv(ty: &Type) -> bool {
 }
 
 /// Extract a compile-time i64 from an integer-literal key expression.
-/// Accepts bare `IntLit(v)` and the parser's negation encoding `BinaryOp(0 - v)` so that
+/// Accepts bare `IntLit(v)` and the negation form `UnaryOp(Neg, v)` so that
 /// `{ -1: … }` is recognised as key `-1` (§5.1.1 disambiguation rule).
 fn extract_int_key(expr: &Expr) -> Option<i64> {
     match expr {
         Expr::IntLit(v, _, _) => Some(*v),
-        Expr::BinaryOp { op: BinOp::Sub, left, right, .. } => {
-            // Parser lowers `-N` as `0 - N`; both sides must be literal integers.
-            if let (Expr::IntLit(0, None, _), Expr::IntLit(v, _, _)) = (left.as_ref(), right.as_ref()) {
-                Some(-v)
-            } else {
-                None
-            }
-        }
+        Expr::UnaryOp { op: lin_parse::ast::UnaryOp::Neg, operand, .. } => match operand.as_ref() {
+            Expr::IntLit(v, _, _) => Some(-v),
+            _ => None,
+        },
         _ => None,
     }
 }

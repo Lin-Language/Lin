@@ -301,6 +301,49 @@ print(toString(m))
 }
 
 #[test]
+fn test_unary_negation_numeric_types() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a: Int32 = 5
+val b: Int64 = 7
+val c: Float64 = 2.5
+val d: Int8 = 3
+val e: Float32 = 1.5
+print(toString(-a))
+print(toString(-b))
+print(toString(-c))
+print(toString(-d))
+print(toString(-e))
+print(toString(-(a + 1)))
+print(toString(-(-a)))
+print(toString(2 * -a))
+print(toString(a - -a))
+"#);
+    assert_eq!(output, vec!["-5", "-7", "-2.5", "-3", "-1.5", "-6", "5", "-10", "10"]);
+}
+
+#[test]
+fn test_unary_negation_in_generic_function() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val flip = (x: Number) => -x
+print(toString(flip(4)))
+print(toString(flip(1.5)))
+"#);
+    assert_eq!(output, vec!["-4", "-1.5"]);
+}
+
+#[test]
+fn test_unary_negation_of_string_is_error() {
+    let err = run_expect_err(r#"val s = "a"
+val t = -s
+"#);
+    assert!(!err.is_empty());
+}
+
+#[test]
 fn test_tuple_in_union_map_slot_roundtrips() {
     // Regression: an all-scalar tuple stored as a value in a union-typed map slot must round-trip
     // intact. The literal `[a, b, c, d]` was inferred as a homogeneous `Int64[]` (elements widened
