@@ -5945,6 +5945,25 @@ print(a[1])
     assert!(result.contains("Float64[]"), "expected a type error, got: {result}");
 }
 
+// A suffixless integer literal argument checks against a parameter typed as a closed union of
+// integer literals in every call position: direct, dot-call, nested and inside a lambda.
+#[test]
+fn test_int_literal_arg_against_literal_union_param() {
+    let output = run(r#"import { print } from "std/io"
+import { map, range, reduce } from "std/iter"
+import { toString } from "std/string"
+type Op = 0 | 1 | 2
+val f = (o: Op, n: Int32): Int32 => n + 1
+val h = (n: Int32, o: Op): Int32 => n + 1
+print(toString(f(0, 1)))
+print(toString(5.h(2)))
+print(toString(h(h(1, 2), 1)))
+print(toString(range(1, 5).reduce(0, (acc, _) => f(0, acc))))
+print(toString(range(0, 3).map(x => h(x, 1))))
+"#);
+    assert_eq!(output, vec!["2", "6", "3", "4", "[1, 2, 3]"]);
+}
+
 // Arity mismatch against a fixed-length array type is a compile-time error.
 #[test]
 fn test_fixed_length_array_arity_mismatch() {
