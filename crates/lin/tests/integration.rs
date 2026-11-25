@@ -25300,3 +25300,63 @@ print("t6=${t6(tenth).toString()} t6b=${t6b(half).toString()} t7a=${t7(44).toStr
         ]
     );
 }
+
+// A recursive sum type folded through `reduce` as the accumulator. The generic boxed-accumulator
+// path must materialize the raw `*SumNode` init into a Json box (and project the result back), the
+// closure wrapper must release the node it projects for the callback, and a pure-IntLit-union
+// field (`op: Op`, an inline i32 slot) must be stored/loaded as i32 across materialize/project.
+#[test]
+fn test_reduce_recursive_sum_type_accumulator() {
+    let out = run(r#"
+import { print } from "std/io"
+import { range, reduce } from "std/iter"
+type Op = 0 | 1 | 2
+val ZERO: Op = 0
+type Num = { "kind": "num", "value": Int32 }
+type Bin = { "kind": "op", "op": Op, "left": Expr, "right": Expr }
+type Expr = Num | Bin
+val num = (v: Int32): Expr => { "kind": "num", "value": v }
+val bin = (o: Op, l: Expr, r: Expr): Expr => { "kind": "op", "op": o, "left": l, "right": r }
+val ev = (e: Expr): Int32 =>
+  match e
+    is Num => e["value"]
+    is Bin => ev(e["left"]) + ev(e["right"])
+val t = range(1, 5).reduce(num(1), (acc, _) => bin(ZERO, acc, num(1)))
+print(ev(t))
+val deep = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].reduce(num(1), (acc, _) => bin(ZERO, acc, num(1)))
+print(ev(deep))
+"#);
+    assert_eq!(out, vec!["5", "13"]);
+}
+
+// A discriminated sum read back from a `{ String: Expr }` map is `Expr | Null`; after the
+// `is Null` arm the `else` arm passes it to a sum-typed parameter, which must project the boxed
+// read rather than treat the box as a node.
+#[test]
+fn test_sum_type_map_read_narrowed_by_null_arm() {
+    let out = run(r#"
+import { print } from "std/io"
+type Num = { "kind": "num", "value": Int32 }
+type Bin = { "kind": "op", "left": Expr, "right": Expr }
+type Expr = Num | Bin
+val num = (v: Int32): Expr => { "kind": "num", "value": v }
+val bin = (l: Expr, r: Expr): Expr => { "kind": "op", "left": l, "right": r }
+val ev = (e: Expr): Int32 =>
+  match e
+    is Num => e["value"]
+    is Bin => ev(e["left"]) + ev(e["right"])
+var m: { String: Expr } = {}
+m["a"] = bin(num(3), num(4))
+val missing = m["b"]
+val r1 = match missing
+  is Null => -1
+  else => ev(missing)
+val present = m["a"]
+val r2 = match present
+  is Null => -1
+  else => ev(present)
+print(r1)
+print(r2)
+"#);
+    assert_eq!(out, vec!["-1", "7"]);
+}
