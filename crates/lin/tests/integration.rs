@@ -5916,6 +5916,88 @@ print(widened[0])
     assert_eq!(output, vec!["age", "42", "20", "3.5", "2", "age"]);
 }
 
+// The declared tuple return type is pushed into `if`/`match` branches, so array literals there
+// form the tuple instead of inferring a homogeneous `Float64[]`.
+#[test]
+fn test_tuple_return_type_pushed_into_if_and_match_branches() {
+    let output = run(r#"import { print } from "std/io"
+val pick = (b: Boolean): [Float64, Float64] =>
+  if b then [1.0, 2.0] else [3.0, 4.0]
+print(pick(true)[0])
+val m = (k: Int32): [Float64, Float64] =>
+  match k
+    is 1 => [1.0, 0.5]
+    else => [0.0, 0.0]
+print(m(1)[1])
+"#);
+    assert_eq!(output, vec!["1.0", "0.5"]);
+}
+
+// A tuple and a packed numeric array have different representations, so sharing one value
+// between them misread the elements. It is now a type error.
+#[test]
+fn test_tuple_not_assignable_to_flat_numeric_array() {
+    let result = run_expect_err(r#"import { print } from "std/io"
+val mk = (): [Float64, Float64] => [1.5, 2.5]
+val a: Float64[] = mk()
+print(a[1])
+"#);
+    assert!(result.contains("Float64[]"), "expected a type error, got: {result}");
+}
+
+// A suffixless integer literal argument checks against a parameter typed as a closed union of
+// integer literals in every call position: direct, dot-call, nested and inside a lambda.
+#[test]
+fn test_int_literal_arg_against_literal_union_param() {
+    let output = run(r#"import { print } from "std/io"
+import { map, range, reduce } from "std/iter"
+import { toString } from "std/string"
+type Op = 0 | 1 | 2
+val f = (o: Op, n: Int32): Int32 => n + 1
+val h = (n: Int32, o: Op): Int32 => n + 1
+print(toString(f(0, 1)))
+print(toString(5.h(2)))
+print(toString(h(h(1, 2), 1)))
+print(toString(range(1, 5).reduce(0, (acc, _) => f(0, acc))))
+print(toString(range(0, 3).map(x => h(x, 1))))
+"#);
+    assert_eq!(output, vec!["2", "6", "3", "4", "[1, 2, 3]"]);
+}
+
+// `flatMap(k => [[k, v], ...]).fromEntries()` forms tuple pairs: the expected `{ String: T }`
+// solves `fromEntries`' `T`, which reaches the flatMap callback as an array-of-tuples return.
+#[test]
+fn test_flatmap_pairs_into_from_entries() {
+    let output = run(r#"import { print } from "std/io"
+import { flatMap } from "std/iter"
+import { keys, fromEntries } from "std/object"
+val m: { String: Int32 } = { "a": 1, "b": 2 }
+val d: { String: Int32 } = m.keys().flatMap(k => [[k, 5], ["${k}2", 6]]).fromEntries()
+print(d)
+"#);
+    assert_eq!(output, vec![r#"{"a": 5, "a2": 6, "b": 5, "b2": 6}"#]);
+}
+
+// An `if` checked against a structured expected type narrows a union binding through a compound
+// (`||`) null test in the else branch, the same as an inferred `if`.
+#[test]
+fn test_expected_type_if_applies_compound_null_narrowing() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type P = { "x": Int32 }
+val mk = (k: Int32): P => { "x": k }
+val pair = (k: Int32): [Int32, Int32] => [k, k]
+val f = (key: Int32 | Null): [Int32, Int32] =>
+  if key == null || key == 5 then [0, 0] else pair(key)
+val g = (key: Int32 | Null): P =>
+  if key == null || key == 5 then { "x": 0 } else mk(key)
+print(toString(f(3)[1]))
+print(toString(g(4)["x"]))
+print(toString(g(null)["x"]))
+"#);
+    assert_eq!(output, vec!["3", "4", "0"]);
+}
+
 // Arity mismatch against a fixed-length array type is a compile-time error.
 #[test]
 fn test_fixed_length_array_arity_mismatch() {

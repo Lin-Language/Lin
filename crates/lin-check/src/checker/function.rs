@@ -117,13 +117,19 @@ impl Checker {
     /// (ADR-085). Restricted to a TUPLE (`FixedArray`) shape with NO remaining generic type var:
     /// that is precisely the case the bottom-up path mis-infers (a 2+-element array literal unions
     /// to `(A|B)[]` instead of forming a tuple), and it covers the nested-tuple-into-`fromEntries`
-    /// chain (`.map(stop => [stop, v])`). Every OTHER expected return (a free generic `U`, a bare
+    /// chain (`.map(stop => [stop, v])`). An ARRAY of tuples is included for the same reason, so a
+    /// `flatMap(k => [[k, v]])` body forms tuple pairs. Every OTHER expected return (a free generic `U`, a bare
     /// scalar, an array/map/record) keeps plain bottom-up inference, so ordinary callbacks — whose
     /// return is solved FROM the body — are completely unaffected. The Json wildcard is excluded by
     /// the `contains_type_var` guard (it counts `u32::MAX`), keeping a heterogeneous `Json` tuple
     /// hint from forcing a strict shape.
     fn expected_ret_drives_body(expected_ret: &Type) -> bool {
-        matches!(expected_ret, Type::FixedArray(_)) && !expected_ret.contains_type_var()
+        let tuple_shaped = match expected_ret {
+            Type::FixedArray(_) => true,
+            Type::Array(elem) => matches!(**elem, Type::FixedArray(_)),
+            _ => false,
+        };
+        tuple_shaped && !expected_ret.contains_type_var()
     }
 
     /// Phase 4.5b: the binding name of an INTERMEDIATE `lin_array_allocate` builder body — the

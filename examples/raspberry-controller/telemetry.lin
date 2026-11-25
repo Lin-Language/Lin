@@ -99,7 +99,7 @@ val u16At = (bytes: Int32[], off: Int32): Int32 =>
   (bytes[off] << 8) | bytes[off + 1]
 
 // Decode the [leftDuty, rightDuty] pair from tag-2's 4 value bytes.
-val motorsField = (fields: Field[]): Int32[] =>
+val motorsField = (fields: Field[]): [Int32, Int32] =>
   val bytes = fieldFor(fields, TAG_MOTORS)
   match bytes
     is Null => [0, 0]

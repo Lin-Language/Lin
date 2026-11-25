@@ -32,7 +32,7 @@ export val clampSpeed = (v: Float64): Float64 =>
 
 // Apply one keypress to the [left, right] speed pair, returning the new pair.
 // Any other key leaves the speeds unchanged.
-export val applyKey = (key: Int32, left: Float64, right: Float64): Float64[] =>
+export val applyKey = (key: Int32, left: Float64, right: Float64): [Float64, Float64] =>
   match key
     is Int32 when key == KEY_LEFT_UP => [clampSpeed(left + STEP), right]
     is Int32 when key == KEY_LEFT_DOWN => [clampSpeed(left - STEP), right]
