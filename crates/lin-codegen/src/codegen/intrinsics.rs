@@ -383,7 +383,8 @@ impl<'ctx> Codegen<'ctx> {
             }
             Intrinsic::StringBuildN => {
                 // lin_string_build_n(parts: *const *const LinString, n: u32) -> *mut LinString
-                // Stack-allocate a [ptr; N] array, store each part, pass its address + count.
+                // Entry-block [ptr; N] scratch (reused per iteration, never grown in loops), store each
+                // part, pass its address + count.
                 let n = args.len() as u32;
                 if n == 0 {
                     // Empty interpolation: produce an empty string literal.
@@ -394,7 +395,7 @@ impl<'ctx> Codegen<'ctx> {
                         .try_as_basic_value().unwrap_basic()
                 } else {
                     let arr_ty = ptr_ty.array_type(n);
-                    let slot = self.builder.alloca(arr_ty, "bldn_parts");
+                    let slot = self.entry_alloca(arr_ty, "bldn_parts");
                     for (i, &part) in args.iter().enumerate() {
                         // GEP: index into arr_ty at element i.
                         let elem_ptr = unsafe {
