@@ -414,7 +414,11 @@ val s = suite("std/array", [
   ),
 
   test("unique dedupes named record arrays structurally", () =>
-    val rs: UniqueRec[] = [{ "name": "a", "score": 1 }, { "name": "a", "score": 1 }, { "name": "b", "score": 2 }]
+    val rs: UniqueRec[] = [
+      { "name": "a", "score": 1 },
+      { "name": "a", "score": 1 },
+      { "name": "b", "score": 2 }
+    ]
     val result = rs.unique()
     [
       expect(result.length()).toBe(2),
