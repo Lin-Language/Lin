@@ -145,7 +145,14 @@ val s = suite("flat map reads", [
 
   test("count-into-a-map idiom", () =>
     var counts: { String: Int32 } = {}
-    val words = ["a", "b", "a", "c", "a", "b"]
+    val words = [
+      "a",
+      "b",
+      "a",
+      "c",
+      "a",
+      "b"
+    ]
     words.for(w => counts[w] = (counts[w] ?? 0) + 1)
     [
       expect(counts["a"] ?? 0).toBe(3),

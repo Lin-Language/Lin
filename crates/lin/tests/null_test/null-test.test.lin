@@ -15,17 +15,26 @@ val maybeRec = (i: Int32): Rec | Null => if i % 2 == 0 then null else { "a": i, 
 val maybeArr = (i: Int32): Int32[] | Null => if i % 2 == 0 then null else [i, i]
 val maybeStrArr = (i: Int32): String[] | Null => if i % 2 == 0 then null else ["x", "y"]
 val maybeShape = (i: Int32): Shape | Null =>
-  if i % 3 == 0 then null
-  else if i % 3 == 1 then { "r": 1.5 }
-  else { "side": 2.0 }
+  if i % 3 == 0 then
+    null
+  else if i % 3 == 1 then
+    { "r": 1.5 }
+  else
+    { "side": 2.0 }
 val mixed = (i: Int32): Int32 | String | Null =>
-  if i % 3 == 0 then null
-  else if i % 3 == 1 then i
-  else "str"
+  if i % 3 == 0 then
+    null
+  else if i % 3 == 1 then
+    i
+  else
+    "str"
 val mixedRec = (i: Int32): Rec | Int32 | Null =>
-  if i % 3 == 0 then null
-  else if i % 3 == 1 then { "a": i, "b": "m" }
-  else i
+  if i % 3 == 0 then
+    null
+  else if i % 3 == 1 then
+    { "a": i, "b": "m" }
+  else
+    i
 val any = (i: Int32): AnyVal => if i % 2 == 0 then null else { "k": i }
 val anyScalar = (i: Int32): AnyVal => if i % 2 == 0 then null else i
 
