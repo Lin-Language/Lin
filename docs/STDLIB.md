@@ -67,6 +67,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`join`](#join) | `(String[], String) -> String` | Join array of strings with separator |
 | [`lastIndexOf`](#lastIndexOf) | `(String, String, Int32 = length(s)) -> Int32` | Last occurrence of needle starting at/before `fromIndex`, or -1 |
 | [`length`](#length-string) | `(String) -> Int32` | Codepoint count |
+| [`lengthBytes`](#lengthBytes) | `(String) -> Int32` | UTF-8 byte count, O(1) |
 | [`lines`](#lines-string) | `(String) -> String[]` | Split a string into lines |
 | [`padEnd`](#padEnd) | `(String, Int32, String = " ") -> String` | Pad to width on the right (pad defaults to a space) |
 | [`padStart`](#padStart) | `(String, Int32, String = " ") -> String` | Pad to width on the left (pad defaults to a space) |
@@ -75,6 +76,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`replaceAll`](#replaceAll) | `(String, String, String) -> String` | Replace all occurrences |
 | [`split`](#split) | `(String, String) -> String[]` | Split by delimiter |
 | [`startsWith`](#startsWith) | `(String, String) -> Boolean` | Test whether string begins with prefix |
+| [`substringBytes`](#substringBytes) | `(String, Int32, Int32) -> String` | Extract a slice by UTF-8 byte offsets |
 | [`substring`](#substring) | `(String, Int32, Int32 = length(s)) -> String` | Extract a slice by codepoint indices |
 | [`toLower`](#toLower) | `(String) -> String` | Convert to lowercase |
 | [`toString`](#toString) | `(AnyVal) -> String` | Convert any value to its string representation |
@@ -523,13 +525,26 @@ codePointAt("hi", -1)    // 105   (i)
 
 ---
 
+### lengthBytes
+
+```txt
+val lengthBytes: (s: String) -> Int32
+```
+
+Returns the number of UTF-8 **bytes** in `s`, in O(1). This is the byte-view companion to [`byteAt`](#byteAt): loop `0..lengthBytes(s)` when scanning with `byteAt`. [`length`](#length-string) counts codepoints (O(n)), so for non-ASCII text `lengthBytes(s) > length(s)`.
+
+```lin
+lengthBytes("café")   // 5
+length("café")        // 4
+```
+
 ### byteAt
 
 ```txt
 val byteAt: (s: String, index: Int32) -> Int32
 ```
 
-Returns the raw UTF-8 **byte** (`0..255`) at byte-index `index`, or `-1` if the index is negative or out of range. Unlike [`codePointAt`](#codePointAt) this is **O(1)** — a direct indexed load — so scanning a whole string (`0..length(s)`) is O(n) rather than O(n²). For pure-ASCII text `byteAt(s, i) == codePointAt(s, i)`; for multi-byte UTF-8 it exposes the individual encoding bytes. Use it for tokenizers, parsers, and other byte-level string scanning written in Lin.
+Returns the raw UTF-8 **byte** (`0..255`) at byte-index `index`, or `-1` if the index is negative or out of range. Unlike [`codePointAt`](#codePointAt) this is **O(1)** — a direct indexed load — so scanning a whole string (`0..lengthBytes(s)`) is O(n) rather than O(n²). For pure-ASCII text `byteAt(s, i) == codePointAt(s, i)`; for multi-byte UTF-8 it exposes the individual encoding bytes. Use it for tokenizers, parsers, and other byte-level string scanning written in Lin.
 
 Unlike [`at`](#at) and [`codePointAt`](#codePointAt), `byteAt` does **not** support negative indexing from the end: it is a raw byte primitive (a negative index simply returns `-1`). Negative-from-end indexing belongs on the codepoint/element accessors, not the byte primitive.
 
@@ -809,6 +824,20 @@ substring("hello", 2)       // "llo"    (omitted end defaults to length)
 substring("hello", 0, -1)   // "hell"   (strip last character)
 substring("hello", 1, -1)   // "ell"
 substring("hello", -3, -1)  // "ll"
+```
+
+---
+
+### substringBytes
+
+```txt
+val substringBytes: (s: String, start: Int32, end: Int32) -> String
+```
+
+Returns the slice of `s` covering UTF-8 **byte** offsets `[start, end)`: the byte-view companion to [`byteAt`](#byteAt) and [`lengthBytes`](#lengthBytes), for scanners that walk a string with `byteAt`. Negative offsets count from the byte end and out-of-range offsets clamp. Offsets must fall on codepoint boundaries (they do when taken from a `byteAt` scan for ASCII delimiters). Unlike `substring`, `substringBytes` is O(1) plus the copy, and a `substringBytes` result used only as a string-keyed map key is not allocated.
+
+```txt
+substringBytes("café!", 0, 5)   // "café"   (é is two bytes)
 ```
 
 ---

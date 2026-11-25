@@ -14,7 +14,7 @@
 // (state = state*16807 mod 2147483647, seed 42); every intermediate stays < 2^53 so
 // it is bit-identical across i64 / int64 / Python-int / JS Number.
 import { print } from "std/io"
-import { toString, substring, fromCodePoints } from "std/string"
+import { toString, substringBytes, fromCodePoints } from "std/string"
 import { keys } from "std/object"
 import { set, arrayAllocateFilled } from "std/array"
 import { while, for } from "std/iter"
@@ -48,7 +48,7 @@ while(() =>
   if i >= end then
     false
   else
-    val key = substring(seq, i, i + K)
+    val key = substringBytes(seq, i, i + K)
     val cur = counts[key]
     counts[key] = if cur == null then 1i64 else cur + 1i64
     i = i + 1

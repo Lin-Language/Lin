@@ -13,7 +13,10 @@ import foreign "lin-runtime"
   val lin_string_to_upper: (String) => String
   val lin_string_to_lower: (String) => String
   val lin_string_length: (String) => Int32
+  val lin_string_byte_length: (String) => Int32
   val lin_string_slice: (String, Int32, Int32) => String
+  val lin_string_byte_slice: (String, Int32, Int32) => String
+  val lin_string_find_byte: (String, String) => Int32
   val lin_string_index_of: (String, String) => Int32
   val lin_string_index_of_from: (String, String, Int32) => Int32
   val lin_string_last_index_of_from: (String, String, Int32) => Int32
@@ -82,6 +85,17 @@ val _length = (s: String): Int32 =>
 val _substring = (s: String, start: Int32, end: Int32): String =>
   lin_string_slice(s, start, end)
 
+// Substring by UTF-8 BYTE offsets: the byte-view companion to `byteAt` and `lengthBytes`. Offsets
+// must fall on codepoint boundaries (they do when taken from a `byteAt` scan of ASCII delimiters).
+// Negative offsets count from the byte end; out-of-range offsets clamp.
+// @param s      the source string.
+// @param start  the start byte offset (inclusive).
+// @param end    the end byte offset (exclusive).
+// @returns the bytes of `s` in `[start, end)` as a string.
+// @example substringBytes("café!", 0, 5)   // "café"  (é is two bytes)
+export val substringBytes = (s: String, start: Int32, end: Int32): String =>
+  lin_string_byte_slice(s, start, end)
+
 // Find the first occurrence of `needle` in `s`, searching from `fromIndex`.
 // @param s          the string to search.
 // @param needle     the substring to find.
@@ -114,7 +128,7 @@ export val isBlank = (s: String): Boolean =>
 // @returns `true` if `needle` occurs in `s`, otherwise `false`.
 // @example contains("hello world", "world")   // true
 export val contains = (s: String, needle: String): Boolean =>
-  lin_string_index_of(s, needle) != -1
+  lin_string_find_byte(s, needle) != -1
 
 // Test whether `s` begins with `prefix`.
 // @param s       the string to test.
@@ -222,7 +236,7 @@ export val byteAt = (s: String, index: Int32): Int32 =>
 // @example lengthBytes("AB")    // 2
 // @example lengthBytes("café")  // 5  (é is two UTF-8 bytes; `length` is 4)
 export val lengthBytes = (s: String): Int32 =>
-  lin_string_length(s)
+  lin_string_byte_length(s)
 
 // Build a single-character string from a Unicode code point.
 // @param code  the code point value.

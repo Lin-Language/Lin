@@ -240,7 +240,7 @@ impl<'ctx> RuntimeFns<'ctx> {
     ///
     /// | Function                | Class          | Evidence |
     /// |-------------------------|----------------|---------|
-    /// | lin_string_length       | Reader         | reads (*s).len only — string.rs:379 |
+    /// | lin_string_length       | Reader         | reads the string bytes only (codepoint count) |
     /// | lin_string_eq           | Opaque         | writes (*key).hash via const-ptr cast (get_or_init_hash) — string.rs:164 |
     /// | lin_print               | Opaque         | stdout I/O |
     /// | lin_panic               | Opaque         | exits/panics |

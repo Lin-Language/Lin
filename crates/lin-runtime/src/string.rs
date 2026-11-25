@@ -465,8 +465,18 @@ pub unsafe extern "C" fn lin_string_build_n(parts: *const *const LinString, n: u
     ptr
 }
 
+/// Number of Unicode codepoints in `s`: counts every byte that is not a UTF-8 continuation byte.
+/// A branch-free byte scan that the compiler vectorizes; use `lin_string_byte_length` for the O(1)
+/// byte count.
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_length(s: *const LinString) -> i32 {
+    let bytes = std::slice::from_raw_parts((*s).data.as_ptr(), (*s).len as usize);
+    bytes.iter().map(|&b| ((b & 0xC0) != 0x80) as u32).sum::<u32>() as i32
+}
+
+/// Number of UTF-8 bytes in `s`, O(1).
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_byte_length(s: *const LinString) -> i32 {
     (*s).len as i32
 }
 
@@ -485,8 +495,40 @@ pub unsafe extern "C" fn lin_string_eq(a: *const LinString, b: *const LinString)
     a_slice == b_slice
 }
 
+/// Substring by Unicode CODEPOINT indices; negative indices count from the codepoint end.
+/// ASCII strings take a direct byte-offset path.
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_slice(
+    s: *const LinString,
+    start: i32,
+    end: i32,
+) -> *mut LinString {
+    let bytes = std::slice::from_raw_parts((*s).data.as_ptr(), (*s).len as usize);
+    // With non-negative bounds, an ASCII prefix up to `end` means codepoint == byte indices, so
+    // only that prefix needs scanning rather than the whole string.
+    let ascii_prefix = if start >= 0 && end >= 0 {
+        bytes[..(end as usize).min(bytes.len())].is_ascii()
+    } else {
+        bytes.is_ascii()
+    };
+    if ascii_prefix {
+        return lin_string_byte_slice(s, start, end);
+    }
+    let st = (*s).as_str();
+    let n = st.chars().count() as i32;
+    let start = (if start < 0 { start + n } else { start }).clamp(0, n) as usize;
+    let end = (if end < 0 { end + n } else { end }).clamp(0, n) as usize;
+    let end = end.max(start);
+    let byte_of = |cp: usize| st.char_indices().nth(cp).map(|(b, _)| b).unwrap_or(st.len());
+    let b0 = byte_of(start);
+    let b1 = if end == n as usize { st.len() } else { byte_of(end) };
+    lin_string_from_bytes(bytes.as_ptr().add(b0), (b1 - b0) as u32)
+}
+
+/// Substring by UTF-8 BYTE offsets (negative offsets count from the byte end). For byte-oriented
+/// callers that scan with `lin_string_byte_at`; the offsets must fall on codepoint boundaries.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_byte_slice(
     s: *const LinString,
     start: i32,
     end: i32,
@@ -780,12 +822,13 @@ pub unsafe extern "C" fn lin_string_to_lower(s: *const LinString) -> *mut LinStr
     lin_string_from_bytes(lower.as_ptr(), lower.len() as u32)
 }
 
+/// Codepoint index of the first occurrence of `needle` in `s`, or -1.
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_index_of(s: *const LinString, needle: *const LinString) -> i32 {
     let st = (*s).as_str();
     let nd = (*needle).as_str();
     match st.find(nd) {
-        Some(i) => i as i32,
+        Some(i) => byte_to_cp(st, i),
         None => -1,
     }
 }
@@ -795,36 +838,55 @@ pub unsafe extern "C" fn lin_string_last_index_of(s: *const LinString, needle: *
     let st = (*s).as_str();
     let nd = (*needle).as_str();
     match st.rfind(nd) {
-        Some(byte_pos) => st[..byte_pos].chars().count() as i32,
+        Some(byte_pos) => byte_to_cp(st, byte_pos),
         None => -1,
     }
 }
 
-/// Index of first occurrence of `needle` at or after byte index `from`. -1 if none.
-/// Returns a BYTE offset (consistent with `lin_string_index_of`).
+/// Byte offset of the first occurrence of `needle` in `s`, or -1. O(1) extra work over the search,
+/// for callers that only test presence or work in bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_find_byte(s: *const LinString, needle: *const LinString) -> i32 {
+    match (*s).as_str().find((*needle).as_str()) {
+        Some(i) => i as i32,
+        None => -1,
+    }
+}
+
+/// Codepoint index of `byte_pos` within `st` (`byte_pos` must be a char boundary).
+fn byte_to_cp(st: &str, byte_pos: usize) -> i32 {
+    if st.as_bytes()[..byte_pos].is_ascii() { byte_pos as i32 } else { st[..byte_pos].chars().count() as i32 }
+}
+
+/// Byte offset of codepoint index `cp` in `st`, or `st.len()` if past the end.
+fn cp_to_byte(st: &str, cp: usize) -> usize {
+    if st.as_bytes()[..cp.min(st.len())].is_ascii() { cp.min(st.len()) } else { st.char_indices().nth(cp).map(|(b, _)| b).unwrap_or(st.len()) }
+}
+
+/// Codepoint index of first occurrence of `needle` at or after codepoint index `from`. -1 if none.
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_index_of_from(s: *const LinString, needle: *const LinString, from: i32) -> i32 {
     let st = (*s).as_str();
     let nd = (*needle).as_str();
-    let from = from.max(0) as usize;
-    if from > st.len() { return -1; }
-    match st[from..].find(nd) {
-        Some(i) => (from + i) as i32,
+    let from_byte = cp_to_byte(st, from.max(0) as usize);
+    match st[from_byte..].find(nd) {
+        Some(i) => byte_to_cp(st, from_byte + i),
         None => -1,
     }
 }
 
-/// Index of last occurrence of `needle` whose start is at or before byte index `before`. -1 if none.
-/// Returns a CODEPOINT count (consistent with `lin_string_last_index_of`).
+/// Codepoint index of last occurrence of `needle` whose start is at or before codepoint index
+/// `before`. -1 if none.
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_last_index_of_from(s: *const LinString, needle: *const LinString, before: i32) -> i32 {
     let st = (*s).as_str();
     let nd = (*needle).as_str();
     if before < 0 { return -1; }
     // A match may START at <= before, so search the prefix ending at before + needle.len().
-    let end = ((before as usize).saturating_add(nd.len())).min(st.len());
+    let mut end = cp_to_byte(st, before as usize).saturating_add(nd.len()).min(st.len());
+    while !st.is_char_boundary(end) { end -= 1; }
     match st[..end].rfind(nd) {
-        Some(byte_pos) => st[..byte_pos].chars().count() as i32,
+        Some(byte_pos) => byte_to_cp(st, byte_pos),
         None => -1,
     }
 }
