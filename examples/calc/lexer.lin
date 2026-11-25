@@ -2,65 +2,72 @@
 //
 // Turns a source string into a flat token array. Each token is a small tagged
 // object: { "kind": "num", "text": "12" } | { "kind": "op", "text": "+" } |
-// { "kind": "lparen" } | { "kind": "rparen" } | { "kind": "bad", "text": "@" }.
-//
-// Lin has no general `while` loop and local `val`s cannot self-recurse (only
-// top-level functions are forward-declared), so the scan is a set of top-level
-// recursive functions threading an index `i` through the source — the idiomatic
-// shape for stateful iteration in Lin. The token accumulator is built fresh and
-// returned out of `tokenize`, which exercises the fresh-arg-escape path.
+// { "kind": "lparen", "text": "(" } | { "kind": "rparen", "text": ")" } |
+// { "kind": "bad", "text": "@" }.
 import { charCode, substring, at } from "std/string"
 import { push, length } from "std/array"
+import { range, find, while } from "std/iter"
 
-// A lexer token. `kind` is the discriminant ("num" | "op" | "lparen" |
-// "rparen" | "bad"); `text` carries the source slice for the kinds that need
-// it (num/op/bad). lparen/rparen omit `text` — structurally still a Token.
-export type Token = { "kind": String, "text": String }
+export type TokenKind = "num" | "op" | "lparen" | "rparen" | "bad"
+export type Token = { "kind": TokenKind, "text": String }
 
-// Character classes (ASCII). charCode gives the codepoint at an index.
+// ASCII code points.
+val TAB = 9
+val NEWLINE = 10
+val CARRIAGE_RETURN = 13
+val SPACE = 32
+val LPAREN = 40
+val RPAREN = 41
+val STAR = 42
+val PLUS = 43
+val MINUS = 45
+val SLASH = 47
+val DIGIT_0 = 48
+val DIGIT_9 = 57
+
 val isDigit = (c: Int32): Boolean =>
-  c >= 48 && c <= 57 // '0'..'9'
+  c >= DIGIT_0 && c <= DIGIT_9
 
 val isSpace = (c: Int32): Boolean =>
-  c == 32 || c == 9 || c == 10 || c == 13
+  c == SPACE || c == TAB || c == NEWLINE || c == CARRIAGE_RETURN
 
-// End index (one past the last digit) of the number run starting at `i`.
-val scanNumberEnd = (src: String, i: Int32, n: Int32): Int32 =>
-  if i < n && isDigit(charCode(src, i)) then
-    scanNumberEnd(src, i + 1, n)
-  else
-    i
+val isOperator = (c: Int32): Boolean =>
+  c == PLUS || c == MINUS || c == STAR || c == SLASH
 
-// Append one token (or skip one space) per step, then recurse on the new index.
-// `tokens` is mutated in place via push and threaded through unchanged.
-val scan = (src: String, i: Int32, n: Int32, tokens: Token[]): Token[] =>
-  if i >= n then
-    tokens
+// End index (one past the last digit) of the number run starting at `start`.
+val numberEnd = (src: String, start: Int32): Int32 =>
+  range(start, src.length()).find(j => !isDigit(src.charCode(j))) ?? src.length()
+
+// Lexes the character (or number run) at `i`, appending any token to `tokens`,
+// and returns the index of the next unread character.
+val lexAt = (src: String, i: Int32, tokens: Token[]): Int32 =>
+  val c = src.charCode(i)
+  if isSpace(c) then
+    i + 1
+  else if isDigit(c) then
+    val end = numberEnd(src, i)
+    tokens.push({ "kind": "num", "text": src.substring(i, end) })
+    end
   else
-    val c = charCode(src, i)
-    if isSpace(c) then
-      scan(src, i + 1, n, tokens)
-    else if isDigit(c) then
-      val end = scanNumberEnd(src, i, n)
-      push(tokens, { "kind": "num", "text": src.substring(i, end) })
-      scan(src, end, n, tokens)
-    else if c == 40 then
-      // '('
-      push(tokens, { "kind": "lparen", "text": "(" })
-      scan(src, i + 1, n, tokens)
-    else if c == 41 then
-      // ')'
-      push(tokens, { "kind": "rparen", "text": ")" })
-      scan(src, i + 1, n, tokens)
-    else if c == 43 || c == 45 || c == 42 || c == 47 then
-      // + - * /
-      push(tokens, { "kind": "op", "text": src.at(i) })
-      scan(src, i + 1, n, tokens)
+    val kind: TokenKind = if c == LPAREN then
+      "lparen"
+    else if c == RPAREN then
+      "rparen"
+    else if isOperator(c) then
+      "op"
     else
-      // Unknown character: emit a bad token the parser will reject.
-      push(tokens, { "kind": "bad", "text": src.at(i) })
-      scan(src, i + 1, n, tokens)
+      "bad"
+    tokens.push({ "kind": kind, "text": src.at(i) })
+    i + 1
 
-// Public entry point: source string -> token array.
 export val tokenize = (src: String): Token[] =>
-  src.scan(0, length(src), [])
+  val tokens: Token[] = []
+  var i = 0
+  while(() =>
+    if i < src.length() then
+      i = lexAt(src, i, tokens)
+      true
+    else
+      false
+  )
+  tokens

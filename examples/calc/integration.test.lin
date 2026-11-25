@@ -5,47 +5,42 @@
 // whitespace handling, and the recoverable / parse error paths.
 import { expect, toBe, toSucceed, toFail, toFailWith, test, suite, run } from "std/test"
 import { calc } from "./calc"
+import { Evaluated } from "./eval"
 
-// The value of a successful calc, or a sentinel for a failure, so the happy-path
-// checks read as a single toBe. calc returns the named union Success | Failure,
-// narrowed here by matching the discriminant.
-val valueOf = (src: String): Int32 =>
-  match calc(src)
-    has { "type": "success", value } => value
-    else => -999999
+val succeeded = (v: Int32): Evaluated => { "type": "success", "value": v }
 
 val s = suite("calc-integration", [
   // --- End-to-end evaluation ---
   test("evaluates a single number", () => [
-    expect(valueOf("42")).toBe(42)
+    expect(calc("42")).toBe(succeeded(42))
   ]),
 
   test("respects * over + precedence", () => [
-    expect(valueOf("2 + 3 * 4")).toBe(14)
+    expect(calc("2 + 3 * 4")).toBe(succeeded(14))
   ]),
 
   test("parentheses override precedence", () => [
-    expect(valueOf("(2 + 3) * 4")).toBe(20)
+    expect(calc("(2 + 3) * 4")).toBe(succeeded(20))
   ]),
 
   test("subtraction is left-associative", () => [
-    expect(valueOf("10 - 3 - 2")).toBe(5)
+    expect(calc("10 - 3 - 2")).toBe(succeeded(5))
   ]),
 
   test("division is left-associative", () => [
-    expect(valueOf("100 / 5 / 2")).toBe(10)
+    expect(calc("100 / 5 / 2")).toBe(succeeded(10))
   ]),
 
   test("deeply nested expression", () => [
-    expect(valueOf("2 * (3 + (4 - 1)) * 2")).toBe(24)
+    expect(calc("2 * (3 + (4 - 1)) * 2")).toBe(succeeded(24))
   ]),
 
   test("whitespace is ignored", () => [
-    expect(valueOf("  1+2  *  3 ")).toBe(7)
+    expect(calc("  1+2  *  3 ")).toBe(succeeded(7))
   ]),
 
   test("a chain of additions", () => [
-    expect(valueOf("1 + 2 + 3 + 4 + 5")).toBe(15)
+    expect(calc("1 + 2 + 3 + 4 + 5")).toBe(succeeded(15))
   ]),
 
   test("a valid expression succeeds", () => [

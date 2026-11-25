@@ -14,33 +14,34 @@
 //   { "kind": "binop", "op": "+"|"-"|"*"|"/", "left": <ast>, "right": <ast> }
 import { length } from "std/array"
 import { parseInt32 } from "std/number"
-import { Token } from "./lexer"
+import { Token, TokenKind } from "./lexer"
+import { Failure, Success, fail } from "./result"
+
+export type Operator = "+" | "-" | "*" | "/"
 
 // AST nodes (recursive). `kind` is the discriminant: "num" | "binop".
 export type Num = { "kind": "num", "value": Int32 }
-export type BinOp = { "kind": "binop", "op": String, "left": Ast, "right": Ast }
+export type BinOp = { "kind": "binop", "op": Operator, "left": Ast, "right": Ast }
 export type Ast = Num | BinOp
 
-// Tagged-result shapes. The discriminant field `type` is a string-literal singleton.
-export type Failure = { "type": "failure", "error": String }
-export type ParseSuccess = { "type": "success", "value": Ast }
-export type Parsed = ParseSuccess | Failure
+export type Parsed = Success<Ast> | Failure
 
 // Internal cursor type: carries the parsed sub-tree and the next token index.
 // Step is either a Cursor (progress) or a Failure (parse error).
 type Cursor = { "type": "cursor", "node": Ast, "pos": Int32 }
 type Step = Cursor | Failure
 
-val fail = (msg: String): Failure =>
-  { "type": "failure", "error": msg }
-
-// Token kind at `pos`, or "eof" past the end. `&&`/short-circuit keeps the OOB
-// access from ever evaluating when pos is past the end.
-val kindAt = (tokens: Token[], pos: Int32): String =>
-  if pos >= length(tokens) then
+// Token kind at `pos`, or "eof" past the end.
+val kindAt = (tokens: Token[], pos: Int32): TokenKind | "eof" =>
+  if pos >= tokens.length() then
     "eof"
   else
     tokens[pos]["kind"]
+
+// The binary operator token at `pos` when it is `a` or `b`, else Null.
+val operatorAt = (tokens: Token[], pos: Int32, a: Operator, b: Operator): Operator | Null =>
+  val text = if kindAt(tokens, pos) == "op" then tokens[pos]["text"] else ""
+  if text == a then a else if text == b then b else null
 
 // factor = number | '(' expr ')'
 val parseFactor = (tokens: Token[], pos: Int32): Step =>
@@ -69,33 +70,25 @@ val parseFactor = (tokens: Token[], pos: Int32): Step =>
 
 // term = factor (('*' | '/') factor)*  — left-associative fold over the * / run.
 val parseTermLoop = (tokens: Token[], left: Ast, pos: Int32): Step =>
-  val k = kindAt(tokens, pos)
-  if k != "op" then
+  val op = operatorAt(tokens, pos, "*", "/")
+  if op == null then
     {
       "type": "cursor",
       "node": left,
       "pos": pos
     }
   else
-    val op = tokens[pos]["text"]
-    if op != "*" && op != "/" then
-      {
-        "type": "cursor",
-        "node": left,
-        "pos": pos
-      }
-    else
-      val right = parseFactor(tokens, pos + 1)
-      match right
-        is Failure => right
-        else =>
-          val node: Ast = {
-            "kind": "binop",
-            "op": op,
-            "left": left,
-            "right": right["node"]
-          }
-          parseTermLoop(tokens, node, right["pos"])
+    val right = parseFactor(tokens, pos + 1)
+    match right
+      is Failure => right
+      else =>
+        val node: Ast = {
+          "kind": "binop",
+          "op": op,
+          "left": left,
+          "right": right["node"]
+        }
+        parseTermLoop(tokens, node, right["pos"])
 
 val parseTerm = (tokens: Token[], pos: Int32): Step =>
   val first = parseFactor(tokens, pos)
@@ -105,33 +98,25 @@ val parseTerm = (tokens: Token[], pos: Int32): Step =>
 
 // expr = term (('+' | '-') term)*  — left-associative fold over the + - run.
 val parseExprLoop = (tokens: Token[], left: Ast, pos: Int32): Step =>
-  val k = kindAt(tokens, pos)
-  if k != "op" then
+  val op = operatorAt(tokens, pos, "+", "-")
+  if op == null then
     {
       "type": "cursor",
       "node": left,
       "pos": pos
     }
   else
-    val op = tokens[pos]["text"]
-    if op != "+" && op != "-" then
-      {
-        "type": "cursor",
-        "node": left,
-        "pos": pos
-      }
-    else
-      val right = parseTerm(tokens, pos + 1)
-      match right
-        is Failure => right
-        else =>
-          val node: Ast = {
-            "kind": "binop",
-            "op": op,
-            "left": left,
-            "right": right["node"]
-          }
-          parseExprLoop(tokens, node, right["pos"])
+    val right = parseTerm(tokens, pos + 1)
+    match right
+      is Failure => right
+      else =>
+        val node: Ast = {
+          "kind": "binop",
+          "op": op,
+          "left": left,
+          "right": right["node"]
+        }
+        parseExprLoop(tokens, node, right["pos"])
 
 val parseExpr = (tokens: Token[], pos: Int32): Step =>
   val first = parseTerm(tokens, pos)
@@ -146,7 +131,7 @@ export val parse = (tokens: Token[]): Parsed =>
   match result
     is Failure => result
     else =>
-      if result["pos"] != length(tokens) then
+      if result["pos"] != tokens.length() then
         fail("unexpected trailing input")
       else
         { "type": "success", "value": result["node"] }

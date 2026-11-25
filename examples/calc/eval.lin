@@ -3,14 +3,10 @@
 // Walks the tree produced by the parser, computing an Int32 result. Division by
 // zero is reported as a recoverable failure value (not a trap), so the whole
 // `evaluate` pipeline returns a tagged result the caller pattern-matches on.
-import { Num, BinOp, Ast, Parsed, Failure } from "./parser"
+import { Num, BinOp, Ast, Parsed } from "./parser"
+import { Failure, Success, fail } from "./result"
 
-// Tagged-result shapes. The discriminant field `type` is a string-literal singleton.
-type EvalSuccess = { "type": "success", "value": Int32 }
-type Evaluated = EvalSuccess | Failure
-
-val fail = (msg: String): Failure =>
-  { "type": "failure", "error": msg }
+export type Evaluated = Success<Int32> | Failure
 
 // Evaluate one AST node to either a number wrapped in success, or a failure.
 // The recursive `Ast` union is matched by variant; in the `BinOp` arm
