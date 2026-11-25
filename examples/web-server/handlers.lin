@@ -1,8 +1,7 @@
 import { json, text, badRequest, matchPath, HttpRequest as Request, HttpResponse as Response } from "std/http"
 import { render } from "std/template"
-import { toString } from "std/string"
 import { Config } from "./config"
-import { solve } from "./routing"
+import { solve, RouteFound, RouteNone, RouteError } from "./routing"
 
 // Where the road-network graph lives on disk (relative to the repo root, like the
 // view paths). Factored out so the /route handler and its tests agree on it.
@@ -39,19 +38,19 @@ export val getRoute = (req: Request): Response =>
   if m == null then
     json(404, { "error": "Not Found" })
   else
-    match solve(GRAPH_PATH, m["from"], m["to"])
-      has { "type": "ok", path, distance } =>
+    val result = solve(GRAPH_PATH, m["from"], m["to"])
+    match result
+      is RouteFound =>
         json(200, {
           "from": m["from"],
           "to": m["to"],
-          "path": path,
-          "distance": distance
+          "path": result["path"],
+          "distance": result["distance"]
         })
-      has { "type": "no-path" } =>
+      is RouteNone =>
         json(404, { "error": "no route from ${m["from"]} to ${m["to"]}" })
-      has { "type": "error", message } =>
-        json(500, { "error": "routing unavailable: ${message}" })
-      else => json(500, { "error": "unexpected routing result" })
+      is RouteError =>
+        json(500, { "error": "routing unavailable: ${result["message"]}" })
 
 // GET /users/:id — a small example resource handler.
 export val getUser = (req: Request): Response =>

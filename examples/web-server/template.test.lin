@@ -2,58 +2,54 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { render } from "std/template"
 import { contains } from "std/string"
 
-// `render` returns `String | Error`; unwrap the success arm (a render failure becomes a sentinel
-// that fails the contains-assertions rather than masking a regression).
-val rendered = (r: String | Error): String =>
-  match r
-    is Error => "<render-error>"
-    else => r
+val indexData = {
+  "title": "T",
+  "heading": "H",
+  "status": "ok",
+  "version": "1.0"
+}
+
+// `render` returns `String | Error`; each test either asserts on the page or surfaces the
+// render error as a failed expectation.
+val renderIndex = (): String | Error =>
+  render("examples/web-server/views/index.jinja", indexData)
 
 // Templating coverage (absorbed from the standalone template demo): render the
 // server's HTML view and assert the {{ ... }} holes are filled from the data object.
 // index.jinja `{% extends "base.jinja" %}` and the base `{% include "footer.jinja" %}`,
-// so this also exercises the layout/inheritance loader (ADR-048).
+// so this also exercises the layout/inheritance loader.
 val s = suite("template", [
   test("renders index.jinja filling all holes", () =>
-    val out = rendered(render("examples/web-server/views/index.jinja", {
-      "title": "T",
-      "heading": "H",
-      "status": "ok",
-      "version": "1.0"
-    }))
-    [
-      expect(out.contains("<title>T</title>")).toBe(true),
-      expect(out.contains("<h1>H</h1>")).toBe(true),
-      expect(out.contains("Status: ok")).toBe(true),
-      expect(out.contains("Version: 1.0")).toBe(true)
-    ]
+    val page = renderIndex()
+    match page
+      is Error => [expect(page["message"]).toBe("")]
+      else =>
+        [
+          expect(page.contains("<title>T</title>")).toBe(true),
+          expect(page.contains("<h1>H</h1>")).toBe(true),
+          expect(page.contains("Status: ok")).toBe(true),
+          expect(page.contains("Version: 1.0")).toBe(true)
+        ]
   ),
 
   test("inherits base layout and includes the footer partial", () =>
-    val out = rendered(render("examples/web-server/views/index.jinja", {
-      "title": "T",
-      "heading": "H",
-      "status": "ok",
-      "version": "1.0"
-    }))
-    [
-      // <!DOCTYPE>/<body> come from base.jinja, not index.jinja — proves {% extends %}.
-      expect(out.contains("<!DOCTYPE html>")).toBe(true),
-      // The footer comes from the {% include "footer.jinja" %} partial.
-      expect(out.contains("<footer>Lin Web Server — v1.0</footer>")).toBe(true)
-    ]
+    val page = renderIndex()
+    match page
+      is Error => [expect(page["message"]).toBe("")]
+      else =>
+        [
+          // <!DOCTYPE>/<body> come from base.jinja, not index.jinja — proves {% extends %}.
+          expect(page.contains("<!DOCTYPE html>")).toBe(true),
+          // The footer comes from the {% include "footer.jinja" %} partial.
+          expect(page.contains("<footer>Lin Web Server — v1.0</footer>")).toBe(true)
+        ]
   ),
 
   test("leaves no unfilled {{ }} holes", () =>
-    val out = rendered(render("examples/web-server/views/index.jinja", {
-      "title": "T",
-      "heading": "H",
-      "status": "ok",
-      "version": "1.0"
-    }))
-    [
-      expect(out.contains("{{")).toBe(false)
-    ]
+    val page = renderIndex()
+    match page
+      is Error => [expect(page["message"]).toBe("")]
+      else => [expect(page.contains("{{")).toBe(false)]
   )
 ])
 run(s)

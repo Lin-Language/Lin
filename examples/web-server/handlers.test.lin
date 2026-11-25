@@ -1,12 +1,11 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { contains } from "std/string"
-import { HttpRequest as Request } from "std/http"
 import { render, renderWith } from "std/template"
 import { solve } from "./routing"
 import { getIndex, getStatus, getRoute, getUser } from "./handlers"
-import { Config } from "./config"
+import { testConfig as config, makeReq } from "./fixtures"
 
-// Handler unit tests. `render` is mocked (ADR-046) with an inline template so the
+// Handler unit tests. `render` is mocked with an inline template so the
 // index handler is tested without the on-disk view path (the real index.jinja
 // render is covered in template.test.lin). `solve` is mocked so the /route
 // handler's ok / no-path / error branches are deterministic and disk-free.
@@ -24,22 +23,6 @@ replace solve = (graphPath: String, from: String, to: String): AnyVal =>
       "path": [from, to],
       "distance": 42
     }
-
-val config: Config = {
-  "host": "0.0.0.0",
-  "port": 3000,
-  "debug": false,
-  "name": "Lin Maps"
-}
-
-val makeReq = (path: String): Request =>
-  {
-    "method": "GET",
-    "path": path,
-    "query": "",
-    "headers": {},
-    "body": ""
-  }
 
 val s = suite("handlers", [
   test("getIndex renders the template with the config name in the body", () =>

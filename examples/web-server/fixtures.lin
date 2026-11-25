@@ -1,0 +1,69 @@
+// Shared fixtures for the web-server test suites.
+import { HttpRequest as Request } from "std/http"
+import { Config } from "./config"
+
+export val testConfig: Config = {
+  "host": "0.0.0.0",
+  "port": 3000,
+  "debug": false,
+  "name": "Lin Maps"
+}
+
+export val makeReq = (path: String): Request =>
+  {
+    "method": "GET",
+    "path": path,
+    "query": "",
+    "headers": {},
+    "body": ""
+  }
+
+// A small road network. "F" is listed as a node but has no incoming edges, so it is
+// unreachable from "A" and exercises the no-path branch.
+export val roadGraph = {
+  "nodes": [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F"
+  ],
+  "edges": [
+    {
+      "from": "A",
+      "to": "B",
+      "weight": 10
+    },
+    {
+      "from": "A",
+      "to": "C",
+      "weight": 3
+    },
+    {
+      "from": "C",
+      "to": "B",
+      "weight": 4
+    },
+    {
+      "from": "C",
+      "to": "D",
+      "weight": 8
+    },
+    {
+      "from": "B",
+      "to": "D",
+      "weight": 2
+    },
+    {
+      "from": "D",
+      "to": "E",
+      "weight": 5
+    },
+    {
+      "from": "B",
+      "to": "E",
+      "weight": 11
+    }
+  ]
+}
