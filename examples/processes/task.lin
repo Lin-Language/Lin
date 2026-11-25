@@ -13,8 +13,9 @@ import { map } from "std/iter"
 
 export type Task = { "name": String, "command": String, "args": String[] }
 
-// outcome: "pass" (exit 0) | "fail" (non-zero exit) | "error" (could not launch).
-export type TaskResult = { "name": String, "outcome": String, "status": Int32, "output": String }
+// "pass" (exit 0) | "fail" (non-zero exit) | "error" (could not launch).
+export type Outcome = "pass" | "fail" | "error"
+export type TaskResult = { "name": String, "outcome": Outcome, "status": Int32, "output": String }
 
 // Classify a successfully-launched command by its exit status.
 val classify = (name: String, r: ExecResult): TaskResult =>
@@ -31,7 +32,7 @@ val launchError = (name: String, message: String): TaskResult =>
   {
     "name": name,
     "outcome": "error",
-    "status": 0 - 1,
+    "status": -1,
     "output": message
   }
 
@@ -40,9 +41,8 @@ val launchError = (name: String, message: String): TaskResult =>
 export val runTask = (t: Task): TaskResult =>
   val r = exec(t["command"], t["args"])
   match r
-    has { "type": "error", message } => launchError(t["name"], message)
     is ExecResult => classify(t["name"], r)
-    else => launchError(t["name"], "unknown error")
+    else => launchError(t["name"], r["message"])
 
 export val runAll = (tasks: Task[]): TaskResult[] =>
-  tasks.map(t => runTask(t))
+  tasks.map(runTask)

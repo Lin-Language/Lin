@@ -15,7 +15,12 @@ export type Config = { "maxParallel": Int32, "retries": Int32, "ci": Boolean }
 val intEnv = (name: String, dflt: Int32, min: Int32): Int32 =>
   val raw = getEnv(name)
   match raw
-    is String => if isInt32(raw) && parseInt32(raw) >= min then parseInt32(raw) else dflt
+    is String =>
+      if isInt32(raw) then
+        val n = parseInt32(raw)
+        if n >= min then n else dflt
+      else
+        dflt
     else => dflt
 
 // An env var is "truthy" when set to "1" or "true" (case-sensitive, the usual CI shape).

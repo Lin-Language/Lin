@@ -2,21 +2,21 @@
 //
 // No subprocesses here: this module is pure data → text, so it unit-tests with
 // synthetic TaskResult values (report.test.lin) without spawning anything.
-import { TaskResult } from "./task"
+import { TaskResult, Outcome } from "./task"
 import { length } from "std/array"
 import { filter, map } from "std/iter"
-import { toString, join } from "std/string"
+import { join } from "std/string"
 
 // A run is `ok` only if every task passed; `failed`/`errored` break the rest down so the
 // footer can distinguish a command that ran-and-failed from one that could not launch.
 export type Summary = { "total": Int32, "passed": Int32, "failed": Int32, "errored": Int32, "ok": Boolean }
 
-val countOutcome = (results: TaskResult[], outcome: String): Int32 =>
+val countOutcome = (results: TaskResult[], outcome: Outcome): Int32 =>
   results.filter(r => r["outcome"] == outcome).length()
 
 // Tally results: a run is `ok` only if every task passed.
 export val summarize = (results: TaskResult[]): Summary =>
-  val total = length(results)
+  val total = results.length()
   val passed = countOutcome(results, "pass")
   val errored = countOutcome(results, "error")
   {
@@ -29,16 +29,16 @@ export val summarize = (results: TaskResult[]): Summary =>
 
 // One status line per task, e.g. "  [pass] build (exit 0)".
 val line = (r: TaskResult): String =>
-  "  [${r["outcome"]}] ${r["name"]} (exit ${toString(r["status"])})"
+  "  [${r["outcome"]}] ${r["name"]} (exit ${r["status"]})"
 
 // The one-line footer summarizing a run.
 val footerFor = (s: Summary): String =>
   if s["ok"] then
-    "all ${toString(s["total"])} task(s) passed"
+    "all ${s["total"]} task(s) passed"
   else if s["errored"] > 0 then
-    "${toString(s["failed"])} of ${toString(s["total"])} task(s) failed (${toString(s["errored"])} could not launch)"
+    "${s["failed"]} of ${s["total"]} task(s) failed (${s["errored"]} could not launch)"
   else
-    "${toString(s["failed"])} of ${toString(s["total"])} task(s) failed"
+    "${s["failed"]} of ${s["total"]} task(s) failed"
 
 // Render the full report: a line per task plus a summary footer.
 export val render = (results: TaskResult[]): String =>

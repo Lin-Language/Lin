@@ -52,7 +52,7 @@ val s = suite("outcome combinators", [
   ),
 
   test("andThen can turn success into failure", () =>
-    val r: Result<Int32, String> = ok(0 - 3)
+    val r: Result<Int32, String> = ok(-3)
     val out: Result<Int32, String> = andThen(r, checkPos)
     [
       expect(out.isOk()).toBe(false)
