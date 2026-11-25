@@ -755,3 +755,17 @@ if r is Error then false else lin_regex_is_match(r, "hello")
 "#);
     assert!(result.is_ok(), "Expected Ok for same-opaque Regex after narrowing, got: {:?}", result.err());
 }
+
+/// `is Error` narrows a `R | Error` scrutinee to `Error` inside the arm, so `message` is `String`.
+#[test]
+fn test_is_error_arm_narrows_message_to_string() {
+    let result = parse_and_check(r#"
+type R = { "status": Int32 }
+val f = (b: Boolean): R | Error => if b then { "status": 0 } else { "type": "error", "message": "boom" }
+val r = f(false)
+val s: String = match r
+  is Error => r["message"]
+  else => "ok"
+"#);
+    assert!(result.is_ok(), "expected message to be String in is Error arm: {:?}", result.err());
+}

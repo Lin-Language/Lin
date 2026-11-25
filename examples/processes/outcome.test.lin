@@ -9,22 +9,6 @@ val dbl = (n: Int32): Int32 => n * 2
 val checkPos = (n: Int32): Result<Int32, String> =>
   if n > 0 then ok(n) else err("not positive")
 
-// `mapOk`'s result type parameter `U` is inferred from `dbl`'s return type. The compiler
-// fails to propagate that inference when the call sits inside an inline anonymous thunk
-// argument (see the BUG #4 note in README.md), so these two bodies are defined as named
-// top-level lambdas — where the inference happens in plain statement position and works.
-val mapOkSuccessBody = () =>
-  val r: Result<Int32, String> = ok(21)
-  [
-    expect(mapOk(r, dbl)["value"]).toBe(42)
-  ]
-
-val mapOkFailureBody = () =>
-  val r: Result<Int32, String> = err("e")
-  [
-    expect(mapOk(r, dbl)["error"]).toBe("e")
-  ]
-
 val s = suite("outcome combinators", [
   test("ok / err construct the tagged shapes", () =>
     val good: Result<Int32, String> = ok(1)
@@ -59,9 +43,19 @@ val s = suite("outcome combinators", [
     ]
   ),
 
-  test("mapOk transforms a success value", mapOkSuccessBody),
+  test("mapOk transforms a success value", () =>
+    val r: Result<Int32, String> = ok(21)
+    [
+      expect(mapOk(r, dbl)["value"]).toBe(42)
+    ]
+  ),
 
-  test("mapOk leaves a failure unchanged", mapOkFailureBody),
+  test("mapOk leaves a failure unchanged", () =>
+    val r: Result<Int32, String> = err("e")
+    [
+      expect(mapOk(r, dbl)["error"]).toBe("e")
+    ]
+  ),
 
   test("unwrapOr returns the value on success", () =>
     val r: Result<Int32, String> = ok(7)
