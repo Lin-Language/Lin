@@ -449,6 +449,24 @@ impl<'ctx> Codegen<'ctx> {
                 return if matches!(op, BinOp::NotEq) { self.builder.not(eq, "sealed_tne").into() } else { eq.into() };
             }
         }
+        // `x == null` / `x != null` on a boxed union: `lin_tagged_eq` against null reduces to
+        // "null pointer or TAG_NULL tag", so test the tag inline instead of boxing a null and
+        // calling the runtime.
+        if matches!(op, BinOp::Eq | BinOp::NotEq) {
+            let boxed_operand = if matches!(rty, Type::Null) && Self::is_union_type(lty) && lv.is_pointer_value() {
+                Some(lv.into_pointer_value())
+            } else if matches!(lty, Type::Null) && Self::is_union_type(rty) && rv.is_pointer_value() {
+                Some(rv.into_pointer_value())
+            } else {
+                None
+            };
+            if let Some(p) = boxed_operand {
+                let is_null = self.emit_tagged_is_null(p);
+                return if matches!(op, BinOp::NotEq) {
+                    self.builder.not(is_null, "ir_nne").into()
+                } else { is_null.into() };
+            }
+        }
         // Equality / ordering where EITHER operand is a boxed union (Json/TypeVar). These
         // must be ORDER-SYMMETRIC: `lit == proj` and `proj == lit` have to agree. The boxed
         // operand is a TaggedVal* whose representation differs from a concrete value (e.g. a

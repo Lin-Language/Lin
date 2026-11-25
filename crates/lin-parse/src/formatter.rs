@@ -930,6 +930,7 @@ fn unaryop_symbol(op: &UnaryOp) -> &'static str {
     match op {
         UnaryOp::BNot => "~",
         UnaryOp::Not => "!",
+        UnaryOp::Neg => "-",
     }
 }
 
@@ -986,19 +987,6 @@ fn fmt_postfix_base(base: &Expr, render: impl Fn(&Expr) -> String) -> String {
     }
 }
 
-/// The operand of a unary minus on a non-literal. The parser desugars `-x` to `0 - x` with the
-/// synthetic `0` carrying the span of the `-` token itself, whereas an explicit `0 - x` has the
-/// `0` literal's own span, distinct from the operator's. That distinguishes the two forms.
-fn negated_operand(e: &Expr) -> Option<&Expr> {
-    match e {
-        Expr::BinaryOp { left, op: BinOp::Sub, right, span } => match &**left {
-            Expr::IntLit(0, None, lspan) if lspan.start == span.start && lspan.end == span.end => Some(right),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 /// Render `-operand`, parenthesising operands that are not postfix-level primaries.
 fn fmt_negation(operand: &Expr, render: impl Fn(&Expr) -> String) -> String {
     let s = render(operand);
@@ -1017,9 +1005,6 @@ fn fmt_negation(operand: &Expr, render: impl Fn(&Expr) -> String) -> String {
 /// The rendering closure `render` produces the operand's own (paren-free) text.
 fn fmt_binop_operand(operand: &Expr, parent: &BinOp, is_right: bool, render: impl Fn(&Expr) -> String) -> String {
     let s = render(operand);
-    if negated_operand(operand).is_some() {
-        return s;
-    }
     match operand {
         Expr::BinaryOp { op: child_op, .. } => {
             let (cp, pp) = (binop_prec(child_op), binop_prec(parent));
@@ -1623,9 +1608,7 @@ fn fmt_inline(expr: &Expr) -> String {
         Expr::NullLit(_) => "null".to_string(),
         Expr::Ident(name, _) => name.clone(),
         Expr::StringInterp(parts, _) => fmt_interp(parts),
-        Expr::BinaryOp { right, .. } if negated_operand(expr).is_some() => {
-            fmt_negation(right, fmt_inline)
-        }
+        Expr::UnaryOp { op: UnaryOp::Neg, operand, .. } => fmt_negation(operand, fmt_inline),
         Expr::BinaryOp { left, op, right, .. } => {
             format!(
                 "{} {} {}",
@@ -1844,9 +1827,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         Expr::Ident(name, _) => name.clone(),
         Expr::StringInterp(parts, _) => fmt_interp(parts),
 
-        Expr::BinaryOp { right, .. } if negated_operand(expr).is_some() => {
-            fmt_negation(right, |e| fmt_expr(e, false, ind))
-        }
+        Expr::UnaryOp { op: UnaryOp::Neg, operand, .. } => fmt_negation(operand, |e| fmt_expr(e, false, ind)),
         Expr::BinaryOp { left, op, right, .. } => {
             let render = |e: &Expr| fmt_expr(e, false, ind);
             format!(

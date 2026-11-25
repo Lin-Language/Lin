@@ -544,7 +544,7 @@ val triple: [String, Int32, Int32] = ["coords", 10, 20]
 
 These are *not* tuples — they remain JSON arrays at runtime. The `[T1, T2, ...]` type form simply constrains length and positional element types at the type level.
 
-A fixed-length array type is assignable to the corresponding unbounded type when all positional types are compatible. The reverse is not true. The exception is an unbounded array of a fixed-width numeric type (`Int32[]`, `Float64[]`, ...), which is a packed buffer with a different representation: a fixed-length array is not assignable to it.
+A fixed-length array type is assignable to the corresponding unbounded type when all positional types are compatible. The reverse is not true.
 
 ### 5.4 Union Types
 

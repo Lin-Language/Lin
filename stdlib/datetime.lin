@@ -437,7 +437,7 @@ export val isAfter = (a: DateTime, b: DateTime): Boolean => toTimestamp(a) > toT
 // Zero-pad a non-negative number to `width`; render a negative number as "-" + padded magnitude.
 val pad = (n: Int64, width: Int32): String =>
   if n < 0 then
-    "-${padStart(toString(0 - n), width, "0")}"
+    "-${padStart(toString(-n), width, "0")}"
   else
     padStart(toString(n), width, "0")
 
@@ -459,7 +459,7 @@ export val toIsoOffset = (offsetMinutes: Int64): String =>
     "Z"
   else
     val sign = if offsetMinutes < 0 then "-" else "+"
-    val mag = if offsetMinutes < 0 then 0 - offsetMinutes else offsetMinutes
+    val mag = if offsetMinutes < 0 then -offsetMinutes else offsetMinutes
     "${sign}${pad(mag / 60, 2)}:${pad(mag % 60, 2)}"
 
 // The ISO 8601 date-time string for an `OffsetDateTime`, e.g. "2024-01-15T10:30:00.500+05:30" (the
@@ -570,7 +570,7 @@ export val parseIsoOffset = (s: String): Int64 | Error =>
                   error("ISO offset out of range: ${s}")
                 else
                   val mag: Int64 = h * 60 + mi
-                  if sign == "-" then 0 - mag else mag
+                  if sign == "-" then -mag else mag
               else => error("invalid offset minutes: ${s}")
           else => error("invalid offset hours: ${s}")
 
