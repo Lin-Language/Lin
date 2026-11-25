@@ -788,27 +788,9 @@ pub(crate) fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type,
 /// must be coerced (boxed/unboxed) to be used as the other. Specifically: one is a
 /// union/Json (TaggedVal*) and the other is a concrete type.
 /// True iff `ty` is a `Scalar | Null` union that codegen represents as a flat `{ i1, i64 }` value
-/// (VA.1 CPR) rather than a boxed `TaggedVal*`. Mirrors codegen's `flat_union_scalar_type` /
-/// `is_flat_union_scalar` EXACTLY so `type_repr_differs` and the return/sig ABI agree.
+/// rather than a boxed `TaggedVal*`.
 fn is_flat_union_scalar_nullable(ty: &Type) -> bool {
-    let Type::Union(vs) = ty else { return false; };
-    if vs.len() != 2 {
-        return false;
-    }
-    let mut has_null = false;
-    let mut scalars = 0;
-    for v in vs {
-        match v {
-            Type::Null => has_null = true,
-            Type::Bool
-            | Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_)
-            | Type::UInt8 | Type::UInt16 | Type::UInt32
-            | Type::Int64 | Type::UInt64
-            | Type::Float32 | Type::Float64 => scalars += 1,
-            _ => return false,
-        }
-    }
-    has_null && scalars == 1
+    crate::repr::flat_nullable_scalar(ty).is_some()
 }
 
 pub(crate) fn type_repr_differs(from: &Type, to: &Type) -> bool {

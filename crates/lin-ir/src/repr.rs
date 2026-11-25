@@ -29,7 +29,7 @@
 //! ever assigned by PROOF from a definite packed producer carried along representation-preserving
 //! edges; on any doubt the temp is Boxed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use lin_check::types::Type;
@@ -129,11 +129,20 @@ pub enum Repr {
     Boxed(Inner),
     /// An unboxed i8/i16/i32/i64/f32/f64 (the `is_flat_scalar` primitive).
     FlatScalar(ScalarTy),
+    /// A `Scalar | Null` temp held as the flat `{ i1 is_null, i64 bits }` aggregate instead of a
+    /// boxed `TaggedVal*`. Only assigned by [`mark_flat_nullable`], which proves every definition
+    /// can produce the aggregate and every use can consume it.
+    FlatNullable { scalar: Type },
     /// No value (e.g. unreachable / never-defined temp).
     Bottom,
 }
 
 impl Repr {
+    /// True iff this temp is held as the flat `{ i1, i64 }` nullable-scalar aggregate.
+    pub fn is_flat_nullable(&self) -> bool {
+        matches!(self, Repr::FlatNullable { .. })
+    }
+
     /// The fail-safe representation: a boxed opaque value. Anything not proven otherwise is this.
     pub fn boxed_opaque() -> Repr {
         Repr::Boxed(Inner::Opaque)
@@ -1224,6 +1233,248 @@ pub fn run(module: &mut LinModule) {
     }
 }
 
+/// True for the scalar member types of a flat `Scalar | Null`.
+pub fn is_flat_nullable_scalar(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Bool
+            | Type::Int8 | Type::Int16 | Type::Int32 | Type::IntLit(_)
+            | Type::UInt8 | Type::UInt16 | Type::UInt32
+            | Type::Int64 | Type::UInt64
+            | Type::Float32 | Type::Float64
+    )
+}
+
+/// If `ty` is exactly `Scalar | Null` (either member order), the scalar member. This is the single
+/// definition of which types use the flat `{ i1, i64 }` return ABI and may be held flat in a temp.
+pub fn flat_nullable_scalar(ty: &Type) -> Option<&Type> {
+    let Type::Union(vs) = ty else { return None };
+    match vs.as_slice() {
+        [Type::Null, s] | [s, Type::Null] if is_flat_nullable_scalar(s) => Some(s),
+        _ => None,
+    }
+}
+
+fn same_flat_scalar(a: Option<&Type>, b: Option<&Type>) -> bool {
+    match (a.and_then(flat_nullable_scalar), b.and_then(flat_nullable_scalar)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Temps that cannot remain flat given the current candidate set `flat`. Every definition of a flat
+/// temp must be flat-capable (flat-return call, `Coerce` from the scalar or `Null`, `Const Null`,
+/// `Phi`, `Copy`/`Bind`/`CloneBox` of a same-scalar temp) and every use flat-aware (`IsType`,
+/// `Coerce` to the scalar or `Null`, `==`/`!=` against `Null`, `Retain`/`Release`, `Return` from a
+/// flat-returning function). Anything else, including instructions not listed here, is reported so
+/// the temp is boxed once at its definition.
+fn flat_violations(func: &LinFunction, instr: &Instruction, flat: &HashSet<Temp>, out: &mut Vec<Temp>) {
+    let ty_of = |t: &Temp| func.temp_types.get(t);
+    let is_null_ty = |t: &Temp| matches!(ty_of(t), Some(Type::Null));
+    let f = |t: &Temp| flat.contains(t);
+    match instr {
+        Instruction::CloneBox { dst, src, .. } => {
+            if f(dst) && !same_flat_scalar(ty_of(dst), ty_of(src)) {
+                out.push(*dst);
+            }
+            if f(src) && !f(dst) {
+                out.push(*src);
+            }
+        }
+        Instruction::Copy { dst, src } | Instruction::Bind { dst, src, .. } => {
+            if f(dst) != f(src) || (f(dst) && !same_flat_scalar(ty_of(dst), ty_of(src))) {
+                out.push(*dst);
+                out.push(*src);
+            }
+        }
+        Instruction::Phi { dst, incomings, .. } => {
+            for (t, _) in incomings {
+                if f(dst) {
+                    let ok = (f(t) && same_flat_scalar(ty_of(t), ty_of(dst))) || is_null_ty(t);
+                    if !ok {
+                        out.push(*dst);
+                    }
+                } else if f(t) {
+                    out.push(*t);
+                }
+            }
+        }
+        Instruction::Const { dst, val } => {
+            if f(dst) && !matches!(val, Const::Null) {
+                out.push(*dst);
+            }
+        }
+        Instruction::Coerce { dst, src, from_ty, to_ty } => {
+            if f(dst) {
+                let ok = flat_nullable_scalar(to_ty)
+                    .map(|s| from_ty == s || matches!(from_ty, Type::Null))
+                    .unwrap_or(false);
+                if !ok {
+                    out.push(*dst);
+                }
+            }
+            if f(src) {
+                let ok = flat_nullable_scalar(from_ty)
+                    .map(|s| to_ty == s || matches!(to_ty, Type::Null))
+                    .unwrap_or(false)
+                    && same_flat_scalar(ty_of(src), Some(from_ty));
+                if !ok {
+                    out.push(*src);
+                }
+            }
+        }
+        Instruction::Call { dst, callee, args, ret_ty } => {
+            if f(dst) {
+                let ok = same_flat_scalar(ty_of(dst), Some(ret_ty))
+                    && match callee {
+                        CallTarget::Direct(_) => true,
+                        CallTarget::Named(n) => !n.starts_with("lin_"),
+                        CallTarget::Indirect(_) => false,
+                    };
+                if !ok {
+                    out.push(*dst);
+                }
+            }
+            out.extend(args.iter().filter(|a| f(a)).copied());
+            if let CallTarget::Indirect(t) = callee {
+                if f(t) {
+                    out.push(*t);
+                }
+            }
+        }
+        Instruction::IsType { val, ty, .. } => {
+            if f(val) {
+                let sc = ty_of(val).and_then(flat_nullable_scalar);
+                if !(matches!(ty, Type::Null) || sc == Some(ty)) {
+                    out.push(*val);
+                }
+            }
+        }
+        Instruction::Binary { lhs, rhs, op, .. } => {
+            let eq = matches!(op, lin_parse::ast::BinOp::Eq | lin_parse::ast::BinOp::NotEq);
+            if f(lhs) && !(eq && is_null_ty(rhs)) {
+                out.push(*lhs);
+            }
+            if f(rhs) && !(eq && is_null_ty(lhs)) {
+                out.push(*rhs);
+            }
+        }
+        Instruction::Retain { .. } | Instruction::Release { .. } => {}
+        other => {
+            let (uses, defs) = crate::liveness::instr_use_def(other);
+            out.extend(uses.into_iter().chain(defs).filter(|t| f(t)));
+        }
+    }
+}
+
+fn flat_terminator_violations(func: &LinFunction, term: &Terminator, flat: &HashSet<Temp>, out: &mut Vec<Temp>) {
+    match term {
+        Terminator::Return(Some(t)) => {
+            let returns_flat = flat_nullable_scalar(&func.ret_ty).is_some();
+            if flat.contains(t) && !(returns_flat && same_flat_scalar(func.temp_types.get(t), Some(&func.ret_ty))) {
+                out.push(*t);
+            }
+        }
+        Terminator::CondJump { cond: t, .. } | Terminator::Switch { val: t, .. } => {
+            if flat.contains(t) {
+                out.push(*t);
+            }
+        }
+        Terminator::TailCall { args } => out.extend(args.iter().filter(|a| flat.contains(a)).copied()),
+        Terminator::Return(None) | Terminator::Jump(_) | Terminator::Unreachable => {}
+    }
+}
+
+fn flat_candidates(func: &LinFunction) -> HashSet<Temp> {
+    let params: HashSet<Temp> = func.params.iter().map(|(t, _)| *t).collect();
+    let mut defined: HashSet<Temp> = HashSet::new();
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            defined.extend(crate::liveness::instr_use_def(instr).1);
+        }
+    }
+    func.temp_types
+        .iter()
+        .filter(|(t, ty)| flat_nullable_scalar(ty).is_some() && defined.contains(t) && !params.contains(t))
+        .map(|(t, _)| *t)
+        .collect()
+}
+
+fn flat_set_violations(func: &LinFunction, flat: &HashSet<Temp>) -> Vec<Temp> {
+    let mut out = Vec::new();
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            flat_violations(func, instr, flat, &mut out);
+        }
+        flat_terminator_violations(func, &block.terminator, flat, &mut out);
+    }
+    out
+}
+
+/// The `Scalar | Null` temps of `func` that may be held flat: the greatest set closed under the
+/// rules in [`flat_violations`]. Dropping a temp can drop its Copy/Phi neighbours, so this iterates
+/// to a fixpoint.
+pub fn flat_nullable_temps(func: &LinFunction) -> HashSet<Temp> {
+    let mut flat = flat_candidates(func);
+    while !flat.is_empty() {
+        let bad = flat_set_violations(func, &flat);
+        if bad.is_empty() {
+            break;
+        }
+        for t in bad {
+            flat.remove(&t);
+        }
+    }
+    flat
+}
+
+/// Marks every provably-flat `Scalar | Null` temp as `Repr::FlatNullable`. Runs after every other
+/// IR pass so no later pass sees or invalidates the proof. Codegen holds a temp as a `{ i1, i64 }`
+/// aggregate iff `func.repr_of(t)` is `FlatNullable`; every other `Scalar | Null` temp is a boxed
+/// `TaggedVal*`, produced once at its definition.
+pub fn mark_flat_nullable(module: &mut LinModule) {
+    for func in &mut module.functions {
+        let flat = flat_nullable_temps(func);
+        if flat.is_empty() {
+            continue;
+        }
+        if func.repr.len() < func.temp_count as usize {
+            func.repr.resize(func.temp_count as usize, Repr::boxed_opaque());
+        }
+        for t in &flat {
+            let scalar = func.temp_types.get(t).and_then(flat_nullable_scalar).cloned().unwrap();
+            func.repr[t.0 as usize] = Repr::FlatNullable { scalar };
+        }
+        let violations = verify_flat_nullable(func);
+        assert!(
+            violations.is_empty(),
+            "flat-nullable verifier violation(s):\n{}",
+            violations.join("\n")
+        );
+    }
+}
+
+/// Re-checks the flat-nullable invariant against the stored repr table: every `FlatNullable` temp
+/// is a defined, non-parameter `Scalar | Null` temp and every definition and use of it is flat-aware.
+pub fn verify_flat_nullable(func: &LinFunction) -> Vec<String> {
+    let fname = func.name.clone().unwrap_or_else(|| format!("fn#{}", func.id.0));
+    let flat: HashSet<Temp> = (0..func.temp_count)
+        .map(Temp)
+        .filter(|t| func.repr_of(*t).is_flat_nullable())
+        .collect();
+    let candidates = flat_candidates(func);
+    let mut bad = Vec::new();
+    for t in &flat {
+        if !candidates.contains(t) {
+            bad.push(format!("{fname}: t{} is FlatNullable but is a parameter, undefined, or not Scalar | Null", t.0));
+        }
+    }
+    for t in flat_set_violations(func, &flat) {
+        bad.push(format!("{fname}: t{} is FlatNullable but has a definition or use that is not flat-aware", t.0));
+    }
+    bad
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1610,5 +1861,148 @@ mod tests {
         // And the well-typed analysis result (t0 seeded Packed from its param type) is clean.
         let clean = analyze(&f);
         assert!(verify(&f, &clean).is_empty(), "well-typed Push must verify clean");
+    }
+
+    fn int_or_null() -> Type {
+        Type::Union(vec![Type::Int32, Type::Null])
+    }
+
+    fn flat_fn(instrs: Vec<Instruction>, ret: Option<Temp>, types: &[(u32, Type)], ret_ty: Type) -> LinFunction {
+        let mut f = func_of(instrs, ret, types.len() as u32, vec![]);
+        for (t, ty) in types {
+            f.temp_types.insert(Temp(*t), ty.clone());
+        }
+        f.ret_ty = ret_ty;
+        f
+    }
+
+    fn flat_call(dst: u32) -> Instruction {
+        Instruction::Call {
+            dst: Temp(dst),
+            callee: CallTarget::Direct(FuncId(7)),
+            args: vec![],
+            ret_ty: int_or_null(),
+        }
+    }
+
+    fn mark(f: &mut LinFunction) -> HashSet<Temp> {
+        let flat = flat_nullable_temps(f);
+        f.repr = vec![Repr::boxed_opaque(); f.temp_count as usize];
+        for t in &flat {
+            f.repr[t.0 as usize] = Repr::FlatNullable { scalar: Type::Int32 };
+        }
+        flat
+    }
+
+    #[test]
+    fn flat_predicate_accepts_either_member_order_only() {
+        assert_eq!(flat_nullable_scalar(&int_or_null()), Some(&Type::Int32));
+        assert_eq!(flat_nullable_scalar(&Type::Union(vec![Type::Null, Type::Float64])), Some(&Type::Float64));
+        assert!(flat_nullable_scalar(&Type::Union(vec![Type::Int32, Type::Str, Type::Null])).is_none());
+        assert!(flat_nullable_scalar(&Type::Union(vec![Type::Int32, Type::Int64])).is_none());
+        assert!(flat_nullable_scalar(&Type::Union(vec![Type::Str, Type::Null])).is_none());
+        assert!(flat_nullable_scalar(&Type::Int32).is_none());
+    }
+
+    #[test]
+    fn flat_call_returned_from_flat_fn_is_flat() {
+        let mut f = flat_fn(vec![flat_call(0)], Some(Temp(0)), &[(0, int_or_null())], int_or_null());
+        assert!(mark(&mut f).contains(&Temp(0)));
+        assert!(verify_flat_nullable(&f).is_empty());
+    }
+
+    #[test]
+    fn flat_call_returned_from_non_flat_fn_is_boxed() {
+        let wide = Type::Union(vec![Type::Int32, Type::Str, Type::Null]);
+        let mut f = flat_fn(vec![flat_call(0)], Some(Temp(0)), &[(0, int_or_null())], wide);
+        assert!(mark(&mut f).is_empty());
+    }
+
+    #[test]
+    fn flat_call_used_as_call_argument_is_boxed() {
+        let instrs = vec![
+            flat_call(0),
+            Instruction::Call {
+                dst: Temp(1),
+                callee: CallTarget::Named("g".into()),
+                args: vec![Temp(0)],
+                ret_ty: Type::Int32,
+            },
+        ];
+        let mut f = flat_fn(instrs, Some(Temp(1)), &[(0, int_or_null()), (1, Type::Int32)], Type::Int32);
+        assert!(mark(&mut f).is_empty());
+    }
+
+    #[test]
+    fn flat_call_compared_with_null_and_is_checked_stays_flat() {
+        let instrs = vec![
+            flat_call(0),
+            Instruction::Const { dst: Temp(1), val: Const::Null },
+            Instruction::Binary {
+                dst: Temp(2),
+                op: lin_parse::ast::BinOp::NotEq,
+                lhs: Temp(0),
+                rhs: Temp(1),
+                operand_ty: int_or_null(),
+                ty: Type::Bool,
+            },
+            Instruction::IsType { dst: Temp(3), val: Temp(0), ty: Type::Int32 },
+            Instruction::Release { val: Temp(0), ty: int_or_null() },
+        ];
+        let types = [(0, int_or_null()), (1, Type::Null), (2, Type::Bool), (3, Type::Bool)];
+        let mut f = flat_fn(instrs, Some(Temp(2)), &types, Type::Bool);
+        assert!(mark(&mut f).contains(&Temp(0)));
+    }
+
+    #[test]
+    fn flat_call_in_arithmetic_or_wider_coerce_is_boxed() {
+        let wide = Type::Union(vec![Type::Int32, Type::Str, Type::Null]);
+        let instrs = vec![
+            flat_call(0),
+            Instruction::Coerce { dst: Temp(1), src: Temp(0), from_ty: int_or_null(), to_ty: wide.clone() },
+        ];
+        let mut f = flat_fn(instrs, Some(Temp(1)), &[(0, int_or_null()), (1, wide.clone())], wide);
+        assert!(mark(&mut f).is_empty());
+    }
+
+    #[test]
+    fn phi_of_boxed_neighbour_demotes_the_whole_component() {
+        let types = [(0, int_or_null()), (1, int_or_null()), (2, int_or_null())];
+        let instrs = vec![
+            flat_call(0),
+            Instruction::Call {
+                dst: Temp(1),
+                callee: CallTarget::Indirect(Temp(9)),
+                args: vec![],
+                ret_ty: int_or_null(),
+            },
+            Instruction::Phi { dst: Temp(2), ty: int_or_null(), incomings: vec![(Temp(0), BlockId(0)), (Temp(1), BlockId(0))] },
+        ];
+        let mut f = flat_fn(instrs, Some(Temp(2)), &types, int_or_null());
+        assert!(mark(&mut f).is_empty());
+    }
+
+    #[test]
+    fn flat_param_is_never_flat() {
+        let mut f = func_of(vec![], Some(Temp(0)), 1, vec![(Temp(0), int_or_null())]);
+        f.ret_ty = int_or_null();
+        assert!(mark(&mut f).is_empty());
+    }
+
+    #[test]
+    fn verifier_rejects_flat_temp_with_non_flat_aware_use() {
+        let instrs = vec![
+            flat_call(0),
+            Instruction::Call {
+                dst: Temp(1),
+                callee: CallTarget::Named("g".into()),
+                args: vec![Temp(0)],
+                ret_ty: Type::Int32,
+            },
+        ];
+        let mut f = flat_fn(instrs, Some(Temp(1)), &[(0, int_or_null()), (1, Type::Int32)], Type::Int32);
+        f.repr = vec![Repr::boxed_opaque(); 2];
+        f.repr[0] = Repr::FlatNullable { scalar: Type::Int32 };
+        assert_eq!(verify_flat_nullable(&f).len(), 1);
     }
 }
