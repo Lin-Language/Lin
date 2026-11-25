@@ -1,0 +1,15 @@
+// render — pixel read-back shared by both demos.
+import { toInt64 } from "std/number"
+import { peekU8, peekI32, peekPtr } from "std/ffi"
+import { SURFACE_PITCH_OFF, SURFACE_PIXELS_OFF, PIXEL_BYTES } from "./constants"
+
+// Read channel `chanOff` (B/G/R) of pixel (x,y) out of a read-back SDL_Surface as an Int64 in
+// [0,255]. Byte address = pixels + y*pitch + x*PIXEL_BYTES + chanOff, where the surface is
+// XRGB8888 (bytes B,G,R,X per pixel on little-endian). The Int32 byte offset widens to the Int64
+// `peek` offset param at the call site; toInt64 widens the UInt8 channel for printing/comparison
+// against integer literals.
+export val pixelChannel = (surf: Ptr, x: Int32, y: Int32, chanOff: Int32): Int64 =>
+  val pitch = peekI32(surf, SURFACE_PITCH_OFF)
+  val pixels = peekPtr(surf, SURFACE_PIXELS_OFF)
+  val off = y * pitch + x * PIXEL_BYTES + chanOff
+  toInt64(peekU8(pixels, off))

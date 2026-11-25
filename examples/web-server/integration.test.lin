@@ -1,10 +1,9 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { contains } from "std/string"
-import { HttpRequest as Request } from "std/http"
 import { render, renderWith } from "std/template"
 import { readJson } from "std/fs"
 import { route } from "./router"
-import { Config } from "./config"
+import { testConfig as config, makeReq, roadGraph } from "./fixtures"
 
 // End-to-end: build a Request, dispatch it through `route` (which selects the
 // handler), and assert the final Response — every route the service exposes plus
@@ -15,78 +14,15 @@ import { Config } from "./config"
 replace render = (path: String, data: {  }): AnyVal =>
   renderWith("<!DOCTYPE html><title>{{ title }}</title><h1>{{ heading }}</h1>", data)
 
-val graph = {
-  "nodes": [
-    "A",
-    "B",
-    "C",
-    "D",
-    "E"
-  ],
-  "edges": [
-    {
-      "from": "A",
-      "to": "B",
-      "weight": 10
-    },
-    {
-      "from": "A",
-      "to": "C",
-      "weight": 3
-    },
-    {
-      "from": "C",
-      "to": "B",
-      "weight": 4
-    },
-    {
-      "from": "C",
-      "to": "D",
-      "weight": 8
-    },
-    {
-      "from": "B",
-      "to": "D",
-      "weight": 2
-    },
-    {
-      "from": "D",
-      "to": "E",
-      "weight": 5
-    },
-    {
-      "from": "B",
-      "to": "E",
-      "weight": 11
-    }
-  ]
-}
-
-replace readJson = (path: String): AnyVal => graph
-
-val config: Config = {
-  "host": "0.0.0.0",
-  "port": 3000,
-  "debug": false,
-  "name": "Lin Maps"
-}
-
-val makeReq = (path: String): Request =>
-  {
-    "method": "GET",
-    "path": path,
-    "query": "",
-    "headers": {},
-    "body": ""
-  }
+replace readJson = (path: String): AnyVal => roadGraph
 
 val s = suite("web-server integration", [
   test("GET / routes to the index page and renders the HTML body", () =>
     val resp = route(makeReq("/"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "<!DOCTYPE html>")).toBe(true),
-      expect(contains(resp["body"], "Lin Maps")).toBe(true)
+      expect(resp["body"].contains("<!DOCTYPE html>")).toBe(true),
+      expect(resp["body"].contains("Lin Maps")).toBe(true)
     ]
   ),
 
@@ -94,7 +30,7 @@ val s = suite("web-server integration", [
     val resp = route(makeReq("/api/status"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "\"status\": \"ok\"")).toBe(true)
+      expect(resp["body"].contains("\"status\": \"ok\"")).toBe(true)
     ]
   ),
 
@@ -102,8 +38,8 @@ val s = suite("web-server integration", [
     val resp = route(makeReq("/route/A/E"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "\"distance\": 14")).toBe(true),
-      expect(contains(resp["body"], "\"A\", \"C\", \"B\", \"D\", \"E\"")).toBe(true)
+      expect(resp["body"].contains("\"distance\": 14")).toBe(true),
+      expect(resp["body"].contains("\"A\", \"C\", \"B\", \"D\", \"E\"")).toBe(true)
     ]
   ),
 
@@ -111,7 +47,7 @@ val s = suite("web-server integration", [
     val resp = route(makeReq("/users/42"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "User 42")).toBe(true)
+      expect(resp["body"].contains("User 42")).toBe(true)
     ]
   ),
 
@@ -119,7 +55,7 @@ val s = suite("web-server integration", [
     val resp = route(makeReq("/no/such/route"), config)
     [
       expect(resp["status"]).toBe(404),
-      expect(contains(resp["body"], "Not Found")).toBe(true)
+      expect(resp["body"].contains("Not Found")).toBe(true)
     ]
   )
 ])

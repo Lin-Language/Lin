@@ -44,15 +44,15 @@ val s = suite("vector", [
   ]),
 
   test("angle between orthogonal unit vectors is PI/2", () => [
-    expect(toFixed(angleBetween(vec2(1.0, 0.0), vec2(0.0, 1.0)), 4)).toBe(toFixed(PI / 2.0, 4))
+    expect(angleBetween(vec2(1.0, 0.0), vec2(0.0, 1.0)).toFixed(4)).toBe((PI / 2.0).toFixed(4))
   ]),
 
   test("heading toward a point due east is 0", () => [
-    expect(toFixed(heading(vec2(0.0, 0.0), vec2(5.0, 0.0)), 4)).toBe("0.0000")
+    expect(heading(vec2(0.0, 0.0), vec2(5.0, 0.0)).toFixed(4)).toBe("0.0000")
   ]),
 
   test("heading toward a point due north is PI/2", () => [
-    expect(toFixed(heading(vec2(0.0, 0.0), vec2(0.0, 5.0)), 4)).toBe(toFixed(PI / 2.0, 4))
+    expect(heading(vec2(0.0, 0.0), vec2(0.0, 5.0)).toFixed(4)).toBe((PI / 2.0).toFixed(4))
   ])
 ])
 run(s)

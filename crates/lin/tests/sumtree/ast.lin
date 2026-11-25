@@ -1,0 +1,59 @@
+// sumtree — a recursive tagged sum type (`Expr`) evaluated as a tree.
+//
+// `Expr` is `Num | BinOp` where `BinOp` carries recursive `left`/`right : Expr` children. Each
+// node is dispatched on its `kind` tag, and a child read is a constant-offset load.
+
+// A literal number.
+export type Num = { "kind": "num", "value": Int32 }
+
+// The operation codes of a `BinOp`: 0 = add, 1 = subtract, 2 = multiply.
+export type OpCode = 0 | 1 | 2
+
+export val ADD: OpCode = 0
+export val SUB: OpCode = 1
+export val MUL: OpCode = 2
+
+// A binary operation over two sub-expressions.
+export type BinOp = { "kind": "op", "op": OpCode, "left": Expr, "right": Expr }
+
+// The recursive expression tree.
+export type Expr = Num | BinOp
+
+// Constructor helpers. These build a node inside a function and return it — the canonical
+// "parser" shape. A leaf number.
+export val num = (v: Int32): Expr =>
+  { "kind": "num", "value": v }
+
+// A binary node built from two already-constructed children.
+export val binOp = (code: OpCode, l: Expr, r: Expr): Expr =>
+  {
+    "kind": "op",
+    "op": code,
+    "left": l,
+    "right": r
+  }
+
+// Recursively build a left-leaning sum spine of `n` leaf 1's. A fresh sub-tree is built and
+// returned at every level.
+export val chain = (n: Int32): Expr =>
+  if n <= 1 then
+    { "kind": "num", "value": 1 }
+  else
+    {
+      "kind": "op",
+      "op": 0,
+      "left": chain(n - 1),
+      "right": { "kind": "num", "value": 1 }
+    }
+
+// Evaluate an expression tree to an Int32.
+export val eval = (e: Expr): Int32 =>
+  match e
+    is Num => e["value"]
+    is BinOp =>
+      val l = eval(e["left"])
+      val r = eval(e["right"])
+      match e["op"]
+        is 0 => l + r
+        is 1 => l - r
+        is 2 => l * r

@@ -15,7 +15,7 @@ val sample: Telemetry = {
   "battery": 87,
   "leftDuty": 750,
   "rightDuty": 1000,
-  "tempC": 0 - 5,
+  "tempC": -5,
   "health": 3,
   "link": 12
 }
@@ -53,9 +53,9 @@ val s = suite("raspberry-telemetry", [
   // temp -5 -> [3,0,1,251]; status (3<<4)|12=60 -> [4,0,1,60]; then checksum.
   test("encodes the documented TLV layout plus a checksum trailer", () =>
     val frame = encodeTelemetry(sample)
-    val body: UInt8[] = frame.slice(0, length(frame) - 1)
+    val body: UInt8[] = frame.slice(0, frame.length() - 1)
     [
-      expect(length(frame)).toBe(20), // 19-byte body + 1 checksum byte
+      expect(frame.length()).toBe(20), // 19-byte body + 1 checksum byte
       expect(frame[0]).toBe(1), // tag battery
       expect(frame[3]).toBe(87), // battery value
       expect(frame[4]).toBe(2), // tag motors
@@ -63,24 +63,14 @@ val s = suite("raspberry-telemetry", [
       expect(frame[7]).toBe(0x02), // leftDuty 750 = 0x02EE, hi byte
       expect(frame[8]).toBe(0xEE), // leftDuty lo byte
       expect(frame[10]).toBe(0xE8), // rightDuty 1000 = 0x03E8, lo byte
-      expect(frame[length(frame) - 1]).toBe(checksum(body)) // trailer = body checksum
+      expect(frame[frame.length() - 1]).toBe(checksum(body)) // trailer = body checksum
     ]
   ),
 
   // --- Full round-trip of every field ---
   test("round-trips every reading through encode/decode", () =>
-    val back = decodeTelemetry(encodeTelemetry(sample))
-    val r = match back
-      is Error => sample
-      else => back
-    // unreachable on a valid frame; keeps the type concrete
     [
-      expect(r["battery"]).toBe(87),
-      expect(r["leftDuty"]).toBe(750),
-      expect(r["rightDuty"]).toBe(1000),
-      expect(r["tempC"]).toBe(0 - 5),
-      expect(r["health"]).toBe(3),
-      expect(r["link"]).toBe(12)
+      expect(decodeTelemetry(encodeTelemetry(sample))).toBe(sample)
     ]
   ),
 
@@ -91,7 +81,7 @@ val s = suite("raspberry-telemetry", [
       "battery": 0,
       "leftDuty": 0,
       "rightDuty": 0,
-      "tempC": 0 - 1,
+      "tempC": -1,
       "health": 0,
       "link": 0
     }
@@ -103,45 +93,27 @@ val s = suite("raspberry-telemetry", [
       "health": 15,
       "link": 15
     }
-    val cRes = decodeTelemetry(encodeTelemetry(cold))
-    val c = match cRes
-      is Error => cold
-      else => cRes
-    val wRes = decodeTelemetry(encodeTelemetry(warm))
-    val w = match wRes
-      is Error => warm
-      else => wRes
     [
-      expect(c["tempC"]).toBe(0 - 1),
-      expect(c["leftDuty"]).toBe(0),
-      expect(w["tempC"]).toBe(40),
-      expect(w["battery"]).toBe(100),
-      expect(w["health"]).toBe(15),
-      expect(w["link"]).toBe(15)
+      expect(decodeTelemetry(encodeTelemetry(cold))).toBe(cold),
+      expect(decodeTelemetry(encodeTelemetry(warm))).toBe(warm)
     ]
   ),
 
   // --- Rejection paths ---
   test("rejects a frame whose checksum trailer is wrong", () =>
     val frame = encodeTelemetry(sample)
-    val body: UInt8[] = frame.slice(0, length(frame) - 1)
+    val body: UInt8[] = frame.slice(0, frame.length() - 1)
     // Re-attach a deliberately wrong trailer (real checksum XOR 0xFF).
     val tampered: UInt8[] = body.concat([checksum(body) ^ 0xFF])
-    val outcome = match decodeTelemetry(tampered)
-      is Error => "error"
-      else => "decoded"
     [
-      expect(outcome).toBe("error")
+      expect(decodeTelemetry(tampered) is Error).toBe(true)
     ]
   ),
 
   test("rejects an empty frame as an Error", () =>
     val empty: UInt8[] = []
-    val outcome = match decodeTelemetry(empty)
-      is Error => "error"
-      else => "decoded"
     [
-      expect(outcome).toBe("error")
+      expect(decodeTelemetry(empty) is Error).toBe(true)
     ]
   )
 ])

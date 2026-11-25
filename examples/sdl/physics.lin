@@ -10,20 +10,23 @@ export type Ball = { "pos": Vec2, "vel": Vec2 }
 export val ball = (pos: Vec2, vel: Vec2): Ball =>
   { "pos": pos, "vel": vel }
 
+// One axis of motion: a position and its velocity.
+export type Axis = { "pos": Float64, "vel": Float64 }
+
 // Reflect a single axis off the walls [0, hi]: advance by v, and if the new position is past a
-// wall, fold it back and flip the velocity. Returns the new (position, velocity) for that axis.
-export val reflect1d = (p: Float64, v: Float64, hi: Float64): Vec2 =>
+// wall, fold it back and flip the velocity. Returns the new position and velocity for that axis.
+export val reflect1d = (p: Float64, v: Float64, hi: Float64): Axis =>
   val np = p + v
   if np < 0.0 then
-    vec2(0.0 - np, 0.0 - v)
+    { "pos": 0.0 - np, "vel": 0.0 - v }
   else if np > hi then
-    vec2(hi - (np - hi), 0.0 - v)
+    { "pos": hi - (np - hi), "vel": 0.0 - v }
   else
-    vec2(np, v)
+    { "pos": np, "vel": v }
 
 // One physics frame: reflect each axis independently within a (maxX, maxY) box. The box is the
 // playfield minus the ball size so the whole ball stays on screen.
 export val stepBall = (b: Ball, maxX: Float64, maxY: Float64): Ball =>
   val xs = reflect1d(b["pos"]["x"], b["vel"]["x"], maxX)
   val ys = reflect1d(b["pos"]["y"], b["vel"]["y"], maxY)
-  ball(vec2(xs["x"], ys["x"]), vec2(xs["y"], ys["y"]))
+  ball(vec2(xs["pos"], ys["pos"]), vec2(xs["vel"], ys["vel"]))

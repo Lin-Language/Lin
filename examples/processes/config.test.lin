@@ -3,7 +3,7 @@ import { loadConfig } from "./config"
 import { getEnv } from "std/env"
 
 // Unit tests for environment-driven configuration. `getEnv` is mocked with `replace`
-// (ADR-046) so the tests are hermetic — they assert how the runner interprets a given
+// so the tests are hermetic — they assert how the runner interprets a given
 // environment without touching the real process environment. The mock answers from a
 // fixed table; an unset var is `null`, exactly as the real `getEnv` would report it.
 replace getEnv = (name: String): String | Null =>

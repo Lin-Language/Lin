@@ -22,14 +22,14 @@ val rowsOf = (body: String): String[] =>
   body
     .splitLines()
     .map(line => line.trim())
-    .filter(line => length(line) > 0)
+    .filter(line => line.length() > 0)
 
 // Pull every non-blank CSV row out of every member of a gzipped tar. Returns the
 // rows as a flat `String[]`, ready for report.lin's `render`. On any read/
 // decompress fault the stream threads an Error in-band; we surface that as an
 // empty batch (the caller's report then shows count=0).
 export val rowsFromArchive = (path: String): String[] =>
-  var rows: String[] = []
+  val rows: String[] = []
   val result = readStream(path)
     .gunzip()
     .untar((meta, data) =>
@@ -48,7 +48,7 @@ export val rowsFromArchive = (path: String): String[] =>
 // List the archive's members without extracting them — a cheap "what's in here?"
 // pass that reads each tar header and skips the body. Returns the member names.
 export val archiveMembers = (path: String): String[] =>
-  var names: String[] = []
+  val names: String[] = []
   readStream(path)
     .gunzip()
     .manifest()
@@ -64,31 +64,31 @@ export val archiveMembers = (path: String): String[] =>
 // regardless of file size; `for` (from std/iter, dispatched to the stream backend)
 // pulls the pipeline to completion on the calling thread.
 export val rowsFromFile = (path: String): String[] =>
-  var rows: String[] = []
+  val rows: String[] = []
   readStream(path)
     .lines()
-    .filter(line => length(trim(line)) > 0)
-    .for(line => rows.push(trim(line)))
+    .filter(line => line.trim().length() > 0)
+    .for(line => rows.push(line.trim()))
   rows
 
 // Where a cleaned copy of `inPath` should be written: same directory, "<stem>.clean.csv".
 // Uses std/path so the derivation is platform-correct rather than string-concatenated.
 export val cleanedPath = (inPath: String): String =>
-  pathJoin([dirname(inPath), "${stem(inPath)}.clean.csv"])
+  pathJoin([inPath.dirname(), "${inPath.stem()}.clean.csv"])
 
 // Normalise a CSV file lazily, file-to-file, holding at most one line in memory at a
 // time: read `inPath` as a line Stream, drop blank lines, trim each row, and write the
 // result to `cleanedPath(inPath)` via the line sink. The pipeline is fully lazy — no
-// read happens until `drain()` pulls it. Returns the output path on success, or "" if
-// the stream threaded an Error in-band (a read/write fault).
-export val normalizeCsv = (inPath: String): String =>
+// read happens until `drain()` pulls it. Returns the output path on success, or the
+// Error the stream threaded in-band (a read/write fault).
+export val normalizeCsv = (inPath: String): String | Error =>
   val outPath = cleanedPath(inPath)
   val result = readStream(inPath)
     .lines()
-    .map(line => trim(line))
-    .filter(line => length(line) > 0)
+    .map(line => line.trim())
+    .filter(line => line.length() > 0)
     .writeLines(outPath)
     .drain()
   match result
-    is Error => ""
-    else => outPath
+    is Null => outPath
+    else => result

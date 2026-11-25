@@ -4,7 +4,7 @@ import { getEnv } from "std/env"
 
 // Covers the fallback paths in config.lin: an unset var, a non-numeric value, and a value
 // below the allowed minimum all fall back to the documented defaults rather than failing.
-// `getEnv` is mocked (ADR-046) to return a malformed environment on purpose.
+// `getEnv` is mocked to return a malformed environment on purpose.
 replace getEnv = (name: String): String | Null =>
   if name == "PROCESSES_MAX_PARALLEL" then
     "0"

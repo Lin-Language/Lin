@@ -3,74 +3,55 @@
 // Covers numbers (incl. multi-digit as one token), operators, parens, whitespace
 // skipping, and the `bad` token emitted for unknown characters.
 import { expect, toBe, test, suite, run } from "std/test"
-import { tokenize } from "./lexer"
-import { length } from "std/array"
+import { tokenize, Token } from "./lexer"
+
+val num = (t: String): Token => { "kind": "num", "text": t }
+val op = (t: String): Token => { "kind": "op", "text": t }
+val lp = (): Token => { "kind": "lparen", "text": "(" }
+val rp = (): Token => { "kind": "rparen", "text": ")" }
+val bad = (t: String): Token => { "kind": "bad", "text": t }
 
 val s = suite("lexer", [
   // --- Numbers ---
   test("tokenizes a single-digit number as one token", () => [
-    expect(length(tokenize("7"))).toBe(1),
-    expect(tokenize("7")[0]["kind"]).toBe("num"),
-    expect(tokenize("7")[0]["text"]).toBe("7")
+    expect(tokenize("7")).toBe([num("7")])
   ]),
 
   test("tokenizes a multi-digit number as one token", () => [
-    expect(length(tokenize("123"))).toBe(1),
-    expect(tokenize("123")[0]["text"]).toBe("123")
+    expect(tokenize("123")).toBe([num("123")])
   ]),
 
   // --- Operators ---
   test("tokenizes each arithmetic operator", () => [
-    expect(tokenize("+")[0]["kind"]).toBe("op"),
-    expect(tokenize("+")[0]["text"]).toBe("+"),
-    expect(tokenize("-")[0]["text"]).toBe("-"),
-    expect(tokenize("*")[0]["text"]).toBe("*"),
-    expect(tokenize("/")[0]["text"]).toBe("/")
+    expect(tokenize("+-*/")).toBe([op("+"), op("-"), op("*"), op("/")])
   ]),
 
   // --- Parens ---
   test("tokenizes parentheses as lparen/rparen", () => [
-    expect(tokenize("(")[0]["kind"]).toBe("lparen"),
-    expect(tokenize(")")[0]["kind"]).toBe("rparen")
+    expect(tokenize("()")).toBe([lp(), rp()])
   ]),
 
-  test("tokenizes operators and parens into the right count", () => [
-    // ( 1 + 2 ) => lparen num op num rparen
-    expect(length(tokenize("(1+2)"))).toBe(5)
+  test("tokenizes operators and parens in order", () => [
+    expect(tokenize("(1+2)")).toBe([lp(), num("1"), op("+"), num("2"), rp()])
   ]),
 
   // --- Whitespace ---
-  test("skips spaces, tabs, and the surrounding stream stays stable", () =>
-    val toks = tokenize("  1 +  2 ")
-    [
-      expect(length(toks)).toBe(3),
-      expect(toks[0]["text"]).toBe("1"),
-      expect(toks[1]["kind"]).toBe("op"),
-      expect(toks[2]["text"]).toBe("2")
-    ]
-  ),
+  test("skips spaces and tabs between tokens", () => [
+    expect(tokenize("  1 +\t 2 ")).toBe([num("1"), op("+"), num("2")])
+  ]),
 
   test("empty source yields no tokens", () => [
-    expect(length(tokenize(""))).toBe(0),
-    expect(length(tokenize("   "))).toBe(0)
+    expect(tokenize("")).toBe([]),
+    expect(tokenize("   ")).toBe([])
   ]),
 
   // --- Bad characters ---
-  test("emits a bad token for an unknown character", () =>
-    val toks = tokenize("@")
-    [
-      expect(length(toks)).toBe(1),
-      expect(toks[0]["kind"]).toBe("bad"),
-      expect(toks[0]["text"]).toBe("@")
-    ]
-  ),
+  test("emits a bad token for an unknown character", () => [
+    expect(tokenize("@")).toBe([bad("@")])
+  ]),
 
-  test("a bad character is one token among the good ones", () =>
-    val toks = tokenize("1 @ 2")
-    [
-      expect(length(toks)).toBe(3),
-      expect(toks[1]["kind"]).toBe("bad")
-    ]
-  )
+  test("a bad character is one token among the good ones", () => [
+    expect(tokenize("1 @ 2")).toBe([num("1"), bad("@"), num("2")])
+  ])
 ])
 run(s)

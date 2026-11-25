@@ -3,26 +3,23 @@
 // on before it binds the port. A raw config is genuinely dynamic input, so it
 // arrives as AnyVal and is resolved into the typed `Config` record here.
 import { keys } from "std/object"
-import { length, push } from "std/array"
-import { for } from "std/iter"
+import { length } from "std/array"
+import { for, flatMap } from "std/iter"
 import { join } from "std/string"
 
 // The fully-resolved service config (after defaults + validation). main.lin reads
 // `port` to bind the listener and surfaces `name` in the index page + /api/status.
 export type Config = { "host": String, "port": Int32, "debug": Boolean, "name": String }
 
-// One schema entry: the expected type tag ("string" | "int" | "bool") and an
-// optional default. The default is heterogeneous (String, Int32 or Boolean) and
-// absent for required fields, so it stays dynamic (AnyVal).
-export type SchemaEntry = { "type": String, "default": AnyVal }
-
 // load() returns a tagged result the caller pattern-matches on.
 export type Success = { "type": "success", "value": Config }
 export type Failure = { "type": "failure", "error": String }
 export type LoadResult = Success | Failure
 
-// The config schema. Each entry is { "type", "default" }; `name` is required so it
-// has no default and must be supplied by the caller.
+// The config schema. Each entry is { "type": "string" | "int" | "bool", "default" }; the
+// default is heterogeneous (String, Int32 or Boolean) and absent for required fields, so
+// it stays dynamic (AnyVal). `name` is required so it has no default and must be supplied
+// by the caller.
 export val schema = (): AnyVal =>
   {
     "host": { "type": "string", "default": "0.0.0.0" },
@@ -31,7 +28,7 @@ export val schema = (): AnyVal =>
     "name": { "type": "string" }
   }
 
-// The runtime type tag of a AnyVal value, as one of our schema type names.
+// The runtime type tag of an AnyVal value, as one of our schema type names.
 val typeName = (v: AnyVal): String =>
   match v
     is String => "string"
@@ -44,7 +41,7 @@ val typeName = (v: AnyVal): String =>
 // caller's input is not mutated.
 export val applyDefaults = (cfg: AnyVal): AnyVal =>
   val sch = schema()
-  var out: { String: AnyVal } = {}
+  val out: { String: AnyVal } = {}
   sch
     .keys()
     .for(k =>
@@ -59,18 +56,18 @@ export val applyDefaults = (cfg: AnyVal): AnyVal =>
 // error message strings (empty array == valid).
 export val validate = (cfg: AnyVal): String[] =>
   val sch = schema()
-  var errors: String[] = []
   sch
     .keys()
-    .for(k =>
+    .flatMap(k =>
       val expected = sch[k]["type"]
       val actual = cfg[k]
       if actual == null then
-        push(errors, "missing required field: ${k}")
+        ["missing required field: ${k}"]
       else if typeName(actual) != expected then
-        push(errors, "field ${k}: expected ${expected}, got ${typeName(actual)}")
+        ["field ${k}: expected ${expected}, got ${typeName(actual)}"]
+      else
+        []
     )
-  errors
 
 // Load a raw config object: apply defaults, validate, and return either
 // { "type": "success", "value": <complete Config> } or
@@ -78,7 +75,7 @@ export val validate = (cfg: AnyVal): String[] =>
 export val load = (raw: AnyVal): LoadResult =>
   val cfg = applyDefaults(raw)
   val errors = validate(cfg)
-  if length(errors) == 0 then
+  if errors.length() == 0 then
     { "type": "success", "value": cfg }
   else
     { "type": "failure", "error": errors.join("; ") }

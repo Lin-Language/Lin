@@ -21,7 +21,7 @@
 //
 // `health` and `link` are 0..15 quality codes packed into one status byte with
 // nibble packing — a compact way to carry two small enums in a single TLV value.
-import { push, length, slice } from "std/array"
+import { length, slice } from "std/array"
 import { concat, reduce, find } from "std/iter"
 import { encode, decode, Field } from "./tlv"
 
@@ -113,11 +113,11 @@ val motorsField = (fields: Field[]): Int32[] =>
 // A frame whose trailing byte does not match the body's XOR checksum is rejected
 // as an Error rather than silently misread.
 export val decodeTelemetry = (frame: UInt8[]): Telemetry | Error =>
-  if length(frame) == 0 then
+  if frame.length() == 0 then
     { "type": "error", "message": "empty telemetry frame" }
   else
-    val body: UInt8[] = frame.slice(0, length(frame) - 1)
-    val trailer = frame[length(frame) - 1]
+    val body: UInt8[] = frame.slice(0, frame.length() - 1)
+    val trailer = frame[frame.length() - 1]
     if checksum(body) != trailer then
       { "type": "error", "message": "telemetry checksum mismatch" }
     else

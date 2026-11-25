@@ -11,30 +11,26 @@
 import { async, await, parallel, timeout, retry, shared, withLock, get, threadPool, poolAsync } from "std/async"
 import { runTask, Task, TaskResult } from "./task"
 import { ok, err, andThen, Result } from "./outcome"
-import { map, for } from "std/iter"
+import { map, flatMap } from "std/iter"
 import { push, length } from "std/array"
-import { toString } from "std/string"
 
 // The aggregate outcome of a concurrent run: the per-task results, plus how many steps
 // actually completed (observed through a shared, lock-guarded progress log).
 export type RunReport = { "results": TaskResult[], "completed": Int32 }
 
-// Read back how many steps logged completion. `withLock` mutates the boxed value IN
-// PLACE (ADR-028), so progress is tracked by pushing each finished task's name into a
+// Read back how many steps logged completion. `withLock` mutates the boxed value in
+// place, so progress is tracked by pushing each finished task's name into a
 // `shared` array; the count is the array length of the snapshot.
 val countOf = (progress: Shared): Int32 =>
-  length(get(progress))
+  get(progress).length()
 
-// Narrow a single parallel result (the stdlib hands back a dynamic value) into the
-// precise TaskResult, filtering and accumulating via push over the narrowed arm.
+// Keep the TaskResults among a batch of dynamic values from `parallel`.
 val collect = (raw: AnyVal[]): TaskResult[] =>
-  var out: TaskResult[] = []
-  raw.for(x =>
+  raw.flatMap(x =>
     match x
-      is TaskResult => push(out, x)
-      else => null
+      is TaskResult => [x]
+      else => []
   )
-  out
 
 // Run every task concurrently with `parallel`. As each task finishes, its thunk logs
 // completion into a `shared` array under `withLock`, so progress is tracked race-free
@@ -44,7 +40,7 @@ export val runConcurrent = (tasks: Task[]): RunReport =>
   val raw = parallel(tasks.map(t =>
     () =>
       val res = runTask(t)
-      withLock(progress, a => push(a, t["name"]))
+      withLock(progress, a => a.push(t["name"]))
       res
   ))
   {
@@ -59,7 +55,7 @@ export val runWithTimeout = (t: Task, ms: Int32): Result<TaskResult, String> =>
   val r = await(timeout(p, ms))
   match r
     is TaskResult => ok(r)
-    else => err("timed out after ${toString(ms)}ms")
+    else => err("timed out after ${ms}ms")
 
 // Run a flaky task up to `times` attempts. `retry` re-spawns the thunk until one attempt
 // returns a non-Error; if every attempt faults, we report giving up. A faulting attempt
@@ -69,14 +65,7 @@ export val runWithRetry = (t: Task, times: Int32): Result<TaskResult, String> =>
   val r = await(retry(() => runTask(t), times))
   match r
     is TaskResult => ok(r)
-    else => err("gave up after ${toString(times)} attempt(s)")
-
-// Drain one pooled promise into the accumulator, narrowing its awaited value.
-val drain = (out: TaskResult[], p: Promise<TaskResult>): Null =>
-  val r = await(p)
-  match r
-    is TaskResult => push(out, r)
-    else => null
+    else => err("gave up after ${times} attempt(s)")
 
 // Run `first` with a deadline and, only if it succeeds, run `second` with a deadline too —
 // a dependent step ("deploy" runs only if "build" met its budget). `andThen` threads the
@@ -88,8 +77,10 @@ export val runThen = (first: Task, second: Task, ms: Int32): Result<TaskResult, 
 // subprocesses are in flight at once. Returns the results in submission order.
 export val runOnPool = (tasks: Task[], workers: Int32): TaskResult[] =>
   val pool = threadPool(workers)
-  var promises: Promise<TaskResult>[] = []
-  tasks.for(t => push(promises, pool.poolAsync(() => runTask(t))))
-  var out: TaskResult[] = []
-  promises.for(p => drain(out, p))
-  out
+  val promises = tasks.map(t => pool.poolAsync(() => runTask(t)))
+  promises.flatMap(p =>
+    val r = await(p)
+    match r
+      is TaskResult => [r]
+      else => []
+  )

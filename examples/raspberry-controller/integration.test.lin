@@ -1,5 +1,5 @@
 import { suite, test, expect, run, toBe } from "std/test"
-import { clampSpeed, applyKey } from "./control"
+import { applyKey, KEY_LEFT_UP, KEY_LEFT_DOWN, KEY_RIGHT_UP, KEY_STOP } from "./control"
 import { encodePacket, parsePacket } from "./protocol"
 import { motorCommand, MotorCommand } from "./motor"
 import { parseNals, NalUnit } from "./nal"
@@ -24,16 +24,16 @@ val s = suite("raspberry-controller integration", [
   // (right +0.1), encode the resulting pair into the 8-byte wire packet, decode it
   // as the server would, and map each decoded speed to a PWM motor command.
   test("control path: keypress -> encode -> decode -> motor PWM", () =>
-    val afterQ: Float64[] = applyKey(113, 0.0, 0.0)             // q: left -> 0.1
-    val afterW: Float64[] = applyKey(119, afterQ[0], afterQ[1]) // w: right -> 0.1
+    val afterQ: Float64[] = applyKey(KEY_LEFT_UP, 0.0, 0.0)              // q: left -> 0.1
+    val afterW: Float64[] = applyKey(KEY_RIGHT_UP, afterQ[0], afterQ[1]) // w: right -> 0.1
     val packet: UInt8[] = encodePacket(afterW[0], afterW[1])
-    val decoded: Float64[] = parsePacket(packet)                // server-side decode
+    val decoded: [Float64, Float64] = parsePacket(packet)                // server-side decode
     val leftCmd: MotorCommand = motorCommand(decoded[0])
     val rightCmd: MotorCommand = motorCommand(decoded[1])
     [
       expect(afterW[0]).toBe(0.1),
       expect(afterW[1]).toBe(0.1),
-      expect(length(packet)).toBe(8), // two big-endian f32
+      expect(packet.length()).toBe(8), // two big-endian f32
       // 0.1 is not f32-exact, so the decoded speed is ~0.1 (not == 0.1); assert
       // the wire round-trips through the motor mapping, whose round() absorbs it.
       expect(decoded[0] > 0.0).toBe(true), // forward after round-trip
@@ -48,11 +48,11 @@ val s = suite("raspberry-controller integration", [
   // Reverse + stop through the same path: 'a' steps left negative, then 'space'
   // stops both. Decode and confirm the motor sees a full stop.
   test("control path: reverse then stop maps to lpwm then stop", () =>
-    val rev: Float64[] = applyKey(97, 0.0, 0.0)           // a: left -> -0.1
+    val rev: Float64[] = applyKey(KEY_LEFT_DOWN, 0.0, 0.0)      // a: left -> -0.1
     val revCmd: MotorCommand = motorCommand(parsePacket(encodePacket(rev[0], rev[1]))[0])
-    val stopped: Float64[] = applyKey(32, rev[0], rev[1]) // space: stop
+    val stopped: Float64[] = applyKey(KEY_STOP, rev[0], rev[1]) // space: stop
     val stopPkt: UInt8[] = encodePacket(stopped[0], stopped[1])
-    val stopDec: Float64[] = parsePacket(stopPkt)
+    val stopDec: [Float64, Float64] = parsePacket(stopPkt)
     val stopCmd: MotorCommand = motorCommand(stopDec[0])
     [
       expect(revCmd["channel"]).toBe("lpwm"), // reverse -> lpwm
@@ -93,10 +93,10 @@ val s = suite("raspberry-controller integration", [
     val seqAfter = nextSequence(0, firstNal)
     val pkt: UInt8[] = packets[0]
     [
-      expect(length(nals)).toBe(2), // SPS(7) + PPS(8), 0x41 flushes
+      expect(nals.length()).toBe(2), // SPS(7) + PPS(8), 0x41 flushes
       expect(nals[0]["nalType"]).toBe(7),
       expect(nals[1]["nalType"]).toBe(8),
-      expect(length(packets)).toBe(1), // small NAL -> single packet
+      expect(packets.length()).toBe(1), // small NAL -> single packet
       expect(pkt[0]).toBe(0x80), // RTP V=2
       expect(pkt[8]).toBe(0x12), // SSRC big-endian
       expect(pkt[12]).toBe(0x67), // payload = NAL verbatim
@@ -109,30 +109,22 @@ val s = suite("raspberry-controller integration", [
   // telemetry packet, and decode it back as the client would — closing the
   // reverse channel from motor.lin's MotorCommand through tlv.lin.
   test("telemetry path: motor duties -> TLV frame -> decode", () =>
-    val fwd: Float64[] = applyKey(113, 0.5, 0.0) // q: left -> 0.6
+    val fwd: Float64[] = applyKey(KEY_LEFT_UP, 0.5, 0.0) // q: left -> 0.6
     val leftCmd: MotorCommand = motorCommand(parsePacket(encodePacket(fwd[0], fwd[1]))[0])
     val rightCmd: MotorCommand = motorCommand(parsePacket(encodePacket(fwd[0], fwd[1]))[1])
     val report: Telemetry = {
       "battery": 64,
       "leftDuty": leftCmd["duty"],
       "rightDuty": rightCmd["duty"],
-      "tempC": 0 - 3,
+      "tempC": -3,
       "health": 2,
       "link": 7
     }
     val frame = encodeTelemetry(report)
-    val tele = decodeTelemetry(frame)
-    val decoded = match tele
-      is Error => report
-      else => tele
     [
       expect(leftCmd["channel"]).toBe("rpwm"), // left drives forward
-      expect(decoded["leftDuty"]).toBe(leftCmd["duty"]), // duty survives the frame
-      expect(decoded["rightDuty"]).toBe(rightCmd["duty"]),
-      expect(decoded["battery"]).toBe(64),
-      expect(decoded["tempC"]).toBe(0 - 3), // signed temp round-trips
-      expect(decoded["health"]).toBe(2),
-      expect(decoded["link"]).toBe(7)
+      // every reading survives the frame, including the signed temperature
+      expect(decodeTelemetry(frame)).toBe(report)
     ]
   )
 ])

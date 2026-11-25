@@ -1,0 +1,8 @@
+// Tagged success/failure shapes shared by the parser, evaluator and pipeline.
+// The discriminant field `type` is a string-literal singleton, so `match … is Failure`
+// narrows a `Success<T> | Failure` union.
+export type Failure = { "type": "failure", "error": String }
+export type Success<T> = { "type": "success", "value": T }
+
+export val fail = (msg: String): Failure =>
+  { "type": "failure", "error": msg }

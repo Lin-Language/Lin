@@ -56,7 +56,7 @@ val s = suite("matrix", [
     val rot = rotation2D(PI / 2.0)
     val pt = applyToVec(rot, vec2(1.0, 0.0))
     [
-      expect(angleBetween(vec2(1.0, 0.0), pt).toFixed(4)).toBe(toFixed(PI / 2.0, 4))
+      expect(angleBetween(vec2(1.0, 0.0), pt).toFixed(4)).toBe((PI / 2.0).toFixed(4))
     ]
   )
 ])

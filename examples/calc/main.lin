@@ -6,15 +6,15 @@
 // Run:   lin run examples/calc/main.lin
 // Test:  lin test examples/calc/
 import { calc } from "./calc"
+import { Failure } from "./result"
 import { print } from "std/io"
-import { toString } from "std/string"
 
 // Print "<expr> = <result>" or "<expr> -> error: <msg>" for one input.
 val show = (src: String): Null =>
-  match calc(src)
-    has { "type": "success", value } => print("${src} = ${toString(value)}")
-    has { "type": "failure", error } => print("${src} -> error: ${error}")
-    else => print("${src} -> ?")
+  val result = calc(src)
+  match result
+    is Failure => print("${src} -> error: ${result["error"]}")
+    else => print("${src} = ${result["value"]}")
 
 show("2 + 3 * 4")
 show("(2 + 3) * 4")

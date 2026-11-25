@@ -1,12 +1,11 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { contains } from "std/string"
-import { HttpRequest as Request } from "std/http"
 import { render, renderWith } from "std/template"
 import { solve } from "./routing"
 import { getIndex, getStatus, getRoute, getUser } from "./handlers"
-import { Config } from "./config"
+import { testConfig as config, makeReq } from "./fixtures"
 
-// Handler unit tests. `render` is mocked (ADR-046) with an inline template so the
+// Handler unit tests. `render` is mocked with an inline template so the
 // index handler is tested without the on-disk view path (the real index.jinja
 // render is covered in template.test.lin). `solve` is mocked so the /route
 // handler's ok / no-path / error branches are deterministic and disk-free.
@@ -25,30 +24,14 @@ replace solve = (graphPath: String, from: String, to: String): AnyVal =>
       "distance": 42
     }
 
-val config: Config = {
-  "host": "0.0.0.0",
-  "port": 3000,
-  "debug": false,
-  "name": "Lin Maps"
-}
-
-val makeReq = (path: String): Request =>
-  {
-    "method": "GET",
-    "path": path,
-    "query": "",
-    "headers": {},
-    "body": ""
-  }
-
 val s = suite("handlers", [
   test("getIndex renders the template with the config name in the body", () =>
     val resp = getIndex(makeReq("/"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "<!DOCTYPE html>")).toBe(true),
-      expect(contains(resp["body"], "Lin Maps")).toBe(true),
-      expect(contains(resp["body"], "Welcome to Lin Maps")).toBe(true)
+      expect(resp["body"].contains("<!DOCTYPE html>")).toBe(true),
+      expect(resp["body"].contains("Lin Maps")).toBe(true),
+      expect(resp["body"].contains("Welcome to Lin Maps")).toBe(true)
     ]
   ),
 
@@ -56,7 +39,7 @@ val s = suite("handlers", [
     val resp = getStatus(makeReq("/api/status"), config)
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "Lin Maps")).toBe(true)
+      expect(resp["body"].contains("Lin Maps")).toBe(true)
     ]
   ),
 
@@ -64,8 +47,8 @@ val s = suite("handlers", [
     val resp = getRoute(makeReq("/route/A/E"))
     [
       expect(resp["status"]).toBe(200),
-      expect(contains(resp["body"], "\"distance\": 42")).toBe(true),
-      expect(contains(resp["body"], "\"from\": \"A\"")).toBe(true)
+      expect(resp["body"].contains("\"distance\": 42")).toBe(true),
+      expect(resp["body"].contains("\"from\": \"A\"")).toBe(true)
     ]
   ),
 
@@ -73,7 +56,7 @@ val s = suite("handlers", [
     val resp = getRoute(makeReq("/route/A/Z"))
     [
       expect(resp["status"]).toBe(404),
-      expect(contains(resp["body"], "no route")).toBe(true)
+      expect(resp["body"].contains("no route")).toBe(true)
     ]
   ),
 
@@ -81,7 +64,7 @@ val s = suite("handlers", [
     val resp = getRoute(makeReq("/route/A/boom"))
     [
       expect(resp["status"]).toBe(500),
-      expect(contains(resp["body"], "routing unavailable")).toBe(true)
+      expect(resp["body"].contains("routing unavailable")).toBe(true)
     ]
   ),
 

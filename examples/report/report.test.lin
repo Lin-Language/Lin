@@ -19,35 +19,35 @@ val sample = [
 val s = suite("report", [
   // --- Splitting valid from invalid ---
   test("keeps only the valid records", () => [
-    expect(length(validRecords(sample))).toBe(4)
+    expect(validRecords(sample).length()).toBe(4)
   ]),
 
   test("collects the parse errors", () => [
-    expect(length(parseErrors(sample))).toBe(2)
+    expect(parseErrors(sample).length()).toBe(2)
   ]),
 
   test("all-invalid input yields zero valid records", () => [
-    expect(length(validRecords(["x", "y", "z"]))).toBe(0)
+    expect(validRecords(["x", "y", "z"]).length()).toBe(0)
   ]),
 
   // --- Deduplication via std/hash structural key ---
   test("drops exact-duplicate records, keeping first occurrence", () =>
     val dupes = validRecords(["Alice, 85", "Bob, 92", "Alice, 85", "Bob, 92"])
     [
-      expect(length(dupes)).toBe(4),
-      expect(length(uniqueRecords(dupes))).toBe(2)
+      expect(dupes.length()).toBe(4),
+      expect(uniqueRecords(dupes).length()).toBe(2)
     ]
   ),
 
   test("keeps same-name records with different scores", () =>
     val rs = validRecords(["Alice, 85", "Alice, 90"])
     [
-      expect(length(uniqueRecords(rs))).toBe(2)
+      expect(uniqueRecords(rs).length()).toBe(2)
     ]
   ),
 
   test("uniqueRecords over no duplicates is identity-length", () => [
-    expect(length(uniqueRecords(validRecords(sample)))).toBe(4)
+    expect(uniqueRecords(validRecords(sample)).length()).toBe(4)
   ]),
 
   // --- Statistics over the valid records ---

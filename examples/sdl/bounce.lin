@@ -29,15 +29,16 @@
 //
 // Run headless:  SDL_VIDEODRIVER=dummy lin run examples/sdl/bounce.lin
 import { print } from "std/io"
-import { toString } from "std/string"
-import { toFloat32, toFloat64, toInt32, toInt64 } from "std/number"
+import { toFloat32, toFloat64, toInt32 } from "std/number"
+import { range, reduce, while } from "std/iter"
 import { toFixed } from "std/math"
-import { alloc, free, pokeF32, peekU8, peekI32, peekPtr, withCstr } from "std/ffi"
-import { Vec2, vec2 } from "./vector"
+import { alloc, free, pokeF32, withCstr } from "std/ffi"
+import { vec2 } from "./vector"
 import { rotation2D, applyToVec } from "./matrix"
 import { Ball, ball, stepBall } from "./physics"
 import { cDistance } from "./mathffi"
-import { SDL_INIT_VIDEO, FRECT_BYTES, FRECT_X_OFF, FRECT_Y_OFF, FRECT_W_OFF, FRECT_H_OFF, EVENT_BYTES, SURFACE_PITCH_OFF, SURFACE_PIXELS_OFF, PIXEL_BYTES, PIXEL_B_OFF, PIXEL_G_OFF, PIXEL_R_OFF } from "./constants"
+import { SDL_INIT_VIDEO, FRECT_BYTES, FRECT_X_OFF, FRECT_Y_OFF, FRECT_W_OFF, FRECT_H_OFF, EVENT_BYTES, PIXEL_B_OFF, PIXEL_G_OFF, PIXEL_R_OFF } from "./constants"
+import { pixelChannel } from "./render"
 
 // Real SDL3 signatures. `void*`/handles (window, renderer, surface, pixels) are carried as `Ptr`
 // (an Int64 alias, never refcounted); `bool` comes back as Int32 (0/1) over the C ABI.
@@ -73,10 +74,7 @@ val TURN = 0.02
 // no events; we still pump so the queue never backs up. We DO NOT use this to terminate — the loop
 // runs a fixed frame count.
 val drainEvents = (eventBuf: Ptr): Null =>
-  if SDL_PollEvent(eventBuf) == 0 then
-    null
-  else
-    drainEvents(eventBuf)
+  while(() => SDL_PollEvent(eventBuf) != 0)
 
 // One frame: drain events, clear to a known background, advance the ball with pure vector physics
 // (rotate the velocity slightly, then reflect off the walls), build an SDL_FRect in `rectBuf` (four
@@ -98,38 +96,22 @@ val drawFrame = (ren: Ptr, rectBuf: Ptr, eventBuf: Ptr, b: Ball): Ball =>
   SDL_RenderPresent(ren)
   next
 
-// Tail-recursive frame loop over a FIXED count. Self-terminating (no event dependency).
-val loop = (ren: Ptr, rectBuf: Ptr, eventBuf: Ptr, b: Ball, n: Int32): Ball =>
-  if n <= 0 then
-    b
-  else
-    loop(ren, rectBuf, eventBuf, drawFrame(ren, rectBuf, eventBuf, b), n - 1)
-
-// Read channel `chanOff` (B/G/R) of pixel (x,y) out of a read-back SDL_Surface as an Int64 in
-// [0,255]. Byte address = pixels + y*pitch + x*PIXEL_BYTES + chanOff. The Int32 byte offset widens
-// to the Int64 `peek` offset param at the call site; toInt64 widens the UInt8 channel for
-// printing/comparison against integer literals.
-val pixelChannel = (surf: Ptr, x: Int32, y: Int32, chanOff: Int32): Int64 =>
-  val pitch = peekI32(surf, SURFACE_PITCH_OFF)
-  val pixels = peekPtr(surf, SURFACE_PIXELS_OFF)
-  val off = y * pitch + x * PIXEL_BYTES + chanOff
-  toInt64(peekU8(pixels, off))
-
 SDL_Init(SDL_INIT_VIDEO)
 val win = withCstr("lin-sdl-bounce", title => SDL_CreateWindow(title, WIDTH, HEIGHT, 0))
-print("window handle non-null: ${toString(win != 0)}")
+print("window handle non-null: ${win != 0}")
 val ren = SDL_CreateRenderer(win, 0)
-print("renderer handle non-null: ${toString(ren != 0)}")
+print("renderer handle non-null: ${ren != 0}")
 
 val rectBuf = alloc(FRECT_BYTES)
 val eventBuf = alloc(EVENT_BYTES)
 
-val finalBall = loop(ren, rectBuf, eventBuf, ball(vec2(0.0, 0.0), vec2(3.0, 2.0)), FRAMES)
+// A FIXED frame count, so the demo self-terminates (no event dependency).
+val finalBall = range(0, FRAMES).reduce(ball(vec2(0.0, 0.0), vec2(3.0, 2.0)), (b, frame) => drawFrame(ren, rectBuf, eventBuf, b))
 val fx = finalBall["pos"]["x"]
 val fy = finalBall["pos"]["y"]
 
-print("frames drawn: ${toString(FRAMES)}")
-print("final ball: ${toString(fx)},${toString(fy)}")
+print("frames drawn: ${FRAMES}")
+print("final ball: ${fx},${fy}")
 
 // Distance from the ball to the playfield centre, measured by the hand-written C library.
 val centreDist = cDistance(fx, fy, toFloat64(WIDTH) / 2.0, toFloat64(HEIGHT) / 2.0)
@@ -145,10 +127,8 @@ val r = pixelChannel(surf, px, py, PIXEL_R_OFF)
 val g = pixelChannel(surf, px, py, PIXEL_G_OFF)
 val b = pixelChannel(surf, px, py, PIXEL_B_OFF)
 val matches = r == 255 && g == 128 && b == 0
-print(
-  "pixel[${toString(px)},${toString(py)}] = ${toString(r)},${toString(g)},${toString(b)}"
-)
-print("rendered pixel matches fill: ${toString(matches)}")
+print("pixel[${px},${py}] = ${r},${g},${b}")
+print("rendered pixel matches fill: ${matches}")
 SDL_DestroySurface(surf)
 
 free(rectBuf)

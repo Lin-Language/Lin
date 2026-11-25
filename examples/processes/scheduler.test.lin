@@ -7,7 +7,7 @@ import { sleep } from "std/time"
 import { length } from "std/array"
 
 // The scheduler's async thunks all call the top-level `runTask`, which calls `exec`; we
-// mock `exec` (ADR-046) so concurrency, timeouts and retries are driven deterministically
+// mock `exec` so concurrency, timeouts and retries are driven deterministically
 // without spawning real subprocesses. The mock dispatches on the command name:
 //   "ok"    — succeeds immediately (exit 0)
 //   "slow"  — sleeps past any small deadline before succeeding (drives the timeout MISS)
@@ -68,7 +68,7 @@ val s = suite("scheduler", [
       task("c", "ok")
     ])
     [
-      expect(length(rep["results"])).toBe(3),
+      expect(rep["results"].length()).toBe(3),
       expect(rep["completed"]).toBe(3),
       expect(rep["results"][0]["outcome"]).toBe("pass")
     ]
@@ -113,7 +113,7 @@ val s = suite("scheduler", [
       2
     )
     [
-      expect(length(results)).toBe(2),
+      expect(results.length()).toBe(2),
       expect(results[0]["name"]).toBe("a"),
       expect(results[1]["outcome"]).toBe("pass")
     ]

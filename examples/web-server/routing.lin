@@ -6,8 +6,9 @@
 // reconstruct the route to `to`, and return a precise tagged result. It is kept
 // free of HTTP concerns (and behind a mockable std/fs read) so the whole
 // graph -> dijkstra -> path flow is unit-testable without a live server or disk.
-import { push, reverse, length } from "std/array"
-import { for, range, reduce, filter, map } from "std/iter"
+import { push, reverse, length, groupBy } from "std/array"
+import { mapValues } from "std/object"
+import { for, range, reduce, filter, map, while } from "std/iter"
 import { readJson } from "std/fs"
 
 // --- graph shapes ---------------------------------------------------------
@@ -38,34 +39,27 @@ val UNREACHABLE = 999999999
 // --- graph construction + path reconstruction -----------------------------
 // Group the edge list into an adjacency map keyed by source node.
 export val buildAdj = (edges: Edge[]): { String: Neighbor[] } =>
-  var adj: { String: Neighbor[] } = {}
-  edges.for(edge =>
-    val existing = adj[edge["from"]]
-    match existing
-      is Null => adj[edge["from"]] = [{ "to": edge["to"], "weight": edge["weight"] }]
-      else => push(existing, { "to": edge["to"], "weight": edge["weight"] })
-  )
-  adj
-
-val walkPath = (prev: { String: String }, source: String, path: String[], current: String): Null =>
-  val p = prev[current]
-  match p
-    is String =>
-      if current != source then
-        push(path, p)
-        walkPath(prev, source, path, p)
-      else
-        null
-    else => null
+  edges
+    .groupBy(edge => edge["from"])
+    .mapValues(group => group.map(edge => { "to": edge["to"], "weight": edge["weight"] }))
 
 // Walk the predecessor map backwards from `target` to `source` into a node list.
 export val reconstructPath = (prev: { String: String }, source: String, target: String): String[] =>
   if target == source then
     [source]
   else
-    var path = [target]
-    walkPath(prev, source, path, target)
-    reverse(path)
+    val path = [target]
+    var current = target
+    while(() =>
+      val p = prev[current]
+      match p
+        is String when current != source =>
+          path.push(p)
+          current = p
+          true
+        else => false
+    )
+    path.reverse()
 
 // --- Dijkstra -------------------------------------------------------------
 val findMinIdx = (pq: PqEntry[]): Int32 =>
@@ -75,31 +69,36 @@ val removeAt = (pq: PqEntry[], idx: Int32): PqEntry[] =>
   range(0, pq.length()).filter(i => i != idx).map(i => pq[i])
 
 val processQueue = (pq: PqEntry[], adj: { String: Neighbor[] }, dist: { String: Int32 }, prev: { String: String }, visited: { String: Boolean }): Null =>
-  if length(pq) > 0 then
-    val midx = findMinIdx(pq)
-    val current = pq[midx]
-    val remaining = removeAt(pq, midx)
-    val u = current["node"]
-    if visited[u] == null then
-      visited[u] = true
-      val neighbors = adj[u] ?? []
-      neighbors.for(edge =>
-        val v = edge["to"]
-        val du = dist[u] ?? 0
-        val dv = dist[v] ?? 0
-        val newDist = du + edge["weight"]
-        if newDist < dv then
-          dist[v] = newDist
-          prev[v] = u
-          push(remaining, { "node": v, "dist": newDist })
-      )
-    processQueue(remaining, adj, dist, prev, visited)
+  var queue = pq
+  while(() =>
+    if queue.length() > 0 then
+      val midx = findMinIdx(queue)
+      val u = queue[midx]["node"]
+      val remaining = removeAt(queue, midx)
+      if visited[u] == null then
+        visited[u] = true
+        val neighbors = adj[u] ?? []
+        neighbors.for(edge =>
+          val v = edge["to"]
+          val du = dist[u] ?? 0
+          val dv = dist[v] ?? 0
+          val newDist = du + edge["weight"]
+          if newDist < dv then
+            dist[v] = newDist
+            prev[v] = u
+            remaining.push({ "node": v, "dist": newDist })
+        )
+      queue = remaining
+      true
+    else
+      false
+  )
 
 // Shortest distances + predecessors from `source` over the adjacency map.
 export val dijkstra = (adj: { String: Neighbor[] }, source: String, allNodes: String[]): DijkstraResult =>
-  var dist: { String: Int32 } = {}
-  var prev: { String: String } = {}
-  var visited: { String: Boolean } = {}
+  val dist: { String: Int32 } = {}
+  val prev: { String: String } = {}
+  val visited: { String: Boolean } = {}
   allNodes.for(n => dist[n] = UNREACHABLE)
   dist[source] = 0
   val pq = [{ "node": source, "dist": 0 }]
