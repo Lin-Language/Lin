@@ -39,7 +39,7 @@ export val matMul = (a: Float64[], b: Float64[]): Float64[] =>
 export val rotation2D = (theta: Float64): Float64[] =>
   val c = cos(theta)
   val s = sin(theta)
-  mat3(c, 0 - s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0)
+  mat3(c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0)
 
 // Map a Vec2 through the (homogeneous) matrix, returning a Vec2. The point's implicit w is 1, so
 // the third column acts as a translation.

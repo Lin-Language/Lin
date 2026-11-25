@@ -986,6 +986,29 @@ fn fmt_postfix_base(base: &Expr, render: impl Fn(&Expr) -> String) -> String {
     }
 }
 
+/// The operand of a unary minus on a non-literal. The parser desugars `-x` to `0 - x` with the
+/// synthetic `0` carrying the span of the `-` token itself, whereas an explicit `0 - x` has the
+/// `0` literal's own span, distinct from the operator's. That distinguishes the two forms.
+fn negated_operand(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::BinaryOp { left, op: BinOp::Sub, right, span } => match &**left {
+            Expr::IntLit(0, None, lspan) if lspan.start == span.start && lspan.end == span.end => Some(right),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Render `-operand`, parenthesising operands that are not postfix-level primaries.
+fn fmt_negation(operand: &Expr, render: impl Fn(&Expr) -> String) -> String {
+    let s = render(operand);
+    if needs_postfix_parens(operand) {
+        format!("-({})", s)
+    } else {
+        format!("-{}", s)
+    }
+}
+
 /// Format a `BinaryOp` operand, wrapping it in parentheses when the parsed
 /// grouping would otherwise be lost. `parent` is the enclosing operator; `is_right`
 /// marks the right operand (which needs parens at EQUAL precedence too, because the
@@ -994,6 +1017,9 @@ fn fmt_postfix_base(base: &Expr, render: impl Fn(&Expr) -> String) -> String {
 /// The rendering closure `render` produces the operand's own (paren-free) text.
 fn fmt_binop_operand(operand: &Expr, parent: &BinOp, is_right: bool, render: impl Fn(&Expr) -> String) -> String {
     let s = render(operand);
+    if negated_operand(operand).is_some() {
+        return s;
+    }
     match operand {
         Expr::BinaryOp { op: child_op, .. } => {
             let (cp, pp) = (binop_prec(child_op), binop_prec(parent));
@@ -1597,6 +1623,9 @@ fn fmt_inline(expr: &Expr) -> String {
         Expr::NullLit(_) => "null".to_string(),
         Expr::Ident(name, _) => name.clone(),
         Expr::StringInterp(parts, _) => fmt_interp(parts),
+        Expr::BinaryOp { right, .. } if negated_operand(expr).is_some() => {
+            fmt_negation(right, fmt_inline)
+        }
         Expr::BinaryOp { left, op, right, .. } => {
             format!(
                 "{} {} {}",
@@ -1815,6 +1844,9 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         Expr::Ident(name, _) => name.clone(),
         Expr::StringInterp(parts, _) => fmt_interp(parts),
 
+        Expr::BinaryOp { right, .. } if negated_operand(expr).is_some() => {
+            fmt_negation(right, |e| fmt_expr(e, false, ind))
+        }
         Expr::BinaryOp { left, op, right, .. } => {
             let render = |e: &Expr| fmt_expr(e, false, ind);
             format!(
@@ -2906,5 +2938,32 @@ mod tests {
         assert_eq!(out, fmt_src(&out), "formatter not idempotent: {out:?}");
         // A genuine negative literal must still render normally.
         assert!(fmt_src("val x: Int64 = -1\n").contains("= -1"));
+    }
+
+    /// Unary minus on a non-literal is desugared by the parser to `0 - x`; the formatter must
+    /// render it back as `-x`, while an explicit `0 - x` / `0.0 - x` stays a subtraction.
+    #[test]
+    fn unary_minus_roundtrips_and_explicit_subtraction_is_kept() {
+        let preserved = [
+            "val a = -x\n",
+            "val a = -f(y)\n",
+            "val a = -(a + b)\n",
+            "val a = -e[\"k\"]\n",
+            "val a = -x.y\n",
+            "val a = 2 * -x\n",
+            "val a = x - -x\n",
+            "val a = -(-x)\n",
+            "val a = (-x).abs()\n",
+            "val a = -1\n",
+            "val a = -1.0\n",
+            "val a = 0 - x\n",
+            "val a = 0.0 - x\n",
+            "val a = 0 - 1\n",
+        ];
+        for src in preserved {
+            let out = format(src);
+            assert_eq!(out, src, "formatter changed {src:?}");
+            assert_eq!(out, format(&out), "formatter not idempotent for {src:?}");
+        }
     }
 }
